@@ -19,7 +19,7 @@ pub struct KeycloakClient {
 }
 
 impl KeycloakClient {
-    pub fn new(config: &AuthConfig) -> Self {
+    pub fn new(config: &AuthConfig) -> sqe_core::Result<Self> {
         let token_url = format!(
             "{}/realms/{}/protocol/openid-connect/token",
             config.keycloak_url.trim_end_matches('/'),
@@ -29,14 +29,14 @@ impl KeycloakClient {
         let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(!config.ssl_verification)
             .build()
-            .expect("Failed to build reqwest client");
+            .map_err(|e| sqe_core::SqeError::Auth(format!("Failed to build HTTP client: {e}")))?;
 
-        Self {
+        Ok(Self {
             client,
             token_url,
             client_id: config.client_id.clone(),
             client_secret: config.client_secret.clone(),
-        }
+        })
     }
 
     pub async fn exchange_credentials(

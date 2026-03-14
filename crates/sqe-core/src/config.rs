@@ -37,7 +37,7 @@ pub struct WorkerConfig {
     pub spill_dir: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct AuthConfig {
     pub keycloak_url: String,
     pub realm: String,
@@ -50,6 +50,19 @@ pub struct AuthConfig {
     pub ssl_verification: bool,
 }
 
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthConfig")
+            .field("keycloak_url", &self.keycloak_url)
+            .field("realm", &self.realm)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[REDACTED]")
+            .field("token_refresh_buffer_secs", &self.token_refresh_buffer_secs)
+            .field("ssl_verification", &self.ssl_verification)
+            .finish()
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct CatalogConfig {
     pub polaris_url: String,
@@ -59,7 +72,7 @@ pub struct CatalogConfig {
     pub metadata_cache_ttl_secs: u64,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Deserialize, Clone, Default)]
 pub struct StorageConfig {
     #[serde(default)]
     pub s3_endpoint: String,
@@ -71,6 +84,18 @@ pub struct StorageConfig {
     pub s3_secret_key: String,
     #[serde(default)]
     pub s3_path_style: bool,
+}
+
+impl std::fmt::Debug for StorageConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageConfig")
+            .field("s3_endpoint", &self.s3_endpoint)
+            .field("s3_region", &self.s3_region)
+            .field("s3_access_key", &"[REDACTED]")
+            .field("s3_secret_key", &"[REDACTED]")
+            .field("s3_path_style", &self.s3_path_style)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
