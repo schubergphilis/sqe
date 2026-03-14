@@ -38,6 +38,7 @@ anyhow = { workspace = true }
 base64 = "0.22"
 sqlparser = { workspace = true }
 iceberg = { workspace = true }
+parquet = { workspace = true }
 
 [dev-dependencies]
 sqe-core = { path = "../sqe-core" }
