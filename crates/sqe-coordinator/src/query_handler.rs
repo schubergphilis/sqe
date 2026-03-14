@@ -6,12 +6,14 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::prelude::SessionContext;
 use tracing::{debug, info};
 
+use sqlparser::ast::Statement;
 use sqe_catalog::{SessionCatalog, SqeCatalogProvider};
 use sqe_core::{Session, SqeConfig, SqeError};
 use sqe_policy::PolicyEnforcer;
 use sqe_sql::{parse_and_classify, StatementKind};
 
 use crate::catalog_ops::CatalogOps;
+use crate::write_handler::WriteHandler;
 
 /// Handles query execution by routing parsed SQL through the appropriate
 /// pipeline: DataFusion for queries, catalog metadata for SHOW commands,
@@ -20,15 +22,18 @@ pub struct QueryHandler {
     policy_enforcer: Arc<dyn PolicyEnforcer>,
     config: SqeConfig,
     catalog_ops: CatalogOps,
+    write_handler: WriteHandler,
 }
 
 impl QueryHandler {
     pub fn new(policy_enforcer: Arc<dyn PolicyEnforcer>, config: SqeConfig) -> Self {
         let catalog_ops = CatalogOps::new(config.clone());
+        let write_handler = WriteHandler::new(config.clone());
         Self {
             policy_enforcer,
             config,
             catalog_ops,
+            write_handler,
         }
     }
 
@@ -92,12 +97,42 @@ impl QueryHandler {
                 Ok(vec![])
             }
 
-            // Write operations: not implemented yet (Chunk 2)
-            StatementKind::Ctas(_)
-            | StatementKind::Insert(_)
-            | StatementKind::Merge(_)
-            | StatementKind::Delete(_) => Err(SqeError::NotImplemented(
-                "Write operations are not yet supported".to_string(),
+            // Write operations: CTAS and INSERT INTO SELECT
+            StatementKind::Ctas(stmt) => {
+                if let Statement::CreateTable(ref ct) = *stmt {
+                    if let Some(ref query) = ct.query {
+                        let select_sql = format!("{query}");
+                        let batches = self.execute_query(session, &select_sql).await?;
+                        self.write_handler.handle_ctas(session, &stmt, batches).await
+                    } else {
+                        Err(SqeError::Execution("CTAS without SELECT query".into()))
+                    }
+                } else {
+                    Err(SqeError::Execution("Expected CreateTable statement".into()))
+                }
+            }
+
+            StatementKind::Insert(stmt) => {
+                if let Statement::Insert(ref ins) = *stmt {
+                    let select_sql = ins
+                        .source
+                        .as_ref()
+                        .map(|q| format!("{q}"))
+                        .ok_or_else(|| {
+                            SqeError::Execution("INSERT without SELECT source".into())
+                        })?;
+                    let batches = self.execute_query(session, &select_sql).await?;
+                    self.write_handler
+                        .handle_insert(session, &stmt, batches)
+                        .await
+                } else {
+                    Err(SqeError::Execution("Expected Insert statement".into()))
+                }
+            }
+
+            // Write operations: not implemented yet
+            StatementKind::Merge(_) | StatementKind::Delete(_) => Err(SqeError::NotImplemented(
+                "MERGE and DELETE operations are not yet supported".to_string(),
             )),
         }
     }
