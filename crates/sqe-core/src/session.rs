@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Session {
     pub id: String,
     pub user: SessionUser,
@@ -9,6 +9,19 @@ pub struct Session {
     pub refresh_token: Option<String>,
     pub token_expiry: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("id", &self.id)
+            .field("user", &self.user)
+            .field("access_token", &"[REDACTED]")
+            .field("refresh_token", &"[REDACTED]")
+            .field("token_expiry", &self.token_expiry)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]

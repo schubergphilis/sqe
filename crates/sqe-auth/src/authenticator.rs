@@ -17,7 +17,7 @@ pub struct Authenticator {
 
 impl Authenticator {
     pub async fn new(config: &AuthConfig) -> sqe_core::Result<Self> {
-        let keycloak = KeycloakClient::new(config);
+        let keycloak = KeycloakClient::new(config)?;
         let cache = TokenCache::new();
         let refresh_buffer_secs = config.token_refresh_buffer_secs;
 

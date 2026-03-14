@@ -26,6 +26,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize auth
     let authenticator = Arc::new(sqe_auth::Authenticator::new(&config.auth).await?);
+    authenticator.start_refresh_task();
 
     // Initialize session manager
     let session_manager = Arc::new(SessionManager::new(authenticator.clone()));

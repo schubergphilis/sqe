@@ -253,27 +253,19 @@ impl FlightSqlService for SqeFlightSqlService {
             app_metadata: vec![].into(),
         };
 
-        // Try to get the schema by executing the query
-        let batches = self
+        // Plan the query to extract the schema without executing it
+        let schema = self
             .query_handler
-            .execute(&session, sql)
+            .get_schema(&session, sql)
             .await
-            .map_err(|e| Status::internal(format!("Query execution failed: {e}")))?;
-
-        let schema = if batches.is_empty() {
-            Schema::empty()
-        } else {
-            (*batches[0].schema()).clone()
-        };
-
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            .map_err(|e| Status::internal(format!("Query planning failed: {e}")))?;
 
         let info = FlightInfo::new()
             .try_with_schema(&schema)
             .map_err(|e| Status::internal(format!("Failed to encode schema: {e}")))?
             .with_descriptor(FlightDescriptor::new_cmd(vec![]))
             .with_endpoint(endpoint)
-            .with_total_records(total_rows as i64)
+            .with_total_records(-1)
             .with_ordered(false);
 
         Ok(Response::new(info))
