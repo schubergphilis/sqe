@@ -1,0 +1,23 @@
+[coordinator]
+flight_sql_port = 50051
+
+[auth]
+keycloak_url = "https://auth.local"
+realm = "iceberg"
+client_id = "sqe-client"
+client_secret = ""
+ssl_verification = false
+
+[catalog]
+polaris_url = "http://localhost:8181/api/catalog"
+warehouse = "iceberg"
+
+[storage]
+s3_endpoint = "http://localhost:9000"
+s3_region = "us-east-1"
+s3_access_key = "s3admin"
+s3_secret_key = "s3admin"
+s3_path_style = true
+
+[policy]
+engine = "passthrough"

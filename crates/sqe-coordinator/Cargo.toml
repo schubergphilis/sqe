@@ -3,6 +3,10 @@ name = "sqe-coordinator"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "sqe_coordinator"
+path = "src/lib.rs"
+
 [[bin]]
 name = "sqe-coordinator"
 path = "src/main.rs"
@@ -34,3 +38,10 @@ anyhow = { workspace = true }
 base64 = "0.22"
 sqlparser = { workspace = true }
 iceberg = { workspace = true }
+
+[dev-dependencies]
+sqe-core = { path = "../sqe-core" }
+sqe-auth = { path = "../sqe-auth" }
+sqe-sql = { path = "../sqe-sql" }
+sqe-policy = { path = "../sqe-policy" }
+tokio = { workspace = true }
