@@ -939,9 +939,496 @@ git commit -m "test: integration tests for Flight SQL auth and Iceberg query via
 
 ## Chunk 2: Write Path + Views (Tasks 8.1-8.16)
 
-Builds on Chunk 1. Adds CTAS, INSERT INTO, MERGE INTO, DELETE FROM, DROP TABLE, ALTER TABLE RENAME, CREATE/DROP VIEW to the coordinator's statement routing.
+Builds on Chunk 1. Adds CTAS, INSERT INTO, DELETE FROM, DROP TABLE, ALTER TABLE RENAME, CREATE/DROP VIEW, and MERGE INTO to the coordinator's query handler. All write operations execute on the coordinator.
 
-*Plan for Chunk 2 will be written after Chunk 1 is implemented and validated.*
+### File Structure (Chunk 2)
+
+```
+crates/
+  sqe-coordinator/
+    src/
+      write_handler.rs          # NEW: Write operation dispatcher
+      writer.rs                 # NEW: Parquet writer using iceberg-rust writer API
+      catalog_ops.rs            # NEW: DROP TABLE, RENAME, CREATE/DROP VIEW via REST
+```
+
+Key dependencies to add to sqe-coordinator:
+- `parquet = { version = "55", features = ["async"] }` (workspace dep)
+- `iceberg` (workspace dep, already declared)
+
+---
+
+### Task 8: Catalog DDL Operations (DROP TABLE, RENAME, CREATE/DROP VIEW)
+
+**Files:**
+- Create: `crates/sqe-coordinator/src/catalog_ops.rs`
+- Modify: `crates/sqe-coordinator/src/lib.rs` (add module)
+- Modify: `crates/sqe-coordinator/src/query_handler.rs` (wire handlers)
+
+- [ ] **Step 1: Implement catalog_ops.rs**
+
+This module handles pure catalog REST operations that don't involve data writing.
+
+```rust
+use std::sync::Arc;
+use iceberg::{Catalog, NamespaceIdent, TableIdent};
+use sqe_catalog::rest_catalog::SessionCatalogBridge;
+use sqe_core::{Session, SqeConfig, SqeError};
+use sqlparser::ast::{ObjectName, ObjectType, Statement};
+use tracing::info;
+
+pub struct CatalogOps {
+    config: SqeConfig,
+}
+
+impl CatalogOps {
+    pub fn new(config: SqeConfig) -> Self {
+        Self { config }
+    }
+
+    /// DROP TABLE [IF EXISTS] ns.table_name
+    pub async fn drop_table(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+    ) -> sqe_core::Result<()> {
+        // Extract table name and if_exists from Statement::Drop
+        // Parse namespace.table from ObjectName
+        // Call catalog.drop_table(&table_ident)
+        // If if_exists and table doesn't exist, return Ok(())
+    }
+
+    /// ALTER TABLE ns.old_name RENAME TO ns.new_name
+    pub async fn rename_table(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+    ) -> sqe_core::Result<()> {
+        // Extract source and target names from Statement::AlterTable
+        // Call catalog.rename_table(&src_ident, &dest_ident)
+    }
+
+    /// CREATE VIEW ns.view_name AS SELECT ...
+    pub async fn create_view(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+    ) -> sqe_core::Result<()> {
+        // Polaris REST API doesn't have a native view API in iceberg-rust 0.5
+        // For now: return NotImplemented with message about Polaris view support
+        // This will be implemented when iceberg-rust adds view API support
+    }
+
+    /// DROP VIEW ns.view_name
+    pub async fn drop_view(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+    ) -> sqe_core::Result<()> {
+        // Same as create_view — stub for now
+    }
+
+    // Helper: create SessionCatalogBridge for the session
+    async fn catalog_bridge(&self, session: &Session) -> sqe_core::Result<Arc<SessionCatalogBridge>> {
+        // Create SessionCatalog and get its bridge
+    }
+
+    // Helper: parse ObjectName into (NamespaceIdent, table_name)
+    fn parse_table_ref(name: &ObjectName) -> sqe_core::Result<(NamespaceIdent, String)> {
+        // Split "ns.table" into namespace and table parts
+    }
+}
+```
+
+- [ ] **Step 2: Wire into query_handler.rs**
+
+Update the `execute` method to route Drop/Rename/CreateView/DropView to CatalogOps:
+- `StatementKind::Drop(stmt)` → `catalog_ops.drop_table(session, &stmt)`
+- `StatementKind::Rename(stmt)` → `catalog_ops.rename_table(session, &stmt)`
+- `StatementKind::CreateView(stmt)` → `catalog_ops.create_view(session, &stmt)` (stub)
+- `StatementKind::DropView(stmt)` → `catalog_ops.drop_view(session, &stmt)` (stub)
+- Return empty RecordBatch vec for success
+
+- [ ] **Step 3: Write unit tests for parse_table_ref**
+
+Test parsing "ns.table", "catalog.ns.table", single-part names.
+
+- [ ] **Step 4: Verify compiles**
+
+Run: `cargo check -p sqe-coordinator`
+
+- [ ] **Step 5: Commit**
+
+```bash
+git commit -m "feat: catalog DDL operations - DROP TABLE, ALTER TABLE RENAME"
+```
+
+---
+
+### Task 9: Iceberg Parquet Writer Infrastructure
+
+**Files:**
+- Create: `crates/sqe-coordinator/src/writer.rs`
+- Modify: `Cargo.toml` (add parquet workspace dep)
+- Modify: `crates/sqe-coordinator/Cargo.toml` (add iceberg, parquet deps)
+- Modify: `crates/sqe-coordinator/src/lib.rs` (add module)
+
+- [ ] **Step 1: Add parquet to workspace dependencies**
+
+In workspace `Cargo.toml`:
+```toml
+parquet = { version = "55", features = ["async"] }
+```
+
+In sqe-coordinator `Cargo.toml`:
+```toml
+iceberg = { workspace = true }
+parquet = { workspace = true }
+```
+
+- [ ] **Step 2: Implement writer.rs — RecordBatch to Iceberg DataFiles**
+
+```rust
+use std::sync::Arc;
+use arrow_array::RecordBatch;
+use iceberg::spec::DataFile;
+use iceberg::table::Table;
+use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::file_writer::ParquetWriterBuilder;
+use iceberg::writer::file_writer::location_generator::{
+    DefaultFileNameGenerator, DefaultLocationGenerator,
+};
+use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
+use parquet::file::properties::WriterProperties;
+use sqe_core::SqeError;
+
+/// Write RecordBatches as Parquet data files for an Iceberg table.
+///
+/// Uses iceberg-rust's writer infrastructure:
+/// ParquetWriterBuilder → DataFileWriterBuilder → IcebergWriter
+///
+/// Returns the list of DataFiles written (with paths, sizes, record counts).
+pub async fn write_data_files(
+    table: &Table,
+    batches: Vec<RecordBatch>,
+    file_prefix: &str,
+) -> sqe_core::Result<Vec<DataFile>> {
+    if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
+        return Ok(vec![]);
+    }
+
+    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
+        .map_err(|e| SqeError::Execution(format!("Failed to create location generator: {e}")))?;
+
+    let file_name_generator = DefaultFileNameGenerator::new(
+        file_prefix.to_string(),
+        None,
+        iceberg::spec::DataFileFormat::Parquet,
+    );
+
+    let parquet_writer_builder = ParquetWriterBuilder::new(
+        WriterProperties::default(),
+        table.metadata().current_schema().clone(),
+        table.file_io().clone(),
+        location_generator,
+        file_name_generator,
+    );
+
+    let data_file_writer_builder = DataFileWriterBuilder::new(
+        parquet_writer_builder,
+        None,  // no target file size
+        table.metadata().default_partition_spec_id(),
+    );
+
+    let mut writer = data_file_writer_builder
+        .build()
+        .await
+        .map_err(|e| SqeError::Execution(format!("Failed to build data file writer: {e}")))?;
+
+    for batch in batches {
+        if batch.num_rows() > 0 {
+            writer
+                .write(batch)
+                .await
+                .map_err(|e| SqeError::Execution(format!("Failed to write batch: {e}")))?;
+        }
+    }
+
+    let data_files = writer
+        .close()
+        .await
+        .map_err(|e| SqeError::Execution(format!("Failed to close writer: {e}")))?;
+
+    Ok(data_files)
+}
+```
+
+Note: The actual iceberg-rust API may require adapting — especially around schema types (iceberg Schema vs Arrow Schema). The `write` method expects `RecordBatch` which matches our data. The writer handles partitioning, file naming, and Parquet encoding.
+
+- [ ] **Step 3: Verify compiles**
+
+Run: `cargo check -p sqe-coordinator`
+
+- [ ] **Step 4: Commit**
+
+```bash
+git commit -m "feat: Iceberg Parquet writer infrastructure for data file creation"
+```
+
+---
+
+### Task 10: CTAS — CREATE TABLE AS SELECT
+
+**Files:**
+- Create: `crates/sqe-coordinator/src/write_handler.rs`
+- Modify: `crates/sqe-coordinator/src/lib.rs` (add module)
+- Modify: `crates/sqe-coordinator/src/query_handler.rs` (wire CTAS handler)
+
+- [ ] **Step 1: Implement write_handler.rs with CTAS**
+
+```rust
+use std::sync::Arc;
+use arrow_array::RecordBatch;
+use arrow_schema::Schema as ArrowSchema;
+use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
+use iceberg::spec::Schema as IcebergSchema;
+use sqe_catalog::rest_catalog::{SessionCatalog, SessionCatalogBridge};
+use sqe_core::{Session, SqeConfig, SqeError};
+use sqlparser::ast::Statement;
+use tracing::info;
+
+use crate::writer::write_data_files;
+
+pub struct WriteHandler {
+    config: SqeConfig,
+}
+
+impl WriteHandler {
+    pub fn new(config: SqeConfig) -> Self {
+        Self { config }
+    }
+
+    /// CTAS: Execute the SELECT, create the table, write data, commit snapshot.
+    ///
+    /// Steps:
+    /// 1. Execute the inner SELECT query to get RecordBatches
+    /// 2. Convert Arrow schema to Iceberg schema
+    /// 3. Create the table in Polaris (empty, with schema)
+    /// 4. Write RecordBatches as Parquet DataFiles
+    /// 5. Fast-append the DataFiles via Transaction
+    /// 6. Commit the transaction
+    pub async fn handle_ctas(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+        execute_query: impl AsyncFnOnce(&str) -> sqe_core::Result<Vec<RecordBatch>>,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // Extract table name, or_replace flag, and inner SELECT from Statement::CreateTable
+        // Execute the inner SELECT
+        // Convert Arrow schema → Iceberg schema using iceberg::arrow::arrow_schema_to_schema
+        // Create table via catalog.create_table(namespace, TableCreation { name, schema, ... })
+        // Write data files using write_data_files()
+        // If data files exist, create Transaction, fast_append, commit
+        // Return empty vec (DDL success)
+    }
+
+    /// INSERT INTO SELECT: Execute SELECT, write data files, append to existing table.
+    pub async fn handle_insert(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+        execute_query: impl AsyncFnOnce(&str) -> sqe_core::Result<Vec<RecordBatch>>,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // Extract target table and inner SELECT from Statement::Insert
+        // Execute the inner SELECT
+        // Load existing table from catalog
+        // Write data files using write_data_files()
+        // Create Transaction, fast_append data files, commit
+        // Return empty vec
+    }
+
+    /// DELETE FROM with predicate: Scan table, find matching rows, write position deletes.
+    pub async fn handle_delete(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+        execute_query: impl AsyncFnOnce(&str) -> sqe_core::Result<Vec<RecordBatch>>,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // For MVP: execute DELETE as a rewrite:
+        // 1. SELECT * FROM table WHERE NOT (delete_predicate) — get rows to keep
+        // 2. Create new table snapshot with only kept rows (overwrite)
+        // This is simpler than position deletes and correct for MVP
+        // Future: use Iceberg position delete files for efficiency
+    }
+
+    /// MERGE INTO: Scan target+source, classify, rewrite.
+    pub async fn handle_merge(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+        execute_query: impl AsyncFnOnce(&str) -> sqe_core::Result<Vec<RecordBatch>>,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // MERGE is complex. For MVP:
+        // 1. Parse the MERGE statement to extract target, source, condition, and actions
+        // 2. Execute as a series of INSERT/DELETE operations
+        // 3. Or return NotImplemented if too complex for initial release
+    }
+
+    // Helpers
+    async fn create_catalog_bridge(&self, session: &Session) -> sqe_core::Result<Arc<SessionCatalogBridge>> { ... }
+    async fn create_session_catalog(&self, session: &Session) -> sqe_core::Result<Arc<SessionCatalog>> { ... }
+}
+```
+
+IMPORTANT: The exact implementation depends heavily on the iceberg-rust API. Key areas to adapt:
+- `iceberg::arrow::arrow_schema_to_schema()` for Arrow → Iceberg schema conversion
+- `TableCreation` builder pattern
+- `Transaction::new(&table).fast_append(None, vec![])` → `.add_data_files()` → `.apply().await` → `.commit(&catalog).await`
+
+- [ ] **Step 2: Wire CTAS into query_handler.rs**
+
+```rust
+// In execute() match:
+StatementKind::Ctas(stmt) => {
+    self.write_handler.handle_ctas(session, &stmt, |sql| {
+        self.execute_query(session, sql)
+    }).await
+}
+```
+
+- [ ] **Step 3: Wire INSERT INTO into query_handler.rs**
+
+```rust
+StatementKind::Insert(stmt) => {
+    self.write_handler.handle_insert(session, &stmt, |sql| {
+        self.execute_query(session, sql)
+    }).await
+}
+```
+
+- [ ] **Step 4: Verify compiles**
+
+Run: `cargo check -p sqe-coordinator`
+
+- [ ] **Step 5: Commit**
+
+```bash
+git commit -m "feat: CTAS and INSERT INTO SELECT write handlers"
+```
+
+---
+
+### Task 11: DELETE FROM and MERGE INTO
+
+**Files:**
+- Modify: `crates/sqe-coordinator/src/write_handler.rs`
+- Modify: `crates/sqe-coordinator/src/query_handler.rs`
+
+- [ ] **Step 1: Implement DELETE FROM handler**
+
+For MVP, use the "copy-on-write" approach:
+1. Parse the DELETE predicate
+2. Execute `SELECT * FROM table WHERE NOT (predicate)` to get surviving rows
+3. Create a new table snapshot with an overwrite operation containing only surviving rows
+
+This avoids the complexity of Iceberg position delete files while being functionally correct.
+
+IMPORTANT: iceberg-rust 0.5 has `FastAppendAction` but may not have an `OverwriteAction`. Check the API. If overwrite is not available:
+- Alternative A: Use `fast_append` with a `replace` operation (check if Transaction supports this)
+- Alternative B: Drop and recreate the table (CTAS pattern) — works but loses table history
+- Alternative C: Return NotImplemented for DELETE in MVP, implement in Chunk 3
+
+- [ ] **Step 2: Implement MERGE INTO handler**
+
+For MVP, MERGE INTO can be decomposed into:
+1. Execute the MERGE join to classify rows (matched vs unmatched)
+2. For WHEN MATCHED UPDATE: delete old rows + insert updated rows
+3. For WHEN NOT MATCHED INSERT: insert new rows
+
+If the decomposition is too complex for the iceberg-rust API:
+- Return NotImplemented with a descriptive message
+- Track as a Chunk 3 item
+
+- [ ] **Step 3: Wire DELETE and MERGE into query_handler.rs**
+
+- [ ] **Step 4: Verify compiles**
+
+Run: `cargo check -p sqe-coordinator`
+
+- [ ] **Step 5: Commit**
+
+```bash
+git commit -m "feat: DELETE FROM and MERGE INTO write handlers"
+```
+
+---
+
+### Task 12: Write Path Integration Tests
+
+**Files:**
+- Modify: `crates/sqe-coordinator/tests/integration_test.rs`
+
+- [ ] **Step 1: Add CTAS integration test**
+
+```rust
+#[tokio::test]
+#[ignore]
+async fn test_ctas_roundtrip() {
+    // Authenticate as root
+    // Execute: CREATE TABLE test_ns.ctas_test AS SELECT 1 as id, 'hello' as name
+    // Execute: SELECT * FROM test_ns.ctas_test
+    // Verify results match
+    // Cleanup: DROP TABLE test_ns.ctas_test
+}
+```
+
+- [ ] **Step 2: Add INSERT INTO integration test**
+
+```rust
+#[tokio::test]
+#[ignore]
+async fn test_insert_into() {
+    // Create table via CTAS
+    // INSERT INTO test_ns.insert_test SELECT 2 as id, 'world' as name
+    // SELECT * → verify both rows
+    // Cleanup
+}
+```
+
+- [ ] **Step 3: Add DROP TABLE integration test**
+
+```rust
+#[tokio::test]
+#[ignore]
+async fn test_drop_table() {
+    // Create table via CTAS
+    // DROP TABLE test_ns.drop_test
+    // Verify table is gone (SHOW TABLES should not include it)
+}
+```
+
+- [ ] **Step 4: Add DELETE FROM integration test**
+
+```rust
+#[tokio::test]
+#[ignore]
+async fn test_delete_from() {
+    // Create table with multiple rows
+    // DELETE FROM test_ns.delete_test WHERE id = 1
+    // SELECT * → verify row removed
+    // Cleanup
+}
+```
+
+- [ ] **Step 5: Verify compiles**
+
+Run: `cargo test -p sqe-coordinator --no-run`
+
+- [ ] **Step 6: Commit**
+
+```bash
+git commit -m "test: write path integration tests for CTAS, INSERT, DELETE, DROP"
+```
 
 ## Chunk 3: Distributed Execution (Tasks 6.5-6.7, 7.5-7.13, 9.1-9.8)
 
