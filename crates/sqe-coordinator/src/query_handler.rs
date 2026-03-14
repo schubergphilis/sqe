@@ -130,9 +130,12 @@ impl QueryHandler {
                 }
             }
 
-            // Write operations: not implemented yet
-            StatementKind::Merge(_) | StatementKind::Delete(_) => Err(SqeError::NotImplemented(
-                "MERGE and DELETE operations are not yet supported".to_string(),
+            // Write operations: require Iceberg overwrite transaction support
+            StatementKind::Delete(_) => Err(SqeError::NotImplemented(
+                "DELETE FROM requires Iceberg overwrite transaction support (planned for Chunk 3)".to_string(),
+            )),
+            StatementKind::Merge(_) => Err(SqeError::NotImplemented(
+                "MERGE INTO requires Iceberg overwrite transaction support (planned for Chunk 3)".to_string(),
             )),
         }
     }
