@@ -2,3 +2,35 @@
 name = "sqe-coordinator"
 version = "0.1.0"
 edition = "2021"
+
+[[bin]]
+name = "sqe-coordinator"
+path = "src/main.rs"
+
+[dependencies]
+sqe-core = { path = "../sqe-core" }
+sqe-auth = { path = "../sqe-auth" }
+sqe-catalog = { path = "../sqe-catalog" }
+sqe-sql = { path = "../sqe-sql" }
+sqe-policy = { path = "../sqe-policy" }
+datafusion = { workspace = true }
+arrow = { workspace = true }
+arrow-flight = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-array = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+dashmap = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }
+prost = { workspace = true }
+anyhow = { workspace = true }
+base64 = "0.22"
+sqlparser = { workspace = true }
+iceberg = { workspace = true }
