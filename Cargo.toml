@@ -1,0 +1,76 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sqe-core",
+    "crates/sqe-auth",
+    "crates/sqe-catalog",
+    "crates/sqe-sql",
+    "crates/sqe-policy",
+    "crates/sqe-planner",
+    "crates/sqe-coordinator",
+    "crates/sqe-worker",
+    "crates/sqe-trino-compat",
+    "crates/sqe-metrics",
+]
+
+[workspace.dependencies]
+# Query engine
+datafusion = "49"
+datafusion-common = "49"
+datafusion-expr = "49"
+datafusion-sql = "49"
+datafusion-proto = "49"
+
+# Arrow
+arrow = { version = "55", features = ["prettyprint"] }
+arrow-flight = { version = "55", features = ["flight-sql-experimental"] }
+arrow-schema = "55"
+arrow-array = "55"
+
+# Iceberg
+iceberg = "0.4"
+iceberg-catalog-rest = "0.4"
+iceberg-datafusion = "0.4"
+
+# SQL parser
+sqlparser = "0.53"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# HTTP
+axum = "0.8"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# gRPC (Arrow Flight)
+tonic = "0.12"
+prost = "0.13"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Concurrency / Caching
+dashmap = "6"
+moka = { version = "0.12", features = ["future"] }
+
+# Auth
+jsonwebtoken = "9"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+prometheus = "0.13"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Misc
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+url = "2"
+bytes = "1"
+futures = "0.3"

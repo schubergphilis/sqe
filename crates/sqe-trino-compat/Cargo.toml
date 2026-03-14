@@ -1,0 +1,4 @@
+[package]
+name = "sqe-trino-compat"
+version = "0.1.0"
+edition = "2021"

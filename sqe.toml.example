@@ -1,0 +1,38 @@
+[coordinator]
+flight_sql_port = 50051
+trino_http_port = 8080
+mode = "hybrid"   # "local", "distributed", or "hybrid"
+
+[worker]
+coordinator_url = "http://coordinator:50052"
+heartbeat_interval_secs = 5
+memory_limit = "8GB"
+spill_dir = "/tmp/sqe-spill"
+
+[auth]
+keycloak_url = "https://auth.local"
+realm = "iceberg"
+client_id = "sqe-client"
+client_secret = ""
+token_refresh_buffer_secs = 60
+ssl_verification = false
+
+[catalog]
+polaris_url = "http://polaris:8181/api/catalog"
+warehouse = "iceberg"
+metadata_cache_ttl_secs = 30
+
+[storage]
+s3_endpoint = "http://s3:9000"
+s3_region = "us-east-1"
+s3_access_key = "s3admin"
+s3_secret_key = "s3admin"
+s3_path_style = true
+
+[policy]
+engine = "passthrough"
+
+[metrics]
+prometheus_port = 9090
+otlp_endpoint = ""
+audit_log_path = ""
