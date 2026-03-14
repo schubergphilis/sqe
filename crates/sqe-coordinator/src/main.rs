@@ -3,13 +3,9 @@ use std::sync::Arc;
 use sqe_core::SqeConfig;
 use tracing_subscriber::EnvFilter;
 
-mod flight_sql;
-mod query_handler;
-mod session_manager;
-
-use flight_sql::SqeFlightSqlService;
-use query_handler::QueryHandler;
-use session_manager::SessionManager;
+use sqe_coordinator::flight_sql::SqeFlightSqlService;
+use sqe_coordinator::QueryHandler;
+use sqe_coordinator::SessionManager;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
