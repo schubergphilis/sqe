@@ -28,9 +28,9 @@ arrow-schema = "55"
 arrow-array = "55"
 
 # Iceberg
-iceberg = "0.4"
-iceberg-catalog-rest = "0.4"
-iceberg-datafusion = "0.4"
+iceberg = "0.5"
+iceberg-catalog-rest = "0.5"
+iceberg-datafusion = "0.5"
 
 # SQL parser
 sqlparser = "0.53"
