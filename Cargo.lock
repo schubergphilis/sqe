@@ -4070,6 +4070,7 @@ dependencies = [
  "datafusion",
  "futures",
  "iceberg",
+ "parquet",
  "prost",
  "serde",
  "serde_json",

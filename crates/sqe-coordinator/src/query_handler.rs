@@ -11,19 +11,24 @@ use sqe_core::{Session, SqeConfig, SqeError};
 use sqe_policy::PolicyEnforcer;
 use sqe_sql::{parse_and_classify, StatementKind};
 
+use crate::catalog_ops::CatalogOps;
+
 /// Handles query execution by routing parsed SQL through the appropriate
 /// pipeline: DataFusion for queries, catalog metadata for SHOW commands,
 /// and policy enforcement for all plans.
 pub struct QueryHandler {
     policy_enforcer: Arc<dyn PolicyEnforcer>,
     config: SqeConfig,
+    catalog_ops: CatalogOps,
 }
 
 impl QueryHandler {
     pub fn new(policy_enforcer: Arc<dyn PolicyEnforcer>, config: SqeConfig) -> Self {
+        let catalog_ops = CatalogOps::new(config.clone());
         Self {
             policy_enforcer,
             config,
+            catalog_ops,
         }
     }
 
@@ -69,15 +74,29 @@ impl QueryHandler {
                 "Policy management not configured".to_string(),
             )),
 
+            // Catalog DDL operations
+            StatementKind::Drop(stmt) => {
+                self.catalog_ops.drop_table(session, &stmt).await?;
+                Ok(vec![]) // DDL success, no result rows
+            }
+            StatementKind::Rename(stmt) => {
+                self.catalog_ops.rename_table(session, &stmt).await?;
+                Ok(vec![])
+            }
+            StatementKind::CreateView(stmt) => {
+                self.catalog_ops.create_view(session, &stmt).await?;
+                Ok(vec![])
+            }
+            StatementKind::DropView(stmt) => {
+                self.catalog_ops.drop_view(session, &stmt).await?;
+                Ok(vec![])
+            }
+
             // Write operations: not implemented yet (Chunk 2)
             StatementKind::Ctas(_)
             | StatementKind::Insert(_)
             | StatementKind::Merge(_)
-            | StatementKind::Delete(_)
-            | StatementKind::Drop(_)
-            | StatementKind::Rename(_)
-            | StatementKind::CreateView(_)
-            | StatementKind::DropView(_) => Err(SqeError::NotImplemented(
+            | StatementKind::Delete(_) => Err(SqeError::NotImplemented(
                 "Write operations are not yet supported".to_string(),
             )),
         }

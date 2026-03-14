@@ -26,6 +26,7 @@ arrow = { version = "55", features = ["prettyprint"] }
 arrow-flight = { version = "55", features = ["flight-sql-experimental"] }
 arrow-schema = "55"
 arrow-array = "55"
+parquet = { version = "55", features = ["async"] }
 
 # Iceberg
 iceberg = "0.5"
