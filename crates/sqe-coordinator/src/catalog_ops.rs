@@ -181,7 +181,7 @@ impl CatalogOps {
 /// - 1 part  → namespace = "default", table = name
 /// - 2 parts → namespace = parts[0], table = parts[1]
 /// - 3 parts → ignore catalog prefix, namespace = parts[1], table = parts[2]
-fn parse_table_ref(name: &ObjectName) -> sqe_core::Result<(NamespaceIdent, String)> {
+pub(crate) fn parse_table_ref(name: &ObjectName) -> sqe_core::Result<(NamespaceIdent, String)> {
     let parts: Vec<String> = name.0.iter().map(|ident| ident.value.clone()).collect();
 
     match parts.len() {
