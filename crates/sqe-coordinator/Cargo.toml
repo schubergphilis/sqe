@@ -17,6 +17,7 @@ sqe-auth = { path = "../sqe-auth" }
 sqe-catalog = { path = "../sqe-catalog" }
 sqe-sql = { path = "../sqe-sql" }
 sqe-policy = { path = "../sqe-policy" }
+sqe-planner = { path = "../sqe-planner" }
 datafusion = { workspace = true }
 arrow = { workspace = true }
 arrow-flight = { workspace = true }

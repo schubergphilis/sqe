@@ -38,6 +38,22 @@ async fn main() -> anyhow::Result<()> {
     // Initialize query handler
     let query_handler = Arc::new(QueryHandler::new(policy_enforcer, config.clone()));
 
+    // Initialize worker registry
+    let _worker_registry = Arc::new(
+        sqe_coordinator::worker_registry::WorkerRegistry::new(
+            config.coordinator.worker_urls.clone(),
+        ),
+    );
+
+    // Start background health checks (every 5 seconds)
+    if !config.coordinator.worker_urls.is_empty() {
+        _worker_registry.start_health_check_task(std::time::Duration::from_secs(5));
+        tracing::info!(
+            workers = ?config.coordinator.worker_urls,
+            "Started worker health check task"
+        );
+    }
+
     // Start Flight SQL server
     let flight_service =
         SqeFlightSqlService::new(session_manager, query_handler, config.clone());

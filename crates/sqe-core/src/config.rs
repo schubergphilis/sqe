@@ -23,12 +23,18 @@ pub struct CoordinatorConfig {
     pub trino_http_port: u16,
     #[serde(default = "default_mode")]
     pub mode: String,
+    /// List of worker Flight server URLs for distributed execution.
+    /// Empty = single-node mode (all queries execute locally).
+    #[serde(default)]
+    pub worker_urls: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct WorkerConfig {
     #[serde(default)]
     pub coordinator_url: String,
+    #[serde(default = "default_worker_flight_port")]
+    pub flight_port: u16,
     #[serde(default = "default_heartbeat")]
     pub heartbeat_interval_secs: u64,
     #[serde(default = "default_memory")]
@@ -133,6 +139,7 @@ impl Default for MetricsConfig {
 fn default_flight_port() -> u16 { 50051 }
 fn default_trino_port() -> u16 { 8080 }
 fn default_mode() -> String { "hybrid".to_string() }
+fn default_worker_flight_port() -> u16 { 50052 }
 fn default_heartbeat() -> u64 { 5 }
 fn default_memory() -> String { "8GB".to_string() }
 fn default_spill_dir() -> String { "/tmp/sqe-spill".to_string() }

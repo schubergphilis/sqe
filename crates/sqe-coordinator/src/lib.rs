@@ -2,6 +2,7 @@ pub mod catalog_ops;
 pub mod flight_sql;
 pub mod query_handler;
 pub mod session_manager;
+pub mod worker_registry;
 pub mod write_handler;
 pub mod writer;
 
