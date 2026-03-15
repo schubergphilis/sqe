@@ -147,6 +147,7 @@ impl FlightSqlService for SqeFlightSqlService {
     ///
     /// Extracts username:password from the Basic auth header, authenticates
     /// via Keycloak, and returns the session ID as a bearer token.
+    #[tracing::instrument(skip_all, name = "flight_sql.handshake")]
     async fn do_handshake(
         &self,
         request: Request<Streaming<HandshakeRequest>>,
@@ -224,6 +225,7 @@ impl FlightSqlService for SqeFlightSqlService {
     }
 
     /// Handle SQL statement queries by creating a ticket for execution.
+    #[tracing::instrument(skip_all, name = "flight_sql.get_flight_info")]
     async fn get_flight_info_statement(
         &self,
         query: CommandStatementQuery,
@@ -272,6 +274,7 @@ impl FlightSqlService for SqeFlightSqlService {
     }
 
     /// Execute a SQL query and stream results.
+    #[tracing::instrument(skip_all, name = "flight_sql.do_get")]
     async fn do_get_statement(
         &self,
         ticket: TicketStatementQuery,

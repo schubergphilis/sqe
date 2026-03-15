@@ -65,6 +65,11 @@ jsonwebtoken = "9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 prometheus = "0.13"
+opentelemetry = "0.31"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "trace", "metrics", "logs"] }
+tracing-opentelemetry = "0.32"
+opentelemetry-appender-tracing = "0.31"
 
 # Error handling
 thiserror = "2"

@@ -14,6 +14,7 @@ use url::Url;
 use sqe_planner::ScanTask;
 
 /// Execute a scan task by reading Parquet files from S3 and returning Arrow RecordBatches.
+#[tracing::instrument(skip(task), fields(fragment_id = %task.fragment_id, file_count = task.data_file_paths.len()))]
 pub async fn execute_scan(task: &ScanTask) -> anyhow::Result<(SchemaRef, Vec<RecordBatch>)> {
     info!(
         fragment_id = %task.fragment_id,

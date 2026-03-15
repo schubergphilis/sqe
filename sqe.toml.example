@@ -34,5 +34,7 @@ engine = "passthrough"
 
 [metrics]
 prometheus_port = 9090
+# OTLP gRPC endpoint for traces, metrics, and logs (e.g. "http://otel-collector:4317")
+# Leave empty to disable OpenTelemetry export (structured JSON logs only)
 otlp_endpoint = ""
 audit_log_path = ""
