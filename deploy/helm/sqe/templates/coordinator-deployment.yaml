@@ -1,0 +1,100 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sqe.fullname" . }}-coordinator
+  labels:
+    {{- include "sqe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: coordinator
+spec:
+  replicas: {{ .Values.coordinator.replicas }}
+  selector:
+    matchLabels:
+      {{- include "sqe.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: coordinator
+  template:
+    metadata:
+      labels:
+        {{- include "sqe.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: coordinator
+      annotations:
+        checksum/config: {{ include (print .Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.coordinator.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: sqe
+          image: {{ include "sqe.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--mode", "coordinator", "--config", "/etc/sqe/sqe.toml"]
+          env:
+            {{- if or .Values.secrets .Values.existingSecret }}
+            - name: SQE_AUTH__CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret | default (printf "%s-secrets" (include "sqe.fullname" .)) }}
+                  key: SQE_AUTH__CLIENT_SECRET
+                  optional: true
+            - name: SQE_STORAGE__S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret | default (printf "%s-secrets" (include "sqe.fullname" .)) }}
+                  key: SQE_STORAGE__S3_ACCESS_KEY
+                  optional: true
+            - name: SQE_STORAGE__S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret | default (printf "%s-secrets" (include "sqe.fullname" .)) }}
+                  key: SQE_STORAGE__S3_SECRET_KEY
+                  optional: true
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: flight-sql
+              containerPort: {{ .Values.config.coordinator.flight_sql_port }}
+            - name: trino-http
+              containerPort: {{ .Values.config.coordinator.trino_http_port }}
+            - name: metrics
+              containerPort: {{ .Values.config.metrics.prometheus_port }}
+            - name: health
+              containerPort: {{ .Values.healthPort }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/sqe
+              readOnly: true
+          resources:
+            {{- toYaml .Values.coordinator.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "sqe.fullname" . }}-config
+      {{- with .Values.coordinator.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.coordinator.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.coordinator.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -1,0 +1,117 @@
+image:
+  repository: sqe
+  tag: latest
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# ── Coordinator ─────────────────────────────────────────────
+coordinator:
+  replicas: 1
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "500m"
+    limits:
+      memory: "2Gi"
+      cpu: "2"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+
+# ── Workers ─────────────────────────────────────────────────
+worker:
+  enabled: false
+  replicas: 2
+  resources:
+    requests:
+      memory: "1Gi"
+      cpu: "1"
+    limits:
+      memory: "8Gi"
+      cpu: "4"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+
+# ── Service ─────────────────────────────────────────────────
+service:
+  type: ClusterIP
+  flightSqlPort: 50051
+  trinoHttpPort: 8080
+  metricsPort: 9090
+
+# ── SQE Configuration (renders to sqe.toml) ────────────────
+config:
+  coordinator:
+    flight_sql_port: 50051
+    trino_http_port: 8080
+    mode: "hybrid"
+
+  worker:
+    heartbeat_interval_secs: 5
+    memory_limit: "8GB"
+    spill_dir: "/tmp/sqe-spill"
+
+  auth:
+    keycloak_url: "https://keycloak.example.com"
+    realm: "iceberg"
+    client_id: "sqe-client"
+    # client_secret: set via secret or env override
+    token_refresh_buffer_secs: 60
+    ssl_verification: true
+
+  catalog:
+    polaris_url: "http://polaris:8181/api/catalog"
+    warehouse: "iceberg"
+    metadata_cache_ttl_secs: 30
+
+  storage:
+    s3_endpoint: "http://s3:9000"
+    s3_region: "us-east-1"
+    s3_path_style: true
+    # s3_access_key / s3_secret_key: set via secret or env override
+
+  policy:
+    engine: "passthrough"
+
+  metrics:
+    prometheus_port: 9090
+    otlp_endpoint: ""
+    audit_log_path: ""
+
+# ── Secrets (mounted as env var overrides) ──────────────────
+# Reference an existing K8s Secret containing sensitive config.
+# Keys should match SQE env var names, e.g.:
+#   SQE_AUTH__CLIENT_SECRET
+#   SQE_STORAGE__S3_ACCESS_KEY
+#   SQE_STORAGE__S3_SECRET_KEY
+existingSecret: ""
+
+# Or provide values inline (a Secret will be created):
+secrets: {}
+  # SQE_AUTH__CLIENT_SECRET: "my-secret"
+  # SQE_STORAGE__S3_ACCESS_KEY: "minioadmin"
+  # SQE_STORAGE__S3_SECRET_KEY: "minioadmin"
+
+# ── Extra env vars ──────────────────────────────────────────
+extraEnv: []
+  # - name: RUST_LOG
+  #   value: "info"
+
+# ── Health probes ───────────────────────────────────────────
+healthPort: 9091
+livenessProbe:
+  initialDelaySeconds: 5
+  periodSeconds: 10
+readinessProbe:
+  initialDelaySeconds: 5
+  periodSeconds: 5
+
+# ── ServiceMonitor (Prometheus Operator) ────────────────────
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}

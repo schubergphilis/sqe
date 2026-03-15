@@ -6,3 +6,6 @@ target/
 docs/
 openspec/
 tests/
+scripts/
+*.md
+.claude/

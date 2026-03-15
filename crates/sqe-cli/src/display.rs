@@ -1,6 +1,15 @@
 use crate::client::QueryResult;
+use crate::OutputFormat;
 
-pub fn print_query_result(result: &QueryResult) {
+pub fn print_query_result(result: &QueryResult, format: &OutputFormat) {
+    match format {
+        OutputFormat::Table => print_table(result),
+        OutputFormat::Csv => print_csv(result),
+        OutputFormat::Json => print_json(result),
+    }
+}
+
+fn print_table(result: &QueryResult) {
     if result.columns.is_empty() {
         eprintln!("(0 rows)");
         return;
@@ -42,4 +51,39 @@ pub fn print_query_result(result: &QueryResult) {
     }
 
     eprintln!("({} rows)", result.rows.len());
+}
+
+fn print_csv(result: &QueryResult) {
+    if result.columns.is_empty() {
+        return;
+    }
+
+    // Header
+    println!("{}", result.columns.join(","));
+
+    // Rows — quote fields that contain commas, quotes, or newlines
+    for row in &result.rows {
+        let cells: Vec<String> = row.iter().map(|v| csv_escape(v)).collect();
+        println!("{}", cells.join(","));
+    }
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn print_json(result: &QueryResult) {
+    for row in &result.rows {
+        let obj: serde_json::Map<String, serde_json::Value> = result
+            .columns
+            .iter()
+            .zip(row.iter())
+            .map(|(col, val)| (col.clone(), serde_json::Value::String(val.clone())))
+            .collect();
+        println!("{}", serde_json::to_string(&obj).unwrap_or_default());
+    }
 }
