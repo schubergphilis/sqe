@@ -61,6 +61,7 @@ impl QueryHandler {
     }
 
     /// Execute a SQL statement for the given session and return collected RecordBatches.
+    #[tracing::instrument(skip(self, session), fields(username = %session.user.username, statement_type))]
     pub async fn execute(
         &self,
         session: &Session,
@@ -75,6 +76,7 @@ impl QueryHandler {
         let start = std::time::Instant::now();
         let kind = parse_and_classify(sql)?;
         let kind_name = kind.name().to_string();
+        tracing::Span::current().record("statement_type", &kind_name.as_str());
 
         let result = match kind {
             StatementKind::Query(_) => self.execute_query(session, sql).await,
@@ -212,6 +214,7 @@ impl QueryHandler {
     }
 
     /// Execute a SELECT query through DataFusion with the user's catalog.
+    #[tracing::instrument(skip(self, session, sql), fields(username = %session.user.username))]
     async fn execute_query(
         &self,
         session: &Session,
@@ -255,6 +258,7 @@ impl QueryHandler {
     }
 
     /// Create a DataFusion SessionContext with the user's Polaris catalog registered.
+    #[tracing::instrument(skip(self, session), fields(username = %session.user.username))]
     async fn create_session_context(
         &self,
         session: &Session,

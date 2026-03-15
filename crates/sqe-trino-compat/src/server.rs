@@ -86,6 +86,7 @@ fn error_response(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(body)).into_response()
 }
 
+#[tracing::instrument(skip_all, name = "trino.submit_query")]
 async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     State(state): State<Arc<TrinoState<A, Q>>>,
     headers: HeaderMap,
@@ -151,6 +152,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     }
 }
 
+#[tracing::instrument(skip_all, name = "trino.get_results")]
 async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     State(state): State<Arc<TrinoState<A, Q>>>,
     Path((id, _token)): Path<(String, String)>,

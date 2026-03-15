@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use sqe_core::SqeConfig;
-use tracing_subscriber::EnvFilter;
 
 use sqe_coordinator::flight_sql::SqeFlightSqlService;
 use sqe_coordinator::QueryHandler;
@@ -44,15 +43,16 @@ impl TrinoQueryExecutor for QueryHandlerAdapter {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("sqe=info".parse()?))
-        .json()
-        .init();
-
     let config_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "sqe.toml".to_string());
     let config = SqeConfig::load(&config_path)?;
+
+    // Initialize tracing + OTel (traces, metrics, logs via OTLP when configured)
+    let _otel_guard = sqe_metrics::otel::init_telemetry(
+        "sqe-coordinator",
+        &config.metrics.otlp_endpoint,
+    );
 
     tracing::info!(
         "Starting SQE coordinator on Flight SQL port {}",
