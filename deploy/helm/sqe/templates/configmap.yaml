@@ -1,0 +1,46 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sqe.fullname" . }}-config
+  labels:
+    {{- include "sqe.labels" . | nindent 4 }}
+data:
+  sqe.toml: |
+    [coordinator]
+    flight_sql_port = {{ .Values.config.coordinator.flight_sql_port }}
+    trino_http_port = {{ .Values.config.coordinator.trino_http_port }}
+    mode = {{ .Values.config.coordinator.mode | quote }}
+    {{- if .Values.worker.enabled }}
+    worker_urls = [{{ range $i, $e := until (int .Values.worker.replicas) }}{{ if $i }}, {{ end }}"http://{{ include "sqe.fullname" $ }}-worker-{{ $e }}.{{ include "sqe.fullname" $ }}-worker-headless:50052"{{ end }}]
+    {{- end }}
+
+    [worker]
+    coordinator_url = "http://{{ include "sqe.fullname" . }}-coordinator:50051"
+    heartbeat_interval_secs = {{ .Values.config.worker.heartbeat_interval_secs }}
+    memory_limit = {{ .Values.config.worker.memory_limit | quote }}
+    spill_dir = {{ .Values.config.worker.spill_dir | quote }}
+
+    [auth]
+    keycloak_url = {{ .Values.config.auth.keycloak_url | quote }}
+    realm = {{ .Values.config.auth.realm | quote }}
+    client_id = {{ .Values.config.auth.client_id | quote }}
+    token_refresh_buffer_secs = {{ .Values.config.auth.token_refresh_buffer_secs }}
+    ssl_verification = {{ .Values.config.auth.ssl_verification }}
+
+    [catalog]
+    polaris_url = {{ .Values.config.catalog.polaris_url | quote }}
+    warehouse = {{ .Values.config.catalog.warehouse | quote }}
+    metadata_cache_ttl_secs = {{ .Values.config.catalog.metadata_cache_ttl_secs }}
+
+    [storage]
+    s3_endpoint = {{ .Values.config.storage.s3_endpoint | quote }}
+    s3_region = {{ .Values.config.storage.s3_region | quote }}
+    s3_path_style = {{ .Values.config.storage.s3_path_style }}
+
+    [policy]
+    engine = {{ .Values.config.policy.engine | quote }}
+
+    [metrics]
+    prometheus_port = {{ .Values.config.metrics.prometheus_port }}
+    otlp_endpoint = {{ .Values.config.metrics.otlp_endpoint | quote }}
+    audit_log_path = {{ .Values.config.metrics.audit_log_path | quote }}
