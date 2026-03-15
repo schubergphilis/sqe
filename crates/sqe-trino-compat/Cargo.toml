@@ -1,0 +1,22 @@
+[package]
+name = "sqe-trino-compat"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sqe-core = { path = "../sqe-core" }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+dashmap = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -1,93 +1,171 @@
-# sqlengine
+# SQE — Sovereign Query Engine
 
+A Rust-based SQL query engine for Apache Iceberg tables. Built on [DataFusion](https://datafusion.apache.org/) and [iceberg-rust](https://github.com/apache/iceberg-rust), with Keycloak OIDC authentication and bearer token passthrough to [Apache Polaris](https://polaris.apache.org/) REST Catalog.
 
+Designed as a drop-in replacement for Trino in environments where all data lives in Iceberg and fine-grained security (row filters, column masks) is required.
 
-## Getting started
-
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-* [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+## Architecture
 
 ```
-cd existing_repo
-git remote add origin https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine.git
-git branch -M main
-git push -uf origin main
+Client (JDBC / Flight SQL / HTTP)
+        │
+        ▼
+   ┌──────────┐     Keycloak
+   │Coordinator│◄───  OIDC
+   │           │     (ROPC)
+   │ DataFusion│
+   │  + Policy │──► OPA / Cedar (planned)
+   └─────┬─────┘
+         │ Bearer token passthrough
+         ▼
+   ┌──────────┐
+   │  Polaris  │──► S3 / MinIO
+   │REST Catalog│
+   └──────────┘
 ```
 
-## Integrate with your tools
+Every query runs as the authenticated user. No service account.
 
-* [Set up project integrations](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/settings/integrations)
+## Features
 
-## Collaborate with your team
+- **SQL**: Full ANSI SQL via DataFusion — window functions (LEAD, LAG, PARTITION BY, etc.), CTEs, subqueries, joins, aggregates, GROUPING SETS. See [docs/features.md](docs/features.md) for a detailed comparison with Trino and Spark.
+- **DDL**: CREATE TABLE AS SELECT, INSERT INTO, CREATE/DROP VIEW, DROP TABLE, ALTER TABLE RENAME
+- **Protocols**: Arrow Flight SQL (primary, gRPC) + Trino HTTP (compatibility layer)
+- **Auth**: Keycloak OIDC with background token refresh
+- **Catalog**: Apache Polaris REST Catalog with per-session bearer token passthrough
+- **Storage**: S3 / MinIO via Iceberg's FileIO (credential vending or static config)
+- **Observability**: OpenTelemetry (traces, metrics, logs via OTLP/gRPC), Prometheus metrics, JSON audit log
+- **Security**: Planned OPA/Cedar policy engine for row-level security and column masking
+- **CLI**: Interactive REPL and one-shot mode with Flight SQL and HTTP backends
 
-* [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+## Crate Structure
 
-## Test and Deploy
+| Crate | Purpose |
+|-------|---------|
+| `sqe-core` | Shared types, config (TOML), errors |
+| `sqe-sql` | SQL parser (sqlparser-rs), statement classifier |
+| `sqe-auth` | Keycloak OIDC, token cache, background refresh |
+| `sqe-catalog` | Iceberg REST catalog client, DataFusion catalog/schema providers, information_schema |
+| `sqe-policy` | PolicyEnforcer trait, passthrough implementation |
+| `sqe-planner` | LogicalPlan manipulation, distributed plan splitting |
+| `sqe-coordinator` | Flight SQL server, query handler, session manager, Trino HTTP compat |
+| `sqe-worker` | Stateless DataFusion executor for distributed mode |
+| `sqe-cli` | Interactive SQL client (Flight SQL + HTTP) |
+| `sqe-metrics` | Prometheus registry, OpenTelemetry setup, audit logger |
+| `sqe-trino-compat` | Trino wire protocol types and HTTP handlers |
 
-Use the built-in continuous integration in GitLab.
+## Quick Start
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+### Build
 
-***
+```bash
+cargo build --release
+```
 
-# Editing this README
+### Docker
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+```bash
+# Build all images
+docker build --target coordinator -t sqe-coordinator .
+docker build --target worker -t sqe-worker .
+docker build --target cli -t sqe-cli .
+```
 
-## Suggestions for a good README
+### Configuration
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+SQE uses a TOML config file:
 
-## Name
-Choose a self-explaining name for your project.
+```toml
+[coordinator]
+flight_sql_port = 50051
+trino_http_port = 8080
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+[auth]
+keycloak_url = "https://keycloak.example.com"
+realm = "my-realm"
+client_id = "sqe"
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+[catalog]
+polaris_url = "https://polaris.example.com/api/catalog"
+warehouse = "my_warehouse"
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+[storage]
+s3_endpoint = "https://s3.example.com"
+s3_region = "eu-west-1"
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+[metrics]
+prometheus_port = 9090
+otlp_endpoint = "http://otel-collector:4317"
+```
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+### Run
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+```bash
+# Coordinator
+SQE_CONFIG=config.toml cargo run --bin sqe-coordinator
+
+# CLI
+cargo run --bin sqe-cli -- --host localhost --port 50051 --username admin --protocol flight
+```
+
+### Example Queries
+
+```sql
+-- Window functions
+SELECT customer_id, amount,
+  LEAD(amount) OVER (PARTITION BY customer_id ORDER BY order_date) AS next_amount,
+  SUM(amount) OVER (PARTITION BY customer_id ORDER BY order_date
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total
+FROM warehouse.sales.orders;
+
+-- CTE with aggregation
+WITH monthly AS (
+  SELECT DATE_TRUNC('month', order_date) AS month, SUM(amount) AS total
+  FROM warehouse.sales.orders
+  GROUP BY 1
+)
+SELECT month, total, LAG(total) OVER (ORDER BY month) AS prev_month
+FROM monthly;
+
+-- CTAS
+CREATE TABLE warehouse.analytics.summary AS
+SELECT region, COUNT(*) AS cnt, AVG(amount) AS avg_amount
+FROM warehouse.sales.orders
+GROUP BY region;
+
+-- Views
+CREATE VIEW warehouse.analytics.active_customers AS
+SELECT customer_id, MAX(order_date) AS last_order
+FROM warehouse.sales.orders
+GROUP BY customer_id
+HAVING MAX(order_date) > CURRENT_DATE - INTERVAL '90' DAY;
+
+-- Metadata
+SHOW CATALOGS;
+SHOW SCHEMAS;
+SHOW TABLES IN sales;
+SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
+```
 
 ## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+- [ ] MERGE INTO, DELETE, UPDATE (Iceberg v2 position deletes)
+- [ ] Distributed execution (coordinator → worker plan shipping)
+- [ ] OPA/Cedar policy engine (row filters, column masks, GRANT/REVOKE SQL)
+- [ ] Iceberg time travel (AS OF snapshot queries)
+- [ ] Manifest caching
+- [ ] dbt adapter (dbt-sqe via ADBC Flight SQL)
+- [ ] Helm chart for Kubernetes deployment
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+## Tech Stack
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+| Component | Technology |
+|-----------|-----------|
+| Language | Rust |
+| Query Engine | Apache DataFusion 51 |
+| Table Format | Apache Iceberg v2 (iceberg-rust) |
+| Catalog | Apache Polaris (Iceberg REST) |
+| Auth | Keycloak OIDC |
+| Wire Protocol | Arrow Flight SQL + Trino HTTP |
+| Storage | S3 / MinIO |
+| Observability | OpenTelemetry + Prometheus |

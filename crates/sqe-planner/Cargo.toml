@@ -1,0 +1,14 @@
+[package]
+name = "sqe-planner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sqe-core = { path = "../sqe-core" }
+arrow-schema = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
