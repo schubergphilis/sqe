@@ -8,7 +8,6 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::empty::EmptyExec;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::table::Table;
 use tracing::debug;
@@ -17,8 +16,8 @@ use tracing::debug;
 ///
 /// This provider converts the Iceberg table schema to an Arrow schema and
 /// makes the table queryable through DataFusion's SQL engine. The scan
-/// implementation currently returns an empty execution plan; actual data
-/// reading will be implemented when the query execution pipeline is built.
+/// method returns an `IcebergScanExec` that reads data from Iceberg tables
+/// via iceberg-rust's scan API and S3/FileIO.
 ///
 /// Note: We implement our own `TableProvider` rather than using
 /// `iceberg-datafusion::IcebergTableProvider` because iceberg-datafusion 0.5.x
@@ -81,6 +80,14 @@ impl TableProvider for SqeTableProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Convert projection indices to column names for iceberg-rust's scan API
+        let projected_columns = projection.map(|indices| {
+            indices
+                .iter()
+                .map(|&i| self.schema.field(i).name().clone())
+                .collect::<Vec<_>>()
+        });
+
         // Determine the projected schema
         let projected_schema = match projection {
             Some(indices) => {
@@ -93,10 +100,10 @@ impl TableProvider for SqeTableProvider {
             None => self.schema.clone(),
         };
 
-        // TODO: Implement actual Iceberg scan using table.scan().build().to_arrow()
-        // For now, return an empty result set with the correct schema.
-        // This will be replaced with a proper IcebergScan execution plan
-        // when the query pipeline (sqe-coordinator) is implemented.
-        Ok(Arc::new(EmptyExec::new(projected_schema)))
+        Ok(Arc::new(crate::iceberg_scan::IcebergScanExec::new(
+            self.table.clone(),
+            projected_schema,
+            projected_columns,
+        )))
     }
 }
