@@ -315,6 +315,7 @@ FROM orders;
 |-----------|:---:|:---:|:---:|
 | `SELECT` | ✅ | ✅ | ✅ |
 | `CREATE TABLE AS SELECT` | ✅ | ✅ | ✅ |
+| `CREATE OR REPLACE TABLE AS SELECT` | ✅ | ✅ | ✅ |
 | `INSERT INTO ... SELECT` | ✅ | ✅ | ✅ |
 | `CREATE VIEW` | ✅ | ✅ | ✅ |
 | `DROP VIEW` | ✅ | ✅ | ✅ |
@@ -325,8 +326,8 @@ FROM orders;
 | `UPDATE` | 🔜 | ✅ | ✅ |
 | `ALTER TABLE ADD COLUMN` | 🔜 | ✅ | ✅ |
 | `ALTER TABLE DROP COLUMN` | 🔜 | ✅ | ✅ |
-| `CREATE SCHEMA` | ❌ | ✅ | ✅ |
-| `DROP SCHEMA` | ❌ | ✅ | ✅ |
+| `CREATE SCHEMA` | ✅ | ✅ | ✅ |
+| `DROP SCHEMA` | ✅ | ✅ | ✅ |
 | `TRUNCATE TABLE` | ❌ | ✅ | ✅ |
 
 ---

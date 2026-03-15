@@ -15,6 +15,8 @@ pub enum StatementKind {
     Rename(Box<Statement>),
     CreateView(Box<Statement>),
     DropView(Box<Statement>),
+    CreateSchema(Box<Statement>),
+    DropSchema(Box<Statement>),
     ShowCatalogs,
     ShowSchemas(String),
     ShowTables(String),
@@ -35,6 +37,8 @@ impl StatementKind {
             StatementKind::Rename(_) => "rename",
             StatementKind::CreateView(_) => "createview",
             StatementKind::DropView(_) => "dropview",
+            StatementKind::CreateSchema(_) => "createschema",
+            StatementKind::DropSchema(_) => "dropschema",
             StatementKind::ShowCatalogs => "showcatalogs",
             StatementKind::ShowSchemas(_) => "showschemas",
             StatementKind::ShowTables(_) => "showtables",
@@ -90,7 +94,7 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
         // DELETE FROM
         Statement::Delete(_) => Ok(StatementKind::Delete(Box::new(stmt))),
 
-        // DROP TABLE / DROP VIEW / DROP other
+        // DROP TABLE / DROP VIEW / DROP SCHEMA / DROP other
         Statement::Drop {
             object_type: ObjectType::View,
             ..
@@ -101,7 +105,12 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
             ..
         } => Ok(StatementKind::Drop(Box::new(stmt))),
 
-        // For other DROP types (index, schema, etc.), treat as utility
+        Statement::Drop {
+            object_type: ObjectType::Schema,
+            ..
+        } => Ok(StatementKind::DropSchema(Box::new(stmt))),
+
+        // For other DROP types (index, etc.), treat as utility
         Statement::Drop { .. } => Ok(StatementKind::Utility(Box::new(stmt))),
 
         // ALTER TABLE — check for RENAME operations
@@ -120,6 +129,9 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
 
         // CREATE VIEW
         Statement::CreateView { .. } => Ok(StatementKind::CreateView(Box::new(stmt))),
+
+        // CREATE SCHEMA
+        Statement::CreateSchema { .. } => Ok(StatementKind::CreateSchema(Box::new(stmt))),
 
         // GRANT → Policy
         Statement::Grant { .. } => Ok(StatementKind::Policy(Box::new(stmt))),
@@ -214,6 +226,12 @@ mod tests {
     #[test]
     fn test_ctas() {
         let result = parse_and_classify("CREATE TABLE foo AS SELECT 1");
+        assert!(matches!(result, Ok(StatementKind::Ctas(_))));
+    }
+
+    #[test]
+    fn test_create_or_replace_table_as_select() {
+        let result = parse_and_classify("CREATE OR REPLACE TABLE foo AS SELECT 1");
         assert!(matches!(result, Ok(StatementKind::Ctas(_))));
     }
 
@@ -335,6 +353,30 @@ mod tests {
             matches!(result, Ok(StatementKind::Utility(_))),
             "RENAME COLUMN should route to Utility, not Rename: {result:?}"
         );
+    }
+
+    #[test]
+    fn test_create_schema() {
+        let result = parse_and_classify("CREATE SCHEMA my_schema");
+        assert!(matches!(result, Ok(StatementKind::CreateSchema(_))));
+    }
+
+    #[test]
+    fn test_create_schema_if_not_exists() {
+        let result = parse_and_classify("CREATE SCHEMA IF NOT EXISTS my_schema");
+        assert!(matches!(result, Ok(StatementKind::CreateSchema(_))));
+    }
+
+    #[test]
+    fn test_drop_schema() {
+        let result = parse_and_classify("DROP SCHEMA my_schema");
+        assert!(matches!(result, Ok(StatementKind::DropSchema(_))));
+    }
+
+    #[test]
+    fn test_drop_schema_if_exists() {
+        let result = parse_and_classify("DROP SCHEMA IF EXISTS my_schema");
+        assert!(matches!(result, Ok(StatementKind::DropSchema(_))));
     }
 
     #[test]
