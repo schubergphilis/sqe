@@ -2,7 +2,7 @@ use arrow::util::display::{ArrayFormatter, FormatOptions};
 use arrow_array::RecordBatch;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use futures::TryStreamExt;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, ClientTlsConfig};
 
 use crate::client::{QueryResult, SqlClient};
 
@@ -16,7 +16,11 @@ impl FlightClient {
         username: &str,
         password: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let channel = Channel::from_shared(url.to_string())?
+        let mut endpoint = Channel::from_shared(url.to_string())?;
+        if url.starts_with("https://") {
+            endpoint = endpoint.tls_config(ClientTlsConfig::new())?;
+        }
+        let channel = endpoint
             .connect()
             .await
             .map_err(|e| format!("Failed to connect to {url}: {e}"))?;
@@ -58,16 +62,18 @@ impl SqlClient for FlightClient {
             }
         }
 
-        Ok(batches_to_result(&all_batches))
+        batches_to_result(&all_batches)
     }
 }
 
-fn batches_to_result(batches: &[RecordBatch]) -> QueryResult {
+fn batches_to_result(
+    batches: &[RecordBatch],
+) -> Result<QueryResult, Box<dyn std::error::Error>> {
     if batches.is_empty() {
-        return QueryResult {
+        return Ok(QueryResult {
             columns: vec![],
             rows: vec![],
-        };
+        });
     }
 
     let schema = batches[0].schema();
@@ -77,14 +83,18 @@ fn batches_to_result(batches: &[RecordBatch]) -> QueryResult {
     let mut rows = Vec::new();
     for batch in batches {
         let formatters: Vec<ArrayFormatter> = (0..batch.num_columns())
-            .map(|i| ArrayFormatter::try_new(batch.column(i).as_ref(), &opts).unwrap())
-            .collect();
+            .map(|i| {
+                ArrayFormatter::try_new(batch.column(i).as_ref(), &opts)
+                    .map_err(|e| format!("Cannot format column {i}: {e}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         for row in 0..batch.num_rows() {
-            let cells: Vec<String> = formatters.iter().map(|fmt| fmt.value(row).to_string()).collect();
+            let cells: Vec<String> =
+                formatters.iter().map(|fmt| fmt.value(row).to_string()).collect();
             rows.push(cells);
         }
     }
 
-    QueryResult { columns, rows }
+    Ok(QueryResult { columns, rows })
 }

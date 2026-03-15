@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
-use sqlparser::ast::{AlterTableOperation, ObjectName, Statement};
+use sqlparser::ast::{AlterTableOperation, ObjectName, ObjectType, Statement};
 use tracing::info;
 
 use sqe_catalog::SessionCatalog;
@@ -134,26 +134,106 @@ impl CatalogOps {
         Ok(())
     }
 
-    /// CREATE VIEW is not yet supported — requires Polaris view API.
+    /// Create a view via the Polaris REST API.
+    ///
+    /// Extracts the view name and SELECT query from a `CREATE VIEW` statement,
+    /// infers the output schema by planning the SELECT via DataFusion, converts
+    /// it to the Iceberg REST API schema format, and calls `SessionCatalog::create_view()`.
     pub async fn create_view(
         &self,
-        _session: &Session,
-        _stmt: &Statement,
+        session: &Session,
+        stmt: &Statement,
+        schema_json: &serde_json::Value,
     ) -> sqe_core::Result<()> {
-        Err(SqeError::NotImplemented(
-            "CREATE VIEW not yet supported - requires Polaris view API".to_string(),
-        ))
+        let (view_name, query) = match stmt {
+            Statement::CreateView { name, query, .. } => (name, query),
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected CREATE VIEW statement, got: {other}"
+                )));
+            }
+        };
+
+        let (namespace, name) = parse_table_ref(view_name)?;
+        let select_sql = format!("{query}");
+
+        info!(
+            username = %session.user.username,
+            view = %name,
+            namespace = ?namespace,
+            "Creating view"
+        );
+
+        let session_catalog = SessionCatalog::new(
+            &self.config.catalog.polaris_url,
+            &self.config.catalog.warehouse,
+            &session.access_token,
+            &self.config.storage,
+        )
+        .await?;
+
+        session_catalog
+            .create_view(&namespace, &name, &select_sql, schema_json)
+            .await
     }
 
-    /// DROP VIEW is not yet supported.
+    /// Drop a view via the Polaris REST API.
+    ///
+    /// Extracts the view name from a `DROP VIEW` statement and calls
+    /// `SessionCatalog::drop_view()`. If `IF EXISTS` is specified and the
+    /// view is not found, this returns `Ok(())`.
     pub async fn drop_view(
         &self,
-        _session: &Session,
-        _stmt: &Statement,
+        session: &Session,
+        stmt: &Statement,
     ) -> sqe_core::Result<()> {
-        Err(SqeError::NotImplemented(
-            "DROP VIEW not yet supported".to_string(),
-        ))
+        let (names, if_exists) = match stmt {
+            Statement::Drop {
+                names,
+                if_exists,
+                object_type: ObjectType::View,
+                ..
+            } => (names, *if_exists),
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected DROP VIEW statement, got: {other}"
+                )));
+            }
+        };
+
+        let view_name = names.first().ok_or_else(|| {
+            SqeError::Execution("DROP VIEW requires at least one view name".to_string())
+        })?;
+
+        let (namespace, name) = parse_table_ref(view_name)?;
+
+        info!(
+            username = %session.user.username,
+            view = %name,
+            namespace = ?namespace,
+            if_exists = if_exists,
+            "Dropping view"
+        );
+
+        let session_catalog = SessionCatalog::new(
+            &self.config.catalog.polaris_url,
+            &self.config.catalog.warehouse,
+            &session.access_token,
+            &self.config.storage,
+        )
+        .await?;
+
+        match session_catalog.drop_view(&namespace, &name).await {
+            Ok(()) => Ok(()),
+            Err(e) if if_exists && e.to_string().contains("404") => {
+                info!(
+                    view = %name,
+                    "View not found, IF EXISTS specified — ignoring"
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Create a `SessionCatalogBridge` (which implements `iceberg::Catalog`)

@@ -1,5 +1,6 @@
 use base64::Engine;
 use serde::Deserialize;
+use url::Url;
 
 use crate::client::{QueryResult, SqlClient};
 
@@ -37,13 +38,13 @@ struct TrinoError {
 }
 
 impl HttpClient {
-    pub fn new(base_url: &str, username: &str, password: &str) -> Self {
+    pub fn new(base_url: &str, username: &str, password: &str, accept_invalid_certs: bool) -> Self {
         let credentials = base64::engine::general_purpose::STANDARD
             .encode(format!("{username}:{password}"));
         let auth_header = format!("Basic {credentials}");
 
         let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_certs(accept_invalid_certs)
             .build()
             .expect("Failed to create HTTP client");
 
@@ -75,7 +76,7 @@ impl HttpClient {
         let status = resp.status();
         let text = resp.text().await?;
 
-        if !status.is_success() && status.as_u16() != 200 {
+        if !status.is_success() {
             return Err(format!("HTTP {status}: {text}").into());
         }
 
@@ -85,6 +86,8 @@ impl HttpClient {
         Ok(parsed)
     }
 }
+
+const MAX_PAGINATION_ROUNDS: usize = 1000;
 
 #[async_trait::async_trait]
 impl SqlClient for HttpClient {
@@ -97,7 +100,7 @@ impl SqlClient for HttpClient {
         // Initial POST
         let mut resp = self.fetch_response(&url, Some(sql)).await?;
 
-        loop {
+        for _ in 0..MAX_PAGINATION_ROUNDS {
             // Check for errors
             if let Some(err) = &resp.error {
                 return Err(err.message.clone().into());
@@ -118,9 +121,15 @@ impl SqlClient for HttpClient {
                 }
             }
 
-            // Follow next_uri for paginated results
+            // Follow next_uri for paginated results (validate same origin to prevent SSRF)
             match resp.next_uri {
                 Some(ref next) => {
+                    if !same_origin(&self.base_url, next) {
+                        return Err(format!(
+                            "Server returned next_uri with different origin: {next}"
+                        )
+                        .into());
+                    }
                     resp = self.fetch_response(next, None).await?;
                 }
                 None => break,
@@ -128,6 +137,13 @@ impl SqlClient for HttpClient {
         }
 
         Ok(QueryResult { columns, rows })
+    }
+}
+
+fn same_origin(base: &str, next: &str) -> bool {
+    match (Url::parse(base), Url::parse(next)) {
+        (Ok(b), Ok(n)) => b.origin() == n.origin(),
+        _ => false,
     }
 }
 

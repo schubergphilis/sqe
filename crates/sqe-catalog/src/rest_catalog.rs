@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 use sqe_core::config::StorageConfig;
+use sqe_core::SqeError;
 
 /// Per-session Iceberg REST catalog wrapper.
 ///
@@ -19,8 +20,10 @@ pub struct SessionCatalog {
     inner: Arc<RwLock<RestCatalog>>,
     polaris_url: String,
     warehouse: String,
+    bearer_token: String,
     token_fingerprint: String,
     storage_config: StorageConfig,
+    http_client: reqwest::Client,
 }
 
 impl std::fmt::Debug for SessionCatalog {
@@ -100,12 +103,16 @@ impl SessionCatalog {
 
         let catalog = RestCatalog::new(config);
 
+        let http_client = reqwest::Client::new();
+
         Ok(Self {
             inner: Arc::new(RwLock::new(catalog)),
             polaris_url: polaris_url.to_string(),
             warehouse: warehouse.to_string(),
+            bearer_token: bearer_token.to_string(),
             token_fingerprint,
             storage_config: storage_config.clone(),
+            http_client,
         })
     }
 
@@ -182,6 +189,121 @@ impl SessionCatalog {
             .map_err(|e| {
                 sqe_core::SqeError::Catalog(format!("Failed to check table existence: {e}"))
             })
+    }
+
+    /// Build the Polaris REST URL prefix for this warehouse.
+    fn rest_prefix(&self) -> String {
+        let base = self.polaris_url.trim_end_matches('/');
+        format!("{base}/v1/{}", self.warehouse)
+    }
+
+    /// Create a view via the Polaris REST API.
+    ///
+    /// Calls `POST /v1/{prefix}/namespaces/{namespace}/views` with the
+    /// Iceberg view creation payload.
+    pub async fn create_view(
+        &self,
+        namespace: &NamespaceIdent,
+        name: &str,
+        sql: &str,
+        schema: &serde_json::Value,
+    ) -> sqe_core::Result<()> {
+        let ns_str = namespace
+            .as_ref()
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\u{1F}"); // Iceberg REST uses unit separator for multi-level namespaces
+        let url = format!(
+            "{}/namespaces/{}/views",
+            self.rest_prefix(),
+            ns_str
+        );
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+
+        let body = serde_json::json!({
+            "name": name,
+            "schema": schema,
+            "view-version": {
+                "version-id": 1,
+                "schema-id": 0,
+                "timestamp-ms": now_ms,
+                "summary": { "engine-name": "sqe" },
+                "representations": [{
+                    "type": "sql",
+                    "sql": sql,
+                    "dialect": "sqe"
+                }],
+                "default-namespace": namespace.as_ref(),
+            },
+            "properties": {}
+        });
+
+        debug!(url = %url, view = name, "Creating view via Polaris REST");
+
+        let resp = self
+            .http_client
+            .post(&url)
+            .bearer_auth(&self.bearer_token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to create view: {e}")))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(SqeError::Catalog(format!(
+                "Failed to create view (HTTP {status}): {text}"
+            )));
+        }
+
+        info!(view = name, namespace = ?namespace, "View created");
+        Ok(())
+    }
+
+    /// Drop a view via the Polaris REST API.
+    ///
+    /// Calls `DELETE /v1/{prefix}/namespaces/{namespace}/views/{view}`.
+    pub async fn drop_view(
+        &self,
+        namespace: &NamespaceIdent,
+        name: &str,
+    ) -> sqe_core::Result<()> {
+        let ns_str = namespace
+            .as_ref()
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\u{1F}");
+        let url = format!(
+            "{}/namespaces/{}/views/{}",
+            self.rest_prefix(),
+            ns_str,
+            name
+        );
+
+        debug!(url = %url, view = name, "Dropping view via Polaris REST");
+
+        let resp = self
+            .http_client
+            .delete(&url)
+            .bearer_auth(&self.bearer_token)
+            .send()
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to drop view: {e}")))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(SqeError::Catalog(format!(
+                "Failed to drop view (HTTP {status}): {text}"
+            )));
+        }
+
+        info!(view = name, namespace = ?namespace, "View dropped");
+        Ok(())
     }
 
     /// Return a bridge that implements iceberg's `Catalog` trait.

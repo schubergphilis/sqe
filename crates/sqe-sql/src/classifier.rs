@@ -109,11 +109,7 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
             ref operations, ..
         } => {
             let is_rename = operations.iter().any(|op| {
-                matches!(
-                    op,
-                    AlterTableOperation::RenameTable { .. }
-                        | AlterTableOperation::RenameColumn { .. }
-                )
+                matches!(op, AlterTableOperation::RenameTable { .. })
             });
             if is_rename {
                 Ok(StatementKind::Rename(Box::new(stmt)))
@@ -334,6 +330,15 @@ mod tests {
     fn test_alter_table_add_column_is_utility() {
         let result = parse_and_classify("ALTER TABLE foo ADD COLUMN bar INT");
         assert!(matches!(result, Ok(StatementKind::Utility(_))));
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_is_utility() {
+        let result = parse_and_classify("ALTER TABLE foo RENAME COLUMN old_col TO new_col");
+        assert!(
+            matches!(result, Ok(StatementKind::Utility(_))),
+            "RENAME COLUMN should route to Utility, not Rename: {result:?}"
+        );
     }
 
     #[test]

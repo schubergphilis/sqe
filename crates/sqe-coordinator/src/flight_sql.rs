@@ -236,7 +236,6 @@ impl FlightSqlService for SqeFlightSqlService {
 
         debug!(
             username = %session.user.username,
-            sql = sql,
             "get_flight_info_statement"
         );
 
@@ -316,7 +315,6 @@ impl FlightSqlService for SqeFlightSqlService {
 
             debug!(
                 username = %session.user.username,
-                sql = %fetch.handle,
                 "do_get_fallback executing query"
             );
 

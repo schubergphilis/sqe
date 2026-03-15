@@ -1,6 +1,6 @@
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter};
+use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::{
     logs::SdkLoggerProvider, metrics::SdkMeterProvider, trace::SdkTracerProvider, Resource,
 };
@@ -25,10 +25,10 @@ pub fn init_telemetry(service_name: &str, otlp_endpoint: &str) -> OtelGuard {
 
     if otlp_endpoint.is_empty() {
         // No OTel — just structured JSON logs
-        tracing_subscriber::registry()
+        let _ = tracing_subscriber::registry()
             .with(env_filter)
             .with(fmt_layer)
-            .init();
+            .try_init();
 
         return OtelGuard {
             tracer_provider: None,
@@ -37,9 +37,6 @@ pub fn init_telemetry(service_name: &str, otlp_endpoint: &str) -> OtelGuard {
         };
     }
 
-    // Set the OTLP endpoint env var so exporters pick it up
-    std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", otlp_endpoint);
-
     let resource = Resource::builder()
         .with_service_name(service_name.to_string())
         .build();
@@ -47,6 +44,7 @@ pub fn init_telemetry(service_name: &str, otlp_endpoint: &str) -> OtelGuard {
     // ── Traces ───────────────────────────────────────────────
     let trace_exporter = SpanExporter::builder()
         .with_tonic()
+        .with_endpoint(otlp_endpoint)
         .build()
         .expect("Failed to create OTLP span exporter");
 
@@ -63,6 +61,7 @@ pub fn init_telemetry(service_name: &str, otlp_endpoint: &str) -> OtelGuard {
     // ── Logs ─────────────────────────────────────────────────
     let log_exporter = LogExporter::builder()
         .with_tonic()
+        .with_endpoint(otlp_endpoint)
         .build()
         .expect("Failed to create OTLP log exporter");
 
@@ -76,7 +75,9 @@ pub fn init_telemetry(service_name: &str, otlp_endpoint: &str) -> OtelGuard {
         .add_directive("hyper=off".parse().unwrap())
         .add_directive("tonic=off".parse().unwrap())
         .add_directive("h2=off".parse().unwrap())
-        .add_directive("reqwest=off".parse().unwrap());
+        .add_directive("reqwest=off".parse().unwrap())
+        .add_directive("tower=off".parse().unwrap())
+        .add_directive("tower_http=off".parse().unwrap());
 
     let otel_log_layer =
         OpenTelemetryTracingBridge::new(&logger_provider).with_filter(otel_log_filter);
@@ -84,6 +85,7 @@ pub fn init_telemetry(service_name: &str, otlp_endpoint: &str) -> OtelGuard {
     // ── Metrics ──────────────────────────────────────────────
     let metric_exporter = MetricExporter::builder()
         .with_tonic()
+        .with_endpoint(otlp_endpoint)
         .build()
         .expect("Failed to create OTLP metric exporter");
 
@@ -95,12 +97,12 @@ pub fn init_telemetry(service_name: &str, otlp_endpoint: &str) -> OtelGuard {
     opentelemetry::global::set_meter_provider(meter_provider.clone());
 
     // ── Compose subscriber ───────────────────────────────────
-    tracing_subscriber::registry()
+    let _ = tracing_subscriber::registry()
         .with(env_filter)
         .with(fmt_layer)
         .with(otel_trace_layer)
         .with(otel_log_layer)
-        .init();
+        .try_init();
 
     tracing::info!(
         otlp_endpoint = otlp_endpoint,
@@ -124,11 +126,12 @@ pub struct OtelGuard {
 
 impl Drop for OtelGuard {
     fn drop(&mut self) {
-        if let Some(tp) = self.tracer_provider.take() {
-            let _ = tp.shutdown();
-        }
+        // Shutdown order: meter → tracer → logger (logger last so flush logs are captured)
         if let Some(mp) = self.meter_provider.take() {
             let _ = mp.shutdown();
+        }
+        if let Some(tp) = self.tracer_provider.take() {
+            let _ = tp.shutdown();
         }
         if let Some(lp) = self.logger_provider.take() {
             let _ = lp.shutdown();

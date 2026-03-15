@@ -39,7 +39,7 @@ impl SqeCatalogProvider {
         let namespaces = session_catalog.list_namespaces().await?;
         let cached_namespaces: Vec<String> = namespaces
             .iter()
-            .flat_map(|ns| ns.as_ref().clone())
+            .map(|ns| ns.as_ref().iter().map(|s| s.as_str()).collect::<Vec<_>>().join("."))
             .collect();
 
         debug!(
