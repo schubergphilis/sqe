@@ -444,3 +444,112 @@ async fn test_distributed_select() {
         .execute(&session, "DROP TABLE test_ns.dist_test")
         .await;
 }
+
+// ---------------------------------------------------------------------------
+// Chunk 4: information_schema + Trino compat + Observability tests
+// ---------------------------------------------------------------------------
+
+// Test: MetricsRegistry can be created and incremented
+#[test]
+fn test_metrics_registry() {
+    let metrics = sqe_metrics::MetricsRegistry::new();
+    metrics
+        .query_count
+        .with_label_values(&["success", "query"])
+        .inc();
+    assert_eq!(
+        metrics
+            .query_count
+            .with_label_values(&["success", "query"])
+            .get(),
+        1.0
+    );
+}
+
+// Test: AuditLogger no-op mode works
+#[test]
+fn test_audit_logger_noop() {
+    let logger = sqe_metrics::audit::AuditLogger::new("");
+    let entry = sqe_metrics::audit::AuditEntry {
+        timestamp: "2026-03-15T00:00:00Z".to_string(),
+        username: "test".to_string(),
+        query_text: "SELECT 1".to_string(),
+        statement_type: "query".to_string(),
+        duration_ms: 10,
+        rows_returned: 1,
+        status: "success".to_string(),
+    };
+    logger.log(&entry); // Should not panic
+}
+
+// Test: Trino type mapping
+#[test]
+fn test_trino_type_mapping() {
+    use arrow_schema::DataType;
+    assert_eq!(
+        sqe_trino_compat::types::arrow_to_trino_type(&DataType::Int64),
+        "bigint"
+    );
+    assert_eq!(
+        sqe_trino_compat::types::arrow_to_trino_type(&DataType::Utf8),
+        "varchar"
+    );
+    assert_eq!(
+        sqe_trino_compat::types::arrow_to_trino_type(&DataType::Float64),
+        "double"
+    );
+}
+
+// Test: Trino response serialization
+#[test]
+fn test_trino_batches_to_json() {
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(StringArray::from(vec!["test"])),
+        ],
+    )
+    .unwrap();
+
+    let (cols, rows) = sqe_trino_compat::protocol::batches_to_trino(&[batch]);
+    assert_eq!(cols.len(), 2);
+    assert_eq!(cols[0].r#type, "bigint");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], serde_json::json!(1));
+}
+
+// Test: information_schema.tables is queryable (requires quickstart stack)
+#[tokio::test]
+#[ignore]
+async fn test_information_schema_tables() {
+    let (session, handler) = setup_handler().await;
+
+    let batches = handler
+        .execute(&session, "SELECT * FROM information_schema.tables")
+        .await
+        .expect("information_schema.tables should be queryable");
+
+    assert!(!batches.is_empty());
+}
+
+// Test: information_schema.schemata is queryable (requires quickstart stack)
+#[tokio::test]
+#[ignore]
+async fn test_information_schema_schemata() {
+    let (session, handler) = setup_handler().await;
+
+    let batches = handler
+        .execute(&session, "SELECT * FROM information_schema.schemata")
+        .await
+        .expect("information_schema.schemata should be queryable");
+
+    assert!(!batches.is_empty());
+}

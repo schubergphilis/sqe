@@ -26,3 +26,7 @@ s3_path_style = true
 
 [policy]
 engine = "passthrough"
+
+[metrics]
+prometheus_port = 19090
+audit_log_path = ""
