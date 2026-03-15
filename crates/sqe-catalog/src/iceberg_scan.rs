@@ -100,9 +100,15 @@ impl ExecutionPlan for IcebergScanExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
+        if partition != 0 {
+            return Err(DataFusionError::Internal(format!(
+                "IcebergScanExec only supports partition 0, got {partition}"
+            )));
+        }
+
         let table = self.table.clone();
         let schema = self.projected_schema.clone();
         let projection = self.projection.clone();

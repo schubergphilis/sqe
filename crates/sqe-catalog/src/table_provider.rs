@@ -95,7 +95,10 @@ impl TableProvider for SqeTableProvider {
                     .iter()
                     .map(|&i| self.schema.field(i).clone())
                     .collect();
-                Arc::new(arrow::datatypes::Schema::new(fields))
+                Arc::new(arrow::datatypes::Schema::new_with_metadata(
+                    fields,
+                    self.schema.metadata().clone(),
+                ))
             }
             None => self.schema.clone(),
         };
