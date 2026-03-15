@@ -13,45 +13,63 @@ dbt Core talks to databases through Python adapter plugins. Each adapter must:
 Here's where SQE stands today vs. what dbt needs:
 
 ┌──────────────────────────┬────────────────────┬───────────────────────────────┐
-│ dbt Requirement          │ SQE Status         │ Gap                           │
+│ dbt Requirement          │ SQE Status         │ Gap / Notes                   │
 ├──────────────────────────┼────────────────────┼───────────────────────────────┤
 │ Python connection        │ ✅ via ADBC        │ adbc_driver_flightsql has     │
 │                          │    Flight SQL      │ DB-API 2.0 interface          │
 ├──────────────────────────┼────────────────────┼───────────────────────────────┤
-│ getCatalogs/getSchemas/  │ ✅ Phase 1         │ Flight SQL metadata calls     │
-│ getTables/getColumns     │                    │ already specced               │
+│ getCatalogs/getSchemas/  │ ✅ Implemented     │ SHOW CATALOGS/SCHEMAS/TABLES  │
+│ getTables/getColumns     │                    │ + Flight SQL metadata         │
 ├──────────────────────────┼────────────────────┼───────────────────────────────┤
-│ SELECT queries           │ ✅ Phase 1         │ Core functionality            │
+│ SELECT queries           │ ✅ Implemented     │ Full DataFusion SQL support   │
 ├──────────────────────────┼────────────────────┼───────────────────────────────┤
-│ CREATE VIEW AS SELECT    │ ✅ Phase 2         │ Via Polaris REST view API     │
+│ CREATE VIEW AS SELECT    │ ✅ Implemented     │ Via Polaris REST view API     │
 ├──────────────────────────┼────────────────────┼───────────────────────────────┤
-│ CREATE TABLE AS SELECT   │ ❌ Not specced     │ Write path: DataFusion →      │
-│                          │                    │ iceberg-rust writer → Polaris  │
+│ DROP VIEW [IF EXISTS]    │ ✅ Implemented     │ Via Polaris REST view API     │
 ├──────────────────────────┼────────────────────┼───────────────────────────────┤
-│ CREATE OR REPLACE TABLE  │ ❌ Not specced     │ Atomic table replacement via   │
-│                          │                    │ Iceberg (new snapshot)         │
+│ CREATE TABLE AS SELECT   │ ✅ Implemented     │ iceberg-rust 0.8 write path   │
 ├──────────────────────────┼────────────────────┼───────────────────────────────┤
-│ DROP TABLE               │ ❌ Not specced     │ Polaris REST: DELETE table     │
+│ CREATE OR REPLACE TABLE  │ ✅ Implemented     │ DROP IF EXISTS + CTAS         │
+│ AS SELECT                │                    │                               │
 ├──────────────────────────┼────────────────────┼───────────────────────────────┤
-│ ALTER TABLE RENAME       │ ❌ Not specced     │ Polaris REST: rename table     │
+│ DROP TABLE [IF EXISTS]   │ ✅ Implemented     │ Polaris REST catalog          │
 ├──────────────────────────┼────────────────────┼───────────────────────────────┤
-│ INSERT INTO              │ ⚠️ Phase 2         │ iceberg-rust 0.8.0 has        │
-│                          │   (partial)        │ partitioned insert support    │
+│ ALTER TABLE RENAME       │ ✅ Implemented     │ Polaris REST catalog          │
 ├──────────────────────────┼────────────────────┼───────────────────────────────┤
-│ MERGE INTO               │ ❌ Not specced     │ Required for incremental      │
-│                          │                    │ merge strategy                │
+│ CREATE/DROP SCHEMA       │ ✅ Implemented     │ Polaris namespace operations  │
 ├──────────────────────────┼────────────────────┼───────────────────────────────┤
-│ DELETE FROM (with pred.) │ ❌ Not specced     │ Required for delete+insert    │
-│                          │                    │ incremental strategy          │
+│ INSERT INTO SELECT       │ ✅ Implemented     │ iceberg-rust 0.8 fast append  │
 ├──────────────────────────┼────────────────────┼───────────────────────────────┤
-│ information_schema       │ ❌ Not specced     │ dbt macros query              │
-│                          │                    │ information_schema heavily    │
+│ MERGE INTO               │ 🔜 Blocked        │ Needs iceberg-rust            │
+│                          │                    │ OverwriteAction (see          │
+│                          │                    │ row-level-writes.md)          │
 ├──────────────────────────┼────────────────────┼───────────────────────────────┤
-│ Transactions (BEGIN/     │ ❌ Not specced     │ Iceberg gives atomic commits  │
-│ COMMIT)                  │                    │ but no multi-statement txns   │
+│ DELETE FROM (with pred.) │ 🔜 Blocked        │ Needs iceberg-rust            │
+│                          │                    │ OverwriteAction               │
 ├──────────────────────────┼────────────────────┼───────────────────────────────┤
-│ Seeds (batch INSERT)     │ ❌ Not specced     │ Small data loads from CSV     │
+│ UPDATE                   │ 🔜 Blocked        │ Needs iceberg-rust            │
+│                          │                    │ OverwriteAction               │
+├──────────────────────────┼────────────────────┼───────────────────────────────┤
+│ information_schema       │ ✅ Implemented     │ Virtual tables/columns/       │
+│                          │                    │ schemata providers            │
+├──────────────────────────┼────────────────────┼───────────────────────────────┤
+│ Transactions (BEGIN/     │ ⚠️ N/A            │ Iceberg gives atomic commits  │
+│ COMMIT)                  │                    │ per statement; multi-stmt     │
+│                          │                    │ txns not needed for dbt       │
+├──────────────────────────┼────────────────────┼───────────────────────────────┤
+│ Seeds (batch INSERT)     │ ✅ Via INSERT INTO │ dbt adapter can batch rows    │
+│                          │                    │ into INSERT INTO SELECT       │
+├──────────────────────────┼────────────────────┼───────────────────────────────┤
+│ dbt-sqe Python adapter   │ ❌ Not started     │ ~1500-2500 lines Python       │
+│                          │                    │ (see design below)            │
 └──────────────────────────┴────────────────────┴───────────────────────────────┘
+
+Summary: All DDL/DML except row-level writes (MERGE/DELETE/UPDATE) is implemented.
+The remaining blockers are:
+  1. MERGE INTO / DELETE FROM / UPDATE — waiting on iceberg-rust upstream
+     (tracked PRs: #2185, #2203, #2219, #1987 — see docs/row-level-writes.md)
+  2. dbt-sqe Python adapter — can be built now with append-only incremental;
+     merge/delete+insert strategies depend on #1 above
 
 
 ================================================================================
@@ -658,36 +676,36 @@ FILE: openspec/changes/phase-2c-dbt/tasks.md
 
 ## Phase 2c.1 — Write Path: DDL (sqe-sql + sqe-coordinator + sqe-catalog)
 
-- [ ] 2c.1.1 Parse CTAS: CREATE [OR REPLACE] TABLE ... AS SELECT
-- [ ] 2c.1.2 Parse DROP TABLE [IF EXISTS]
-- [ ] 2c.1.3 Parse ALTER TABLE ... RENAME TO
-- [ ] 2c.1.4 Parse CREATE SCHEMA / DROP SCHEMA
-- [ ] 2c.1.5 Implement CTAS execution: query → infer schema → create table → write → commit
-- [ ] 2c.1.6 Implement CREATE OR REPLACE TABLE: new snapshot replacing all data
-- [ ] 2c.1.7 Implement DROP TABLE: Polaris REST delete
-- [ ] 2c.1.8 Implement ALTER TABLE RENAME: Polaris REST rename
-- [ ] 2c.1.9 Implement CREATE/DROP SCHEMA: Polaris namespace operations
+- [x] 2c.1.1 Parse CTAS: CREATE [OR REPLACE] TABLE ... AS SELECT
+- [x] 2c.1.2 Parse DROP TABLE [IF EXISTS]
+- [x] 2c.1.3 Parse ALTER TABLE ... RENAME TO
+- [x] 2c.1.4 Parse CREATE SCHEMA / DROP SCHEMA
+- [x] 2c.1.5 Implement CTAS execution: query → infer schema → create table → write → commit
+- [x] 2c.1.6 Implement CREATE OR REPLACE TABLE: DROP IF EXISTS + CTAS
+- [x] 2c.1.7 Implement DROP TABLE: Polaris REST catalog via iceberg-rust
+- [x] 2c.1.8 Implement ALTER TABLE RENAME: Polaris REST catalog via iceberg-rust
+- [x] 2c.1.9 Implement CREATE/DROP SCHEMA: Polaris namespace operations
 - [ ] 2c.1.10 Integration test: CTAS creates Iceberg table readable by subsequent SELECT
 - [ ] 2c.1.11 Integration test: CREATE OR REPLACE atomically swaps table contents
 
 ## Phase 2c.2 — Write Path: DML (sqe-sql + sqe-coordinator + sqe-catalog)
 
-- [ ] 2c.2.1 Parse INSERT INTO ... SELECT
-- [ ] 2c.2.2 Parse DELETE FROM ... WHERE
-- [ ] 2c.2.3 Parse MERGE INTO ... USING ... ON ... WHEN MATCHED/NOT MATCHED
-- [ ] 2c.2.4 Implement INSERT INTO: execute SELECT → write new data files → commit
-- [ ] 2c.2.5 Implement DELETE FROM: scan → identify affected rows → write position deletes → commit
-- [ ] 2c.2.6 Implement MERGE INTO: join → classify rows → write deletes + inserts → commit
+- [x] 2c.2.1 Parse INSERT INTO ... SELECT
+- [x] 2c.2.2 Parse DELETE FROM ... WHERE
+- [x] 2c.2.3 Parse MERGE INTO ... USING ... ON ... WHEN MATCHED/NOT MATCHED
+- [x] 2c.2.4 Implement INSERT INTO: execute SELECT → write new data files → commit
+- [ ] 2c.2.5 Implement DELETE FROM: 🔜 blocked on iceberg-rust OverwriteAction
+- [ ] 2c.2.6 Implement MERGE INTO: 🔜 blocked on iceberg-rust OverwriteAction
 - [ ] 2c.2.7 Integration test: INSERT INTO appends data correctly
 - [ ] 2c.2.8 Integration test: DELETE FROM removes matching rows
 - [ ] 2c.2.9 Integration test: MERGE INTO updates existing + inserts new
 
 ## Phase 2c.3 — information_schema (sqe-coordinator)
 
-- [ ] 2c.3.1 Implement InfoSchemaTablesProvider (virtual TableProvider)
-- [ ] 2c.3.2 Implement InfoSchemaColumnsProvider
-- [ ] 2c.3.3 Implement InfoSchemaSchemataProvider
-- [ ] 2c.3.4 Register information_schema as virtual schema per session
+- [x] 2c.3.1 Implement InfoSchemaTablesProvider (virtual TableProvider)
+- [x] 2c.3.2 Implement InfoSchemaColumnsProvider
+- [x] 2c.3.3 Implement InfoSchemaSchemataProvider
+- [x] 2c.3.4 Register information_schema as virtual schema per session
 - [ ] 2c.3.5 Integration test: SELECT * FROM information_schema.tables WHERE table_schema = 'x'
 - [ ] 2c.3.6 Integration test: information_schema respects user access (different results per user)
 
@@ -701,11 +719,11 @@ FILE: openspec/changes/phase-2c-dbt/tasks.md
 - [ ] 2c.4.6 Implement table materialization macro
 - [ ] 2c.4.7 Implement view materialization macro
 - [ ] 2c.4.8 Implement incremental materialization: append strategy
-- [ ] 2c.4.9 Implement incremental materialization: delete+insert strategy
-- [ ] 2c.4.10 Implement incremental materialization: merge strategy
+- [ ] 2c.4.9 Implement incremental materialization: delete+insert strategy (blocked on DELETE)
+- [ ] 2c.4.10 Implement incremental materialization: merge strategy (blocked on MERGE)
 - [ ] 2c.4.11 Implement seed macro (batch INSERT from CSV)
 - [ ] 2c.4.12 Implement catalog generation macro (for dbt docs)
-- [ ] 2c.4.13 Implement snapshot materialization (SCD Type 2 via MERGE)
+- [ ] 2c.4.13 Implement snapshot materialization (SCD Type 2 via MERGE — blocked on MERGE)
 
 ## Phase 2c.5 — End-to-End dbt Testing
 
@@ -715,11 +733,11 @@ FILE: openspec/changes/phase-2c-dbt/tasks.md
 - [ ] 2c.5.4 Test: `dbt run` with table materialization
 - [ ] 2c.5.5 Test: `dbt run` with view materialization
 - [ ] 2c.5.6 Test: `dbt run` with incremental (append)
-- [ ] 2c.5.7 Test: `dbt run` with incremental (merge)
-- [ ] 2c.5.8 Test: `dbt run` with incremental (delete+insert)
+- [ ] 2c.5.7 Test: `dbt run` with incremental (merge) — blocked on MERGE
+- [ ] 2c.5.8 Test: `dbt run` with incremental (delete+insert) — blocked on DELETE
 - [ ] 2c.5.9 Test: `dbt run --full-refresh` with CREATE OR REPLACE
 - [ ] 2c.5.10 Test: `dbt test` runs assertion queries
 - [ ] 2c.5.11 Test: `dbt docs generate` produces catalog JSON
-- [ ] 2c.5.12 Test: `dbt snapshot` creates SCD Type 2 table
+- [ ] 2c.5.12 Test: `dbt snapshot` creates SCD Type 2 table — blocked on MERGE
 - [ ] 2c.5.13 Test: dbt run with different users sees policy-filtered results
 - [ ] 2c.5.14 Test: concurrent dbt runs from different users don't conflict
