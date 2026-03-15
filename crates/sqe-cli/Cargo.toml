@@ -12,7 +12,7 @@ arrow = { workspace = true }
 arrow-flight = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
-tonic = { workspace = true, features = ["transport", "tls"] }
+tonic = { workspace = true, features = ["transport", "tls-native-roots"] }
 tokio = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }

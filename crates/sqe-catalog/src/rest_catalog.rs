@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use iceberg::table::Table;
-use iceberg::{Catalog, NamespaceIdent, TableIdent};
-use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
+use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent};
+use iceberg_catalog_rest::{RestCatalog, RestCatalogBuilder};
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
@@ -68,6 +68,10 @@ impl SessionCatalog {
         // and uses it in the Authorization: Bearer header.
         props.insert("token".to_string(), bearer_token.to_string());
 
+        // Set the REST catalog URI and warehouse
+        props.insert("uri".to_string(), polaris_url.to_string());
+        props.insert("warehouse".to_string(), warehouse.to_string());
+
         // Inject S3 storage config as properties so that FileIO can be configured
         // when loading tables (fallback when credential vending is not available).
         if !storage_config.s3_endpoint.is_empty() {
@@ -95,13 +99,14 @@ impl SessionCatalog {
             props.insert("s3.path-style-access".to_string(), "true".to_string());
         }
 
-        let config = RestCatalogConfig::builder()
-            .uri(polaris_url.to_string())
-            .warehouse(warehouse.to_string())
-            .props(props)
-            .build();
-
-        let catalog = RestCatalog::new(config);
+        // iceberg-rust 0.8 uses CatalogBuilder::load(name, props) pattern
+        let catalog = RestCatalogBuilder::default()
+            .load(
+                format!("sqe-session-{}", &token_fingerprint),
+                props,
+            )
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to create REST catalog: {e}")))?;
 
         let http_client = reqwest::Client::new();
 
@@ -409,6 +414,15 @@ impl Catalog for SessionCatalogBridge {
     ) -> iceberg::Result<()> {
         let catalog = self.session.inner.read().await;
         catalog.rename_table(src, dest).await
+    }
+
+    async fn register_table(
+        &self,
+        table: &TableIdent,
+        metadata_location: String,
+    ) -> iceberg::Result<Table> {
+        let catalog = self.session.inner.read().await;
+        catalog.register_table(table, metadata_location).await
     }
 
     async fn update_table(&self, commit: iceberg::TableCommit) -> iceberg::Result<Table> {
