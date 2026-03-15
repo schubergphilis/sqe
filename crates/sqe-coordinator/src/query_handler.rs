@@ -23,6 +23,7 @@ pub struct QueryHandler {
     config: SqeConfig,
     catalog_ops: CatalogOps,
     write_handler: WriteHandler,
+    #[allow(dead_code)] // Wired in Chunk 3 for distributed execution; query routing TBD
     worker_registry: Option<Arc<crate::worker_registry::WorkerRegistry>>,
     metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
     audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
@@ -50,6 +51,7 @@ impl QueryHandler {
     }
 
     /// Check if distributed execution should be used for a query.
+    #[allow(dead_code)] // Will be used when distributed query routing is wired in
     async fn should_distribute(&self) -> bool {
         if let Some(ref registry) = self.worker_registry {
             !registry.healthy_workers().await.is_empty()
@@ -72,11 +74,7 @@ impl QueryHandler {
 
         let start = std::time::Instant::now();
         let kind = parse_and_classify(sql)?;
-        let kind_name = format!("{kind:?}")
-            .split('(')
-            .next()
-            .unwrap_or("unknown")
-            .to_lowercase();
+        let kind_name = kind.name().to_string();
 
         let result = match kind {
             StatementKind::Query(_) => self.execute_query(session, sql).await,
