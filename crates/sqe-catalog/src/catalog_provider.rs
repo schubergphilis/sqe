@@ -20,6 +20,7 @@ use crate::schema_provider::SqeSchemaProvider;
 pub struct SqeCatalogProvider {
     session_catalog: Arc<SessionCatalog>,
     storage_config: StorageConfig,
+    warehouse: String,
     /// Cached namespace names, populated at construction time.
     /// This avoids async calls in the synchronous `schema_names()` method.
     cached_namespaces: Vec<String>,
@@ -33,6 +34,7 @@ impl SqeCatalogProvider {
     pub async fn try_new(
         session_catalog: Arc<SessionCatalog>,
         storage_config: StorageConfig,
+        warehouse: String,
     ) -> sqe_core::Result<Self> {
         let namespaces = session_catalog.list_namespaces().await?;
         let cached_namespaces: Vec<String> = namespaces
@@ -48,6 +50,7 @@ impl SqeCatalogProvider {
         Ok(Self {
             session_catalog,
             storage_config,
+            warehouse,
             cached_namespaces,
         })
     }
@@ -57,11 +60,13 @@ impl SqeCatalogProvider {
     pub fn with_namespaces(
         session_catalog: Arc<SessionCatalog>,
         storage_config: StorageConfig,
+        warehouse: String,
         namespaces: Vec<String>,
     ) -> Self {
         Self {
             session_catalog,
             storage_config,
+            warehouse,
             cached_namespaces: namespaces,
         }
     }
@@ -73,10 +78,21 @@ impl CatalogProvider for SqeCatalogProvider {
     }
 
     fn schema_names(&self) -> Vec<String> {
-        self.cached_namespaces.clone()
+        let mut names = self.cached_namespaces.clone();
+        names.push("information_schema".to_string());
+        names
     }
 
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+        if name == "information_schema" {
+            return Some(Arc::new(
+                crate::info_schema::InformationSchemaProvider::new(
+                    self.session_catalog.clone(),
+                    self.warehouse.clone(),
+                ),
+            ));
+        }
+
         if !self.cached_namespaces.contains(&name.to_string()) {
             debug!(schema = name, "Schema not found in cached namespaces");
             return None;
