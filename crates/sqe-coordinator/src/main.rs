@@ -7,6 +7,41 @@ use sqe_coordinator::flight_sql::SqeFlightSqlService;
 use sqe_coordinator::QueryHandler;
 use sqe_coordinator::SessionManager;
 
+// Trino adapter types
+use sqe_trino_compat::server::{TrinoAuthenticator, TrinoQueryExecutor};
+
+struct AuthenticatorAdapter(Arc<sqe_auth::Authenticator>);
+
+#[async_trait::async_trait]
+impl TrinoAuthenticator for AuthenticatorAdapter {
+    async fn authenticate(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<sqe_core::Session, String> {
+        self.0
+            .authenticate(username, password)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+struct QueryHandlerAdapter(Arc<QueryHandler>);
+
+#[async_trait::async_trait]
+impl TrinoQueryExecutor for QueryHandlerAdapter {
+    async fn execute(
+        &self,
+        session: &sqe_core::Session,
+        sql: &str,
+    ) -> Result<Vec<arrow_array::RecordBatch>, String> {
+        self.0
+            .execute(session, sql)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -51,6 +86,19 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Initialize metrics
+    let metrics = Arc::new(sqe_metrics::MetricsRegistry::new());
+    let audit = Arc::new(sqe_metrics::audit::AuditLogger::new(
+        &config.metrics.audit_log_path,
+    ));
+
+    // Start metrics server
+    sqe_metrics::server::start_metrics_server(metrics.clone(), config.metrics.prometheus_port);
+    tracing::info!(
+        "Prometheus metrics on port {}",
+        config.metrics.prometheus_port
+    );
+
     // Initialize query handler
     let query_handler = Arc::new(QueryHandler::new(
         policy_enforcer,
@@ -60,7 +108,24 @@ async fn main() -> anyhow::Result<()> {
         } else {
             Some(worker_registry.clone())
         },
+        Some(metrics.clone()),
+        Some(audit.clone()),
     ));
+
+    // Start Trino-compat HTTP server
+    if config.coordinator.trino_http_port > 0 {
+        let auth_adapter = Arc::new(AuthenticatorAdapter(authenticator.clone()));
+        let handler_adapter = Arc::new(QueryHandlerAdapter(query_handler.clone()));
+        sqe_trino_compat::server::start_trino_server(
+            auth_adapter,
+            handler_adapter,
+            config.coordinator.trino_http_port,
+        );
+        tracing::info!(
+            "Trino-compat HTTP server on port {}",
+            config.coordinator.trino_http_port
+        );
+    }
 
     // Start Flight SQL server
     let flight_service =
