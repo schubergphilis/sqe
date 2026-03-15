@@ -11,6 +11,7 @@ members = [
     "crates/sqe-worker",
     "crates/sqe-trino-compat",
     "crates/sqe-metrics",
+    "crates/sqe-cli",
 ]
 
 [workspace.dependencies]

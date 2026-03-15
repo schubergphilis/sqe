@@ -1,0 +1,27 @@
+[package]
+name = "sqe-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sqe-cli"
+path = "src/main.rs"
+
+[dependencies]
+arrow = { workspace = true }
+arrow-flight = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-array = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+rustyline = "15"
+rpassword = "7"
+reqwest = { workspace = true }
+async-trait = { workspace = true }
