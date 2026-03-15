@@ -10,8 +10,10 @@ pub fn print_query_result(result: &QueryResult) {
     let mut widths: Vec<usize> = result.columns.iter().map(|c| c.len()).collect();
     for row in &result.rows {
         for (i, cell) in row.iter().enumerate() {
-            if cell.len() > widths[i] {
-                widths[i] = cell.len();
+            if let Some(w) = widths.get_mut(i) {
+                if cell.len() > *w {
+                    *w = cell.len();
+                }
             }
         }
     }
@@ -34,7 +36,7 @@ pub fn print_query_result(result: &QueryResult) {
         let cells: Vec<String> = row
             .iter()
             .enumerate()
-            .map(|(i, v)| format!("{:width$}", v, width = widths[i]))
+            .map(|(i, v)| format!("{:width$}", v, width = widths.get(i).copied().unwrap_or(0)))
             .collect();
         println!(" {} ", cells.join(" | "));
     }

@@ -12,7 +12,7 @@ arrow = { workspace = true }
 arrow-flight = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
-tonic = { workspace = true }
+tonic = { workspace = true, features = ["transport", "tls"] }
 tokio = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
@@ -24,4 +24,5 @@ clap = { version = "4", features = ["derive"] }
 rustyline = "15"
 rpassword = "7"
 reqwest = { workspace = true }
+url = { workspace = true }
 async-trait = { workspace = true }

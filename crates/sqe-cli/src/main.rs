@@ -32,6 +32,10 @@ struct Cli {
     /// Use HTTPS/TLS (applies to both protocols)
     #[arg(long, default_value_t = false)]
     tls: bool,
+
+    /// Accept invalid TLS certificates (insecure, use for development only)
+    #[arg(long, default_value_t = false)]
+    insecure: bool,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -56,7 +60,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let password = std::env::var("SQE_PASSWORD").unwrap_or_else(|_| {
-        rpassword::prompt_password("Password: ").unwrap_or_default()
+        rpassword::prompt_password("Password: ")
+            .expect("Failed to read password (not a terminal?)")
     });
 
     let scheme = if cli.tls { "https" } else { "http" };
@@ -67,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Protocol::Http => {
             let url = format!("{scheme}://{}:{}", cli.host, cli.port);
-            Box::new(http::HttpClient::new(&url, &username, &password))
+            Box::new(http::HttpClient::new(&url, &username, &password, cli.insecure))
         }
     };
 

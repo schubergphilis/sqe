@@ -61,7 +61,7 @@ impl QueryHandler {
     }
 
     /// Execute a SQL statement for the given session and return collected RecordBatches.
-    #[tracing::instrument(skip(self, session), fields(username = %session.user.username, statement_type))]
+    #[tracing::instrument(skip(self, session, sql), fields(username = %session.user.username, statement_type))]
     pub async fn execute(
         &self,
         session: &Session,
@@ -69,7 +69,7 @@ impl QueryHandler {
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         info!(
             username = %session.user.username,
-            sql = sql,
+            sql_length = sql.len(),
             "Executing query"
         );
 
@@ -114,7 +114,7 @@ impl QueryHandler {
                 Ok(vec![])
             }
             StatementKind::CreateView(stmt) => {
-                self.catalog_ops.create_view(session, &stmt).await?;
+                self.handle_create_view(session, &stmt).await?;
                 Ok(vec![])
             }
             StatementKind::DropView(stmt) => {
@@ -433,6 +433,34 @@ impl QueryHandler {
         Ok(vec![batch])
     }
 
+    /// Handle CREATE VIEW by inferring the output schema from the SELECT query
+    /// and then calling the Polaris REST API to create the view.
+    async fn handle_create_view(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+    ) -> sqe_core::Result<()> {
+        let query = match stmt {
+            Statement::CreateView { query, .. } => query,
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected CREATE VIEW statement, got: {other}"
+                )));
+            }
+        };
+
+        // Infer the output schema by planning the SELECT query through DataFusion
+        let select_sql = format!("{query}");
+        let schema = self.get_schema(session, &select_sql).await?;
+
+        // Convert Arrow schema to Iceberg REST API schema format
+        let schema_json = arrow_schema_to_iceberg_json(&schema);
+
+        self.catalog_ops
+            .create_view(session, stmt, &schema_json)
+            .await
+    }
+
     /// Handle EXPLAIN by planning the inner statement and returning the plan as text.
     async fn handle_explain(
         &self,
@@ -453,5 +481,65 @@ impl QueryHandler {
             .map_err(|e| SqeError::Execution(format!("EXPLAIN execution failed: {e}")))?;
 
         Ok(batches)
+    }
+}
+
+/// Convert an Arrow `SchemaRef` to Iceberg REST API schema JSON format.
+///
+/// Produces a JSON object like:
+/// ```json
+/// {
+///   "type": "struct",
+///   "schema-id": 0,
+///   "fields": [
+///     { "id": 1, "name": "col", "required": false, "type": "string" },
+///     ...
+///   ]
+/// }
+/// ```
+fn arrow_schema_to_iceberg_json(schema: &SchemaRef) -> serde_json::Value {
+    let fields: Vec<serde_json::Value> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, field)| {
+            serde_json::json!({
+                "id": i + 1,
+                "name": field.name(),
+                "required": !field.is_nullable(),
+                "type": arrow_type_to_iceberg(field.data_type()),
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "type": "struct",
+        "schema-id": 0,
+        "fields": fields,
+    })
+}
+
+/// Map an Arrow `DataType` to an Iceberg type string.
+fn arrow_type_to_iceberg(dt: &DataType) -> serde_json::Value {
+    match dt {
+        DataType::Boolean => serde_json::json!("boolean"),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 => serde_json::json!("int"),
+        DataType::Int64 => serde_json::json!("long"),
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 => serde_json::json!("int"),
+        DataType::UInt64 => serde_json::json!("long"),
+        DataType::Float16 | DataType::Float32 => serde_json::json!("float"),
+        DataType::Float64 => serde_json::json!("double"),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => serde_json::json!("string"),
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
+            serde_json::json!("binary")
+        }
+        DataType::Date32 | DataType::Date64 => serde_json::json!("date"),
+        DataType::Timestamp(_, _) => serde_json::json!("timestamptz"),
+        DataType::Time32(_) | DataType::Time64(_) => serde_json::json!("time"),
+        DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => {
+            serde_json::json!(format!("decimal({p},{s})"))
+        }
+        DataType::FixedSizeBinary(len) => serde_json::json!(format!("fixed[{len}]")),
+        _ => serde_json::json!("string"), // fallback
     }
 }

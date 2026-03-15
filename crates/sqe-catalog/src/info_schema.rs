@@ -202,7 +202,7 @@ impl InformationSchemaProvider {
         match self.session_catalog.list_namespaces().await {
             Ok(namespaces) => namespaces
                 .iter()
-                .flat_map(|ns| ns.as_ref().clone())
+                .map(|ns| ns.as_ref().iter().map(|s| s.as_str()).collect::<Vec<_>>().join("."))
                 .collect(),
             Err(e) => {
                 error!(error = %e, "Failed to list namespaces for information_schema");

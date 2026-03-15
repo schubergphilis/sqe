@@ -69,6 +69,13 @@ impl Authenticator {
         Ok(session)
     }
 
+    /// Look up the latest cached token for a session.
+    ///
+    /// Used by `SessionManager` to pick up tokens refreshed by the background task.
+    pub fn get_cached_token(&self, session_id: &str) -> Option<CachedToken> {
+        self.cache.get(session_id)
+    }
+
     pub async fn refresh_session(&self, session: &mut Session) -> sqe_core::Result<()> {
         let refresh_token = session
             .refresh_token
