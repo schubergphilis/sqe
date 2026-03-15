@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
-use sqlparser::ast::{AlterTableOperation, ObjectName, ObjectType, RenameTableNameKind, Statement};
+use sqlparser::ast::{AlterTableOperation, ObjectName, ObjectType, RenameTableNameKind, SchemaName, Statement};
 use tracing::info;
 
 use sqe_catalog::SessionCatalog;
@@ -68,6 +69,104 @@ impl CatalogOps {
                 Ok(())
             }
             Err(e) => Err(SqeError::Catalog(format!("Failed to drop table: {e}"))),
+        }
+    }
+
+    /// Create a schema (namespace) via the Iceberg REST catalog.
+    ///
+    /// Maps SQL `CREATE SCHEMA` to Iceberg `create_namespace`.
+    pub async fn create_schema(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+    ) -> sqe_core::Result<()> {
+        let (schema_name, if_not_exists) = match stmt {
+            Statement::CreateSchema {
+                schema_name,
+                if_not_exists,
+                ..
+            } => (schema_name, *if_not_exists),
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected CREATE SCHEMA statement, got: {other}"
+                )));
+            }
+        };
+
+        let namespace = parse_schema_name(schema_name)?;
+
+        info!(
+            username = %session.user.username,
+            namespace = ?namespace,
+            if_not_exists = if_not_exists,
+            "Creating schema"
+        );
+
+        let catalog = self.create_catalog_bridge(session).await?;
+
+        match catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if if_not_exists && is_namespace_already_exists(&e) => {
+                info!(
+                    namespace = ?namespace,
+                    "Schema already exists, IF NOT EXISTS specified — ignoring"
+                );
+                Ok(())
+            }
+            Err(e) => Err(SqeError::Catalog(format!("Failed to create schema: {e}"))),
+        }
+    }
+
+    /// Drop a schema (namespace) via the Iceberg REST catalog.
+    ///
+    /// Maps SQL `DROP SCHEMA` to Iceberg `drop_namespace`.
+    pub async fn drop_schema(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+    ) -> sqe_core::Result<()> {
+        let (names, if_exists) = match stmt {
+            Statement::Drop {
+                names,
+                if_exists,
+                object_type: ObjectType::Schema,
+                ..
+            } => (names, *if_exists),
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected DROP SCHEMA statement, got: {other}"
+                )));
+            }
+        };
+
+        let schema_name_obj = names.first().ok_or_else(|| {
+            SqeError::Execution("DROP SCHEMA requires at least one schema name".to_string())
+        })?;
+
+        let namespace = parse_namespace_from_object_name(schema_name_obj)?;
+
+        info!(
+            username = %session.user.username,
+            namespace = ?namespace,
+            if_exists = if_exists,
+            "Dropping schema"
+        );
+
+        let catalog = self.create_catalog_bridge(session).await?;
+
+        match catalog.drop_namespace(&namespace).await {
+            Ok(()) => Ok(()),
+            Err(e) if if_exists && is_namespace_not_found(&e) => {
+                info!(
+                    namespace = ?namespace,
+                    "Schema not found, IF EXISTS specified — ignoring"
+                );
+                Ok(())
+            }
+            Err(e) => Err(SqeError::Catalog(format!("Failed to drop schema: {e}"))),
         }
     }
 
@@ -293,6 +392,37 @@ pub(crate) fn parse_table_ref(name: &ObjectName) -> sqe_core::Result<(NamespaceI
     }
 }
 
+/// Parse a sqlparser `SchemaName` into an iceberg `NamespaceIdent`.
+fn parse_schema_name(schema_name: &SchemaName) -> sqe_core::Result<NamespaceIdent> {
+    match schema_name {
+        SchemaName::Simple(name) => parse_namespace_from_object_name(name),
+        SchemaName::UnnamedAuthorization(ident) => {
+            Ok(NamespaceIdent::new(ident.value.clone()))
+        }
+        SchemaName::NamedAuthorization(name, _) => parse_namespace_from_object_name(name),
+    }
+}
+
+/// Parse a sqlparser `ObjectName` into an iceberg `NamespaceIdent`.
+///
+/// - 1 part  → namespace = name
+/// - 2 parts → ignore catalog prefix, namespace = parts[1]
+fn parse_namespace_from_object_name(name: &ObjectName) -> sqe_core::Result<NamespaceIdent> {
+    let parts: Vec<String> = name
+        .0
+        .iter()
+        .filter_map(|part| part.as_ident().map(|ident| ident.value.clone()))
+        .collect();
+
+    match parts.len() {
+        1 => Ok(NamespaceIdent::new(parts[0].clone())),
+        2 => Ok(NamespaceIdent::new(parts[1].clone())),
+        n => Err(SqeError::Execution(format!(
+            "Invalid schema reference with {n} parts: {name}"
+        ))),
+    }
+}
+
 /// Check if an iceberg error indicates a table was not found.
 fn is_table_not_found(err: &iceberg::Error) -> bool {
     let msg = err.to_string().to_lowercase();
@@ -300,6 +430,23 @@ fn is_table_not_found(err: &iceberg::Error) -> bool {
         || msg.contains("no such table")
         || msg.contains("does not exist")
         || msg.contains("404")
+}
+
+/// Check if an iceberg error indicates a namespace was not found.
+fn is_namespace_not_found(err: &iceberg::Error) -> bool {
+    let msg = err.to_string().to_lowercase();
+    msg.contains("not found")
+        || msg.contains("no such namespace")
+        || msg.contains("does not exist")
+        || msg.contains("404")
+}
+
+/// Check if an iceberg error indicates a namespace already exists.
+fn is_namespace_already_exists(err: &iceberg::Error) -> bool {
+    let msg = err.to_string().to_lowercase();
+    msg.contains("already exists")
+        || msg.contains("409")
+        || msg.contains("conflict")
 }
 
 #[cfg(test)]
