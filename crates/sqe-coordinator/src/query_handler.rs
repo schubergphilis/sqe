@@ -121,10 +121,23 @@ impl QueryHandler {
                 self.catalog_ops.drop_view(session, &stmt).await?;
                 Ok(vec![])
             }
+            StatementKind::CreateSchema(stmt) => {
+                self.catalog_ops.create_schema(session, &stmt).await?;
+                Ok(vec![])
+            }
+            StatementKind::DropSchema(stmt) => {
+                self.catalog_ops.drop_schema(session, &stmt).await?;
+                Ok(vec![])
+            }
 
             StatementKind::Ctas(stmt) => {
                 if let Statement::CreateTable(ref ct) = *stmt {
                     if let Some(ref query) = ct.query {
+                        // Handle CREATE OR REPLACE TABLE AS SELECT:
+                        // drop the existing table first, then create a new one.
+                        if ct.or_replace {
+                            self.drop_table_if_exists(session, &ct.name).await?;
+                        }
                         let select_sql = format!("{query}");
                         let batches = self.execute_query(session, &select_sql).await?;
                         self.write_handler.handle_ctas(session, &stmt, batches).await
@@ -459,6 +472,43 @@ impl QueryHandler {
         self.catalog_ops
             .create_view(session, stmt, &schema_json)
             .await
+    }
+
+    /// Drop a table if it exists — used for CREATE OR REPLACE TABLE.
+    async fn drop_table_if_exists(
+        &self,
+        session: &Session,
+        table_name: &sqlparser::ast::ObjectName,
+    ) -> sqe_core::Result<()> {
+        use crate::catalog_ops::parse_table_ref;
+        use iceberg::{Catalog, TableIdent};
+
+        let (namespace, name) = parse_table_ref(table_name)?;
+        let table_ident = TableIdent::new(namespace, name);
+
+        let session_catalog = Arc::new(
+            SessionCatalog::new(
+                &self.config.catalog.polaris_url,
+                &self.config.catalog.warehouse,
+                &session.access_token,
+                &self.config.storage,
+            )
+            .await?,
+        );
+
+        let catalog = session_catalog.as_catalog();
+        if catalog.table_exists(&table_ident).await.unwrap_or(false) {
+            info!(
+                table = %table_ident,
+                "DROP existing table for CREATE OR REPLACE"
+            );
+            catalog
+                .drop_table(&table_ident)
+                .await
+                .map_err(|e| SqeError::Catalog(format!("Failed to drop table for replace: {e}")))?;
+        }
+
+        Ok(())
     }
 
     /// Handle EXPLAIN by planning the inner statement and returning the plan as text.
