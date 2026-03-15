@@ -236,6 +236,7 @@ impl QueryHandler {
         let catalog_provider = SqeCatalogProvider::try_new(
             session_catalog,
             self.config.storage.clone(),
+            self.config.catalog.warehouse.clone(),
         )
         .await?;
 

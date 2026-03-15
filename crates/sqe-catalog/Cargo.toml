@@ -8,6 +8,7 @@ sqe-core = { path = "../sqe-core" }
 datafusion = { workspace = true }
 arrow = { workspace = true }
 arrow-schema = { workspace = true }
+arrow-array = { workspace = true }
 iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 tokio = { workspace = true }
