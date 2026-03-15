@@ -119,7 +119,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         Ok(batches) => {
             let (columns, data) = protocol::batches_to_trino(&batches);
             let response = TrinoResponse {
-                id: query_id,
+                id: query_id.clone(),
                 info_uri: None,
                 next_uri: None,
                 columns: Some(columns),
@@ -127,6 +127,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 stats: TrinoStats::finished(),
                 error: None,
             };
+            state.results.insert(query_id, CachedResult { response: response.clone() });
             (StatusCode::OK, Json(response)).into_response()
         }
         Err(e) => {

@@ -22,6 +22,28 @@ pub enum StatementKind {
     Utility(Box<Statement>),
 }
 
+impl StatementKind {
+    /// Return a stable lowercase label for metrics and audit logging.
+    pub fn name(&self) -> &'static str {
+        match self {
+            StatementKind::Query(_) => "query",
+            StatementKind::Ctas(_) => "ctas",
+            StatementKind::Insert(_) => "insert",
+            StatementKind::Merge(_) => "merge",
+            StatementKind::Delete(_) => "delete",
+            StatementKind::Drop(_) => "drop",
+            StatementKind::Rename(_) => "rename",
+            StatementKind::CreateView(_) => "createview",
+            StatementKind::DropView(_) => "dropview",
+            StatementKind::ShowCatalogs => "showcatalogs",
+            StatementKind::ShowSchemas(_) => "showschemas",
+            StatementKind::ShowTables(_) => "showtables",
+            StatementKind::Policy(_) => "policy",
+            StatementKind::Utility(_) => "utility",
+        }
+    }
+}
+
 /// Parse a SQL string and classify the first statement.
 pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
     // Before parsing with sqlparser, check for SHOW CATALOGS which sqlparser
