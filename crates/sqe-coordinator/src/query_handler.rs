@@ -24,6 +24,8 @@ pub struct QueryHandler {
     catalog_ops: CatalogOps,
     write_handler: WriteHandler,
     worker_registry: Option<Arc<crate::worker_registry::WorkerRegistry>>,
+    metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
+    audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
 }
 
 impl QueryHandler {
@@ -31,6 +33,8 @@ impl QueryHandler {
         policy_enforcer: Arc<dyn PolicyEnforcer>,
         config: SqeConfig,
         worker_registry: Option<Arc<crate::worker_registry::WorkerRegistry>>,
+        metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
+        audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
     ) -> Self {
         let catalog_ops = CatalogOps::new(config.clone());
         let write_handler = WriteHandler::new(config.clone());
@@ -40,6 +44,8 @@ impl QueryHandler {
             catalog_ops,
             write_handler,
             worker_registry,
+            metrics,
+            audit,
         }
     }
 
@@ -64,9 +70,15 @@ impl QueryHandler {
             "Executing query"
         );
 
+        let start = std::time::Instant::now();
         let kind = parse_and_classify(sql)?;
+        let kind_name = format!("{kind:?}")
+            .split('(')
+            .next()
+            .unwrap_or("unknown")
+            .to_lowercase();
 
-        match kind {
+        let result = match kind {
             StatementKind::Query(_) => self.execute_query(session, sql).await,
 
             StatementKind::ShowCatalogs => self.handle_show_catalogs(session).await,
@@ -80,7 +92,6 @@ impl QueryHandler {
             }
 
             StatementKind::Utility(stmt) => {
-                // Handle EXPLAIN by planning and returning the plan as text
                 if let sqlparser::ast::Statement::Explain { statement, .. } = *stmt {
                     self.handle_explain(session, &statement.to_string()).await
                 } else {
@@ -94,10 +105,9 @@ impl QueryHandler {
                 "Policy management not configured".to_string(),
             )),
 
-            // Catalog DDL operations
             StatementKind::Drop(stmt) => {
                 self.catalog_ops.drop_table(session, &stmt).await?;
-                Ok(vec![]) // DDL success, no result rows
+                Ok(vec![])
             }
             StatementKind::Rename(stmt) => {
                 self.catalog_ops.rename_table(session, &stmt).await?;
@@ -112,7 +122,6 @@ impl QueryHandler {
                 Ok(vec![])
             }
 
-            // Write operations: CTAS and INSERT INTO SELECT
             StatementKind::Ctas(stmt) => {
                 if let Statement::CreateTable(ref ct) = *stmt {
                     if let Some(ref query) = ct.query {
@@ -145,14 +154,47 @@ impl QueryHandler {
                 }
             }
 
-            // Write operations: require Iceberg overwrite transaction support
             StatementKind::Delete(_) => Err(SqeError::NotImplemented(
                 "DELETE FROM requires Iceberg overwrite transaction support (planned for Chunk 3)".to_string(),
             )),
             StatementKind::Merge(_) => Err(SqeError::NotImplemented(
                 "MERGE INTO requires Iceberg overwrite transaction support (planned for Chunk 3)".to_string(),
             )),
+        };
+
+        // Record metrics and audit
+        let duration = start.elapsed();
+        let status = if result.is_ok() { "success" } else { "error" };
+        let rows: usize = result
+            .as_ref()
+            .map(|b| b.iter().map(|r| r.num_rows()).sum())
+            .unwrap_or(0);
+
+        if let Some(ref metrics) = self.metrics {
+            metrics
+                .query_count
+                .with_label_values(&[status, &kind_name])
+                .inc();
+            metrics
+                .query_duration
+                .with_label_values(&[&kind_name])
+                .observe(duration.as_secs_f64());
+            metrics.rows_returned.inc_by(rows as f64);
         }
+
+        if let Some(ref audit) = self.audit {
+            audit.log(&sqe_metrics::audit::AuditEntry {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                username: session.user.username.clone(),
+                query_text: sql.to_string(),
+                statement_type: kind_name,
+                duration_ms: duration.as_millis() as u64,
+                rows_returned: rows,
+                status: status.to_string(),
+            });
+        }
+
+        result
     }
 
     /// Plan a SQL query and return only its schema, without executing it.
