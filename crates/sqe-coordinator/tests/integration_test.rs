@@ -97,7 +97,7 @@ async fn test_simple_select() {
 
     // SELECT 1 goes through the full query pipeline including catalog registration
     let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(sqe_policy::PassthroughEnforcer);
-    let handler = sqe_coordinator::QueryHandler::new(policy, config);
+    let handler = sqe_coordinator::QueryHandler::new(policy, config, None);
 
     let batches = handler
         .execute(&session, "SELECT 1")
@@ -148,7 +148,7 @@ async fn setup_handler() -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
         .await
         .expect("Auth failed for root");
     let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(sqe_policy::PassthroughEnforcer);
-    let handler = sqe_coordinator::QueryHandler::new(policy, config);
+    let handler = sqe_coordinator::QueryHandler::new(policy, config, None);
     (session, handler)
 }
 

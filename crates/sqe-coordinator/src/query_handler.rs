@@ -23,10 +23,15 @@ pub struct QueryHandler {
     config: SqeConfig,
     catalog_ops: CatalogOps,
     write_handler: WriteHandler,
+    worker_registry: Option<Arc<crate::worker_registry::WorkerRegistry>>,
 }
 
 impl QueryHandler {
-    pub fn new(policy_enforcer: Arc<dyn PolicyEnforcer>, config: SqeConfig) -> Self {
+    pub fn new(
+        policy_enforcer: Arc<dyn PolicyEnforcer>,
+        config: SqeConfig,
+        worker_registry: Option<Arc<crate::worker_registry::WorkerRegistry>>,
+    ) -> Self {
         let catalog_ops = CatalogOps::new(config.clone());
         let write_handler = WriteHandler::new(config.clone());
         Self {
@@ -34,6 +39,16 @@ impl QueryHandler {
             config,
             catalog_ops,
             write_handler,
+            worker_registry,
+        }
+    }
+
+    /// Check if distributed execution should be used for a query.
+    async fn should_distribute(&self) -> bool {
+        if let Some(ref registry) = self.worker_registry {
+            !registry.healthy_workers().await.is_empty()
+        } else {
+            false
         }
     }
 
