@@ -6,6 +6,7 @@ use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use iceberg::writer::file_writer::ParquetWriterBuilder;
+use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::file::properties::WriterProperties;
 use sqe_core::SqeError;
@@ -41,19 +42,19 @@ pub async fn write_data_files(
     let parquet_writer_builder = ParquetWriterBuilder::new(
         WriterProperties::builder().build(),
         table.metadata().current_schema().clone(),
+    );
+
+    let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_writer_builder,
         table.file_io().clone(),
         location_generator,
         file_name_generator,
     );
 
-    let data_file_writer_builder = DataFileWriterBuilder::new(
-        parquet_writer_builder,
-        None,
-        table.metadata().default_partition_spec_id(),
-    );
+    let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
 
     let mut writer = data_file_writer_builder
-        .build()
+        .build(None)
         .await
         .map_err(|e| SqeError::Execution(format!("Failed to build data file writer: {e}")))?;
 

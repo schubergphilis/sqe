@@ -4,7 +4,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use iceberg::arrow::arrow_type_to_type;
 use iceberg::spec::{NestedField, Schema as IcebergSchema};
-use iceberg::transaction::Transaction;
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, TableCreation, TableIdent};
 use sqlparser::ast::Statement;
 use tracing::info;
@@ -113,15 +113,9 @@ impl WriteHandler {
             if !data_files.is_empty() {
                 // Commit data files via fast-append transaction
                 let tx = Transaction::new(&table);
-                let mut action = tx.fast_append(None, vec![]).map_err(|e| {
-                    SqeError::Execution(format!("Failed to create fast append action: {e}"))
-                })?;
+                let action = tx.fast_append().add_data_files(data_files);
 
-                action.add_data_files(data_files).map_err(|e| {
-                    SqeError::Execution(format!("Failed to add data files: {e}"))
-                })?;
-
-                let tx = action.apply().await.map_err(|e| {
+                let tx = action.apply(tx).map_err(|e| {
                     SqeError::Execution(format!("Failed to apply fast append: {e}"))
                 })?;
 
@@ -160,7 +154,14 @@ impl WriteHandler {
         batches: Vec<RecordBatch>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_name = match stmt {
-            Statement::Insert(ins) => &ins.table_name,
+            Statement::Insert(ins) => match &ins.table {
+                sqlparser::ast::TableObject::TableName(name) => name,
+                other => {
+                    return Err(SqeError::Execution(format!(
+                        "INSERT INTO table function not supported: {other}"
+                    )));
+                }
+            },
             other => {
                 return Err(SqeError::Execution(format!(
                     "Expected Insert statement, got: {other}"
@@ -199,15 +200,9 @@ impl WriteHandler {
         if !data_files.is_empty() {
             // Commit via fast-append
             let tx = Transaction::new(&table);
-            let mut action = tx.fast_append(None, vec![]).map_err(|e| {
-                SqeError::Execution(format!("Failed to create fast append action: {e}"))
-            })?;
+            let action = tx.fast_append().add_data_files(data_files);
 
-            action.add_data_files(data_files).map_err(|e| {
-                SqeError::Execution(format!("Failed to add data files: {e}"))
-            })?;
-
-            let tx = action.apply().await.map_err(|e| {
+            let tx = action.apply(tx).map_err(|e| {
                 SqeError::Execution(format!("Failed to apply fast append: {e}"))
             })?;
 

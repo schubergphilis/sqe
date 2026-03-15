@@ -137,8 +137,10 @@ impl WorkerRegistry {
     async fn health_check_worker(url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use arrow_flight::flight_service_client::FlightServiceClient;
         use arrow_flight::Action;
+        use tonic::transport::Endpoint;
 
-        let mut client = FlightServiceClient::connect(url.to_string()).await?;
+        let channel = Endpoint::new(url.to_string())?.connect().await?;
+        let mut client = FlightServiceClient::new(channel);
         let action = Action {
             r#type: "health_check".to_string(),
             body: bytes::Bytes::new(),

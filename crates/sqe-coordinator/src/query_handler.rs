@@ -210,7 +210,7 @@ impl QueryHandler {
             .await
             .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
 
-        Ok(Arc::new(df.schema().into()))
+        Ok(Arc::new(df.schema().as_arrow().clone()))
     }
 
     /// Execute a SELECT query through DataFusion with the user's catalog.

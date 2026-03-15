@@ -15,28 +15,28 @@ members = [
 ]
 
 [workspace.dependencies]
-# Query engine
-datafusion = "49"
-datafusion-common = "49"
-datafusion-expr = "49"
-datafusion-sql = "49"
-datafusion-proto = "49"
+# Query engine — pinned to 51.x for iceberg-datafusion 0.8 compatibility
+datafusion = "51"
+datafusion-common = "51"
+datafusion-expr = "51"
+datafusion-sql = "51"
+datafusion-proto = "51"
 
-# Arrow
-arrow = { version = "55", features = ["prettyprint"] }
-arrow-flight = { version = "55", features = ["flight-sql-experimental"] }
-arrow-schema = "55"
-arrow-array = "55"
-parquet = { version = "55", features = ["async"] }
+# Arrow — pinned to 57.x for iceberg-datafusion 0.8 compatibility
+arrow = { version = "57", features = ["prettyprint"] }
+arrow-flight = { version = "57", features = ["flight-sql-experimental"] }
+arrow-schema = "57"
+arrow-array = "57"
+parquet = { version = "57", features = ["async"] }
 object_store = { version = "0.12", features = ["aws"] }
 
 # Iceberg
-iceberg = "0.5"
-iceberg-catalog-rest = "0.5"
-iceberg-datafusion = "0.5"
+iceberg = "0.8"
+iceberg-catalog-rest = "0.8"
+iceberg-datafusion = "0.8"
 
-# SQL parser
-sqlparser = "0.53"
+# SQL parser — DataFusion 51 requires ^0.59
+sqlparser = "0.59"
 
 # Async
 tokio = { version = "1", features = ["full"] }
@@ -45,9 +45,9 @@ tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
-# gRPC (Arrow Flight)
-tonic = "0.12"
-prost = "0.13"
+# gRPC (Arrow Flight) — arrow-flight 57 requires tonic 0.14
+tonic = "0.14"
+prost = "0.14"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

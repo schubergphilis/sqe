@@ -129,14 +129,20 @@ impl ExecutionPlan for DistributedScanExec {
                 DataFusionError::External(Box::new(e))
             })?;
 
-            let mut client =
-                FlightServiceClient::connect(worker_url.clone())
+            let channel = tonic::transport::Endpoint::new(worker_url.clone())
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "Failed to create endpoint for worker {worker_url}: {e}"
+                        ))
+                    })?
+                    .connect()
                     .await
                     .map_err(|e| {
                         DataFusionError::Execution(format!(
                             "Failed to connect to worker {worker_url}: {e}"
                         ))
                     })?;
+            let mut client = FlightServiceClient::new(channel);
 
             let ticket = Ticket::new(ticket_bytes);
             let response = client
