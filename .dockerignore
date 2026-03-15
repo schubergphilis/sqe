@@ -1,0 +1,8 @@
+target/
+.git/
+*.swp
+*.swo
+.DS_Store
+docs/
+openspec/
+tests/
