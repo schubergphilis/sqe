@@ -334,3 +334,113 @@ fn test_delete_returns_not_implemented() {
         "DELETE error message should mention '{expected_msg}'"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Chunk 3: Distributed execution tests
+// ---------------------------------------------------------------------------
+
+// Test: Worker registry starts empty when no workers configured
+#[test]
+fn test_worker_registry_no_workers() {
+    let registry = sqe_coordinator::worker_registry::WorkerRegistry::new(vec![]);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let healthy = rt.block_on(registry.healthy_workers());
+    assert!(healthy.is_empty());
+}
+
+// Test: Coordinator with no workers falls back to local execution
+#[tokio::test]
+#[ignore] // Requires quickstart stack
+async fn test_local_fallback_without_workers() {
+    let (session, handler) = setup_handler().await;
+
+    // SELECT 1 should work even without workers (local execution)
+    let batches = handler
+        .execute(&session, "SELECT 1 as x")
+        .await
+        .expect("SELECT 1 should succeed in local mode");
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 1);
+}
+
+// Test: ScanTask serialization roundtrip
+#[test]
+fn test_scan_task_roundtrip() {
+    let task = sqe_planner::ScanTask {
+        fragment_id: "test-001".to_string(),
+        data_file_paths: vec![
+            "s3://bucket/data/file1.parquet".to_string(),
+        ],
+        projected_columns: vec!["id".to_string()],
+        s3_endpoint: "http://localhost:9000".to_string(),
+        s3_region: "us-east-1".to_string(),
+        s3_access_key: "key".to_string(),
+        s3_secret_key: "secret".to_string(),
+        s3_session_token: String::new(),
+        s3_path_style: true,
+    };
+
+    let bytes = task.to_bytes().unwrap();
+    let decoded = sqe_planner::ScanTask::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.fragment_id, "test-001");
+    assert_eq!(decoded.data_file_paths.len(), 1);
+}
+
+// Test: Distributed SELECT with coordinator + worker (requires both running)
+#[tokio::test]
+#[ignore] // Requires quickstart stack + running worker
+async fn test_distributed_select() {
+    // This test requires:
+    // 1. Quickstart stack (Keycloak, Polaris, MinIO)
+    // 2. A worker running on localhost:50052
+    // 3. A table with data in Polaris
+    //
+    // Run the worker: cargo run -p sqe-worker -- tests/sqe-test.toml
+    // Then run: cargo test -p sqe-coordinator --test integration_test test_distributed_select -- --ignored
+
+    let config = sqe_core::SqeConfig::load("tests/sqe-test.toml")
+        .expect("Failed to load test config");
+
+    let authenticator = sqe_auth::Authenticator::new(&config.auth)
+        .await
+        .expect("Failed to create authenticator");
+    let session = authenticator
+        .authenticate("root", "root123")
+        .await
+        .expect("Auth failed");
+
+    let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(sqe_policy::PassthroughEnforcer);
+
+    let registry = Arc::new(sqe_coordinator::worker_registry::WorkerRegistry::new(
+        vec!["http://localhost:50052".to_string()],
+    ));
+
+    // Mark worker as healthy for the test
+    registry.mark_healthy("http://localhost:50052").await;
+
+    let handler = sqe_coordinator::QueryHandler::new(policy, config, Some(registry));
+
+    // First create a test table
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.dist_test")
+        .await;
+    handler
+        .execute(&session, "CREATE TABLE test_ns.dist_test AS SELECT 1 as id, 'distributed' as name")
+        .await
+        .expect("CTAS should succeed");
+
+    // Query should work (may use local or distributed path)
+    let batches = handler
+        .execute(&session, "SELECT * FROM test_ns.dist_test")
+        .await
+        .expect("Distributed SELECT should succeed");
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 1);
+
+    // Cleanup
+    let _ = handler
+        .execute(&session, "DROP TABLE test_ns.dist_test")
+        .await;
+}

@@ -46,4 +46,5 @@ sqe-core = { path = "../sqe-core" }
 sqe-auth = { path = "../sqe-auth" }
 sqe-sql = { path = "../sqe-sql" }
 sqe-policy = { path = "../sqe-policy" }
+sqe-planner = { path = "../sqe-planner" }
 tokio = { workspace = true }
