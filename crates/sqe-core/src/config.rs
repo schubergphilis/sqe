@@ -76,6 +76,9 @@ pub struct CatalogConfig {
     pub warehouse: String,
     #[serde(default = "default_cache_ttl")]
     pub metadata_cache_ttl_secs: u64,
+    /// Default Iceberg table format version for new tables (2 or 3).
+    #[serde(default = "default_table_format_version")]
+    pub default_table_format_version: u8,
 }
 
 #[derive(Deserialize, Clone, Default)]
@@ -146,6 +149,7 @@ fn default_spill_dir() -> String { "/tmp/sqe-spill".to_string() }
 fn default_refresh_buffer() -> u64 { 60 }
 fn default_true() -> bool { true }
 fn default_cache_ttl() -> u64 { 30 }
+fn default_table_format_version() -> u8 { 2 }
 fn default_passthrough() -> String { "passthrough".to_string() }
 fn default_prometheus_port() -> u16 { 9090 }
 
@@ -186,6 +190,7 @@ impl SqeConfig {
         env_override_str("SQE_CATALOG__POLARIS_URL", &mut self.catalog.polaris_url);
         env_override_str("SQE_CATALOG__WAREHOUSE", &mut self.catalog.warehouse);
         env_override_u64("SQE_CATALOG__METADATA_CACHE_TTL_SECS", &mut self.catalog.metadata_cache_ttl_secs);
+        env_override_u8("SQE_CATALOG__DEFAULT_TABLE_FORMAT_VERSION", &mut self.catalog.default_table_format_version);
 
         // Storage
         env_override_str("SQE_STORAGE__S3_ENDPOINT", &mut self.storage.s3_endpoint);
@@ -207,6 +212,16 @@ impl SqeConfig {
 fn env_override_str(key: &str, target: &mut String) {
     if let Ok(val) = std::env::var(key) {
         *target = val;
+    }
+}
+
+fn env_override_u8(key: &str, target: &mut u8) {
+    if let Ok(val) = std::env::var(key) {
+        if let Ok(parsed) = val.parse() {
+            *target = parsed;
+        } else {
+            tracing::warn!("{key}={val:?} is not a valid u8, ignoring");
+        }
     }
 }
 
