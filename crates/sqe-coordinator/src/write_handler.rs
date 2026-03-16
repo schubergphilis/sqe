@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use iceberg::arrow::arrow_type_to_type;
-use iceberg::spec::{NestedField, Schema as IcebergSchema};
+use iceberg::spec::{FormatVersion, NestedField, Schema as IcebergSchema};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, TableCreation, TableIdent};
 use sqlparser::ast::Statement;
@@ -90,6 +90,7 @@ impl WriteHandler {
         let table_creation = TableCreation::builder()
             .name(name.clone())
             .schema(iceberg_schema)
+            .format_version(self.format_version())
             .build();
 
         let _created_table = catalog
@@ -218,6 +219,14 @@ impl WriteHandler {
         }
 
         Ok(vec![]) // DML success, no result rows
+    }
+
+    fn format_version(&self) -> FormatVersion {
+        match self.config.catalog.default_table_format_version {
+            3 => FormatVersion::V3,
+            1 => FormatVersion::V1,
+            _ => FormatVersion::V2,
+        }
     }
 
     /// Create a `SessionCatalogBridge` (which implements `iceberg::Catalog`)

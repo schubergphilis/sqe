@@ -76,6 +76,9 @@ pub struct CatalogConfig {
     pub warehouse: String,
     #[serde(default = "default_cache_ttl")]
     pub metadata_cache_ttl_secs: u64,
+    /// Default Iceberg table format version for new tables (2 or 3).
+    #[serde(default = "default_table_format_version")]
+    pub default_table_format_version: u8,
 }
 
 #[derive(Deserialize, Clone, Default)]
@@ -146,6 +149,7 @@ fn default_spill_dir() -> String { "/tmp/sqe-spill".to_string() }
 fn default_refresh_buffer() -> u64 { 60 }
 fn default_true() -> bool { true }
 fn default_cache_ttl() -> u64 { 30 }
+fn default_table_format_version() -> u8 { 2 }
 fn default_passthrough() -> String { "passthrough".to_string() }
 fn default_prometheus_port() -> u16 { 9090 }
 
@@ -153,7 +157,100 @@ impl SqeConfig {
     pub fn load(path: &str) -> crate::error::Result<Self> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| crate::error::SqeError::Config(format!("Failed to read {path}: {e}")))?;
-        toml::from_str(&content)
-            .map_err(|e| crate::error::SqeError::Config(format!("Failed to parse config: {e}")))
+        let mut config: Self = toml::from_str(&content)
+            .map_err(|e| crate::error::SqeError::Config(format!("Failed to parse config: {e}")))?;
+        config.apply_env_overrides();
+        Ok(config)
+    }
+
+    /// Apply environment variable overrides. Convention: `SQE_<SECTION>__<FIELD>`.
+    /// E.g. `SQE_AUTH__KEYCLOAK_URL=https://...` overrides `auth.keycloak_url`.
+    fn apply_env_overrides(&mut self) {
+        // Coordinator
+        env_override_u16("SQE_COORDINATOR__FLIGHT_SQL_PORT", &mut self.coordinator.flight_sql_port);
+        env_override_u16("SQE_COORDINATOR__TRINO_HTTP_PORT", &mut self.coordinator.trino_http_port);
+        env_override_str("SQE_COORDINATOR__MODE", &mut self.coordinator.mode);
+
+        // Worker
+        env_override_str("SQE_WORKER__COORDINATOR_URL", &mut self.worker.coordinator_url);
+        env_override_u16("SQE_WORKER__FLIGHT_PORT", &mut self.worker.flight_port);
+        env_override_u64("SQE_WORKER__HEARTBEAT_INTERVAL_SECS", &mut self.worker.heartbeat_interval_secs);
+        env_override_str("SQE_WORKER__MEMORY_LIMIT", &mut self.worker.memory_limit);
+        env_override_str("SQE_WORKER__SPILL_DIR", &mut self.worker.spill_dir);
+
+        // Auth
+        env_override_str("SQE_AUTH__KEYCLOAK_URL", &mut self.auth.keycloak_url);
+        env_override_str("SQE_AUTH__REALM", &mut self.auth.realm);
+        env_override_str("SQE_AUTH__CLIENT_ID", &mut self.auth.client_id);
+        env_override_str("SQE_AUTH__CLIENT_SECRET", &mut self.auth.client_secret);
+        env_override_u64("SQE_AUTH__TOKEN_REFRESH_BUFFER_SECS", &mut self.auth.token_refresh_buffer_secs);
+        env_override_bool("SQE_AUTH__SSL_VERIFICATION", &mut self.auth.ssl_verification);
+
+        // Catalog
+        env_override_str("SQE_CATALOG__POLARIS_URL", &mut self.catalog.polaris_url);
+        env_override_str("SQE_CATALOG__WAREHOUSE", &mut self.catalog.warehouse);
+        env_override_u64("SQE_CATALOG__METADATA_CACHE_TTL_SECS", &mut self.catalog.metadata_cache_ttl_secs);
+        env_override_u8("SQE_CATALOG__DEFAULT_TABLE_FORMAT_VERSION", &mut self.catalog.default_table_format_version);
+
+        // Storage
+        env_override_str("SQE_STORAGE__S3_ENDPOINT", &mut self.storage.s3_endpoint);
+        env_override_str("SQE_STORAGE__S3_REGION", &mut self.storage.s3_region);
+        env_override_str("SQE_STORAGE__S3_ACCESS_KEY", &mut self.storage.s3_access_key);
+        env_override_str("SQE_STORAGE__S3_SECRET_KEY", &mut self.storage.s3_secret_key);
+        env_override_bool("SQE_STORAGE__S3_PATH_STYLE", &mut self.storage.s3_path_style);
+
+        // Policy
+        env_override_str("SQE_POLICY__ENGINE", &mut self.policy.engine);
+
+        // Metrics
+        env_override_u16("SQE_METRICS__PROMETHEUS_PORT", &mut self.metrics.prometheus_port);
+        env_override_str("SQE_METRICS__OTLP_ENDPOINT", &mut self.metrics.otlp_endpoint);
+        env_override_str("SQE_METRICS__AUDIT_LOG_PATH", &mut self.metrics.audit_log_path);
+    }
+}
+
+fn env_override_str(key: &str, target: &mut String) {
+    if let Ok(val) = std::env::var(key) {
+        *target = val;
+    }
+}
+
+fn env_override_u8(key: &str, target: &mut u8) {
+    if let Ok(val) = std::env::var(key) {
+        if let Ok(parsed) = val.parse() {
+            *target = parsed;
+        } else {
+            tracing::warn!("{key}={val:?} is not a valid u8, ignoring");
+        }
+    }
+}
+
+fn env_override_u16(key: &str, target: &mut u16) {
+    if let Ok(val) = std::env::var(key) {
+        if let Ok(parsed) = val.parse() {
+            *target = parsed;
+        } else {
+            tracing::warn!("{key}={val:?} is not a valid u16, ignoring");
+        }
+    }
+}
+
+fn env_override_u64(key: &str, target: &mut u64) {
+    if let Ok(val) = std::env::var(key) {
+        if let Ok(parsed) = val.parse() {
+            *target = parsed;
+        } else {
+            tracing::warn!("{key}={val:?} is not a valid u64, ignoring");
+        }
+    }
+}
+
+fn env_override_bool(key: &str, target: &mut bool) {
+    if let Ok(val) = std::env::var(key) {
+        match val.to_lowercase().as_str() {
+            "true" | "1" | "yes" => *target = true,
+            "false" | "0" | "no" => *target = false,
+            _ => tracing::warn!("{key}={val:?} is not a valid bool, ignoring"),
+        }
     }
 }

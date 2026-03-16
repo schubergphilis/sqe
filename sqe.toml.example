@@ -21,6 +21,7 @@ ssl_verification = false
 polaris_url = "http://polaris:8181/api/catalog"
 warehouse = "iceberg"
 metadata_cache_ttl_secs = 30
+default_table_format_version = 2  # 2 (default) or 3 for Iceberg v3 tables
 
 [storage]
 s3_endpoint = "http://s3:9000"
