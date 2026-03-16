@@ -5,3 +5,5 @@ pub mod session;
 pub use config::SqeConfig;
 pub use error::{Result, SqeError};
 pub use session::{Session, SessionUser};
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

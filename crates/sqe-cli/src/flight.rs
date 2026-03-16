@@ -16,15 +16,7 @@ impl FlightClient {
         username: &str,
         password: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut endpoint = Channel::from_shared(url.to_string())?;
-        if url.starts_with("https://") {
-            endpoint = endpoint.tls_config(ClientTlsConfig::new())?;
-        }
-        let channel = endpoint
-            .connect()
-            .await
-            .map_err(|e| format!("Failed to connect to {url}: {e}"))?;
-
+        let channel = build_channel(url).await?;
         let mut inner = FlightSqlServiceClient::new(channel);
 
         let token = inner
@@ -36,6 +28,28 @@ impl FlightClient {
 
         Ok(Self { inner })
     }
+
+    pub async fn connect_with_token(
+        url: &str,
+        token: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let channel = build_channel(url).await?;
+        let mut inner = FlightSqlServiceClient::new(channel);
+        inner.set_token(token.to_string());
+        Ok(Self { inner })
+    }
+}
+
+async fn build_channel(url: &str) -> Result<Channel, Box<dyn std::error::Error>> {
+    let mut endpoint = Channel::from_shared(url.to_string())?;
+    if url.starts_with("https://") {
+        endpoint = endpoint.tls_config(ClientTlsConfig::new())?;
+    }
+    let channel = endpoint
+        .connect()
+        .await
+        .map_err(|e| format!("Failed to connect to {url}: {e}"))?;
+    Ok(channel)
 }
 
 #[async_trait::async_trait]

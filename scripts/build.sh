@@ -11,12 +11,12 @@ PROFILE="${1:-release}"
 case "$PROFILE" in
     release)
         echo "Building release binaries..."
-        cargo build --release --bin sqe-coordinator --bin sqe-worker --bin sqe-cli
+        cargo build --release --bin sqe-server --bin sqe-cli
         BIN_DIR="target/release"
         ;;
     debug)
         echo "Building debug binaries..."
-        cargo build --bin sqe-coordinator --bin sqe-worker --bin sqe-cli
+        cargo build --bin sqe-server --bin sqe-cli
         BIN_DIR="target/debug"
         ;;
     *)
@@ -27,4 +27,4 @@ esac
 
 echo ""
 echo "Binaries:"
-ls -lh "$BIN_DIR/sqe-coordinator" "$BIN_DIR/sqe-worker" "$BIN_DIR/sqe-cli"
+ls -lh "$BIN_DIR/sqe-server" "$BIN_DIR/sqe-cli"

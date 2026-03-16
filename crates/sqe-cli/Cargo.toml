@@ -8,6 +8,7 @@ name = "sqe-cli"
 path = "src/main.rs"
 
 [dependencies]
+sqe-core = { path = "../sqe-core" }
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
 arrow-schema = { workspace = true }

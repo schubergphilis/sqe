@@ -1,0 +1,18 @@
+SQE has been deployed!
+
+Coordinator: {{ include "sqe.fullname" . }}-coordinator
+{{- if .Values.worker.enabled }}
+Workers:     {{ .Values.worker.replicas }} replicas
+{{- else }}
+Workers:     disabled (single-node mode)
+{{- end }}
+
+Connect via Flight SQL:
+  kubectl port-forward svc/{{ include "sqe.fullname" . }}-coordinator {{ .Values.service.flightSqlPort }}:{{ .Values.service.flightSqlPort }}
+  sqe-cli --host localhost --port {{ .Values.service.flightSqlPort }}
+
+Connect via Trino HTTP:
+  kubectl port-forward svc/{{ include "sqe.fullname" . }}-coordinator {{ .Values.service.trinoHttpPort }}:{{ .Values.service.trinoHttpPort }}
+
+Interactive SQL in the cluster:
+  kubectl exec -it deploy/{{ include "sqe.fullname" . }}-coordinator -- sqe-cli

@@ -1,0 +1,125 @@
+# Observability
+
+SQE provides comprehensive observability through Prometheus metrics, OpenTelemetry traces/logs, and structured audit logging.
+
+## Metrics (Prometheus)
+
+Available at `http://coordinator:9090/metrics` in Prometheus text format.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `sqe_query_count_total` | Counter | `status`, `statement_type` | Total queries by status and type |
+| `sqe_query_duration_seconds` | Histogram | `statement_type` | Query duration distribution |
+| `sqe_rows_returned_total` | Counter | — | Cumulative rows returned |
+| `sqe_active_sessions` | Gauge | — | Current active sessions |
+| `sqe_healthy_workers` | Gauge | — | Workers passing health checks |
+
+Histogram buckets: 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s, 30s, 60s.
+
+Statement types: `query`, `ctas`, `insert`, `merge`, `delete`, `drop`, `create_view`, `create_schema`, `show_catalogs`, `show_schemas`, `show_tables`, `policy`, `utility`.
+
+### Example Queries (PromQL)
+
+```promql
+# Query rate (queries per second)
+rate(sqe_query_count_total[5m])
+
+# Error rate
+rate(sqe_query_count_total{status="error"}[5m])
+
+# P99 query duration
+histogram_quantile(0.99, rate(sqe_query_duration_seconds_bucket[5m]))
+
+# Active sessions
+sqe_active_sessions
+```
+
+## OpenTelemetry
+
+When `otlp_endpoint` is configured, SQE exports traces, metrics, and logs via OTLP/gRPC:
+
+```mermaid
+graph LR
+    SQE["sqe-server"] -->|OTLP gRPC| COLL["OTel Collector"]
+    COLL --> JAEGER["Jaeger<br/>(traces)"]
+    COLL --> PROM["Prometheus<br/>(metrics)"]
+    COLL --> LOKI["Loki<br/>(logs)"]
+```
+
+Configuration:
+```toml
+[metrics]
+otlp_endpoint = "http://otel-collector:4317"
+```
+
+When the endpoint is empty (default), SQE falls back to structured JSON logs on stdout — no external dependency required.
+
+### Trace Spans
+
+Key spans emitted:
+- `sqe.query.execute` — full query lifecycle
+- `sqe.query.plan` — SQL parsing and planning
+- `sqe.policy.evaluate` — policy enforcement
+- `sqe.flight.do_get` — result streaming
+- `sqe.auth.handshake` — authentication
+- `sqe.worker.scan` — worker scan execution
+
+## Audit Log
+
+SQE writes a JSONL audit log capturing every query:
+
+```json
+{
+  "timestamp": "2025-03-15T10:30:00Z",
+  "username": "alice",
+  "query_text": "SELECT * FROM sales.orders WHERE region = 'EU'",
+  "statement_type": "query",
+  "duration_ms": 142,
+  "rows_returned": 1583,
+  "status": "ok"
+}
+```
+
+Configuration:
+```toml
+[metrics]
+audit_log_path = "/var/log/sqe/audit.jsonl"
+```
+
+When the path is empty (default), audit logging is disabled (no-op).
+
+## Structured Logging
+
+All SQE components use `tracing` with JSON output:
+
+```json
+{
+  "timestamp": "2025-03-15T10:30:00.142Z",
+  "level": "INFO",
+  "target": "sqe_coordinator::query_handler",
+  "message": "Query executed",
+  "user": "alice",
+  "statement_type": "query",
+  "duration_ms": 142,
+  "rows": 1583
+}
+```
+
+Log level controlled via `RUST_LOG` environment variable:
+```bash
+RUST_LOG=info             # Default
+RUST_LOG=sqe=debug        # Debug SQE crates only
+RUST_LOG=sqe=trace        # Everything
+```
+
+## Kubernetes Integration
+
+The Helm chart includes optional `ServiceMonitor` for Prometheus Operator:
+
+```yaml
+serviceMonitor:
+  enabled: true
+  interval: 30s
+  labels:
+    release: prometheus
+```
