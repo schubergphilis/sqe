@@ -17,6 +17,23 @@ The system SHALL implement the Trino REST protocol for query submission and resu
 - **WHEN** a client DELETEs `/v1/statement/{id}`
 - **THEN** the query is cancelled and resources are freed
 
+### Requirement: Trino /v1/info server information
+The system SHALL implement the Trino `/v1/info` and `/v1/info/state` endpoints on the Trino HTTP port for compatibility with Trino clients and monitoring tools.
+
+#### Scenario: Server info endpoint
+- **WHEN** a client GETs `/v1/info`
+- **THEN** a JSON response is returned matching Trino's format with:
+  - `nodeVersion.version`: SQE version
+  - `environment`: `"production"`
+  - `coordinator`: `true`
+  - `starting`: `false` when ready, `true` during startup
+  - `uptime`: human-readable uptime string
+
+#### Scenario: Server state endpoint
+- **WHEN** a client GETs `/v1/info/state`
+- **THEN** `"ACTIVE"` is returned when the server is ready
+- **AND** `"STARTING"` is returned during initialization
+
 ### Requirement: Trino session properties
 The system SHALL support basic Trino session properties for catalog and schema selection.
 
