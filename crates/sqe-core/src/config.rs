@@ -45,11 +45,17 @@ pub struct WorkerConfig {
 
 #[derive(Deserialize, Clone)]
 pub struct AuthConfig {
+    #[serde(default)]
     pub keycloak_url: String,
+    #[serde(default)]
     pub realm: String,
     pub client_id: String,
     #[serde(default)]
     pub client_secret: String,
+    /// Generic OAuth2 token endpoint for client_credentials grant.
+    /// When set (and keycloak_url is empty), the engine uses client_credentials mode.
+    #[serde(default)]
+    pub token_endpoint: String,
     #[serde(default = "default_refresh_buffer")]
     pub token_refresh_buffer_secs: u64,
     #[serde(default = "default_true")]
@@ -63,6 +69,7 @@ impl std::fmt::Debug for AuthConfig {
             .field("realm", &self.realm)
             .field("client_id", &self.client_id)
             .field("client_secret", &"[REDACTED]")
+            .field("token_endpoint", &self.token_endpoint)
             .field("token_refresh_buffer_secs", &self.token_refresh_buffer_secs)
             .field("ssl_verification", &self.ssl_verification)
             .finish()
@@ -183,6 +190,7 @@ impl SqeConfig {
         env_override_str("SQE_AUTH__REALM", &mut self.auth.realm);
         env_override_str("SQE_AUTH__CLIENT_ID", &mut self.auth.client_id);
         env_override_str("SQE_AUTH__CLIENT_SECRET", &mut self.auth.client_secret);
+        env_override_str("SQE_AUTH__TOKEN_ENDPOINT", &mut self.auth.token_endpoint);
         env_override_u64("SQE_AUTH__TOKEN_REFRESH_BUFFER_SECS", &mut self.auth.token_refresh_buffer_secs);
         env_override_bool("SQE_AUTH__SSL_VERIFICATION", &mut self.auth.ssl_verification);
 
