@@ -1,4 +1,6 @@
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Instant;
 
 use sqe_core::SqeConfig;
 
@@ -7,7 +9,7 @@ use sqe_coordinator::QueryHandler;
 use sqe_coordinator::SessionManager;
 
 // Trino adapter types
-use sqe_trino_compat::server::{TrinoAuthenticator, TrinoQueryExecutor};
+use sqe_trino_compat::server::{NodeContext, TrinoAuthenticator, TrinoQueryExecutor};
 
 struct AuthenticatorAdapter(Arc<sqe_auth::Authenticator>);
 
@@ -43,6 +45,9 @@ impl TrinoQueryExecutor for QueryHandlerAdapter {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let started_at = Instant::now();
+    let ready = Arc::new(AtomicBool::new(false));
+
     let config_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "sqe.toml".to_string());
@@ -120,6 +125,11 @@ async fn main() -> anyhow::Result<()> {
             auth_adapter,
             handler_adapter,
             config.coordinator.trino_http_port,
+            NodeContext {
+                version: sqe_core::VERSION.to_string(),
+                ready: ready.clone(),
+                started_at,
+            },
         );
         tracing::info!(
             "Trino-compat HTTP server on port {}",
