@@ -152,21 +152,35 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         return error_response(StatusCode::BAD_REQUEST, "Empty query");
     }
 
-    let session = match extract_basic_auth(&headers) {
-        Some((user, pass)) => {
-            match state.authenticator.authenticate(&user, &pass).await {
-                Ok(s) => s,
-                Err(e) => {
-                    return error_response(
-                        StatusCode::UNAUTHORIZED,
-                        format!("Authentication failed: {e}"),
-                    );
-                }
+    let session = if let Some(token) = extract_bearer_token(&headers) {
+        // Bearer token auth: create session directly from the JWT.
+        // The backend already authenticated the user via Keycloak and passes
+        // the access token + X-Trino-User header.
+        let username = headers
+            .get("x-trino-user")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+        Session::new(
+            username,
+            token,
+            None,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            vec![],
+        )
+    } else if let Some((user, pass)) = extract_basic_auth(&headers) {
+        // Basic auth: authenticate via Keycloak ROPC
+        match state.authenticator.authenticate(&user, &pass).await {
+            Ok(s) => s,
+            Err(e) => {
+                return error_response(
+                    StatusCode::UNAUTHORIZED,
+                    format!("Authentication failed: {e}"),
+                );
             }
         }
-        None => {
-            return error_response(StatusCode::UNAUTHORIZED, "Missing Authorization header");
-        }
+    } else {
+        return error_response(StatusCode::UNAUTHORIZED, "Missing Authorization header");
     };
 
     let query_id = Uuid::new_v4().to_string();
@@ -240,6 +254,15 @@ async fn cancel_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 ) -> StatusCode {
     state.results.remove(&id);
     StatusCode::NO_CONTENT
+}
+
+fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
+    let auth = headers.get("authorization")?.to_str().ok()?;
+    let token = auth.strip_prefix("Bearer ")?;
+    if token.is_empty() {
+        return None;
+    }
+    Some(token.to_string())
 }
 
 fn extract_basic_auth(headers: &HeaderMap) -> Option<(String, String)> {
@@ -360,6 +383,38 @@ mod tests {
         async fn execute(&self, _: &Session, _: &str) -> Result<Vec<arrow_array::RecordBatch>, String> {
             Err("mock".to_string())
         }
+    }
+
+    #[test]
+    fn test_extract_bearer_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer eyJhbGciOi.payload.sig".parse().unwrap());
+        let token = extract_bearer_token(&headers).unwrap();
+        assert_eq!(token, "eyJhbGciOi.payload.sig");
+    }
+
+    #[test]
+    fn test_extract_bearer_token_missing() {
+        let headers = HeaderMap::new();
+        assert!(extract_bearer_token(&headers).is_none());
+    }
+
+    #[test]
+    fn test_extract_bearer_token_empty() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer ".parse().unwrap());
+        assert!(extract_bearer_token(&headers).is_none());
+    }
+
+    #[test]
+    fn test_extract_bearer_token_basic_auth_ignored() {
+        let mut headers = HeaderMap::new();
+        let encoded = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            b"user:pass",
+        );
+        headers.insert("authorization", format!("Basic {encoded}").parse().unwrap());
+        assert!(extract_bearer_token(&headers).is_none());
     }
 
     #[test]

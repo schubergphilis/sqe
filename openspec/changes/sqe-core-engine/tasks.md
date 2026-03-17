@@ -115,10 +115,11 @@
 - [ ] 11.3 Implement GET /v1/statement/{id}/{token}: result pagination
 - [ ] 11.4 Implement DELETE /v1/statement/{id}: query cancellation
 - [ ] 11.5 Implement Arrow → Trino JSON column format type mapping
-- [ ] 11.6 Implement X-Trino-Catalog/Schema/User/Source header handling
-- [x] 11.7 Implement Trino /v1/info endpoint: node version, environment, coordinator flag, starting state, uptime
-- [x] 11.8 Implement Trino /v1/info/state endpoint: ACTIVE / STARTING state string
-- [ ] 11.9 Integration test: connect via Trino JDBC driver → execute query → verify results
+- [x] 11.6 Implement dual auth on /v1/statement: Bearer token (JWT passthrough from backend + X-Trino-User) and Basic auth (Keycloak ROPC), Bearer takes priority
+- [ ] 11.7 Implement X-Trino-Catalog/Schema/User/Source header handling
+- [x] 11.8 Implement Trino /v1/info endpoint: node version, environment, coordinator flag, starting state, uptime
+- [x] 11.9 Implement Trino /v1/info/state endpoint: ACTIVE / STARTING state string
+- [ ] 11.10 Integration test: connect via Trino JDBC driver → execute query → verify results
 
 ## 12. Observability (sqe-metrics)
 
