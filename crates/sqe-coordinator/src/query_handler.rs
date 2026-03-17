@@ -130,6 +130,10 @@ impl QueryHandler {
                 Ok(vec![])
             }
 
+            StatementKind::CreateTable(stmt) => {
+                self.write_handler.handle_create_table(session, &stmt).await
+            }
+
             StatementKind::Ctas(stmt) => {
                 if let Statement::CreateTable(ref ct) = *stmt {
                     if let Some(ref query) = ct.query {
@@ -210,20 +214,31 @@ impl QueryHandler {
         result
     }
 
-    /// Plan a SQL query and return only its schema, without executing it.
+    /// Return the schema for a SQL statement without executing it.
+    ///
+    /// Only pure SELECT/WITH queries are planned via DataFusion. For all
+    /// other statements (SHOW, DDL, DML) we return an empty schema since
+    /// they are side-effect-only and Flight SQL only needs the schema for
+    /// the `get_flight_info` response.
     pub async fn get_schema(
         &self,
         session: &Session,
         sql: &str,
     ) -> sqe_core::Result<SchemaRef> {
-        let ctx = self.create_session_context(session).await?;
+        let kind = parse_and_classify(sql)?;
 
-        let df = ctx
-            .sql(sql)
-            .await
-            .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
-
-        Ok(Arc::new(df.schema().as_arrow().clone()))
+        if matches!(kind, StatementKind::Query(_)) {
+            let ctx = self.create_session_context(session).await?;
+            let df = ctx
+                .sql(sql)
+                .await
+                .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
+            Ok(Arc::new(df.schema().as_arrow().clone()))
+        } else {
+            // Non-query statements: return empty schema. The actual execution
+            // happens in do_get_statement via execute().
+            Ok(Arc::new(Schema::empty()))
+        }
     }
 
     /// Execute a SELECT query through DataFusion with the user's catalog.

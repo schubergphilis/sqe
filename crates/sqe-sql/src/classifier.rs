@@ -7,6 +7,7 @@ use sqlparser::parser::Parser;
 #[derive(Debug)]
 pub enum StatementKind {
     Query(Box<Statement>),
+    CreateTable(Box<Statement>),
     Ctas(Box<Statement>),
     Insert(Box<Statement>),
     Merge(Box<Statement>),
@@ -29,6 +30,7 @@ impl StatementKind {
     pub fn name(&self) -> &'static str {
         match self {
             StatementKind::Query(_) => "query",
+            StatementKind::CreateTable(_) => "createtable",
             StatementKind::Ctas(_) => "ctas",
             StatementKind::Insert(_) => "insert",
             StatementKind::Merge(_) => "merge",
@@ -76,12 +78,12 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
         // SELECT / WITH ... SELECT
         Statement::Query(_) => Ok(StatementKind::Query(Box::new(stmt))),
 
-        // CREATE TABLE ... AS SELECT (CTAS) vs regular CREATE TABLE
+        // CREATE TABLE ... AS SELECT (CTAS) vs regular CREATE TABLE (columns)
         Statement::CreateTable(ref ct) => {
             if ct.query.is_some() {
                 Ok(StatementKind::Ctas(Box::new(stmt)))
             } else {
-                Ok(StatementKind::Utility(Box::new(stmt)))
+                Ok(StatementKind::CreateTable(Box::new(stmt)))
             }
         }
 
@@ -236,9 +238,17 @@ mod tests {
     }
 
     #[test]
-    fn test_create_table_without_query_is_utility() {
+    fn test_create_table_without_query_is_create_table() {
         let result = parse_and_classify("CREATE TABLE foo (id INT)");
-        assert!(matches!(result, Ok(StatementKind::Utility(_))));
+        assert!(matches!(result, Ok(StatementKind::CreateTable(_))));
+    }
+
+    #[test]
+    fn test_create_table_if_not_exists() {
+        let result = parse_and_classify(
+            "CREATE TABLE IF NOT EXISTS ns.table (id BIGINT, name VARCHAR)",
+        );
+        assert!(matches!(result, Ok(StatementKind::CreateTable(_))));
     }
 
     #[test]
