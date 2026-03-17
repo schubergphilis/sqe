@@ -17,6 +17,7 @@ dashmap = { workspace = true }
 uuid = { workspace = true }
 async-trait = { workspace = true }
 base64 = "0.22"
+chrono = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
