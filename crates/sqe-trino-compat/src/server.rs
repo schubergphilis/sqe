@@ -1,4 +1,6 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -11,12 +13,20 @@ use uuid::Uuid;
 
 use sqe_core::Session;
 
-use crate::protocol::{self, TrinoError, TrinoResponse, TrinoStats};
+use crate::protocol::{self, NodeVersion, ServerInfo, TrinoError, TrinoResponse, TrinoStats};
+
+/// Shared context for Trino /v1/info endpoints.
+pub struct NodeContext {
+    pub version: String,
+    pub ready: Arc<AtomicBool>,
+    pub started_at: Instant,
+}
 
 pub struct TrinoState<A, Q> {
     pub authenticator: Arc<A>,
     pub query_handler: Arc<Q>,
     pub results: DashMap<String, CachedResult>,
+    pub node: NodeContext,
 }
 
 pub struct CachedResult {
@@ -41,6 +51,7 @@ pub fn start_trino_server<A, Q>(
     authenticator: Arc<A>,
     query_handler: Arc<Q>,
     port: u16,
+    node: NodeContext,
 ) -> tokio::task::JoinHandle<()>
 where
     A: TrinoAuthenticator,
@@ -50,10 +61,13 @@ where
         authenticator,
         query_handler,
         results: DashMap::new(),
+        node,
     });
 
     tokio::spawn(async move {
         let app = Router::new()
+            .route("/v1/info", get(server_info::<A, Q>))
+            .route("/v1/info/state", get(server_state::<A, Q>))
             .route("/v1/statement", post(submit_query::<A, Q>))
             .route("/v1/statement/{id}/{token}", get(get_results::<A, Q>))
             .route("/v1/statement/{id}", delete(cancel_query::<A, Q>))
@@ -66,6 +80,47 @@ where
 
         axum::serve(listener, app).await.unwrap();
     })
+}
+
+// ── Trino /v1/info ────────────────────────────────────────────
+
+fn format_uptime(started_at: Instant) -> String {
+    let secs = started_at.elapsed().as_secs();
+    if secs < 60 {
+        format!("{secs}.00s")
+    } else if secs < 3600 {
+        format!("{:.2}m", secs as f64 / 60.0)
+    } else if secs < 86400 {
+        format!("{:.2}h", secs as f64 / 3600.0)
+    } else {
+        format!("{:.2}d", secs as f64 / 86400.0)
+    }
+}
+
+async fn server_info<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
+    State(state): State<Arc<TrinoState<A, Q>>>,
+) -> Json<ServerInfo> {
+    let ready = state.node.ready.load(Ordering::Relaxed);
+    Json(ServerInfo {
+        node_version: NodeVersion {
+            version: state.node.version.clone(),
+        },
+        environment: "production".to_string(),
+        coordinator: true,
+        starting: !ready,
+        uptime: format_uptime(state.node.started_at),
+    })
+}
+
+async fn server_state<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
+    State(state): State<Arc<TrinoState<A, Q>>>,
+) -> String {
+    let ready = state.node.ready.load(Ordering::Relaxed);
+    if ready {
+        "ACTIVE".to_string()
+    } else {
+        "STARTING".to_string()
+    }
 }
 
 fn error_response(status: StatusCode, msg: impl Into<String>) -> Response {
@@ -201,6 +256,111 @@ fn extract_basic_auth(headers: &HeaderMap) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_format_uptime_seconds() {
+        // Instant doesn't let us control elapsed, so test the boundaries via the function logic
+        // We'll test the function indirectly through the string format patterns
+        let started = Instant::now();
+        let uptime = format_uptime(started);
+        // Just started, should be "0.00s" or very small seconds
+        assert!(uptime.ends_with('s'), "Expected seconds format, got: {uptime}");
+    }
+
+    #[tokio::test]
+    async fn test_server_info_when_ready() {
+        let ready = Arc::new(AtomicBool::new(true));
+        let started_at = Instant::now();
+
+        let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
+            authenticator: Arc::new(MockAuth),
+            query_handler: Arc::new(MockQuery),
+            results: DashMap::new(),
+            node: NodeContext {
+                version: "0.1.0".to_string(),
+                ready: ready.clone(),
+                started_at,
+            },
+        });
+
+        let Json(info) = server_info(State(state)).await;
+        assert_eq!(info.node_version.version, "0.1.0");
+        assert!(info.coordinator);
+        assert!(!info.starting);
+        assert_eq!(info.environment, "production");
+    }
+
+    #[tokio::test]
+    async fn test_server_info_when_starting() {
+        let ready = Arc::new(AtomicBool::new(false));
+        let started_at = Instant::now();
+
+        let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
+            authenticator: Arc::new(MockAuth),
+            query_handler: Arc::new(MockQuery),
+            results: DashMap::new(),
+            node: NodeContext {
+                version: "0.1.0".to_string(),
+                ready,
+                started_at,
+            },
+        });
+
+        let Json(info) = server_info(State(state)).await;
+        assert!(info.starting);
+    }
+
+    #[tokio::test]
+    async fn test_server_state_active() {
+        let ready = Arc::new(AtomicBool::new(true));
+        let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
+            authenticator: Arc::new(MockAuth),
+            query_handler: Arc::new(MockQuery),
+            results: DashMap::new(),
+            node: NodeContext {
+                version: "0.1.0".to_string(),
+                ready,
+                started_at: Instant::now(),
+            },
+        });
+
+        let result = server_state(State(state)).await;
+        assert_eq!(result, "ACTIVE");
+    }
+
+    #[tokio::test]
+    async fn test_server_state_starting() {
+        let ready = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
+            authenticator: Arc::new(MockAuth),
+            query_handler: Arc::new(MockQuery),
+            results: DashMap::new(),
+            node: NodeContext {
+                version: "0.1.0".to_string(),
+                ready,
+                started_at: Instant::now(),
+            },
+        });
+
+        let result = server_state(State(state)).await;
+        assert_eq!(result, "STARTING");
+    }
+
+    // Minimal mock types for handler tests
+    struct MockAuth;
+    #[async_trait::async_trait]
+    impl TrinoAuthenticator for MockAuth {
+        async fn authenticate(&self, _: &str, _: &str) -> Result<Session, String> {
+            Err("mock".to_string())
+        }
+    }
+    struct MockQuery;
+    #[async_trait::async_trait]
+    impl TrinoQueryExecutor for MockQuery {
+        async fn execute(&self, _: &Session, _: &str) -> Result<Vec<arrow_array::RecordBatch>, String> {
+            Err("mock".to_string())
+        }
+    }
 
     #[test]
     fn test_extract_basic_auth() {

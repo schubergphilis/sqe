@@ -34,6 +34,51 @@ histogram_quantile(0.99, rate(sqe_query_duration_seconds_bucket[5m]))
 sqe_active_sessions
 ```
 
+## Health Endpoints
+
+Available on port 9091 (metrics port + 1) for both coordinator and workers.
+
+### Kubernetes Probes
+
+| Endpoint | Purpose | Response |
+|---|---|---|
+| `GET /healthz` | Liveness probe | Always returns `200 ok` |
+| `GET /readyz` | Readiness probe | `200` when ready, `503` during init |
+
+### Cluster Status (Ballista/DataFusion-style)
+
+`GET /api/v1/status` returns a JSON snapshot of the node and cluster:
+
+```json
+{
+  "status": "ACTIVE",
+  "node": {
+    "role": "coordinator",
+    "version": "0.1.0",
+    "datafusionVersion": "51",
+    "uptimeSeconds": 3600
+  },
+  "workers": {
+    "total": 2,
+    "healthy": 2,
+    "healthyUrls": ["http://worker-0:50052", "http://worker-1:50052"]
+  }
+}
+```
+
+For worker nodes, the `workers` field is `null`.
+
+### Trino-Compatible Info (port 8080)
+
+When the Trino compat layer is enabled, standard Trino info endpoints are available on the Trino HTTP port:
+
+| Endpoint | Response |
+|---|---|
+| `GET /v1/info` | JSON: `nodeVersion`, `environment`, `coordinator`, `starting`, `uptime` |
+| `GET /v1/info/state` | Plain text: `ACTIVE` or `STARTING` |
+
+These endpoints are compatible with Trino JDBC drivers, DBeaver, and other Trino-aware tools for auto-detecting node state.
+
 ## OpenTelemetry
 
 When `otlp_endpoint` is configured, SQE exports traces, metrics, and logs via OTLP/gRPC:

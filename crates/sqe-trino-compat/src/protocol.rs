@@ -3,6 +3,24 @@ use serde::Serialize;
 
 use crate::types::{arrow_to_trino_type, arrow_value_to_json};
 
+// ── Trino /v1/info response ──────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerInfo {
+    pub node_version: NodeVersion,
+    pub environment: String,
+    pub coordinator: bool,
+    pub starting: bool,
+    pub uptime: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeVersion {
+    pub version: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrinoResponse {
@@ -143,6 +161,45 @@ mod tests {
         assert_eq!(rows[0][1], serde_json::json!("alice"));
         assert_eq!(rows[1][0], serde_json::json!(2));
         assert_eq!(rows[1][1], serde_json::json!("bob"));
+    }
+
+    #[test]
+    fn test_server_info_serialization() {
+        let info = ServerInfo {
+            node_version: NodeVersion {
+                version: "0.1.0".to_string(),
+            },
+            environment: "production".to_string(),
+            coordinator: true,
+            starting: false,
+            uptime: "5.00m".to_string(),
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["nodeVersion"]["version"], "0.1.0");
+        assert_eq!(parsed["environment"], "production");
+        assert_eq!(parsed["coordinator"], true);
+        assert_eq!(parsed["starting"], false);
+        assert_eq!(parsed["uptime"], "5.00m");
+    }
+
+    #[test]
+    fn test_server_info_starting_state() {
+        let info = ServerInfo {
+            node_version: NodeVersion {
+                version: "0.1.0".to_string(),
+            },
+            environment: "production".to_string(),
+            coordinator: true,
+            starting: true,
+            uptime: "0.00s".to_string(),
+        };
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&info).unwrap()).unwrap();
+        assert_eq!(parsed["starting"], true);
     }
 
     #[test]

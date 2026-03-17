@@ -16,6 +16,45 @@ The system SHALL optionally export distributed traces via OTLP with per-query sp
 - **THEN** a trace with spans for parse, auth, policy, optimize, schedule, execute is exported
 - **AND** worker spans are children of the coordinator's execute span
 
+### Requirement: Liveness and readiness probes
+The system SHALL expose `/healthz` (liveness) and `/readyz` (readiness) HTTP endpoints on a dedicated health port for Kubernetes probes.
+
+#### Scenario: Liveness check always succeeds
+- **WHEN** a probe hits `GET /healthz`
+- **THEN** HTTP 200 is returned with body `ok`
+
+#### Scenario: Readiness reflects initialization state
+- **GIVEN** the server is still initializing (auth, workers, metrics)
+- **WHEN** a probe hits `GET /readyz`
+- **THEN** HTTP 503 is returned
+- **AND** after all initialization completes, HTTP 200 is returned
+
+### Requirement: Cluster status endpoint (Ballista/DataFusion-style)
+The system SHALL expose a `GET /api/v1/status` JSON endpoint on the health port reporting node role, version, uptime, DataFusion version, and worker cluster state.
+
+#### Scenario: Coordinator status with workers
+- **GIVEN** the coordinator is running with 2 configured workers, 1 healthy
+- **WHEN** a client GETs `/api/v1/status`
+- **THEN** a JSON response is returned with:
+  - `status`: `"ACTIVE"`
+  - `node.role`: `"coordinator"`
+  - `node.version`: SQE version
+  - `node.datafusionVersion`: DataFusion version
+  - `node.uptimeSeconds`: seconds since startup
+  - `workers.total`: 2
+  - `workers.healthy`: 1
+  - `workers.healthyUrls`: list of healthy worker URLs
+
+#### Scenario: Worker status (no workers section)
+- **GIVEN** a worker node is running
+- **WHEN** a client GETs `/api/v1/status`
+- **THEN** the response has `node.role` = `"worker"` and `workers` is null
+
+#### Scenario: Status while starting
+- **GIVEN** the server has not yet completed initialization
+- **WHEN** a client GETs `/api/v1/status`
+- **THEN** `status` is `"STARTING"`
+
 ### Requirement: Query audit log
 The system SHALL write structured JSON audit log entries for every executed query.
 
