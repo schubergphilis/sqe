@@ -3,10 +3,29 @@
 ### Requirement: Trino v1/statement HTTP protocol
 The system SHALL implement the Trino REST protocol for query submission and result pagination.
 
-#### Scenario: Submit query via Trino protocol
-- **WHEN** a client POSTs SQL to `/v1/statement` with basic auth
-- **THEN** the query is authenticated and executed
+#### Scenario: Submit query via basic auth
+- **WHEN** a client POSTs SQL to `/v1/statement` with `Authorization: Basic <base64>`
+- **THEN** the credentials are exchanged with Keycloak via ROPC grant
+- **AND** the query is executed as the authenticated user
 - **AND** the first page of results is returned in Trino JSON column format with a nextUri
+
+#### Scenario: Submit query via bearer token
+- **WHEN** a client POSTs SQL to `/v1/statement` with `Authorization: Bearer <jwt>` and `X-Trino-User` header
+- **THEN** the JWT is used directly as the session access token (no Keycloak round-trip)
+- **AND** the username is taken from the `X-Trino-User` header
+- **AND** the query is executed as the identified user
+
+### Requirement: Dual authentication on Trino HTTP endpoint
+The system SHALL support both Bearer token and Basic auth on the Trino `/v1/statement` endpoint, with Bearer taking priority when both are present.
+
+#### Scenario: Bearer token preferred over basic auth
+- **GIVEN** a request with both `Authorization: Bearer <jwt>` and basic auth credentials
+- **WHEN** the request is processed
+- **THEN** the Bearer token is used (basic auth is ignored)
+
+#### Scenario: Missing authorization
+- **WHEN** a client POSTs SQL without an `Authorization` header
+- **THEN** HTTP 401 is returned with a Trino error response
 
 #### Scenario: Paginate results
 - **GIVEN** a query with results spanning multiple pages
