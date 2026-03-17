@@ -110,13 +110,15 @@
 
 ## 11. Trino Wire Compatibility (sqe-trino-compat)
 
-- [ ] 11.1 Implement axum HTTP server for Trino v1/statement endpoints
+- [x] 11.1 Implement axum HTTP server for Trino v1/statement endpoints
 - [ ] 11.2 Implement POST /v1/statement: auth + SQL submission + first result page
 - [ ] 11.3 Implement GET /v1/statement/{id}/{token}: result pagination
 - [ ] 11.4 Implement DELETE /v1/statement/{id}: query cancellation
 - [ ] 11.5 Implement Arrow → Trino JSON column format type mapping
 - [ ] 11.6 Implement X-Trino-Catalog/Schema/User/Source header handling
-- [ ] 11.7 Integration test: connect via Trino JDBC driver → execute query → verify results
+- [x] 11.7 Implement Trino /v1/info endpoint: node version, environment, coordinator flag, starting state, uptime
+- [x] 11.8 Implement Trino /v1/info/state endpoint: ACTIVE / STARTING state string
+- [ ] 11.9 Integration test: connect via Trino JDBC driver → execute query → verify results
 
 ## 12. Observability (sqe-metrics)
 
@@ -126,6 +128,8 @@
 - [ ] 12.4 Implement structured JSON audit log writer
 - [ ] 12.5 Implement optional OpenTelemetry trace export via OTLP
 - [ ] 12.6 Propagate trace context to workers via Flight metadata
+- [x] 12.7 Implement /healthz liveness and /readyz readiness probes on health port
+- [x] 12.8 Implement /api/v1/status Ballista/DataFusion-style cluster status endpoint (role, version, uptime, workers)
 
 ## 13. Docker & Integration
 
