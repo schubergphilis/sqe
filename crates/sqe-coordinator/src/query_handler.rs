@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_array::{ArrayRef, builder::StringBuilder};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use tracing::{debug, info};
 
 use sqlparser::ast::Statement;
@@ -291,7 +291,9 @@ impl QueryHandler {
         &self,
         session: &Session,
     ) -> sqe_core::Result<SessionContext> {
-        let ctx = SessionContext::new();
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().with_information_schema(true),
+        );
 
         // Create a per-session catalog connected to Polaris with the user's bearer token
         let session_catalog = Arc::new(
