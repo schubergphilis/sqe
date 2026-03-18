@@ -605,7 +605,16 @@ fn fmt_val(col: &dyn Array, row: usize) -> String {
     if let Some(a) = col.as_any().downcast_ref::<arrow_array::Int32Array>() {
         return a.value(row).to_string();
     }
+    if let Some(a) = col.as_any().downcast_ref::<arrow_array::UInt64Array>() {
+        return a.value(row).to_string();
+    }
+    if let Some(a) = col.as_any().downcast_ref::<arrow_array::UInt32Array>() {
+        return a.value(row).to_string();
+    }
     if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
+        return format!("{:.2}", a.value(row));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<arrow_array::Float32Array>() {
         return format!("{:.2}", a.value(row));
     }
     if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
@@ -614,7 +623,8 @@ fn fmt_val(col: &dyn Array, row: usize) -> String {
     if let Some(a) = col.as_any().downcast_ref::<arrow_array::BooleanArray>() {
         return a.value(row).to_string();
     }
-    "?".to_string()
+    // Fallback: show the Arrow type name so unknown types are diagnosable
+    format!("?({:?})", col.data_type())
 }
 
 // ---------------------------------------------------------------------------
