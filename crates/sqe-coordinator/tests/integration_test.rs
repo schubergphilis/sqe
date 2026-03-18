@@ -22,7 +22,7 @@ fn test_config_path() -> String {
 }
 
 // Test: Authenticate via client_credentials against Polaris built-in OAuth
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_authentication() {
     let config =
@@ -43,7 +43,7 @@ async fn test_authentication() {
 }
 
 // Test: Token fingerprint is stable for the same principal
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_token_fingerprint() {
     let config =
@@ -65,7 +65,7 @@ async fn test_token_fingerprint() {
 }
 
 // Test: Query handler executes SELECT 1
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_simple_select() {
     let config =
@@ -136,7 +136,7 @@ async fn setup_handler() -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
 }
 
 // Test: CTAS roundtrip — create a table, select from it, verify, cleanup
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_ctas_roundtrip() {
     let (session, handler) = setup_handler().await;
@@ -192,7 +192,7 @@ async fn test_ctas_roundtrip() {
 }
 
 // Test: INSERT INTO — create a table, insert a second row, verify both rows
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_insert_into() {
     let (session, handler) = setup_handler().await;
@@ -237,7 +237,7 @@ async fn test_insert_into() {
 }
 
 // Test: DROP TABLE — create a table, drop it, verify it no longer appears
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_drop_table() {
     let (session, handler) = setup_handler().await;
@@ -273,7 +273,7 @@ async fn test_drop_table() {
 }
 
 // Test: DROP TABLE IF EXISTS on a non-existent table should not error
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_drop_table_if_exists_no_error() {
     let (session, handler) = setup_handler().await;
@@ -332,7 +332,7 @@ fn test_worker_registry_no_workers() {
 }
 
 // Test: Coordinator with no workers falls back to local execution
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_local_fallback_without_workers() {
     let (session, handler) = setup_handler().await;
@@ -371,7 +371,7 @@ fn test_scan_task_roundtrip() {
 }
 
 // Test: Distributed SELECT with coordinator + worker (requires both running)
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh + running worker
 async fn test_distributed_select() {
     // This test requires:
@@ -510,7 +510,7 @@ fn test_trino_batches_to_json() {
 }
 
 // Test: information_schema.tables is queryable
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_information_schema_tables() {
     let (session, handler) = setup_handler().await;
@@ -524,7 +524,7 @@ async fn test_information_schema_tables() {
 }
 
 // Test: information_schema.schemata is queryable
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_information_schema_schemata() {
     let (session, handler) = setup_handler().await;
