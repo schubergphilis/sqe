@@ -114,7 +114,15 @@ fn stamp_field_ids(
                 .unwrap_or((i + 1) as i32);
             let mut meta = arrow_field.metadata().clone();
             meta.insert("PARQUET:field_id".to_string(), field_id.to_string());
-            Arc::new(arrow_field.as_ref().clone().with_metadata(meta))
+            // DataFusion sometimes marks a field as non-nullable even when the column
+            // contains nulls (e.g. CAST(NULL AS T) in UNION ALL). Check across ALL batches
+            // because the null value may appear in any batch, not just the first one.
+            let has_nulls = batches.iter().any(|b| b.column(i).null_count() > 0);
+            let nullable = arrow_field.is_nullable() || has_nulls;
+            Arc::new(
+                arrow_schema::Field::new(arrow_field.name(), arrow_field.data_type().clone(), nullable)
+                    .with_metadata(meta),
+            )
         })
         .collect();
 
