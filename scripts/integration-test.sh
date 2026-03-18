@@ -20,10 +20,15 @@ docker compose -f "$COMPOSE_FILE" up -d
 "$SCRIPT_DIR/bootstrap-test.sh"
 
 # ── Run integration tests ─────────────────────────────────────
+SQE_LOG_FILE="$(mktemp /tmp/sqe-test-XXXXXX.log)"
+
 echo ""
 echo "Running integration tests..."
-cargo test -p sqe-coordinator --test integration_test -- --ignored "$@"
-EXIT_CODE=$?
+# Capture SQE coordinator tracing output (requires RUST_LOG to be set for structured logs)
+RUST_LOG="${RUST_LOG:-sqe_coordinator=info,sqe_catalog=info,sqe_auth=info,warn}" \
+    cargo test -p sqe-coordinator --test integration_test -- --ignored --test-threads=1 --nocapture "$@" 2>&1 \
+    | tee "$SQE_LOG_FILE"
+EXIT_CODE=${PIPESTATUS[0]}
 
 echo ""
 if [ $EXIT_CODE -eq 0 ]; then
@@ -31,5 +36,30 @@ if [ $EXIT_CODE -eq 0 ]; then
 else
     echo "=== Integration tests FAILED (exit $EXIT_CODE) ==="
 fi
+
+# ── Show service logs before teardown ─────────────────────────
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  SQE Engine logs (last 200 lines)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+tail -200 "$SQE_LOG_FILE"
+rm -f "$SQE_LOG_FILE"
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  Polaris logs (last 100 lines)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+docker compose -f "$COMPOSE_FILE" logs --no-log-prefix --tail=100 polaris
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  RustFS logs (last 50 lines)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+docker compose -f "$COMPOSE_FILE" logs --no-log-prefix --tail=50 rustfs
+
+# ── Tear down test stack ───────────────────────────────────────
+echo ""
+echo "Tearing down test stack..."
+docker compose -f "$COMPOSE_FILE" down
 
 exit $EXIT_CODE

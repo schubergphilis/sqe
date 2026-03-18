@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use arrow_array::RecordBatch;
-use iceberg::spec::DataFile;
+use arrow_schema::Schema as ArrowSchema;
+use iceberg::spec::{DataFile, Schema as IcebergSchema};
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
@@ -29,6 +32,12 @@ pub async fn write_data_files(
     }
 
     info!(total_rows, file_prefix, "Writing data files for Iceberg table");
+
+    // DataFusion-produced RecordBatches have no Iceberg field-ID metadata on their
+    // Arrow fields. The Parquet writer requires "PARQUET:field_id" in each field's
+    // metadata to map columns to the Iceberg schema. Stamp the IDs from the table's
+    // current schema onto the batch schema before writing.
+    let batches = stamp_field_ids(batches, table.metadata().current_schema())?;
 
     let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
         .map_err(|e| SqeError::Execution(format!("Location generator error: {e}")))?;
@@ -79,4 +88,50 @@ pub async fn write_data_files(
     );
 
     Ok(data_files)
+}
+
+/// Add Iceberg field IDs to each Arrow field's metadata so the Parquet writer
+/// can map columns to the Iceberg schema. The mapping is positional: field N in
+/// the batch corresponds to field N in the Iceberg schema.
+fn stamp_field_ids(
+    batches: Vec<RecordBatch>,
+    iceberg_schema: &IcebergSchema,
+) -> sqe_core::Result<Vec<RecordBatch>> {
+    let Some(first) = batches.first() else {
+        return Ok(batches);
+    };
+
+    let iceberg_fields = iceberg_schema.as_struct().fields();
+    let new_fields: Vec<Arc<arrow_schema::Field>> = first
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, arrow_field)| {
+            let field_id = iceberg_fields
+                .get(i)
+                .map(|f| f.id)
+                .unwrap_or((i + 1) as i32);
+            let mut meta = arrow_field.metadata().clone();
+            meta.insert("PARQUET:field_id".to_string(), field_id.to_string());
+            // DataFusion sometimes marks a field as non-nullable even when the column
+            // contains nulls (e.g. CAST(NULL AS T) in UNION ALL). Check across ALL batches
+            // because the null value may appear in any batch, not just the first one.
+            let has_nulls = batches.iter().any(|b| b.column(i).null_count() > 0);
+            let nullable = arrow_field.is_nullable() || has_nulls;
+            Arc::new(
+                arrow_schema::Field::new(arrow_field.name(), arrow_field.data_type().clone(), nullable)
+                    .with_metadata(meta),
+            )
+        })
+        .collect();
+
+    let new_schema = Arc::new(ArrowSchema::new(new_fields));
+    batches
+        .into_iter()
+        .map(|batch| {
+            RecordBatch::try_new(new_schema.clone(), batch.columns().to_vec())
+                .map_err(|e| SqeError::Execution(format!("Failed to stamp field IDs: {e}")))
+        })
+        .collect()
 }

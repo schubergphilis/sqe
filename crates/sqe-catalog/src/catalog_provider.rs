@@ -102,8 +102,10 @@ impl CatalogProvider for SqeCatalogProvider {
             self.session_catalog.clone(),
             name.to_string(),
             self.storage_config.clone(),
+            self.warehouse.clone(),
         );
 
         Some(Arc::new(provider))
+
     }
 }

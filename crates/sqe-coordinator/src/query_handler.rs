@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_array::{ArrayRef, builder::StringBuilder};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use tracing::{debug, info};
 
 use sqlparser::ast::Statement;
@@ -291,7 +291,17 @@ impl QueryHandler {
         &self,
         session: &Session,
     ) -> sqe_core::Result<SessionContext> {
-        let ctx = SessionContext::new();
+        let catalog_name = if self.config.catalog.warehouse.is_empty() {
+            "default".to_string()
+        } else {
+            self.config.catalog.warehouse.clone()
+        };
+
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new()
+                .with_information_schema(true)
+                .with_default_catalog_and_schema(&catalog_name, "default"),
+        );
 
         // Create a per-session catalog connected to Polaris with the user's bearer token
         let session_catalog = Arc::new(
@@ -311,13 +321,6 @@ impl QueryHandler {
             self.config.catalog.warehouse.clone(),
         )
         .await?;
-
-        // Register the catalog with the warehouse name
-        let catalog_name = if self.config.catalog.warehouse.is_empty() {
-            "default".to_string()
-        } else {
-            self.config.catalog.warehouse.clone()
-        };
 
         ctx.register_catalog(&catalog_name, Arc::new(catalog_provider));
 
