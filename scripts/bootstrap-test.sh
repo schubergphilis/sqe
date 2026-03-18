@@ -85,13 +85,9 @@ HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
             \"storageConfigInfo\": {
                 \"storageType\": \"S3\",
                 \"allowedLocations\": [\"s3://warehouse/\"],
-                \"properties\": {
-                    \"s3.endpoint\": \"http://rustfs:9000\",
-                    \"s3.path-style-access\": \"true\",
-                    \"s3.access-key-id\": \"$S3_ACCESS_KEY\",
-                    \"s3.secret-access-key\": \"$S3_SECRET_KEY\",
-                    \"region\": \"us-east-1\"
-                }
+                \"endpoint\": \"$S3_URL\",
+                \"endpointInternal\": \"http://rustfs:9000\",
+                \"pathStyleAccess\": true
             },
             \"properties\": {
                 \"default-base-location\": \"s3://warehouse/\"
