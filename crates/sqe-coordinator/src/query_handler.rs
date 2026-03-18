@@ -291,8 +291,16 @@ impl QueryHandler {
         &self,
         session: &Session,
     ) -> sqe_core::Result<SessionContext> {
+        let catalog_name = if self.config.catalog.warehouse.is_empty() {
+            "default".to_string()
+        } else {
+            self.config.catalog.warehouse.clone()
+        };
+
         let ctx = SessionContext::new_with_config(
-            SessionConfig::new().with_information_schema(true),
+            SessionConfig::new()
+                .with_information_schema(true)
+                .with_default_catalog_and_schema(&catalog_name, "default"),
         );
 
         // Create a per-session catalog connected to Polaris with the user's bearer token
@@ -313,13 +321,6 @@ impl QueryHandler {
             self.config.catalog.warehouse.clone(),
         )
         .await?;
-
-        // Register the catalog with the warehouse name
-        let catalog_name = if self.config.catalog.warehouse.is_empty() {
-            "default".to_string()
-        } else {
-            self.config.catalog.warehouse.clone()
-        };
 
         ctx.register_catalog(&catalog_name, Arc::new(catalog_provider));
 
