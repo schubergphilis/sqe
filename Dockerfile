@@ -1,10 +1,20 @@
-# ── Stage 1: Generate dependency recipe ───────────────────────
+# ── Stage 1: Base builder with tools ──────────────────────────
 FROM rust:bookworm AS chef
 
-RUN cargo install cargo-chef --locked && \
-    apt-get update && apt-get install -y --no-install-recommends \
-    cmake protobuf-compiler libssl-dev pkg-config && \
-    rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake protobuf-compiler libssl-dev pkg-config \
+    clang mold && \
+    rm -rf /var/lib/apt/lists/* && \
+    cargo install cargo-chef --locked && \
+    cargo install sccache --locked
+
+# Use mold linker (2-5x faster than default ld)
+ENV RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=mold"
+# Use sccache for compilation caching
+ENV RUSTC_WRAPPER=sccache
+# sccache config: local disk cache (in Docker layer cache)
+ENV SCCACHE_DIR=/sccache
+ENV SCCACHE_CACHE_SIZE=2G
 
 WORKDIR /build
 
@@ -17,13 +27,15 @@ RUN cargo chef prepare --recipe-path recipe.json
 # ── Stage 3: Build dependencies (cached unless recipe changes) ─
 FROM chef AS deps
 COPY --from=planner /build/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json && \
+    sccache --show-stats
 
 # ── Stage 4: Build application (only workspace crates recompile) ─
 FROM deps AS builder
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
-RUN cargo build --release --bin sqe-server --bin sqe-cli
+RUN cargo build --release --bin sqe-server --bin sqe-cli && \
+    sccache --show-stats
 
 # ── Stage 5: Runtime image ────────────────────────────────────
 FROM debian:bookworm-slim
