@@ -90,7 +90,8 @@ HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
                 \"pathStyleAccess\": true
             },
             \"properties\": {
-                \"default-base-location\": \"s3://warehouse/\"
+                \"default-base-location\": \"s3://warehouse/\",
+                \"polaris.config.drop-with-purge.enabled\": \"true\"
             }
         }
     }" 2>/dev/null)

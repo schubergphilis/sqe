@@ -16,6 +16,8 @@ services:
       QUARKUS_LOG_CATEGORY__ORG_APACHE_POLARIS__LEVEL: WARN
       quarkus.otel.sdk.disabled: "true"
       polaris.realm-context.realms: POLARIS
+      # Allow DROP VIEW/TABLE to purge metadata files from object storage
+      POLARIS_FEATURES_DEFAULTS_DROP_WITH_PURGE_ENABLED: "true"
       # S3 credentials for RustFS — used by Polaris for its own S3 operations
       AWS_REGION: us-east-1
       AWS_ACCESS_KEY_ID: s3admin

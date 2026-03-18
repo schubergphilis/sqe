@@ -268,6 +268,96 @@ impl SessionCatalog {
         Ok(())
     }
 
+    /// List views in a namespace via the Polaris REST API.
+    pub async fn list_views(
+        &self,
+        namespace: &NamespaceIdent,
+    ) -> sqe_core::Result<Vec<String>> {
+        let ns_str = namespace
+            .as_ref()
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\u{1F}");
+        let url = format!("{}/namespaces/{}/views", self.rest_prefix(), ns_str);
+
+        let resp = self
+            .http_client
+            .get(&url)
+            .bearer_auth(&self.bearer_token)
+            .send()
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to list views: {e}")))?;
+
+        if !resp.status().is_success() {
+            return Ok(vec![]);
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to parse views list: {e}")))?;
+
+        let names = body["identifiers"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v["name"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(names)
+    }
+
+    /// Load a view's SQL definition from the Polaris REST API.
+    ///
+    /// Returns `None` if the view does not exist (404), or the SQL string on success.
+    pub async fn load_view_sql(
+        &self,
+        namespace: &NamespaceIdent,
+        name: &str,
+    ) -> sqe_core::Result<Option<String>> {
+        let ns_str = namespace
+            .as_ref()
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\u{1F}");
+        let url = format!("{}/namespaces/{}/views/{}", self.rest_prefix(), ns_str, name);
+
+        let resp = self
+            .http_client
+            .get(&url)
+            .bearer_auth(&self.bearer_token)
+            .send()
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to load view: {e}")))?;
+
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to parse view response: {e}")))?;
+
+        // Iceberg REST view response: metadata.versions[last].representations[type=sql].sql
+        let sql = body["metadata"]["versions"]
+            .as_array()
+            .and_then(|v| v.last())
+            .and_then(|v| v["representations"].as_array())
+            .and_then(|r| r.iter().find(|rep| rep["type"] == "sql"))
+            .and_then(|rep| rep["sql"].as_str())
+            .map(String::from);
+
+        Ok(sql)
+    }
+
     /// Drop a view via the Polaris REST API.
     ///
     /// Calls `DELETE /v1/{prefix}/namespaces/{namespace}/views/{view}`.

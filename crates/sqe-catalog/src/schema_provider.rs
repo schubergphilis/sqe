@@ -3,28 +3,30 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::catalog::SchemaProvider;
+use datafusion::datasource::ViewTable;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use iceberg::NamespaceIdent;
 use tracing::{debug, error};
 
 use sqe_core::config::StorageConfig;
 
+use crate::catalog_provider::SqeCatalogProvider;
 use crate::rest_catalog::SessionCatalog;
 use crate::table_provider::SqeTableProvider;
 
 /// DataFusion `SchemaProvider` that maps an Iceberg namespace to a DataFusion schema.
 ///
 /// Tables are loaded lazily when `table()` is called. The `table_names()` method
-/// performs an async call via `tokio::task::block_in_place` to list tables from the
-/// Iceberg catalog.
+/// performs an async call via `tokio::task::block_in_place` to list tables and views
+/// from the Iceberg catalog.
 #[derive(Debug)]
 pub struct SqeSchemaProvider {
     session_catalog: Arc<SessionCatalog>,
     namespace: String,
-    /// Retained for future use with credential vending per-table.
-    #[allow(dead_code)]
     storage_config: StorageConfig,
+    warehouse: String,
 }
 
 impl SqeSchemaProvider {
@@ -33,11 +35,13 @@ impl SqeSchemaProvider {
         session_catalog: Arc<SessionCatalog>,
         namespace: String,
         storage_config: StorageConfig,
+        warehouse: String,
     ) -> Self {
         Self {
             session_catalog,
             namespace,
             storage_config,
+            warehouse,
         }
     }
 }
@@ -49,12 +53,9 @@ impl SchemaProvider for SqeSchemaProvider {
     }
 
     fn table_names(&self) -> Vec<String> {
-        // SchemaProvider::table_names() is synchronous, but listing tables requires
-        // an async call. We use a best-effort approach: spawn a blocking task.
         let catalog = self.session_catalog.clone();
         let ns = self.namespace.clone();
 
-        // Try to get the current tokio runtime handle to block on
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
@@ -64,17 +65,28 @@ impl SchemaProvider for SqeSchemaProvider {
         };
 
         let ns_ident = NamespaceIdent::new(ns.clone());
-        match tokio::task::block_in_place(|| handle.block_on(catalog.list_tables(&ns_ident))) {
-            Ok(tables) => tables.iter().map(|t| t.name().to_string()).collect(),
+
+        let tables =
+            tokio::task::block_in_place(|| handle.block_on(catalog.list_tables(&ns_ident)));
+        let mut names: Vec<String> = match tables {
+            Ok(t) => t.iter().map(|t| t.name().to_string()).collect(),
             Err(e) => {
                 error!(namespace = %ns, error = %e, "Failed to list tables");
                 Vec::new()
             }
+        };
+
+        // Also include views
+        let views =
+            tokio::task::block_in_place(|| handle.block_on(catalog.list_views(&ns_ident)));
+        if let Ok(view_names) = views {
+            names.extend(view_names);
         }
+
+        names
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        // Use table_names for a simple existence check
         self.table_names().contains(&name.to_string())
     }
 
@@ -82,36 +94,88 @@ impl SchemaProvider for SqeSchemaProvider {
         debug!(
             namespace = %self.namespace,
             table = name,
-            "Loading table via SqeSchemaProvider"
+            "Loading table/view via SqeSchemaProvider"
         );
 
         let ns_ident = NamespaceIdent::new(self.namespace.clone());
-        let table_ident = iceberg::TableIdent::new(ns_ident, name.to_string());
+        let table_ident = iceberg::TableIdent::new(ns_ident.clone(), name.to_string());
 
-        let table = match self.session_catalog.load_table(&table_ident).await {
-            Ok(t) => t,
-            Err(e) => {
-                error!(
-                    namespace = %self.namespace,
-                    table = name,
-                    error = %e,
-                    "Failed to load table from catalog"
-                );
-                return Ok(None);
+        // First: try loading as a regular Iceberg table
+        match self.session_catalog.load_table(&table_ident).await {
+            Ok(table) => {
+                match SqeTableProvider::try_new(table).await {
+                    Ok(provider) => return Ok(Some(Arc::new(provider))),
+                    Err(e) => {
+                        error!(table = name, error = %e, "Failed to create table provider");
+                    }
+                }
             }
-        };
-
-        match SqeTableProvider::try_new(table).await {
-            Ok(provider) => Ok(Some(Arc::new(provider))),
-            Err(e) => {
-                error!(
-                    namespace = %self.namespace,
-                    table = name,
-                    error = %e,
-                    "Failed to create table provider"
-                );
-                Ok(None)
+            Err(_) => {
+                debug!(table = name, "Not found as table, trying view");
             }
         }
+
+        // Second: try loading as an Iceberg view
+        match self.session_catalog.load_view_sql(&ns_ident, name).await {
+            Ok(Some(sql)) => {
+                debug!(view = name, sql = %sql, "Loaded view SQL, planning...");
+                return self.plan_view(name, sql).await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                debug!(view = name, error = %e, "Failed to load view SQL");
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+impl SqeSchemaProvider {
+    /// Plan a view's SQL and wrap it in a DataFusion ViewTable.
+    ///
+    /// Creates a minimal SessionContext with the same catalog registered so that
+    /// the view's SQL can reference tables in the same namespace.
+    async fn plan_view(
+        &self,
+        name: &str,
+        sql: String,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        let catalog_name = &self.warehouse;
+
+        let mini_ctx = SessionContext::new_with_config(
+            SessionConfig::new()
+                .with_information_schema(true)
+                .with_default_catalog_and_schema(catalog_name, "default"),
+        );
+
+        // Register the same catalog so the view's SQL can reference its tables
+        let catalog_provider = SqeCatalogProvider::try_new(
+            self.session_catalog.clone(),
+            self.storage_config.clone(),
+            self.warehouse.clone(),
+        )
+        .await
+        .map_err(|e| {
+            datafusion::error::DataFusionError::External(format!(
+                "Failed to create catalog for view planning: {e}"
+            ).into())
+        })?;
+
+        mini_ctx.register_catalog(catalog_name, Arc::new(catalog_provider));
+
+        let df = mini_ctx.sql(&sql).await.map_err(|e| {
+            datafusion::error::DataFusionError::External(
+                format!("Failed to plan view '{name}' SQL: {e}").into(),
+            )
+        })?;
+
+        let plan = df.into_optimized_plan().map_err(|e| {
+            datafusion::error::DataFusionError::External(
+                format!("Failed to optimize view '{name}' plan: {e}").into(),
+            )
+        })?;
+
+        Ok(Some(Arc::new(ViewTable::new(plan, Some(sql)))))
     }
 }
