@@ -137,6 +137,20 @@ case "$HTTP_CODE" in
     *) echo "FAILED (HTTP $HTTP_CODE)"; exit 1 ;;
 esac
 
+# ── 6. Create test_ns namespace (used by integration tests) ───
+echo -n "Creating namespace 'test_ns'... "
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+    "$POLARIS_URL/api/catalog/v1/$WAREHOUSE/namespaces" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"namespace": ["test_ns"]}' 2>/dev/null)
+
+case "$HTTP_CODE" in
+    200) echo "done" ;;
+    409) echo "already exists" ;;
+    *) echo "FAILED (HTTP $HTTP_CODE)"; exit 1 ;;
+esac
+
 echo ""
 echo "=== Bootstrap complete ==="
 echo "SQE can connect with:"
