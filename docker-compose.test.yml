@@ -14,9 +14,12 @@ services:
       QUARKUS_HTTP_PORT: 8181
       QUARKUS_LOG_LEVEL: INFO
       QUARKUS_LOG_CATEGORY__ORG_APACHE_POLARIS__LEVEL: WARN
+      # S3 credentials for RustFS (used directly, no STS credential vending)
       AWS_REGION: us-east-1
       AWS_ACCESS_KEY_ID: s3admin
       AWS_SECRET_ACCESS_KEY: s3admin
+      # Skip STS AssumeRole — use static S3 credentials from env vars
+      POLARIS_FEATURES_DEFAULTS_SKIP_CREDENTIAL_SUBSCOPING_INDIRECTION: "true"
     ports:
       - "8181:8181"
     healthcheck:
