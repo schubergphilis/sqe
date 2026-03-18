@@ -14,6 +14,9 @@ services:
       QUARKUS_HTTP_PORT: 8181
       QUARKUS_LOG_LEVEL: INFO
       QUARKUS_LOG_CATEGORY__ORG_APACHE_POLARIS__LEVEL: WARN
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: s3admin
+      AWS_SECRET_ACCESS_KEY: s3admin
     ports:
       - "8181:8181"
     healthcheck:
