@@ -82,3 +82,9 @@ chrono = { version = "0.4", features = ["serde"] }
 url = "2"
 bytes = "1"
 futures = "0.3"
+
+# ── Release profile: fast builds with good runtime performance ─
+[profile.release]
+codegen-units = 4        # More parallelism during codegen (default=1)
+lto = "thin"             # Thin LTO: ~80% of full LTO benefit, much faster link
+strip = true             # Strip debug symbols from binary (~50% smaller)

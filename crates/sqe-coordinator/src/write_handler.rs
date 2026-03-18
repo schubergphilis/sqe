@@ -140,6 +140,86 @@ impl WriteHandler {
         Ok(vec![]) // DDL success, no result rows
     }
 
+    /// Handle CREATE TABLE [IF NOT EXISTS] ns.table (column definitions)
+    ///
+    /// Creates an empty Iceberg table from explicit column definitions.
+    pub async fn handle_create_table(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let ct = match stmt {
+            Statement::CreateTable(ct) => ct,
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected CreateTable statement, got: {other}"
+                )));
+            }
+        };
+
+        let (namespace, name) = parse_table_ref(&ct.name)?;
+
+        // Convert SQL column definitions to Arrow schema
+        let arrow_fields: Vec<arrow_schema::Field> = ct
+            .columns
+            .iter()
+            .map(|col| {
+                let arrow_type = sql_type_to_arrow(&col.data_type)?;
+                let nullable = !col
+                    .options
+                    .iter()
+                    .any(|opt| matches!(opt.option, sqlparser::ast::ColumnOption::NotNull));
+                Ok(arrow_schema::Field::new(col.name.value.clone(), arrow_type, nullable))
+            })
+            .collect::<sqe_core::Result<Vec<_>>>()?;
+
+        if arrow_fields.is_empty() {
+            return Err(SqeError::Execution(
+                "CREATE TABLE requires at least one column definition".into(),
+            ));
+        }
+
+        let arrow_schema = ArrowSchema::new(arrow_fields);
+        let iceberg_schema = arrow_schema_to_iceberg(&arrow_schema)?;
+
+        info!(
+            username = %session.user.username,
+            namespace = %namespace,
+            table = %name,
+            columns = arrow_schema.fields().len(),
+            "Creating empty table"
+        );
+
+        let catalog = self.create_catalog_bridge(session).await?;
+
+        if ct.if_not_exists {
+            let table_ident = TableIdent::new(namespace.clone(), name.clone());
+            if catalog.load_table(&table_ident).await.is_ok() {
+                info!(table = %table_ident, "Table already exists, skipping (IF NOT EXISTS)");
+                return Ok(vec![]);
+            }
+        }
+
+        let table_creation = TableCreation::builder()
+            .name(name.clone())
+            .schema(iceberg_schema)
+            .format_version(self.format_version())
+            .build();
+
+        catalog
+            .create_table(&namespace, table_creation)
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to create table: {e}")))?;
+
+        info!(
+            namespace = %namespace,
+            table = %name,
+            "Table created successfully"
+        );
+
+        Ok(vec![])
+    }
+
     /// Handle INSERT INTO ns.table SELECT ...
     ///
     /// The caller has already executed the SELECT and provides the result
@@ -256,6 +336,47 @@ impl WriteHandler {
 /// requires the `PARQUET_FIELD_ID` key). Instead, we convert each Arrow field
 /// individually using `arrow_type_to_type` and assign sequential field IDs
 /// starting from 1.
+/// Convert a sqlparser SQL data type to an Arrow DataType.
+fn sql_type_to_arrow(sql_type: &sqlparser::ast::DataType) -> sqe_core::Result<arrow_schema::DataType> {
+    use arrow_schema::DataType;
+    use sqlparser::ast::DataType as SqlType;
+
+    match sql_type {
+        SqlType::Boolean => Ok(DataType::Boolean),
+        SqlType::TinyInt(_) | SqlType::Int8(_) => Ok(DataType::Int8),
+        SqlType::SmallInt(_) | SqlType::Int16 => Ok(DataType::Int16),
+        SqlType::Int(_) | SqlType::Integer(_) | SqlType::Int32 => Ok(DataType::Int32),
+        SqlType::BigInt(_) | SqlType::Int64 => Ok(DataType::Int64),
+        SqlType::Float(_) | SqlType::Real => Ok(DataType::Float32),
+        SqlType::Double(_) | SqlType::DoublePrecision => Ok(DataType::Float64),
+        SqlType::Varchar(_) | SqlType::CharVarying(_) | SqlType::Text | SqlType::String(_) => {
+            Ok(DataType::Utf8)
+        }
+        SqlType::Char(_) | SqlType::Character(_) => Ok(DataType::Utf8),
+        SqlType::Binary(_) | SqlType::Varbinary(_) | SqlType::Bytea => Ok(DataType::Binary),
+        SqlType::Date => Ok(DataType::Date32),
+        SqlType::Timestamp(precision, _tz_info) => {
+            let p = precision.unwrap_or(6);
+            match p {
+                0..=3 => Ok(DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None)),
+                4..=6 => Ok(DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)),
+                _ => Ok(DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None)),
+            }
+        }
+        SqlType::Decimal(info) | SqlType::Numeric(info) => {
+            let (precision, scale) = match info {
+                sqlparser::ast::ExactNumberInfo::PrecisionAndScale(p, s) => (*p, *s),
+                sqlparser::ast::ExactNumberInfo::Precision(p) => (*p, 0),
+                sqlparser::ast::ExactNumberInfo::None => (38, 10),
+            };
+            Ok(DataType::Decimal128(precision as u8, scale as i8))
+        }
+        other => Err(SqeError::NotImplemented(format!(
+            "SQL type not supported for CREATE TABLE: {other}"
+        ))),
+    }
+}
+
 fn arrow_schema_to_iceberg(arrow_schema: &ArrowSchema) -> sqe_core::Result<IcebergSchema> {
     let mut fields = Vec::with_capacity(arrow_schema.fields().len());
 
