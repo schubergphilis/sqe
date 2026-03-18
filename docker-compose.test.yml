@@ -19,7 +19,8 @@ services:
       AWS_ACCESS_KEY_ID: s3admin
       AWS_SECRET_ACCESS_KEY: s3admin
       # Skip STS AssumeRole — use static S3 credentials from env vars
-      POLARIS_FEATURES_DEFAULTS_SKIP_CREDENTIAL_SUBSCOPING_INDIRECTION: "true"
+      JAVA_OPTS_APPEND: >-
+        -Dpolaris.features.defaults."SKIP_CREDENTIAL_SUBSCOPING_INDIRECTION"=true
     ports:
       - "8181:8181"
     healthcheck:
