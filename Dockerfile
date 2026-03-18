@@ -1,43 +1,43 @@
-# ── Build stage ──────────────────────────────────────────────
-FROM rust:bookworm AS builder
+# ── Stage 1: Base builder with tools ──────────────────────────
+FROM rust:bookworm AS chef
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake protobuf-compiler libssl-dev pkg-config && \
-    rm -rf /var/lib/apt/lists/*
+    cmake protobuf-compiler libssl-dev pkg-config \
+    clang mold && \
+    rm -rf /var/lib/apt/lists/* && \
+    cargo install cargo-chef --locked && \
+    cargo install sccache --locked
+
+# Use mold linker (2-5x faster than default ld)
+ENV RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=mold"
+# Use sccache for compilation caching
+ENV RUSTC_WRAPPER=sccache
+# sccache config: local disk cache (in Docker layer cache)
+ENV SCCACHE_DIR=/sccache
+ENV SCCACHE_CACHE_SIZE=2G
 
 WORKDIR /build
 
-# ── Dependency caching layer ────────────────────────────────
-# Copy only manifests first so dependency compilation is cached
+# ── Stage 2: Compute recipe (changes only when Cargo.toml/lock change) ─
+FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
-COPY crates/sqe-core/Cargo.toml crates/sqe-core/Cargo.toml
-COPY crates/sqe-auth/Cargo.toml crates/sqe-auth/Cargo.toml
-COPY crates/sqe-catalog/Cargo.toml crates/sqe-catalog/Cargo.toml
-COPY crates/sqe-sql/Cargo.toml crates/sqe-sql/Cargo.toml
-COPY crates/sqe-policy/Cargo.toml crates/sqe-policy/Cargo.toml
-COPY crates/sqe-planner/Cargo.toml crates/sqe-planner/Cargo.toml
-COPY crates/sqe-coordinator/Cargo.toml crates/sqe-coordinator/Cargo.toml
-COPY crates/sqe-worker/Cargo.toml crates/sqe-worker/Cargo.toml
-COPY crates/sqe-trino-compat/Cargo.toml crates/sqe-trino-compat/Cargo.toml
-COPY crates/sqe-metrics/Cargo.toml crates/sqe-metrics/Cargo.toml
-COPY crates/sqe-cli/Cargo.toml crates/sqe-cli/Cargo.toml
-
-# Create dummy source files so cargo can resolve the workspace and cache deps
-RUN find crates -name "Cargo.toml" -exec sh -c ' \
-    dir=$(dirname "$1"); \
-    mkdir -p "$dir/src" "$dir/src/bin"; \
-    echo "fn main() {}" > "$dir/src/main.rs"; \
-    echo "" > "$dir/src/lib.rs"; \
-    ' _ {} \;
-RUN cargo build --release --bin sqe-server --bin sqe-cli 2>/dev/null || true
-
-# ── Full build ──────────────────────────────────────────────
-# Copy real sources — only recompiles workspace crates, not deps
 COPY crates/ crates/
-RUN touch crates/*/src/*.rs && \
-    cargo build --release --bin sqe-server --bin sqe-cli
+RUN cargo chef prepare --recipe-path recipe.json
 
-# ── Runtime image ───────────────────────────────────────────
+# ── Stage 3: Build dependencies (cached unless recipe changes) ─
+FROM chef AS deps
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json && \
+    sccache --show-stats
+
+# ── Stage 4: Build application (only workspace crates recompile) ─
+FROM deps AS builder
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+RUN cargo build --release --bin sqe-server --bin sqe-cli && \
+    sccache --show-stats
+
+# ── Stage 5: Runtime image ────────────────────────────────────
 FROM debian:bookworm-slim
 
 ARG VERSION=dev
@@ -52,7 +52,7 @@ LABEL org.opencontainers.image.title="sqe" \
       org.opencontainers.image.source="https://github.com/schuberg/sqe"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates libssl3 && \
+    ca-certificates libssl3 curl && \
     rm -rf /var/lib/apt/lists/* && \
     groupadd -r sqe && useradd -r -g sqe -u 1000 sqe
 
@@ -61,5 +61,8 @@ COPY --from=builder /build/target/release/sqe-cli /usr/local/bin/
 
 USER sqe
 EXPOSE 50051 50052 8080 9090 9091
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:9091/healthz || exit 1
 
 ENTRYPOINT ["sqe-server"]

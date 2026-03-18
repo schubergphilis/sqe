@@ -7,19 +7,50 @@ use sqe_core::config::AuthConfig;
 use sqe_core::Session;
 
 use crate::keycloak::KeycloakClient;
+use crate::oauth::OAuthClient;
 use crate::token_cache::{CachedToken, TokenCache};
 
+/// Selects which auth backend the engine uses at runtime.
+enum AuthBackend {
+    /// Keycloak ROPC — exchanges username/password for a token via Keycloak.
+    Keycloak(KeycloakClient),
+    /// Generic OAuth2 client_credentials — obtains a service token from any
+    /// OAuth2-compliant endpoint (e.g. Polaris). Username/password are ignored.
+    ClientCredentials(OAuthClient),
+}
+
 pub struct Authenticator {
-    keycloak: KeycloakClient,
+    backend: AuthBackend,
     cache: TokenCache,
     refresh_buffer_secs: u64,
 }
 
 impl Authenticator {
     pub async fn new(config: &AuthConfig) -> sqe_core::Result<Self> {
-        let keycloak = KeycloakClient::new(config)?;
         let cache = TokenCache::new();
         let refresh_buffer_secs = config.token_refresh_buffer_secs;
+
+        let backend = if !config.token_endpoint.is_empty() && config.keycloak_url.is_empty() {
+            info!(
+                token_endpoint = config.token_endpoint,
+                "Using OAuth2 client_credentials backend"
+            );
+            let oauth = OAuthClient::new(
+                &config.token_endpoint,
+                &config.client_id,
+                &config.client_secret,
+                !config.ssl_verification,
+            )?;
+            AuthBackend::ClientCredentials(oauth)
+        } else {
+            info!(
+                keycloak_url = config.keycloak_url,
+                realm = config.realm,
+                "Using Keycloak ROPC backend"
+            );
+            let keycloak = KeycloakClient::new(config)?;
+            AuthBackend::Keycloak(keycloak)
+        };
 
         info!(
             refresh_buffer_secs = refresh_buffer_secs,
@@ -27,7 +58,7 @@ impl Authenticator {
         );
 
         Ok(Self {
-            keycloak,
+            backend,
             cache,
             refresh_buffer_secs,
         })
@@ -38,35 +69,71 @@ impl Authenticator {
         username: &str,
         password: &str,
     ) -> sqe_core::Result<Session> {
-        let token_response = self.keycloak.exchange_credentials(username, password).await?;
-        let roles = self.keycloak.extract_roles(&token_response.access_token);
+        match &self.backend {
+            AuthBackend::Keycloak(kc) => {
+                let token_response = kc.exchange_credentials(username, password).await?;
+                let roles = kc.extract_roles(&token_response.access_token);
+                let token_expiry =
+                    Utc::now() + Duration::seconds(token_response.expires_in as i64);
 
-        let token_expiry = Utc::now() + Duration::seconds(token_response.expires_in as i64);
+                let session = Session::new(
+                    username.to_string(),
+                    token_response.access_token.clone(),
+                    token_response.refresh_token.clone(),
+                    token_expiry,
+                    roles,
+                );
 
-        let session = Session::new(
-            username.to_string(),
-            token_response.access_token.clone(),
-            token_response.refresh_token.clone(),
-            token_expiry,
-            roles,
-        );
+                self.cache.insert(
+                    &session.id,
+                    CachedToken {
+                        access_token: token_response.access_token,
+                        refresh_token: token_response.refresh_token,
+                        expiry: token_expiry,
+                    },
+                );
 
-        self.cache.insert(
-            &session.id,
-            CachedToken {
-                access_token: token_response.access_token,
-                refresh_token: token_response.refresh_token,
-                expiry: token_expiry,
-            },
-        );
+                debug!(
+                    session_id = session.id,
+                    username = username,
+                    "Session created and cached (Keycloak)"
+                );
 
-        debug!(
-            session_id = session.id,
-            username = username,
-            "Session created and cached"
-        );
+                Ok(session)
+            }
+            AuthBackend::ClientCredentials(oauth) => {
+                let token_response = oauth.get_token().await?;
+                let token_expiry =
+                    Utc::now() + Duration::seconds(token_response.expires_in as i64);
 
-        Ok(session)
+                // client_credentials mode: username is informational only, no
+                // refresh_token (we re-fetch via client_credentials when needed).
+                let session = Session::new(
+                    username.to_string(),
+                    token_response.access_token.clone(),
+                    None,
+                    token_expiry,
+                    Vec::new(),
+                );
+
+                self.cache.insert(
+                    &session.id,
+                    CachedToken {
+                        access_token: token_response.access_token,
+                        refresh_token: None,
+                        expiry: token_expiry,
+                    },
+                );
+
+                debug!(
+                    session_id = session.id,
+                    username = username,
+                    "Session created and cached (client_credentials)"
+                );
+
+                Ok(session)
+            }
+        }
     }
 
     /// Look up the latest cached token for a session.
@@ -77,28 +144,59 @@ impl Authenticator {
     }
 
     pub async fn refresh_session(&self, session: &mut Session) -> sqe_core::Result<()> {
-        let refresh_token = session
-            .refresh_token
-            .as_deref()
-            .ok_or_else(|| sqe_core::SqeError::Auth("No refresh token available".to_string()))?;
+        match &self.backend {
+            AuthBackend::Keycloak(kc) => {
+                let refresh_token = session
+                    .refresh_token
+                    .as_deref()
+                    .ok_or_else(|| {
+                        sqe_core::SqeError::Auth("No refresh token available".to_string())
+                    })?;
 
-        let token_response = self.keycloak.refresh_token(refresh_token).await?;
-        let token_expiry = Utc::now() + Duration::seconds(token_response.expires_in as i64);
+                let token_response = kc.refresh_token(refresh_token).await?;
+                let token_expiry =
+                    Utc::now() + Duration::seconds(token_response.expires_in as i64);
 
-        session.access_token = token_response.access_token.clone();
-        session.refresh_token = token_response.refresh_token.clone();
-        session.token_expiry = token_expiry;
+                session.access_token = token_response.access_token.clone();
+                session.refresh_token = token_response.refresh_token.clone();
+                session.token_expiry = token_expiry;
 
-        self.cache.insert(
-            &session.id,
-            CachedToken {
-                access_token: token_response.access_token,
-                refresh_token: token_response.refresh_token,
-                expiry: token_expiry,
-            },
-        );
+                self.cache.insert(
+                    &session.id,
+                    CachedToken {
+                        access_token: token_response.access_token,
+                        refresh_token: token_response.refresh_token,
+                        expiry: token_expiry,
+                    },
+                );
 
-        debug!(session_id = session.id, "Session token refreshed");
+                debug!(session_id = session.id, "Session token refreshed (Keycloak)");
+            }
+            AuthBackend::ClientCredentials(oauth) => {
+                // No refresh_token in client_credentials mode — simply re-fetch.
+                let token_response = oauth.get_token().await?;
+                let token_expiry =
+                    Utc::now() + Duration::seconds(token_response.expires_in as i64);
+
+                session.access_token = token_response.access_token.clone();
+                session.refresh_token = None;
+                session.token_expiry = token_expiry;
+
+                self.cache.insert(
+                    &session.id,
+                    CachedToken {
+                        access_token: token_response.access_token,
+                        refresh_token: None,
+                        expiry: token_expiry,
+                    },
+                );
+
+                debug!(
+                    session_id = session.id,
+                    "Session token refreshed (client_credentials)"
+                );
+            }
+        }
 
         Ok(())
     }
@@ -130,39 +228,75 @@ impl Authenticator {
                         None => continue,
                     };
 
-                    let refresh_token = match cached.refresh_token.as_deref() {
-                        Some(rt) => rt,
-                        None => {
-                            debug!(
-                                session_id = session_id,
-                                "No refresh token, removing from cache"
-                            );
-                            this.cache.remove(&session_id);
-                            continue;
-                        }
-                    };
+                    match &this.backend {
+                        AuthBackend::Keycloak(kc) => {
+                            let refresh_token = match cached.refresh_token.as_deref() {
+                                Some(rt) => rt,
+                                None => {
+                                    debug!(
+                                        session_id = session_id,
+                                        "No refresh token, removing from cache"
+                                    );
+                                    this.cache.remove(&session_id);
+                                    continue;
+                                }
+                            };
 
-                    match this.keycloak.refresh_token(refresh_token).await {
-                        Ok(token_response) => {
-                            let expiry = Utc::now()
-                                + Duration::seconds(token_response.expires_in as i64);
-                            this.cache.insert(
-                                &session_id,
-                                CachedToken {
-                                    access_token: token_response.access_token,
-                                    refresh_token: token_response.refresh_token,
-                                    expiry,
-                                },
-                            );
-                            debug!(session_id = session_id, "Background token refresh succeeded");
+                            match kc.refresh_token(refresh_token).await {
+                                Ok(token_response) => {
+                                    let expiry = Utc::now()
+                                        + Duration::seconds(token_response.expires_in as i64);
+                                    this.cache.insert(
+                                        &session_id,
+                                        CachedToken {
+                                            access_token: token_response.access_token,
+                                            refresh_token: token_response.refresh_token,
+                                            expiry,
+                                        },
+                                    );
+                                    debug!(
+                                        session_id = session_id,
+                                        "Background token refresh succeeded (Keycloak)"
+                                    );
+                                }
+                                Err(e) => {
+                                    error!(
+                                        session_id = session_id,
+                                        error = %e,
+                                        "Background token refresh failed, removing session"
+                                    );
+                                    this.cache.remove(&session_id);
+                                }
+                            }
                         }
-                        Err(e) => {
-                            error!(
-                                session_id = session_id,
-                                error = %e,
-                                "Background token refresh failed, removing session"
-                            );
-                            this.cache.remove(&session_id);
+                        AuthBackend::ClientCredentials(oauth) => {
+                            // Re-fetch via client_credentials (no refresh_token needed).
+                            match oauth.get_token().await {
+                                Ok(token_response) => {
+                                    let expiry = Utc::now()
+                                        + Duration::seconds(token_response.expires_in as i64);
+                                    this.cache.insert(
+                                        &session_id,
+                                        CachedToken {
+                                            access_token: token_response.access_token,
+                                            refresh_token: None,
+                                            expiry,
+                                        },
+                                    );
+                                    debug!(
+                                        session_id = session_id,
+                                        "Background token refresh succeeded (client_credentials)"
+                                    );
+                                }
+                                Err(e) => {
+                                    error!(
+                                        session_id = session_id,
+                                        error = %e,
+                                        "Background token refresh failed, removing session"
+                                    );
+                                    this.cache.remove(&session_id);
+                                }
+                            }
                         }
                     }
                 }

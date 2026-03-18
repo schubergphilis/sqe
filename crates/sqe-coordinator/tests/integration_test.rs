@@ -1,13 +1,13 @@
 //! Integration tests for SQE coordinator.
-//! These tests require a running quickstart stack (Keycloak, Polaris, S3).
+//! These tests require a running lightweight test stack (Polaris in-memory + RustFS).
 //! Run with: cargo test -p sqe-coordinator --test integration_test -- --ignored
 
 use std::sync::Arc;
 
-// Test: Authenticate against Keycloak
+// Test: Authenticate via client_credentials against Polaris built-in OAuth
 #[tokio::test]
-#[ignore] // Requires running quickstart stack
-async fn test_keycloak_authentication() {
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn test_authentication() {
     let config =
         sqe_core::SqeConfig::load("tests/sqe-test.toml").expect("Failed to load test config");
     let authenticator = sqe_auth::Authenticator::new(&config.auth)
@@ -15,7 +15,7 @@ async fn test_keycloak_authentication() {
         .expect("Failed to create authenticator");
 
     let session = authenticator
-        .authenticate("root", "root123")
+        .authenticate("root", "")
         .await
         .expect("Authentication failed");
     assert!(
@@ -25,34 +25,9 @@ async fn test_keycloak_authentication() {
     assert_eq!(session.user.username, "root");
 }
 
-// Test: Different users get different sessions
+// Test: Token fingerprint is stable for the same principal
 #[tokio::test]
-#[ignore]
-async fn test_different_users_get_different_sessions() {
-    let config =
-        sqe_core::SqeConfig::load("tests/sqe-test.toml").expect("Failed to load test config");
-    let authenticator = sqe_auth::Authenticator::new(&config.auth)
-        .await
-        .expect("Failed to create authenticator");
-
-    let session1 = authenticator
-        .authenticate("root", "root123")
-        .await
-        .expect("Auth failed for root");
-    let session2 = authenticator
-        .authenticate("testuser", "testuser123")
-        .await
-        .expect("Auth failed for testuser");
-
-    assert_ne!(session1.id, session2.id);
-    assert_ne!(session1.access_token, session2.access_token);
-    assert_eq!(session1.user.username, "root");
-    assert_eq!(session2.user.username, "testuser");
-}
-
-// Test: Token fingerprint changes with different tokens
-#[tokio::test]
-#[ignore]
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_token_fingerprint() {
     let config =
         sqe_core::SqeConfig::load("tests/sqe-test.toml").expect("Failed to load test config");
@@ -60,30 +35,21 @@ async fn test_token_fingerprint() {
         .await
         .expect("Failed to create authenticator");
 
-    let session1 = authenticator
-        .authenticate("root", "root123")
-        .await
-        .expect("Auth failed");
-    let session2 = authenticator
-        .authenticate("testuser", "testuser123")
+    let session = authenticator
+        .authenticate("root", "")
         .await
         .expect("Auth failed");
 
-    let fp1 = session1.token_fingerprint();
-    let fp2 = session2.token_fingerprint();
-    assert_ne!(
-        fp1, fp2,
-        "Different users should have different token fingerprints"
-    );
+    let fp = session.token_fingerprint();
     assert!(
-        fp1.starts_with("root-"),
+        fp.starts_with("root-"),
         "Fingerprint should start with username"
     );
 }
 
 // Test: Query handler executes SELECT 1
 #[tokio::test]
-#[ignore]
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_simple_select() {
     let config =
         sqe_core::SqeConfig::load("tests/sqe-test.toml").expect("Failed to load test config");
@@ -91,7 +57,7 @@ async fn test_simple_select() {
         .await
         .expect("Failed to create authenticator");
     let session = authenticator
-        .authenticate("root", "root123")
+        .authenticate("root", "")
         .await
         .expect("Auth failed");
 
@@ -144,7 +110,7 @@ async fn setup_handler() -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
         .await
         .expect("Failed to create authenticator");
     let session = authenticator
-        .authenticate("root", "root123")
+        .authenticate("root", "")
         .await
         .expect("Auth failed for root");
     let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(sqe_policy::PassthroughEnforcer);
@@ -154,7 +120,7 @@ async fn setup_handler() -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
 
 // Test: CTAS roundtrip — create a table, select from it, verify, cleanup
 #[tokio::test]
-#[ignore] // Requires quickstart stack
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_ctas_roundtrip() {
     let (session, handler) = setup_handler().await;
 
@@ -210,7 +176,7 @@ async fn test_ctas_roundtrip() {
 
 // Test: INSERT INTO — create a table, insert a second row, verify both rows
 #[tokio::test]
-#[ignore] // Requires quickstart stack
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_insert_into() {
     let (session, handler) = setup_handler().await;
 
@@ -255,7 +221,7 @@ async fn test_insert_into() {
 
 // Test: DROP TABLE — create a table, drop it, verify it no longer appears
 #[tokio::test]
-#[ignore] // Requires quickstart stack
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_drop_table() {
     let (session, handler) = setup_handler().await;
 
@@ -291,7 +257,7 @@ async fn test_drop_table() {
 
 // Test: DROP TABLE IF EXISTS on a non-existent table should not error
 #[tokio::test]
-#[ignore] // Requires quickstart stack
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_drop_table_if_exists_no_error() {
     let (session, handler) = setup_handler().await;
 
@@ -311,7 +277,7 @@ async fn test_drop_table_if_exists_no_error() {
 // Test: DELETE FROM returns a descriptive "not implemented" error
 #[test]
 fn test_delete_returns_not_implemented() {
-    // This test does not need the quickstart stack — it only checks the error
+    // This test does not need the test stack — it only checks the error
     // message produced by the SQL classifier + query handler routing.
     //
     // We verify at the classifier level that DELETE is recognized, and check
@@ -350,7 +316,7 @@ fn test_worker_registry_no_workers() {
 
 // Test: Coordinator with no workers falls back to local execution
 #[tokio::test]
-#[ignore] // Requires quickstart stack
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_local_fallback_without_workers() {
     let (session, handler) = setup_handler().await;
 
@@ -389,10 +355,10 @@ fn test_scan_task_roundtrip() {
 
 // Test: Distributed SELECT with coordinator + worker (requires both running)
 #[tokio::test]
-#[ignore] // Requires quickstart stack + running worker
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh + running worker
 async fn test_distributed_select() {
     // This test requires:
-    // 1. Quickstart stack (Keycloak, Polaris, MinIO)
+    // 1. Test stack (Polaris in-memory, RustFS)
     // 2. A worker running on localhost:50052
     // 3. A table with data in Polaris
     //
@@ -406,7 +372,7 @@ async fn test_distributed_select() {
         .await
         .expect("Failed to create authenticator");
     let session = authenticator
-        .authenticate("root", "root123")
+        .authenticate("root", "")
         .await
         .expect("Auth failed");
 
@@ -526,9 +492,9 @@ fn test_trino_batches_to_json() {
     assert_eq!(rows[0][0], serde_json::json!(1));
 }
 
-// Test: information_schema.tables is queryable (requires quickstart stack)
+// Test: information_schema.tables is queryable
 #[tokio::test]
-#[ignore]
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_information_schema_tables() {
     let (session, handler) = setup_handler().await;
 
@@ -540,9 +506,9 @@ async fn test_information_schema_tables() {
     assert!(!batches.is_empty());
 }
 
-// Test: information_schema.schemata is queryable (requires quickstart stack)
+// Test: information_schema.schemata is queryable
 #[tokio::test]
-#[ignore]
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_information_schema_schemata() {
     let (session, handler) = setup_handler().await;
 
