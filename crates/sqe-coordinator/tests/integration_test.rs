@@ -1,15 +1,32 @@
 //! Integration tests for SQE coordinator.
 //! These tests require a running lightweight test stack (Polaris in-memory + RustFS).
-//! Run with: cargo test -p sqe-coordinator --test integration_test -- --ignored
+//! Run with: ./scripts/integration-test.sh
 
 use std::sync::Arc;
+
+/// Resolve the test config path relative to the workspace root.
+/// CARGO_MANIFEST_DIR points to the crate dir (crates/sqe-coordinator),
+/// so we go up two levels to reach the workspace root.
+fn test_config_path() -> String {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+        .unwrap_or_else(|_| ".".to_string());
+    let workspace_root = std::path::Path::new(&manifest_dir)
+        .parent()  // crates/
+        .and_then(|p| p.parent())  // workspace root
+        .unwrap_or(std::path::Path::new("."));
+    workspace_root
+        .join("tests")
+        .join("sqe-test.toml")
+        .to_string_lossy()
+        .to_string()
+}
 
 // Test: Authenticate via client_credentials against Polaris built-in OAuth
 #[tokio::test]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_authentication() {
     let config =
-        sqe_core::SqeConfig::load("tests/sqe-test.toml").expect("Failed to load test config");
+        sqe_core::SqeConfig::load(&test_config_path()).expect("Failed to load test config");
     let authenticator = sqe_auth::Authenticator::new(&config.auth)
         .await
         .expect("Failed to create authenticator");
@@ -30,7 +47,7 @@ async fn test_authentication() {
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_token_fingerprint() {
     let config =
-        sqe_core::SqeConfig::load("tests/sqe-test.toml").expect("Failed to load test config");
+        sqe_core::SqeConfig::load(&test_config_path()).expect("Failed to load test config");
     let authenticator = sqe_auth::Authenticator::new(&config.auth)
         .await
         .expect("Failed to create authenticator");
@@ -52,7 +69,7 @@ async fn test_token_fingerprint() {
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_simple_select() {
     let config =
-        sqe_core::SqeConfig::load("tests/sqe-test.toml").expect("Failed to load test config");
+        sqe_core::SqeConfig::load(&test_config_path()).expect("Failed to load test config");
     let authenticator = sqe_auth::Authenticator::new(&config.auth)
         .await
         .expect("Failed to create authenticator");
@@ -105,7 +122,7 @@ fn test_sql_classification() {
 /// Helper: authenticate as root and return (session, handler).
 async fn setup_handler() -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
     let config =
-        sqe_core::SqeConfig::load("tests/sqe-test.toml").expect("Failed to load test config");
+        sqe_core::SqeConfig::load(&test_config_path()).expect("Failed to load test config");
     let authenticator = sqe_auth::Authenticator::new(&config.auth)
         .await
         .expect("Failed to create authenticator");
@@ -365,7 +382,7 @@ async fn test_distributed_select() {
     // Run the worker: cargo run -p sqe-worker -- tests/sqe-test.toml
     // Then run: cargo test -p sqe-coordinator --test integration_test test_distributed_select -- --ignored
 
-    let config = sqe_core::SqeConfig::load("tests/sqe-test.toml")
+    let config = sqe_core::SqeConfig::load(&test_config_path())
         .expect("Failed to load test config");
 
     let authenticator = sqe_auth::Authenticator::new(&config.auth)
