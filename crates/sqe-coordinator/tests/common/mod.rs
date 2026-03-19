@@ -55,6 +55,8 @@ pub async fn setup_handler() -> (sqe_core::Session, sqe_coordinator::QueryHandle
 }
 
 /// Format a single cell value from an Arrow column for display / comparison.
+// Used by sql_compat_test.rs; integration_test.rs uses print_results instead.
+#[allow(dead_code)]
 pub fn fmt_val(col: &dyn arrow_array::Array, row: usize) -> String {
     #[allow(unused_imports)]
     use arrow_array::Array as _;
