@@ -18,6 +18,11 @@ The script:
 ./scripts/integration-test.sh test_inner_join
 ```
 
+**Run only SQL compat tests:**
+```bash
+./scripts/integration-test.sh test_sql_compat
+```
+
 **Increase log verbosity:**
 ```bash
 RUST_LOG=debug ./scripts/integration-test.sh
@@ -142,6 +147,32 @@ Fixture tables: `test_ns.employees`, `test_ns.departments`
 |---|---|
 | `test_window_functions` | `SELECT name, dept_id, salary, ROW_NUMBER() OVER (PARTITION BY dept_id ORDER BY salary DESC) as row_num, RANK() OVER (PARTITION BY dept_id ORDER BY salary DESC) as rnk FROM test_ns.employees WHERE dept_id IN (10, 20) ORDER BY dept_id, salary DESC` |
 | `test_window_running_total` | `SELECT name, salary, SUM(salary) OVER (ORDER BY salary ROWS UNBOUNDED PRECEDING) as running_total FROM test_ns.employees ORDER BY salary` |
+
+---
+
+## SQL Compatibility Tests
+
+File-driven tests in `crates/sqe-coordinator/tests/sql/` use a simple block format — no test stack needed for the format itself, but the engine is required:
+
+```
+--- test_name
+SQL statement;
+--- expect
+col1 | col2
+val1 | val2
+```
+
+Each `.sql` file is one `#[tokio::test]` function in `tests/sql_compat_test.rs`. Tests use CTEs instead of fixture tables so they are fully self-contained.
+
+| File | Contents |
+|---|---|
+| `01_basic_select.sql` | Integer literals, arithmetic, CAST, CASE, COALESCE, NULL |
+| `02_null_handling.sql` | IS NULL, COALESCE, NULLIF, NULL propagation |
+| `03_cte_queries.sql` | WITH clauses, filters, aggregations, self-join, subquery in WHERE |
+| `04_string_functions.sql` | UPPER, LOWER, LENGTH, CONCAT, TRIM, SUBSTRING, LIKE |
+| `05_aggregations.sql` | COUNT, SUM, AVG, MIN/MAX, GROUP BY, HAVING, COUNT DISTINCT |
+
+**Add a new SQL compat test** by appending a block to any existing file or creating a new one and registering it in `sql_compat_test.rs`.
 
 ---
 

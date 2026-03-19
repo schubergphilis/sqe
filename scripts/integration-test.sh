@@ -2,9 +2,10 @@
 set -euo pipefail
 
 # Run integration tests against the lightweight test stack (Polaris in-memory + RustFS).
-# Usage: ./scripts/integration-test.sh [cargo test args...]
-# Example: ./scripts/integration-test.sh test_authentication
-#          ./scripts/integration-test.sh                      # run all
+# Usage: ./scripts/integration-test.sh [filter]
+# Example: ./scripts/integration-test.sh test_authentication      # single test by name
+#          ./scripts/integration-test.sh test_sql_compat          # all SQL compat tests
+#          ./scripts/integration-test.sh                          # run all
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -24,9 +25,10 @@ SQE_LOG_FILE="$(mktemp /tmp/sqe-test-XXXXXX.log)"
 
 echo ""
 echo "Running integration tests..."
+# Runs all test binaries in sqe-coordinator (integration_test + sql_compat_test).
 # Capture SQE coordinator tracing output (requires RUST_LOG to be set for structured logs)
 RUST_LOG="${RUST_LOG:-sqe_coordinator=info,sqe_catalog=info,sqe_auth=info,warn}" \
-    cargo test -p sqe-coordinator --test integration_test -- --ignored --test-threads=1 --nocapture "$@" 2>&1 \
+    cargo test -p sqe-coordinator -- --ignored --test-threads=1 --nocapture "$@" 2>&1 \
     | tee "$SQE_LOG_FILE"
 EXIT_CODE=${PIPESTATUS[0]}
 
