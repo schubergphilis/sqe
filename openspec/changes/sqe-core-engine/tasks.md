@@ -46,12 +46,14 @@
 
 ## 6. Query Engine & Planner (sqe-planner)
 
+> **Prerequisite for 6.x:** Upgrade to iceberg-rust 0.9.0 + DataFusion 52 first (Step 0 in nextsteps.md). Implement `ExecutionPlan::apply_expressions()` on `IcebergScanExec` (required new trait method, DataFusion PR #20337) and handle `IcebergTableProvider` static/non-static split (iceberg-rust PR #1879) as part of that upgrade.
+
 - [x] 6.1 Implement query planning: parse → LogicalPlan via DataFusion SQL planner
 - [x] 6.2 Wire policy enforcement into plan pipeline (passthrough)
-- [ ] 6.3 Implement DataFusion optimizer pass with Iceberg predicate pushdown
+- [ ] 6.3 Implement DataFusion optimizer pass with Iceberg predicate pushdown (DataFusion 52 extends pushdown to LIMIT, LIKE, Boolean, Timestamp — available after Step 0 upgrade)
 - [x] 6.4 Implement PhysicalPlan generation from optimized LogicalPlan
 - [x] 6.5 Implement adaptive fragment splitting: extract Iceberg manifest groups from PhysicalPlan
-- [ ] 6.6 Implement custom datafusion-proto codec extensions for iceberg-rust plan nodes
+- [ ] 6.6 Implement custom datafusion-proto codec extensions for iceberg-rust plan nodes — use `PhysicalExtensionProtoCodec` trait (DataFusion PR #19437) + model `IcebergScanExecNode` on `ArrowScanExecNode` pattern (PR #20284); replaces JSON ScanTask workaround
 - [x] 6.7 Unit tests: fragment splitting for small (1 manifest) and large (100+ manifests) tables
 
 ## 7. Coordinator (sqe-coordinator)
@@ -75,8 +77,8 @@
 - [x] 8.1 Implement CTAS: execute SELECT → infer schema → create table in Polaris → write Parquet → commit snapshot
 - [x] 8.2 Implement CREATE OR REPLACE TABLE: new snapshot replacement, old snapshots retained
 - [x] 8.3 Implement INSERT INTO SELECT: execute SELECT → write new data files → append snapshot
-- [ ] 8.4 Implement DELETE FROM: scan with predicate → write position delete files → commit
-- [ ] 8.5 Implement MERGE INTO: scan target+source → join → classify → position deletes + new data → atomic commit
+- [ ] 8.4 Implement DELETE FROM: scan with predicate → write position delete files → commit ⚠️ **BLOCKED** — requires iceberg-rust Merge-on-Read (Epic #2186, ETA Q3 2026)
+- [ ] 8.5 Implement MERGE INTO: scan target+source → join → classify → position deletes + new data → atomic commit ⚠️ **BLOCKED** — requires iceberg-rust Merge-on-Read (Epic #2186, ETA Q3 2026)
 - [x] 8.6 Implement DROP TABLE / DROP TABLE IF EXISTS: Polaris REST delete
 - [x] 8.7 Implement ALTER TABLE RENAME: Polaris REST rename
 - [x] 8.8 Implement CREATE VIEW: serialize SQL to Polaris REST view API
