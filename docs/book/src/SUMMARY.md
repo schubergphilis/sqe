@@ -25,6 +25,7 @@
 # Features
 
 - [SQL Support](./features/sql-support.md)
+- [Query Plan Inspection](./features/explain.md)
 - [Custom SQL Extensions](./features/custom-sql.md)
 - [Iceberg Integration](./features/iceberg.md)
 - [Write Path](./features/write-path.md)
