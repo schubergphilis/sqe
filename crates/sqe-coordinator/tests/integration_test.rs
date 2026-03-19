@@ -1352,6 +1352,8 @@ async fn test_explain_full() {
     assert!(batch.column_by_name("estimated_bytes").is_some());
     assert!(batch.column_by_name("files_scanned").is_some());
     assert!(batch.column_by_name("files_total").is_some());
+    assert!(batch.column_by_name("output_rows").is_some());
+    assert!(batch.column_by_name("elapsed_ms").is_some());
 
     let ops = batch
         .column_by_name("operation")
