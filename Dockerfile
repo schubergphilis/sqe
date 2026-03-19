@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # ── Stage 1: Base builder with tools ──────────────────────────
 FROM rust:bookworm AS chef
 
