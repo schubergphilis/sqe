@@ -27,29 +27,32 @@ fn print_table(result: &QueryResult) {
         }
     }
 
+    let border: String = widths.iter().map(|w| format!("+{}", "-".repeat(w + 2))).collect::<String>() + "+";
+
     // Header
+    println!("{border}");
     let header: Vec<String> = result
         .columns
         .iter()
         .enumerate()
-        .map(|(i, c)| format!("{:width$}", c, width = widths[i]))
+        .map(|(i, c)| format!(" {:width$} ", c, width = widths[i]))
         .collect();
-    println!(" {} ", header.join(" | "));
+    println!("|{}|", header.join("|"));
 
     // Separator
-    let sep: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
-    println!("-{}-", sep.join("-+-"));
+    println!("{border}");
 
     // Rows
     for row in &result.rows {
         let cells: Vec<String> = row
             .iter()
             .enumerate()
-            .map(|(i, v)| format!("{:width$}", v, width = widths.get(i).copied().unwrap_or(0)))
+            .map(|(i, v)| format!(" {:width$} ", v, width = widths.get(i).copied().unwrap_or(0)))
             .collect();
-        println!(" {} ", cells.join(" | "));
+        println!("|{}|", cells.join("|"));
     }
 
+    println!("{border}");
     eprintln!("({} rows)", result.rows.len());
 }
 
