@@ -1258,3 +1258,150 @@ async fn test_window_running_total() {
 
     teardown_join_fixture(&session, &handler).await;
 }
+
+// ---------------------------------------------------------------------------
+// EXPLAIN / EXPLAIN ANALYZE / EXPLAIN FULL integration tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_explain_plan() {
+    let (session, handler) = setup_join_fixture().await;
+
+    let sql = "EXPLAIN SELECT * FROM test_ns.employees WHERE dept_id = 10";
+    let batches = handler
+        .execute(&session, sql)
+        .await
+        .expect("EXPLAIN should succeed");
+
+    common::print_results("EXPLAIN", sql, &batches);
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2, "EXPLAIN returns exactly 2 rows (logical + physical)");
+
+    let batch = &batches[0];
+    let plan_type_col = batch.column_by_name("plan_type").expect("plan_type column");
+    let plan_col = batch.column_by_name("plan").expect("plan column");
+
+    let plan_types = plan_type_col
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("plan_type is Utf8");
+    assert_eq!(plan_types.value(0), "logical_plan");
+    assert_eq!(plan_types.value(1), "physical_plan");
+
+    let plans = plan_col
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("plan is Utf8");
+    assert!(!plans.value(0).is_empty(), "logical plan text must not be empty");
+    assert!(!plans.value(1).is_empty(), "physical plan text must not be empty");
+    assert!(
+        plans.value(0).contains("employees"),
+        "logical plan should mention 'employees' table"
+    );
+
+    teardown_join_fixture(&session, &handler).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_explain_analyze() {
+    let (session, handler) = setup_join_fixture().await;
+
+    let sql = "EXPLAIN ANALYZE SELECT dept_id, COUNT(*) FROM test_ns.employees GROUP BY dept_id";
+    let batches = handler
+        .execute(&session, sql)
+        .await
+        .expect("EXPLAIN ANALYZE should succeed");
+
+    common::print_results("EXPLAIN ANALYZE", sql, &batches);
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert!(total_rows >= 1, "EXPLAIN ANALYZE should return at least one operator row");
+
+    let batch = &batches[0];
+    assert!(batch.column_by_name("step").is_some(), "must have 'step' column");
+    assert!(batch.column_by_name("operation").is_some(), "must have 'operation' column");
+    assert!(batch.column_by_name("output_rows").is_some(), "must have 'output_rows' column");
+    assert!(batch.column_by_name("elapsed_ms").is_some(), "must have 'elapsed_ms' column");
+
+    teardown_join_fixture(&session, &handler).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_explain_full() {
+    let (session, handler) = setup_join_fixture().await;
+
+    let sql = "EXPLAIN FULL SELECT * FROM test_ns.employees";
+    let batches = handler
+        .execute(&session, sql)
+        .await
+        .expect("EXPLAIN FULL should succeed");
+
+    common::print_results("EXPLAIN FULL", sql, &batches);
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert!(total_rows >= 1, "EXPLAIN FULL should return at least one row");
+
+    let batch = &batches[0];
+    assert!(batch.column_by_name("step").is_some());
+    assert!(batch.column_by_name("operation").is_some());
+    assert!(batch.column_by_name("estimated_rows").is_some());
+    assert!(batch.column_by_name("estimated_bytes").is_some());
+    assert!(batch.column_by_name("files_scanned").is_some());
+    assert!(batch.column_by_name("files_total").is_some());
+
+    let ops = batch
+        .column_by_name("operation")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let files_total_col = batch.column_by_name("files_total").unwrap();
+
+    let scan_row = (0..batch.num_rows())
+        .find(|&i| ops.value(i) == "IcebergScanExec");
+
+    assert!(
+        scan_row.is_some(),
+        "Expected an IcebergScanExec row in EXPLAIN FULL output"
+    );
+    let row = scan_row.unwrap();
+    assert!(
+        !files_total_col.is_null(row),
+        "IcebergScanExec row should have non-NULL files_total"
+    );
+
+    teardown_join_fixture(&session, &handler).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_explain_policy_aware() {
+    let (session, handler) = setup_join_fixture().await;
+
+    let sql = "EXPLAIN SELECT name, salary FROM test_ns.employees ORDER BY salary DESC";
+    let batches = handler
+        .execute(&session, sql)
+        .await
+        .expect("EXPLAIN with policy enforcement should succeed");
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2, "Should still return 2 plan rows");
+
+    let batch = &batches[0];
+    let plans = batch
+        .column_by_name("plan")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert!(
+        plans.value(0).contains("employees") || plans.value(1).contains("employees"),
+        "Plan should reference the queried table"
+    );
+
+    teardown_join_fixture(&session, &handler).await;
+}
