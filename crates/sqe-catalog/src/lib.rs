@@ -7,4 +7,5 @@ pub mod iceberg_scan;
 pub mod info_schema;
 
 pub use catalog_provider::SqeCatalogProvider;
+pub use iceberg_scan::IcebergScanExec;
 pub use rest_catalog::SessionCatalog;
