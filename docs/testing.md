@@ -148,6 +148,15 @@ Fixture tables: `test_ns.employees`, `test_ns.departments`
 | `test_window_functions` | `SELECT name, dept_id, salary, ROW_NUMBER() OVER (PARTITION BY dept_id ORDER BY salary DESC) as row_num, RANK() OVER (PARTITION BY dept_id ORDER BY salary DESC) as rnk FROM test_ns.employees WHERE dept_id IN (10, 20) ORDER BY dept_id, salary DESC` |
 | `test_window_running_total` | `SELECT name, salary, SUM(salary) OVER (ORDER BY salary ROWS UNBOUNDED PRECEDING) as running_total FROM test_ns.employees ORDER BY salary` |
 
+#### EXPLAIN
+
+| Test | What it checks |
+|---|---|
+| `test_explain_plan` | `EXPLAIN SELECT …` returns 2 rows (`logical_plan`, `physical_plan`); plan text non-empty and contains table name |
+| `test_explain_analyze` | `EXPLAIN ANALYZE SELECT …` returns ≥1 row; all schema columns present |
+| `test_explain_full` | `EXPLAIN FULL SELECT …` returns ≥1 row; `IcebergScanExec` row has non-NULL `files_total` |
+| `test_explain_policy_aware` | EXPLAIN with passthrough enforcer succeeds; plan references queried table |
+
 ---
 
 ## SQL Compatibility Tests
