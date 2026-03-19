@@ -8,8 +8,8 @@
 pipelining = true
 
 # ── Local development (macOS) ─────────────────────────────────────────────
-# On macOS, use lld via Apple's llvm-15+ if available (brew install llvm).
-# Uncomment and adjust the path if you have LLVM installed:
+# mold does NOT support macOS native linking (Mach-O format).
+# For faster macOS linking: brew install llvm, then use ld64.lld:
 # [target.aarch64-apple-darwin]
 # rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/opt/llvm/bin/ld64.lld"]
 
