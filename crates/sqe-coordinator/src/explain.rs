@@ -136,9 +136,11 @@ impl ExplainHandler {
         Ok(vec![batch])
     }
 
-    /// EXPLAIN FULL <query> — plan + Iceberg statistics, no execution.
+    /// EXPLAIN FULL <query> — executes the query and returns Iceberg statistics
+    /// combined with actual per-operator metrics.
     /// Output schema: (step INT32, operation TEXT, estimated_rows INT64,
-    ///                 estimated_bytes INT64, files_scanned INT32, files_total INT32)
+    ///                 estimated_bytes INT64, files_scanned INT32, files_total INT32,
+    ///                 output_rows INT64, elapsed_ms FLOAT64)
     pub async fn full(
         &self,
         session: &Session,
@@ -161,6 +163,11 @@ impl ExplainHandler {
             .await
             .map_err(|e| SqeError::Execution(format!("Physical planning failed: {e}")))?;
 
+        // Execute — populates per-node metrics in-place
+        collect(physical.clone(), ctx.task_ctx())
+            .await
+            .map_err(|e| SqeError::Execution(format!("EXPLAIN FULL execution failed: {e}")))?;
+
         let mut rows: Vec<FullRow> = Vec::new();
         walk_full(&physical, &mut rows);
 
@@ -171,6 +178,8 @@ impl ExplainHandler {
             Field::new("estimated_bytes", DataType::Int64, true),
             Field::new("files_scanned", DataType::Int32, true),
             Field::new("files_total", DataType::Int32, true),
+            Field::new("output_rows", DataType::Int64, true),
+            Field::new("elapsed_ms", DataType::Float64, true),
         ]));
 
         let steps: ArrayRef = Arc::new(Int32Array::from(
@@ -197,10 +206,12 @@ impl ExplainHandler {
         let est_bytes = nullable_array!(arrow_array::builder::Int64Builder, &rows, estimated_bytes);
         let f_scanned = nullable_array!(arrow_array::builder::Int32Builder, &rows, files_scanned);
         let f_total = nullable_array!(arrow_array::builder::Int32Builder, &rows, files_total);
+        let out_rows = nullable_array!(arrow_array::builder::Int64Builder, &rows, output_rows);
+        let elapsed = nullable_array!(arrow_array::builder::Float64Builder, &rows, elapsed_ms);
 
         let batch = RecordBatch::try_new(
             schema,
-            vec![steps, ops, est_rows, est_bytes, f_scanned, f_total],
+            vec![steps, ops, est_rows, est_bytes, f_scanned, f_total, out_rows, elapsed],
         )
         .map_err(|e| SqeError::Execution(format!("Failed to build full explain batch: {e}")))?;
 
@@ -226,6 +237,8 @@ struct FullRow {
     estimated_bytes: Option<i64>,
     files_scanned: Option<i32>,
     files_total: Option<i32>,
+    output_rows: Option<i64>,
+    elapsed_ms: Option<f64>,
 }
 
 fn walk_analyze(node: &Arc<dyn ExecutionPlan>, rows: &mut Vec<AnalyzeRow>) {
@@ -253,6 +266,11 @@ fn walk_full(node: &Arc<dyn ExecutionPlan>, rows: &mut Vec<FullRow>) {
     let step = rows.len() as i32;
     let operation = node.name().to_string();
 
+    // Actual execution metrics (populated after collect())
+    let metrics = node.metrics();
+    let output_rows = metrics.as_ref().and_then(|m| m.output_rows()).map(|r| r as i64);
+    let elapsed_ms = metrics.as_ref().and_then(|m| m.elapsed_compute()).map(|ns| ns as f64 / 1_000_000.0);
+
     if let Some(scan) = node.as_any().downcast_ref::<IcebergScanExec>() {
         let table = scan.table();
         let snap = table.metadata().current_snapshot();
@@ -260,18 +278,12 @@ fn walk_full(node: &Arc<dyn ExecutionPlan>, rows: &mut Vec<FullRow>) {
 
         let parse_i64 = |key: &str| -> Option<i64> {
             props.as_ref()?.get(key)?.parse::<i64>()
-                .map_err(|e| {
-                    tracing::warn!(key, "Failed to parse Iceberg snapshot stat: {e}");
-                    e
-                })
+                .map_err(|e| { tracing::warn!(key, "Failed to parse Iceberg snapshot stat: {e}"); e })
                 .ok()
         };
         let parse_i32 = |key: &str| -> Option<i32> {
             props.as_ref()?.get(key)?.parse::<i32>()
-                .map_err(|e| {
-                    tracing::warn!(key, "Failed to parse Iceberg snapshot stat: {e}");
-                    e
-                })
+                .map_err(|e| { tracing::warn!(key, "Failed to parse Iceberg snapshot stat: {e}"); e })
                 .ok()
         };
 
@@ -280,14 +292,7 @@ fn walk_full(node: &Arc<dyn ExecutionPlan>, rows: &mut Vec<FullRow>) {
         let files_total = parse_i32("total-data-files");
         let files_scanned = files_total;
 
-        rows.push(FullRow {
-            step,
-            operation,
-            estimated_rows,
-            estimated_bytes,
-            files_scanned,
-            files_total,
-        });
+        rows.push(FullRow { step, operation, estimated_rows, estimated_bytes, files_scanned, files_total, output_rows, elapsed_ms });
     } else {
         use datafusion::common::stats::Precision;
         let estimated_rows = node
@@ -298,13 +303,6 @@ fn walk_full(node: &Arc<dyn ExecutionPlan>, rows: &mut Vec<FullRow>) {
                 Precision::Absent => None,
             });
 
-        rows.push(FullRow {
-            step,
-            operation,
-            estimated_rows,
-            estimated_bytes: None,
-            files_scanned: None,
-            files_total: None,
-        });
+        rows.push(FullRow { step, operation, estimated_rows, estimated_bytes: None, files_scanned: None, files_total: None, output_rows, elapsed_ms });
     }
 }
