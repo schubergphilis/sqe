@@ -1399,8 +1399,8 @@ async fn test_explain_policy_aware() {
         .downcast_ref::<StringArray>()
         .unwrap();
     assert!(
-        plans.value(0).contains("employees") || plans.value(1).contains("employees"),
-        "Plan should reference the queried table"
+        plans.value(0).contains("employees"),
+        "Logical plan should reference the queried table"
     );
 
     teardown_join_fixture(&session, &handler).await;
