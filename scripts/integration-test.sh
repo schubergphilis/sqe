@@ -46,24 +46,24 @@ echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  SQE Engine logs (last 200 lines)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-tail -200 "$SQE_LOG_FILE"
-rm -f "$SQE_LOG_FILE"
+#tail -200 "$SQE_LOG_FILE"
+#rm -f "$SQE_LOG_FILE"
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  Polaris logs (last 100 lines)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-docker compose -f "$COMPOSE_FILE" logs --no-log-prefix --tail=100 polaris
+#docker compose -f "$COMPOSE_FILE" logs --no-log-prefix --tail=100 polaris
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  RustFS logs (last 50 lines)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-docker compose -f "$COMPOSE_FILE" logs --no-log-prefix --tail=50 rustfs
+#docker compose -f "$COMPOSE_FILE" logs --no-log-prefix --tail=50 rustfs
 
 # ── Tear down test stack ───────────────────────────────────────
 echo ""
 echo "Tearing down test stack..."
-docker compose -f "$COMPOSE_FILE" down
+#docker compose -f "$COMPOSE_FILE" down
 
 exit $EXIT_CODE
