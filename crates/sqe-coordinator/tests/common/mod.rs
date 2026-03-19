@@ -58,7 +58,7 @@ pub async fn setup_handler() -> (sqe_core::Session, sqe_coordinator::QueryHandle
 pub fn fmt_val(col: &dyn arrow_array::Array, row: usize) -> String {
     #[allow(unused_imports)]
     use arrow_array::Array as _;
-    if col.is_null(row) {
+    if col.is_null(row) || col.as_any().downcast_ref::<arrow_array::NullArray>().is_some() {
         return "NULL".to_string();
     }
     if let Some(a) = col.as_any().downcast_ref::<arrow_array::Int64Array>() {
@@ -92,31 +92,13 @@ pub fn fmt_val(col: &dyn arrow_array::Array, row: usize) -> String {
     format!("?({:?})", col.data_type())
 }
 
-/// Pretty-print RecordBatches for test diagnostics.
+/// Pretty-print RecordBatches for test diagnostics using Arrow's built-in formatter.
 pub fn print_results(label: &str, sql: &str, batches: &[arrow_array::RecordBatch]) {
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    println!("\n╔══ {label} ══╗");
-    println!("│ SQL: {sql}");
-    println!("│ Rows: {total_rows}");
-    if let Some(batch) = batches.first() {
-        if batch.num_rows() > 0 {
-            let schema = batch.schema();
-            let headers: Vec<&str> =
-                schema.fields().iter().map(|f| f.name().as_str()).collect();
-            let header_line = headers.join(" | ");
-            println!("│ {header_line}");
-            println!("│ {}", "─".repeat(header_line.len()));
-        }
+    println!("\n-- {label} ({total_rows} rows)");
+    println!("-- {sql}");
+    match arrow::util::pretty::pretty_format_batches(batches) {
+        Ok(table) => println!("{table}"),
+        Err(e) => println!("(could not format: {e})"),
     }
-    for batch in batches {
-        for row in 0..batch.num_rows() {
-            let vals: Vec<String> = batch
-                .columns()
-                .iter()
-                .map(|col| fmt_val(col.as_ref(), row))
-                .collect();
-            println!("│ {}", vals.join(" | "));
-        }
-    }
-    println!("╚{}╝", "═".repeat(label.len() + 4));
 }
