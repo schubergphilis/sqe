@@ -4,6 +4,24 @@
 
 ---
 
+## Step 0: Dependency Alignment Sprint
+
+**Must complete before anything else** — upstream breaking changes in DataFusion 52 and iceberg-rust 0.9.0 will block compilation of custom plan nodes if left unaddressed.
+
+| Task | Detail |
+|---|---|
+| Upgrade `iceberg-rust` 0.8.0 → 0.9.0 | Released March 10, 2026. Brings DataFusion 52.2, CoW OverwriteAction, predicate pushdown improvements |
+| Implement `apply_expressions()` on `IcebergScanExec` | **Required** new method in `ExecutionPlan` trait (DataFusion PR #20337); will not compile without it |
+| Handle `IcebergTableProvider` static/non-static split | API broken in 0.9.0 (PR #1879); use live-fetch variant for per-user auth sessions |
+| Add `iceberg-storage-opendal` crate dependency | OpenDAL storage moved to separate crate in 0.9.0; any direct FileIO usage breaks |
+| Update MSRV to Rust 1.92.0 | Required by iceberg-rust 0.9.0; check CI Rust toolchain version |
+| Replace JSON `ScanTask` worker dispatch with `PhysicalExtensionProtoCodec` | DataFusion PR #19437 provides the proper extension serialization hook; addresses task 6.6 |
+| Fix Polaris request ID header | `Polaris-Request-Id` → `X-Request-ID` (changed in Polaris 1.3.0) |
+
+> **Monitoring:** OPA SPI refactor in Polaris (PR #3999, still draft) will affect Phase 5 OPA integration when it lands — do not implement OPA against Polaris until this stabilises. Remote S3 signing (Iceberg 1.12, not yet released) will affect the pluggable-catalogs design.
+
+---
+
 ## Step 1: Security and Functional Audit
 
 Before starting new feature development, audit the current codebase against the design intent. Do this as a structured review, not just a code read.
@@ -62,10 +80,14 @@ The core engine is functional but has unimplemented items across every subsystem
 
 ### 2a. Write Path
 
-| Task | Ref |
-|---|---|
-| `DELETE FROM` — position delete files → commit snapshot | 8.4 |
-| `MERGE INTO` — join target+source → position deletes + new data files → atomic commit | 8.5 |
+> **Blocked:** `DELETE FROM` and `MERGE INTO` require iceberg-rust Merge-on-Read (position delete files) support, tracked in iceberg-rust Epic #2186. ETA Q3 2026. These tasks cannot land until then — do not attempt implementation ahead of the library.
+
+| Task | Ref | Status |
+|---|---|---|
+| `DELETE FROM` — position delete files → commit snapshot | 8.4 | Blocked — iceberg-rust MoR (#2186) |
+| `MERGE INTO` — join target+source → position deletes + new data → atomic commit | 8.5 | Blocked — iceberg-rust MoR (#2186) |
+
+In the meantime, `OverwriteAction` (CoW, merged iceberg-rust PR #2185) is available in 0.9.0 and can be used to implement full-table `INSERT OVERWRITE` semantics as a partial substitute.
 
 ### 2b. Distributed Execution
 
@@ -80,10 +102,10 @@ The core engine is functional but has unimplemented items across every subsystem
 
 ### 2c. Optimizer
 
-| Task | Ref |
-|---|---|
-| DataFusion optimizer pass with Iceberg predicate pushdown | 6.3 |
-| Custom `datafusion-proto` codec for iceberg-rust plan nodes | 6.6 |
+| Task | Ref | Notes |
+|---|---|---|
+| DataFusion optimizer pass with Iceberg predicate pushdown | 6.3 | DataFusion 52 extends pushdown to LIMIT, LIKE, Boolean, Timestamp — available after Step 0 upgrade |
+| Custom `datafusion-proto` codec for iceberg-rust plan nodes | 6.6 | Use `PhysicalExtensionProtoCodec` trait (DataFusion PR #19437) + model `IcebergScanExecNode` on `ArrowScanExecNode` pattern (PR #20284); replaces the current JSON ScanTask workaround |
 
 ### 2d. Trino Compat
 
@@ -110,8 +132,8 @@ The core engine is functional but has unimplemented items across every subsystem
 | Coordinator: two users → different catalog visibility | 7.13 |
 | Write: CTAS → SELECT roundtrip | 8.11 |
 | Write: INSERT INTO → verify appended rows | 8.12 |
-| Write: MERGE INTO → verify upserted rows | 8.13 |
-| Write: DELETE FROM → verify rows removed | 8.14 |
+| Write: MERGE INTO → verify upserted rows | 8.13 | Blocked — iceberg-rust MoR |
+| Write: DELETE FROM → verify rows removed | 8.14 | Blocked — iceberg-rust MoR |
 | Write: DROP TABLE → verify removed from Polaris | 8.15 |
 | Write: CREATE VIEW → query view → verify results | 8.16 |
 | Distributed: coordinator + 2 workers → SELECT → correct results | 9.8 |
@@ -221,12 +243,15 @@ Four sub-systems that make SQE agent-native and semantically aware.
 ## Implementation Order Rationale
 
 ```
-Step 1: audit              (1–2 days — catches issues before they compound)
-Step 2: core engine gaps   (close the open tasks before layering new features)
-Step 3: security hardening (prerequisite for OSS release; no API changes)
-Step 4: pluggable auth     (depends on Step 3 renames being done first)
-Step 5: pluggable catalogs (independent of auth; can run in parallel with Step 4)
-Step 6: semantic layer     (new crates; fully additive; no existing code broken)
+Step 0: dependency upgrade  (iceberg-rust 0.9.0 + DataFusion 52 + apply_expressions; must go first)
+Step 1: audit               (1–2 days — catches issues before they compound)
+Step 2: core engine gaps    (close the open tasks; DELETE/MERGE blocked until iceberg-rust MoR Q3 2026)
+Step 3: security hardening  (prerequisite for OSS release; no API changes)
+Step 4: pluggable auth      (depends on Step 3 renames being done first)
+Step 5: pluggable catalogs  (independent of auth; can run in parallel with Step 4)
+Step 6: semantic layer      (new crates; fully additive; no existing code broken)
 ```
 
 Steps 4 and 5 can be worked in parallel by two engineers. Step 6 is independent of 3–5 and can start any time.
+
+> **Upstream watch list:** iceberg-rust MoR (Epic #2186, Q3 2026) unblocks DELETE/MERGE; Polaris OPA SPI refactor (PR #3999) must stabilise before Phase 5 OPA integration; remote S3 signing (Iceberg 1.12) will require revisiting pluggable-catalogs credential vending design.
