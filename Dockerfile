@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # ── Stage 1: Base builder with tools ──────────────────────────
 FROM rust:bookworm AS chef
 
@@ -27,14 +28,20 @@ RUN cargo chef prepare --recipe-path recipe.json
 # ── Stage 3: Build dependencies (cached unless recipe changes) ─
 FROM chef AS deps
 COPY --from=planner /build/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json && \
+RUN --mount=type=cache,id=sqe-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=sqe-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=sqe-sccache,target=/sccache \
+    cargo chef cook --release --recipe-path recipe.json && \
     sccache --show-stats
 
 # ── Stage 4: Build application (only workspace crates recompile) ─
 FROM deps AS builder
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
-RUN cargo build --release --bin sqe-server --bin sqe-cli && \
+RUN --mount=type=cache,id=sqe-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=sqe-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=sqe-sccache,target=/sccache \
+    cargo build --release --bin sqe-server --bin sqe-cli && \
     sccache --show-stats
 
 # ── Stage 5: Runtime image ────────────────────────────────────

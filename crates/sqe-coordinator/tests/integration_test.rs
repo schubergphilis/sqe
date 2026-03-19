@@ -2,48 +2,16 @@
 //! These tests require a running lightweight test stack (Polaris in-memory + RustFS).
 //! Run with: ./scripts/integration-test.sh
 
+mod common;
+
 use std::sync::Arc;
-
-/// Initialize the tracing subscriber once for the entire test binary.
-/// Called explicitly by setup_handler(); tests that don't use setup_handler
-/// won't emit structured logs but that is acceptable.
-fn init_tracing() {
-    static TRACING_INIT: std::sync::Once = std::sync::Once::new();
-    TRACING_INIT.call_once(|| {
-        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(
-                "sqe_coordinator=info,sqe_catalog=info,sqe_auth=info,warn",
-            ));
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(std::io::stderr)
-            .init();
-    });
-}
-
-/// Resolve the test config path relative to the workspace root.
-/// CARGO_MANIFEST_DIR points to the crate dir (crates/sqe-coordinator),
-/// so we go up two levels to reach the workspace root.
-fn test_config_path() -> String {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-        .unwrap_or_else(|_| ".".to_string());
-    let workspace_root = std::path::Path::new(&manifest_dir)
-        .parent()  // crates/
-        .and_then(|p| p.parent())  // workspace root
-        .unwrap_or(std::path::Path::new("."));
-    workspace_root
-        .join("tests")
-        .join("sqe-test.toml")
-        .to_string_lossy()
-        .to_string()
-}
 
 // Test: Authenticate via client_credentials against Polaris built-in OAuth
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_authentication() {
     let config =
-        sqe_core::SqeConfig::load(&test_config_path()).expect("Failed to load test config");
+        sqe_core::SqeConfig::load(&common::test_config_path()).expect("Failed to load test config");
     let authenticator = sqe_auth::Authenticator::new(&config.auth)
         .await
         .expect("Failed to create authenticator");
@@ -64,7 +32,7 @@ async fn test_authentication() {
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_token_fingerprint() {
     let config =
-        sqe_core::SqeConfig::load(&test_config_path()).expect("Failed to load test config");
+        sqe_core::SqeConfig::load(&common::test_config_path()).expect("Failed to load test config");
     let authenticator = sqe_auth::Authenticator::new(&config.auth)
         .await
         .expect("Failed to create authenticator");
@@ -86,7 +54,7 @@ async fn test_token_fingerprint() {
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_simple_select() {
     let config =
-        sqe_core::SqeConfig::load(&test_config_path()).expect("Failed to load test config");
+        sqe_core::SqeConfig::load(&common::test_config_path()).expect("Failed to load test config");
     let authenticator = sqe_auth::Authenticator::new(&config.auth)
         .await
         .expect("Failed to create authenticator");
@@ -136,29 +104,12 @@ fn test_sql_classification() {
 // Write-path integration tests
 // ---------------------------------------------------------------------------
 
-/// Helper: authenticate as root and return (session, handler).
-async fn setup_handler() -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
-    init_tracing();
-
-    let config =
-        sqe_core::SqeConfig::load(&test_config_path()).expect("Failed to load test config");
-    let authenticator = sqe_auth::Authenticator::new(&config.auth)
-        .await
-        .expect("Failed to create authenticator");
-    let session = authenticator
-        .authenticate("root", "")
-        .await
-        .expect("Auth failed for root");
-    let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(sqe_policy::PassthroughEnforcer);
-    let handler = sqe_coordinator::QueryHandler::new(policy, config, None, None, None);
-    (session, handler)
-}
 
 // Test: CTAS roundtrip — create a table, select from it, verify, cleanup
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_ctas_roundtrip() {
-    let (session, handler) = setup_handler().await;
+    let (session, handler) = common::setup_handler().await;
 
     // Cleanup in case a previous run left the table behind
     let _ = handler
@@ -214,7 +165,7 @@ async fn test_ctas_roundtrip() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_insert_into() {
-    let (session, handler) = setup_handler().await;
+    let (session, handler) = common::setup_handler().await;
 
     // Cleanup leftover
     let _ = handler
@@ -259,7 +210,7 @@ async fn test_insert_into() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_drop_table() {
-    let (session, handler) = setup_handler().await;
+    let (session, handler) = common::setup_handler().await;
 
     // Cleanup leftover
     let _ = handler
@@ -295,7 +246,7 @@ async fn test_drop_table() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_drop_table_if_exists_no_error() {
-    let (session, handler) = setup_handler().await;
+    let (session, handler) = common::setup_handler().await;
 
     // This table does not exist; IF EXISTS should prevent an error
     let result = handler
@@ -354,7 +305,7 @@ fn test_worker_registry_no_workers() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_local_fallback_without_workers() {
-    let (session, handler) = setup_handler().await;
+    let (session, handler) = common::setup_handler().await;
 
     // SELECT 1 should work even without workers (local execution)
     let batches = handler
@@ -401,7 +352,7 @@ async fn test_distributed_select() {
     // Run the worker: cargo run -p sqe-worker -- tests/sqe-test.toml
     // Then run: cargo test -p sqe-coordinator --test integration_test test_distributed_select -- --ignored
 
-    let config = sqe_core::SqeConfig::load(&test_config_path())
+    let config = sqe_core::SqeConfig::load(&common::test_config_path())
         .expect("Failed to load test config");
 
     let authenticator = sqe_auth::Authenticator::new(&config.auth)
@@ -532,7 +483,7 @@ fn test_trino_batches_to_json() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_information_schema_tables() {
-    let (session, handler) = setup_handler().await;
+    let (session, handler) = common::setup_handler().await;
 
     let batches = handler
         .execute(&session, "SELECT * FROM information_schema.tables")
@@ -546,7 +497,7 @@ async fn test_information_schema_tables() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_information_schema_schemata() {
-    let (session, handler) = setup_handler().await;
+    let (session, handler) = common::setup_handler().await;
 
     let batches = handler
         .execute(&session, "SELECT * FROM information_schema.schemata")
@@ -568,64 +519,7 @@ async fn test_information_schema_schemata() {
 //   test_distributed_select     → CTAS + SELECT (with worker registry)
 // ---------------------------------------------------------------------------
 
-use arrow_array::{Array, Float64Array, Int64Array, StringArray};
-use arrow_array::RecordBatch;
-
-/// Pretty-print RecordBatches for test diagnostics.
-fn print_results(label: &str, sql: &str, batches: &[RecordBatch]) {
-    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    println!("\n╔══ {label} ══╗");
-    println!("│ SQL: {sql}");
-    println!("│ Rows: {total_rows}");
-    if let Some(batch) = batches.first() {
-        if batch.num_rows() > 0 {
-            let schema = batch.schema();
-            let headers: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-            let header_line = headers.join(" | ");
-            println!("│ {header_line}");
-            println!("│ {}", "─".repeat(header_line.len()));
-        }
-    }
-    for batch in batches {
-        for row in 0..batch.num_rows() {
-            let vals: Vec<String> = batch.columns().iter().map(|col| fmt_val(col, row)).collect();
-            println!("│ {}", vals.join(" | "));
-        }
-    }
-    println!("╚{}╝", "═".repeat(label.len() + 4));
-}
-
-fn fmt_val(col: &dyn Array, row: usize) -> String {
-    if col.is_null(row) {
-        return "NULL".to_string();
-    }
-    if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
-        return a.value(row).to_string();
-    }
-    if let Some(a) = col.as_any().downcast_ref::<arrow_array::Int32Array>() {
-        return a.value(row).to_string();
-    }
-    if let Some(a) = col.as_any().downcast_ref::<arrow_array::UInt64Array>() {
-        return a.value(row).to_string();
-    }
-    if let Some(a) = col.as_any().downcast_ref::<arrow_array::UInt32Array>() {
-        return a.value(row).to_string();
-    }
-    if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
-        return format!("{:.2}", a.value(row));
-    }
-    if let Some(a) = col.as_any().downcast_ref::<arrow_array::Float32Array>() {
-        return format!("{:.2}", a.value(row));
-    }
-    if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
-        return a.value(row).to_string();
-    }
-    if let Some(a) = col.as_any().downcast_ref::<arrow_array::BooleanArray>() {
-        return a.value(row).to_string();
-    }
-    // Fallback: show the Arrow type name so unknown types are diagnosable
-    format!("?({:?})", col.data_type())
-}
+use arrow_array::{Int64Array, StringArray};
 
 // ---------------------------------------------------------------------------
 // Helpers: set up shared fixture tables
@@ -634,7 +528,7 @@ fn fmt_val(col: &dyn Array, row: usize) -> String {
 /// Create employees + departments tables for join/aggregation tests.
 /// Returns (session, handler).
 async fn setup_join_fixture() -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
-    let (session, handler) = setup_handler().await;
+    let (session, handler) = common::setup_handler().await;
 
     // employees: id BIGINT, name VARCHAR, dept_id BIGINT, salary DOUBLE
     let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.employees").await;
@@ -688,7 +582,7 @@ async fn test_create_and_drop_view() {
     let batches = handler.execute(&session, "SELECT * FROM test_ns.eng_view")
         .await.expect("SELECT from view should succeed");
 
-    print_results("CREATE VIEW + SELECT", "SELECT * FROM test_ns.eng_view", &batches);
+    common::print_results("CREATE VIEW + SELECT", "SELECT * FROM test_ns.eng_view", &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 2, "Engineering dept has Alice and Bob");
@@ -721,7 +615,7 @@ async fn test_view_with_aggregation() {
         "SELECT dept_id, headcount, avg_salary FROM test_ns.dept_stats ORDER BY dept_id"
     ).await.expect("SELECT from aggregation view");
 
-    print_results("VIEW with GROUP BY", "SELECT * FROM test_ns.dept_stats", &batches);
+    common::print_results("VIEW with GROUP BY", "SELECT * FROM test_ns.dept_stats", &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 4, "Four distinct dept_ids (10, 20, 30, 99)");
@@ -748,7 +642,7 @@ async fn test_inner_join() {
     let batches = handler.execute(&session, sql)
         .await.expect("INNER JOIN should succeed");
 
-    print_results("INNER JOIN", sql, &batches);
+    common::print_results("INNER JOIN", sql, &batches);
 
     // Frank (dept_id=99) and HR (id=40) are excluded
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -777,7 +671,7 @@ async fn test_left_join() {
     let batches = handler.execute(&session, sql)
         .await.expect("LEFT JOIN should succeed");
 
-    print_results("LEFT JOIN", sql, &batches);
+    common::print_results("LEFT JOIN", sql, &batches);
 
     // All 6 employees, Frank gets NULL dept_name
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -805,7 +699,7 @@ async fn test_right_join() {
     let batches = handler.execute(&session, sql)
         .await.expect("RIGHT JOIN should succeed");
 
-    print_results("RIGHT JOIN", sql, &batches);
+    common::print_results("RIGHT JOIN", sql, &batches);
 
     // 5 matched + 1 HR row with NULL employee columns
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -828,7 +722,7 @@ async fn test_full_outer_join() {
     let batches = handler.execute(&session, sql)
         .await.expect("FULL OUTER JOIN should succeed");
 
-    print_results("FULL OUTER JOIN", sql, &batches);
+    common::print_results("FULL OUTER JOIN", sql, &batches);
 
     // 5 matched + 1 Frank unmatched + 1 HR unmatched = 7
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -841,7 +735,7 @@ async fn test_full_outer_join() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_cross_join() {
-    let (session, handler) = setup_handler().await;
+    let (session, handler) = common::setup_handler().await;
 
     let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.colors").await;
     let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.sizes").await;
@@ -859,7 +753,7 @@ async fn test_cross_join() {
     let sql = "SELECT color, size FROM test_ns.colors CROSS JOIN test_ns.sizes ORDER BY color, size";
     let batches = handler.execute(&session, sql).await.expect("CROSS JOIN");
 
-    print_results("CROSS JOIN (3×3)", sql, &batches);
+    common::print_results("CROSS JOIN (3×3)", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 9, "3 colors × 3 sizes = 9 combinations");
@@ -872,7 +766,7 @@ async fn test_cross_join() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_self_join() {
-    let (session, handler) = setup_handler().await;
+    let (session, handler) = common::setup_handler().await;
 
     let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.org").await;
     handler.execute(&session,
@@ -890,7 +784,7 @@ async fn test_self_join() {
                ORDER BY e.id";
 
     let batches = handler.execute(&session, sql).await.expect("Self-join");
-    print_results("SELF JOIN (org hierarchy)", sql, &batches);
+    common::print_results("SELF JOIN (org hierarchy)", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 5, "5 employees in org");
@@ -924,7 +818,7 @@ async fn test_aggregation_basic() {
                ORDER BY dept_id";
 
     let batches = handler.execute(&session, sql).await.expect("Aggregation");
-    print_results("GROUP BY + aggregates", sql, &batches);
+    common::print_results("GROUP BY + aggregates", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 4, "Four dept groups: 10, 20, 30, 99");
@@ -951,7 +845,7 @@ async fn test_having_clause() {
                ORDER BY dept_id";
 
     let batches = handler.execute(&session, sql).await.expect("HAVING clause");
-    print_results("HAVING AVG(salary) > 75000", sql, &batches);
+    common::print_results("HAVING AVG(salary) > 75000", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     // dept 10: avg=87500 ✓, dept 20: avg=72500 ✗, dept 30: avg=95000 ✓, dept 99: avg=60000 ✗
@@ -973,7 +867,7 @@ async fn test_join_with_aggregation() {
                ORDER BY headcount DESC, d.dept_name";
 
     let batches = handler.execute(&session, sql).await.expect("JOIN + GROUP BY");
-    print_results("JOIN + GROUP BY", sql, &batches);
+    common::print_results("JOIN + GROUP BY", sql, &batches);
 
     // 4 departments, HR has 0 employees
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -997,7 +891,7 @@ async fn test_cte_join() {
                ORDER BY h.name";
 
     let batches = handler.execute(&session, sql).await.expect("CTE + JOIN");
-    print_results("CTE + INNER JOIN", sql, &batches);
+    common::print_results("CTE + INNER JOIN", sql, &batches);
 
     // Alice (90000), Bob (85000), Eve (95000) earn > 80000 and have valid depts
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1018,7 +912,7 @@ async fn test_subquery_where() {
                ORDER BY salary DESC";
 
     let batches = handler.execute(&session, sql).await.expect("Subquery in WHERE");
-    print_results("Subquery (salary > AVG)", sql, &batches);
+    common::print_results("Subquery (salary > AVG)", sql, &batches);
 
     // AVG salary = (90000+85000+70000+75000+95000+60000)/6 = 79166.67
     // Above avg: Alice(90000), Bob(85000), Eve(95000)
@@ -1046,7 +940,7 @@ async fn test_scalar_subquery_select() {
                ORDER BY salary_vs_avg DESC";
 
     let batches = handler.execute(&session, sql).await.expect("Scalar subquery in SELECT");
-    print_results("Salary vs AVG (scalar subquery)", sql, &batches);
+    common::print_results("Salary vs AVG (scalar subquery)", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 6, "All 6 employees");
@@ -1058,7 +952,7 @@ async fn test_scalar_subquery_select() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_union_all() {
-    let (session, handler) = setup_handler().await;
+    let (session, handler) = common::setup_handler().await;
 
     let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.q1_sales").await;
     let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.q2_sales").await;
@@ -1081,7 +975,7 @@ async fn test_union_all() {
                ORDER BY quarter, product";
 
     let batches = handler.execute(&session, sql).await.expect("UNION ALL across tables");
-    print_results("UNION ALL across tables", sql, &batches);
+    common::print_results("UNION ALL across tables", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 4, "2 rows from Q1 + 2 from Q2");
@@ -1098,7 +992,7 @@ async fn test_order_limit_offset() {
 
     let sql = "SELECT name, salary FROM test_ns.employees ORDER BY salary DESC LIMIT 3 OFFSET 1";
     let batches = handler.execute(&session, sql).await.expect("ORDER BY + LIMIT + OFFSET");
-    print_results("ORDER BY DESC LIMIT 3 OFFSET 1", sql, &batches);
+    common::print_results("ORDER BY DESC LIMIT 3 OFFSET 1", sql, &batches);
 
     // Sorted: Eve(95000), Alice(90000), Bob(85000), Dave(75000), Charlie(70000), Frank(60000)
     // Offset 1 skips Eve → Alice, Bob, Dave
@@ -1125,7 +1019,7 @@ async fn test_where_conditions() {
                ORDER BY salary DESC";
 
     let batches = handler.execute(&session, sql).await.expect("Complex WHERE");
-    print_results("WHERE (dept=10 OR dept=20) AND salary >= 75000", sql, &batches);
+    common::print_results("WHERE (dept=10 OR dept=20) AND salary >= 75000", sql, &batches);
 
     // dept 10: Alice(90000)✓ Bob(85000)✓  |  dept 20: Dave(75000)✓ Charlie(70000)✗
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1150,7 +1044,7 @@ async fn test_case_expression() {
                ORDER BY salary DESC";
 
     let batches = handler.execute(&session, sql).await.expect("CASE expression");
-    print_results("CASE WHEN salary tiers", sql, &batches);
+    common::print_results("CASE WHEN salary tiers", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 6);
@@ -1181,7 +1075,7 @@ async fn test_string_functions() {
                LIMIT 3";
 
     let batches = handler.execute(&session, sql).await.expect("String functions");
-    print_results("String functions (UPPER, LOWER, LENGTH, CONCAT)", sql, &batches);
+    common::print_results("String functions (UPPER, LOWER, LENGTH, CONCAT)", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 3);
@@ -1207,7 +1101,7 @@ async fn test_math_expressions() {
                ORDER BY id";
 
     let batches = handler.execute(&session, sql).await.expect("Math expressions");
-    print_results("Math (ROUND, FLOOR, salary expressions)", sql, &batches);
+    common::print_results("Math (ROUND, FLOOR, salary expressions)", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 6);
@@ -1234,7 +1128,7 @@ async fn test_multiple_ctes() {
                ORDER BY e.salary DESC";
 
     let batches = handler.execute(&session, sql).await.expect("Multiple CTEs");
-    print_results("Multiple CTEs (dept_avg → high_depts → employees)", sql, &batches);
+    common::print_results("Multiple CTEs (dept_avg → high_depts → employees)", sql, &batches);
 
     // dept 10: avg=87500 ✓ (Alice+Bob), dept 30: avg=95000 ✓ (Eve), dept 20: avg=72500 ✗
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1265,7 +1159,7 @@ async fn test_three_way_join() {
                ORDER BY e.name, p.project_name";
 
     let batches = handler.execute(&session, sql).await.expect("Three-way JOIN");
-    print_results("Three-way JOIN (employees × departments × projects)", sql, &batches);
+    common::print_results("Three-way JOIN (employees × departments × projects)", sql, &batches);
 
     // eng dept (10): Alice+Bob × Alpha+Gamma = 4 rows
     // mkt dept (20): Charlie+Dave × Beta = 2 rows
@@ -1289,7 +1183,7 @@ async fn test_in_subquery() {
                ORDER BY name";
 
     let batches = handler.execute(&session, sql).await.expect("IN subquery");
-    print_results("IN (subquery: depts with 'ing' in name)", sql, &batches);
+    common::print_results("IN (subquery: depts with 'ing' in name)", sql, &batches);
 
     // 'Engineering' and 'Marketing' match — dept ids 10 and 20
     // Alice, Bob (dept 10), Charlie, Dave (dept 20)
@@ -1313,7 +1207,7 @@ async fn test_exists_subquery() {
                ORDER BY dept_name";
 
     let batches = handler.execute(&session, sql).await.expect("EXISTS subquery");
-    print_results("EXISTS (dept has high earner > 85000)", sql, &batches);
+    common::print_results("EXISTS (dept has high earner > 85000)", sql, &batches);
 
     // dept 10: Alice(90000) > 85000 ✓ | dept 30: Eve(95000) > 85000 ✓ | others ✗
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1336,7 +1230,7 @@ async fn test_window_functions() {
                ORDER BY dept_id, salary DESC";
 
     let batches = handler.execute(&session, sql).await.expect("Window functions");
-    print_results("ROW_NUMBER + RANK (partition by dept)", sql, &batches);
+    common::print_results("ROW_NUMBER + RANK (partition by dept)", sql, &batches);
 
     // dept 10: Alice row_num=1, Bob row_num=2 | dept 20: Dave row_num=1, Charlie row_num=2
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1357,10 +1251,159 @@ async fn test_window_running_total() {
                ORDER BY salary";
 
     let batches = handler.execute(&session, sql).await.expect("Running total window");
-    print_results("Running total (SUM OVER ORDER BY salary)", sql, &batches);
+    common::print_results("Running total (SUM OVER ORDER BY salary)", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 6);
+
+    teardown_join_fixture(&session, &handler).await;
+}
+
+// ---------------------------------------------------------------------------
+// EXPLAIN / EXPLAIN ANALYZE / EXPLAIN FULL integration tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_explain_plan() {
+    let (session, handler) = setup_join_fixture().await;
+
+    let sql = "EXPLAIN SELECT * FROM test_ns.employees WHERE dept_id = 10";
+    let batches = handler
+        .execute(&session, sql)
+        .await
+        .expect("EXPLAIN should succeed");
+
+    common::print_results("EXPLAIN", sql, &batches);
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2, "EXPLAIN returns exactly 2 rows (logical + physical)");
+
+    let batch = &batches[0];
+    let plan_type_col = batch.column_by_name("plan_type").expect("plan_type column");
+    let plan_col = batch.column_by_name("plan").expect("plan column");
+
+    let plan_types = plan_type_col
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("plan_type is Utf8");
+    assert_eq!(plan_types.value(0), "logical_plan");
+    assert_eq!(plan_types.value(1), "physical_plan");
+
+    let plans = plan_col
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("plan is Utf8");
+    assert!(!plans.value(0).is_empty(), "logical plan text must not be empty");
+    assert!(!plans.value(1).is_empty(), "physical plan text must not be empty");
+    assert!(
+        plans.value(0).contains("employees"),
+        "logical plan should mention 'employees' table"
+    );
+
+    teardown_join_fixture(&session, &handler).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_explain_analyze() {
+    let (session, handler) = setup_join_fixture().await;
+
+    let sql = "EXPLAIN ANALYZE SELECT dept_id, COUNT(*) FROM test_ns.employees GROUP BY dept_id";
+    let batches = handler
+        .execute(&session, sql)
+        .await
+        .expect("EXPLAIN ANALYZE should succeed");
+
+    common::print_results("EXPLAIN ANALYZE", sql, &batches);
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert!(total_rows >= 1, "EXPLAIN ANALYZE should return at least one operator row");
+
+    let batch = &batches[0];
+    assert!(batch.column_by_name("step").is_some(), "must have 'step' column");
+    assert!(batch.column_by_name("operation").is_some(), "must have 'operation' column");
+    assert!(batch.column_by_name("output_rows").is_some(), "must have 'output_rows' column");
+    assert!(batch.column_by_name("elapsed_ms").is_some(), "must have 'elapsed_ms' column");
+
+    teardown_join_fixture(&session, &handler).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_explain_full() {
+    let (session, handler) = setup_join_fixture().await;
+
+    let sql = "EXPLAIN FULL SELECT * FROM test_ns.employees";
+    let batches = handler
+        .execute(&session, sql)
+        .await
+        .expect("EXPLAIN FULL should succeed");
+
+    common::print_results("EXPLAIN FULL", sql, &batches);
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert!(total_rows >= 1, "EXPLAIN FULL should return at least one row");
+
+    let batch = &batches[0];
+    assert!(batch.column_by_name("step").is_some());
+    assert!(batch.column_by_name("operation").is_some());
+    assert!(batch.column_by_name("estimated_rows").is_some());
+    assert!(batch.column_by_name("estimated_bytes").is_some());
+    assert!(batch.column_by_name("files_scanned").is_some());
+    assert!(batch.column_by_name("files_total").is_some());
+    assert!(batch.column_by_name("output_rows").is_some());
+    assert!(batch.column_by_name("elapsed_ms").is_some());
+
+    let ops = batch
+        .column_by_name("operation")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let files_total_col = batch.column_by_name("files_total").unwrap();
+
+    let scan_row = (0..batch.num_rows())
+        .find(|&i| ops.value(i) == "IcebergScanExec");
+
+    assert!(
+        scan_row.is_some(),
+        "Expected an IcebergScanExec row in EXPLAIN FULL output"
+    );
+    let row = scan_row.unwrap();
+    assert!(
+        !files_total_col.is_null(row),
+        "IcebergScanExec row should have non-NULL files_total"
+    );
+
+    teardown_join_fixture(&session, &handler).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_explain_policy_aware() {
+    let (session, handler) = setup_join_fixture().await;
+
+    let sql = "EXPLAIN SELECT name, salary FROM test_ns.employees ORDER BY salary DESC";
+    let batches = handler
+        .execute(&session, sql)
+        .await
+        .expect("EXPLAIN with policy enforcement should succeed");
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2, "Should still return 2 plan rows");
+
+    let batch = &batches[0];
+    let plans = batch
+        .column_by_name("plan")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert!(
+        plans.value(0).contains("employees"),
+        "Logical plan should reference the queried table"
+    );
 
     teardown_join_fixture(&session, &handler).await;
 }

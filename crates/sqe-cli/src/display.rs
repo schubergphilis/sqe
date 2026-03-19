@@ -4,7 +4,8 @@ use crate::OutputFormat;
 pub fn print_query_result(result: &QueryResult, format: &OutputFormat) {
     match format {
         OutputFormat::Table => print_table(result),
-        OutputFormat::Csv => print_csv(result),
+        OutputFormat::Csv => print_separated(result, ','),
+        OutputFormat::Tsv => print_separated(result, '\t'),
         OutputFormat::Json => print_json(result),
     }
 }
@@ -27,49 +28,49 @@ fn print_table(result: &QueryResult) {
         }
     }
 
+    let border: String = widths.iter().map(|w| format!("+{}", "-".repeat(w + 2))).collect::<String>() + "+";
+
     // Header
+    println!("{border}");
     let header: Vec<String> = result
         .columns
         .iter()
         .enumerate()
-        .map(|(i, c)| format!("{:width$}", c, width = widths[i]))
+        .map(|(i, c)| format!(" {:width$} ", c, width = widths[i]))
         .collect();
-    println!(" {} ", header.join(" | "));
+    println!("|{}|", header.join("|"));
 
     // Separator
-    let sep: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
-    println!("-{}-", sep.join("-+-"));
+    println!("{border}");
 
     // Rows
     for row in &result.rows {
         let cells: Vec<String> = row
             .iter()
             .enumerate()
-            .map(|(i, v)| format!("{:width$}", v, width = widths.get(i).copied().unwrap_or(0)))
+            .map(|(i, v)| format!(" {:width$} ", v, width = widths.get(i).copied().unwrap_or(0)))
             .collect();
-        println!(" {} ", cells.join(" | "));
+        println!("|{}|", cells.join("|"));
     }
 
+    println!("{border}");
     eprintln!("({} rows)", result.rows.len());
 }
 
-fn print_csv(result: &QueryResult) {
+fn print_separated(result: &QueryResult, sep: char) {
     if result.columns.is_empty() {
         return;
     }
-
-    // Header
-    println!("{}", result.columns.join(","));
-
-    // Rows — quote fields that contain commas, quotes, or newlines
+    let sep_str = sep.to_string();
+    println!("{}", result.columns.join(&sep_str));
     for row in &result.rows {
-        let cells: Vec<String> = row.iter().map(|v| csv_escape(v)).collect();
-        println!("{}", cells.join(","));
+        let cells: Vec<String> = row.iter().map(|v| sep_escape(v, sep)).collect();
+        println!("{}", cells.join(&sep_str));
     }
 }
 
-fn csv_escape(value: &str) -> String {
-    if value.contains(',') || value.contains('"') || value.contains('\n') {
+fn sep_escape(value: &str, sep: char) -> String {
+    if value.contains(sep) || value.contains('"') || value.contains('\n') {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
         value.to_string()

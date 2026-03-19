@@ -23,6 +23,7 @@ pub enum StatementKind {
     ShowTables(String),
     Policy(Box<Statement>),
     Utility(Box<Statement>),
+    ExplainFull(String), // inner SQL string (EXPLAIN FULL pre-processed)
 }
 
 impl StatementKind {
@@ -46,6 +47,7 @@ impl StatementKind {
             StatementKind::ShowTables(_) => "showtables",
             StatementKind::Policy(_) => "policy",
             StatementKind::Utility(_) => "utility",
+            StatementKind::ExplainFull(_) => "explain_full",
         }
     }
 }
@@ -59,6 +61,12 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
 
     if upper == "SHOW CATALOGS" || upper.starts_with("SHOW CATALOGS ") {
         return Ok(StatementKind::ShowCatalogs);
+    }
+
+    // Pre-scan for EXPLAIN FULL — not standard SQL, sqlparser won't parse it.
+    if upper.starts_with("EXPLAIN FULL ") {
+        let inner = trimmed["EXPLAIN FULL ".len()..].trim().to_string();
+        return Ok(StatementKind::ExplainFull(inner));
     }
 
     let dialect = GenericDialect {};
@@ -405,5 +413,42 @@ mod tests {
     fn test_invalid_sql_is_error() {
         let result = parse_and_classify("NOT VALID SQL AT ALL %%$#@");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_explain_analyze_is_utility() {
+        let result = parse_and_classify("EXPLAIN ANALYZE SELECT 1");
+        assert!(matches!(result, Ok(StatementKind::Utility(_))));
+    }
+
+    #[test]
+    fn test_explain_full_is_explain_full() {
+        let result = parse_and_classify("EXPLAIN FULL SELECT 1");
+        assert!(
+            matches!(result, Ok(StatementKind::ExplainFull(_))),
+            "Expected ExplainFull, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_explain_full_lowercase() {
+        let result = parse_and_classify("explain full SELECT 1");
+        assert!(matches!(result, Ok(StatementKind::ExplainFull(_))));
+    }
+
+    #[test]
+    fn test_explain_full_extracts_inner_sql() {
+        let result = parse_and_classify("EXPLAIN FULL SELECT 1 AS n").unwrap();
+        if let StatementKind::ExplainFull(inner) = result {
+            assert_eq!(inner, "SELECT 1 AS n");
+        } else {
+            panic!("Expected ExplainFull");
+        }
+    }
+
+    #[test]
+    fn test_explain_full_name() {
+        let kind = StatementKind::ExplainFull("SELECT 1".to_string());
+        assert_eq!(kind.name(), "explain_full");
     }
 }

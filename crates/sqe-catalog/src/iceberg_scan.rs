@@ -13,6 +13,7 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use futures::{Stream, TryStreamExt};
 use iceberg::table::Table;
 use tracing::debug;
@@ -33,6 +34,8 @@ pub struct IcebergScanExec {
     projection: Option<Vec<String>>,
     /// Cached plan properties.
     properties: PlanProperties,
+    /// Execution metrics (elapsed time, output rows).
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl IcebergScanExec {
@@ -50,6 +53,7 @@ impl IcebergScanExec {
             projected_schema,
             projection,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 
@@ -98,6 +102,10 @@ impl ExecutionPlan for IcebergScanExec {
         Ok(self) // no children to replace
     }
 
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
     fn execute(
         &self,
         partition: usize,
@@ -112,6 +120,7 @@ impl ExecutionPlan for IcebergScanExec {
         let table = self.table.clone();
         let schema = self.projected_schema.clone();
         let projection = self.projection.clone();
+        let baseline = BaselineMetrics::new(&self.metrics, partition);
 
         debug!(
             table = %table.identifier(),
@@ -146,6 +155,7 @@ impl ExecutionPlan for IcebergScanExec {
         Ok(Box::pin(IcebergRecordBatchStream {
             schema,
             inner: Box::pin(stream),
+            baseline,
         }))
     }
 }
@@ -156,16 +166,32 @@ impl ExecutionPlan for IcebergScanExec {
 /// `Stream<Item = DFResult<RecordBatch>>` trait and the `RecordBatchStream`
 /// trait (which adds a `schema()` method). This wrapper bridges the
 /// iceberg-rust arrow stream to satisfy both requirements.
+///
+/// The `baseline` field records elapsed wall-clock time and output row counts
+/// so that `EXPLAIN ANALYZE` and `EXPLAIN FULL` can report scan metrics.
 struct IcebergRecordBatchStream {
     schema: SchemaRef,
     inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>,
+    baseline: BaselineMetrics,
 }
 
 impl Stream for IcebergRecordBatchStream {
     type Item = DFResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.inner.as_mut().poll_next(cx)
+        // SAFETY: We do not move any fields out of self. `inner` remains pinned
+        // (accessed only through Pin::as_mut()). `baseline` is Unpin.
+        // This split is needed because Pin<&mut T> does not allow splitting
+        // borrows of distinct fields through its DerefMut impl.
+        let s = unsafe { self.as_mut().get_unchecked_mut() };
+        let poll = {
+            let _timer = s.baseline.elapsed_compute().timer();
+            s.inner.as_mut().poll_next(cx)
+        };
+        if let Poll::Ready(Some(Ok(ref batch))) = poll {
+            s.baseline.record_output(batch.num_rows());
+        }
+        poll
     }
 }
 

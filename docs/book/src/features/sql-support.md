@@ -118,8 +118,14 @@ SELECT * FROM information_schema.tables;
 SELECT * FROM information_schema.schemata;
 SELECT * FROM information_schema.columns WHERE table_name = 'orders';
 
--- Query plan
+-- Query plan (logical + physical)
 EXPLAIN SELECT * FROM orders WHERE amount > 100;
+
+-- With actual execution metrics
+EXPLAIN ANALYZE SELECT * FROM orders WHERE amount > 100;
+
+-- With Iceberg file/row estimates (no execution)
+EXPLAIN FULL SELECT * FROM orders WHERE amount > 100;
 ```
 
 ## Feature Comparison
