@@ -38,8 +38,8 @@ iceberg-datafusion = "0.8"
 # SQL parser — DataFusion 51 requires ^0.59
 sqlparser = "0.59"
 
-# Async
-tokio = { version = "1", features = ["full"] }
+# Async — use only what is needed; avoid ["full"] which includes fs/process/io-std
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
 
 # HTTP
 axum = "0.8"

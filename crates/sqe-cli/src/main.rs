@@ -60,8 +60,31 @@ enum OutputFormat {
     Table,
     /// Comma-separated values
     Csv,
+    /// Tab-separated values
+    Tsv,
     /// Newline-delimited JSON objects
     Json,
+}
+
+impl OutputFormat {
+    fn name(&self) -> &'static str {
+        match self {
+            OutputFormat::Table => "table",
+            OutputFormat::Csv => "csv",
+            OutputFormat::Tsv => "tsv",
+            OutputFormat::Json => "json",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "table" => Some(OutputFormat::Table),
+            "csv" => Some(OutputFormat::Csv),
+            "tsv" => Some(OutputFormat::Tsv),
+            "json" => Some(OutputFormat::Json),
+            _ => None,
+        }
+    }
 }
 
 #[tokio::main]
@@ -126,18 +149,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    repl(client.as_mut(), &cli.format).await
+    repl(client.as_mut(), cli.format).await
 }
 
 async fn repl(
     client: &mut dyn SqlClient,
-    format: &OutputFormat,
+    initial_format: OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut rl = rustyline::DefaultEditor::new()?;
     let history_path = dirs_home().join(".sqe_history");
     let _ = rl.load_history(&history_path);
 
+    let mut format = initial_format;
+
     eprintln!("Type SQL queries, or \\q to quit. End multi-line queries with ;");
+    eprintln!("Use \\format [table|csv|tsv|json] to change output format.");
 
     let mut buf = String::new();
 
@@ -156,6 +182,39 @@ async fn repl(
                     continue;
                 }
 
+                // Client-side metacommand: \format [value]
+                if let Some(rest) = trimmed.strip_prefix("\\format") {
+                    let arg = rest.trim();
+                    if arg.is_empty() {
+                        eprintln!("Output format: {}", format.name());
+                    } else if let Some(f) = OutputFormat::from_str(arg) {
+                        format = f;
+                        eprintln!("Output format set to: {}", format.name());
+                    } else {
+                        eprintln!("Unknown format '{arg}'. Valid: table, csv, tsv, json");
+                    }
+                    continue;
+                }
+
+                // Client-side: SET format = '...' (intercepted, not sent to server)
+                {
+                    let upper = trimmed.to_ascii_uppercase();
+                    let stripped = upper
+                        .trim_end_matches(';')
+                        .trim()
+                        .strip_prefix("SET FORMAT")
+                        .map(|s| s.trim().trim_start_matches('=').trim().trim_matches('\'').trim_matches('"').to_ascii_lowercase());
+                    if let Some(val) = stripped {
+                        if let Some(f) = OutputFormat::from_str(&val) {
+                            format = f;
+                            eprintln!("Output format set to: {}", format.name());
+                        } else {
+                            eprintln!("Unknown format '{val}'. Valid: table, csv, tsv, json");
+                        }
+                        continue;
+                    }
+                }
+
                 buf.push_str(trimmed);
                 buf.push(' ');
 
@@ -164,7 +223,7 @@ async fn repl(
                     if !sql.is_empty() {
                         rl.add_history_entry(sql)?;
                         match client.execute(sql).await {
-                            Ok(result) => display::print_query_result(&result, format),
+                            Ok(result) => display::print_query_result(&result, &format),
                             Err(e) => eprintln!("Error: {e}"),
                         }
                     }
