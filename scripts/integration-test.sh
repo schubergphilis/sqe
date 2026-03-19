@@ -21,6 +21,8 @@ docker compose -f "$COMPOSE_FILE" up -d
 "$SCRIPT_DIR/bootstrap-test.sh"
 
 # ── Run integration tests ─────────────────────────────────────
+# Clean up any stale log files from aborted previous runs
+rm -f /tmp/sqe-test-*.log
 SQE_LOG_FILE="$(mktemp /tmp/sqe-test-XXXXXX.log)"
 
 echo ""
