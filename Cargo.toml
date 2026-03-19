@@ -39,14 +39,14 @@ iceberg-datafusion = "0.8"
 sqlparser = "0.59"
 
 # Async — use only what is needed; avoid ["full"] which includes fs/process/io-std
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
 
 # HTTP
 axum = "0.8"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
 # gRPC (Arrow Flight) — arrow-flight 57 requires tonic 0.14
-tonic = "0.14"
+tonic = { version = "0.14", features = ["transport"] }
 prost = "0.14"
 
 # Serialization
@@ -82,6 +82,14 @@ chrono = { version = "0.4", features = ["serde"] }
 url = "2"
 bytes = "1"
 futures = "0.3"
+
+# ── Dev profile: fast incremental builds ───────────────────────
+[profile.dev]
+# Line-tables only — enough for backtraces/panics, much less to generate.
+debug = 1
+# On macOS: skip dsymutil post-link step (no .dSYM bundle, separate dwarf files
+# instead). Saves ~20-30% of link time on every rebuild.
+split-debuginfo = "unpacked"
 
 # ── Release profile: fast builds with good runtime performance ─
 [profile.release]
