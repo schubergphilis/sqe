@@ -23,6 +23,7 @@ pub struct QueryHandler {
     config: SqeConfig,
     catalog_ops: CatalogOps,
     write_handler: WriteHandler,
+    explain_handler: crate::explain::ExplainHandler,
     #[allow(dead_code)] // Wired in Chunk 3 for distributed execution; query routing TBD
     worker_registry: Option<Arc<crate::worker_registry::WorkerRegistry>>,
     metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
@@ -39,11 +40,13 @@ impl QueryHandler {
     ) -> Self {
         let catalog_ops = CatalogOps::new(config.clone());
         let write_handler = WriteHandler::new(config.clone());
+        let explain_handler = crate::explain::ExplainHandler::new(Arc::clone(&policy_enforcer));
         Self {
             policy_enforcer,
             config,
             catalog_ops,
             write_handler,
+            explain_handler,
             worker_registry,
             metrics,
             audit,
@@ -92,8 +95,14 @@ impl QueryHandler {
             }
 
             StatementKind::Utility(stmt) => {
-                if let sqlparser::ast::Statement::Explain { statement, .. } = *stmt {
-                    self.handle_explain(session, &statement.to_string()).await
+                if let sqlparser::ast::Statement::Explain { analyze, statement, .. } = *stmt {
+                    let inner = statement.to_string();
+                    let ctx = self.create_session_context(session).await?;
+                    if analyze {
+                        self.explain_handler.analyze(session, &inner, &ctx).await
+                    } else {
+                        self.explain_handler.plan(session, &inner, &ctx).await
+                    }
                 } else {
                     Err(SqeError::NotImplemented(format!(
                         "Utility statement not supported: {stmt}"
@@ -171,9 +180,10 @@ impl QueryHandler {
                 }
             }
 
-            StatementKind::ExplainFull(_inner_sql) => Err(SqeError::NotImplemented(
-                "EXPLAIN FULL is not yet wired into QueryHandler (planned for Task 5)".to_string(),
-            )),
+            StatementKind::ExplainFull(inner) => {
+                let ctx = self.create_session_context(session).await?;
+                self.explain_handler.full(session, &inner, &ctx).await
+            }
 
             StatementKind::Delete(_) => Err(SqeError::NotImplemented(
                 "DELETE FROM requires Iceberg overwrite transaction support (planned for Chunk 3)".to_string(),
@@ -533,27 +543,6 @@ impl QueryHandler {
         Ok(())
     }
 
-    /// Handle EXPLAIN by planning the inner statement and returning the plan as text.
-    async fn handle_explain(
-        &self,
-        session: &Session,
-        inner_sql: &str,
-    ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let ctx = self.create_session_context(session).await?;
-
-        let explain_sql = format!("EXPLAIN {inner_sql}");
-        let df = ctx
-            .sql(&explain_sql)
-            .await
-            .map_err(|e| SqeError::Execution(format!("EXPLAIN planning failed: {e}")))?;
-
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| SqeError::Execution(format!("EXPLAIN execution failed: {e}")))?;
-
-        Ok(batches)
-    }
 }
 
 /// Convert an Arrow `SchemaRef` to Iceberg REST API schema JSON format.
