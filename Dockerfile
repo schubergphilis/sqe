@@ -1,21 +1,29 @@
 # syntax=docker/dockerfile:1
 # ── Stage 1: Base builder with tools ──────────────────────────
-FROM rust:bookworm AS chef
+# Use cargo-chef official image — cargo-chef pre-installed, avoids slow cargo install
+FROM lukemathwalker/cargo-chef:latest-rust-bookworm AS chef
 
 ARG TARGETARCH
+ARG SCCACHE_VERSION=0.9.0
 
+# Install build deps + download pre-compiled sccache binary (avoids ~10 min cargo install sccache)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake protobuf-compiler libssl-dev pkg-config \
-    clang lld && \
+    cmake protobuf-compiler libssl-dev pkg-config clang lld curl && \
     rm -rf /var/lib/apt/lists/* && \
-    cargo install cargo-chef --locked && \
-    cargo install sccache --locked
+    case "$TARGETARCH" in \
+        amd64) SCCACHE_ARCH=x86_64 ;; \
+        arm64) SCCACHE_ARCH=aarch64 ;; \
+        *) echo "unsupported arch: $TARGETARCH" && exit 1 ;; \
+    esac && \
+    curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz" \
+    | tar xz --strip-components=1 -C /usr/local/bin \
+        "sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl/sccache"
 
 # Use lld linker (faster than default ld, works on amd64 + aarch64)
 ENV RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=lld"
 # Use sccache for compilation caching
 ENV RUSTC_WRAPPER=sccache
-# sccache config: local disk cache (in Docker layer cache)
+# sccache config: local disk cache (in Docker BuildKit cache mount)
 ENV SCCACHE_DIR=/sccache
 ENV SCCACHE_CACHE_SIZE=2G
 
