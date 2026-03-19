@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Int32Array, Int64Array, Float64Array, RecordBatch, StringArray};
+use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::physical_plan::{collect, displayable, ExecutionPlan};
 use datafusion::prelude::SessionContext;
