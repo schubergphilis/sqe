@@ -1,5 +1,6 @@
 pub mod catalog_ops;
 pub mod distributed_scan;
+pub mod explain;
 pub mod flight_sql;
 pub mod mode;
 pub mod query_handler;

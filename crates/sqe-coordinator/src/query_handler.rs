@@ -171,6 +171,10 @@ impl QueryHandler {
                 }
             }
 
+            StatementKind::ExplainFull(_inner_sql) => Err(SqeError::NotImplemented(
+                "EXPLAIN FULL is not yet wired into QueryHandler (planned for Task 5)".to_string(),
+            )),
+
             StatementKind::Delete(_) => Err(SqeError::NotImplemented(
                 "DELETE FROM requires Iceberg overwrite transaction support (planned for Chunk 3)".to_string(),
             )),
