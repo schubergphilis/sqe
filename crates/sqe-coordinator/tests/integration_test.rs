@@ -620,6 +620,9 @@ fn fmt_val(col: &dyn Array, row: usize) -> String {
     if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
         return a.value(row).to_string();
     }
+    if let Some(a) = col.as_any().downcast_ref::<arrow_array::StringViewArray>() {
+        return a.value(row).to_string();
+    }
     if let Some(a) = col.as_any().downcast_ref::<arrow_array::BooleanArray>() {
         return a.value(row).to_string();
     }
