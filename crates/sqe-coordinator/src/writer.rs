@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
+use arrow::compute::cast;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
+use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::spec::{DataFile, Schema as IcebergSchema};
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -91,8 +93,12 @@ pub async fn write_data_files(
 }
 
 /// Add Iceberg field IDs to each Arrow field's metadata so the Parquet writer
-/// can map columns to the Iceberg schema. The mapping is positional: field N in
-/// the batch corresponds to field N in the Iceberg schema.
+/// can map columns to the Iceberg schema, and cast columns to the Iceberg-expected
+/// Arrow types (e.g. Timestamp(ns) → Timestamp(µs)).
+///
+/// DataFusion produces `Timestamp(Nanosecond, None)` for CURRENT_TIMESTAMP and
+/// timestamp literals, but Iceberg stores timestamps as `Timestamp(Microsecond, None)`.
+/// The Parquet writer rejects type mismatches, so we cast here before writing.
 fn stamp_field_ids(
     batches: Vec<RecordBatch>,
     iceberg_schema: &IcebergSchema,
@@ -100,6 +106,13 @@ fn stamp_field_ids(
     let Some(first) = batches.first() else {
         return Ok(batches);
     };
+
+    // Build the canonical Arrow schema from the Iceberg schema so we know the
+    // expected Arrow data type for each column (e.g. Timestamp(µs) not Timestamp(ns)).
+    let expected_arrow_schema =
+        schema_to_arrow_schema(iceberg_schema).map_err(|e| {
+            SqeError::Execution(format!("Failed to derive expected Arrow schema: {e}"))
+        })?;
 
     let iceberg_fields = iceberg_schema.as_struct().fields();
     let new_fields: Vec<Arc<arrow_schema::Field>> = first
@@ -119,18 +132,46 @@ fn stamp_field_ids(
             // because the null value may appear in any batch, not just the first one.
             let has_nulls = batches.iter().any(|b| b.column(i).null_count() > 0);
             let nullable = arrow_field.is_nullable() || has_nulls;
+            // Use the Iceberg-expected Arrow data type (may differ, e.g. Timestamp precision).
+            let target_type = expected_arrow_schema
+                .fields()
+                .get(i)
+                .map(|f| f.data_type().clone())
+                .unwrap_or_else(|| arrow_field.data_type().clone());
             Arc::new(
-                arrow_schema::Field::new(arrow_field.name(), arrow_field.data_type().clone(), nullable)
+                arrow_schema::Field::new(arrow_field.name(), target_type, nullable)
                     .with_metadata(meta),
             )
         })
         .collect();
 
     let new_schema = Arc::new(ArrowSchema::new(new_fields));
+
     batches
         .into_iter()
         .map(|batch| {
-            RecordBatch::try_new(new_schema.clone(), batch.columns().to_vec())
+            // Cast any columns whose type changed (e.g. Timestamp(ns) → Timestamp(µs)).
+            let new_columns: Result<Vec<_>, _> = batch
+                .columns()
+                .iter()
+                .enumerate()
+                .map(|(i, col)| {
+                    let target = new_schema.field(i).data_type();
+                    if col.data_type() == target {
+                        Ok(col.clone())
+                    } else {
+                        cast(col, target).map_err(|e| {
+                            SqeError::Execution(format!(
+                                "Failed to cast column '{}' from {:?} to {:?}: {e}",
+                                new_schema.field(i).name(),
+                                col.data_type(),
+                                target,
+                            ))
+                        })
+                    }
+                })
+                .collect();
+            RecordBatch::try_new(new_schema.clone(), new_columns?)
                 .map_err(|e| SqeError::Execution(format!("Failed to stamp field IDs: {e}")))
         })
         .collect()
