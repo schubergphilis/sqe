@@ -1,6 +1,22 @@
 # SQE — Next Steps
 
-> Status as of 2026-03-20. Step 0 dependency alignment complete and merged. All feature branches merged into `main`.
+> Status as of 2026-03-19. All feature branches have been merged into `main` locally.
+
+---
+
+## Step 0: Dependency Alignment Sprint
+
+**Must complete before anything else** — upstream breaking changes in DataFusion 52 and iceberg-rust 0.9.0 will block compilation of custom plan nodes if left unaddressed.
+
+| Task | Detail |
+|---|---|
+| Upgrade `iceberg-rust` 0.8.0 → 0.9.0 | Released March 10, 2026. Brings DataFusion 52.2, CoW OverwriteAction, predicate pushdown improvements |
+| Implement `apply_expressions()` on `IcebergScanExec` | **Required** new method in `ExecutionPlan` trait (DataFusion PR #20337); will not compile without it |
+| Handle `IcebergTableProvider` static/non-static split | API broken in 0.9.0 (PR #1879); use live-fetch variant for per-user auth sessions |
+| Add `iceberg-storage-opendal` crate dependency | OpenDAL storage moved to separate crate in 0.9.0; any direct FileIO usage breaks |
+| Update MSRV to Rust 1.92.0 | Required by iceberg-rust 0.9.0; check CI Rust toolchain version |
+| Replace JSON `ScanTask` worker dispatch with `PhysicalExtensionProtoCodec` | DataFusion PR #19437 provides the proper extension serialization hook; addresses task 6.6 |
+| Fix Polaris request ID header | `Polaris-Request-Id` → `X-Request-ID` (changed in Polaris 1.3.0) |
 
 > **Monitoring:** OPA SPI refactor in Polaris (PR #3999, still draft) will affect Phase 5 OPA integration when it lands — do not implement OPA against Polaris until this stabilises. Remote S3 signing (Iceberg 1.12, not yet released) will affect the pluggable-catalogs design.
 
@@ -88,7 +104,8 @@ In the meantime, `OverwriteAction` (CoW, merged iceberg-rust PR #2185) is availa
 
 | Task | Ref | Notes |
 |---|---|---|
-| DataFusion optimizer pass with Iceberg predicate pushdown | 6.3 | DataFusion 52 extends pushdown to LIMIT, LIKE, Boolean, Timestamp — now available |
+| DataFusion optimizer pass with Iceberg predicate pushdown | 6.3 | DataFusion 52 extends pushdown to LIMIT, LIKE, Boolean, Timestamp — available after Step 0 upgrade |
+| Custom `datafusion-proto` codec for iceberg-rust plan nodes | 6.6 | Use `PhysicalExtensionProtoCodec` trait (DataFusion PR #19437) + model `IcebergScanExecNode` on `ArrowScanExecNode` pattern (PR #20284); replaces the current JSON ScanTask workaround |
 
 ### 2d. Trino Compat
 
@@ -226,6 +243,7 @@ Four sub-systems that make SQE agent-native and semantically aware.
 ## Implementation Order Rationale
 
 ```
+Step 0: dependency upgrade  (iceberg-rust 0.9.0 + DataFusion 52 + apply_expressions; must go first)
 Step 1: audit               (1–2 days — catches issues before they compound)
 Step 2: core engine gaps    (close the open tasks; DELETE/MERGE blocked until iceberg-rust MoR Q3 2026)
 Step 3: security hardening  (prerequisite for OSS release; no API changes)
