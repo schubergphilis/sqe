@@ -235,14 +235,7 @@ impl WriteHandler {
         batches: Vec<RecordBatch>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_name = match stmt {
-            Statement::Insert(ins) => match &ins.table {
-                sqlparser::ast::TableObject::TableName(name) => name,
-                other => {
-                    return Err(SqeError::Execution(format!(
-                        "INSERT INTO table function not supported: {other}"
-                    )));
-                }
-            },
+            Statement::Insert(ins) => &ins.table_name,
             other => {
                 return Err(SqeError::Execution(format!(
                     "Expected Insert statement, got: {other}"
@@ -348,7 +341,7 @@ fn sql_type_to_arrow(sql_type: &sqlparser::ast::DataType) -> sqe_core::Result<ar
         SqlType::Int(_) | SqlType::Integer(_) | SqlType::Int32 => Ok(DataType::Int32),
         SqlType::BigInt(_) | SqlType::Int64 => Ok(DataType::Int64),
         SqlType::Float(_) | SqlType::Real => Ok(DataType::Float32),
-        SqlType::Double(_) | SqlType::DoublePrecision => Ok(DataType::Float64),
+        SqlType::Double | SqlType::DoublePrecision => Ok(DataType::Float64),
         SqlType::Varchar(_) | SqlType::CharVarying(_) | SqlType::Text | SqlType::String(_) => {
             Ok(DataType::Utf8)
         }

@@ -15,28 +15,29 @@ members = [
 ]
 
 [workspace.dependencies]
-# Query engine — pinned to 51.x for iceberg-datafusion 0.8 compatibility
-datafusion = "51"
-datafusion-common = "51"
-datafusion-expr = "51"
-datafusion-sql = "51"
-datafusion-proto = "51"
+# Query engine — DataFusion 52 with iceberg-rust 0.9 compatibility
+datafusion = "52"
+datafusion-common = "52"
+datafusion-expr = "52"
+datafusion-sql = "52"
+datafusion-proto = "52"
 
-# Arrow — pinned to 57.x for iceberg-datafusion 0.8 compatibility
+# Arrow — arrow 57 aligns with DataFusion 52, iceberg-rust 0.9, and parquet 57
 arrow = { version = "57", features = ["prettyprint"] }
 arrow-flight = { version = "57", features = ["flight-sql-experimental"] }
 arrow-schema = "57"
 arrow-array = "57"
-parquet = { version = "57", features = ["async"] }
+parquet = { version = "57", features = ["async", "object_store"] }
 object_store = { version = "0.12", features = ["aws"] }
 
 # Iceberg
-iceberg = "0.8"
-iceberg-catalog-rest = "0.8"
-iceberg-datafusion = "0.8"
+iceberg = "0.9"
+iceberg-catalog-rest = "0.9"
+iceberg-storage-opendal = "0.9"
+iceberg-datafusion = "0.9"
 
-# SQL parser — DataFusion 51 requires ^0.59
-sqlparser = "0.59"
+# SQL parser — DataFusion 52 ships sqlparser 0.53
+sqlparser = "0.53"
 
 # Async — use only what is needed; avoid ["full"] which includes fs/process/io-std
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
