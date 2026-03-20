@@ -53,7 +53,7 @@
 - [ ] 6.3 Implement DataFusion optimizer pass with Iceberg predicate pushdown (DataFusion 52 extends pushdown to LIMIT, LIKE, Boolean, Timestamp — available after Step 0 upgrade)
 - [x] 6.4 Implement PhysicalPlan generation from optimized LogicalPlan
 - [x] 6.5 Implement adaptive fragment splitting: extract Iceberg manifest groups from PhysicalPlan
-- [ ] 6.6 Implement custom datafusion-proto codec extensions for iceberg-rust plan nodes — use `PhysicalExtensionProtoCodec` trait (DataFusion PR #19437) + model `IcebergScanExecNode` on `ArrowScanExecNode` pattern (PR #20284); replaces JSON ScanTask workaround
+- [x] 6.6 Implement custom datafusion-proto codec extensions for iceberg-rust plan nodes — use `PhysicalExtensionProtoCodec` trait (DataFusion PR #19437) + model `IcebergScanExecNode` on `ArrowScanExecNode` pattern (PR #20284); replaces JSON ScanTask workaround
 - [x] 6.7 Unit tests: fragment splitting for small (1 manifest) and large (100+ manifests) tables
 
 ## 7. Coordinator (sqe-coordinator)
