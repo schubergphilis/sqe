@@ -11,6 +11,7 @@ arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
 iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
+iceberg-storage-opendal = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
