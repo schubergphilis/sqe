@@ -38,11 +38,12 @@ pub async fn execute_scan(task: &ScanTask) -> anyhow::Result<(SchemaRef, Vec<Rec
         let object_key = s3_url_to_key(file_path)?;
         let path = ObjectPath::from(object_key.as_str());
 
-        // Use head() to get file size for bounded range requests (avoids suffix range requests)
+        // Use head() to get ObjectMeta (includes size) for bounded range requests
         let meta = store.head(&path).await?;
-        let reader = ParquetObjectReader::new(store.clone(), path)
+        let reader = ParquetObjectReader::new(store.clone(), meta.location)
             .with_file_size(meta.size);
-        let mut builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+        let mut builder: ParquetRecordBatchStreamBuilder<ParquetObjectReader> =
+            ParquetRecordBatchStreamBuilder::new(reader).await?;
 
         // Apply column projection if specified
         if !task.projected_columns.is_empty() {

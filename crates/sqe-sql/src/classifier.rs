@@ -153,8 +153,13 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
         Statement::Explain { .. } => Ok(StatementKind::Utility(Box::new(stmt))),
         Statement::ExplainTable { .. } => Ok(StatementKind::Utility(Box::new(stmt))),
 
-        // SET → Utility (sqlparser 0.59 consolidated all SET variants)
-        Statement::Set(_) => Ok(StatementKind::Utility(Box::new(stmt))),
+        // SET → Utility (sqlparser 0.53 uses separate variants per SET flavour)
+        Statement::SetVariable { .. }
+        | Statement::SetTimeZone { .. }
+        | Statement::SetNames { .. }
+        | Statement::SetNamesDefault { .. }
+        | Statement::SetTransaction { .. }
+        | Statement::SetRole { .. } => Ok(StatementKind::Utility(Box::new(stmt))),
 
         // SHOW SCHEMAS — sqlparser has a ShowSchemas variant
         Statement::ShowSchemas { ref show_options, .. } => {

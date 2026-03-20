@@ -23,3 +23,5 @@ anyhow = { workspace = true }
 url = { workspace = true }
 dashmap = { workspace = true }
 chrono = { workspace = true }
+uuid = { workspace = true }
+iceberg-datafusion = { workspace = true }
