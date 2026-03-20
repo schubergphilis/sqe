@@ -23,6 +23,7 @@ sqe-sql = { path = "../sqe-sql" }
 sqe-policy = { path = "../sqe-policy" }
 sqe-planner = { path = "../sqe-planner" }
 datafusion = { workspace = true }
+datafusion-proto = { workspace = true }
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
 arrow-schema = { workspace = true }

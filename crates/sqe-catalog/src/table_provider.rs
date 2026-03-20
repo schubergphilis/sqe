@@ -20,10 +20,9 @@ use tracing::debug;
 /// via iceberg-rust's scan API and S3/FileIO.
 ///
 /// Note: We implement our own `TableProvider` rather than using
-/// `iceberg-datafusion::IcebergTableProvider` because iceberg-datafusion 0.5.x
-/// depends on datafusion 47, which is incompatible with our datafusion 49.
-/// Since iceberg 0.5.x uses arrow 55 (same as our workspace), the schema
-/// types are fully compatible.
+/// `iceberg-datafusion::IcebergTableProvider` to retain the per-user Table
+/// object (with vended S3 credentials). For catalog-backed access,
+/// `iceberg-datafusion::IcebergTableProvider` can be used via `SessionCatalogBridge`.
 #[derive(Debug, Clone)]
 pub struct SqeTableProvider {
     /// The underlying Iceberg table.

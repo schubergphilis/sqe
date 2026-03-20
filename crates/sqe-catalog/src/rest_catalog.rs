@@ -6,6 +6,7 @@ use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogBuilder};
 use tokio::sync::RwLock;
 use tracing::{debug, info};
+use uuid::Uuid;
 
 use sqe_core::config::StorageConfig;
 use sqe_core::SqeError;
@@ -99,7 +100,7 @@ impl SessionCatalog {
             props.insert("s3.path-style-access".to_string(), "true".to_string());
         }
 
-        // iceberg-rust 0.8 uses CatalogBuilder::load(name, props) pattern
+        // iceberg-rust 0.9 uses CatalogBuilder::load(name, props) pattern
         let catalog = RestCatalogBuilder::default()
             .load(
                 format!("sqe-session-{}", &token_fingerprint),
@@ -251,6 +252,7 @@ impl SessionCatalog {
             .http_client
             .post(&url)
             .bearer_auth(&self.bearer_token)
+            .header("X-Request-ID", Uuid::new_v4().to_string())
             .json(&body)
             .send()
             .await
@@ -285,6 +287,7 @@ impl SessionCatalog {
             .http_client
             .get(&url)
             .bearer_auth(&self.bearer_token)
+            .header("X-Request-ID", Uuid::new_v4().to_string())
             .send()
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to list views: {e}")))?;
@@ -330,6 +333,7 @@ impl SessionCatalog {
             .http_client
             .get(&url)
             .bearer_auth(&self.bearer_token)
+            .header("X-Request-ID", Uuid::new_v4().to_string())
             .send()
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to load view: {e}")))?;
@@ -385,6 +389,7 @@ impl SessionCatalog {
             .http_client
             .delete(&url)
             .bearer_auth(&self.bearer_token)
+            .header("X-Request-ID", Uuid::new_v4().to_string())
             .send()
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to drop view: {e}")))?;

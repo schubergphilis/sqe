@@ -35,6 +35,16 @@ pub struct DistributedScanExec {
 }
 
 impl DistributedScanExec {
+    /// Returns the scan tasks for all partitions.
+    pub fn scan_tasks(&self) -> &[ScanTask] {
+        &self.scan_tasks
+    }
+
+    /// Returns the worker URLs corresponding to each scan task.
+    pub fn worker_urls(&self) -> &[String] {
+        &self.worker_urls
+    }
+
     pub fn new(
         scan_tasks: Vec<ScanTask>,
         worker_urls: Vec<String>,

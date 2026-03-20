@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
-use sqlparser::ast::{AlterTableOperation, ObjectName, ObjectType, RenameTableNameKind, SchemaName, Statement};
+use sqlparser::ast::{AlterTableOperation, ObjectName, ObjectType, SchemaName, Statement};
 use tracing::info;
 
 use sqe_catalog::SessionCatalog;
@@ -190,17 +190,11 @@ impl CatalogOps {
             }
         };
 
-        // Find the RenameTable operation and extract the ObjectName from the RenameTableNameKind
+        // Find the RenameTable operation and extract the destination ObjectName
         let dest_obj_name = operations
             .iter()
             .find_map(|op| match op {
-                AlterTableOperation::RenameTable { table_name } => {
-                    let obj_name = match table_name {
-                        RenameTableNameKind::To(name) => name,
-                        RenameTableNameKind::As(name) => name,
-                    };
-                    Some(obj_name)
-                }
+                AlterTableOperation::RenameTable { table_name } => Some(table_name),
                 _ => None,
             })
             .ok_or_else(|| {
@@ -370,7 +364,7 @@ pub(crate) fn parse_table_ref(name: &ObjectName) -> sqe_core::Result<(NamespaceI
     let parts: Vec<String> = name
         .0
         .iter()
-        .filter_map(|part| part.as_ident().map(|ident| ident.value.clone()))
+        .map(|ident| ident.value.clone())
         .collect();
 
     match parts.len() {
@@ -411,7 +405,7 @@ fn parse_namespace_from_object_name(name: &ObjectName) -> sqe_core::Result<Names
     let parts: Vec<String> = name
         .0
         .iter()
-        .filter_map(|part| part.as_ident().map(|ident| ident.value.clone()))
+        .map(|ident| ident.value.clone())
         .collect();
 
     match parts.len() {
@@ -456,7 +450,7 @@ mod tests {
 
     #[test]
     fn test_parse_table_ref_one_part() {
-        let name = ObjectName::from(vec![Ident::new("my_table")]);
+        let name = ObjectName(vec![Ident::new("my_table")]);
         let (ns, table) = parse_table_ref(&name).unwrap();
         assert_eq!(ns, NamespaceIdent::new("default".to_string()));
         assert_eq!(table, "my_table");
@@ -464,7 +458,7 @@ mod tests {
 
     #[test]
     fn test_parse_table_ref_two_parts() {
-        let name = ObjectName::from(vec![Ident::new("my_schema"), Ident::new("my_table")]);
+        let name = ObjectName(vec![Ident::new("my_schema"), Ident::new("my_table")]);
         let (ns, table) = parse_table_ref(&name).unwrap();
         assert_eq!(ns, NamespaceIdent::new("my_schema".to_string()));
         assert_eq!(table, "my_table");
@@ -472,7 +466,7 @@ mod tests {
 
     #[test]
     fn test_parse_table_ref_three_parts() {
-        let name = ObjectName::from(vec![
+        let name = ObjectName(vec![
             Ident::new("my_catalog"),
             Ident::new("my_schema"),
             Ident::new("my_table"),
@@ -484,13 +478,13 @@ mod tests {
 
     #[test]
     fn test_parse_table_ref_empty_is_error() {
-        let name = ObjectName::from(vec![] as Vec<Ident>);
+        let name = ObjectName(vec![] as Vec<Ident>);
         assert!(parse_table_ref(&name).is_err());
     }
 
     #[test]
     fn test_parse_table_ref_four_parts_is_error() {
-        let name = ObjectName::from(vec![
+        let name = ObjectName(vec![
             Ident::new("a"),
             Ident::new("b"),
             Ident::new("c"),
