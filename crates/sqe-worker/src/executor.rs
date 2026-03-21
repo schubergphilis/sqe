@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
+use datafusion::execution::memory_pool::MemoryConsumer;
+use datafusion::prelude::SessionContext;
 use object_store::aws::AmazonS3Builder;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
@@ -19,6 +21,11 @@ use crate::credential_channel::RefreshableCredentials;
 
 /// Execute a scan task by reading Parquet files from S3 and returning Arrow RecordBatches.
 ///
+/// The `session_ctx` parameter supplies the DataFusion [`SessionContext`] whose
+/// `RuntimeEnv` carries the configured memory pool. Each batch read is
+/// accounted against that pool via a [`MemoryConsumer`] reservation so the
+/// worker respects its memory limit.
+///
 /// When `metrics` is provided, the function records:
 /// - `sqe_worker_fragments_executed_total` (incremented by 1)
 /// - `sqe_worker_rows_scanned_total` (incremented by total rows read)
@@ -29,10 +36,11 @@ use crate::credential_channel::RefreshableCredentials;
 /// before each file read. If new credentials are available, the S3 object store is
 /// rebuilt with the updated credentials so that long-running scans survive credential
 /// expiry.
-#[tracing::instrument(skip(task, metrics, credential_rx), fields(fragment_id = %task.fragment_id, file_count = task.data_file_paths.len()))]
+#[tracing::instrument(skip(task, metrics, session_ctx, credential_rx), fields(fragment_id = %task.fragment_id, file_count = task.data_file_paths.len()))]
 pub async fn execute_scan(
     task: &ScanTask,
     metrics: Option<&Arc<WorkerMetricsRegistry>>,
+    session_ctx: &SessionContext,
     credential_rx: Option<watch::Receiver<Option<RefreshableCredentials>>>,
 ) -> anyhow::Result<(SchemaRef, Vec<RecordBatch>)> {
     let start = std::time::Instant::now();
@@ -60,6 +68,12 @@ pub async fn execute_scan(
         &current_session_token,
     )?;
     let mut store: Arc<dyn ObjectStore> = Arc::new(store);
+
+    // Register a memory consumer with the session's pool so that batch
+    // allocations are tracked and the worker memory limit is enforced.
+    let pool = session_ctx.runtime_env().memory_pool.clone();
+    let consumer = MemoryConsumer::new(format!("scan:{}", task.fragment_id));
+    let mut reservation = consumer.register(&pool);
 
     let mut all_batches = Vec::new();
     let mut result_schema: Option<SchemaRef> = None;
@@ -145,10 +159,20 @@ pub async fn execute_scan(
             result_schema = Some(batches[0].schema());
         }
 
+        // Account for the in-memory size of the Arrow batches against the
+        // memory pool.  `try_grow` will return an error if the limit is
+        // exceeded, propagating back-pressure to the caller.
+        let batch_mem: usize = batches
+            .iter()
+            .map(|b| b.get_array_memory_size())
+            .sum();
+        reservation.try_grow(batch_mem)?;
+
         debug!(
             file = %file_path,
             batch_count = batches.len(),
             rows = batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            batch_memory_bytes = batch_mem,
             "Read Parquet file"
         );
 

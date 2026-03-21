@@ -15,6 +15,7 @@ path = "src/main.rs"
 sqe-core = { path = "../sqe-core" }
 sqe-planner = { path = "../sqe-planner" }
 sqe-metrics = { path = "../sqe-metrics" }
+datafusion = { workspace = true }
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
 arrow-schema = { workspace = true }
