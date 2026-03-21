@@ -1,6 +1,7 @@
 pub mod server;
 pub mod audit;
 pub mod otel;
+pub mod propagation;
 
 use prometheus::{
     Counter, CounterVec, HistogramOpts, HistogramVec, IntGauge, Opts, Registry,
