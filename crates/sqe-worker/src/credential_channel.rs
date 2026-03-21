@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 /// Refreshed S3 credential payload sent from coordinator to worker.
 ///
 /// Serialized as JSON in the Arrow Flight action body.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RefreshableCredentials {
     /// The fragment this credential update applies to.
     pub fragment_id: String,
@@ -31,6 +31,18 @@ pub struct RefreshableCredentials {
     pub session_token: String,
     /// When these credentials expire (RFC 3339).
     pub expiry: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for RefreshableCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshableCredentials")
+            .field("fragment_id", &self.fragment_id)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"[REDACTED]")
+            .field("session_token", &"[REDACTED]")
+            .field("expiry", &self.expiry)
+            .finish()
+    }
 }
 
 /// Manages per-fragment credential watch channels.

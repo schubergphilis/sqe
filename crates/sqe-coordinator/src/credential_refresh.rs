@@ -26,7 +26,7 @@ use tracing::{debug, info, warn};
 /// This mirrors `sqe_worker::credential_channel::RefreshableCredentials` but is
 /// defined here to avoid a circular dependency.  Both sides serialize/deserialize
 /// the same JSON schema.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RefreshableCredentials {
     /// The fragment this credential update applies to.
     pub fragment_id: String,
@@ -38,6 +38,18 @@ pub struct RefreshableCredentials {
     pub session_token: String,
     /// When these credentials expire (RFC 3339).
     pub expiry: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for RefreshableCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshableCredentials")
+            .field("fragment_id", &self.fragment_id)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"[REDACTED]")
+            .field("session_token", &"[REDACTED]")
+            .field("expiry", &self.expiry)
+            .finish()
+    }
 }
 
 /// Tracks an active fragment dispatched to a worker.
@@ -176,6 +188,8 @@ pub async fn push_credentials_to_worker(
     let body = serde_json::to_vec(credentials)?;
 
     let channel = tonic::transport::Endpoint::new(worker_url.to_string())?
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
         .connect()
         .await?;
     let mut client = FlightServiceClient::new(channel);

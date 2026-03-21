@@ -212,14 +212,18 @@ impl ExecutionPlan for DistributedScanExec {
             // Inject W3C TraceContext (traceparent/tracestate) into gRPC metadata
             inject_trace_context(&parent_cx, request.metadata_mut());
 
-            let response = client
-                .do_get(request)
-                .await
-                .map_err(|e| {
-                    DataFusionError::Execution(format!(
+            let response = match client.do_get(request).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    // Clean up tracker on failure to prevent fragment leak
+                    if let Some(ref tracker) = credential_tracker {
+                        tracker.unregister(&task.fragment_id).await;
+                    }
+                    return Err(DataFusionError::Execution(format!(
                         "Worker {worker_url} do_get failed: {e}"
-                    ))
-                })?;
+                    )));
+                }
+            };
 
             let flight_stream = FlightRecordBatchStream::new_from_flight_data(
                 response
