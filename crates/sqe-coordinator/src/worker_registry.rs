@@ -79,6 +79,29 @@ impl WorkerRegistry {
         }
     }
 
+    /// Register a worker (if not already known) and mark it healthy.
+    ///
+    /// Called when the coordinator receives a heartbeat from a worker.
+    /// Workers that were not in the initial config list are dynamically added.
+    pub async fn register_heartbeat(&self, url: &str) {
+        let mut inner = self.inner.write().await;
+        let state = inner.workers.entry(url.to_string()).or_insert_with(|| {
+            info!(worker = url, "Discovered new worker via heartbeat");
+            WorkerState {
+                url: url.to_string(),
+                healthy: false,
+                consecutive_failures: 0,
+                last_healthy: None,
+            }
+        });
+        if !state.healthy {
+            info!(worker = url, "Worker became healthy");
+        }
+        state.healthy = true;
+        state.consecutive_failures = 0;
+        state.last_healthy = Some(Instant::now());
+    }
+
     pub async fn mark_failed(&self, url: &str) {
         let mut inner = self.inner.write().await;
         if let Some(state) = inner.workers.get_mut(url) {
@@ -206,6 +229,55 @@ mod tests {
         assert!(registry.healthy_workers().await.is_empty());
 
         registry.mark_healthy("http://worker1:50052").await;
+        assert_eq!(registry.healthy_workers().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_register_heartbeat_new_worker() {
+        let registry = WorkerRegistry::new(vec![]);
+        assert_eq!(registry.total_workers().await, 0);
+
+        registry
+            .register_heartbeat("http://worker1:50052")
+            .await;
+
+        assert_eq!(registry.total_workers().await, 1);
+        assert_eq!(
+            registry.healthy_workers().await,
+            vec!["http://worker1:50052"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_register_heartbeat_existing_worker() {
+        let registry = WorkerRegistry::new(vec!["http://worker1:50052".to_string()]);
+        // Worker starts unhealthy
+        assert!(registry.healthy_workers().await.is_empty());
+
+        // Heartbeat marks it healthy
+        registry
+            .register_heartbeat("http://worker1:50052")
+            .await;
+        assert_eq!(registry.healthy_workers().await.len(), 1);
+        // Total count unchanged (was already registered)
+        assert_eq!(registry.total_workers().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_register_heartbeat_recovers_failed_worker() {
+        let registry = WorkerRegistry::new(vec!["http://worker1:50052".to_string()]);
+        registry.mark_healthy("http://worker1:50052").await;
+
+        // Fail the worker
+        for _ in 0..3 {
+            registry.mark_failed("http://worker1:50052").await;
+        }
+        assert!(registry.healthy_workers().await.is_empty());
+
+        // Heartbeat recovers it
+        registry
+            .register_heartbeat("http://worker1:50052")
+            .await;
         assert_eq!(registry.healthy_workers().await.len(), 1);
     }
 }
