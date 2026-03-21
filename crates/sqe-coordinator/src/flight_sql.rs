@@ -39,6 +39,8 @@ use sqe_core::SqeConfig;
 use crate::query_handler::QueryHandler;
 use crate::session_manager::SessionManager;
 
+type FlightStream = Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send>>;
+
 /// Custom protobuf message to carry query handles in tickets.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FetchResults {
@@ -113,10 +115,7 @@ impl SqeFlightSqlService {
     /// Convert RecordBatches into a streaming Flight response.
     fn batches_to_stream(
         batches: Vec<RecordBatch>,
-    ) -> Result<
-        Response<Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send>>>,
-        Status,
-    > {
+    ) -> Result<Response<FlightStream>, Status> {
         if batches.is_empty() {
             let schema = Arc::new(Schema::empty());
             let stream = FlightDataEncoderBuilder::new()
@@ -132,8 +131,7 @@ impl SqeFlightSqlService {
             .into_iter()
             .map(Ok);
 
-        let stream: Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send>> =
-            Box::pin(stream::iter(flight_data));
+        let stream: FlightStream = Box::pin(stream::iter(flight_data));
 
         Ok(Response::new(stream))
     }

@@ -79,7 +79,7 @@ impl QueryHandler {
         let start = std::time::Instant::now();
         let kind = parse_and_classify(sql)?;
         let kind_name = kind.name().to_string();
-        tracing::Span::current().record("statement_type", &kind_name.as_str());
+        tracing::Span::current().record("statement_type", kind_name.as_str());
 
         let result = match kind {
             StatementKind::Query(_) => self.execute_query(session, sql).await,
