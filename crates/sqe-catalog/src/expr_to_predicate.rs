@@ -193,6 +193,10 @@ fn to_iceberg_operation(op: Operator) -> OpTransformedResult {
 }
 
 /// For AND, if only one side converts, we still push that side down.
+/// SAFETY: Dropping one side of an AND is correct only because
+/// supports_filters_pushdown returns Inexact, which forces DataFusion
+/// to re-evaluate the full filter post-scan. If this ever changes to
+/// Exact, partial pushdown would silently drop filter conditions.
 fn to_iceberg_and_predicate(
     left: TransformedResult,
     right: TransformedResult,
@@ -263,7 +267,10 @@ fn scalar_value_to_datum(value: &ScalarValue) -> Option<Datum> {
         ScalarValue::Date32(Some(v)) => Some(Datum::date(*v)),
         ScalarValue::Date64(Some(v)) => Some(Datum::date((*v / MILLIS_PER_DAY) as i32)),
         ScalarValue::TimestampMicrosecond(Some(v), _) => Some(Datum::timestamp_micros(*v)),
-        ScalarValue::TimestampNanosecond(Some(v), _) => Some(Datum::timestamp_nanos(*v)),
+        ScalarValue::TimestampNanosecond(Some(v), _) => {
+            // Iceberg timestamps use microsecond precision; convert nanos → micros
+            Some(Datum::timestamp_micros(*v / 1_000))
+        }
         _ => None,
     }
 }
