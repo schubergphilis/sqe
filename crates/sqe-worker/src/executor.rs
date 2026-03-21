@@ -8,11 +8,14 @@ use object_store::path::Path as ObjectPath;
 use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use futures::TryStreamExt;
-use tracing::{debug, info};
+use tokio::sync::watch;
+use tracing::{debug, info, warn};
 use url::Url;
 
 use sqe_metrics::WorkerMetricsRegistry;
 use sqe_planner::ScanTask;
+
+use crate::credential_channel::RefreshableCredentials;
 
 /// Execute a scan task by reading Parquet files from S3 and returning Arrow RecordBatches.
 ///
@@ -21,10 +24,16 @@ use sqe_planner::ScanTask;
 /// - `sqe_worker_rows_scanned_total` (incremented by total rows read)
 /// - `sqe_worker_bytes_read_total` (incremented by storage bytes read)
 /// - `sqe_worker_fragment_duration_seconds` (observed elapsed wall time)
-#[tracing::instrument(skip(task, metrics), fields(fragment_id = %task.fragment_id, file_count = task.data_file_paths.len()))]
+///
+/// When `credential_rx` is provided, the executor checks for refreshed credentials
+/// before each file read. If new credentials are available, the S3 object store is
+/// rebuilt with the updated credentials so that long-running scans survive credential
+/// expiry.
+#[tracing::instrument(skip(task, metrics, credential_rx), fields(fragment_id = %task.fragment_id, file_count = task.data_file_paths.len()))]
 pub async fn execute_scan(
     task: &ScanTask,
     metrics: Option<&Arc<WorkerMetricsRegistry>>,
+    credential_rx: Option<watch::Receiver<Option<RefreshableCredentials>>>,
 ) -> anyhow::Result<(SchemaRef, Vec<RecordBatch>)> {
     let start = std::time::Instant::now();
 
@@ -38,14 +47,61 @@ pub async fn execute_scan(
         anyhow::bail!("ScanTask has no data files");
     }
 
-    let store = build_object_store(task)?;
-    let store = Arc::new(store);
+    // Mutable credential state — may be updated between files
+    let mut current_access_key = task.s3_access_key.clone();
+    let mut current_secret_key = task.s3_secret_key.clone();
+    let mut current_session_token = task.s3_session_token.clone();
+    let mut credential_rx = credential_rx;
+
+    let store = build_object_store_with_creds(
+        task,
+        &current_access_key,
+        &current_secret_key,
+        &current_session_token,
+    )?;
+    let mut store: Arc<dyn ObjectStore> = Arc::new(store);
 
     let mut all_batches = Vec::new();
     let mut result_schema: Option<SchemaRef> = None;
     let mut total_bytes: u64 = 0;
 
     for file_path in &task.data_file_paths {
+        // Check for credential refresh before each file read
+        if let Some(ref mut rx) = credential_rx {
+            if rx.has_changed().unwrap_or(false) {
+                let new_creds = rx.borrow_and_update().clone();
+                if let Some(creds) = new_creds {
+                    info!(
+                        fragment_id = %task.fragment_id,
+                        expiry = %creds.expiry,
+                        "Applying refreshed credentials for next file read"
+                    );
+                    current_access_key = creds.access_key_id;
+                    current_secret_key = creds.secret_access_key;
+                    current_session_token = creds.session_token;
+
+                    match build_object_store_with_creds(
+                        task,
+                        &current_access_key,
+                        &current_secret_key,
+                        &current_session_token,
+                    ) {
+                        Ok(new_store) => {
+                            store = Arc::new(new_store);
+                        }
+                        Err(e) => {
+                            warn!(
+                                fragment_id = %task.fragment_id,
+                                error = %e,
+                                "Failed to rebuild object store with refreshed credentials, \
+                                 continuing with previous credentials"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         debug!(file = %file_path, "Reading Parquet file");
 
         let object_key = s3_url_to_key(file_path)?;
@@ -124,8 +180,17 @@ pub async fn execute_scan(
     Ok((schema, all_batches))
 }
 
-/// Build an S3 ObjectStore from ScanTask credentials.
-fn build_object_store(task: &ScanTask) -> anyhow::Result<impl ObjectStore> {
+/// Build an S3 ObjectStore from ScanTask config with explicit credentials.
+///
+/// This is separated from `build_object_store` so that the executor can rebuild
+/// the store when refreshed credentials arrive without re-reading the ScanTask's
+/// original (possibly expired) credentials.
+fn build_object_store_with_creds(
+    task: &ScanTask,
+    access_key: &str,
+    secret_key: &str,
+    session_token: &str,
+) -> anyhow::Result<impl ObjectStore> {
     let mut builder = AmazonS3Builder::new();
 
     if !task.s3_endpoint.is_empty() {
@@ -134,14 +199,14 @@ fn build_object_store(task: &ScanTask) -> anyhow::Result<impl ObjectStore> {
     if !task.s3_region.is_empty() {
         builder = builder.with_region(&task.s3_region);
     }
-    if !task.s3_access_key.is_empty() {
-        builder = builder.with_access_key_id(&task.s3_access_key);
+    if !access_key.is_empty() {
+        builder = builder.with_access_key_id(access_key);
     }
-    if !task.s3_secret_key.is_empty() {
-        builder = builder.with_secret_access_key(&task.s3_secret_key);
+    if !secret_key.is_empty() {
+        builder = builder.with_secret_access_key(secret_key);
     }
-    if !task.s3_session_token.is_empty() {
-        builder = builder.with_token(&task.s3_session_token);
+    if !session_token.is_empty() {
+        builder = builder.with_token(session_token);
     }
     if task.s3_path_style {
         builder = builder.with_virtual_hosted_style_request(false);
@@ -151,7 +216,11 @@ fn build_object_store(task: &ScanTask) -> anyhow::Result<impl ObjectStore> {
     builder = builder.with_allow_http(true);
 
     // Extract bucket from the first file path
-    let bucket = s3_url_to_bucket(&task.data_file_paths[0])?;
+    let bucket = s3_url_to_bucket(
+        task.data_file_paths
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("ScanTask has no data files"))?,
+    )?;
     builder = builder.with_bucket_name(&bucket);
 
     Ok(builder.build()?)
