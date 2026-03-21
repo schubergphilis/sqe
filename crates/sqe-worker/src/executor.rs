@@ -11,11 +11,23 @@ use futures::TryStreamExt;
 use tracing::{debug, info};
 use url::Url;
 
+use sqe_metrics::WorkerMetricsRegistry;
 use sqe_planner::ScanTask;
 
 /// Execute a scan task by reading Parquet files from S3 and returning Arrow RecordBatches.
-#[tracing::instrument(skip(task), fields(fragment_id = %task.fragment_id, file_count = task.data_file_paths.len()))]
-pub async fn execute_scan(task: &ScanTask) -> anyhow::Result<(SchemaRef, Vec<RecordBatch>)> {
+///
+/// When `metrics` is provided, the function records:
+/// - `sqe_worker_fragments_executed_total` (incremented by 1)
+/// - `sqe_worker_rows_scanned_total` (incremented by total rows read)
+/// - `sqe_worker_bytes_read_total` (incremented by storage bytes read)
+/// - `sqe_worker_fragment_duration_seconds` (observed elapsed wall time)
+#[tracing::instrument(skip(task, metrics), fields(fragment_id = %task.fragment_id, file_count = task.data_file_paths.len()))]
+pub async fn execute_scan(
+    task: &ScanTask,
+    metrics: Option<&Arc<WorkerMetricsRegistry>>,
+) -> anyhow::Result<(SchemaRef, Vec<RecordBatch>)> {
+    let start = std::time::Instant::now();
+
     info!(
         fragment_id = %task.fragment_id,
         file_count = task.data_file_paths.len(),
@@ -31,6 +43,7 @@ pub async fn execute_scan(task: &ScanTask) -> anyhow::Result<(SchemaRef, Vec<Rec
 
     let mut all_batches = Vec::new();
     let mut result_schema: Option<SchemaRef> = None;
+    let mut total_bytes: u64 = 0;
 
     for file_path in &task.data_file_paths {
         debug!(file = %file_path, "Reading Parquet file");
@@ -40,6 +53,7 @@ pub async fn execute_scan(task: &ScanTask) -> anyhow::Result<(SchemaRef, Vec<Rec
 
         // Use head() to get ObjectMeta (includes size) for bounded range requests
         let meta = store.head(&path).await?;
+        total_bytes += meta.size as u64;
         let reader = ParquetObjectReader::new(store.clone(), meta.location)
             .with_file_size(meta.size);
         let mut builder: ParquetRecordBatchStreamBuilder<ParquetObjectReader> =
@@ -87,12 +101,25 @@ pub async fn execute_scan(task: &ScanTask) -> anyhow::Result<(SchemaRef, Vec<Rec
 
     let schema = result_schema.unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()));
 
+    let total_rows: usize = all_batches.iter().map(|b| b.num_rows()).sum();
+    let elapsed = start.elapsed();
+
     info!(
         fragment_id = %task.fragment_id,
         total_batches = all_batches.len(),
-        total_rows = all_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+        total_rows = total_rows,
+        total_bytes = total_bytes,
+        elapsed_ms = elapsed.as_millis() as u64,
         "Scan task complete"
     );
+
+    // Record worker metrics
+    if let Some(m) = metrics {
+        m.fragments_executed.inc();
+        m.rows_scanned.inc_by(total_rows as f64);
+        m.bytes_read.inc_by(total_bytes as f64);
+        m.fragment_duration.observe(elapsed.as_secs_f64());
+    }
 
     Ok((schema, all_batches))
 }
