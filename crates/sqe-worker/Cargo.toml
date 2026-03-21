@@ -31,6 +31,8 @@ futures = { workspace = true }
 bytes = { workspace = true }
 anyhow = { workspace = true }
 url = { workspace = true }
+opentelemetry = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
