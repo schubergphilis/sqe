@@ -2,7 +2,8 @@ use opentelemetry::trace::TracerProvider;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::{
-    logs::SdkLoggerProvider, metrics::SdkMeterProvider, trace::SdkTracerProvider, Resource,
+    logs::SdkLoggerProvider, metrics::SdkMeterProvider,
+    propagation::TraceContextPropagator, trace::SdkTracerProvider, Resource,
 };
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::Layer;
@@ -55,6 +56,9 @@ pub fn init_telemetry(service_name: &str, otlp_endpoint: &str) -> OtelGuard {
 
     let tracer = tracer_provider.tracer(service_name.to_string());
     opentelemetry::global::set_tracer_provider(tracer_provider.clone());
+
+    // Register W3C TraceContext propagator so inject/extract helpers work
+    opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
 
     let otel_trace_layer = OpenTelemetryLayer::new(tracer);
 

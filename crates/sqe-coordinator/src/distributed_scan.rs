@@ -17,8 +17,10 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
 use futures::{Stream, TryStreamExt};
-use tracing::info;
+use tracing::{info, info_span};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+use sqe_metrics::propagation::inject_trace_context;
 use sqe_planner::ScanTask;
 
 /// DataFusion `ExecutionPlan` that distributes scan work across workers.
@@ -127,12 +129,20 @@ impl ExecutionPlan for DistributedScanExec {
         let worker_url = self.worker_urls[partition].clone();
         let schema = self.schema.clone();
 
-        info!(
+        let dispatch_span = info_span!(
+            "dispatch_to_worker",
             fragment_id = %task.fragment_id,
             worker = %worker_url,
             file_count = task.data_file_paths.len(),
+        );
+
+        info!(
+            parent: &dispatch_span,
             "Dispatching scan to worker"
         );
+
+        // Capture the current OTel context so it can be propagated to the worker
+        let parent_cx = dispatch_span.context();
 
         let stream = futures::stream::once(async move {
             let ticket_bytes = task.to_bytes().map_err(|e| {
@@ -155,8 +165,13 @@ impl ExecutionPlan for DistributedScanExec {
             let mut client = FlightServiceClient::new(channel);
 
             let ticket = Ticket::new(ticket_bytes);
+            let mut request = tonic::Request::new(ticket);
+
+            // Inject W3C TraceContext (traceparent/tracestate) into gRPC metadata
+            inject_trace_context(&parent_cx, request.metadata_mut());
+
             let response = client
-                .do_get(tonic::Request::new(ticket))
+                .do_get(request)
                 .await
                 .map_err(|e| {
                     DataFusionError::Execution(format!(
