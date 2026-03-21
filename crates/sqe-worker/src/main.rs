@@ -1,5 +1,8 @@
+use std::time::Duration;
+
 use sqe_core::SqeConfig;
 use sqe_worker::flight_service::WorkerFlightService;
+use sqe_worker::heartbeat;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -17,6 +20,22 @@ async fn main() -> anyhow::Result<()> {
     let addr = format!("0.0.0.0:{port}").parse()?;
 
     tracing::info!("Starting SQE worker on port {port}");
+
+    // Start heartbeat to coordinator if a coordinator URL is configured.
+    if !config.worker.coordinator_url.is_empty() {
+        let worker_url = format!("http://0.0.0.0:{port}");
+        let interval = Duration::from_secs(config.worker.heartbeat_interval_secs);
+        tracing::info!(
+            coordinator = %config.worker.coordinator_url,
+            interval_secs = config.worker.heartbeat_interval_secs,
+            "Starting heartbeat to coordinator"
+        );
+        heartbeat::start_heartbeat_task(
+            config.worker.coordinator_url.clone(),
+            worker_url,
+            interval,
+        );
+    }
 
     let flight_service = WorkerFlightService::new();
 
