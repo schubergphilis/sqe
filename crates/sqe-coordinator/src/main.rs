@@ -138,8 +138,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Start Flight SQL server
-    let flight_service =
+    let mut flight_service =
         SqeFlightSqlService::new(session_manager, query_handler, config.clone());
+    if !config.coordinator.worker_urls.is_empty() {
+        flight_service = flight_service.with_worker_registry(worker_registry.clone());
+    }
     let addr = format!("0.0.0.0:{}", config.coordinator.flight_sql_port).parse()?;
 
     tracing::info!("SQE coordinator listening on {}", addr);
