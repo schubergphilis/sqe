@@ -4619,6 +4619,7 @@ dependencies = [
  "arrow-flight",
  "arrow-schema",
  "bytes",
+ "datafusion",
  "futures",
  "object_store",
  "opentelemetry",
