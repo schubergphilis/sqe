@@ -216,7 +216,11 @@ fn build_object_store_with_creds(
     builder = builder.with_allow_http(true);
 
     // Extract bucket from the first file path
-    let bucket = s3_url_to_bucket(&task.data_file_paths[0])?;
+    let bucket = s3_url_to_bucket(
+        task.data_file_paths
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("ScanTask has no data files"))?,
+    )?;
     builder = builder.with_bucket_name(&bucket);
 
     Ok(builder.build()?)
