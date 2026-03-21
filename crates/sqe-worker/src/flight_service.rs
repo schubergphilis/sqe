@@ -9,8 +9,10 @@ use arrow_flight::{
 };
 use futures::{Stream, TryStreamExt, stream};
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, info_span, warn, Instrument};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+use sqe_metrics::propagation::extract_trace_context;
 use sqe_planner::ScanTask;
 
 use crate::executor;
@@ -22,6 +24,12 @@ use crate::executor;
 /// - `do_action("health_check")`: Return OK for coordinator health monitoring
 #[derive(Clone)]
 pub struct WorkerFlightService {}
+
+impl Default for WorkerFlightService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl WorkerFlightService {
     pub fn new() -> Self {
@@ -49,31 +57,49 @@ impl FlightService for WorkerFlightService {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
+        // Extract W3C TraceContext from incoming gRPC metadata so this
+        // worker span becomes a child of the coordinator's trace.
+        let parent_cx = extract_trace_context(request.metadata());
+
         let ticket = request.into_inner();
 
         let scan_task = ScanTask::from_bytes(&ticket.ticket).map_err(|e| {
             Status::invalid_argument(format!("Failed to decode ScanTask: {e}"))
         })?;
 
-        info!(
+        let worker_span = info_span!(
+            "worker_execute_scan",
             fragment_id = %scan_task.fragment_id,
             file_count = scan_task.data_file_paths.len(),
-            "Worker received scan task"
         );
+        // Link this span to the coordinator's trace
+        let _set_parent_result = worker_span.set_parent(parent_cx);
 
-        let (schema, batches) = executor::execute_scan(&scan_task).await.map_err(|e| {
-            warn!(error = %e, "Scan task execution failed");
-            Status::internal(format!("Scan execution failed: {e}"))
-        })?;
+        async {
+            info!(
+                fragment_id = %scan_task.fragment_id,
+                file_count = scan_task.data_file_paths.len(),
+                "Worker received scan task"
+            );
 
-        let schema = Arc::new((*schema).clone());
-        let batch_stream = stream::iter(batches.into_iter().map(Ok));
-        let flight_stream = FlightDataEncoderBuilder::new()
-            .with_schema(schema)
-            .build(batch_stream)
-            .map_err(Status::from);
+            let (schema, batches) = executor::execute_scan(&scan_task).await.map_err(|e| {
+                warn!(error = %e, "Scan task execution failed");
+                Status::internal(format!("Scan execution failed: {e}"))
+            })?;
 
-        Ok(Response::new(Box::pin(flight_stream)))
+            let schema = Arc::new((*schema).clone());
+            let batch_stream = stream::iter(batches.into_iter().map(Ok));
+            let flight_stream = FlightDataEncoderBuilder::new()
+                .with_schema(schema)
+                .build(batch_stream)
+                .map_err(Status::from);
+
+            Ok(Response::new(
+                Box::pin(flight_stream) as Self::DoGetStream
+            ))
+        }
+        .instrument(worker_span)
+        .await
     }
 
     async fn do_action(

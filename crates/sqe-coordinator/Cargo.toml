@@ -51,6 +51,8 @@ chrono = { workspace = true }
 axum = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 sqe-worker = { path = "../sqe-worker" }
+opentelemetry = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 
 [dev-dependencies]
 toml = { workspace = true }

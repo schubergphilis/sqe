@@ -111,6 +111,7 @@ impl SqeFlightSqlService {
     }
 
     /// Convert RecordBatches into a streaming Flight response.
+    #[allow(clippy::type_complexity)]
     fn batches_to_stream(
         batches: Vec<RecordBatch>,
     ) -> Result<
