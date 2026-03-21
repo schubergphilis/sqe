@@ -12,6 +12,7 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, info_span, warn, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+use datafusion::prelude::SessionContext;
 use sqe_metrics::WorkerMetricsRegistry;
 use sqe_metrics::propagation::extract_trace_context;
 use sqe_planner::ScanTask;
@@ -23,14 +24,22 @@ use crate::executor;
 /// Handles two operations:
 /// - `do_get`: Execute a scan task and stream results back
 /// - `do_action("health_check")`: Return OK for coordinator health monitoring
+///
+/// The service holds a [`SessionContext`] whose `RuntimeEnv` carries the
+/// configured memory pool and disk manager so that every scan execution
+/// respects the worker's memory limits.
 #[derive(Clone)]
 pub struct WorkerFlightService {
     metrics: Arc<WorkerMetricsRegistry>,
+    session_ctx: SessionContext,
 }
 
 impl WorkerFlightService {
-    pub fn new(metrics: Arc<WorkerMetricsRegistry>) -> Self {
-        Self { metrics }
+    pub fn new(metrics: Arc<WorkerMetricsRegistry>, session_ctx: SessionContext) -> Self {
+        Self {
+            metrics,
+            session_ctx,
+        }
     }
 
     pub fn into_server(self) -> FlightServiceServer<Self> {
@@ -73,6 +82,7 @@ impl FlightService for WorkerFlightService {
         let _set_parent_result = worker_span.set_parent(parent_cx);
 
         let metrics = self.metrics.clone();
+        let session_ctx = self.session_ctx.clone();
         async move {
             info!(
                 fragment_id = %scan_task.fragment_id,
@@ -81,7 +91,7 @@ impl FlightService for WorkerFlightService {
             );
 
             let (schema, batches) =
-                executor::execute_scan(&scan_task, Some(&metrics))
+                executor::execute_scan(&scan_task, Some(&metrics), &session_ctx)
                     .await
                     .map_err(|e| {
                         warn!(error = %e, "Scan task execution failed");

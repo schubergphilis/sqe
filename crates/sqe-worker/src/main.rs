@@ -28,7 +28,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Build a configured DataFusion SessionContext with memory limits and spill-to-disk.
     // The context is created early to fail fast on invalid config (e.g. bad memory_limit).
-    let _session_ctx = runtime::build_session_context(&config.worker)?;
+    // It is passed into WorkerFlightService so every scan execution respects the pool.
+    let session_ctx = runtime::build_session_context(&config.worker)?;
 
     let port = config.worker.flight_port;
     let addr = format!("0.0.0.0:{port}").parse()?;
@@ -51,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let flight_service = WorkerFlightService::new(worker_metrics);
+    let flight_service = WorkerFlightService::new(worker_metrics, session_ctx);
 
     tonic::transport::Server::builder()
         .add_service(flight_service.into_server())
