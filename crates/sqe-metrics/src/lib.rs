@@ -4,8 +4,17 @@ pub mod otel;
 pub mod propagation;
 
 use prometheus::{
-    Counter, CounterVec, HistogramOpts, HistogramVec, IntGauge, Opts, Registry,
+    Counter, CounterVec, Histogram, HistogramOpts, HistogramVec, IntGauge, Opts, Registry,
 };
+
+/// Trait for types that expose a Prometheus [`Registry`] for metrics serving.
+pub trait HasRegistry: Send + Sync + 'static {
+    fn prometheus_registry(&self) -> &Registry;
+}
+
+// ---------------------------------------------------------------------------
+// Coordinator metrics
+// ---------------------------------------------------------------------------
 
 /// Central metrics registry for the SQE coordinator.
 #[derive(Clone)]
@@ -75,9 +84,105 @@ impl Default for MetricsRegistry {
     }
 }
 
+impl HasRegistry for MetricsRegistry {
+    fn prometheus_registry(&self) -> &Registry {
+        &self.registry
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Worker metrics
+// ---------------------------------------------------------------------------
+
+/// Metrics registry for SQE workers.
+///
+/// Tracks per-worker counters for fragments executed, rows scanned, bytes read,
+/// and a histogram of fragment execution durations.
+#[derive(Clone)]
+pub struct WorkerMetricsRegistry {
+    pub registry: Registry,
+    /// Total number of scan fragments executed by this worker.
+    pub fragments_executed: Counter,
+    /// Total rows scanned across all fragments.
+    pub rows_scanned: Counter,
+    /// Total bytes read from storage across all fragments.
+    pub bytes_read: Counter,
+    /// Histogram of per-fragment execution time in seconds.
+    pub fragment_duration: Histogram,
+}
+
+impl WorkerMetricsRegistry {
+    pub fn new() -> Self {
+        let registry = Registry::new();
+
+        let fragments_executed = Counter::new(
+            "sqe_worker_fragments_executed_total",
+            "Total number of scan fragments executed",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(fragments_executed.clone()))
+            .unwrap();
+
+        let rows_scanned = Counter::new(
+            "sqe_worker_rows_scanned_total",
+            "Total rows scanned across all fragments",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(rows_scanned.clone()))
+            .unwrap();
+
+        let bytes_read = Counter::new(
+            "sqe_worker_bytes_read_total",
+            "Total bytes read from storage",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(bytes_read.clone()))
+            .unwrap();
+
+        let fragment_duration = Histogram::with_opts(
+            HistogramOpts::new(
+                "sqe_worker_fragment_duration_seconds",
+                "Per-fragment execution time",
+            )
+            .buckets(vec![
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+            ]),
+        )
+        .unwrap();
+        registry
+            .register(Box::new(fragment_duration.clone()))
+            .unwrap();
+
+        Self {
+            registry,
+            fragments_executed,
+            rows_scanned,
+            bytes_read,
+            fragment_duration,
+        }
+    }
+}
+
+impl Default for WorkerMetricsRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HasRegistry for WorkerMetricsRegistry {
+    fn prometheus_registry(&self) -> &Registry {
+        &self.registry
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Coordinator MetricsRegistry tests ────────────────────────
 
     #[test]
     fn test_metrics_registry_creation() {
@@ -115,5 +220,61 @@ mod tests {
         assert_eq!(metrics.active_sessions.get(), 2);
         metrics.active_sessions.dec();
         assert_eq!(metrics.active_sessions.get(), 1);
+    }
+
+    // ── WorkerMetricsRegistry tests ─────────────────────────────
+
+    #[test]
+    fn test_worker_metrics_registry_creation() {
+        let m = WorkerMetricsRegistry::new();
+        // Touch each metric so Prometheus includes it in gather()
+        m.fragments_executed.inc_by(0.0);
+        m.rows_scanned.inc_by(0.0);
+        m.bytes_read.inc_by(0.0);
+        m.fragment_duration.observe(0.0);
+        assert!(m.registry.gather().len() >= 4);
+    }
+
+    #[test]
+    fn test_worker_fragments_executed_counter() {
+        let m = WorkerMetricsRegistry::new();
+        m.fragments_executed.inc();
+        m.fragments_executed.inc();
+        assert_eq!(m.fragments_executed.get(), 2.0);
+    }
+
+    #[test]
+    fn test_worker_rows_scanned_counter() {
+        let m = WorkerMetricsRegistry::new();
+        m.rows_scanned.inc_by(500.0);
+        m.rows_scanned.inc_by(300.0);
+        assert_eq!(m.rows_scanned.get(), 800.0);
+    }
+
+    #[test]
+    fn test_worker_bytes_read_counter() {
+        let m = WorkerMetricsRegistry::new();
+        m.bytes_read.inc_by(1024.0);
+        m.bytes_read.inc_by(2048.0);
+        assert_eq!(m.bytes_read.get(), 3072.0);
+    }
+
+    #[test]
+    fn test_worker_fragment_duration_histogram() {
+        let m = WorkerMetricsRegistry::new();
+        m.fragment_duration.observe(0.1);
+        m.fragment_duration.observe(0.5);
+        m.fragment_duration.observe(2.0);
+        assert_eq!(m.fragment_duration.get_sample_count(), 3);
+        let sum = m.fragment_duration.get_sample_sum();
+        assert!((sum - 2.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_worker_metrics_default() {
+        let m = WorkerMetricsRegistry::default();
+        // Confirm Default trait works
+        m.fragments_executed.inc();
+        assert_eq!(m.fragments_executed.get(), 1.0);
     }
 }

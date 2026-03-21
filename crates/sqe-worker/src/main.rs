@@ -1,6 +1,8 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use sqe_core::SqeConfig;
+use sqe_metrics::WorkerMetricsRegistry;
 use sqe_worker::flight_service::WorkerFlightService;
 use sqe_worker::heartbeat;
 
@@ -14,6 +16,13 @@ async fn main() -> anyhow::Result<()> {
     let _otel_guard = sqe_metrics::otel::init_telemetry(
         "sqe-worker",
         &config.metrics.otlp_endpoint,
+    );
+
+    // Worker-specific Prometheus metrics
+    let worker_metrics = Arc::new(WorkerMetricsRegistry::new());
+    sqe_metrics::server::start_metrics_server(
+        worker_metrics.clone(),
+        config.metrics.prometheus_port,
     );
 
     let port = config.worker.flight_port;
@@ -37,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let flight_service = WorkerFlightService::new();
+    let flight_service = WorkerFlightService::new(worker_metrics);
 
     tonic::transport::Server::builder()
         .add_service(flight_service.into_server())
