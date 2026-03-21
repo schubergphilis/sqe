@@ -5,6 +5,8 @@
 
 use std::sync::Arc;
 
+use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+use datafusion::execution::memory_pool::FairSpillPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use tracing::info;
@@ -15,12 +17,12 @@ use sqe_core::parse_memory_limit;
 /// Build a DataFusion [`SessionContext`] configured with the memory limit
 /// and spill-to-disk settings from [`WorkerConfig`].
 ///
-/// - Memory is managed via a [`FairSpillPool`] wrapped in a
-///   [`TrackConsumersPool`] (through `RuntimeEnvBuilder::with_memory_limit`).
+/// - Memory is managed via a [`FairSpillPool`] set directly on the runtime
+///   via `RuntimeEnvBuilder::with_memory_pool`.
 /// - When `spill_to_disk` is `true`, the spill directory is set to
-///   `config.spill_dir`.
-/// - When `spill_to_disk` is `false`, a `DiskManagerMode::Disabled` disk
-///   manager is used.
+///   `config.spill_dir` via `RuntimeEnvBuilder::with_temp_file_path`.
+/// - When `spill_to_disk` is `false`, the disk manager is disabled via
+///   `DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled)`.
 pub fn build_session_context(config: &WorkerConfig) -> anyhow::Result<SessionContext> {
     let memory_bytes = parse_memory_limit(&config.memory_limit).map_err(|e| {
         anyhow::anyhow!("Invalid worker memory_limit '{}': {e}", config.memory_limit)
@@ -34,19 +36,18 @@ pub fn build_session_context(config: &WorkerConfig) -> anyhow::Result<SessionCon
         "Configuring DataFusion runtime"
     );
 
-    let mut builder = RuntimeEnvBuilder::new()
-        // Use the full pool size (fraction = 1.0). The FairSpillPool divides
-        // memory fairly among spillable operators.  TrackConsumersPool wrapping
-        // is applied automatically by `with_memory_limit`.
-        .with_memory_limit(memory_bytes, 1.0);
+    // Use FairSpillPool directly — it divides memory fairly among spillable
+    // operators and triggers spill when the limit is reached.
+    let memory_pool = Arc::new(FairSpillPool::new(memory_bytes));
+
+    let mut builder = RuntimeEnvBuilder::new().with_memory_pool(memory_pool);
 
     if config.spill_to_disk {
         builder = builder.with_temp_file_path(&config.spill_dir);
     } else {
         // Disable disk manager — any attempt to spill will return an error.
-        use datafusion::execution::disk_manager::DiskManagerMode;
-        let disk_builder = datafusion::execution::disk_manager::DiskManagerBuilder::default()
-            .with_mode(DiskManagerMode::Disabled);
+        let disk_builder =
+            DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled);
         builder = builder.with_disk_manager_builder(disk_builder);
     }
 

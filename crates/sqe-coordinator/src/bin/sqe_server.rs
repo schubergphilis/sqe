@@ -346,7 +346,9 @@ async fn run_worker(config: SqeConfig) -> anyhow::Result<()> {
         config.metrics.prometheus_port,
     );
 
-    let flight_service = sqe_worker::flight_service::WorkerFlightService::new(worker_metrics);
+    let session_ctx = sqe_worker::runtime::build_session_context(&config.worker)?;
+    let flight_service =
+        sqe_worker::flight_service::WorkerFlightService::new(worker_metrics, session_ctx);
 
     // Mark ready
     ready.store(true, Ordering::Relaxed);
