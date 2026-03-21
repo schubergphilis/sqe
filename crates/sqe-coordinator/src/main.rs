@@ -113,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
         } else {
             Some(worker_registry.clone())
         },
+        None, // credential tracker — wired via sqe_server binary
         Some(metrics.clone()),
         Some(audit.clone()),
     ));

@@ -5,6 +5,7 @@ use sqe_core::SqeConfig;
 use sqe_metrics::WorkerMetricsRegistry;
 use sqe_worker::flight_service::WorkerFlightService;
 use sqe_worker::heartbeat;
+use sqe_worker::runtime;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -24,6 +25,11 @@ async fn main() -> anyhow::Result<()> {
         worker_metrics.clone(),
         config.metrics.prometheus_port,
     );
+
+    // Build a configured DataFusion SessionContext with memory limits and spill-to-disk.
+    // The context is created early to fail fast on invalid config (e.g. bad memory_limit).
+    // It is passed into WorkerFlightService so every scan execution respects the pool.
+    let session_ctx = runtime::build_session_context(&config.worker)?;
 
     let port = config.worker.flight_port;
     let addr = format!("0.0.0.0:{port}").parse()?;
@@ -46,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let flight_service = WorkerFlightService::new(worker_metrics);
+    let flight_service = WorkerFlightService::new(worker_metrics, session_ctx);
 
     tonic::transport::Server::builder()
         .add_service(flight_service.into_server())

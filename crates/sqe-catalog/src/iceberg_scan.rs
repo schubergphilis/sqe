@@ -15,6 +15,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use futures::{Stream, TryStreamExt};
+use iceberg::expr::Predicate;
 use iceberg::table::Table;
 use tracing::debug;
 
@@ -32,6 +33,8 @@ pub struct IcebergScanExec {
     projected_schema: SchemaRef,
     /// Column names to project (None = all columns).
     projection: Option<Vec<String>>,
+    /// Iceberg predicates to push down into the scan (manifest filtering + row-group pruning).
+    predicates: Option<Predicate>,
     /// Cached plan properties.
     properties: PlanProperties,
     /// Execution metrics (elapsed time, output rows).
@@ -40,7 +43,12 @@ pub struct IcebergScanExec {
 
 impl IcebergScanExec {
     /// Create a new Iceberg scan execution plan.
-    pub fn new(table: Table, projected_schema: SchemaRef, projection: Option<Vec<String>>) -> Self {
+    pub fn new(
+        table: Table,
+        projected_schema: SchemaRef,
+        projection: Option<Vec<String>>,
+        predicates: Option<Predicate>,
+    ) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(projected_schema.clone()),
             Partitioning::UnknownPartitioning(1),
@@ -52,6 +60,7 @@ impl IcebergScanExec {
             table,
             projected_schema,
             projection,
+            predicates,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -61,15 +70,23 @@ impl IcebergScanExec {
     pub fn table(&self) -> &Table {
         &self.table
     }
+
+    /// Returns the pushed-down predicates, if any.
+    pub fn predicates(&self) -> Option<&Predicate> {
+        self.predicates.as_ref()
+    }
 }
 
 impl DisplayAs for IcebergScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "IcebergScanExec: table={}, projection={:?}",
+            "IcebergScanExec: table={}, projection={:?}, predicate=[{}]",
             self.table.identifier(),
             self.projection,
+            self.predicates
+                .as_ref()
+                .map_or(String::new(), |p| format!("{p}")),
         )
     }
 }
@@ -120,10 +137,12 @@ impl ExecutionPlan for IcebergScanExec {
         let table = self.table.clone();
         let schema = self.projected_schema.clone();
         let projection = self.projection.clone();
+        let predicates = self.predicates.clone();
         let baseline = BaselineMetrics::new(&self.metrics, partition);
 
         debug!(
             table = %table.identifier(),
+            predicates = ?predicates,
             "Executing IcebergScanExec"
         );
 
@@ -135,6 +154,11 @@ impl ExecutionPlan for IcebergScanExec {
             // Apply column projection if specified
             if let Some(ref cols) = projection {
                 scan_builder = scan_builder.select(cols.iter().map(|s| s.as_str()));
+            }
+
+            // Apply pushed-down predicates for manifest/row-group pruning
+            if let Some(pred) = predicates {
+                scan_builder = scan_builder.with_filter(pred);
             }
 
             let scan = scan_builder
@@ -178,18 +202,14 @@ struct IcebergRecordBatchStream {
 impl Stream for IcebergRecordBatchStream {
     type Item = DFResult<RecordBatch>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // SAFETY: We do not move any fields out of self. `inner` remains pinned
-        // (accessed only through Pin::as_mut()). `baseline` is Unpin.
-        // This split is needed because Pin<&mut T> does not allow splitting
-        // borrows of distinct fields through its DerefMut impl.
-        let s = unsafe { self.as_mut().get_unchecked_mut() };
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
         let poll = {
-            let _timer = s.baseline.elapsed_compute().timer();
-            s.inner.as_mut().poll_next(cx)
+            let _timer = this.baseline.elapsed_compute().timer();
+            this.inner.as_mut().poll_next(cx)
         };
         if let Poll::Ready(Some(Ok(ref batch))) = poll {
-            s.baseline.record_output(batch.num_rows());
+            this.baseline.record_output(batch.num_rows());
         }
         poll
     }
