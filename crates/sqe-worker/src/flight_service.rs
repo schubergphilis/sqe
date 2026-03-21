@@ -12,6 +12,7 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, info_span, warn, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+use sqe_metrics::WorkerMetricsRegistry;
 use sqe_metrics::propagation::extract_trace_context;
 use sqe_planner::ScanTask;
 
@@ -22,18 +23,14 @@ use crate::executor;
 /// Handles two operations:
 /// - `do_get`: Execute a scan task and stream results back
 /// - `do_action("health_check")`: Return OK for coordinator health monitoring
-#[derive(Clone, Default)]
-pub struct WorkerFlightService {}
-
-impl Default for WorkerFlightService {
-    fn default() -> Self {
-        Self::new()
-    }
+#[derive(Clone)]
+pub struct WorkerFlightService {
+    metrics: Arc<WorkerMetricsRegistry>,
 }
 
 impl WorkerFlightService {
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(metrics: Arc<WorkerMetricsRegistry>) -> Self {
+        Self { metrics }
     }
 
     pub fn into_server(self) -> FlightServiceServer<Self> {
@@ -75,17 +72,21 @@ impl FlightService for WorkerFlightService {
         // Link this span to the coordinator's trace
         let _set_parent_result = worker_span.set_parent(parent_cx);
 
-        async {
+        let metrics = self.metrics.clone();
+        async move {
             info!(
                 fragment_id = %scan_task.fragment_id,
                 file_count = scan_task.data_file_paths.len(),
                 "Worker received scan task"
             );
 
-            let (schema, batches) = executor::execute_scan(&scan_task).await.map_err(|e| {
-                warn!(error = %e, "Scan task execution failed");
-                Status::internal(format!("Scan execution failed: {e}"))
-            })?;
+            let (schema, batches) =
+                executor::execute_scan(&scan_task, Some(&metrics))
+                    .await
+                    .map_err(|e| {
+                        warn!(error = %e, "Scan task execution failed");
+                        Status::internal(format!("Scan execution failed: {e}"))
+                    })?;
 
             let schema = Arc::new((*schema).clone());
             let batch_stream = stream::iter(batches.into_iter().map(Ok));

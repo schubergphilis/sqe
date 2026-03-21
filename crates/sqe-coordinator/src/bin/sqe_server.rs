@@ -340,7 +340,13 @@ async fn run_worker(config: SqeConfig) -> anyhow::Result<()> {
     let port = config.worker.flight_port;
     let addr = format!("0.0.0.0:{port}").parse()?;
 
-    let flight_service = sqe_worker::flight_service::WorkerFlightService::new();
+    let worker_metrics = Arc::new(sqe_metrics::WorkerMetricsRegistry::new());
+    sqe_metrics::server::start_metrics_server(
+        worker_metrics.clone(),
+        config.metrics.prometheus_port,
+    );
+
+    let flight_service = sqe_worker::flight_service::WorkerFlightService::new(worker_metrics);
 
     // Mark ready
     ready.store(true, Ordering::Relaxed);

@@ -4,15 +4,20 @@ use axum::{Router, routing::get, extract::State, response::IntoResponse};
 use prometheus::Encoder;
 use tracing::info;
 
-use crate::MetricsRegistry;
+use crate::HasRegistry;
 
-pub fn start_metrics_server(
-    metrics: Arc<MetricsRegistry>,
+/// Start an HTTP metrics server that serves Prometheus metrics at `/metrics`.
+///
+/// Works with any registry type that implements [`HasRegistry`] — both the
+/// coordinator's [`MetricsRegistry`](crate::MetricsRegistry) and the worker's
+/// [`WorkerMetricsRegistry`](crate::WorkerMetricsRegistry).
+pub fn start_metrics_server<R: HasRegistry + Clone>(
+    metrics: Arc<R>,
     port: u16,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let app = Router::new()
-            .route("/metrics", get(metrics_handler))
+            .route("/metrics", get(metrics_handler::<R>))
             .with_state(metrics);
 
         let addr = format!("0.0.0.0:{port}");
@@ -24,11 +29,11 @@ pub fn start_metrics_server(
     })
 }
 
-async fn metrics_handler(
-    State(metrics): State<Arc<MetricsRegistry>>,
+async fn metrics_handler<R: HasRegistry>(
+    State(metrics): State<Arc<R>>,
 ) -> impl IntoResponse {
     let encoder = prometheus::TextEncoder::new();
-    let metric_families = metrics.registry.gather();
+    let metric_families = metrics.prometheus_registry().gather();
     let mut buffer = Vec::new();
     encoder.encode(&metric_families, &mut buffer).unwrap();
 
@@ -41,6 +46,7 @@ async fn metrics_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MetricsRegistry;
 
     #[tokio::test]
     async fn test_metrics_handler_returns_text() {
@@ -50,12 +56,34 @@ mod tests {
         metrics.query_duration.with_label_values(&["query"]).observe(0.1);
 
         let encoder = prometheus::TextEncoder::new();
-        let metric_families = metrics.registry.gather();
+        let metric_families = metrics.prometheus_registry().gather();
         let mut buffer = Vec::new();
         encoder.encode(&metric_families, &mut buffer).unwrap();
         let output = String::from_utf8(buffer).unwrap();
 
         assert!(output.contains("sqe_query_count_total"));
         assert!(output.contains("sqe_query_duration_seconds"));
+    }
+
+    #[tokio::test]
+    async fn test_worker_metrics_handler_returns_text() {
+        use crate::WorkerMetricsRegistry;
+
+        let metrics = Arc::new(WorkerMetricsRegistry::new());
+        metrics.fragments_executed.inc();
+        metrics.rows_scanned.inc_by(42.0);
+        metrics.bytes_read.inc_by(1024.0);
+        metrics.fragment_duration.observe(0.123);
+
+        let encoder = prometheus::TextEncoder::new();
+        let metric_families = metrics.prometheus_registry().gather();
+        let mut buffer = Vec::new();
+        encoder.encode(&metric_families, &mut buffer).unwrap();
+        let output = String::from_utf8(buffer).unwrap();
+
+        assert!(output.contains("sqe_worker_fragments_executed_total"));
+        assert!(output.contains("sqe_worker_rows_scanned_total"));
+        assert!(output.contains("sqe_worker_bytes_read_total"));
+        assert!(output.contains("sqe_worker_fragment_duration_seconds"));
     }
 }
