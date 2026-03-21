@@ -102,6 +102,27 @@ impl WorkerRegistry {
         state.last_healthy = Some(Instant::now());
     }
 
+    /// Immediately mark a worker as unhealthy.
+    ///
+    /// Unlike [`mark_failed`](Self::mark_failed), this does not use a
+    /// consecutive-failure threshold — the worker is removed from the active
+    /// pool right away.  Used when a worker fails during query execution
+    /// (connection error, timeout, etc.) which is a stronger signal than a
+    /// missed health check.
+    pub async fn mark_unhealthy(&self, url: &str) {
+        let mut inner = self.inner.write().await;
+        if let Some(state) = inner.workers.get_mut(url) {
+            if state.healthy {
+                warn!(
+                    worker = url,
+                    "Worker marked unhealthy immediately (execution failure)"
+                );
+            }
+            state.healthy = false;
+            state.consecutive_failures = MAX_CONSECUTIVE_FAILURES;
+        }
+    }
+
     pub async fn mark_failed(&self, url: &str) {
         let mut inner = self.inner.write().await;
         if let Some(state) = inner.workers.get_mut(url) {
@@ -275,6 +296,31 @@ mod tests {
         assert!(registry.healthy_workers().await.is_empty());
 
         // Heartbeat recovers it
+        registry
+            .register_heartbeat("http://worker1:50052")
+            .await;
+        assert_eq!(registry.healthy_workers().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_mark_unhealthy_immediate() {
+        let registry = WorkerRegistry::new(vec!["http://worker1:50052".to_string()]);
+        registry.mark_healthy("http://worker1:50052").await;
+        assert_eq!(registry.healthy_workers().await.len(), 1);
+
+        // A single mark_unhealthy call should immediately remove the worker
+        registry.mark_unhealthy("http://worker1:50052").await;
+        assert!(registry.healthy_workers().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mark_unhealthy_recovers_with_heartbeat() {
+        let registry = WorkerRegistry::new(vec!["http://worker1:50052".to_string()]);
+        registry.mark_healthy("http://worker1:50052").await;
+        registry.mark_unhealthy("http://worker1:50052").await;
+        assert!(registry.healthy_workers().await.is_empty());
+
+        // Heartbeat should still recover after immediate unhealthy
         registry
             .register_heartbeat("http://worker1:50052")
             .await;
