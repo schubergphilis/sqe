@@ -156,7 +156,11 @@ impl FragmentScheduler for WeightedScheduler {
             loads[min_pos].0 += cost;
         }
 
-        let result: Vec<Assignment> = assignments.into_iter().map(|a| a.unwrap()).collect();
+        let result: Vec<Assignment> = assignments
+            .into_iter()
+            .enumerate()
+            .map(|(_i, a)| a.expect("BUG: every task must be assigned; healthy worker check passed above"))
+            .collect();
 
         debug!(
             task_count = tasks.len(),
