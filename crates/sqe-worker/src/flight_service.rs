@@ -20,7 +20,7 @@ use crate::executor;
 /// Handles two operations:
 /// - `do_get`: Execute a scan task and stream results back
 /// - `do_action("health_check")`: Return OK for coordinator health monitoring
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct WorkerFlightService {}
 
 impl WorkerFlightService {

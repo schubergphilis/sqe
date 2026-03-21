@@ -38,6 +38,7 @@ use sqe_core::SqeConfig;
 
 use crate::query_handler::QueryHandler;
 use crate::session_manager::SessionManager;
+use crate::worker_registry::WorkerRegistry;
 
 /// Custom protobuf message to carry query handles in tickets.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -69,6 +70,7 @@ pub struct SqeFlightSqlService {
     session_manager: Arc<SessionManager>,
     query_handler: Arc<QueryHandler>,
     config: SqeConfig,
+    worker_registry: Option<Arc<WorkerRegistry>>,
 }
 
 impl SqeFlightSqlService {
@@ -81,7 +83,13 @@ impl SqeFlightSqlService {
             session_manager,
             query_handler,
             config,
+            worker_registry: None,
         }
+    }
+
+    pub fn with_worker_registry(mut self, registry: Arc<WorkerRegistry>) -> Self {
+        self.worker_registry = Some(registry);
+        self
     }
 
     /// Extract and validate a bearer token from the request metadata,
@@ -111,6 +119,7 @@ impl SqeFlightSqlService {
     }
 
     /// Convert RecordBatches into a streaming Flight response.
+    #[allow(clippy::type_complexity)]
     fn batches_to_stream(
         batches: Vec<RecordBatch>,
     ) -> Result<
@@ -729,6 +738,48 @@ impl FlightSqlService for SqeFlightSqlService {
         _request: Request<Action>,
     ) -> Result<ActionCancelQueryResult, Status> {
         Err(Status::unimplemented("Query cancellation not supported"))
+    }
+
+    /// Handle custom (non-Flight-SQL) actions such as worker heartbeats.
+    async fn do_action_fallback(
+        &self,
+        request: Request<Action>,
+    ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
+        let action = request.into_inner();
+        match action.r#type.as_str() {
+            "heartbeat" => {
+                let worker_url = std::str::from_utf8(&action.body).map_err(|e| {
+                    Status::invalid_argument(format!("Invalid heartbeat body: {e}"))
+                })?;
+
+                if worker_url.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "Heartbeat body must contain the worker URL",
+                    ));
+                }
+
+                if let Some(ref registry) = self.worker_registry {
+                    debug!(worker = %worker_url, "Received heartbeat from worker");
+                    registry.register_heartbeat(worker_url).await;
+                } else {
+                    debug!(
+                        worker = %worker_url,
+                        "Received heartbeat but no worker registry configured, ignoring"
+                    );
+                }
+
+                let result = arrow_flight::Result {
+                    body: bytes::Bytes::from_static(b"ok"),
+                };
+                Ok(Response::new(
+                    Box::pin(stream::once(async { Ok(result) }))
+                        as <Self as FlightService>::DoActionStream,
+                ))
+            }
+            other => Err(Status::invalid_argument(format!(
+                "Unknown action type: {other}"
+            ))),
+        }
     }
 
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
