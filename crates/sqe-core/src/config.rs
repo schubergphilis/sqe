@@ -29,7 +29,7 @@ pub struct CoordinatorConfig {
     pub worker_urls: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct WorkerConfig {
     #[serde(default)]
     pub coordinator_url: String,
@@ -39,8 +39,61 @@ pub struct WorkerConfig {
     pub heartbeat_interval_secs: u64,
     #[serde(default = "default_memory")]
     pub memory_limit: String,
+    #[serde(default = "default_true")]
+    pub spill_to_disk: bool,
     #[serde(default = "default_spill_dir")]
     pub spill_dir: String,
+}
+
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        Self {
+            coordinator_url: String::new(),
+            flight_port: default_worker_flight_port(),
+            heartbeat_interval_secs: default_heartbeat(),
+            memory_limit: default_memory(),
+            spill_to_disk: true,
+            spill_dir: default_spill_dir(),
+        }
+    }
+}
+
+/// Parse a human-readable memory size string (e.g. "1GB", "512MB", "1024") into bytes.
+///
+/// Supported suffixes (case-insensitive): `B`, `KB`/`K`, `MB`/`M`, `GB`/`G`, `TB`/`T`.
+/// A bare number without a suffix is interpreted as bytes.
+pub fn parse_memory_limit(s: &str) -> crate::error::Result<usize> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(crate::error::SqeError::Config(
+            "Empty memory limit string".to_string(),
+        ));
+    }
+
+    // Find where the numeric part ends and the suffix begins
+    let (num_str, suffix) = match s.find(|c: char| !c.is_ascii_digit() && c != '.') {
+        Some(idx) => (&s[..idx], s[idx..].trim().to_uppercase()),
+        None => (s, String::new()),
+    };
+
+    let num: f64 = num_str.parse().map_err(|e| {
+        crate::error::SqeError::Config(format!("Invalid memory limit number '{num_str}': {e}"))
+    })?;
+
+    let multiplier: f64 = match suffix.as_str() {
+        "" | "B" => 1.0,
+        "K" | "KB" => 1024.0,
+        "M" | "MB" => 1024.0 * 1024.0,
+        "G" | "GB" => 1024.0 * 1024.0 * 1024.0,
+        "T" | "TB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        other => {
+            return Err(crate::error::SqeError::Config(format!(
+                "Unknown memory limit suffix '{other}' in '{s}'"
+            )))
+        }
+    };
+
+    Ok((num * multiplier) as usize)
 }
 
 #[derive(Deserialize, Clone)]
@@ -183,6 +236,7 @@ impl SqeConfig {
         env_override_u16("SQE_WORKER__FLIGHT_PORT", &mut self.worker.flight_port);
         env_override_u64("SQE_WORKER__HEARTBEAT_INTERVAL_SECS", &mut self.worker.heartbeat_interval_secs);
         env_override_str("SQE_WORKER__MEMORY_LIMIT", &mut self.worker.memory_limit);
+        env_override_bool("SQE_WORKER__SPILL_TO_DISK", &mut self.worker.spill_to_disk);
         env_override_str("SQE_WORKER__SPILL_DIR", &mut self.worker.spill_dir);
 
         // Auth
@@ -260,5 +314,78 @@ fn env_override_bool(key: &str, target: &mut bool) {
             "false" | "0" | "no" => *target = false,
             _ => tracing::warn!("{key}={val:?} is not a valid bool, ignoring"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_memory_limit_bytes() {
+        assert_eq!(parse_memory_limit("1024").unwrap(), 1024);
+        assert_eq!(parse_memory_limit("1024B").unwrap(), 1024);
+        assert_eq!(parse_memory_limit("1024b").unwrap(), 1024);
+    }
+
+    #[test]
+    fn test_parse_memory_limit_kilobytes() {
+        assert_eq!(parse_memory_limit("1K").unwrap(), 1024);
+        assert_eq!(parse_memory_limit("1KB").unwrap(), 1024);
+        assert_eq!(parse_memory_limit("2kb").unwrap(), 2048);
+    }
+
+    #[test]
+    fn test_parse_memory_limit_megabytes() {
+        assert_eq!(parse_memory_limit("1M").unwrap(), 1024 * 1024);
+        assert_eq!(parse_memory_limit("1MB").unwrap(), 1024 * 1024);
+        assert_eq!(parse_memory_limit("512MB").unwrap(), 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_memory_limit_gigabytes() {
+        assert_eq!(parse_memory_limit("1G").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_memory_limit("1GB").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_memory_limit("8GB").unwrap(), 8 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_memory_limit_terabytes() {
+        assert_eq!(
+            parse_memory_limit("1TB").unwrap(),
+            1024 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn test_parse_memory_limit_whitespace() {
+        assert_eq!(parse_memory_limit("  1GB  ").unwrap(), 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_memory_limit_empty() {
+        assert!(parse_memory_limit("").is_err());
+        assert!(parse_memory_limit("   ").is_err());
+    }
+
+    #[test]
+    fn test_parse_memory_limit_invalid() {
+        assert!(parse_memory_limit("abc").is_err());
+        assert!(parse_memory_limit("GB").is_err());
+    }
+
+    #[test]
+    fn test_parse_memory_limit_unknown_suffix() {
+        assert!(parse_memory_limit("100XB").is_err());
+    }
+
+    #[test]
+    fn test_worker_config_defaults() {
+        let config = WorkerConfig::default();
+        assert_eq!(config.memory_limit, "8GB");
+        assert!(config.spill_to_disk);
+        assert_eq!(config.spill_dir, "/tmp/sqe-spill");
+        assert_eq!(config.flight_port, 50052);
+        assert_eq!(config.heartbeat_interval_secs, 5);
     }
 }

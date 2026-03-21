@@ -12,6 +12,7 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, info_span, warn, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+use datafusion::prelude::SessionContext;
 use sqe_metrics::WorkerMetricsRegistry;
 use sqe_metrics::propagation::extract_trace_context;
 use sqe_planner::ScanTask;
@@ -25,17 +26,23 @@ use crate::executor;
 /// - `do_get`: Execute a scan task and stream results back
 /// - `do_action("health_check")`: Return OK for coordinator health monitoring
 /// - `do_action("refresh_credentials")`: Accept refreshed S3 credentials from coordinator
+///
+/// The service holds a [`SessionContext`] whose `RuntimeEnv` carries the
+/// configured memory pool and disk manager so that every scan execution
+/// respects the worker's memory limits.
 #[derive(Clone)]
 pub struct WorkerFlightService {
     metrics: Arc<WorkerMetricsRegistry>,
     credential_store: CredentialStore,
+    session_ctx: SessionContext,
 }
 
 impl WorkerFlightService {
-    pub fn new(metrics: Arc<WorkerMetricsRegistry>) -> Self {
+    pub fn new(metrics: Arc<WorkerMetricsRegistry>, session_ctx: SessionContext) -> Self {
         Self {
             metrics,
             credential_store: CredentialStore::new(),
+            session_ctx,
         }
     }
 
@@ -45,11 +52,13 @@ impl WorkerFlightService {
     /// (e.g. the executor needs to subscribe before the Flight service starts).
     pub fn with_credential_store(
         metrics: Arc<WorkerMetricsRegistry>,
+        session_ctx: SessionContext,
         credential_store: CredentialStore,
     ) -> Self {
         Self {
             metrics,
             credential_store,
+            session_ctx,
         }
     }
 
@@ -99,6 +108,7 @@ impl FlightService for WorkerFlightService {
 
         let metrics = self.metrics.clone();
         let credential_store = self.credential_store.clone();
+        let session_ctx = self.session_ctx.clone();
         async move {
             info!(
                 fragment_id = %scan_task.fragment_id,
@@ -110,7 +120,7 @@ impl FlightService for WorkerFlightService {
             let cred_rx = credential_store.subscribe(&scan_task.fragment_id).await;
 
             let (schema, batches) =
-                executor::execute_scan(&scan_task, Some(&metrics), Some(cred_rx))
+                executor::execute_scan(&scan_task, Some(&metrics), &session_ctx, Some(cred_rx))
                     .await
                     .map_err(|e| {
                         warn!(error = %e, "Scan task execution failed");

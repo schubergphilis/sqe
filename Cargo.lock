@@ -4620,6 +4620,7 @@ dependencies = [
  "arrow-schema",
  "bytes",
  "chrono",
+ "datafusion",
  "futures",
  "object_store",
  "opentelemetry",
