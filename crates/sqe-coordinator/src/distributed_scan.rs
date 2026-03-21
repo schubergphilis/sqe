@@ -194,6 +194,7 @@ impl ExecutionPlan for DistributedScanExec {
             worker = %initial_worker_url,
             file_count = task.data_file_paths.len(),
         );
+        let _guard = dispatch_span.enter();
 
         info!(
             parent: &dispatch_span,
@@ -216,6 +217,9 @@ impl ExecutionPlan for DistributedScanExec {
             // Attempt the initial worker + up to max_retries reassignments
             for attempt in 0..=max_retries {
                 if attempt > 0 {
+                    let delay = std::time::Duration::from_millis(50 * (1 << attempt.min(4)));
+                    tokio::time::sleep(delay).await;
+
                     warn!(
                         fragment_id = %task.fragment_id,
                         attempt = attempt,
