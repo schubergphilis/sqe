@@ -50,7 +50,7 @@ pub async fn setup_handler() -> (sqe_core::Session, sqe_coordinator::QueryHandle
         .await
         .expect("Auth failed for root");
     let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(sqe_policy::PassthroughEnforcer);
-    let handler = sqe_coordinator::QueryHandler::new(policy, config, None, None, None);
+    let handler = sqe_coordinator::QueryHandler::new(policy, config, None, None, None, None);
     (session, handler)
 }
 
