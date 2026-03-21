@@ -9,6 +9,7 @@ use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::Ticket;
 use arrow_schema::SchemaRef;
+use chrono::{DateTime, Utc};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -23,17 +24,27 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use sqe_metrics::propagation::inject_trace_context;
 use sqe_planner::ScanTask;
 
+use crate::credential_refresh::CredentialRefreshTracker;
+
 /// DataFusion `ExecutionPlan` that distributes scan work across workers.
 ///
 /// Each partition maps to one worker. When DataFusion calls `execute(i)`,
 /// the DistributedScanExec sends a `ScanTask` to worker[i] via Arrow Flight
 /// `do_get` and returns the result stream.
+///
+/// When a `credential_tracker` is set, the exec registers each dispatched
+/// fragment so the coordinator's background refresh loop can push new
+/// credentials before they expire.
 #[derive(Debug)]
 pub struct DistributedScanExec {
     scan_tasks: Vec<ScanTask>,
     worker_urls: Vec<String>,
     schema: SchemaRef,
     properties: PlanProperties,
+    /// Optional credential expiry for the vended credentials included in scan tasks.
+    credential_expiry: Option<DateTime<Utc>>,
+    /// Optional tracker for coordinating credential refresh pushes.
+    credential_tracker: Option<Arc<CredentialRefreshTracker>>,
 }
 
 impl DistributedScanExec {
@@ -67,7 +78,25 @@ impl DistributedScanExec {
             worker_urls,
             schema,
             properties,
+            credential_expiry: None,
+            credential_tracker: None,
         }
+    }
+
+    /// Set the credential expiry for the vended credentials in these scan tasks.
+    ///
+    /// When combined with a credential tracker, this enables the coordinator to
+    /// detect when credentials are approaching expiry and push refreshed ones
+    /// to workers.
+    pub fn with_credential_expiry(mut self, expiry: DateTime<Utc>) -> Self {
+        self.credential_expiry = Some(expiry);
+        self
+    }
+
+    /// Set the credential refresh tracker for monitoring expiring credentials.
+    pub fn with_credential_tracker(mut self, tracker: Arc<CredentialRefreshTracker>) -> Self {
+        self.credential_tracker = Some(tracker);
+        self
     }
 }
 
@@ -128,6 +157,8 @@ impl ExecutionPlan for DistributedScanExec {
         let task = self.scan_tasks[partition].clone();
         let worker_url = self.worker_urls[partition].clone();
         let schema = self.schema.clone();
+        let credential_expiry = self.credential_expiry;
+        let credential_tracker = self.credential_tracker.clone();
 
         let dispatch_span = info_span!(
             "dispatch_to_worker",
@@ -145,6 +176,17 @@ impl ExecutionPlan for DistributedScanExec {
         let parent_cx = dispatch_span.context();
 
         let stream = futures::stream::once(async move {
+            // Register fragment with the credential tracker if available
+            if let Some(ref tracker) = credential_tracker {
+                tracker
+                    .register(
+                        task.fragment_id.clone(),
+                        worker_url.clone(),
+                        credential_expiry,
+                    )
+                    .await;
+            }
+
             let ticket_bytes = task.to_bytes().map_err(|e| {
                 DataFusionError::External(Box::new(e))
             })?;
@@ -170,14 +212,18 @@ impl ExecutionPlan for DistributedScanExec {
             // Inject W3C TraceContext (traceparent/tracestate) into gRPC metadata
             inject_trace_context(&parent_cx, request.metadata_mut());
 
-            let response = client
-                .do_get(request)
-                .await
-                .map_err(|e| {
-                    DataFusionError::Execution(format!(
+            let response = match client.do_get(request).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    // Clean up tracker on failure to prevent fragment leak
+                    if let Some(ref tracker) = credential_tracker {
+                        tracker.unregister(&task.fragment_id).await;
+                    }
+                    return Err(DataFusionError::Execution(format!(
                         "Worker {worker_url} do_get failed: {e}"
-                    ))
-                })?;
+                    )));
+                }
+            };
 
             let flight_stream = FlightRecordBatchStream::new_from_flight_data(
                 response
@@ -290,5 +336,35 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.err().unwrap().to_string();
         assert!(err_msg.contains("out of range"), "unexpected error: {err_msg}");
+    }
+
+    #[test]
+    fn test_with_credential_expiry() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let expiry = Utc::now() + chrono::Duration::hours(1);
+
+        let exec = DistributedScanExec::new(
+            vec![make_task("f1")],
+            vec!["http://w1:50052".to_string()],
+            schema,
+        )
+        .with_credential_expiry(expiry);
+
+        assert_eq!(exec.credential_expiry, Some(expiry));
+    }
+
+    #[test]
+    fn test_with_credential_tracker() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let tracker = Arc::new(CredentialRefreshTracker::new());
+
+        let exec = DistributedScanExec::new(
+            vec![make_task("f1")],
+            vec!["http://w1:50052".to_string()],
+            schema,
+        )
+        .with_credential_tracker(tracker);
+
+        assert!(exec.credential_tracker.is_some());
     }
 }
