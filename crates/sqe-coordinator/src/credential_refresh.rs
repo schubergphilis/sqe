@@ -177,6 +177,47 @@ impl Default for CredentialRefreshTracker {
     }
 }
 
+/// Spawn a background task that periodically checks for expiring credentials
+/// and pushes refreshed ones to workers.
+///
+/// The task runs every `interval` and calls `refresh_expiring_credentials`
+/// with the provided callback.  It is designed to be spawned once at
+/// coordinator startup and will run until the tokio runtime shuts down.
+///
+/// `get_fresh_credentials` is a callback that obtains new credentials for a
+/// given fragment.  In production this would re-load the table from Polaris
+/// to obtain a fresh set of vended S3 credentials.
+pub fn start_credential_refresh_task<F, Fut>(
+    tracker: Arc<CredentialRefreshTracker>,
+    interval: std::time::Duration,
+    get_fresh_credentials: F,
+) where
+    F: Fn(ActiveFragment) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Option<RefreshableCredentials>> + Send,
+{
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        // First tick fires immediately — skip it so we don't do a
+        // pointless check at startup when no fragments are registered.
+        tick.tick().await;
+
+        loop {
+            tick.tick().await;
+
+            let active = tracker.active_count().await;
+            if active == 0 {
+                continue;
+            }
+
+            debug!(active_fragments = active, "Credential refresh tick");
+            let refreshed = refresh_expiring_credentials(&tracker, &get_fresh_credentials).await;
+            if refreshed > 0 {
+                info!(count = refreshed, "Pushed refreshed credentials to workers");
+            }
+        }
+    });
+}
+
 /// Push refreshed credentials to a single worker via Arrow Flight `do_action`.
 ///
 /// Returns `Ok(())` if the worker accepted the credentials, or an error if the

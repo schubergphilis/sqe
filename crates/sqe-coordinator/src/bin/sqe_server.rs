@@ -272,6 +272,26 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     sqe_metrics::server::start_metrics_server(metrics.clone(), config.metrics.prometheus_port);
     tracing::info!("Prometheus metrics on port {}", config.metrics.prometheus_port);
 
+    // Credential refresh tracker — shared between query handler and background task
+    let credential_tracker = Arc::new(
+        sqe_coordinator::credential_refresh::CredentialRefreshTracker::new(),
+    );
+
+    // Start background credential refresh loop (checks every 60s)
+    if !config.coordinator.worker_urls.is_empty() {
+        sqe_coordinator::credential_refresh::start_credential_refresh_task(
+            credential_tracker.clone(),
+            std::time::Duration::from_secs(60),
+            |_fragment| async {
+                // TODO: implement actual credential vending — re-load table from
+                // Polaris to obtain fresh STS credentials for this fragment.
+                // For now, return None (no refresh) until catalog vending is wired.
+                None
+            },
+        );
+        tracing::info!("Started credential refresh background task (60s interval)");
+    }
+
     // Query handler
     let query_handler = Arc::new(QueryHandler::new(
         policy_enforcer,
@@ -280,6 +300,11 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             None
         } else {
             Some(worker_registry.clone())
+        },
+        if config.coordinator.worker_urls.is_empty() {
+            None
+        } else {
+            Some(credential_tracker)
         },
         Some(metrics.clone()),
         Some(audit.clone()),

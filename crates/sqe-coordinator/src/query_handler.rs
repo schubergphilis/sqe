@@ -13,6 +13,7 @@ use sqe_policy::PolicyEnforcer;
 use sqe_sql::{parse_and_classify, StatementKind};
 
 use crate::catalog_ops::CatalogOps;
+use crate::credential_refresh::CredentialRefreshTracker;
 use crate::write_handler::WriteHandler;
 
 /// Handles query execution by routing parsed SQL through the appropriate
@@ -26,6 +27,8 @@ pub struct QueryHandler {
     explain_handler: crate::explain::ExplainHandler,
     #[allow(dead_code)] // Wired in Chunk 3 for distributed execution; query routing TBD
     worker_registry: Option<Arc<crate::worker_registry::WorkerRegistry>>,
+    #[allow(dead_code)] // Used when constructing DistributedScanExec for distributed queries
+    credential_tracker: Option<Arc<CredentialRefreshTracker>>,
     metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
     audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
 }
@@ -35,6 +38,7 @@ impl QueryHandler {
         policy_enforcer: Arc<dyn PolicyEnforcer>,
         config: SqeConfig,
         worker_registry: Option<Arc<crate::worker_registry::WorkerRegistry>>,
+        credential_tracker: Option<Arc<CredentialRefreshTracker>>,
         metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
         audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
     ) -> Self {
@@ -48,6 +52,7 @@ impl QueryHandler {
             write_handler,
             explain_handler,
             worker_registry,
+            credential_tracker,
             metrics,
             audit,
         }
