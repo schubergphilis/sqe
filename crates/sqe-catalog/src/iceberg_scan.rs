@@ -202,18 +202,14 @@ struct IcebergRecordBatchStream {
 impl Stream for IcebergRecordBatchStream {
     type Item = DFResult<RecordBatch>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // SAFETY: We do not move any fields out of self. `inner` remains pinned
-        // (accessed only through Pin::as_mut()). `baseline` is Unpin.
-        // This split is needed because Pin<&mut T> does not allow splitting
-        // borrows of distinct fields through its DerefMut impl.
-        let s = unsafe { self.as_mut().get_unchecked_mut() };
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
         let poll = {
-            let _timer = s.baseline.elapsed_compute().timer();
-            s.inner.as_mut().poll_next(cx)
+            let _timer = this.baseline.elapsed_compute().timer();
+            this.inner.as_mut().poll_next(cx)
         };
         if let Poll::Ready(Some(Ok(ref batch))) = poll {
-            s.baseline.record_output(batch.num_rows());
+            this.baseline.record_output(batch.num_rows());
         }
         poll
     }
