@@ -21,7 +21,7 @@ pub struct NodeVersion {
     pub version: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrinoResponse {
     pub id: String,
@@ -38,14 +38,14 @@ pub struct TrinoResponse {
     pub error: Option<TrinoError>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrinoColumn {
     pub name: String,
     pub r#type: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrinoStats {
     pub state: String,
@@ -56,7 +56,7 @@ pub struct TrinoStats {
     pub completed_splits: u32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrinoError {
     pub message: String,
@@ -116,6 +116,18 @@ impl TrinoStats {
             nodes: 1,
             total_splits: 1,
             completed_splits: 0,
+        }
+    }
+
+    /// Stats for an in-progress paginated result.
+    pub fn running(completed_pages: usize, total_pages: usize) -> Self {
+        Self {
+            state: "RUNNING".to_string(),
+            queued: false,
+            scheduled: true,
+            nodes: 1,
+            total_splits: total_pages as u32,
+            completed_splits: completed_pages as u32,
         }
     }
 }
