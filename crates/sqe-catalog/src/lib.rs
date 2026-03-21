@@ -3,6 +3,7 @@ pub mod catalog_provider;
 pub mod schema_provider;
 pub mod table_provider;
 pub mod credential_vending;
+pub mod expr_to_predicate;
 pub mod iceberg_scan;
 pub mod info_schema;
 

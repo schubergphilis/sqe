@@ -6,11 +6,13 @@ use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::table::Table;
 use tracing::debug;
+
+use crate::expr_to_predicate;
 
 /// DataFusion `TableProvider` that wraps an Iceberg `Table`.
 ///
@@ -72,11 +74,31 @@ impl TableProvider for SqeTableProvider {
         TableType::Base
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DFResult<Vec<TableProviderFilterPushDown>> {
+        Ok(filters
+            .iter()
+            .map(|f| {
+                if expr_to_predicate::is_filter_pushdown_supported(f) {
+                    // Inexact: DataFusion must still evaluate the filter after
+                    // scanning because Iceberg predicate pushdown only prunes
+                    // manifests and row-groups — it does not guarantee per-row
+                    // correctness for all expression types.
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
+    }
+
     async fn scan(
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Convert projection indices to column names for iceberg-rust's scan API
@@ -102,10 +124,17 @@ impl TableProvider for SqeTableProvider {
             None => self.schema.clone(),
         };
 
+        // Convert DataFusion filter expressions to an Iceberg predicate
+        let predicates = expr_to_predicate::convert_filters_to_predicate(filters);
+        if let Some(ref pred) = predicates {
+            debug!(predicate = %pred, "Pushing predicate down to Iceberg scan");
+        }
+
         Ok(Arc::new(crate::iceberg_scan::IcebergScanExec::new(
             self.table.clone(),
             projected_schema,
             projected_columns,
+            predicates,
         )))
     }
 }
