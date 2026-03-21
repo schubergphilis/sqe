@@ -1,5 +1,6 @@
 pub mod catalog_ops;
 pub mod codec;
+pub mod credential_refresh;
 pub mod distributed_scan;
 pub mod explain;
 pub mod flight_sql;
