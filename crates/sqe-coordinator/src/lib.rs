@@ -5,6 +5,7 @@ pub mod explain;
 pub mod flight_sql;
 pub mod mode;
 pub mod query_handler;
+pub mod scheduler;
 pub mod session_manager;
 pub mod worker_registry;
 pub mod write_handler;
