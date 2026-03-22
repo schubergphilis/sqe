@@ -25,6 +25,8 @@ pub struct ScanTask {
     pub s3_session_token: String,
     /// Whether to use path-style S3 access (required for most S3-compatible endpoints).
     pub s3_path_style: bool,
+    /// Allow plaintext HTTP for S3 endpoints. Only enable for dev/test (e.g., MinIO).
+    pub s3_allow_http: bool,
 }
 
 impl std::fmt::Debug for ScanTask {
@@ -44,6 +46,7 @@ impl std::fmt::Debug for ScanTask {
             .field("s3_secret_key", &"[REDACTED]")
             .field("s3_session_token", &session_token_display)
             .field("s3_path_style", &self.s3_path_style)
+            .field("s3_allow_http", &self.s3_allow_http)
             .finish()
     }
 }
@@ -79,6 +82,7 @@ mod tests {
             s3_secret_key: "testadmin".to_string(),
             s3_session_token: String::new(),
             s3_path_style: true,
+            s3_allow_http: true,
         };
 
         let bytes = task.to_bytes().unwrap();
@@ -88,6 +92,7 @@ mod tests {
         assert_eq!(decoded.data_file_paths.len(), 2);
         assert_eq!(decoded.projected_columns, vec!["id", "name"]);
         assert!(decoded.s3_path_style);
+        assert!(decoded.s3_allow_http);
     }
 
     #[test]
@@ -102,6 +107,7 @@ mod tests {
             s3_secret_key: String::new(),
             s3_session_token: String::new(),
             s3_path_style: false,
+            s3_allow_http: true,
         };
 
         let bytes = task.to_bytes().unwrap();
@@ -121,6 +127,7 @@ mod tests {
             s3_secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
             s3_session_token: "session-token-value".to_string(),
             s3_path_style: true,
+            s3_allow_http: false,
         };
         let debug_output = format!("{task:?}");
         assert!(!debug_output.contains("AKIAIOSFODNN7EXAMPLE"));

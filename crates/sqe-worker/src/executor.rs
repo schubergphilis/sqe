@@ -236,8 +236,9 @@ fn build_object_store_with_creds(
         builder = builder.with_virtual_hosted_style_request(false);
     }
 
-    // Allow HTTP for dev (S3-compatible endpoints without TLS)
-    builder = builder.with_allow_http(true);
+    // Allow HTTP only when explicitly configured (dev/test with S3-compatible endpoints like MinIO).
+    // Defaults to false (HTTPS required) to prevent plaintext S3 traffic in production.
+    builder = builder.with_allow_http(task.s3_allow_http);
 
     // Extract bucket from the first file path
     let bucket = s3_url_to_bucket(
