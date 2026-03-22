@@ -358,9 +358,19 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         SqeFlightSqlService::new(session_manager, query_handler, config.clone());
     let addr = format!("0.0.0.0:{}", config.coordinator.flight_sql_port).parse()?;
 
-    tracing::info!("SQE coordinator listening on {addr}");
+    // Optional TLS
+    let tls_config = sqe_coordinator::tls::build_server_tls_config(&config.coordinator.tls)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    tonic::transport::Server::builder()
+    let mut server_builder = tonic::transport::Server::builder();
+    if let Some(tls) = tls_config {
+        server_builder = server_builder.tls_config(tls)?;
+        tracing::info!("SQE coordinator listening on {addr} (TLS)");
+    } else {
+        tracing::info!("SQE coordinator listening on {addr} (plaintext)");
+    }
+
+    server_builder
         .add_service(
             arrow_flight::flight_service_server::FlightServiceServer::new(flight_service),
         )
@@ -401,9 +411,19 @@ async fn run_worker(config: SqeConfig) -> anyhow::Result<()> {
     // Mark ready
     ready.store(true, Ordering::Relaxed);
 
-    tracing::info!("SQE worker listening on {addr}");
+    // Optional TLS (reuse coordinator TLS config for workers)
+    let tls_config = sqe_coordinator::tls::build_server_tls_config(&config.coordinator.tls)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    tonic::transport::Server::builder()
+    let mut server_builder = tonic::transport::Server::builder();
+    if let Some(tls) = tls_config {
+        server_builder = server_builder.tls_config(tls)?;
+        tracing::info!("SQE worker listening on {addr} (TLS)");
+    } else {
+        tracing::info!("SQE worker listening on {addr} (plaintext)");
+    }
+
+    server_builder
         .add_service(flight_service.into_server())
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;
