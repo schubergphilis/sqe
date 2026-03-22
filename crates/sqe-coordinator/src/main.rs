@@ -52,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
         .nth(1)
         .unwrap_or_else(|| "sqe.toml".to_string());
     let config = SqeConfig::load(&config_path)?;
+    config.validate()?;
 
     // Initialize tracing + OTel (traces, metrics, logs via OTLP when configured)
     let _otel_guard = sqe_metrics::otel::init_telemetry(
@@ -146,9 +147,18 @@ async fn main() -> anyhow::Result<()> {
     }
     let addr = format!("0.0.0.0:{}", config.coordinator.flight_sql_port).parse()?;
 
-    tracing::info!("SQE coordinator listening on {}", addr);
+    // Optional TLS
+    let tls_config = sqe_coordinator::tls::build_server_tls_config(&config.coordinator.tls)?;
 
-    tonic::transport::Server::builder()
+    let mut server_builder = tonic::transport::Server::builder();
+    if let Some(tls) = tls_config {
+        server_builder = server_builder.tls_config(tls)?;
+        tracing::info!("SQE coordinator listening on {} (TLS)", addr);
+    } else {
+        tracing::info!("SQE coordinator listening on {} (plaintext)", addr);
+    }
+
+    server_builder
         .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(
             flight_service,
         ))

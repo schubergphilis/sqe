@@ -1,6 +1,6 @@
 # SQE — Next Steps
 
-> Status as of 2026-03-22. Step 0 dependency alignment complete. Step 2 core engine effectively complete (99/103 tasks — 4 remaining are blocked on iceberg-rust MoR). All feature branches merged into `main`.
+> Status as of 2026-03-22. Step 0 dependency alignment complete. Step 2 core engine effectively complete (99/103 — 4 blocked on iceberg-rust MoR). Step 3 OSS security hardening complete (51/51). All feature branches merged into `main`.
 
 > **Monitoring:** OPA SPI refactor in Polaris (PR #3999, still draft) will affect Phase 5 OPA integration when it lands — do not implement OPA against Polaris until this stabilises. Remote S3 signing (Iceberg 1.12, not yet released) will affect the pluggable-catalogs design.
 
@@ -74,26 +74,13 @@ Step 2 is effectively complete. All implementation and test tasks are done. Only
 
 ---
 
-## Step 3: OSS Security Hardening
+## ~~Step 3: OSS Security Hardening~~ ✅ (51/51)
 
-**Plan:** `docs/superpowers/plans/2026-03-19-oss-security-hardening.md`
 **Spec:** `openspec/changes/oss-security-hardening/`
 
-Remove all vendor-specific identifiers (Keycloak → OAuth2/OIDC, MinIO → generic S3-compatible) and add production security controls that are currently absent.
+Step 3 is complete. All vendor-specific identifiers renamed and production security controls implemented.
 
-| Task | Description |
-|---|---|
-| Rename config + source files | `keycloak.rs` → `oidc_password.rs`; `[keycloak]` → `[auth.oidc]` with deprecation shim |
-| Remove MinIO from docker-compose | Replace with generic S3-compatible note; update docs |
-| Startup validation | Fail-fast on invalid config; clear error messages |
-| TLS enforcement | `tonic` TLS for Flight SQL listener; admin port TLS-optional |
-| Rate limiting | `governor` token bucket per client IP + per user |
-| Query timeouts | Per-query wall-clock timeout via `tokio-util` CancellationToken |
-| Session lifecycle | Idle timeout + absolute session max-age |
-| Query cancellation | Client disconnect → clean execution abort |
-| Audit log | JSON log line per query: user, query hash, duration, row count, outcome |
-| Error sanitisation | `client_message()` strips internals; request ID threads through |
-| Health endpoints | `axum` HTTP on port 9090: `/health/live`, `/health/ready`, `/metrics` |
+**Completed (2026-03-22):** Keycloak → OIDC rename (`oidc_password.rs` + deprecated re-export), MinIO → generic S3 language, config validation (fail-fast on missing fields + port conflicts), TLS support (`[coordinator.tls]` with optional mTLS via `ca_file`), rate limiting (per-user + global via `governor`), query timeouts (per-role overrides), session lifecycle (idle + absolute timeouts with background sweeper), query cancellation (`CancellationToken` registry + Flight cancel handler), audit log enhancements (session_id, query_hash, client_ip), error sanitisation (`client_message()` + debug mode toggle), health endpoints (already existed).
 
 ---
 
@@ -175,9 +162,9 @@ Four sub-systems that make SQE agent-native and semantically aware.
 ```
 Step 1: audit               (1–2 days — catches issues before they compound)
 Step 2: core engine gaps    ✅ DONE (99/103 — 4 blocked on iceberg-rust MoR Q3 2026)
-Step 3: security hardening  (prerequisite for OSS release; no API changes) ← NEXT
-Step 4: pluggable auth      (depends on Step 3 renames being done first)
-Step 5: pluggable catalogs  (independent of auth; can run in parallel with Step 4)
+Step 3: security hardening  ✅ DONE (51/51 — TLS, rate limiting, timeouts, cancellation, audit, error sanitisation)
+Step 4: pluggable auth      (depends on Step 3 renames being done first) ← NEXT
+Step 5: pluggable catalogs  (independent of auth; can run in parallel with Step 4) ← NEXT
 Step 6: semantic layer      (new crates; fully additive; no existing code broken)
 ```
 

@@ -31,9 +31,9 @@ Every query runs as the authenticated user. No service account.
 - **SQL**: Full ANSI SQL via DataFusion — window functions (LEAD, LAG, PARTITION BY, etc.), CTEs, subqueries, joins, aggregates, GROUPING SETS. See [docs/features.md](docs/features.md) for a detailed comparison with Trino and Spark.
 - **DDL**: CREATE TABLE AS SELECT, INSERT INTO, CREATE/DROP VIEW, DROP TABLE, ALTER TABLE RENAME
 - **Protocols**: Arrow Flight SQL (primary, gRPC) + Trino HTTP (compatibility layer)
-- **Auth**: Keycloak OIDC with background token refresh
+- **Auth**: OIDC password grant (any OIDC provider) with background token refresh
 - **Catalog**: Apache Polaris REST Catalog with per-session bearer token passthrough
-- **Storage**: S3 / MinIO via Iceberg's FileIO (credential vending or static config)
+- **Storage**: S3-compatible storage via Iceberg's FileIO (credential vending or static config)
 - **Observability**: OpenTelemetry (traces, metrics, logs via OTLP/gRPC), Prometheus metrics, JSON audit log
 - **Security**: Planned OPA/Cedar policy engine for row-level security and column masking
 - **CLI**: Interactive REPL and one-shot mode with Flight SQL and HTTP backends
@@ -44,7 +44,7 @@ Every query runs as the authenticated user. No service account.
 |-------|---------|
 | `sqe-core` | Shared types, config (TOML), errors |
 | `sqe-sql` | SQL parser (sqlparser-rs), statement classifier |
-| `sqe-auth` | Keycloak OIDC, token cache, background refresh |
+| `sqe-auth` | OIDC password grant (Keycloak, Auth0, Okta, etc.), token cache, background refresh |
 | `sqe-catalog` | Iceberg REST catalog client, DataFusion catalog/schema providers, information_schema |
 | `sqe-policy` | PolicyEnforcer trait, passthrough implementation |
 | `sqe-planner` | LogicalPlan manipulation, distributed plan splitting |
@@ -156,7 +156,7 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 - [x] Integration & E2E test suite
 - [ ] MERGE INTO, DELETE (blocked on iceberg-rust Merge-on-Read, ETA Q3 2026)
 - [ ] OPA/Cedar policy engine (row filters, column masks, GRANT/REVOKE SQL)
-- [ ] OSS security hardening (TLS enforcement, rate limiting, config renames)
+- [x] OSS security hardening (TLS, rate limiting, query timeouts, session lifecycle, error sanitisation, vendor-neutral naming)
 - [ ] Pluggable auth providers (bearer token, API key, mTLS, anonymous)
 - [ ] Pluggable catalog backends (AWS Glue, Nessie, Hive Metastore, storage-only)
 - [ ] Semantic AI layer (RDF/SPARQL, property graph/GQL, vector search, agent interfaces)
@@ -171,7 +171,7 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 | Query Engine | Apache DataFusion 52 |
 | Table Format | Apache Iceberg v2 (iceberg-rust 0.9) |
 | Catalog | Apache Polaris (Iceberg REST) |
-| Auth | Keycloak OIDC |
+| Auth | OIDC (Keycloak, Auth0, Okta, or any OIDC provider) |
 | Wire Protocol | Arrow Flight SQL + Trino HTTP |
-| Storage | S3 / MinIO |
+| Storage | S3-compatible (AWS S3, Ceph, Garage, R2, etc.) |
 | Observability | OpenTelemetry + Prometheus |

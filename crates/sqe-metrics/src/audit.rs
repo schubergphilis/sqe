@@ -8,11 +8,26 @@ use tracing::{error, info};
 pub struct AuditEntry {
     pub timestamp: String,
     pub username: String,
-    pub query_text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// SHA-256 hash of normalised SQL (whitespace-collapsed, uppercase keywords).
+    pub query_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_text: Option<String>,
     pub statement_type: String,
     pub duration_ms: u64,
     pub rows_returned: usize,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_ip: Option<String>,
+}
+
+/// Compute SHA-256 hash of normalised SQL (whitespace-collapsed, uppercase keywords).
+pub fn query_hash(sql: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let normalised: String = sql.split_whitespace().collect::<Vec<_>>().join(" ").to_uppercase();
+    let hash = Sha256::digest(normalised.as_bytes());
+    format!("{hash:x}")
 }
 
 pub struct AuditLogger {
@@ -68,36 +83,60 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
-    #[test]
-    fn test_noop_logger() {
-        let logger = AuditLogger::new("");
-        let entry = AuditEntry {
+    fn test_entry() -> AuditEntry {
+        AuditEntry {
             timestamp: Utc::now().to_rfc3339(),
             username: "test".to_string(),
-            query_text: "SELECT 1".to_string(),
+            session_id: Some("sess-123".to_string()),
+            query_hash: query_hash("SELECT 1"),
+            query_text: Some("SELECT 1".to_string()),
             statement_type: "query".to_string(),
             duration_ms: 42,
             rows_returned: 1,
             status: "success".to_string(),
-        };
-        logger.log(&entry);
+            client_ip: Some("127.0.0.1".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_noop_logger() {
+        let logger = AuditLogger::new("");
+        logger.log(&test_entry());
     }
 
     #[test]
     fn test_audit_entry_serialization() {
-        let entry = AuditEntry {
-            timestamp: "2026-03-15T00:00:00Z".to_string(),
-            username: "root".to_string(),
-            query_text: "SELECT * FROM t".to_string(),
-            statement_type: "query".to_string(),
-            duration_ms: 100,
-            rows_returned: 5,
-            status: "success".to_string(),
-        };
-
+        let entry = test_entry();
         let json = serde_json::to_string(&entry).unwrap();
-        assert!(json.contains("\"username\":\"root\""));
-        assert!(json.contains("\"duration_ms\":100"));
+        assert!(json.contains("\"username\":\"test\""));
+        assert!(json.contains("\"query_hash\":"));
+        assert!(json.contains("\"session_id\":\"sess-123\""));
+    }
+
+    #[test]
+    fn test_audit_entry_omits_none_fields() {
+        let mut entry = test_entry();
+        entry.query_text = None;
+        entry.client_ip = None;
+        entry.session_id = None;
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("query_text"));
+        assert!(!json.contains("client_ip"));
+        assert!(!json.contains("session_id"));
+    }
+
+    #[test]
+    fn test_query_hash_normalises() {
+        let h1 = query_hash("select  1  from   t");
+        let h2 = query_hash("SELECT 1 FROM T");
+        assert_eq!(h1, h2, "Hashes should match after normalisation");
+    }
+
+    #[test]
+    fn test_query_hash_differs_for_different_sql() {
+        let h1 = query_hash("SELECT 1");
+        let h2 = query_hash("SELECT 2");
+        assert_ne!(h1, h2);
     }
 
     #[test]
@@ -107,20 +146,11 @@ mod tests {
         let path_str = path.to_str().unwrap();
 
         let logger = AuditLogger::new(path_str);
-        let entry = AuditEntry {
-            timestamp: "2026-03-15T00:00:00Z".to_string(),
-            username: "testuser".to_string(),
-            query_text: "SELECT 1".to_string(),
-            statement_type: "query".to_string(),
-            duration_ms: 10,
-            rows_returned: 1,
-            status: "success".to_string(),
-        };
-        logger.log(&entry);
+        logger.log(&test_entry());
 
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("testuser"));
-        assert!(content.contains("SELECT 1"));
+        assert!(content.contains("\"username\":\"test\""));
+        assert!(content.contains("query_hash"));
 
         let _ = std::fs::remove_file(&path);
     }

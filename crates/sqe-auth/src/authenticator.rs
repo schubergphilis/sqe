@@ -6,14 +6,15 @@ use tracing::{debug, error, info};
 use sqe_core::config::AuthConfig;
 use sqe_core::Session;
 
-use crate::keycloak::KeycloakClient;
+use crate::oidc_password::OidcPasswordClient;
 use crate::oauth::OAuthClient;
 use crate::token_cache::{CachedToken, TokenCache};
 
 /// Selects which auth backend the engine uses at runtime.
 enum AuthBackend {
-    /// Keycloak ROPC — exchanges username/password for a token via Keycloak.
-    Keycloak(KeycloakClient),
+    /// OIDC Password Grant (ROPC) — exchanges username/password for a token
+    /// via any OIDC-compliant provider (Keycloak, Auth0, Okta, etc.).
+    OidcPassword(OidcPasswordClient),
     /// Generic OAuth2 client_credentials — obtains a service token from any
     /// OAuth2-compliant endpoint (e.g. Polaris). Username/password are ignored.
     ClientCredentials(OAuthClient),
@@ -46,10 +47,10 @@ impl Authenticator {
             info!(
                 keycloak_url = config.keycloak_url,
                 realm = config.realm,
-                "Using Keycloak ROPC backend"
+                "Using OIDC password grant backend"
             );
-            let keycloak = KeycloakClient::new(config)?;
-            AuthBackend::Keycloak(keycloak)
+            let oidc = OidcPasswordClient::new(config)?;
+            AuthBackend::OidcPassword(oidc)
         };
 
         info!(
@@ -70,7 +71,7 @@ impl Authenticator {
         password: &str,
     ) -> sqe_core::Result<Session> {
         match &self.backend {
-            AuthBackend::Keycloak(kc) => {
+            AuthBackend::OidcPassword(kc) => {
                 let token_response = kc.exchange_credentials(username, password).await?;
                 let roles = kc.extract_roles(&token_response.access_token);
                 let token_expiry =
@@ -96,7 +97,7 @@ impl Authenticator {
                 debug!(
                     session_id = session.id,
                     username = username,
-                    "Session created and cached (Keycloak)"
+                    "Session created and cached (OIDC)"
                 );
 
                 Ok(session)
@@ -145,7 +146,7 @@ impl Authenticator {
 
     pub async fn refresh_session(&self, session: &mut Session) -> sqe_core::Result<()> {
         match &self.backend {
-            AuthBackend::Keycloak(kc) => {
+            AuthBackend::OidcPassword(kc) => {
                 let refresh_token = session
                     .refresh_token
                     .as_deref()
@@ -170,7 +171,7 @@ impl Authenticator {
                     },
                 );
 
-                debug!(session_id = session.id, "Session token refreshed (Keycloak)");
+                debug!(session_id = session.id, "Session token refreshed (OIDC)");
             }
             AuthBackend::ClientCredentials(oauth) => {
                 // No refresh_token in client_credentials mode — simply re-fetch.
@@ -229,7 +230,7 @@ impl Authenticator {
                     };
 
                     match &this.backend {
-                        AuthBackend::Keycloak(kc) => {
+                        AuthBackend::OidcPassword(kc) => {
                             let refresh_token = match cached.refresh_token.as_deref() {
                                 Some(rt) => rt,
                                 None => {
@@ -256,7 +257,7 @@ impl Authenticator {
                                     );
                                     debug!(
                                         session_id = session_id,
-                                        "Background token refresh succeeded (Keycloak)"
+                                        "Background token refresh succeeded (OIDC)"
                                     );
                                 }
                                 Err(e) => {

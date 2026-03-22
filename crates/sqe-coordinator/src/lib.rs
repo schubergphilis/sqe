@@ -1,4 +1,5 @@
 pub mod catalog_ops;
+pub mod tls;
 pub mod codec;
 pub mod credential_refresh;
 pub mod distributed_scan;
@@ -6,6 +7,8 @@ pub mod explain;
 pub mod flight_sql;
 pub mod mode;
 pub mod query_handler;
+pub mod query_registry;
+pub mod rate_limiter;
 pub mod scheduler;
 pub mod session_manager;
 pub mod worker_registry;

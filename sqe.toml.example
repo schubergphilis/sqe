@@ -2,6 +2,15 @@
 flight_sql_port = 50051
 trino_http_port = 8080
 mode = "hybrid"   # "local", "distributed", or "hybrid"
+# debug = false   # Set true for verbose error messages (dev only)
+
+# Optional TLS for Flight SQL listener.
+# When cert_file + key_file are set, the server runs with TLS.
+# When omitted, the server runs in plaintext.
+# [coordinator.tls]
+# cert_file = "/etc/sqe/server.crt"
+# key_file  = "/etc/sqe/server.key"
+# ca_file   = ""  # Optional: PEM CA for mTLS client cert verification
 
 [worker]
 coordinator_url = "http://coordinator:50052"
@@ -32,6 +41,10 @@ s3_path_style = true
 
 [policy]
 engine = "passthrough"
+
+[session]
+idle_timeout_secs = 900       # 15 minutes — sessions idle longer than this are expired
+absolute_timeout_secs = 28800  # 8 hours — sessions older than this are expired regardless of activity
 
 [metrics]
 prometheus_port = 9090

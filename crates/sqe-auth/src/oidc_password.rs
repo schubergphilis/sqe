@@ -11,14 +11,14 @@ pub struct TokenResponse {
     pub token_type: String,
 }
 
-pub struct KeycloakClient {
+pub struct OidcPasswordClient {
     client: reqwest::Client,
     token_url: String,
     client_id: String,
     client_secret: String,
 }
 
-impl KeycloakClient {
+impl OidcPasswordClient {
     pub fn new(config: &AuthConfig) -> sqe_core::Result<Self> {
         let token_url = format!(
             "{}/realms/{}/protocol/openid-connect/token",
@@ -69,7 +69,7 @@ impl KeycloakClient {
                 .await
                 .unwrap_or_else(|_| "unable to read body".to_string());
             return Err(sqe_core::SqeError::Auth(format!(
-                "Keycloak returned {status}: {body}"
+                "OIDC provider returned {status}: {body}"
             )));
         }
 
@@ -83,7 +83,7 @@ impl KeycloakClient {
         &self,
         refresh_token: &str,
     ) -> sqe_core::Result<TokenResponse> {
-        debug!("Refreshing token via Keycloak");
+        debug!("Refreshing token via OIDC provider");
 
         let params = [
             ("grant_type", "refresh_token"),
@@ -107,7 +107,7 @@ impl KeycloakClient {
                 .await
                 .unwrap_or_else(|_| "unable to read body".to_string());
             return Err(sqe_core::SqeError::Auth(format!(
-                "Keycloak refresh returned {status}: {body}"
+                "OIDC refresh returned {status}: {body}"
             )));
         }
 
@@ -119,7 +119,7 @@ impl KeycloakClient {
             })
     }
 
-    /// Decode JWT payload without signature verification (Keycloak already validated).
+    /// Decode JWT payload without signature verification (OIDC provider already validated).
     /// Extracts `realm_access.roles` from the claims.
     ///
     /// Returns an empty `Vec` for malformed tokens.
@@ -187,8 +187,8 @@ mod tests {
         }
     }
 
-    fn make_client() -> KeycloakClient {
-        KeycloakClient::new(&test_config()).unwrap()
+    fn make_client() -> OidcPasswordClient {
+        OidcPasswordClient::new(&test_config()).unwrap()
     }
 
     #[test]
@@ -274,7 +274,7 @@ mod tests {
     fn token_url_strips_trailing_slash() {
         let mut config = test_config();
         config.keycloak_url = "http://localhost:8080/".to_string();
-        let client = KeycloakClient::new(&config).unwrap();
+        let client = OidcPasswordClient::new(&config).unwrap();
         assert_eq!(
             client.token_url,
             "http://localhost:8080/realms/test/protocol/openid-connect/token"
