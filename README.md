@@ -156,7 +156,7 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 - [x] Integration & E2E test suite
 - [ ] MERGE INTO, DELETE (blocked on iceberg-rust Merge-on-Read, ETA Q3 2026)
 - [ ] OPA/Cedar policy engine (row filters, column masks, GRANT/REVOKE SQL)
-- [ ] OSS security hardening (TLS enforcement, rate limiting, config renames)
+- [x] OSS security hardening (TLS, rate limiting, query timeouts, session lifecycle, error sanitisation, vendor-neutral naming)
 - [ ] Pluggable auth providers (bearer token, API key, mTLS, anonymous)
 - [ ] Pluggable catalog backends (AWS Glue, Nessie, Hive Metastore, storage-only)
 - [ ] Semantic AI layer (RDF/SPARQL, property graph/GQL, vector search, agent interfaces)

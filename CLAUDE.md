@@ -104,3 +104,13 @@ cargo audit
 - All changes go through branches + GitLab MRs (never push directly to main)
 - Remote: `origin` = GitLab (`sbp.gitlab.schubergphilis.com`)
 - Use `glab` CLI for MR creation
+
+## After Completing Work
+
+When finishing a feature, bugfix, or any implementation task, **always update these files** before committing:
+
+1. **`README.md`** — Update the roadmap checklist (mark items done, add new items)
+2. **`nextsteps.md`** — Update status line, mark completed steps, shift "← NEXT" pointer
+3. **`openspec/changes/*/tasks.md`** — Check off completed tasks (`- [ ]` → `- [x]`)
+
+This ensures the project state is always visible to anyone reading the repo.
