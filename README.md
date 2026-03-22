@@ -149,11 +149,17 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 
 ## Roadmap
 
-- [ ] MERGE INTO, DELETE, UPDATE (Iceberg v2 position deletes)
-- [ ] Distributed execution (coordinator → worker plan shipping)
+- [x] Distributed execution (coordinator → worker plan shipping, fragment scheduler, heartbeat, credential refresh)
+- [x] Iceberg predicate pushdown (DataFusion 52 optimizer pass)
+- [x] Trino HTTP compatibility (pagination, header handling, dual auth)
+- [x] Worker observability (metrics, OTel trace propagation, memory limits, spill-to-disk)
+- [x] Integration & E2E test suite
+- [ ] MERGE INTO, DELETE (blocked on iceberg-rust Merge-on-Read, ETA Q3 2026)
 - [ ] OPA/Cedar policy engine (row filters, column masks, GRANT/REVOKE SQL)
-- [ ] Iceberg time travel (AS OF snapshot queries)
-- [ ] Manifest caching
+- [ ] OSS security hardening (TLS enforcement, rate limiting, config renames)
+- [ ] Pluggable auth providers (bearer token, API key, mTLS, anonymous)
+- [ ] Pluggable catalog backends (AWS Glue, Nessie, Hive Metastore, storage-only)
+- [ ] Semantic AI layer (RDF/SPARQL, property graph/GQL, vector search, agent interfaces)
 - [ ] dbt adapter (dbt-sqe via ADBC Flight SQL)
 - [ ] Helm chart for Kubernetes deployment
 
@@ -162,8 +168,8 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 | Component | Technology |
 |-----------|-----------|
 | Language | Rust |
-| Query Engine | Apache DataFusion 51 |
-| Table Format | Apache Iceberg v2 (iceberg-rust) |
+| Query Engine | Apache DataFusion 52 |
+| Table Format | Apache Iceberg v2 (iceberg-rust 0.9) |
 | Catalog | Apache Polaris (Iceberg REST) |
 | Auth | Keycloak OIDC |
 | Wire Protocol | Arrow Flight SQL + Trino HTTP |
