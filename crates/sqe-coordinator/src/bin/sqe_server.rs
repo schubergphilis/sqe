@@ -195,6 +195,9 @@ async fn main() -> anyhow::Result<()> {
 
     let config = SqeConfig::load(&config_path)
         .map_err(|e| anyhow::anyhow!("Failed to load config from {config_path}: {e}"))?;
+    config
+        .validate()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Priority: --mode flag > SQE_MODE env > config file mode
     // Since clap always has a default, check if user explicitly passed --mode
@@ -292,6 +295,26 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         tracing::info!("Started credential refresh background task (60s interval)");
     }
 
+    // Session expiry sweeper — runs every 60s to remove idle/absolute-expired sessions
+    {
+        let sm = session_manager.clone();
+        let idle = config.session.idle_timeout_secs;
+        let absolute = config.session.absolute_timeout_secs;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.tick().await; // skip first immediate tick
+            loop {
+                tick.tick().await;
+                sm.sweep_expired_sessions(idle, absolute);
+            }
+        });
+        tracing::info!(
+            idle_timeout_secs = config.session.idle_timeout_secs,
+            absolute_timeout_secs = config.session.absolute_timeout_secs,
+            "Started session expiry sweeper (60s interval)"
+        );
+    }
+
     // Query handler
     let query_handler = Arc::new(QueryHandler::new(
         policy_enforcer,
@@ -335,9 +358,19 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         SqeFlightSqlService::new(session_manager, query_handler, config.clone());
     let addr = format!("0.0.0.0:{}", config.coordinator.flight_sql_port).parse()?;
 
-    tracing::info!("SQE coordinator listening on {addr}");
+    // Optional TLS
+    let tls_config = sqe_coordinator::tls::build_server_tls_config(&config.coordinator.tls)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    tonic::transport::Server::builder()
+    let mut server_builder = tonic::transport::Server::builder();
+    if let Some(tls) = tls_config {
+        server_builder = server_builder.tls_config(tls)?;
+        tracing::info!("SQE coordinator listening on {addr} (TLS)");
+    } else {
+        tracing::info!("SQE coordinator listening on {addr} (plaintext)");
+    }
+
+    server_builder
         .add_service(
             arrow_flight::flight_service_server::FlightServiceServer::new(flight_service),
         )
@@ -378,9 +411,19 @@ async fn run_worker(config: SqeConfig) -> anyhow::Result<()> {
     // Mark ready
     ready.store(true, Ordering::Relaxed);
 
-    tracing::info!("SQE worker listening on {addr}");
+    // Optional TLS (reuse coordinator TLS config for workers)
+    let tls_config = sqe_coordinator::tls::build_server_tls_config(&config.coordinator.tls)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    tonic::transport::Server::builder()
+    let mut server_builder = tonic::transport::Server::builder();
+    if let Some(tls) = tls_config {
+        server_builder = server_builder.tls_config(tls)?;
+        tracing::info!("SQE worker listening on {addr} (TLS)");
+    } else {
+        tracing::info!("SQE worker listening on {addr} (plaintext)");
+    }
+
+    server_builder
         .add_service(flight_service.into_server())
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;

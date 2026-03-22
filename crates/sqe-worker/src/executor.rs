@@ -236,7 +236,7 @@ fn build_object_store_with_creds(
         builder = builder.with_virtual_hosted_style_request(false);
     }
 
-    // Allow HTTP for dev (MinIO)
+    // Allow HTTP for dev (S3-compatible endpoints without TLS)
     builder = builder.with_allow_http(true);
 
     // Extract bucket from the first file path
