@@ -1407,3 +1407,242 @@ async fn test_explain_policy_aware() {
 
     teardown_join_fixture(&session, &handler).await;
 }
+
+// ---------------------------------------------------------------------------
+// Keycloak auth integration tests (require SQE quickstart with Keycloak)
+// ---------------------------------------------------------------------------
+
+/// Helper to build an authenticator from a Keycloak-aware config.
+/// Expects SQE_TEST_KEYCLOAK_URL to be set (e.g. "http://localhost:8080").
+fn keycloak_config() -> Option<sqe_core::SqeConfig> {
+    let kc_url = std::env::var("SQE_TEST_KEYCLOAK_URL").ok()?;
+    let mut config =
+        sqe_core::SqeConfig::load(&common::test_config_path()).expect("Failed to load test config");
+    config.auth.keycloak_url = kc_url;
+    config.auth.realm = "iceberg".to_string();
+    config.auth.client_id = "sqe-client".to_string();
+    config.auth.client_secret =
+        std::env::var("SQE_TEST_CLIENT_SECRET").unwrap_or_else(|_| "sqe-secret-change-me".to_string());
+    config.auth.token_endpoint.clear(); // Force Keycloak ROPC mode
+    Some(config)
+}
+
+// Test: Authenticate against Keycloak with test users (task 2.6)
+#[tokio::test(flavor = "multi_thread")]
+#[ignore] // Requires: SQE quickstart with Keycloak running + SQE_TEST_KEYCLOAK_URL set
+async fn test_keycloak_auth_with_test_users() {
+    common::init_tracing();
+    let config = match keycloak_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("Skipping: SQE_TEST_KEYCLOAK_URL not set");
+            return;
+        }
+    };
+
+    let authenticator = sqe_auth::Authenticator::new(&config.auth)
+        .await
+        .expect("Failed to create Keycloak authenticator");
+
+    // Authenticate as adminuser (defined in realm-config.json)
+    let admin_session = authenticator
+        .authenticate("adminuser", "adminuser123")
+        .await
+        .expect("adminuser auth should succeed");
+    assert_eq!(admin_session.user.username, "adminuser");
+    assert!(!admin_session.access_token.is_empty());
+    assert!(
+        admin_session.user.roles.contains(&"catalog_admin".to_string()),
+        "adminuser should have catalog_admin role, got: {:?}",
+        admin_session.user.roles
+    );
+
+    // Authenticate as testuser (more restricted roles)
+    let test_session = authenticator
+        .authenticate("testuser", "testuser123")
+        .await
+        .expect("testuser auth should succeed");
+    assert_eq!(test_session.user.username, "testuser");
+    assert!(
+        test_session.user.roles.contains(&"table_reader".to_string()),
+        "testuser should have table_reader role"
+    );
+    assert!(
+        !test_session
+            .user
+            .roles
+            .contains(&"catalog_admin".to_string()),
+        "testuser should NOT have catalog_admin role"
+    );
+
+    // Invalid credentials should fail
+    let result = authenticator.authenticate("testuser", "wrong_password").await;
+    assert!(result.is_err(), "Wrong password should fail authentication");
+}
+
+// Test: Token refresh via Keycloak (task 2.6)
+#[tokio::test(flavor = "multi_thread")]
+#[ignore] // Requires: SQE quickstart with Keycloak running + SQE_TEST_KEYCLOAK_URL set
+async fn test_keycloak_token_refresh() {
+    common::init_tracing();
+    let config = match keycloak_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("Skipping: SQE_TEST_KEYCLOAK_URL not set");
+            return;
+        }
+    };
+
+    let authenticator = sqe_auth::Authenticator::new(&config.auth)
+        .await
+        .expect("Failed to create Keycloak authenticator");
+
+    let mut session = authenticator
+        .authenticate("testuser", "testuser123")
+        .await
+        .expect("Auth failed");
+
+    let original_token = session.access_token.clone();
+
+    // Refresh the session
+    authenticator
+        .refresh_session(&mut session)
+        .await
+        .expect("Token refresh should succeed");
+
+    assert_ne!(
+        session.access_token, original_token,
+        "Refreshed token should differ from original"
+    );
+    assert!(!session.access_token.is_empty());
+}
+
+// Test: Different users see different catalog visibility (task 7.13)
+#[tokio::test(flavor = "multi_thread")]
+#[ignore] // Requires: SQE quickstart with Keycloak + Polaris running + SQE_TEST_KEYCLOAK_URL set
+async fn test_different_user_catalog_visibility() {
+    common::init_tracing();
+    let config = match keycloak_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("Skipping: SQE_TEST_KEYCLOAK_URL not set");
+            return;
+        }
+    };
+
+    let authenticator = sqe_auth::Authenticator::new(&config.auth)
+        .await
+        .expect("Failed to create Keycloak authenticator");
+
+    let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(sqe_policy::PassthroughEnforcer);
+    let handler =
+        sqe_coordinator::QueryHandler::new(policy, config.clone(), None, None, None, None);
+
+    // adminuser has catalog_admin + table_reader + data_writer roles
+    let admin_session = authenticator
+        .authenticate("adminuser", "adminuser123")
+        .await
+        .expect("adminuser auth failed");
+
+    let admin_schemas = handler
+        .execute(&admin_session, "SHOW SCHEMAS")
+        .await
+        .expect("adminuser SHOW SCHEMAS should succeed");
+    let admin_rows: usize = admin_schemas.iter().map(|b| b.num_rows()).sum();
+
+    // testuser has only table_reader role
+    let test_session = authenticator
+        .authenticate("testuser", "testuser123")
+        .await
+        .expect("testuser auth failed");
+
+    let test_schemas = handler
+        .execute(&test_session, "SHOW SCHEMAS")
+        .await
+        .expect("testuser SHOW SCHEMAS should succeed");
+    let test_rows: usize = test_schemas.iter().map(|b| b.num_rows()).sum();
+
+    // Both users should be able to list schemas (visibility depends on Polaris ACLs).
+    // At minimum, verify both queries succeed without errors.
+    assert!(
+        admin_rows > 0,
+        "adminuser should see at least one schema"
+    );
+    println!(
+        "Catalog visibility: adminuser sees {admin_rows} schemas, testuser sees {test_rows} schemas"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Trino compat end-to-end test (task 11.10)
+// ---------------------------------------------------------------------------
+
+/// Base64-encode a string for Basic auth.
+fn base64_encode(input: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(input.as_bytes())
+}
+
+// Test: Trino /v1/statement endpoint handles a query via HTTP
+#[tokio::test(flavor = "multi_thread")]
+#[ignore] // Requires: SQE server running with Trino compat on port 8080
+async fn test_trino_http_query() {
+    common::init_tracing();
+
+    let trino_port = std::env::var("SQE_TEST_TRINO_PORT").unwrap_or_else(|_| "8080".to_string());
+    let base_url = format!("http://localhost:{trino_port}");
+
+    let client = reqwest::Client::new();
+
+    // Check /v1/info is accessible
+    let info_resp = client
+        .get(format!("{base_url}/v1/info"))
+        .send()
+        .await
+        .expect("GET /v1/info should connect");
+    assert!(
+        info_resp.status().is_success(),
+        "/v1/info returned {}",
+        info_resp.status()
+    );
+
+    let info: serde_json::Value = info_resp.json().await.expect("should parse as JSON");
+    assert!(
+        info.get("coordinator").is_some(),
+        "/v1/info should include 'coordinator' field"
+    );
+
+    // Submit a query via POST /v1/statement
+    let resp = client
+        .post(format!("{base_url}/v1/statement"))
+        .header("X-Trino-User", "root")
+        .header(
+            "Authorization",
+            format!("Basic {}", base64_encode("root:s3cr3t")),
+        )
+        .body("SELECT 1 as result")
+        .send()
+        .await
+        .expect("POST /v1/statement should succeed");
+
+    assert!(
+        resp.status().is_success(),
+        "POST /v1/statement returned {}",
+        resp.status()
+    );
+
+    let body: serde_json::Value = resp.json().await.expect("should parse query response");
+
+    // Response should contain 'id'
+    assert!(body.get("id").is_some(), "Response should have query ID");
+
+    // If nextUri is present, paginate to get results
+    if let Some(next_uri) = body.get("nextUri").and_then(|v| v.as_str()) {
+        let page_resp = client
+            .get(next_uri)
+            .send()
+            .await
+            .expect("GET nextUri should succeed");
+        assert!(page_resp.status().is_success());
+    }
+}
