@@ -308,7 +308,11 @@ impl SessionCatalog {
             .map_err(|e| SqeError::Catalog(format!("Failed to list views: {e}")))?;
 
         if !resp.status().is_success() {
-            return Ok(vec![]);
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(SqeError::Catalog(format!(
+                "Failed to list views (HTTP {status}): {text}"
+            )));
         }
 
         let body: serde_json::Value = resp
@@ -361,7 +365,11 @@ impl SessionCatalog {
             return Ok(None);
         }
         if !resp.status().is_success() {
-            return Ok(None);
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(SqeError::Catalog(format!(
+                "Failed to load view '{name}' (HTTP {status}): {text}"
+            )));
         }
 
         let body: serde_json::Value = resp
