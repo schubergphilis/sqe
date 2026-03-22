@@ -37,6 +37,7 @@ use tracing::{debug, info, warn};
 use sqe_core::SqeConfig;
 
 use crate::query_handler::QueryHandler;
+use crate::query_registry::QueryRegistry;
 use crate::session_manager::SessionManager;
 use crate::worker_registry::WorkerRegistry;
 
@@ -64,7 +65,7 @@ impl ProstMessageExt for FetchResults {
 
 /// Flight SQL service implementation for SQE.
 ///
-/// Wires together session management (Keycloak auth) and query execution
+/// Wires together session management (OIDC auth) and query execution
 /// (DataFusion + Polaris catalog + policy enforcement) into the Arrow
 /// Flight SQL protocol.
 #[derive(Clone)]
@@ -73,6 +74,7 @@ pub struct SqeFlightSqlService {
     query_handler: Arc<QueryHandler>,
     config: SqeConfig,
     worker_registry: Option<Arc<WorkerRegistry>>,
+    query_registry: Arc<QueryRegistry>,
 }
 
 impl SqeFlightSqlService {
@@ -86,7 +88,14 @@ impl SqeFlightSqlService {
             query_handler,
             config,
             worker_registry: None,
+            query_registry: Arc::new(QueryRegistry::new()),
         }
+    }
+
+    /// Returns a reference to the query registry for external access
+    /// (e.g., metrics, admin endpoints).
+    pub fn query_registry(&self) -> &Arc<QueryRegistry> {
+        &self.query_registry
     }
 
     pub fn with_worker_registry(mut self, registry: Arc<WorkerRegistry>) -> Self {
@@ -153,7 +162,7 @@ impl FlightSqlService for SqeFlightSqlService {
     /// Handle client authentication via Basic auth.
     ///
     /// Extracts username:password from the Basic auth header, authenticates
-    /// via Keycloak, and returns the session ID as a bearer token.
+    /// via the configured OIDC provider, and returns the session ID as a bearer token.
     #[tracing::instrument(skip_all, name = "flight_sql.handshake")]
     async fn do_handshake(
         &self,
@@ -732,10 +741,53 @@ impl FlightSqlService for SqeFlightSqlService {
 
     async fn do_action_cancel_query(
         &self,
-        _query: ActionCancelQueryRequest,
+        query: ActionCancelQueryRequest,
         _request: Request<Action>,
     ) -> Result<ActionCancelQueryResult, Status> {
-        Err(Status::unimplemented("Query cancellation not supported"))
+        // ActionCancelQueryRequest.info contains the serialized FlightInfo
+        // from get_flight_info_statement. Decode it to extract the query
+        // handle from the first endpoint ticket.
+        let flight_info: arrow_flight::FlightInfo =
+            Message::decode(&*query.info).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "CancelQuery: failed to decode FlightInfo: {e}"
+                ))
+            })?;
+
+        let query_id = flight_info
+            .endpoint
+            .first()
+            .and_then(|ep| ep.ticket.as_ref())
+            .map(|t| {
+                // Try to decode as our FetchResults protobuf to get the handle
+                if let Ok(fetch) = <FetchResults as Message>::decode(&*t.ticket) {
+                    fetch.handle
+                } else {
+                    String::from_utf8_lossy(&t.ticket).to_string()
+                }
+            })
+            .ok_or_else(|| {
+                Status::invalid_argument(
+                    "CancelQuery request missing ticket in FlightInfo endpoint",
+                )
+            })?;
+
+        let cancelled = self.query_registry.cancel(&query_id);
+        if cancelled {
+            info!(query_id = %query_id, "Query cancelled via Flight CancelQuery action");
+        } else {
+            debug!(
+                query_id = %query_id,
+                "CancelQuery: query not found in registry (already completed or unknown)"
+            );
+        }
+
+        // ActionCancelQueryResult.result is an i32 matching the CancelResult
+        // protobuf enum: 0 = UNSPECIFIED, 1 = CANCELLED, 2 = CANCELLING,
+        // 3 = NOT_CANCELLABLE.
+        Ok(ActionCancelQueryResult {
+            result: if cancelled { 1 } else { 0 },
+        })
     }
 
     /// Handle custom (non-Flight-SQL) actions such as worker heartbeats.

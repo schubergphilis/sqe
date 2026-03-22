@@ -33,6 +33,10 @@ s3_path_style = true
 [policy]
 engine = "passthrough"
 
+[session]
+idle_timeout_secs = 900       # 15 minutes — sessions idle longer than this are expired
+absolute_timeout_secs = 28800  # 8 hours — sessions older than this are expired regardless of activity
+
 [metrics]
 prometheus_port = 9090
 # OTLP gRPC endpoint for traces, metrics, and logs (e.g. "http://otel-collector:4317")

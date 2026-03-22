@@ -23,7 +23,7 @@ pub struct ScanTask {
     pub s3_secret_key: String,
     /// S3 session token (from credential vending, empty if static).
     pub s3_session_token: String,
-    /// Whether to use path-style S3 access (required for MinIO).
+    /// Whether to use path-style S3 access (required for most S3-compatible endpoints).
     pub s3_path_style: bool,
 }
 
@@ -54,8 +54,8 @@ mod tests {
             projected_columns: vec!["id".to_string(), "name".to_string()],
             s3_endpoint: "http://localhost:9000".to_string(),
             s3_region: "us-east-1".to_string(),
-            s3_access_key: "minioadmin".to_string(),
-            s3_secret_key: "minioadmin".to_string(),
+            s3_access_key: "testadmin".to_string(),
+            s3_secret_key: "testadmin".to_string(),
             s3_session_token: String::new(),
             s3_path_style: true,
         };

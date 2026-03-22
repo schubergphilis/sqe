@@ -1,20 +1,37 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_array::RecordBatch;
 use arrow_array::{ArrayRef, builder::StringBuilder};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::prelude::{SessionConfig, SessionContext};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use sqlparser::ast::Statement;
 use sqe_catalog::{SessionCatalog, SqeCatalogProvider};
-use sqe_core::{Session, SqeConfig, SqeError};
+use sqe_core::{QueryConfig, Session, SqeConfig, SqeError};
 use sqe_policy::PolicyEnforcer;
 use sqe_sql::{parse_and_classify, StatementKind};
 
 use crate::catalog_ops::CatalogOps;
 use crate::credential_refresh::CredentialRefreshTracker;
 use crate::write_handler::WriteHandler;
+
+/// Determine the effective query timeout for a session.
+///
+/// If any of the user's roles appear in `config.role_overrides`, the highest
+/// matching override wins. Otherwise the global `config.timeout_secs` is used.
+pub fn timeout_for_session(config: &QueryConfig, session: &Session) -> u64 {
+    let override_timeout = session
+        .user
+        .roles
+        .iter()
+        .filter_map(|role| config.role_overrides.get(role))
+        .copied()
+        .max();
+
+    override_timeout.unwrap_or(config.timeout_secs)
+}
 
 /// Handles query execution by routing parsed SQL through the appropriate
 /// pipeline: DataFusion for queries, catalog metadata for SHOW commands,
@@ -86,116 +103,136 @@ impl QueryHandler {
         let kind_name = kind.name().to_string();
         tracing::Span::current().record("statement_type", kind_name.as_str());
 
-        let result = match kind {
-            StatementKind::Query(_) => self.execute_query(session, sql).await,
+        // Determine the effective timeout for this session (role overrides may increase it)
+        let timeout_secs = timeout_for_session(&self.config.query, session);
+        let timeout_duration = Duration::from_secs(timeout_secs);
 
-            StatementKind::ShowCatalogs => self.handle_show_catalogs(session).await,
+        let execution_future = async {
+            match kind {
+                StatementKind::Query(_) => self.execute_query(session, sql).await,
 
-            StatementKind::ShowSchemas(_filter) => {
-                self.handle_show_schemas(session).await
-            }
+                StatementKind::ShowCatalogs => self.handle_show_catalogs(session).await,
 
-            StatementKind::ShowTables(filter) => {
-                self.handle_show_tables(session, &filter).await
-            }
-
-            StatementKind::Utility(stmt) => {
-                if let sqlparser::ast::Statement::Explain { analyze, statement, .. } = *stmt {
-                    let inner = statement.to_string();
-                    let ctx = self.create_session_context(session).await?;
-                    if analyze {
-                        self.explain_handler.analyze(session, &inner, &ctx).await
-                    } else {
-                        self.explain_handler.plan(session, &inner, &ctx).await
-                    }
-                } else {
-                    Err(SqeError::NotImplemented(format!(
-                        "Utility statement not supported: {stmt}"
-                    )))
+                StatementKind::ShowSchemas(_filter) => {
+                    self.handle_show_schemas(session).await
                 }
-            }
 
-            StatementKind::Policy(_) => Err(SqeError::NotImplemented(
-                "Policy management not configured".to_string(),
-            )),
+                StatementKind::ShowTables(filter) => {
+                    self.handle_show_tables(session, &filter).await
+                }
 
-            StatementKind::Drop(stmt) => {
-                self.catalog_ops.drop_table(session, &stmt).await?;
-                Ok(vec![])
-            }
-            StatementKind::Rename(stmt) => {
-                self.catalog_ops.rename_table(session, &stmt).await?;
-                Ok(vec![])
-            }
-            StatementKind::CreateView(stmt) => {
-                self.handle_create_view(session, &stmt).await?;
-                Ok(vec![])
-            }
-            StatementKind::DropView(stmt) => {
-                self.catalog_ops.drop_view(session, &stmt).await?;
-                Ok(vec![])
-            }
-            StatementKind::CreateSchema(stmt) => {
-                self.catalog_ops.create_schema(session, &stmt).await?;
-                Ok(vec![])
-            }
-            StatementKind::DropSchema(stmt) => {
-                self.catalog_ops.drop_schema(session, &stmt).await?;
-                Ok(vec![])
-            }
-
-            StatementKind::CreateTable(stmt) => {
-                self.write_handler.handle_create_table(session, &stmt).await
-            }
-
-            StatementKind::Ctas(stmt) => {
-                if let Statement::CreateTable(ref ct) = *stmt {
-                    if let Some(ref query) = ct.query {
-                        // Handle CREATE OR REPLACE TABLE AS SELECT:
-                        // drop the existing table first, then create a new one.
-                        if ct.or_replace {
-                            self.drop_table_if_exists(session, &ct.name).await?;
+                StatementKind::Utility(stmt) => {
+                    if let sqlparser::ast::Statement::Explain { analyze, statement, .. } = *stmt {
+                        let inner = statement.to_string();
+                        let ctx = self.create_session_context(session).await?;
+                        if analyze {
+                            self.explain_handler.analyze(session, &inner, &ctx).await
+                        } else {
+                            self.explain_handler.plan(session, &inner, &ctx).await
                         }
-                        let select_sql = format!("{query}");
-                        let batches = self.execute_query(session, &select_sql).await?;
-                        self.write_handler.handle_ctas(session, &stmt, batches).await
                     } else {
-                        Err(SqeError::Execution("CTAS without SELECT query".into()))
+                        Err(SqeError::NotImplemented(format!(
+                            "Utility statement not supported: {stmt}"
+                        )))
                     }
-                } else {
-                    Err(SqeError::Execution("Expected CreateTable statement".into()))
                 }
-            }
 
-            StatementKind::Insert(stmt) => {
-                if let Statement::Insert(ref ins) = *stmt {
-                    let select_sql = ins
-                        .source
-                        .as_ref()
-                        .map(|q| format!("{q}"))
-                        .ok_or_else(|| {
-                            SqeError::Execution("INSERT without SELECT source".into())
-                        })?;
-                    let batches = self.execute_query(session, &select_sql).await?;
-                    self.write_handler
-                        .handle_insert(session, &stmt, batches)
-                        .await
-                } else {
-                    Err(SqeError::Execution("Expected Insert statement".into()))
+                StatementKind::Policy(_) => Err(SqeError::NotImplemented(
+                    "Policy management not configured".to_string(),
+                )),
+
+                StatementKind::Drop(stmt) => {
+                    self.catalog_ops.drop_table(session, &stmt).await?;
+                    Ok(vec![])
                 }
-            }
+                StatementKind::Rename(stmt) => {
+                    self.catalog_ops.rename_table(session, &stmt).await?;
+                    Ok(vec![])
+                }
+                StatementKind::CreateView(stmt) => {
+                    self.handle_create_view(session, &stmt).await?;
+                    Ok(vec![])
+                }
+                StatementKind::DropView(stmt) => {
+                    self.catalog_ops.drop_view(session, &stmt).await?;
+                    Ok(vec![])
+                }
+                StatementKind::CreateSchema(stmt) => {
+                    self.catalog_ops.create_schema(session, &stmt).await?;
+                    Ok(vec![])
+                }
+                StatementKind::DropSchema(stmt) => {
+                    self.catalog_ops.drop_schema(session, &stmt).await?;
+                    Ok(vec![])
+                }
 
-            StatementKind::ExplainFull(inner) => {
-                let ctx = self.create_session_context(session).await?;
-                self.explain_handler.full(session, &inner, &ctx).await
-            }
+                StatementKind::CreateTable(stmt) => {
+                    self.write_handler.handle_create_table(session, &stmt).await
+                }
 
-            StatementKind::Delete(_) => Err(SqeError::NotImplemented(
-                "DELETE FROM requires Iceberg overwrite transaction support (planned for Chunk 3)".to_string(),
-            )),
-            StatementKind::Merge(_) => Err(SqeError::NotImplemented(
-                "MERGE INTO requires Iceberg overwrite transaction support (planned for Chunk 3)".to_string(),
-            )),
+                StatementKind::Ctas(stmt) => {
+                    if let Statement::CreateTable(ref ct) = *stmt {
+                        if let Some(ref query) = ct.query {
+                            // Handle CREATE OR REPLACE TABLE AS SELECT:
+                            // drop the existing table first, then create a new one.
+                            if ct.or_replace {
+                                self.drop_table_if_exists(session, &ct.name).await?;
+                            }
+                            let select_sql = format!("{query}");
+                            let batches = self.execute_query(session, &select_sql).await?;
+                            self.write_handler.handle_ctas(session, &stmt, batches).await
+                        } else {
+                            Err(SqeError::Execution("CTAS without SELECT query".into()))
+                        }
+                    } else {
+                        Err(SqeError::Execution("Expected CreateTable statement".into()))
+                    }
+                }
+
+                StatementKind::Insert(stmt) => {
+                    if let Statement::Insert(ref ins) = *stmt {
+                        let select_sql = ins
+                            .source
+                            .as_ref()
+                            .map(|q| format!("{q}"))
+                            .ok_or_else(|| {
+                                SqeError::Execution("INSERT without SELECT source".into())
+                            })?;
+                        let batches = self.execute_query(session, &select_sql).await?;
+                        self.write_handler
+                            .handle_insert(session, &stmt, batches)
+                            .await
+                    } else {
+                        Err(SqeError::Execution("Expected Insert statement".into()))
+                    }
+                }
+
+                StatementKind::ExplainFull(inner) => {
+                    let ctx = self.create_session_context(session).await?;
+                    self.explain_handler.full(session, &inner, &ctx).await
+                }
+
+                StatementKind::Delete(_) => Err(SqeError::NotImplemented(
+                    "DELETE FROM requires Iceberg overwrite transaction support (planned for Chunk 3)".to_string(),
+                )),
+                StatementKind::Merge(_) => Err(SqeError::NotImplemented(
+                    "MERGE INTO requires Iceberg overwrite transaction support (planned for Chunk 3)".to_string(),
+                )),
+            }
+        };
+
+        let result = match tokio::time::timeout(timeout_duration, execution_future).await {
+            Ok(inner_result) => inner_result,
+            Err(_elapsed) => {
+                warn!(
+                    username = %session.user.username,
+                    timeout_secs = timeout_secs,
+                    "Query timed out"
+                );
+                Err(SqeError::Execution(format!(
+                    "Query timed out after {timeout_secs}s"
+                )))
+            }
         };
 
         // Record metrics and audit
@@ -222,11 +259,14 @@ impl QueryHandler {
             audit.log(&sqe_metrics::audit::AuditEntry {
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 username: session.user.username.clone(),
-                query_text: sql.to_string(),
+                session_id: Some(session.id.clone()),
+                query_hash: sqe_metrics::audit::query_hash(sql),
+                query_text: Some(sql.to_string()),
                 statement_type: kind_name,
                 duration_ms: duration.as_millis() as u64,
                 rows_returned: rows,
                 status: status.to_string(),
+                client_ip: None,
             });
         }
 
@@ -607,5 +647,73 @@ fn arrow_type_to_iceberg(dt: &DataType) -> serde_json::Value {
         }
         DataType::FixedSizeBinary(len) => serde_json::json!(format!("fixed[{len}]")),
         _ => serde_json::json!("string"), // fallback
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqe_core::config::QueryConfig;
+    use sqe_core::session::{Session, SessionUser};
+
+    /// Build a minimal session for timeout tests.
+    fn test_session(roles: Vec<&str>) -> Session {
+        let now = chrono::Utc::now();
+        Session {
+            id: "test-session".to_string(),
+            user: SessionUser {
+                username: "alice".to_string(),
+                roles: roles.into_iter().map(String::from).collect(),
+            },
+            access_token: "tok".to_string(),
+            refresh_token: None,
+            token_expiry: now + chrono::Duration::hours(1),
+            created_at: now,
+            last_activity: now,
+            default_catalog: None,
+            default_schema: None,
+            source: None,
+        }
+    }
+
+    #[test]
+    fn timeout_for_session_uses_default_when_no_overrides() {
+        let config = QueryConfig::default();
+        let session = test_session(vec!["viewer"]);
+        assert_eq!(timeout_for_session(&config, &session), 300);
+    }
+
+    #[test]
+    fn timeout_for_session_uses_default_when_roles_dont_match() {
+        let mut config = QueryConfig::default();
+        config.role_overrides.insert("admin".to_string(), 600);
+        let session = test_session(vec!["viewer"]);
+        assert_eq!(timeout_for_session(&config, &session), 300);
+    }
+
+    #[test]
+    fn timeout_for_session_uses_role_override() {
+        let mut config = QueryConfig::default();
+        config.role_overrides.insert("etl".to_string(), 900);
+        let session = test_session(vec!["viewer", "etl"]);
+        assert_eq!(timeout_for_session(&config, &session), 900);
+    }
+
+    #[test]
+    fn timeout_for_session_picks_highest_matching_role() {
+        let mut config = QueryConfig::default();
+        config.role_overrides.insert("etl".to_string(), 900);
+        config.role_overrides.insert("admin".to_string(), 3600);
+        config.role_overrides.insert("viewer".to_string(), 120);
+        let session = test_session(vec!["viewer", "admin", "etl"]);
+        assert_eq!(timeout_for_session(&config, &session), 3600);
+    }
+
+    #[test]
+    fn timeout_for_session_empty_roles() {
+        let mut config = QueryConfig::default();
+        config.role_overrides.insert("admin".to_string(), 600);
+        let session = test_session(vec![]);
+        assert_eq!(timeout_for_session(&config, &session), 300);
     }
 }
