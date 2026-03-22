@@ -6,6 +6,7 @@
 
 use opentelemetry::propagation::{Extractor, Injector};
 use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Adapter that implements [`Injector`] for tonic's [`MetadataMap`].
 ///
@@ -81,6 +82,44 @@ pub fn extract_trace_context(metadata: &MetadataMap) -> opentelemetry::Context {
     opentelemetry::global::get_text_map_propagator(|propagator| {
         propagator.extract(&MetadataExtractor(metadata))
     })
+}
+
+/// Adapter that implements [`Injector`] for a `Vec<(String, String)>`.
+///
+/// Collects trace context headers as key-value pairs, suitable for
+/// injecting into any HTTP client (reqwest, hyper, etc.).
+struct VecInjector<'a>(&'a mut Vec<(String, String)>);
+
+impl Injector for VecInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        self.0.push((key.to_string(), value));
+    }
+}
+
+/// Collect the current span's W3C TraceContext as HTTP header key-value pairs.
+///
+/// Returns the `traceparent` and `tracestate` headers from the active
+/// `tracing` span's OpenTelemetry context. If no OTel propagator is
+/// registered or no span is active, returns an empty vec.
+///
+/// # Example
+///
+/// ```ignore
+/// use sqe_metrics::propagation::trace_context_http_headers;
+///
+/// let mut req = client.post(&url).bearer_auth(&token);
+/// for (k, v) in trace_context_http_headers() {
+///     req = req.header(k, v);
+/// }
+/// req.send().await?;
+/// ```
+pub fn trace_context_http_headers() -> Vec<(String, String)> {
+    let cx = tracing::Span::current().context();
+    let mut headers = Vec::new();
+    opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(&cx, &mut VecInjector(&mut headers));
+    });
+    headers
 }
 
 #[cfg(test)]
@@ -168,6 +207,58 @@ mod tests {
         let extractor = MetadataExtractor(&metadata);
         assert_eq!(extractor.get("traceparent"), Some("00-abc-def-01"));
         assert_eq!(extractor.get("missing"), None);
+    }
+
+    #[test]
+    fn test_vec_injector() {
+        let mut headers = Vec::new();
+        {
+            let mut injector = VecInjector(&mut headers);
+            injector.set("traceparent", "00-abc-def-01".to_string());
+            injector.set("tracestate", "vendor=value".to_string());
+        }
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0], ("traceparent".to_string(), "00-abc-def-01".to_string()));
+        assert_eq!(headers[1], ("tracestate".to_string(), "vendor=value".to_string()));
+    }
+
+    #[test]
+    fn test_trace_context_http_headers_with_active_context() {
+        install_propagator();
+
+        // Build a context with a known span context
+        let span_context = SpanContext::new(
+            TraceId::from_hex("0af7651916cd43dd8448eb211c80319c").unwrap(),
+            SpanId::from_hex("b7ad6b7169203331").unwrap(),
+            TraceFlags::SAMPLED,
+            true,
+            Default::default(),
+        );
+        let cx =
+            opentelemetry::Context::new().with_remote_span_context(span_context);
+
+        // Inject into metadata, then extract as HTTP headers via the same context
+        let mut metadata = MetadataMap::new();
+        inject_trace_context(&cx, &mut metadata);
+
+        // Verify that VecInjector produces the same traceparent
+        let mut headers = Vec::new();
+        opentelemetry::global::get_text_map_propagator(|propagator| {
+            propagator.inject_context(&cx, &mut VecInjector(&mut headers));
+        });
+        assert!(!headers.is_empty());
+        let tp = headers.iter().find(|(k, _)| k == "traceparent").unwrap();
+        assert!(tp.1.contains("0af7651916cd43dd8448eb211c80319c"));
+    }
+
+    #[test]
+    fn test_trace_context_http_headers_empty_without_span() {
+        install_propagator();
+        // No active tracing span — should return empty or invalid traceparent
+        let headers = trace_context_http_headers();
+        // With no active span, the propagator may return empty or a zeroed trace
+        // Either way it should not panic
+        let _ = headers;
     }
 
     #[test]

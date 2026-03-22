@@ -4524,6 +4524,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqe-core",
+ "sqe-metrics",
  "tokio",
  "tracing",
  "url",
