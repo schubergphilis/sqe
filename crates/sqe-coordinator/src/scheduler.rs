@@ -158,8 +158,7 @@ impl FragmentScheduler for WeightedScheduler {
 
         let result: Vec<Assignment> = assignments
             .into_iter()
-            .enumerate()
-            .map(|(_i, a)| a.expect("BUG: every task must be assigned; healthy worker check passed above"))
+            .map(|a| a.expect("BUG: every task must be assigned; healthy worker check passed above"))
             .collect();
 
         debug!(

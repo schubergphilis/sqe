@@ -28,7 +28,7 @@ arrow = { workspace = true }
 arrow-flight = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
-tonic = { workspace = true }
+tonic = { workspace = true, features = ["tls-ring"] }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }

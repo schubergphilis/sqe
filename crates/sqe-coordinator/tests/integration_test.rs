@@ -1586,15 +1586,84 @@ fn base64_encode(input: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(input.as_bytes())
 }
 
+// Adapter types for Trino compat server (mirrors sqe-coordinator/src/main.rs)
+struct TestTrinoAuth(Arc<sqe_auth::Authenticator>);
+
+#[async_trait::async_trait]
+impl sqe_trino_compat::server::TrinoAuthenticator for TestTrinoAuth {
+    async fn authenticate(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<sqe_core::Session, String> {
+        self.0
+            .authenticate(username, password)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+struct TestTrinoQuery(Arc<sqe_coordinator::QueryHandler>);
+
+#[async_trait::async_trait]
+impl sqe_trino_compat::server::TrinoQueryExecutor for TestTrinoQuery {
+    async fn execute(
+        &self,
+        session: &sqe_core::Session,
+        sql: &str,
+    ) -> Result<Vec<arrow_array::RecordBatch>, String> {
+        self.0
+            .execute(session, sql)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
 // Test: Trino /v1/statement endpoint handles a query via HTTP
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: SQE server running with Trino compat on port 8080
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_trino_http_query() {
     common::init_tracing();
 
-    let trino_port = std::env::var("SQE_TEST_TRINO_PORT").unwrap_or_else(|_| "8080".to_string());
-    let base_url = format!("http://localhost:{trino_port}");
+    let config =
+        sqe_core::SqeConfig::load(&common::test_config_path()).expect("Failed to load test config");
+    let authenticator = Arc::new(
+        sqe_auth::Authenticator::new(&config.auth)
+            .await
+            .expect("Failed to create authenticator"),
+    );
+    let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(sqe_policy::PassthroughEnforcer);
+    let handler = Arc::new(sqe_coordinator::QueryHandler::new(
+        policy,
+        config,
+        None,
+        None,
+        None,
+        None,
+    ));
 
+    // Bind to port 0 to get an OS-assigned free port
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to ephemeral port");
+    let trino_port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let node = sqe_trino_compat::server::NodeContext {
+        version: "test".to_string(),
+        ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        started_at: std::time::Instant::now(),
+    };
+
+    let _server_handle = sqe_trino_compat::server::start_trino_server(
+        Arc::new(TestTrinoAuth(authenticator)),
+        Arc::new(TestTrinoQuery(handler)),
+        trino_port,
+        node,
+    );
+
+    // Give the server a moment to bind
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let base_url = format!("http://127.0.0.1:{trino_port}");
     let client = reqwest::Client::new();
 
     // Check /v1/info is accessible
@@ -1615,7 +1684,7 @@ async fn test_trino_http_query() {
         "/v1/info should include 'coordinator' field"
     );
 
-    // Submit a query via POST /v1/statement
+    // Submit a query via POST /v1/statement with Basic auth
     let resp = client
         .post(format!("{base_url}/v1/statement"))
         .header("X-Trino-User", "root")
