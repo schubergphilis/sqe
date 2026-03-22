@@ -60,6 +60,11 @@ pub struct CoordinatorConfig {
     /// Optional TLS configuration for the Flight SQL listener.
     #[serde(default)]
     pub tls: TlsConfig,
+    /// Shared secret that workers must supply in the `x-sqe-worker-secret`
+    /// metadata header when sending heartbeats. An empty value disables the
+    /// check (backwards compatible default).
+    #[serde(default)]
+    pub worker_secret: String,
 }
 
 /// TLS configuration for gRPC (Flight SQL) and worker listeners.
@@ -408,6 +413,7 @@ impl SqeConfig {
         env_override_u16("SQE_COORDINATOR__TRINO_HTTP_PORT", &mut self.coordinator.trino_http_port);
         env_override_str("SQE_COORDINATOR__MODE", &mut self.coordinator.mode);
         env_override_bool("SQE_COORDINATOR__DEBUG", &mut self.coordinator.debug);
+        env_override_str("SQE_COORDINATOR__WORKER_SECRET", &mut self.coordinator.worker_secret);
         env_override_str("SQE_TLS__CERT_FILE", &mut self.coordinator.tls.cert_file);
         env_override_str("SQE_TLS__KEY_FILE", &mut self.coordinator.tls.key_file);
         env_override_str("SQE_TLS__CA_FILE", &mut self.coordinator.tls.ca_file);
@@ -602,6 +608,7 @@ mod tests {
                 worker_urls: vec![],
                 debug: false,
                 tls: TlsConfig::default(),
+                worker_secret: String::new(),
             },
             worker: WorkerConfig::default(),
             auth: AuthConfig {
