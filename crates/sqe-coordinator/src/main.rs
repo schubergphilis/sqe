@@ -52,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
         .nth(1)
         .unwrap_or_else(|| "sqe.toml".to_string());
     let config = SqeConfig::load(&config_path)?;
+    config.validate()?;
 
     // Initialize tracing + OTel (traces, metrics, logs via OTLP when configured)
     let _otel_guard = sqe_metrics::otel::init_telemetry(

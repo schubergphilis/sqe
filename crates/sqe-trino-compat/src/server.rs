@@ -274,7 +274,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             vec![],
         )
     } else if let Some((user, pass)) = extract_basic_auth(&headers) {
-        // Basic auth: authenticate via Keycloak ROPC
+        // Basic auth: authenticate via OIDC password grant
         match state.authenticator.authenticate(&user, &pass).await {
             Ok(s) => s,
             Err(e) => {

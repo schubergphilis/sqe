@@ -3,7 +3,7 @@ use tracing::debug;
 
 /// Token response from a generic OAuth2 token endpoint (client_credentials grant).
 ///
-/// This is intentionally separate from `keycloak::TokenResponse` — the two
+/// This is intentionally separate from `oidc_password::TokenResponse` — the two
 /// endpoints can return different shapes and we don't want to couple them.
 #[derive(Debug, Deserialize)]
 pub struct TokenResponse {

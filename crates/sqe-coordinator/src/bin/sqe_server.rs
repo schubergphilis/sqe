@@ -195,6 +195,9 @@ async fn main() -> anyhow::Result<()> {
 
     let config = SqeConfig::load(&config_path)
         .map_err(|e| anyhow::anyhow!("Failed to load config from {config_path}: {e}"))?;
+    config
+        .validate()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Priority: --mode flag > SQE_MODE env > config file mode
     // Since clap always has a default, check if user explicitly passed --mode
@@ -290,6 +293,26 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             },
         );
         tracing::info!("Started credential refresh background task (60s interval)");
+    }
+
+    // Session expiry sweeper — runs every 60s to remove idle/absolute-expired sessions
+    {
+        let sm = session_manager.clone();
+        let idle = config.session.idle_timeout_secs;
+        let absolute = config.session.absolute_timeout_secs;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.tick().await; // skip first immediate tick
+            loop {
+                tick.tick().await;
+                sm.sweep_expired_sessions(idle, absolute);
+            }
+        });
+        tracing::info!(
+            idle_timeout_secs = config.session.idle_timeout_secs,
+            absolute_timeout_secs = config.session.absolute_timeout_secs,
+            "Started session expiry sweeper (60s interval)"
+        );
     }
 
     // Query handler

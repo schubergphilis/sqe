@@ -426,11 +426,14 @@ fn test_audit_logger_noop() {
     let entry = sqe_metrics::audit::AuditEntry {
         timestamp: "2026-03-15T00:00:00Z".to_string(),
         username: "test".to_string(),
-        query_text: "SELECT 1".to_string(),
+        session_id: None,
+        query_hash: sqe_metrics::audit::query_hash("SELECT 1"),
+        query_text: Some("SELECT 1".to_string()),
         statement_type: "query".to_string(),
         duration_ms: 10,
         rows_returned: 1,
         status: "success".to_string(),
+        client_ip: None,
     };
     logger.log(&entry); // Should not panic
 }

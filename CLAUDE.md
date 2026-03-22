@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**SQE (Sovereign Query Engine)** — A Rust-based distributed SQL query engine replacing patched Trino (DCAF branch). Built on DataFusion + iceberg-rust for querying Apache Iceberg tables via Polaris REST Catalog, with Keycloak OIDC auth passthrough and OPA/Cedar-based fine-grained security.
+**SQE (Sovereign Query Engine)** — A Rust-based distributed SQL query engine replacing patched Trino (DCAF branch). Built on DataFusion + iceberg-rust for querying Apache Iceberg tables via Polaris REST Catalog, with OIDC auth passthrough and OPA/Cedar-based fine-grained security.
 
 This repository contains the full engine implementation across 10 crates.
 
@@ -16,7 +16,7 @@ Client (JDBC/Flight SQL) → Coordinator → Workers (DataFusion) → Iceberg (P
 
 - **Coordinator**: SQL parsing, auth, policy enforcement (plan rewriting), optimization, distributed scheduling
 - **Workers**: Stateless DataFusion executors receiving secured plan fragments + user bearer tokens
-- **Auth model**: No service account — every query runs as the authenticated user via Keycloak OIDC password grant → bearer token passthrough to Polaris/S3
+- **Auth model**: No service account — every query runs as the authenticated user via OIDC password grant → bearer token passthrough to Polaris/S3
 - **Security**: Policy enforcement via LogicalPlan rewriting *before* DataFusion optimization (row filters, column masks, column restriction). Pluggable backend: OPA, Cedar, or passthrough
 
 ## Planned Crate Structure
@@ -25,7 +25,7 @@ Client (JDBC/Flight SQL) → Coordinator → Workers (DataFusion) → Iceberg (P
 |---|---|
 | `sqe-core` | Shared types, config, errors |
 | `sqe-sql` | Extended SQL parser (sqlparser-rs), custom AST for GRANT/REVOKE/SHOW GRANTS/SHOW EFFECTIVE POLICY |
-| `sqe-auth` | Keycloak OIDC, session manager, JWT validation |
+| `sqe-auth` | OIDC password grant, session manager, JWT validation |
 | `sqe-policy` | PolicyEnforcer trait, PolicyStore trait (OPA/Cedar/InMemory), PlanRewriter, policy cache (moka) |
 | `sqe-catalog` | Iceberg REST catalog client (wraps iceberg-rust), information_schema virtual providers |
 | `sqe-planner` | LogicalPlan → PhysicalPlan, partition-aware splitting |
@@ -59,7 +59,7 @@ Key docs:
 
 ## Implementation Phases
 
-1. **Phase 1** — Single-node: DataFusion + iceberg-rust + Keycloak + Flight SQL
+1. **Phase 1** — Single-node: DataFusion + iceberg-rust + OIDC auth + Flight SQL
 2. **Phase 2** — Views, INSERT INTO, manifest caching, audit logging
 3. **Phase 2c** — dbt compatibility: write path (CTAS, MERGE, DELETE), information_schema, dbt-sqe adapter
 4. **Phase 3** — Distributed execution: Ballista-derived scheduler + workers
@@ -73,10 +73,10 @@ Key docs:
 - **Distribution**: Ballista (forked)
 - **Table format**: Apache Iceberg v3 via iceberg-rust 0.8.0+
 - **Catalog**: Apache Polaris (Iceberg REST)
-- **Auth**: Keycloak OIDC
+- **Auth**: OIDC (any provider: Keycloak, Auth0, Okta, etc.)
 - **Policy**: OPA (Rego) or Cedar (pluggable)
 - **Wire protocol**: Arrow Flight SQL (primary), Trino HTTP (optional compat)
-- **Storage**: S3 / MinIO
+- **Storage**: S3-compatible (AWS S3, Ceph, Garage, R2, etc.)
 - **Policy cache**: moka (async TTL cache)
 - **Deployment**: Kubernetes (Helm)
 
@@ -92,7 +92,7 @@ cargo test --all
 # Clippy (strict)
 cargo clippy --all-targets --all-features -- -D warnings
 
-# Integration tests (requires running quickstart stack: Polaris + MinIO + Keycloak)
+# Integration tests (requires running quickstart stack: Polaris + S3-compatible storage)
 scripts/integration-test.sh
 
 # Security advisory scan
