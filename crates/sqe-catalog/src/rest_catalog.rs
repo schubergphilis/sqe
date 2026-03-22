@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use sqe_core::config::StorageConfig;
 use sqe_core::SqeError;
+use sqe_metrics::propagation::trace_context_http_headers;
 
 /// Per-session Iceberg REST catalog wrapper.
 ///
@@ -254,12 +255,16 @@ impl SessionCatalog {
 
         debug!(url = %url, view = name, "Creating view via Polaris REST");
 
-        let resp = self
+        let mut req = self
             .http_client
             .post(&url)
             .bearer_auth(&self.bearer_token)
             .header("X-Request-ID", Uuid::new_v4().to_string())
-            .json(&body)
+            .json(&body);
+        for (k, v) in trace_context_http_headers() {
+            req = req.header(k, v);
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to create view: {e}")))?;
@@ -289,11 +294,15 @@ impl SessionCatalog {
             .join("\u{1F}");
         let url = format!("{}/namespaces/{}/views", self.rest_prefix(), ns_str);
 
-        let resp = self
+        let mut req = self
             .http_client
             .get(&url)
             .bearer_auth(&self.bearer_token)
-            .header("X-Request-ID", Uuid::new_v4().to_string())
+            .header("X-Request-ID", Uuid::new_v4().to_string());
+        for (k, v) in trace_context_http_headers() {
+            req = req.header(k, v);
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to list views: {e}")))?;
@@ -335,11 +344,15 @@ impl SessionCatalog {
             .join("\u{1F}");
         let url = format!("{}/namespaces/{}/views/{}", self.rest_prefix(), ns_str, name);
 
-        let resp = self
+        let mut req = self
             .http_client
             .get(&url)
             .bearer_auth(&self.bearer_token)
-            .header("X-Request-ID", Uuid::new_v4().to_string())
+            .header("X-Request-ID", Uuid::new_v4().to_string());
+        for (k, v) in trace_context_http_headers() {
+            req = req.header(k, v);
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to load view: {e}")))?;
@@ -391,11 +404,15 @@ impl SessionCatalog {
 
         debug!(url = %url, view = name, "Dropping view via Polaris REST");
 
-        let resp = self
+        let mut req = self
             .http_client
             .delete(&url)
             .bearer_auth(&self.bearer_token)
-            .header("X-Request-ID", Uuid::new_v4().to_string())
+            .header("X-Request-ID", Uuid::new_v4().to_string());
+        for (k, v) in trace_context_http_headers() {
+            req = req.header(k, v);
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to drop view: {e}")))?;
