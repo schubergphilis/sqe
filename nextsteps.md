@@ -1,6 +1,6 @@
 # SQE — Next Steps
 
-> Status as of 2026-03-20. Step 0 dependency alignment complete and merged. All feature branches merged into `main`.
+> Status as of 2026-03-22. Step 0 dependency alignment complete. Step 2 core engine effectively complete (99/103 tasks — 4 remaining are blocked on iceberg-rust MoR). All feature branches merged into `main`.
 
 > **Monitoring:** OPA SPI refactor in Polaris (PR #3999, still draft) will affect Phase 5 OPA integration when it lands — do not implement OPA against Polaris until this stabilises. Remote S3 signing (Iceberg 1.12, not yet released) will affect the pluggable-catalogs design.
 
@@ -55,75 +55,22 @@ cargo +nightly udeps --all-targets
 
 ---
 
-## Step 2: Complete Core Engine Spec
+## ~~Step 2: Complete Core Engine Spec~~ ✅ (99/103)
 
 **Spec:** `openspec/changes/sqe-core-engine/tasks.md`
-**Plan:** `docs/superpowers/plans/2026-03-14-sqe-core-engine.md`
 
-The core engine is functional but has unimplemented items across every subsystem. These should be closed before layering new features on top.
-
-### 2a. Write Path
-
-> **Blocked:** `DELETE FROM` and `MERGE INTO` require iceberg-rust Merge-on-Read (position delete files) support, tracked in iceberg-rust Epic #2186. ETA Q3 2026. These tasks cannot land until then — do not attempt implementation ahead of the library.
+Step 2 is effectively complete. All implementation and test tasks are done. Only 4 tasks remain, all blocked on upstream:
 
 | Task | Ref | Status |
 |---|---|---|
-| `DELETE FROM` — position delete files → commit snapshot | 8.4 | Blocked — iceberg-rust MoR (#2186) |
-| `MERGE INTO` — join target+source → position deletes + new data → atomic commit | 8.5 | Blocked — iceberg-rust MoR (#2186) |
+| `DELETE FROM` — position delete files → commit snapshot | 8.4 | Blocked — iceberg-rust MoR (#2186, ETA Q3 2026) |
+| `MERGE INTO` — join target+source → position deletes + new data → atomic commit | 8.5 | Blocked — iceberg-rust MoR (#2186, ETA Q3 2026) |
+| Integration test: MERGE INTO | 8.13 | Blocked — depends on 8.5 |
+| Integration test: DELETE FROM | 8.14 | Blocked — depends on 8.4 |
 
-In the meantime, `OverwriteAction` (CoW, merged iceberg-rust PR #2185) is available in 0.9.0 and can be used to implement full-table `INSERT OVERWRITE` semantics as a partial substitute.
+`OverwriteAction` (CoW, merged iceberg-rust PR #2185) is available in 0.9.0 and can be used for full-table `INSERT OVERWRITE` semantics as a partial substitute.
 
-### 2b. Distributed Execution
-
-| Task | Ref |
-|---|---|
-| Fragment scheduler: assign fragments to workers with load weighting | 7.6 |
-| Credential refresh push to workers for long-running queries | 7.10 |
-| Failure handling: re-assign read fragments on worker death; local fallback | 7.11 |
-| Worker heartbeat to coordinator (5s interval) | 9.5 |
-| Credential update channel on worker: accept refreshed tokens | 9.6 |
-| Worker memory limit + spill-to-disk | 9.7 |
-
-### 2c. Optimizer
-
-| Task | Ref | Notes |
-|---|---|---|
-| DataFusion optimizer pass with Iceberg predicate pushdown | 6.3 | DataFusion 52 extends pushdown to LIMIT, LIKE, Boolean, Timestamp — now available |
-
-### 2d. Trino Compat
-
-| Task | Ref |
-|---|---|
-| `GET /v1/statement/{id}/{token}` — result pagination | 11.3 |
-| `X-Trino-Catalog/Schema/User/Source` header handling | 11.7 |
-
-### 2e. Observability
-
-| Task | Ref |
-|---|---|
-| Instrument workers: fragments executed, rows scanned, bytes read | 12.3 |
-| Propagate OTel trace context to workers via Flight metadata | 12.6 |
-
-### 2f. Integration Tests (all currently missing)
-
-| Test | Ref |
-|---|---|
-| Auth: token acquisition, refresh, expiry | 2.5 |
-| Catalog: list namespaces/tables via Polaris with user token | 3.10 |
-| Catalog: SELECT from Iceberg table with vended S3 creds | 3.11 |
-| Coordinator: single-node SELECT end-to-end (Flight SQL → Polaris → S3) | 7.12 |
-| Coordinator: two users → different catalog visibility | 7.13 |
-| Write: CTAS → SELECT roundtrip | 8.11 |
-| Write: INSERT INTO → verify appended rows | 8.12 |
-| Write: MERGE INTO → verify upserted rows | 8.13 | Blocked — iceberg-rust MoR |
-| Write: DELETE FROM → verify rows removed | 8.14 | Blocked — iceberg-rust MoR |
-| Write: DROP TABLE → verify removed from Polaris | 8.15 |
-| Write: CREATE VIEW → query view → verify results | 8.16 |
-| Distributed: coordinator + 2 workers → SELECT → correct results | 9.8 |
-| information_schema: SELECT from tables / columns / schemata | 10.5 |
-| Trino: JDBC driver → execute query → verify results | 11.10 |
-| E2E: docker-compose up → Flight SQL → SELECT → results | 13.4 |
-| E2E: docker-compose up → Trino JDBC → SELECT → results | 13.5 |
+**Completed since last update (2026-03-22):** distributed execution (7.6, 7.10, 7.11, 9.5, 9.6, 9.7), predicate pushdown (6.3), Trino pagination + headers (11.3, 11.7), worker metrics (12.3), OTel trace propagation (12.6), sqe-auth unit tests (2.5), Keycloak realm registration (13.3), all integration tests (2.6, 3.10, 3.11, 7.12, 7.13, 8.11, 8.12, 8.15, 8.16, 9.8, 10.5, 11.10, 13.4, 13.5), e2e test script.
 
 ---
 
@@ -227,8 +174,8 @@ Four sub-systems that make SQE agent-native and semantically aware.
 
 ```
 Step 1: audit               (1–2 days — catches issues before they compound)
-Step 2: core engine gaps    (close the open tasks; DELETE/MERGE blocked until iceberg-rust MoR Q3 2026)
-Step 3: security hardening  (prerequisite for OSS release; no API changes)
+Step 2: core engine gaps    ✅ DONE (99/103 — 4 blocked on iceberg-rust MoR Q3 2026)
+Step 3: security hardening  (prerequisite for OSS release; no API changes) ← NEXT
 Step 4: pluggable auth      (depends on Step 3 renames being done first)
 Step 5: pluggable catalogs  (independent of auth; can run in parallel with Step 4)
 Step 6: semantic layer      (new crates; fully additive; no existing code broken)
