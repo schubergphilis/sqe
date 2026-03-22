@@ -4504,6 +4504,7 @@ dependencies = [
  "opentelemetry",
  "parquet",
  "prost",
+ "reqwest",
  "serde",
  "serde_json",
  "sqe-auth",

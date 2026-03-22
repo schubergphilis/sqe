@@ -67,3 +67,5 @@ arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+reqwest = { workspace = true }
+base64 = "0.22"
