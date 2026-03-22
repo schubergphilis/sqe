@@ -9,7 +9,7 @@ use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::Result as DFResult;
 use iceberg::NamespaceIdent;
-use tracing::{debug, error};
+use tracing::{error, warn};
 
 use crate::rest_catalog::SessionCatalog;
 
@@ -85,7 +85,7 @@ impl InformationSchemaProvider {
                     }
                 }
                 Err(e) => {
-                    debug!(namespace = %ns, error = %e, "Failed to list tables for information_schema");
+                    warn!(namespace = %ns, error = %e, "Failed to list tables for information_schema");
                 }
             }
         }
@@ -128,7 +128,10 @@ impl InformationSchemaProvider {
             let ns_ident = NamespaceIdent::new(ns.clone());
             let tables = match self.session_catalog.list_tables(&ns_ident).await {
                 Ok(t) => t,
-                Err(_) => continue,
+                Err(e) => {
+                    warn!(namespace = ?ns, error = %e, "Failed to list tables for columns");
+                    continue;
+                }
             };
 
             for table_ident in &tables {
@@ -137,7 +140,7 @@ impl InformationSchemaProvider {
                 let table = match self.session_catalog.load_table(&full_ident).await {
                     Ok(t) => t,
                     Err(e) => {
-                        debug!(table = %table_ident.name(), error = %e, "Failed to load table for columns");
+                        warn!(table = %table_ident.name(), error = %e, "Failed to load table for columns");
                         continue;
                     }
                 };
