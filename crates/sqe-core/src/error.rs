@@ -38,6 +38,15 @@ impl SqeError {
         }
     }
 
+    /// Return `true` if this error represents an HTTP 404 / resource-not-found
+    /// condition from the catalog layer.
+    pub fn is_not_found(&self) -> bool {
+        match self {
+            SqeError::Catalog(msg) => msg.contains("HTTP 404"),
+            _ => false,
+        }
+    }
+
     /// Build the error string returned to a client.
     ///
     /// * **debug = true** (dev mode): return the full `Display` representation
@@ -115,6 +124,28 @@ mod tests {
         let output = err.to_client_error(true);
         assert!(output.contains("audience mismatch"));
         assert!(output.contains("Authentication failed"));
+    }
+
+    #[test]
+    fn is_not_found_true_for_catalog_http_404() {
+        let err = SqeError::Catalog(
+            "Failed to drop view (HTTP 404 Not Found): view not found".into(),
+        );
+        assert!(err.is_not_found());
+    }
+
+    #[test]
+    fn is_not_found_false_for_catalog_other_status() {
+        let err =
+            SqeError::Catalog("Failed to drop view (HTTP 500 Internal Server Error)".into());
+        assert!(!err.is_not_found());
+    }
+
+    #[test]
+    fn is_not_found_false_for_non_catalog_variants() {
+        assert!(!SqeError::Auth("HTTP 404".into()).is_not_found());
+        assert!(!SqeError::Execution("HTTP 404".into()).is_not_found());
+        assert!(!SqeError::NotImplemented("HTTP 404".into()).is_not_found());
     }
 
     #[test]

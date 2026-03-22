@@ -324,7 +324,7 @@ impl CatalogOps {
 
         match session_catalog.drop_view(&namespace, &name).await {
             Ok(()) => Ok(()),
-            Err(e) if if_exists && e.to_string().contains("404") => {
+            Err(e) if if_exists && e.is_not_found() => {
                 info!(
                     view = %name,
                     "View not found, IF EXISTS specified — ignoring"

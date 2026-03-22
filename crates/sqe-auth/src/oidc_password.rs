@@ -68,6 +68,11 @@ impl OidcPasswordClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "unable to read body".to_string());
+            let body = if body.len() > 500 {
+                format!("{}...[truncated]", &body[..500])
+            } else {
+                body
+            };
             return Err(sqe_core::SqeError::Auth(format!(
                 "OIDC provider returned {status}: {body}"
             )));
@@ -106,6 +111,11 @@ impl OidcPasswordClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "unable to read body".to_string());
+            let body = if body.len() > 500 {
+                format!("{}...[truncated]", &body[..500])
+            } else {
+                body
+            };
             return Err(sqe_core::SqeError::Auth(format!(
                 "OIDC refresh returned {status}: {body}"
             )));
