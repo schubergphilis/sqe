@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
 use dashmap::DashMap;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use sqe_core::Session;
@@ -97,11 +97,19 @@ where
             .with_state(state);
 
         let addr = format!("0.0.0.0:{port}");
-        let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+        let listener = match tokio::net::TcpListener::bind(&addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                error!(addr = %addr, error = %e, "Failed to bind Trino-compat HTTP server");
+                return;
+            }
+        };
 
         info!("Trino-compat HTTP server listening on {addr}");
 
-        axum::serve(listener, app).await.unwrap();
+        if let Err(e) = axum::serve(listener, app).await {
+            error!(error = %e, "Trino-compat HTTP server exited with error");
+        }
     })
 }
 
@@ -278,10 +286,8 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         match state.authenticator.authenticate(&user, &pass).await {
             Ok(s) => s,
             Err(e) => {
-                return error_response(
-                    StatusCode::UNAUTHORIZED,
-                    format!("Authentication failed: {e}"),
-                );
+                warn!(error = %e, user = %user, "Trino authentication failed");
+                return error_response(StatusCode::UNAUTHORIZED, "Authentication failed");
             }
         }
     } else {
@@ -332,7 +338,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 data: None,
                 stats: TrinoStats::failed(),
                 error: Some(TrinoError {
-                    message: e.to_string(),
+                    message: "Query execution failed".to_string(),
                     error_code: 1,
                     error_name: "INTERNAL_ERROR".to_string(),
                     error_type: "INTERNAL_ERROR".to_string(),
