@@ -332,6 +332,7 @@ fn test_scan_task_roundtrip() {
         s3_secret_key: "secret".to_string(),
         s3_session_token: String::new(),
         s3_path_style: true,
+        s3_allow_http: true,
     };
 
     let bytes = task.to_bytes().unwrap();
@@ -422,7 +423,7 @@ fn test_metrics_registry() {
 // Test: AuditLogger no-op mode works
 #[test]
 fn test_audit_logger_noop() {
-    let logger = sqe_metrics::audit::AuditLogger::new("");
+    let logger = sqe_metrics::audit::AuditLogger::new("").unwrap();
     let entry = sqe_metrics::audit::AuditEntry {
         timestamp: "2026-03-15T00:00:00Z".to_string(),
         username: "test".to_string(),

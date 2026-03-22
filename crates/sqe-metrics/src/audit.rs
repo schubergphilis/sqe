@@ -2,7 +2,7 @@ use std::io::Write;
 use std::sync::Mutex;
 
 use serde::Serialize;
-use tracing::{error, info};
+use tracing::info;
 
 #[derive(Debug, Serialize)]
 pub struct AuditEntry {
@@ -35,36 +35,44 @@ pub struct AuditLogger {
 }
 
 impl AuditLogger {
-    pub fn new(path: &str) -> Self {
+    pub fn new(path: &str) -> Result<Self, String> {
         if path.is_empty() {
-            return Self { writer: None };
+            return Ok(Self { writer: None });
         }
 
-        match std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
-        {
-            Ok(file) => {
-                info!(path = path, "Audit log initialized");
-                Self {
-                    writer: Some(Mutex::new(std::io::BufWriter::new(file))),
-                }
-            }
-            Err(e) => {
-                error!(path = path, error = %e, "Failed to open audit log file");
-                Self { writer: None }
-            }
-        }
+            .map_err(|e| format!("Failed to open audit log file '{path}': {e}"))?;
+
+        info!(path = path, "Audit log initialized");
+        Ok(Self {
+            writer: Some(Mutex::new(std::io::BufWriter::new(file))),
+        })
     }
 
     pub fn log(&self, entry: &AuditEntry) {
         if let Some(ref writer) = self.writer {
-            if let Ok(mut w) = writer.lock() {
-                if let Ok(json) = serde_json::to_string(entry) {
-                    let _ = writeln!(w, "{json}");
-                    let _ = w.flush();
+            let mut w = match writer.lock() {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("AUDIT: mutex poisoned, audit entry lost: {e}");
+                    return;
                 }
+            };
+            let json = match serde_json::to_string(entry) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!("AUDIT: serialization failed: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = writeln!(w, "{json}") {
+                eprintln!("AUDIT: write failed: {e}");
+            }
+            if let Err(e) = w.flush() {
+                eprintln!("AUDIT: flush failed: {e}");
             }
         }
     }
@@ -100,7 +108,7 @@ mod tests {
 
     #[test]
     fn test_noop_logger() {
-        let logger = AuditLogger::new("");
+        let logger = AuditLogger::new("").unwrap();
         logger.log(&test_entry());
     }
 
@@ -145,7 +153,7 @@ mod tests {
         let path = dir.join("sqe-audit-test.jsonl");
         let path_str = path.to_str().unwrap();
 
-        let logger = AuditLogger::new(path_str);
+        let logger = AuditLogger::new(path_str).unwrap();
         logger.log(&test_entry());
 
         let content = std::fs::read_to_string(&path).unwrap();
