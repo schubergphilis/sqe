@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **SQE (Sovereign Query Engine)** — A Rust-based distributed SQL query engine replacing patched Trino (DCAF branch). Built on DataFusion + iceberg-rust for querying Apache Iceberg tables via Polaris REST Catalog, with Keycloak OIDC auth passthrough and OPA/Cedar-based fine-grained security.
 
-This repository is currently in the **design/specification phase** — it contains architecture docs and openspec specifications but no source code yet.
+This repository contains the full engine implementation across 10 crates.
 
 ## Architecture
 
@@ -79,3 +79,28 @@ Key docs:
 - **Storage**: S3 / MinIO
 - **Policy cache**: moka (async TTL cache)
 - **Deployment**: Kubernetes (Helm)
+
+## Common Commands
+
+```bash
+# Build
+cargo build --all
+
+# Unit tests
+cargo test --all
+
+# Clippy (strict)
+cargo clippy --all-targets --all-features -- -D warnings
+
+# Integration tests (requires running quickstart stack: Polaris + MinIO + Keycloak)
+scripts/integration-test.sh
+
+# Security advisory scan
+cargo audit
+```
+
+## Git Workflow
+
+- All changes go through branches + GitLab MRs (never push directly to main)
+- Remote: `origin` = GitLab (`sbp.gitlab.schubergphilis.com`)
+- Use `glab` CLI for MR creation
