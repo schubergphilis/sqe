@@ -505,7 +505,7 @@ impl QueryHandler {
                     }
                 }
                 Err(e) => {
-                    debug!(
+                    warn!(
                         namespace = ?ns,
                         error = %e,
                         "Failed to list tables in namespace, skipping"
@@ -574,15 +574,20 @@ impl QueryHandler {
         );
 
         let catalog = session_catalog.as_catalog();
-        if catalog.table_exists(&table_ident).await.unwrap_or(false) {
-            info!(
-                table = %table_ident,
-                "DROP existing table for CREATE OR REPLACE"
-            );
-            catalog
-                .drop_table(&table_ident)
-                .await
-                .map_err(|e| SqeError::Catalog(format!("Failed to drop table for replace: {e}")))?;
+        match catalog.table_exists(&table_ident).await {
+            Ok(true) => {
+                info!(table = %table_ident, "DROP existing table for CREATE OR REPLACE");
+                catalog
+                    .drop_table(&table_ident)
+                    .await
+                    .map_err(|e| SqeError::Catalog(format!("Failed to drop table for replace: {e}")))?;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                return Err(SqeError::Catalog(format!(
+                    "Failed to check table existence for replace: {e}"
+                )));
+            }
         }
 
         Ok(())
