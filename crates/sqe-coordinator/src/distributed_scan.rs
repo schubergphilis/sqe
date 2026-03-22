@@ -451,6 +451,7 @@ mod tests {
             s3_secret_key: String::new(),
             s3_session_token: String::new(),
             s3_path_style: false,
+            s3_allow_http: true,
         }
     }
 
@@ -467,6 +468,7 @@ mod tests {
             s3_secret_key: String::new(),
             s3_session_token: String::new(),
             s3_path_style: false,
+            s3_allow_http: true,
         };
 
         let exec: Arc<dyn ExecutionPlan> = Arc::new(DistributedScanExec::new(

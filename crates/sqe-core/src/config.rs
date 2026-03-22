@@ -217,6 +217,9 @@ pub struct StorageConfig {
     pub s3_secret_key: String,
     #[serde(default)]
     pub s3_path_style: bool,
+    /// Allow plaintext HTTP for S3 endpoints. Only enable for dev/test (e.g., MinIO).
+    #[serde(default)]
+    pub s3_allow_http: bool,
 }
 
 impl std::fmt::Debug for StorageConfig {
@@ -227,6 +230,7 @@ impl std::fmt::Debug for StorageConfig {
             .field("s3_access_key", &"[REDACTED]")
             .field("s3_secret_key", &"[REDACTED]")
             .field("s3_path_style", &self.s3_path_style)
+            .field("s3_allow_http", &self.s3_allow_http)
             .finish()
     }
 }
@@ -447,6 +451,7 @@ impl SqeConfig {
         env_override_str("SQE_STORAGE__S3_ACCESS_KEY", &mut self.storage.s3_access_key);
         env_override_str("SQE_STORAGE__S3_SECRET_KEY", &mut self.storage.s3_secret_key);
         env_override_bool("SQE_STORAGE__S3_PATH_STYLE", &mut self.storage.s3_path_style);
+        env_override_bool("SQE_STORAGE__S3_ALLOW_HTTP", &mut self.storage.s3_allow_http);
 
         // Policy
         env_override_str("SQE_POLICY__ENGINE", &mut self.policy.engine);
@@ -769,5 +774,11 @@ mod tests {
             err.contains("tls.cert_file") && err.contains("not found"),
             "Expected missing file error, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_storage_config_s3_allow_http_defaults_false() {
+        let config = StorageConfig::default();
+        assert!(!config.s3_allow_http, "s3_allow_http should default to false (secure by default)");
     }
 }

@@ -125,6 +125,7 @@ mod tests {
             s3_secret_key: "secret".to_string(),
             s3_session_token: String::new(),
             s3_path_style: true,
+            s3_allow_http: true,
         }
     }
 
