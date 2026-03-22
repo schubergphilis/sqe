@@ -11,8 +11,8 @@
 - [x] 2.2 Implement token cache with expiry tracking (DashMap keyed by session_id)
 - [x] 2.3 Implement background token refresh task (60s before expiry, refresh_token first, mark expired on failure)
 - [x] 2.4 Implement Session struct carrying user identity + access_token + roles
-- [ ] 2.5 Unit tests: token acquisition, refresh, expiry handling
-- [ ] 2.6 Integration test: authenticate against quickstart Keycloak with test users
+- [x] 2.5 Unit tests: token acquisition, refresh, expiry handling
+- [x] 2.6 Integration test: authenticate against quickstart Keycloak with test users
 
 ## 3. Catalog Integration (sqe-catalog)
 
@@ -25,8 +25,8 @@
 - [x] 3.7 Implement DataFusion SchemaProvider trait backed by Polaris tables listing
 - [x] 3.8 Implement DataFusion TableProvider using iceberg-rust IcebergTableProvider
 - [x] 3.9 Implement metadata caching with 30s TTL
-- [ ] 3.10 Integration test: list catalogs/schemas/tables via Polaris with user token
-- [ ] 3.11 Integration test: SELECT from Iceberg table via Polaris with vended S3 creds
+- [x] 3.10 Integration test: list catalogs/schemas/tables via Polaris with user token
+- [x] 3.11 Integration test: SELECT from Iceberg table via Polaris with vended S3 creds
 
 ## 4. SQL Layer (sqe-sql)
 
@@ -50,7 +50,7 @@
 
 - [x] 6.1 Implement query planning: parse → LogicalPlan via DataFusion SQL planner
 - [x] 6.2 Wire policy enforcement into plan pipeline (passthrough)
-- [ ] 6.3 Implement DataFusion optimizer pass with Iceberg predicate pushdown (DataFusion 52 extends pushdown to LIMIT, LIKE, Boolean, Timestamp — available after Step 0 upgrade)
+- [x] 6.3 Implement DataFusion optimizer pass with Iceberg predicate pushdown (DataFusion 52 extends pushdown to LIMIT, LIKE, Boolean, Timestamp — available after Step 0 upgrade)
 - [x] 6.4 Implement PhysicalPlan generation from optimized LogicalPlan
 - [x] 6.5 Implement adaptive fragment splitting: extract Iceberg manifest groups from PhysicalPlan
 - [x] 6.6 Implement custom datafusion-proto codec extensions for iceberg-rust plan nodes — use `PhysicalExtensionProtoCodec` trait (DataFusion PR #19437) + model `IcebergScanExecNode` on `ArrowScanExecNode` pattern (PR #20284); replaces JSON ScanTask workaround
@@ -63,14 +63,14 @@
 - [x] 7.3 Implement statement routing: classify → dispatch to appropriate handler
 - [x] 7.4 Implement local execution path (single-node mode via DataFusion SessionContext)
 - [x] 7.5 Implement worker registry with heartbeat-based liveness tracking
-- [ ] 7.6 Implement fragment scheduler: assign fragments to workers with load weighting
+- [x] 7.6 Implement fragment scheduler: assign fragments to workers with load weighting
 - [x] 7.7 Implement distributed dispatch: send fragments via Arrow Flight do_exchange with credentials in metadata
 - [x] 7.8 Implement result collection: merge Arrow RecordBatch streams from workers
 - [x] 7.9 Implement local/distributed decision logic (adaptive based on table size and worker availability)
-- [ ] 7.10 Implement credential refresh push to workers for long-running queries
-- [ ] 7.11 Implement failure handling: re-assign read fragments on worker death, local fallback
-- [ ] 7.12 Integration test: single-node SELECT query end-to-end (Flight SQL → Polaris → S3 → results)
-- [ ] 7.13 Integration test: authenticate as different users, verify different catalog visibility
+- [x] 7.10 Implement credential refresh push to workers for long-running queries
+- [x] 7.11 Implement failure handling: re-assign read fragments on worker death, local fallback
+- [x] 7.12 Integration test: single-node SELECT query end-to-end (Flight SQL → Polaris → S3 → results)
+- [x] 7.13 Integration test: authenticate as different users, verify different catalog visibility
 
 ## 8. Write Path (sqe-coordinator)
 
@@ -84,12 +84,12 @@
 - [x] 8.8 Implement CREATE VIEW: serialize SQL to Polaris REST view API
 - [x] 8.9 Implement DROP VIEW: Polaris REST view delete
 - [x] 8.10 Implement view resolution on read: resolve view SQL → parse → inline into query plan
-- [ ] 8.11 Integration test: CTAS → SELECT roundtrip
-- [ ] 8.12 Integration test: INSERT INTO → verify appended data
+- [x] 8.11 Integration test: CTAS → SELECT roundtrip
+- [x] 8.12 Integration test: INSERT INTO → verify appended data
 - [ ] 8.13 Integration test: MERGE INTO → verify upserted data
 - [ ] 8.14 Integration test: DELETE FROM → verify rows removed
-- [ ] 8.15 Integration test: DROP TABLE → verify removed from Polaris
-- [ ] 8.16 Integration test: CREATE VIEW → query view → verify results
+- [x] 8.15 Integration test: DROP TABLE → verify removed from Polaris
+- [x] 8.16 Integration test: CREATE VIEW → query view → verify results
 
 ## 9. Worker (sqe-worker)
 
@@ -97,10 +97,10 @@
 - [x] 9.2 Implement fragment deserialization (JSON-based ScanTask, not proto codec)
 - [x] 9.3 Implement local DataFusion execution with injected user credentials
 - [x] 9.4 Implement RecordBatch streaming back to coordinator
-- [ ] 9.5 Implement heartbeat to coordinator (5s interval)
-- [ ] 9.6 Implement credential update channel: accept refreshed tokens from coordinator
-- [ ] 9.7 Implement configurable memory limit and spill-to-disk
-- [ ] 9.8 Integration test: coordinator + 2 workers → distributed SELECT → verify correct results
+- [x] 9.5 Implement heartbeat to coordinator (5s interval)
+- [x] 9.6 Implement credential update channel: accept refreshed tokens from coordinator
+- [x] 9.7 Implement configurable memory limit and spill-to-disk
+- [x] 9.8 Integration test: coordinator + 2 workers → distributed SELECT → verify correct results
 
 ## 10. information_schema (sqe-catalog)
 
@@ -108,29 +108,29 @@
 - [x] 10.2 Implement InfoSchemaColumnsProvider: Iceberg table schema → column metadata
 - [x] 10.3 Implement InfoSchemaSchemataProvider: Polaris listNamespaces
 - [x] 10.4 Register information_schema as virtual schema per session
-- [ ] 10.5 Integration test: SELECT from information_schema.tables/columns/schemata
+- [x] 10.5 Integration test: SELECT from information_schema.tables/columns/schemata
 
 ## 11. Trino Wire Compatibility (sqe-trino-compat)
 
 - [x] 11.1 Implement axum HTTP server for Trino v1/statement endpoints
 - [x] 11.2 Implement POST /v1/statement: auth + SQL submission + first result page
-- [ ] 11.3 Implement GET /v1/statement/{id}/{token}: result pagination
+- [x] 11.3 Implement GET /v1/statement/{id}/{token}: result pagination
 - [x] 11.4 Implement DELETE /v1/statement/{id}: query cancellation
 - [x] 11.5 Implement Arrow → Trino JSON column format type mapping
 - [x] 11.6 Implement dual auth on /v1/statement: Bearer token (JWT passthrough from backend + X-Trino-User) and Basic auth (Keycloak ROPC), Bearer takes priority
-- [ ] 11.7 Implement X-Trino-Catalog/Schema/User/Source header handling
+- [x] 11.7 Implement X-Trino-Catalog/Schema/User/Source header handling
 - [x] 11.8 Implement Trino /v1/info endpoint: node version, environment, coordinator flag, starting state, uptime
 - [x] 11.9 Implement Trino /v1/info/state endpoint: ACTIVE / STARTING state string
-- [ ] 11.10 Integration test: connect via Trino JDBC driver → execute query → verify results
+- [x] 11.10 Integration test: connect via Trino JDBC driver → execute query → verify results
 
 ## 12. Observability (sqe-metrics)
 
 - [x] 12.1 Implement Prometheus /metrics endpoint with core metrics
 - [x] 12.2 Instrument coordinator: query counts, durations, active sessions, worker counts
-- [ ] 12.3 Instrument workers: fragments executed, rows scanned, bytes read
+- [x] 12.3 Instrument workers: fragments executed, rows scanned, bytes read
 - [x] 12.4 Implement structured JSON audit log writer
 - [x] 12.5 Implement optional OpenTelemetry trace export via OTLP
-- [ ] 12.6 Propagate trace context to workers via Flight metadata
+- [x] 12.6 Propagate trace context to workers via Flight metadata
 - [x] 12.7 Implement /healthz liveness and /readyz readiness probes on health port
 - [x] 12.8 Implement /api/v1/status Ballista/DataFusion-style cluster status endpoint (role, version, uptime, workers)
 
@@ -138,6 +138,6 @@
 
 - [x] 13.1 Create unified Dockerfile (multi-stage Rust build, single sqe-server binary for coordinator + worker)
 - [x] 13.2 Create docker-compose.yml connecting SQE to existing quickstart network
-- [ ] 13.3 Register sqe-client in Keycloak realm config (same config as trino-client)
-- [ ] 13.4 End-to-end test: docker-compose up → Flight SQL connect → SELECT → verify results
-- [ ] 13.5 End-to-end test: docker-compose up → Trino JDBC connect → SELECT → verify results
+- [x] 13.3 Register sqe-client in Keycloak realm config (same config as trino-client)
+- [x] 13.4 End-to-end test: docker-compose up → Flight SQL connect → SELECT → verify results
+- [x] 13.5 End-to-end test: docker-compose up → Trino JDBC connect → SELECT → verify results

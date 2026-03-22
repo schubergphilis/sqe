@@ -121,6 +121,8 @@ impl KeycloakClient {
 
     /// Decode JWT payload without signature verification (Keycloak already validated).
     /// Extracts `realm_access.roles` from the claims.
+    ///
+    /// Returns an empty `Vec` for malformed tokens.
     pub fn extract_roles(&self, access_token: &str) -> Vec<String> {
         let parts: Vec<&str> = access_token.split('.').collect();
         if parts.len() != 3 {
@@ -154,5 +156,128 @@ impl KeycloakClient {
                     .collect()
             })
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+    use sqe_core::config::AuthConfig;
+
+    /// Build a fake JWT (header.payload.signature) from a JSON claims object.
+    fn fake_jwt(claims: &serde_json::Value) -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(b"{\"alg\":\"RS256\",\"typ\":\"JWT\"}");
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(claims).unwrap());
+        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"fake-sig");
+        format!("{header}.{payload}.{signature}")
+    }
+
+    fn test_config() -> AuthConfig {
+        AuthConfig {
+            keycloak_url: "http://localhost:8080".to_string(),
+            realm: "test".to_string(),
+            client_id: "test-client".to_string(),
+            client_secret: "secret".to_string(),
+            token_endpoint: String::new(),
+            token_refresh_buffer_secs: 60,
+            ssl_verification: false,
+        }
+    }
+
+    fn make_client() -> KeycloakClient {
+        KeycloakClient::new(&test_config()).unwrap()
+    }
+
+    #[test]
+    fn extract_roles_from_valid_jwt() {
+        let client = make_client();
+        let claims = serde_json::json!({
+            "sub": "user1",
+            "realm_access": {
+                "roles": ["admin", "user", "data_engineer"]
+            }
+        });
+
+        let roles = client.extract_roles(&fake_jwt(&claims));
+        assert_eq!(roles, vec!["admin", "user", "data_engineer"]);
+    }
+
+    #[test]
+    fn extract_roles_empty_when_no_realm_access() {
+        let client = make_client();
+        let claims = serde_json::json!({ "sub": "user1" });
+
+        let roles = client.extract_roles(&fake_jwt(&claims));
+        assert!(roles.is_empty());
+    }
+
+    #[test]
+    fn extract_roles_empty_when_roles_missing() {
+        let client = make_client();
+        let claims = serde_json::json!({
+            "realm_access": { "other": "value" }
+        });
+
+        let roles = client.extract_roles(&fake_jwt(&claims));
+        assert!(roles.is_empty());
+    }
+
+    #[test]
+    fn extract_roles_handles_not_a_jwt() {
+        let client = make_client();
+        let roles = client.extract_roles("not-a-jwt");
+        assert!(roles.is_empty());
+    }
+
+    #[test]
+    fn extract_roles_handles_invalid_base64_payload() {
+        let client = make_client();
+        let roles = client.extract_roles("header.!!!invalid!!!.sig");
+        assert!(roles.is_empty());
+    }
+
+    #[test]
+    fn extract_roles_handles_non_json_payload() {
+        let client = make_client();
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"not json");
+        let token = format!("header.{payload}.sig");
+        let roles = client.extract_roles(&token);
+        assert!(roles.is_empty());
+    }
+
+    #[test]
+    fn extract_roles_skips_non_string_role_values() {
+        let client = make_client();
+        let claims = serde_json::json!({
+            "realm_access": {
+                "roles": ["admin", 42, null, "user"]
+            }
+        });
+
+        let roles = client.extract_roles(&fake_jwt(&claims));
+        assert_eq!(roles, vec!["admin", "user"]);
+    }
+
+    #[test]
+    fn token_url_construction() {
+        let client = make_client();
+        assert_eq!(
+            client.token_url,
+            "http://localhost:8080/realms/test/protocol/openid-connect/token"
+        );
+    }
+
+    #[test]
+    fn token_url_strips_trailing_slash() {
+        let mut config = test_config();
+        config.keycloak_url = "http://localhost:8080/".to_string();
+        let client = KeycloakClient::new(&config).unwrap();
+        assert_eq!(
+            client.token_url,
+            "http://localhost:8080/realms/test/protocol/openid-connect/token"
+        );
     }
 }
