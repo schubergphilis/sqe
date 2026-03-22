@@ -60,6 +60,11 @@ pub struct CoordinatorConfig {
     /// Optional TLS configuration for the Flight SQL listener.
     #[serde(default)]
     pub tls: TlsConfig,
+    /// Shared secret that workers must supply in the `x-sqe-worker-secret`
+    /// metadata header when sending heartbeats. An empty value disables the
+    /// check (backwards compatible default).
+    #[serde(default)]
+    pub worker_secret: String,
 }
 
 /// TLS configuration for gRPC (Flight SQL) and worker listeners.
@@ -212,6 +217,9 @@ pub struct StorageConfig {
     pub s3_secret_key: String,
     #[serde(default)]
     pub s3_path_style: bool,
+    /// Allow plaintext HTTP for S3 endpoints. Only enable for dev/test (e.g., MinIO).
+    #[serde(default)]
+    pub s3_allow_http: bool,
 }
 
 impl std::fmt::Debug for StorageConfig {
@@ -222,6 +230,7 @@ impl std::fmt::Debug for StorageConfig {
             .field("s3_access_key", &"[REDACTED]")
             .field("s3_secret_key", &"[REDACTED]")
             .field("s3_path_style", &self.s3_path_style)
+            .field("s3_allow_http", &self.s3_allow_http)
             .finish()
     }
 }
@@ -408,6 +417,7 @@ impl SqeConfig {
         env_override_u16("SQE_COORDINATOR__TRINO_HTTP_PORT", &mut self.coordinator.trino_http_port);
         env_override_str("SQE_COORDINATOR__MODE", &mut self.coordinator.mode);
         env_override_bool("SQE_COORDINATOR__DEBUG", &mut self.coordinator.debug);
+        env_override_str("SQE_COORDINATOR__WORKER_SECRET", &mut self.coordinator.worker_secret);
         env_override_str("SQE_TLS__CERT_FILE", &mut self.coordinator.tls.cert_file);
         env_override_str("SQE_TLS__KEY_FILE", &mut self.coordinator.tls.key_file);
         env_override_str("SQE_TLS__CA_FILE", &mut self.coordinator.tls.ca_file);
@@ -441,6 +451,7 @@ impl SqeConfig {
         env_override_str("SQE_STORAGE__S3_ACCESS_KEY", &mut self.storage.s3_access_key);
         env_override_str("SQE_STORAGE__S3_SECRET_KEY", &mut self.storage.s3_secret_key);
         env_override_bool("SQE_STORAGE__S3_PATH_STYLE", &mut self.storage.s3_path_style);
+        env_override_bool("SQE_STORAGE__S3_ALLOW_HTTP", &mut self.storage.s3_allow_http);
 
         // Policy
         env_override_str("SQE_POLICY__ENGINE", &mut self.policy.engine);
@@ -602,6 +613,7 @@ mod tests {
                 worker_urls: vec![],
                 debug: false,
                 tls: TlsConfig::default(),
+                worker_secret: String::new(),
             },
             worker: WorkerConfig::default(),
             auth: AuthConfig {
@@ -762,5 +774,11 @@ mod tests {
             err.contains("tls.cert_file") && err.contains("not found"),
             "Expected missing file error, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_storage_config_s3_allow_http_defaults_false() {
+        let config = StorageConfig::default();
+        assert!(!config.s3_allow_http, "s3_allow_http should default to false (secure by default)");
     }
 }

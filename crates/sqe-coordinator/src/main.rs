@@ -94,9 +94,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize metrics
     let metrics = Arc::new(sqe_metrics::MetricsRegistry::new());
-    let audit = Arc::new(sqe_metrics::audit::AuditLogger::new(
-        &config.metrics.audit_log_path,
-    ));
+    let audit = Arc::new(
+        sqe_metrics::audit::AuditLogger::new(&config.metrics.audit_log_path)
+            .map_err(|e| anyhow::anyhow!(e))?,
+    );
 
     // Start metrics server
     sqe_metrics::server::start_metrics_server(metrics.clone(), config.metrics.prometheus_port);

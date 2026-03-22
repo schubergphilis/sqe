@@ -79,8 +79,11 @@ impl SchemaProvider for SqeSchemaProvider {
         // Also include views
         let views =
             tokio::task::block_in_place(|| handle.block_on(catalog.list_views(&ns_ident)));
-        if let Ok(view_names) = views {
-            names.extend(view_names);
+        match views {
+            Ok(view_names) => names.extend(view_names),
+            Err(e) => {
+                error!(namespace = %ns, error = %e, "Failed to list views");
+            }
         }
 
         names
@@ -110,8 +113,8 @@ impl SchemaProvider for SqeSchemaProvider {
                     }
                 }
             }
-            Err(_) => {
-                debug!(table = name, "Not found as table, trying view");
+            Err(e) => {
+                debug!(table = name, error = %e, "Not found as table, trying view");
             }
         }
 

@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
 use dashmap::DashMap;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use sqe_core::Session;
@@ -19,6 +19,9 @@ use crate::protocol::{
 
 /// Default number of rows per page for result pagination.
 const DEFAULT_PAGE_SIZE: usize = 1000;
+
+/// Results older than this are evicted (5 minutes).
+const RESULT_TTL_SECS: u64 = 300;
 
 /// Shared context for Trino /v1/info endpoints.
 pub struct NodeContext {
@@ -44,6 +47,8 @@ pub struct PaginatedResult {
     pub pages: Vec<Vec<Vec<serde_json::Value>>>,
     /// Total number of pages.
     pub total_pages: usize,
+    /// Wall-clock time at which this result was stored; used for TTL eviction.
+    pub created_at: std::time::Instant,
 }
 
 /// Trino client headers extracted from the request.
@@ -87,6 +92,26 @@ where
         page_size: DEFAULT_PAGE_SIZE,
     });
 
+    let state_sweep = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let expired: Vec<String> = state_sweep
+                .results
+                .iter()
+                .filter(|entry| entry.value().created_at.elapsed().as_secs() > RESULT_TTL_SECS)
+                .map(|entry| entry.key().clone())
+                .collect();
+            for id in &expired {
+                state_sweep.results.remove(id);
+            }
+            if !expired.is_empty() {
+                tracing::debug!(count = expired.len(), "Evicted stale Trino result sets");
+            }
+        }
+    });
+
     tokio::spawn(async move {
         let app = Router::new()
             .route("/v1/info", get(server_info::<A, Q>))
@@ -97,11 +122,19 @@ where
             .with_state(state);
 
         let addr = format!("0.0.0.0:{port}");
-        let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+        let listener = match tokio::net::TcpListener::bind(&addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                error!(addr = %addr, error = %e, "Failed to bind Trino-compat HTTP server");
+                return;
+            }
+        };
 
         info!("Trino-compat HTTP server listening on {addr}");
 
-        axum::serve(listener, app).await.unwrap();
+        if let Err(e) = axum::serve(listener, app).await {
+            error!(error = %e, "Trino-compat HTTP server exited with error");
+        }
     })
 }
 
@@ -278,10 +311,8 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         match state.authenticator.authenticate(&user, &pass).await {
             Ok(s) => s,
             Err(e) => {
-                return error_response(
-                    StatusCode::UNAUTHORIZED,
-                    format!("Authentication failed: {e}"),
-                );
+                warn!(error = %e, user = %user, "Trino authentication failed");
+                return error_response(StatusCode::UNAUTHORIZED, "Authentication failed");
             }
         }
     } else {
@@ -312,6 +343,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 columns,
                 pages,
                 total_pages,
+                created_at: std::time::Instant::now(),
             };
 
             // Build the first page response (token = 0).
@@ -332,7 +364,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 data: None,
                 stats: TrinoStats::failed(),
                 error: Some(TrinoError {
-                    message: e.to_string(),
+                    message: "Query execution failed".to_string(),
                     error_code: 1,
                     error_name: "INTERNAL_ERROR".to_string(),
                     error_type: "INTERNAL_ERROR".to_string(),
@@ -681,6 +713,7 @@ mod tests {
                 vec![vec![serde_json::json!(3)]],
             ],
             total_pages: 2,
+            created_at: Instant::now(),
         };
 
         let resp = build_page_response("q-abc", &paginated, 0);
@@ -705,6 +738,7 @@ mod tests {
                 vec![vec![serde_json::json!(3)]],
             ],
             total_pages: 2,
+            created_at: Instant::now(),
         };
 
         let resp = build_page_response("q-abc", &paginated, 1);
@@ -719,6 +753,7 @@ mod tests {
             columns: vec![],
             pages: vec![vec![vec![serde_json::json!(42)]]],
             total_pages: 1,
+            created_at: Instant::now(),
         };
 
         let resp = build_page_response("q-single", &paginated, 0);
@@ -828,6 +863,7 @@ mod tests {
                 columns: vec![],
                 pages: vec![vec![], vec![]],
                 total_pages: 2,
+                created_at: Instant::now(),
             },
         );
 
@@ -884,6 +920,7 @@ mod tests {
                 columns: vec![],
                 pages: vec![vec![]],
                 total_pages: 1,
+                created_at: Instant::now(),
             },
         );
 
@@ -923,6 +960,7 @@ mod tests {
                     vec![vec![serde_json::json!(30)]],
                 ],
                 total_pages: 3,
+                created_at: Instant::now(),
             },
         );
 
@@ -976,6 +1014,7 @@ mod tests {
                     vec![vec![serde_json::json!(2)]],
                 ],
                 total_pages: 2,
+                created_at: Instant::now(),
             },
         );
 
@@ -1010,6 +1049,7 @@ mod tests {
                 columns: vec![],
                 pages: vec![vec![], vec![]],
                 total_pages: 2,
+                created_at: Instant::now(),
             },
         );
 

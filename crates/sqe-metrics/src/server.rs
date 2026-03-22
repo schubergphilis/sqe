@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{Router, routing::get, extract::State, response::IntoResponse};
 use prometheus::Encoder;
-use tracing::info;
+use tracing::{info, error};
 
 use crate::HasRegistry;
 
@@ -21,11 +21,19 @@ pub fn start_metrics_server<R: HasRegistry + Clone>(
             .with_state(metrics);
 
         let addr = format!("0.0.0.0:{port}");
-        let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+        let listener = match tokio::net::TcpListener::bind(&addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                error!(addr = %addr, error = %e, "Failed to bind metrics server");
+                return;
+            }
+        };
 
         info!("Metrics server listening on {addr}");
 
-        axum::serve(listener, app).await.unwrap();
+        if let Err(e) = axum::serve(listener, app).await {
+            error!(error = %e, "Metrics server exited with error");
+        }
     })
 }
 

@@ -44,11 +44,8 @@ impl SessionManager {
         let session = Arc::new(session);
         self.sessions.insert(session_id.clone(), session.clone());
 
-        info!(
-            session_id = %session_id,
-            username = username,
-            "Session created"
-        );
+        info!(username = username, "Session created");
+        debug!(session_id = %session_id, username = username, "Session details");
 
         Ok(session)
     }
