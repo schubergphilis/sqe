@@ -117,13 +117,18 @@ SQE writes a JSONL audit log capturing every query:
 {
   "timestamp": "2025-03-15T10:30:00Z",
   "username": "alice",
+  "session_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "query_text": "SELECT * FROM sales.orders WHERE region = 'EU'",
+  "query_hash": "sha256:e3b0c44298fc1c149afb...",
   "statement_type": "query",
+  "client_ip": "10.0.1.42",
   "duration_ms": 142,
   "rows_returned": 1583,
   "status": "ok"
 }
 ```
+
+The `query_hash` field is a SHA-256 hash of the SQL text, useful for correlating repeated queries without storing the full text. When audit logging is enabled, all fields are always present.
 
 Configuration:
 ```toml
