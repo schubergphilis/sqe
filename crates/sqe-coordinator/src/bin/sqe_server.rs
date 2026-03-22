@@ -268,9 +268,10 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
 
     // Metrics & audit
     let metrics = Arc::new(sqe_metrics::MetricsRegistry::new());
-    let audit = Arc::new(sqe_metrics::audit::AuditLogger::new(
-        &config.metrics.audit_log_path,
-    ));
+    let audit = Arc::new(
+        sqe_metrics::audit::AuditLogger::new(&config.metrics.audit_log_path)
+            .map_err(|e| anyhow::anyhow!(e))?,
+    );
 
     sqe_metrics::server::start_metrics_server(metrics.clone(), config.metrics.prometheus_port);
     tracing::info!("Prometheus metrics on port {}", config.metrics.prometheus_port);
