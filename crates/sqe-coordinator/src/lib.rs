@@ -1,4 +1,5 @@
 pub mod catalog_ops;
+pub mod tls;
 pub mod codec;
 pub mod credential_refresh;
 pub mod distributed_scan;

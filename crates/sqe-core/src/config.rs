@@ -57,6 +57,35 @@ pub struct CoordinatorConfig {
     /// When `false` (default / production), only sanitised messages are returned.
     #[serde(default)]
     pub debug: bool,
+    /// Optional TLS configuration for the Flight SQL listener.
+    #[serde(default)]
+    pub tls: TlsConfig,
+}
+
+/// TLS configuration for gRPC (Flight SQL) and worker listeners.
+///
+/// When `cert_file` and `key_file` are both set, the server enables TLS.
+/// If omitted, the server runs in plaintext (suitable for development).
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct TlsConfig {
+    /// Path to PEM-encoded server certificate.
+    #[serde(default)]
+    pub cert_file: String,
+    /// Path to PEM-encoded private key.
+    #[serde(default)]
+    pub key_file: String,
+    /// Path to PEM-encoded CA certificate for client verification (mTLS).
+    /// When set, the server requires clients to present a valid certificate
+    /// signed by this CA.
+    #[serde(default)]
+    pub ca_file: String,
+}
+
+impl TlsConfig {
+    /// Returns `true` when both cert and key are configured.
+    pub fn is_enabled(&self) -> bool {
+        !self.cert_file.is_empty() && !self.key_file.is_empty()
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -325,6 +354,26 @@ impl SqeConfig {
             ));
         }
 
+        // TLS validation: if one of cert/key is set, both must be set
+        let tls = &self.coordinator.tls;
+        if !tls.cert_file.is_empty() && tls.key_file.is_empty() {
+            errors.push("tls.cert_file is set but tls.key_file is missing".to_string());
+        }
+        if tls.cert_file.is_empty() && !tls.key_file.is_empty() {
+            errors.push("tls.key_file is set but tls.cert_file is missing".to_string());
+        }
+        if tls.is_enabled() {
+            if !std::path::Path::new(&tls.cert_file).exists() {
+                errors.push(format!("tls.cert_file '{}' not found", tls.cert_file));
+            }
+            if !std::path::Path::new(&tls.key_file).exists() {
+                errors.push(format!("tls.key_file '{}' not found", tls.key_file));
+            }
+            if !tls.ca_file.is_empty() && !std::path::Path::new(&tls.ca_file).exists() {
+                errors.push(format!("tls.ca_file '{}' not found", tls.ca_file));
+            }
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -359,6 +408,9 @@ impl SqeConfig {
         env_override_u16("SQE_COORDINATOR__TRINO_HTTP_PORT", &mut self.coordinator.trino_http_port);
         env_override_str("SQE_COORDINATOR__MODE", &mut self.coordinator.mode);
         env_override_bool("SQE_COORDINATOR__DEBUG", &mut self.coordinator.debug);
+        env_override_str("SQE_TLS__CERT_FILE", &mut self.coordinator.tls.cert_file);
+        env_override_str("SQE_TLS__KEY_FILE", &mut self.coordinator.tls.key_file);
+        env_override_str("SQE_TLS__CA_FILE", &mut self.coordinator.tls.ca_file);
 
         // Worker
         env_override_str("SQE_WORKER__COORDINATOR_URL", &mut self.worker.coordinator_url);
@@ -549,6 +601,7 @@ mod tests {
                 mode: "hybrid".to_string(),
                 worker_urls: vec![],
                 debug: false,
+                tls: TlsConfig::default(),
             },
             worker: WorkerConfig::default(),
             auth: AuthConfig {
@@ -656,6 +709,58 @@ mod tests {
         assert!(
             err.contains("auth.client_id") && err.contains("catalog.polaris_url"),
             "Expected multiple errors, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_tls_config_disabled_by_default() {
+        let tls = TlsConfig::default();
+        assert!(!tls.is_enabled());
+    }
+
+    #[test]
+    fn test_tls_config_enabled_with_cert_and_key() {
+        let tls = TlsConfig {
+            cert_file: "/tmp/cert.pem".to_string(),
+            key_file: "/tmp/key.pem".to_string(),
+            ca_file: String::new(),
+        };
+        assert!(tls.is_enabled());
+    }
+
+    #[test]
+    fn test_validate_tls_cert_without_key() {
+        let mut config = valid_config();
+        config.coordinator.tls.cert_file = "/tmp/cert.pem".to_string();
+        // key_file is empty
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("tls.key_file is missing"),
+            "Expected cert-without-key error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_tls_key_without_cert() {
+        let mut config = valid_config();
+        config.coordinator.tls.key_file = "/tmp/key.pem".to_string();
+        // cert_file is empty
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("tls.cert_file is missing"),
+            "Expected key-without-cert error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_tls_missing_files() {
+        let mut config = valid_config();
+        config.coordinator.tls.cert_file = "/nonexistent/cert.pem".to_string();
+        config.coordinator.tls.key_file = "/nonexistent/key.pem".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("tls.cert_file") && err.contains("not found"),
+            "Expected missing file error, got: {err}"
         );
     }
 }

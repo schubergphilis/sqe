@@ -21,12 +21,12 @@
 - [x] 3.3 TLS validation: if `allow_plaintext = false`, verify cert+key files are readable at startup
 - [x] 3.4 Unit tests: missing required field, port conflict, missing cert file all produce clear errors
 
-## 4. TLS — SKIPPED (deferred to pluggable-auth change)
+## 4. TLS
 
-- [ ] 4.1 ~~Add `[server.tls]` config~~ — deferred
-- [ ] 4.2 ~~Configure `tonic` server transport with TLS~~ — deferred
-- [ ] 4.3 ~~Dev mode plaintext~~ — deferred
-- [ ] 4.4 ~~Integration test~~ — deferred
+- [x] 4.1 Add `[coordinator.tls]` config: `cert_file`, `key_file`, `ca_file` (optional mTLS)
+- [x] 4.2 Configure `tonic` server transport with TLS from loaded cert/key; mTLS when ca_file set
+- [x] 4.3 Dev mode: if no cert configured, start in plaintext (logged); TLS validation at startup
+- [x] 4.4 Unit tests: config validation for partial cert/key, missing files, disabled by default
 
 ## 5. Rate Limiting
 
