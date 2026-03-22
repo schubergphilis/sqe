@@ -75,6 +75,7 @@ pub struct SqeFlightSqlService {
     config: SqeConfig,
     worker_registry: Option<Arc<WorkerRegistry>>,
     query_registry: Arc<QueryRegistry>,
+    worker_secret: String,
 }
 
 impl SqeFlightSqlService {
@@ -83,12 +84,14 @@ impl SqeFlightSqlService {
         query_handler: Arc<QueryHandler>,
         config: SqeConfig,
     ) -> Self {
+        let worker_secret = config.coordinator.worker_secret.clone();
         Self {
             session_manager,
             query_handler,
             config,
             worker_registry: None,
             query_registry: Arc::new(QueryRegistry::new()),
+            worker_secret,
         }
     }
 
@@ -795,9 +798,20 @@ impl FlightSqlService for SqeFlightSqlService {
         &self,
         request: Request<Action>,
     ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
-        let action = request.into_inner();
+        let (metadata, _, action) = request.into_parts();
         match action.r#type.as_str() {
             "heartbeat" => {
+                // Validate the worker secret when one is configured.
+                if !self.worker_secret.is_empty() {
+                    let provided = metadata
+                        .get("x-sqe-worker-secret")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    if provided != self.worker_secret {
+                        return Err(Status::unauthenticated("Invalid worker secret"));
+                    }
+                }
+
                 let worker_url = std::str::from_utf8(&action.body).map_err(|e| {
                     Status::invalid_argument(format!("Invalid heartbeat body: {e}"))
                 })?;
