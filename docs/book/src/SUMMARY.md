@@ -30,6 +30,7 @@
 - [Iceberg Integration](./features/iceberg.md)
 - [Write Path](./features/write-path.md)
 - [Observability](./features/observability.md)
+- [Trino Compatibility](./features/trino-compatibility.md)
 
 ---
 
