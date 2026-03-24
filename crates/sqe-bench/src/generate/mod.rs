@@ -5,6 +5,7 @@ pub mod tpcc;
 pub mod tpce;
 pub mod tpch;
 pub mod tpcbb;
+pub mod tpcds;
 
 use arrow_schema::SchemaRef;
 use std::time::Duration;
@@ -48,8 +49,9 @@ pub fn get_generator(name: &str) -> anyhow::Result<Box<dyn BenchmarkGenerator>> 
         "tpce" => Ok(Box::new(tpce::TpceGenerator)),
         "tpcbb" => Ok(Box::new(tpcbb::TpcbbGenerator)),
         "clickbench" => Ok(Box::new(clickbench::ClickBenchGenerator)),
+        "tpcds" => Ok(Box::new(tpcds::TpcdsGenerator)),
         _ => anyhow::bail!(
-            "Unknown benchmark: {name}. Supported: tpch, ssb, tpcc, tpce, tpcbb, clickbench"
+            "Unknown benchmark: {name}. Supported: tpch, ssb, tpcc, tpce, tpcbb, clickbench, tpcds"
         ),
     }
 }
