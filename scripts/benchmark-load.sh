@@ -22,8 +22,9 @@ BENCH_SCALE="${BENCH_SCALE:-0.01}"
 BENCH_PROTOCOL="${BENCH_PROTOCOL:-flight}"
 BENCH_DATA_DIR="${BENCH_DATA_DIR:-/tmp/sqe-bench-data}"
 BENCH_KEEP_RUNNING="${BENCH_KEEP_RUNNING:-0}"
-BENCH_HOST_FLIGHT="localhost:50051"
-BENCH_HOST_TRINO="localhost:8080"
+BENCH_HOST="localhost"
+BENCH_PORT_FLIGHT="50051"
+BENCH_PORT_TRINO="8080"
 
 # Credentials (match test stack — same as integration-test.sh)
 S3_ACCESS_KEY="${S3_ACCESS_KEY:-s3admin}"
@@ -41,9 +42,9 @@ else
 fi
 
 if [ "$BENCH_PROTOCOL" = "trino" ]; then
-    BENCH_HOST="$BENCH_HOST_TRINO"
+    BENCH_PORT="$BENCH_PORT_TRINO"
 else
-    BENCH_HOST="$BENCH_HOST_FLIGHT"
+    BENCH_PORT="$BENCH_PORT_FLIGHT"
 fi
 
 cd "$ROOT_DIR"
@@ -159,6 +160,7 @@ for BENCH in "${BENCHMARKS[@]}"; do
         --data "$BENCH_DATA_DIR" \
         --protocol "$BENCH_PROTOCOL" \
         --host "$BENCH_HOST" \
+        --port "$BENCH_PORT" \
         --username "$SQE_USERNAME" \
         --password "$SQE_PASSWORD" \
         --s3-access-key "$S3_ACCESS_KEY" \
