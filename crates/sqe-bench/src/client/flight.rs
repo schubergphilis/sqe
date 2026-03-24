@@ -90,6 +90,8 @@ async fn fetch_client_credentials_token(
 }
 
 async fn build_channel(host: &str) -> anyhow::Result<Channel> {
+    use std::time::Duration;
+
     let url = if host.starts_with("http://") || host.starts_with("https://") {
         host.to_string()
     } else {
@@ -97,6 +99,14 @@ async fn build_channel(host: &str) -> anyhow::Result<Channel> {
     };
     let channel = Channel::from_shared(url.clone())
         .map_err(|e| anyhow::anyhow!("Invalid endpoint URI '{url}': {e}"))?
+        // Keep the connection alive during long queries
+        .keep_alive_while_idle(true)
+        .http2_keep_alive_interval(Duration::from_secs(10))
+        .keep_alive_timeout(Duration::from_secs(20))
+        // Per-request timeout (5 minutes max per query)
+        .timeout(Duration::from_secs(300))
+        // Connection timeout
+        .connect_timeout(Duration::from_secs(10))
         .connect()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to connect to '{url}': {e}"))?;
