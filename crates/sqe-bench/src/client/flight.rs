@@ -14,17 +14,30 @@ pub struct FlightSqlBenchClient {
 }
 
 impl FlightSqlBenchClient {
-    /// Connect to a Flight SQL server, performing the handshake if
-    /// username and password are provided.
+    /// Connect to a Flight SQL server.
+    ///
+    /// Auth modes (tried in order):
+    /// 1. If `token_endpoint` + `client_id` + `client_secret` are provided,
+    ///    fetch a bearer token via OAuth2 client_credentials grant.
+    /// 2. If `username` + `password` are provided, do a Flight SQL handshake.
+    /// 3. Otherwise, connect without auth.
     pub async fn connect(
         host: &str,
         username: Option<&str>,
         password: Option<&str>,
+        token_endpoint: Option<&str>,
+        client_id: Option<&str>,
+        client_secret: Option<&str>,
     ) -> anyhow::Result<Self> {
         let channel = build_channel(host).await?;
         let mut inner = FlightSqlServiceClient::new(channel);
 
-        if let (Some(user), Some(pass)) = (username, password) {
+        if let (Some(endpoint), Some(cid), Some(secret)) = (token_endpoint, client_id, client_secret) {
+            // OAuth2 client_credentials → bearer token
+            let token = fetch_client_credentials_token(endpoint, cid, secret).await?;
+            inner.set_token(token);
+        } else if let (Some(user), Some(pass)) = (username, password) {
+            // Flight SQL handshake (OIDC password grant)
             let token = inner
                 .handshake(user, pass)
                 .await
@@ -40,6 +53,40 @@ impl FlightSqlBenchClient {
             client: Mutex::new(inner),
         })
     }
+}
+
+/// Fetch an access token via OAuth2 client_credentials grant.
+async fn fetch_client_credentials_token(
+    endpoint: &str,
+    client_id: &str,
+    client_secret: &str,
+) -> anyhow::Result<String> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(endpoint)
+        .form(&[
+            ("grant_type", "client_credentials"),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("scope", "PRINCIPAL_ROLE:ALL"),
+        ])
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Token request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Token endpoint returned {status}: {body}");
+    }
+
+    let body: serde_json::Value = resp.json().await
+        .map_err(|e| anyhow::anyhow!("Failed to parse token response: {e}"))?;
+
+    body["access_token"]
+        .as_str()
+        .map(String::from)
+        .ok_or_else(|| anyhow::anyhow!("No access_token in token response"))
 }
 
 async fn build_channel(host: &str) -> anyhow::Result<Channel> {

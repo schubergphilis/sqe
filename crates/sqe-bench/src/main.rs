@@ -48,6 +48,9 @@ async fn main() -> anyhow::Result<()> {
             s3_region,
             username,
             password,
+            token_endpoint,
+            client_id,
+            client_secret,
             ..
         } => {
             let protocol_str = match protocol {
@@ -60,6 +63,9 @@ async fn main() -> anyhow::Result<()> {
                 &endpoint,
                 username.as_deref(),
                 password.as_deref(),
+                token_endpoint.as_deref(),
+                client_id.as_deref(),
+                client_secret.as_deref(),
             )
             .await?;
 
@@ -90,6 +96,9 @@ async fn main() -> anyhow::Result<()> {
             query,
             username,
             password,
+            token_endpoint,
+            client_id,
+            client_secret,
         } => {
             let protocol_str = match protocol {
                 cli::Protocol::Flight => "flight",
@@ -101,6 +110,9 @@ async fn main() -> anyhow::Result<()> {
                 &endpoint,
                 username.as_deref(),
                 password.as_deref(),
+                token_endpoint.as_deref(),
+                client_id.as_deref(),
+                client_secret.as_deref(),
             )
             .await?;
 

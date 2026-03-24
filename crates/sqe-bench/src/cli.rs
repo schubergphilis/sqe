@@ -98,13 +98,25 @@ pub enum Command {
         #[arg(long, env = "AWS_DEFAULT_REGION", default_value = "us-east-1")]
         s3_region: String,
 
-        /// Username for authentication
+        /// Username for authentication (OIDC password grant)
         #[arg(long, env = "SQE_USER")]
         username: Option<String>,
 
-        /// Password for authentication
+        /// Password for authentication (OIDC password grant)
         #[arg(long, env = "SQE_PASSWORD")]
         password: Option<String>,
+
+        /// OAuth2 token endpoint for client_credentials auth
+        #[arg(long, env = "SQE_TOKEN_ENDPOINT")]
+        token_endpoint: Option<String>,
+
+        /// OAuth2 client ID
+        #[arg(long, env = "SQE_CLIENT_ID")]
+        client_id: Option<String>,
+
+        /// OAuth2 client secret
+        #[arg(long, env = "SQE_CLIENT_SECRET")]
+        client_secret: Option<String>,
     },
 
     /// Run benchmark queries and report timing
@@ -133,13 +145,25 @@ pub enum Command {
         #[arg(long)]
         query: Option<String>,
 
-        /// Username for authentication
+        /// Username for authentication (OIDC password grant)
         #[arg(long, env = "SQE_USER")]
         username: Option<String>,
 
-        /// Password for authentication
+        /// Password for authentication (OIDC password grant)
         #[arg(long, env = "SQE_PASSWORD")]
         password: Option<String>,
+
+        /// OAuth2 token endpoint for client_credentials auth
+        #[arg(long, env = "SQE_TOKEN_ENDPOINT")]
+        token_endpoint: Option<String>,
+
+        /// OAuth2 client ID
+        #[arg(long, env = "SQE_CLIENT_ID")]
+        client_id: Option<String>,
+
+        /// OAuth2 client secret
+        #[arg(long, env = "SQE_CLIENT_SECRET")]
+        client_secret: Option<String>,
     },
 }
 
