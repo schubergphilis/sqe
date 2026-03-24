@@ -42,8 +42,13 @@ impl FlightSqlBenchClient {
     }
 }
 
-async fn build_channel(url: &str) -> anyhow::Result<Channel> {
-    let channel = Channel::from_shared(url.to_string())
+async fn build_channel(host: &str) -> anyhow::Result<Channel> {
+    let url = if host.starts_with("http://") || host.starts_with("https://") {
+        host.to_string()
+    } else {
+        format!("http://{host}")
+    };
+    let channel = Channel::from_shared(url.clone())
         .map_err(|e| anyhow::anyhow!("Invalid endpoint URI '{url}': {e}"))?
         .connect()
         .await
