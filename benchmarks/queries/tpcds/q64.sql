@@ -39,7 +39,7 @@ cross_sales AS (
       AND ss_item_sk               = sr_item_sk
       AND ss_customer_sk           = sr_customer_sk
       AND sr_returned_date_sk      = d2.d_date_sk
-      AND cs_ui.item_sk            = ss_item_sk
+      AND cs_ui.cs_item_sk         = ss_item_sk
       AND c_current_cdemo_sk       = cd2.cd_demo_sk
       AND c_current_hdemo_sk       = hd2.hd_demo_sk
       AND c_current_addr_sk        = ad2.ca_address_sk

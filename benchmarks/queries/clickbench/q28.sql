@@ -2,12 +2,12 @@
 -- timeout: 30s
 -- note: REGEXP_REPLACE is supported in DataFusion
 SELECT
-    REGEXP_REPLACE(Referer, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS key,
-    AVG(LENGTH(Referer)) AS l,
+    REGEXP_REPLACE("Referer", '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS key,
+    AVG(LENGTH("Referer")) AS l,
     COUNT(*) AS c,
-    MIN(Referer)
+    MIN("Referer")
 FROM hits
-WHERE Referer <> ''
+WHERE "Referer" <> ''
 GROUP BY key
 HAVING COUNT(*) > 100000
 ORDER BY l DESC

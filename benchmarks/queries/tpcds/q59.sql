@@ -29,10 +29,10 @@ FROM (
            tue_sales AS tue_sales1, wed_sales AS wed_sales1,
            thu_sales AS thu_sales1, fri_sales AS fri_sales1,
            sat_sales AS sat_sales1
-    FROM wss, store, date_dim
-    WHERE d_week_seq   = wss.d_week_seq
+    FROM wss, store, date_dim d
+    WHERE d.d_week_seq = wss.d_week_seq
       AND ss_store_sk  = s_store_sk
-      AND d_year       = 2001
+      AND d.d_year     = 2001
 ) y,
 (
     SELECT s_store_name AS s_store_name2, wss.d_week_seq AS d_week_seq2,
@@ -41,10 +41,10 @@ FROM (
            tue_sales AS tue_sales2, wed_sales AS wed_sales2,
            thu_sales AS thu_sales2, fri_sales AS fri_sales2,
            sat_sales AS sat_sales2
-    FROM wss, store, date_dim
-    WHERE d_week_seq   = wss.d_week_seq
+    FROM wss, store, date_dim d
+    WHERE d.d_week_seq = wss.d_week_seq
       AND ss_store_sk  = s_store_sk
-      AND d_year       = 2002
+      AND d.d_year     = 2002
 ) x
 WHERE d_week_seq1 = d_week_seq2 - 52
   AND s_store_id1 = s_store_id2

@@ -7,10 +7,9 @@ WITH in_store AS (
            SUM(ss_net_profit - COALESCE(sr_net_loss, 0)) AS profit
     FROM store_sales
     LEFT OUTER JOIN store_returns ON ss_item_sk = sr_item_sk
-                                  AND ss_ticket_number = sr_ticket_number,
-         date_dim
-    WHERE d_date_sk = ss_sold_date_sk
-      AND d_year    = 2001
+                                  AND ss_ticket_number = sr_ticket_number
+    JOIN date_dim ON d_date_sk = ss_sold_date_sk
+    WHERE d_year    = 2001
       AND d_moy     = 12
     GROUP BY ss_item_sk
 ),
@@ -21,10 +20,9 @@ in_catalog AS (
            SUM(cs_net_profit - COALESCE(cr_net_loss, 0)) AS profit
     FROM catalog_sales
     LEFT OUTER JOIN catalog_returns ON cs_item_sk = cr_item_sk
-                                    AND cs_order_number = cr_order_number,
-         date_dim
-    WHERE d_date_sk = cs_sold_date_sk
-      AND d_year    = 2001
+                                    AND cs_order_number = cr_order_number
+    JOIN date_dim ON d_date_sk = cs_sold_date_sk
+    WHERE d_year    = 2001
       AND d_moy     = 12
     GROUP BY cs_item_sk
 ),
@@ -35,10 +33,9 @@ in_web AS (
            SUM(ws_net_profit - COALESCE(wr_net_loss, 0)) AS profit
     FROM web_sales
     LEFT OUTER JOIN web_returns ON ws_item_sk = wr_item_sk
-                                AND ws_order_number = wr_order_number,
-         date_dim
-    WHERE d_date_sk = ws_sold_date_sk
-      AND d_year    = 2001
+                                AND ws_order_number = wr_order_number
+    JOIN date_dim ON d_date_sk = ws_sold_date_sk
+    WHERE d_year    = 2001
       AND d_moy     = 12
     GROUP BY ws_item_sk
 )

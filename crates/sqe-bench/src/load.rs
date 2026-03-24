@@ -16,7 +16,13 @@ pub async fn load_benchmark(
     s3_args: &S3Args,
     clean: bool,
 ) -> anyhow::Result<()> {
-    let namespace = crate::bench_namespace(benchmark, scale);
+    // TPC-BB reuses the TPC-DS namespace: its two extra tables go into tpcds_sfN
+    // alongside the TPC-DS tables so queries can reference them in the same schema.
+    let namespace = if benchmark == "tpcbb" {
+        crate::bench_namespace("tpcds", scale)
+    } else {
+        crate::bench_namespace(benchmark, scale)
+    };
     let gen = generate::get_generator(benchmark)?;
 
     println!("Loading {benchmark} SF{scale} into namespace {namespace}");

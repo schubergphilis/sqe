@@ -6,7 +6,7 @@
 --   warehouse:   W rows
 --   district:    W * 10 rows
 --   customer:    W * 30,000 rows
---   history:     W * 30,000 rows
+--   hist:        W * 30,000 rows
 --   orders:      W * 30,000 rows
 --   new_order:   W * 9,000 rows   (last 900 orders per district)
 --   order_line:  W * 300,000 rows (avg 10 lines per order)
@@ -66,7 +66,7 @@ CREATE TABLE customer (
     PRIMARY KEY (c_w_id, c_d_id, c_id)
 );
 
-CREATE TABLE history (
+CREATE TABLE hist (
     h_c_id   INTEGER        NOT NULL,
     h_c_d_id INTEGER        NOT NULL,
     h_c_w_id INTEGER        NOT NULL,
