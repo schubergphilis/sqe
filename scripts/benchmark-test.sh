@@ -135,7 +135,7 @@ RESULTS=()
 for BENCH in "${BENCHMARKS[@]}"; do
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "  Benchmark: ${BENCH^^} (SF${BENCH_SCALE})"
+    echo "  Benchmark: $(echo "$BENCH" | tr '[:lower:]' '[:upper:]') (SF${BENCH_SCALE})"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     # ── Step 1: Generate ──────────────────────────────────────
