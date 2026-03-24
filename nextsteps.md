@@ -1,6 +1,6 @@
 # SQE — Next Steps
 
-> Status as of 2026-03-22. Step 0 dependency alignment complete. Step 2 core engine effectively complete (99/103 — 4 blocked on iceberg-rust MoR). Step 3 OSS security hardening complete (51/51). All feature branches merged into `main`.
+> Status as of 2026-03-24. Step 0 dependency alignment complete. Step 2 core engine effectively complete (99/103 — 4 blocked on iceberg-rust MoR). Step 3 OSS security hardening complete (51/51). Benchmark suite (sqe-bench) complete — `read_parquet()` TVF, 6 benchmark generators, generate/load/test pipeline, CI scripts. All feature branches merged into `main`.
 
 > **Monitoring:** OPA SPI refactor in Polaris (PR #3999, still draft) will affect Phase 5 OPA integration when it lands — do not implement OPA against Polaris until this stabilises. Remote S3 signing (Iceberg 1.12, not yet released) will affect the pluggable-catalogs design.
 
@@ -84,6 +84,24 @@ Step 3 is complete. All vendor-specific identifiers renamed and production secur
 
 ---
 
+## ~~Step 3b: Benchmark Suite~~ ✅
+
+**Design:** `docs/superpowers/specs/2026-03-24-sqe-bench-design.md`
+
+Benchmark suite is complete. `sqe-bench` CLI provides generate/load/test pipeline for 6 benchmark suites. The `read_parquet()` TVF enables zero-copy Parquet → Iceberg loading.
+
+**Completed (2026-03-24):**
+- `read_parquet()` TVF — local filesystem and S3 with inline credentials; glob patterns; registered on every `SessionContext`
+- `sqe-bench generate` — Parquet data generation for TPC-H (22q), TPC-DS (99q), SSB (13q), TPC-C (8q), TPC-E (11q), TPC-BB (10q)
+- `sqe-bench load` — CTAS-based table loading via `read_parquet()`, namespace creation, `--clean` flag
+- `sqe-bench test` — query runner with correctness validation (PASS/FAIL/DIFF/SKIP/ERROR), Flight SQL + Trino HTTP clients, JSON reports
+- Scripts: `benchmark-generate-all.sh`, `benchmark-load.sh`, `benchmark-test.sh`
+- Query files and expected results for all benchmarks
+
+**First results (TPC-H SF1, Flight SQL):** 20/22 PASS, 1 DIFF (decimal precision), 1 SKIP (unsupported feature).
+
+---
+
 ## Step 4: Pluggable Auth
 
 **Plan:** `docs/superpowers/plans/2026-03-19-pluggable-auth.md`
@@ -163,6 +181,7 @@ Four sub-systems that make SQE agent-native and semantically aware.
 Step 1: audit               (1–2 days — catches issues before they compound)
 Step 2: core engine gaps    ✅ DONE (99/103 — 4 blocked on iceberg-rust MoR Q3 2026)
 Step 3: security hardening  ✅ DONE (51/51 — TLS, rate limiting, timeouts, cancellation, audit, error sanitisation)
+Step 3b: benchmark suite    ✅ DONE (sqe-bench: generate/load/test, 6 benchmarks, read_parquet() TVF, CI scripts)
 Step 4: pluggable auth      (depends on Step 3 renames being done first) ← NEXT
 Step 5: pluggable catalogs  (independent of auth; can run in parallel with Step 4) ← NEXT
 Step 6: semantic layer      (new crates; fully additive; no existing code broken)

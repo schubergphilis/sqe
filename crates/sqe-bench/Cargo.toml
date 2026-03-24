@@ -1,0 +1,32 @@
+[package]
+name = "sqe-bench"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sqe-bench"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-flight = { workspace = true }
+parquet = { workspace = true }
+object_store = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+csv = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+url = { workspace = true }
+tonic = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }

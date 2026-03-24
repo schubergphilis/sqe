@@ -29,8 +29,10 @@
 - [Custom SQL Extensions](./features/custom-sql.md)
 - [Iceberg Integration](./features/iceberg.md)
 - [Write Path](./features/write-path.md)
+- [read\_parquet TVF](./features/read-parquet.md)
 - [Observability](./features/observability.md)
 - [Trino Compatibility](./features/trino-compatibility.md)
+- [Benchmark Suite](./features/benchmarks.md)
 
 ---
 
