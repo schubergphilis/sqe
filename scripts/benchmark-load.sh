@@ -55,6 +55,7 @@ echo "  Building sqe-bench + sqe-coordinator..."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 cargo build -p sqe-bench -p sqe-coordinator --release 2>&1
 BENCH_BIN="$ROOT_DIR/target/release/sqe-bench"
+SQE_BIN="$ROOT_DIR/target/release/sqe-coordinator"
 echo ""
 
 # ── Start test stack ──────────────────────────────────────────
@@ -75,12 +76,12 @@ SQE_LOG_FILE="$(mktemp /tmp/sqe-bench-coord-XXXXXX.log)"
 SQE_CONFIG="$ROOT_DIR/tests/sqe-test.toml"
 
 RUST_LOG="${RUST_LOG:-sqe=info,warn}" \
-    cargo run -p sqe-coordinator --release --bin sqe-coordinator -- --config "$SQE_CONFIG" \
+    "$SQE_BIN" --config "$SQE_CONFIG" \
     > "$SQE_LOG_FILE" 2>&1 &
 SQE_PID=$!
 
-echo -n "Waiting for SQE coordinator..."
-for i in $(seq 1 30); do
+echo -n "Waiting for SQE coordinator (may take a while on first build)..."
+for i in $(seq 1 300); do
     if curl -so /dev/null "http://localhost:8080/v1/info" 2>/dev/null; then
         echo " ready (PID $SQE_PID)"
         break
@@ -90,7 +91,7 @@ for i in $(seq 1 30); do
         tail -20 "$SQE_LOG_FILE"
         exit 1
     fi
-    if [ "$i" -eq 30 ]; then
+    if [ "$i" -eq 300 ]; then
         echo " TIMEOUT"
         kill "$SQE_PID" 2>/dev/null || true
         exit 1
