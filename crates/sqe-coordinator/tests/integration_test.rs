@@ -497,6 +497,129 @@ async fn test_information_schema_tables() {
     assert!(!batches.is_empty());
 }
 
+// ---------------------------------------------------------------------------
+// read_parquet() TVF integration tests
+// ---------------------------------------------------------------------------
+
+/// Write a small Parquet file with known data into `dir`, returning the path.
+///
+/// Schema: id INT64, name VARCHAR — three rows:
+///   (1, "alice"), (2, "bob"), (3, "carol")
+fn write_test_parquet(dir: &std::path::Path) -> std::path::PathBuf {
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+
+    let path = dir.join("test.parquet");
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+            Arc::new(StringArray::from(vec!["alice", "bob", "carol"])),
+        ],
+    )
+    .expect("failed to build test RecordBatch");
+
+    let file = std::fs::File::create(&path).expect("failed to create test parquet file");
+    let mut writer =
+        ArrowWriter::try_new(file, Arc::clone(&schema), None)
+            .expect("failed to create ArrowWriter");
+    writer.write(&batch).expect("failed to write batch");
+    writer.close().expect("failed to close ArrowWriter");
+
+    path
+}
+
+// Test: read_parquet() TVF — CTAS from a local Parquet file, verify round-trip
+#[tokio::test(flavor = "multi_thread")]
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn test_read_parquet_local_file() {
+    let (session, handler) = common::setup_handler().await;
+
+    // 1. Create a small Parquet file in a temp directory.
+    let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let parquet_path = write_test_parquet(tmp_dir.path());
+    let parquet_path_str = parquet_path
+        .to_str()
+        .expect("parquet path is not valid UTF-8")
+        .to_string();
+
+    // 2. Cleanup any leftover table from a previous interrupted run.
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.from_parquet")
+        .await;
+
+    // 3. CTAS: load the local Parquet file into an Iceberg table.
+    let ctas_sql = format!(
+        "CREATE TABLE test_ns.from_parquet AS SELECT * FROM read_parquet('{parquet_path_str}')"
+    );
+    handler
+        .execute(&session, &ctas_sql)
+        .await
+        .expect("CTAS from read_parquet should succeed");
+
+    // 4. Query the newly created table.
+    let batches = handler
+        .execute(
+            &session,
+            "SELECT * FROM test_ns.from_parquet ORDER BY id",
+        )
+        .await
+        .expect("SELECT from from_parquet should succeed");
+
+    // 5. Verify row count.
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3, "from_parquet table should contain exactly 3 rows");
+
+    // 6. Verify column values — collect all rows across batches.
+    let mut ids: Vec<i64> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+
+    for batch in &batches {
+        let id_col = batch
+            .column_by_name("id")
+            .expect("batch should have 'id' column");
+        let name_col = batch
+            .column_by_name("name")
+            .expect("batch should have 'name' column");
+
+        let id_arr = id_col
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("'id' column should be Int64");
+        let name_arr = name_col
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .expect("'name' column should be Utf8");
+
+        for row in 0..batch.num_rows() {
+            ids.push(id_arr.value(row));
+            names.push(name_arr.value(row).to_string());
+        }
+    }
+
+    assert_eq!(ids, vec![1, 2, 3], "ids should be [1, 2, 3] in order");
+    assert_eq!(
+        names,
+        vec!["alice", "bob", "carol"],
+        "names should be [alice, bob, carol] in order"
+    );
+
+    // 7. Cleanup.
+    handler
+        .execute(&session, "DROP TABLE test_ns.from_parquet")
+        .await
+        .expect("DROP TABLE cleanup should succeed");
+
+    // tmp_dir is dropped here, cleaning up the temp Parquet file.
+}
+
 // Test: information_schema.schemata is queryable
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
