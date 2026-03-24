@@ -266,6 +266,13 @@ fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> String {
     };
 
     let mut tables: Vec<String> = gen.tables().into_iter().map(|t| t.name).collect();
+
+    // TPC-BB queries reference TPC-DS tables — include them for qualification
+    if benchmark == "tpcbb" {
+        if let Ok(tpcds_gen) = crate::generate::get_generator("tpcds") {
+            tables.extend(tpcds_gen.tables().into_iter().map(|t| t.name));
+        }
+    }
     // Longest first to prevent "part" matching inside "partsupp"
     tables.sort_by_key(|t| std::cmp::Reverse(t.len()));
 
