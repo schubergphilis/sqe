@@ -23,13 +23,13 @@ BENCH_PROTOCOL="${BENCH_PROTOCOL:-flight}"
 BENCH_DATA_DIR="${BENCH_DATA_DIR:-/tmp/sqe-bench-data}"
 BENCH_KEEP_RUNNING="${BENCH_KEEP_RUNNING:-0}"
 BENCH_HOST="localhost"
-BENCH_PORT_FLIGHT="50051"
-BENCH_PORT_TRINO="8080"
+BENCH_PORT_FLIGHT="60051"
+BENCH_PORT_TRINO="18080"
 
 # Credentials (match test stack — same as integration-test.sh)
 S3_ACCESS_KEY="${S3_ACCESS_KEY:-s3admin}"
 S3_SECRET_KEY="${S3_SECRET_KEY:-s3admin}"
-S3_ENDPOINT="${S3_ENDPOINT:-http://localhost:9000}"
+S3_ENDPOINT="${S3_ENDPOINT:-http://localhost:19000}"
 S3_REGION="${S3_REGION:-us-east-1}"
 # Auth: Flight SQL handshake (username + password). In client_credentials mode
 # the password is ignored by SQE — set it to empty string.
@@ -84,7 +84,7 @@ SQE_PID=$!
 
 echo -n "Waiting for SQE coordinator (may take a while on first build)..."
 for i in $(seq 1 300); do
-    if curl -so /dev/null "http://localhost:8080/v1/info" 2>/dev/null; then
+    if curl -so /dev/null "http://localhost:18080/v1/info" 2>/dev/null; then
         echo " ready (PID $SQE_PID)"
         break
     fi
@@ -108,8 +108,8 @@ cleanup() {
     if [ "$BENCH_KEEP_RUNNING" = "1" ]; then
         echo ""
         echo "SQE coordinator still running (PID $SQE_PID)"
-        echo "  Flight SQL: localhost:50051"
-        echo "  Trino HTTP: localhost:8080"
+        echo "  Flight SQL: localhost:60051"
+        echo "  Trino HTTP: localhost:18080"
         echo "  Logs: $SQE_LOG_FILE"
         echo ""
         echo "Run queries with:"

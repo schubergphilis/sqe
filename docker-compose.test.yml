@@ -1,4 +1,5 @@
 # docker-compose.test.yml — Lightweight test stack (2 containers, no DB/Keycloak)
+# Ports are offset by +10000 from production defaults to avoid conflicts.
 # Usage:
 #   docker compose -f docker-compose.test.yml up -d
 #   ./scripts/bootstrap-test.sh
@@ -23,7 +24,7 @@ services:
       AWS_ACCESS_KEY_ID: s3admin
       AWS_SECRET_ACCESS_KEY: s3admin
     ports:
-      - "8181:8181"
+      - "18181:8181"
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://localhost:8182/q/health"]
       interval: 5s
@@ -41,7 +42,7 @@ services:
     volumes:
       - rustfs-data:/data
     ports:
-      - "9000:9000"
+      - "19000:9000"
 
 volumes:
   rustfs-data:
