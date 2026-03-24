@@ -10,7 +10,7 @@ WITH zips AS (
             '34101','33? 97','24305','54933'
         )
         INTERSECT
-        SELECT d_zip
+        SELECT SUBSTR(ca.ca_zip, 1, 5) AS ca_zip
         FROM date_dim d, store_sales s, customer_address ca
         WHERE d.d_qoy = 1 AND d.d_year = 1998
           AND s.ss_sold_date_sk = d.d_date_sk

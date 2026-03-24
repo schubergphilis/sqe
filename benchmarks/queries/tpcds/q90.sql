@@ -1,6 +1,6 @@
 -- name: AM to PM web sales ratio by page type
 -- timeout: 60s
-SELECT CAST(amc AS DECIMAL(15,4)) / CAST(pmc AS DECIMAL(15,4)) AS am_pm_ratio
+SELECT CAST(amc AS DECIMAL(15,4)) / NULLIF(CAST(pmc AS DECIMAL(15,4)), 0) AS am_pm_ratio
 FROM (
     SELECT COUNT(*) AS amc
     FROM web_sales, household_demographics, time_dim, web_page

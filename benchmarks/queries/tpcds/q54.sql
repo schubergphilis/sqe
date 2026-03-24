@@ -19,7 +19,7 @@ WITH my_customers AS (
     WHERE cs_item_sk        = i_item_sk
       AND i_category        = 'Women'
       AND i_class           = 'accessories'
-      AND c_customer_sk     = cs_bill_customer_sk
+      AND c_customer_sk     = cs_or_ws_sales.c_customer_sk
 ),
 my_revenue AS (
     SELECT c_customer_sk,

@@ -10,9 +10,9 @@
 --   2. Updates district.d_ytd (increment by payment amount)
 --   3. Reads or selects the customer (by id or by last name)
 --   4. Updates customer balance, ytd_payment, payment_cnt; sets credit data for BC customers
---   5. Inserts a row into history
+--   5. Inserts a row into hist
 --
--- Read-only equivalent: inspect recent payment history per district
+-- Read-only equivalent: inspect recent payment hist per district
 
 SELECT
     h.h_c_id,
@@ -32,7 +32,7 @@ SELECT
     w.w_name,
     d.d_name
 FROM
-    history h
+    hist h
     JOIN customer c
         ON c.c_id = h.h_c_id
         AND c.c_d_id = h.h_c_d_id

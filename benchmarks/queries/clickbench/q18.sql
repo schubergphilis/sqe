@@ -3,11 +3,11 @@
 -- note: EventTime is Int64 (unix timestamp seconds). Minute extraction uses
 --       integer arithmetic: (EventTime / 60) % 60
 SELECT
-    UserID,
-    CAST(EventTime / 60 % 60 AS INT) AS m,
-    SearchPhrase,
+    "UserID",
+    CAST("EventTime" / 60 % 60 AS INT) AS m,
+    "SearchPhrase",
     COUNT(*)
 FROM hits
-GROUP BY UserID, m, SearchPhrase
+GROUP BY "UserID", m, "SearchPhrase"
 ORDER BY COUNT(*) DESC
 LIMIT 10;

@@ -943,7 +943,7 @@ impl BenchmarkGenerator for TpccGenerator {
                 row_count: |sf| (sf * 30_000.0) as usize,
             },
             TableDef {
-                name: "history".into(),
+                name: "hist".into(),
                 schema: history_schema(),
                 row_count: |sf| (sf * 30_000.0) as usize,
             },
@@ -987,7 +987,7 @@ impl BenchmarkGenerator for TpccGenerator {
             "warehouse" => generate_warehouse(scale),
             "district" => generate_district(scale),
             "customer" => generate_customer(scale),
-            "history" => generate_history(scale),
+            "hist" => generate_history(scale),
             "orders" => generate_orders(scale),
             "new_order" => generate_new_order(scale),
             "order_line" => generate_order_line(scale),
@@ -1029,7 +1029,7 @@ mod tests {
         assert!(names.contains(&"warehouse"));
         assert!(names.contains(&"district"));
         assert!(names.contains(&"customer"));
-        assert!(names.contains(&"history"));
+        assert!(names.contains(&"hist"));
         assert!(names.contains(&"orders"));
         assert!(names.contains(&"new_order"));
         assert!(names.contains(&"order_line"));
@@ -1047,7 +1047,7 @@ mod tests {
                 "warehouse" => assert_eq!(expected, 1),
                 "district" => assert_eq!(expected, 10),
                 "customer" => assert_eq!(expected, 30_000),
-                "history" => assert_eq!(expected, 30_000),
+                "hist" => assert_eq!(expected, 30_000),
                 "orders" => assert_eq!(expected, 30_000),
                 "new_order" => assert_eq!(expected, 9_000),
                 "order_line" => assert_eq!(expected, 300_000),
@@ -1068,7 +1068,7 @@ mod tests {
                 "warehouse" => assert_eq!(expected, 10),
                 "district" => assert_eq!(expected, 100),
                 "customer" => assert_eq!(expected, 300_000),
-                "history" => assert_eq!(expected, 300_000),
+                "hist" => assert_eq!(expected, 300_000),
                 "orders" => assert_eq!(expected, 300_000),
                 "new_order" => assert_eq!(expected, 90_000),
                 "order_line" => assert_eq!(expected, 3_000_000),
