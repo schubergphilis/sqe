@@ -26,9 +26,7 @@ use clap::Parser;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    eprintln!("[sqe-bench] starting...");
     let cli = cli::Cli::parse();
-    eprintln!("[sqe-bench] parsed CLI args");
     match cli.command {
         cli::Command::Generate {
             benchmark,
@@ -122,7 +120,9 @@ async fn main() -> anyhow::Result<()> {
                 cli::Protocol::Http => "trino",
             };
             let endpoint = format!("http://{host}:{port}");
-            eprintln!("[sqe-bench] connecting to {endpoint} via {protocol_str}...");
+            if std::env::var("BENCH_DEBUG").is_ok() {
+                eprintln!("[sqe-bench] connecting to {endpoint} via {protocol_str}...");
+            }
             let bench_client = client::create_client(
                 protocol_str,
                 &endpoint,
@@ -133,7 +133,9 @@ async fn main() -> anyhow::Result<()> {
                 client_secret.as_deref(),
             )
             .await?;
-            eprintln!("[sqe-bench] connected, running tests...");
+            if std::env::var("BENCH_DEBUG").is_ok() {
+                eprintln!("[sqe-bench] connected, running tests...");
+            }
 
             let results = test::run_benchmark_test(
                 bench_client.as_ref(),
