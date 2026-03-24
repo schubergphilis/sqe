@@ -238,25 +238,101 @@ fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> String {
     // Longest first to prevent "part" matching inside "partsupp"
     tables.sort_by_key(|t| std::cmp::Reverse(t.len()));
 
-    let mut result = sql.to_string();
-    for table in &tables {
-        // Skip tables that are already qualified (contain a dot before them)
-        // We replace the most common boundary patterns: surrounding whitespace,
-        // comma, newline, tab.
-        let qualified = format!("{namespace}.{table}");
-        for (pat, rep) in [
-            (format!(" {table} "), format!(" {qualified} ")),
-            (format!(" {table}\n"), format!(" {qualified}\n")),
-            (format!(" {table},"), format!(" {qualified},")),
-            (format!(" {table}\t"), format!(" {qualified}\t")),
-            (format!(" {table})"), format!(" {qualified})")),
-            (format!("\n{table} "), format!("\n{qualified} ")),
-            (format!("\n{table}\n"), format!("\n{qualified}\n")),
-            (format!("\n{table},"), format!("\n{qualified},")),
-        ] {
-            result = result.replace(&pat, &rep);
+    // Build a set for O(1) lookup
+    let table_set: std::collections::HashSet<String> =
+        tables.iter().map(|t| t.to_lowercase()).collect();
+
+    // Tokenize by whitespace/punctuation boundaries and only qualify table names
+    // that appear after SQL keywords (FROM, JOIN, TABLE, INTO, EXISTS, UPDATE).
+    let sql_keywords = [
+        "from", "join", "table", "into", "exists", "update",
+        "inner", "left", "right", "full", "cross", "natural",
+    ];
+
+    let mut result = String::with_capacity(sql.len() * 2);
+    let mut after_from_keyword = false;
+
+    for line in sql.lines() {
+        if !result.is_empty() {
+            result.push('\n');
+        }
+
+        // Split line into tokens preserving whitespace
+        let mut i = 0;
+        let chars: Vec<char> = line.chars().collect();
+
+        while i < chars.len() {
+            // Skip whitespace
+            if chars[i].is_whitespace() {
+                result.push(chars[i]);
+                i += 1;
+                continue;
+            }
+
+            // Skip punctuation (commas, parens, etc.)
+            if !chars[i].is_alphanumeric() && chars[i] != '_' && chars[i] != '"' {
+                result.push(chars[i]);
+                i += 1;
+                continue;
+            }
+
+            // Read a word (identifier)
+            let start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            let lower = word.to_lowercase();
+
+            // Check if this word is a SQL keyword that precedes table names
+            if sql_keywords.contains(&lower.as_str()) {
+                after_from_keyword = true;
+                result.push_str(&word);
+                continue;
+            }
+
+            // If we're after a FROM/JOIN keyword and this word is a known table name,
+            // qualify it with the namespace
+            if after_from_keyword && table_set.contains(&lower) {
+                // Check it's not already qualified (preceded by a dot)
+                let already_qualified = result.ends_with('.');
+                if already_qualified {
+                    result.push_str(&word);
+                } else {
+                    result.push_str(&format!("{namespace}.{word}"));
+                }
+                // Stay in after_from_keyword mode for comma-separated table lists
+                // (FROM t1, t2, t3 — all need qualifying)
+            } else {
+                // Regular word — could be a column, alias, keyword, etc.
+                result.push_str(&word);
+                // After a non-table word following FROM, keep looking for more tables
+                // (comma-separated table lists: FROM t1, t2, t3)
+                // Reset after hitting keywords like WHERE, ON, GROUP, etc.
+                let reset_keywords = [
+                    "where", "on", "group", "order", "having", "limit",
+                    "select", "set", "values", "as", "and", "or", "when",
+                    "then", "else", "end", "case", "with", "union", "except",
+                    "intersect",
+                ];
+                if reset_keywords.contains(&lower.as_str()) {
+                    after_from_keyword = false;
+                }
+            }
         }
     }
+
+    // Handle comma-separated table lists in FROM clauses:
+    // After qualifying one table, if a comma follows, the next identifier
+    // should also be checked. The above logic handles this because
+    // after_from_keyword stays true until a reset keyword is hit.
+    // But we need to re-enable it after commas in FROM lists.
+    // Let's do a second pass for comma-separated FROM tables.
+
+    // Actually, the above should work because after_from_keyword persists
+    // across commas (commas are punctuation, not reset keywords).
+    // Let's verify with tests.
+
     result
 }
 
@@ -315,7 +391,7 @@ mod tests {
 
     #[test]
     fn prefix_tables_qualifies_tpch_tables() {
-        let sql = " lineitem WHERE l_shipdate > DATE '1998-01-01'";
+        let sql = "SELECT * FROM lineitem WHERE l_shipdate > DATE '1998-01-01'";
         let result = prefix_tables(sql, "tpch_sf1", "tpch");
         assert!(
             result.contains("tpch_sf1.lineitem"),
@@ -325,8 +401,8 @@ mod tests {
 
     #[test]
     fn prefix_tables_longest_first_no_partial() {
-        // "partsupp" must be prefixed before "part" to avoid "tpch_sf1.parttpch_sf1.supp"
-        let sql = " partsupp , part WHERE ps_partkey = p_partkey";
+        // "partsupp" must be prefixed before "part" to avoid partial match
+        let sql = "SELECT * FROM partsupp, part WHERE ps_partkey = p_partkey";
         let result = prefix_tables(sql, "tpch_sf1", "tpch");
         assert!(
             result.contains("tpch_sf1.partsupp"),
@@ -342,5 +418,28 @@ mod tests {
             !result.contains("tpch_sf1.tpch_sf1"),
             "double-qualified: {result}"
         );
+    }
+
+    #[test]
+    fn prefix_tables_does_not_qualify_aliases() {
+        let sql = "SELECT cc_call_center_id AS call_center FROM call_center WHERE 1=1";
+        let result = prefix_tables(sql, "tpcds_sf1", "tpcds");
+        assert!(
+            result.contains("FROM tpcds_sf1.call_center"),
+            "FROM table should be qualified: {result}"
+        );
+        assert!(
+            result.contains("AS call_center"),
+            "alias should not be qualified: {result}"
+        );
+    }
+
+    #[test]
+    fn prefix_tables_comma_list() {
+        let sql = "FROM catalog_returns, call_center, customer WHERE 1=1";
+        let result = prefix_tables(sql, "tpcds_sf1", "tpcds");
+        assert!(result.contains("tpcds_sf1.catalog_returns"), "catalog_returns: {result}");
+        assert!(result.contains("tpcds_sf1.call_center"), "call_center: {result}");
+        assert!(result.contains("tpcds_sf1.customer"), "customer: {result}");
     }
 }
