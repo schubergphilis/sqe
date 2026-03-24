@@ -1,6 +1,9 @@
+pub mod clickbench;
 pub mod parquet_writer;
 pub mod ssb;
+pub mod tpcc;
 pub mod tpch;
+pub mod tpcbb;
 
 use arrow_schema::SchemaRef;
 use std::time::Duration;
@@ -15,6 +18,7 @@ pub struct TableDef {
 }
 
 #[allow(dead_code)]
+#[derive(Debug)]
 pub struct GenerateStats {
     pub table: String,
     pub rows: usize,
@@ -39,6 +43,11 @@ pub fn get_generator(name: &str) -> anyhow::Result<Box<dyn BenchmarkGenerator>> 
     match name {
         "tpch" => Ok(Box::new(tpch::TpchGenerator)),
         "ssb" => Ok(Box::new(ssb::SsbGenerator)),
-        _ => anyhow::bail!("Unknown benchmark: {name}. Supported: tpch, ssb"),
+        "tpcc" => Ok(Box::new(tpcc::TpccGenerator)),
+        "tpcbb" => Ok(Box::new(tpcbb::TpcbbGenerator)),
+        "clickbench" => Ok(Box::new(clickbench::ClickBenchGenerator)),
+        _ => anyhow::bail!(
+            "Unknown benchmark: {name}. Supported: tpch, ssb, tpcc, tpcbb, clickbench"
+        ),
     }
 }
