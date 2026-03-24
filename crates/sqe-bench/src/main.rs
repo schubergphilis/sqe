@@ -1,10 +1,10 @@
 mod cli;
 mod client;
+mod compare;
 mod generate;
-// mod load;
-// mod test;
-// mod compare;
-// mod report;
+mod load;
+mod report;
+mod test;
 
 use clap::Parser;
 
@@ -33,7 +33,92 @@ async fn main() -> anyhow::Result<()> {
             println!("Done.");
             Ok(())
         }
-        cli::Command::Load { .. } => todo!("load command not yet implemented"),
-        cli::Command::Test { .. } => todo!("test command not yet implemented"),
+
+        cli::Command::Load {
+            benchmark,
+            scale,
+            data,
+            protocol,
+            host,
+            port,
+            clean,
+            s3_endpoint,
+            s3_access_key,
+            s3_secret_key,
+            s3_region,
+            username,
+            password,
+            ..
+        } => {
+            let protocol_str = match protocol {
+                cli::Protocol::Flight => "flight",
+                cli::Protocol::Http => "trino",
+            };
+            let endpoint = format!("http://{host}:{port}");
+            let bench_client = client::create_client(
+                protocol_str,
+                &endpoint,
+                username.as_deref(),
+                password.as_deref(),
+            )
+            .await?;
+
+            let s3_args = load::S3Args {
+                access_key: s3_access_key,
+                secret_key: s3_secret_key,
+                endpoint: s3_endpoint,
+                region: s3_region,
+            };
+
+            load::load_benchmark(
+                bench_client.as_ref(),
+                &benchmark,
+                scale,
+                &data,
+                &s3_args,
+                clean,
+            )
+            .await
+        }
+
+        cli::Command::Test {
+            benchmark,
+            scale,
+            protocol,
+            host,
+            port,
+            query,
+            username,
+            password,
+        } => {
+            let protocol_str = match protocol {
+                cli::Protocol::Flight => "flight",
+                cli::Protocol::Http => "trino",
+            };
+            let endpoint = format!("http://{host}:{port}");
+            let bench_client = client::create_client(
+                protocol_str,
+                &endpoint,
+                username.as_deref(),
+                password.as_deref(),
+            )
+            .await?;
+
+            let results = test::run_benchmark_test(
+                bench_client.as_ref(),
+                &benchmark,
+                scale,
+                query.as_deref(),
+            )
+            .await?;
+
+            report::print_summary(&benchmark, scale, protocol_str, &results);
+
+            let report_path =
+                report::write_json_report(&benchmark, scale, protocol_str, &results)?;
+            println!("\nReport written to: {report_path}");
+
+            Ok(())
+        }
     }
 }
