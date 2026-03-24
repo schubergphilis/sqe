@@ -3,6 +3,21 @@ mod client;
 mod compare;
 mod generate;
 mod load;
+
+/// Format a scale factor as an identifier-safe string (no dots).
+/// 0.01 → "0_01", 1.0 → "1", 10.0 → "10"
+pub fn format_scale(scale: f64) -> String {
+    if scale == scale.floor() {
+        format!("{}", scale as u64)
+    } else {
+        format!("{scale}").replace('.', "_")
+    }
+}
+
+/// Build the namespace name for a benchmark at a given scale factor.
+pub fn bench_namespace(benchmark: &str, scale: f64) -> String {
+    format!("{}_sf{}", benchmark, format_scale(scale))
+}
 mod report;
 mod test;
 

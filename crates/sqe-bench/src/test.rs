@@ -138,7 +138,7 @@ pub async fn run_benchmark_test(
     scale: f64,
     query_filter: Option<&str>,
 ) -> anyhow::Result<Vec<QueryResult>> {
-    let namespace = format!("{}_sf{}", benchmark, scale);
+    let namespace = crate::bench_namespace(benchmark, scale);
     let queries = load_query_files(benchmark)?;
     let mut results = Vec::new();
 
