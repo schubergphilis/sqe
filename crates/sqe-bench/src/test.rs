@@ -300,9 +300,23 @@ fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> String {
             }
 
             // Skip punctuation (commas, parens, etc.)
-            if !chars[i].is_alphanumeric() && chars[i] != '_' && chars[i] != '"' {
-                result.push(chars[i]);
-                i += 1;
+            if !chars[i].is_alphanumeric() && chars[i] != '_' {
+                // Handle quoted identifiers ("30 days", "column name")
+                if chars[i] == '"' {
+                    result.push(chars[i]);
+                    i += 1;
+                    while i < chars.len() && chars[i] != '"' {
+                        result.push(chars[i]);
+                        i += 1;
+                    }
+                    if i < chars.len() {
+                        result.push(chars[i]); // closing quote
+                        i += 1;
+                    }
+                } else {
+                    result.push(chars[i]);
+                    i += 1;
+                }
                 continue;
             }
 
