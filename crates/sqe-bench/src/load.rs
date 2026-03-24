@@ -16,7 +16,7 @@ pub async fn load_benchmark(
     s3_args: &S3Args,
     clean: bool,
 ) -> anyhow::Result<()> {
-    let namespace = format!("{}_sf{}", benchmark, scale);
+    let namespace = crate::bench_namespace(benchmark, scale);
     let gen = generate::get_generator(benchmark)?;
 
     println!("Loading {benchmark} SF{scale} into namespace {namespace}");
