@@ -256,8 +256,9 @@ fn normalize_query_id(id: &str) -> String {
 /// Replace unqualified table names in the query SQL with
 /// `<namespace>.<table>` qualified names.
 ///
-/// Tables are processed longest-name-first to avoid partial replacements
-/// (e.g. "partsupp" must be handled before "part").
+/// Uses word-boundary matching: a table name is qualified when it appears
+/// as a standalone word (not preceded/followed by `_` or `.`).
+/// Tables are processed longest-name-first to avoid partial replacements.
 fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> String {
     let gen = match crate::generate::get_generator(benchmark) {
         Ok(g) => g,
@@ -268,114 +269,62 @@ fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> String {
     // Longest first to prevent "part" matching inside "partsupp"
     tables.sort_by_key(|t| std::cmp::Reverse(t.len()));
 
-    // Build a set for O(1) lookup
-    let table_set: std::collections::HashSet<String> =
-        tables.iter().map(|t| t.to_lowercase()).collect();
+    let mut result = sql.to_string();
 
-    // Tokenize by whitespace/punctuation boundaries and only qualify table names
-    // that appear after SQL keywords (FROM, JOIN, TABLE, INTO, EXISTS, UPDATE).
-    let sql_keywords = [
-        "from", "join", "table", "into", "exists", "update",
-        "inner", "left", "right", "full", "cross", "natural",
-    ];
+    for table in &tables {
+        let qualified = format!("{namespace}.{table}");
+        let mut output = String::with_capacity(result.len() + 256);
+        let mut remaining = result.as_str();
 
-    let mut result = String::with_capacity(sql.len() * 2);
-    let mut after_from_keyword = false;
-
-    for line in sql.lines() {
-        if !result.is_empty() {
-            result.push('\n');
-        }
-
-        // Split line into tokens preserving whitespace
-        let mut i = 0;
-        let chars: Vec<char> = line.chars().collect();
-
-        while i < chars.len() {
-            // Skip whitespace
-            if chars[i].is_whitespace() {
-                result.push(chars[i]);
-                i += 1;
-                continue;
-            }
-
-            // Skip punctuation (commas, parens, etc.)
-            if !chars[i].is_alphanumeric() && chars[i] != '_' {
-                // Handle quoted identifiers ("30 days", "column name")
-                if chars[i] == '"' {
-                    result.push(chars[i]);
-                    i += 1;
-                    while i < chars.len() && chars[i] != '"' {
-                        result.push(chars[i]);
-                        i += 1;
-                    }
-                    if i < chars.len() {
-                        result.push(chars[i]); // closing quote
-                        i += 1;
-                    }
-                } else {
-                    result.push(chars[i]);
-                    i += 1;
-                }
-                continue;
-            }
-
-            // Read a word (identifier)
-            let start = i;
-            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
-                i += 1;
-            }
-            let word: String = chars[start..i].iter().collect();
-            let lower = word.to_lowercase();
-
-            // Check if this word is a SQL keyword that precedes table names
-            if sql_keywords.contains(&lower.as_str()) {
-                after_from_keyword = true;
-                result.push_str(&word);
-                continue;
-            }
-
-            // If we're after a FROM/JOIN keyword and this word is a known table name,
-            // qualify it with the namespace
-            if after_from_keyword && table_set.contains(&lower) {
-                // Check it's not already qualified (preceded by a dot)
-                let already_qualified = result.ends_with('.');
-                if already_qualified {
-                    result.push_str(&word);
-                } else {
-                    result.push_str(&format!("{namespace}.{word}"));
-                }
-                // Stay in after_from_keyword mode for comma-separated table lists
-                // (FROM t1, t2, t3 — all need qualifying)
+        while let Some(pos) = remaining.find(table.as_str()) {
+            // Check character before the match (word boundary)
+            let before_ok = if pos == 0 {
+                true
             } else {
-                // Regular word — could be a column, alias, keyword, etc.
-                result.push_str(&word);
-                // After a non-table word following FROM, keep looking for more tables
-                // (comma-separated table lists: FROM t1, t2, t3)
-                // Reset after hitting keywords like WHERE, ON, GROUP, etc.
-                let reset_keywords = [
-                    "where", "on", "group", "order", "having", "limit",
-                    "select", "set", "values", "as", "and", "or", "when",
-                    "then", "else", "end", "case", "with", "union", "except",
-                    "intersect",
-                ];
-                if reset_keywords.contains(&lower.as_str()) {
-                    after_from_keyword = false;
+                let before = remaining.as_bytes()[pos - 1];
+                // Not preceded by alphanumeric, underscore, or dot
+                !before.is_ascii_alphanumeric() && before != b'_' && before != b'.'
+            };
+
+            // Check character after the match
+            let end = pos + table.len();
+            let after_ok = if end >= remaining.len() {
+                true
+            } else {
+                let after = remaining.as_bytes()[end];
+                // Not followed by alphanumeric or underscore (would be part of a longer identifier)
+                !after.is_ascii_alphanumeric() && after != b'_'
+            };
+
+            if before_ok && after_ok {
+                // Skip if preceded by "AS " (this is an alias, not a table ref)
+                let before_str = &remaining[..pos];
+                let trimmed_before = before_str.trim_end();
+                if trimmed_before.to_uppercase().ends_with(" AS") {
+                    output.push_str(&remaining[..end]);
+                    remaining = &remaining[end..];
+                    continue;
+                }
+
+                // Check it's not inside a quoted string (simple heuristic:
+                // count double quotes before this position — odd means inside quotes)
+                let quotes_before = remaining[..pos].matches('"').count();
+                if quotes_before % 2 == 0 {
+                    output.push_str(&remaining[..pos]);
+                    output.push_str(&qualified);
+                    remaining = &remaining[end..];
+                    continue;
                 }
             }
+
+            // Not a match — copy up to and including the found text, continue searching
+            output.push_str(&remaining[..end]);
+            remaining = &remaining[end..];
         }
+
+        output.push_str(remaining);
+        result = output;
     }
-
-    // Handle comma-separated table lists in FROM clauses:
-    // After qualifying one table, if a comma follows, the next identifier
-    // should also be checked. The above logic handles this because
-    // after_from_keyword stays true until a reset keyword is hit.
-    // But we need to re-enable it after commas in FROM lists.
-    // Let's do a second pass for comma-separated FROM tables.
-
-    // Actually, the above should work because after_from_keyword persists
-    // across commas (commas are punctuation, not reset keywords).
-    // Let's verify with tests.
 
     result
 }
