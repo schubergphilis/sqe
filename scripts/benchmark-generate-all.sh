@@ -38,7 +38,7 @@ FAIL=0
 
 for BENCH in "${BENCHMARKS[@]}"; do
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "  Generating: ${BENCH^^} (SF${BENCH_SCALE})"
+    echo "  Generating: $(echo "$BENCH" | tr '[:lower:]' '[:upper:]') (SF${BENCH_SCALE})"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     TOTAL=$((TOTAL + 1))
     START=$(date +%s)
@@ -56,10 +56,10 @@ for BENCH in "${BENCHMARKS[@]}"; do
             FILES=0
             SIZE="0"
         fi
-        echo "  ✓ ${BENCH^^}: ${FILES} files, ${SIZE}, $((END - START))s"
+        echo "  ✓ $(echo "$BENCH" | tr '[:lower:]' '[:upper:]'): ${FILES} files, ${SIZE}, $((END - START))s"
         PASS=$((PASS + 1))
     else
-        echo "  ✗ ${BENCH^^}: FAILED"
+        echo "  ✗ $(echo "$BENCH" | tr '[:lower:]' '[:upper:]'): FAILED"
         FAIL=$((FAIL + 1))
     fi
     echo ""
