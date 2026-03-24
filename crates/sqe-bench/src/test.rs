@@ -177,8 +177,28 @@ pub async fn run_benchmark_test(
             eprintln!("[bench] SQL:\n{sql}\n---");
         }
 
+        let timeout_secs = query.timeout_secs.max(60);
         let start = std::time::Instant::now();
-        match client.execute(&sql).await {
+        let execute_result = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            client.execute(&sql),
+        ).await;
+
+        let execute_result = match execute_result {
+            Ok(inner) => inner,
+            Err(_) => {
+                results.push(QueryResult {
+                    id: query.id.clone(),
+                    status: TestStatus::Error(format!("Timed out after {timeout_secs}s")),
+                    duration: start.elapsed(),
+                    rows: 0,
+                });
+                eprintln!("[bench] {} TIMEOUT after {}s", query.id, timeout_secs);
+                continue;
+            }
+        };
+
+        match execute_result {
             Ok(batches) => {
                 let duration = start.elapsed();
                 let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
