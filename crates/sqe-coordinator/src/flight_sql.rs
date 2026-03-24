@@ -138,12 +138,13 @@ impl SqeFlightSqlService {
         batches: Vec<RecordBatch>,
     ) -> Result<Response<FlightStream>, Status> {
         if batches.is_empty() {
-            let schema = Arc::new(Schema::empty());
-            let stream = FlightDataEncoderBuilder::new()
-                .with_schema(schema)
-                .build(futures::stream::empty())
-                .map_err(Status::from);
-            return Ok(Response::new(Box::pin(stream)));
+            // Return an empty stream with a proper schema.
+            // Using Schema::empty() here caused clients to hang because
+            // get_flight_info sends the real query schema but do_get sent
+            // a 0-column schema, confusing the FlightRecordBatchStream decoder.
+            let stream = futures::stream::empty();
+            let flight_stream: FlightStream = Box::pin(stream);
+            return Ok(Response::new(flight_stream));
         }
 
         let schema = batches[0].schema();
