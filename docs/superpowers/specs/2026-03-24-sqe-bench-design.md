@@ -23,15 +23,22 @@ Generates Parquet data files for a benchmark at the given scale factor.
 
 ### `load`
 
-Creates Iceberg tables from generated Parquet files via SQE's write path.
+Creates Iceberg tables from generated Parquet files via `read_parquet()` + CTAS.
 
 - **Input:** benchmark name, scale factor, data path, connection details
 - **Process:**
   1. Connect to SQE via Flight SQL or Trino HTTP
   2. Create namespace `<benchmark>_sf<N>` (e.g., `tpch_sf1`)
-  3. For each table: `CREATE TABLE AS SELECT * FROM '<parquet-path>'`
-  4. If `--clean`: drop existing tables first
-- **Depends on:** SQE supporting CTAS from external Parquet files (or INSERT from generated data)
+  3. If `--clean`: drop existing tables first
+  4. For each table, send SQL:
+     ```sql
+     CREATE TABLE <ns>.<table> AS
+     SELECT * FROM read_parquet('<data-path>/<benchmark>/sf<N>/<table>/*.parquet',
+       access_key => '...', secret_key => '...', endpoint => '...', region => '...')
+     ```
+  5. For local paths: `read_parquet('/abs/path/to/<table>/*.parquet')`
+- **Credentials:** passed via `--s3-access-key`, `--s3-secret-key`, `--s3-endpoint`, `--s3-region` CLI flags (injected into SQL). For local paths, no credentials needed.
+- **Depends on:** `read_parquet()` TVF in SQE (see prerequisite section)
 
 ### `test`
 
@@ -57,6 +64,41 @@ Runs the query suite and validates results against expected output.
 | `tpcc` | 9 | 5 tx types | OLTP | Read queries now, writes when DELETE/MERGE land |
 | `tpce` | 33 | 10 tx types | OLTP | Read queries now, writes when DELETE/MERGE land |
 | `tpcbb` | ~25 | 10 (SQL-only) | Mixed | Reuses TPC-DS data + web logs, skips ML/UDF queries |
+
+## Prerequisite: `read_parquet` Table-Valued Function
+
+The `load` command depends on a `read_parquet()` TVF in SQE that reads Parquet files from local filesystem or S3 and returns them as a DataFusion table scan. This enables:
+
+```sql
+-- Local file
+CREATE TABLE tpch_sf1.lineitem AS
+SELECT * FROM read_parquet('/data/tpch/sf1/lineitem/*.parquet');
+
+-- S3 with inline credentials
+CREATE TABLE tpch_sf1.lineitem AS
+SELECT * FROM read_parquet(
+  's3://bench-data/tpch/sf1/lineitem/*.parquet',
+  access_key => 'AKIA...',
+  secret_key => '...',
+  endpoint => 'http://localhost:9000',
+  region => 'us-east-1'
+);
+
+-- S3 with default credentials (falls back to sqe.toml storage config)
+CREATE TABLE tpch_sf1.lineitem AS
+SELECT * FROM read_parquet('s3://bench-data/tpch/sf1/lineitem/*.parquet');
+```
+
+### Implementation
+
+Register a DataFusion `TableFunction` that:
+1. Parses the path argument (detect `s3://` vs local `file://` / absolute path)
+2. For S3: builds an `AmazonS3Builder` from inline named args (`access_key`, `secret_key`, `endpoint`, `region`) with fallback to `StorageConfig` defaults
+3. For local: uses DataFusion's built-in local filesystem `ObjectStore`
+4. Supports glob patterns (`*.parquet`, `**/*.parquet`)
+5. Returns a `ListingTable` scan over the matched Parquet files
+
+This lives in `sqe-catalog` or a new `sqe-functions` crate and is registered on every `SessionContext` during query planning.
 
 ## Data Generation
 
@@ -280,10 +322,11 @@ From workspace (already available):
 
 ## Implementation Priority
 
-1. **Phase 1: TPC-H + SSB** — Simplest schemas, well-understood queries, validates the full pipeline (generate → load → test)
-2. **Phase 2: TPC-DS** — More complex SQL (correlated subqueries, window functions, CTEs), larger schema
-3. **Phase 3: TPC-C + TPC-E** — Schema + data generation, read-only queries now, write queries behind feature flag
-4. **Phase 4: TPC-BB** — Extends TPC-DS with semi-structured data, SQL-only subset
+1. **Phase 0: `read_parquet()` TVF** — Prerequisite for the `load` command. Inline S3 credentials + local file support.
+2. **Phase 1: TPC-H + SSB** — Simplest schemas, well-understood queries, validates the full pipeline (generate → load → test)
+3. **Phase 2: TPC-DS** — More complex SQL (correlated subqueries, window functions, CTEs), larger schema
+4. **Phase 3: TPC-C + TPC-E** — Schema + data generation, read-only queries now, write queries behind feature flag
+5. **Phase 4: TPC-BB** — Extends TPC-DS with semi-structured data, SQL-only subset
 
 ## Success Criteria
 
