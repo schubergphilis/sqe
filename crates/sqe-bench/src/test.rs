@@ -304,10 +304,37 @@ fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> String {
             };
 
             if before_ok && after_ok {
-                // Skip if preceded by "AS " (this is an alias, not a table ref)
                 let before_str = &remaining[..pos];
                 let trimmed_before = before_str.trim_end();
-                if trimmed_before.to_uppercase().ends_with(" AS") {
+                let upper_before = trimmed_before.to_uppercase();
+
+                // Skip if preceded by "AS " (this is an alias, not a table ref)
+                if upper_before.ends_with(" AS") {
+                    output.push_str(&remaining[..end]);
+                    remaining = &remaining[end..];
+                    continue;
+                }
+
+                // Only qualify if preceded by a table-introducing context:
+                // FROM, JOIN, TABLE, INTO, UPDATE, or comma (for FROM t1, t2 lists)
+                let in_table_context = upper_before.ends_with(" FROM")
+                    || upper_before.ends_with(" JOIN")
+                    || upper_before.ends_with(" TABLE")
+                    || upper_before.ends_with(" INTO")
+                    || upper_before.ends_with(" UPDATE")
+                    || upper_before.ends_with(" EXISTS")
+                    || trimmed_before.ends_with(',')
+                    // Also handle newline after FROM/JOIN (table on next line)
+                    || {
+                        // Look back past whitespace for a keyword
+                        let words: Vec<&str> = trimmed_before.split_whitespace().collect();
+                        words.last().map(|w| {
+                            let u = w.to_uppercase();
+                            u == "FROM" || u == "JOIN" || u == "TABLE" || u == "INTO"
+                        }).unwrap_or(false)
+                    };
+
+                if !in_table_context {
                     output.push_str(&remaining[..end]);
                     remaining = &remaining[end..];
                     continue;
