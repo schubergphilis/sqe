@@ -12,6 +12,7 @@ members = [
     "crates/sqe-trino-compat",
     "crates/sqe-metrics",
     "crates/sqe-cli",
+    "crates/sqe-bench",
 ]
 
 [workspace.dependencies]
@@ -78,6 +79,13 @@ opentelemetry-appender-tracing = "0.31"
 # Error handling
 thiserror = "2"
 anyhow = "1"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Data generation
+csv = "1"
+rand = "0.8"
 
 # Misc
 async-trait = "0.1"
