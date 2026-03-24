@@ -383,6 +383,16 @@ impl QueryHandler {
 
         ctx.register_catalog(&catalog_name, Arc::new(catalog_provider));
 
+        // Register the read_parquet() table-valued function so users can
+        // query external Parquet files directly from SQL:
+        //   SELECT * FROM read_parquet('s3://bucket/path/*.parquet', ...)
+        ctx.register_udtf(
+            "read_parquet",
+            Arc::new(sqe_catalog::read_parquet::ReadParquetFunction::new(
+                self.config.storage.clone(),
+            )),
+        );
+
         debug!(
             catalog_name = %catalog_name,
             username = %session.user.username,
