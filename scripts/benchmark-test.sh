@@ -22,13 +22,13 @@ BENCH_SCALE="${BENCH_SCALE:-1}"
 BENCH_PROTOCOL="${BENCH_PROTOCOL:-flight}"
 BENCH_DATA_DIR="${BENCH_DATA_DIR:-/tmp/sqe-bench-data}"
 BENCH_HOST="localhost"
-BENCH_PORT_FLIGHT="50051"
-BENCH_PORT_TRINO="8080"
+BENCH_PORT_FLIGHT="60051"
+BENCH_PORT_TRINO="18080"
 
 # S3 credentials (match test stack)
 S3_ACCESS_KEY="${S3_ACCESS_KEY:-s3admin}"
 S3_SECRET_KEY="${S3_SECRET_KEY:-s3admin}"
-S3_ENDPOINT="${S3_ENDPOINT:-http://localhost:9000}"
+S3_ENDPOINT="${S3_ENDPOINT:-http://localhost:19000}"
 S3_REGION="${S3_REGION:-us-east-1}"
 
 # Auth credentials (match test stack)
@@ -93,7 +93,7 @@ SQE_PID=$!
 # Wait for coordinator to be ready
 echo -n "Waiting for SQE coordinator (may take a while on first build)..."
 for i in $(seq 1 300); do
-    if curl -so /dev/null "http://localhost:8080/v1/info" 2>/dev/null; then
+    if curl -so /dev/null "http://localhost:18080/v1/info" 2>/dev/null; then
         echo " ready (PID $SQE_PID)"
         break
     fi
