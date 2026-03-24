@@ -117,7 +117,7 @@ async fn build_channel(host: &str) -> anyhow::Result<Channel> {
 #[async_trait::async_trait]
 impl super::BenchClient for FlightSqlBenchClient {
     async fn execute(&self, sql: &str) -> anyhow::Result<Vec<RecordBatch>> {
-        // Acquire the lock, call execute, then release before looping over endpoints.
+        eprintln!("[flight] get_flight_info...");
         let flight_info = {
             let mut guard = self.client.lock().await;
             guard
@@ -125,15 +125,17 @@ impl super::BenchClient for FlightSqlBenchClient {
                 .await
                 .map_err(|e| anyhow::anyhow!("Query failed: {e}"))?
         };
+        eprintln!("[flight] got {} endpoints", flight_info.endpoint.len());
 
         let mut batches = Vec::new();
 
-        for endpoint in flight_info.endpoint {
+        for (i, endpoint) in flight_info.endpoint.iter().enumerate() {
             let ticket = endpoint
                 .ticket
+                .clone()
                 .ok_or_else(|| anyhow::anyhow!("Flight endpoint returned no ticket"))?;
 
-            // Re-acquire the lock for each do_get call; release between iterations.
+            eprintln!("[flight] do_get endpoint {i}...");
             let stream = {
                 let mut guard = self.client.lock().await;
                 guard
@@ -142,11 +144,13 @@ impl super::BenchClient for FlightSqlBenchClient {
                     .map_err(|e| anyhow::anyhow!("do_get failed: {e}"))?
             };
 
+            eprintln!("[flight] collecting batches from endpoint {i}...");
             let endpoint_batches: Vec<RecordBatch> = stream
                 .try_collect()
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to collect record batches: {e}"))?;
 
+            eprintln!("[flight] got {} batches from endpoint {i}", endpoint_batches.len());
             batches.extend(endpoint_batches);
         }
 
