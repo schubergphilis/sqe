@@ -75,7 +75,7 @@ SQE_LOG_FILE="$(mktemp /tmp/sqe-bench-coord-XXXXXX.log)"
 SQE_CONFIG="$ROOT_DIR/tests/sqe-test.toml"
 
 RUST_LOG="${RUST_LOG:-sqe=info,warn}" \
-    cargo run -p sqe-coordinator --release -- --config "$SQE_CONFIG" \
+    cargo run -p sqe-coordinator --release --bin sqe-coordinator -- --config "$SQE_CONFIG" \
     > "$SQE_LOG_FILE" 2>&1 &
 SQE_PID=$!
 
