@@ -416,6 +416,7 @@ where
         let mut cols: Vec<Vec<ColVal>> = (0..ncols).map(|_| Vec::with_capacity(n)).collect();
         for i in 0..n {
             let row = build_row(offset + i, &mut rng);
+            assert_eq!(row.len(), ncols, "Row {} has {} values but schema has {} columns", offset + i, row.len(), ncols);
             for (c, v) in row.into_iter().enumerate() {
                 cols[c].push(v);
             }
@@ -544,7 +545,7 @@ fn generate_catalog_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             i!(rng.gen_range(1..18_000i32)), i!(rng.gen_range(1..300i32)),
             i!((row + 1) as i32), i!(qty), f!(wc), f!(lp), f!(sp),
             f!(0.0), f!(sp * qty as f64), f!(wc * qty as f64), f!(lp * qty as f64),
-            f!(tax), f!(ship), f!(sp * qty as f64),
+            f!(tax), f!(0.0), f!(ship), f!(sp * qty as f64),
             f!(sp * qty as f64 + tax), f!(sp * qty as f64 + ship),
             f!(sp * qty as f64 + ship + tax), f!(sp * qty as f64 - wc * qty as f64),
         ]
@@ -593,7 +594,7 @@ fn generate_web_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             i!(rng.gen_range(1..5i32)), i!(rng.gen_range(1..300i32)),
             i!((row + 1) as i32), i!(qty), f!(wc), f!(lp), f!(sp),
             f!(0.0), f!(sp * qty as f64), f!(wc * qty as f64), f!(lp * qty as f64),
-            f!(tax), f!(ship), f!(sp * qty as f64),
+            f!(tax), f!(0.0), f!(ship), f!(sp * qty as f64),
             f!(sp * qty as f64 + tax), f!(sp * qty as f64 + ship),
             f!(sp * qty as f64 + ship + tax), f!(sp * qty as f64 - wc * qty as f64),
         ]
