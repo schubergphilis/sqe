@@ -26,7 +26,6 @@ use arrow_flight::{
     Action, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest,
     HandshakeResponse, Ticket,
 };
-use arrow_schema::Schema;
 use base64::Engine;
 use futures::{Stream, TryStreamExt, stream};
 use prost::Message;
