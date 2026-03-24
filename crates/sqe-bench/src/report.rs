@@ -67,11 +67,17 @@ pub fn print_summary(benchmark: &str, scale: f64, protocol: &str, results: &[Que
     }
 
     let (pass, fail, diff, skip, error, total_ms) = count_results(results);
+    let total = results.len();
 
     println!();
     println!(
         "Results: {pass} pass, {fail} fail, {diff} diff, {skip} skip, {error} error  (total {:.1}s)",
         total_ms as f64 / 1_000.0
+    );
+
+    // Machine-readable summary line for shell script parsing
+    println!(
+        "BENCH_SUMMARY:{benchmark}:{pass}:{fail}:{diff}:{skip}:{error}:{total}:{total_ms}"
     );
 }
 

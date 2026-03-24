@@ -133,6 +133,8 @@ TOTAL_FAIL=0
 TOTAL_SKIP=0
 TOTAL_ERROR=0
 RESULTS=()
+# Collect per-benchmark summary lines: "name:pass:fail:diff:skip:error:total:ms"
+SUMMARIES=()
 
 for BENCH in "${BENCHMARKS[@]}"; do
     echo ""
@@ -184,25 +186,27 @@ for BENCH in "${BENCHMARKS[@]}"; do
     echo ""
     echo "  [3/3] Running queries..."
     TEST_START=$(date +%s)
-    if "$BENCH_BIN" test "$BENCH" \
+    TEST_OUTPUT=$("$BENCH_BIN" test "$BENCH" \
         --scale "$BENCH_SCALE" \
         --protocol "$BENCH_PROTOCOL" \
         --host "$BENCH_HOST" \
         --port "$BENCH_PORT" \
         --username "$SQE_USERNAME" \
-        --password "$SQE_PASSWORD" 2>&1; then
-        TEST_EXIT=0
-    else
-        TEST_EXIT=$?
-    fi
+        --password "$SQE_PASSWORD" 2>&1) || true
     TEST_END=$(date +%s)
-    echo "  Completed in $((TEST_END - TEST_START))s"
 
-    if [ $TEST_EXIT -eq 0 ]; then
-        RESULTS+=("$BENCH: PASS")
+    # Show the output
+    echo "$TEST_OUTPUT"
+
+    # Parse the BENCH_SUMMARY line: name:pass:fail:diff:skip:error:total:ms
+    SUMMARY_LINE=$(echo "$TEST_OUTPUT" | grep "^BENCH_SUMMARY:" | tail -1)
+    if [ -n "$SUMMARY_LINE" ]; then
+        SUMMARIES+=("$SUMMARY_LINE")
+        RESULTS+=("$BENCH: DONE")
         TOTAL_PASS=$((TOTAL_PASS + 1))
     else
-        RESULTS+=("$BENCH: FAIL (exit $TEST_EXIT)")
+        SUMMARIES+=("BENCH_SUMMARY:$BENCH:0:0:0:0:0:0:0")
+        RESULTS+=("$BENCH: FAIL (no summary)")
         TOTAL_FAIL=$((TOTAL_FAIL + 1))
     fi
 
@@ -210,24 +214,38 @@ for BENCH in "${BENCHMARKS[@]}"; do
     rm -rf "${BENCH_DATA_DIR:?}/$BENCH"
 done
 
-# ── Summary ───────────────────────────────────────────────────
+# ── Summary table ─────────────────────────────────────────────
 echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  Benchmark Summary (SF${BENCH_SCALE}, ${BENCH_PROTOCOL})"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-for R in "${RESULTS[@]}"; do
-    echo "  $R"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  Benchmark Results (SF${BENCH_SCALE}, $(echo "$BENCH_PROTOCOL" | tr '[:lower:]' '[:upper:]'))"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+printf "  %-14s %5s %5s %5s %5s %5s %5s %8s\n" "Benchmark" "Pass" "Fail" "Diff" "Skip" "Error" "Total" "Time"
+echo "  ─────────────────────────────────────────────────────────────────"
+
+SUM_PASS=0; SUM_FAIL=0; SUM_DIFF=0; SUM_SKIP=0; SUM_ERROR=0; SUM_TOTAL=0; SUM_MS=0
+
+for S in "${SUMMARIES[@]}"; do
+    # Parse BENCH_SUMMARY:name:pass:fail:diff:skip:error:total:ms
+    IFS=':' read -r _ NAME PASS FAIL DIFF SKIP ERR TOTAL MS <<< "$S"
+    TIME_S=$(echo "scale=1; $MS / 1000" | bc 2>/dev/null || echo "0.0")
+    printf "  %-14s %5s %5s %5s %5s %5s %5s %7ss\n" "$NAME" "$PASS" "$FAIL" "$DIFF" "$SKIP" "$ERR" "$TOTAL" "$TIME_S"
+    SUM_PASS=$((SUM_PASS + PASS))
+    SUM_FAIL=$((SUM_FAIL + FAIL))
+    SUM_DIFF=$((SUM_DIFF + DIFF))
+    SUM_SKIP=$((SUM_SKIP + SKIP))
+    SUM_ERROR=$((SUM_ERROR + ERR))
+    SUM_TOTAL=$((SUM_TOTAL + TOTAL))
+    SUM_MS=$((SUM_MS + MS))
 done
-echo ""
-echo "  Total: $((TOTAL_PASS + TOTAL_FAIL + TOTAL_ERROR)) benchmarks"
-echo "  Pass:  $TOTAL_PASS"
-echo "  Fail:  $TOTAL_FAIL"
-echo "  Error: $TOTAL_ERROR"
+
+echo "  ─────────────────────────────────────────────────────────────────"
+SUM_TIME_S=$(echo "scale=1; $SUM_MS / 1000" | bc 2>/dev/null || echo "0.0")
+printf "  %-14s %5s %5s %5s %5s %5s %5s %7ss\n" "TOTAL" "$SUM_PASS" "$SUM_FAIL" "$SUM_DIFF" "$SUM_SKIP" "$SUM_ERROR" "$SUM_TOTAL" "$SUM_TIME_S"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 echo "  Reports: benchmarks/results/"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-# Exit with failure if any benchmark failed
-if [ $((TOTAL_FAIL + TOTAL_ERROR)) -gt 0 ]; then
+# Exit with failure if any query failed
+if [ $((SUM_FAIL + SUM_ERROR)) -gt 0 ]; then
     exit 1
 fi
