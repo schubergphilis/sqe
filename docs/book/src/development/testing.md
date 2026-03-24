@@ -144,3 +144,61 @@ s3_secret_key = "s3admin"
 s3_region = "us-east-1"
 s3_path_style = true
 ```
+
+## Benchmark Testing
+
+Beyond unit and integration tests, SQE ships with `sqe-bench` — a benchmark CLI that validates SQL correctness and measures performance across industry-standard query suites.
+
+Benchmark tests differ from integration tests in scope and purpose:
+
+| | Integration tests | Benchmark tests |
+|---|---|---|
+| Data | Synthetic fixtures (small) | TPC/SSB scale factor data (GB scale) |
+| Queries | Targeted feature tests | Full benchmark query suites (22–99 queries) |
+| Validation | Pass/fail assertions | PASS / DIFF / FAIL / SKIP / ERROR with timing |
+| Purpose | Regression detection | SQL correctness + performance tracking |
+
+### Quick benchmark run
+
+```bash
+# Generate TPC-H data at scale factor 1
+cargo run -p sqe-bench -- generate tpch --scale 1 --output ./data
+
+# Load into SQE (requires running stack)
+cargo run -p sqe-bench -- load tpch --scale 1 --data ./data \
+  --host localhost --port 60051 --username root --password ""
+
+# Run all 22 TPC-H queries
+cargo run -p sqe-bench -- test tpch --scale 1 \
+  --host localhost --port 60051 --username root --password ""
+
+# Or use the script wrapper
+./scripts/benchmark-test.sh tpch
+```
+
+### Supported benchmarks
+
+| Benchmark | Queries | Notes |
+|-----------|---------|-------|
+| `tpch` | 22 | Standard first check for any SQL engine |
+| `tpcds` | 99 | Complex SQL: correlated subqueries, window functions, GROUPING SETS |
+| `ssb` | 13 | Fast smoke test — denormalized star schema |
+| `tpcc` | 8 | OLTP reads; write queries skip until DELETE/MERGE land |
+| `tpce` | 11 | Brokerage OLTP reads |
+| `tpcbb` | 10 | SQL-only subset over TPC-DS data |
+
+### Benchmark test in CI
+
+TPC-H at SF1 runs as a post-merge smoke test. The full suite (TPC-H + TPC-DS + SSB) runs nightly. JSON reports are written to `benchmarks/results/` and archived as CI artifacts for regression tracking.
+
+```bash
+# CI smoke test (TPC-H SF1 only, fails on any ERROR or FAIL)
+./scripts/benchmark-test.sh tpch
+
+# Nightly full suite
+./scripts/benchmark-test.sh tpch
+./scripts/benchmark-test.sh tpcds
+./scripts/benchmark-test.sh ssb
+```
+
+For full documentation of benchmark commands, scale factors, result formats, and how to add new benchmarks, see [Benchmark Suite](../features/benchmarks.md).

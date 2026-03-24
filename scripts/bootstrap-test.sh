@@ -7,8 +7,8 @@ set -euo pipefail
 # Credentials come from POLARIS_BOOTSTRAP_CREDENTIALS env var in docker-compose.
 # Format: realm,client_id,client_secret → "POLARIS,root,s3cr3t"
 
-POLARIS_URL="${POLARIS_URL:-http://localhost:8181}"
-S3_URL="${S3_URL:-http://localhost:9000}"
+POLARIS_URL="${POLARIS_URL:-http://localhost:18181}"
+S3_URL="${S3_URL:-http://localhost:19000}"
 S3_ACCESS_KEY="${S3_ACCESS_KEY:-s3admin}"
 S3_SECRET_KEY="${S3_SECRET_KEY:-s3admin}"
 CLIENT_ID="${CLIENT_ID:-root}"

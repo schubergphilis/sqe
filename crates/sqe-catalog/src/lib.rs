@@ -6,6 +6,7 @@ pub mod credential_vending;
 pub mod expr_to_predicate;
 pub mod iceberg_scan;
 pub mod info_schema;
+pub mod read_parquet;
 
 pub use catalog_provider::SqeCatalogProvider;
 pub use iceberg_scan::IcebergScanExec;

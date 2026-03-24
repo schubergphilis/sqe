@@ -1,0 +1,151 @@
+{
+  "benchmark": "tpch",
+  "scale_factor": 1.0,
+  "protocol": "flight",
+  "timestamp": "2026-03-24T14:20:05",
+  "summary": {
+    "total": 22,
+    "pass": 20,
+    "fail": 0,
+    "diff": 0,
+    "skip": 0,
+    "error": 2,
+    "total_duration_ms": 21817
+  },
+  "queries": [
+    {
+      "id": "q01",
+      "status": "pass",
+      "duration_ms": 1078,
+      "rows": 6
+    },
+    {
+      "id": "q02",
+      "status": "pass",
+      "duration_ms": 733,
+      "rows": 100
+    },
+    {
+      "id": "q03",
+      "status": "pass",
+      "duration_ms": 1270,
+      "rows": 10
+    },
+    {
+      "id": "q04",
+      "status": "pass",
+      "duration_ms": 875,
+      "rows": 5
+    },
+    {
+      "id": "q05",
+      "status": "pass",
+      "duration_ms": 1286,
+      "rows": 5
+    },
+    {
+      "id": "q06",
+      "status": "pass",
+      "duration_ms": 881,
+      "rows": 1
+    },
+    {
+      "id": "q07",
+      "status": "pass",
+      "duration_ms": 1389,
+      "rows": 4
+    },
+    {
+      "id": "q08",
+      "status": "error",
+      "duration_ms": 0,
+      "rows": 0,
+      "message": "Query failed: Ipc error: Status { code: Internal, message: \"Query planning failed: Query execution error: Parse error: sql parser error: Expected: ), found: o_orderdate at Line: 8, Column: 27\", metadata: MetadataMap { headers: {\"content-type\": \"application/grpc\", \"date\": \"Tue, 24 Mar 2026 14:19:51 GMT\"} }, source: None }"
+    },
+    {
+      "id": "q09",
+      "status": "error",
+      "duration_ms": 0,
+      "rows": 0,
+      "message": "Query failed: Ipc error: Status { code: Internal, message: \"Query planning failed: Query execution error: Parse error: sql parser error: Expected: ), found: AS at Line: 9, Column: 72\", metadata: MetadataMap { headers: {\"content-type\": \"application/grpc\", \"date\": \"Tue, 24 Mar 2026 14:19:51 GMT\"} }, source: None }"
+    },
+    {
+      "id": "q10",
+      "status": "pass",
+      "duration_ms": 1352,
+      "rows": 20
+    },
+    {
+      "id": "q11",
+      "status": "pass",
+      "duration_ms": 600,
+      "rows": 1189
+    },
+    {
+      "id": "q12",
+      "status": "pass",
+      "duration_ms": 1224,
+      "rows": 2
+    },
+    {
+      "id": "q13",
+      "status": "pass",
+      "duration_ms": 961,
+      "rows": 28
+    },
+    {
+      "id": "q14",
+      "status": "pass",
+      "duration_ms": 982,
+      "rows": 1
+    },
+    {
+      "id": "q15",
+      "status": "pass",
+      "duration_ms": 1207,
+      "rows": 0
+    },
+    {
+      "id": "q16",
+      "status": "pass",
+      "duration_ms": 572,
+      "rows": 2880
+    },
+    {
+      "id": "q17",
+      "status": "pass",
+      "duration_ms": 1118,
+      "rows": 1
+    },
+    {
+      "id": "q18",
+      "status": "pass",
+      "duration_ms": 1518,
+      "rows": 100
+    },
+    {
+      "id": "q19",
+      "status": "pass",
+      "duration_ms": 1108,
+      "rows": 1
+    },
+    {
+      "id": "q20",
+      "status": "pass",
+      "duration_ms": 934,
+      "rows": 155
+    },
+    {
+      "id": "q21",
+      "status": "pass",
+      "duration_ms": 2135,
+      "rows": 100
+    },
+    {
+      "id": "q22",
+      "status": "pass",
+      "duration_ms": 594,
+      "rows": 0
+    }
+  ]
+}
