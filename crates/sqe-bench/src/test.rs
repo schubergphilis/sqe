@@ -179,27 +179,40 @@ pub async fn run_benchmark_test(
 
         let timeout_secs = query.timeout_secs.max(120);
         let start = std::time::Instant::now();
-        let execute_result = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            client.execute(&sql),
-        ).await;
 
-        let execute_result = match execute_result {
-            Ok(inner) => inner,
-            Err(_) => {
+        // Use tokio::select! so the timeout fires even if the gRPC stream
+        // is stuck in a non-cancellation-safe recv. The losing branch gets
+        // dropped, which closes the connection.
+        let execute_result = tokio::select! {
+            result = client.execute(&sql) => {
+                Some(result)
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
+                eprintln!("[bench] {} TIMEOUT after {}s — skipping", query.id, timeout_secs);
+                None
+            }
+        };
+
+        match execute_result {
+            None => {
                 results.push(QueryResult {
                     id: query.id.clone(),
                     status: TestStatus::Error(format!("Timed out after {timeout_secs}s")),
                     duration: start.elapsed(),
                     rows: 0,
                 });
-                eprintln!("[bench] {} TIMEOUT after {}s", query.id, timeout_secs);
                 continue;
             }
-        };
-
-        match execute_result {
-            Ok(batches) => {
+            Some(Err(e)) => {
+                results.push(QueryResult {
+                    id: query.id.clone(),
+                    status: TestStatus::Error(e.to_string()),
+                    duration: start.elapsed(),
+                    rows: 0,
+                });
+                continue;
+            }
+            Some(Ok(batches)) => {
                 let duration = start.elapsed();
                 let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
@@ -220,14 +233,6 @@ pub async fn run_benchmark_test(
                     status,
                     duration,
                     rows,
-                });
-            }
-            Err(e) => {
-                results.push(QueryResult {
-                    id: query.id.clone(),
-                    status: TestStatus::Error(e.to_string()),
-                    duration: start.elapsed(),
-                    rows: 0,
                 });
             }
         }
