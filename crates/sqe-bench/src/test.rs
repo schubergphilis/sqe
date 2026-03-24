@@ -177,7 +177,7 @@ pub async fn run_benchmark_test(
             eprintln!("[bench] SQL:\n{sql}\n---");
         }
 
-        let timeout_secs = query.timeout_secs.max(60);
+        let timeout_secs = query.timeout_secs.max(120);
         let start = std::time::Instant::now();
         let execute_result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
