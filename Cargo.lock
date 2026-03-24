@@ -4503,6 +4503,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqe-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "arrow-array",
+ "arrow-flight",
+ "arrow-schema",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "clap",
+ "csv",
+ "futures",
+ "object_store",
+ "parquet",
+ "rand 0.8.5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "sqe-catalog"
 version = "0.1.0"
 dependencies = [
@@ -4595,6 +4623,7 @@ dependencies = [
  "sqe-trino-compat",
  "sqe-worker",
  "sqlparser 0.53.0",
+ "tempfile",
  "tokio",
  "tokio-util",
  "toml",
