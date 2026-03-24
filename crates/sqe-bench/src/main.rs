@@ -1,7 +1,7 @@
 mod cli;
+mod client;
 mod generate;
 // mod load;
-// mod client;
 // mod test;
 // mod compare;
 // mod report;
