@@ -1,26 +1,19 @@
 use arrow_array::RecordBatch;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use futures::TryStreamExt;
-use tokio::sync::Mutex;
 use tonic::transport::Channel;
 
 /// Flight SQL benchmark client.
 ///
-/// Wraps `FlightSqlServiceClient` in a `Mutex` because the upstream
-/// client methods take `&mut self`, while `BenchClient::execute` only
-/// receives a shared `&self` reference.
+/// Creates a fresh gRPC connection per query to avoid HTTP/2 stream
+/// accumulation issues on long-running benchmark sessions.
 pub struct FlightSqlBenchClient {
-    client: Mutex<FlightSqlServiceClient<Channel>>,
+    host: String,
+    token: Option<String>,
 }
 
 impl FlightSqlBenchClient {
-    /// Connect to a Flight SQL server.
-    ///
-    /// Auth modes (tried in order):
-    /// 1. If `token_endpoint` + `client_id` + `client_secret` are provided,
-    ///    fetch a bearer token via OAuth2 client_credentials grant.
-    /// 2. If `username` + `password` are provided, do a Flight SQL handshake.
-    /// 3. Otherwise, connect without auth.
+    /// Connect to a Flight SQL server and obtain auth credentials.
     pub async fn connect(
         host: &str,
         username: Option<&str>,
@@ -29,29 +22,39 @@ impl FlightSqlBenchClient {
         client_id: Option<&str>,
         client_secret: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let channel = build_channel(host).await?;
-        let mut inner = FlightSqlServiceClient::new(channel);
-
-        if let (Some(endpoint), Some(cid), Some(secret)) = (token_endpoint, client_id, client_secret) {
-            // OAuth2 client_credentials → bearer token
-            let token = fetch_client_credentials_token(endpoint, cid, secret).await?;
-            inner.set_token(token);
+        let token = if let (Some(endpoint), Some(cid), Some(secret)) =
+            (token_endpoint, client_id, client_secret)
+        {
+            Some(fetch_client_credentials_token(endpoint, cid, secret).await?)
         } else if let (Some(user), Some(pass)) = (username, password) {
-            // Flight SQL handshake (OIDC password grant)
-            let token = inner
+            let channel = build_channel(host).await?;
+            let mut client = FlightSqlServiceClient::new(channel);
+            let handshake_token = client
                 .handshake(user, pass)
                 .await
                 .map_err(|e| anyhow::anyhow!("Authentication failed: {e}"))?;
-
-            inner.set_token(
-                String::from_utf8(token.to_vec())
+            Some(
+                String::from_utf8(handshake_token.to_vec())
                     .map_err(|e| anyhow::anyhow!("Token is not valid UTF-8: {e}"))?,
-            );
-        }
+            )
+        } else {
+            None
+        };
 
         Ok(Self {
-            client: Mutex::new(inner),
+            host: host.to_string(),
+            token,
         })
+    }
+
+    /// Create a fresh FlightSqlServiceClient with the stored token.
+    async fn new_client(&self) -> anyhow::Result<FlightSqlServiceClient<Channel>> {
+        let channel = build_channel(&self.host).await?;
+        let mut client = FlightSqlServiceClient::new(channel);
+        if let Some(ref token) = self.token {
+            client.set_token(token.clone());
+        }
+        Ok(client)
     }
 }
 
@@ -80,7 +83,9 @@ async fn fetch_client_credentials_token(
         anyhow::bail!("Token endpoint returned {status}: {body}");
     }
 
-    let body: serde_json::Value = resp.json().await
+    let body: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to parse token response: {e}"))?;
 
     body["access_token"]
@@ -99,13 +104,10 @@ async fn build_channel(host: &str) -> anyhow::Result<Channel> {
     };
     let channel = Channel::from_shared(url.clone())
         .map_err(|e| anyhow::anyhow!("Invalid endpoint URI '{url}': {e}"))?
-        // Keep the connection alive during long queries
         .keep_alive_while_idle(true)
         .http2_keep_alive_interval(Duration::from_secs(10))
         .keep_alive_timeout(Duration::from_secs(20))
-        // Per-request timeout (5 minutes max per query)
         .timeout(Duration::from_secs(300))
-        // Connection timeout
         .connect_timeout(Duration::from_secs(10))
         .connect()
         .await
@@ -117,14 +119,14 @@ async fn build_channel(host: &str) -> anyhow::Result<Channel> {
 #[async_trait::async_trait]
 impl super::BenchClient for FlightSqlBenchClient {
     async fn execute(&self, sql: &str) -> anyhow::Result<Vec<RecordBatch>> {
+        // Fresh connection per query — avoids HTTP/2 stream accumulation
+        let mut client = self.new_client().await?;
+
         eprintln!("[flight] get_flight_info...");
-        let flight_info = {
-            let mut guard = self.client.lock().await;
-            guard
-                .execute(sql.to_string(), None)
-                .await
-                .map_err(|e| anyhow::anyhow!("Query failed: {e}"))?
-        };
+        let flight_info = client
+            .execute(sql.to_string(), None)
+            .await
+            .map_err(|e| anyhow::anyhow!("Query failed: {e}"))?;
         eprintln!("[flight] got {} endpoints", flight_info.endpoint.len());
 
         let mut batches = Vec::new();
@@ -136,13 +138,10 @@ impl super::BenchClient for FlightSqlBenchClient {
                 .ok_or_else(|| anyhow::anyhow!("Flight endpoint returned no ticket"))?;
 
             eprintln!("[flight] do_get endpoint {i}...");
-            let stream = {
-                let mut guard = self.client.lock().await;
-                guard
-                    .do_get(ticket)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("do_get failed: {e}"))?
-            };
+            let stream = client
+                .do_get(ticket)
+                .await
+                .map_err(|e| anyhow::anyhow!("do_get failed: {e}"))?;
 
             eprintln!("[flight] collecting batches from endpoint {i}...");
             let endpoint_batches: Vec<RecordBatch> = stream
@@ -150,7 +149,10 @@ impl super::BenchClient for FlightSqlBenchClient {
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to collect record batches: {e}"))?;
 
-            eprintln!("[flight] got {} batches from endpoint {i}", endpoint_batches.len());
+            eprintln!(
+                "[flight] got {} batches from endpoint {i}",
+                endpoint_batches.len()
+            );
             batches.extend(endpoint_batches);
         }
 
@@ -158,8 +160,6 @@ impl super::BenchClient for FlightSqlBenchClient {
     }
 
     async fn execute_update(&self, sql: &str) -> anyhow::Result<()> {
-        // SQE doesn't implement do_put_statement_update — route through
-        // the regular execute path which handles DDL/DML via query routing.
         let _ = self.execute(sql).await?;
         Ok(())
     }
