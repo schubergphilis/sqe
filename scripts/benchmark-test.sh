@@ -186,20 +186,19 @@ for BENCH in "${BENCHMARKS[@]}"; do
     echo ""
     echo "  [3/3] Running queries..."
     TEST_START=$(date +%s)
-    TEST_OUTPUT=$("$BENCH_BIN" test "$BENCH" \
+    TEST_LOG="/tmp/sqe-bench-test-$$.log"
+    "$BENCH_BIN" test "$BENCH" \
         --scale "$BENCH_SCALE" \
         --protocol "$BENCH_PROTOCOL" \
         --host "$BENCH_HOST" \
         --port "$BENCH_PORT" \
         --username "$SQE_USERNAME" \
-        --password "$SQE_PASSWORD" 2>&1) || true
+        --password "$SQE_PASSWORD" 2>&1 | tee "$TEST_LOG" || true
     TEST_END=$(date +%s)
 
-    # Show the output
-    echo "$TEST_OUTPUT"
-
     # Parse the BENCH_SUMMARY line: name:pass:fail:diff:skip:error:total:ms
-    SUMMARY_LINE=$(echo "$TEST_OUTPUT" | grep "^BENCH_SUMMARY:" | tail -1)
+    SUMMARY_LINE=$(grep "^BENCH_SUMMARY:" "$TEST_LOG" | tail -1)
+    rm -f "$TEST_LOG"
     if [ -n "$SUMMARY_LINE" ]; then
         SUMMARIES+=("$SUMMARY_LINE")
         RESULTS+=("$BENCH: DONE")
