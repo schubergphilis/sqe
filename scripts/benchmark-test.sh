@@ -32,8 +32,9 @@ S3_ENDPOINT="${S3_ENDPOINT:-http://localhost:9000}"
 S3_REGION="${S3_REGION:-us-east-1}"
 
 # Auth credentials (match test stack)
-SQE_USERNAME="${SQE_USERNAME:-root}"
-SQE_PASSWORD="${SQE_PASSWORD:-s3cr3t}"
+SQE_TOKEN_ENDPOINT="${SQE_TOKEN_ENDPOINT:-http://localhost:8181/api/catalog/v1/oauth/tokens}"
+SQE_CLIENT_ID="${SQE_CLIENT_ID:-root}"
+SQE_CLIENT_SECRET="${SQE_CLIENT_SECRET:-s3cr3t}"
 
 # Benchmarks to run (default: all)
 ALL_BENCHMARKS=(tpch ssb tpcds tpcc tpce tpcbb clickbench)
@@ -165,8 +166,9 @@ for BENCH in "${BENCHMARKS[@]}"; do
         --protocol "$BENCH_PROTOCOL" \
         --host "$BENCH_HOST" \
         --port "$BENCH_PORT" \
-        --username "$SQE_USERNAME" \
-        --password "$SQE_PASSWORD" \
+        --token-endpoint "$SQE_TOKEN_ENDPOINT" \
+        --client-id "$SQE_CLIENT_ID" \
+        --client-secret "$SQE_CLIENT_SECRET" \
         --s3-access-key "$S3_ACCESS_KEY" \
         --s3-secret-key "$S3_SECRET_KEY" \
         --s3-endpoint "$S3_ENDPOINT" \
