@@ -76,7 +76,7 @@ SQE_LOG_FILE="/tmp/sqe-bench-coord-$$.log"
 SQE_CONFIG="$ROOT_DIR/tests/sqe-test.toml"
 
 RUST_LOG="${RUST_LOG:-sqe=info,warn}" \
-    "$SQE_BIN" --config "$SQE_CONFIG" \
+    "$SQE_BIN" "$SQE_CONFIG" \
     > "$SQE_LOG_FILE" 2>&1 &
 SQE_PID=$!
 
