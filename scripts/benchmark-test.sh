@@ -82,7 +82,7 @@ echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  Starting SQE coordinator..."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-SQE_LOG_FILE="$(mktemp /tmp/sqe-bench-coord-XXXXXX.log)"
+SQE_LOG_FILE="/tmp/sqe-bench-coord-$$.log"
 SQE_CONFIG="$ROOT_DIR/tests/sqe-test.toml"
 
 RUST_LOG="${RUST_LOG:-sqe=info,warn}" \
