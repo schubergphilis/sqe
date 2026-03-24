@@ -2,6 +2,7 @@ pub mod clickbench;
 pub mod parquet_writer;
 pub mod ssb;
 pub mod tpcc;
+pub mod tpce;
 pub mod tpch;
 pub mod tpcbb;
 
@@ -44,10 +45,11 @@ pub fn get_generator(name: &str) -> anyhow::Result<Box<dyn BenchmarkGenerator>> 
         "tpch" => Ok(Box::new(tpch::TpchGenerator)),
         "ssb" => Ok(Box::new(ssb::SsbGenerator)),
         "tpcc" => Ok(Box::new(tpcc::TpccGenerator)),
+        "tpce" => Ok(Box::new(tpce::TpceGenerator)),
         "tpcbb" => Ok(Box::new(tpcbb::TpcbbGenerator)),
         "clickbench" => Ok(Box::new(clickbench::ClickBenchGenerator)),
         _ => anyhow::bail!(
-            "Unknown benchmark: {name}. Supported: tpch, ssb, tpcc, tpcbb, clickbench"
+            "Unknown benchmark: {name}. Supported: tpch, ssb, tpcc, tpce, tpcbb, clickbench"
         ),
     }
 }
