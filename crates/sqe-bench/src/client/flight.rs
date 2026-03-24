@@ -144,12 +144,9 @@ impl super::BenchClient for FlightSqlBenchClient {
     }
 
     async fn execute_update(&self, sql: &str) -> anyhow::Result<()> {
-        let mut guard = self.client.lock().await;
-        guard
-            .execute_update(sql.to_string(), None)
-            .await
-            .map_err(|e| anyhow::anyhow!("Update failed: {e}"))?;
-
+        // SQE doesn't implement do_put_statement_update — route through
+        // the regular execute path which handles DDL/DML via query routing.
+        let _ = self.execute(sql).await?;
         Ok(())
     }
 
