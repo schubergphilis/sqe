@@ -172,6 +172,11 @@ pub async fn run_benchmark_test(
         // Qualify unqualified table names with the benchmark namespace
         let sql = prefix_tables(&query.sql, &namespace, benchmark);
 
+        eprintln!("[bench] Running {} ({} chars)...", query.id, sql.len());
+        if std::env::var("BENCH_DEBUG").is_ok() {
+            eprintln!("[bench] SQL:\n{sql}\n---");
+        }
+
         let start = std::time::Instant::now();
         match client.execute(&sql).await {
             Ok(batches) => {
