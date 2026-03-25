@@ -7,7 +7,10 @@ pub mod expr_to_predicate;
 pub mod iceberg_scan;
 pub mod info_schema;
 pub mod read_parquet;
+pub mod system_catalog;
+pub mod system_jdbc;
 
 pub use catalog_provider::SqeCatalogProvider;
 pub use iceberg_scan::IcebergScanExec;
 pub use rest_catalog::SessionCatalog;
+pub use system_catalog::SystemCatalogProvider;
