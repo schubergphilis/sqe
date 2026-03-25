@@ -348,6 +348,7 @@ const BATCH_SIZE: usize = 10_000;
 fn generate_supplier(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = supplier_schema();
     let total = (scale * 10_000.0) as usize;
+    let total = total.max(1);
     let mut rng = StdRng::seed_from_u64(seed_for_table("supplier"));
     let mut batches = Vec::new();
 
@@ -403,6 +404,7 @@ fn generate_supplier(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = customer_schema();
     let total = (scale * 150_000.0) as usize;
+    let total = total.max(1);
     let mut rng = StdRng::seed_from_u64(seed_for_table("customer"));
     let mut batches = Vec::new();
 
@@ -462,6 +464,7 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_part(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = part_schema();
     let total = (scale * 200_000.0) as usize;
+    let total = total.max(1);
     let mut rng = StdRng::seed_from_u64(seed_for_table("part"));
     let mut batches = Vec::new();
 
@@ -539,6 +542,7 @@ fn generate_partsupp(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let num_suppliers = (scale * 10_000.0) as i32;
     // 4 suppliers per part → SF * 800,000 rows
     let total = (scale * 800_000.0) as usize;
+    let total = total.max(1);
     let mut rng = StdRng::seed_from_u64(seed_for_table("partsupp"));
     let mut batches = Vec::new();
 
@@ -597,6 +601,7 @@ fn generate_partsupp(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_orders(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = orders_schema();
     let total = (scale * 1_500_000.0) as usize;
+    let total = total.max(1);
     let num_customers = (scale * 150_000.0) as i32;
     let mut rng = StdRng::seed_from_u64(seed_for_table("orders"));
     let mut batches = Vec::new();
@@ -662,6 +667,7 @@ fn generate_orders(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_lineitem(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = lineitem_schema();
     let total = (scale * 6_000_000.0) as usize;
+    let total = total.max(1);
     let num_orders = (scale * 1_500_000.0) as i64;
     let num_parts = (scale * 200_000.0) as i32;
     let num_suppliers = (scale * 10_000.0) as i32;
