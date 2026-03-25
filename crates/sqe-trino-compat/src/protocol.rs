@@ -25,7 +25,6 @@ pub struct NodeVersion {
 #[serde(rename_all = "camelCase")]
 pub struct TrinoResponse {
     pub id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub info_uri: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_uri: Option<String>,
@@ -233,5 +232,20 @@ mod tests {
         assert!(json.contains("\"id\":\"q-001\""));
         assert!(json.contains("\"state\":\"FINISHED\""));
         assert!(!json.contains("nextUri")); // Skipped because None
+    }
+
+    #[test]
+    fn test_trino_response_always_includes_info_uri() {
+        let resp = TrinoResponse {
+            id: "q-001".to_string(),
+            info_uri: None,
+            next_uri: None,
+            columns: None,
+            data: None,
+            stats: TrinoStats::finished(),
+            error: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"infoUri\":null"), "infoUri must always be present, got: {json}");
     }
 }
