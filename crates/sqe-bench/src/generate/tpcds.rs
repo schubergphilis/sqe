@@ -486,7 +486,7 @@ macro_rules! d { ($x:expr) => { ColVal::Date(Some($x)) }; }
 // ---------------------------------------------------------------------------
 
 fn generate_store_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = (scale * 2_880_000.0) as usize;
+    let total = super::scaled(scale, 2_880_000.0);
     let total = total.max(1);
     generate_batches(store_sales_schema(), total, seed_for_table("store_sales"), |row, rng| {
         let qty = rng.gen_range(1..100i32);
@@ -509,7 +509,7 @@ fn generate_store_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_store_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = (scale * 287_999.0) as usize;
+    let total = super::scaled(scale, 287_999.0);
     let total = total.max(1);
     generate_batches(store_returns_schema(), total, seed_for_table("store_returns"), |row, rng| {
         let qty = rng.gen_range(1..50i32);
@@ -528,7 +528,7 @@ fn generate_store_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_catalog_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = (scale * 1_441_548.0) as usize;
+    let total = super::scaled(scale, 1_441_548.0);
     let total = total.max(1);
     generate_batches(catalog_sales_schema(), total, seed_for_table("catalog_sales"), |row, rng| {
         let qty = rng.gen_range(1..100i32);
@@ -556,7 +556,7 @@ fn generate_catalog_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_catalog_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = (scale * 144_067.0) as usize;
+    let total = super::scaled(scale, 144_067.0);
     let total = total.max(1);
     generate_batches(catalog_returns_schema(), total, seed_for_table("catalog_returns"), |row, rng| {
         let qty = rng.gen_range(1..50i32);
@@ -579,7 +579,7 @@ fn generate_catalog_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_web_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = (scale * 719_384.0) as usize;
+    let total = super::scaled(scale, 719_384.0);
     let total = total.max(1);
     generate_batches(web_sales_schema(), total, seed_for_table("web_sales"), |row, rng| {
         let qty = rng.gen_range(1..100i32);
@@ -607,7 +607,7 @@ fn generate_web_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_web_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = (scale * 71_763.0) as usize;
+    let total = super::scaled(scale, 71_763.0);
     let total = total.max(1);
     generate_batches(web_returns_schema(), total, seed_for_table("web_returns"), |row, rng| {
         let qty = rng.gen_range(1..50i32);
@@ -628,7 +628,7 @@ fn generate_web_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_inventory(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = (scale * 11_745_000.0) as usize;
+    let total = super::scaled(scale, 11_745_000.0);
     let total = total.max(1);
     generate_batches(inventory_schema(), total, seed_for_table("inventory"), |_row, rng| {
         vec![
@@ -687,7 +687,7 @@ fn generate_time_dim() -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_item(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = (scale * 18_000.0) as usize;
+    let total = super::scaled(scale, 18_000.0);
     let total = total.max(1);
     generate_batches(item_schema(), total, seed_for_table("item"), |row, rng| {
         let sk = (row + 1) as i32;
@@ -709,7 +709,7 @@ fn generate_item(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = (scale * 100_000.0) as usize;
+    let total = super::scaled(scale, 100_000.0);
     let total = total.max(1);
     generate_batches(customer_schema(), total, seed_for_table("customer"), |row, rng| {
         let sk = (row + 1) as i32;
@@ -728,7 +728,7 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_customer_address(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = (scale * 50_000.0) as usize;
+    let total = super::scaled(scale, 50_000.0);
     let total = total.max(1);
     generate_batches(customer_address_schema(), total, seed_for_table("customer_address"), |row, rng| {
         let sk = (row + 1) as i32;

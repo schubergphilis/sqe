@@ -251,7 +251,7 @@ const BATCH_SIZE: usize = 10_000;
 
 fn generate_warehouse(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = warehouse_schema();
-    let total = scale as usize;
+    let total = (scale as usize).max(1);
     let mut rng = StdRng::seed_from_u64(seed_for_table("warehouse"));
     let mut batches = Vec::new();
 
@@ -315,7 +315,7 @@ fn generate_district(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = district_schema();
     let num_warehouses = scale as i32;
     // 10 districts per warehouse
-    let total = (scale * 10.0) as usize;
+    let total = super::scaled(scale, 10.0);
     let total = total.max(1);
     let mut rng = StdRng::seed_from_u64(seed_for_table("district"));
     let mut batches = Vec::new();
@@ -389,7 +389,7 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = customer_schema();
     let num_warehouses = scale as i32;
     // 3000 customers per district, 10 districts per warehouse
-    let total = (scale * 30_000.0) as usize;
+    let total = super::scaled(scale, 30_000.0);
     let total = total.max(1);
     let mut rng = StdRng::seed_from_u64(seed_for_table("customer"));
     let mut batches = Vec::new();
@@ -509,7 +509,7 @@ fn generate_history(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = history_schema();
     let num_warehouses = scale as i32;
     // 1 history record per customer: SF * 30,000
-    let total = (scale * 30_000.0) as usize;
+    let total = super::scaled(scale, 30_000.0);
     let total = total.max(1);
     let mut rng = StdRng::seed_from_u64(seed_for_table("history"));
     let mut batches = Vec::new();
@@ -570,7 +570,7 @@ fn generate_orders(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = orders_schema();
     let num_warehouses = scale as i32;
     // 3000 orders per district, 10 districts per warehouse
-    let total = (scale * 30_000.0) as usize;
+    let total = super::scaled(scale, 30_000.0);
     let total = total.max(1);
     let num_customers_per_district = 3000i32;
     let mut rng = StdRng::seed_from_u64(seed_for_table("orders"));
@@ -637,7 +637,7 @@ fn generate_new_order(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = new_order_schema();
     let num_warehouses = scale as i32;
     // last 900 orders per district are new orders: SF * 10 districts * 900 = SF * 9000
-    let total = (scale * 9_000.0) as usize;
+    let total = super::scaled(scale, 9_000.0);
     let total = total.max(1);
     let mut batches = Vec::new();
 
@@ -682,7 +682,7 @@ fn generate_order_line(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let num_warehouses = scale as i32;
     // average 10 lines per order (range 5-15), 30,000 orders per warehouse
     // TPC-C spec uses exactly 300,000 per warehouse for estimation
-    let total = (scale * 300_000.0) as usize;
+    let total = super::scaled(scale, 300_000.0);
     let total = total.max(1);
     let num_items = 100_000i32;
     let mut rng = StdRng::seed_from_u64(seed_for_table("order_line"));
@@ -821,7 +821,7 @@ fn generate_stock(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = stock_schema();
     let num_warehouses = scale as i32;
     // 100,000 stock rows per warehouse
-    let total = (scale * 100_000.0) as usize;
+    let total = super::scaled(scale, 100_000.0);
     let total = total.max(1);
     let num_items = 100_000i32;
     let mut rng = StdRng::seed_from_u64(seed_for_table("stock"));
