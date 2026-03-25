@@ -415,7 +415,7 @@ fn generate_dim_date() -> (SchemaRef, Vec<RecordBatch>) {
 
 fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = customer_schema();
-    let total = (scale * 30_000.0) as usize;
+    let total = super::scaled(scale, 30_000.0);
     let total = total.max(1);
     let mut rng = StdRng::seed_from_u64(seed_for_table("customer"));
     let mut batches = Vec::new();
@@ -481,7 +481,7 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
 fn generate_supplier(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = supplier_schema();
-    let total = (scale * 2_000.0) as usize;
+    let total = super::scaled(scale, 2_000.0);
     let total = total.max(1);
     let mut rng = StdRng::seed_from_u64(seed_for_table("supplier"));
     let mut batches = Vec::new();
@@ -543,7 +543,7 @@ fn generate_supplier(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_part(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = part_schema();
     // SSB spec: SF × 200,000 × 0.4 = SF × 80,000
-    let total = (scale * 80_000.0) as usize;
+    let total = super::scaled(scale, 80_000.0);
     let total = total.max(1);
     let mut rng = StdRng::seed_from_u64(seed_for_table("part"));
     let mut batches = Vec::new();
@@ -616,7 +616,7 @@ fn generate_part(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
 fn generate_lineorder(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = lineorder_schema();
-    let total = (scale * 6_000_000.0) as usize;
+    let total = super::scaled(scale, 6_000_000.0);
     let total = total.max(1);
     let num_customers = (scale * 30_000.0) as i32;
     let num_parts = (scale * 80_000.0) as i32;
