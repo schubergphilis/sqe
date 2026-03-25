@@ -1,0 +1,524 @@
+use std::any::Any;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow_array::builder::{BooleanBuilder, Int32Builder, StringBuilder};
+use arrow_array::{ArrayRef, RecordBatch};
+use datafusion::catalog::SchemaProvider;
+use datafusion::datasource::{MemTable, TableProvider};
+use datafusion::error::Result as DFResult;
+use iceberg::NamespaceIdent;
+use tracing::{error, warn};
+
+use crate::rest_catalog::SessionCatalog;
+
+/// Descriptor for a single row in the `system.jdbc.types` table.
+struct JdbcTypeRow {
+    name: &'static str,
+    jdbc_type: i32,
+    precision: i32,
+    literal_prefix: Option<&'static str>,
+    literal_suffix: Option<&'static str>,
+    case_sensitive: bool,
+    min_scale: i32,
+    max_scale: i32,
+    num_prec_radix: Option<i32>,
+}
+
+/// DataFusion `SchemaProvider` for the virtual `system.jdbc` schema.
+///
+/// Exposes JDBC metadata tables (`types`, `catalogs`, `schemas`, `tables`, `columns`)
+/// required by Trino JDBC drivers (e.g. DBeaver) for metadata browsing.
+pub struct JdbcSchemaProvider {
+    session_catalog: Arc<SessionCatalog>,
+    warehouse: String,
+}
+
+impl JdbcSchemaProvider {
+    pub fn new(session_catalog: Arc<SessionCatalog>, warehouse: String) -> Self {
+        Self {
+            session_catalog,
+            warehouse,
+        }
+    }
+}
+
+impl std::fmt::Debug for JdbcSchemaProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JdbcSchemaProvider")
+            .field("warehouse", &self.warehouse)
+            .finish()
+    }
+}
+
+#[async_trait]
+impl SchemaProvider for JdbcSchemaProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn table_names(&self) -> Vec<String> {
+        vec![
+            "types".into(),
+            "catalogs".into(),
+            "schemas".into(),
+            "tables".into(),
+            "columns".into(),
+        ]
+    }
+
+    fn table_exist(&self, name: &str) -> bool {
+        matches!(name, "types" | "catalogs" | "schemas" | "tables" | "columns")
+    }
+
+    async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        match name {
+            "types" => Ok(Some(build_types_table()?)),
+            "catalogs" => Ok(Some(build_catalogs_table(&self.warehouse)?)),
+            "schemas" => Ok(Some(self.build_schemas_table().await?)),
+            "tables" => Ok(Some(self.build_tables_table().await?)),
+            "columns" => Ok(Some(self.build_columns_table().await?)),
+            _ => Ok(None),
+        }
+    }
+}
+
+impl JdbcSchemaProvider {
+    async fn list_namespaces_safe(&self) -> Vec<String> {
+        match self.session_catalog.list_namespaces().await {
+            Ok(namespaces) => namespaces
+                .iter()
+                .map(|ns| {
+                    ns.as_ref()
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".")
+                })
+                .collect(),
+            Err(e) => {
+                error!(error = %e, "Failed to list namespaces for system.jdbc");
+                Vec::new()
+            }
+        }
+    }
+
+    async fn build_schemas_table(&self) -> DFResult<Arc<dyn TableProvider>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("table_schem", DataType::Utf8, false),
+            Field::new("table_catalog", DataType::Utf8, false),
+        ]));
+
+        let namespaces = self.list_namespaces_safe().await;
+
+        let mut schem_builder = StringBuilder::new();
+        let mut catalog_builder = StringBuilder::new();
+
+        // Always include information_schema
+        schem_builder.append_value("information_schema");
+        catalog_builder.append_value(&self.warehouse);
+
+        for ns in &namespaces {
+            schem_builder.append_value(ns);
+            catalog_builder.append_value(&self.warehouse);
+        }
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(schem_builder.finish()) as ArrayRef,
+                Arc::new(catalog_builder.finish()) as ArrayRef,
+            ],
+        )?;
+
+        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    }
+
+    async fn build_tables_table(&self) -> DFResult<Arc<dyn TableProvider>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("table_cat", DataType::Utf8, true),
+            Field::new("table_schem", DataType::Utf8, true),
+            Field::new("table_name", DataType::Utf8, false),
+            Field::new("table_type", DataType::Utf8, false),
+            Field::new("remarks", DataType::Utf8, true),
+            Field::new("type_cat", DataType::Utf8, true),
+            Field::new("type_schem", DataType::Utf8, true),
+            Field::new("type_name", DataType::Utf8, true),
+            Field::new("self_referencing_col_name", DataType::Utf8, true),
+            Field::new("ref_generation", DataType::Utf8, true),
+        ]));
+
+        let namespaces = self.list_namespaces_safe().await;
+
+        let mut cat_b = StringBuilder::new();
+        let mut schem_b = StringBuilder::new();
+        let mut name_b = StringBuilder::new();
+        let mut type_b = StringBuilder::new();
+        let mut remarks_b = StringBuilder::new();
+        let mut type_cat_b = StringBuilder::new();
+        let mut type_schem_b = StringBuilder::new();
+        let mut type_name_b = StringBuilder::new();
+        let mut self_ref_b = StringBuilder::new();
+        let mut ref_gen_b = StringBuilder::new();
+
+        for ns in &namespaces {
+            let ns_ident = NamespaceIdent::new(ns.clone());
+            match self.session_catalog.list_tables(&ns_ident).await {
+                Ok(tables) => {
+                    for table in &tables {
+                        cat_b.append_value(&self.warehouse);
+                        schem_b.append_value(ns);
+                        name_b.append_value(table.name());
+                        type_b.append_value("TABLE");
+                        remarks_b.append_null();
+                        type_cat_b.append_null();
+                        type_schem_b.append_null();
+                        type_name_b.append_null();
+                        self_ref_b.append_null();
+                        ref_gen_b.append_null();
+                    }
+                }
+                Err(e) => {
+                    warn!(namespace = %ns, error = %e, "Failed to list tables for system.jdbc.tables");
+                }
+            }
+        }
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(cat_b.finish()) as ArrayRef,
+                Arc::new(schem_b.finish()) as ArrayRef,
+                Arc::new(name_b.finish()) as ArrayRef,
+                Arc::new(type_b.finish()) as ArrayRef,
+                Arc::new(remarks_b.finish()) as ArrayRef,
+                Arc::new(type_cat_b.finish()) as ArrayRef,
+                Arc::new(type_schem_b.finish()) as ArrayRef,
+                Arc::new(type_name_b.finish()) as ArrayRef,
+                Arc::new(self_ref_b.finish()) as ArrayRef,
+                Arc::new(ref_gen_b.finish()) as ArrayRef,
+            ],
+        )?;
+
+        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    }
+
+    async fn build_columns_table(&self) -> DFResult<Arc<dyn TableProvider>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("table_cat", DataType::Utf8, true),
+            Field::new("table_schem", DataType::Utf8, true),
+            Field::new("table_name", DataType::Utf8, false),
+            Field::new("column_name", DataType::Utf8, false),
+            Field::new("data_type", DataType::Int32, false),
+            Field::new("type_name", DataType::Utf8, false),
+            Field::new("column_size", DataType::Int32, true),
+            Field::new("decimal_digits", DataType::Int32, true),
+            Field::new("num_prec_radix", DataType::Int32, true),
+            Field::new("nullable", DataType::Int32, false),
+            Field::new("remarks", DataType::Utf8, true),
+            Field::new("column_def", DataType::Utf8, true),
+            Field::new("ordinal_position", DataType::Int32, false),
+            Field::new("is_nullable", DataType::Utf8, false),
+            Field::new("is_autoincrement", DataType::Utf8, false),
+        ]));
+
+        let namespaces = self.list_namespaces_safe().await;
+
+        let mut cat_b = StringBuilder::new();
+        let mut schem_b = StringBuilder::new();
+        let mut tbl_b = StringBuilder::new();
+        let mut col_b = StringBuilder::new();
+        let mut dtype_b = Int32Builder::new();
+        let mut tname_b = StringBuilder::new();
+        let mut colsize_b = Int32Builder::new();
+        let mut dec_digits_b = Int32Builder::new();
+        let mut radix_b = Int32Builder::new();
+        let mut nullable_b = Int32Builder::new();
+        let mut remarks_b = StringBuilder::new();
+        let mut coldef_b = StringBuilder::new();
+        let mut ordinal_b = Int32Builder::new();
+        let mut is_nullable_b = StringBuilder::new();
+        let mut is_auto_b = StringBuilder::new();
+
+        for ns in &namespaces {
+            let ns_ident = NamespaceIdent::new(ns.clone());
+            let tables = match self.session_catalog.list_tables(&ns_ident).await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(namespace = %ns, error = %e, "Failed to list tables for system.jdbc.columns");
+                    continue;
+                }
+            };
+
+            for table_ident in &tables {
+                let full_ident =
+                    iceberg::TableIdent::new(ns_ident.clone(), table_ident.name().to_string());
+                let table = match self.session_catalog.load_table(&full_ident).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!(table = %table_ident.name(), error = %e, "Failed to load table for system.jdbc.columns");
+                        continue;
+                    }
+                };
+
+                let iceberg_schema = table.metadata().current_schema();
+                for (idx, field) in iceberg_schema.as_struct().fields().iter().enumerate() {
+                    let (jdbc_type, type_name) = iceberg_type_to_jdbc(&field.field_type);
+
+                    cat_b.append_value(&self.warehouse);
+                    schem_b.append_value(ns);
+                    tbl_b.append_value(table_ident.name());
+                    col_b.append_value(&field.name);
+                    dtype_b.append_value(jdbc_type);
+                    tname_b.append_value(type_name);
+                    colsize_b.append_null();
+                    dec_digits_b.append_null();
+                    radix_b.append_null();
+                    // nullable: 1 = columnNullable, 0 = columnNoNulls
+                    nullable_b.append_value(if field.required { 0 } else { 1 });
+                    remarks_b.append_null();
+                    coldef_b.append_null();
+                    ordinal_b.append_value((idx + 1) as i32);
+                    is_nullable_b.append_value(if field.required { "NO" } else { "YES" });
+                    is_auto_b.append_value("NO");
+                }
+            }
+        }
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(cat_b.finish()) as ArrayRef,
+                Arc::new(schem_b.finish()) as ArrayRef,
+                Arc::new(tbl_b.finish()) as ArrayRef,
+                Arc::new(col_b.finish()) as ArrayRef,
+                Arc::new(dtype_b.finish()) as ArrayRef,
+                Arc::new(tname_b.finish()) as ArrayRef,
+                Arc::new(colsize_b.finish()) as ArrayRef,
+                Arc::new(dec_digits_b.finish()) as ArrayRef,
+                Arc::new(radix_b.finish()) as ArrayRef,
+                Arc::new(nullable_b.finish()) as ArrayRef,
+                Arc::new(remarks_b.finish()) as ArrayRef,
+                Arc::new(coldef_b.finish()) as ArrayRef,
+                Arc::new(ordinal_b.finish()) as ArrayRef,
+                Arc::new(is_nullable_b.finish()) as ArrayRef,
+                Arc::new(is_auto_b.finish()) as ArrayRef,
+            ],
+        )?;
+
+        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    }
+}
+
+/// Build the static `system.jdbc.types` table with standard SQL/JDBC type metadata.
+fn build_types_table() -> DFResult<Arc<dyn TableProvider>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("type_name", DataType::Utf8, false),
+        Field::new("data_type", DataType::Int32, false),
+        Field::new("precision", DataType::Int32, true),
+        Field::new("literal_prefix", DataType::Utf8, true),
+        Field::new("literal_suffix", DataType::Utf8, true),
+        Field::new("create_params", DataType::Utf8, true),
+        Field::new("nullable", DataType::Int32, false),
+        Field::new("case_sensitive", DataType::Boolean, false),
+        Field::new("searchable", DataType::Int32, false),
+        Field::new("unsigned_attribute", DataType::Boolean, false),
+        Field::new("fixed_prec_scale", DataType::Boolean, false),
+        Field::new("auto_increment", DataType::Boolean, false),
+        Field::new("local_type_name", DataType::Utf8, true),
+        Field::new("minimum_scale", DataType::Int32, false),
+        Field::new("maximum_scale", DataType::Int32, false),
+        Field::new("sql_data_type", DataType::Int32, false),
+        Field::new("sql_datetime_sub", DataType::Int32, false),
+        Field::new("num_prec_radix", DataType::Int32, true),
+    ]));
+
+    let type_rows: Vec<JdbcTypeRow> = vec![
+        JdbcTypeRow { name: "boolean",   jdbc_type: 16, precision:  1, literal_prefix: None,              literal_suffix: None,       case_sensitive: false, min_scale: 0, max_scale:  0, num_prec_radix: Some(10) },
+        JdbcTypeRow { name: "tinyint",   jdbc_type: -6, precision:  3, literal_prefix: None,              literal_suffix: None,       case_sensitive: false, min_scale: 0, max_scale:  0, num_prec_radix: Some(10) },
+        JdbcTypeRow { name: "smallint",  jdbc_type:  5, precision:  5, literal_prefix: None,              literal_suffix: None,       case_sensitive: false, min_scale: 0, max_scale:  0, num_prec_radix: Some(10) },
+        JdbcTypeRow { name: "integer",   jdbc_type:  4, precision: 10, literal_prefix: None,              literal_suffix: None,       case_sensitive: false, min_scale: 0, max_scale:  0, num_prec_radix: Some(10) },
+        JdbcTypeRow { name: "bigint",    jdbc_type: -5, precision: 19, literal_prefix: None,              literal_suffix: None,       case_sensitive: false, min_scale: 0, max_scale:  0, num_prec_radix: Some(10) },
+        JdbcTypeRow { name: "real",      jdbc_type:  7, precision: 24, literal_prefix: None,              literal_suffix: None,       case_sensitive: false, min_scale: 0, max_scale:  0, num_prec_radix: Some(10) },
+        JdbcTypeRow { name: "double",    jdbc_type:  8, precision: 53, literal_prefix: None,              literal_suffix: None,       case_sensitive: false, min_scale: 0, max_scale:  0, num_prec_radix: Some(10) },
+        JdbcTypeRow { name: "decimal",   jdbc_type:  3, precision: 38, literal_prefix: None,              literal_suffix: None,       case_sensitive: false, min_scale: 0, max_scale: 38, num_prec_radix: Some(10) },
+        JdbcTypeRow { name: "varchar",   jdbc_type: 12, precision:  0, literal_prefix: Some("'"),         literal_suffix: Some("'"),  case_sensitive: true,  min_scale: 0, max_scale:  0, num_prec_radix: None     },
+        JdbcTypeRow { name: "varbinary", jdbc_type: -3, precision:  0, literal_prefix: Some("X'"),        literal_suffix: Some("'"),  case_sensitive: false, min_scale: 0, max_scale:  0, num_prec_radix: None     },
+        JdbcTypeRow { name: "date",      jdbc_type: 91, precision:  0, literal_prefix: Some("DATE '"),    literal_suffix: Some("'"),  case_sensitive: false, min_scale: 0, max_scale:  0, num_prec_radix: Some(10) },
+        JdbcTypeRow { name: "timestamp", jdbc_type: 93, precision:  0, literal_prefix: Some("TIMESTAMP '"), literal_suffix: Some("'"), case_sensitive: false, min_scale: 0, max_scale: 9, num_prec_radix: Some(10) },
+    ];
+
+    let mut name_b = StringBuilder::new();
+    let mut dtype_b = Int32Builder::new();
+    let mut prec_b = Int32Builder::new();
+    let mut prefix_b = StringBuilder::new();
+    let mut suffix_b = StringBuilder::new();
+    let mut params_b = StringBuilder::new();
+    let mut nullable_b = Int32Builder::new();
+    let mut case_b = BooleanBuilder::new();
+    let mut search_b = Int32Builder::new();
+    let mut unsigned_b = BooleanBuilder::new();
+    let mut fixed_b = BooleanBuilder::new();
+    let mut auto_b = BooleanBuilder::new();
+    let mut local_b = StringBuilder::new();
+    let mut min_scale_b = Int32Builder::new();
+    let mut max_scale_b = Int32Builder::new();
+    let mut sql_dtype_b = Int32Builder::new();
+    let mut sql_dtsub_b = Int32Builder::new();
+    let mut radix_b = Int32Builder::new();
+
+    for row in &type_rows {
+        name_b.append_value(row.name);
+        dtype_b.append_value(row.jdbc_type);
+        prec_b.append_value(row.precision);
+        match row.literal_prefix {
+            Some(v) => prefix_b.append_value(v),
+            None => prefix_b.append_null(),
+        }
+        match row.literal_suffix {
+            Some(v) => suffix_b.append_value(v),
+            None => suffix_b.append_null(),
+        }
+        params_b.append_null(); // create_params always null
+        nullable_b.append_value(1); // typeNullable
+        case_b.append_value(row.case_sensitive);
+        search_b.append_value(3); // typeSearchable
+        unsigned_b.append_value(false);
+        fixed_b.append_value(false);
+        auto_b.append_value(false);
+        local_b.append_null(); // local_type_name always null
+        min_scale_b.append_value(row.min_scale);
+        max_scale_b.append_value(row.max_scale);
+        sql_dtype_b.append_value(0); // sql_data_type
+        sql_dtsub_b.append_value(0); // sql_datetime_sub
+        match row.num_prec_radix {
+            Some(v) => radix_b.append_value(v),
+            None => radix_b.append_null(),
+        }
+    }
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(name_b.finish()) as ArrayRef,
+            Arc::new(dtype_b.finish()) as ArrayRef,
+            Arc::new(prec_b.finish()) as ArrayRef,
+            Arc::new(prefix_b.finish()) as ArrayRef,
+            Arc::new(suffix_b.finish()) as ArrayRef,
+            Arc::new(params_b.finish()) as ArrayRef,
+            Arc::new(nullable_b.finish()) as ArrayRef,
+            Arc::new(case_b.finish()) as ArrayRef,
+            Arc::new(search_b.finish()) as ArrayRef,
+            Arc::new(unsigned_b.finish()) as ArrayRef,
+            Arc::new(fixed_b.finish()) as ArrayRef,
+            Arc::new(auto_b.finish()) as ArrayRef,
+            Arc::new(local_b.finish()) as ArrayRef,
+            Arc::new(min_scale_b.finish()) as ArrayRef,
+            Arc::new(max_scale_b.finish()) as ArrayRef,
+            Arc::new(sql_dtype_b.finish()) as ArrayRef,
+            Arc::new(sql_dtsub_b.finish()) as ArrayRef,
+            Arc::new(radix_b.finish()) as ArrayRef,
+        ],
+    )?;
+
+    Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+}
+
+/// Build the `system.jdbc.catalogs` table with a single row for the warehouse.
+fn build_catalogs_table(warehouse: &str) -> DFResult<Arc<dyn TableProvider>> {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "table_cat",
+        DataType::Utf8,
+        false,
+    )]));
+
+    let mut cat_b = StringBuilder::new();
+    cat_b.append_value(warehouse);
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(cat_b.finish()) as ArrayRef],
+    )?;
+
+    Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+}
+
+/// Map Iceberg types to JDBC type codes and type name strings.
+fn iceberg_type_to_jdbc(ty: &iceberg::spec::Type) -> (i32, &'static str) {
+    use iceberg::spec::PrimitiveType;
+    match ty {
+        iceberg::spec::Type::Primitive(p) => match p {
+            PrimitiveType::Boolean => (16, "boolean"),
+            PrimitiveType::Int => (4, "integer"),
+            PrimitiveType::Long => (-5, "bigint"),
+            PrimitiveType::Float => (7, "real"),
+            PrimitiveType::Double => (8, "double"),
+            PrimitiveType::Decimal { .. } => (3, "decimal"),
+            PrimitiveType::Date => (91, "date"),
+            PrimitiveType::Time => (92, "time"),
+            PrimitiveType::Timestamp => (93, "timestamp"),
+            PrimitiveType::Timestamptz => (93, "timestamp with time zone"),
+            PrimitiveType::TimestampNs => (93, "timestamp"),
+            PrimitiveType::TimestamptzNs => (93, "timestamp with time zone"),
+            PrimitiveType::String => (12, "varchar"),
+            PrimitiveType::Uuid => (12, "varchar"),
+            PrimitiveType::Fixed(_) => (-3, "varbinary"),
+            PrimitiveType::Binary => (-3, "varbinary"),
+        },
+        _ => (12, "varchar"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_types_table_schema() {
+        let table = build_types_table().unwrap();
+        let schema = table.schema();
+        assert_eq!(schema.field(0).name(), "type_name");
+        assert_eq!(schema.field(1).name(), "data_type");
+        assert!(schema.fields().len() >= 18);
+    }
+
+    #[test]
+    fn test_catalogs_table() {
+        let table = build_catalogs_table("my_warehouse").unwrap();
+        let schema = table.schema();
+        assert_eq!(schema.field(0).name(), "table_cat");
+    }
+
+    #[test]
+    fn test_iceberg_type_to_jdbc_string() {
+        use iceberg::spec::{PrimitiveType, Type};
+        let (code, name) = iceberg_type_to_jdbc(&Type::Primitive(PrimitiveType::String));
+        assert_eq!(code, 12);
+        assert_eq!(name, "varchar");
+    }
+
+    #[test]
+    fn test_iceberg_type_to_jdbc_long() {
+        use iceberg::spec::{PrimitiveType, Type};
+        let (code, name) = iceberg_type_to_jdbc(&Type::Primitive(PrimitiveType::Long));
+        assert_eq!(code, -5);
+        assert_eq!(name, "bigint");
+    }
+
+    #[test]
+    fn test_iceberg_type_to_jdbc_boolean() {
+        use iceberg::spec::{PrimitiveType, Type};
+        let (code, name) = iceberg_type_to_jdbc(&Type::Primitive(PrimitiveType::Boolean));
+        assert_eq!(code, 16);
+        assert_eq!(name, "boolean");
+    }
+
+    #[test]
+    fn test_iceberg_type_to_jdbc_timestamp() {
+        use iceberg::spec::{PrimitiveType, Type};
+        let (code, name) = iceberg_type_to_jdbc(&Type::Primitive(PrimitiveType::Timestamp));
+        assert_eq!(code, 93);
+        assert_eq!(name, "timestamp");
+    }
+}
