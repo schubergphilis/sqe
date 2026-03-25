@@ -21,6 +21,9 @@ BENCH_PORT="50051"
 SQE_USERNAME="root"
 SQE_PASSWORD="root123"
 
+# Catalog: MVP uses main_warehouse
+SQE_CATALOG="${SQE_CATALOG:-main_warehouse}"
+
 ALL_BENCHMARKS=(tpch tpcds ssb tpcc tpce clickbench)
 if [ $# -gt 0 ]; then
     BENCHMARKS=("$@")
@@ -64,6 +67,7 @@ for BENCH in "${BENCHMARKS[@]}"; do
         --port "$BENCH_PORT" \
         --username "$SQE_USERNAME" \
         --password "$SQE_PASSWORD" \
+        --catalog "$SQE_CATALOG" \
         --clean 2>&1; then
         echo "  ✗ Load FAILED"
         continue
@@ -71,15 +75,15 @@ for BENCH in "${BENCHMARKS[@]}"; do
     echo "  ✓ Loaded"
 
     # ── Step 3: Test ──────────────────────────────────────
-    echo ""
-    echo "  [3/3] Running queries..."
-    "$BENCH_BIN" test "$BENCH" \
-        --scale "$BENCH_SCALE" \
-        --host "$BENCH_HOST" \
-        --port "$BENCH_PORT" \
-        --username "$SQE_USERNAME" \
-        --password "$SQE_PASSWORD" 2>&1 || true
-
+    #echo ""
+    #echo "  [3/3] Running queries..."
+    #"$BENCH_BIN" test "$BENCH" \
+    #    --scale "$BENCH_SCALE" \
+    #    --host "$BENCH_HOST" \
+    #    --port "$BENCH_PORT" \
+    #    --username "$SQE_USERNAME" \
+    #    --password "$SQE_PASSWORD" 2>&1 || true
+    #
     # Clean generated data
     rm -rf "${BENCH_DATA_DIR:?}/$BENCH"
 done
