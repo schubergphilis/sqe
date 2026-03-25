@@ -66,6 +66,8 @@ async fn main() -> anyhow::Result<()> {
             token_endpoint,
             client_id,
             client_secret,
+            catalog,
+            namespace,
             ..
         } => {
             let protocol_str = match protocol {
@@ -73,6 +75,9 @@ async fn main() -> anyhow::Result<()> {
                 cli::Protocol::Http => "trino",
             };
             let endpoint = format!("http://{host}:{port}");
+            if std::env::var("BENCH_DEBUG").is_ok() {
+                eprintln!("[sqe-bench] connecting to {endpoint} via {protocol_str}...");
+            }
             let bench_client = client::create_client(
                 protocol_str,
                 &endpoint,
@@ -98,6 +103,8 @@ async fn main() -> anyhow::Result<()> {
                 &data,
                 &s3_args,
                 clean,
+                catalog.as_deref(),
+                namespace.as_deref(),
             )
             .await
         }
@@ -114,6 +121,8 @@ async fn main() -> anyhow::Result<()> {
             token_endpoint,
             client_id,
             client_secret,
+            catalog,
+            namespace,
         } => {
             let protocol_str = match protocol {
                 cli::Protocol::Flight => "flight",
@@ -142,6 +151,8 @@ async fn main() -> anyhow::Result<()> {
                 &benchmark,
                 scale,
                 query.as_deref(),
+                catalog.as_deref(),
+                namespace.as_deref(),
             )
             .await?;
 

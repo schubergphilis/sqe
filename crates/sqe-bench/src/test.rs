@@ -137,12 +137,17 @@ pub async fn run_benchmark_test(
     benchmark: &str,
     scale: f64,
     query_filter: Option<&str>,
+    catalog: Option<&str>,
+    namespace_override: Option<&str>,
 ) -> anyhow::Result<Vec<QueryResult>> {
-    // TPC-BB queries reference TPC-DS tables, so use the tpcds namespace for resolution.
-    let namespace = if benchmark == "tpcbb" {
-        crate::bench_namespace("tpcds", scale)
-    } else {
-        crate::bench_namespace(benchmark, scale)
+    let ns_base = match namespace_override {
+        Some(ns) => ns.to_string(),
+        None if benchmark == "tpcbb" => crate::bench_namespace("tpcds", scale),
+        None => crate::bench_namespace(benchmark, scale),
+    };
+    let namespace = match catalog {
+        Some(cat) => format!("{cat}.{ns_base}"),
+        None => ns_base,
     };
     let queries = load_query_files(benchmark)?;
     let mut results = Vec::new();

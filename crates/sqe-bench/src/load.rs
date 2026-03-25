@@ -15,21 +15,29 @@ pub async fn load_benchmark(
     data_path: &str,
     s3_args: &S3Args,
     clean: bool,
+    catalog: Option<&str>,
+    namespace_override: Option<&str>,
 ) -> anyhow::Result<()> {
-    // TPC-BB reuses the TPC-DS namespace: its two extra tables go into tpcds_sfN
-    // alongside the TPC-DS tables so queries can reference them in the same schema.
-    let namespace = if benchmark == "tpcbb" {
-        crate::bench_namespace("tpcds", scale)
-    } else {
-        crate::bench_namespace(benchmark, scale)
+    // Build the namespace: user override > auto-generated
+    let ns_base = match namespace_override {
+        Some(ns) => ns.to_string(),
+        None if benchmark == "tpcbb" => crate::bench_namespace("tpcds", scale),
+        None => crate::bench_namespace(benchmark, scale),
     };
+
+    // Full qualified prefix: catalog.namespace or just namespace
+    let qualified_ns = match catalog {
+        Some(cat) => format!("{cat}.{ns_base}"),
+        None => ns_base.clone(),
+    };
+
     let gen = generate::get_generator(benchmark)?;
 
-    println!("Loading {benchmark} SF{scale} into namespace {namespace}");
+    println!("Loading {benchmark} SF{scale} into {qualified_ns}");
 
     // Create namespace (ignore error if exists)
     let _ = client
-        .execute_update(&format!("CREATE SCHEMA IF NOT EXISTS {namespace}"))
+        .execute_update(&format!("CREATE SCHEMA IF NOT EXISTS {qualified_ns}"))
         .await;
 
     for table_def in gen.tables() {
@@ -41,7 +49,7 @@ pub async fn load_benchmark(
         if clean {
             let _ = client
                 .execute_update(&format!(
-                    "DROP TABLE IF EXISTS {namespace}.{}",
+                    "DROP TABLE IF EXISTS {qualified_ns}.{}",
                     table_def.name
                 ))
                 .await;
@@ -49,7 +57,7 @@ pub async fn load_benchmark(
 
         // Build CTAS with read_parquet
         let mut sql = format!(
-            "CREATE TABLE {namespace}.{} AS SELECT * FROM read_parquet('{}/*.parquet'",
+            "CREATE TABLE {qualified_ns}.{} AS SELECT * FROM read_parquet('{}/*.parquet'",
             table_def.name, table_path
         );
 
@@ -66,11 +74,11 @@ pub async fn load_benchmark(
         sql.push_str(&format!(", region => '{}'", s3_args.region));
         sql.push(')');
 
-        println!("  Loading {}.{}...", namespace, table_def.name);
+        println!("  Loading {}.{}...", qualified_ns, table_def.name);
         client.execute_update(&sql).await?;
-        println!("  Done: {}.{}", namespace, table_def.name);
+        println!("  Done: {}.{}", qualified_ns, table_def.name);
     }
 
-    println!("Done. All tables loaded into {namespace}.");
+    println!("Done. All tables loaded into {qualified_ns}.");
     Ok(())
 }
