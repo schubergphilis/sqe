@@ -74,6 +74,15 @@ pub enum Command {
         #[arg(long, default_value_t = 50051u16)]
         port: u16,
 
+        /// Catalog name (e.g. main_warehouse). If set, tables are created as
+        /// <catalog>.<namespace>.<table> instead of <namespace>.<table>.
+        #[arg(long, env = "SQE_CATALOG")]
+        catalog: Option<String>,
+
+        /// Override the auto-generated namespace (default: <benchmark>_sf<scale>)
+        #[arg(long, env = "SQE_NAMESPACE")]
+        namespace: Option<String>,
+
         /// Drop and recreate tables before loading
         #[arg(long, default_value_t = false)]
         clean: bool,
@@ -144,6 +153,14 @@ pub enum Command {
         /// Run only the specified query (e.g. "q1" or "1"); runs all if omitted
         #[arg(long)]
         query: Option<String>,
+
+        /// Catalog name (must match the value used during load)
+        #[arg(long, env = "SQE_CATALOG")]
+        catalog: Option<String>,
+
+        /// Override namespace (must match the value used during load)
+        #[arg(long, env = "SQE_NAMESPACE")]
+        namespace: Option<String>,
 
         /// Username for authentication (OIDC password grant)
         #[arg(long, env = "SQE_USER")]
