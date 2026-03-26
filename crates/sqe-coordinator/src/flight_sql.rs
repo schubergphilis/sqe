@@ -2,7 +2,7 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
+use arrow_array::{Array, RecordBatch};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::sql::server::FlightSqlService;
@@ -107,6 +107,11 @@ impl SqeFlightSqlService {
 
     /// Extract and validate a bearer token from the request metadata,
     /// returning the associated session.
+    ///
+    /// Supports two token types:
+    /// 1. SQE session ID (from do_handshake) — looked up in session manager
+    /// 2. Raw JWT (from backend BFF pass-through) — wrapped into an ad-hoc session,
+    ///    same pattern as the Trino-compat HTTP endpoint
     fn get_session_from_request<T>(
         &self,
         request: &Request<T>,
@@ -125,10 +130,33 @@ impl SqeFlightSqlService {
             ));
         }
 
-        let session_id = &auth[bearer_prefix.len()..];
-        self.session_manager.get_session(session_id).ok_or_else(|| {
-            Status::unauthenticated("Invalid or expired session token")
-        })
+        let token = &auth[bearer_prefix.len()..];
+
+        // Try session lookup first (handshake flow)
+        if let Some(session) = self.session_manager.get_session(token) {
+            return Ok(session);
+        }
+
+        // If the token looks like a JWT (contains dots), treat it as a raw
+        // access token — create an ad-hoc session like Trino-compat does.
+        if token.contains('.') {
+            let username = metadata
+                .get("x-trino-user")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("unknown")
+                .to_string();
+            debug!(username = %username, "Flight: accepting raw JWT as bearer token");
+            let session = sqe_core::Session::new(
+                username,
+                token.to_string(),
+                None,
+                chrono::Utc::now() + chrono::Duration::hours(1),
+                vec![],
+            );
+            return Ok(Arc::new(session));
+        }
+
+        Err(Status::unauthenticated("Invalid or expired session token"))
     }
 
     /// Convert RecordBatches into a streaming Flight response.
@@ -379,6 +407,7 @@ impl FlightSqlService for SqeFlightSqlService {
         query: CommandGetCatalogs,
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        info!("Flight SQL: do_get_catalogs called");
         let catalog_name = if self.config.catalog.warehouse.is_empty() {
             "default".to_string()
         } else {
@@ -387,13 +416,8 @@ impl FlightSqlService for SqeFlightSqlService {
 
         let mut builder = query.into_builder();
         builder.append(&catalog_name);
-        let schema = builder.schema();
-        let batch = builder.build();
-        let stream = FlightDataEncoderBuilder::new()
-            .with_schema(schema)
-            .build(futures::stream::once(async { batch }))
-            .map_err(Status::from);
-        Ok(Response::new(Box::pin(stream)))
+        let batch = builder.build().map_err(|e| Status::internal(format!("Failed to build batch: {e}")))?;
+        Self::batches_to_stream(vec![batch])
     }
 
     async fn get_flight_info_schemas(
@@ -417,17 +441,42 @@ impl FlightSqlService for SqeFlightSqlService {
     async fn do_get_schemas(
         &self,
         query: CommandGetDbSchemas,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        // Return an empty schema list for now; real implementation needs session context
-        let builder = query.into_builder();
+        info!("Flight SQL: do_get_schemas called");
+        let session = self.get_session_from_request(&request)?;
+
+        let catalog_name = if self.config.catalog.warehouse.is_empty() {
+            "default".to_string()
+        } else {
+            self.config.catalog.warehouse.clone()
+        };
+
+        // Use query handler to list schemas via the session catalog
+        let batches = self
+            .query_handler
+            .execute(&session, "SHOW SCHEMAS")
+            .await
+            .map_err(|e| Status::internal(format!("Failed to list schemas: {e}")))?;
+
+        // Build the Flight SQL GetDbSchemas response using the builder
+        let mut builder = query.into_builder();
+        for batch in &batches {
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .ok_or_else(|| Status::internal("Expected string column for schema names"))?;
+            for i in 0..col.len() {
+                if !col.is_null(i) {
+                    builder.append(&catalog_name, col.value(i));
+                }
+            }
+        }
+
         let schema = builder.schema();
-        let batch = builder.build();
-        let stream = FlightDataEncoderBuilder::new()
-            .with_schema(schema)
-            .build(futures::stream::once(async { batch }))
-            .map_err(Status::from);
-        Ok(Response::new(Box::pin(stream)))
+        let batch = builder.build().map_err(|e| Status::internal(format!("Failed to build batch: {e}")))?;
+        Self::batches_to_stream(vec![batch])
     }
 
     async fn get_flight_info_tables(
@@ -451,16 +500,82 @@ impl FlightSqlService for SqeFlightSqlService {
     async fn do_get_tables(
         &self,
         query: CommandGetTables,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let builder = query.into_builder();
-        let schema = builder.schema();
-        let batch = builder.build();
-        let stream = FlightDataEncoderBuilder::new()
-            .with_schema(schema)
-            .build(futures::stream::once(async { batch }))
-            .map_err(Status::from);
-        Ok(Response::new(Box::pin(stream)))
+        info!("Flight SQL: do_get_tables called");
+        let session = self.get_session_from_request(&request)?;
+
+        let catalog_name = if self.config.catalog.warehouse.is_empty() {
+            "default".to_string()
+        } else {
+            self.config.catalog.warehouse.clone()
+        };
+
+        // SQE doesn't have information_schema — use SHOW SCHEMAS + SHOW TABLES
+        // to enumerate all schemas and their tables.
+        let schema_batches = self
+            .query_handler
+            .execute(&session, "SHOW SCHEMAS")
+            .await
+            .map_err(|e| Status::internal(format!("Failed to list schemas: {e}")))?;
+
+        // Collect schema names
+        let mut schema_names: Vec<String> = Vec::new();
+        for batch in &schema_batches {
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .ok_or_else(|| Status::internal("Expected string column for schema names"))?;
+            for i in 0..col.len() {
+                if !col.is_null(i) {
+                    schema_names.push(col.value(i).to_string());
+                }
+            }
+        }
+
+        let mut builder = query.into_builder();
+        let empty_schema = arrow_schema::Schema::empty();
+
+        // For each schema, list its tables
+        for ns in &schema_names {
+            let sql = format!("SHOW TABLES IN {}", ns);
+            match self.query_handler.execute(&session, &sql).await {
+                Ok(table_batches) => {
+                    for batch in &table_batches {
+                        // SHOW TABLES returns (namespace, table_name) — column 1 is the table name
+                        let col = batch
+                            .column(1)
+                            .as_any()
+                            .downcast_ref::<arrow_array::StringArray>()
+                            .ok_or_else(|| {
+                                Status::internal("Expected string column for table names")
+                            })?;
+                        for i in 0..col.len() {
+                            if !col.is_null(i) {
+                                builder
+                                    .append(
+                                        &catalog_name,
+                                        ns,
+                                        col.value(i),
+                                        "TABLE",
+                                        &empty_schema,
+                                    )
+                                    .map_err(|e| {
+                                        Status::internal(format!("Failed to append table: {e}"))
+                                    })?;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(schema = %ns, error = %e, "Failed to list tables in schema");
+                }
+            }
+        }
+
+        let batch = builder.build().map_err(|e| Status::internal(format!("Failed to build batch: {e}")))?;
+        Self::batches_to_stream(vec![batch])
     }
 
     // ------------------------------------------------------------------
@@ -477,12 +592,40 @@ impl FlightSqlService for SqeFlightSqlService {
 
     async fn get_flight_info_prepared_statement(
         &self,
-        _cmd: CommandPreparedStatementQuery,
-        _request: Request<FlightDescriptor>,
+        cmd: CommandPreparedStatementQuery,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        Err(Status::unimplemented(
-            "Prepared statements not yet supported",
-        ))
+        let session = self.get_session_from_request(&request)?;
+
+        // Decode the SQL from the prepared statement handle
+        let fetch: FetchResults =
+            Message::decode(&*cmd.prepared_statement_handle)
+                .map_err(|e| Status::internal(format!("Failed to decode prepared statement handle: {e}")))?;
+
+        let schema = self
+            .query_handler
+            .get_schema(&session, &fetch.handle)
+            .await
+            .map_err(|e| Status::internal(format!("Query planning failed: {e}")))?;
+
+        let ticket = Ticket {
+            ticket: cmd.as_any().encode_to_vec().into(),
+        };
+        let endpoint = FlightEndpoint {
+            ticket: Some(ticket),
+            location: vec![],
+            expiration_time: None,
+            app_metadata: vec![].into(),
+        };
+
+        let info = FlightInfo::new()
+            .try_with_schema(&schema)
+            .map_err(|e| Status::internal(format!("Failed to encode schema: {e}")))?
+            .with_descriptor(FlightDescriptor::new_cmd(vec![]))
+            .with_endpoint(endpoint)
+            .with_total_records(-1);
+
+        Ok(Response::new(info))
     }
 
     async fn get_flight_info_table_types(
@@ -521,34 +664,58 @@ impl FlightSqlService for SqeFlightSqlService {
 
     async fn get_flight_info_primary_keys(
         &self,
-        _query: CommandGetPrimaryKeys,
-        _request: Request<FlightDescriptor>,
+        query: CommandGetPrimaryKeys,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        Err(Status::unimplemented("Primary keys not supported"))
+        let flight_descriptor = request.into_inner();
+        let ticket = Ticket { ticket: query.as_any().encode_to_vec().into() };
+        let endpoint = FlightEndpoint::new().with_ticket(ticket);
+        let info = FlightInfo::new()
+            .with_endpoint(endpoint)
+            .with_descriptor(flight_descriptor);
+        Ok(Response::new(info))
     }
 
     async fn get_flight_info_exported_keys(
         &self,
-        _query: CommandGetExportedKeys,
-        _request: Request<FlightDescriptor>,
+        query: CommandGetExportedKeys,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        Err(Status::unimplemented("Exported keys not supported"))
+        let flight_descriptor = request.into_inner();
+        let ticket = Ticket { ticket: query.as_any().encode_to_vec().into() };
+        let endpoint = FlightEndpoint::new().with_ticket(ticket);
+        let info = FlightInfo::new()
+            .with_endpoint(endpoint)
+            .with_descriptor(flight_descriptor);
+        Ok(Response::new(info))
     }
 
     async fn get_flight_info_imported_keys(
         &self,
-        _query: CommandGetImportedKeys,
-        _request: Request<FlightDescriptor>,
+        query: CommandGetImportedKeys,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        Err(Status::unimplemented("Imported keys not supported"))
+        let flight_descriptor = request.into_inner();
+        let ticket = Ticket { ticket: query.as_any().encode_to_vec().into() };
+        let endpoint = FlightEndpoint::new().with_ticket(ticket);
+        let info = FlightInfo::new()
+            .with_endpoint(endpoint)
+            .with_descriptor(flight_descriptor);
+        Ok(Response::new(info))
     }
 
     async fn get_flight_info_cross_reference(
         &self,
-        _query: CommandGetCrossReference,
-        _request: Request<FlightDescriptor>,
+        query: CommandGetCrossReference,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        Err(Status::unimplemented("Cross reference not supported"))
+        let flight_descriptor = request.into_inner();
+        let ticket = Ticket { ticket: query.as_any().encode_to_vec().into() };
+        let endpoint = FlightEndpoint::new().with_ticket(ticket);
+        let info = FlightInfo::new()
+            .with_endpoint(endpoint)
+            .with_descriptor(flight_descriptor);
+        Ok(Response::new(info))
     }
 
     async fn get_flight_info_xdbc_type_info(
@@ -561,12 +728,29 @@ impl FlightSqlService for SqeFlightSqlService {
 
     async fn do_get_prepared_statement(
         &self,
-        _query: CommandPreparedStatementQuery,
-        _request: Request<Ticket>,
+        query: CommandPreparedStatementQuery,
+        request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        Err(Status::unimplemented(
-            "Prepared statements not yet supported",
-        ))
+        let session = self.get_session_from_request(&request)?;
+
+        // Decode the SQL from the prepared statement handle
+        let fetch: FetchResults =
+            Message::decode(&*query.prepared_statement_handle)
+                .map_err(|e| Status::internal(format!("Failed to decode prepared statement handle: {e}")))?;
+
+        debug!(
+            username = %session.user.username,
+            sql = %fetch.handle,
+            "Executing prepared statement"
+        );
+
+        let batches = self
+            .query_handler
+            .execute(&session, &fetch.handle)
+            .await
+            .map_err(|e| Status::internal(format!("Query execution failed: {e}")))?;
+
+        Self::batches_to_stream(batches)
     }
 
     async fn do_get_table_types(
@@ -605,7 +789,8 @@ impl FlightSqlService for SqeFlightSqlService {
         _query: CommandGetPrimaryKeys,
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        Err(Status::unimplemented("Primary keys not supported"))
+        // Iceberg tables have no primary keys — return empty stream
+        Self::batches_to_stream(vec![])
     }
 
     async fn do_get_exported_keys(
@@ -613,7 +798,7 @@ impl FlightSqlService for SqeFlightSqlService {
         _query: CommandGetExportedKeys,
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        Err(Status::unimplemented("Exported keys not supported"))
+        Self::batches_to_stream(vec![])
     }
 
     async fn do_get_imported_keys(
@@ -621,7 +806,7 @@ impl FlightSqlService for SqeFlightSqlService {
         _query: CommandGetImportedKeys,
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        Err(Status::unimplemented("Imported keys not supported"))
+        Self::batches_to_stream(vec![])
     }
 
     async fn do_get_cross_reference(
@@ -629,7 +814,7 @@ impl FlightSqlService for SqeFlightSqlService {
         _query: CommandGetCrossReference,
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        Err(Status::unimplemented("Cross reference not supported"))
+        Self::batches_to_stream(vec![])
     }
 
     async fn do_get_xdbc_type_info(
@@ -686,12 +871,38 @@ impl FlightSqlService for SqeFlightSqlService {
 
     async fn do_action_create_prepared_statement(
         &self,
-        _query: ActionCreatePreparedStatementRequest,
-        _request: Request<Action>,
+        query: ActionCreatePreparedStatementRequest,
+        request: Request<Action>,
     ) -> Result<ActionCreatePreparedStatementResult, Status> {
-        Err(Status::unimplemented(
-            "Prepared statements not yet supported",
-        ))
+        let session = self.get_session_from_request(&request)?;
+        let sql = &query.query;
+
+        debug!(username = %session.user.username, sql = %sql, "Creating prepared statement");
+
+        // Get schema by planning the query
+        let schema = self
+            .query_handler
+            .get_schema(&session, sql)
+            .await
+            .map_err(|e| Status::internal(format!("Query planning failed: {e}")))?;
+
+        // Encode the SQL in the handle so we can execute it later
+        let fetch = FetchResults {
+            handle: sql.clone(),
+        };
+        let handle = fetch.encode_to_vec();
+
+        // Encode the schema as IPC for the prepared statement result.
+        // Use FlightInfo's try_with_schema to get the encoded bytes, then extract them.
+        let encoded_info = FlightInfo::new()
+            .try_with_schema(&schema)
+            .map_err(|e| Status::internal(format!("Failed to encode schema: {e}")))?;
+
+        Ok(ActionCreatePreparedStatementResult {
+            prepared_statement_handle: handle.into(),
+            dataset_schema: encoded_info.schema,
+            parameter_schema: Default::default(),
+        })
     }
 
     async fn do_action_close_prepared_statement(

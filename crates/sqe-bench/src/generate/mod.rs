@@ -10,6 +10,11 @@ pub mod tpcds;
 use arrow_schema::SchemaRef;
 use std::time::Duration;
 
+/// Scale a row count ensuring at least 1 row for small scale factors.
+pub(crate) fn scaled(scale: f64, base: f64) -> usize {
+    (scale * base).max(1.0) as usize
+}
+
 // These fields and methods will be consumed by the generator implementations
 // added in Task 7; allow dead_code for now so clippy stays clean.
 #[allow(dead_code)]

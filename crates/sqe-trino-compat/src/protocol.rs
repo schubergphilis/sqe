@@ -25,7 +25,6 @@ pub struct NodeVersion {
 #[serde(rename_all = "camelCase")]
 pub struct TrinoResponse {
     pub id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub info_uri: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_uri: Option<String>,
@@ -43,6 +42,27 @@ pub struct TrinoResponse {
 pub struct TrinoColumn {
     pub name: String,
     pub r#type: String,
+    pub type_signature: TrinoTypeSignature,
+}
+
+/// Trino column type signature — required by the Trino JDBC driver.
+///
+/// The driver calls `ClientTypeSignature.getRawType()` on every column;
+/// if `typeSignature` is missing from the JSON the field deserializes as
+/// `null` and the driver throws NPE.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrinoTypeSignature {
+    pub raw_type: String,
+    #[serde(default)]
+    pub arguments: Vec<TrinoTypeArgument>,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrinoTypeArgument {
+    pub kind: String,
+    pub value: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -65,6 +85,67 @@ pub struct TrinoError {
     pub error_type: String,
 }
 
+/// Build a `TrinoTypeSignature` from a Trino type string.
+///
+/// For parameterized types like `decimal(18,2)`, the precision and scale
+/// are extracted into `arguments`. For simple types, `arguments` is empty.
+pub fn type_signature_for(trino_type: &str) -> TrinoTypeSignature {
+    // The Trino JDBC driver accesses arguments[0] for varchar, varbinary,
+    // and decimal types. Missing arguments cause ArrayIndexOutOfBoundsException.
+
+    // Handle "decimal(p,s)" → rawType "decimal", arguments [{LONG,p},{LONG,s}]
+    if let Some(rest) = trino_type.strip_prefix("decimal(") {
+        if let Some(params) = rest.strip_suffix(')') {
+            let parts: Vec<&str> = params.split(',').collect();
+            if parts.len() == 2 {
+                let args: Vec<TrinoTypeArgument> = parts
+                    .iter()
+                    .filter_map(|p| p.trim().parse::<i64>().ok())
+                    .map(|v| TrinoTypeArgument {
+                        kind: "LONG".to_string(),
+                        value: serde_json::json!(v),
+                    })
+                    .collect();
+                return TrinoTypeSignature {
+                    raw_type: "decimal".to_string(),
+                    arguments: args,
+                };
+            }
+        }
+    }
+
+    let long_arg = |v: i64| TrinoTypeArgument {
+        kind: "LONG".to_string(),
+        value: serde_json::json!(v),
+    };
+
+    match trino_type {
+        // varchar/varbinary: driver reads arguments[0] for display size
+        "varchar" => TrinoTypeSignature {
+            raw_type: "varchar".to_string(),
+            arguments: vec![long_arg(2147483647)],
+        },
+        "varbinary" => TrinoTypeSignature {
+            raw_type: "varbinary".to_string(),
+            arguments: vec![long_arg(2147483647)],
+        },
+        // timestamp types: driver reads arguments[0] for precision (default 3 if missing,
+        // but we provide 6 for microsecond precision to match Iceberg)
+        "timestamp" => TrinoTypeSignature {
+            raw_type: "timestamp".to_string(),
+            arguments: vec![long_arg(6)],
+        },
+        "timestamp with time zone" => TrinoTypeSignature {
+            raw_type: "timestamp with time zone".to_string(),
+            arguments: vec![long_arg(6)],
+        },
+        _ => TrinoTypeSignature {
+            raw_type: trino_type.to_string(),
+            arguments: vec![],
+        },
+    }
+}
+
 pub fn batches_to_trino(
     batches: &[RecordBatch],
 ) -> (Vec<TrinoColumn>, Vec<Vec<serde_json::Value>>) {
@@ -77,9 +158,14 @@ pub fn batches_to_trino(
     let columns: Vec<TrinoColumn> = schema
         .fields()
         .iter()
-        .map(|f| TrinoColumn {
-            name: f.name().clone(),
-            r#type: arrow_to_trino_type(f.data_type()),
+        .map(|f| {
+            let trino_type = arrow_to_trino_type(f.data_type());
+            let type_signature = type_signature_for(&trino_type);
+            TrinoColumn {
+                name: f.name().clone(),
+                r#type: trino_type,
+                type_signature,
+            }
         })
         .collect();
 
@@ -223,6 +309,7 @@ mod tests {
             columns: Some(vec![TrinoColumn {
                 name: "x".to_string(),
                 r#type: "bigint".to_string(),
+                type_signature: type_signature_for("bigint"),
             }]),
             data: Some(vec![vec![serde_json::json!(1)]]),
             stats: TrinoStats::finished(),
@@ -233,5 +320,22 @@ mod tests {
         assert!(json.contains("\"id\":\"q-001\""));
         assert!(json.contains("\"state\":\"FINISHED\""));
         assert!(!json.contains("nextUri")); // Skipped because None
+        assert!(json.contains("\"typeSignature\""), "typeSignature must be present, got: {json}");
+        assert!(json.contains("\"rawType\":\"bigint\""), "rawType must be present, got: {json}");
+    }
+
+    #[test]
+    fn test_trino_response_always_includes_info_uri() {
+        let resp = TrinoResponse {
+            id: "q-001".to_string(),
+            info_uri: None,
+            next_uri: None,
+            columns: None,
+            data: None,
+            stats: TrinoStats::finished(),
+            error: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"infoUri\":null"), "infoUri must always be present, got: {json}");
     }
 }

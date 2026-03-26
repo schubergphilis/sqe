@@ -137,12 +137,17 @@ pub async fn run_benchmark_test(
     benchmark: &str,
     scale: f64,
     query_filter: Option<&str>,
+    catalog: Option<&str>,
+    namespace_override: Option<&str>,
 ) -> anyhow::Result<Vec<QueryResult>> {
-    // TPC-BB queries reference TPC-DS tables, so use the tpcds namespace for resolution.
-    let namespace = if benchmark == "tpcbb" {
-        crate::bench_namespace("tpcds", scale)
-    } else {
-        crate::bench_namespace(benchmark, scale)
+    let ns_base = match namespace_override {
+        Some(ns) => ns.to_string(),
+        None if benchmark == "tpcbb" => crate::bench_namespace("tpcds", scale),
+        None => crate::bench_namespace(benchmark, scale),
+    };
+    let namespace = match catalog {
+        Some(cat) => format!("{cat}.{ns_base}"),
+        None => ns_base,
     };
     let queries = load_query_files(benchmark)?;
     let mut results = Vec::new();
@@ -304,10 +309,41 @@ fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> String {
             };
 
             if before_ok && after_ok {
-                // Skip if preceded by "AS " (this is an alias, not a table ref)
                 let before_str = &remaining[..pos];
                 let trimmed_before = before_str.trim_end();
-                if trimmed_before.to_uppercase().ends_with(" AS") {
+                let upper_before = trimmed_before.to_uppercase();
+
+                // Skip if preceded by "AS " (this is an alias, not a table ref)
+                if upper_before.ends_with(" AS") {
+                    output.push_str(&remaining[..end]);
+                    remaining = &remaining[end..];
+                    continue;
+                }
+
+                // Only qualify if preceded by a table-introducing context:
+                // FROM, JOIN, TABLE, INTO, UPDATE, or a comma that follows
+                // a previously qualified table name (for FROM t1, t2 lists).
+                let in_table_context = upper_before.ends_with(" FROM")
+                    || upper_before.ends_with(" JOIN")
+                    || upper_before.ends_with(" TABLE")
+                    || upper_before.ends_with(" INTO")
+                    || upper_before.ends_with(" UPDATE")
+                    || upper_before.ends_with(" EXISTS")
+                    // Comma after a qualified table: "ns.table1," → next word is also a table
+                    || {
+                        let t = trimmed_before;
+                        t.ends_with(',') && t[..t.len()-1].trim_end().contains(&format!("{namespace}."))
+                    }
+                    // Also handle newline after FROM/JOIN (table on next line)
+                    || {
+                        let words: Vec<&str> = trimmed_before.split_whitespace().collect();
+                        words.last().map(|w| {
+                            let u = w.to_uppercase();
+                            u == "FROM" || u == "JOIN" || u == "TABLE" || u == "INTO"
+                        }).unwrap_or(false)
+                    };
+
+                if !in_table_context {
                     output.push_str(&remaining[..end]);
                     remaining = &remaining[end..];
                     continue;
