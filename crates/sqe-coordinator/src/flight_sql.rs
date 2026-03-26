@@ -2,7 +2,7 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
+use arrow_array::{Array, RecordBatch};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::sql::server::FlightSqlService;
@@ -107,6 +107,11 @@ impl SqeFlightSqlService {
 
     /// Extract and validate a bearer token from the request metadata,
     /// returning the associated session.
+    ///
+    /// Supports two token types:
+    /// 1. SQE session ID (from do_handshake) — looked up in session manager
+    /// 2. Raw JWT (from backend BFF pass-through) — wrapped into an ad-hoc session,
+    ///    same pattern as the Trino-compat HTTP endpoint
     fn get_session_from_request<T>(
         &self,
         request: &Request<T>,
@@ -125,10 +130,33 @@ impl SqeFlightSqlService {
             ));
         }
 
-        let session_id = &auth[bearer_prefix.len()..];
-        self.session_manager.get_session(session_id).ok_or_else(|| {
-            Status::unauthenticated("Invalid or expired session token")
-        })
+        let token = &auth[bearer_prefix.len()..];
+
+        // Try session lookup first (handshake flow)
+        if let Some(session) = self.session_manager.get_session(token) {
+            return Ok(session);
+        }
+
+        // If the token looks like a JWT (contains dots), treat it as a raw
+        // access token — create an ad-hoc session like Trino-compat does.
+        if token.contains('.') {
+            let username = metadata
+                .get("x-trino-user")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("unknown")
+                .to_string();
+            debug!(username = %username, "Flight: accepting raw JWT as bearer token");
+            let session = sqe_core::Session::new(
+                username,
+                token.to_string(),
+                None,
+                chrono::Utc::now() + chrono::Duration::hours(1),
+                vec![],
+            );
+            return Ok(Arc::new(session));
+        }
+
+        Err(Status::unauthenticated("Invalid or expired session token"))
     }
 
     /// Convert RecordBatches into a streaming Flight response.
@@ -417,10 +445,38 @@ impl FlightSqlService for SqeFlightSqlService {
     async fn do_get_schemas(
         &self,
         query: CommandGetDbSchemas,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        // Return an empty schema list for now; real implementation needs session context
-        let builder = query.into_builder();
+        let session = self.get_session_from_request(&request)?;
+
+        let catalog_name = if self.config.catalog.warehouse.is_empty() {
+            "default".to_string()
+        } else {
+            self.config.catalog.warehouse.clone()
+        };
+
+        // Use query handler to list schemas via the session catalog
+        let batches = self
+            .query_handler
+            .execute(&session, "SHOW SCHEMAS")
+            .await
+            .map_err(|e| Status::internal(format!("Failed to list schemas: {e}")))?;
+
+        // Build the Flight SQL GetDbSchemas response using the builder
+        let mut builder = query.into_builder();
+        for batch in &batches {
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .ok_or_else(|| Status::internal("Expected string column for schema names"))?;
+            for i in 0..col.len() {
+                if !col.is_null(i) {
+                    builder.append(&catalog_name, col.value(i));
+                }
+            }
+        }
+
         let schema = builder.schema();
         let batch = builder.build();
         let stream = FlightDataEncoderBuilder::new()
@@ -451,9 +507,46 @@ impl FlightSqlService for SqeFlightSqlService {
     async fn do_get_tables(
         &self,
         query: CommandGetTables,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let builder = query.into_builder();
+        let session = self.get_session_from_request(&request)?;
+
+        let catalog_name = if self.config.catalog.warehouse.is_empty() {
+            "default".to_string()
+        } else {
+            self.config.catalog.warehouse.clone()
+        };
+
+        // Query information_schema.tables for the full table listing
+        let batches = self
+            .query_handler
+            .execute(
+                &session,
+                "SELECT table_schema, table_name, table_type FROM information_schema.tables",
+            )
+            .await
+            .map_err(|e| Status::internal(format!("Failed to list tables: {e}")))?;
+
+        let mut builder = query.into_builder();
+        for batch in &batches {
+            let schema_col = batch.column(0).as_any().downcast_ref::<arrow_array::StringArray>()
+                .ok_or_else(|| Status::internal("Expected string column"))?;
+            let name_col = batch.column(1).as_any().downcast_ref::<arrow_array::StringArray>()
+                .ok_or_else(|| Status::internal("Expected string column"))?;
+            let type_col = batch.column(2).as_any().downcast_ref::<arrow_array::StringArray>()
+                .ok_or_else(|| Status::internal("Expected string column"))?;
+
+            let empty_schema = arrow_schema::Schema::empty();
+            for i in 0..batch.num_rows() {
+                let db_schema = if schema_col.is_null(i) { "" } else { schema_col.value(i) };
+                let table_name = if name_col.is_null(i) { "" } else { name_col.value(i) };
+                let table_type = if type_col.is_null(i) { "TABLE" } else { type_col.value(i) };
+                builder
+                    .append(&catalog_name, db_schema, table_name, table_type, &empty_schema)
+                    .map_err(|e| Status::internal(format!("Failed to append table: {e}")))?;
+            }
+        }
+
         let schema = builder.schema();
         let batch = builder.build();
         let stream = FlightDataEncoderBuilder::new()
