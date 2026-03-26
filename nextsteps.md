@@ -1,6 +1,6 @@
 # SQE — Next Steps
 
-> Status as of 2026-03-24. Step 0 dependency alignment complete. Step 2 core engine effectively complete (99/103 — 4 blocked on iceberg-rust MoR). Step 3 OSS security hardening complete (51/51). Benchmark suite (sqe-bench) complete — `read_parquet()` TVF, 6 benchmark generators, generate/load/test pipeline, CI scripts. All feature branches merged into `main`.
+> Status as of 2026-03-26. Step 0 dependency alignment complete. Step 2 core engine effectively complete (99/103 — 4 blocked on iceberg-rust MoR). Step 3 OSS security hardening complete (51/51). Benchmark suite (sqe-bench) complete — `read_parquet()` TVF, 6 benchmark generators, generate/load/test pipeline, CI scripts. Trino JDBC compat hardened — `infoUri` always present, `system.jdbc.*` metadata tables added for DBeaver browsing. All feature branches merged into `main`.
 
 > **Monitoring:** OPA SPI refactor in Polaris (PR #3999, still draft) will affect Phase 5 OPA integration when it lands — do not implement OPA against Polaris until this stabilises. Remote S3 signing (Iceberg 1.12, not yet released) will affect the pluggable-catalogs design.
 
