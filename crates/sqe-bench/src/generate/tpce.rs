@@ -783,7 +783,8 @@ fn generate_zip_code() -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_address(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // SF × 5,500
     let schema = address_schema();
-    let total = (scale * 5_500.0) as usize;
+    let total = super::scaled(scale, 5_500.0);
+    let total = total.max(1);
     let mut rng = StdRng::seed_from_u64(seed_for_table("address"));
     let mut batches = Vec::new();
     let mut offset = 0usize;
@@ -832,7 +833,8 @@ fn generate_address(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // SF × 1,000
     let schema = customer_schema();
-    let total = (scale * 1_000.0) as usize;
+    let total = super::scaled(scale, 1_000.0);
+    let total = total.max(1);
     let num_addr = (scale * 5_500.0).max(1.0) as i64;
     let mut rng = StdRng::seed_from_u64(seed_for_table("customer"));
     let mut batches = Vec::new();
@@ -924,7 +926,8 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_customer_account(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // SF × 5
     let schema = customer_account_schema();
-    let total = (scale * 5.0) as usize;
+    let total = super::scaled(scale, 5.0);
+    let total = total.max(1);
     let num_customers = (scale * 1_000.0).max(1.0) as i64;
     let num_brokers = (scale * 10.0).max(1.0) as i64;
     let mut rng = StdRng::seed_from_u64(seed_for_table("customer_account"));
@@ -975,7 +978,8 @@ fn generate_customer_account(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_customer_taxrate(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // SF × 2,000
     let schema = customer_taxrate_schema();
-    let total = (scale * 2_000.0) as usize;
+    let total = super::scaled(scale, 2_000.0);
+    let total = total.max(1);
     let num_customers = (scale * 1_000.0).max(1.0) as i64;
     let num_taxrates = 320i64;
     let mut rng = StdRng::seed_from_u64(seed_for_table("customer_taxrate"));
@@ -1013,7 +1017,8 @@ fn generate_customer_taxrate(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_account_permission(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // SF × 5,000
     let schema = account_permission_schema();
-    let total = (scale * 5_000.0) as usize;
+    let total = super::scaled(scale, 5_000.0);
+    let total = total.max(1);
     let num_accounts = (scale * 5.0).max(1.0) as i64;
     let mut rng = StdRng::seed_from_u64(seed_for_table("account_permission"));
     let mut batches = Vec::new();
@@ -1063,7 +1068,8 @@ fn generate_account_permission(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_broker(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // SF × 10
     let schema = broker_schema();
-    let total = (scale * 10.0) as usize;
+    let total = super::scaled(scale, 10.0);
+    let total = total.max(1);
     let mut rng = StdRng::seed_from_u64(seed_for_table("broker"));
     let mut batches = Vec::new();
     let mut offset = 0usize;
@@ -1110,7 +1116,8 @@ fn generate_broker(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_company(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // SF × 5
     let schema = company_schema();
-    let total = (scale * 5.0) as usize;
+    let total = super::scaled(scale, 5.0);
+    let total = total.max(1);
     let num_addr = (scale * 5_500.0).max(1.0) as i64;
     let mut rng = StdRng::seed_from_u64(seed_for_table("company"));
     let mut batches = Vec::new();
@@ -1178,7 +1185,8 @@ fn generate_company(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_company_competitor(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // SF × 15
     let schema = company_competitor_schema();
-    let total = (scale * 15.0) as usize;
+    let total = super::scaled(scale, 15.0);
+    let total = total.max(1);
     let num_co = (scale * 5.0).max(1.0) as i64;
     let mut rng = StdRng::seed_from_u64(seed_for_table("company_competitor"));
     let mut batches = Vec::new();
@@ -1218,7 +1226,8 @@ fn generate_company_competitor(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_security(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // SF × 6.85 (rounded to integer)
     let schema = security_schema();
-    let total = (scale * 6.85) as usize;
+    let total = super::scaled(scale, 6.85);
+    let total = total.max(1);
     let num_co = (scale * 5.0).max(1.0) as i64;
     let mut rng = StdRng::seed_from_u64(seed_for_table("security"));
     let mut batches = Vec::new();
@@ -1305,7 +1314,8 @@ fn generate_security(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_daily_market(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // SF × 17,136
     let schema = daily_market_schema();
-    let total = (scale * 17_136.0) as usize;
+    let total = super::scaled(scale, 17_136.0);
+    let total = total.max(1);
     let num_symb = (scale * 6.85).max(1.0) as usize;
     let mut rng = StdRng::seed_from_u64(seed_for_table("daily_market"));
     let mut batches = Vec::new();
@@ -1357,7 +1367,8 @@ fn generate_daily_market(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_financial(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // SF × 100
     let schema = financial_schema();
-    let total = (scale * 100.0) as usize;
+    let total = super::scaled(scale, 100.0);
+    let total = total.max(1);
     let num_co = (scale * 5.0).max(1.0) as i64;
     let mut rng = StdRng::seed_from_u64(seed_for_table("financial"));
     let mut batches = Vec::new();
@@ -1430,7 +1441,8 @@ fn generate_financial(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_last_trade(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // SF × 6.85 (one row per security)
     let schema = last_trade_schema();
-    let total = (scale * 6.85) as usize;
+    let total = super::scaled(scale, 6.85);
+    let total = total.max(1);
     let mut rng = StdRng::seed_from_u64(seed_for_table("last_trade"));
     let mut batches = Vec::new();
     let mut offset = 0usize;
@@ -1477,7 +1489,8 @@ fn generate_last_trade(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_news_item(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // SF × 100
     let schema = news_item_schema();
-    let total = (scale * 100.0) as usize;
+    let total = super::scaled(scale, 100.0);
+    let total = total.max(1);
     let mut rng = StdRng::seed_from_u64(seed_for_table("news_item"));
     let mut batches = Vec::new();
     let mut offset = 0usize;
@@ -1533,7 +1546,8 @@ fn generate_news_item(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_news_xref(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // SF × 100
     let schema = news_xref_schema();
-    let total = (scale * 100.0) as usize;
+    let total = super::scaled(scale, 100.0);
+    let total = total.max(1);
     let num_news = (scale * 100.0).max(1.0) as i64;
     let num_co = (scale * 5.0).max(1.0) as i64;
     let mut rng = StdRng::seed_from_u64(seed_for_table("news_xref"));
@@ -1569,7 +1583,8 @@ fn generate_news_xref(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_trade(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // SF × 17,280
     let schema = trade_schema();
-    let total = (scale * 17_280.0) as usize;
+    let total = super::scaled(scale, 17_280.0);
+    let total = total.max(1);
     let num_symb = (scale * 6.85).max(1.0) as usize;
     let num_accounts = (scale * 5.0).max(1.0) as i64;
     let mut rng = StdRng::seed_from_u64(seed_for_table("trade"));
@@ -1652,7 +1667,8 @@ fn generate_trade(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_trade_history(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // SF × 51,840 (3 history rows per trade)
     let schema = trade_history_schema();
-    let total = (scale * 51_840.0) as usize;
+    let total = super::scaled(scale, 51_840.0);
+    let total = total.max(1);
     let num_trades = (scale * 17_280.0).max(1.0) as i64;
     let mut rng = StdRng::seed_from_u64(seed_for_table("trade_history"));
     let mut batches = Vec::new();
@@ -1692,7 +1708,8 @@ fn generate_trade_history(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_trade_request(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // SF × 100
     let schema = trade_request_schema();
-    let total = (scale * 100.0) as usize;
+    let total = super::scaled(scale, 100.0);
+    let total = total.max(1);
     let num_symb = (scale * 6.85).max(1.0) as usize;
     let num_brokers = (scale * 10.0).max(1.0) as i64;
     let num_trades = (scale * 17_280.0).max(1.0) as i64;
@@ -1744,7 +1761,8 @@ fn generate_trade_request(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_settlement(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // SF × 17,280 (one per trade)
     let schema = settlement_schema();
-    let total = (scale * 17_280.0) as usize;
+    let total = super::scaled(scale, 17_280.0);
+    let total = total.max(1);
     let num_trades = (scale * 17_280.0).max(1.0) as i64;
     let mut rng = StdRng::seed_from_u64(seed_for_table("settlement"));
     let mut batches = Vec::new();
@@ -1787,7 +1805,8 @@ fn generate_settlement(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_cash_transaction(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // SF × 13,824 (80% of trades have a cash transaction)
     let schema = cash_transaction_schema();
-    let total = (scale * 13_824.0) as usize;
+    let total = super::scaled(scale, 13_824.0);
+    let total = total.max(1);
     let num_trades = (scale * 17_280.0).max(1.0) as i64;
     let mut rng = StdRng::seed_from_u64(seed_for_table("cash_transaction"));
     let mut batches = Vec::new();
@@ -1830,7 +1849,8 @@ fn generate_cash_transaction(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_holding(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // SF × 12,500
     let schema = holding_schema();
-    let total = (scale * 12_500.0) as usize;
+    let total = super::scaled(scale, 12_500.0);
+    let total = total.max(1);
     let num_trades = (scale * 17_280.0).max(1.0) as i64;
     let num_accounts = (scale * 5.0).max(1.0) as i64;
     let num_symb = (scale * 6.85).max(1.0) as usize;
@@ -1881,7 +1901,8 @@ fn generate_holding(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_holding_history(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // SF × 25,000
     let schema = holding_history_schema();
-    let total = (scale * 25_000.0) as usize;
+    let total = super::scaled(scale, 25_000.0);
+    let total = total.max(1);
     let num_trades = (scale * 17_280.0).max(1.0) as i64;
     let mut rng = StdRng::seed_from_u64(seed_for_table("holding_history"));
     let mut batches = Vec::new();
@@ -1924,7 +1945,8 @@ fn generate_holding_history(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_holding_summary(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // SF × 5,000
     let schema = holding_summary_schema();
-    let total = (scale * 5_000.0) as usize;
+    let total = super::scaled(scale, 5_000.0);
+    let total = total.max(1);
     let num_accounts = (scale * 5.0).max(1.0) as i64;
     let num_symb = (scale * 6.85).max(1.0) as usize;
     let mut rng = StdRng::seed_from_u64(seed_for_table("holding_summary"));
@@ -1965,7 +1987,8 @@ fn generate_holding_summary(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_watch_list(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // SF × 5,000
     let schema = watch_list_schema();
-    let total = (scale * 5_000.0) as usize;
+    let total = super::scaled(scale, 5_000.0);
+    let total = total.max(1);
     let num_customers = (scale * 1_000.0).max(1.0) as i64;
     let mut rng = StdRng::seed_from_u64(seed_for_table("watch_list"));
     let mut batches = Vec::new();
@@ -2000,7 +2023,8 @@ fn generate_watch_list(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_watch_item(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // SF × 50,000
     let schema = watch_item_schema();
-    let total = (scale * 50_000.0) as usize;
+    let total = super::scaled(scale, 50_000.0);
+    let total = total.max(1);
     let num_wl = (scale * 5_000.0).max(1.0) as i64;
     let num_symb = (scale * 6.85).max(1.0) as usize;
     let mut rng = StdRng::seed_from_u64(seed_for_table("watch_item"));

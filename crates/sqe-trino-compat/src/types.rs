@@ -3,10 +3,10 @@ use arrow_schema::DataType;
 pub fn arrow_to_trino_type(dt: &DataType) -> String {
     match dt {
         DataType::Boolean => "boolean".to_string(),
-        DataType::Int8 => "tinyint".to_string(),
-        DataType::Int16 => "smallint".to_string(),
+        DataType::Int8 | DataType::UInt8 => "tinyint".to_string(),
+        DataType::Int16 | DataType::UInt16 => "smallint".to_string(),
         DataType::Int32 => "integer".to_string(),
-        DataType::Int64 => "bigint".to_string(),
+        DataType::UInt32 | DataType::Int64 | DataType::UInt64 => "bigint".to_string(),
         DataType::Float32 => "real".to_string(),
         DataType::Float64 => "double".to_string(),
         DataType::Utf8 | DataType::LargeUtf8 => "varchar".to_string(),
@@ -39,16 +39,32 @@ pub fn arrow_value_to_json(
             let arr = array.as_any().downcast_ref::<Int8Array>().unwrap();
             serde_json::json!(arr.value(row))
         }
+        DataType::UInt8 => {
+            let arr = array.as_any().downcast_ref::<UInt8Array>().unwrap();
+            serde_json::json!(arr.value(row))
+        }
         DataType::Int16 => {
             let arr = array.as_any().downcast_ref::<Int16Array>().unwrap();
+            serde_json::json!(arr.value(row))
+        }
+        DataType::UInt16 => {
+            let arr = array.as_any().downcast_ref::<UInt16Array>().unwrap();
             serde_json::json!(arr.value(row))
         }
         DataType::Int32 => {
             let arr = array.as_any().downcast_ref::<Int32Array>().unwrap();
             serde_json::json!(arr.value(row))
         }
+        DataType::UInt32 => {
+            let arr = array.as_any().downcast_ref::<UInt32Array>().unwrap();
+            serde_json::json!(arr.value(row))
+        }
         DataType::Int64 => {
             let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
+            serde_json::json!(arr.value(row))
+        }
+        DataType::UInt64 => {
+            let arr = array.as_any().downcast_ref::<UInt64Array>().unwrap();
             serde_json::json!(arr.value(row))
         }
         DataType::Float32 => {
@@ -66,6 +82,45 @@ pub fn arrow_value_to_json(
         DataType::LargeUtf8 => {
             let arr = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
             serde_json::Value::String(arr.value(row).to_string())
+        }
+        // Timestamps must use Trino format: "2024-03-20 08:00:00.000" (space separator, millis)
+        // The JDBC driver rejects ISO 8601 "T" separator.
+        DataType::Timestamp(unit, tz) => {
+            let s = arrow::util::display::array_value_to_string(array, row).unwrap_or_default();
+            // Replace 'T' with space and ensure fractional seconds
+            let s = s.replace('T', " ");
+            // Strip timezone suffix if present (Trino handles tz separately)
+            let s = if tz.is_none() {
+                // Remove any trailing Z or +00:00 for naive timestamps
+                s.trim_end_matches('Z')
+                    .trim_end_matches("+00:00")
+                    .trim_end_matches("+00")
+                    .to_string()
+            } else {
+                s
+            };
+            // Ensure fractional seconds exist (Trino expects at least .000)
+            let s = if !s.contains('.') {
+                let precision = match unit {
+                    arrow_schema::TimeUnit::Second => 0,
+                    arrow_schema::TimeUnit::Millisecond => 3,
+                    arrow_schema::TimeUnit::Microsecond => 6,
+                    arrow_schema::TimeUnit::Nanosecond => 9,
+                };
+                if precision > 0 {
+                    format!("{s}.{:0>width$}", 0, width = precision)
+                } else {
+                    format!("{s}.000")
+                }
+            } else {
+                s
+            };
+            serde_json::Value::String(s)
+        }
+        DataType::Date32 | DataType::Date64 => {
+            serde_json::Value::String(
+                arrow::util::display::array_value_to_string(array, row).unwrap_or_default()
+            )
         }
         _ => {
             serde_json::Value::String(

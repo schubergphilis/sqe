@@ -144,7 +144,8 @@ fn random_time_str(rng: &mut StdRng) -> String {
 
 fn generate_web_clickstreams(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = web_clickstreams_schema();
-    let total = (scale * 4_000_000.0) as usize;
+    let total = super::scaled(scale, 4_000_000.0);
+    let total = total.max(1);
     // Use a realistic number of items / web pages / users tied to scale factor.
     // TPC-DS SF1 has ~18,000 items, ~2,040 web pages, ~100,000 customers.
     let num_items = ((scale * 18_000.0) as i32).max(1);
@@ -235,7 +236,8 @@ fn generate_web_clickstreams(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
 fn generate_product_reviews(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = product_reviews_schema();
-    let total = (scale * 100_000.0) as usize;
+    let total = super::scaled(scale, 100_000.0);
+    let total = total.max(1);
     let num_items = ((scale * 18_000.0) as i32).max(1);
     let num_users = ((scale * 100_000.0) as i32).max(1);
     let num_orders = ((scale * 720_000.0) as i64).max(1);

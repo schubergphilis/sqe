@@ -373,6 +373,9 @@ impl QueryHandler {
             .await?,
         );
 
+        // Clone before moving into SqeCatalogProvider (which consumes the Arc)
+        let session_catalog_for_system = session_catalog.clone();
+
         // Create the DataFusion CatalogProvider from the session catalog
         let catalog_provider = SqeCatalogProvider::try_new(
             session_catalog,
@@ -382,6 +385,14 @@ impl QueryHandler {
         .await?;
 
         ctx.register_catalog(&catalog_name, Arc::new(catalog_provider));
+
+        // Register the system catalog for Trino JDBC metadata browsing
+        // (system.jdbc.types, system.jdbc.catalogs, system.jdbc.schemas, etc.)
+        let system_catalog = sqe_catalog::SystemCatalogProvider::new(
+            session_catalog_for_system,
+            self.config.catalog.warehouse.clone(),
+        );
+        ctx.register_catalog("system", Arc::new(system_catalog));
 
         // Register the read_parquet() table-valued function so users can
         // query external Parquet files directly from SQL:

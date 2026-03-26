@@ -33,18 +33,20 @@ WITH clv AS (
         cd.cd_gender,
         cd.cd_education_status
 )
-SELECT
-    c_customer_id,
-    ca_state,
-    cd_gender,
-    cd_education_status,
-    first_purchase_year,
-    last_purchase_year,
-    (last_purchase_year - first_purchase_year + 1)        AS years_active,
-    store_transactions + catalog_transactions
-        + web_transactions                                AS total_transactions,
-    store_revenue + catalog_revenue + web_revenue         AS total_lifetime_value
-FROM clv
+SELECT * FROM (
+    SELECT
+        c_customer_id,
+        ca_state,
+        cd_gender,
+        cd_education_status,
+        first_purchase_year,
+        last_purchase_year,
+        (last_purchase_year - first_purchase_year + 1)        AS years_active,
+        store_transactions + catalog_transactions
+            + web_transactions                                AS total_transactions,
+        store_revenue + catalog_revenue + web_revenue         AS total_lifetime_value
+    FROM clv
+) ranked
 WHERE
     total_lifetime_value > 0
 ORDER BY

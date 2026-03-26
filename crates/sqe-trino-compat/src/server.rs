@@ -37,6 +37,8 @@ pub struct TrinoState<A, Q> {
     pub node: NodeContext,
     /// Number of rows per page. Configurable for testing; defaults to [`DEFAULT_PAGE_SIZE`].
     pub page_size: usize,
+    /// The TCP port the Trino-compat HTTP server is bound to.
+    pub port: u16,
 }
 
 /// Stores the full result set split into pages for pagination.
@@ -90,6 +92,7 @@ where
         results: DashMap::new(),
         node,
         page_size: DEFAULT_PAGE_SIZE,
+        port,
     });
 
     let state_sweep = state.clone();
@@ -242,16 +245,33 @@ fn paginate_rows(
 }
 
 /// Build a `nextUri` for the given query id and page token, or `None` if this is the last page.
-fn next_uri(query_id: &str, token: usize, total_pages: usize) -> Option<String> {
+fn next_uri(base_url: &str, query_id: &str, token: usize, total_pages: usize) -> Option<String> {
     if token + 1 < total_pages {
-        Some(format!("/v1/statement/{query_id}/{}", token + 1))
+        Some(format!("{base_url}/v1/statement/{query_id}/{}", token + 1))
     } else {
         None
     }
 }
 
+/// Build an absolute `infoUri` for the given query.
+fn info_uri(base_url: &str, query_id: &str) -> String {
+    format!("{base_url}/v1/query/{query_id}")
+}
+
+/// Derive the base URL from the `Host` header, falling back to `localhost:<port>`.
+fn extract_base_url(headers: &HeaderMap, bound_port: u16) -> String {
+    let scheme = extract_header(headers, "x-forwarded-proto")
+        .unwrap_or_else(|| "http".to_string());
+    if let Some(host) = extract_header(headers, "host") {
+        format!("{scheme}://{host}")
+    } else {
+        format!("http://localhost:{bound_port}")
+    }
+}
+
 /// Build a [`TrinoResponse`] for the given page of a paginated result.
 fn build_page_response(
+    base_url: &str,
     query_id: &str,
     paginated: &PaginatedResult,
     page_token: usize,
@@ -265,8 +285,8 @@ fn build_page_response(
 
     TrinoResponse {
         id: query_id.to_string(),
-        info_uri: None,
-        next_uri: next_uri(query_id, page_token, paginated.total_pages),
+        info_uri: Some(info_uri(base_url, query_id)),
+        next_uri: next_uri(base_url, query_id, page_token, paginated.total_pages),
         columns: Some(paginated.columns.clone()),
         data: Some(page_data),
         stats: if is_last {
@@ -332,6 +352,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     );
 
     let query_id = Uuid::new_v4().to_string();
+    let base_url = extract_base_url(&headers, state.port);
 
     match state.query_handler.execute(&session, sql).await {
         Ok(batches) => {
@@ -347,7 +368,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             };
 
             // Build the first page response (token = 0).
-            let response = build_page_response(&query_id, &paginated, 0);
+            let response = build_page_response(&base_url, &query_id, &paginated, 0);
 
             // Store for subsequent GET requests (if there are more pages).
             state.results.insert(query_id, paginated);
@@ -357,8 +378,8 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         Err(e) => {
             warn!(error = %e, sql = sql, "Trino query execution failed");
             let response = TrinoResponse {
-                id: query_id,
-                info_uri: None,
+                id: query_id.clone(),
+                info_uri: Some(info_uri(&base_url, &query_id)),
                 next_uri: None,
                 columns: None,
                 data: None,
@@ -378,6 +399,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 #[tracing::instrument(skip_all, name = "trino.get_results")]
 async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     State(state): State<Arc<TrinoState<A, Q>>>,
+    headers: HeaderMap,
     Path((id, token)): Path<(String, String)>,
 ) -> Response {
     // Parse the token as a page index.
@@ -388,13 +410,29 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         }
     };
 
+    let base_url = extract_base_url(&headers, state.port);
+
     match state.results.get(&id) {
         Some(paginated) => {
             if page_token >= paginated.total_pages {
-                return error_response(StatusCode::NOT_FOUND, "Page token out of range");
+                let response = TrinoResponse {
+                    id: id.clone(),
+                    info_uri: Some(info_uri(&base_url, &id)),
+                    next_uri: None,
+                    columns: None,
+                    data: None,
+                    stats: TrinoStats::failed(),
+                    error: Some(TrinoError {
+                        message: "Page token out of range".to_string(),
+                        error_code: 1,
+                        error_name: "USER_ERROR".to_string(),
+                        error_type: "USER_ERROR".to_string(),
+                    }),
+                };
+                return (StatusCode::NOT_FOUND, Json(response)).into_response();
             }
 
-            let response = build_page_response(&id, &paginated, page_token);
+            let response = build_page_response(&base_url, &id, &paginated, page_token);
             let is_last = page_token + 1 >= paginated.total_pages;
 
             // Drop the borrow before mutating.
@@ -409,8 +447,8 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         }
         None => {
             let response = TrinoResponse {
-                id,
-                info_uri: None,
+                id: id.clone(),
+                info_uri: Some(info_uri(&base_url, &id)),
                 next_uri: None,
                 columns: None,
                 data: None,
@@ -485,6 +523,7 @@ mod tests {
                 started_at,
             },
             page_size: DEFAULT_PAGE_SIZE,
+            port: 8080,
         });
 
         let Json(info) = server_info(State(state)).await;
@@ -509,6 +548,7 @@ mod tests {
                 started_at,
             },
             page_size: DEFAULT_PAGE_SIZE,
+            port: 8080,
         });
 
         let Json(info) = server_info(State(state)).await;
@@ -528,6 +568,7 @@ mod tests {
                 started_at: Instant::now(),
             },
             page_size: DEFAULT_PAGE_SIZE,
+            port: 8080,
         });
 
         let result = server_state(State(state)).await;
@@ -547,6 +588,7 @@ mod tests {
                 started_at: Instant::now(),
             },
             page_size: DEFAULT_PAGE_SIZE,
+            port: 8080,
         });
 
         let result = server_state(State(state)).await;
@@ -685,19 +727,19 @@ mod tests {
 
     #[test]
     fn test_next_uri_has_next() {
-        let uri = next_uri("q-123", 0, 3);
-        assert_eq!(uri, Some("/v1/statement/q-123/1".to_string()));
+        let uri = next_uri("http://localhost:8080", "q-123", 0, 3);
+        assert_eq!(uri, Some("http://localhost:8080/v1/statement/q-123/1".to_string()));
     }
 
     #[test]
     fn test_next_uri_last_page() {
-        let uri = next_uri("q-123", 2, 3);
+        let uri = next_uri("http://localhost:8080", "q-123", 2, 3);
         assert!(uri.is_none());
     }
 
     #[test]
     fn test_next_uri_single_page() {
-        let uri = next_uri("q-123", 0, 1);
+        let uri = next_uri("http://localhost:8080", "q-123", 0, 1);
         assert!(uri.is_none());
     }
 
@@ -707,6 +749,7 @@ mod tests {
             columns: vec![TrinoColumn {
                 name: "id".to_string(),
                 r#type: "bigint".to_string(),
+                type_signature: crate::protocol::type_signature_for("bigint"),
             }],
             pages: vec![
                 vec![vec![serde_json::json!(1)], vec![serde_json::json!(2)]],
@@ -716,11 +759,15 @@ mod tests {
             created_at: Instant::now(),
         };
 
-        let resp = build_page_response("q-abc", &paginated, 0);
+        let resp = build_page_response("http://localhost:8080", "q-abc", &paginated, 0);
         assert_eq!(resp.id, "q-abc");
         assert_eq!(
+            resp.info_uri,
+            Some("http://localhost:8080/v1/query/q-abc".to_string())
+        );
+        assert_eq!(
             resp.next_uri,
-            Some("/v1/statement/q-abc/1".to_string())
+            Some("http://localhost:8080/v1/statement/q-abc/1".to_string())
         );
         assert_eq!(resp.data.as_ref().unwrap().len(), 2);
         assert_eq!(resp.stats.state, "RUNNING");
@@ -732,6 +779,7 @@ mod tests {
             columns: vec![TrinoColumn {
                 name: "id".to_string(),
                 r#type: "bigint".to_string(),
+                type_signature: crate::protocol::type_signature_for("bigint"),
             }],
             pages: vec![
                 vec![vec![serde_json::json!(1)], vec![serde_json::json!(2)]],
@@ -741,7 +789,7 @@ mod tests {
             created_at: Instant::now(),
         };
 
-        let resp = build_page_response("q-abc", &paginated, 1);
+        let resp = build_page_response("http://localhost:8080", "q-abc", &paginated, 1);
         assert!(resp.next_uri.is_none());
         assert_eq!(resp.data.as_ref().unwrap().len(), 1);
         assert_eq!(resp.stats.state, "FINISHED");
@@ -756,7 +804,7 @@ mod tests {
             created_at: Instant::now(),
         };
 
-        let resp = build_page_response("q-single", &paginated, 0);
+        let resp = build_page_response("http://localhost:8080", "q-single", &paginated, 0);
         assert!(resp.next_uri.is_none());
         assert_eq!(resp.stats.state, "FINISHED");
     }
@@ -887,10 +935,12 @@ mod tests {
                 started_at: Instant::now(),
             },
             page_size: DEFAULT_PAGE_SIZE,
+            port: 8080,
         });
 
         let response = get_results::<MockAuth, MockQuery>(
             State(state),
+            HeaderMap::new(),
             Path(("q-123".to_string(), "not-a-number".to_string())),
         )
         .await;
@@ -911,6 +961,7 @@ mod tests {
                 started_at: Instant::now(),
             },
             page_size: DEFAULT_PAGE_SIZE,
+            port: 8080,
         });
 
         // Insert a result with 1 page
@@ -926,6 +977,7 @@ mod tests {
 
         let response = get_results::<MockAuth, MockQuery>(
             State(state),
+            HeaderMap::new(),
             Path(("q-456".to_string(), "5".to_string())),
         )
         .await;
@@ -945,6 +997,7 @@ mod tests {
                 started_at: Instant::now(),
             },
             page_size: DEFAULT_PAGE_SIZE,
+            port: 8080,
         });
 
         state.results.insert(
@@ -953,6 +1006,7 @@ mod tests {
                 columns: vec![TrinoColumn {
                     name: "val".to_string(),
                     r#type: "bigint".to_string(),
+                    type_signature: crate::protocol::type_signature_for("bigint"),
                 }],
                 pages: vec![
                     vec![vec![serde_json::json!(10)]],
@@ -967,6 +1021,7 @@ mod tests {
         // Fetch page 1 (middle)
         let response = get_results::<MockAuth, MockQuery>(
             State(state.clone()),
+            HeaderMap::new(),
             Path(("q-paged".to_string(), "1".to_string())),
         )
         .await;
@@ -983,9 +1038,10 @@ mod tests {
         assert_eq!(trino_resp.data.as_ref().unwrap()[0][0], serde_json::json!(20));
         assert_eq!(
             trino_resp.next_uri,
-            Some("/v1/statement/q-paged/2".to_string())
+            Some("http://localhost:8080/v1/statement/q-paged/2".to_string())
         );
         assert_eq!(trino_resp.stats.state, "RUNNING");
+        assert!(trino_resp.info_uri.is_some(), "infoUri must be present");
 
         // Result should still exist (not the last page)
         assert!(state.results.get("q-paged").is_some());
@@ -1003,6 +1059,7 @@ mod tests {
                 started_at: Instant::now(),
             },
             page_size: DEFAULT_PAGE_SIZE,
+            port: 8080,
         });
 
         state.results.insert(
@@ -1021,6 +1078,7 @@ mod tests {
         // Fetch the last page (token = 1)
         let _response = get_results::<MockAuth, MockQuery>(
             State(state.clone()),
+            HeaderMap::new(),
             Path(("q-cleanup".to_string(), "1".to_string())),
         )
         .await;
@@ -1041,6 +1099,7 @@ mod tests {
                 started_at: Instant::now(),
             },
             page_size: DEFAULT_PAGE_SIZE,
+            port: 8080,
         });
 
         state.results.insert(
@@ -1061,5 +1120,28 @@ mod tests {
 
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert!(state.results.get("q-cancel").is_none());
+    }
+
+    // ── Base URL extraction tests ────────────────────────────────
+
+    #[test]
+    fn test_extract_base_url_from_host_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "myhost:9090".parse().unwrap());
+        assert_eq!(extract_base_url(&headers, 8080), "http://myhost:9090");
+    }
+
+    #[test]
+    fn test_extract_base_url_fallback() {
+        let headers = HeaderMap::new();
+        assert_eq!(extract_base_url(&headers, 8080), "http://localhost:8080");
+    }
+
+    #[test]
+    fn test_extract_base_url_with_forwarded_proto() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "myhost:9090".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert_eq!(extract_base_url(&headers, 8080), "https://myhost:9090");
     }
 }
