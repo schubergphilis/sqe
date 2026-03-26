@@ -749,6 +749,7 @@ mod tests {
             columns: vec![TrinoColumn {
                 name: "id".to_string(),
                 r#type: "bigint".to_string(),
+                type_signature: crate::protocol::type_signature_for("bigint"),
             }],
             pages: vec![
                 vec![vec![serde_json::json!(1)], vec![serde_json::json!(2)]],
@@ -778,6 +779,7 @@ mod tests {
             columns: vec![TrinoColumn {
                 name: "id".to_string(),
                 r#type: "bigint".to_string(),
+                type_signature: crate::protocol::type_signature_for("bigint"),
             }],
             pages: vec![
                 vec![vec![serde_json::json!(1)], vec![serde_json::json!(2)]],
@@ -1004,6 +1006,7 @@ mod tests {
                 columns: vec![TrinoColumn {
                     name: "val".to_string(),
                     r#type: "bigint".to_string(),
+                    type_signature: crate::protocol::type_signature_for("bigint"),
                 }],
                 pages: vec![
                     vec![vec![serde_json::json!(10)]],
