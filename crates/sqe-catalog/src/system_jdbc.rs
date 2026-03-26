@@ -205,6 +205,7 @@ impl JdbcSchemaProvider {
     }
 
     async fn build_columns_table(&self) -> DFResult<Arc<dyn TableProvider>> {
+        // Full JDBC getColumns() schema — all 24 columns that DBeaver/Trino JDBC expects
         let schema = Arc::new(Schema::new(vec![
             Field::new("table_cat", DataType::Utf8, true),
             Field::new("table_schem", DataType::Utf8, true),
@@ -213,14 +214,23 @@ impl JdbcSchemaProvider {
             Field::new("data_type", DataType::Int32, false),
             Field::new("type_name", DataType::Utf8, false),
             Field::new("column_size", DataType::Int32, true),
+            Field::new("buffer_length", DataType::Int32, true),
             Field::new("decimal_digits", DataType::Int32, true),
             Field::new("num_prec_radix", DataType::Int32, true),
             Field::new("nullable", DataType::Int32, false),
             Field::new("remarks", DataType::Utf8, true),
             Field::new("column_def", DataType::Utf8, true),
+            Field::new("sql_data_type", DataType::Int32, true),
+            Field::new("sql_datetime_sub", DataType::Int32, true),
+            Field::new("char_octet_length", DataType::Int32, true),
             Field::new("ordinal_position", DataType::Int32, false),
             Field::new("is_nullable", DataType::Utf8, false),
+            Field::new("scope_catalog", DataType::Utf8, true),
+            Field::new("scope_schema", DataType::Utf8, true),
+            Field::new("scope_table", DataType::Utf8, true),
+            Field::new("source_data_type", DataType::Int32, true),
             Field::new("is_autoincrement", DataType::Utf8, false),
+            Field::new("is_generatedcolumn", DataType::Utf8, false),
         ]));
 
         let namespaces = self.list_namespaces_safe().await;
@@ -232,14 +242,23 @@ impl JdbcSchemaProvider {
         let mut dtype_b = Int32Builder::new();
         let mut tname_b = StringBuilder::new();
         let mut colsize_b = Int32Builder::new();
+        let mut buflen_b = Int32Builder::new();
         let mut dec_digits_b = Int32Builder::new();
         let mut radix_b = Int32Builder::new();
         let mut nullable_b = Int32Builder::new();
         let mut remarks_b = StringBuilder::new();
         let mut coldef_b = StringBuilder::new();
+        let mut sql_dt_b = Int32Builder::new();
+        let mut sql_sub_b = Int32Builder::new();
+        let mut char_oct_b = Int32Builder::new();
         let mut ordinal_b = Int32Builder::new();
         let mut is_nullable_b = StringBuilder::new();
+        let mut scope_cat_b = StringBuilder::new();
+        let mut scope_sch_b = StringBuilder::new();
+        let mut scope_tbl_b = StringBuilder::new();
+        let mut src_dt_b = Int32Builder::new();
         let mut is_auto_b = StringBuilder::new();
+        let mut is_gen_b = StringBuilder::new();
 
         for ns in &namespaces {
             let ns_ident = NamespaceIdent::new(ns.clone());
@@ -273,15 +292,23 @@ impl JdbcSchemaProvider {
                     dtype_b.append_value(jdbc_type);
                     tname_b.append_value(type_name);
                     colsize_b.append_null();
+                    buflen_b.append_null();
                     dec_digits_b.append_null();
                     radix_b.append_null();
-                    // nullable: 1 = columnNullable, 0 = columnNoNulls
                     nullable_b.append_value(if field.required { 0 } else { 1 });
                     remarks_b.append_null();
                     coldef_b.append_null();
+                    sql_dt_b.append_null();
+                    sql_sub_b.append_null();
+                    char_oct_b.append_null();
                     ordinal_b.append_value((idx + 1) as i32);
                     is_nullable_b.append_value(if field.required { "NO" } else { "YES" });
+                    scope_cat_b.append_null();
+                    scope_sch_b.append_null();
+                    scope_tbl_b.append_null();
+                    src_dt_b.append_null();
                     is_auto_b.append_value("NO");
+                    is_gen_b.append_value("NO");
                 }
             }
         }
@@ -296,14 +323,23 @@ impl JdbcSchemaProvider {
                 Arc::new(dtype_b.finish()) as ArrayRef,
                 Arc::new(tname_b.finish()) as ArrayRef,
                 Arc::new(colsize_b.finish()) as ArrayRef,
+                Arc::new(buflen_b.finish()) as ArrayRef,
                 Arc::new(dec_digits_b.finish()) as ArrayRef,
                 Arc::new(radix_b.finish()) as ArrayRef,
                 Arc::new(nullable_b.finish()) as ArrayRef,
                 Arc::new(remarks_b.finish()) as ArrayRef,
                 Arc::new(coldef_b.finish()) as ArrayRef,
+                Arc::new(sql_dt_b.finish()) as ArrayRef,
+                Arc::new(sql_sub_b.finish()) as ArrayRef,
+                Arc::new(char_oct_b.finish()) as ArrayRef,
                 Arc::new(ordinal_b.finish()) as ArrayRef,
                 Arc::new(is_nullable_b.finish()) as ArrayRef,
+                Arc::new(scope_cat_b.finish()) as ArrayRef,
+                Arc::new(scope_sch_b.finish()) as ArrayRef,
+                Arc::new(scope_tbl_b.finish()) as ArrayRef,
+                Arc::new(src_dt_b.finish()) as ArrayRef,
                 Arc::new(is_auto_b.finish()) as ArrayRef,
+                Arc::new(is_gen_b.finish()) as ArrayRef,
             ],
         )?;
 
