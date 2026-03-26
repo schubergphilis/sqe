@@ -90,6 +90,9 @@ pub struct TrinoError {
 /// For parameterized types like `decimal(18,2)`, the precision and scale
 /// are extracted into `arguments`. For simple types, `arguments` is empty.
 pub fn type_signature_for(trino_type: &str) -> TrinoTypeSignature {
+    // The Trino JDBC driver accesses arguments[0] for varchar, varbinary,
+    // and decimal types. Missing arguments cause ArrayIndexOutOfBoundsException.
+
     // Handle "decimal(p,s)" → rawType "decimal", arguments [{LONG,p},{LONG,s}]
     if let Some(rest) = trino_type.strip_prefix("decimal(") {
         if let Some(params) = rest.strip_suffix(')') {
@@ -111,9 +114,35 @@ pub fn type_signature_for(trino_type: &str) -> TrinoTypeSignature {
         }
     }
 
-    TrinoTypeSignature {
-        raw_type: trino_type.to_string(),
-        arguments: vec![],
+    let long_arg = |v: i64| TrinoTypeArgument {
+        kind: "LONG".to_string(),
+        value: serde_json::json!(v),
+    };
+
+    match trino_type {
+        // varchar/varbinary: driver reads arguments[0] for display size
+        "varchar" => TrinoTypeSignature {
+            raw_type: "varchar".to_string(),
+            arguments: vec![long_arg(2147483647)],
+        },
+        "varbinary" => TrinoTypeSignature {
+            raw_type: "varbinary".to_string(),
+            arguments: vec![long_arg(2147483647)],
+        },
+        // timestamp types: driver reads arguments[0] for precision (default 3 if missing,
+        // but we provide 6 for microsecond precision to match Iceberg)
+        "timestamp" => TrinoTypeSignature {
+            raw_type: "timestamp".to_string(),
+            arguments: vec![long_arg(6)],
+        },
+        "timestamp with time zone" => TrinoTypeSignature {
+            raw_type: "timestamp with time zone".to_string(),
+            arguments: vec![long_arg(6)],
+        },
+        _ => TrinoTypeSignature {
+            raw_type: trino_type.to_string(),
+            arguments: vec![],
+        },
     }
 }
 
