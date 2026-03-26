@@ -151,7 +151,7 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 
 - [x] Distributed execution (coordinator → worker plan shipping, fragment scheduler, heartbeat, credential refresh)
 - [x] Iceberg predicate pushdown (DataFusion 52 optimizer pass)
-- [x] Trino HTTP compatibility (pagination, header handling, dual auth)
+- [x] Trino HTTP compatibility (pagination, header handling, dual auth, infoUri, system.jdbc.* metadata)
 - [x] Worker observability (metrics, OTel trace propagation, memory limits, spill-to-disk)
 - [x] Integration & E2E test suite
 - [x] Benchmark suite (sqe-bench: TPC-H, TPC-DS, SSB, TPC-C, TPC-E, TPC-BB; `read_parquet()` TVF)
