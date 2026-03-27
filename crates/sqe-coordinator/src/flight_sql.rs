@@ -17,10 +17,10 @@ use arrow_flight::sql::{
     CommandGetPrimaryKeys, CommandGetSqlInfo, CommandGetTableTypes, CommandGetTables,
     CommandGetXdbcTypeInfo, CommandPreparedStatementQuery, CommandPreparedStatementUpdate,
     CommandStatementIngest, CommandStatementQuery, CommandStatementSubstraitPlan,
-    CommandStatementUpdate, DoPutPreparedStatementResult, ProstMessageExt, SqlInfo,
-    TicketStatementQuery,
+    CommandStatementUpdate, DoPutPreparedStatementResult, Nullable, ProstMessageExt, Searchable,
+    SqlInfo, TicketStatementQuery, XdbcDataType,
 };
-use arrow_flight::sql::metadata::SqlInfoDataBuilder;
+use arrow_flight::sql::metadata::{SqlInfoDataBuilder, XdbcTypeInfo, XdbcTypeInfoDataBuilder};
 use arrow_flight::utils::batches_to_flight_data;
 use arrow_flight::{
     Action, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest,
@@ -630,10 +630,16 @@ impl FlightSqlService for SqeFlightSqlService {
 
     async fn get_flight_info_table_types(
         &self,
-        _query: CommandGetTableTypes,
-        _request: Request<FlightDescriptor>,
+        query: CommandGetTableTypes,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        Err(Status::unimplemented("get_flight_info_table_types not supported"))
+        let flight_descriptor = request.into_inner();
+        let ticket = Ticket::new(query.as_any().encode_to_vec());
+        let endpoint = FlightEndpoint::new().with_ticket(ticket);
+        let info = FlightInfo::new()
+            .with_endpoint(endpoint)
+            .with_descriptor(flight_descriptor);
+        Ok(Response::new(info))
     }
 
     async fn get_flight_info_sql_info(
@@ -720,10 +726,16 @@ impl FlightSqlService for SqeFlightSqlService {
 
     async fn get_flight_info_xdbc_type_info(
         &self,
-        _query: CommandGetXdbcTypeInfo,
-        _request: Request<FlightDescriptor>,
+        query: CommandGetXdbcTypeInfo,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        Err(Status::unimplemented("XDBC type info not supported"))
+        let flight_descriptor = request.into_inner();
+        let ticket = Ticket::new(query.as_any().encode_to_vec());
+        let endpoint = FlightEndpoint::new().with_ticket(ticket);
+        let info = FlightInfo::new()
+            .with_endpoint(endpoint)
+            .with_descriptor(flight_descriptor);
+        Ok(Response::new(info))
     }
 
     async fn do_get_prepared_statement(
@@ -758,7 +770,16 @@ impl FlightSqlService for SqeFlightSqlService {
         _query: CommandGetTableTypes,
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        Err(Status::unimplemented("Table types not supported"))
+        let mut builder = arrow_array::builder::StringBuilder::new();
+        builder.append_value("TABLE");
+        builder.append_value("VIEW");
+        let arr = builder.finish();
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("table_type", arrow_schema::DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)])
+            .map_err(|e| Status::internal(format!("Failed to build table types: {e}")))?;
+        Self::batches_to_stream(vec![batch])
     }
 
     async fn do_get_sql_info(
@@ -819,10 +840,166 @@ impl FlightSqlService for SqeFlightSqlService {
 
     async fn do_get_xdbc_type_info(
         &self,
-        _query: CommandGetXdbcTypeInfo,
+        query: CommandGetXdbcTypeInfo,
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        Err(Status::unimplemented("XDBC type info not supported"))
+        let mut builder = XdbcTypeInfoDataBuilder::new();
+
+        builder.append(XdbcTypeInfo {
+            type_name: "boolean".into(),
+            data_type: XdbcDataType::XdbcBit,
+            column_size: Some(1),
+            nullable: Nullable::NullabilityNullable,
+            case_sensitive: false,
+            searchable: Searchable::Full,
+            unsigned_attribute: Some(false),
+            fixed_prec_scale: false,
+            auto_increment: Some(false),
+            sql_data_type: XdbcDataType::XdbcBit,
+            num_prec_radix: Some(0),
+            ..Default::default()
+        });
+
+        for (name, dt, size, radix) in [
+            ("tinyint",  XdbcDataType::XdbcTinyint,  3,  10),
+            ("smallint", XdbcDataType::XdbcSmallint, 5,  10),
+            ("integer",  XdbcDataType::XdbcInteger,  10, 10),
+            ("bigint",   XdbcDataType::XdbcBigint,   19, 10),
+        ] {
+            builder.append(XdbcTypeInfo {
+                type_name: name.into(),
+                data_type: dt,
+                column_size: Some(size),
+                nullable: Nullable::NullabilityNullable,
+                case_sensitive: false,
+                searchable: Searchable::Full,
+                unsigned_attribute: Some(false),
+                fixed_prec_scale: false,
+                auto_increment: Some(false),
+                sql_data_type: dt,
+                num_prec_radix: Some(radix),
+                ..Default::default()
+            });
+        }
+
+        for (name, dt, size) in [
+            ("real",   XdbcDataType::XdbcReal,   7),
+            ("double", XdbcDataType::XdbcDouble, 15),
+        ] {
+            builder.append(XdbcTypeInfo {
+                type_name: name.into(),
+                data_type: dt,
+                column_size: Some(size),
+                nullable: Nullable::NullabilityNullable,
+                case_sensitive: false,
+                searchable: Searchable::Full,
+                unsigned_attribute: Some(false),
+                fixed_prec_scale: false,
+                auto_increment: Some(false),
+                sql_data_type: dt,
+                num_prec_radix: Some(10),
+                ..Default::default()
+            });
+        }
+
+        builder.append(XdbcTypeInfo {
+            type_name: "decimal".into(),
+            data_type: XdbcDataType::XdbcDecimal,
+            column_size: Some(38),
+            create_params: Some(vec!["precision".into(), "scale".into()]),
+            nullable: Nullable::NullabilityNullable,
+            case_sensitive: false,
+            searchable: Searchable::Full,
+            unsigned_attribute: Some(false),
+            fixed_prec_scale: true,
+            auto_increment: Some(false),
+            sql_data_type: XdbcDataType::XdbcDecimal,
+            minimum_scale: Some(0),
+            maximum_scale: Some(38),
+            num_prec_radix: Some(10),
+            ..Default::default()
+        });
+
+        builder.append(XdbcTypeInfo {
+            type_name: "varchar".into(),
+            data_type: XdbcDataType::XdbcVarchar,
+            column_size: Some(2_147_483_647),
+            literal_prefix: Some("'".into()),
+            literal_suffix: Some("'".into()),
+            create_params: Some(vec!["length".into()]),
+            nullable: Nullable::NullabilityNullable,
+            case_sensitive: true,
+            searchable: Searchable::Full,
+            fixed_prec_scale: false,
+            sql_data_type: XdbcDataType::XdbcVarchar,
+            ..Default::default()
+        });
+
+        builder.append(XdbcTypeInfo {
+            type_name: "varbinary".into(),
+            data_type: XdbcDataType::XdbcVarbinary,
+            column_size: Some(2_147_483_647),
+            literal_prefix: Some("X'".into()),
+            literal_suffix: Some("'".into()),
+            nullable: Nullable::NullabilityNullable,
+            case_sensitive: false,
+            searchable: Searchable::Full,
+            fixed_prec_scale: false,
+            sql_data_type: XdbcDataType::XdbcVarbinary,
+            ..Default::default()
+        });
+
+        builder.append(XdbcTypeInfo {
+            type_name: "date".into(),
+            data_type: XdbcDataType::XdbcDate,
+            column_size: Some(10),
+            literal_prefix: Some("DATE '".into()),
+            literal_suffix: Some("'".into()),
+            nullable: Nullable::NullabilityNullable,
+            case_sensitive: false,
+            searchable: Searchable::Full,
+            fixed_prec_scale: false,
+            sql_data_type: XdbcDataType::XdbcDate,
+            ..Default::default()
+        });
+
+        builder.append(XdbcTypeInfo {
+            type_name: "time".into(),
+            data_type: XdbcDataType::XdbcTime,
+            column_size: Some(15),
+            literal_prefix: Some("TIME '".into()),
+            literal_suffix: Some("'".into()),
+            nullable: Nullable::NullabilityNullable,
+            case_sensitive: false,
+            searchable: Searchable::Full,
+            fixed_prec_scale: false,
+            sql_data_type: XdbcDataType::XdbcTime,
+            ..Default::default()
+        });
+
+        builder.append(XdbcTypeInfo {
+            type_name: "timestamp".into(),
+            data_type: XdbcDataType::XdbcTimestamp,
+            column_size: Some(29),
+            literal_prefix: Some("TIMESTAMP '".into()),
+            literal_suffix: Some("'".into()),
+            nullable: Nullable::NullabilityNullable,
+            case_sensitive: false,
+            searchable: Searchable::Full,
+            fixed_prec_scale: false,
+            sql_data_type: XdbcDataType::XdbcTimestamp,
+            ..Default::default()
+        });
+
+        let xdbc_data = builder.build().map_err(|e| {
+            Status::internal(format!("Failed to build XDBC type info: {e}"))
+        })?;
+
+        let batch = xdbc_data.record_batch(query.data_type).map_err(|e| {
+            Status::internal(format!("Failed to filter XDBC type info: {e}"))
+        })?;
+
+        Self::batches_to_stream(vec![batch])
     }
 
     async fn do_put_statement_update(
