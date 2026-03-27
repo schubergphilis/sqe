@@ -331,23 +331,33 @@ fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> String {
                     || upper_before.ends_with(" INTO")
                     || upper_before.ends_with(" UPDATE")
                     || upper_before.ends_with(" EXISTS")
-                    // Trailing comma — only qualifies if we're inside a FROM/JOIN clause
+                    // Trailing comma — only qualifies if we're inside a FROM/JOIN clause.
+                    // Strip parenthesized subexpressions so that WHERE/SELECT inside
+                    // subqueries don't interfere with outer FROM clause detection.
                     || (trimmed_before.ends_with(',') && {
-                        // Build full context: output so far + current segment before match
                         let full_ctx = format!("{}{}", output, before_str);
-                        let full_upper = full_ctx.to_uppercase();
-                        // Find the last FROM/JOIN keyword (handles start-of-string, after space, or after newline)
+                        // Strip content inside balanced parentheses (subqueries)
+                        let mut flat = String::with_capacity(full_ctx.len());
+                        let mut depth = 0i32;
+                        for ch in full_ctx.chars() {
+                            match ch {
+                                '(' => depth += 1,
+                                ')' if depth > 0 => depth -= 1,
+                                _ if depth == 0 => flat.push(ch),
+                                _ => {}
+                            }
+                        }
+                        let flat_upper = flat.to_uppercase();
                         let find_keyword = |kw: &str| -> Option<usize> {
-                            full_upper.rfind(&format!(" {kw}"))
-                                .or_else(|| full_upper.rfind(&format!("\n{kw}")))
-                                .or_else(|| if full_upper.starts_with(kw) { Some(0) } else { None })
+                            flat_upper.rfind(&format!(" {kw}"))
+                                .or_else(|| flat_upper.rfind(&format!("\n{kw}")))
+                                .or_else(|| if flat_upper.starts_with(kw) { Some(0) } else { None })
                         };
                         let from_pos = find_keyword("FROM").unwrap_or(0);
                         let join_pos = find_keyword("JOIN").unwrap_or(0);
                         let table_clause_pos = from_pos.max(join_pos);
                         let has_from = find_keyword("FROM").is_some() || find_keyword("JOIN").is_some();
-                        // Check no non-table clause keyword appears after the last FROM/JOIN
-                        let after_clause = &full_upper[table_clause_pos..];
+                        let after_clause = &flat_upper[table_clause_pos..];
                         has_from
                             && !after_clause.contains(" WHERE ")
                             && !after_clause.contains(" SELECT ")
@@ -541,6 +551,16 @@ mod tests {
         assert!(result.contains("tpce_sf1.trade_type ON"), "FROM trade_type should be qualified: {result}");
         // trade_type in ORDER BY should NOT be qualified (it's a column alias)
         assert!(result.ends_with("ORDER BY trade_type"), "ORDER BY alias should not be qualified: {result}");
+    }
+
+    #[test]
+    fn prefix_tables_subquery_then_comma_tables() {
+        // Pattern from TPC-DS: subquery with WHERE, then comma-separated tables
+        let sql = "FROM (\n    SELECT x FROM store_sales WHERE 1=1\n) sub,\nitem, customer\nWHERE 1=1";
+        let result = prefix_tables(sql, "tpcds_sf1", "tpcds");
+        assert!(result.contains("tpcds_sf1.store_sales"), "store_sales in subquery FROM: {result}");
+        assert!(result.contains("tpcds_sf1.item"), "item after subquery comma: {result}");
+        assert!(result.contains("tpcds_sf1.customer"), "customer after subquery comma: {result}");
     }
 
     #[test]
