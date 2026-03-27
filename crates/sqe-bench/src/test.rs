@@ -329,10 +329,21 @@ fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> String {
                     || upper_before.ends_with(" INTO")
                     || upper_before.ends_with(" UPDATE")
                     || upper_before.ends_with(" EXISTS")
-                    // Comma after a qualified table: "ns.table1," → next word is also a table
+                    // Comma after a table name: "table1," or "ns.table1," → next word is also a table
                     || {
                         let t = trimmed_before;
-                        t.ends_with(',') && t[..t.len()-1].trim_end().contains(&format!("{namespace}."))
+                        if let Some(stripped) = t.strip_suffix(',') {
+                            let before_comma = stripped.trim_end();
+                            // Get the last word before comma
+                            let last_word = before_comma.rsplit_once(|c: char| c.is_whitespace() || c == '.')
+                                .map(|(_, w)| w)
+                                .unwrap_or(before_comma);
+                            // Check if it's a known table name (qualified or not)
+                            tables.iter().any(|tn| tn == last_word)
+                                || before_comma.contains(&format!("{namespace}."))
+                        } else {
+                            false
+                        }
                     }
                     // Also handle newline after FROM/JOIN (table on next line)
                     || {
@@ -477,5 +488,17 @@ mod tests {
         assert!(result.contains("tpcds_sf1.catalog_returns"), "catalog_returns: {result}");
         assert!(result.contains("tpcds_sf1.call_center"), "call_center: {result}");
         assert!(result.contains("tpcds_sf1.customer"), "customer: {result}");
+    }
+
+    #[test]
+    fn prefix_tables_multiline_comma_list() {
+        // TPC-H q02 style: FROM with each table on its own line
+        let sql = "SELECT * FROM\n    part,\n    supplier,\n    partsupp,\n    nation,\n    region\nWHERE 1=1";
+        let result = prefix_tables(sql, "tpch_sf1", "tpch");
+        assert!(result.contains("tpch_sf1.part"), "part: {result}");
+        assert!(result.contains("tpch_sf1.supplier"), "supplier: {result}");
+        assert!(result.contains("tpch_sf1.partsupp"), "partsupp: {result}");
+        assert!(result.contains("tpch_sf1.nation"), "nation: {result}");
+        assert!(result.contains("tpch_sf1.region"), "region: {result}");
     }
 }
