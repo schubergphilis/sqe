@@ -2,20 +2,44 @@ use arrow_schema::DataType;
 
 pub fn arrow_to_trino_type(dt: &DataType) -> String {
     match dt {
+        DataType::Null => "unknown".to_string(),
         DataType::Boolean => "boolean".to_string(),
         DataType::Int8 | DataType::UInt8 => "tinyint".to_string(),
         DataType::Int16 | DataType::UInt16 => "smallint".to_string(),
         DataType::Int32 => "integer".to_string(),
         DataType::UInt32 | DataType::Int64 | DataType::UInt64 => "bigint".to_string(),
-        DataType::Float32 => "real".to_string(),
+        DataType::Float16 | DataType::Float32 => "real".to_string(),
         DataType::Float64 => "double".to_string(),
-        DataType::Utf8 | DataType::LargeUtf8 => "varchar".to_string(),
-        DataType::Binary | DataType::LargeBinary => "varbinary".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "varchar".to_string(),
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView | DataType::FixedSizeBinary(_) => "varbinary".to_string(),
         DataType::Date32 | DataType::Date64 => "date".to_string(),
+        DataType::Time32(_) | DataType::Time64(_) => "time".to_string(),
         DataType::Timestamp(_, None) => "timestamp".to_string(),
         DataType::Timestamp(_, Some(_)) => "timestamp with time zone".to_string(),
-        DataType::Decimal128(p, s) => format!("decimal({p},{s})"),
-        DataType::Decimal256(p, s) => format!("decimal({p},{s})"),
+        DataType::Duration(_) => "interval day to second".to_string(),
+        DataType::Interval(arrow_schema::IntervalUnit::YearMonth) => "interval year to month".to_string(),
+        DataType::Interval(_) => "interval day to second".to_string(),
+        DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => format!("decimal({p},{s})"),
+        DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => {
+            format!("array({})", arrow_to_trino_type(f.data_type()))
+        }
+        DataType::Map(entries_field, _) => {
+            if let DataType::Struct(fields) = entries_field.data_type() {
+                if fields.len() == 2 {
+                    let key_type = arrow_to_trino_type(fields[0].data_type());
+                    let val_type = arrow_to_trino_type(fields[1].data_type());
+                    return format!("map({key_type},{val_type})");
+                }
+            }
+            "map(varchar,varchar)".to_string()
+        }
+        DataType::Struct(fields) => {
+            let cols: Vec<String> = fields
+                .iter()
+                .map(|f| format!("{} {}", f.name(), arrow_to_trino_type(f.data_type())))
+                .collect();
+            format!("row({})", cols.join(","))
+        }
         other => format!("{other:?}"),
     }
 }
@@ -119,7 +143,7 @@ pub fn arrow_value_to_json(
         }
         DataType::Date32 | DataType::Date64 => {
             serde_json::Value::String(
-                arrow::util::display::array_value_to_string(array, row).unwrap_or_default()
+                arrow::util::display::array_value_to_string(array, row).unwrap_or_default(),
             )
         }
         DataType::Utf8View => {
@@ -128,23 +152,23 @@ pub fn arrow_value_to_json(
         }
         DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => {
             serde_json::Value::String(
-                arrow::util::display::array_value_to_string(array, row).unwrap_or_default()
+                arrow::util::display::array_value_to_string(array, row).unwrap_or_default(),
             )
         }
         DataType::Time32(_) | DataType::Time64(_) => {
             serde_json::Value::String(
-                arrow::util::display::array_value_to_string(array, row).unwrap_or_default()
+                arrow::util::display::array_value_to_string(array, row).unwrap_or_default(),
             )
         }
         DataType::Binary | DataType::LargeBinary | DataType::BinaryView
         | DataType::FixedSizeBinary(_) => {
             serde_json::Value::String(
-                arrow::util::display::array_value_to_string(array, row).unwrap_or_default()
+                arrow::util::display::array_value_to_string(array, row).unwrap_or_default(),
             )
         }
         _ => {
             serde_json::Value::String(
-                arrow::util::display::array_value_to_string(array, row).unwrap_or_default()
+                arrow::util::display::array_value_to_string(array, row).unwrap_or_default(),
             )
         }
     }
