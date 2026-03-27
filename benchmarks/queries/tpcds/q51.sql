@@ -29,20 +29,20 @@ store_v1 AS (
 SELECT *
 FROM (
     SELECT item_sk, d_date,
-           web_sales, store_sales,
-           MAX(web_sales) OVER (
+           web_cume, store_cume,
+           MAX(web_cume) OVER (
                PARTITION BY item_sk ORDER BY d_date
                ROWS UNBOUNDED PRECEDING
            ) AS web_cumulative,
-           MAX(store_sales) OVER (
+           MAX(store_cume) OVER (
                PARTITION BY item_sk ORDER BY d_date
                ROWS UNBOUNDED PRECEDING
            ) AS store_cumulative
     FROM (
         SELECT COALESCE(web.item_sk, store.item_sk)   AS item_sk,
                COALESCE(web.d_date, store.d_date)     AS d_date,
-               web.cume_sales   AS web_sales,
-               store.cume_sales AS store_sales
+               web.cume_sales   AS web_cume,
+               store.cume_sales AS store_cume
         FROM web_v1 web
         FULL OUTER JOIN store_v1 store
             ON web.item_sk = store.item_sk

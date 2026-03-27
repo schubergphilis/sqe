@@ -1,7 +1,7 @@
 -- name: Return rate by channel for items with high return-to-sale ratio
 -- timeout: 60s
 WITH in_store AS (
-    SELECT 'store' AS channel, ss_item_sk AS item,
+    SELECT 'store' AS channel, ss_item_sk AS item_sk,
            SUM(ss_quantity * ss_sales_price)    AS sales,
            SUM(COALESCE(sr_return_quantity, 0) * COALESCE(sr_return_amt, 0)) AS returns,
            SUM(ss_net_profit - COALESCE(sr_net_loss, 0)) AS profit
@@ -14,7 +14,7 @@ WITH in_store AS (
     GROUP BY ss_item_sk
 ),
 in_catalog AS (
-    SELECT 'catalog' AS channel, cs_item_sk AS item,
+    SELECT 'catalog' AS channel, cs_item_sk AS item_sk,
            SUM(cs_quantity * cs_sales_price)    AS sales,
            SUM(COALESCE(cr_return_quantity, 0) * COALESCE(cr_return_amount, 0)) AS returns,
            SUM(cs_net_profit - COALESCE(cr_net_loss, 0)) AS profit
@@ -27,7 +27,7 @@ in_catalog AS (
     GROUP BY cs_item_sk
 ),
 in_web AS (
-    SELECT 'web' AS channel, ws_item_sk AS item,
+    SELECT 'web' AS channel, ws_item_sk AS item_sk,
            SUM(ws_quantity * ws_sales_price)    AS sales,
            SUM(COALESCE(wr_return_quantity, 0) * COALESCE(wr_return_amt, 0)) AS returns,
            SUM(ws_net_profit - COALESCE(wr_net_loss, 0)) AS profit
@@ -39,7 +39,7 @@ in_web AS (
       AND d_moy     = 12
     GROUP BY ws_item_sk
 )
-SELECT channel, item,
+SELECT channel, item_sk,
        SUM(sales)   AS sales,
        SUM(returns) AS returns,
        SUM(profit)  AS profit
@@ -50,6 +50,6 @@ FROM (
     UNION ALL
     SELECT * FROM in_web
 ) x
-GROUP BY channel, item
-ORDER BY channel, item
+GROUP BY channel, item_sk
+ORDER BY channel, item_sk
 LIMIT 100;
