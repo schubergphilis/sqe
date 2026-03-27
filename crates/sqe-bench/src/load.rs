@@ -8,16 +8,28 @@ pub struct S3Args {
     pub region: String,
 }
 
+pub struct LoadArgs<'a> {
+    pub benchmark: &'a str,
+    pub scale: f64,
+    pub data_path: &'a str,
+    pub s3_args: &'a S3Args,
+    pub clean: bool,
+    pub catalog: Option<&'a str>,
+    pub namespace_override: Option<&'a str>,
+}
+
 pub async fn load_benchmark(
     client: &dyn BenchClient,
-    benchmark: &str,
-    scale: f64,
-    data_path: &str,
-    s3_args: &S3Args,
-    clean: bool,
-    catalog: Option<&str>,
-    namespace_override: Option<&str>,
+    args: &LoadArgs<'_>,
 ) -> anyhow::Result<()> {
+    let benchmark = args.benchmark;
+    let scale = args.scale;
+    let data_path = args.data_path;
+    let s3_args = args.s3_args;
+    let clean = args.clean;
+    let catalog = args.catalog;
+    let namespace_override = args.namespace_override;
+
     // Build the namespace: user override > auto-generated
     let ns_base = match namespace_override {
         Some(ns) => ns.to_string(),

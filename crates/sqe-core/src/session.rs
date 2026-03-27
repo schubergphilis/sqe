@@ -78,9 +78,10 @@ impl Session {
     }
 
     pub fn token_fingerprint(&self) -> String {
-        let token = &self.access_token;
-        let tail = &token[token.len().saturating_sub(8)..];
-        format!("{}-{}", self.user.username, tail)
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.access_token.hash(&mut hasher);
+        format!("{}-{:016x}", self.user.username, hasher.finish())
     }
 
     pub fn is_token_expiring(&self, buffer_secs: u64) -> bool {

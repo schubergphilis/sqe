@@ -321,19 +321,21 @@ fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> String {
                 }
 
                 // Only qualify if preceded by a table-introducing context:
-                // FROM, JOIN, TABLE, INTO, UPDATE, or a comma that follows
-                // a previously qualified table name (for FROM t1, t2 lists).
+                // FROM, JOIN, TABLE, INTO, UPDATE, or a comma within a FROM/JOIN clause.
+                //
+                // To determine if a trailing comma is in FROM/JOIN context (vs SELECT/ORDER BY),
+                // scan the full text so far (output + current segment) for the last SQL clause keyword.
                 let in_table_context = upper_before.ends_with(" FROM")
                     || upper_before.ends_with(" JOIN")
                     || upper_before.ends_with(" TABLE")
                     || upper_before.ends_with(" INTO")
                     || upper_before.ends_with(" UPDATE")
                     || upper_before.ends_with(" EXISTS")
-                    // Comma after a qualified table: "ns.table1," → next word is also a table
-                    || {
-                        let t = trimmed_before;
-                        t.ends_with(',') && t[..t.len()-1].trim_end().contains(&format!("{namespace}."))
-                    }
+                    // Trailing comma means continuation of a table list
+                    // (handles "FROM t1, t2", "FROM t1 a1,\n t2 a2", etc.)
+                    // Note: this can over-qualify column aliases that share names with tables.
+                    // Such queries are fixed by renaming the conflicting aliases in the query files.
+                    || trimmed_before.ends_with(',')
                     // Also handle newline after FROM/JOIN (table on next line)
                     || {
                         let words: Vec<&str> = trimmed_before.split_whitespace().collect();
@@ -352,7 +354,7 @@ fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> String {
                 // Check it's not inside a quoted string (simple heuristic:
                 // count double quotes before this position — odd means inside quotes)
                 let quotes_before = remaining[..pos].matches('"').count();
-                if quotes_before % 2 == 0 {
+                if quotes_before.is_multiple_of(2) {
                     output.push_str(&remaining[..pos]);
                     output.push_str(&qualified);
                     remaining = &remaining[end..];
@@ -477,5 +479,36 @@ mod tests {
         assert!(result.contains("tpcds_sf1.catalog_returns"), "catalog_returns: {result}");
         assert!(result.contains("tpcds_sf1.call_center"), "call_center: {result}");
         assert!(result.contains("tpcds_sf1.customer"), "customer: {result}");
+    }
+
+    #[test]
+    fn prefix_tables_q16_partsupp_part() {
+        // q16: FROM partsupp, part (same line) + subquery FROM supplier
+        let sql = "FROM\n    partsupp,\n    part\nWHERE 1=1 AND ps_suppkey NOT IN (\n    SELECT s_suppkey FROM supplier\n)";
+        let result = prefix_tables(sql, "tpch_sf1", "tpch");
+        assert!(result.contains("tpch_sf1.partsupp"), "partsupp: {result}");
+        assert!(result.contains("tpch_sf1.part"), "part not qualified: {result}");
+        assert!(result.contains("FROM tpch_sf1.supplier"), "supplier: {result}");
+    }
+
+    #[test]
+    fn prefix_tables_aliased_tables() {
+        // q07: nation n1, nation n2 — table with alias
+        let sql = "FROM\n    supplier,\n    lineitem,\n    orders,\n    customer,\n    nation n1,\n    nation n2\nWHERE 1=1";
+        let result = prefix_tables(sql, "tpch_sf1", "tpch");
+        assert!(result.contains("tpch_sf1.nation n1"), "nation n1: {result}");
+        assert!(result.contains("tpch_sf1.nation n2"), "nation n2: {result}");
+    }
+
+    #[test]
+    fn prefix_tables_multiline_comma_list() {
+        // TPC-H q02 style: FROM with each table on its own line
+        let sql = "SELECT * FROM\n    part,\n    supplier,\n    partsupp,\n    nation,\n    region\nWHERE 1=1";
+        let result = prefix_tables(sql, "tpch_sf1", "tpch");
+        assert!(result.contains("tpch_sf1.part"), "part: {result}");
+        assert!(result.contains("tpch_sf1.supplier"), "supplier: {result}");
+        assert!(result.contains("tpch_sf1.partsupp"), "partsupp: {result}");
+        assert!(result.contains("tpch_sf1.nation"), "nation: {result}");
+        assert!(result.contains("tpch_sf1.region"), "region: {result}");
     }
 }

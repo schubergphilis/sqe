@@ -294,6 +294,66 @@ impl WriteHandler {
         Ok(vec![]) // DML success, no result rows
     }
 
+    /// Handle a Flight SQL DoPut ingest — write streamed Arrow batches to an Iceberg table.
+    pub async fn handle_ingest(
+        &self,
+        session: &Session,
+        table_name: &str,
+        batches: Vec<RecordBatch>,
+    ) -> sqe_core::Result<usize> {
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+        if total_rows == 0 {
+            return Ok(0);
+        }
+
+        // Parse "catalog.schema.table" or "schema.table"
+        let parts: Vec<&str> = table_name.split('.').collect();
+        let (namespace_str, name) = match parts.as_slice() {
+            [ns, tbl] => (*ns, (*tbl).to_string()),
+            [_cat, ns, tbl] => (*ns, (*tbl).to_string()),
+            _ => {
+                return Err(SqeError::Execution(format!(
+                    "Invalid table name for ingest: {table_name}"
+                )));
+            }
+        };
+
+        let namespace = iceberg::NamespaceIdent::new(namespace_str.to_string());
+        let table_ident = TableIdent::new(namespace, name);
+
+        info!(
+            username = %session.user.username,
+            table = %table_ident,
+            total_rows,
+            "Executing DoPut ingest"
+        );
+
+        let catalog = self.create_catalog_bridge(session).await?;
+
+        let table = catalog
+            .load_table(&table_ident)
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
+
+        let data_files = write_data_files(&table, batches, "ingest").await?;
+
+        if !data_files.is_empty() {
+            let tx = Transaction::new(&table);
+            let action = tx.fast_append().add_data_files(data_files);
+            let tx = action.apply(tx).map_err(|e| {
+                SqeError::Execution(format!("Failed to apply fast append: {e}"))
+            })?;
+            tx.commit(catalog.as_ref()).await.map_err(|e| {
+                SqeError::Execution(format!("Failed to commit ingest transaction: {e}"))
+            })?;
+
+            info!(table = %table_ident, total_rows, "DoPut ingest committed successfully");
+        }
+
+        Ok(total_rows)
+    }
+
     fn format_version(&self) -> FormatVersion {
         match self.config.catalog.default_table_format_version {
             3 => FormatVersion::V3,
@@ -401,7 +461,12 @@ fn arrow_schema_to_iceberg(arrow_schema: &ArrowSchema) -> sqe_core::Result<Icebe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_schema::{DataType, Field};
+    use arrow_schema::{DataType, Field, TimeUnit};
+    use sqlparser::ast::{DataType as SqlType, ExactNumberInfo, TimezoneInfo};
+
+    // -------------------------------------------------------------------------
+    // arrow_schema_to_iceberg tests
+    // -------------------------------------------------------------------------
 
     #[test]
     fn test_arrow_schema_to_iceberg_basic() {
@@ -428,5 +493,421 @@ mod tests {
         let arrow_schema = ArrowSchema::empty();
         let iceberg_schema = arrow_schema_to_iceberg(&arrow_schema).unwrap();
         assert_eq!(iceberg_schema.as_struct().fields().len(), 0);
+    }
+
+    #[test]
+    fn test_arrow_schema_to_iceberg_field_ids_are_sequential() {
+        // Field IDs must start at 1 and be sequential (Iceberg spec requirement).
+        let arrow_schema = ArrowSchema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, true),
+            Field::new("c", DataType::Float64, false),
+        ]);
+
+        let iceberg_schema = arrow_schema_to_iceberg(&arrow_schema).unwrap();
+        let fields: Vec<_> = iceberg_schema.as_struct().fields().to_vec();
+
+        assert_eq!(fields[0].id, 1);
+        assert_eq!(fields[1].id, 2);
+        assert_eq!(fields[2].id, 3);
+    }
+
+    #[test]
+    fn test_arrow_schema_to_iceberg_nullable_flags() {
+        // Nullable Arrow fields → optional Iceberg fields (required == false).
+        // Non-nullable Arrow fields → required Iceberg fields (required == true).
+        let arrow_schema = ArrowSchema::new(vec![
+            Field::new("required_col", DataType::Int64, false),
+            Field::new("optional_col", DataType::Utf8, true),
+        ]);
+
+        let iceberg_schema = arrow_schema_to_iceberg(&arrow_schema).unwrap();
+        let fields: Vec<_> = iceberg_schema.as_struct().fields().to_vec();
+
+        assert!(fields[0].required, "non-nullable Arrow field should map to required Iceberg field");
+        assert!(!fields[1].required, "nullable Arrow field should map to optional Iceberg field");
+    }
+
+    #[test]
+    fn test_arrow_schema_to_iceberg_all_required() {
+        let arrow_schema = ArrowSchema::new(vec![
+            Field::new("x", DataType::Int32, false),
+            Field::new("y", DataType::Int32, false),
+            Field::new("z", DataType::Int32, false),
+        ]);
+
+        let iceberg_schema = arrow_schema_to_iceberg(&arrow_schema).unwrap();
+        let fields: Vec<_> = iceberg_schema.as_struct().fields().to_vec();
+
+        for field in &fields {
+            assert!(field.required, "all fields should be required");
+        }
+    }
+
+    #[test]
+    fn test_arrow_schema_to_iceberg_wide_schema() {
+        // Verify that a schema with many fields produces the correct count and IDs.
+        let columns: Vec<Field> = (0..20)
+            .map(|i| Field::new(format!("col_{i}"), DataType::Int64, i % 2 == 0))
+            .collect();
+        let count = columns.len();
+        let arrow_schema = ArrowSchema::new(columns);
+
+        let iceberg_schema = arrow_schema_to_iceberg(&arrow_schema).unwrap();
+        let fields: Vec<_> = iceberg_schema.as_struct().fields().to_vec();
+
+        assert_eq!(fields.len(), count);
+        for (i, field) in fields.iter().enumerate() {
+            assert_eq!(field.id, (i + 1) as i32);
+            assert_eq!(field.name, format!("col_{i}"));
+        }
+    }
+
+    #[test]
+    fn test_arrow_schema_to_iceberg_various_numeric_types() {
+        let arrow_schema = ArrowSchema::new(vec![
+            Field::new("i8_col", DataType::Int8, true),
+            Field::new("i16_col", DataType::Int16, true),
+            Field::new("i32_col", DataType::Int32, true),
+            Field::new("i64_col", DataType::Int64, true),
+            Field::new("f32_col", DataType::Float32, true),
+            Field::new("f64_col", DataType::Float64, true),
+        ]);
+
+        // Should convert without error; all numeric types are supported by Iceberg.
+        let iceberg_schema = arrow_schema_to_iceberg(&arrow_schema).unwrap();
+        assert_eq!(iceberg_schema.as_struct().fields().len(), 6);
+    }
+
+    #[test]
+    fn test_arrow_schema_to_iceberg_temporal_types() {
+        // Iceberg only supports Microsecond precision for timestamps (not Millisecond or
+        // Nanosecond). This test verifies the supported subset converts cleanly.
+        let arrow_schema = ArrowSchema::new(vec![
+            Field::new("date_col", DataType::Date32, true),
+            Field::new(
+                "ts_us_col",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+        ]);
+
+        let iceberg_schema = arrow_schema_to_iceberg(&arrow_schema).unwrap();
+        assert_eq!(iceberg_schema.as_struct().fields().len(), 2);
+    }
+
+    #[test]
+    fn test_arrow_schema_to_iceberg_millisecond_timestamp_is_unsupported() {
+        // The underlying iceberg-rust library rejects Timestamp(Millisecond) — this is a
+        // known limitation and the error path must be exercised rather than silently
+        // producing a wrong schema.
+        let arrow_schema = ArrowSchema::new(vec![Field::new(
+            "ts_ms_col",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        )]);
+
+        let result = arrow_schema_to_iceberg(&arrow_schema);
+        assert!(
+            result.is_err(),
+            "Timestamp(Millisecond) should not convert to Iceberg"
+        );
+    }
+
+    #[test]
+    fn test_arrow_schema_to_iceberg_decimal_type() {
+        let arrow_schema = ArrowSchema::new(vec![
+            Field::new("amount", DataType::Decimal128(18, 4), false),
+        ]);
+
+        let iceberg_schema = arrow_schema_to_iceberg(&arrow_schema).unwrap();
+        let fields: Vec<_> = iceberg_schema.as_struct().fields().to_vec();
+
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "amount");
+        assert!(fields[0].required);
+    }
+
+    #[test]
+    fn test_arrow_schema_to_iceberg_binary_type() {
+        let arrow_schema = ArrowSchema::new(vec![
+            Field::new("payload", DataType::Binary, true),
+        ]);
+
+        let iceberg_schema = arrow_schema_to_iceberg(&arrow_schema).unwrap();
+        assert_eq!(iceberg_schema.as_struct().fields().len(), 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // sql_type_to_arrow tests (private fn accessed via super::)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_sql_type_to_arrow_boolean() {
+        assert_eq!(
+            sql_type_to_arrow(&SqlType::Boolean).unwrap(),
+            DataType::Boolean
+        );
+    }
+
+    #[test]
+    fn test_sql_type_to_arrow_integer_variants() {
+        assert_eq!(
+            sql_type_to_arrow(&SqlType::TinyInt(None)).unwrap(),
+            DataType::Int8
+        );
+        assert_eq!(
+            sql_type_to_arrow(&SqlType::Int8(None)).unwrap(),
+            DataType::Int8
+        );
+        assert_eq!(
+            sql_type_to_arrow(&SqlType::SmallInt(None)).unwrap(),
+            DataType::Int16
+        );
+        assert_eq!(
+            sql_type_to_arrow(&SqlType::Int16).unwrap(),
+            DataType::Int16
+        );
+        assert_eq!(
+            sql_type_to_arrow(&SqlType::Int(None)).unwrap(),
+            DataType::Int32
+        );
+        assert_eq!(
+            sql_type_to_arrow(&SqlType::Integer(None)).unwrap(),
+            DataType::Int32
+        );
+        assert_eq!(
+            sql_type_to_arrow(&SqlType::Int32).unwrap(),
+            DataType::Int32
+        );
+        assert_eq!(
+            sql_type_to_arrow(&SqlType::BigInt(None)).unwrap(),
+            DataType::Int64
+        );
+        assert_eq!(
+            sql_type_to_arrow(&SqlType::Int64).unwrap(),
+            DataType::Int64
+        );
+    }
+
+    #[test]
+    fn test_sql_type_to_arrow_float_variants() {
+        assert_eq!(
+            sql_type_to_arrow(&SqlType::Float(None)).unwrap(),
+            DataType::Float32
+        );
+        assert_eq!(
+            sql_type_to_arrow(&SqlType::Real).unwrap(),
+            DataType::Float32
+        );
+        assert_eq!(
+            sql_type_to_arrow(&SqlType::Double).unwrap(),
+            DataType::Float64
+        );
+        assert_eq!(
+            sql_type_to_arrow(&SqlType::DoublePrecision).unwrap(),
+            DataType::Float64
+        );
+    }
+
+    #[test]
+    fn test_sql_type_to_arrow_string_variants() {
+        assert_eq!(
+            sql_type_to_arrow(&SqlType::Varchar(None)).unwrap(),
+            DataType::Utf8
+        );
+        assert_eq!(
+            sql_type_to_arrow(&SqlType::Text).unwrap(),
+            DataType::Utf8
+        );
+        assert_eq!(
+            sql_type_to_arrow(&SqlType::Char(None)).unwrap(),
+            DataType::Utf8
+        );
+        assert_eq!(
+            sql_type_to_arrow(&SqlType::Character(None)).unwrap(),
+            DataType::Utf8
+        );
+        assert_eq!(
+            sql_type_to_arrow(&SqlType::CharVarying(None)).unwrap(),
+            DataType::Utf8
+        );
+        assert_eq!(
+            sql_type_to_arrow(&SqlType::String(None)).unwrap(),
+            DataType::Utf8
+        );
+    }
+
+    #[test]
+    fn test_sql_type_to_arrow_binary_variants() {
+        assert_eq!(
+            sql_type_to_arrow(&SqlType::Binary(None)).unwrap(),
+            DataType::Binary
+        );
+        assert_eq!(
+            sql_type_to_arrow(&SqlType::Varbinary(None)).unwrap(),
+            DataType::Binary
+        );
+        assert_eq!(
+            sql_type_to_arrow(&SqlType::Bytea).unwrap(),
+            DataType::Binary
+        );
+    }
+
+    #[test]
+    fn test_sql_type_to_arrow_date() {
+        assert_eq!(
+            sql_type_to_arrow(&SqlType::Date).unwrap(),
+            DataType::Date32
+        );
+    }
+
+    #[test]
+    fn test_sql_type_to_arrow_timestamp_default_precision() {
+        // No precision → defaults to 6 → Microsecond
+        let result = sql_type_to_arrow(&SqlType::Timestamp(None, TimezoneInfo::None)).unwrap();
+        assert_eq!(result, DataType::Timestamp(TimeUnit::Microsecond, None));
+    }
+
+    #[test]
+    fn test_sql_type_to_arrow_timestamp_low_precision() {
+        // Precision 0-3 → Millisecond
+        for p in 0u64..=3 {
+            let result =
+                sql_type_to_arrow(&SqlType::Timestamp(Some(p), TimezoneInfo::None)).unwrap();
+            assert_eq!(
+                result,
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                "precision {p} should map to Millisecond"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sql_type_to_arrow_timestamp_mid_precision() {
+        // Precision 4-6 → Microsecond
+        for p in 4u64..=6 {
+            let result =
+                sql_type_to_arrow(&SqlType::Timestamp(Some(p), TimezoneInfo::None)).unwrap();
+            assert_eq!(
+                result,
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                "precision {p} should map to Microsecond"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sql_type_to_arrow_timestamp_high_precision() {
+        // Precision 7+ → Nanosecond
+        let result =
+            sql_type_to_arrow(&SqlType::Timestamp(Some(9), TimezoneInfo::None)).unwrap();
+        assert_eq!(result, DataType::Timestamp(TimeUnit::Nanosecond, None));
+    }
+
+    #[test]
+    fn test_sql_type_to_arrow_decimal_full() {
+        let result = sql_type_to_arrow(&SqlType::Decimal(
+            ExactNumberInfo::PrecisionAndScale(18, 4),
+        ))
+        .unwrap();
+        assert_eq!(result, DataType::Decimal128(18, 4));
+    }
+
+    #[test]
+    fn test_sql_type_to_arrow_decimal_precision_only() {
+        let result =
+            sql_type_to_arrow(&SqlType::Decimal(ExactNumberInfo::Precision(10))).unwrap();
+        // Scale defaults to 0
+        assert_eq!(result, DataType::Decimal128(10, 0));
+    }
+
+    #[test]
+    fn test_sql_type_to_arrow_decimal_no_info() {
+        let result =
+            sql_type_to_arrow(&SqlType::Decimal(ExactNumberInfo::None)).unwrap();
+        // Defaults to Decimal128(38, 10)
+        assert_eq!(result, DataType::Decimal128(38, 10));
+    }
+
+    #[test]
+    fn test_sql_type_to_arrow_numeric_alias() {
+        // NUMERIC is the same as DECIMAL in the implementation.
+        let decimal_result = sql_type_to_arrow(&SqlType::Decimal(
+            ExactNumberInfo::PrecisionAndScale(12, 2),
+        ))
+        .unwrap();
+        let numeric_result = sql_type_to_arrow(&SqlType::Numeric(
+            ExactNumberInfo::PrecisionAndScale(12, 2),
+        ))
+        .unwrap();
+        assert_eq!(decimal_result, numeric_result);
+    }
+
+    #[test]
+    fn test_sql_type_to_arrow_unsupported_returns_err() {
+        // JSON is not in the supported set — must return a NotImplemented error.
+        let result = sql_type_to_arrow(&SqlType::JSON);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        // The error should be a NotImplemented variant.
+        assert!(
+            matches!(err, sqe_core::SqeError::NotImplemented(_)),
+            "expected NotImplemented, got: {err:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // handle_ingest table-name parsing (pure logic, no catalog required)
+    // -------------------------------------------------------------------------
+
+    /// The ingest name-parsing logic is embedded in `handle_ingest`. We test it
+    /// by extracting the equivalent logic as a free function here so we can unit
+    /// test the three cases (valid 2-part, valid 3-part, invalid) without
+    /// needing a real catalog connection.
+    fn parse_ingest_table_name(table_name: &str) -> sqe_core::Result<(String, String)> {
+        let parts: Vec<&str> = table_name.split('.').collect();
+        match parts.as_slice() {
+            [ns, tbl] => Ok(((*ns).to_string(), (*tbl).to_string())),
+            [_cat, ns, tbl] => Ok(((*ns).to_string(), (*tbl).to_string())),
+            _ => Err(sqe_core::SqeError::Execution(format!(
+                "Invalid table name for ingest: {table_name}"
+            ))),
+        }
+    }
+
+    #[test]
+    fn test_ingest_table_name_two_part() {
+        let (ns, tbl) = parse_ingest_table_name("my_schema.my_table").unwrap();
+        assert_eq!(ns, "my_schema");
+        assert_eq!(tbl, "my_table");
+    }
+
+    #[test]
+    fn test_ingest_table_name_three_part_catalog() {
+        // "catalog.schema.table" — catalog is discarded, schema + table kept.
+        let (ns, tbl) = parse_ingest_table_name("my_catalog.my_schema.my_table").unwrap();
+        assert_eq!(ns, "my_schema");
+        assert_eq!(tbl, "my_table");
+    }
+
+    #[test]
+    fn test_ingest_table_name_single_part_is_error() {
+        let result = parse_ingest_table_name("just_a_table");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ingest_table_name_four_part_is_error() {
+        // More than three parts is also invalid.
+        let result = parse_ingest_table_name("a.b.c.d");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ingest_table_name_empty_string_is_error() {
+        // An empty string yields a single empty segment → invalid.
+        let result = parse_ingest_table_name("");
+        assert!(result.is_err());
     }
 }

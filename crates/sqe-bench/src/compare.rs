@@ -77,6 +77,14 @@ pub fn compare_results(
                 continue;
             }
 
+            // Normalize: trim trailing zeros from decimal-like strings
+            // "123.4500" == "123.45", "100.00" == "100"
+            let a_norm = a.trim_end_matches('0').trim_end_matches('.');
+            let e_norm = e.trim_end_matches('0').trim_end_matches('.');
+            if a_norm == e_norm {
+                continue;
+            }
+
             // Numeric tolerance for float columns
             if float_columns.get(col_idx).copied().unwrap_or(false) {
                 match (a.parse::<f64>(), e.parse::<f64>()) {
@@ -202,13 +210,8 @@ fn cell_to_string(array: &dyn Array, row: usize) -> String {
         DataType::UInt32 => format!("{}", array.as_primitive::<arrow_array::types::UInt32Type>().value(row)),
         DataType::UInt64 => format!("{}", array.as_primitive::<arrow_array::types::UInt64Type>().value(row)),
         DataType::Boolean => format!("{}", array.as_boolean().value(row)),
-        DataType::Date32 => {
-            let days = array.as_primitive::<arrow_array::types::Date32Type>().value(row);
-            format!("{days}")
-        }
-        DataType::Date64 => {
-            let ms = array.as_primitive::<arrow_array::types::Date64Type>().value(row);
-            format!("{ms}")
+        DataType::Date32 | DataType::Date64 => {
+            arrow::util::display::array_value_to_string(array, row).unwrap_or_default()
         }
         DataType::Decimal128(_, scale) => {
             let raw = array
@@ -223,6 +226,16 @@ fn cell_to_string(array: &dyn Array, row: usize) -> String {
                 let frac = (raw % divisor).unsigned_abs();
                 format!("{integer}.{frac:0>width$}", width = scale as usize)
             }
+        }
+        DataType::Utf8View => {
+            let arr = array.as_any().downcast_ref::<arrow_array::StringViewArray>().unwrap();
+            arr.value(row).to_string()
+        }
+        DataType::Timestamp(_, _) | DataType::Time32(_) | DataType::Time64(_) => {
+            arrow::util::display::array_value_to_string(array, row).unwrap_or_default()
+        }
+        DataType::Decimal256(_, _) => {
+            arrow::util::display::array_value_to_string(array, row).unwrap_or_default()
         }
         other => {
             // Fallback: use Debug representation of the array type
@@ -263,7 +276,7 @@ fn detect_float_columns(batches: &[RecordBatch], headers: &[String]) -> Vec<bool
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Float64Array, Int64Array, StringArray};
+    use arrow_array::{Float64Array, Int64Array, StringArray, *};
     use arrow_schema::{Field, Schema};
     use std::sync::Arc;
 
@@ -366,5 +379,43 @@ mod tests {
         let csv = "id\n";
         let status = compare_results(&[batch], csv, 1e-4).unwrap();
         assert!(matches!(status, CompareStatus::Pass), "{status:?}");
+    }
+
+    #[test]
+    fn test_cell_to_string_utf8view() {
+        let arr = StringViewArray::from(vec!["hello"]);
+        assert_eq!(cell_to_string(&arr, 0), "hello");
+    }
+
+    #[test]
+    fn test_cell_to_string_timestamp() {
+        let arr = TimestampMicrosecondArray::from(vec![1_710_000_000_000_000i64]);
+        let s = cell_to_string(&arr, 0);
+        assert!(s.contains("2024"), "timestamp should contain year: {s}");
+    }
+
+    #[test]
+    fn test_cell_to_string_date32_readable() {
+        let arr = Date32Array::from(vec![19800]);
+        let s = cell_to_string(&arr, 0);
+        assert!(s.contains("2024"), "date should be human-readable: {s}");
+    }
+
+    #[test]
+    fn test_compare_decimal_trailing_zeros() {
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("amount", DataType::Decimal128(10, 4), false),
+        ]));
+        // 1234500 with scale 4 = 123.4500
+        let arr = Decimal128Array::from(vec![1_234_500i128])
+            .with_precision_and_scale(10, 4)
+            .unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+
+        let csv = "amount\n123.45\n";
+        let result = compare_results(&[batch], csv, 1e-4).unwrap();
+        assert!(matches!(result, CompareStatus::Pass), "trailing zeros should match: {result:?}");
     }
 }

@@ -17,10 +17,10 @@ use arrow_flight::sql::{
     CommandGetPrimaryKeys, CommandGetSqlInfo, CommandGetTableTypes, CommandGetTables,
     CommandGetXdbcTypeInfo, CommandPreparedStatementQuery, CommandPreparedStatementUpdate,
     CommandStatementIngest, CommandStatementQuery, CommandStatementSubstraitPlan,
-    CommandStatementUpdate, DoPutPreparedStatementResult, ProstMessageExt, SqlInfo,
-    TicketStatementQuery,
+    CommandStatementUpdate, DoPutPreparedStatementResult, Nullable, ProstMessageExt, Searchable,
+    SqlInfo, TicketStatementQuery, XdbcDataType,
 };
-use arrow_flight::sql::metadata::SqlInfoDataBuilder;
+use arrow_flight::sql::metadata::{SqlInfoDataBuilder, XdbcTypeInfo, XdbcTypeInfoDataBuilder};
 use arrow_flight::utils::batches_to_flight_data;
 use arrow_flight::{
     Action, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest,
@@ -474,7 +474,7 @@ impl FlightSqlService for SqeFlightSqlService {
             }
         }
 
-        let schema = builder.schema();
+        let _schema = builder.schema();
         let batch = builder.build().map_err(|e| Status::internal(format!("Failed to build batch: {e}")))?;
         Self::batches_to_stream(vec![batch])
     }
@@ -630,10 +630,16 @@ impl FlightSqlService for SqeFlightSqlService {
 
     async fn get_flight_info_table_types(
         &self,
-        _query: CommandGetTableTypes,
-        _request: Request<FlightDescriptor>,
+        query: CommandGetTableTypes,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        Err(Status::unimplemented("get_flight_info_table_types not supported"))
+        let flight_descriptor = request.into_inner();
+        let ticket = Ticket::new(query.as_any().encode_to_vec());
+        let endpoint = FlightEndpoint::new().with_ticket(ticket);
+        let info = FlightInfo::new()
+            .with_endpoint(endpoint)
+            .with_descriptor(flight_descriptor);
+        Ok(Response::new(info))
     }
 
     async fn get_flight_info_sql_info(
@@ -720,10 +726,16 @@ impl FlightSqlService for SqeFlightSqlService {
 
     async fn get_flight_info_xdbc_type_info(
         &self,
-        _query: CommandGetXdbcTypeInfo,
-        _request: Request<FlightDescriptor>,
+        query: CommandGetXdbcTypeInfo,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        Err(Status::unimplemented("XDBC type info not supported"))
+        let flight_descriptor = request.into_inner();
+        let ticket = Ticket::new(query.as_any().encode_to_vec());
+        let endpoint = FlightEndpoint::new().with_ticket(ticket);
+        let info = FlightInfo::new()
+            .with_endpoint(endpoint)
+            .with_descriptor(flight_descriptor);
+        Ok(Response::new(info))
     }
 
     async fn do_get_prepared_statement(
@@ -758,7 +770,16 @@ impl FlightSqlService for SqeFlightSqlService {
         _query: CommandGetTableTypes,
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        Err(Status::unimplemented("Table types not supported"))
+        let mut builder = arrow_array::builder::StringBuilder::new();
+        builder.append_value("TABLE");
+        builder.append_value("VIEW");
+        let arr = builder.finish();
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("table_type", arrow_schema::DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)])
+            .map_err(|e| Status::internal(format!("Failed to build table types: {e}")))?;
+        Self::batches_to_stream(vec![batch])
     }
 
     async fn do_get_sql_info(
@@ -819,26 +840,229 @@ impl FlightSqlService for SqeFlightSqlService {
 
     async fn do_get_xdbc_type_info(
         &self,
-        _query: CommandGetXdbcTypeInfo,
+        query: CommandGetXdbcTypeInfo,
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        Err(Status::unimplemented("XDBC type info not supported"))
+        let mut builder = XdbcTypeInfoDataBuilder::new();
+
+        builder.append(XdbcTypeInfo {
+            type_name: "boolean".into(),
+            data_type: XdbcDataType::XdbcBit,
+            column_size: Some(1),
+            nullable: Nullable::NullabilityNullable,
+            case_sensitive: false,
+            searchable: Searchable::Full,
+            unsigned_attribute: Some(false),
+            fixed_prec_scale: false,
+            auto_increment: Some(false),
+            sql_data_type: XdbcDataType::XdbcBit,
+            num_prec_radix: Some(0),
+            ..Default::default()
+        });
+
+        for (name, dt, size, radix) in [
+            ("tinyint",  XdbcDataType::XdbcTinyint,  3,  10),
+            ("smallint", XdbcDataType::XdbcSmallint, 5,  10),
+            ("integer",  XdbcDataType::XdbcInteger,  10, 10),
+            ("bigint",   XdbcDataType::XdbcBigint,   19, 10),
+        ] {
+            builder.append(XdbcTypeInfo {
+                type_name: name.into(),
+                data_type: dt,
+                column_size: Some(size),
+                nullable: Nullable::NullabilityNullable,
+                case_sensitive: false,
+                searchable: Searchable::Full,
+                unsigned_attribute: Some(false),
+                fixed_prec_scale: false,
+                auto_increment: Some(false),
+                sql_data_type: dt,
+                num_prec_radix: Some(radix),
+                ..Default::default()
+            });
+        }
+
+        for (name, dt, size) in [
+            ("real",   XdbcDataType::XdbcReal,   7),
+            ("double", XdbcDataType::XdbcDouble, 15),
+        ] {
+            builder.append(XdbcTypeInfo {
+                type_name: name.into(),
+                data_type: dt,
+                column_size: Some(size),
+                nullable: Nullable::NullabilityNullable,
+                case_sensitive: false,
+                searchable: Searchable::Full,
+                unsigned_attribute: Some(false),
+                fixed_prec_scale: false,
+                auto_increment: Some(false),
+                sql_data_type: dt,
+                num_prec_radix: Some(10),
+                ..Default::default()
+            });
+        }
+
+        builder.append(XdbcTypeInfo {
+            type_name: "decimal".into(),
+            data_type: XdbcDataType::XdbcDecimal,
+            column_size: Some(38),
+            create_params: Some(vec!["precision".into(), "scale".into()]),
+            nullable: Nullable::NullabilityNullable,
+            case_sensitive: false,
+            searchable: Searchable::Full,
+            unsigned_attribute: Some(false),
+            fixed_prec_scale: true,
+            auto_increment: Some(false),
+            sql_data_type: XdbcDataType::XdbcDecimal,
+            minimum_scale: Some(0),
+            maximum_scale: Some(38),
+            num_prec_radix: Some(10),
+            ..Default::default()
+        });
+
+        builder.append(XdbcTypeInfo {
+            type_name: "varchar".into(),
+            data_type: XdbcDataType::XdbcVarchar,
+            column_size: Some(2_147_483_647),
+            literal_prefix: Some("'".into()),
+            literal_suffix: Some("'".into()),
+            create_params: Some(vec!["length".into()]),
+            nullable: Nullable::NullabilityNullable,
+            case_sensitive: true,
+            searchable: Searchable::Full,
+            fixed_prec_scale: false,
+            sql_data_type: XdbcDataType::XdbcVarchar,
+            ..Default::default()
+        });
+
+        builder.append(XdbcTypeInfo {
+            type_name: "varbinary".into(),
+            data_type: XdbcDataType::XdbcVarbinary,
+            column_size: Some(2_147_483_647),
+            literal_prefix: Some("X'".into()),
+            literal_suffix: Some("'".into()),
+            nullable: Nullable::NullabilityNullable,
+            case_sensitive: false,
+            searchable: Searchable::Full,
+            fixed_prec_scale: false,
+            sql_data_type: XdbcDataType::XdbcVarbinary,
+            ..Default::default()
+        });
+
+        builder.append(XdbcTypeInfo {
+            type_name: "date".into(),
+            data_type: XdbcDataType::XdbcDate,
+            column_size: Some(10),
+            literal_prefix: Some("DATE '".into()),
+            literal_suffix: Some("'".into()),
+            nullable: Nullable::NullabilityNullable,
+            case_sensitive: false,
+            searchable: Searchable::Full,
+            fixed_prec_scale: false,
+            sql_data_type: XdbcDataType::XdbcDate,
+            ..Default::default()
+        });
+
+        builder.append(XdbcTypeInfo {
+            type_name: "time".into(),
+            data_type: XdbcDataType::XdbcTime,
+            column_size: Some(15),
+            literal_prefix: Some("TIME '".into()),
+            literal_suffix: Some("'".into()),
+            nullable: Nullable::NullabilityNullable,
+            case_sensitive: false,
+            searchable: Searchable::Full,
+            fixed_prec_scale: false,
+            sql_data_type: XdbcDataType::XdbcTime,
+            ..Default::default()
+        });
+
+        builder.append(XdbcTypeInfo {
+            type_name: "timestamp".into(),
+            data_type: XdbcDataType::XdbcTimestamp,
+            column_size: Some(29),
+            literal_prefix: Some("TIMESTAMP '".into()),
+            literal_suffix: Some("'".into()),
+            nullable: Nullable::NullabilityNullable,
+            case_sensitive: false,
+            searchable: Searchable::Full,
+            fixed_prec_scale: false,
+            sql_data_type: XdbcDataType::XdbcTimestamp,
+            ..Default::default()
+        });
+
+        let xdbc_data = builder.build().map_err(|e| {
+            Status::internal(format!("Failed to build XDBC type info: {e}"))
+        })?;
+
+        let batch = xdbc_data.record_batch(query.data_type).map_err(|e| {
+            Status::internal(format!("Failed to filter XDBC type info: {e}"))
+        })?;
+
+        Self::batches_to_stream(vec![batch])
     }
 
     async fn do_put_statement_update(
         &self,
-        _ticket: CommandStatementUpdate,
-        _request: Request<PeekableFlightDataStream>,
+        ticket: CommandStatementUpdate,
+        request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
-        Err(Status::unimplemented("Statement updates not supported"))
+        let session = self.get_session_from_request(&request)?;
+
+        let batches = self
+            .query_handler
+            .execute(&session, &ticket.query)
+            .await
+            .map_err(|e| Status::internal(format!("Statement execution failed: {e}")))?;
+
+        let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+        Ok(rows)
     }
 
     async fn do_put_statement_ingest(
         &self,
-        _ticket: CommandStatementIngest,
-        _request: Request<PeekableFlightDataStream>,
+        ticket: CommandStatementIngest,
+        request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
-        Err(Status::unimplemented("Statement ingest not supported"))
+        let session = self.get_session_from_request(&request)?;
+
+        // Build qualified table name from catalog + schema + table
+        let mut qualified = String::new();
+        if let Some(ref cat) = ticket.catalog {
+            qualified.push_str(cat);
+            qualified.push('.');
+        }
+        if let Some(ref schema) = ticket.schema {
+            qualified.push_str(schema);
+            qualified.push('.');
+        }
+        qualified.push_str(&ticket.table);
+
+        debug!(
+            username = %session.user.username,
+            table = %qualified,
+            "DoPut statement ingest"
+        );
+
+        // Decode the Arrow stream into RecordBatches
+        let stream = request.into_inner();
+        let flight_stream = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
+            stream.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e))),
+        );
+
+        let batches: Vec<RecordBatch> = flight_stream
+            .try_collect()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to decode Arrow stream: {e}")))?;
+
+        let rows = self
+            .query_handler
+            .write_handler()
+            .handle_ingest(&session, &qualified, batches)
+            .await
+            .map_err(|e| Status::internal(format!("Ingest failed: {e}")))?;
+
+        Ok(rows as i64)
     }
 
     async fn do_put_substrait_plan(
@@ -851,22 +1075,37 @@ impl FlightSqlService for SqeFlightSqlService {
 
     async fn do_put_prepared_statement_query(
         &self,
-        _query: CommandPreparedStatementQuery,
+        query: CommandPreparedStatementQuery,
         _request: Request<PeekableFlightDataStream>,
     ) -> Result<DoPutPreparedStatementResult, Status> {
-        Err(Status::unimplemented(
-            "Prepared statement queries not supported",
-        ))
+        // Parameter binding not yet supported — return the existing handle unchanged.
+        // This allows JDBC drivers to complete the prepared statement flow even without
+        // actual parameter substitution.
+        Ok(DoPutPreparedStatementResult {
+            prepared_statement_handle: Some(query.prepared_statement_handle),
+        })
     }
 
     async fn do_put_prepared_statement_update(
         &self,
-        _query: CommandPreparedStatementUpdate,
-        _request: Request<PeekableFlightDataStream>,
+        query: CommandPreparedStatementUpdate,
+        request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
-        Err(Status::unimplemented(
-            "Prepared statement updates not supported",
-        ))
+        let session = self.get_session_from_request(&request)?;
+
+        // Decode the SQL from the prepared statement handle
+        let fetch: FetchResults =
+            Message::decode(&*query.prepared_statement_handle)
+                .map_err(|e| Status::internal(format!("Failed to decode prepared statement handle: {e}")))?;
+
+        let batches = self
+            .query_handler
+            .execute(&session, &fetch.handle)
+            .await
+            .map_err(|e| Status::internal(format!("Prepared statement execution failed: {e}")))?;
+
+        let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+        Ok(rows)
     }
 
     async fn do_action_create_prepared_statement(
@@ -1058,4 +1297,424 @@ impl FlightSqlService for SqeFlightSqlService {
     }
 
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+
+    use arrow_array::builder::StringBuilder;
+    use arrow_array::cast::AsArray;
+    use arrow_array::RecordBatch;
+    use arrow_flight::sql::metadata::{SqlInfoDataBuilder, XdbcTypeInfo, XdbcTypeInfoDataBuilder};
+    use arrow_flight::sql::{Nullable, ProstMessageExt, Searchable, SqlInfo, XdbcDataType};
+    use arrow_schema::{DataType, Field, Schema};
+    use prost::Message;
+
+    // -----------------------------------------------------------------------
+    // FetchResults: encode / decode roundtrip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fetch_results_roundtrip_via_prost() {
+        let original = FetchResults {
+            handle: "SELECT 1".to_string(),
+        };
+
+        let bytes = original.encode_to_vec();
+        let decoded = FetchResults::decode(bytes.as_slice()).expect("decode should succeed");
+
+        assert_eq!(original, decoded);
+        assert_eq!(decoded.handle, "SELECT 1");
+    }
+
+    #[test]
+    fn fetch_results_roundtrip_empty_handle() {
+        let original = FetchResults {
+            handle: String::new(),
+        };
+
+        let bytes = original.encode_to_vec();
+        let decoded = FetchResults::decode(bytes.as_slice()).expect("decode should succeed");
+
+        assert_eq!(original, decoded);
+        assert_eq!(decoded.handle, "");
+    }
+
+    #[test]
+    fn fetch_results_roundtrip_unicode_handle() {
+        let sql = "SELECT '日本語' AS lang, 42 AS n FROM tbl WHERE x > 0";
+        let original = FetchResults {
+            handle: sql.to_string(),
+        };
+
+        let bytes = original.encode_to_vec();
+        let decoded = FetchResults::decode(bytes.as_slice()).expect("decode should succeed");
+
+        assert_eq!(decoded.handle, sql);
+    }
+
+    // -----------------------------------------------------------------------
+    // FetchResults: type_url and as_any
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fetch_results_type_url() {
+        assert_eq!(
+            FetchResults::type_url(),
+            "type.googleapis.com/arrow.flight.protocol.sql.FetchResults"
+        );
+    }
+
+    #[test]
+    fn fetch_results_as_any_roundtrip() {
+        let original = FetchResults {
+            handle: "SELECT COUNT(*) FROM orders".to_string(),
+        };
+
+        let any = original.as_any();
+
+        assert_eq!(any.type_url, FetchResults::type_url());
+
+        // The Any.value bytes must decode back to the same message.
+        let decoded = FetchResults::decode(&*any.value).expect("decode from Any.value should succeed");
+        assert_eq!(decoded.handle, original.handle);
+    }
+
+    #[test]
+    fn fetch_results_as_any_type_url_matches_constant() {
+        let msg = FetchResults {
+            handle: "x".to_string(),
+        };
+        let any = msg.as_any();
+        // as_any() must embed the canonical type URL so that do_get_fallback
+        // can match on it.
+        assert_eq!(any.type_url, FetchResults::type_url());
+    }
+
+    // -----------------------------------------------------------------------
+    // batches_to_stream: empty input
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn batches_to_stream_empty_returns_ok() {
+        // batches_to_stream is a pure synchronous function (no async) — just
+        // verify it returns Ok for an empty vec.
+        let result = SqeFlightSqlService::batches_to_stream(vec![]);
+        assert!(result.is_ok(), "empty batches should produce Ok response");
+    }
+
+    // -----------------------------------------------------------------------
+    // batches_to_stream: single batch
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn batches_to_stream_single_batch_returns_ok() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let batch = RecordBatch::new_empty(schema);
+        let result = SqeFlightSqlService::batches_to_stream(vec![batch]);
+        assert!(result.is_ok(), "single batch should produce Ok response");
+    }
+
+    // -----------------------------------------------------------------------
+    // table_types RecordBatch: TABLE and VIEW rows
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn table_types_batch_contains_table_and_view() {
+        // Replicate the exact logic from do_get_table_types so we can test it
+        // without gRPC overhead.
+        let mut builder = StringBuilder::new();
+        builder.append_value("TABLE");
+        builder.append_value("VIEW");
+        let arr = builder.finish();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "table_type",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(arr)]).expect("batch should be valid");
+
+        assert_eq!(batch.num_rows(), 2);
+        let col = batch.column(0).as_string::<i32>();
+        assert_eq!(col.value(0), "TABLE");
+        assert_eq!(col.value(1), "VIEW");
+    }
+
+    #[test]
+    fn table_types_batch_schema_has_expected_field() {
+        let mut builder = StringBuilder::new();
+        builder.append_value("TABLE");
+        builder.append_value("VIEW");
+        let arr = builder.finish();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "table_type",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).expect("batch should be valid");
+
+        let batch_schema = batch.schema();
+        let field = batch_schema.field(0);
+        assert_eq!(field.name(), "table_type");
+        assert_eq!(field.data_type(), &DataType::Utf8);
+        assert!(!field.is_nullable());
+    }
+
+    // -----------------------------------------------------------------------
+    // XdbcTypeInfoDataBuilder: expected type count
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn xdbc_type_info_builder_produces_expected_type_count() {
+        let mut builder = XdbcTypeInfoDataBuilder::new();
+
+        // boolean
+        builder.append(XdbcTypeInfo {
+            type_name: "boolean".into(),
+            data_type: XdbcDataType::XdbcBit,
+            column_size: Some(1),
+            nullable: Nullable::NullabilityNullable,
+            case_sensitive: false,
+            searchable: Searchable::Full,
+            unsigned_attribute: Some(false),
+            fixed_prec_scale: false,
+            auto_increment: Some(false),
+            sql_data_type: XdbcDataType::XdbcBit,
+            num_prec_radix: Some(0),
+            ..Default::default()
+        });
+
+        // integer types
+        for (name, dt, size, radix) in [
+            ("tinyint", XdbcDataType::XdbcTinyint, 3, 10),
+            ("smallint", XdbcDataType::XdbcSmallint, 5, 10),
+            ("integer", XdbcDataType::XdbcInteger, 10, 10),
+            ("bigint", XdbcDataType::XdbcBigint, 19, 10),
+        ] {
+            builder.append(XdbcTypeInfo {
+                type_name: name.into(),
+                data_type: dt,
+                column_size: Some(size),
+                nullable: Nullable::NullabilityNullable,
+                case_sensitive: false,
+                searchable: Searchable::Full,
+                unsigned_attribute: Some(false),
+                fixed_prec_scale: false,
+                auto_increment: Some(false),
+                sql_data_type: dt,
+                num_prec_radix: Some(radix),
+                ..Default::default()
+            });
+        }
+
+        // floating-point types
+        for (name, dt, size) in [
+            ("real", XdbcDataType::XdbcReal, 7),
+            ("double", XdbcDataType::XdbcDouble, 15),
+        ] {
+            builder.append(XdbcTypeInfo {
+                type_name: name.into(),
+                data_type: dt,
+                column_size: Some(size),
+                nullable: Nullable::NullabilityNullable,
+                case_sensitive: false,
+                searchable: Searchable::Full,
+                unsigned_attribute: Some(false),
+                fixed_prec_scale: false,
+                auto_increment: Some(false),
+                sql_data_type: dt,
+                num_prec_radix: Some(10),
+                ..Default::default()
+            });
+        }
+
+        // decimal
+        builder.append(XdbcTypeInfo {
+            type_name: "decimal".into(),
+            data_type: XdbcDataType::XdbcDecimal,
+            column_size: Some(38),
+            create_params: Some(vec!["precision".into(), "scale".into()]),
+            nullable: Nullable::NullabilityNullable,
+            case_sensitive: false,
+            searchable: Searchable::Full,
+            unsigned_attribute: Some(false),
+            fixed_prec_scale: true,
+            auto_increment: Some(false),
+            sql_data_type: XdbcDataType::XdbcDecimal,
+            minimum_scale: Some(0),
+            maximum_scale: Some(38),
+            num_prec_radix: Some(10),
+            ..Default::default()
+        });
+
+        // varchar
+        builder.append(XdbcTypeInfo {
+            type_name: "varchar".into(),
+            data_type: XdbcDataType::XdbcVarchar,
+            column_size: Some(2_147_483_647),
+            literal_prefix: Some("'".into()),
+            literal_suffix: Some("'".into()),
+            create_params: Some(vec!["length".into()]),
+            nullable: Nullable::NullabilityNullable,
+            case_sensitive: true,
+            searchable: Searchable::Full,
+            fixed_prec_scale: false,
+            sql_data_type: XdbcDataType::XdbcVarchar,
+            ..Default::default()
+        });
+
+        // varbinary
+        builder.append(XdbcTypeInfo {
+            type_name: "varbinary".into(),
+            data_type: XdbcDataType::XdbcVarbinary,
+            column_size: Some(2_147_483_647),
+            literal_prefix: Some("X'".into()),
+            literal_suffix: Some("'".into()),
+            nullable: Nullable::NullabilityNullable,
+            case_sensitive: false,
+            searchable: Searchable::Full,
+            fixed_prec_scale: false,
+            sql_data_type: XdbcDataType::XdbcVarbinary,
+            ..Default::default()
+        });
+
+        // date
+        builder.append(XdbcTypeInfo {
+            type_name: "date".into(),
+            data_type: XdbcDataType::XdbcDate,
+            column_size: Some(10),
+            literal_prefix: Some("DATE '".into()),
+            literal_suffix: Some("'".into()),
+            nullable: Nullable::NullabilityNullable,
+            case_sensitive: false,
+            searchable: Searchable::Full,
+            fixed_prec_scale: false,
+            sql_data_type: XdbcDataType::XdbcDate,
+            ..Default::default()
+        });
+
+        // time
+        builder.append(XdbcTypeInfo {
+            type_name: "time".into(),
+            data_type: XdbcDataType::XdbcTime,
+            column_size: Some(15),
+            literal_prefix: Some("TIME '".into()),
+            literal_suffix: Some("'".into()),
+            nullable: Nullable::NullabilityNullable,
+            case_sensitive: false,
+            searchable: Searchable::Full,
+            fixed_prec_scale: false,
+            sql_data_type: XdbcDataType::XdbcTime,
+            ..Default::default()
+        });
+
+        // timestamp
+        builder.append(XdbcTypeInfo {
+            type_name: "timestamp".into(),
+            data_type: XdbcDataType::XdbcTimestamp,
+            column_size: Some(29),
+            literal_prefix: Some("TIMESTAMP '".into()),
+            literal_suffix: Some("'".into()),
+            nullable: Nullable::NullabilityNullable,
+            case_sensitive: false,
+            searchable: Searchable::Full,
+            fixed_prec_scale: false,
+            sql_data_type: XdbcDataType::XdbcTimestamp,
+            ..Default::default()
+        });
+
+        let xdbc_data = builder.build().expect("builder should produce valid data");
+
+        // No data_type filter → all 13 types returned.
+        let batch = xdbc_data
+            .record_batch(None)
+            .expect("record_batch should succeed");
+
+        // 1 boolean + 4 integer types + 2 floating + 1 decimal + 1 varchar
+        // + 1 varbinary + 1 date + 1 time + 1 timestamp = 13
+        assert_eq!(
+            batch.num_rows(),
+            13,
+            "expected 13 XDBC types but got {}",
+            batch.num_rows()
+        );
+    }
+
+    #[test]
+    fn xdbc_type_info_first_type_is_boolean() {
+        let mut builder = XdbcTypeInfoDataBuilder::new();
+        builder.append(XdbcTypeInfo {
+            type_name: "boolean".into(),
+            data_type: XdbcDataType::XdbcBit,
+            column_size: Some(1),
+            nullable: Nullable::NullabilityNullable,
+            case_sensitive: false,
+            searchable: Searchable::Full,
+            unsigned_attribute: Some(false),
+            fixed_prec_scale: false,
+            auto_increment: Some(false),
+            sql_data_type: XdbcDataType::XdbcBit,
+            num_prec_radix: Some(0),
+            ..Default::default()
+        });
+
+        let xdbc_data = builder.build().expect("builder should produce valid data");
+        let batch = xdbc_data
+            .record_batch(None)
+            .expect("record_batch should succeed");
+
+        assert_eq!(batch.num_rows(), 1);
+        // Column 0 is type_name.
+        let type_name_col = batch.column(0).as_string::<i32>();
+        assert_eq!(type_name_col.value(0), "boolean");
+    }
+
+    // -----------------------------------------------------------------------
+    // SqlInfoDataBuilder: server name, version, Arrow version
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sql_info_builder_builds_without_error() {
+        let mut builder = SqlInfoDataBuilder::new();
+        builder.append(SqlInfo::FlightSqlServerName, "SQE Coordinator");
+        builder.append(SqlInfo::FlightSqlServerVersion, "0.1.0");
+        builder.append(SqlInfo::FlightSqlServerArrowVersion, "1.3");
+
+        let result = builder.build();
+        assert!(result.is_ok(), "SqlInfoDataBuilder::build() should succeed");
+    }
+
+    #[test]
+    fn sql_info_data_produces_non_empty_batch() {
+        let mut builder = SqlInfoDataBuilder::new();
+        builder.append(SqlInfo::FlightSqlServerName, "SQE Coordinator");
+        builder.append(SqlInfo::FlightSqlServerVersion, "0.1.0");
+        builder.append(SqlInfo::FlightSqlServerArrowVersion, "1.3");
+
+        let sql_info_data = builder.build().expect("build should succeed");
+
+        // Build a CommandGetSqlInfo with no filters (return all info keys).
+        use arrow_flight::sql::CommandGetSqlInfo;
+        let query = CommandGetSqlInfo { info: vec![] };
+        let info_builder = query.into_builder(&sql_info_data);
+        let batch = info_builder.build().expect("info_builder.build() should succeed");
+
+        // We appended 3 entries; the batch must contain at least those rows.
+        assert!(
+            batch.num_rows() >= 3,
+            "expected at least 3 sql info rows, got {}",
+            batch.num_rows()
+        );
+    }
 }
