@@ -1075,22 +1075,37 @@ impl FlightSqlService for SqeFlightSqlService {
 
     async fn do_put_prepared_statement_query(
         &self,
-        _query: CommandPreparedStatementQuery,
+        query: CommandPreparedStatementQuery,
         _request: Request<PeekableFlightDataStream>,
     ) -> Result<DoPutPreparedStatementResult, Status> {
-        Err(Status::unimplemented(
-            "Prepared statement queries not supported",
-        ))
+        // Parameter binding not yet supported — return the existing handle unchanged.
+        // This allows JDBC drivers to complete the prepared statement flow even without
+        // actual parameter substitution.
+        Ok(DoPutPreparedStatementResult {
+            prepared_statement_handle: Some(query.prepared_statement_handle),
+        })
     }
 
     async fn do_put_prepared_statement_update(
         &self,
-        _query: CommandPreparedStatementUpdate,
-        _request: Request<PeekableFlightDataStream>,
+        query: CommandPreparedStatementUpdate,
+        request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
-        Err(Status::unimplemented(
-            "Prepared statement updates not supported",
-        ))
+        let session = self.get_session_from_request(&request)?;
+
+        // Decode the SQL from the prepared statement handle
+        let fetch: FetchResults =
+            Message::decode(&*query.prepared_statement_handle)
+                .map_err(|e| Status::internal(format!("Failed to decode prepared statement handle: {e}")))?;
+
+        let batches = self
+            .query_handler
+            .execute(&session, &fetch.handle)
+            .await
+            .map_err(|e| Status::internal(format!("Prepared statement execution failed: {e}")))?;
+
+        let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+        Ok(rows)
     }
 
     async fn do_action_create_prepared_statement(
