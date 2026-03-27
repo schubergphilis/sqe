@@ -474,7 +474,7 @@ impl FlightSqlService for SqeFlightSqlService {
             }
         }
 
-        let schema = builder.schema();
+        let _schema = builder.schema();
         let batch = builder.build().map_err(|e| Status::internal(format!("Failed to build batch: {e}")))?;
         Self::batches_to_stream(vec![batch])
     }

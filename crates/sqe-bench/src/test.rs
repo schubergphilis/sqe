@@ -352,7 +352,7 @@ fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> String {
                 // Check it's not inside a quoted string (simple heuristic:
                 // count double quotes before this position — odd means inside quotes)
                 let quotes_before = remaining[..pos].matches('"').count();
-                if quotes_before % 2 == 0 {
+                if quotes_before.is_multiple_of(2) {
                     output.push_str(&remaining[..pos]);
                     output.push_str(&qualified);
                     remaining = &remaining[end..];
