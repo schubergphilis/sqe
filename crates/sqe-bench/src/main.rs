@@ -98,13 +98,15 @@ async fn main() -> anyhow::Result<()> {
 
             load::load_benchmark(
                 bench_client.as_ref(),
-                &benchmark,
-                scale,
-                &data,
-                &s3_args,
-                clean,
-                catalog.as_deref(),
-                namespace.as_deref(),
+                &load::LoadArgs {
+                    benchmark: &benchmark,
+                    scale,
+                    data_path: &data,
+                    s3_args: &s3_args,
+                    clean,
+                    catalog: catalog.as_deref(),
+                    namespace_override: namespace.as_deref(),
+                },
             )
             .await
         }
