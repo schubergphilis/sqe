@@ -321,17 +321,42 @@ fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> String {
                 }
 
                 // Only qualify if preceded by a table-introducing context:
-                // FROM, JOIN, TABLE, INTO, UPDATE, or a comma that follows
-                // a previously qualified table name (for FROM t1, t2 lists).
+                // FROM, JOIN, TABLE, INTO, UPDATE, or a comma within a FROM/JOIN clause.
+                //
+                // To determine if a trailing comma is in FROM/JOIN context (vs SELECT/ORDER BY),
+                // scan the full text so far (output + current segment) for the last SQL clause keyword.
                 let in_table_context = upper_before.ends_with(" FROM")
                     || upper_before.ends_with(" JOIN")
                     || upper_before.ends_with(" TABLE")
                     || upper_before.ends_with(" INTO")
                     || upper_before.ends_with(" UPDATE")
                     || upper_before.ends_with(" EXISTS")
-                    // Trailing comma means continuation of a table list
-                    // (handles "FROM t1, t2", "FROM t1 a1,\n t2 a2", etc.)
-                    || trimmed_before.ends_with(',')
+                    // Trailing comma — only qualifies if we're inside a FROM/JOIN clause
+                    || (trimmed_before.ends_with(',') && {
+                        // Build full context: output so far + current segment before match
+                        let full_ctx = format!("{}{}", output, before_str);
+                        let full_upper = full_ctx.to_uppercase();
+                        // Find the last FROM/JOIN keyword (handles start-of-string, after space, or after newline)
+                        let find_keyword = |kw: &str| -> Option<usize> {
+                            full_upper.rfind(&format!(" {kw}"))
+                                .or_else(|| full_upper.rfind(&format!("\n{kw}")))
+                                .or_else(|| if full_upper.starts_with(kw) { Some(0) } else { None })
+                        };
+                        let from_pos = find_keyword("FROM").unwrap_or(0);
+                        let join_pos = find_keyword("JOIN").unwrap_or(0);
+                        let table_clause_pos = from_pos.max(join_pos);
+                        let has_from = find_keyword("FROM").is_some() || find_keyword("JOIN").is_some();
+                        // Check no non-table clause keyword appears after the last FROM/JOIN
+                        let after_clause = &full_upper[table_clause_pos..];
+                        has_from
+                            && !after_clause.contains(" WHERE ")
+                            && !after_clause.contains(" SELECT ")
+                            && !after_clause.contains(" GROUP ")
+                            && !after_clause.contains(" ORDER ")
+                            && !after_clause.contains(" HAVING ")
+                            && !after_clause.contains(" LIMIT ")
+                            && !after_clause.contains(" UNION ")
+                    })
                     // Also handle newline after FROM/JOIN (table on next line)
                     || {
                         let words: Vec<&str> = trimmed_before.split_whitespace().collect();
@@ -494,6 +519,28 @@ mod tests {
         let result = prefix_tables(sql, "tpch_sf1", "tpch");
         assert!(result.contains("tpch_sf1.nation n1"), "nation n1: {result}");
         assert!(result.contains("tpch_sf1.nation n2"), "nation n2: {result}");
+    }
+
+    #[test]
+    fn prefix_tables_select_comma_no_qualify() {
+        // Column aliases named like tables should NOT be qualified in SELECT/ORDER BY
+        let sql = "SELECT channel, item, SUM(sales) FROM (SELECT * FROM in_store) x GROUP BY channel, item ORDER BY channel, item";
+        let result = prefix_tables(sql, "tpcds_sf1", "tpcds");
+        // "item" in SELECT and GROUP BY/ORDER BY should NOT be qualified
+        assert!(!result.contains("tpcds_sf1.item"), "item in SELECT should not be qualified: {result}");
+        // "store" in CTE name "in_store" should not be qualified either (preceded by _)
+        assert!(result.contains("in_store"), "in_store should not be mangled: {result}");
+    }
+
+    #[test]
+    fn prefix_tables_order_by_no_qualify() {
+        // trade_type as alias in ORDER BY should not be qualified
+        let sql = "SELECT b_name, tt_name AS trade_type FROM trade JOIN trade_type ON 1=1 ORDER BY trade_type";
+        let result = prefix_tables(sql, "tpce_sf1", "tpce");
+        // trade_type in FROM/JOIN context should be qualified
+        assert!(result.contains("tpce_sf1.trade_type ON"), "FROM trade_type should be qualified: {result}");
+        // trade_type in ORDER BY should NOT be qualified (it's a column alias)
+        assert!(result.ends_with("ORDER BY trade_type"), "ORDER BY alias should not be qualified: {result}");
     }
 
     #[test]
