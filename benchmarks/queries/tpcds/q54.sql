@@ -1,7 +1,7 @@
 -- name: Customers who bought from catalog or web after switching from store
 -- timeout: 60s
 WITH my_customers AS (
-    SELECT DISTINCT c_customer_sk, c_current_addr_sk
+    SELECT DISTINCT customer.c_customer_sk, customer.c_current_addr_sk
     FROM (
         SELECT cs_bill_customer_sk AS c_customer_sk, cs_item_sk
         FROM catalog_sales, date_dim
@@ -19,7 +19,7 @@ WITH my_customers AS (
     WHERE cs_item_sk        = i_item_sk
       AND i_category        = 'Women'
       AND i_class           = 'accessories'
-      AND c_customer_sk     = cs_or_ws_sales.c_customer_sk
+      AND customer.c_customer_sk = cs_or_ws_sales.c_customer_sk
 ),
 my_revenue AS (
     SELECT c_customer_sk,

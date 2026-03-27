@@ -151,3 +151,346 @@ impl SessionManager {
         removed
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+    use sqe_core::config::AuthConfig;
+    use sqe_core::Session;
+
+    /// Build a minimal `AuthConfig` that constructs an HTTP client without any
+    /// network access. The OIDC password grant path is selected because
+    /// `keycloak_url` is non-empty and `token_endpoint` is empty.
+    fn test_auth_config() -> AuthConfig {
+        AuthConfig {
+            keycloak_url: "http://localhost:18080".to_string(),
+            realm: "test".to_string(),
+            client_id: "test-client".to_string(),
+            client_secret: "secret".to_string(),
+            token_endpoint: String::new(),
+            token_refresh_buffer_secs: 60,
+            ssl_verification: false,
+        }
+    }
+
+    /// Build an `Authenticator` synchronously. `Authenticator::new` only
+    /// constructs an HTTP client — it makes no network calls.
+    async fn make_authenticator() -> Arc<Authenticator> {
+        Arc::new(
+            Authenticator::new(&test_auth_config())
+                .await
+                .expect("Authenticator::new should not make network calls"),
+        )
+    }
+
+    /// Build a fresh `Session` with a token that expires one hour from now.
+    fn make_session(username: &str) -> Session {
+        Session::new(
+            username.to_string(),
+            "access_tok".to_string(),
+            Some("refresh_tok".to_string()),
+            Utc::now() + Duration::hours(1),
+            vec!["analyst".to_string()],
+        )
+    }
+
+    /// Build a `Session` whose token has already expired (in the past).
+    fn make_expired_token_session(username: &str) -> Session {
+        Session::new(
+            username.to_string(),
+            "expired_tok".to_string(),
+            None,
+            Utc::now() - Duration::minutes(5),
+            vec![],
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: get_session returns None on an empty manager
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn get_session_returns_none_on_empty_manager() {
+        let auth = make_authenticator().await;
+        let manager = SessionManager::new(auth);
+
+        assert!(
+            manager.get_session("nonexistent-id").is_none(),
+            "Expected None for unknown session ID on empty manager"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: creating a session and retrieving it by ID
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn insert_and_retrieve_session() {
+        let auth = make_authenticator().await;
+        let manager = SessionManager::new(auth);
+
+        let session = Arc::new(make_session("alice"));
+        let id = session.id.clone();
+
+        // Insert directly via the private DashMap (allowed because this test
+        // module is a child of the module that owns `SessionManager`).
+        manager.sessions.insert(id.clone(), session.clone());
+
+        // get_session should find the session. Note: get_session always calls
+        // authenticator.get_cached_token first; since no token was inserted
+        // into the authenticator's cache the `None` branch is taken, then the
+        // token_expiry check passes (token is valid for 1 h), and the session
+        // is returned with a refreshed last_activity timestamp.
+        let retrieved = manager
+            .get_session(&id)
+            .expect("Session should be found by its ID");
+
+        assert_eq!(retrieved.id, id, "Retrieved session ID must match");
+        assert_eq!(retrieved.user.username, "alice");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: unknown session ID returns None
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn get_session_returns_none_for_unknown_id() {
+        let auth = make_authenticator().await;
+        let manager = SessionManager::new(auth);
+
+        // Insert one real session so the map is not trivially empty
+        let session = Arc::new(make_session("bob"));
+        manager.sessions.insert(session.id.clone(), session);
+
+        assert!(
+            manager.get_session("completely-wrong-id").is_none(),
+            "Should return None for an ID that was never inserted"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: get_session evicts sessions whose token has expired (no cache hit)
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn get_session_evicts_expired_token_session() {
+        let auth = make_authenticator().await;
+        let manager = SessionManager::new(auth);
+
+        // A session whose token_expiry is in the past and is NOT in the
+        // authenticator's token cache — the manager should evict it.
+        let session = Arc::new(make_expired_token_session("charlie"));
+        let id = session.id.clone();
+        manager.sessions.insert(id.clone(), session);
+
+        // get_session: no cache hit → token_expiry <= Utc::now() → evict → None
+        let result = manager.get_session(&id);
+        assert!(
+            result.is_none(),
+            "Expired token session with no cache entry should be evicted and return None"
+        );
+
+        // Confirm the session was actually removed from the map
+        assert!(
+            manager.sessions.get(&id).is_none(),
+            "Evicted session must not remain in the sessions map"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: remove_session removes an existing session
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn remove_session_removes_existing_session() {
+        let auth = make_authenticator().await;
+        let manager = SessionManager::new(auth);
+
+        let session = Arc::new(make_session("dave"));
+        let id = session.id.clone();
+        manager.sessions.insert(id.clone(), session);
+
+        // Confirm it exists before removal
+        assert!(manager.sessions.get(&id).is_some());
+
+        manager.remove_session(&id);
+
+        assert!(
+            manager.sessions.get(&id).is_none(),
+            "Session should be absent after remove_session"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: remove_session is a no-op for non-existent ID
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn remove_session_noop_for_unknown_id() {
+        let auth = make_authenticator().await;
+        let manager = SessionManager::new(auth);
+
+        // Should not panic
+        manager.remove_session("no-such-id");
+
+        assert_eq!(
+            manager.sessions.len(),
+            0,
+            "Manager should still be empty after removing unknown ID"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: sweep_expired_sessions returns 0 for an empty manager
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn sweep_empty_manager_returns_zero() {
+        let auth = make_authenticator().await;
+        let manager = SessionManager::new(auth);
+
+        let removed = manager.sweep_expired_sessions(900, 28800);
+        assert_eq!(removed, 0, "Empty manager sweep should remove nothing");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: sweep_expired_sessions removes idle sessions
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn sweep_removes_idle_sessions() {
+        let auth = make_authenticator().await;
+        let manager = SessionManager::new(auth);
+
+        // Create a session and backdate its last_activity so it looks idle
+        let mut session = make_session("eve");
+        // 20 minutes ago — exceeds the 15-minute (900 s) idle timeout used below
+        session.last_activity = Utc::now() - Duration::seconds(1200);
+        let id = session.id.clone();
+        manager.sessions.insert(id.clone(), Arc::new(session));
+
+        let removed = manager.sweep_expired_sessions(900, 28800);
+
+        assert_eq!(removed, 1, "One idle session should have been swept");
+        assert!(
+            manager.sessions.get(&id).is_none(),
+            "Idle session must be absent after sweep"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: sweep_expired_sessions removes absolutely-expired sessions
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn sweep_removes_absolutely_expired_sessions() {
+        let auth = make_authenticator().await;
+        let manager = SessionManager::new(auth);
+
+        // Create a session and backdate created_at beyond the absolute timeout
+        let mut session = make_session("frank");
+        // 9 hours ago — exceeds the 8-hour (28800 s) absolute timeout
+        session.created_at = Utc::now() - Duration::hours(9);
+        // Keep last_activity recent so idle timeout would NOT trigger
+        session.last_activity = Utc::now();
+        let id = session.id.clone();
+        manager.sessions.insert(id.clone(), Arc::new(session));
+
+        let removed = manager.sweep_expired_sessions(900, 28800);
+
+        assert_eq!(removed, 1, "One absolutely-expired session should have been swept");
+        assert!(
+            manager.sessions.get(&id).is_none(),
+            "Absolutely-expired session must be absent after sweep"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: sweep_expired_sessions does not remove active sessions
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn sweep_retains_active_sessions() {
+        let auth = make_authenticator().await;
+        let manager = SessionManager::new(auth);
+
+        // Active session — both last_activity and created_at are recent
+        let session = Arc::new(make_session("grace"));
+        let id = session.id.clone();
+        manager.sessions.insert(id.clone(), session);
+
+        // Very short timeouts to ensure the session is NOT triggered by edge
+        // cases — 15 min idle, 8 h absolute, session is fresh
+        let removed = manager.sweep_expired_sessions(900, 28800);
+
+        assert_eq!(removed, 0, "Active session must not be swept");
+        assert!(
+            manager.sessions.get(&id).is_some(),
+            "Active session must still be present after sweep"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: sweep handles a mix of expired and active sessions correctly
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn sweep_mixed_sessions_removes_only_expired() {
+        let auth = make_authenticator().await;
+        let manager = SessionManager::new(auth);
+
+        // Active session
+        let active = Arc::new(make_session("henry"));
+        let active_id = active.id.clone();
+        manager.sessions.insert(active_id.clone(), active);
+
+        // Idle session (last_activity 20 minutes ago)
+        let mut idle_session = make_session("irene");
+        idle_session.last_activity = Utc::now() - Duration::seconds(1200);
+        let idle_id = idle_session.id.clone();
+        manager.sessions.insert(idle_id.clone(), Arc::new(idle_session));
+
+        // Absolutely-expired session (created 9 hours ago)
+        let mut abs_session = make_session("jake");
+        abs_session.created_at = Utc::now() - Duration::hours(9);
+        abs_session.last_activity = Utc::now();
+        let abs_id = abs_session.id.clone();
+        manager.sessions.insert(abs_id.clone(), Arc::new(abs_session));
+
+        let removed = manager.sweep_expired_sessions(900, 28800);
+
+        assert_eq!(removed, 2, "Exactly two expired sessions should have been swept");
+        assert!(manager.sessions.get(&active_id).is_some(), "Active session must survive sweep");
+        assert!(manager.sessions.get(&idle_id).is_none(), "Idle session must be swept");
+        assert!(manager.sessions.get(&abs_id).is_none(), "Absolutely-expired session must be swept");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: concurrent access — multiple threads insert and sweep safely
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn concurrent_insert_and_sweep() {
+        use std::sync::Arc as StdArc;
+
+        let auth = make_authenticator().await;
+        let manager = StdArc::new(SessionManager::new(auth));
+
+        // Spawn several tasks that each insert a session concurrently.
+        let mut handles = Vec::new();
+        for i in 0..10u32 {
+            let mgr = StdArc::clone(&manager);
+            handles.push(tokio::spawn(async move {
+                let session = Arc::new(make_session(&format!("user_{i}")));
+                mgr.sessions.insert(session.id.clone(), session);
+            }));
+        }
+
+        for handle in handles {
+            handle.await.expect("Concurrent insert task panicked");
+        }
+
+        assert_eq!(
+            manager.sessions.len(),
+            10,
+            "All 10 sessions should be present after concurrent inserts"
+        );
+
+        // Sweep with large timeouts well within chrono::Duration bounds — nothing should be removed.
+        // chrono::Duration stores nanoseconds as i64, so max seconds ≈ i64::MAX / 1e9 ≈ 9.2e9.
+        // 100 years in seconds is ~3.15e9, safely within bounds.
+        let large_timeout: u64 = 86400 * 365 * 100;
+        let removed = manager.sweep_expired_sessions(large_timeout, large_timeout);
+        assert_eq!(removed, 0, "No active sessions should be swept");
+        assert_eq!(manager.sessions.len(), 10, "All sessions should survive the sweep");
+    }
+}
