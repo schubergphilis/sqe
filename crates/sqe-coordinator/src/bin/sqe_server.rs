@@ -287,9 +287,12 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             credential_tracker.clone(),
             std::time::Duration::from_secs(60),
             |_fragment| async {
-                // TODO: implement actual credential vending — re-load table from
-                // Polaris to obtain fresh STS credentials for this fragment.
-                // For now, return None (no refresh) until catalog vending is wired.
+                // Credential vending is deferred to Step 5 (Pluggable Catalogs):
+                // the CatalogBackend trait will expose a `vend_credentials(table)`
+                // method that reloads the table from Polaris to obtain fresh STS
+                // tokens scoped to the fragment's data files.
+                // Until then, workers use the original session credentials.
+                // Tracking: nextsteps.md Step 5, openspec/changes/pluggable-catalogs/
                 None
             },
         );
