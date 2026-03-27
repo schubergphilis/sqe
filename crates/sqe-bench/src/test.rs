@@ -329,22 +329,9 @@ fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> String {
                     || upper_before.ends_with(" INTO")
                     || upper_before.ends_with(" UPDATE")
                     || upper_before.ends_with(" EXISTS")
-                    // Comma after a table name: "table1," or "ns.table1," → next word is also a table
-                    || {
-                        let t = trimmed_before;
-                        if let Some(stripped) = t.strip_suffix(',') {
-                            let before_comma = stripped.trim_end();
-                            // Get the last word before comma
-                            let last_word = before_comma.rsplit_once(|c: char| c.is_whitespace() || c == '.')
-                                .map(|(_, w)| w)
-                                .unwrap_or(before_comma);
-                            // Check if it's a known table name (qualified or not)
-                            tables.iter().any(|tn| tn == last_word)
-                                || before_comma.contains(&format!("{namespace}."))
-                        } else {
-                            false
-                        }
-                    }
+                    // Trailing comma means continuation of a table list
+                    // (handles "FROM t1, t2", "FROM t1 a1,\n t2 a2", etc.)
+                    || trimmed_before.ends_with(',')
                     // Also handle newline after FROM/JOIN (table on next line)
                     || {
                         let words: Vec<&str> = trimmed_before.split_whitespace().collect();
@@ -488,6 +475,25 @@ mod tests {
         assert!(result.contains("tpcds_sf1.catalog_returns"), "catalog_returns: {result}");
         assert!(result.contains("tpcds_sf1.call_center"), "call_center: {result}");
         assert!(result.contains("tpcds_sf1.customer"), "customer: {result}");
+    }
+
+    #[test]
+    fn prefix_tables_q16_partsupp_part() {
+        // q16: FROM partsupp, part (same line) + subquery FROM supplier
+        let sql = "FROM\n    partsupp,\n    part\nWHERE 1=1 AND ps_suppkey NOT IN (\n    SELECT s_suppkey FROM supplier\n)";
+        let result = prefix_tables(sql, "tpch_sf1", "tpch");
+        assert!(result.contains("tpch_sf1.partsupp"), "partsupp: {result}");
+        assert!(result.contains("tpch_sf1.part"), "part not qualified: {result}");
+        assert!(result.contains("FROM tpch_sf1.supplier"), "supplier: {result}");
+    }
+
+    #[test]
+    fn prefix_tables_aliased_tables() {
+        // q07: nation n1, nation n2 — table with alias
+        let sql = "FROM\n    supplier,\n    lineitem,\n    orders,\n    customer,\n    nation n1,\n    nation n2\nWHERE 1=1";
+        let result = prefix_tables(sql, "tpch_sf1", "tpch");
+        assert!(result.contains("tpch_sf1.nation n1"), "nation n1: {result}");
+        assert!(result.contains("tpch_sf1.nation n2"), "nation n2: {result}");
     }
 
     #[test]
