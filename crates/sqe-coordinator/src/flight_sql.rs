@@ -1004,18 +1004,65 @@ impl FlightSqlService for SqeFlightSqlService {
 
     async fn do_put_statement_update(
         &self,
-        _ticket: CommandStatementUpdate,
-        _request: Request<PeekableFlightDataStream>,
+        ticket: CommandStatementUpdate,
+        request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
-        Err(Status::unimplemented("Statement updates not supported"))
+        let session = self.get_session_from_request(&request)?;
+
+        let batches = self
+            .query_handler
+            .execute(&session, &ticket.query)
+            .await
+            .map_err(|e| Status::internal(format!("Statement execution failed: {e}")))?;
+
+        let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+        Ok(rows)
     }
 
     async fn do_put_statement_ingest(
         &self,
-        _ticket: CommandStatementIngest,
-        _request: Request<PeekableFlightDataStream>,
+        ticket: CommandStatementIngest,
+        request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
-        Err(Status::unimplemented("Statement ingest not supported"))
+        let session = self.get_session_from_request(&request)?;
+
+        // Build qualified table name from catalog + schema + table
+        let mut qualified = String::new();
+        if let Some(ref cat) = ticket.catalog {
+            qualified.push_str(cat);
+            qualified.push('.');
+        }
+        if let Some(ref schema) = ticket.schema {
+            qualified.push_str(schema);
+            qualified.push('.');
+        }
+        qualified.push_str(&ticket.table);
+
+        debug!(
+            username = %session.user.username,
+            table = %qualified,
+            "DoPut statement ingest"
+        );
+
+        // Decode the Arrow stream into RecordBatches
+        let stream = request.into_inner();
+        let flight_stream = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
+            stream.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e))),
+        );
+
+        let batches: Vec<RecordBatch> = flight_stream
+            .try_collect()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to decode Arrow stream: {e}")))?;
+
+        let rows = self
+            .query_handler
+            .write_handler()
+            .handle_ingest(&session, &qualified, batches)
+            .await
+            .map_err(|e| Status::internal(format!("Ingest failed: {e}")))?;
+
+        Ok(rows as i64)
     }
 
     async fn do_put_substrait_plan(

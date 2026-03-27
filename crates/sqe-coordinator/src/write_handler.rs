@@ -294,6 +294,66 @@ impl WriteHandler {
         Ok(vec![]) // DML success, no result rows
     }
 
+    /// Handle a Flight SQL DoPut ingest — write streamed Arrow batches to an Iceberg table.
+    pub async fn handle_ingest(
+        &self,
+        session: &Session,
+        table_name: &str,
+        batches: Vec<RecordBatch>,
+    ) -> sqe_core::Result<usize> {
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+        if total_rows == 0 {
+            return Ok(0);
+        }
+
+        // Parse "catalog.schema.table" or "schema.table"
+        let parts: Vec<&str> = table_name.split('.').collect();
+        let (namespace_str, name) = match parts.as_slice() {
+            [ns, tbl] => (*ns, (*tbl).to_string()),
+            [_cat, ns, tbl] => (*ns, (*tbl).to_string()),
+            _ => {
+                return Err(SqeError::Execution(format!(
+                    "Invalid table name for ingest: {table_name}"
+                )));
+            }
+        };
+
+        let namespace = iceberg::NamespaceIdent::new(namespace_str.to_string());
+        let table_ident = TableIdent::new(namespace, name);
+
+        info!(
+            username = %session.user.username,
+            table = %table_ident,
+            total_rows,
+            "Executing DoPut ingest"
+        );
+
+        let catalog = self.create_catalog_bridge(session).await?;
+
+        let table = catalog
+            .load_table(&table_ident)
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
+
+        let data_files = write_data_files(&table, batches, "ingest").await?;
+
+        if !data_files.is_empty() {
+            let tx = Transaction::new(&table);
+            let action = tx.fast_append().add_data_files(data_files);
+            let tx = action.apply(tx).map_err(|e| {
+                SqeError::Execution(format!("Failed to apply fast append: {e}"))
+            })?;
+            tx.commit(catalog.as_ref()).await.map_err(|e| {
+                SqeError::Execution(format!("Failed to commit ingest transaction: {e}"))
+            })?;
+
+            info!(table = %table_ident, total_rows, "DoPut ingest committed successfully");
+        }
+
+        Ok(total_rows)
+    }
+
     fn format_version(&self) -> FormatVersion {
         match self.config.catalog.default_table_format_version {
             3 => FormatVersion::V3,

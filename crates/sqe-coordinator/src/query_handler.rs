@@ -75,6 +75,10 @@ impl QueryHandler {
         }
     }
 
+    pub fn write_handler(&self) -> &WriteHandler {
+        &self.write_handler
+    }
+
     /// Check if distributed execution should be used for a query.
     #[allow(dead_code)] // Will be used when distributed query routing is wired in
     async fn should_distribute(&self) -> bool {
