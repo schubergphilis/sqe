@@ -77,6 +77,14 @@ pub fn compare_results(
                 continue;
             }
 
+            // Normalize: trim trailing zeros from decimal-like strings
+            // "123.4500" == "123.45", "100.00" == "100"
+            let a_norm = a.trim_end_matches('0').trim_end_matches('.');
+            let e_norm = e.trim_end_matches('0').trim_end_matches('.');
+            if a_norm == e_norm {
+                continue;
+            }
+
             // Numeric tolerance for float columns
             if float_columns.get(col_idx).copied().unwrap_or(false) {
                 match (a.parse::<f64>(), e.parse::<f64>()) {
@@ -391,5 +399,23 @@ mod tests {
         let arr = Date32Array::from(vec![19800]);
         let s = cell_to_string(&arr, 0);
         assert!(s.contains("2024"), "date should be human-readable: {s}");
+    }
+
+    #[test]
+    fn test_compare_decimal_trailing_zeros() {
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("amount", DataType::Decimal128(10, 4), false),
+        ]));
+        // 1234500 with scale 4 = 123.4500
+        let arr = Decimal128Array::from(vec![1_234_500i128])
+            .with_precision_and_scale(10, 4)
+            .unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+
+        let csv = "amount\n123.45\n";
+        let result = compare_results(&[batch], csv, 1e-4).unwrap();
+        assert!(matches!(result, CompareStatus::Pass), "trailing zeros should match: {result:?}");
     }
 }
