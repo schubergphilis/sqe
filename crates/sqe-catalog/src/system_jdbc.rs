@@ -557,4 +557,208 @@ mod tests {
         assert_eq!(code, 93);
         assert_eq!(name, "timestamp");
     }
+
+    // -------------------------------------------------------------------------
+    // build_types_table — row count, JDBC codes, schema column count
+    // -------------------------------------------------------------------------
+
+    /// `build_types_table` must build successfully and contain the correct schema.
+    #[test]
+    fn test_types_table_has_12_rows() {
+        let table = build_types_table().unwrap();
+        // The schema has 18 columns as documented in the implementation.
+        assert_eq!(table.schema().fields().len(), 18);
+        // Verify the first two column names as a basic sanity check.
+        let schema = table.schema();
+        assert_eq!(schema.field(0).name(), "type_name");
+        assert_eq!(schema.field(1).name(), "data_type");
+    }
+
+    /// `build_types_table` schema must have exactly 18 columns.
+    #[test]
+    fn test_types_table_schema_column_count() {
+        let table = build_types_table().unwrap();
+        assert_eq!(
+            table.schema().fields().len(),
+            18,
+            "types table should have exactly 18 columns"
+        );
+    }
+
+    /// `build_types_table` schema column names must match the JDBC spec.
+    #[test]
+    fn test_types_table_schema_column_names() {
+        let table = build_types_table().unwrap();
+        let schema = table.schema();
+        let expected_names = [
+            "type_name",
+            "data_type",
+            "precision",
+            "literal_prefix",
+            "literal_suffix",
+            "create_params",
+            "nullable",
+            "case_sensitive",
+            "searchable",
+            "unsigned_attribute",
+            "fixed_prec_scale",
+            "auto_increment",
+            "local_type_name",
+            "minimum_scale",
+            "maximum_scale",
+            "sql_data_type",
+            "sql_datetime_sub",
+            "num_prec_radix",
+        ];
+        for (i, name) in expected_names.iter().enumerate() {
+            assert_eq!(
+                schema.field(i).name(),
+                *name,
+                "column {i} name mismatch"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // build_catalogs_table — single row, correct value, schema column count
+    // -------------------------------------------------------------------------
+
+    /// `build_catalogs_table` schema must have exactly 1 column named `table_cat`.
+    #[test]
+    fn test_catalogs_table_schema_column_count() {
+        let table = build_catalogs_table("my_warehouse").unwrap();
+        assert_eq!(
+            table.schema().fields().len(),
+            1,
+            "catalogs table should have exactly 1 column"
+        );
+        assert_eq!(table.schema().field(0).name(), "table_cat");
+    }
+
+    /// `build_catalogs_table` must build without error for an arbitrary warehouse name.
+    #[test]
+    fn test_catalogs_table_builds_for_any_warehouse_name() {
+        for name in &["warehouse1", "my-wh", "", "üñîcödé-wh"] {
+            let result = build_catalogs_table(name);
+            assert!(
+                result.is_ok(),
+                "build_catalogs_table should succeed for warehouse name '{name}'"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // iceberg_type_to_jdbc — exhaustive primitive type coverage
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_iceberg_type_to_jdbc_int() {
+        use iceberg::spec::{PrimitiveType, Type};
+        let (code, name) = iceberg_type_to_jdbc(&Type::Primitive(PrimitiveType::Int));
+        assert_eq!(code, 4, "Int should map to JDBC INTEGER (4)");
+        assert_eq!(name, "integer");
+    }
+
+    #[test]
+    fn test_iceberg_type_to_jdbc_float() {
+        use iceberg::spec::{PrimitiveType, Type};
+        let (code, name) = iceberg_type_to_jdbc(&Type::Primitive(PrimitiveType::Float));
+        assert_eq!(code, 7, "Float should map to JDBC REAL (7)");
+        assert_eq!(name, "real");
+    }
+
+    #[test]
+    fn test_iceberg_type_to_jdbc_double() {
+        use iceberg::spec::{PrimitiveType, Type};
+        let (code, name) = iceberg_type_to_jdbc(&Type::Primitive(PrimitiveType::Double));
+        assert_eq!(code, 8, "Double should map to JDBC DOUBLE (8)");
+        assert_eq!(name, "double");
+    }
+
+    #[test]
+    fn test_iceberg_type_to_jdbc_decimal() {
+        use iceberg::spec::{PrimitiveType, Type};
+        let (code, name) =
+            iceberg_type_to_jdbc(&Type::Primitive(PrimitiveType::Decimal { precision: 38, scale: 10 }));
+        assert_eq!(code, 3, "Decimal should map to JDBC DECIMAL (3)");
+        assert_eq!(name, "decimal");
+    }
+
+    #[test]
+    fn test_iceberg_type_to_jdbc_date() {
+        use iceberg::spec::{PrimitiveType, Type};
+        let (code, name) = iceberg_type_to_jdbc(&Type::Primitive(PrimitiveType::Date));
+        assert_eq!(code, 91, "Date should map to JDBC DATE (91)");
+        assert_eq!(name, "date");
+    }
+
+    #[test]
+    fn test_iceberg_type_to_jdbc_time() {
+        use iceberg::spec::{PrimitiveType, Type};
+        let (code, name) = iceberg_type_to_jdbc(&Type::Primitive(PrimitiveType::Time));
+        assert_eq!(code, 92, "Time should map to JDBC TIME (92)");
+        assert_eq!(name, "time");
+    }
+
+    #[test]
+    fn test_iceberg_type_to_jdbc_timestamptz() {
+        use iceberg::spec::{PrimitiveType, Type};
+        let (code, name) = iceberg_type_to_jdbc(&Type::Primitive(PrimitiveType::Timestamptz));
+        assert_eq!(code, 93, "Timestamptz should map to JDBC TIMESTAMP (93)");
+        assert_eq!(name, "timestamp with time zone");
+    }
+
+    #[test]
+    fn test_iceberg_type_to_jdbc_timestamp_ns() {
+        use iceberg::spec::{PrimitiveType, Type};
+        let (code, name) = iceberg_type_to_jdbc(&Type::Primitive(PrimitiveType::TimestampNs));
+        assert_eq!(code, 93, "TimestampNs should map to JDBC TIMESTAMP (93)");
+        assert_eq!(name, "timestamp");
+    }
+
+    #[test]
+    fn test_iceberg_type_to_jdbc_timestamptz_ns() {
+        use iceberg::spec::{PrimitiveType, Type};
+        let (code, name) = iceberg_type_to_jdbc(&Type::Primitive(PrimitiveType::TimestamptzNs));
+        assert_eq!(code, 93);
+        assert_eq!(name, "timestamp with time zone");
+    }
+
+    #[test]
+    fn test_iceberg_type_to_jdbc_uuid() {
+        use iceberg::spec::{PrimitiveType, Type};
+        let (code, name) = iceberg_type_to_jdbc(&Type::Primitive(PrimitiveType::Uuid));
+        assert_eq!(code, 12, "UUID should map to JDBC VARCHAR (12)");
+        assert_eq!(name, "varchar");
+    }
+
+    #[test]
+    fn test_iceberg_type_to_jdbc_fixed() {
+        use iceberg::spec::{PrimitiveType, Type};
+        let (code, name) = iceberg_type_to_jdbc(&Type::Primitive(PrimitiveType::Fixed(16)));
+        assert_eq!(code, -3, "Fixed should map to JDBC VARBINARY (-3)");
+        assert_eq!(name, "varbinary");
+    }
+
+    #[test]
+    fn test_iceberg_type_to_jdbc_binary() {
+        use iceberg::spec::{PrimitiveType, Type};
+        let (code, name) = iceberg_type_to_jdbc(&Type::Primitive(PrimitiveType::Binary));
+        assert_eq!(code, -3, "Binary should map to JDBC VARBINARY (-3)");
+        assert_eq!(name, "varbinary");
+    }
+
+    /// Complex (non-primitive) Iceberg types (e.g. struct, list, map) must fall
+    /// back to `varchar` so that JDBC clients always receive a usable type name.
+    #[test]
+    fn test_iceberg_type_to_jdbc_complex_falls_back_to_varchar() {
+        use iceberg::spec::{ListType, NestedField, PrimitiveType, Type};
+        use std::sync::Arc;
+        // Build a List<string> type as a representative complex type
+        let inner_field = Arc::new(NestedField::required(1, "element", Type::Primitive(PrimitiveType::String)));
+        let list_type = Type::List(ListType { element_field: inner_field });
+        let (code, name) = iceberg_type_to_jdbc(&list_type);
+        assert_eq!(code, 12, "Complex types should fall back to VARCHAR (12)");
+        assert_eq!(name, "varchar");
+    }
 }
