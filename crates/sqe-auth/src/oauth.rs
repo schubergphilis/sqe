@@ -90,3 +90,119 @@ impl OAuthClient {
             })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------------------------------------
+    // OAuthClient construction
+    // -------------------------------------------------------------------------
+
+    /// `OAuthClient::new` must succeed with valid parameters (no HTTP call is made).
+    #[test]
+    fn new_succeeds_with_valid_parameters() {
+        let result = OAuthClient::new(
+            "http://localhost:8181/api/catalog/v1/oauth/tokens",
+            "polaris-client",
+            "polaris-secret",
+            false, // accept_invalid_certs
+        );
+        assert!(result.is_ok(), "Expected Ok, got {:?}", result.err());
+    }
+
+    /// `OAuthClient::new` with `accept_invalid_certs = true` must also succeed.
+    #[test]
+    fn new_succeeds_with_invalid_certs_accepted() {
+        let result = OAuthClient::new(
+            "https://internal.corp/oauth/token",
+            "client",
+            "secret",
+            true, // skip TLS verification
+        );
+        assert!(result.is_ok(), "Expected Ok with accept_invalid_certs=true");
+    }
+
+    /// Constructing an `OAuthClient` with an empty token endpoint is allowed —
+    /// the URL is only used when `get_token()` is called, not during construction.
+    #[test]
+    fn new_allows_empty_token_endpoint() {
+        let result = OAuthClient::new("", "client", "secret", false);
+        assert!(
+            result.is_ok(),
+            "Construction should succeed even with an empty endpoint"
+        );
+    }
+
+    /// Constructing an `OAuthClient` with empty credentials is allowed — the
+    /// server rejects bad creds, not the client constructor.
+    #[test]
+    fn new_allows_empty_credentials() {
+        let result = OAuthClient::new("http://localhost/token", "", "", false);
+        assert!(
+            result.is_ok(),
+            "Construction should succeed even with empty client_id/secret"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TokenResponse deserialization
+    // -------------------------------------------------------------------------
+
+    /// `TokenResponse` must deserialize a standard OAuth2 JSON body correctly.
+    #[test]
+    fn token_response_deserialises_standard_json() {
+        let json = r#"{
+            "access_token": "eyJhbGciOiJSUzI1NiJ9.payload.sig",
+            "expires_in": 3600,
+            "token_type": "Bearer"
+        }"#;
+
+        let response: TokenResponse =
+            serde_json::from_str(json).expect("should deserialise standard response");
+
+        assert_eq!(
+            response.access_token,
+            "eyJhbGciOiJSUzI1NiJ9.payload.sig"
+        );
+        assert_eq!(response.expires_in, 3600);
+        assert_eq!(response.token_type, "Bearer");
+    }
+
+    /// `TokenResponse` with lowercase `bearer` must also deserialize correctly.
+    #[test]
+    fn token_response_deserialises_lowercase_bearer() {
+        let json = r#"{
+            "access_token": "tok123",
+            "expires_in": 1800,
+            "token_type": "bearer"
+        }"#;
+
+        let response: TokenResponse =
+            serde_json::from_str(json).expect("should deserialise lowercase bearer");
+        assert_eq!(response.token_type, "bearer");
+        assert_eq!(response.expires_in, 1800);
+    }
+
+    /// `TokenResponse` missing `access_token` must fail deserialization.
+    #[test]
+    fn token_response_fails_without_access_token() {
+        let json = r#"{"expires_in": 3600, "token_type": "Bearer"}"#;
+        let result: Result<TokenResponse, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "Deserialization should fail when access_token is missing"
+        );
+    }
+
+    /// `TokenResponse` missing `expires_in` must fail deserialization.
+    #[test]
+    fn token_response_fails_without_expires_in() {
+        let json = r#"{"access_token": "tok", "token_type": "Bearer"}"#;
+        let result: Result<TokenResponse, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "Deserialization should fail when expires_in is missing"
+        );
+    }
+}

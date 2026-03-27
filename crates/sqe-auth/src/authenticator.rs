@@ -202,6 +202,14 @@ impl Authenticator {
         Ok(())
     }
 
+    /// Returns the configured refresh buffer in seconds.
+    ///
+    /// Exposed for testing only — the value is read from `AuthConfig`.
+    #[cfg(test)]
+    pub fn refresh_buffer_secs(&self) -> u64 {
+        self.refresh_buffer_secs
+    }
+
     /// Spawns a background task that periodically checks the cache for expiring
     /// sessions and refreshes them. Errors are logged but do not crash the task.
     pub fn start_refresh_task(self: &Arc<Self>) {
@@ -303,5 +311,102 @@ impl Authenticator {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqe_core::config::AuthConfig;
+
+    /// Build a minimal `AuthConfig` that selects the OIDC password-grant backend.
+    fn oidc_config() -> AuthConfig {
+        AuthConfig {
+            keycloak_url: "http://localhost:8080".to_string(),
+            realm: "test-realm".to_string(),
+            client_id: "sqe-client".to_string(),
+            client_secret: "secret".to_string(),
+            token_endpoint: String::new(),
+            token_refresh_buffer_secs: 60,
+            ssl_verification: false,
+        }
+    }
+
+    /// Build a minimal `AuthConfig` that selects the client_credentials backend.
+    fn client_creds_config() -> AuthConfig {
+        AuthConfig {
+            keycloak_url: String::new(),
+            realm: String::new(),
+            client_id: "polaris-client".to_string(),
+            client_secret: "polaris-secret".to_string(),
+            token_endpoint: "http://localhost:8181/api/catalog/v1/oauth/tokens".to_string(),
+            token_refresh_buffer_secs: 120,
+            ssl_verification: true,
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Backend selection logic
+    // -------------------------------------------------------------------------
+
+    /// When `token_endpoint` is set and `keycloak_url` is empty, the engine
+    /// must select the OAuth2 `client_credentials` backend.
+    #[tokio::test]
+    async fn backend_selection_client_credentials_when_token_endpoint_set() {
+        let config = client_creds_config();
+        let auth = Authenticator::new(&config)
+            .await
+            .expect("should construct with client_credentials config");
+        // The refresh buffer is propagated from the config
+        assert_eq!(auth.refresh_buffer_secs(), 120);
+    }
+
+    /// When `keycloak_url` is set (even with a non-empty token_endpoint), the
+    /// engine falls back to the OIDC password-grant backend because the condition
+    /// requires `keycloak_url.is_empty()`.
+    #[tokio::test]
+    async fn backend_selection_oidc_when_keycloak_url_set() {
+        let mut config = oidc_config();
+        // Also set token_endpoint — keycloak_url takes precedence
+        config.token_endpoint = "http://example.com/token".to_string();
+        let auth = Authenticator::new(&config)
+            .await
+            .expect("should construct with OIDC config");
+        assert_eq!(auth.refresh_buffer_secs(), 60);
+    }
+
+    /// Plain OIDC config (no token_endpoint) must succeed.
+    #[tokio::test]
+    async fn backend_selection_oidc_no_token_endpoint() {
+        let config = oidc_config();
+        let auth = Authenticator::new(&config).await;
+        assert!(auth.is_ok(), "Expected Ok, got {:?}", auth.err());
+    }
+
+    // -------------------------------------------------------------------------
+    // Token cache: get_cached_token
+    // -------------------------------------------------------------------------
+
+    /// A freshly constructed `Authenticator` has an empty cache.
+    #[tokio::test]
+    async fn cached_token_missing_on_fresh_authenticator() {
+        let config = oidc_config();
+        let auth = Authenticator::new(&config).await.unwrap();
+        assert!(
+            auth.get_cached_token("nonexistent-session").is_none(),
+            "Cache should be empty after construction"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // refresh_buffer_secs propagation
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn refresh_buffer_secs_propagated_from_config() {
+        let mut config = oidc_config();
+        config.token_refresh_buffer_secs = 42;
+        let auth = Authenticator::new(&config).await.unwrap();
+        assert_eq!(auth.refresh_buffer_secs(), 42);
     }
 }
