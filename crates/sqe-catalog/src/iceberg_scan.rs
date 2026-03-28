@@ -75,6 +75,34 @@ impl IcebergScanExec {
     pub fn predicates(&self) -> Option<&Predicate> {
         self.predicates.as_ref()
     }
+
+    /// List all data file paths from the table's current snapshot.
+    ///
+    /// Uses the scan builder with the same projection and predicates as
+    /// the execution, then calls `plan_files()` to get the filtered
+    /// file scan tasks.
+    pub async fn data_file_paths(&self) -> Result<Vec<String>, iceberg::Error> {
+        let mut scan_builder = self.table.scan();
+
+        if let Some(ref cols) = self.projection {
+            scan_builder = scan_builder.select(cols.iter().map(|s| s.as_str()));
+        }
+
+        if let Some(ref pred) = self.predicates {
+            scan_builder = scan_builder.with_filter(pred.clone());
+        }
+
+        let scan = scan_builder.build()?;
+
+        let tasks: Vec<_> = scan.plan_files().await?.try_collect().await?;
+
+        Ok(tasks.iter().map(|t| t.data_file_path().to_string()).collect())
+    }
+
+    /// Returns the projected column names, if any.
+    pub fn projection(&self) -> Option<&[String]> {
+        self.projection.as_deref()
+    }
 }
 
 impl DisplayAs for IcebergScanExec {
