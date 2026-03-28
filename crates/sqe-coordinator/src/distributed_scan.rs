@@ -64,6 +64,8 @@ pub struct DistributedScanExec {
     /// When set, fragments that cannot be executed on any worker
     /// will be executed locally using the coordinator's DataFusion runtime.
     local_executor: Option<Arc<dyn LocalExecutor>>,
+    /// Optional callback fired when each fragment completes or fails.
+    fragment_callback: FragmentCallbackOpt,
 }
 
 /// Trait for local execution fallback.
@@ -77,6 +79,25 @@ pub trait LocalExecutor: Send + Sync + std::fmt::Debug {
         task: &ScanTask,
         schema: SchemaRef,
     ) -> DFResult<SendableRecordBatchStream>;
+}
+
+/// Callback invoked when a fragment stream completes or fails.
+/// Args: (fragment_id, success: bool, elapsed_ms, output_rows)
+pub type FragmentCallback = Arc<dyn Fn(&str, bool, u64, usize) + Send + Sync>;
+
+/// Newtype wrapper around [`FragmentCallback`] that provides a `Debug` implementation
+/// so it can be used inside `#[derive(Debug)]` structs.
+#[derive(Clone)]
+struct FragmentCallbackOpt(Option<FragmentCallback>);
+
+impl fmt::Debug for FragmentCallbackOpt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.is_some() {
+            write!(f, "Some(<FragmentCallback>)")
+        } else {
+            write!(f, "None")
+        }
+    }
 }
 
 impl DistributedScanExec {
@@ -115,6 +136,7 @@ impl DistributedScanExec {
             worker_registry: None,
             max_retries: DEFAULT_MAX_RETRIES,
             local_executor: None,
+            fragment_callback: FragmentCallbackOpt(None),
         }
     }
 
@@ -149,6 +171,12 @@ impl DistributedScanExec {
     /// Set the local executor for fallback when all workers are down.
     pub fn with_local_executor(mut self, executor: Arc<dyn LocalExecutor>) -> Self {
         self.local_executor = Some(executor);
+        self
+    }
+
+    /// Set an optional callback that fires when each fragment stream completes or fails.
+    pub fn with_fragment_callback(mut self, cb: FragmentCallback) -> Self {
+        self.fragment_callback = FragmentCallbackOpt(Some(cb));
         self
     }
 }
@@ -217,6 +245,7 @@ impl ExecutionPlan for DistributedScanExec {
         let max_retries = self.max_retries;
         let worker_registry = self.worker_registry.clone();
         let local_executor = self.local_executor.clone();
+        let fragment_callback = self.fragment_callback.0.clone();
 
         let dispatch_span = info_span!(
             "dispatch_to_worker",
@@ -251,6 +280,7 @@ impl ExecutionPlan for DistributedScanExec {
                     .await;
             }
 
+            let start = std::time::Instant::now();
             let mut last_error: Option<DataFusionError> = None;
             let mut current_worker_url = initial_worker_url;
             let mut failed_workers: Vec<String> = Vec::new();
@@ -277,7 +307,19 @@ impl ExecutionPlan for DistributedScanExec {
                                 flight_stream
                                     .map_err(|e| DataFusionError::External(Box::new(e))),
                             );
-                        return Ok(inner);
+                        // Wrap the stream so the callback fires when it completes
+                        let wrapped: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
+                            if let Some(cb) = fragment_callback.clone() {
+                                Box::pin(CallbackStream::new(
+                                    inner,
+                                    task.fragment_id.clone(),
+                                    cb,
+                                    start,
+                                ))
+                            } else {
+                                inner
+                            };
+                        return Ok(wrapped);
                     }
                     Err(e) => {
                         warn!(
@@ -287,6 +329,16 @@ impl ExecutionPlan for DistributedScanExec {
                             attempt = attempt,
                             "Worker execution failed"
                         );
+
+                        // Fire callback with failure for each failed attempt
+                        if let Some(ref cb) = fragment_callback {
+                            cb(
+                                &task.fragment_id,
+                                false,
+                                start.elapsed().as_millis() as u64,
+                                0,
+                            );
+                        }
 
                         // Mark the worker as unhealthy in the registry
                         if let Some(ref registry) = worker_registry {
@@ -334,10 +386,22 @@ impl ExecutionPlan for DistributedScanExec {
                 let local_stream = executor.execute_local(&task, schema)?;
                 let inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
                     Box::pin(local_stream);
-                return Ok(inner);
+                // Wrap the fallback stream so the callback fires on completion
+                let wrapped: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
+                    if let Some(cb) = fragment_callback {
+                        Box::pin(CallbackStream::new(
+                            inner,
+                            task.fragment_id.clone(),
+                            cb,
+                            start,
+                        ))
+                    } else {
+                        inner
+                    };
+                return Ok(wrapped);
             }
 
-            // No local fallback available — propagate the last error
+            // No local fallback available — fire callback with failure and propagate the last error
             let err = last_error.unwrap_or_else(|| {
                 DataFusionError::Execution(
                     "All workers failed and no local fallback configured".to_string(),
@@ -431,6 +495,74 @@ impl Stream for DistributedRecordBatchStream {
 impl datafusion::physical_plan::RecordBatchStream for DistributedRecordBatchStream {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+}
+
+/// Stream wrapper that fires a [`FragmentCallback`] when the inner stream is fully
+/// consumed (returns `Poll::Ready(None)`) or when an error is produced.
+///
+/// The callback receives:
+/// - `fragment_id` — the fragment that was executed
+/// - `success` — `true` if the stream ended cleanly, `false` on the first error
+/// - `elapsed_ms` — wall-clock time from the start of `execute()` to completion
+/// - `output_rows` — total number of rows produced across all batches
+struct CallbackStream {
+    inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>,
+    fragment_id: String,
+    callback: FragmentCallback,
+    start: std::time::Instant,
+    output_rows: usize,
+    /// Whether the callback has already been fired (ensures exactly-once semantics).
+    fired: bool,
+}
+
+impl CallbackStream {
+    fn new(
+        inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>,
+        fragment_id: String,
+        callback: FragmentCallback,
+        start: std::time::Instant,
+    ) -> Self {
+        Self {
+            inner,
+            fragment_id,
+            callback,
+            start,
+            output_rows: 0,
+            fired: false,
+        }
+    }
+}
+
+impl Stream for CallbackStream {
+    type Item = DFResult<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(None) => {
+                // Stream exhausted — fire callback with success=true
+                if !self.fired {
+                    self.fired = true;
+                    let elapsed_ms = self.start.elapsed().as_millis() as u64;
+                    (self.callback)(&self.fragment_id, true, elapsed_ms, self.output_rows);
+                }
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(e))) => {
+                // Stream produced an error — fire callback with success=false
+                if !self.fired {
+                    self.fired = true;
+                    let elapsed_ms = self.start.elapsed().as_millis() as u64;
+                    (self.callback)(&self.fragment_id, false, elapsed_ms, self.output_rows);
+                }
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(Some(Ok(batch))) => {
+                self.output_rows += batch.num_rows();
+                Poll::Ready(Some(Ok(batch)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
