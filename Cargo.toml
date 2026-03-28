@@ -58,7 +58,7 @@ toml = "0.8"
 
 # Concurrency / Caching
 dashmap = "6"
-moka = { version = "0.12", features = ["future"] }
+moka = { version = "0.12", features = ["future", "sync"] }
 
 # Rate limiting
 governor = "0.8"
