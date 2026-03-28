@@ -19,16 +19,10 @@ TOTAL=0
 SQE_HOST="localhost"
 SQE_PORT="60051"
 TRINO_PORT="28080"
-POLARIS_URL="http://localhost:18181"
-CLIENT_ID="root"
-CLIENT_SECRET="s3cr3t"
+SQE_USER="${SQE_USER:-root}"
+export SQE_PASSWORD="${SQE_PASSWORD:-}"
 
 cd "$ROOT_DIR"
-
-# Get a bearer token from Polaris
-TOKEN=$(curl -s -X POST "$POLARIS_URL/api/catalog/v1/oauth/tokens" \
-    -d "grant_type=client_credentials&client_id=$CLIENT_ID&client_secret=$CLIENT_SECRET&scope=PRINCIPAL_ROLE:ALL" \
-    | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
 
 # Build CLI if needed
 cargo build -p sqe-cli --release 2>/dev/null
@@ -36,19 +30,18 @@ CLI="$ROOT_DIR/target/release/sqe-cli"
 
 run_sql() {
     local sql="$1"
-    "$CLI" --host "$SQE_HOST" --port "$SQE_PORT" --token "$TOKEN" \
+    "$CLI" --host "$SQE_HOST" --port "$SQE_PORT" --user "$SQE_USER" \
         --protocol flight -e "$sql" 2>/dev/null
 }
 
 run_sql_trino() {
     local sql="$1"
-    # Submit query
-    local resp
-    resp=$(curl -s -X POST "http://$SQE_HOST:$TRINO_PORT/v1/statement" \
-        -H "Authorization: Bearer $TOKEN" \
-        -H "X-Trino-User: root" \
-        -d "$sql")
-    echo "$resp"
+    local creds
+    creds=$(printf '%s:%s' "$SQE_USER" "$SQE_PASSWORD" | base64)
+    curl -s -X POST "http://$SQE_HOST:$TRINO_PORT/v1/statement" \
+        -H "Authorization: Basic $creds" \
+        -H "X-Trino-User: $SQE_USER" \
+        -d "$sql"
 }
 
 assert_contains() {
