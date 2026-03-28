@@ -62,12 +62,16 @@ HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$POLARIS_URL/api/manageme
         \"catalog\": {
             \"name\": \"$WAREHOUSE\",
             \"type\": \"INTERNAL\",
-            \"properties\": {
-                \"default-base-location\": \"s3://warehouse/\"
-            },
             \"storageConfigInfo\": {
                 \"storageType\": \"S3\",
-                \"allowedLocations\": [\"s3://warehouse/\"]
+                \"allowedLocations\": [\"s3://warehouse/\"],
+                \"endpoint\": \"$S3_URL\",
+                \"endpointInternal\": \"http://rustfs:9000\",
+                \"pathStyleAccess\": true
+            },
+            \"properties\": {
+                \"default-base-location\": \"s3://warehouse/\",
+                \"polaris.config.drop-with-purge.enabled\": \"true\"
             }
         }
     }")

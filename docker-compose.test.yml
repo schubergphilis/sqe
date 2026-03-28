@@ -7,7 +7,7 @@
 
 services:
   polaris:
-    image: apache/polaris:latest
+    image: apache/polaris:1.3.0-incubating
     environment:
       POLARIS_PERSISTENCE_TYPE: in-memory
       POLARIS_BOOTSTRAP_CREDENTIALS: "POLARIS,root,s3cr3t"
@@ -19,8 +19,6 @@ services:
       polaris.realm-context.realms: POLARIS
       # Allow DROP VIEW/TABLE to purge metadata files from object storage
       POLARIS_FEATURES_DEFAULTS_DROP_WITH_PURGE_ENABLED: "true"
-      # Skip STS credential vending — use server-default credentials for all FileIO.
-      # Required for non-AWS S3 backends (RustFS, MinIO, Ceph, etc.)
       # S3 credentials for RustFS — used by Polaris for its own S3 operations
       AWS_REGION: us-east-1
       AWS_ACCESS_KEY_ID: s3admin
