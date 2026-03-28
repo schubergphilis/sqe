@@ -89,7 +89,7 @@ rand = "0.8"
 
 # Misc
 async-trait = "0.1"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v7"] }
 chrono = { version = "0.4", features = ["serde"] }
 url = "2"
 bytes = "1"
