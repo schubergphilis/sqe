@@ -15,8 +15,8 @@ WAREHOUSE="${WAREHOUSE:-test_warehouse}"
 echo "=== SQE Distributed Stack Bootstrap ==="
 echo "Polaris:      $POLARIS_URL"
 echo "S3:           $S3_URL"
-echo "Coordinator:  localhost:50051 (Flight SQL) / localhost:8080 (Trino HTTP)"
-echo "Workers:      localhost:50061, localhost:50062"
+echo "Coordinator:  localhost:60051 (Flight SQL) / localhost:28080 (Trino HTTP)"
+echo "Workers:      localhost:60061, localhost:60062"
 echo ""
 
 # ── Wait for Polaris ───────────────────────────────────────────
@@ -91,7 +91,7 @@ if [ "$HTTP" = "200" ]; then echo "done"; elif [ "$HTTP" = "409" ]; then echo "a
 echo ""
 echo -n "Waiting for SQE coordinator..."
 for i in $(seq 1 60); do
-    if curl -so /dev/null "http://localhost:8080/v1/info" 2>/dev/null; then
+    if curl -so /dev/null "http://localhost:28080/v1/info" 2>/dev/null; then
         echo " ready"; break
     fi
     if [ "$i" -eq 60 ]; then echo " TIMEOUT"; exit 1; fi
@@ -108,10 +108,10 @@ echo ""
 echo "=== Distributed Stack Ready ==="
 echo ""
 echo "Query via Flight SQL:"
-echo "  cargo run --bin sqe-cli -- --host localhost --port 50051 --username root --password ''"
+echo "  cargo run --bin sqe-cli -- --host localhost --port 60051 --username root --password ''"
 echo ""
 echo "Query via Trino HTTP:"
-echo "  curl -X POST http://localhost:8080/v1/statement -u root: -d 'SELECT * FROM system.runtime.nodes'"
+echo "  curl -X POST http://localhost:28080/v1/statement -u root: -d 'SELECT * FROM system.runtime.nodes'"
 echo ""
 echo "System tables to try:"
 echo "  SELECT * FROM system.runtime.queries ORDER BY created DESC;"
