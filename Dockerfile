@@ -53,7 +53,7 @@ COPY crates/ crates/
 RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
     --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},target=/usr/local/cargo/git \
     --mount=type=cache,id=sqe-sccache-${TARGETARCH},target=/sccache \
-    cargo build --release --bin sqe-server --bin sqe-cli && \
+    cargo build --release --bin sqe-server --bin sqe-worker --bin sqe-cli && \
     sccache --show-stats
 
 # ── Stage 5: Runtime image ────────────────────────────────────
@@ -76,6 +76,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     groupadd -r sqe && useradd -r -g sqe -u 1000 sqe
 
 COPY --from=builder /build/target/release/sqe-server /usr/local/bin/
+COPY --from=builder /build/target/release/sqe-worker /usr/local/bin/
 COPY --from=builder /build/target/release/sqe-cli /usr/local/bin/
 
 USER sqe
