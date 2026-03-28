@@ -37,6 +37,20 @@ impl std::fmt::Display for RuntimeQueryState {
     }
 }
 
+/// Lightweight mirror of a single fragment's execution info.
+///
+/// Mirrors `sqe_coordinator::query_tracker::FragmentInfo` without importing
+/// it directly (to avoid a circular crate dependency).
+#[derive(Debug, Clone)]
+pub struct RuntimeFragmentInfo {
+    pub task_id: String,
+    pub worker_url: String,
+    pub state: String,
+    pub elapsed_ms: u64,
+    pub input_rows: usize,
+    pub output_rows: usize,
+}
+
 /// Lightweight snapshot of a single query record.
 ///
 /// Populated from `QueryTracker::records()` in the coordinator before being
@@ -57,6 +71,7 @@ pub struct RuntimeQueryRecord {
     pub output_rows: usize,
     pub error_type: Option<String>,
     pub error_code: Option<String>,
+    pub fragments: Vec<RuntimeFragmentInfo>,
 }
 
 // ---------------------------------------------------------------------------
@@ -342,7 +357,7 @@ fn tasks_schema() -> Schema {
 
 fn build_tasks_table(
     records: &[RuntimeQueryRecord],
-    node_id: &str,
+    coordinator_node_id: &str,
 ) -> DFResult<Arc<dyn TableProvider>> {
     let schema = Arc::new(tasks_schema());
 
@@ -358,13 +373,27 @@ fn build_tasks_table(
         if rec.state != RuntimeQueryState::Finished {
             continue;
         }
-        query_id_b.append_value(&rec.query_id);
-        task_id_b.append_value(format!("{}-0", rec.query_id));
-        node_id_b.append_value(node_id);
-        state_b.append_value("FINISHED");
-        elapsed_ms_b.append_value(rec.execution_ms as i64);
-        input_rows_b.append_value(rec.output_rows as i64); // single-node: input ≈ output
-        output_rows_b.append_value(rec.output_rows as i64);
+        if rec.fragments.is_empty() {
+            // Local (single-node) execution — emit one synthetic task.
+            query_id_b.append_value(&rec.query_id);
+            task_id_b.append_value(format!("{}-0", rec.query_id));
+            node_id_b.append_value(coordinator_node_id);
+            state_b.append_value("FINISHED");
+            elapsed_ms_b.append_value(rec.execution_ms as i64);
+            input_rows_b.append_value(rec.output_rows as i64); // single-node: input ≈ output
+            output_rows_b.append_value(rec.output_rows as i64);
+        } else {
+            // Distributed execution — emit one row per fragment with real worker URLs.
+            for frag in &rec.fragments {
+                query_id_b.append_value(&rec.query_id);
+                task_id_b.append_value(&frag.task_id);
+                node_id_b.append_value(&frag.worker_url);
+                state_b.append_value(&frag.state);
+                elapsed_ms_b.append_value(frag.elapsed_ms as i64);
+                input_rows_b.append_value(frag.input_rows as i64);
+                output_rows_b.append_value(frag.output_rows as i64);
+            }
+        }
     }
 
     let batch = RecordBatch::try_new(
@@ -408,6 +437,7 @@ mod tests {
                 output_rows: 1,
                 error_type: None,
                 error_code: None,
+                fragments: vec![],
             },
             RuntimeQueryRecord {
                 query_id: "00000000-0000-0000-0000-000000000002".to_string(),
@@ -424,6 +454,7 @@ mod tests {
                 output_rows: 0,
                 error_type: Some("SyntaxError".to_string()),
                 error_code: Some("42000".to_string()),
+                fragments: vec![],
             },
             RuntimeQueryRecord {
                 query_id: "00000000-0000-0000-0000-000000000003".to_string(),
@@ -440,6 +471,7 @@ mod tests {
                 output_rows: 0,
                 error_type: None,
                 error_code: None,
+                fragments: vec![],
             },
         ]
     }
@@ -598,6 +630,76 @@ mod tests {
     #[test]
     fn test_tasks_table_empty() {
         let table = build_tasks_table(&[], "my-wh").unwrap();
+        assert_eq!(table.schema().fields().len(), 7);
+    }
+
+    #[test]
+    fn test_tasks_table_distributed_uses_worker_urls() {
+        // A finished query with two fragments should emit two task rows using
+        // real worker URLs as node_id.
+        let records = vec![RuntimeQueryRecord {
+            query_id: "00000000-0000-0000-0000-000000000010".to_string(),
+            state: RuntimeQueryState::Finished,
+            user: "alice".to_string(),
+            source: None,
+            sql: "SELECT 1".to_string(),
+            created: Utc::now(),
+            started: Some(Utc::now()),
+            ended: Some(Utc::now()),
+            queued_ms: 0,
+            planning_ms: 5,
+            execution_ms: 200,
+            output_rows: 42,
+            error_type: None,
+            error_code: None,
+            fragments: vec![
+                RuntimeFragmentInfo {
+                    task_id: "frag-0".to_string(),
+                    worker_url: "http://worker-1:50052".to_string(),
+                    state: "FINISHED".to_string(),
+                    elapsed_ms: 100,
+                    input_rows: 20,
+                    output_rows: 20,
+                },
+                RuntimeFragmentInfo {
+                    task_id: "frag-1".to_string(),
+                    worker_url: "http://worker-2:50052".to_string(),
+                    state: "FINISHED".to_string(),
+                    elapsed_ms: 150,
+                    input_rows: 22,
+                    output_rows: 22,
+                },
+            ],
+        }];
+
+        // Schema must still have 7 columns.
+        let table = build_tasks_table(&records, "my-wh").unwrap();
+        assert_eq!(table.schema().fields().len(), 7);
+    }
+
+    #[test]
+    fn test_tasks_table_local_uses_coordinator_node_id() {
+        // A finished query with NO fragments should emit one synthetic task
+        // using the coordinator node_id.
+        let records = vec![RuntimeQueryRecord {
+            query_id: "00000000-0000-0000-0000-000000000020".to_string(),
+            state: RuntimeQueryState::Finished,
+            user: "bob".to_string(),
+            source: None,
+            sql: "SELECT 1".to_string(),
+            created: Utc::now(),
+            started: Some(Utc::now()),
+            ended: Some(Utc::now()),
+            queued_ms: 0,
+            planning_ms: 3,
+            execution_ms: 50,
+            output_rows: 5,
+            error_type: None,
+            error_code: None,
+            fragments: vec![],
+        }];
+
+        let table = build_tasks_table(&records, "my-coordinator").unwrap();
         assert_eq!(table.schema().fields().len(), 7);
     }
 
