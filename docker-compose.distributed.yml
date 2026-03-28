@@ -51,14 +51,13 @@ services:
   # ── SQE Coordinator ────────────────────────────────────────
   coordinator:
     build: .
-    entrypoint: ["sqe-server"]
-    command: ["/config/coordinator.toml"]
+    entrypoint: ["sqe-server", "--config", "/config/coordinator.toml"]
     volumes:
       - ./tests/distributed/coordinator.toml:/config/coordinator.toml:ro
     ports:
-      - "50051:50051"   # Flight SQL
-      - "8080:8080"     # Trino HTTP
-      - "9090:9090"     # Prometheus metrics
+      - "60051:50051"   # Flight SQL (offset to avoid conflicts)
+      - "28080:8080"    # Trino HTTP
+      - "29090:9090"    # Prometheus metrics
     environment:
       RUST_LOG: sqe=info,warn
     depends_on:
@@ -70,13 +69,12 @@ services:
   # ── SQE Worker 1 ───────────────────────────────────────────
   worker-1:
     build: .
-    entrypoint: ["sqe-worker"]
-    command: ["/config/worker.toml"]
+    entrypoint: ["sqe-worker", "/config/worker.toml"]
     volumes:
       - ./tests/distributed/worker.toml:/config/worker.toml:ro
     ports:
-      - "50061:50052"   # Worker Flight (mapped to avoid conflict)
-      - "9091:9091"     # Worker metrics
+      - "60061:50052"   # Worker Flight
+      - "29091:9091"    # Worker metrics
     environment:
       RUST_LOG: sqe=info,warn
     depends_on:
@@ -85,13 +83,12 @@ services:
   # ── SQE Worker 2 ───────────────────────────────────────────
   worker-2:
     build: .
-    entrypoint: ["sqe-worker"]
-    command: ["/config/worker.toml"]
+    entrypoint: ["sqe-worker", "/config/worker.toml"]
     volumes:
       - ./tests/distributed/worker.toml:/config/worker.toml:ro
     ports:
-      - "50062:50052"   # Worker Flight (mapped to avoid conflict)
-      - "9092:9091"     # Worker metrics
+      - "60062:50052"   # Worker Flight
+      - "29092:9091"    # Worker metrics
     environment:
       RUST_LOG: sqe=info,warn
     depends_on:
