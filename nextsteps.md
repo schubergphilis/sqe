@@ -184,6 +184,7 @@ Step 3: security hardening  ✅ DONE (51/51 — TLS, rate limiting, timeouts, ca
 Step 3b: benchmark suite    ✅ DONE (sqe-bench: generate/load/test, 6 benchmarks, read_parquet() TVF, CI scripts)
 Step 3c: hardening pass     ✅ DONE (type formatting, Flight SQL DoPut + metadata, clippy, decimal DIFF, token fingerprint)
 Step 3d: query history+cache ✅ DONE (system.runtime.queries, in-memory history store, query result cache, config sections)
+Step 3e: distributed wiring ✅ DONE (try_distribute in execute_query, fragment tracking, system.runtime.tasks shows workers)
 Step 4: pluggable auth      (depends on Step 3 renames being done first) ← NEXT
 Step 5: pluggable catalogs  (independent of auth; can run in parallel with Step 4) ← NEXT
 Step 6: semantic layer      (new crates; fully additive; no existing code broken)
