@@ -36,7 +36,7 @@ use tracing::{debug, info, warn};
 use sqe_core::SqeConfig;
 
 use crate::query_handler::QueryHandler;
-use crate::query_registry::QueryRegistry;
+use crate::query_tracker::QueryTracker;
 use crate::session_manager::SessionManager;
 use crate::worker_registry::WorkerRegistry;
 
@@ -73,7 +73,7 @@ pub struct SqeFlightSqlService {
     query_handler: Arc<QueryHandler>,
     config: SqeConfig,
     worker_registry: Option<Arc<WorkerRegistry>>,
-    query_registry: Arc<QueryRegistry>,
+    query_tracker: Arc<QueryTracker>,
     worker_secret: String,
 }
 
@@ -84,20 +84,21 @@ impl SqeFlightSqlService {
         config: SqeConfig,
     ) -> Self {
         let worker_secret = config.coordinator.worker_secret.clone();
+        let query_tracker = Arc::clone(query_handler.query_tracker());
         Self {
             session_manager,
             query_handler,
             config,
             worker_registry: None,
-            query_registry: Arc::new(QueryRegistry::new()),
+            query_tracker,
             worker_secret,
         }
     }
 
-    /// Returns a reference to the query registry for external access
+    /// Returns a reference to the query tracker for external access
     /// (e.g., metrics, admin endpoints).
-    pub fn query_registry(&self) -> &Arc<QueryRegistry> {
-        &self.query_registry
+    pub fn query_tracker(&self) -> &Arc<QueryTracker> {
+        &self.query_tracker
     }
 
     pub fn with_worker_registry(mut self, registry: Arc<WorkerRegistry>) -> Self {
@@ -1225,13 +1226,25 @@ impl FlightSqlService for SqeFlightSqlService {
                 )
             })?;
 
-        let cancelled = self.query_registry.cancel(&query_id);
+        // QueryTracker uses Uuid keys. Try to parse the handle as a UUID;
+        // if it's a SQL string (legacy ticket format) we cannot map it to a
+        // tracked query yet — full query-ID propagation via tickets is planned.
+        let cancelled = if let Ok(uuid) = uuid::Uuid::parse_str(&query_id) {
+            self.query_tracker.cancel(&uuid)
+        } else {
+            debug!(
+                query_id = %query_id,
+                "CancelQuery: handle is not a UUID, cannot map to tracked query"
+            );
+            false
+        };
+
         if cancelled {
             info!(query_id = %query_id, "Query cancelled via Flight CancelQuery action");
         } else {
             debug!(
                 query_id = %query_id,
-                "CancelQuery: query not found in registry (already completed or unknown)"
+                "CancelQuery: query not found in tracker (already completed or unknown)"
             );
         }
 
