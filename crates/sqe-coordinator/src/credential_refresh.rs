@@ -522,4 +522,106 @@ mod tests {
         let count = refresh_expiring_credentials(&tracker, |_| async { None }).await;
         assert_eq!(count, 0);
     }
+
+    #[tokio::test]
+    async fn test_concurrent_register_unregister() {
+        // Multiple tasks registering/unregistering fragments simultaneously.
+        let tracker = Arc::new(CredentialRefreshTracker::new());
+        let mut handles = tokio::task::JoinSet::new();
+
+        // 10 tasks register, 10 tasks unregister (different fragments)
+        for i in 0..10 {
+            let t = tracker.clone();
+            handles.spawn(async move {
+                t.register(
+                    format!("frag-{i}"),
+                    format!("http://w{i}:50052"),
+                    Some(Utc::now() + Duration::hours(1)),
+                )
+                .await;
+            });
+        }
+
+        // Wait for all registrations
+        while let Some(result) = handles.join_next().await {
+            result.expect("register should not panic");
+        }
+
+        assert_eq!(tracker.active_count().await, 10);
+
+        // Now concurrently unregister half and register new ones
+        let mut handles = tokio::task::JoinSet::new();
+        for i in 0..10 {
+            let t = tracker.clone();
+            if i % 2 == 0 {
+                // Unregister existing
+                handles.spawn(async move {
+                    t.unregister(&format!("frag-{i}")).await;
+                });
+            } else {
+                // Register new
+                handles.spawn(async move {
+                    t.register(
+                        format!("frag-new-{i}"),
+                        format!("http://w{i}:50052"),
+                        Some(Utc::now() + Duration::hours(1)),
+                    )
+                    .await;
+                });
+            }
+        }
+
+        while let Some(result) = handles.join_next().await {
+            result.expect("concurrent register/unregister should not panic");
+        }
+
+        // 10 original - 5 unregistered + 5 new = 10
+        assert_eq!(tracker.active_count().await, 10);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_buffer_edge_case() {
+        // Credential expiry exactly at the buffer boundary.
+        // With a 300-second buffer, a credential expiring exactly 300 seconds
+        // from now should be at the threshold (expiry <= now + buffer).
+        let buffer_secs = 300;
+        let tracker = CredentialRefreshTracker::with_refresh_buffer(buffer_secs);
+
+        // Exactly at the boundary: expiry == now + buffer
+        // Since we compute threshold = now + buffer and check expiry <= threshold,
+        // this should be included.
+        let expiry_at_boundary = Utc::now() + Duration::seconds(buffer_secs);
+        tracker
+            .register(
+                "frag-boundary".to_string(),
+                "http://w1:50052".to_string(),
+                Some(expiry_at_boundary),
+            )
+            .await;
+
+        let needing = tracker.fragments_needing_refresh().await;
+        assert_eq!(
+            needing.len(),
+            1,
+            "credential expiring exactly at buffer boundary should need refresh"
+        );
+        assert_eq!(needing[0].fragment_id, "frag-boundary");
+
+        // Just outside the boundary: expiry == now + buffer + 1 second
+        let tracker2 = CredentialRefreshTracker::with_refresh_buffer(buffer_secs);
+        let expiry_outside = Utc::now() + Duration::seconds(buffer_secs + 2);
+        tracker2
+            .register(
+                "frag-outside".to_string(),
+                "http://w1:50052".to_string(),
+                Some(expiry_outside),
+            )
+            .await;
+
+        let needing2 = tracker2.fragments_needing_refresh().await;
+        assert!(
+            needing2.is_empty(),
+            "credential expiring outside buffer should not need refresh"
+        );
+    }
 }

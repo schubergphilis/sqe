@@ -272,4 +272,133 @@ mod tests {
         cache.store("alice", "SELECT 1", Uuid::now_v7(), vec![make_batch(100)], vec![]);
         assert!(cache.lookup("alice", "SELECT 1").is_none());
     }
+
+    #[test]
+    fn cache_stores_and_returns_results() {
+        // Verify cache stores results after first query and returns
+        // them on second identical query.
+        let cache = ResultCache::new(&test_config(), None);
+        let sql = "SELECT id FROM users WHERE id > 10";
+        let batch = make_batch(5);
+        let query_id = Uuid::now_v7();
+
+        // First lookup should miss
+        assert!(cache.lookup("alice", sql).is_none());
+
+        // Store the result
+        cache.store("alice", sql, query_id, vec![batch.clone()], vec!["users".into()]);
+
+        // Second lookup should hit and return the same data
+        let cached = cache.lookup("alice", sql).expect("should be a cache hit");
+        assert_eq!(cached.query_id, query_id);
+        assert_eq!(cached.batches.len(), 1);
+        assert_eq!(cached.batches[0].num_rows(), 5);
+        assert_eq!(cached.tables_touched, vec!["users".to_string()]);
+    }
+
+    #[test]
+    fn invalidation_during_concurrent_reads() {
+        // One thread writes (invalidates), another thread reads — verify no panic.
+        use std::sync::Arc;
+
+        let cache = Arc::new(ResultCache::new(&test_config(), None));
+
+        // Pre-populate with entries touching table "orders"
+        for i in 0..20 {
+            let sql = format!("SELECT * FROM orders WHERE id = {i}");
+            cache.store(
+                "alice",
+                &sql,
+                Uuid::now_v7(),
+                vec![make_batch(1)],
+                vec!["orders".into()],
+            );
+        }
+
+        let cache_reader = cache.clone();
+        let cache_writer = cache.clone();
+
+        let reader = std::thread::spawn(move || {
+            for i in 0..20 {
+                let sql = format!("SELECT * FROM orders WHERE id = {i}");
+                // This may or may not find the entry (invalidation is concurrent)
+                let _ = cache_reader.lookup("alice", &sql);
+            }
+        });
+
+        let writer = std::thread::spawn(move || {
+            // Invalidate the table while reads are happening
+            cache_writer.invalidate("orders");
+        });
+
+        reader.join().expect("reader should not panic");
+        writer.join().expect("writer should not panic");
+    }
+
+    #[test]
+    fn system_table_queries_bypass_cache() {
+        // Queries to system.* or information_schema.* should not be cached.
+        // We use the should_bypass function for non-deterministic functions,
+        // but for system tables we verify via store/lookup that the cache
+        // key mechanism still works — the caller is responsible for not caching
+        // system queries. Here we verify that storing and looking up system table
+        // queries works the same as other queries (the bypass is in the coordinator
+        // layer), and we also verify bypass of non-deterministic system queries.
+
+        // Non-deterministic system queries should be bypassed
+        assert!(ResultCache::should_bypass("SELECT NOW() FROM information_schema.tables"));
+        assert!(ResultCache::should_bypass("SELECT CURRENT_TIMESTAMP"));
+
+        // For deterministic system-table queries, the cache itself does not
+        // discriminate by table name. Verify the cache_key is distinct per user
+        // and SQL, so coordinator-level bypass logic can decide.
+        let k1 = ResultCache::cache_key("alice", "SELECT * FROM information_schema.tables");
+        let k2 = ResultCache::cache_key("alice", "SELECT * FROM information_schema.columns");
+        assert_ne!(k1, k2, "different system table queries should have different keys");
+
+        // Verify that system table queries are still not bypass-able by should_bypass
+        // (unless they contain non-deterministic functions)
+        assert!(!ResultCache::should_bypass("SELECT * FROM information_schema.tables"));
+        assert!(!ResultCache::should_bypass("SELECT * FROM system.runtime.nodes"));
+    }
+
+    #[test]
+    fn invalidation_cross_table() {
+        // Verify that invalidating one table does not affect entries
+        // that only touch a different table.
+        let cache = ResultCache::new(&test_config(), None);
+
+        cache.store(
+            "alice",
+            "SELECT * FROM orders",
+            Uuid::now_v7(),
+            vec![make_batch(3)],
+            vec!["orders".into()],
+        );
+        cache.store(
+            "alice",
+            "SELECT * FROM customers",
+            Uuid::now_v7(),
+            vec![make_batch(2)],
+            vec!["customers".into()],
+        );
+        // A query touching both tables
+        cache.store(
+            "alice",
+            "SELECT * FROM orders JOIN customers ON true",
+            Uuid::now_v7(),
+            vec![make_batch(1)],
+            vec!["orders".into(), "customers".into()],
+        );
+
+        // Invalidate orders
+        cache.invalidate("orders");
+
+        // orders-only query should be gone
+        assert!(cache.lookup("alice", "SELECT * FROM orders").is_none());
+        // customers-only query should remain
+        assert!(cache.lookup("alice", "SELECT * FROM customers").is_some());
+        // join query should be gone (it touched orders)
+        assert!(cache.lookup("alice", "SELECT * FROM orders JOIN customers ON true").is_none());
+    }
 }

@@ -837,4 +837,121 @@ mod tests {
             self.0.execute_local(task, schema)
         }
     }
+
+    #[tokio::test]
+    async fn test_concurrent_retry_two_partitions_fail_simultaneously() {
+        // Two partitions fail simultaneously, both should retry on different workers
+        // and ultimately fall back to local execution.
+        let registry = Arc::new(WorkerRegistry::new(vec![
+            "http://w1:50052".to_string(),
+            "http://w2:50052".to_string(),
+        ]));
+        registry.mark_healthy("http://w1:50052").await;
+        registry.mark_healthy("http://w2:50052").await;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let local_exec = Arc::new(TestLocalExecutor::new());
+
+        let exec = Arc::new(
+            DistributedScanExec::new(
+                vec![make_task("f1"), make_task("f2")],
+                vec![
+                    "http://w1:50052".to_string(),
+                    "http://w2:50052".to_string(),
+                ],
+                schema,
+            )
+            .with_worker_registry(registry.clone())
+            .with_max_retries(1)
+            .with_local_executor(Arc::new(LocalExecutorWrapper(local_exec.clone()))),
+        );
+
+        let context = Arc::new(TaskContext::default());
+
+        // Execute both partitions concurrently
+        let exec0 = exec.clone();
+        let ctx0 = context.clone();
+        let exec1 = exec.clone();
+        let ctx1 = context.clone();
+
+        let (res0, res1) = tokio::join!(
+            async move {
+                use futures::StreamExt;
+                let stream = exec0.execute(0, ctx0).unwrap();
+                stream.collect::<Vec<_>>().await
+            },
+            async move {
+                use futures::StreamExt;
+                let stream = exec1.execute(1, ctx1).unwrap();
+                stream.collect::<Vec<_>>().await
+            }
+        );
+
+        // Both partitions should have fallen back to local execution
+        // (workers are unreachable), so the local executor should be called twice
+        assert_eq!(
+            local_exec.calls(),
+            2,
+            "Local executor should be called for each failed partition"
+        );
+        assert_eq!(res0.len(), 1, "partition 0 should produce one batch");
+        assert_eq!(res1.len(), 1, "partition 1 should produce one batch");
+        assert!(res0[0].is_ok(), "partition 0 batch should be Ok");
+        assert!(res1[0].is_ok(), "partition 1 batch should be Ok");
+    }
+
+    #[tokio::test]
+    async fn test_fallback_after_all_workers_fail() {
+        // When all workers in the registry are marked unhealthy,
+        // verify the fallback executor is called.
+        let registry = Arc::new(WorkerRegistry::new(vec![
+            "http://w1:50052".to_string(),
+            "http://w2:50052".to_string(),
+            "http://w3:50052".to_string(),
+        ]));
+        registry.mark_healthy("http://w1:50052").await;
+        registry.mark_healthy("http://w2:50052").await;
+        registry.mark_healthy("http://w3:50052").await;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let local_exec = Arc::new(TestLocalExecutor::new());
+
+        let exec = DistributedScanExec::new(
+            vec![make_task("f1")],
+            vec!["http://w1:50052".to_string()],
+            schema,
+        )
+        .with_worker_registry(registry.clone())
+        .with_max_retries(2) // allow retries across workers
+        .with_local_executor(Arc::new(LocalExecutorWrapper(local_exec.clone())));
+
+        let context = Arc::new(TaskContext::default());
+        let stream = exec.execute(0, context).unwrap();
+
+        use futures::StreamExt;
+        let results: Vec<_> = stream.collect().await;
+
+        // All workers are unreachable, so after exhausting retries the fallback
+        // should have been invoked.
+        assert_eq!(
+            local_exec.calls(),
+            1,
+            "Local executor should be called when all workers fail"
+        );
+        assert_eq!(results.len(), 1);
+        let batch = results[0].as_ref().unwrap();
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(col.value(0), 42, "Should get marker value from fallback");
+
+        // Verify the workers got marked unhealthy
+        assert!(
+            registry.healthy_workers().await.is_empty()
+                || registry.healthy_workers().await.len() < 3,
+            "At least the attempted workers should be marked unhealthy"
+        );
+    }
 }
