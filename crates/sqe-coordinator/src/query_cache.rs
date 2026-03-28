@@ -10,6 +10,7 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use sqe_core::QueryCacheConfig;
+use sqe_metrics::MetricsRegistry;
 
 pub struct CachedResult {
     pub query_id: Uuid,
@@ -24,10 +25,11 @@ pub struct ResultCache {
     /// Secondary index: table_name → set of cache keys that touch this table
     table_index: DashMap<String, HashSet<String>>,
     max_entry_bytes: usize,
+    metrics: Option<Arc<MetricsRegistry>>,
 }
 
 impl ResultCache {
-    pub fn new(config: &QueryCacheConfig) -> Self {
+    pub fn new(config: &QueryCacheConfig, metrics: Option<Arc<MetricsRegistry>>) -> Self {
         let max_bytes = config.max_memory_mb * 1024 * 1024;
         let cache = Cache::builder()
             .max_capacity(max_bytes)
@@ -41,6 +43,7 @@ impl ResultCache {
             cache,
             table_index: DashMap::new(),
             max_entry_bytes: (config.max_entry_mb as usize) * 1024 * 1024,
+            metrics,
         }
     }
 
@@ -68,7 +71,11 @@ impl ResultCache {
             return None;
         }
         let key = Self::cache_key(user, sql);
-        self.cache.get(&key)
+        let result = self.cache.get(&key);
+        if let Some(ref m) = self.metrics {
+            if result.is_some() { m.cache_hits.inc(); } else { m.cache_misses.inc(); }
+        }
+        result
     }
 
     /// Store a query result in the cache.
@@ -112,6 +119,11 @@ impl ResultCache {
                 .or_default()
                 .insert(key.clone());
         }
+
+        if let Some(ref m) = self.metrics {
+            m.cache_entries.set(self.cache.entry_count() as f64);
+            m.cache_size_bytes.set(self.cache.weighted_size() as f64);
+        }
     }
 
     /// Invalidate all cached results that touch the given table.
@@ -129,6 +141,11 @@ impl ResultCache {
                 for mut entry in self.table_index.iter_mut() {
                     entry.value_mut().remove(key);
                 }
+            }
+            if let Some(ref m) = self.metrics {
+                m.cache_invalidations.inc_by(count as f64);
+                m.cache_entries.set(self.cache.entry_count() as f64);
+                m.cache_size_bytes.set(self.cache.weighted_size() as f64);
             }
         }
     }
@@ -206,7 +223,7 @@ mod tests {
 
     #[test]
     fn lookup_miss_then_hit() {
-        let cache = ResultCache::new(&test_config());
+        let cache = ResultCache::new(&test_config(), None);
         assert!(cache.lookup("alice", "SELECT 1").is_none());
         cache.store("alice", "SELECT 1", Uuid::now_v7(), vec![make_batch(5)], vec!["t1".into()]);
         assert!(cache.lookup("alice", "SELECT 1").is_some());
@@ -214,7 +231,7 @@ mod tests {
 
     #[test]
     fn user_isolation() {
-        let cache = ResultCache::new(&test_config());
+        let cache = ResultCache::new(&test_config(), None);
         cache.store("alice", "SELECT 1", Uuid::now_v7(), vec![make_batch(1)], vec![]);
         assert!(cache.lookup("alice", "SELECT 1").is_some());
         assert!(cache.lookup("bob", "SELECT 1").is_none());
@@ -222,7 +239,7 @@ mod tests {
 
     #[test]
     fn invalidation_evicts_matching_entries() {
-        let cache = ResultCache::new(&test_config());
+        let cache = ResultCache::new(&test_config(), None);
         cache.store("alice", "SELECT * FROM t1", Uuid::now_v7(), vec![make_batch(1)], vec!["t1".into()]);
         cache.store("alice", "SELECT * FROM t2", Uuid::now_v7(), vec![make_batch(1)], vec!["t2".into()]);
         // Verify both entries are retrievable before invalidation
@@ -251,7 +268,7 @@ mod tests {
             max_entry_mb: 0, // 0 MB = nothing gets cached
             ttl_secs: 60,
         };
-        let cache = ResultCache::new(&config);
+        let cache = ResultCache::new(&config, None);
         cache.store("alice", "SELECT 1", Uuid::now_v7(), vec![make_batch(100)], vec![]);
         assert!(cache.lookup("alice", "SELECT 1").is_none());
     }

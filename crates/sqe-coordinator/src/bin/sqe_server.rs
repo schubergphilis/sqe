@@ -324,7 +324,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history),
     );
     let query_cache = if config.query_cache.enabled {
-        Some(Arc::new(sqe_coordinator::query_cache::ResultCache::new(&config.query_cache)))
+        Some(Arc::new(sqe_coordinator::query_cache::ResultCache::new(&config.query_cache, Some(metrics.clone()))))
     } else {
         None
     };
