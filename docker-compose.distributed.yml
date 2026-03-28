@@ -1,53 +1,14 @@
-# docker-compose.distributed.yml — Full distributed SQE stack
+# docker-compose.distributed.yml — Distributed SQE stack
 #
-# 1 coordinator + 2 workers + Polaris + RustFS (S3)
+# Extends docker-compose.test.yml with coordinator + 2 workers.
+# Uses the same Polaris + RustFS as the integration test stack.
 #
 # Usage:
-#   docker compose -f docker-compose.distributed.yml up --build -d
-#   ./scripts/bootstrap-distributed.sh
-#   # Then query via Flight SQL (port 50051) or Trino HTTP (port 8080)
-#
-# System tables to verify:
-#   SELECT * FROM system.runtime.queries ORDER BY created DESC;
-#   SELECT * FROM system.runtime.nodes;
-#   SELECT * FROM system.runtime.tasks;
-#   SELECT * FROM system.metadata.catalogs;
+#   docker compose -f docker-compose.test.yml -f docker-compose.distributed.yml up --build -d
+#   ./scripts/bootstrap-test.sh
+#   ./scripts/distributed-test.sh
 
 services:
-  # ── Infrastructure ──────────────────────────────────────────
-  polaris:
-    image: apache/polaris:latest
-    environment:
-      POLARIS_PERSISTENCE_TYPE: in-memory
-      POLARIS_BOOTSTRAP_CREDENTIALS: "POLARIS,root,s3cr3t"
-      POLARIS_PRODUCTION_READINESS_CHECKS_ENABLED: "false"
-      QUARKUS_HTTP_PORT: 8181
-      QUARKUS_LOG_LEVEL: INFO
-      QUARKUS_LOG_CATEGORY__ORG_APACHE_POLARIS__LEVEL: WARN
-      quarkus.otel.sdk.disabled: "true"
-      polaris.realm-context.realms: POLARIS
-      POLARIS_FEATURES_DEFAULTS_DROP_WITH_PURGE_ENABLED: "true"
-      AWS_REGION: us-east-1
-      AWS_ACCESS_KEY_ID: s3admin
-      AWS_SECRET_ACCESS_KEY: s3admin
-    ports:
-      - "18181:8181"
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8182/q/health"]
-      interval: 5s
-      timeout: 3s
-      retries: 15
-      start_period: 15s
-
-  rustfs:
-    image: rustfs/rustfs:latest
-    environment:
-      RUSTFS_ACCESS_KEY: s3admin
-      RUSTFS_SECRET_KEY: s3admin
-      RUSTFS_ADDRESS: ":9000"
-    ports:
-      - "19000:9000"
-
   # ── SQE Coordinator ────────────────────────────────────────
   coordinator:
     build: .
@@ -55,7 +16,7 @@ services:
     volumes:
       - ./tests/distributed/coordinator.toml:/config/coordinator.toml:ro
     ports:
-      - "60051:50051"   # Flight SQL (offset to avoid conflicts)
+      - "60051:50051"   # Flight SQL
       - "28080:8080"    # Trino HTTP
       - "29090:9090"    # Prometheus metrics
     environment:
@@ -73,8 +34,8 @@ services:
     volumes:
       - ./tests/distributed/worker.toml:/config/worker.toml:ro
     ports:
-      - "60061:50052"   # Worker Flight
-      - "29091:9091"    # Worker metrics
+      - "60061:50052"
+      - "29091:9091"
     environment:
       RUST_LOG: sqe=info,warn
     depends_on:
@@ -87,8 +48,8 @@ services:
     volumes:
       - ./tests/distributed/worker.toml:/config/worker.toml:ro
     ports:
-      - "60062:50052"   # Worker Flight
-      - "29092:9091"    # Worker metrics
+      - "60062:50052"
+      - "29092:9091"
     environment:
       RUST_LOG: sqe=info,warn
     depends_on:
