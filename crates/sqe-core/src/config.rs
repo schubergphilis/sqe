@@ -19,6 +19,10 @@ pub struct SqeConfig {
     pub session: SessionConfig,
     #[serde(default)]
     pub query: QueryConfig,
+    #[serde(default)]
+    pub query_cache: QueryCacheConfig,
+    #[serde(default)]
+    pub query_history: QueryHistoryConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -40,6 +44,54 @@ impl Default for QueryConfig {
         }
     }
 }
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct QueryCacheConfig {
+    #[serde(default = "default_cache_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_cache_max_memory_mb")]
+    pub max_memory_mb: u64,
+    #[serde(default = "default_cache_max_entry_mb")]
+    pub max_entry_mb: u64,
+    #[serde(default = "default_cache_ttl_secs")]
+    pub ttl_secs: u64,
+}
+
+impl Default for QueryCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_cache_enabled(),
+            max_memory_mb: default_cache_max_memory_mb(),
+            max_entry_mb: default_cache_max_entry_mb(),
+            ttl_secs: default_cache_ttl_secs(),
+        }
+    }
+}
+
+fn default_cache_enabled() -> bool { true }
+fn default_cache_max_memory_mb() -> u64 { 256 }
+fn default_cache_max_entry_mb() -> u64 { 5 }
+fn default_cache_ttl_secs() -> u64 { 300 }
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct QueryHistoryConfig {
+    #[serde(default = "default_history_max_entries")]
+    pub max_entries: u64,
+    #[serde(default = "default_history_ttl_secs")]
+    pub ttl_secs: u64,
+}
+
+impl Default for QueryHistoryConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: default_history_max_entries(),
+            ttl_secs: default_history_ttl_secs(),
+        }
+    }
+}
+
+fn default_history_max_entries() -> u64 { 10000 }
+fn default_history_ttl_secs() -> u64 { 1800 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct CoordinatorConfig {
@@ -637,6 +689,8 @@ mod tests {
             rate_limit: RateLimitConfig::default(),
             session: SessionConfig::default(),
             query: QueryConfig::default(),
+            query_cache: QueryCacheConfig::default(),
+            query_history: QueryHistoryConfig::default(),
         }
     }
 
@@ -780,5 +834,21 @@ mod tests {
     fn test_storage_config_s3_allow_http_defaults_false() {
         let config = StorageConfig::default();
         assert!(!config.s3_allow_http, "s3_allow_http should default to false (secure by default)");
+    }
+
+    #[test]
+    fn test_query_cache_defaults() {
+        let config = QueryCacheConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.max_memory_mb, 256);
+        assert_eq!(config.max_entry_mb, 5);
+        assert_eq!(config.ttl_secs, 300);
+    }
+
+    #[test]
+    fn test_query_history_defaults() {
+        let config = QueryHistoryConfig::default();
+        assert_eq!(config.max_entries, 10000);
+        assert_eq!(config.ttl_secs, 1800);
     }
 }
