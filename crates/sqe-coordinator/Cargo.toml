@@ -53,6 +53,7 @@ sqe-trino-compat = { path = "../sqe-trino-compat" }
 chrono = { workspace = true }
 axum = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+sha2 = "0.10"
 sqe-worker = { path = "../sqe-worker" }
 opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }
