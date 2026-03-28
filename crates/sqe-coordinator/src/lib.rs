@@ -8,6 +8,7 @@ pub mod flight_sql;
 pub mod mode;
 pub mod query_handler;
 pub mod query_registry;  // keep temporarily until Task 4 migrates callers
+pub mod query_cache;
 pub mod query_tracker;
 pub mod rate_limiter;
 pub mod scheduler;
