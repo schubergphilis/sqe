@@ -4,7 +4,7 @@ pub mod otel;
 pub mod propagation;
 
 use prometheus::{
-    Counter, CounterVec, Histogram, HistogramOpts, HistogramVec, IntGauge, Opts, Registry,
+    Counter, CounterVec, Gauge, Histogram, HistogramOpts, HistogramVec, IntGauge, Opts, Registry,
 };
 
 /// Trait for types that expose a Prometheus [`Registry`] for metrics serving.
@@ -25,6 +25,11 @@ pub struct MetricsRegistry {
     pub rows_returned: Counter,
     pub active_sessions: IntGauge,
     pub healthy_workers: IntGauge,
+    pub cache_hits: Counter,
+    pub cache_misses: Counter,
+    pub cache_invalidations: Counter,
+    pub cache_size_bytes: Gauge,
+    pub cache_entries: Gauge,
 }
 
 impl MetricsRegistry {
@@ -67,6 +72,18 @@ impl MetricsRegistry {
         .unwrap();
         registry.register(Box::new(healthy_workers.clone())).unwrap();
 
+        let cache_hits = Counter::new("sqe_cache_hits_total", "Total cache hits").unwrap();
+        let cache_misses = Counter::new("sqe_cache_misses_total", "Total cache misses").unwrap();
+        let cache_invalidations = Counter::new("sqe_cache_invalidations_total", "Total cache invalidations").unwrap();
+        let cache_size_bytes = Gauge::new("sqe_cache_size_bytes", "Current cache memory usage in bytes").unwrap();
+        let cache_entries = Gauge::new("sqe_cache_entries", "Current number of cached entries").unwrap();
+
+        registry.register(Box::new(cache_hits.clone())).unwrap();
+        registry.register(Box::new(cache_misses.clone())).unwrap();
+        registry.register(Box::new(cache_invalidations.clone())).unwrap();
+        registry.register(Box::new(cache_size_bytes.clone())).unwrap();
+        registry.register(Box::new(cache_entries.clone())).unwrap();
+
         Self {
             registry,
             query_count,
@@ -74,6 +91,11 @@ impl MetricsRegistry {
             rows_returned,
             active_sessions,
             healthy_workers,
+            cache_hits,
+            cache_misses,
+            cache_invalidations,
+            cache_size_bytes,
+            cache_entries,
         }
     }
 }
@@ -193,7 +215,12 @@ mod tests {
         metrics.rows_returned.inc_by(0.0);
         metrics.active_sessions.set(0);
         metrics.healthy_workers.set(0);
-        assert!(metrics.registry.gather().len() >= 5);
+        metrics.cache_hits.inc_by(0.0);
+        metrics.cache_misses.inc_by(0.0);
+        metrics.cache_invalidations.inc_by(0.0);
+        metrics.cache_size_bytes.set(0.0);
+        metrics.cache_entries.set(0.0);
+        assert!(metrics.registry.gather().len() >= 10);
     }
 
     #[test]
