@@ -1,6 +1,6 @@
 # SQE — Next Steps
 
-> Status as of 2026-03-27. Step 0 dependency alignment complete. Step 2 core engine effectively complete (99/103 — 4 blocked on iceberg-rust MoR). Step 3 OSS security hardening complete (51/51). Benchmark suite (sqe-bench) complete. **Hardening pass complete:** all Arrow types mapped to Trino types, Trino value serialization extended (Utf8View, Decimal, Time, Binary), benchmark comparator extended (Timestamp, Utf8View, human-readable dates, decimal trailing-zero normalization), Flight SQL DoPut implemented (Arrow data ingestion + statement updates), GetTableTypes + GetXdbcTypeInfo added for JDBC/BI tool compatibility, all clippy errors fixed, token fingerprint hardened (hash instead of raw suffix). All feature branches merged into `main`.
+> Status as of 2026-03-28. Step 0 dependency alignment complete. Step 2 core engine effectively complete (99/103 — 4 blocked on iceberg-rust MoR). Step 3 OSS security hardening complete (51/51). Benchmark suite (sqe-bench) complete. **Hardening pass complete:** all Arrow types mapped to Trino types, Trino value serialization extended (Utf8View, Decimal, Time, Binary), benchmark comparator extended (Timestamp, Utf8View, human-readable dates, decimal trailing-zero normalization), Flight SQL DoPut implemented (Arrow data ingestion + statement updates), GetTableTypes + GetXdbcTypeInfo added for JDBC/BI tool compatibility, all clippy errors fixed, token fingerprint hardened (hash instead of raw suffix). **Query history and cache complete:** `system.runtime.queries` virtual table (Flight SQL + Trino compat), in-memory query history store (moka TTL cache, max_entries cap), query result cache (`[query_cache]` config section, moka-backed, per-entry size cap), config sections added to `sqe.toml.example`. All feature branches merged into `main`.
 
 > **Monitoring:** OPA SPI refactor in Polaris (PR #3999, still draft) will affect Phase 5 OPA integration when it lands — do not implement OPA against Polaris until this stabilises. Remote S3 signing (Iceberg 1.12, not yet released) will affect the pluggable-catalogs design.
 
@@ -183,6 +183,7 @@ Step 2: core engine gaps    ✅ DONE (99/103 — 4 blocked on iceberg-rust MoR Q
 Step 3: security hardening  ✅ DONE (51/51 — TLS, rate limiting, timeouts, cancellation, audit, error sanitisation)
 Step 3b: benchmark suite    ✅ DONE (sqe-bench: generate/load/test, 6 benchmarks, read_parquet() TVF, CI scripts)
 Step 3c: hardening pass     ✅ DONE (type formatting, Flight SQL DoPut + metadata, clippy, decimal DIFF, token fingerprint)
+Step 3d: query history+cache ✅ DONE (system.runtime.queries, in-memory history store, query result cache, config sections)
 Step 4: pluggable auth      (depends on Step 3 renames being done first) ← NEXT
 Step 5: pluggable catalogs  (independent of auth; can run in parallel with Step 4) ← NEXT
 Step 6: semantic layer      (new crates; fully additive; no existing code broken)

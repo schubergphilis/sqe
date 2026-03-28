@@ -157,6 +157,7 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 - [x] Benchmark suite (sqe-bench: TPC-H, TPC-DS, SSB, TPC-C, TPC-E, TPC-BB; `read_parquet()` TVF)
 - [x] Flight SQL DoPut (Arrow data ingestion, statement updates, GetTableTypes, GetXdbcTypeInfo)
 - [x] Complete data type formatting (all Arrow types → Trino, benchmark comparator, value serialization)
+- [x] system.runtime.* virtual tables (queries, nodes, tasks — query history and cluster topology)
 - [ ] MERGE INTO, DELETE (blocked on iceberg-rust Merge-on-Read, ETA Q3 2026)
 - [ ] OPA/Cedar policy engine (row filters, column masks, GRANT/REVOKE SQL)
 - [x] OSS security hardening (TLS, rate limiting, query timeouts, session lifecycle, error sanitisation, vendor-neutral naming)

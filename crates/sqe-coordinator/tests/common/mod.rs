@@ -50,7 +50,17 @@ pub async fn setup_handler() -> (sqe_core::Session, sqe_coordinator::QueryHandle
         .await
         .expect("Auth failed for root");
     let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(sqe_policy::PassthroughEnforcer);
-    let handler = sqe_coordinator::QueryHandler::new(policy, config, None, None, None, None);
+    let query_tracker = Arc::new(
+        sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history),
+    );
+    let query_cache = if config.query_cache.enabled {
+        Some(Arc::new(sqe_coordinator::query_cache::ResultCache::new(&config.query_cache, None)))
+    } else {
+        None
+    };
+    let handler = sqe_coordinator::QueryHandler::new(
+        policy, config, None, None, None, None, query_tracker, query_cache,
+    );
     (session, handler)
 }
 

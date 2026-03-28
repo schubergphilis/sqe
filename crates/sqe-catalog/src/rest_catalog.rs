@@ -159,6 +159,25 @@ impl SessionCatalog {
             .map_err(|e| sqe_core::SqeError::Catalog(format!("Failed to list namespaces: {e}")))
     }
 
+    /// Get a namespace by its identifier.
+    ///
+    /// Returns the `Namespace` object which includes namespace properties.
+    pub async fn get_namespace(
+        &self,
+        namespace: &NamespaceIdent,
+    ) -> sqe_core::Result<iceberg::Namespace> {
+        debug!(
+            token_fingerprint = %self.token_fingerprint,
+            namespace = ?namespace,
+            "Getting namespace"
+        );
+        let catalog = self.inner.read().await;
+        catalog
+            .get_namespace(namespace)
+            .await
+            .map_err(|e| sqe_core::SqeError::Catalog(format!("Failed to get namespace: {e}")))
+    }
+
     /// List all tables in the given namespace.
     pub async fn list_tables(
         &self,

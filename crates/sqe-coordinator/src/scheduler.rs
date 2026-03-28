@@ -428,6 +428,138 @@ mod tests {
     }
 
     #[test]
+    fn test_concurrent_scheduling_no_panic() {
+        // Multiple concurrent calls to assign() should not panic or produce
+        // overlapping assignments (each call is independent — no shared mutable state).
+        let tasks: Vec<ScanTask> = (0..20)
+            .map(|i| make_task(&format!("f{i}"), 3))
+            .collect();
+        let workers = vec![
+            make_worker("http://w1:50052", true, 0),
+            make_worker("http://w2:50052", true, 0),
+            make_worker("http://w3:50052", true, 0),
+        ];
+
+        // Run many concurrent assignments (simulated via threads since assign is sync)
+        let results: Vec<_> = (0..50)
+            .map(|_| {
+                let s = WeightedScheduler::new();
+                let t = tasks.clone();
+                let w = workers.clone();
+                std::thread::spawn(move || s.assign(&t, &w))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect();
+
+        for result in &results {
+            let assignments = result.as_ref().unwrap();
+            assert_eq!(assignments.len(), 20);
+            // Verify no overlapping: each task_index appears exactly once
+            let mut seen = std::collections::HashSet::new();
+            for a in assignments {
+                assert!(seen.insert(a.task_index), "duplicate task_index {}", a.task_index);
+            }
+        }
+    }
+
+    #[test]
+    fn test_load_tracking_during_assignment() {
+        // After assigning tasks, the internal load balancing should have produced
+        // a fair distribution. We verify this by examining the final assignment
+        // spread across workers.
+        let scheduler = WeightedScheduler::new();
+        // 6 tasks with varying costs: 10, 8, 6, 4, 2, 1
+        let tasks = vec![
+            make_task("heavy", 10),
+            make_task("mid_heavy", 8),
+            make_task("mid", 6),
+            make_task("mid_light", 4),
+            make_task("light", 2),
+            make_task("tiny", 1),
+        ];
+        let workers = vec![
+            make_worker("http://w1:50052", true, 0),
+            make_worker("http://w2:50052", true, 0),
+            make_worker("http://w3:50052", true, 0),
+        ];
+
+        let assignments = scheduler.assign(&tasks, &workers).unwrap();
+        assert_eq!(assignments.len(), 6);
+
+        // Compute the total cost assigned to each worker
+        let mut worker_loads: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+        for a in &assignments {
+            let cost = tasks[a.task_index].data_file_paths.len() as u64;
+            let cost = cost.max(1);
+            *worker_loads.entry(&a.worker_url).or_insert(0) += cost;
+        }
+
+        // Total cost = 10 + 8 + 6 + 4 + 2 + 1 = 31
+        // Ideal per worker = ~10.3
+        // With largest-first bin packing, we expect reasonably balanced loads
+        let loads: Vec<u64> = worker_loads.values().copied().collect();
+        let max_load = *loads.iter().max().unwrap();
+        let min_load = *loads.iter().min().unwrap();
+        // The difference between max and min should be small relative to the total
+        assert!(
+            max_load - min_load <= 6,
+            "load imbalance too high: max={max_load}, min={min_load}, loads={worker_loads:?}"
+        );
+    }
+
+    #[test]
+    fn test_rebalancing_after_failure() {
+        // After marking a worker unhealthy, reassigning should skip it.
+        let scheduler = WeightedScheduler::new();
+        let tasks = vec![
+            make_task("f1", 3),
+            make_task("f2", 3),
+            make_task("f3", 3),
+            make_task("f4", 3),
+        ];
+
+        // First assignment: 3 healthy workers
+        let workers_before = vec![
+            make_worker("http://w1:50052", true, 0),
+            make_worker("http://w2:50052", true, 0),
+            make_worker("http://w3:50052", true, 0),
+        ];
+        let assignments_before = scheduler.assign(&tasks, &workers_before).unwrap();
+        assert_eq!(assignments_before.len(), 4);
+
+        // Now w2 has failed — simulate by passing it as unhealthy
+        let workers_after = vec![
+            make_worker("http://w1:50052", true, 0),
+            make_worker("http://w2:50052", false, 0), // unhealthy
+            make_worker("http://w3:50052", true, 0),
+        ];
+        let assignments_after = scheduler.assign(&tasks, &workers_after).unwrap();
+        assert_eq!(assignments_after.len(), 4);
+
+        // No task should be assigned to the unhealthy worker
+        for a in &assignments_after {
+            assert_ne!(
+                a.worker_url, "http://w2:50052",
+                "unhealthy worker should not receive tasks after failure"
+            );
+        }
+
+        // All tasks should go to w1 and w3 — 2 each
+        let w1_count = assignments_after
+            .iter()
+            .filter(|a| a.worker_url == "http://w1:50052")
+            .count();
+        let w3_count = assignments_after
+            .iter()
+            .filter(|a| a.worker_url == "http://w3:50052")
+            .count();
+        assert_eq!(w1_count, 2);
+        assert_eq!(w3_count, 2);
+    }
+
+    #[test]
     fn test_all_unhealthy_except_one() {
         let scheduler = WeightedScheduler::new();
         let tasks = vec![
