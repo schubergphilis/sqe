@@ -259,4 +259,122 @@ mod tests {
         }
         assert_eq!(tracker.records().len(), 5);
     }
+
+    #[tokio::test]
+    async fn concurrent_query_lifecycle() {
+        // 20 concurrent queries going through full lifecycle
+        // (start -> running -> complete)
+        let tracker = Arc::new(QueryTracker::new(&test_config()));
+        let mut handles = tokio::task::JoinSet::new();
+
+        for i in 0..20 {
+            let tracker = tracker.clone();
+            handles.spawn(async move {
+                let id = Uuid::now_v7();
+                let user = format!("user{i}");
+                let sql = format!("SELECT {i}");
+                tracker.start(id, &user, None, &sql, "session", None, vec![]);
+                tracker.running(&id, (i * 5) as u64);
+                // Simulate some work
+                tokio::task::yield_now().await;
+                tracker.complete(&id, i as usize, (i * 10) as u64, vec![format!("table{i}")]);
+                id
+            });
+        }
+
+        let mut query_ids = Vec::new();
+        while let Some(result) = handles.join_next().await {
+            query_ids.push(result.expect("task should not panic"));
+        }
+
+        // All queries should be finished and no longer active
+        assert_eq!(tracker.active_count(), 0, "all queries should be complete");
+
+        // All 20 records should exist in history
+        let records = tracker.records();
+        assert_eq!(records.len(), 20);
+
+        // Every record should be in Finished state
+        for record in &records {
+            assert_eq!(
+                record.state,
+                QueryState::Finished,
+                "query {} should be Finished",
+                record.query_id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_mixed_lifecycle() {
+        // 20 queries with a mix of finish, fail, cancel to test
+        // concurrent state transitions.
+        let tracker = Arc::new(QueryTracker::new(&test_config()));
+        let mut handles = tokio::task::JoinSet::new();
+
+        for i in 0..20 {
+            let tracker = tracker.clone();
+            handles.spawn(async move {
+                let id = Uuid::now_v7();
+                tracker.start(id, "user", None, "SELECT 1", "s", None, vec![]);
+                tracker.running(&id, 5);
+                tokio::task::yield_now().await;
+
+                match i % 3 {
+                    0 => tracker.complete(&id, 10, 100, vec![]),
+                    1 => tracker.failed(&id, "TestError", Some("E001")),
+                    _ => { tracker.cancel(&id); }
+                }
+                (id, i % 3)
+            });
+        }
+
+        let mut outcomes = Vec::new();
+        while let Some(result) = handles.join_next().await {
+            outcomes.push(result.expect("task should not panic"));
+        }
+
+        assert_eq!(tracker.active_count(), 0, "all queries should be inactive");
+        let records = tracker.records();
+        assert_eq!(records.len(), 20);
+
+        // Verify states match the modulo pattern
+        for (id, remainder) in &outcomes {
+            let rec = tracker.history.get(id).unwrap();
+            match remainder {
+                0 => assert_eq!(rec.state, QueryState::Finished),
+                1 => assert_eq!(rec.state, QueryState::Failed),
+                _ => assert_eq!(rec.state, QueryState::Canceled),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn history_cache_eviction() {
+        // Create more queries than max_entries; verify old ones are evicted.
+        let config = QueryHistoryConfig {
+            max_entries: 5,
+            ttl_secs: 60,
+        };
+        let tracker = QueryTracker::new(&config);
+
+        let mut ids = Vec::new();
+        for i in 0..10 {
+            let id = Uuid::now_v7();
+            tracker.start(id, &format!("user{i}"), None, "SELECT 1", "s", None, vec![]);
+            tracker.complete(&id, 0, 0, vec![]);
+            ids.push(id);
+        }
+
+        // moka uses async eviction — run pending tasks to trigger it
+        tracker.history.run_pending_tasks();
+
+        let records = tracker.records();
+        // With max_capacity=5, the cache should have evicted some entries
+        assert!(
+            records.len() <= 5,
+            "cache should evict old entries: found {} records, expected <= 5",
+            records.len()
+        );
+    }
 }

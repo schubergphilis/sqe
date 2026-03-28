@@ -326,4 +326,112 @@ mod tests {
             .await;
         assert_eq!(registry.healthy_workers().await.len(), 1);
     }
+
+    #[tokio::test]
+    async fn test_concurrent_health_updates() {
+        // 10 tokio tasks marking the same worker healthy/unhealthy simultaneously.
+        // The final state is non-deterministic, but no panics should occur.
+        let registry = Arc::new(WorkerRegistry::new(vec![
+            "http://worker1:50052".to_string(),
+        ]));
+        registry.mark_healthy("http://worker1:50052").await;
+
+        let mut handles = tokio::task::JoinSet::new();
+        for i in 0..10 {
+            let reg = registry.clone();
+            handles.spawn(async move {
+                if i % 2 == 0 {
+                    reg.mark_healthy("http://worker1:50052").await;
+                } else {
+                    reg.mark_unhealthy("http://worker1:50052").await;
+                }
+            });
+        }
+
+        // Wait for all tasks to complete — no panics expected
+        while let Some(result) = handles.join_next().await {
+            result.expect("task should not panic");
+        }
+
+        // The worker should exist regardless of the final health state
+        assert_eq!(registry.total_workers().await, 1);
+        // Health state is non-deterministic, but the count must be 0 or 1
+        let healthy_count = registry.healthy_workers().await.len();
+        assert!(
+            healthy_count <= 1,
+            "healthy count should be 0 or 1, got {healthy_count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_recovery_after_mark_failed() {
+        // After mark_failed reaches the threshold, a heartbeat immediately
+        // recovers the worker.
+        let registry = WorkerRegistry::new(vec!["http://worker1:50052".to_string()]);
+        registry.mark_healthy("http://worker1:50052").await;
+
+        // Fail to the threshold (3 consecutive failures)
+        for _ in 0..MAX_CONSECUTIVE_FAILURES {
+            registry.mark_failed("http://worker1:50052").await;
+        }
+        assert!(
+            registry.healthy_workers().await.is_empty(),
+            "worker should be unhealthy after reaching failure threshold"
+        );
+
+        // A single heartbeat should immediately recover it
+        registry
+            .register_heartbeat("http://worker1:50052")
+            .await;
+        let healthy = registry.healthy_workers().await;
+        assert_eq!(healthy.len(), 1);
+        assert_eq!(healthy[0], "http://worker1:50052");
+    }
+
+    #[tokio::test]
+    async fn test_many_workers() {
+        // Registry with 50 workers; mark a subset healthy and verify
+        // healthy_workers() returns exactly that subset.
+        let urls: Vec<String> = (0..50)
+            .map(|i| format!("http://worker{i}:50052"))
+            .collect();
+        let registry = WorkerRegistry::new(urls.clone());
+
+        assert_eq!(registry.total_workers().await, 50);
+        assert!(
+            registry.healthy_workers().await.is_empty(),
+            "all workers should start unhealthy"
+        );
+
+        // Mark even-indexed workers healthy
+        let expected_healthy: Vec<String> = (0..50)
+            .filter(|i| i % 2 == 0)
+            .map(|i| format!("http://worker{i}:50052"))
+            .collect();
+        for url in &expected_healthy {
+            registry.mark_healthy(url).await;
+        }
+
+        let mut healthy = registry.healthy_workers().await;
+        healthy.sort();
+        let mut expected_sorted = expected_healthy.clone();
+        expected_sorted.sort();
+
+        assert_eq!(healthy.len(), 25);
+        assert_eq!(healthy, expected_sorted);
+
+        // Mark some of them failed past the threshold
+        for url in expected_healthy.iter().take(5) {
+            for _ in 0..MAX_CONSECUTIVE_FAILURES {
+                registry.mark_failed(url).await;
+            }
+        }
+
+        let healthy_after = registry.healthy_workers().await;
+        assert_eq!(
+            healthy_after.len(),
+            20,
+            "5 workers should have been removed from healthy pool"
+        );
+    }
 }
