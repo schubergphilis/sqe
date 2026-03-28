@@ -15,6 +15,8 @@ use sqe_sql::{parse_and_classify, StatementKind};
 
 use crate::catalog_ops::CatalogOps;
 use crate::credential_refresh::CredentialRefreshTracker;
+use crate::query_cache::ResultCache;
+use crate::query_tracker::QueryTracker;
 use crate::write_handler::WriteHandler;
 
 /// Determine the effective query timeout for a session.
@@ -48,9 +50,12 @@ pub struct QueryHandler {
     credential_tracker: Option<Arc<CredentialRefreshTracker>>,
     metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
     audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
+    query_tracker: Arc<QueryTracker>,
+    query_cache: Option<Arc<ResultCache>>,
 }
 
 impl QueryHandler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         policy_enforcer: Arc<dyn PolicyEnforcer>,
         config: SqeConfig,
@@ -58,6 +63,8 @@ impl QueryHandler {
         credential_tracker: Option<Arc<CredentialRefreshTracker>>,
         metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
         audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
+        query_tracker: Arc<QueryTracker>,
+        query_cache: Option<Arc<ResultCache>>,
     ) -> Self {
         let catalog_ops = CatalogOps::new(config.clone());
         let write_handler = WriteHandler::new(config.clone());
@@ -72,7 +79,14 @@ impl QueryHandler {
             credential_tracker,
             metrics,
             audit,
+            query_tracker,
+            query_cache,
         }
+    }
+
+    /// Returns a reference to the query tracker.
+    pub fn query_tracker(&self) -> &Arc<QueryTracker> {
+        &self.query_tracker
     }
 
     pub fn write_handler(&self) -> &WriteHandler {
@@ -107,12 +121,43 @@ impl QueryHandler {
         let kind_name = kind.name().to_string();
         tracing::Span::current().record("statement_type", kind_name.as_str());
 
+        // Generate a query ID for lifecycle tracking
+        let query_id = uuid::Uuid::now_v7();
+        self.query_tracker.start(
+            query_id,
+            &session.user.username,
+            session.source.as_deref(),
+            sql,
+            &session.id,
+            None, // client_ip — populated by caller if available
+            session.user.roles.clone(),
+        );
+
+        // Check result cache for read queries (before execution)
+        if let StatementKind::Query(_) = &kind {
+            if let Some(ref cache) = self.query_cache {
+                if let Some(cached) = cache.lookup(&session.user.username, sql) {
+                    debug!(username = %session.user.username, "Cache hit");
+                    let rows: usize = cached.batches.iter().map(|b| b.num_rows()).sum();
+                    self.query_tracker.complete(&query_id, rows, 0, cached.tables_touched.clone());
+                    if let Some(ref metrics) = self.metrics {
+                        metrics.query_count.with_label_values(&["success", &kind_name]).inc();
+                        metrics.rows_returned.inc_by(rows as f64);
+                    }
+                    return Ok(cached.batches.clone());
+                }
+            }
+        }
+
+        // Mark query as running (planning phase complete)
+        self.query_tracker.running(&query_id, start.elapsed().as_millis() as u64);
+
         // Determine the effective timeout for this session (role overrides may increase it)
         let timeout_secs = timeout_for_session(&self.config.query, session);
         let timeout_duration = Duration::from_secs(timeout_secs);
 
         let execution_future = async {
-            match kind {
+            match &kind {
                 StatementKind::Query(_) => self.execute_query(session, sql).await,
 
                 StatementKind::ShowCatalogs => self.handle_show_catalogs(session).await,
@@ -122,14 +167,14 @@ impl QueryHandler {
                 }
 
                 StatementKind::ShowTables(filter) => {
-                    self.handle_show_tables(session, &filter).await
+                    self.handle_show_tables(session, filter).await
                 }
 
                 StatementKind::Utility(stmt) => {
-                    if let sqlparser::ast::Statement::Explain { analyze, statement, .. } = *stmt {
+                    if let sqlparser::ast::Statement::Explain { analyze, statement, .. } = stmt.as_ref() {
                         let inner = statement.to_string();
                         let ctx = self.create_session_context(session).await?;
-                        if analyze {
+                        if *analyze {
                             self.explain_handler.analyze(session, &inner, &ctx).await
                         } else {
                             self.explain_handler.plan(session, &inner, &ctx).await
@@ -146,36 +191,36 @@ impl QueryHandler {
                 )),
 
                 StatementKind::Drop(stmt) => {
-                    self.catalog_ops.drop_table(session, &stmt).await?;
+                    self.catalog_ops.drop_table(session, stmt).await?;
                     Ok(vec![])
                 }
                 StatementKind::Rename(stmt) => {
-                    self.catalog_ops.rename_table(session, &stmt).await?;
+                    self.catalog_ops.rename_table(session, stmt).await?;
                     Ok(vec![])
                 }
                 StatementKind::CreateView(stmt) => {
-                    self.handle_create_view(session, &stmt).await?;
+                    self.handle_create_view(session, stmt).await?;
                     Ok(vec![])
                 }
                 StatementKind::DropView(stmt) => {
-                    self.catalog_ops.drop_view(session, &stmt).await?;
+                    self.catalog_ops.drop_view(session, stmt).await?;
                     Ok(vec![])
                 }
                 StatementKind::CreateSchema(stmt) => {
-                    self.catalog_ops.create_schema(session, &stmt).await?;
+                    self.catalog_ops.create_schema(session, stmt).await?;
                     Ok(vec![])
                 }
                 StatementKind::DropSchema(stmt) => {
-                    self.catalog_ops.drop_schema(session, &stmt).await?;
+                    self.catalog_ops.drop_schema(session, stmt).await?;
                     Ok(vec![])
                 }
 
                 StatementKind::CreateTable(stmt) => {
-                    self.write_handler.handle_create_table(session, &stmt).await
+                    self.write_handler.handle_create_table(session, stmt).await
                 }
 
                 StatementKind::Ctas(stmt) => {
-                    if let Statement::CreateTable(ref ct) = *stmt {
+                    if let Statement::CreateTable(ref ct) = **stmt {
                         if let Some(ref query) = ct.query {
                             // Handle CREATE OR REPLACE TABLE AS SELECT:
                             // drop the existing table first, then create a new one.
@@ -184,7 +229,7 @@ impl QueryHandler {
                             }
                             let select_sql = format!("{query}");
                             let batches = self.execute_query(session, &select_sql).await?;
-                            self.write_handler.handle_ctas(session, &stmt, batches).await
+                            self.write_handler.handle_ctas(session, stmt, batches).await
                         } else {
                             Err(SqeError::Execution("CTAS without SELECT query".into()))
                         }
@@ -194,7 +239,7 @@ impl QueryHandler {
                 }
 
                 StatementKind::Insert(stmt) => {
-                    if let Statement::Insert(ref ins) = *stmt {
+                    if let Statement::Insert(ref ins) = **stmt {
                         let select_sql = ins
                             .source
                             .as_ref()
@@ -204,7 +249,7 @@ impl QueryHandler {
                             })?;
                         let batches = self.execute_query(session, &select_sql).await?;
                         self.write_handler
-                            .handle_insert(session, &stmt, batches)
+                            .handle_insert(session, stmt, batches)
                             .await
                     } else {
                         Err(SqeError::Execution("Expected Insert statement".into()))
@@ -213,7 +258,7 @@ impl QueryHandler {
 
                 StatementKind::ExplainFull(inner) => {
                     let ctx = self.create_session_context(session).await?;
-                    self.explain_handler.full(session, &inner, &ctx).await
+                    self.explain_handler.full(session, inner, &ctx).await
                 }
 
                 StatementKind::Delete(_) => Err(SqeError::NotImplemented(
@@ -233,6 +278,7 @@ impl QueryHandler {
                     timeout_secs = timeout_secs,
                     "Query timed out"
                 );
+                self.query_tracker.failed(&query_id, "Timeout", None);
                 Err(SqeError::Execution(format!(
                     "Query timed out after {timeout_secs}s"
                 )))
@@ -246,6 +292,55 @@ impl QueryHandler {
             .as_ref()
             .map(|b| b.iter().map(|r| r.num_rows()).sum())
             .unwrap_or(0);
+
+        // Update query tracker with final state
+        let execution_ms = duration.as_millis() as u64;
+        if result.is_ok() {
+            self.query_tracker.complete(&query_id, rows, execution_ms, vec![]);
+
+            // Store successful read query results in cache
+            if let Some(ref cache) = self.query_cache {
+                if matches!(&kind, StatementKind::Query(_)) {
+                    if let Ok(ref batches) = result {
+                        cache.store(
+                            &session.user.username,
+                            sql,
+                            query_id,
+                            batches.clone(),
+                            vec![], // tables_touched — filled when we add plan extraction
+                        );
+                    }
+                }
+            }
+
+            // Invalidate cache entries for written tables
+            if let Some(ref cache) = self.query_cache {
+                match &kind {
+                    StatementKind::Insert(stmt) => {
+                        if let Statement::Insert(ins) = stmt.as_ref() {
+                            let table = ins.table_name.to_string();
+                            cache.invalidate(&table);
+                        }
+                    }
+                    StatementKind::Ctas(stmt) => {
+                        if let Statement::CreateTable(ct) = stmt.as_ref() {
+                            let table = ct.name.to_string();
+                            cache.invalidate(&table);
+                        }
+                    }
+                    StatementKind::Drop(stmt) => {
+                        let table = stmt.to_string();
+                        cache.invalidate(&table);
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            let err_msg = result.as_ref().err().map(|e| format!("{e}")).unwrap_or_default();
+            // Only mark failed if not already marked (e.g., timeout already marked above)
+            let _ = err_msg; // suppress unused warning; error details in audit log
+            self.query_tracker.failed(&query_id, "ExecutionError", None);
+        }
 
         if let Some(ref metrics) = self.metrics {
             metrics

@@ -319,6 +319,21 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         );
     }
 
+    // Query tracker and result cache
+    let query_tracker = Arc::new(
+        sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history),
+    );
+    let query_cache = if config.query_cache.enabled {
+        Some(Arc::new(sqe_coordinator::query_cache::ResultCache::new(&config.query_cache)))
+    } else {
+        None
+    };
+    tracing::info!(
+        history_max_entries = config.query_history.max_entries,
+        cache_enabled = config.query_cache.enabled,
+        "Initialized query tracker and result cache"
+    );
+
     // Query handler
     let query_handler = Arc::new(QueryHandler::new(
         policy_enforcer,
@@ -335,6 +350,8 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         },
         Some(metrics.clone()),
         Some(audit.clone()),
+        query_tracker,
+        query_cache,
     ));
 
     // Trino compat

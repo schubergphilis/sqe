@@ -65,7 +65,12 @@ async fn test_simple_select() {
 
     // SELECT 1 goes through the full query pipeline including catalog registration
     let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(sqe_policy::PassthroughEnforcer);
-    let handler = sqe_coordinator::QueryHandler::new(policy, config, None, None, None, None);
+    let query_tracker = Arc::new(
+        sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history),
+    );
+    let handler = sqe_coordinator::QueryHandler::new(
+        policy, config, None, None, None, None, query_tracker, None,
+    );
 
     let batches = handler
         .execute(&session, "SELECT 1")
@@ -373,7 +378,12 @@ async fn test_distributed_select() {
     // Mark worker as healthy for the test
     registry.mark_healthy("http://localhost:50052").await;
 
-    let handler = sqe_coordinator::QueryHandler::new(policy, config, Some(registry), None, None, None);
+    let query_tracker = Arc::new(
+        sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history),
+    );
+    let handler = sqe_coordinator::QueryHandler::new(
+        policy, config, Some(registry), None, None, None, query_tracker, None,
+    );
 
     // First create a test table
     let _ = handler
@@ -1663,7 +1673,13 @@ async fn test_different_user_catalog_visibility() {
 
     let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(sqe_policy::PassthroughEnforcer);
     let handler =
-        sqe_coordinator::QueryHandler::new(policy, config.clone(), None, None, None, None);
+        sqe_coordinator::QueryHandler::new(
+            policy,
+            config.clone(),
+            None, None, None, None,
+            Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history)),
+            None,
+        );
 
     // adminuser has catalog_admin + table_reader + data_writer roles
     let admin_session = authenticator
@@ -1757,12 +1773,17 @@ async fn test_trino_http_query() {
             .expect("Failed to create authenticator"),
     );
     let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(sqe_policy::PassthroughEnforcer);
+    let query_tracker = Arc::new(
+        sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history),
+    );
     let handler = Arc::new(sqe_coordinator::QueryHandler::new(
         policy,
         config,
         None,
         None,
         None,
+        None,
+        query_tracker,
         None,
     ));
 
