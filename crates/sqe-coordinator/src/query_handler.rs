@@ -725,6 +725,18 @@ impl QueryHandler {
                     output_rows: r.output_rows,
                     error_type: r.error_type.clone(),
                     error_code: r.error_code.clone(),
+                    fragments: r
+                        .fragments
+                        .iter()
+                        .map(|f| sqe_catalog::system_runtime::RuntimeFragmentInfo {
+                            task_id: f.task_id.clone(),
+                            worker_url: f.worker_url.clone(),
+                            state: f.state.to_string(),
+                            elapsed_ms: f.elapsed_ms,
+                            input_rows: f.input_rows,
+                            output_rows: f.output_rows,
+                        })
+                        .collect(),
                 })
                 .collect()
         });
