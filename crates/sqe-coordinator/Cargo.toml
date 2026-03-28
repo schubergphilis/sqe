@@ -36,6 +36,7 @@ tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 dashmap = { workspace = true }
+moka = { workspace = true }
 governor = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
@@ -52,6 +53,7 @@ sqe-trino-compat = { path = "../sqe-trino-compat" }
 chrono = { workspace = true }
 axum = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+sha2 = "0.10"
 sqe-worker = { path = "../sqe-worker" }
 opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }

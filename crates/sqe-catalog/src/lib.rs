@@ -9,6 +9,8 @@ pub mod info_schema;
 pub mod read_parquet;
 pub mod system_catalog;
 pub mod system_jdbc;
+pub mod system_metadata;
+pub mod system_runtime;
 
 pub use catalog_provider::SqeCatalogProvider;
 pub use iceberg_scan::IcebergScanExec;
