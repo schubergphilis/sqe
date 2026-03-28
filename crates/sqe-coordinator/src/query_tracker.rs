@@ -28,6 +28,35 @@ impl std::fmt::Display for QueryState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FragmentState {
+    Running,
+    Finished,
+    Failed,
+    Retried,
+}
+
+impl std::fmt::Display for FragmentState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Running => write!(f, "RUNNING"),
+            Self::Finished => write!(f, "FINISHED"),
+            Self::Failed => write!(f, "FAILED"),
+            Self::Retried => write!(f, "RETRIED"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FragmentInfo {
+    pub task_id: String,
+    pub worker_url: String,
+    pub state: FragmentState,
+    pub elapsed_ms: u64,
+    pub input_rows: usize,
+    pub output_rows: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct QueryRecord {
     pub query_id: Uuid,
@@ -48,6 +77,7 @@ pub struct QueryRecord {
     pub error_type: Option<String>,
     pub error_code: Option<String>,
     pub tables_touched: Vec<String>,
+    pub fragments: Vec<FragmentInfo>,
 }
 
 pub struct QueryTracker {
@@ -98,6 +128,7 @@ impl QueryTracker {
             error_type: None,
             error_code: None,
             tables_touched: Vec::new(),
+            fragments: Vec::new(),
         };
         self.history.insert(query_id, Arc::new(record));
         self.active.insert(query_id, token.clone());
@@ -165,6 +196,33 @@ impl QueryTracker {
             true
         } else {
             false
+        }
+    }
+
+    pub fn set_fragments(&self, query_id: &Uuid, fragments: Vec<FragmentInfo>) {
+        if let Some(old) = self.history.get(query_id) {
+            let mut record = (*old).clone();
+            record.fragments = fragments;
+            self.history.insert(*query_id, Arc::new(record));
+        }
+    }
+
+    pub fn update_fragment(
+        &self,
+        query_id: &Uuid,
+        task_id: &str,
+        state: FragmentState,
+        elapsed_ms: u64,
+        output_rows: usize,
+    ) {
+        if let Some(old) = self.history.get(query_id) {
+            let mut record = (*old).clone();
+            if let Some(frag) = record.fragments.iter_mut().find(|f| f.task_id == task_id) {
+                frag.state = state;
+                frag.elapsed_ms = elapsed_ms;
+                frag.output_rows = output_rows;
+            }
+            self.history.insert(*query_id, Arc::new(record));
         }
     }
 
@@ -347,6 +405,51 @@ mod tests {
                 _ => assert_eq!(rec.state, QueryState::Canceled),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn set_and_update_fragments() {
+        let tracker = QueryTracker::new(&test_config());
+        let id = Uuid::now_v7();
+        tracker.start(id, "alice", None, "SELECT *", "s1", None, vec![]);
+
+        let frags = vec![
+            FragmentInfo {
+                task_id: "frag-0".into(),
+                worker_url: "http://worker-1:50052".into(),
+                state: FragmentState::Running,
+                elapsed_ms: 0,
+                input_rows: 0,
+                output_rows: 0,
+            },
+            FragmentInfo {
+                task_id: "frag-1".into(),
+                worker_url: "http://worker-2:50052".into(),
+                state: FragmentState::Running,
+                elapsed_ms: 0,
+                input_rows: 0,
+                output_rows: 0,
+            },
+        ];
+        tracker.set_fragments(&id, frags);
+
+        let rec = tracker.history.get(&id).unwrap();
+        assert_eq!(rec.fragments.len(), 2);
+
+        tracker.update_fragment(&id, "frag-0", FragmentState::Finished, 42, 100);
+        let rec = tracker.history.get(&id).unwrap();
+        assert_eq!(rec.fragments[0].state, FragmentState::Finished);
+        assert_eq!(rec.fragments[0].elapsed_ms, 42);
+        assert_eq!(rec.fragments[1].state, FragmentState::Running);
+    }
+
+    #[tokio::test]
+    async fn update_fragment_unknown_is_noop() {
+        let tracker = QueryTracker::new(&test_config());
+        let id = Uuid::now_v7();
+        tracker.start(id, "bob", None, "SELECT 1", "s2", None, vec![]);
+        tracker.update_fragment(&id, "nonexistent", FragmentState::Failed, 0, 0);
+        // Should not panic
     }
 
     #[tokio::test]
