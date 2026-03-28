@@ -4,11 +4,12 @@ use std::time::Duration;
 use arrow_array::RecordBatch;
 use arrow_array::{ArrayRef, builder::StringBuilder};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use tracing::{debug, info, warn};
 
 use sqlparser::ast::Statement;
-use sqe_catalog::{SessionCatalog, SqeCatalogProvider};
+use sqe_catalog::{IcebergScanExec, SessionCatalog, SqeCatalogProvider};
 use sqe_core::{QueryConfig, Session, SqeConfig, SqeError};
 use sqe_policy::PolicyEnforcer;
 use sqe_sql::{parse_and_classify, StatementKind};
@@ -16,7 +17,7 @@ use sqe_sql::{parse_and_classify, StatementKind};
 use crate::catalog_ops::CatalogOps;
 use crate::credential_refresh::CredentialRefreshTracker;
 use crate::query_cache::ResultCache;
-use crate::query_tracker::QueryTracker;
+use crate::query_tracker::{FragmentState, QueryTracker};
 use crate::write_handler::WriteHandler;
 
 /// Determine the effective query timeout for a session.
@@ -44,7 +45,6 @@ pub struct QueryHandler {
     catalog_ops: CatalogOps,
     write_handler: WriteHandler,
     explain_handler: crate::explain::ExplainHandler,
-    #[allow(dead_code)] // Wired in Chunk 3 for distributed execution; query routing TBD
     worker_registry: Option<Arc<crate::worker_registry::WorkerRegistry>>,
     #[allow(dead_code)] // Used when constructing DistributedScanExec for distributed queries
     credential_tracker: Option<Arc<CredentialRefreshTracker>>,
@@ -158,7 +158,7 @@ impl QueryHandler {
 
         let execution_future = async {
             match &kind {
-                StatementKind::Query(_) => self.execute_query(session, sql).await,
+                StatementKind::Query(_) => self.execute_query(session, sql, &query_id).await,
 
                 StatementKind::ShowCatalogs => self.handle_show_catalogs(session).await,
 
@@ -228,7 +228,7 @@ impl QueryHandler {
                                 self.drop_table_if_exists(session, &ct.name).await?;
                             }
                             let select_sql = format!("{query}");
-                            let batches = self.execute_query(session, &select_sql).await?;
+                            let batches = self.execute_query(session, &select_sql, &query_id).await?;
                             self.write_handler.handle_ctas(session, stmt, batches).await
                         } else {
                             Err(SqeError::Execution("CTAS without SELECT query".into()))
@@ -247,7 +247,7 @@ impl QueryHandler {
                             .ok_or_else(|| {
                                 SqeError::Execution("INSERT without SELECT source".into())
                             })?;
-                        let batches = self.execute_query(session, &select_sql).await?;
+                        let batches = self.execute_query(session, &select_sql, &query_id).await?;
                         self.write_handler
                             .handle_insert(session, stmt, batches)
                             .await
@@ -400,11 +400,17 @@ impl QueryHandler {
     }
 
     /// Execute a SELECT query through DataFusion with the user's catalog.
-    #[tracing::instrument(skip(self, session, sql), fields(username = %session.user.username))]
+    ///
+    /// After policy enforcement and physical planning, this method attempts to
+    /// distribute the scan work across available workers via [`try_distribute`].
+    /// If distribution is not possible (single-node mode, no healthy workers,
+    /// too few files, or complex multi-table plans), the query executes locally.
+    #[tracing::instrument(skip(self, session, sql, query_id), fields(username = %session.user.username))]
     async fn execute_query(
         &self,
         session: &Session,
         sql: &str,
+        query_id: &uuid::Uuid,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let ctx = self.create_session_context(session).await?;
 
@@ -423,14 +429,23 @@ impl QueryHandler {
 
         debug!("Policy-enforced plan: {:?}", enforced_plan);
 
-        // Create a new DataFrame from the enforced plan and execute
+        // Create a new DataFrame from the enforced plan
         let enforced_df = ctx
             .execute_logical_plan(enforced_plan)
             .await
             .map_err(|e| SqeError::Execution(format!("Failed to create execution plan: {e}")))?;
 
-        let batches = enforced_df
-            .collect()
+        // Get the physical plan
+        let physical_plan = enforced_df
+            .create_physical_plan()
+            .await
+            .map_err(|e| SqeError::Execution(format!("Physical plan creation failed: {e}")))?;
+
+        // Try to distribute scan work across workers
+        let final_plan = self.try_distribute(physical_plan, session, query_id).await;
+
+        // Execute the (possibly distributed) plan
+        let batches = collect(final_plan, ctx.task_ctx())
             .await
             .map_err(|e| SqeError::Execution(format!("Query execution failed: {e}")))?;
 
@@ -441,6 +456,192 @@ impl QueryHandler {
         );
 
         Ok(batches)
+    }
+
+    /// Attempt to distribute scan work across available workers.
+    ///
+    /// If distribution is possible, the plan's IcebergScanExec is replaced
+    /// with a DistributedScanExec that fans out to workers via Arrow Flight.
+    /// Otherwise, the original plan is returned unchanged for local execution.
+    ///
+    /// Distribution is skipped when:
+    /// - No worker registry is configured (single-node mode)
+    /// - No healthy workers are available
+    /// - The query has no IcebergScanExec (e.g., metadata queries)
+    /// - The total data file count is less than the number of healthy workers
+    /// - The query has multiple IcebergScanExec nodes (joins — not yet supported)
+    async fn try_distribute(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        session: &Session,
+        query_id: &uuid::Uuid,
+    ) -> Arc<dyn ExecutionPlan> {
+        // 1. Check if we have a worker registry (distributed mode)
+        let registry = match self.worker_registry {
+            Some(ref r) => r,
+            None => return plan,
+        };
+
+        // 2. Get healthy workers — if none, fall back to local
+        let healthy = registry.healthy_workers().await;
+        if healthy.is_empty() {
+            debug!("No healthy workers available, executing locally");
+            return plan;
+        }
+
+        // 3. Find IcebergScanExec node in the plan tree
+        let scan_node = match find_iceberg_scan(&plan) {
+            Some(node) => node,
+            None => {
+                debug!("No IcebergScanExec found in plan, executing locally");
+                return plan;
+            }
+        };
+
+        let iceberg_scan = scan_node
+            .as_any()
+            .downcast_ref::<IcebergScanExec>()
+            .expect("find_iceberg_scan returned a non-IcebergScanExec node");
+
+        // 4. Get data file paths from the scan
+        let file_paths = match iceberg_scan.data_file_paths().await {
+            Ok(paths) => paths,
+            Err(e) => {
+                warn!(error = %e, "Failed to list data files for distribution, executing locally");
+                return plan;
+            }
+        };
+
+        let total_files = file_paths.len();
+        if total_files == 0 {
+            debug!("No data files to distribute, executing locally");
+            return plan;
+        }
+
+        // 5. Check if there are enough files to justify distribution
+        let num_workers = healthy.len();
+        if total_files < num_workers {
+            debug!(
+                total_files,
+                num_workers,
+                "Fewer files than workers, executing locally"
+            );
+            return plan;
+        }
+
+        info!(
+            total_files,
+            num_workers,
+            "Distributing scan across workers"
+        );
+
+        // 6. Get projected columns from the scan
+        let projected_cols: Vec<String> = iceberg_scan
+            .projection()
+            .map(|cols| cols.to_vec())
+            .unwrap_or_default();
+
+        // 7. Split files across workers
+        let file_groups = sqe_planner::split_files(file_paths, num_workers);
+
+        // 8. Build ScanTasks
+        let storage = &self.config.storage;
+        let scan_tasks: Vec<sqe_planner::ScanTask> = file_groups
+            .into_iter()
+            .filter(|files| !files.is_empty())
+            .map(|files| sqe_planner::ScanTask {
+                fragment_id: uuid::Uuid::now_v7().to_string(),
+                data_file_paths: files,
+                projected_columns: projected_cols.clone(),
+                s3_endpoint: storage.s3_endpoint.clone(),
+                s3_region: storage.s3_region.clone(),
+                s3_access_key: storage.s3_access_key.clone(),
+                s3_secret_key: storage.s3_secret_key.clone(),
+                s3_session_token: String::new(),
+                s3_path_style: storage.s3_path_style,
+                s3_allow_http: storage.s3_endpoint.starts_with("http://"),
+            })
+            .collect();
+
+        if scan_tasks.is_empty() {
+            debug!("No non-empty scan tasks after splitting, executing locally");
+            return plan;
+        }
+
+        // 9. Schedule tasks to workers using weighted scheduler
+        let worker_infos: Vec<crate::scheduler::WorkerInfo> = healthy
+            .iter()
+            .map(|url| crate::scheduler::WorkerInfo {
+                url: url.clone(),
+                healthy: true,
+                active_fragments: 0, // First version: no active fragment tracking
+            })
+            .collect();
+
+        let scheduler = crate::scheduler::WeightedScheduler::new();
+        let assignments = match crate::scheduler::FragmentScheduler::assign(
+            &scheduler,
+            &scan_tasks,
+            &worker_infos,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(error = %e, "Scheduling failed, executing locally");
+                return plan;
+            }
+        };
+
+        // Build ordered worker URLs matching the scan_tasks order
+        let worker_urls: Vec<String> = assignments.iter().map(|a| a.worker_url.clone()).collect();
+
+        // 10. Record fragments in query tracker
+        let fragment_infos: Vec<crate::query_tracker::FragmentInfo> = scan_tasks
+            .iter()
+            .zip(worker_urls.iter())
+            .map(|(task, url)| crate::query_tracker::FragmentInfo {
+                task_id: task.fragment_id.clone(),
+                worker_url: url.clone(),
+                state: crate::query_tracker::FragmentState::Running,
+                elapsed_ms: 0,
+                input_rows: 0,
+                output_rows: 0,
+            })
+            .collect();
+        self.query_tracker.set_fragments(query_id, fragment_infos);
+
+        // 11. Build fragment callback for progress tracking
+        let tracker = self.query_tracker.clone();
+        let qid = *query_id;
+        let callback: crate::distributed_scan::FragmentCallback =
+            Arc::new(move |task_id, success, elapsed_ms, rows| {
+                let state = if success {
+                    FragmentState::Finished
+                } else {
+                    FragmentState::Failed
+                };
+                tracker.update_fragment(&qid, task_id, state, elapsed_ms, rows);
+            });
+
+        // 12. Build the DistributedScanExec
+        let schema = scan_node.schema();
+        let mut exec = crate::distributed_scan::DistributedScanExec::new(
+            scan_tasks,
+            worker_urls,
+            schema,
+        )
+        .with_fragment_callback(callback);
+
+        // Attach worker registry for health tracking / failover
+        exec = exec.with_worker_registry(Arc::clone(registry));
+
+        info!(
+            username = %session.user.username,
+            query_id = %query_id,
+            partitions = exec.scan_tasks().len(),
+            "Distributed scan plan created"
+        );
+
+        Arc::new(exec)
     }
 
     /// Create a DataFusion SessionContext with the user's Polaris catalog registered.
@@ -764,6 +965,24 @@ impl QueryHandler {
         Ok(())
     }
 
+}
+
+/// Walk a physical plan tree to find the first `IcebergScanExec` node.
+///
+/// Uses iterative depth-first search (plan trees are shallow, so no need
+/// for async recursion). Returns the first matching node, or `None` if the
+/// plan contains no Iceberg table scans.
+fn find_iceberg_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+    let mut stack: Vec<Arc<dyn ExecutionPlan>> = vec![Arc::clone(plan)];
+    while let Some(node) = stack.pop() {
+        if node.as_any().downcast_ref::<IcebergScanExec>().is_some() {
+            return Some(node);
+        }
+        for child in node.children() {
+            stack.push(Arc::clone(child));
+        }
+    }
+    None
 }
 
 /// Convert an Arrow `SchemaRef` to Iceberg REST API schema JSON format.
