@@ -487,10 +487,61 @@ impl QueryHandler {
 
         // Register the system catalog for Trino JDBC metadata browsing
         // (system.jdbc.types, system.jdbc.catalogs, system.jdbc.schemas, etc.)
+        // and the system.runtime.* virtual tables for query/node/task info.
+        let tracker = Arc::clone(&self.query_tracker);
+        let records_fn: sqe_catalog::system_runtime::QueryRecordsFn = Arc::new(move || {
+            tracker
+                .records()
+                .into_iter()
+                .map(|r| sqe_catalog::system_runtime::RuntimeQueryRecord {
+                    query_id: r.query_id.to_string(),
+                    state: match r.state {
+                        crate::query_tracker::QueryState::Queued => {
+                            sqe_catalog::system_runtime::RuntimeQueryState::Queued
+                        }
+                        crate::query_tracker::QueryState::Running => {
+                            sqe_catalog::system_runtime::RuntimeQueryState::Running
+                        }
+                        crate::query_tracker::QueryState::Finished => {
+                            sqe_catalog::system_runtime::RuntimeQueryState::Finished
+                        }
+                        crate::query_tracker::QueryState::Failed => {
+                            sqe_catalog::system_runtime::RuntimeQueryState::Failed
+                        }
+                        crate::query_tracker::QueryState::Canceled => {
+                            sqe_catalog::system_runtime::RuntimeQueryState::Canceled
+                        }
+                    },
+                    user: r.user.clone(),
+                    source: r.source.clone(),
+                    sql: r.sql.clone(),
+                    created: r.created,
+                    started: r.started,
+                    ended: r.ended,
+                    queued_ms: r.queued_ms,
+                    planning_ms: r.planning_ms,
+                    execution_ms: r.execution_ms,
+                    output_rows: r.output_rows,
+                    error_type: r.error_type.clone(),
+                    error_code: r.error_code.clone(),
+                })
+                .collect()
+        });
+        let coordinator_uri = format!(
+            "http://localhost:{}",
+            self.config.coordinator.flight_sql_port
+        );
+        let runtime_schema = Arc::new(sqe_catalog::system_runtime::RuntimeSchemaProvider::new(
+            records_fn,
+            self.config.catalog.warehouse.clone(),
+            coordinator_uri,
+            self.config.coordinator.worker_urls.clone(),
+        ));
         let system_catalog = sqe_catalog::SystemCatalogProvider::new(
             session_catalog_for_system,
             self.config.catalog.warehouse.clone(),
-        );
+        )
+        .with_runtime(runtime_schema);
         ctx.register_catalog("system", Arc::new(system_catalog));
 
         // Register the read_parquet() table-valued function so users can

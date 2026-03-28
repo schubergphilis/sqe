@@ -538,7 +538,7 @@ git commit -m "feat: wire QueryTracker and ResultCache into query execution pipe
 - Modify: `crates/sqe-catalog/src/system_catalog.rs`
 - Modify: `crates/sqe-catalog/src/lib.rs`
 
-- [ ] **Step 1: Create RuntimeSchemaProvider**
+- [x] **Step 1: Create RuntimeSchemaProvider**
 
 Create `crates/sqe-catalog/src/system_runtime.rs` implementing `SchemaProvider` with three tables:
 
@@ -550,21 +550,21 @@ Create `crates/sqe-catalog/src/system_runtime.rs` implementing `SchemaProvider` 
 
 The `RuntimeSchemaProvider` needs `Arc<QueryTracker>` and optionally `Arc<WorkerRegistry>`.
 
-- [ ] **Step 2: Add tests**
+- [x] **Step 2: Add tests**
 
 Test: queries table schema has 17 columns, nodes table includes coordinator row, tasks table has one row per query.
 
-- [ ] **Step 3: Register in SystemCatalogProvider**
+- [x] **Step 3: Register in SystemCatalogProvider**
 
 In `system_catalog.rs`, add a `runtime_schema` field, extend `schema_names()` to return `["jdbc", "runtime"]`, and route `schema("runtime")` to the new provider.
 
 Update the constructor to accept `Arc<QueryTracker>` and `Option<Arc<WorkerRegistry>>`.
 
-- [ ] **Step 4: Update lib.rs**
+- [x] **Step 4: Update lib.rs**
 
 Add `pub mod system_runtime;` to `crates/sqe-catalog/src/lib.rs`.
 
-- [ ] **Step 5: Verify**
+- [x] **Step 5: Verify**
 
 Run: `cargo test -p sqe-catalog -- system_runtime && cargo clippy -p sqe-catalog -- -D warnings`
 
