@@ -238,9 +238,15 @@ impl FlightSqlService for SqeFlightSqlService {
 
         info!(username = username, "Handshake authentication attempt");
 
+        let credentials = sqe_auth::FlightCredentials {
+            username: Some(username.to_string()),
+            password: Some(password.to_string()),
+            ..Default::default()
+        };
+
         let session = self
             .session_manager
-            .authenticate(username, password)
+            .authenticate_credentials(&credentials)
             .await
             .map_err(|e| {
                 warn!(username = username, error = %e, "Authentication failed");

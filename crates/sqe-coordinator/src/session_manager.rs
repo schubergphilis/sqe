@@ -4,85 +4,149 @@ use chrono::Utc;
 use dashmap::DashMap;
 use tracing::{debug, info, warn};
 
+use sqe_auth::{AuthProvider, FlightCredentials, Identity};
 use sqe_auth::Authenticator;
 use sqe_core::Session;
 
 /// Manages authenticated sessions for the coordinator.
 ///
-/// Sessions are created during the Flight SQL handshake via OIDC password grant
-/// authentication and stored in a concurrent map keyed by session ID. The
-/// session ID is returned to the client as a bearer token for subsequent
+/// Sessions are created during the Flight SQL handshake via the pluggable
+/// `AuthProvider` chain and stored in a concurrent map keyed by session ID.
+/// The session ID is returned to the client as a bearer token for subsequent
 /// requests.
 ///
-/// On each `get_session` call, the manager checks the `TokenCache` for
-/// tokens that were refreshed by the background task and updates the
-/// stored session accordingly. Expired sessions are evicted automatically.
+/// Supports two construction modes:
+/// - `new(Arc<Authenticator>)` — legacy path, backwards compatible
+/// - `with_provider(Arc<dyn AuthProvider>)` — new pluggable path
+///
+/// On each `get_session` call, the manager checks if the session's token
+/// has expired and evicts it if so. Expired sessions are evicted automatically.
 pub struct SessionManager {
-    authenticator: Arc<Authenticator>,
+    /// The pluggable auth provider (may be a single provider or an AuthChain).
+    auth_provider: Arc<dyn AuthProvider>,
+    /// Legacy authenticator kept for token cache lookups (background refresh).
+    /// Will be `None` when constructed via `with_provider`.
+    legacy_authenticator: Option<Arc<Authenticator>>,
     sessions: DashMap<String, Arc<Session>>,
 }
 
 impl SessionManager {
+    /// Create a new `SessionManager` with the legacy `Authenticator`.
+    ///
+    /// The `Authenticator` is used both as an `AuthProvider` (via its trait impl)
+    /// and for its token cache (background refresh).
     pub fn new(authenticator: Arc<Authenticator>) -> Self {
         Self {
-            authenticator,
+            auth_provider: authenticator.clone() as Arc<dyn AuthProvider>,
+            legacy_authenticator: Some(authenticator),
             sessions: DashMap::new(),
         }
     }
 
-    /// Authenticate a user via the configured OIDC provider, create a session, and store it.
+    /// Create a new `SessionManager` with a pluggable `AuthProvider`.
+    ///
+    /// Use this for the new auth chain architecture. Background token refresh
+    /// via the legacy token cache is not available in this mode; providers
+    /// should handle refresh via `refresh_catalog_token` instead.
+    pub fn with_provider(provider: Arc<dyn AuthProvider>) -> Self {
+        Self {
+            auth_provider: provider,
+            legacy_authenticator: None,
+            sessions: DashMap::new(),
+        }
+    }
+
+    /// Authenticate using `FlightCredentials` via the configured provider chain.
     ///
     /// Returns the session wrapped in an Arc. The session ID can be used
     /// as a bearer token for subsequent Flight SQL requests.
+    pub async fn authenticate_credentials(
+        &self,
+        credentials: &FlightCredentials,
+    ) -> sqe_core::Result<Arc<Session>> {
+        let identity = self
+            .auth_provider
+            .authenticate(credentials)
+            .await
+            .map_err(|e| sqe_core::SqeError::Auth(e.to_string()))?;
+
+        let session = self.identity_to_session(&identity);
+        let session_id = session.id.clone();
+        let session = Arc::new(session);
+        self.sessions.insert(session_id.clone(), session.clone());
+
+        info!(user_id = %identity.user_id, "Session created");
+        debug!(session_id = %session_id, user_id = %identity.user_id, "Session details");
+
+        Ok(session)
+    }
+
+    /// Authenticate a user via username/password (legacy convenience method).
+    ///
+    /// Wraps the credentials into `FlightCredentials` and delegates to
+    /// `authenticate_credentials`. This preserves backward compatibility
+    /// with the existing Flight SQL handshake flow.
     pub async fn authenticate(
         &self,
         username: &str,
         password: &str,
     ) -> sqe_core::Result<Arc<Session>> {
-        let session = self.authenticator.authenticate(username, password).await?;
-        let session_id = session.id.clone();
-        let session = Arc::new(session);
-        self.sessions.insert(session_id.clone(), session.clone());
+        let credentials = FlightCredentials {
+            username: Some(username.to_string()),
+            password: Some(password.to_string()),
+            ..Default::default()
+        };
+        self.authenticate_credentials(&credentials).await
+    }
 
-        info!(username = username, "Session created");
-        debug!(session_id = %session_id, username = username, "Session details");
-
-        Ok(session)
+    /// Convert an `Identity` into a `Session`.
+    fn identity_to_session(&self, identity: &Identity) -> Session {
+        let token_expiry = Utc::now() + chrono::Duration::hours(1);
+        Session::new(
+            identity.user_id.clone(),
+            identity.catalog_token.clone().unwrap_or_default(),
+            identity.refresh_token.clone(),
+            token_expiry,
+            identity.roles.clone(),
+        )
     }
 
     /// Look up a session by its ID (bearer token).
     ///
-    /// If the background refresh task has updated the token in the cache,
-    /// the stored session is updated with the fresh token. If the token
-    /// has expired and is no longer in the cache, the session is evicted.
+    /// If the legacy authenticator is present and the background refresh task
+    /// has updated the token in the cache, the stored session is updated with
+    /// the fresh token. If the token has expired and is no longer in the cache,
+    /// the session is evicted.
     ///
     /// Each successful lookup also updates the session's `last_activity`
     /// timestamp so that the idle-timeout sweeper can detect stale sessions.
     pub fn get_session(&self, session_id: &str) -> Option<Arc<Session>> {
         let session = self.sessions.get(session_id)?.clone();
 
-        // Check if the background task refreshed this token
-        if let Some(cached) = self.authenticator.get_cached_token(session_id) {
-            if cached.access_token != session.access_token {
-                let mut updated = (*session).clone();
-                updated.access_token = cached.access_token;
-                updated.refresh_token = cached.refresh_token;
-                updated.token_expiry = cached.expiry;
-                updated.touch();
-                let updated = Arc::new(updated);
-                self.sessions.insert(session_id.to_string(), updated.clone());
-                debug!(session_id = %session_id, "Session updated with refreshed token");
-                return Some(updated);
+        // Check if the legacy background task refreshed this token
+        if let Some(ref authenticator) = self.legacy_authenticator {
+            if let Some(cached) = authenticator.get_cached_token(session_id) {
+                if cached.access_token != session.access_token {
+                    let mut updated = (*session).clone();
+                    updated.access_token = cached.access_token;
+                    updated.refresh_token = cached.refresh_token;
+                    updated.token_expiry = cached.expiry;
+                    updated.touch();
+                    let updated = Arc::new(updated);
+                    self.sessions.insert(session_id.to_string(), updated.clone());
+                    debug!(session_id = %session_id, "Session updated with refreshed token");
+                    return Some(updated);
+                }
+                // Token unchanged — just touch the session for idle tracking
+                let mut touched = (*session).clone();
+                touched.touch();
+                let touched = Arc::new(touched);
+                self.sessions.insert(session_id.to_string(), touched.clone());
+                return Some(touched);
             }
-            // Token unchanged — just touch the session for idle tracking
-            let mut touched = (*session).clone();
-            touched.touch();
-            let touched = Arc::new(touched);
-            self.sessions.insert(session_id.to_string(), touched.clone());
-            return Some(touched);
         }
 
-        // Token is no longer in cache — check if it's expired
+        // Token is no longer in cache (or no legacy authenticator) — check if expired
         if session.token_expiry <= Utc::now() {
             warn!(session_id = %session_id, "Session token expired, evicting");
             self.sessions.remove(session_id);
@@ -171,6 +235,7 @@ mod tests {
             token_endpoint: String::new(),
             token_refresh_buffer_secs: 60,
             ssl_verification: false,
+            providers: Vec::new(),
         }
     }
 

@@ -69,7 +69,7 @@ async fn test_simple_select() {
         sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history),
     );
     let handler = sqe_coordinator::QueryHandler::new(
-        policy, config, None, None, None, None, query_tracker, None,
+        policy, None, config, None, None, None, None, query_tracker, None,
     );
 
     let batches = handler
@@ -382,7 +382,7 @@ async fn test_distributed_select() {
         sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history),
     );
     let handler = sqe_coordinator::QueryHandler::new(
-        policy, config, Some(registry), None, None, None, query_tracker, None,
+        policy, None, config, Some(registry), None, None, None, query_tracker, None,
     );
 
     // First create a test table
@@ -1675,6 +1675,7 @@ async fn test_different_user_catalog_visibility() {
     let handler =
         sqe_coordinator::QueryHandler::new(
             policy,
+            None,
             config.clone(),
             None, None, None, None,
             Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history)),
@@ -1778,6 +1779,7 @@ async fn test_trino_http_query() {
     );
     let handler = Arc::new(sqe_coordinator::QueryHandler::new(
         policy,
+        None,
         config,
         None,
         None,

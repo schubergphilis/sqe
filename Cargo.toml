@@ -87,6 +87,11 @@ clap = { version = "4", features = ["derive", "env"] }
 csv = "1"
 rand = "0.8"
 
+# Crypto
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+
 # Misc
 async-trait = "0.1"
 uuid = { version = "1", features = ["v4", "v7"] }

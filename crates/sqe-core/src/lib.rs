@@ -2,7 +2,7 @@ pub mod config;
 pub mod error;
 pub mod session;
 
-pub use config::{QueryCacheConfig, QueryConfig, QueryHistoryConfig, SqeConfig, parse_memory_limit};
+pub use config::{AuthProviderConfig, QueryCacheConfig, QueryConfig, QueryHistoryConfig, SqeConfig, parse_memory_limit};
 pub use error::{Result, SqeError};
 pub use session::{Session, SessionUser};
 
