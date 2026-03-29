@@ -17,7 +17,7 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
-use futures::{Stream, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use tracing::{error, info, info_span, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -302,10 +302,39 @@ impl ExecutionPlan for DistributedScanExec {
 
                 match dispatch_to_worker(&task, &current_worker_url, &parent_cx).await {
                     Ok(flight_stream) => {
+                        // Project received batches to match the expected schema.
+                        // Workers return full table columns, but the plan may expect
+                        // fewer columns (e.g., COUNT(*) expects 0 columns).
+                        let expected_schema = schema.clone();
                         let inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
                             Box::pin(
                                 flight_stream
-                                    .map_err(|e| DataFusionError::External(Box::new(e))),
+                                    .map_err(|e| DataFusionError::External(Box::new(e)))
+                                    .map(move |batch_result| {
+                                        let batch = batch_result?;
+                                        let expected_cols = expected_schema.fields().len();
+                                        if batch.num_columns() == expected_cols {
+                                            Ok(batch)
+                                        } else if expected_cols == 0 {
+                                            // COUNT(*) case: return empty-column batch with row count
+                                            Ok(RecordBatch::try_new_with_options(
+                                                expected_schema.clone(),
+                                                vec![],
+                                                &arrow_array::RecordBatchOptions::new()
+                                                    .with_row_count(Some(batch.num_rows())),
+                                            )?)
+                                        } else {
+                                            // Select matching columns by name
+                                            let columns: Vec<_> = expected_schema.fields().iter().map(|f| {
+                                                batch.column_by_name(f.name()).cloned().ok_or_else(|| {
+                                                    DataFusionError::Internal(format!(
+                                                        "Column '{}' not found in worker batch", f.name()
+                                                    ))
+                                                })
+                                            }).collect::<DFResult<Vec<_>>>()?;
+                                            Ok(RecordBatch::try_new(expected_schema.clone(), columns)?)
+                                        }
+                                    }),
                             );
                         // Wrap the stream so the callback fires when it completes
                         let wrapped: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
