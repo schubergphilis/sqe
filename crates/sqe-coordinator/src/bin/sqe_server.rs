@@ -337,6 +337,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     // Query handler
     let query_handler = Arc::new(QueryHandler::new(
         policy_enforcer,
+        None, // policy_store — wired when policy engine is enabled
         config.clone(),
         if config.coordinator.worker_urls.is_empty() {
             None

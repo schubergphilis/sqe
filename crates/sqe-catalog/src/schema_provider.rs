@@ -52,6 +52,13 @@ impl SchemaProvider for SqeSchemaProvider {
         self
     }
 
+    // SAFETY NOTE: DataFusion's SchemaProvider::table_names() is synchronous by design
+    // (returns Vec<String>, not a Future). Since our catalog is async (HTTP calls to
+    // Polaris), we use `block_in_place` to bridge the sync-async gap. This yields the
+    // current tokio thread first (avoiding deadlock with the current-thread runtime),
+    // then blocks on the async call. This is a known DataFusion design constraint —
+    // the SchemaProvider trait predates DataFusion's async catalog work. A future
+    // DataFusion version may provide an async alternative.
     fn table_names(&self) -> Vec<String> {
         let catalog = self.session_catalog.clone();
         let ns = self.namespace.clone();

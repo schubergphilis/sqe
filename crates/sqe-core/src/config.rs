@@ -212,16 +212,123 @@ pub fn parse_memory_limit(s: &str) -> crate::error::Result<usize> {
     Ok((num * multiplier) as usize)
 }
 
+/// Configuration for a single auth provider in the `[[auth.providers]]` array.
+///
+/// Each variant maps to a concrete `AuthProvider` implementation in `sqe-auth`.
+/// The `type` field in TOML selects the variant via the serde tag.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AuthProviderConfig {
+    /// OIDC Resource Owner Password Credentials (ROPC) grant.
+    /// Works with any OIDC provider (Keycloak, Auth0, Okta, Zitadel, etc.).
+    OidcPassword {
+        /// Full token endpoint URL.
+        token_url: String,
+        /// OAuth2 client_id.
+        client_id: String,
+        /// OAuth2 client_secret. Empty string for public clients.
+        #[serde(default)]
+        client_secret: String,
+        /// Dot-separated JSON path to the roles array in the JWT payload.
+        /// Default: `"realm_access.roles"`.
+        #[serde(default = "default_roles_claim")]
+        roles_claim: String,
+    },
+    /// Generic OAuth2 client_credentials grant (e.g. Polaris service token).
+    ClientCredentials {
+        /// OAuth2 token endpoint URL.
+        token_endpoint: String,
+        /// OAuth2 client_id.
+        client_id: String,
+        /// OAuth2 client_secret.
+        client_secret: String,
+    },
+    /// OAuth2 Token Exchange (RFC 8693) — exchanges an incoming credential for a
+    /// user-scoped JWT via an OIDC token endpoint. Catch-all; place last in chain.
+    TokenExchange {
+        /// Full token endpoint URL.
+        token_url: String,
+        /// OAuth2 client_id.
+        client_id: String,
+        /// OAuth2 client_secret. Optional for public clients.
+        #[serde(default)]
+        client_secret: Option<String>,
+        /// Target audience for the exchanged token (e.g. `"polaris"`).
+        #[serde(default)]
+        audience: Option<String>,
+        /// JWT claim that carries the user identifier. Default: `"sub"`.
+        #[serde(default = "default_user_claim")]
+        user_claim: String,
+        /// Dot-separated JSON path to the roles array in the JWT payload.
+        /// Default: `"realm_access.roles"`.
+        #[serde(default = "default_roles_claim")]
+        roles_claim: String,
+    },
+    /// Pre-obtained JWT validated via JWKS. For programmatic clients, SSO flows, Airflow.
+    BearerToken {
+        /// JWKS endpoint URL for signature verification.
+        jwks_url: String,
+        /// Expected issuer (`iss` claim). Optional.
+        #[serde(default)]
+        issuer: Option<String>,
+        /// Expected audience (`aud` claim). Optional.
+        #[serde(default)]
+        audience: Option<String>,
+        /// JWT claim for user identity. Default: `"sub"`.
+        #[serde(default = "default_user_claim")]
+        user_claim: String,
+        /// Dot-separated JSON path to roles. Default: `"realm_access.roles"`.
+        #[serde(default = "default_roles_claim")]
+        roles_claim: String,
+    },
+    /// AWS IAM authentication via STS GetCallerIdentity.
+    AwsIam {
+        /// AWS region for STS endpoint. Default: `"us-east-1"`.
+        #[serde(default = "default_aws_region")]
+        region: String,
+        /// Whether to validate credentials via STS call. Default: true.
+        #[serde(default = "default_true")]
+        validate_with_sts: bool,
+    },
+    /// Fixed-identity provider for development/testing.
+    Anonymous {
+        /// User name to assign. Default: `"anonymous"`.
+        #[serde(default = "default_anonymous_user")]
+        user: String,
+        /// Roles to assign. Default: empty.
+        #[serde(default)]
+        roles: Vec<String>,
+    },
+}
+
+fn default_roles_claim() -> String {
+    "realm_access.roles".to_string()
+}
+fn default_aws_region() -> String {
+    "us-east-1".to_string()
+}
+fn default_user_claim() -> String {
+    "sub".to_string()
+}
+fn default_anonymous_user() -> String {
+    "anonymous".to_string()
+}
+
 #[derive(Deserialize, Clone)]
 pub struct AuthConfig {
+    /// Legacy: Keycloak base URL. Deprecated in favor of `[[auth.providers]]`.
     #[serde(default)]
     pub keycloak_url: String,
+    /// Legacy: Keycloak realm. Deprecated in favor of `[[auth.providers]]`.
     #[serde(default)]
     pub realm: String,
+    /// Legacy: OAuth2 client_id (used when `providers` is empty for backward compat).
+    #[serde(default)]
     pub client_id: String,
+    /// Legacy: OAuth2 client_secret.
     #[serde(default)]
     pub client_secret: String,
-    /// Generic OAuth2 token endpoint for client_credentials grant.
+    /// Legacy: Generic OAuth2 token endpoint for client_credentials grant.
     /// When set (and keycloak_url is empty), the engine uses client_credentials mode.
     #[serde(default)]
     pub token_endpoint: String,
@@ -229,6 +336,10 @@ pub struct AuthConfig {
     pub token_refresh_buffer_secs: u64,
     #[serde(default = "default_true")]
     pub ssl_verification: bool,
+    /// Explicit provider chain. When non-empty, takes precedence over the
+    /// legacy `keycloak_url` / `token_endpoint` fields.
+    #[serde(default)]
+    pub providers: Vec<AuthProviderConfig>,
 }
 
 impl std::fmt::Debug for AuthConfig {
@@ -241,6 +352,7 @@ impl std::fmt::Debug for AuthConfig {
             .field("token_endpoint", &self.token_endpoint)
             .field("token_refresh_buffer_secs", &self.token_refresh_buffer_secs)
             .field("ssl_verification", &self.ssl_verification)
+            .field("providers", &format!("[{} provider(s)]", self.providers.len()))
             .finish()
     }
 }
@@ -384,17 +496,23 @@ impl SqeConfig {
         let mut errors = Vec::new();
 
         // Required fields
-        if self.auth.client_id.trim().is_empty() {
+        //
+        // When `auth.providers` is configured, the legacy fields (client_id,
+        // keycloak_url, token_endpoint) are not required.
+        let has_providers = !self.auth.providers.is_empty();
+
+        if !has_providers && self.auth.client_id.trim().is_empty() {
             errors.push("auth.client_id is required".to_string());
         }
         if self.catalog.polaris_url.trim().is_empty() {
             errors.push("catalog.polaris_url is required".to_string());
         }
-        if self.auth.keycloak_url.trim().is_empty()
+        if !has_providers
+            && self.auth.keycloak_url.trim().is_empty()
             && self.auth.token_endpoint.trim().is_empty()
         {
             errors.push(
-                "at least one of auth.keycloak_url or auth.token_endpoint must be set"
+                "at least one of auth.keycloak_url or auth.token_endpoint must be set, or configure auth.providers"
                     .to_string(),
             );
         }
@@ -676,6 +794,7 @@ mod tests {
                 token_endpoint: String::new(),
                 token_refresh_buffer_secs: 60,
                 ssl_verification: true,
+                providers: Vec::new(),
             },
             catalog: CatalogConfig {
                 polaris_url: "https://polaris.example.com".to_string(),
@@ -850,5 +969,165 @@ mod tests {
         let config = QueryHistoryConfig::default();
         assert_eq!(config.max_entries, 10000);
         assert_eq!(config.ttl_secs, 1800);
+    }
+
+    // -----------------------------------------------------------------------
+    // AuthProviderConfig parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_oidc_password_provider() {
+        let toml_str = r#"
+            type = "oidc_password"
+            token_url = "https://idp.example.com/token"
+            client_id = "sqe"
+            client_secret = "changeme"
+            roles_claim = "custom.roles"
+        "#;
+
+        let config: AuthProviderConfig = toml::from_str(toml_str).unwrap();
+        match config {
+            AuthProviderConfig::OidcPassword {
+                token_url,
+                client_id,
+                client_secret,
+                roles_claim,
+            } => {
+                assert_eq!(token_url, "https://idp.example.com/token");
+                assert_eq!(client_id, "sqe");
+                assert_eq!(client_secret, "changeme");
+                assert_eq!(roles_claim, "custom.roles");
+            }
+            other => panic!("Expected OidcPassword, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_oidc_password_provider_defaults() {
+        let toml_str = r#"
+            type = "oidc_password"
+            token_url = "https://idp.example.com/token"
+            client_id = "sqe"
+        "#;
+
+        let config: AuthProviderConfig = toml::from_str(toml_str).unwrap();
+        match config {
+            AuthProviderConfig::OidcPassword {
+                client_secret,
+                roles_claim,
+                ..
+            } => {
+                assert_eq!(client_secret, "");
+                assert_eq!(roles_claim, "realm_access.roles");
+            }
+            other => panic!("Expected OidcPassword, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_client_credentials_provider() {
+        let toml_str = r#"
+            type = "client_credentials"
+            token_endpoint = "https://polaris.example.com/oauth/tokens"
+            client_id = "polaris-client"
+            client_secret = "polaris-secret"
+        "#;
+
+        let config: AuthProviderConfig = toml::from_str(toml_str).unwrap();
+        match config {
+            AuthProviderConfig::ClientCredentials {
+                token_endpoint,
+                client_id,
+                client_secret,
+            } => {
+                assert_eq!(token_endpoint, "https://polaris.example.com/oauth/tokens");
+                assert_eq!(client_id, "polaris-client");
+                assert_eq!(client_secret, "polaris-secret");
+            }
+            other => panic!("Expected ClientCredentials, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_anonymous_provider() {
+        let toml_str = r#"
+            type = "anonymous"
+            user = "dev-user"
+            roles = ["admin", "reader"]
+        "#;
+
+        let config: AuthProviderConfig = toml::from_str(toml_str).unwrap();
+        match config {
+            AuthProviderConfig::Anonymous { user, roles } => {
+                assert_eq!(user, "dev-user");
+                assert_eq!(roles, vec!["admin", "reader"]);
+            }
+            other => panic!("Expected Anonymous, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_anonymous_provider_defaults() {
+        let toml_str = r#"
+            type = "anonymous"
+        "#;
+
+        let config: AuthProviderConfig = toml::from_str(toml_str).unwrap();
+        match config {
+            AuthProviderConfig::Anonymous { user, roles } => {
+                assert_eq!(user, "anonymous");
+                assert!(roles.is_empty());
+            }
+            other => panic!("Expected Anonymous, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_providers_array_in_auth_config() {
+        let toml_str = r#"
+            client_id = "sqe"
+
+            [[providers]]
+            type = "oidc_password"
+            token_url = "https://idp.example.com/token"
+            client_id = "sqe"
+
+            [[providers]]
+            type = "anonymous"
+            user = "fallback"
+        "#;
+
+        let config: AuthConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.providers.len(), 2);
+        assert!(matches!(config.providers[0], AuthProviderConfig::OidcPassword { .. }));
+        assert!(matches!(config.providers[1], AuthProviderConfig::Anonymous { .. }));
+    }
+
+    #[test]
+    fn test_parse_auth_config_no_providers_backward_compat() {
+        let toml_str = r#"
+            keycloak_url = "https://keycloak.example.com"
+            realm = "sqe"
+            client_id = "sqe-client"
+            client_secret = "secret"
+        "#;
+
+        let config: AuthConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.providers.is_empty());
+        assert_eq!(config.keycloak_url, "https://keycloak.example.com");
+        assert_eq!(config.client_id, "sqe-client");
+    }
+
+    #[test]
+    fn test_validate_with_providers_no_legacy_fields_needed() {
+        let mut config = valid_config();
+        config.auth.keycloak_url = String::new();
+        config.auth.token_endpoint = String::new();
+        config.auth.client_id = String::new();
+        config.auth.providers = vec![AuthProviderConfig::Anonymous {
+            user: "test".to_string(),
+            roles: vec![],
+        }];
+        assert!(config.validate().is_ok());
     }
 }

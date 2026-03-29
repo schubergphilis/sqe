@@ -1,0 +1,1206 @@
+//! `BearerTokenProvider` -- JWT bearer token validation against a JWKS endpoint.
+//!
+//! Clients pre-obtain a JWT (e.g. Kubernetes ServiceAccount token, Workload Identity,
+//! CI OIDC token, or a service-account PAT) and pass it as the `bearer_token` field
+//! in `FlightCredentials`, or via the Flight `Authorization: Bearer` header.
+//!
+//! This provider:
+//! 1. Detects credentials that look like a JWT (starts with `eyJ`)
+//! 2. Fetches and caches the JWKS from the configured endpoint
+//! 3. Validates the JWT signature (RS256), expiry, and optionally audience/issuer
+//! 4. Extracts user identity and roles from configurable claim paths
+//! 5. Returns the same JWT as the catalog token (passthrough)
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use jsonwebtoken::{
+    decode, decode_header, Algorithm, DecodingKey, TokenData, Validation,
+};
+use moka::future::Cache;
+use serde::Deserialize;
+use tokio::sync::Mutex;
+use tracing::{debug, warn};
+
+use crate::provider::{AuthError, AuthProvider, FlightCredentials, Identity};
+
+/// Configuration for the bearer token provider.
+#[derive(Debug, Clone)]
+pub struct BearerTokenProviderConfig {
+    /// URL to fetch the JSON Web Key Set (JWKS) from.
+    /// Example: `https://idp.example.com/.well-known/jwks.json`
+    pub jwks_url: String,
+    /// Optional: expected JWT `iss` (issuer) claim. Skipped if empty.
+    pub issuer: Option<String>,
+    /// Optional: expected JWT `aud` (audience) claim. Skipped if empty.
+    pub audience: Option<String>,
+    /// JWT claim to use as the user ID. Default: `"sub"`.
+    pub user_claim: String,
+    /// Dot-separated JSON path to the roles array in the JWT payload.
+    /// Default: `"realm_access.roles"`.
+    pub roles_claim: String,
+}
+
+impl Default for BearerTokenProviderConfig {
+    fn default() -> Self {
+        Self {
+            jwks_url: String::new(),
+            issuer: None,
+            audience: None,
+            user_claim: "sub".to_string(),
+            roles_claim: "realm_access.roles".to_string(),
+        }
+    }
+}
+
+/// A single JSON Web Key from a JWKS response.
+#[derive(Debug, Clone, Deserialize)]
+struct Jwk {
+    /// Key ID (used to match against JWT `kid` header).
+    kid: Option<String>,
+    /// Key type (e.g. "RSA").
+    kty: String,
+    /// RSA modulus (base64url-encoded).
+    n: Option<String>,
+    /// RSA exponent (base64url-encoded).
+    e: Option<String>,
+    /// Algorithm (e.g. "RS256").
+    #[serde(default)]
+    #[allow(dead_code)]
+    alg: Option<String>,
+}
+
+/// JWKS response from the identity provider.
+#[derive(Debug, Clone, Deserialize)]
+struct JwksResponse {
+    keys: Vec<Jwk>,
+}
+
+/// Cached JWKS: maps `kid` -> `DecodingKey`.
+type JwksMap = HashMap<String, DecodingKey>;
+
+/// Bearer token authentication provider.
+///
+/// Validates pre-obtained JWTs against a remote JWKS endpoint. The JWKS is
+/// cached with a 15-minute TTL and refreshed on cache miss or `kid` mismatch.
+pub struct BearerTokenProvider {
+    client: reqwest::Client,
+    config: BearerTokenProviderConfig,
+    /// Cached JWKS keyed by a fixed cache key. The value is an `Arc<JwksMap>`.
+    jwks_cache: Cache<String, Arc<JwksMap>>,
+    /// Mutex to prevent concurrent JWKS fetches (thundering herd).
+    fetch_mutex: Mutex<()>,
+}
+
+impl BearerTokenProvider {
+    /// Create a new bearer token provider with the given configuration.
+    pub fn new(config: BearerTokenProviderConfig) -> Result<Self, AuthError> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| {
+                AuthError::Internal(anyhow::anyhow!("Failed to build HTTP client: {e}"))
+            })?;
+
+        let jwks_cache = Cache::builder()
+            .max_capacity(1)
+            .time_to_live(Duration::from_secs(15 * 60)) // 15 minutes
+            .build();
+
+        Ok(Self {
+            client,
+            config,
+            jwks_cache,
+            fetch_mutex: Mutex::new(()),
+        })
+    }
+
+    /// Create a new provider with a custom reqwest client (for testing).
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn with_client(
+        config: BearerTokenProviderConfig,
+        client: reqwest::Client,
+    ) -> Self {
+        let jwks_cache = Cache::builder()
+            .max_capacity(1)
+            .time_to_live(Duration::from_secs(15 * 60))
+            .build();
+
+        Self {
+            client,
+            config,
+            jwks_cache,
+            fetch_mutex: Mutex::new(()),
+        }
+    }
+
+    /// The fixed cache key for the JWKS.
+    const CACHE_KEY: &'static str = "jwks";
+
+    /// Get the cached JWKS, or fetch it from the endpoint.
+    async fn get_jwks(&self) -> Result<Arc<JwksMap>, AuthError> {
+        if let Some(cached) = self.jwks_cache.get(Self::CACHE_KEY).await {
+            return Ok(cached);
+        }
+        self.fetch_and_cache_jwks().await
+    }
+
+    /// Fetch the JWKS from the configured URL and cache it.
+    ///
+    /// Uses a mutex to prevent concurrent fetches (thundering herd protection).
+    async fn fetch_and_cache_jwks(&self) -> Result<Arc<JwksMap>, AuthError> {
+        let _guard = self.fetch_mutex.lock().await;
+
+        // Double-check: another task may have populated the cache while we waited.
+        if let Some(cached) = self.jwks_cache.get(Self::CACHE_KEY).await {
+            return Ok(cached);
+        }
+
+        debug!(url = %self.config.jwks_url, "Fetching JWKS from endpoint");
+
+        let response = self
+            .client
+            .get(&self.config.jwks_url)
+            .send()
+            .await
+            .map_err(|e| {
+                AuthError::Internal(anyhow::anyhow!("JWKS fetch failed: {e}"))
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            return Err(AuthError::Internal(anyhow::anyhow!(
+                "JWKS endpoint returned {status}"
+            )));
+        }
+
+        let jwks: JwksResponse = response.json().await.map_err(|e| {
+            AuthError::Internal(anyhow::anyhow!("Failed to parse JWKS response: {e}"))
+        })?;
+
+        let mut map = HashMap::new();
+        for key in &jwks.keys {
+            // Only process RSA keys.
+            if key.kty != "RSA" {
+                continue;
+            }
+
+            let (n, e) = match (&key.n, &key.e) {
+                (Some(n), Some(e)) => (n.as_str(), e.as_str()),
+                _ => continue,
+            };
+
+            let decoding_key = match DecodingKey::from_rsa_components(n, e) {
+                Ok(dk) => dk,
+                Err(err) => {
+                    warn!(kid = ?key.kid, error = %err, "Skipping malformed RSA key");
+                    continue;
+                }
+            };
+
+            if let Some(kid) = &key.kid {
+                map.insert(kid.clone(), decoding_key);
+            }
+        }
+
+        debug!(key_count = map.len(), "JWKS loaded and cached");
+
+        let cached = Arc::new(map);
+        self.jwks_cache
+            .insert(Self::CACHE_KEY.to_string(), Arc::clone(&cached))
+            .await;
+        Ok(cached)
+    }
+
+    /// Force-invalidate the JWKS cache and re-fetch.
+    async fn refetch_jwks(&self) -> Result<Arc<JwksMap>, AuthError> {
+        self.jwks_cache.invalidate(Self::CACHE_KEY).await;
+        self.fetch_and_cache_jwks().await
+    }
+
+    /// Validate and decode a JWT token against the cached JWKS.
+    ///
+    /// On `kid` mismatch, refetches the JWKS once and retries (handles key rotation).
+    async fn validate_jwt(
+        &self,
+        token: &str,
+    ) -> Result<TokenData<serde_json::Value>, AuthError> {
+        // Decode the JWT header to find the `kid`.
+        let header = decode_header(token).map_err(|e| {
+            AuthError::AuthFailed(format!("Invalid JWT header: {e}"))
+        })?;
+
+        let kid = header.kid.ok_or_else(|| {
+            AuthError::AuthFailed("JWT header missing `kid` field".to_string())
+        })?;
+
+        // Build the validation configuration.
+        let mut validation = Validation::new(Algorithm::RS256);
+
+        // Configure audience validation.
+        match &self.config.audience {
+            Some(aud) if !aud.is_empty() => {
+                validation.set_audience(&[aud]);
+            }
+            _ => {
+                validation.validate_aud = false;
+            }
+        }
+
+        // Configure issuer validation.
+        match &self.config.issuer {
+            Some(iss) if !iss.is_empty() => {
+                validation.set_issuer(&[iss]);
+            }
+            _ => {}
+        }
+
+        // exp is validated by default in jsonwebtoken.
+
+        // First attempt: use cached JWKS.
+        let jwks = self.get_jwks().await?;
+
+        if let Some(decoding_key) = jwks.get(&kid) {
+            match decode::<serde_json::Value>(token, decoding_key, &validation) {
+                Ok(token_data) => return Ok(token_data),
+                Err(e) => {
+                    // If it's not a key-related error, don't retry.
+                    let err_str = e.to_string();
+                    if !err_str.contains("InvalidSignature") {
+                        return Err(Self::map_jwt_error(e));
+                    }
+                    debug!(kid = %kid, "Signature validation failed, will try JWKS refetch");
+                }
+            }
+        } else {
+            debug!(kid = %kid, "Key ID not found in cached JWKS, refetching");
+        }
+
+        // Second attempt: refetch JWKS and retry (handles key rotation).
+        let jwks = self.refetch_jwks().await?;
+
+        let decoding_key = jwks.get(&kid).ok_or_else(|| {
+            AuthError::AuthFailed(format!(
+                "Key ID '{kid}' not found in JWKS after refresh"
+            ))
+        })?;
+
+        decode::<serde_json::Value>(token, decoding_key, &validation)
+            .map_err(Self::map_jwt_error)
+    }
+
+    /// Map a `jsonwebtoken::errors::Error` to an `AuthError`.
+    fn map_jwt_error(err: jsonwebtoken::errors::Error) -> AuthError {
+        use jsonwebtoken::errors::ErrorKind;
+        match err.kind() {
+            ErrorKind::ExpiredSignature => {
+                AuthError::AuthFailed("JWT has expired".to_string())
+            }
+            ErrorKind::InvalidAudience => {
+                AuthError::AuthFailed("JWT audience mismatch".to_string())
+            }
+            ErrorKind::InvalidIssuer => {
+                AuthError::AuthFailed("JWT issuer mismatch".to_string())
+            }
+            ErrorKind::InvalidSignature => {
+                AuthError::AuthFailed("JWT signature verification failed".to_string())
+            }
+            _ => AuthError::AuthFailed(format!("JWT validation failed: {err}")),
+        }
+    }
+
+    /// Extract a claim value by a dot-separated path (e.g. "realm_access.roles").
+    fn extract_claim_by_path<'a>(
+        claims: &'a serde_json::Value,
+        path: &str,
+    ) -> Option<&'a serde_json::Value> {
+        let mut current = claims;
+        for segment in path.split('.') {
+            current = current.get(segment)?;
+        }
+        Some(current)
+    }
+
+    /// Extract the user ID from JWT claims using the configured `user_claim`.
+    fn extract_user_id(
+        claims: &serde_json::Value,
+        user_claim: &str,
+    ) -> Option<String> {
+        Self::extract_claim_by_path(claims, user_claim)
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    }
+
+    /// Extract roles from JWT claims using the configured `roles_claim` path.
+    fn extract_roles(claims: &serde_json::Value, roles_claim: &str) -> Vec<String> {
+        Self::extract_claim_by_path(claims, roles_claim)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Detect if the credentials contain a JWT meant for this provider.
+    ///
+    /// A JWT is detected by the `eyJ` prefix (base64-encoded `{"` header start).
+    /// Checks `bearer_token` first, then falls back to `password`.
+    fn detect_jwt(credentials: &FlightCredentials) -> Option<String> {
+        // Primary: explicit bearer_token field.
+        if let Some(token) = &credentials.bearer_token {
+            if token.starts_with("eyJ") {
+                return Some(token.clone());
+            }
+        }
+
+        // Fallback: password field that looks like a JWT (Flight Basic auth workaround).
+        if let Some(password) = &credentials.password {
+            if password.starts_with("eyJ") {
+                return Some(password.clone());
+            }
+        }
+
+        None
+    }
+}
+
+#[async_trait]
+impl AuthProvider for BearerTokenProvider {
+    async fn authenticate(&self, credentials: &FlightCredentials) -> Result<Identity, AuthError> {
+        // Step 1: Detect if credentials contain a JWT.
+        let token = match Self::detect_jwt(credentials) {
+            Some(t) => t,
+            None => return Err(AuthError::NotMyCredentials),
+        };
+
+        // Step 2-3: Validate the JWT (signature, expiry, audience, issuer).
+        let token_data = self.validate_jwt(&token).await?;
+        let claims = &token_data.claims;
+
+        // Step 4: Extract user identity and roles.
+        let user_id = Self::extract_user_id(claims, &self.config.user_claim)
+            .ok_or_else(|| {
+                AuthError::AuthFailed(format!(
+                    "JWT missing '{}' claim",
+                    self.config.user_claim
+                ))
+            })?;
+
+        let roles = Self::extract_roles(claims, &self.config.roles_claim);
+
+        debug!(
+            user_id = %user_id,
+            roles = ?roles,
+            "Bearer token authentication succeeded"
+        );
+
+        Ok(Identity {
+            user_id: user_id.clone(),
+            display_name: user_id,
+            roles,
+            catalog_token: Some(token),
+            refresh_token: None,
+        })
+    }
+
+    /// Return the same JWT as the catalog token (passthrough).
+    async fn refresh_catalog_token(
+        &self,
+        identity: &Identity,
+    ) -> Result<Option<String>, AuthError> {
+        Ok(identity.catalog_token.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use rsa::traits::PublicKeyParts;
+    use serde_json::json;
+    use std::sync::LazyLock;
+
+    const TEST_KID: &str = "test-key-1";
+
+    /// RSA key pair generated once at test-time (thread-safe lazy init).
+    struct TestKeyPair {
+        encoding_key: EncodingKey,
+        /// Base64url-encoded RSA modulus (n) for JWKS.
+        n: String,
+        /// Base64url-encoded RSA exponent (e) for JWKS.
+        e: String,
+    }
+
+    static TEST_KEYS: LazyLock<TestKeyPair> = LazyLock::new(|| {
+        use rsa::pkcs1::EncodeRsaPrivateKey;
+
+        let mut rng = rand::thread_rng();
+        let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let public_key = private_key.to_public_key();
+
+        // Encode private key as PKCS#1 PEM for jsonwebtoken.
+        let pem = private_key
+            .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
+            .unwrap();
+        let encoding_key = EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
+
+        // Extract n and e as base64url-encoded values for JWKS.
+        let n = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(public_key.n().to_bytes_be());
+        let e = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(public_key.e().to_bytes_be());
+
+        TestKeyPair { encoding_key, n, e }
+    });
+
+    /// Build a valid JWT signed with the test RSA key.
+    fn build_signed_jwt(claims: &serde_json::Value) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(TEST_KID.to_string());
+
+        encode(&header, claims, &TEST_KEYS.encoding_key).unwrap()
+    }
+
+    /// Build a JWKS JSON response containing the test public key.
+    fn build_jwks_json() -> serde_json::Value {
+        json!({
+            "keys": [{
+                "kty": "RSA",
+                "kid": TEST_KID,
+                "alg": "RS256",
+                "use": "sig",
+                "n": &TEST_KEYS.n,
+                "e": &TEST_KEYS.e
+            }]
+        })
+    }
+
+    /// Default config for tests.
+    fn test_config(jwks_url: &str) -> BearerTokenProviderConfig {
+        BearerTokenProviderConfig {
+            jwks_url: jwks_url.to_string(),
+            issuer: None,
+            audience: None,
+            user_claim: "sub".to_string(),
+            roles_claim: "realm_access.roles".to_string(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // detect_jwt
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn detect_jwt_from_bearer_token() {
+        let creds = FlightCredentials {
+            bearer_token: Some("eyJhbGciOiJSUzI1NiJ9.payload.sig".to_string()),
+            ..Default::default()
+        };
+        let token = BearerTokenProvider::detect_jwt(&creds);
+        assert!(token.is_some());
+        assert!(token.unwrap().starts_with("eyJ"));
+    }
+
+    #[test]
+    fn detect_jwt_from_password_field() {
+        let creds = FlightCredentials {
+            password: Some("eyJhbGciOiJSUzI1NiJ9.payload.sig".to_string()),
+            ..Default::default()
+        };
+        let token = BearerTokenProvider::detect_jwt(&creds);
+        assert!(token.is_some());
+    }
+
+    #[test]
+    fn detect_jwt_bearer_token_takes_precedence() {
+        let creds = FlightCredentials {
+            bearer_token: Some("eyJbearer".to_string()),
+            password: Some("eyJpassword".to_string()),
+            ..Default::default()
+        };
+        let token = BearerTokenProvider::detect_jwt(&creds);
+        assert_eq!(token.unwrap(), "eyJbearer");
+    }
+
+    #[test]
+    fn detect_jwt_returns_none_for_non_jwt() {
+        let creds = FlightCredentials {
+            password: Some("regular-password".to_string()),
+            ..Default::default()
+        };
+        assert!(BearerTokenProvider::detect_jwt(&creds).is_none());
+    }
+
+    #[test]
+    fn detect_jwt_returns_none_for_empty_credentials() {
+        let creds = FlightCredentials::default();
+        assert!(BearerTokenProvider::detect_jwt(&creds).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_claim_by_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_claim_single_segment() {
+        let claims = json!({"sub": "alice"});
+        let result = BearerTokenProvider::extract_claim_by_path(&claims, "sub");
+        assert_eq!(result.unwrap().as_str().unwrap(), "alice");
+    }
+
+    #[test]
+    fn extract_claim_nested_path() {
+        let claims = json!({
+            "realm_access": {
+                "roles": ["admin", "user"]
+            }
+        });
+        let result =
+            BearerTokenProvider::extract_claim_by_path(&claims, "realm_access.roles");
+        assert!(result.unwrap().is_array());
+    }
+
+    #[test]
+    fn extract_claim_missing_path() {
+        let claims = json!({"sub": "alice"});
+        let result =
+            BearerTokenProvider::extract_claim_by_path(&claims, "nonexistent.path");
+        assert!(result.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_user_id
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_user_id_default_claim() {
+        let claims = json!({"sub": "user-123"});
+        assert_eq!(
+            BearerTokenProvider::extract_user_id(&claims, "sub"),
+            Some("user-123".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_user_id_custom_claim() {
+        let claims = json!({"email": "alice@example.com"});
+        assert_eq!(
+            BearerTokenProvider::extract_user_id(&claims, "email"),
+            Some("alice@example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_user_id_missing_claim() {
+        let claims = json!({"other": "value"});
+        assert!(BearerTokenProvider::extract_user_id(&claims, "sub").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_roles
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_roles_nested() {
+        let claims = json!({
+            "realm_access": {
+                "roles": ["admin", "user"]
+            }
+        });
+        let roles =
+            BearerTokenProvider::extract_roles(&claims, "realm_access.roles");
+        assert_eq!(roles, vec!["admin", "user"]);
+    }
+
+    #[test]
+    fn extract_roles_flat() {
+        let claims = json!({"groups": ["engineering", "platform"]});
+        let roles = BearerTokenProvider::extract_roles(&claims, "groups");
+        assert_eq!(roles, vec!["engineering", "platform"]);
+    }
+
+    #[test]
+    fn extract_roles_missing_returns_empty() {
+        let claims = json!({"sub": "alice"});
+        let roles =
+            BearerTokenProvider::extract_roles(&claims, "realm_access.roles");
+        assert!(roles.is_empty());
+    }
+
+    #[test]
+    fn extract_roles_skips_non_strings() {
+        let claims = json!({"roles": ["admin", 42, null, "user"]});
+        let roles = BearerTokenProvider::extract_roles(&claims, "roles");
+        assert_eq!(roles, vec!["admin", "user"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // config defaults
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn config_defaults() {
+        let config = BearerTokenProviderConfig::default();
+        assert!(config.jwks_url.is_empty());
+        assert!(config.issuer.is_none());
+        assert!(config.audience.is_none());
+        assert_eq!(config.user_claim, "sub");
+        assert_eq!(config.roles_claim, "realm_access.roles");
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration tests with mock JWKS server
+    // -----------------------------------------------------------------------
+
+    /// Start a mock HTTP server that serves a JWKS response.
+    async fn start_jwks_server(
+        jwks_json: serde_json::Value,
+    ) -> (tokio::task::JoinHandle<()>, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://127.0.0.1:{}", addr.port());
+
+        let jwks_body = serde_json::to_string(&jwks_json).unwrap();
+
+        let handle = tokio::spawn(async move {
+            // Serve up to 10 requests then stop.
+            for _ in 0..10 {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    jwks_body.len(),
+                    jwks_body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        (handle, url)
+    }
+
+    /// Start a mock HTTP server that tracks request counts (for JWKS refetch testing).
+    async fn start_counting_jwks_server(
+        jwks_json: serde_json::Value,
+    ) -> (tokio::task::JoinHandle<()>, String, Arc<std::sync::atomic::AtomicUsize>)
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://127.0.0.1:{}", addr.port());
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+
+        let jwks_body = serde_json::to_string(&jwks_json).unwrap();
+
+        let handle = tokio::spawn(async move {
+            for _ in 0..10 {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+
+                counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    jwks_body.len(),
+                    jwks_body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        (handle, url, counter)
+    }
+
+    // -----------------------------------------------------------------------
+    // 3.7: Valid JWT → returns Identity with correct claims
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn valid_jwt_returns_identity() {
+        let jwks = build_jwks_json();
+        let (_handle, jwks_url) = start_jwks_server(jwks).await;
+
+        let config = test_config(&jwks_url);
+        let provider = BearerTokenProvider::new(config).unwrap();
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = json!({
+            "sub": "alice",
+            "realm_access": {
+                "roles": ["admin", "reader"]
+            },
+            "exp": now + 3600,
+            "iat": now
+        });
+
+        let token = build_signed_jwt(&claims);
+
+        let creds = FlightCredentials {
+            bearer_token: Some(token.clone()),
+            ..Default::default()
+        };
+
+        let identity = provider
+            .authenticate(&creds)
+            .await
+            .expect("should authenticate successfully");
+
+        assert_eq!(identity.user_id, "alice");
+        assert_eq!(identity.display_name, "alice");
+        assert_eq!(identity.roles, vec!["admin", "reader"]);
+        assert_eq!(identity.catalog_token, Some(token));
+        assert!(identity.refresh_token.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // 3.7: Expired JWT → returns AuthFailed
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn expired_jwt_returns_auth_failed() {
+        let jwks = build_jwks_json();
+        let (_handle, jwks_url) = start_jwks_server(jwks).await;
+
+        let config = test_config(&jwks_url);
+        let provider = BearerTokenProvider::new(config).unwrap();
+
+        let claims = json!({
+            "sub": "alice",
+            "realm_access": { "roles": ["admin"] },
+            "exp": 1000000000, // long expired
+            "iat": 999999000
+        });
+
+        let token = build_signed_jwt(&claims);
+
+        let creds = FlightCredentials {
+            bearer_token: Some(token),
+            ..Default::default()
+        };
+
+        let result = provider.authenticate(&creds).await;
+        match result {
+            Err(AuthError::AuthFailed(msg)) => {
+                assert!(
+                    msg.contains("expired"),
+                    "Expected expiry error, got: {msg}"
+                );
+            }
+            other => panic!("Expected AuthFailed, got: {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 3.7: No bearer token in credentials → returns NotMyCredentials
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn no_bearer_token_returns_not_my_credentials() {
+        let config = BearerTokenProviderConfig {
+            jwks_url: "http://localhost:0/jwks".to_string(),
+            ..Default::default()
+        };
+        let provider = BearerTokenProvider::new(config).unwrap();
+
+        // No bearer_token, no password, nothing JWT-like.
+        let creds = FlightCredentials {
+            username: Some("alice".to_string()),
+            password: Some("regular-password".to_string()),
+            ..Default::default()
+        };
+
+        let result = provider.authenticate(&creds).await;
+        assert!(
+            matches!(result, Err(AuthError::NotMyCredentials)),
+            "Expected NotMyCredentials, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_credentials_returns_not_my_credentials() {
+        let config = BearerTokenProviderConfig {
+            jwks_url: "http://localhost:0/jwks".to_string(),
+            ..Default::default()
+        };
+        let provider = BearerTokenProvider::new(config).unwrap();
+
+        let creds = FlightCredentials::default();
+        let result = provider.authenticate(&creds).await;
+        assert!(matches!(result, Err(AuthError::NotMyCredentials)));
+    }
+
+    // -----------------------------------------------------------------------
+    // 3.7: Unknown kid → triggers JWKS refetch
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn unknown_kid_triggers_jwks_refetch() {
+        // Start with a JWKS that has the correct key (the refetch will also
+        // return the correct key). The key point is verifying that the JWKS
+        // endpoint is called more than once when the kid is initially unknown.
+        let jwks = build_jwks_json();
+        let (_handle, jwks_url, counter) =
+            start_counting_jwks_server(jwks).await;
+
+        let config = test_config(&jwks_url);
+        let provider = BearerTokenProvider::new(config).unwrap();
+
+        // Pre-populate cache with a JWKS that does NOT contain our kid.
+        let wrong_jwks: Arc<JwksMap> = Arc::new(HashMap::new());
+        provider
+            .jwks_cache
+            .insert(BearerTokenProvider::CACHE_KEY.to_string(), wrong_jwks)
+            .await;
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = json!({
+            "sub": "bob",
+            "realm_access": { "roles": ["viewer"] },
+            "exp": now + 3600,
+            "iat": now
+        });
+
+        let token = build_signed_jwt(&claims);
+
+        let creds = FlightCredentials {
+            bearer_token: Some(token),
+            ..Default::default()
+        };
+
+        // This should fail to find the kid in the pre-populated cache, refetch, and succeed.
+        let identity = provider
+            .authenticate(&creds)
+            .await
+            .expect("should succeed after JWKS refetch");
+
+        assert_eq!(identity.user_id, "bob");
+        assert_eq!(identity.roles, vec!["viewer"]);
+
+        // The JWKS endpoint should have been called at least once (the refetch).
+        let fetch_count =
+            counter.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            fetch_count >= 1,
+            "Expected at least 1 JWKS fetch, got {fetch_count}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Audience validation
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn audience_mismatch_returns_auth_failed() {
+        let jwks = build_jwks_json();
+        let (_handle, jwks_url) = start_jwks_server(jwks).await;
+
+        let config = BearerTokenProviderConfig {
+            jwks_url: jwks_url.clone(),
+            audience: Some("expected-audience".to_string()),
+            ..Default::default()
+        };
+        let provider = BearerTokenProvider::new(config).unwrap();
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = json!({
+            "sub": "alice",
+            "aud": "wrong-audience",
+            "exp": now + 3600,
+            "iat": now
+        });
+
+        let token = build_signed_jwt(&claims);
+        let creds = FlightCredentials {
+            bearer_token: Some(token),
+            ..Default::default()
+        };
+
+        let result = provider.authenticate(&creds).await;
+        match result {
+            Err(AuthError::AuthFailed(msg)) => {
+                assert!(
+                    msg.contains("audience"),
+                    "Expected audience error, got: {msg}"
+                );
+            }
+            other => panic!("Expected AuthFailed for audience mismatch, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn audience_match_succeeds() {
+        let jwks = build_jwks_json();
+        let (_handle, jwks_url) = start_jwks_server(jwks).await;
+
+        let config = BearerTokenProviderConfig {
+            jwks_url: jwks_url.clone(),
+            audience: Some("sqe".to_string()),
+            ..Default::default()
+        };
+        let provider = BearerTokenProvider::new(config).unwrap();
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = json!({
+            "sub": "alice",
+            "aud": "sqe",
+            "realm_access": { "roles": ["admin"] },
+            "exp": now + 3600,
+            "iat": now
+        });
+
+        let token = build_signed_jwt(&claims);
+        let creds = FlightCredentials {
+            bearer_token: Some(token),
+            ..Default::default()
+        };
+
+        let identity = provider
+            .authenticate(&creds)
+            .await
+            .expect("should succeed with matching audience");
+        assert_eq!(identity.user_id, "alice");
+    }
+
+    // -----------------------------------------------------------------------
+    // Issuer validation
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn issuer_mismatch_returns_auth_failed() {
+        let jwks = build_jwks_json();
+        let (_handle, jwks_url) = start_jwks_server(jwks).await;
+
+        let config = BearerTokenProviderConfig {
+            jwks_url: jwks_url.clone(),
+            issuer: Some("https://expected.example.com".to_string()),
+            ..Default::default()
+        };
+        let provider = BearerTokenProvider::new(config).unwrap();
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = json!({
+            "sub": "alice",
+            "iss": "https://wrong.example.com",
+            "exp": now + 3600,
+            "iat": now
+        });
+
+        let token = build_signed_jwt(&claims);
+        let creds = FlightCredentials {
+            bearer_token: Some(token),
+            ..Default::default()
+        };
+
+        let result = provider.authenticate(&creds).await;
+        match result {
+            Err(AuthError::AuthFailed(msg)) => {
+                assert!(
+                    msg.contains("issuer"),
+                    "Expected issuer error, got: {msg}"
+                );
+            }
+            other => panic!("Expected AuthFailed for issuer mismatch, got: {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // JWT passed as password field (Flight Basic auth workaround)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn jwt_in_password_field_works() {
+        let jwks = build_jwks_json();
+        let (_handle, jwks_url) = start_jwks_server(jwks).await;
+
+        let config = test_config(&jwks_url);
+        let provider = BearerTokenProvider::new(config).unwrap();
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = json!({
+            "sub": "charlie",
+            "realm_access": { "roles": ["developer"] },
+            "exp": now + 3600,
+            "iat": now
+        });
+
+        let token = build_signed_jwt(&claims);
+        let creds = FlightCredentials {
+            username: Some("ignored".to_string()),
+            password: Some(token),
+            ..Default::default()
+        };
+
+        let identity = provider
+            .authenticate(&creds)
+            .await
+            .expect("should accept JWT from password field");
+        assert_eq!(identity.user_id, "charlie");
+        assert_eq!(identity.roles, vec!["developer"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Custom user_claim and roles_claim
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn custom_claims_extraction() {
+        let jwks = build_jwks_json();
+        let (_handle, jwks_url) = start_jwks_server(jwks).await;
+
+        let config = BearerTokenProviderConfig {
+            jwks_url: jwks_url.clone(),
+            user_claim: "email".to_string(),
+            roles_claim: "groups".to_string(),
+            ..Default::default()
+        };
+        let provider = BearerTokenProvider::new(config).unwrap();
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = json!({
+            "sub": "user-123",
+            "email": "alice@example.com",
+            "groups": ["engineering", "platform"],
+            "exp": now + 3600,
+            "iat": now
+        });
+
+        let token = build_signed_jwt(&claims);
+        let creds = FlightCredentials {
+            bearer_token: Some(token),
+            ..Default::default()
+        };
+
+        let identity = provider
+            .authenticate(&creds)
+            .await
+            .expect("should use custom claims");
+        assert_eq!(identity.user_id, "alice@example.com");
+        assert_eq!(identity.roles, vec!["engineering", "platform"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Missing user claim → AuthFailed
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn missing_user_claim_returns_auth_failed() {
+        let jwks = build_jwks_json();
+        let (_handle, jwks_url) = start_jwks_server(jwks).await;
+
+        let config = BearerTokenProviderConfig {
+            jwks_url: jwks_url.clone(),
+            user_claim: "email".to_string(),
+            ..Default::default()
+        };
+        let provider = BearerTokenProvider::new(config).unwrap();
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = json!({
+            "sub": "user-123",
+            // no "email" claim
+            "exp": now + 3600,
+            "iat": now
+        });
+
+        let token = build_signed_jwt(&claims);
+        let creds = FlightCredentials {
+            bearer_token: Some(token),
+            ..Default::default()
+        };
+
+        let result = provider.authenticate(&creds).await;
+        match result {
+            Err(AuthError::AuthFailed(msg)) => {
+                assert!(msg.contains("email"), "Expected mention of claim, got: {msg}");
+            }
+            other => panic!("Expected AuthFailed, got: {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // refresh_catalog_token returns the same JWT (passthrough)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn refresh_returns_same_token() {
+        let config = BearerTokenProviderConfig {
+            jwks_url: "http://localhost:0/jwks".to_string(),
+            ..Default::default()
+        };
+        let provider = BearerTokenProvider::new(config).unwrap();
+
+        let identity = Identity {
+            user_id: "alice".to_string(),
+            display_name: "Alice".to_string(),
+            roles: vec!["admin".to_string()],
+            catalog_token: Some("the-jwt-token".to_string()),
+            refresh_token: None,
+        };
+
+        let result = provider
+            .refresh_catalog_token(&identity)
+            .await
+            .expect("should succeed");
+        assert_eq!(result, Some("the-jwt-token".to_string()));
+    }
+
+    #[tokio::test]
+    async fn refresh_returns_none_when_no_catalog_token() {
+        let config = BearerTokenProviderConfig {
+            jwks_url: "http://localhost:0/jwks".to_string(),
+            ..Default::default()
+        };
+        let provider = BearerTokenProvider::new(config).unwrap();
+
+        let identity = Identity {
+            user_id: "alice".to_string(),
+            display_name: "Alice".to_string(),
+            roles: vec![],
+            catalog_token: None,
+            refresh_token: None,
+        };
+
+        let result = provider
+            .refresh_catalog_token(&identity)
+            .await
+            .expect("should succeed");
+        assert_eq!(result, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Provider construction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn new_succeeds_with_valid_config() {
+        let config = BearerTokenProviderConfig {
+            jwks_url: "http://localhost:8080/.well-known/jwks.json".to_string(),
+            issuer: Some("https://idp.example.com".to_string()),
+            audience: Some("sqe".to_string()),
+            user_claim: "sub".to_string(),
+            roles_claim: "realm_access.roles".to_string(),
+        };
+        assert!(BearerTokenProvider::new(config).is_ok());
+    }
+}

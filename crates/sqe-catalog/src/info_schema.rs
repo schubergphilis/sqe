@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -11,20 +12,45 @@ use datafusion::error::Result as DFResult;
 use iceberg::NamespaceIdent;
 use tracing::{error, warn};
 
+use sqe_core::SessionUser;
+use sqe_policy::PolicyStore;
+
 use crate::rest_catalog::SessionCatalog;
 
 /// DataFusion `SchemaProvider` for the virtual `information_schema`.
-#[derive(Debug)]
+///
+/// When a `PolicyStore` and `SessionUser` are provided, restricted columns
+/// are filtered out of `information_schema.columns` so that users cannot
+/// discover column names they are not allowed to see.
 pub struct InformationSchemaProvider {
     session_catalog: Arc<SessionCatalog>,
     warehouse: String,
+    policy_store: Option<Arc<dyn PolicyStore>>,
+    session_user: Option<SessionUser>,
+}
+
+impl fmt::Debug for InformationSchemaProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InformationSchemaProvider")
+            .field("warehouse", &self.warehouse)
+            .field("has_policy_store", &self.policy_store.is_some())
+            .field("session_user", &self.session_user)
+            .finish()
+    }
 }
 
 impl InformationSchemaProvider {
-    pub fn new(session_catalog: Arc<SessionCatalog>, warehouse: String) -> Self {
+    pub fn new(
+        session_catalog: Arc<SessionCatalog>,
+        warehouse: String,
+        policy_store: Option<Arc<dyn PolicyStore>>,
+        session_user: Option<SessionUser>,
+    ) -> Self {
         Self {
             session_catalog,
             warehouse,
+            policy_store,
+            session_user,
         }
     }
 }
@@ -145,13 +171,38 @@ impl InformationSchemaProvider {
                     }
                 };
 
+                // Resolve restricted columns for this table when policy is active
+                let restricted_columns = match (&self.policy_store, &self.session_user) {
+                    (Some(store), Some(user)) => {
+                        match store.resolve(user, table_ident.name(), ns).await {
+                            Ok(policy) => policy.restricted_columns,
+                            Err(e) => {
+                                warn!(
+                                    table = %table_ident.name(),
+                                    namespace = %ns,
+                                    error = %e,
+                                    "Failed to resolve policy for information_schema.columns; showing all columns"
+                                );
+                                Vec::new()
+                            }
+                        }
+                    }
+                    _ => Vec::new(),
+                };
+
                 let iceberg_schema = table.metadata().current_schema();
-                for (idx, field) in iceberg_schema.as_struct().fields().iter().enumerate() {
+                let mut ordinal = 0i32;
+                for field in iceberg_schema.as_struct().fields().iter() {
+                    // Filter out restricted columns so they are invisible
+                    if restricted_columns.contains(&field.name) {
+                        continue;
+                    }
+                    ordinal += 1;
                     cat_b.append_value(&self.warehouse);
                     sch_b.append_value(ns);
                     tbl_b.append_value(table_ident.name());
                     col_b.append_value(&field.name);
-                    ord_b.append_value((idx + 1) as i32);
+                    ord_b.append_value(ordinal);
                     null_b.append_value(if field.required { "NO" } else { "YES" });
                     type_b.append_value(format!("{}", field.field_type));
                 }

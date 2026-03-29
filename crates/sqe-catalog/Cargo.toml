@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 sqe-core = { path = "../sqe-core" }
+sqe-policy = { path = "../sqe-policy" }
 sqe-metrics = { path = "../sqe-metrics" }
 datafusion = { workspace = true }
 datafusion-expr = { workspace = true }
