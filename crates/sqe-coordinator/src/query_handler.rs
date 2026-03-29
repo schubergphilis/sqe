@@ -641,7 +641,11 @@ impl QueryHandler {
             "Distributed scan plan created"
         );
 
-        Arc::new(exec)
+        let dist_scan: Arc<dyn ExecutionPlan> = Arc::new(exec);
+
+        // Replace the IcebergScanExec leaf within the plan tree, keeping
+        // all parent nodes (filter, aggregate, sort, projection) intact.
+        replace_scan_in_plan(&plan, &scan_node, dist_scan)
     }
 
     /// Create a DataFusion SessionContext with the user's Polaris catalog registered.
@@ -995,6 +999,48 @@ fn find_iceberg_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionP
         }
     }
     None
+}
+
+/// Replace a specific scan node in a physical plan tree with a new node,
+/// keeping all parent nodes (filter, aggregate, sort, projection) intact.
+///
+/// Walks the tree recursively. When the target node is found (by Arc pointer
+/// equality), it's replaced with the replacement. All ancestor nodes are
+/// rebuilt via `with_new_children()` to incorporate the change.
+fn replace_scan_in_plan(
+    plan: &Arc<dyn ExecutionPlan>,
+    target: &Arc<dyn ExecutionPlan>,
+    replacement: Arc<dyn ExecutionPlan>,
+) -> Arc<dyn ExecutionPlan> {
+    // Check if this node IS the target (pointer equality)
+    if Arc::ptr_eq(plan, target) {
+        return replacement;
+    }
+
+    let children = plan.children();
+    if children.is_empty() {
+        // Leaf node that isn't the target — return as-is
+        return Arc::clone(plan);
+    }
+
+    // Recurse into children and rebuild if any changed
+    let new_children: Vec<Arc<dyn ExecutionPlan>> = children
+        .iter()
+        .map(|child| replace_scan_in_plan(child, target, Arc::clone(&replacement)))
+        .collect();
+
+    // Check if any child actually changed (avoid unnecessary cloning)
+    let changed = new_children
+        .iter()
+        .zip(children.iter())
+        .any(|(new, old)| !Arc::ptr_eq(new, old));
+
+    if changed {
+        plan.clone().with_new_children(new_children)
+            .unwrap_or_else(|_| Arc::clone(plan))
+    } else {
+        Arc::clone(plan)
+    }
 }
 
 /// Convert an Arrow `SchemaRef` to Iceberg REST API schema JSON format.
