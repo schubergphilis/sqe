@@ -290,4 +290,73 @@ mod tests {
     fn test_parse_mask_type_null() {
         assert!(matches!(parse_mask_type("null"), MaskType::Nullify));
     }
+
+    #[test]
+    fn test_parse_mask_type_nullify_alias() {
+        // Both "null" and "nullify" map to MaskType::Nullify
+        assert!(matches!(parse_mask_type("nullify"), MaskType::Nullify));
+    }
+
+    #[test]
+    fn test_parse_mask_type_unknown_defaults_to_redact() {
+        // Unrecognised mask strings should be treated as a literal redact value
+        let mask = parse_mask_type("CUSTOM_VALUE");
+        assert!(matches!(mask, MaskType::Redact(_)));
+        if let MaskType::Redact(val) = mask {
+            assert_eq!(val, "CUSTOM_VALUE");
+        }
+    }
+
+    #[test]
+    fn test_parse_filter_expr_eq() {
+        let expr = parse_filter_expr("status = 'active'").unwrap();
+        assert!(matches!(expr, datafusion::logical_expr::Expr::BinaryExpr(_)));
+    }
+
+    #[test]
+    fn test_parse_filter_expr_not_eq() {
+        let expr = parse_filter_expr("deleted != 1").unwrap();
+        assert!(matches!(expr, datafusion::logical_expr::Expr::BinaryExpr(_)));
+    }
+
+    #[test]
+    fn test_parse_filter_expr_lt() {
+        let expr = parse_filter_expr("risk_score < 5").unwrap();
+        assert!(matches!(expr, datafusion::logical_expr::Expr::BinaryExpr(_)));
+    }
+
+    #[test]
+    fn test_parse_filter_expr_lte() {
+        let expr = parse_filter_expr("tier <= 3").unwrap();
+        assert!(matches!(expr, datafusion::logical_expr::Expr::BinaryExpr(_)));
+    }
+
+    #[test]
+    fn test_parse_filter_expr_gt() {
+        let expr = parse_filter_expr("age > 18").unwrap();
+        assert!(matches!(expr, datafusion::logical_expr::Expr::BinaryExpr(_)));
+    }
+
+    #[test]
+    fn test_parse_filter_expr_float_literal() {
+        let expr = parse_filter_expr("score >= 0.5").unwrap();
+        assert!(matches!(expr, datafusion::logical_expr::Expr::BinaryExpr(_)));
+    }
+
+    #[test]
+    fn test_parse_filter_expr_no_operator_returns_none() {
+        // A string without a recognised operator should return None
+        let result = parse_filter_expr("just_a_column_name");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_mask_type_redact_with_custom_string() {
+        let mask = parse_mask_type("redact:[HIDDEN]");
+        if let MaskType::Redact(val) = mask {
+            assert_eq!(val, "[HIDDEN]");
+        } else {
+            panic!("Expected Redact variant");
+        }
+    }
 }

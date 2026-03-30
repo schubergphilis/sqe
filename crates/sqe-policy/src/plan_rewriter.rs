@@ -226,4 +226,26 @@ mod tests {
         let expr = apply_mask("ssn", &MaskType::Redact("***".to_string()));
         assert!(matches!(expr, Expr::Literal(..)));
     }
+
+    #[test]
+    fn test_apply_mask_hash_produces_scalar_function() {
+        let expr = apply_mask("email", &MaskType::Hash);
+        // Hash mask must produce a ScalarFunction (the registered sha256 UDF)
+        assert!(
+            matches!(expr, Expr::ScalarFunction(_)),
+            "Expected ScalarFunction for Hash mask, got: {expr:?}"
+        );
+    }
+
+    #[test]
+    fn test_apply_mask_custom_returns_provided_expr() {
+        let custom_expr = datafusion::logical_expr::lit("REDACTED");
+        let result = apply_mask("secret", &MaskType::Custom(custom_expr.clone()));
+        // The returned expression must be equal to the custom expression we supplied.
+        assert_eq!(
+            format!("{result:?}"),
+            format!("{custom_expr:?}"),
+            "Custom mask should return the provided expression unchanged"
+        );
+    }
 }
