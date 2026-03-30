@@ -4,6 +4,43 @@ use std::sync::Mutex;
 use serde::Serialize;
 use tracing::info;
 
+/// Redact common PII patterns from SQL text for audit log safety.
+///
+/// Replaces:
+/// - Email addresses → [EMAIL]
+/// - Phone numbers (US/intl) → [PHONE]
+/// - SSN patterns (XXX-XX-XXXX) → [SSN]
+/// - Credit card-like numbers (13-19 digits) → [CARD]
+/// - Quoted string literals that look like identifiers → preserved
+pub fn redact_pii(sql: &str) -> String {
+    let mut result = sql.to_string();
+
+    // Email: word@word.tld pattern inside single quotes
+    let email_re = regex_lite::Regex::new(
+        r"'[^']*[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[^']*'",
+    )
+    .unwrap();
+    result = email_re.replace_all(&result, "'[EMAIL]'").to_string();
+
+    // SSN: XXX-XX-XXXX
+    let ssn_re = regex_lite::Regex::new(r"'\d{3}-\d{2}-\d{4}'").unwrap();
+    result = ssn_re.replace_all(&result, "'[SSN]'").to_string();
+
+    // Phone: various formats (10-15 digits with optional separators)
+    let phone_re = regex_lite::Regex::new(
+        r"'(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}'",
+    )
+    .unwrap();
+    result = phone_re.replace_all(&result, "'[PHONE]'").to_string();
+
+    // Credit card: 4-groups of digits (possibly with spaces/dashes)
+    let card_re =
+        regex_lite::Regex::new(r"'\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{1,7}'").unwrap();
+    result = card_re.replace_all(&result, "'[CARD]'").to_string();
+
+    result
+}
+
 #[derive(Debug, Serialize)]
 pub struct AuditEntry {
     pub timestamp: String,
@@ -60,6 +97,26 @@ impl AuditLogger {
                     eprintln!("AUDIT: mutex poisoned, audit entry lost: {e}");
                     return;
                 }
+            };
+            // Redact PII from query_text before writing to the audit log.
+            // query_hash is a non-reversible hash and is left untouched.
+            let redacted_entry;
+            let entry = if entry.query_text.is_some() {
+                redacted_entry = AuditEntry {
+                    query_text: entry.query_text.as_deref().map(redact_pii),
+                    timestamp: entry.timestamp.clone(),
+                    username: entry.username.clone(),
+                    session_id: entry.session_id.clone(),
+                    query_hash: entry.query_hash.clone(),
+                    statement_type: entry.statement_type.clone(),
+                    duration_ms: entry.duration_ms,
+                    rows_returned: entry.rows_returned,
+                    status: entry.status.clone(),
+                    client_ip: entry.client_ip.clone(),
+                };
+                &redacted_entry
+            } else {
+                entry
             };
             let json = match serde_json::to_string(entry) {
                 Ok(j) => j,
@@ -159,6 +216,67 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("\"username\":\"test\""));
         assert!(content.contains("query_hash"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- PII redaction tests ---
+
+    #[test]
+    fn redact_email_in_where_clause() {
+        let sql = "SELECT * FROM users WHERE email = 'alice@example.com'";
+        let redacted = redact_pii(sql);
+        assert!(!redacted.contains("alice@example.com"));
+        assert!(redacted.contains("[EMAIL]"));
+    }
+
+    #[test]
+    fn redact_ssn() {
+        let sql = "SELECT * FROM records WHERE ssn = '123-45-6789'";
+        let redacted = redact_pii(sql);
+        assert!(!redacted.contains("123-45-6789"));
+        assert!(redacted.contains("[SSN]"));
+    }
+
+    #[test]
+    fn redact_phone() {
+        let sql = "SELECT * FROM contacts WHERE phone = '(555) 123-4567'";
+        let redacted = redact_pii(sql);
+        assert!(redacted.contains("[PHONE]"));
+    }
+
+    #[test]
+    fn no_redaction_for_normal_sql() {
+        let sql = "SELECT id, name FROM products WHERE category = 'electronics'";
+        let redacted = redact_pii(sql);
+        assert_eq!(redacted, sql);
+    }
+
+    #[test]
+    fn redact_multiple_patterns() {
+        let sql = "INSERT INTO users (email, ssn) VALUES ('bob@test.com', '987-65-4321')";
+        let redacted = redact_pii(sql);
+        assert!(redacted.contains("[EMAIL]"));
+        assert!(redacted.contains("[SSN]"));
+        assert!(!redacted.contains("bob@test.com"));
+    }
+
+    #[test]
+    fn test_log_redacts_pii_in_written_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("sqe-audit-pii-test.jsonl");
+        let path_str = path.to_str().unwrap();
+
+        let logger = AuditLogger::new(path_str).unwrap();
+        let mut entry = test_entry();
+        entry.query_text = Some(
+            "SELECT * FROM users WHERE email = 'carol@example.com'".to_string(),
+        );
+        logger.log(&entry);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("carol@example.com"), "PII must not appear in audit log");
+        assert!(content.contains("[EMAIL]"));
 
         let _ = std::fs::remove_file(&path);
     }
