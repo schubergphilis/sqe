@@ -352,10 +352,20 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         )
     } else if let Some((user, pass)) = extract_basic_auth(&headers) {
         // Basic auth: authenticate via OIDC password grant
+        let client_ip = extract_header(&headers, "x-forwarded-for")
+            .map(|s| {
+                s.split(',')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown".to_string());
         match state.authenticator.authenticate(&user, &pass).await {
             Ok(s) => s,
             Err(e) => {
-                warn!(error = %e, user = %user, "Trino authentication failed");
+                warn!(error = %e, user = %user, client_ip = %client_ip, "Trino authentication failed");
                 return error_response(StatusCode::UNAUTHORIZED, "Authentication failed");
             }
         }
@@ -421,6 +431,10 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 error = %sqe_err,
                 "Trino query execution failed"
             );
+            let is_rate_limited = sqe_err
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("rate limit");
             let trino_error = TrinoError::from_sqe_error(&sqe_err, Some(&query_id));
             let response = TrinoResponse {
                 id: query_id.clone(),
@@ -431,7 +445,14 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 stats: TrinoStats::failed(),
                 error: Some(trino_error),
             };
-            (StatusCode::OK, Json(response)).into_response()
+            let mut resp = (StatusCode::OK, Json(response)).into_response();
+            if is_rate_limited {
+                resp.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from_static("1"),
+                );
+            }
+            resp
         }
     }
 }
