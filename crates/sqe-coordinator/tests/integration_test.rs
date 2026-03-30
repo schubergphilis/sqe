@@ -1805,6 +1805,7 @@ async fn test_trino_http_query() {
         Arc::new(TestTrinoQuery(handler)),
         trino_port,
         node,
+        None,
     );
 
     // Give the server a moment to bind

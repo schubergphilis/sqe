@@ -53,10 +53,8 @@ impl PolicyEnforcer for PolicyPlanRewriter {
         plan.apply(|node| {
             if let LogicalPlan::TableScan(scan) = node {
                 let table_name = scan.table_name.to_string();
-                if !table_policies.contains_key(&table_name) {
-                    // We'll resolve policies after collecting all table names
-                    table_policies.insert(table_name, ResolvedPolicy::default());
-                }
+                // We'll resolve policies after collecting all table names
+                table_policies.entry(table_name).or_default();
             }
             Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
         })
