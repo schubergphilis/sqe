@@ -459,9 +459,17 @@ impl QueryHandler {
             batches.push(RecordBatch::new_empty(output_schema));
         }
 
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        if self.config.query.max_result_rows > 0 && total_rows > self.config.query.max_result_rows {
+            return Err(SqeError::Execution(format!(
+                "Query result exceeds maximum allowed rows ({} > {}). Use LIMIT to reduce output.",
+                total_rows, self.config.query.max_result_rows
+            )));
+        }
+
         info!(
             batch_count = batches.len(),
-            total_rows = batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            total_rows = total_rows,
             "Query execution complete"
         );
 

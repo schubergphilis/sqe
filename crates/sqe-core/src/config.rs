@@ -36,6 +36,9 @@ pub struct QueryConfig {
     /// seconds. When a user has multiple matching roles the highest value wins.
     #[serde(default)]
     pub role_overrides: std::collections::HashMap<String, u64>,
+    /// Maximum number of rows returned per query. Default: 1_000_000. Set to 0 for unlimited.
+    #[serde(default = "default_max_result_rows")]
+    pub max_result_rows: usize,
 }
 
 impl Default for QueryConfig {
@@ -43,6 +46,7 @@ impl Default for QueryConfig {
         Self {
             timeout_secs: default_query_timeout(),
             role_overrides: std::collections::HashMap::new(),
+            max_result_rows: default_max_result_rows(),
         }
     }
 }
@@ -542,6 +546,7 @@ impl Default for SessionConfig {
 fn default_idle_timeout() -> u64 { 900 }       // 15 minutes
 fn default_absolute_timeout() -> u64 { 28800 }  // 8 hours
 fn default_query_timeout() -> u64 { 300 }       // 5 minutes
+fn default_max_result_rows() -> usize { 1_000_000 }
 
 fn default_flight_port() -> u16 { 50051 }
 fn default_trino_port() -> u16 { 8080 }
