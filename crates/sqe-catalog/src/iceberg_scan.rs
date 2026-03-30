@@ -174,6 +174,24 @@ impl ExecutionPlan for IcebergScanExec {
             "Executing IcebergScanExec"
         );
 
+        // If the table has no current snapshot (empty table, never written to),
+        // return an empty stream immediately — there are no data files to read.
+        if table.metadata().current_snapshot().is_none() {
+            debug!(
+                table = %table.identifier(),
+                "Table has no snapshot — returning empty result"
+            );
+            let empty_batch = RecordBatch::new_empty(schema.clone());
+            let stream = futures::stream::once(async move {
+                Ok::<_, DataFusionError>(empty_batch)
+            });
+            return Ok(Box::pin(IcebergRecordBatchStream {
+                schema,
+                inner: Box::pin(stream),
+                baseline,
+            }));
+        }
+
         // Build the scan lazily -- to_arrow() is async, execute() is sync.
         // We create a stream that initializes the scan on first poll.
         let stream = futures::stream::once(async move {
