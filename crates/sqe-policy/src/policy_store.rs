@@ -117,4 +117,94 @@ mod tests {
         assert!(resolved.column_masks.is_empty());
         assert!(resolved.restricted_columns.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_role_policy_applied_to_user_with_matching_role() {
+        let store = InMemoryPolicyStore::new();
+        let policy = ResolvedPolicy {
+            restricted_columns: vec!["salary".to_string()],
+            ..Default::default()
+        };
+        store.add_role_policy("analyst", policy).await;
+
+        let user = SessionUser {
+            username: "bob".to_string(),
+            roles: vec!["analyst".to_string()],
+        };
+        let resolved = store.resolve(&user, "employees", "hr").await.unwrap();
+        assert_eq!(resolved.restricted_columns, vec!["salary"]);
+    }
+
+    #[tokio::test]
+    async fn test_role_policy_not_applied_when_no_matching_role() {
+        let store = InMemoryPolicyStore::new();
+        let policy = ResolvedPolicy {
+            restricted_columns: vec!["salary".to_string()],
+            ..Default::default()
+        };
+        store.add_role_policy("analyst", policy).await;
+
+        let user = SessionUser {
+            username: "charlie".to_string(),
+            roles: vec!["viewer".to_string()],
+        };
+        let resolved = store.resolve(&user, "employees", "hr").await.unwrap();
+        assert!(resolved.restricted_columns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_table_policy_takes_priority_over_role_policy() {
+        let store = InMemoryPolicyStore::new();
+
+        let role_policy = ResolvedPolicy {
+            restricted_columns: vec!["salary".to_string()],
+            ..Default::default()
+        };
+        store.add_role_policy("analyst", role_policy).await;
+
+        let table_policy = ResolvedPolicy {
+            restricted_columns: vec!["ssn".to_string(), "dob".to_string()],
+            ..Default::default()
+        };
+        store.add_table_policy("hr", "employees", table_policy).await;
+
+        let user = SessionUser {
+            username: "dave".to_string(),
+            roles: vec!["analyst".to_string()],
+        };
+        let resolved = store.resolve(&user, "employees", "hr").await.unwrap();
+        // Table-specific policy wins; salary should NOT be restricted, ssn and dob should be
+        assert!(resolved.restricted_columns.contains(&"ssn".to_string()));
+        assert!(resolved.restricted_columns.contains(&"dob".to_string()));
+        assert!(!resolved.restricted_columns.contains(&"salary".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_user_with_multiple_roles_gets_first_matching_role_policy() {
+        let store = InMemoryPolicyStore::new();
+
+        let analyst_policy = ResolvedPolicy {
+            restricted_columns: vec!["salary".to_string()],
+            ..Default::default()
+        };
+        store.add_role_policy("analyst", analyst_policy).await;
+
+        let user = SessionUser {
+            username: "eve".to_string(),
+            roles: vec!["viewer".to_string(), "analyst".to_string()],
+        };
+        let resolved = store.resolve(&user, "employees", "hr").await.unwrap();
+        assert_eq!(resolved.restricted_columns, vec!["salary"]);
+    }
+
+    #[tokio::test]
+    async fn test_default_store_same_as_new() {
+        let store: InMemoryPolicyStore = Default::default();
+        let user = SessionUser {
+            username: "alice".to_string(),
+            roles: vec![],
+        };
+        let resolved = store.resolve(&user, "t", "ns").await.unwrap();
+        assert!(resolved.row_filters.is_empty());
+    }
 }

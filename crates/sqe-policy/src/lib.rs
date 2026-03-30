@@ -83,3 +83,82 @@ pub trait PolicyStore: Send + Sync {
         namespace: &str,
     ) -> sqe_core::Result<ResolvedPolicy>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_user(username: &str, roles: &[&str]) -> SessionUser {
+        SessionUser {
+            username: username.to_string(),
+            roles: roles.iter().map(|r| r.to_string()).collect(),
+        }
+    }
+
+    // Build a trivial LogicalPlan (EmptyRelation) that we can pass through the enforcer.
+    fn empty_plan() -> LogicalPlan {
+        use datafusion::logical_expr::LogicalPlanBuilder;
+        LogicalPlanBuilder::empty(false)
+            .build()
+            .expect("Failed to build empty plan")
+    }
+
+    // PassthroughEnforcer tests
+
+    #[tokio::test]
+    async fn test_passthrough_returns_plan_unchanged() {
+        let enforcer = PassthroughEnforcer;
+        let user = make_user("alice", &[]);
+        let plan = empty_plan();
+        // We compare the debug representation since LogicalPlan doesn't implement PartialEq.
+        let before = format!("{plan:?}");
+        let result = enforcer.evaluate(&user, plan).await.unwrap();
+        let after = format!("{result:?}");
+        assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn test_passthrough_ignores_user_roles() {
+        let enforcer = PassthroughEnforcer;
+        let admin = make_user("admin", &["superuser", "admin", "data_owner"]);
+        let plan = empty_plan();
+        let before = format!("{plan:?}");
+        let result = enforcer.evaluate(&admin, plan).await.unwrap();
+        assert_eq!(before, format!("{result:?}"));
+    }
+
+    #[tokio::test]
+    async fn test_passthrough_with_no_roles() {
+        let enforcer = PassthroughEnforcer;
+        let guest = make_user("guest", &[]);
+        let plan = empty_plan();
+        let before = format!("{plan:?}");
+        let result = enforcer.evaluate(&guest, plan).await.unwrap();
+        assert_eq!(before, format!("{result:?}"));
+    }
+
+    // ResolvedPolicy default is empty (allow-all passthrough)
+
+    #[test]
+    fn test_resolved_policy_default_is_empty() {
+        let policy = ResolvedPolicy::default();
+        assert!(policy.row_filters.is_empty());
+        assert!(policy.column_masks.is_empty());
+        assert!(policy.restricted_columns.is_empty());
+    }
+
+    // MaskType variants are constructible and debug-printable
+
+    #[test]
+    fn test_mask_type_variants_debug() {
+        let nullify = MaskType::Nullify;
+        let redact = MaskType::Redact("***".to_string());
+        let hash = MaskType::Hash;
+        let custom = MaskType::Custom(datafusion::logical_expr::lit("custom"));
+
+        assert!(format!("{nullify:?}").contains("Nullify"));
+        assert!(format!("{redact:?}").contains("Redact"));
+        assert!(format!("{hash:?}").contains("Hash"));
+        assert!(format!("{custom:?}").contains("Custom"));
+    }
+}
