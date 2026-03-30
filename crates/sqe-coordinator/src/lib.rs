@@ -5,6 +5,7 @@ pub mod credential_refresh;
 pub mod distributed_scan;
 pub mod explain;
 pub mod flight_sql;
+pub mod flight_sql_helpers;
 pub mod mode;
 pub mod query_handler;
 pub mod session_context;
