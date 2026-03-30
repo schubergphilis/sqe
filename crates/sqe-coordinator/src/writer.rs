@@ -45,11 +45,12 @@ pub async fn write_data_files(
     let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
         .map_err(|e| SqeError::Execution(format!("Location generator error: {e}")))?;
 
-    // Include a UUID in the file prefix to guarantee unique file names across
-    // multiple writes to the same table. Without this, the counter-based naming
-    // (e.g. insert-00000.parquet) collides when a second INSERT commits to a
-    // table that already has files from a previous INSERT.
-    let unique_prefix = format!("{}-{}", file_prefix, Uuid::now_v7());
+    // Generate a unique write ID for this operation. File names follow the
+    // Iceberg convention: {write_uuid}-{counter}.parquet — no operation label.
+    // This matches Spark/Trino behavior and prevents collisions across writes.
+    let _ = file_prefix; // kept for logging; not used in file names
+    let write_id = Uuid::now_v7();
+    let unique_prefix = format!("{write_id}");
 
     let file_name_generator = DefaultFileNameGenerator::new(
         unique_prefix,
