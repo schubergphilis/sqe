@@ -2074,3 +2074,84 @@ async fn test_table_lifecycle_edge_cases() {
     println!("\n=== Result: {} test(s) failed ===", failures);
     assert_eq!(failures, 0, "{failures} edge case(s) failed");
 }
+
+/// Test that large INSERTs producing multiple internal batches don't collide
+/// on data file names. This reproduces the bug where a 2000-row INSERT via dbt
+/// failed with "Cannot add files that are already referenced by table".
+#[tokio::test(flavor = "multi_thread")]
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn test_large_insert_multi_batch() {
+    let (session, handler) = common::setup_handler().await;
+
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.large_insert_test")
+        .await;
+
+    // Create table with CTAS (small seed)
+    handler
+        .execute(
+            &session,
+            "CREATE TABLE test_ns.large_insert_test AS SELECT 0 as id, 'seed' as name",
+        )
+        .await
+        .expect("CTAS seed should succeed");
+
+    // Generate a large INSERT using a recursive CTE that produces 2000+ rows.
+    // This forces DataFusion to produce multiple RecordBatches internally,
+    // which in turn creates multiple Parquet data files in a single commit.
+    let large_insert_sql = r#"
+        INSERT INTO test_ns.large_insert_test
+        SELECT row_num as id, CONCAT('name-', CAST(row_num AS VARCHAR)) as name
+        FROM (
+            SELECT ROW_NUMBER() OVER () as row_num
+            FROM (
+                SELECT 1 as x FROM (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) t1(x)
+                CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) t2(x)
+                CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) t3(x)
+            ) nums
+        ) numbered
+    "#;
+
+    // This is the operation that previously failed with:
+    // "Cannot add files that are already referenced by table"
+    handler
+        .execute(&session, large_insert_sql)
+        .await
+        .expect("Large INSERT (1000 rows) should succeed");
+
+    // Do a second large INSERT to the same table — tests cross-commit uniqueness
+    handler
+        .execute(&session, large_insert_sql)
+        .await
+        .expect("Second large INSERT should succeed");
+
+    // Verify total row count: 1 seed + 1000 + 1000 = 2001
+    let batches = handler
+        .execute(
+            &session,
+            "SELECT COUNT(*) as cnt FROM test_ns.large_insert_test",
+        )
+        .await
+        .expect("COUNT should succeed");
+
+    common::print_results(
+        "Large multi-batch INSERT",
+        "SELECT COUNT(*) FROM test_ns.large_insert_test",
+        &batches,
+    );
+
+    // Extract the count value
+    let count_batch = &batches[0];
+    let count_col = count_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::Int64Array>()
+        .expect("COUNT should return Int64");
+    let total_count = count_col.value(0);
+    assert_eq!(total_count, 2001, "Expected 1 seed + 1000 + 1000 = 2001 rows");
+
+    // Cleanup
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.large_insert_test")
+        .await;
+}
