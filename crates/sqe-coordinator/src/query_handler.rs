@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 use sqlparser::ast::Statement;
 use sqe_catalog::{IcebergScanExec, SessionCatalog, SqeCatalogProvider};
 use sqe_core::{QueryConfig, Session, SqeConfig, SqeError};
-use sqe_policy::PolicyEnforcer;
+use sqe_policy::{PolicyEnforcer, PolicyStore};
 use sqe_sql::{parse_and_classify, StatementKind};
 
 use crate::catalog_ops::CatalogOps;
@@ -41,6 +41,8 @@ pub fn timeout_for_session(config: &QueryConfig, session: &Session) -> u64 {
 /// and policy enforcement for all plans.
 pub struct QueryHandler {
     policy_enforcer: Arc<dyn PolicyEnforcer>,
+    /// Optional policy store for filtering restricted columns in information_schema.
+    policy_store: Option<Arc<dyn PolicyStore>>,
     config: SqeConfig,
     catalog_ops: CatalogOps,
     write_handler: WriteHandler,
@@ -58,6 +60,7 @@ impl QueryHandler {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         policy_enforcer: Arc<dyn PolicyEnforcer>,
+        policy_store: Option<Arc<dyn PolicyStore>>,
         config: SqeConfig,
         worker_registry: Option<Arc<crate::worker_registry::WorkerRegistry>>,
         credential_tracker: Option<Arc<CredentialRefreshTracker>>,
@@ -71,6 +74,7 @@ impl QueryHandler {
         let explain_handler = crate::explain::ExplainHandler::new(Arc::clone(&policy_enforcer));
         Self {
             policy_enforcer,
+            policy_store,
             config,
             catalog_ops,
             write_handler,
@@ -445,9 +449,16 @@ impl QueryHandler {
         let final_plan = self.try_distribute(physical_plan, session, query_id).await;
 
         // Execute the (possibly distributed) plan
-        let batches = collect(final_plan, ctx.task_ctx())
+        let output_schema = final_plan.schema();
+        let mut batches = collect(final_plan, ctx.task_ctx())
             .await
             .map_err(|e| SqeError::Execution(format!("Query execution failed: {e}")))?;
+
+        // Ensure we always return at least one batch so callers can infer the
+        // output schema (e.g. CTAS with WHERE false that returns zero rows).
+        if batches.is_empty() {
+            batches.push(RecordBatch::new_empty(output_schema));
+        }
 
         info!(
             batch_count = batches.len(),
@@ -680,11 +691,14 @@ impl QueryHandler {
         // Clone before moving into SqeCatalogProvider (which consumes the Arc)
         let session_catalog_for_system = session_catalog.clone();
 
-        // Create the DataFusion CatalogProvider from the session catalog
-        let catalog_provider = SqeCatalogProvider::try_new(
+        // Create the DataFusion CatalogProvider from the session catalog,
+        // passing policy store and session user for information_schema column filtering.
+        let catalog_provider = SqeCatalogProvider::try_new_with_policy(
             session_catalog,
             self.config.storage.clone(),
             self.config.catalog.warehouse.clone(),
+            self.policy_store.clone(),
+            Some(session.user.clone()),
         )
         .await?;
 
@@ -760,6 +774,14 @@ impl QueryHandler {
         )
         .with_runtime(runtime_schema);
         ctx.register_catalog("system", Arc::new(system_catalog));
+
+        // Register the sha256() scalar function for column masking.
+        // DataFusion does not ship a built-in sha256 — we provide one via sqe-policy.
+        ctx.register_udf(sqe_policy::sha256_udf::sha256_udf());
+
+        // Register Trino-compatible function aliases (year(), month(), day_of_week(), etc.)
+        // so Trino SQL and dbt models work without modification.
+        crate::trino_functions::register_trino_functions(&ctx);
 
         // Register the read_parquet() table-valued function so users can
         // query external Parquet files directly from SQL:

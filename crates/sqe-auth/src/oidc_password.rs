@@ -194,6 +194,8 @@ mod tests {
             token_endpoint: String::new(),
             token_refresh_buffer_secs: 60,
             ssl_verification: false,
+            providers: Vec::new(),
+            role_mappings: std::collections::HashMap::new(),
         }
     }
 

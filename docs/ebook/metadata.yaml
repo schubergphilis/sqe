@@ -1,0 +1,63 @@
+---
+title: "Sovereign by Design"
+subtitle: "Building a Production Query Engine on DataFusion"
+author: Jacob Verhoeks
+date: 2026
+lang: en-GB
+description: |
+  The complete journey of replacing Trino with a purpose-built Rust query engine.
+  From first DataFusion query to distributed execution over Apache Iceberg,
+  with OIDC auth passthrough, policy-as-plan-rewriting, and zero service accounts.
+  A practitioner's guide to building data infrastructure you actually own.
+
+rights: "Copyright 2026 Jacob Verhoeks. All rights reserved."
+
+publisher: Self-published
+cover-image: diagrams/cover.png
+
+# Pandoc settings
+documentclass: book
+papersize: a5
+fontsize: 11pt
+mainfont: "Georgia"
+sansfont: "Helvetica Neue"
+monofont: "Menlo"
+geometry:
+  - top=25mm
+  - bottom=25mm
+  - left=20mm
+  - right=20mm
+linestretch: 1.25
+toc: true
+toc-depth: 0
+number-sections: true
+header-includes:
+  - \setcounter{tocdepth}{0}
+  - \usepackage{graphicx}
+  - \usepackage{xcolor}
+  - \usepackage{tikz}
+  - |
+    \renewcommand{\maketitle}{%
+      \thispagestyle{empty}%
+      \newgeometry{margin=0pt}%
+      \begin{tikzpicture}[remember picture,overlay]
+        \node[anchor=center] at (current page.center) {%
+          \includegraphics[width=\paperwidth,height=\paperheight]{diagrams/cover.png}%
+        };
+        \fill[black,opacity=0.5] ([yshift=20mm]current page.west) rectangle ([yshift=-25mm]current page.east);
+        \node[anchor=center,text width=0.85\paperwidth,align=center] at ([yshift=2mm]current page.center) {%
+          {\fontsize{28}{34}\selectfont\bfseries\color{white}\textsf{Sovereign by Design}\par}%
+          \vspace{5pt}%
+          {\fontsize{10}{14}\selectfont\color{white!85}\textsf{Building a Production Query Engine on DataFusion}\par}%
+          \vspace{8pt}%
+          {\fontsize{11}{15}\selectfont\color{white}\textsf{Jacob Verhoeks}\par}%
+        };
+      \end{tikzpicture}%
+      \restoregeometry%
+      \clearpage%
+    }
+colorlinks: true
+linkcolor: NavyBlue
+urlcolor: NavyBlue
+highlight-style: tango
+---
