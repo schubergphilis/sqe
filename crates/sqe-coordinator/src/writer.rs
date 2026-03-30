@@ -15,7 +15,7 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::file::properties::WriterProperties;
 use sqe_core::SqeError;
-use tracing::info;
+use tracing::{info, instrument};
 use uuid::Uuid;
 
 /// Write RecordBatches as Parquet data files for an Iceberg table.
@@ -24,6 +24,7 @@ use uuid::Uuid;
 /// Iceberg data files with correct metadata (file path, size, record count, etc.)
 ///
 /// Returns the DataFile descriptors needed for Iceberg transaction commits.
+#[instrument(skip(table, batches), fields(table = %table.identifier(), file_prefix, total_rows))]
 pub async fn write_data_files(
     table: &Table,
     batches: Vec<RecordBatch>,
