@@ -19,6 +19,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 sha2 = "0.10"
+regex-lite = "0.1"
 
 [dev-dependencies]
 tokio = { workspace = true }
