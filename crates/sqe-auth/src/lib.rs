@@ -14,6 +14,7 @@ pub mod provider;
 pub mod chain;
 pub mod factory;
 pub mod pending_auth;
+pub mod device_code;
 
 /// Deprecated: use `oidc_password` instead.
 #[deprecated(note = "renamed to oidc_password")]
@@ -34,3 +35,4 @@ pub use mtls::{MtlsProvider, MtlsProviderConfig};
 pub use token_exchange::{TokenExchangeProvider, TokenExchangeConfig};
 pub use factory::build_auth_chain;
 pub use pending_auth::{PendingAuthStore, PendingAuth, TokenSet};
+pub use device_code::{DeviceCodeService, DeviceAuthSession, DevicePollResult};
