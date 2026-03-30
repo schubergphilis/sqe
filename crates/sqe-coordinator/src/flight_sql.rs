@@ -96,14 +96,34 @@ impl SqeFlightSqlService {
     /// 1. SQE session ID (from do_handshake) — looked up in session manager
     /// 2. Raw JWT (from backend BFF pass-through) — wrapped into an ad-hoc session,
     ///    same pattern as the Trino-compat HTTP endpoint
+    /// Extract client IP from request metadata (x-forwarded-for or peer addr).
+    fn extract_client_ip<T>(request: &Request<T>) -> String {
+        request
+            .metadata()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
+            .unwrap_or_else(|| {
+                request
+                    .remote_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            })
+    }
+
     fn get_session_from_request<T>(
         &self,
         request: &Request<T>,
     ) -> Result<Arc<sqe_core::Session>, Status> {
         let metadata = request.metadata();
+        let client_ip = Self::extract_client_ip(request);
+
         let auth = metadata
             .get("authorization")
-            .ok_or_else(|| Status::unauthenticated("No authorization header"))?
+            .ok_or_else(|| {
+                debug!(client_ip = %client_ip, "Request missing authorization header");
+                Status::unauthenticated("No authorization header")
+            })?
             .to_str()
             .map_err(|e| Status::internal(format!("Invalid authorization header: {e}")))?;
 
@@ -118,6 +138,12 @@ impl SqeFlightSqlService {
 
         // Try session lookup first (handshake flow)
         if let Some(session) = self.session_manager.get_session(token) {
+            debug!(
+                username = %session.user.username,
+                client_ip = %client_ip,
+                session_id = %session.id,
+                "Request authenticated via session"
+            );
             return Ok(session);
         }
 
@@ -129,7 +155,11 @@ impl SqeFlightSqlService {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("unknown")
                 .to_string();
-            debug!(username = %username, "Flight: accepting raw JWT as bearer token");
+            debug!(
+                username = %username,
+                client_ip = %client_ip,
+                "Flight: accepting raw JWT as bearer token"
+            );
             let session = sqe_core::Session::new(
                 username,
                 token.to_string(),
@@ -140,6 +170,7 @@ impl SqeFlightSqlService {
             return Ok(Arc::new(session));
         }
 
+        warn!(client_ip = %client_ip, "Invalid or expired session token");
         Err(Status::unauthenticated("Invalid or expired session token"))
     }
 
@@ -219,21 +250,7 @@ impl FlightSqlService for SqeFlightSqlService {
             }
         };
 
-        // Extract client IP: prefer x-forwarded-for (set by reverse proxies),
-        // fall back to the TCP peer address reported by tonic.
-        let client_ip: String = request
-            .metadata()
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
-            .unwrap_or_else(|| {
-                request
-                    .remote_addr()
-                    .map(|a| a.to_string())
-                    // TODO: tonic 0.14 only surfaces peer addr when the transport
-                    // layer injects it via Extensions; may be None without ConnectInfo.
-                    .unwrap_or_else(|| "unknown".to_string())
-            });
+        let client_ip = Self::extract_client_ip(&request);
 
         info!(username = username, "Handshake authentication attempt");
 

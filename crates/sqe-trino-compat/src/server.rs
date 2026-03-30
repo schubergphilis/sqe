@@ -335,6 +335,13 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         return error_response(StatusCode::BAD_REQUEST, "Empty query");
     }
 
+    // Extract client IP for logging on every request
+    let client_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
     let trino_headers = extract_trino_headers(&headers);
 
     let session = if let Some(token) = extract_bearer_token(&headers) {
@@ -392,6 +399,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 
     info!(
         user = %session.user.username,
+        client_ip = %client_ip,
         catalog = ?session.default_catalog,
         schema = ?session.default_schema,
         source = ?session.source,
