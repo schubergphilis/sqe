@@ -17,7 +17,7 @@ use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSe
 use futures::{Stream, TryStreamExt};
 use iceberg::expr::Predicate;
 use iceberg::table::Table;
-use tracing::debug;
+use tracing::{debug, info_span};
 
 /// Custom DataFusion `ExecutionPlan` that scans an Iceberg table using
 /// iceberg-rust's scan API. This replaces the `EmptyExec` placeholder
@@ -156,6 +156,14 @@ impl ExecutionPlan for IcebergScanExec {
         partition: usize,
         _context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
+        let span = info_span!(
+            "iceberg_scan",
+            table = %self.table.identifier(),
+            partition = partition,
+            predicates = ?self.predicates,
+        );
+        let _guard = span.enter();
+
         if partition != 0 {
             return Err(DataFusionError::Internal(format!(
                 "IcebergScanExec only supports partition 0, got {partition}"

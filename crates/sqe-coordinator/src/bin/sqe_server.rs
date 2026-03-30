@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::response::Json;
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use axum::Router;
 use clap::Parser;
@@ -41,6 +41,7 @@ struct HealthState {
     started_at: Instant,
     role: &'static str,
     worker_registry: Option<Arc<sqe_coordinator::worker_registry::WorkerRegistry>>,
+    polaris_url: String,
 }
 
 async fn healthz() -> &'static str {
@@ -49,11 +50,49 @@ async fn healthz() -> &'static str {
 
 async fn readyz(
     state: axum::extract::State<Arc<HealthState>>,
-) -> axum::http::StatusCode {
-    if state.ready.load(Ordering::Relaxed) {
-        axum::http::StatusCode::OK
+) -> Response {
+    if !state.ready.load(Ordering::Relaxed) {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not ready").into_response();
+    }
+
+    let mut checks = serde_json::Map::new();
+    let mut all_healthy = true;
+
+    // Check Polaris catalog reachability
+    if !state.polaris_url.is_empty() {
+        let polaris_ok = reqwest::Client::new()
+            .get(format!("{}/api/catalog/v1/config", state.polaris_url))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .map(|r| r.status().is_success() || r.status().as_u16() == 401)
+            .unwrap_or(false);
+
+        checks.insert(
+            "polaris".to_string(),
+            serde_json::Value::String(if polaris_ok {
+                "ok".to_string()
+            } else {
+                "unreachable".to_string()
+            }),
+        );
+        if !polaris_ok {
+            all_healthy = false;
+        }
+    }
+
+    if all_healthy {
+        (
+            axum::http::StatusCode::OK,
+            Json(serde_json::json!({"status": "healthy", "checks": checks})),
+        )
+            .into_response()
     } else {
-        axum::http::StatusCode::SERVICE_UNAVAILABLE
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"status": "unhealthy", "checks": checks})),
+        )
+            .into_response()
     }
 }
 
@@ -274,6 +313,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         } else {
             Some(worker_registry.clone())
         },
+        polaris_url: config.catalog.polaris_url.clone(),
     });
     start_health_server(health_port, health_state);
 
@@ -327,6 +367,32 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             idle_timeout_secs = config.session.idle_timeout_secs,
             absolute_timeout_secs = config.session.absolute_timeout_secs,
             "Started session expiry sweeper (60s interval)"
+        );
+    }
+
+    // File-based session persistence — optional, off by default
+    if config.session.persistence == "file" {
+        // Try to restore sessions from the last snapshot on startup (best-effort)
+        session_manager.restore_from_file(&config.session.persistence_path);
+
+        // Spawn background task to periodically snapshot sessions to disk
+        let sm = session_manager.clone();
+        let path = config.session.persistence_path.clone();
+        let interval = config.session.snapshot_interval_secs;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval));
+            ticker.tick().await; // skip first immediate tick
+            loop {
+                ticker.tick().await;
+                if let Err(e) = sm.snapshot_to_file(&path) {
+                    tracing::warn!(error = %e, "Session snapshot failed");
+                }
+            }
+        });
+        tracing::info!(
+            path = %config.session.persistence_path,
+            interval_secs = config.session.snapshot_interval_secs,
+            "File-based session persistence enabled"
         );
     }
 
@@ -426,6 +492,7 @@ async fn run_worker(config: SqeConfig) -> anyhow::Result<()> {
         started_at,
         role: "worker",
         worker_registry: None,
+        polaris_url: String::new(), // workers do not connect to Polaris directly
     });
     start_health_server(health_port, health_state);
 
@@ -543,6 +610,7 @@ mod tests {
             started_at: Instant::now(),
             role: "coordinator",
             worker_registry: None,
+            polaris_url: String::new(),
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -558,6 +626,7 @@ mod tests {
             started_at: Instant::now(),
             role: "worker",
             worker_registry: None,
+            polaris_url: String::new(),
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -579,6 +648,7 @@ mod tests {
             started_at: Instant::now(),
             role: "coordinator",
             worker_registry: Some(registry),
+            polaris_url: String::new(),
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -591,15 +661,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_readyz_ready() {
+        // With an empty polaris_url, no Polaris check is performed — always healthy.
         let state = Arc::new(HealthState {
             ready: Arc::new(AtomicBool::new(true)),
             started_at: Instant::now(),
             role: "coordinator",
             worker_registry: None,
+            polaris_url: String::new(),
         });
 
-        let code = readyz(axum::extract::State(state)).await;
-        assert_eq!(code, axum::http::StatusCode::OK);
+        let response = readyz(axum::extract::State(state)).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
     }
 
     #[tokio::test]
@@ -609,9 +681,10 @@ mod tests {
             started_at: Instant::now(),
             role: "coordinator",
             worker_registry: None,
+            polaris_url: String::new(),
         });
 
-        let code = readyz(axum::extract::State(state)).await;
-        assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let response = readyz(axum::extract::State(state)).await;
+        assert_eq!(response.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
     }
 }

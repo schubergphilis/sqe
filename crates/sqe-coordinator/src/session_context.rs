@@ -30,11 +30,22 @@ pub async fn create_session_context(
         config.catalog.warehouse.clone()
     };
 
-    let ctx = SessionContext::new_with_config(
-        SessionConfig::new()
-            .with_information_schema(true)
-            .with_default_catalog_and_schema(&catalog_name, "default"),
-    );
+    // Configure per-query memory limit via DataFusion's memory pool
+    let max_memory = sqe_core::parse_memory_limit(&config.query.max_query_memory).unwrap_or(256 * 1024 * 1024);
+    let session_config = SessionConfig::new()
+        .with_information_schema(true)
+        .with_default_catalog_and_schema(&catalog_name, "default");
+
+    let ctx = if max_memory > 0 {
+        let pool = Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(max_memory));
+        let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+            .with_memory_pool(pool)
+            .build_arc()
+            .map_err(|e| sqe_core::SqeError::Config(format!("Failed to create runtime env: {e}")))?;
+        SessionContext::new_with_config_rt(session_config, runtime)
+    } else {
+        SessionContext::new_with_config(session_config)
+    };
 
     // Create a per-session catalog connected to Polaris with the user's bearer token
     let session_catalog = Arc::new(
@@ -43,6 +54,7 @@ pub async fn create_session_context(
             &config.catalog.warehouse,
             &session.access_token,
             &config.storage,
+            None, None,
         )
         .await?,
     );
