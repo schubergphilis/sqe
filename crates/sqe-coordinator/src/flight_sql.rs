@@ -40,6 +40,62 @@ use crate::query_tracker::QueryTracker;
 use crate::session_manager::SessionManager;
 use crate::worker_registry::WorkerRegistry;
 
+/// Convert an SqeError to a gRPC Status with the correct status code.
+fn sqe_error_to_status(e: &sqe_core::SqeError, query_id: Option<&uuid::Uuid>) -> tonic::Status {
+    let code = e.error_code();
+    let grpc_code = match code {
+        sqe_core::SqeErrorCode::SyntaxError
+        | sqe_core::SqeErrorCode::ParseError
+        | sqe_core::SqeErrorCode::SemanticError
+        | sqe_core::SqeErrorCode::TypeMismatch
+        | sqe_core::SqeErrorCode::InvalidArguments
+        | sqe_core::SqeErrorCode::DivisionByZero
+        | sqe_core::SqeErrorCode::InvalidCast
+        | sqe_core::SqeErrorCode::ColumnNotFound
+        | sqe_core::SqeErrorCode::DuplicateColumn => tonic::Code::InvalidArgument,
+
+        sqe_core::SqeErrorCode::TableNotFound
+        | sqe_core::SqeErrorCode::SchemaNotFound
+        | sqe_core::SqeErrorCode::CatalogNotFound
+        | sqe_core::SqeErrorCode::ViewNotFound
+        | sqe_core::SqeErrorCode::FunctionNotFound => tonic::Code::NotFound,
+
+        sqe_core::SqeErrorCode::DuplicateTable => tonic::Code::AlreadyExists,
+        sqe_core::SqeErrorCode::AuthenticationFailed | sqe_core::SqeErrorCode::SessionExpired => {
+            tonic::Code::Unauthenticated
+        }
+        sqe_core::SqeErrorCode::AccessDenied => tonic::Code::PermissionDenied,
+        sqe_core::SqeErrorCode::NotSupported => tonic::Code::Unimplemented,
+        sqe_core::SqeErrorCode::QueryTimeout => tonic::Code::DeadlineExceeded,
+        sqe_core::SqeErrorCode::QueryCancelled => tonic::Code::Cancelled,
+        sqe_core::SqeErrorCode::ResourceExhausted => tonic::Code::ResourceExhausted,
+        _ => tonic::Code::Internal,
+    };
+
+    let message = e.client_message();
+    let mut status = tonic::Status::new(grpc_code, &message);
+
+    if let Ok(val) = code.name().parse() {
+        status.metadata_mut().insert("x-sqe-error-code", val);
+    }
+    if let Some(qid) = query_id {
+        if let Ok(val) = qid.to_string().parse() {
+            status.metadata_mut().insert("x-sqe-query-id", val);
+        }
+    }
+
+    tracing::warn!(
+        error_code = %code,
+        query_id = ?query_id,
+        grpc_code = ?grpc_code,
+        client_message = %message,
+        internal_detail = %e,
+        "Flight SQL error"
+    );
+
+    status
+}
+
 type FlightStream = Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send>>;
 
 /// Custom protobuf message to carry query handles in tickets.
@@ -313,7 +369,7 @@ impl FlightSqlService for SqeFlightSqlService {
             .query_handler
             .get_schema(&session, sql)
             .await
-            .map_err(|e| Status::internal(format!("Query planning failed: {e}")))?;
+            .map_err(|e| sqe_error_to_status(&e, None))?;
 
         let info = FlightInfo::new()
             .try_with_schema(&schema)
@@ -349,7 +405,7 @@ impl FlightSqlService for SqeFlightSqlService {
             .query_handler
             .execute(&session, sql_str)
             .await
-            .map_err(|e| Status::internal(format!("Query execution failed: {e}")))?;
+            .map_err(|e| sqe_error_to_status(&e, None))?;
 
         Self::batches_to_stream(batches)
     }
@@ -376,7 +432,7 @@ impl FlightSqlService for SqeFlightSqlService {
                 .query_handler
                 .execute(&session, &fetch.handle)
                 .await
-                .map_err(|e| Status::internal(format!("Query execution failed: {e}")))?;
+                .map_err(|e| sqe_error_to_status(&e, None))?;
 
             return Self::batches_to_stream(batches);
         }
@@ -464,7 +520,7 @@ impl FlightSqlService for SqeFlightSqlService {
             .query_handler
             .execute(&session, "SHOW SCHEMAS")
             .await
-            .map_err(|e| Status::internal(format!("Failed to list schemas: {e}")))?;
+            .map_err(|e| sqe_error_to_status(&e, None))?;
 
         // Build the Flight SQL GetDbSchemas response using the builder
         let mut builder = query.into_builder();
@@ -524,7 +580,7 @@ impl FlightSqlService for SqeFlightSqlService {
             .query_handler
             .execute(&session, "SHOW SCHEMAS")
             .await
-            .map_err(|e| Status::internal(format!("Failed to list schemas: {e}")))?;
+            .map_err(|e| sqe_error_to_status(&e, None))?;
 
         // Collect schema names
         let mut schema_names: Vec<String> = Vec::new();
@@ -613,7 +669,7 @@ impl FlightSqlService for SqeFlightSqlService {
             .query_handler
             .get_schema(&session, &fetch.handle)
             .await
-            .map_err(|e| Status::internal(format!("Query planning failed: {e}")))?;
+            .map_err(|e| sqe_error_to_status(&e, None))?;
 
         let ticket = Ticket {
             ticket: cmd.as_any().encode_to_vec().into(),
@@ -767,7 +823,7 @@ impl FlightSqlService for SqeFlightSqlService {
             .query_handler
             .execute(&session, &fetch.handle)
             .await
-            .map_err(|e| Status::internal(format!("Query execution failed: {e}")))?;
+            .map_err(|e| sqe_error_to_status(&e, None))?;
 
         Self::batches_to_stream(batches)
     }
@@ -1020,7 +1076,7 @@ impl FlightSqlService for SqeFlightSqlService {
             .query_handler
             .execute(&session, &ticket.query)
             .await
-            .map_err(|e| Status::internal(format!("Statement execution failed: {e}")))?;
+            .map_err(|e| sqe_error_to_status(&e, None))?;
 
         let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
         Ok(rows)
@@ -1067,7 +1123,7 @@ impl FlightSqlService for SqeFlightSqlService {
             .write_handler()
             .handle_ingest(&session, &qualified, batches)
             .await
-            .map_err(|e| Status::internal(format!("Ingest failed: {e}")))?;
+            .map_err(|e| sqe_error_to_status(&e, None))?;
 
         Ok(rows as i64)
     }
@@ -1109,7 +1165,7 @@ impl FlightSqlService for SqeFlightSqlService {
             .query_handler
             .execute(&session, &fetch.handle)
             .await
-            .map_err(|e| Status::internal(format!("Prepared statement execution failed: {e}")))?;
+            .map_err(|e| sqe_error_to_status(&e, None))?;
 
         let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
         Ok(rows)
@@ -1130,7 +1186,7 @@ impl FlightSqlService for SqeFlightSqlService {
             .query_handler
             .get_schema(&session, sql)
             .await
-            .map_err(|e| Status::internal(format!("Query planning failed: {e}")))?;
+            .map_err(|e| sqe_error_to_status(&e, None))?;
 
         // Encode the SQL in the handle so we can execute it later
         let fetch = FetchResults {
