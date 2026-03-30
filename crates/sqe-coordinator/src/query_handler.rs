@@ -449,9 +449,16 @@ impl QueryHandler {
         let final_plan = self.try_distribute(physical_plan, session, query_id).await;
 
         // Execute the (possibly distributed) plan
-        let batches = collect(final_plan, ctx.task_ctx())
+        let output_schema = final_plan.schema();
+        let mut batches = collect(final_plan, ctx.task_ctx())
             .await
             .map_err(|e| SqeError::Execution(format!("Query execution failed: {e}")))?;
+
+        // Ensure we always return at least one batch so callers can infer the
+        // output schema (e.g. CTAS with WHERE false that returns zero rows).
+        if batches.is_empty() {
+            batches.push(RecordBatch::new_empty(output_schema));
+        }
 
         info!(
             batch_count = batches.len(),
