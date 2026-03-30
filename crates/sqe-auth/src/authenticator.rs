@@ -372,6 +372,7 @@ mod tests {
             token_refresh_buffer_secs: 60,
             ssl_verification: false,
             providers: Vec::new(),
+            role_mappings: std::collections::HashMap::new(),
         }
     }
 
@@ -386,6 +387,7 @@ mod tests {
             token_refresh_buffer_secs: 120,
             ssl_verification: true,
             providers: Vec::new(),
+            role_mappings: std::collections::HashMap::new(),
         }
     }
 
