@@ -161,6 +161,61 @@ impl SessionManager {
         Some(touched)
     }
 
+    /// Save current sessions to a JSON file for crash recovery.
+    ///
+    /// Only key fields are serialized (id, username, access_token, expires_at).
+    /// Failure is non-fatal: errors are logged and the caller receives an `Err`.
+    pub fn snapshot_to_file(&self, path: &str) -> Result<(), String> {
+        let sessions: Vec<_> = self
+            .sessions
+            .iter()
+            .map(|entry| {
+                let session = entry.value();
+                serde_json::json!({
+                    "id": session.id,
+                    "username": session.user.username,
+                    "access_token": session.access_token,
+                    "expires_at": session.token_expiry.to_rfc3339(),
+                })
+            })
+            .collect();
+
+        let json = serde_json::to_string_pretty(&sessions)
+            .map_err(|e| format!("Failed to serialize sessions: {e}"))?;
+        std::fs::write(path, json)
+            .map_err(|e| format!("Failed to write session snapshot: {e}"))?;
+        tracing::debug!(path = path, count = sessions.len(), "Session snapshot saved");
+        Ok(())
+    }
+
+    /// Restore sessions from a JSON snapshot file (best-effort).
+    ///
+    /// If the file does not exist or cannot be parsed the method returns
+    /// silently — a missing snapshot is not an error condition.
+    /// Full restore (re-creating live `Session` objects) requires re-validating
+    /// tokens against the OIDC provider and is deferred to a future iteration.
+    pub fn restore_from_file(&self, path: &str) {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return, // No snapshot to restore
+        };
+        match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(serde_json::Value::Array(entries)) => {
+                tracing::info!(
+                    path = path,
+                    count = entries.len(),
+                    "Found session snapshot — full restore requires token re-validation (not yet implemented)"
+                );
+            }
+            Ok(_) => {
+                tracing::warn!(path = path, "Session snapshot has unexpected format, skipping restore");
+            }
+            Err(e) => {
+                tracing::warn!(path = path, error = %e, "Failed to parse session snapshot, skipping restore");
+            }
+        }
+    }
+
     /// Remove a session from the manager.
     pub fn remove_session(&self, id: &str) {
         if self.sessions.remove(id).is_some() {

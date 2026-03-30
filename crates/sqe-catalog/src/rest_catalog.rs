@@ -13,12 +13,20 @@ use sqe_core::config::StorageConfig;
 use sqe_core::SqeError;
 use sqe_metrics::propagation::trace_context_http_headers;
 
+use crate::circuit_breaker::CircuitBreaker;
+
 /// Per-session Iceberg REST catalog wrapper.
 ///
 /// Each authenticated user session gets its own `SessionCatalog` instance
 /// configured with the user's bearer token. The token is passed directly to
 /// the Polaris REST catalog so that table-level authorization is enforced by
 /// the catalog server.
+///
+/// A single `reqwest::Client` and `CircuitBreaker` are shared across all
+/// sessions (passed in at construction time) to ensure:
+/// * **Connection reuse**: one hyper connection pool, no per-session teardown.
+/// * **Fault isolation**: when Polaris is unavailable the circuit opens and
+///   subsequent requests fail fast without wasting threads / connections.
 pub struct SessionCatalog {
     inner: Arc<RwLock<RestCatalog>>,
     polaris_url: String,
@@ -27,6 +35,8 @@ pub struct SessionCatalog {
     token_fingerprint: String,
     storage_config: StorageConfig,
     http_client: reqwest::Client,
+    /// Shared circuit breaker for Polaris REST calls.
+    circuit_breaker: Arc<CircuitBreaker>,
 }
 
 impl std::fmt::Debug for SessionCatalog {
@@ -35,6 +45,7 @@ impl std::fmt::Debug for SessionCatalog {
             .field("polaris_url", &self.polaris_url)
             .field("warehouse", &self.warehouse)
             .field("token_fingerprint", &self.token_fingerprint)
+            .field("circuit_breaker", &self.circuit_breaker.state_label())
             .finish()
     }
 }
@@ -47,11 +58,17 @@ impl SessionCatalog {
     ///
     /// A token fingerprint (last 8 chars) is included in the session identifier to
     /// ensure that token refreshes invalidate the iceberg-rust internal REST session cache.
+    ///
+    /// `http_client` and `circuit_breaker` should be shared across all sessions (created
+    /// once at startup) so that TCP connections and failure state are pooled globally.
+    /// Pass `None` for either to fall back to per-instance defaults (suitable for tests).
     pub async fn new(
         polaris_url: &str,
         warehouse: &str,
         bearer_token: &str,
         storage_config: &StorageConfig,
+        http_client: Option<reqwest::Client>,
+        circuit_breaker: Option<Arc<CircuitBreaker>>,
     ) -> sqe_core::Result<Self> {
         let token_fingerprint = {
             let len = bearer_token.len();
@@ -116,7 +133,14 @@ impl SessionCatalog {
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to create REST catalog: {e}")))?;
 
-        let http_client = reqwest::Client::new();
+        let http_client = http_client.unwrap_or_default();
+        let circuit_breaker = circuit_breaker.unwrap_or_else(|| {
+            Arc::new(CircuitBreaker::new(
+                "polaris-rest",
+                5,
+                std::time::Duration::from_secs(30),
+            ))
+        });
 
         Ok(Self {
             inner: Arc::new(RwLock::new(catalog)),
@@ -126,6 +150,7 @@ impl SessionCatalog {
             token_fingerprint,
             storage_config: storage_config.clone(),
             http_client,
+            circuit_breaker,
         })
     }
 
@@ -152,11 +177,19 @@ impl SessionCatalog {
     /// List all namespaces in the catalog.
     pub async fn list_namespaces(&self) -> sqe_core::Result<Vec<NamespaceIdent>> {
         debug!(token_fingerprint = %self.token_fingerprint, "Listing namespaces");
+        self.circuit_breaker
+            .check()
+            .map_err(sqe_core::SqeError::Catalog)?;
         let catalog = self.inner.read().await;
-        catalog
+        let result = catalog
             .list_namespaces(None)
             .await
-            .map_err(|e| sqe_core::SqeError::Catalog(format!("Failed to list namespaces: {e}")))
+            .map_err(|e| sqe_core::SqeError::Catalog(format!("Failed to list namespaces: {e}")));
+        match &result {
+            Ok(_) => self.circuit_breaker.record_success(),
+            Err(_) => self.circuit_breaker.record_failure(),
+        }
+        result
     }
 
     /// Get a namespace by its identifier.
@@ -188,11 +221,19 @@ impl SessionCatalog {
             namespace = ?namespace,
             "Listing tables"
         );
+        self.circuit_breaker
+            .check()
+            .map_err(sqe_core::SqeError::Catalog)?;
         let catalog = self.inner.read().await;
-        catalog
+        let result = catalog
             .list_tables(namespace)
             .await
-            .map_err(|e| sqe_core::SqeError::Catalog(format!("Failed to list tables: {e}")))
+            .map_err(|e| sqe_core::SqeError::Catalog(format!("Failed to list tables: {e}")));
+        match &result {
+            Ok(_) => self.circuit_breaker.record_success(),
+            Err(_) => self.circuit_breaker.record_failure(),
+        }
+        result
     }
 
     /// Load a table by its identifier.
@@ -205,11 +246,19 @@ impl SessionCatalog {
             table = ?table_ident,
             "Loading table"
         );
+        self.circuit_breaker
+            .check()
+            .map_err(sqe_core::SqeError::Catalog)?;
         let catalog = self.inner.read().await;
-        catalog
+        let result = catalog
             .load_table(table_ident)
             .await
-            .map_err(|e| sqe_core::SqeError::Catalog(format!("Failed to load table: {e}")))
+            .map_err(|e| sqe_core::SqeError::Catalog(format!("Failed to load table: {e}")));
+        match &result {
+            Ok(_) => self.circuit_breaker.record_success(),
+            Err(_) => self.circuit_breaker.record_failure(),
+        }
+        result
     }
 
     /// Check if a table exists.
