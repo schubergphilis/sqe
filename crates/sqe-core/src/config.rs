@@ -23,6 +23,8 @@ pub struct SqeConfig {
     pub query_cache: QueryCacheConfig,
     #[serde(default)]
     pub query_history: QueryHistoryConfig,
+    #[serde(default)]
+    pub external: Option<ExternalAuthConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -290,6 +292,23 @@ pub enum AuthProviderConfig {
         #[serde(default = "default_true")]
         validate_with_sts: bool,
     },
+    /// API key authentication from a keys file.
+    ApiKey {
+        /// Path to the TOML file containing API key entries.
+        keys_file: String,
+        /// Prefix that identifies an API key (default: `"sqe_"`).
+        #[serde(default = "default_api_key_prefix")]
+        key_prefix: String,
+    },
+    /// Mutual TLS client certificate authentication.
+    Mtls {
+        /// Whether to extract OU from the cert subject as a group.
+        #[serde(default = "default_true")]
+        extract_ou: bool,
+        /// Whether to extract SAN DNS names as groups.
+        #[serde(default)]
+        extract_san: bool,
+    },
     /// Fixed-identity provider for development/testing.
     Anonymous {
         /// User name to assign. Default: `"anonymous"`.
@@ -312,6 +331,9 @@ fn default_user_claim() -> String {
 }
 fn default_anonymous_user() -> String {
     "anonymous".to_string()
+}
+fn default_api_key_prefix() -> String {
+    "sqe_".to_string()
 }
 
 #[derive(Deserialize, Clone)]
@@ -340,6 +362,10 @@ pub struct AuthConfig {
     /// legacy `keycloak_url` / `token_endpoint` fields.
     #[serde(default)]
     pub providers: Vec<AuthProviderConfig>,
+    /// Group/ARN → roles mapping shared across providers that support it.
+    /// Keys are group names or ARN patterns, values are role lists.
+    #[serde(default)]
+    pub role_mappings: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl std::fmt::Debug for AuthConfig {
@@ -353,8 +379,51 @@ impl std::fmt::Debug for AuthConfig {
             .field("token_refresh_buffer_secs", &self.token_refresh_buffer_secs)
             .field("ssl_verification", &self.ssl_verification)
             .field("providers", &format!("[{} provider(s)]", self.providers.len()))
+            .field("role_mappings", &format!("[{} mapping(s)]", self.role_mappings.len()))
             .finish()
     }
+}
+
+/// Configuration for interactive OIDC flows (device code, Trino external auth).
+#[derive(Debug, Deserialize, Clone)]
+pub struct ExternalAuthConfig {
+    pub issuer: String,
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    #[serde(default = "default_redirect_uri")]
+    pub redirect_uri: String,
+    #[serde(default = "default_external_scopes")]
+    pub scopes: Vec<String>,
+    #[serde(default = "default_challenge_timeout")]
+    pub challenge_timeout_secs: u64,
+    #[serde(default)]
+    pub authorization_endpoint: Option<String>,
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
+    #[serde(default)]
+    pub device_authorization_endpoint: Option<String>,
+    #[serde(default)]
+    pub device: Option<DeviceAuthConfig>,
+    #[serde(default)]
+    pub accept_invalid_certs: bool,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct DeviceAuthConfig {
+    pub client_id: String,
+    #[serde(default = "default_external_scopes")]
+    pub scopes: Vec<String>,
+}
+
+fn default_redirect_uri() -> String {
+    "http://localhost:8080/oauth2/callback".to_string()
+}
+fn default_external_scopes() -> Vec<String> {
+    vec!["openid".to_string(), "profile".to_string()]
+}
+fn default_challenge_timeout() -> u64 {
+    900
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -795,6 +864,7 @@ mod tests {
                 token_refresh_buffer_secs: 60,
                 ssl_verification: true,
                 providers: Vec::new(),
+                role_mappings: std::collections::HashMap::new(),
             },
             catalog: CatalogConfig {
                 polaris_url: "https://polaris.example.com".to_string(),
@@ -810,6 +880,7 @@ mod tests {
             query: QueryConfig::default(),
             query_cache: QueryCacheConfig::default(),
             query_history: QueryHistoryConfig::default(),
+            external: None,
         }
     }
 
@@ -1129,5 +1200,40 @@ mod tests {
             roles: vec![],
         }];
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_parse_external_auth_config() {
+        let toml_str = r#"
+            issuer = "https://idp.example.com/realms/sqe"
+            client_id = "sqe"
+            client_secret = "secret"
+            scopes = ["openid", "profile"]
+
+            [device]
+            client_id = "sqe-cli"
+            scopes = ["openid", "profile", "offline_access"]
+        "#;
+        let config: ExternalAuthConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.issuer, "https://idp.example.com/realms/sqe");
+        assert_eq!(config.client_id, "sqe");
+        assert_eq!(config.client_secret, Some("secret".to_string()));
+        assert_eq!(config.challenge_timeout_secs, 900);
+        assert!(config.device.is_some());
+        let device = config.device.unwrap();
+        assert_eq!(device.client_id, "sqe-cli");
+        assert_eq!(device.scopes, vec!["openid", "profile", "offline_access"]);
+    }
+
+    #[test]
+    fn test_parse_external_auth_config_minimal() {
+        let toml_str = r#"
+            issuer = "https://idp.example.com"
+            client_id = "sqe"
+        "#;
+        let config: ExternalAuthConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.client_secret.is_none());
+        assert!(config.device.is_none());
+        assert_eq!(config.scopes, vec!["openid", "profile"]);
     }
 }
