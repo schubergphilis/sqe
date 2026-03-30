@@ -26,6 +26,20 @@ client_secret = ""
 token_refresh_buffer_secs = 60
 ssl_verification = false
 
+# ── Interactive OIDC flows (Trino SSO + CLI device code) ────────
+# Uncomment to enable browser-based SSO for Trino JDBC and device code for CLI.
+# [auth.external]
+# issuer = "https://idp.example.com/realms/sqe"
+# client_id = "sqe"
+# client_secret = "your-client-secret"
+# redirect_uri = "https://sqe.example.com/oauth2/callback"
+# scopes = ["openid", "profile"]
+# challenge_timeout_secs = 900
+#
+# [auth.external.device]
+# client_id = "sqe-cli"
+# scopes = ["openid", "profile", "offline_access"]
+
 [catalog]
 polaris_url = "http://polaris:8181/api/catalog"
 warehouse = "iceberg"
