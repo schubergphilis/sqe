@@ -114,12 +114,6 @@ impl QueryHandler {
         session: &Session,
         sql: &str,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        info!(
-            username = %session.user.username,
-            sql_length = sql.len(),
-            "Executing query"
-        );
-
         let start = std::time::Instant::now();
         let kind = parse_and_classify(sql)?;
         let kind_name = kind.name().to_string();
@@ -127,6 +121,12 @@ impl QueryHandler {
 
         // Generate a query ID for lifecycle tracking
         let query_id = uuid::Uuid::now_v7();
+        info!(
+            query_id = %query_id,
+            username = %session.user.username,
+            sql_length = sql.len(),
+            "Executing query"
+        );
         self.query_tracker.start(
             query_id,
             &session.user.username,
@@ -282,10 +282,11 @@ impl QueryHandler {
                     timeout_secs = timeout_secs,
                     "Query timed out"
                 );
-                self.query_tracker.failed(&query_id, "Timeout", None);
-                Err(SqeError::Execution(format!(
+                let timeout_error = SqeError::Execution(format!(
                     "Query timed out after {timeout_secs}s"
-                )))
+                ));
+                self.query_tracker.failed(&query_id, &timeout_error);
+                Err(timeout_error)
             }
         };
 
@@ -339,11 +340,9 @@ impl QueryHandler {
                     _ => {}
                 }
             }
-        } else {
-            let err_msg = result.as_ref().err().map(|e| format!("{e}")).unwrap_or_default();
+        } else if let Err(ref e) = result {
             // Only mark failed if not already marked (e.g., timeout already marked above)
-            let _ = err_msg; // suppress unused warning; error details in audit log
-            self.query_tracker.failed(&query_id, "ExecutionError", None);
+            self.query_tracker.failed(&query_id, e);
         }
 
         if let Some(ref metrics) = self.metrics {
