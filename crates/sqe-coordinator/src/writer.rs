@@ -16,6 +16,7 @@ use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::file::properties::WriterProperties;
 use sqe_core::SqeError;
 use tracing::info;
+use uuid::Uuid;
 
 /// Write RecordBatches as Parquet data files for an Iceberg table.
 ///
@@ -44,8 +45,14 @@ pub async fn write_data_files(
     let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
         .map_err(|e| SqeError::Execution(format!("Location generator error: {e}")))?;
 
+    // Include a UUID in the file prefix to guarantee unique file names across
+    // multiple writes to the same table. Without this, the counter-based naming
+    // (e.g. insert-00000.parquet) collides when a second INSERT commits to a
+    // table that already has files from a previous INSERT.
+    let unique_prefix = format!("{}-{}", file_prefix, Uuid::now_v7());
+
     let file_name_generator = DefaultFileNameGenerator::new(
-        file_prefix.to_string(),
+        unique_prefix,
         None,
         iceberg::spec::DataFileFormat::Parquet,
     );
