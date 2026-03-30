@@ -89,13 +89,6 @@ impl SqeFlightSqlService {
         self
     }
 
-    /// Extract and validate a bearer token from the request metadata,
-    /// returning the associated session.
-    ///
-    /// Supports two token types:
-    /// 1. SQE session ID (from do_handshake) — looked up in session manager
-    /// 2. Raw JWT (from backend BFF pass-through) — wrapped into an ad-hoc session,
-    ///    same pattern as the Trino-compat HTTP endpoint
     /// Extract client IP from request metadata (x-forwarded-for or peer addr).
     fn extract_client_ip<T>(request: &Request<T>) -> String {
         request
@@ -111,6 +104,13 @@ impl SqeFlightSqlService {
             })
     }
 
+    /// Extract and validate a bearer token from the request metadata,
+    /// returning the associated session.
+    ///
+    /// Supports two token types:
+    /// 1. SQE session ID (from do_handshake) — looked up in session manager
+    /// 2. Raw JWT (from backend BFF pass-through) — wrapped into an ad-hoc session,
+    ///    same pattern as the Trino-compat HTTP endpoint
     fn get_session_from_request<T>(
         &self,
         request: &Request<T>,

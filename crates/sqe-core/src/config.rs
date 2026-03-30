@@ -39,6 +39,15 @@ pub struct QueryConfig {
     /// Maximum number of rows returned per query. Default: 1_000_000. Set to 0 for unlimited.
     #[serde(default = "default_max_result_rows")]
     pub max_result_rows: usize,
+    /// Maximum concurrent queries. Default: 100. Set to 0 for unlimited.
+    #[serde(default = "default_max_concurrent_queries")]
+    pub max_concurrent_queries: usize,
+    /// Queries taking longer than this are logged at WARN level. Default: 30. Set to 0 to disable.
+    #[serde(default = "default_slow_query_threshold")]
+    pub slow_query_threshold_secs: u64,
+    /// Maximum memory per query. Default: "256MB". Supports: B, KB, MB, GB. Set to "0" for unlimited.
+    #[serde(default = "default_max_query_memory")]
+    pub max_query_memory: String,
 }
 
 impl Default for QueryConfig {
@@ -47,6 +56,9 @@ impl Default for QueryConfig {
             timeout_secs: default_query_timeout(),
             role_overrides: std::collections::HashMap::new(),
             max_result_rows: default_max_result_rows(),
+            max_concurrent_queries: default_max_concurrent_queries(),
+            slow_query_threshold_secs: default_slow_query_threshold(),
+            max_query_memory: default_max_query_memory(),
         }
     }
 }
@@ -532,6 +544,17 @@ pub struct SessionConfig {
     /// Absolute timeout in seconds. Sessions older than this are expired regardless of activity.
     #[serde(default = "default_absolute_timeout")]
     pub absolute_timeout_secs: u64,
+    /// Session persistence backend. Options: "memory" (default), "file".
+    /// "memory" = in-process only (lost on restart).
+    /// "file" = periodic snapshot to disk (survives restart, best-effort).
+    #[serde(default = "default_session_persistence")]
+    pub persistence: String,
+    /// Path for file-based session persistence. Default: "/tmp/sqe-sessions.json"
+    #[serde(default = "default_session_persistence_path")]
+    pub persistence_path: String,
+    /// How often to snapshot sessions to disk (seconds). Default: 60.
+    #[serde(default = "default_session_snapshot_interval")]
+    pub snapshot_interval_secs: u64,
 }
 
 impl Default for SessionConfig {
@@ -539,14 +562,23 @@ impl Default for SessionConfig {
         Self {
             idle_timeout_secs: default_idle_timeout(),
             absolute_timeout_secs: default_absolute_timeout(),
+            persistence: default_session_persistence(),
+            persistence_path: default_session_persistence_path(),
+            snapshot_interval_secs: default_session_snapshot_interval(),
         }
     }
 }
 
 fn default_idle_timeout() -> u64 { 900 }       // 15 minutes
 fn default_absolute_timeout() -> u64 { 28800 }  // 8 hours
+fn default_session_persistence() -> String { "memory".to_string() }
+fn default_session_persistence_path() -> String { "/tmp/sqe-sessions.json".to_string() }
+fn default_session_snapshot_interval() -> u64 { 60 }
 fn default_query_timeout() -> u64 { 300 }       // 5 minutes
 fn default_max_result_rows() -> usize { 1_000_000 }
+fn default_max_concurrent_queries() -> usize { 100 }
+fn default_slow_query_threshold() -> u64 { 30 }
+fn default_max_query_memory() -> String { "256MB".to_string() }
 
 fn default_flight_port() -> u16 { 50051 }
 fn default_trino_port() -> u16 { 8080 }

@@ -268,6 +268,7 @@ impl CatalogOps {
             &self.config.catalog.warehouse,
             &session.access_token,
             &self.config.storage,
+            None, None,
         )
         .await?;
 
@@ -319,6 +320,7 @@ impl CatalogOps {
             &self.config.catalog.warehouse,
             &session.access_token,
             &self.config.storage,
+            None, None,
         )
         .await?;
 
@@ -347,6 +349,7 @@ impl CatalogOps {
                 &self.config.catalog.warehouse,
                 &session.access_token,
                 &self.config.storage,
+            None, None,
             )
             .await?,
         );

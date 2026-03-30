@@ -330,6 +330,32 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         );
     }
 
+    // File-based session persistence — optional, off by default
+    if config.session.persistence == "file" {
+        // Try to restore sessions from the last snapshot on startup (best-effort)
+        session_manager.restore_from_file(&config.session.persistence_path);
+
+        // Spawn background task to periodically snapshot sessions to disk
+        let sm = session_manager.clone();
+        let path = config.session.persistence_path.clone();
+        let interval = config.session.snapshot_interval_secs;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval));
+            ticker.tick().await; // skip first immediate tick
+            loop {
+                ticker.tick().await;
+                if let Err(e) = sm.snapshot_to_file(&path) {
+                    tracing::warn!(error = %e, "Session snapshot failed");
+                }
+            }
+        });
+        tracing::info!(
+            path = %config.session.persistence_path,
+            interval_secs = config.session.snapshot_interval_secs,
+            "File-based session persistence enabled"
+        );
+    }
+
     // Query tracker and result cache
     let query_tracker = Arc::new(
         sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history),
