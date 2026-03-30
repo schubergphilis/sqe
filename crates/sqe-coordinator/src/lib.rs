@@ -7,6 +7,7 @@ pub mod explain;
 pub mod flight_sql;
 pub mod mode;
 pub mod query_handler;
+pub mod session_context;
 pub mod query_cache;
 pub mod query_tracker;
 pub mod rate_limiter;

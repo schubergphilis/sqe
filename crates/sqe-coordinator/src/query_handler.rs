@@ -5,11 +5,11 @@ use arrow_array::RecordBatch;
 use arrow_array::{ArrayRef, builder::StringBuilder};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_plan::{collect, ExecutionPlan};
-use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::prelude::SessionContext;
 use tracing::{debug, info, warn};
 
 use sqlparser::ast::Statement;
-use sqe_catalog::{IcebergScanExec, SessionCatalog, SqeCatalogProvider};
+use sqe_catalog::{IcebergScanExec, SessionCatalog};
 use sqe_core::{QueryConfig, Session, SqeConfig, SqeError};
 use sqe_policy::{PolicyEnforcer, PolicyStore};
 use sqe_sql::{parse_and_classify, StatementKind};
@@ -667,146 +667,20 @@ impl QueryHandler {
     }
 
     /// Create a DataFusion SessionContext with the user's Polaris catalog registered.
-    #[tracing::instrument(skip(self, session), fields(username = %session.user.username))]
+    ///
+    /// Delegates to [`crate::session_context::create_session_context`] which
+    /// owns the full setup logic, keeping this file focused on query routing.
     async fn create_session_context(
         &self,
         session: &Session,
     ) -> sqe_core::Result<SessionContext> {
-        let catalog_name = if self.config.catalog.warehouse.is_empty() {
-            "default".to_string()
-        } else {
-            self.config.catalog.warehouse.clone()
-        };
-
-        let ctx = SessionContext::new_with_config(
-            SessionConfig::new()
-                .with_information_schema(true)
-                .with_default_catalog_and_schema(&catalog_name, "default"),
-        );
-
-        // Create a per-session catalog connected to Polaris with the user's bearer token
-        let session_catalog = Arc::new(
-            SessionCatalog::new(
-                &self.config.catalog.polaris_url,
-                &self.config.catalog.warehouse,
-                &session.access_token,
-                &self.config.storage,
-            )
-            .await?,
-        );
-
-        // Clone before moving into SqeCatalogProvider (which consumes the Arc)
-        let session_catalog_for_system = session_catalog.clone();
-
-        // Create the DataFusion CatalogProvider from the session catalog,
-        // passing policy store and session user for information_schema column filtering.
-        let catalog_provider = SqeCatalogProvider::try_new_with_policy(
-            session_catalog,
-            self.config.storage.clone(),
-            self.config.catalog.warehouse.clone(),
-            self.policy_store.clone(),
-            Some(session.user.clone()),
+        crate::session_context::create_session_context(
+            &self.config,
+            session,
+            self.policy_store.as_ref(),
+            &self.query_tracker,
         )
-        .await?;
-
-        ctx.register_catalog(&catalog_name, Arc::new(catalog_provider));
-
-        // Register the system catalog for Trino JDBC metadata browsing
-        // (system.jdbc.types, system.jdbc.catalogs, system.jdbc.schemas, etc.)
-        // and the system.runtime.* virtual tables for query/node/task info.
-        let tracker = Arc::clone(&self.query_tracker);
-        let records_fn: sqe_catalog::system_runtime::QueryRecordsFn = Arc::new(move || {
-            tracker
-                .records()
-                .into_iter()
-                .map(|r| sqe_catalog::system_runtime::RuntimeQueryRecord {
-                    query_id: r.query_id.to_string(),
-                    state: match r.state {
-                        crate::query_tracker::QueryState::Queued => {
-                            sqe_catalog::system_runtime::RuntimeQueryState::Queued
-                        }
-                        crate::query_tracker::QueryState::Running => {
-                            sqe_catalog::system_runtime::RuntimeQueryState::Running
-                        }
-                        crate::query_tracker::QueryState::Finished => {
-                            sqe_catalog::system_runtime::RuntimeQueryState::Finished
-                        }
-                        crate::query_tracker::QueryState::Failed => {
-                            sqe_catalog::system_runtime::RuntimeQueryState::Failed
-                        }
-                        crate::query_tracker::QueryState::Canceled => {
-                            sqe_catalog::system_runtime::RuntimeQueryState::Canceled
-                        }
-                    },
-                    user: r.user.clone(),
-                    source: r.source.clone(),
-                    sql: r.sql.clone(),
-                    created: r.created,
-                    started: r.started,
-                    ended: r.ended,
-                    queued_ms: r.queued_ms,
-                    planning_ms: r.planning_ms,
-                    execution_ms: r.execution_ms,
-                    output_rows: r.output_rows,
-                    error_type: r.error_type.clone(),
-                    error_code: r.error_code.clone(),
-                    fragments: r
-                        .fragments
-                        .iter()
-                        .map(|f| sqe_catalog::system_runtime::RuntimeFragmentInfo {
-                            task_id: f.task_id.clone(),
-                            worker_url: f.worker_url.clone(),
-                            state: f.state.to_string(),
-                            elapsed_ms: f.elapsed_ms,
-                            input_rows: f.input_rows,
-                            output_rows: f.output_rows,
-                        })
-                        .collect(),
-                })
-                .collect()
-        });
-        let coordinator_uri = format!(
-            "http://localhost:{}",
-            self.config.coordinator.flight_sql_port
-        );
-        let runtime_schema = Arc::new(sqe_catalog::system_runtime::RuntimeSchemaProvider::new(
-            records_fn,
-            self.config.catalog.warehouse.clone(),
-            coordinator_uri,
-            self.config.coordinator.worker_urls.clone(),
-        ));
-        let system_catalog = sqe_catalog::SystemCatalogProvider::new(
-            session_catalog_for_system,
-            self.config.catalog.warehouse.clone(),
-        )
-        .with_runtime(runtime_schema);
-        ctx.register_catalog("system", Arc::new(system_catalog));
-
-        // Register the sha256() scalar function for column masking.
-        // DataFusion does not ship a built-in sha256 — we provide one via sqe-policy.
-        ctx.register_udf(sqe_policy::sha256_udf::sha256_udf());
-
-        // Register Trino-compatible function aliases (year(), month(), day_of_week(), etc.)
-        // so Trino SQL and dbt models work without modification.
-        crate::trino_functions::register_trino_functions(&ctx);
-
-        // Register the read_parquet() table-valued function so users can
-        // query external Parquet files directly from SQL:
-        //   SELECT * FROM read_parquet('s3://bucket/path/*.parquet', ...)
-        ctx.register_udtf(
-            "read_parquet",
-            Arc::new(sqe_catalog::read_parquet::ReadParquetFunction::new(
-                self.config.storage.clone(),
-            )),
-        );
-
-        debug!(
-            catalog_name = %catalog_name,
-            username = %session.user.username,
-            "Registered session catalog in DataFusion context"
-        );
-
-        Ok(ctx)
+        .await
     }
 
     /// Handle SHOW CATALOGS by returning the configured warehouse name.
