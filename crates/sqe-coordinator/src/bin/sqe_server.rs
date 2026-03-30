@@ -368,6 +368,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
                 ready: ready.clone(),
                 started_at,
             },
+            None, // OAuth2 external auth — wired when [auth.external] is configured
         );
         tracing::info!("Trino-compat HTTP on port {}", config.coordinator.trino_http_port);
     }

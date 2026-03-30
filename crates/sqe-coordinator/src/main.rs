@@ -146,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
                 ready: ready.clone(),
                 started_at,
             },
+            None, // OAuth2 external auth — wired when [auth.external] is configured
         );
         tracing::info!(
             "Trino-compat HTTP server on port {}",
