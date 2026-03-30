@@ -463,17 +463,14 @@ impl ScalarUDFImpl for DateDiff {
                     if arr.is_null(i) {
                         return None;
                     }
-                    if let Some(a) = arr.as_any().downcast_ref::<Date32Array>() {
-                        a.value(i)
-                            .checked_rem(1)
-                            .map(|_| ())
-                            .and(Some(temporal_conversions::date32_to_datetime(a.value(i)).unwrap().date()))
-                            .or_else(|| Some(temporal_conversions::date32_to_datetime(a.value(i)).unwrap().date()))
-                    } else if let Some(a) = arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-                        Some(us_to_naive(a.value(i)).date())
-                    } else {
-                        None
-                    }
+                    arr.as_any()
+                        .downcast_ref::<Date32Array>()
+                        .map(|a| temporal_conversions::date32_to_datetime(a.value(i)).unwrap().date())
+                        .or_else(|| {
+                            arr.as_any()
+                                .downcast_ref::<TimestampMicrosecondArray>()
+                                .map(|a| us_to_naive(a.value(i)).date())
+                        })
                 };
                 let len = arr1.len();
                 let result: Int64Array = (0..len)
@@ -700,7 +697,7 @@ impl ScalarUDFImpl for TrinoDate {
                     array.as_any().downcast_ref::<Date32Array>()
                 {
                     // Clone as-is
-                    arr.iter().map(|v| v).collect()
+                    arr.iter().collect()
                 } else if let Some(arr) =
                     array.as_any().downcast_ref::<TimestampMicrosecondArray>()
                 {
