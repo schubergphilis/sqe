@@ -11,9 +11,11 @@ use tracing::info;
 use sqe_core::config::{AuthConfig, AuthProviderConfig};
 
 use crate::anonymous::{AnonymousProvider, AnonymousProviderConfig};
+use crate::api_key::{ApiKeyProvider, ApiKeyProviderConfig};
 use crate::aws_iam::{AwsIamProvider, AwsIamProviderConfig};
 use crate::bearer_token::{BearerTokenProvider, BearerTokenProviderConfig};
 use crate::chain::AuthChain;
+use crate::mtls::{MtlsProvider, MtlsProviderConfig};
 use crate::oidc_provider::{OidcPasswordProvider, OidcPasswordProviderConfig};
 use crate::token_exchange::{TokenExchangeProvider, TokenExchangeConfig};
 use crate::provider::AuthProvider;
@@ -83,6 +85,7 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                         token_refresh_buffer_secs: config.token_refresh_buffer_secs,
                         ssl_verification: config.ssl_verification,
                         providers: Vec::new(),
+                        role_mappings: HashMap::new(),
                     };
                     let auth = Authenticator::new(&legacy_config).await?;
                     Arc::new(auth)
@@ -155,10 +158,49 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                     let aws_config = AwsIamProviderConfig {
                         region: region.clone(),
                         validate_with_sts: *validate_with_sts,
-                        role_mappings: HashMap::new(), // TODO: parse from config
-                        key_mappings: HashMap::new(),  // TODO: parse from config
+                        role_mappings: config.role_mappings.clone(),
+                        key_mappings: HashMap::new(),
                     };
                     Arc::new(AwsIamProvider::new(aws_config))
+                }
+                AuthProviderConfig::ApiKey {
+                    keys_file,
+                    key_prefix,
+                } => {
+                    info!(
+                        index = i,
+                        keys_file = %keys_file,
+                        "Adding ApiKeyProvider to chain"
+                    );
+                    let ak_config = ApiKeyProviderConfig {
+                        keys_file: keys_file.into(),
+                        key_prefix: key_prefix.clone(),
+                        role_mappings: config.role_mappings.clone(),
+                        ..Default::default()
+                    };
+                    let provider = ApiKeyProvider::new(ak_config).map_err(|e| {
+                        sqe_core::SqeError::Config(format!(
+                            "Failed to create ApiKeyProvider: {e}"
+                        ))
+                    })?;
+                    Arc::new(provider)
+                }
+                AuthProviderConfig::Mtls {
+                    extract_ou,
+                    extract_san,
+                } => {
+                    info!(
+                        index = i,
+                        extract_ou = extract_ou,
+                        extract_san = extract_san,
+                        "Adding MtlsProvider to chain"
+                    );
+                    let mtls_config = MtlsProviderConfig {
+                        extract_ou: *extract_ou,
+                        extract_san: *extract_san,
+                        role_mappings: config.role_mappings.clone(),
+                    };
+                    Arc::new(MtlsProvider::new(mtls_config))
                 }
                 AuthProviderConfig::Anonymous { user, roles } => {
                     info!(
@@ -207,6 +249,7 @@ mod tests {
                 user: "dev-user".to_string(),
                 roles: vec!["admin".to_string()],
             }],
+            role_mappings: HashMap::new(),
         };
 
         let chain = build_auth_chain(&config).await.expect("should build chain");
@@ -240,6 +283,7 @@ mod tests {
                 client_secret: "secret".to_string(),
                 roles_claim: "realm_access.roles".to_string(),
             }],
+            role_mappings: HashMap::new(),
         };
 
         let chain = build_auth_chain(&config).await.expect("should build chain");
@@ -272,6 +316,7 @@ mod tests {
                     roles: vec!["public".to_string()],
                 },
             ],
+            role_mappings: HashMap::new(),
         };
 
         let chain = build_auth_chain(&config).await.expect("should build chain");
@@ -301,6 +346,7 @@ mod tests {
             token_refresh_buffer_secs: 60,
             ssl_verification: false,
             providers: Vec::new(),
+            role_mappings: HashMap::new(),
         };
 
         let chain = build_auth_chain(&config).await.expect("should build chain");
