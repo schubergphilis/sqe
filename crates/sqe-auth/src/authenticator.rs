@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use tracing::{debug, error, info};
 
@@ -8,6 +9,7 @@ use sqe_core::Session;
 
 use crate::oidc_password::OidcPasswordClient;
 use crate::oauth::OAuthClient;
+use crate::provider::{AuthError, AuthProvider, FlightCredentials, Identity};
 use crate::token_cache::{CachedToken, TokenCache};
 
 /// Selects which auth backend the engine uses at runtime.
@@ -314,6 +316,46 @@ impl Authenticator {
     }
 }
 
+/// Bridge implementation: makes the existing `Authenticator` usable as an `AuthProvider`.
+///
+/// This allows the `Authenticator` to participate in the `AuthChain` alongside
+/// new providers. It handles both OIDC password grant and OAuth2 client_credentials
+/// backends.
+///
+/// Credential mapping:
+/// - Requires `username` and `password` in `FlightCredentials`
+/// - Returns `NotMyCredentials` if either is missing
+#[async_trait]
+impl AuthProvider for Authenticator {
+    async fn authenticate(&self, credentials: &FlightCredentials) -> Result<Identity, AuthError> {
+        let username = credentials
+            .username
+            .as_deref()
+            .ok_or(AuthError::NotMyCredentials)?;
+        let password = credentials
+            .password
+            .as_deref()
+            .ok_or(AuthError::NotMyCredentials)?;
+
+        if username.is_empty() && password.is_empty() {
+            return Err(AuthError::NotMyCredentials);
+        }
+
+        let session = self
+            .authenticate(username, password)
+            .await
+            .map_err(|e| AuthError::AuthFailed(e.to_string()))?;
+
+        Ok(Identity {
+            user_id: session.user.username.clone(),
+            display_name: session.user.username.clone(),
+            roles: session.user.roles.clone(),
+            catalog_token: Some(session.access_token.clone()),
+            refresh_token: session.refresh_token.clone(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +371,8 @@ mod tests {
             token_endpoint: String::new(),
             token_refresh_buffer_secs: 60,
             ssl_verification: false,
+            providers: Vec::new(),
+            role_mappings: std::collections::HashMap::new(),
         }
     }
 
@@ -342,6 +386,8 @@ mod tests {
             token_endpoint: "http://localhost:8181/api/catalog/v1/oauth/tokens".to_string(),
             token_refresh_buffer_secs: 120,
             ssl_verification: true,
+            providers: Vec::new(),
+            role_mappings: std::collections::HashMap::new(),
         }
     }
 

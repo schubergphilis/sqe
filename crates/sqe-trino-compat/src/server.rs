@@ -39,6 +39,8 @@ pub struct TrinoState<A, Q> {
     pub page_size: usize,
     /// The TCP port the Trino-compat HTTP server is bound to.
     pub port: u16,
+    /// OAuth2 external auth state. None if [auth.external] is not configured.
+    pub oauth2: Option<Arc<crate::oauth2::OAuth2State>>,
 }
 
 /// Stores the full result set split into pages for pagination.
@@ -81,6 +83,7 @@ pub fn start_trino_server<A, Q>(
     query_handler: Arc<Q>,
     port: u16,
     node: NodeContext,
+    oauth2: Option<Arc<crate::oauth2::OAuth2State>>,
 ) -> tokio::task::JoinHandle<()>
 where
     A: TrinoAuthenticator,
@@ -93,6 +96,7 @@ where
         node,
         page_size: DEFAULT_PAGE_SIZE,
         port,
+        oauth2: oauth2.clone(),
     });
 
     let state_sweep = state.clone();
@@ -116,13 +120,32 @@ where
     });
 
     tokio::spawn(async move {
-        let app = Router::new()
+        let mut app = Router::new()
             .route("/v1/info", get(server_info::<A, Q>))
             .route("/v1/info/state", get(server_state::<A, Q>))
             .route("/v1/statement", post(submit_query::<A, Q>))
             .route("/v1/statement/{id}/{token}", get(get_results::<A, Q>))
             .route("/v1/statement/{id}", delete(cancel_query::<A, Q>))
             .with_state(state);
+
+        if let Some(oauth2_state) = oauth2 {
+            let oauth2_routes = Router::new()
+                .route(
+                    "/oauth2/token/initiate/{auth_id_hash}",
+                    get(crate::oauth2::initiate_handler),
+                )
+                .route("/oauth2/callback", get(crate::oauth2::callback_handler))
+                .route(
+                    "/oauth2/token/{auth_id}",
+                    get(crate::oauth2::poll_token_handler),
+                )
+                .route(
+                    "/oauth2/token/{auth_id}",
+                    delete(crate::oauth2::delete_token_handler),
+                )
+                .with_state(oauth2_state);
+            app = app.merge(oauth2_routes);
+        }
 
         let addr = format!("0.0.0.0:{port}");
         let listener = match tokio::net::TcpListener::bind(&addr).await {
@@ -335,6 +358,20 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 return error_response(StatusCode::UNAUTHORIZED, "Authentication failed");
             }
         }
+    } else if let Some(ref oauth2_state) = state.oauth2 {
+        match crate::oauth2::generate_challenge(oauth2_state).await {
+            Ok((_auth_id, www_authenticate)) => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    [(axum::http::header::WWW_AUTHENTICATE, www_authenticate)],
+                    "Authentication required",
+                )
+                    .into_response();
+            }
+            Err(status) => {
+                return error_response(status, "Failed to generate auth challenge");
+            }
+        }
     } else {
         return error_response(StatusCode::UNAUTHORIZED, "Missing Authorization header");
     };
@@ -524,6 +561,7 @@ mod tests {
             },
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
+            oauth2: None,
         });
 
         let Json(info) = server_info(State(state)).await;
@@ -549,6 +587,7 @@ mod tests {
             },
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
+            oauth2: None,
         });
 
         let Json(info) = server_info(State(state)).await;
@@ -569,6 +608,7 @@ mod tests {
             },
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
+            oauth2: None,
         });
 
         let result = server_state(State(state)).await;
@@ -589,6 +629,7 @@ mod tests {
             },
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
+            oauth2: None,
         });
 
         let result = server_state(State(state)).await;
@@ -936,6 +977,7 @@ mod tests {
             },
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
+            oauth2: None,
         });
 
         let response = get_results::<MockAuth, MockQuery>(
@@ -962,6 +1004,7 @@ mod tests {
             },
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
+            oauth2: None,
         });
 
         // Insert a result with 1 page
@@ -998,6 +1041,7 @@ mod tests {
             },
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
+            oauth2: None,
         });
 
         state.results.insert(
@@ -1060,6 +1104,7 @@ mod tests {
             },
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
+            oauth2: None,
         });
 
         state.results.insert(
@@ -1100,6 +1145,7 @@ mod tests {
             },
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
+            oauth2: None,
         });
 
         state.results.insert(

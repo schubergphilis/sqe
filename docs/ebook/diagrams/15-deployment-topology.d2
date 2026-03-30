@@ -1,0 +1,70 @@
+# Chapter 15: Kubernetes Deployment Topology
+direction: down
+
+k8s: Kubernetes Cluster {
+  style.fill: "#e3f2fd"
+
+  ingress: Ingress {
+    style.fill: "#1565c0"
+    style.font-color: "#ffffff"
+    label: "Ingress\nFlight SQL :50051\nTrino HTTP :8080"
+  }
+
+  coord: Coordinator {
+    style.fill: "#1565c0"
+    style.font-color: "#ffffff"
+
+    pod: "Deployment (1 replica)\nCPU: 500m-2000m\nMem: 1Gi-4Gi"
+    metrics: ":9090 /metrics"
+    health: ":9091 /healthz"
+  }
+
+  workers: Workers {
+    style.fill: "#2e7d32"
+    style.font-color: "#ffffff"
+
+    w1: "Worker Pod 1\nCPU: 2000m-4000m\nMem: 4Gi-16Gi"
+    w2: "Worker Pod 2\nCPU: 2000m-4000m\nMem: 4Gi-16Gi"
+  }
+
+  config: ConfigMap {
+    style.fill: "#f57f17"
+    label: "sqe.toml"
+  }
+
+  secrets: Secret {
+    style.fill: "#c62828"
+    style.font-color: "#ffffff"
+    label: "OIDC credentials"
+  }
+}
+
+polaris: Polaris {
+  style.fill: "#6a1b9a"
+  style.font-color: "#ffffff"
+}
+
+s3: S3 {
+  shape: cylinder
+  style.fill: "#e65100"
+  style.font-color: "#ffffff"
+}
+
+prometheus: Prometheus {
+  style.fill: "#ff8f00"
+}
+
+ingress -> coord
+coord -> workers.w1: "gRPC (internal)"
+coord -> workers.w2: "gRPC (internal)"
+config -> coord
+config -> workers
+secrets -> coord
+secrets -> workers
+coord -> polaris
+workers.w1 -> polaris
+workers.w2 -> polaris
+workers.w1 -> s3
+workers.w2 -> s3
+prometheus -> coord.metrics
+prometheus -> workers

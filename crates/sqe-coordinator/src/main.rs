@@ -119,6 +119,7 @@ async fn main() -> anyhow::Result<()> {
     // Initialize query handler
     let query_handler = Arc::new(QueryHandler::new(
         policy_enforcer,
+        None, // policy_store — wired when policy engine is enabled
         config.clone(),
         if config.coordinator.worker_urls.is_empty() {
             None
@@ -145,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
                 ready: ready.clone(),
                 started_at,
             },
+            None, // OAuth2 external auth — wired when [auth.external] is configured
         );
         tracing::info!(
             "Trino-compat HTTP server on port {}",

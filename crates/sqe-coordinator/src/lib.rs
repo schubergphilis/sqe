@@ -13,6 +13,7 @@ pub mod rate_limiter;
 pub mod scheduler;
 pub mod session_manager;
 pub mod worker_registry;
+pub mod trino_functions;
 pub mod write_handler;
 pub mod writer;
 

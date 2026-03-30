@@ -59,7 +59,7 @@ pub async fn setup_handler() -> (sqe_core::Session, sqe_coordinator::QueryHandle
         None
     };
     let handler = sqe_coordinator::QueryHandler::new(
-        policy, config, None, None, None, None, query_tracker, query_cache,
+        policy, None, config, None, None, None, None, query_tracker, query_cache,
     );
     (session, handler)
 }
