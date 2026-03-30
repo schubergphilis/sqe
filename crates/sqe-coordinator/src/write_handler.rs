@@ -52,12 +52,13 @@ impl WriteHandler {
                     ));
                 }
 
-                // Get the Arrow schema from the first batch, or return early if empty
+                // Get the Arrow schema from the first batch. The caller guarantees
+                // at least one batch is present (possibly with 0 rows).
                 let schema = if let Some(batch) = batches.first() {
                     batch.schema()
                 } else {
                     return Err(SqeError::Execution(
-                        "CTAS query returned no results — cannot infer schema".into(),
+                        "CTAS query returned no batches — cannot infer schema".into(),
                     ));
                 };
 

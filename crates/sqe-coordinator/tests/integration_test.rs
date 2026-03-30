@@ -1891,3 +1891,154 @@ async fn test_trino_http_query() {
         assert!(page_resp.status().is_success());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Edge case: table lifecycle robustness
+// ---------------------------------------------------------------------------
+
+/// Tests edge cases around table lifecycle operations:
+/// - SELECT from empty table (no snapshot)
+/// - DROP + re-CREATE same table name
+/// - DROP non-existent table (with/without IF EXISTS)
+/// - SELECT from non-existent table
+/// - Double CREATE (should fail)
+#[tokio::test(flavor = "multi_thread")]
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn test_table_lifecycle_edge_cases() {
+    let (session, handler) = common::setup_handler().await;
+
+    // Helper to run a SQL statement and check success/failure
+    async fn check(
+        handler: &sqe_coordinator::QueryHandler,
+        session: &sqe_core::Session,
+        label: &str,
+        sql: &str,
+        expect_ok: bool,
+    ) -> bool {
+        let result = handler.execute(session, sql).await;
+        let actual_ok = result.is_ok();
+        if actual_ok == expect_ok {
+            let rows = result.as_ref().map(|b| b.iter().map(|b| b.num_rows()).sum::<usize>()).unwrap_or(0);
+            println!("  ✓ {label} (rows={rows})");
+            true
+        } else {
+            let detail = match &result {
+                Ok(batches) => format!("Ok({} rows)", batches.iter().map(|b| b.num_rows()).sum::<usize>()),
+                Err(e) => format!("Err({e})"),
+            };
+            println!("  ✗ {label}: expected ok={expect_ok}, got {detail}");
+            false
+        }
+    }
+
+    let mut failures = 0;
+
+    // --- Empty table ---
+    println!("\n=== Empty table lifecycle ===");
+    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.edge_empty").await;
+
+    if !check(&handler, &session,
+        "CTAS empty",
+        "CREATE TABLE test_ns.edge_empty AS SELECT CAST(1 AS INT) as id, 'x' as name WHERE false",
+        true,
+    ).await { failures += 1; }
+
+    if !check(&handler, &session,
+        "SELECT from empty table",
+        "SELECT * FROM test_ns.edge_empty",
+        true,
+    ).await { failures += 1; }
+
+    if !check(&handler, &session,
+        "COUNT from empty table",
+        "SELECT COUNT(*) FROM test_ns.edge_empty",
+        true,
+    ).await { failures += 1; }
+
+    if !check(&handler, &session,
+        "DROP empty table",
+        "DROP TABLE test_ns.edge_empty",
+        true,
+    ).await { failures += 1; }
+
+    // --- DROP + re-CREATE ---
+    println!("\n=== Drop and re-create ===");
+    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.edge_recreate").await;
+
+    if !check(&handler, &session,
+        "CTAS first version",
+        "CREATE TABLE test_ns.edge_recreate AS SELECT 1 as id, 'first' as val",
+        true,
+    ).await { failures += 1; }
+
+    if !check(&handler, &session,
+        "SELECT first version",
+        "SELECT * FROM test_ns.edge_recreate",
+        true,
+    ).await { failures += 1; }
+
+    if !check(&handler, &session,
+        "DROP for re-create",
+        "DROP TABLE test_ns.edge_recreate",
+        true,
+    ).await { failures += 1; }
+
+    // Small delay for catalog consistency
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    if !check(&handler, &session,
+        "CTAS re-create same name",
+        "CREATE TABLE test_ns.edge_recreate AS SELECT 2 as id, 'second' as val",
+        true,
+    ).await { failures += 1; }
+
+    if !check(&handler, &session,
+        "SELECT after re-create",
+        "SELECT * FROM test_ns.edge_recreate",
+        true,
+    ).await { failures += 1; }
+
+    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.edge_recreate").await;
+
+    // --- Non-existent table ---
+    println!("\n=== Non-existent table ===");
+
+    if !check(&handler, &session,
+        "DROP IF EXISTS non-existent",
+        "DROP TABLE IF EXISTS test_ns.does_not_exist_xyz",
+        true,
+    ).await { failures += 1; }
+
+    if !check(&handler, &session,
+        "DROP strict non-existent (should fail)",
+        "DROP TABLE test_ns.does_not_exist_xyz",
+        false,
+    ).await { failures += 1; }
+
+    if !check(&handler, &session,
+        "SELECT from non-existent (should fail)",
+        "SELECT * FROM test_ns.does_not_exist_xyz",
+        false,
+    ).await { failures += 1; }
+
+    // --- Double CREATE ---
+    println!("\n=== Double create ===");
+    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.edge_double").await;
+
+    if !check(&handler, &session,
+        "CREATE first",
+        "CREATE TABLE test_ns.edge_double AS SELECT 1 as x",
+        true,
+    ).await { failures += 1; }
+
+    if !check(&handler, &session,
+        "CREATE duplicate (should fail)",
+        "CREATE TABLE test_ns.edge_double AS SELECT 2 as x",
+        false,
+    ).await { failures += 1; }
+
+    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.edge_double").await;
+
+    println!("\n=== Result: {} test(s) failed ===", failures);
+    assert_eq!(failures, 0, "{failures} edge case(s) failed");
+}
