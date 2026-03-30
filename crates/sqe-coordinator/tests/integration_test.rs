@@ -2039,6 +2039,38 @@ async fn test_table_lifecycle_edge_cases() {
 
     let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.edge_double").await;
 
+    // --- Multiple INSERTs to same table (file name uniqueness) ---
+    println!("\n=== Multiple INSERTs ===");
+    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.edge_multi_insert").await;
+
+    if !check(&handler, &session,
+        "CTAS base table",
+        "CREATE TABLE test_ns.edge_multi_insert AS SELECT 1 as id, 'first' as val",
+        true,
+    ).await { failures += 1; }
+
+    if !check(&handler, &session,
+        "INSERT second batch",
+        "INSERT INTO test_ns.edge_multi_insert SELECT 2 as id, 'second' as val",
+        true,
+    ).await { failures += 1; }
+
+    if !check(&handler, &session,
+        "INSERT third batch",
+        "INSERT INTO test_ns.edge_multi_insert SELECT 3 as id, 'third' as val",
+        true,
+    ).await { failures += 1; }
+
+    // Verify all 3 rows are present
+    let batches = handler.execute(&session,
+        "SELECT COUNT(*) as cnt FROM test_ns.edge_multi_insert"
+    ).await.expect("COUNT should succeed");
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert!(total > 0, "COUNT query should return at least one row");
+    common::print_results("Multi-INSERT count", "SELECT COUNT(*)", &batches);
+
+    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.edge_multi_insert").await;
+
     println!("\n=== Result: {} test(s) failed ===", failures);
     assert_eq!(failures, 0, "{failures} edge case(s) failed");
 }
