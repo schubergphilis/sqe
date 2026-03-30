@@ -54,6 +54,8 @@ pub struct QueryHandler {
     audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
     query_tracker: Arc<QueryTracker>,
     query_cache: Option<Arc<ResultCache>>,
+    /// Semaphore limiting concurrent query execution.
+    query_semaphore: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl QueryHandler {
@@ -72,6 +74,11 @@ impl QueryHandler {
         let catalog_ops = CatalogOps::new(config.clone());
         let write_handler = WriteHandler::new(config.clone());
         let explain_handler = crate::explain::ExplainHandler::new(Arc::clone(&policy_enforcer));
+        let query_semaphore = if config.query.max_concurrent_queries > 0 {
+            Some(Arc::new(tokio::sync::Semaphore::new(config.query.max_concurrent_queries)))
+        } else {
+            None
+        };
         Self {
             policy_enforcer,
             policy_store,
@@ -85,6 +92,7 @@ impl QueryHandler {
             audit,
             query_tracker,
             query_cache,
+            query_semaphore,
         }
     }
 
@@ -114,6 +122,21 @@ impl QueryHandler {
         session: &Session,
         sql: &str,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // Backpressure: reject if too many concurrent queries
+        let _permit = if let Some(ref sem) = self.query_semaphore {
+            match sem.try_acquire() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    return Err(SqeError::Execution(format!(
+                        "Too many concurrent queries ({} active). Please retry later.",
+                        self.config.query.max_concurrent_queries
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
         let start = std::time::Instant::now();
         let kind = parse_and_classify(sql)?;
         let kind_name = kind.name().to_string();
@@ -370,6 +393,20 @@ impl QueryHandler {
                 status: status.to_string(),
                 client_ip: None,
             });
+        }
+
+        // Slow query warning
+        let elapsed_secs = duration.as_secs();
+        if self.config.query.slow_query_threshold_secs > 0
+            && elapsed_secs >= self.config.query.slow_query_threshold_secs
+        {
+            warn!(
+                query_id = %query_id,
+                username = %session.user.username,
+                elapsed_secs = elapsed_secs,
+                sql_length = sql.len(),
+                "Slow query detected"
+            );
         }
 
         result
@@ -720,6 +757,7 @@ impl QueryHandler {
             &self.config.catalog.warehouse,
             &session.access_token,
             &self.config.storage,
+            None, None,
         )
         .await?;
 
@@ -756,6 +794,7 @@ impl QueryHandler {
             &self.config.catalog.warehouse,
             &session.access_token,
             &self.config.storage,
+            None, None,
         )
         .await?;
 
@@ -860,6 +899,7 @@ impl QueryHandler {
                 &self.config.catalog.warehouse,
                 &session.access_token,
                 &self.config.storage,
+            None, None,
             )
             .await?,
         );

@@ -161,6 +161,61 @@ impl SessionManager {
         Some(touched)
     }
 
+    /// Save current sessions to a JSON file for crash recovery.
+    ///
+    /// Only key fields are serialized (id, username, access_token, expires_at).
+    /// Failure is non-fatal: errors are logged and the caller receives an `Err`.
+    pub fn snapshot_to_file(&self, path: &str) -> Result<(), String> {
+        let sessions: Vec<_> = self
+            .sessions
+            .iter()
+            .map(|entry| {
+                let session = entry.value();
+                serde_json::json!({
+                    "id": session.id,
+                    "username": session.user.username,
+                    "access_token": session.access_token,
+                    "expires_at": session.token_expiry.to_rfc3339(),
+                })
+            })
+            .collect();
+
+        let json = serde_json::to_string_pretty(&sessions)
+            .map_err(|e| format!("Failed to serialize sessions: {e}"))?;
+        std::fs::write(path, json)
+            .map_err(|e| format!("Failed to write session snapshot: {e}"))?;
+        tracing::debug!(path = path, count = sessions.len(), "Session snapshot saved");
+        Ok(())
+    }
+
+    /// Restore sessions from a JSON snapshot file (best-effort).
+    ///
+    /// If the file does not exist or cannot be parsed the method returns
+    /// silently — a missing snapshot is not an error condition.
+    /// Full restore (re-creating live `Session` objects) requires re-validating
+    /// tokens against the OIDC provider and is deferred to a future iteration.
+    pub fn restore_from_file(&self, path: &str) {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return, // No snapshot to restore
+        };
+        match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(serde_json::Value::Array(entries)) => {
+                tracing::info!(
+                    path = path,
+                    count = entries.len(),
+                    "Found session snapshot — full restore requires token re-validation (not yet implemented)"
+                );
+            }
+            Ok(_) => {
+                tracing::warn!(path = path, "Session snapshot has unexpected format, skipping restore");
+            }
+            Err(e) => {
+                tracing::warn!(path = path, error = %e, "Failed to parse session snapshot, skipping restore");
+            }
+        }
+    }
+
     /// Remove a session from the manager.
     pub fn remove_session(&self, id: &str) {
         if self.sessions.remove(id).is_some() {
@@ -519,6 +574,54 @@ mod tests {
         assert!(manager.sessions.get(&active_id).is_some(), "Active session must survive sweep");
         assert!(manager.sessions.get(&idle_id).is_none(), "Idle session must be swept");
         assert!(manager.sessions.get(&abs_id).is_none(), "Absolutely-expired session must be swept");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: snapshot_to_file writes a JSON file; restore_from_file reads it back
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_session_snapshot_and_restore() {
+        let auth = make_authenticator().await;
+        let manager = SessionManager::new(auth);
+
+        // Insert a session so the snapshot is non-empty
+        let session = Arc::new(make_session("snapshot-user"));
+        let session_id = session.id.clone();
+        manager.sessions.insert(session_id.clone(), session);
+
+        // Snapshot to a temporary file
+        let tmp_path = format!("/tmp/sqe-test-snapshot-{}.json", uuid_simple());
+        manager
+            .snapshot_to_file(&tmp_path)
+            .expect("snapshot_to_file should succeed");
+
+        // File must exist and contain valid JSON
+        let content = std::fs::read_to_string(&tmp_path)
+            .expect("Snapshot file must exist after snapshot_to_file");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).expect("Snapshot file must contain valid JSON");
+        let entries = parsed.as_array().expect("Snapshot JSON must be an array");
+        assert_eq!(entries.len(), 1, "Snapshot must contain exactly one entry");
+        assert_eq!(
+            entries[0]["username"], "snapshot-user",
+            "Snapshot entry must include the correct username"
+        );
+
+        // restore_from_file is best-effort / logs only — it must not panic
+        manager.restore_from_file(&tmp_path);
+
+        // Clean up
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+
+    /// Produce a short random hex string suitable for use in temp file names.
+    fn uuid_simple() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        format!("{nanos:08x}")
     }
 
     // -----------------------------------------------------------------------

@@ -7,6 +7,7 @@ use tracing::info;
 
 use sqe_catalog::SessionCatalog;
 use sqe_core::{Session, SqeConfig, SqeError};
+use tracing::instrument;
 
 /// Handles catalog DDL operations (DROP TABLE, ALTER TABLE RENAME, views).
 ///
@@ -26,6 +27,7 @@ impl CatalogOps {
     /// Extracts the table name from a `DROP TABLE` statement and calls
     /// the catalog's `drop_table` method. If `IF EXISTS` is specified
     /// and the table is not found, this returns `Ok(())`.
+    #[instrument(skip(self, session, stmt), fields(username = %session.user.username))]
     pub async fn drop_table(
         &self,
         session: &Session,
@@ -75,6 +77,7 @@ impl CatalogOps {
     /// Create a schema (namespace) via the Iceberg REST catalog.
     ///
     /// Maps SQL `CREATE SCHEMA` to Iceberg `create_namespace`.
+    #[instrument(skip(self, session, stmt), fields(username = %session.user.username))]
     pub async fn create_schema(
         &self,
         session: &Session,
@@ -123,6 +126,7 @@ impl CatalogOps {
     /// Drop a schema (namespace) via the Iceberg REST catalog.
     ///
     /// Maps SQL `DROP SCHEMA` to Iceberg `drop_namespace`.
+    #[instrument(skip(self, session, stmt), fields(username = %session.user.username))]
     pub async fn drop_schema(
         &self,
         session: &Session,
@@ -238,6 +242,7 @@ impl CatalogOps {
     /// Extracts the view name and SELECT query from a `CREATE VIEW` statement,
     /// infers the output schema by planning the SELECT via DataFusion, converts
     /// it to the Iceberg REST API schema format, and calls `SessionCatalog::create_view()`.
+    #[instrument(skip(self, session, stmt, schema_json), fields(username = %session.user.username))]
     pub async fn create_view(
         &self,
         session: &Session,
@@ -268,6 +273,7 @@ impl CatalogOps {
             &self.config.catalog.warehouse,
             &session.access_token,
             &self.config.storage,
+            None, None,
         )
         .await?;
 
@@ -281,6 +287,7 @@ impl CatalogOps {
     /// Extracts the view name from a `DROP VIEW` statement and calls
     /// `SessionCatalog::drop_view()`. If `IF EXISTS` is specified and the
     /// view is not found, this returns `Ok(())`.
+    #[instrument(skip(self, session, stmt), fields(username = %session.user.username))]
     pub async fn drop_view(
         &self,
         session: &Session,
@@ -319,6 +326,7 @@ impl CatalogOps {
             &self.config.catalog.warehouse,
             &session.access_token,
             &self.config.storage,
+            None, None,
         )
         .await?;
 
@@ -347,6 +355,7 @@ impl CatalogOps {
                 &self.config.catalog.warehouse,
                 &session.access_token,
                 &self.config.storage,
+            None, None,
             )
             .await?,
         );

@@ -11,6 +11,7 @@ use tracing::info;
 
 use sqe_catalog::SessionCatalog;
 use sqe_core::{Session, SqeConfig, SqeError};
+use tracing::instrument;
 
 use crate::catalog_ops::parse_table_ref;
 use crate::writer::write_data_files;
@@ -38,6 +39,7 @@ impl WriteHandler {
     /// 3. Creates the table in the catalog
     /// 4. Writes RecordBatches as Parquet data files
     /// 5. Commits the data files via a fast-append transaction
+    #[instrument(skip(self, session, stmt, batches), fields(username = %session.user.username))]
     pub async fn handle_ctas(
         &self,
         session: &Session,
@@ -144,6 +146,7 @@ impl WriteHandler {
     /// Handle CREATE TABLE [IF NOT EXISTS] ns.table (column definitions)
     ///
     /// Creates an empty Iceberg table from explicit column definitions.
+    #[instrument(skip(self, session, stmt), fields(username = %session.user.username))]
     pub async fn handle_create_table(
         &self,
         session: &Session,
@@ -229,6 +232,7 @@ impl WriteHandler {
     /// 2. Loads the existing table from the catalog
     /// 3. Writes RecordBatches as Parquet data files
     /// 4. Commits the data files via a fast-append transaction
+    #[instrument(skip(self, session, stmt, batches), fields(username = %session.user.username))]
     pub async fn handle_insert(
         &self,
         session: &Session,
@@ -375,6 +379,7 @@ impl WriteHandler {
                 &self.config.catalog.warehouse,
                 &session.access_token,
                 &self.config.storage,
+                None, None,
             )
             .await?,
         );
