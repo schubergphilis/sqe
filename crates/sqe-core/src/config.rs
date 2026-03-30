@@ -1273,4 +1273,62 @@ mod tests {
         assert!(config.device.is_none());
         assert_eq!(config.scopes, vec!["openid", "profile"]);
     }
+
+    // -----------------------------------------------------------------------
+    // QueryConfig: defaults and custom values
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_query_config_defaults() {
+        let config = QueryConfig::default();
+        assert_eq!(config.timeout_secs, 300);
+        assert_eq!(config.max_result_rows, 1_000_000);
+        assert_eq!(config.max_concurrent_queries, 100);
+        assert_eq!(config.slow_query_threshold_secs, 30);
+        assert_eq!(config.max_query_memory, "256MB");
+    }
+
+    #[test]
+    fn test_query_config_custom_values() {
+        let toml_str = r#"
+            timeout_secs = 60
+            max_result_rows = 500
+            max_concurrent_queries = 50
+            slow_query_threshold_secs = 10
+            max_query_memory = "512MB"
+        "#;
+        let config: QueryConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.timeout_secs, 60);
+        assert_eq!(config.max_result_rows, 500);
+        assert_eq!(config.max_concurrent_queries, 50);
+        assert_eq!(config.slow_query_threshold_secs, 10);
+        assert_eq!(config.max_query_memory, "512MB");
+    }
+
+    // -----------------------------------------------------------------------
+    // SessionConfig: defaults and file persistence
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_session_config_defaults() {
+        let config = SessionConfig::default();
+        assert_eq!(config.idle_timeout_secs, 900);
+        assert_eq!(config.absolute_timeout_secs, 28800);
+        assert_eq!(config.persistence, "memory");
+        assert_eq!(config.persistence_path, "/tmp/sqe-sessions.json");
+        assert_eq!(config.snapshot_interval_secs, 60);
+    }
+
+    #[test]
+    fn test_session_config_file_persistence() {
+        let toml_str = r#"
+            persistence = "file"
+            persistence_path = "/var/data/sessions.json"
+            snapshot_interval_secs = 30
+        "#;
+        let config: SessionConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.persistence, "file");
+        assert_eq!(config.persistence_path, "/var/data/sessions.json");
+        assert_eq!(config.snapshot_interval_secs, 30);
+    }
 }

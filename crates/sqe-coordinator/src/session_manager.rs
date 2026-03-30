@@ -577,6 +577,54 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Test: snapshot_to_file writes a JSON file; restore_from_file reads it back
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_session_snapshot_and_restore() {
+        let auth = make_authenticator().await;
+        let manager = SessionManager::new(auth);
+
+        // Insert a session so the snapshot is non-empty
+        let session = Arc::new(make_session("snapshot-user"));
+        let session_id = session.id.clone();
+        manager.sessions.insert(session_id.clone(), session);
+
+        // Snapshot to a temporary file
+        let tmp_path = format!("/tmp/sqe-test-snapshot-{}.json", uuid_simple());
+        manager
+            .snapshot_to_file(&tmp_path)
+            .expect("snapshot_to_file should succeed");
+
+        // File must exist and contain valid JSON
+        let content = std::fs::read_to_string(&tmp_path)
+            .expect("Snapshot file must exist after snapshot_to_file");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).expect("Snapshot file must contain valid JSON");
+        let entries = parsed.as_array().expect("Snapshot JSON must be an array");
+        assert_eq!(entries.len(), 1, "Snapshot must contain exactly one entry");
+        assert_eq!(
+            entries[0]["username"], "snapshot-user",
+            "Snapshot entry must include the correct username"
+        );
+
+        // restore_from_file is best-effort / logs only — it must not panic
+        manager.restore_from_file(&tmp_path);
+
+        // Clean up
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+
+    /// Produce a short random hex string suitable for use in temp file names.
+    fn uuid_simple() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        format!("{nanos:08x}")
+    }
+
+    // -----------------------------------------------------------------------
     // Test: concurrent access — multiple threads insert and sweep safely
     // -----------------------------------------------------------------------
     #[tokio::test]
