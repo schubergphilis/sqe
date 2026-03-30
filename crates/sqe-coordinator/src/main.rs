@@ -54,6 +54,17 @@ async fn main() -> anyhow::Result<()> {
     let config = SqeConfig::load(&config_path)?;
     config.validate()?;
 
+    // Security warnings for production readiness
+    if !config.coordinator.tls.is_enabled() {
+        tracing::warn!("WARNING: TLS is DISABLED -- Flight SQL and worker connections are unencrypted. Set [coordinator.tls] cert_file and key_file for production.");
+    }
+    if !config.rate_limit.enabled {
+        tracing::warn!("WARNING: Rate limiting is DISABLED -- no protection against query flooding. Set [rate_limit] enabled = true for production.");
+    }
+    if !config.auth.ssl_verification {
+        tracing::warn!("WARNING: SSL certificate verification is DISABLED for auth endpoints -- vulnerable to MITM. Set auth.ssl_verification = true for production.");
+    }
+
     // Initialize tracing + OTel (traces, metrics, logs via OTLP when configured)
     let _otel_guard = sqe_metrics::otel::init_telemetry(
         "sqe-coordinator",
