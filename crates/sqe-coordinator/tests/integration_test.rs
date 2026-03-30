@@ -2075,6 +2075,57 @@ async fn test_table_lifecycle_edge_cases() {
     assert_eq!(failures, 0, "{failures} edge case(s) failed");
 }
 
+/// Probe: function compatibility and type mismatch error quality.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_function_compat_and_type_errors() {
+    let (session, handler) = common::setup_handler().await;
+
+    let cases: Vec<(&str, &str, bool)> = vec![
+        // Type mismatches — should fail with clear errors
+        ("lower(boolean)", "SELECT lower(true)", false),
+        ("lower(int)", "SELECT lower(42)", false),
+        ("upper(boolean)", "SELECT upper(false)", false),
+        ("abs(varchar)", "SELECT abs('hello')", false),
+
+        // Date/time functions — needed for dbt models
+        ("year(date)", "SELECT year(DATE '2026-03-30')", true),
+        ("month(date)", "SELECT month(DATE '2026-03-30')", true),
+        ("day_of_week(date)", "SELECT extract(DOW FROM DATE '2026-03-30')", true),
+        ("date_part year", "SELECT date_part('year', DATE '2026-03-30')", true),
+        ("date_part month", "SELECT date_part('month', DATE '2026-03-30')", true),
+
+        // Trino-style functions that may not exist in DataFusion
+        ("day_of_week() trino-style", "SELECT day_of_week(DATE '2026-03-30')", true),
+
+        // Decimal arithmetic
+        ("decimal math", "SELECT CAST(5 AS DECIMAL(10,2)) * 19.99 * (1 - 10.0 / 100)", true),
+
+        // CAST to date
+        ("cast to date", "SELECT CAST('2026-03-30' AS DATE)", true),
+    ];
+
+    let mut pass = 0;
+    let mut fail = 0;
+    for (label, sql, expect_ok) in &cases {
+        let result = handler.execute(&session, sql).await;
+        let actual_ok = result.is_ok();
+        if actual_ok == *expect_ok {
+            println!("  ✓ {label}");
+            pass += 1;
+        } else {
+            let detail = match &result {
+                Ok(_) => "Ok (unexpected)".to_string(),
+                Err(e) => format!("{e}"),
+            };
+            println!("  ✗ {label}: expected ok={expect_ok}, got {detail}");
+            fail += 1;
+        }
+    }
+    println!("\nFunction compat: {pass} passed, {fail} failed");
+    // Don't assert — this is a diagnostic probe, not a gate
+}
+
 /// Test that large INSERTs producing multiple internal batches don't collide
 /// on data file names. This reproduces the bug where a 2000-row INSERT via dbt
 /// failed with "Cannot add files that are already referenced by table".

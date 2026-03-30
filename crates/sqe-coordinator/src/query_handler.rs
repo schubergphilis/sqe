@@ -779,6 +779,10 @@ impl QueryHandler {
         // DataFusion does not ship a built-in sha256 — we provide one via sqe-policy.
         ctx.register_udf(sqe_policy::sha256_udf::sha256_udf());
 
+        // Register Trino-compatible function aliases (year(), month(), day_of_week(), etc.)
+        // so Trino SQL and dbt models work without modification.
+        crate::trino_functions::register_trino_functions(&ctx);
+
         // Register the read_parquet() table-valued function so users can
         // query external Parquet files directly from SQL:
         //   SELECT * FROM read_parquet('s3://bucket/path/*.parquet', ...)
