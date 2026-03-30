@@ -218,6 +218,7 @@ fn error_response(status: StatusCode, msg: impl Into<String>) -> Response {
             error_code: 1,
             error_name: "USER_ERROR".to_string(),
             error_type: "USER_ERROR".to_string(),
+            query_id: None,
         }),
     };
     (status, Json(body)).into_response()
@@ -413,7 +414,14 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             (StatusCode::OK, Json(response)).into_response()
         }
         Err(e) => {
-            warn!(error = %e, sql = sql, "Trino query execution failed");
+            let sqe_err = sqe_core::SqeError::Execution(e);
+            tracing::warn!(
+                error_code = %sqe_err.error_code(),
+                query_id = %query_id,
+                error = %sqe_err,
+                "Trino query execution failed"
+            );
+            let trino_error = TrinoError::from_sqe_error(&sqe_err, Some(&query_id));
             let response = TrinoResponse {
                 id: query_id.clone(),
                 info_uri: Some(info_uri(&base_url, &query_id)),
@@ -421,12 +429,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 columns: None,
                 data: None,
                 stats: TrinoStats::failed(),
-                error: Some(TrinoError {
-                    message: "Query execution failed".to_string(),
-                    error_code: 1,
-                    error_name: "INTERNAL_ERROR".to_string(),
-                    error_type: "INTERNAL_ERROR".to_string(),
-                }),
+                error: Some(trino_error),
             };
             (StatusCode::OK, Json(response)).into_response()
         }
@@ -464,6 +467,7 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                         error_code: 1,
                         error_name: "USER_ERROR".to_string(),
                         error_type: "USER_ERROR".to_string(),
+                        query_id: None,
                     }),
                 };
                 return (StatusCode::NOT_FOUND, Json(response)).into_response();
@@ -495,6 +499,7 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                     error_code: 1,
                     error_name: "USER_ERROR".to_string(),
                     error_type: "USER_ERROR".to_string(),
+                    query_id: None,
                 }),
             };
             (StatusCode::NOT_FOUND, Json(response)).into_response()

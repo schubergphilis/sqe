@@ -83,6 +83,21 @@ pub struct TrinoError {
     pub error_code: i32,
     pub error_name: String,
     pub error_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_id: Option<String>,
+}
+
+impl TrinoError {
+    pub fn from_sqe_error(e: &sqe_core::SqeError, query_id: Option<&str>) -> Self {
+        let code = e.error_code();
+        Self {
+            message: e.client_message(),
+            error_code: code.trino_error_code(),
+            error_name: code.name().to_string(),
+            error_type: code.trino_error_type().to_string(),
+            query_id: query_id.map(|s| s.to_string()),
+        }
+    }
 }
 
 /// Build a `TrinoTypeSignature` from a Trino type string.
