@@ -22,8 +22,10 @@ sha2 = { workspace = true }
 hmac = { workspace = true }
 hex = { workspace = true }
 url = { workspace = true }
+toml = { workspace = true }
+subtle = "2"
+rand = { workspace = true }
 
 [dev-dependencies]
 rsa = "0.9"
 pkcs1 = { version = "0.7", features = ["pem"] }
-rand = { workspace = true }
