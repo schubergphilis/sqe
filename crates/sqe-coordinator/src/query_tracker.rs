@@ -76,6 +76,7 @@ pub struct QueryRecord {
     pub output_rows: usize,
     pub error_type: Option<String>,
     pub error_code: Option<String>,
+    pub error_message: Option<String>,
     pub tables_touched: Vec<String>,
     pub fragments: Vec<FragmentInfo>,
 }
@@ -127,6 +128,7 @@ impl QueryTracker {
             output_rows: 0,
             error_type: None,
             error_code: None,
+            error_message: None,
             tables_touched: Vec::new(),
             fragments: Vec::new(),
         };
@@ -167,13 +169,15 @@ impl QueryTracker {
         self.active.remove(query_id);
     }
 
-    pub fn failed(&self, query_id: &Uuid, error_type: &str, error_code: Option<&str>) {
+    pub fn failed(&self, query_id: &Uuid, error: &sqe_core::SqeError) {
         if let Some(old) = self.history.get(query_id) {
             let mut record = (*old).clone();
+            let code = error.error_code();
             record.state = QueryState::Failed;
             record.ended = Some(Utc::now());
-            record.error_type = Some(error_type.to_string());
-            record.error_code = error_code.map(|s| s.to_string());
+            record.error_type = Some(code.trino_error_type().to_string());
+            record.error_code = Some(code.name().to_string());
+            record.error_message = Some(error.client_message());
             self.history.insert(*query_id, Arc::new(record));
         }
         self.active.remove(query_id);
@@ -281,11 +285,13 @@ mod tests {
         let id = Uuid::now_v7();
         tracker.start(id, "carol", None, "BAD SQL", "s3", None, vec![]);
         tracker.running(&id, 0);
-        tracker.failed(&id, "SyntaxError", Some("42000"));
+        let err = sqe_core::SqeError::Execution("syntax error near BAD".to_string());
+        tracker.failed(&id, &err);
         let rec = tracker.history.get(&id).unwrap();
         assert_eq!(rec.state, QueryState::Failed);
-        assert_eq!(rec.error_type.as_deref(), Some("SyntaxError"));
-        assert_eq!(rec.error_code.as_deref(), Some("42000"));
+        assert!(rec.error_type.is_some());
+        assert!(rec.error_code.is_some());
+        assert!(rec.error_message.is_some());
         assert_eq!(tracker.active_count(), 0);
     }
 
@@ -380,7 +386,7 @@ mod tests {
 
                 match i % 3 {
                     0 => tracker.complete(&id, 10, 100, vec![]),
-                    1 => tracker.failed(&id, "TestError", Some("E001")),
+                    1 => tracker.failed(&id, &sqe_core::SqeError::Execution("test error".to_string())),
                     _ => { tracker.cancel(&id); }
                 }
                 (id, i % 3)

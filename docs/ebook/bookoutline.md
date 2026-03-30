@@ -59,6 +59,7 @@ Mar 25  — Query history, result cache, system.runtime.* virtual tables
 Mar 27  — Distributed docker-compose: coordinator + 2 workers
 Mar 28  — Distributed execution wired into query pipeline
 Mar 29  — Concurrent client load test, schema projection fix
+Mar 30  — dbt hardening: file collision fix, 17 Trino function aliases, structured error codes
 ```
 
 Each chapter in this book connects to this journey. The callout boxes reference specific commits, articles, and experiences.
