@@ -52,6 +52,7 @@ sqe-metrics = { path = "../sqe-metrics" }
 sqe-trino-compat = { path = "../sqe-trino-compat" }
 chrono = { workspace = true }
 axum = { workspace = true }
+reqwest = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 sha2 = "0.10"
 sqe-worker = { path = "../sqe-worker" }

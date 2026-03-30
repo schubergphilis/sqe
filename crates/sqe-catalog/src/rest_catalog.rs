@@ -6,7 +6,7 @@ use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogBuilder};
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, instrument};
 use uuid::Uuid;
 
 use sqe_core::config::StorageConfig;
@@ -175,6 +175,7 @@ impl SessionCatalog {
     }
 
     /// List all namespaces in the catalog.
+    #[instrument(skip(self), fields(warehouse = %self.warehouse))]
     pub async fn list_namespaces(&self) -> sqe_core::Result<Vec<NamespaceIdent>> {
         debug!(token_fingerprint = %self.token_fingerprint, "Listing namespaces");
         self.circuit_breaker
@@ -212,6 +213,7 @@ impl SessionCatalog {
     }
 
     /// List all tables in the given namespace.
+    #[instrument(skip(self), fields(namespace = ?namespace, warehouse = %self.warehouse))]
     pub async fn list_tables(
         &self,
         namespace: &NamespaceIdent,
@@ -240,6 +242,7 @@ impl SessionCatalog {
     ///
     /// The returned `Table` includes metadata and a FileIO configured with
     /// vended credentials (if Polaris provides them) or static S3 config.
+    #[instrument(skip(self), fields(table = %table_ident, warehouse = %self.warehouse))]
     pub async fn load_table(&self, table_ident: &TableIdent) -> sqe_core::Result<Table> {
         debug!(
             token_fingerprint = %self.token_fingerprint,
@@ -282,6 +285,7 @@ impl SessionCatalog {
     ///
     /// Calls `POST /v1/{prefix}/namespaces/{namespace}/views` with the
     /// Iceberg view creation payload.
+    #[instrument(skip(self, sql, schema), fields(namespace = ?namespace, view = %name, warehouse = %self.warehouse))]
     pub async fn create_view(
         &self,
         namespace: &NamespaceIdent,
@@ -350,6 +354,7 @@ impl SessionCatalog {
     }
 
     /// List views in a namespace via the Polaris REST API.
+    #[instrument(skip(self), fields(namespace = ?namespace, warehouse = %self.warehouse))]
     pub async fn list_views(
         &self,
         namespace: &NamespaceIdent,
@@ -403,6 +408,7 @@ impl SessionCatalog {
     /// Load a view's SQL definition from the Polaris REST API.
     ///
     /// Returns `None` if the view does not exist (404), or the SQL string on success.
+    #[instrument(skip(self), fields(namespace = ?namespace, view = %name, warehouse = %self.warehouse))]
     pub async fn load_view_sql(
         &self,
         namespace: &NamespaceIdent,
@@ -460,6 +466,7 @@ impl SessionCatalog {
     /// Drop a view via the Polaris REST API.
     ///
     /// Calls `DELETE /v1/{prefix}/namespaces/{namespace}/views/{view}`.
+    #[instrument(skip(self), fields(namespace = ?namespace, view = %name, warehouse = %self.warehouse))]
     pub async fn drop_view(
         &self,
         namespace: &NamespaceIdent,
