@@ -292,6 +292,22 @@ impl FlightSqlService for SqeFlightSqlService {
             }
         };
 
+        // Extract client IP: prefer x-forwarded-for (set by reverse proxies),
+        // fall back to the TCP peer address reported by tonic.
+        let client_ip: String = request
+            .metadata()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
+            .unwrap_or_else(|| {
+                request
+                    .remote_addr()
+                    .map(|a| a.to_string())
+                    // TODO: tonic 0.14 only surfaces peer addr when the transport
+                    // layer injects it via Extensions; may be None without ConnectInfo.
+                    .unwrap_or_else(|| "unknown".to_string())
+            });
+
         info!(username = username, "Handshake authentication attempt");
 
         let credentials = sqe_auth::FlightCredentials {
@@ -300,14 +316,23 @@ impl FlightSqlService for SqeFlightSqlService {
             ..Default::default()
         };
 
-        let session = self
-            .session_manager
-            .authenticate_credentials(&credentials)
-            .await
-            .map_err(|e| {
-                warn!(username = username, error = %e, "Authentication failed");
-                Status::unauthenticated(format!("Authentication failed: {e}"))
-            })?;
+        let auth_result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.session_manager.authenticate_credentials(&credentials),
+        )
+        .await;
+
+        let session = match auth_result {
+            Ok(Ok(session)) => session,
+            Ok(Err(e)) => {
+                warn!(username = username, client_ip = %client_ip, error = %e, "Authentication failed");
+                return Err(Status::unauthenticated(format!("Authentication failed: {e}")));
+            }
+            Err(_) => {
+                warn!(username = username, "Handshake timed out after 30s");
+                return Err(Status::deadline_exceeded("Authentication timed out"));
+            }
+        };
 
         info!(
             username = username,
