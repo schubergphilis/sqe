@@ -2206,3 +2206,93 @@ async fn test_large_insert_multi_batch() {
         .execute(&session, "DROP TABLE IF EXISTS test_ns.large_insert_test")
         .await;
 }
+
+/// Test that error codes are properly classified — not generic INTERNAL_ERROR.
+/// Each error scenario should produce a specific SqeErrorCode, not ExecutionFailed.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn test_error_classification_live() {
+    let (session, handler) = common::setup_handler().await;
+
+    let cases: Vec<(&str, &str, &str)> = vec![
+        // (label, sql, expected_error_code_name)
+        (
+            "table not found",
+            "SELECT * FROM test_ns.does_not_exist_xyz",
+            "TABLE_NOT_FOUND",
+        ),
+        (
+            "schema not found (reported as table not found by DataFusion)",
+            "SELECT * FROM nonexistent_ns.some_table",
+            "TABLE_NOT_FOUND",
+        ),
+        (
+            "function not found",
+            "SELECT bogus_function(1)",
+            "FUNCTION_NOT_FOUND",
+        ),
+        (
+            "type mismatch",
+            "SELECT lower(true)",
+            "TYPE_MISMATCH",
+        ),
+        (
+            "not supported (DELETE)",
+            "DELETE FROM test_ns.some_table WHERE id = 1",
+            "NOT_SUPPORTED",
+        ),
+        (
+            "not supported (MERGE)",
+            "MERGE INTO test_ns.t USING test_ns.s ON t.id = s.id WHEN MATCHED THEN DELETE",
+            "NOT_SUPPORTED",
+        ),
+        (
+            "duplicate table",
+            "CREATE TABLE test_ns.large_insert_test AS SELECT 1 as x",
+            // First create, then try duplicate
+            "DUPLICATE_TABLE",
+        ),
+    ];
+
+    let mut pass = 0;
+    let mut fail = 0;
+
+    // Setup for duplicate table test
+    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.err_dup_test").await;
+    let _ = handler.execute(&session, "CREATE TABLE test_ns.err_dup_test AS SELECT 1 as x").await;
+
+    for (label, sql, expected_code) in &cases {
+        // For the duplicate table case, use our pre-created table
+        let actual_sql = if *label == "duplicate table" {
+            "CREATE TABLE test_ns.err_dup_test AS SELECT 2 as x"
+        } else {
+            sql
+        };
+
+        let result = handler.execute(&session, actual_sql).await;
+        match result {
+            Err(ref e) => {
+                let code = e.error_code();
+                let code_name = code.name();
+                let client_msg = e.client_message();
+                if code_name == *expected_code {
+                    println!("  ✓ {label}: {code_name} — \"{client_msg}\"");
+                    pass += 1;
+                } else {
+                    println!("  ✗ {label}: expected {expected_code}, got {code_name} — \"{client_msg}\"");
+                    println!("    full error: {e}");
+                    fail += 1;
+                }
+            }
+            Ok(_) => {
+                println!("  ✗ {label}: expected error, got Ok");
+                fail += 1;
+            }
+        }
+    }
+
+    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.err_dup_test").await;
+
+    println!("\nError classification: {pass} passed, {fail} failed");
+    assert_eq!(fail, 0, "{fail} error classification(s) wrong");
+}
