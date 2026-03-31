@@ -282,7 +282,11 @@ fn classify_catalog_error(msg: &str) -> SqeErrorCode {
 /// Classify a [`SqeError::Execution`] message into a specific error code.
 fn classify_execution_error(msg: &str) -> SqeErrorCode {
     let lower = msg.to_lowercase();
-    if lower.contains("table") && lower.contains("not found") {
+    // TypeMismatch must be checked BEFORE FunctionNotFound because DataFusion
+    // concatenates both messages: "TypeSignatureClass... No function matches..."
+    if lower.contains("typesignatureclass") || lower.contains("type mismatch") {
+        SqeErrorCode::TypeMismatch
+    } else if lower.contains("table") && lower.contains("not found") {
         SqeErrorCode::TableNotFound
     } else if lower.contains("schema") && lower.contains("not found") {
         SqeErrorCode::SchemaNotFound
@@ -290,8 +294,6 @@ fn classify_execution_error(msg: &str) -> SqeErrorCode {
         SqeErrorCode::ColumnNotFound
     } else if lower.contains("invalid function") || lower.contains("no function matches") {
         SqeErrorCode::FunctionNotFound
-    } else if lower.contains("typesignatureclass") || lower.contains("type mismatch") {
-        SqeErrorCode::TypeMismatch
     } else if lower.contains("not yet supported")
         || lower.contains("not implemented")
         || lower.contains("not supported")
