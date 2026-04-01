@@ -611,7 +611,8 @@ async fn run_worker(config: SqeConfig) -> anyhow::Result<()> {
 
     let session_ctx = sqe_worker::runtime::build_session_context(&config.worker)?;
     let flight_service =
-        sqe_worker::flight_service::WorkerFlightService::new(worker_metrics, session_ctx);
+        sqe_worker::flight_service::WorkerFlightService::new(worker_metrics, session_ctx)
+            .with_scan_timeout(config.worker.scan_timeout_secs);
 
     // Mark ready
     ready.store(true, Ordering::Relaxed);
