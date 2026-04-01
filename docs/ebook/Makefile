@@ -19,12 +19,15 @@ diagrams:
 	done
 
 # --- PDF (print-quality) ---
+# Uses xelatex if available, falls back to weasyprint
+PDF_ENGINE := $(shell command -v xelatex >/dev/null 2>&1 && echo xelatex || echo weasyprint)
+
 pdf: $(OUT)/sovereign-by-design.pdf
 
 $(OUT)/sovereign-by-design.pdf: $(META) $(CHAPTERS) | $(OUT)
-	@echo "==> Building PDF"
+	@echo "==> Building PDF (engine: $(PDF_ENGINE))"
 	pandoc $(META) $(CHAPTERS) \
-		--pdf-engine=xelatex \
+		--pdf-engine=$(PDF_ENGINE) \
 		--filter pandoc-crossref \
 		--top-level-division=chapter \
 		--resource-path=.:diagrams/rendered \
