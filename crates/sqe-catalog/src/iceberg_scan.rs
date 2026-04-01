@@ -82,6 +82,16 @@ impl IcebergScanExec {
     /// the execution, then calls `plan_files()` to get the filtered
     /// file scan tasks.
     pub async fn data_file_paths(&self) -> Result<Vec<String>, iceberg::Error> {
+        let info = self.data_file_info().await?;
+        Ok(info.into_iter().map(|(path, _)| path).collect())
+    }
+
+    /// List all data file paths and their sizes from the table's current snapshot.
+    ///
+    /// Returns a vec of `(path, size_bytes)` pairs in the same order as
+    /// `plan_files()` yields them. Size is taken from the Iceberg manifest
+    /// metadata (`file_size_in_bytes`) and does not require opening the file.
+    pub async fn data_file_info(&self) -> Result<Vec<(String, u64)>, iceberg::Error> {
         let mut scan_builder = self.table.scan();
 
         if let Some(ref cols) = self.projection {
@@ -96,7 +106,14 @@ impl IcebergScanExec {
 
         let tasks: Vec<_> = scan.plan_files().await?.try_collect().await?;
 
-        Ok(tasks.iter().map(|t| t.data_file_path().to_string()).collect())
+        Ok(tasks
+            .iter()
+            .map(|t| {
+                let path = t.data_file_path().to_string();
+                let size = t.length;
+                (path, size)
+            })
+            .collect())
     }
 
     /// Returns the projected column names, if any.
