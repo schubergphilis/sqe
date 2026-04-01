@@ -605,6 +605,7 @@ mod tests {
         ScanTask {
             fragment_id: id.to_string(),
             data_file_paths: vec![],
+            file_sizes_bytes: vec![],
             projected_columns: vec![],
             s3_endpoint: String::new(),
             s3_region: String::new(),
@@ -622,6 +623,7 @@ mod tests {
         let task = ScanTask {
             fragment_id: "frag-001".to_string(),
             data_file_paths: vec!["s3://bucket/file.parquet".to_string()],
+            file_sizes_bytes: vec![],
             projected_columns: vec![],
             s3_endpoint: String::new(),
             s3_region: String::new(),
