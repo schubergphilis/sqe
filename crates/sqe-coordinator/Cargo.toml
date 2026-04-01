@@ -58,6 +58,7 @@ axum = { workspace = true }
 reqwest = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 sha2 = "0.10"
+subtle = "2"
 sqe-worker = { path = "../sqe-worker" }
 opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }

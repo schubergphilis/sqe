@@ -13,31 +13,37 @@ use tracing::info;
 /// - Credit card-like numbers (13-19 digits) → [CARD]
 /// - Quoted string literals that look like identifiers → preserved
 pub fn redact_pii(sql: &str) -> String {
+    use std::sync::OnceLock;
+
+    static EMAIL_RE: OnceLock<regex_lite::Regex> = OnceLock::new();
+    static SSN_RE: OnceLock<regex_lite::Regex> = OnceLock::new();
+    static PHONE_RE: OnceLock<regex_lite::Regex> = OnceLock::new();
+    static CARD_RE: OnceLock<regex_lite::Regex> = OnceLock::new();
+
+    let email_re = EMAIL_RE.get_or_init(|| {
+        regex_lite::Regex::new(
+            r"'[^']*[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[^']*'",
+        )
+        .unwrap()
+    });
+    let ssn_re = SSN_RE.get_or_init(|| {
+        regex_lite::Regex::new(r"'\d{3}-\d{2}-\d{4}'").unwrap()
+    });
+    let phone_re = PHONE_RE.get_or_init(|| {
+        regex_lite::Regex::new(
+            r"'(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}'",
+        )
+        .unwrap()
+    });
+    let card_re = CARD_RE.get_or_init(|| {
+        regex_lite::Regex::new(r"'\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{1,7}'").unwrap()
+    });
+
     let mut result = sql.to_string();
-
-    // Email: word@word.tld pattern inside single quotes
-    let email_re = regex_lite::Regex::new(
-        r"'[^']*[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[^']*'",
-    )
-    .unwrap();
     result = email_re.replace_all(&result, "'[EMAIL]'").to_string();
-
-    // SSN: XXX-XX-XXXX
-    let ssn_re = regex_lite::Regex::new(r"'\d{3}-\d{2}-\d{4}'").unwrap();
     result = ssn_re.replace_all(&result, "'[SSN]'").to_string();
-
-    // Phone: various formats (10-15 digits with optional separators)
-    let phone_re = regex_lite::Regex::new(
-        r"'(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}'",
-    )
-    .unwrap();
     result = phone_re.replace_all(&result, "'[PHONE]'").to_string();
-
-    // Credit card: 4-groups of digits (possibly with spaces/dashes)
-    let card_re =
-        regex_lite::Regex::new(r"'\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{1,7}'").unwrap();
     result = card_re.replace_all(&result, "'[CARD]'").to_string();
-
     result
 }
 

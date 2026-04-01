@@ -27,11 +27,21 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
       containers:
         - name: sqe
           image: {{ include "sqe.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["--mode", "worker", "--config", "/etc/sqe/sqe.toml"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           env:
             {{- if or .Values.secrets .Values.existingSecret }}
             - name: SQE_STORAGE__S3_ACCESS_KEY
