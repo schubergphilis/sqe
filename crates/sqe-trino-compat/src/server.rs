@@ -68,13 +68,12 @@ pub struct TrinoClientHeaders {
 pub trait TrinoAuthenticator: Send + Sync + 'static {
     async fn authenticate(&self, username: &str, password: &str) -> Result<Session, String>;
 
-    /// Validate a Bearer token (JWT) and return an authenticated session.
+    /// Validate a raw bearer token (JWT) and return an authenticated session.
     ///
-    /// The default implementation rejects all bearer tokens. Implementors that
-    /// support bearer authentication (e.g. via JWKS validation) should override
-    /// this method.
+    /// The default implementation rejects all bearer tokens. Override this in
+    /// the coordinator adapter to route through the JWKS-validating auth chain.
     async fn authenticate_bearer(&self, _token: &str) -> Result<Session, String> {
-        Err("Bearer token authentication is not configured".to_string())
+        Err("Bearer token authentication not configured".to_string())
     }
 }
 
@@ -354,42 +353,12 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     let trino_headers = extract_trino_headers(&headers);
 
     let session = if let Some(token) = extract_bearer_token(&headers) {
-        // Bearer token auth: try validated JWT via JWKS first.
+        // Bearer token auth: validate JWT through the auth provider chain.
         match state.authenticator.authenticate_bearer(&token).await {
             Ok(s) => s,
             Err(e) => {
-                // Fallback: if the token looks like a JWT, accept it as a
-                // passthrough — same behaviour as the Flight SQL BFF path.
-                if token.contains('.') {
-                    let username = trino_headers
-                        .user
-                        .as_deref()
-                        .unwrap_or("unknown")
-                        .to_string();
-                    debug!(
-                        username = %username,
-                        client_ip = %client_ip,
-                        error = %e,
-                        "Trino: bearer provider unavailable/rejected token, accepting raw JWT passthrough"
-                    );
-                    Session::new(
-                        username,
-                        token,
-                        None,
-                        chrono::Utc::now() + chrono::Duration::hours(1),
-                        vec![],
-                    )
-                } else {
-                    warn!(
-                        error = %e,
-                        client_ip = %client_ip,
-                        "Trino bearer token authentication failed"
-                    );
-                    return error_response(
-                        StatusCode::UNAUTHORIZED,
-                        "Bearer token authentication failed",
-                    );
-                }
+                warn!(error = %e, client_ip = %client_ip, "Trino bearer token validation failed");
+                return error_response(StatusCode::UNAUTHORIZED, "Invalid bearer token");
             }
         }
     } else if let Some((user, pass)) = extract_basic_auth(&headers) {
@@ -432,13 +401,19 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     // Apply Trino client headers (catalog, schema, source) to the session.
     let session = apply_trino_headers(session, &trino_headers);
 
+    let sql_hash = {
+        use sha2::{Digest, Sha256};
+        let normalised: String = sql.split_whitespace().collect::<Vec<_>>().join(" ").to_uppercase();
+        format!("{:x}", Sha256::digest(normalised.as_bytes()))
+    };
     info!(
         user = %session.user.username,
         client_ip = %client_ip,
         catalog = ?session.default_catalog,
         schema = ?session.default_schema,
         source = ?session.source,
-        sql = sql,
+        sql_hash = %sql_hash,
+        sql_len = sql.len(),
         "Trino query submitted"
     );
 
