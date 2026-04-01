@@ -341,6 +341,110 @@ This is the deepest lesson of this chapter. The auth model is not a feature on a
 
 We know, because we spent those years on Trino before we built SQE.
 
+## Ten Ways to Prove You're You
+
+When we built the first version of SQE, there was exactly one way to authenticate: OIDC password grant. You sent a username and password over the Flight SQL handshake, we exchanged them for a JWT with Keycloak, and that JWT became your session. Simple. Sufficient.
+
+Then came the real world.
+
+The data engineering team wanted to run dbt from Airflow. Airflow already had a JWT — obtained through its own OIDC exchange — and had no username or password to offer. The platform team wanted to connect from AWS Lambda functions using IAM execution roles. The security team wanted mutual TLS for service-to-service calls. A consultant needed an API key that could be rotated without touching an identity provider. The testing infrastructure wanted an anonymous provider that just says yes to everything in CI.
+
+A single provider couldn't serve all of these. But we also didn't want to make auth a configuration burden — the engine needed to figure out which mechanism applied to which connection automatically.
+
+The answer was `AuthProvider` and `AuthChain`.
+
+### The Trait and the Chain
+
+Every auth mechanism implements one trait:
+
+```rust
+#[async_trait]
+pub trait AuthProvider: Send + Sync {
+    async fn authenticate(&self, credentials: &FlightCredentials) -> Result<Identity, AuthError>;
+
+    async fn refresh_catalog_token(&self, identity: &Identity) -> Result<Option<String>, AuthError> {
+        Ok(None)
+    }
+}
+```
+
+`FlightCredentials` carries whatever the client sent — a username and password, a bearer token, a client certificate CN, or nothing at all. The provider inspects what it knows how to handle and returns one of three things: an `Identity` on success, `AuthError::NotMyCredentials` if the credential type isn't for it, or `AuthError::AuthFailed` if the credential type matches but the credentials are wrong.
+
+That `NotMyCredentials` variant is the key to how `AuthChain` works. The chain tries providers in order. The first one that returns `Ok(Identity)` wins. If a provider says `NotMyCredentials`, the chain moves on. If a provider says `AuthFailed`, the chain stops immediately — no point trying the next provider when the credential type matched but was explicitly rejected.
+
+The implication: a connection carrying a JWT won't accidentally fall through to the anonymous provider just because it was listed last. The bearer token provider will recognise the JWT, attempt validation, and either accept it or definitively reject it.
+
+### The Ten Providers
+
+**`OidcPasswordProvider`** is the workhorse. A JDBC user in DBeaver sends `username:password`; the provider POSTs a `grant_type=password` request to the OIDC token endpoint and gets back a JWT. Works with Keycloak, Auth0, Okta, Zitadel, or any OIDC-compliant provider. Appropriate when your users are humans with credentials in an identity directory.
+
+**`BearerTokenProvider`** validates a pre-obtained JWT via JWKS. The client sends a token it already has — from a browser SSO flow, a service that did its own OIDC exchange, or a backend BFF. The provider fetches the JWKS endpoint, verifies the signature, and extracts the identity. No password exchange needed. This is the right provider for Airflow, dbt running in CI, and any programmatic client that manages its own token lifecycle.
+
+**`TokenExchangeProvider`** implements RFC 8693 — it takes an incoming credential (a JWT from one issuer) and exchanges it at the OIDC token endpoint for a user-scoped JWT from another issuer. This is the federated identity path: your users authenticate with your corporate IdP, and the engine mints a Polaris-compatible token without them ever needing Polaris credentials.
+
+**`ApiKeyProvider`** accepts opaque keys from a TOML keys file, identified by a configurable prefix (`sqe_` by default). Comparison is constant-time to prevent timing attacks. Appropriate for scripts, automation, and service accounts that can't do browser-based OIDC and don't need per-user identity — the keys file maps each key to a user ID and role set.
+
+**`AwsIamProvider`** uses STS `GetCallerIdentity` with a SigV4-signed request to verify that the connecting client is who it claims to be on AWS. Lambda functions, EC2 instances, and ECS tasks can authenticate using their IAM execution role without any credentials to manage. Role mappings in `[auth.role_mappings]` translate IAM ARN patterns to SQE roles.
+
+**`MtlsProvider`** authenticates via mutual TLS client certificates. The client certificate's Common Name becomes the user identity; the Organizational Unit can be mapped to roles. This is service-to-service auth for environments where certificate infrastructure is already in place — Kubernetes clusters with cert-manager, internal meshes, compliance environments where every service must present a certificate.
+
+**`AnonymousProvider`** assigns a fixed identity and role set to any connection, regardless of credentials. The only provider that ignores `FlightCredentials` entirely. Appropriate for local development stacks, integration test environments, and public read-only query endpoints. Put it last in the chain — it accepts everything, so anything after it will never be reached.
+
+**`DeviceCodeProvider`** implements RFC 8628 — the device authorization grant. The client calls the engine to start a flow, receives a short code and a URL, and tells the user "go to `https://auth.example.com/device` and enter `GBTF-ZPQR`." Once the user completes auth in a browser, the engine's polling loop receives the token. This is how `gh auth login` works. For SQL query tools on servers without browser access, or CLI tools used by non-technical users, this is the right flow.
+
+**`AuthCodeService`** implements OAuth2 Authorization Code + PKCE (RFC 7636). This is the browser redirect flow — the Trino `externalAuthentication=true` path. The client initiates a handshake, gets redirected to the IdP's login page, authenticates there, and the IdP sends the code back to the engine's callback URL. For JDBC clients that can open a browser, this is the most secure interactive flow available.
+
+**Legacy `Authenticator`** is the original `OidcPassword` + `ClientCredentials` backend. It exists for backward compatibility. When the `[[auth.providers]]` array is empty, the factory wraps it in a single-provider chain and everything works exactly as it did before we built any of this. No configuration changes needed for existing deployments.
+
+### The Configuration
+
+Providers are configured as a TOML array. The order matters — it's the order the chain tries them:
+
+```toml
+[[auth.providers]]
+type = "oidc_password"
+token_url = "https://keycloak.example.com/realms/data/protocol/openid-connect/token"
+client_id = "sqe"
+client_secret = "changeme"
+
+[[auth.providers]]
+type = "bearer_token"
+jwks_url = "https://keycloak.example.com/realms/data/protocol/openid-connect/certs"
+issuer = "https://keycloak.example.com/realms/data"
+
+[[auth.providers]]
+type = "api_key"
+keys_file = "/etc/sqe/api-keys.toml"
+key_prefix = "sqe_"
+
+[[auth.providers]]
+type = "anonymous"
+user = "dev"
+roles = ["public"]
+
+[auth.role_mappings]
+"arn:aws:iam::123456789012:role/DataEngineering" = ["analyst", "writer"]
+"data-team" = ["analyst"]
+```
+
+The `[auth.role_mappings]` table is shared across providers that support it — `AwsIamProvider` maps IAM role ARNs, `MtlsProvider` maps certificate OUs, `ApiKeyProvider` reads them from the keys file.
+
+### OIDC Discovery
+
+The `DeviceCodeProvider` and `AuthCodeService` don't take explicit endpoint URLs. Instead, they take an OIDC issuer URL and perform discovery: a GET request to `{issuer}/.well-known/openid-configuration` returns a JSON document with all the endpoints needed — `token_endpoint`, `authorization_endpoint`, `device_authorization_endpoint`, `jwks_uri`. The `OidcDiscovery` module fetches this once at first use and caches the result in a `OnceCell`. Endpoint overrides are available for environments where the discovery document doesn't match the reachable URLs (common in Kubernetes where the internal and external URLs differ).
+
+### The Design Philosophy
+
+We could have picked one auth mechanism and made it the standard. Every other query engine does. Trino uses a plugin system that ships with LDAP and Kerberos. Spark uses the cluster's Hadoop security. Presto has file-based passwords.
+
+The problem is that "pick one" is a constraint on the operator, not the engine. A data platform serving a bank has different auth requirements from a startup's internal analytics cluster. The bank has Kerberos, mutual TLS, and an IAM policy council. The startup has Okta and a Slack channel. Neither should have to fork the engine to support their auth model.
+
+> Sovereign means you pick your auth, not us.
+
+The `AuthProvider` trait is deliberately minimal — one method, one input type, one output type. Implementing a new provider is an afternoon of work. The chain composes them without any of them knowing about each other. And the legacy fallback means existing deployments don't need to change a thing.
+
+The "you are the query" principle still holds for every one of these ten providers. Whether Alice proves her identity via Keycloak password grant, a pre-obtained JWT, an IAM execution role, or an mTLS certificate, what flows downstream is the same thing: an `Identity` with a `catalog_token` that Polaris and S3 will recognise as Alice. The mechanism changes. The property — every S3 access attributed to a specific human or service — does not.
+
 ::: {.devto}
 **dev.to connection:** "Software Supply Chain Security: Keeping Your (Rust) Dependencies Clean"
 (2025) explored the broader question of trust in your dependency chain. The auth model is the
