@@ -585,6 +585,9 @@ impl QueryHandler {
                 threshold = file_threshold,
                 "Scan below distribution file threshold — executing locally"
             );
+            if let Some(ref metrics) = self.metrics {
+                metrics.scheduler_decisions.with_label_values(&["local"]).inc();
+            }
             return plan;
         }
 
@@ -602,6 +605,9 @@ impl QueryHandler {
                     total_files,
                     "Scan below distribution byte threshold — executing locally"
                 );
+                if let Some(ref metrics) = self.metrics {
+                    metrics.scheduler_decisions.with_label_values(&["local"]).inc();
+                }
                 return plan;
             }
         }
@@ -614,6 +620,9 @@ impl QueryHandler {
                 num_workers,
                 "Fewer files than workers, executing locally"
             );
+            if let Some(ref metrics) = self.metrics {
+                metrics.scheduler_decisions.with_label_values(&["local"]).inc();
+            }
             return plan;
         }
 
@@ -665,7 +674,19 @@ impl QueryHandler {
 
         if scan_tasks.is_empty() {
             debug!("No non-empty scan tasks after splitting, executing locally");
+            if let Some(ref metrics) = self.metrics {
+                metrics.scheduler_decisions.with_label_values(&["local"]).inc();
+            }
             return plan;
+        }
+
+        if let Some(ref metrics) = self.metrics {
+            metrics.scheduler_decisions.with_label_values(&["distributed"]).inc();
+            metrics.scheduler_task_count.observe(scan_tasks.len() as f64);
+            for task in &scan_tasks {
+                let size_mb = task.file_sizes_bytes.iter().sum::<u64>() as f64 / (1024.0 * 1024.0);
+                metrics.scheduler_task_size_mb.observe(size_mb);
+            }
         }
 
         // 9. Schedule tasks to workers using weighted scheduler
@@ -712,6 +733,7 @@ impl QueryHandler {
         // 11. Build fragment callback for progress tracking and straggler detection
         let tracker = self.query_tracker.clone();
         let qid = *query_id;
+        let callback_metrics = self.metrics.clone();
         let callback: crate::distributed_scan::FragmentCallback =
             Arc::new(move |task_id, success, elapsed_ms, rows| {
                 let state = if success {
@@ -759,6 +781,9 @@ impl QueryHandler {
                                         "Straggler detected: fragment took {}x the median",
                                         ratio,
                                     );
+                                    if let Some(ref metrics) = callback_metrics {
+                                        metrics.scheduler_stragglers.inc();
+                                    }
                                 }
                             }
                         }

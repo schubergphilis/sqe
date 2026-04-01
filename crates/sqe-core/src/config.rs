@@ -518,6 +518,14 @@ pub struct MetricsConfig {
     pub otlp_endpoint: String,
     #[serde(default)]
     pub audit_log_path: String,
+    /// OTel trace sampling rate (0.0 to 1.0). Default: 0.01 (1%).
+    /// Set to 1.0 to trace all queries (expensive). Set to 0.0 to disable tracing.
+    #[serde(default = "default_trace_sample_rate")]
+    pub trace_sample_rate: f64,
+}
+
+fn default_trace_sample_rate() -> f64 {
+    0.01
 }
 
 impl Default for MetricsConfig {
@@ -526,6 +534,7 @@ impl Default for MetricsConfig {
             prometheus_port: 9090,
             otlp_endpoint: String::new(),
             audit_log_path: String::new(),
+            trace_sample_rate: default_trace_sample_rate(),
         }
     }
 }

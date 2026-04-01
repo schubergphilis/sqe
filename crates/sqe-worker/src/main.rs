@@ -14,9 +14,10 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| "sqe.toml".to_string());
     let config = SqeConfig::load(&config_path)?;
 
-    let _otel_guard = sqe_metrics::otel::init_telemetry(
+    let _otel_guard = sqe_metrics::otel::init_telemetry_with_sampling(
         "sqe-worker",
         &config.metrics.otlp_endpoint,
+        config.metrics.trace_sample_rate,
     );
 
     // Worker-specific Prometheus metrics
