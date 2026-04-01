@@ -523,6 +523,8 @@ impl QueryHandler {
     /// - No worker registry is configured (single-node mode)
     /// - No healthy workers are available
     /// - The query has no IcebergScanExec (e.g., metadata queries)
+    /// - The scan is below the configured file-count threshold (`distribution_file_threshold`)
+    /// - The estimated scan size is below the configured byte threshold (`distribution_threshold`)
     /// - The total data file count is less than the number of healthy workers
     /// - The query has multiple IcebergScanExec nodes (joins — not yet supported)
     async fn try_distribute(
@@ -558,22 +560,53 @@ impl QueryHandler {
             .downcast_ref::<IcebergScanExec>()
             .expect("find_iceberg_scan returned a non-IcebergScanExec node");
 
-        // 4. Get data file paths from the scan
-        let file_paths = match iceberg_scan.data_file_paths().await {
-            Ok(paths) => paths,
+        // 4. Get data file paths and sizes from the scan manifest metadata
+        let file_info = match iceberg_scan.data_file_info().await {
+            Ok(info) => info,
             Err(e) => {
                 warn!(error = %e, "Failed to list data files for distribution, executing locally");
                 return plan;
             }
         };
 
-        let total_files = file_paths.len();
+        let total_files = file_info.len();
         if total_files == 0 {
             debug!("No data files to distribute, executing locally");
             return plan;
         }
 
-        // 5. Check if there are enough files to justify distribution
+        // 5. Check if the scan is large enough to benefit from distribution.
+        // Use the configured file-count threshold as a fast proxy (no file size
+        // metadata needed at this point).
+        let file_threshold = self.config.query.distribution_file_threshold;
+        if file_threshold > 0 && total_files < file_threshold {
+            debug!(
+                total_files,
+                threshold = file_threshold,
+                "Scan below distribution file threshold — executing locally"
+            );
+            return plan;
+        }
+
+        // Also check the byte-size threshold using real sizes from the manifest.
+        let distribution_threshold = sqe_core::parse_memory_limit(
+            &self.config.query.distribution_threshold
+        ).unwrap_or(128 * 1024 * 1024);
+
+        if distribution_threshold > 0 {
+            let total_bytes: u64 = file_info.iter().map(|(_, size)| size).sum();
+            if total_bytes < distribution_threshold as u64 {
+                debug!(
+                    total_bytes,
+                    threshold = distribution_threshold,
+                    total_files,
+                    "Scan below distribution byte threshold — executing locally"
+                );
+                return plan;
+            }
+        }
+
+        // 6. Check if there are enough files to justify distribution
         let num_workers = healthy.len();
         if total_files < num_workers {
             debug!(
@@ -596,25 +629,37 @@ impl QueryHandler {
             .map(|cols| cols.to_vec())
             .unwrap_or_default();
 
-        // 7. Split files across workers
-        let file_groups = sqe_planner::split_files(file_paths, num_workers);
+        // 7. Split (path, size) pairs across workers using round-robin
+        let file_groups = {
+            let mut groups: Vec<Vec<(String, u64)>> =
+                (0..num_workers).map(|_| Vec::new()).collect();
+            for (i, pair) in file_info.into_iter().enumerate() {
+                groups[i % num_workers].push(pair);
+            }
+            groups
+        };
 
-        // 8. Build ScanTasks
+        // 8. Build ScanTasks — paths and sizes are parallel vecs within each group
         let storage = &self.config.storage;
         let scan_tasks: Vec<sqe_planner::ScanTask> = file_groups
             .into_iter()
-            .filter(|files| !files.is_empty())
-            .map(|files| sqe_planner::ScanTask {
-                fragment_id: uuid::Uuid::now_v7().to_string(),
-                data_file_paths: files,
-                projected_columns: projected_cols.clone(),
-                s3_endpoint: storage.s3_endpoint.clone(),
-                s3_region: storage.s3_region.clone(),
-                s3_access_key: storage.s3_access_key.clone(),
-                s3_secret_key: storage.s3_secret_key.clone(),
-                s3_session_token: String::new(),
-                s3_path_style: storage.s3_path_style,
-                s3_allow_http: storage.s3_endpoint.starts_with("http://"),
+            .filter(|group| !group.is_empty())
+            .map(|group| {
+                let (data_file_paths, file_sizes_bytes): (Vec<String>, Vec<u64>) =
+                    group.into_iter().unzip();
+                sqe_planner::ScanTask {
+                    fragment_id: uuid::Uuid::now_v7().to_string(),
+                    data_file_paths,
+                    file_sizes_bytes,
+                    projected_columns: projected_cols.clone(),
+                    s3_endpoint: storage.s3_endpoint.clone(),
+                    s3_region: storage.s3_region.clone(),
+                    s3_access_key: storage.s3_access_key.clone(),
+                    s3_secret_key: storage.s3_secret_key.clone(),
+                    s3_session_token: String::new(),
+                    s3_path_style: storage.s3_path_style,
+                    s3_allow_http: storage.s3_endpoint.starts_with("http://"),
+                }
             })
             .collect();
 
