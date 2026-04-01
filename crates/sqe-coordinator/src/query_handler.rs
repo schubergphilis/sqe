@@ -523,6 +523,8 @@ impl QueryHandler {
     /// - No worker registry is configured (single-node mode)
     /// - No healthy workers are available
     /// - The query has no IcebergScanExec (e.g., metadata queries)
+    /// - The scan is below the configured file-count threshold (`distribution_file_threshold`)
+    /// - The estimated scan size is below the configured byte threshold (`distribution_threshold`)
     /// - The total data file count is less than the number of healthy workers
     /// - The query has multiple IcebergScanExec nodes (joins — not yet supported)
     async fn try_distribute(
@@ -558,22 +560,59 @@ impl QueryHandler {
             .downcast_ref::<IcebergScanExec>()
             .expect("find_iceberg_scan returned a non-IcebergScanExec node");
 
-        // 4. Get data file paths from the scan
-        let file_paths = match iceberg_scan.data_file_paths().await {
-            Ok(paths) => paths,
+        // 4. Get data file paths and sizes from the scan manifest metadata
+        let file_info = match iceberg_scan.data_file_info().await {
+            Ok(info) => info,
             Err(e) => {
                 warn!(error = %e, "Failed to list data files for distribution, executing locally");
                 return plan;
             }
         };
 
-        let total_files = file_paths.len();
+        let total_files = file_info.len();
         if total_files == 0 {
             debug!("No data files to distribute, executing locally");
             return plan;
         }
 
-        // 5. Check if there are enough files to justify distribution
+        // 5. Check if the scan is large enough to benefit from distribution.
+        // Use the configured file-count threshold as a fast proxy (no file size
+        // metadata needed at this point).
+        let file_threshold = self.config.query.distribution_file_threshold;
+        if file_threshold > 0 && total_files < file_threshold {
+            debug!(
+                total_files,
+                threshold = file_threshold,
+                "Scan below distribution file threshold — executing locally"
+            );
+            if let Some(ref metrics) = self.metrics {
+                metrics.scheduler_decisions.with_label_values(&["local"]).inc();
+            }
+            return plan;
+        }
+
+        // Also check the byte-size threshold using real sizes from the manifest.
+        let distribution_threshold = sqe_core::parse_memory_limit(
+            &self.config.query.distribution_threshold
+        ).unwrap_or(128 * 1024 * 1024);
+
+        if distribution_threshold > 0 {
+            let total_bytes: u64 = file_info.iter().map(|(_, size)| size).sum();
+            if total_bytes < distribution_threshold as u64 {
+                debug!(
+                    total_bytes,
+                    threshold = distribution_threshold,
+                    total_files,
+                    "Scan below distribution byte threshold — executing locally"
+                );
+                if let Some(ref metrics) = self.metrics {
+                    metrics.scheduler_decisions.with_label_values(&["local"]).inc();
+                }
+                return plan;
+            }
+        }
+
+        // 6. Check if there are enough files to justify distribution
         let num_workers = healthy.len();
         if total_files < num_workers {
             debug!(
@@ -581,6 +620,9 @@ impl QueryHandler {
                 num_workers,
                 "Fewer files than workers, executing locally"
             );
+            if let Some(ref metrics) = self.metrics {
+                metrics.scheduler_decisions.with_label_values(&["local"]).inc();
+            }
             return plan;
         }
 
@@ -596,31 +638,55 @@ impl QueryHandler {
             .map(|cols| cols.to_vec())
             .unwrap_or_default();
 
-        // 7. Split files across workers
-        let file_groups = sqe_planner::split_files(file_paths, num_workers);
+        // 7. Split (path, size) pairs into size-balanced bins using bin-packing.
+        // target_size_bytes: read from config or fall back to 256 MiB.
+        // max_bins: allow up to 3 tasks per worker so work is evenly spread
+        // even when file sizes vary widely.
+        let target_size_bytes = sqe_core::parse_memory_limit(
+            &self.config.query.target_task_size
+        ).unwrap_or(256 * 1024 * 1024) as u64;
+        let max_bins = num_workers * 3;
+        let file_groups = sqe_planner::bin_pack_files(file_info, target_size_bytes, max_bins);
 
-        // 8. Build ScanTasks
+        // 8. Build ScanTasks — paths and sizes are parallel vecs within each group
         let storage = &self.config.storage;
         let scan_tasks: Vec<sqe_planner::ScanTask> = file_groups
             .into_iter()
-            .filter(|files| !files.is_empty())
-            .map(|files| sqe_planner::ScanTask {
-                fragment_id: uuid::Uuid::now_v7().to_string(),
-                data_file_paths: files,
-                projected_columns: projected_cols.clone(),
-                s3_endpoint: storage.s3_endpoint.clone(),
-                s3_region: storage.s3_region.clone(),
-                s3_access_key: storage.s3_access_key.clone(),
-                s3_secret_key: storage.s3_secret_key.clone(),
-                s3_session_token: String::new(),
-                s3_path_style: storage.s3_path_style,
-                s3_allow_http: storage.s3_endpoint.starts_with("http://"),
+            .filter(|group| !group.is_empty())
+            .map(|group| {
+                let (data_file_paths, file_sizes_bytes): (Vec<String>, Vec<u64>) =
+                    group.into_iter().unzip();
+                sqe_planner::ScanTask {
+                    fragment_id: uuid::Uuid::now_v7().to_string(),
+                    data_file_paths,
+                    file_sizes_bytes,
+                    projected_columns: projected_cols.clone(),
+                    s3_endpoint: storage.s3_endpoint.clone(),
+                    s3_region: storage.s3_region.clone(),
+                    s3_access_key: storage.s3_access_key.clone(),
+                    s3_secret_key: storage.s3_secret_key.clone(),
+                    s3_session_token: String::new(),
+                    s3_path_style: storage.s3_path_style,
+                    s3_allow_http: storage.s3_endpoint.starts_with("http://"),
+                }
             })
             .collect();
 
         if scan_tasks.is_empty() {
             debug!("No non-empty scan tasks after splitting, executing locally");
+            if let Some(ref metrics) = self.metrics {
+                metrics.scheduler_decisions.with_label_values(&["local"]).inc();
+            }
             return plan;
+        }
+
+        if let Some(ref metrics) = self.metrics {
+            metrics.scheduler_decisions.with_label_values(&["distributed"]).inc();
+            metrics.scheduler_task_count.observe(scan_tasks.len() as f64);
+            for task in &scan_tasks {
+                let size_mb = task.file_sizes_bytes.iter().sum::<u64>() as f64 / (1024.0 * 1024.0);
+                metrics.scheduler_task_size_mb.observe(size_mb);
+            }
         }
 
         // 9. Schedule tasks to workers using weighted scheduler
@@ -664,9 +730,10 @@ impl QueryHandler {
             .collect();
         self.query_tracker.set_fragments(query_id, fragment_infos);
 
-        // 11. Build fragment callback for progress tracking
+        // 11. Build fragment callback for progress tracking and straggler detection
         let tracker = self.query_tracker.clone();
         let qid = *query_id;
+        let callback_metrics = self.metrics.clone();
         let callback: crate::distributed_scan::FragmentCallback =
             Arc::new(move |task_id, success, elapsed_ms, rows| {
                 let state = if success {
@@ -675,6 +742,53 @@ impl QueryHandler {
                     FragmentState::Failed
                 };
                 tracker.update_fragment(&qid, task_id, state, elapsed_ms, rows);
+
+                // Once all fragments are done, emit a summary and check for stragglers.
+                if let Some(timings) = tracker.all_fragments_done(&qid) {
+                    let durations: Vec<u64> = timings.iter().map(|(_, _, ms)| *ms).collect();
+                    let total_ms: u64 = durations.iter().sum();
+                    let max_ms = *durations.iter().max().unwrap_or(&0);
+                    let min_ms = *durations.iter().min().unwrap_or(&0);
+
+                    tracing::info!(
+                        query_id = %qid,
+                        fragment_count = durations.len(),
+                        total_ms,
+                        max_ms,
+                        min_ms,
+                        "Distributed scan complete"
+                    );
+
+                    // Straggler detection: warn when any fragment took >3× the median.
+                    if durations.len() >= 2 {
+                        let mut sorted = durations.clone();
+                        sorted.sort_unstable();
+                        let median = sorted[sorted.len() / 2];
+                        let threshold = median.saturating_mul(3);
+
+                        if median > 0 {
+                            for (i, (frag_id, worker_url, duration)) in timings.iter().enumerate() {
+                                if *duration > threshold {
+                                    let ratio = duration / median.max(1);
+                                    tracing::warn!(
+                                        query_id = %qid,
+                                        fragment_index = i,
+                                        fragment_id = %frag_id,
+                                        duration_ms = duration,
+                                        median_ms = median,
+                                        ratio,
+                                        worker = %worker_url,
+                                        "Straggler detected: fragment took {}x the median",
+                                        ratio,
+                                    );
+                                    if let Some(ref metrics) = callback_metrics {
+                                        metrics.scheduler_stragglers.inc();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             });
 
         // 12. Build the DistributedScanExec

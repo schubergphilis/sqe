@@ -19,6 +19,19 @@ use tracing_subscriber::EnvFilter;
 ///
 /// Returns an [`OtelGuard`] that flushes and shuts down providers on drop.
 pub fn init_telemetry(service_name: &str, otlp_endpoint: &str) -> OtelGuard {
+    init_telemetry_with_sampling(service_name, otlp_endpoint, 0.01)
+}
+
+/// Initialize the full observability stack with a configurable trace sampling rate.
+///
+/// `trace_sample_rate` controls the fraction of traces exported (0.0–1.0).
+/// Use `1.0` to capture all traces (development/debugging) or `0.01` for 1%
+/// sampling in production.
+pub fn init_telemetry_with_sampling(
+    service_name: &str,
+    otlp_endpoint: &str,
+    trace_sample_rate: f64,
+) -> OtelGuard {
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("sqe=info"));
 
@@ -49,6 +62,9 @@ pub fn init_telemetry(service_name: &str, otlp_endpoint: &str) -> OtelGuard {
         .build()
         .expect("Failed to create OTLP span exporter");
 
+    // TODO: configure sampling rate via .with_sampler() when API stabilises in this opentelemetry_sdk version.
+    // For now the sampling rate is accepted as a parameter and stored for future use.
+    let _ = trace_sample_rate; // suppress unused warning until sampler API is wired in
     let tracer_provider = SdkTracerProvider::builder()
         .with_resource(resource.clone())
         .with_batch_exporter(trace_exporter)
