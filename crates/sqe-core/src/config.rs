@@ -48,6 +48,14 @@ pub struct QueryConfig {
     /// Maximum memory per query. Default: "256MB". Supports: B, KB, MB, GB. Set to "0" for unlimited.
     #[serde(default = "default_max_query_memory")]
     pub max_query_memory: String,
+    /// Minimum total scan size to distribute across workers. Below this, execute on coordinator.
+    /// Default: "128MB". Set to "0" to always distribute.
+    #[serde(default = "default_distribution_threshold")]
+    pub distribution_threshold: String,
+    /// Minimum number of data files to distribute. Below this, execute locally on coordinator.
+    /// Default: 4. Used as a fast check when file sizes are not yet available.
+    #[serde(default = "default_distribution_file_threshold")]
+    pub distribution_file_threshold: usize,
 }
 
 impl Default for QueryConfig {
@@ -59,6 +67,8 @@ impl Default for QueryConfig {
             max_concurrent_queries: default_max_concurrent_queries(),
             slow_query_threshold_secs: default_slow_query_threshold(),
             max_query_memory: default_max_query_memory(),
+            distribution_threshold: default_distribution_threshold(),
+            distribution_file_threshold: default_distribution_file_threshold(),
         }
     }
 }
@@ -579,6 +589,8 @@ fn default_max_result_rows() -> usize { 1_000_000 }
 fn default_max_concurrent_queries() -> usize { 100 }
 fn default_slow_query_threshold() -> u64 { 30 }
 fn default_max_query_memory() -> String { "256MB".to_string() }
+fn default_distribution_threshold() -> String { "128MB".to_string() }
+fn default_distribution_file_threshold() -> usize { 4 }
 
 fn default_flight_port() -> u16 { 50051 }
 fn default_trino_port() -> u16 { 8080 }
@@ -867,6 +879,13 @@ mod tests {
     #[test]
     fn test_parse_memory_limit_unknown_suffix() {
         assert!(parse_memory_limit("100XB").is_err());
+    }
+
+    #[test]
+    fn test_distribution_threshold_config() {
+        let config = QueryConfig::default();
+        assert_eq!(config.distribution_threshold, "128MB");
+        assert_eq!(config.distribution_file_threshold, 4);
     }
 
     #[test]
