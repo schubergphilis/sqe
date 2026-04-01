@@ -84,6 +84,20 @@ fn estimate_cost(task: &ScanTask) -> u64 {
     }
 }
 
+/// Compute a preferred worker index for a set of files using consistent hashing.
+/// Returns the worker index that should handle these files for cache affinity.
+fn preferred_worker(file_paths: &[String], num_workers: usize) -> usize {
+    if num_workers == 0 || file_paths.is_empty() {
+        return 0;
+    }
+    // Hash the first file path (representative of the task's data locality)
+    let mut hash: u64 = 0;
+    for byte in file_paths[0].as_bytes() {
+        hash = hash.wrapping_mul(31).wrapping_add(*byte as u64);
+    }
+    (hash as usize) % num_workers
+}
+
 /// Weighted fragment scheduler that assigns tasks to the least-loaded worker.
 ///
 /// Strategy:
@@ -151,7 +165,19 @@ impl FragmentScheduler for WeightedScheduler {
                 .map(|(pos, _)| pos)
                 .expect("healthy workers vec is non-empty");
 
-            let worker_idx = loads[min_pos].1;
+            // Cache affinity: prefer the consistent-hash worker if its load is within 20% of minimum
+            let preferred = preferred_worker(&tasks[task_idx].data_file_paths, healthy.len());
+            let preferred_load = loads[preferred].0;
+            let min_load = loads[min_pos].0;
+            let threshold = min_load + (min_load / 5).max(1); // 20% tolerance
+
+            let chosen = if preferred_load <= threshold {
+                preferred
+            } else {
+                min_pos
+            };
+
+            let worker_idx = loads[chosen].1;
             let worker = &healthy[worker_idx];
 
             assignments[task_idx] = Some(Assignment {
@@ -160,7 +186,7 @@ impl FragmentScheduler for WeightedScheduler {
             });
 
             // Update the load for this worker
-            loads[min_pos].0 += cost;
+            loads[chosen].0 += cost;
         }
 
         let result: Vec<Assignment> = assignments
@@ -614,6 +640,76 @@ mod tests {
             .count();
         assert_eq!(w1_count, 2);
         assert_eq!(w3_count, 2);
+    }
+
+    #[test]
+    fn test_preferred_worker_deterministic() {
+        let paths = vec!["s3://bucket/data/file1.parquet".to_string()];
+        let w1 = preferred_worker(&paths, 3);
+        let w2 = preferred_worker(&paths, 3);
+        assert_eq!(w1, w2, "same files should hash to same worker");
+    }
+
+    #[test]
+    fn test_preferred_worker_distributes() {
+        // Different file paths should distribute across workers
+        let mut workers_hit = std::collections::HashSet::new();
+        for i in 0..100 {
+            let paths = vec![format!("s3://bucket/table/part-{i}.parquet")];
+            workers_hit.insert(preferred_worker(&paths, 5));
+        }
+        assert!(workers_hit.len() >= 3, "should use at least 3 of 5 workers");
+    }
+
+    #[test]
+    fn test_cache_affinity_prefers_consistent_worker() {
+        // When all workers have equal load, the scheduler should consistently
+        // pick the same worker for the same file path (cache affinity).
+        let scheduler = WeightedScheduler::new();
+        let file_path = "s3://bucket/dashboard/metrics.parquet".to_string();
+
+        let task1 = ScanTask {
+            fragment_id: "q1_scan".to_string(),
+            data_file_paths: vec![file_path.clone()],
+            file_sizes_bytes: vec![100 * MB],
+            projected_columns: vec![],
+            s3_endpoint: String::new(),
+            s3_region: String::new(),
+            s3_access_key: String::new(),
+            s3_secret_key: String::new(),
+            s3_session_token: String::new(),
+            s3_path_style: false,
+            s3_allow_http: true,
+        };
+        let task2 = ScanTask {
+            fragment_id: "q2_scan".to_string(),
+            data_file_paths: vec![file_path.clone()],
+            file_sizes_bytes: vec![100 * MB],
+            projected_columns: vec![],
+            s3_endpoint: String::new(),
+            s3_region: String::new(),
+            s3_access_key: String::new(),
+            s3_secret_key: String::new(),
+            s3_session_token: String::new(),
+            s3_path_style: false,
+            s3_allow_http: true,
+        };
+
+        let workers = vec![
+            make_worker("http://w1:50052", true, 0),
+            make_worker("http://w2:50052", true, 0),
+            make_worker("http://w3:50052", true, 0),
+        ];
+
+        // Both scans reference the same file; each is submitted as a separate single-task batch.
+        let a1 = scheduler.assign(&[task1], &workers).unwrap();
+        let a2 = scheduler.assign(&[task2], &workers).unwrap();
+
+        // The same file path must consistently hash to the same worker
+        assert_eq!(
+            a1[0].worker_url, a2[0].worker_url,
+            "repeated scans of the same file should go to the same worker for cache affinity"
+        );
     }
 
     #[test]
