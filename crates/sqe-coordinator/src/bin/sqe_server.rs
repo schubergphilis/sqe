@@ -262,8 +262,11 @@ async fn main() -> anyhow::Result<()> {
         Mode::Worker => "sqe-worker",
     };
 
-    let _otel_guard =
-        sqe_metrics::otel::init_telemetry(service_name, &config.metrics.otlp_endpoint);
+    let _otel_guard = sqe_metrics::otel::init_telemetry_with_sampling(
+        service_name,
+        &config.metrics.otlp_endpoint,
+        config.metrics.trace_sample_rate,
+    );
 
     tracing::info!(mode = ?mode, config = config_path, "Starting sqe-server");
 
