@@ -11,6 +11,11 @@ pub struct ScanTask {
     pub fragment_id: String,
     /// S3 URLs of Parquet data files to scan.
     pub data_file_paths: Vec<String>,
+    /// Size in bytes per file, parallel to `data_file_paths`.
+    /// Empty if sizes were not available at planning time — callers should
+    /// treat an empty vec as "unknown" and fall back to file-count cost.
+    #[serde(default)]
+    pub file_sizes_bytes: Vec<u64>,
     /// Column names to project (empty = all columns).
     pub projected_columns: Vec<String>,
     /// S3 endpoint URL.
@@ -36,9 +41,11 @@ impl std::fmt::Debug for ScanTask {
         } else {
             "[REDACTED]"
         };
+        let total_bytes: u64 = self.file_sizes_bytes.iter().sum();
         f.debug_struct("ScanTask")
             .field("fragment_id", &self.fragment_id)
             .field("data_file_paths", &self.data_file_paths)
+            .field("total_bytes", &total_bytes)
             .field("projected_columns", &self.projected_columns)
             .field("s3_endpoint", &self.s3_endpoint)
             .field("s3_region", &self.s3_region)
@@ -75,6 +82,7 @@ mod tests {
                 "s3://bucket/data/file1.parquet".to_string(),
                 "s3://bucket/data/file2.parquet".to_string(),
             ],
+            file_sizes_bytes: vec![],
             projected_columns: vec!["id".to_string(), "name".to_string()],
             s3_endpoint: "http://localhost:9000".to_string(),
             s3_region: "us-east-1".to_string(),
@@ -100,6 +108,7 @@ mod tests {
         let task = ScanTask {
             fragment_id: "frag-002".to_string(),
             data_file_paths: vec!["s3://bucket/data/file1.parquet".to_string()],
+            file_sizes_bytes: vec![],
             projected_columns: vec![],
             s3_endpoint: String::new(),
             s3_region: String::new(),
@@ -120,6 +129,7 @@ mod tests {
         let task = ScanTask {
             fragment_id: "frag-001".to_string(),
             data_file_paths: vec![],
+            file_sizes_bytes: vec![],
             projected_columns: vec![],
             s3_endpoint: "http://localhost:9000".to_string(),
             s3_region: "us-east-1".to_string(),

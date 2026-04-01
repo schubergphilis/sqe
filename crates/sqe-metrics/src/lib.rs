@@ -4,7 +4,8 @@ pub mod otel;
 pub mod propagation;
 
 use prometheus::{
-    Counter, CounterVec, Gauge, Histogram, HistogramOpts, HistogramVec, IntGauge, Opts, Registry,
+    Counter, CounterVec, Gauge, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec,
+    IntGauge, Opts, Registry,
 };
 
 /// Trait for types that expose a Prometheus [`Registry`] for metrics serving.
@@ -30,6 +31,11 @@ pub struct MetricsRegistry {
     pub cache_invalidations: Counter,
     pub cache_size_bytes: Gauge,
     pub cache_entries: Gauge,
+    // Scheduler metrics
+    pub scheduler_decisions: IntCounterVec,
+    pub scheduler_task_count: Histogram,
+    pub scheduler_task_size_mb: Histogram,
+    pub scheduler_stragglers: IntCounter,
 }
 
 impl MetricsRegistry {
@@ -84,6 +90,40 @@ impl MetricsRegistry {
         registry.register(Box::new(cache_size_bytes.clone())).unwrap();
         registry.register(Box::new(cache_entries.clone())).unwrap();
 
+        let scheduler_decisions = IntCounterVec::new(
+            Opts::new("sqe_scheduler_decisions_total", "Scheduling decisions by type"),
+            &["decision"],
+        )
+        .unwrap();
+        registry.register(Box::new(scheduler_decisions.clone())).unwrap();
+
+        let scheduler_task_count = Histogram::with_opts(
+            HistogramOpts::new(
+                "sqe_scheduler_task_count",
+                "Number of tasks per distributed query",
+            )
+            .buckets(vec![1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0, 100.0]),
+        )
+        .unwrap();
+        registry.register(Box::new(scheduler_task_count.clone())).unwrap();
+
+        let scheduler_task_size_mb = Histogram::with_opts(
+            HistogramOpts::new(
+                "sqe_scheduler_task_size_mb",
+                "Size of individual scan tasks in MB",
+            )
+            .buckets(vec![1.0, 10.0, 50.0, 100.0, 256.0, 512.0, 1024.0, 5120.0]),
+        )
+        .unwrap();
+        registry.register(Box::new(scheduler_task_size_mb.clone())).unwrap();
+
+        let scheduler_stragglers = IntCounter::new(
+            "sqe_scheduler_stragglers_total",
+            "Number of straggler fragments detected",
+        )
+        .unwrap();
+        registry.register(Box::new(scheduler_stragglers.clone())).unwrap();
+
         Self {
             registry,
             query_count,
@@ -96,6 +136,10 @@ impl MetricsRegistry {
             cache_invalidations,
             cache_size_bytes,
             cache_entries,
+            scheduler_decisions,
+            scheduler_task_count,
+            scheduler_task_size_mb,
+            scheduler_stragglers,
         }
     }
 }
@@ -220,7 +264,11 @@ mod tests {
         metrics.cache_invalidations.inc_by(0.0);
         metrics.cache_size_bytes.set(0.0);
         metrics.cache_entries.set(0.0);
-        assert!(metrics.registry.gather().len() >= 10);
+        metrics.scheduler_decisions.with_label_values(&["local"]).inc_by(0);
+        metrics.scheduler_task_count.observe(0.0);
+        metrics.scheduler_task_size_mb.observe(0.0);
+        metrics.scheduler_stragglers.inc_by(0);
+        assert!(metrics.registry.gather().len() >= 14);
     }
 
     #[test]

@@ -66,9 +66,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Initialize tracing + OTel (traces, metrics, logs via OTLP when configured)
-    let _otel_guard = sqe_metrics::otel::init_telemetry(
+    let _otel_guard = sqe_metrics::otel::init_telemetry_with_sampling(
         "sqe-coordinator",
         &config.metrics.otlp_endpoint,
+        config.metrics.trace_sample_rate,
     );
 
     tracing::info!(

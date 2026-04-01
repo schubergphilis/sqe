@@ -330,6 +330,7 @@ fn test_scan_task_roundtrip() {
         data_file_paths: vec![
             "s3://bucket/data/file1.parquet".to_string(),
         ],
+        file_sizes_bytes: vec![],
         projected_columns: vec!["id".to_string()],
         s3_endpoint: "http://localhost:9000".to_string(),
         s3_region: "us-east-1".to_string(),
