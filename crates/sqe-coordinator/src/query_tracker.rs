@@ -230,6 +230,33 @@ impl QueryTracker {
         }
     }
 
+    /// Check whether all fragments have completed and return per-fragment timing
+    /// for straggler analysis.
+    ///
+    /// Returns `Some(Vec<(task_id, worker_url, elapsed_ms)>)` when every fragment
+    /// is in a terminal state (`Finished` or `Failed`).  Returns `None` if any
+    /// fragment is still `Running` or `Retried`, or if the query is unknown.
+    pub fn all_fragments_done(&self, query_id: &Uuid) -> Option<Vec<(String, String, u64)>> {
+        let record = self.history.get(query_id)?;
+        if record.fragments.is_empty() {
+            return None;
+        }
+        let all_done = record.fragments.iter().all(|f| {
+            matches!(f.state, FragmentState::Finished | FragmentState::Failed)
+        });
+        if all_done {
+            Some(
+                record
+                    .fragments
+                    .iter()
+                    .map(|f| (f.task_id.clone(), f.worker_url.clone(), f.elapsed_ms))
+                    .collect(),
+            )
+        } else {
+            None
+        }
+    }
+
     pub fn records(&self) -> Vec<Arc<QueryRecord>> {
         let mut records = Vec::new();
         for (_, v) in &self.history {
@@ -456,6 +483,96 @@ mod tests {
         tracker.start(id, "bob", None, "SELECT 1", "s2", None, vec![]);
         tracker.update_fragment(&id, "nonexistent", FragmentState::Failed, 0, 0);
         // Should not panic
+    }
+
+    #[tokio::test]
+    async fn all_fragments_done_returns_none_while_running() {
+        let tracker = QueryTracker::new(&test_config());
+        let id = Uuid::now_v7();
+        tracker.start(id, "alice", None, "SELECT *", "s1", None, vec![]);
+
+        let frags = vec![
+            FragmentInfo {
+                task_id: "frag-0".into(),
+                worker_url: "http://w1:50052".into(),
+                state: FragmentState::Running,
+                elapsed_ms: 0,
+                input_rows: 0,
+                output_rows: 0,
+            },
+            FragmentInfo {
+                task_id: "frag-1".into(),
+                worker_url: "http://w2:50052".into(),
+                state: FragmentState::Running,
+                elapsed_ms: 0,
+                input_rows: 0,
+                output_rows: 0,
+            },
+        ];
+        tracker.set_fragments(&id, frags);
+
+        // Neither fragment done yet
+        assert!(tracker.all_fragments_done(&id).is_none());
+
+        // Finish only frag-0
+        tracker.update_fragment(&id, "frag-0", FragmentState::Finished, 100, 50);
+        assert!(tracker.all_fragments_done(&id).is_none(), "frag-1 still running");
+
+        // Finish frag-1 too
+        tracker.update_fragment(&id, "frag-1", FragmentState::Finished, 500, 200);
+        let timings = tracker.all_fragments_done(&id);
+        assert!(timings.is_some(), "all done now");
+        let timings = timings.unwrap();
+        assert_eq!(timings.len(), 2);
+        assert_eq!(timings[0].2, 100);
+        assert_eq!(timings[1].2, 500);
+    }
+
+    #[tokio::test]
+    async fn all_fragments_done_returns_none_for_unknown_query() {
+        let tracker = QueryTracker::new(&test_config());
+        assert!(tracker.all_fragments_done(&Uuid::now_v7()).is_none());
+    }
+
+    #[tokio::test]
+    async fn all_fragments_done_returns_none_for_empty_fragments() {
+        let tracker = QueryTracker::new(&test_config());
+        let id = Uuid::now_v7();
+        tracker.start(id, "alice", None, "SELECT 1", "s1", None, vec![]);
+        // No fragments set — treated as "not a distributed query"
+        assert!(tracker.all_fragments_done(&id).is_none());
+    }
+
+    #[tokio::test]
+    async fn all_fragments_done_works_with_failed_fragments() {
+        let tracker = QueryTracker::new(&test_config());
+        let id = Uuid::now_v7();
+        tracker.start(id, "alice", None, "SELECT *", "s1", None, vec![]);
+
+        let frags = vec![
+            FragmentInfo {
+                task_id: "frag-0".into(),
+                worker_url: "http://w1:50052".into(),
+                state: FragmentState::Running,
+                elapsed_ms: 0,
+                input_rows: 0,
+                output_rows: 0,
+            },
+            FragmentInfo {
+                task_id: "frag-1".into(),
+                worker_url: "http://w2:50052".into(),
+                state: FragmentState::Running,
+                elapsed_ms: 0,
+                input_rows: 0,
+                output_rows: 0,
+            },
+        ];
+        tracker.set_fragments(&id, frags);
+
+        tracker.update_fragment(&id, "frag-0", FragmentState::Finished, 200, 10);
+        tracker.update_fragment(&id, "frag-1", FragmentState::Failed, 50, 0);
+        // Both are terminal (Finished / Failed) — should be "done"
+        assert!(tracker.all_fragments_done(&id).is_some());
     }
 
     #[tokio::test]
