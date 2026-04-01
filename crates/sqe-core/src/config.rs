@@ -56,6 +56,9 @@ pub struct QueryConfig {
     /// Default: 4. Used as a fast check when file sizes are not yet available.
     #[serde(default = "default_distribution_file_threshold")]
     pub distribution_file_threshold: usize,
+    /// Target size per scan task for bin-packing. Default: "256MB".
+    #[serde(default = "default_target_task_size")]
+    pub target_task_size: String,
 }
 
 impl Default for QueryConfig {
@@ -69,6 +72,7 @@ impl Default for QueryConfig {
             max_query_memory: default_max_query_memory(),
             distribution_threshold: default_distribution_threshold(),
             distribution_file_threshold: default_distribution_file_threshold(),
+            target_task_size: default_target_task_size(),
         }
     }
 }
@@ -591,6 +595,7 @@ fn default_slow_query_threshold() -> u64 { 30 }
 fn default_max_query_memory() -> String { "256MB".to_string() }
 fn default_distribution_threshold() -> String { "128MB".to_string() }
 fn default_distribution_file_threshold() -> usize { 4 }
+fn default_target_task_size() -> String { "256MB".to_string() }
 
 fn default_flight_port() -> u16 { 50051 }
 fn default_trino_port() -> u16 { 8080 }

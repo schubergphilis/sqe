@@ -629,15 +629,15 @@ impl QueryHandler {
             .map(|cols| cols.to_vec())
             .unwrap_or_default();
 
-        // 7. Split (path, size) pairs across workers using round-robin
-        let file_groups = {
-            let mut groups: Vec<Vec<(String, u64)>> =
-                (0..num_workers).map(|_| Vec::new()).collect();
-            for (i, pair) in file_info.into_iter().enumerate() {
-                groups[i % num_workers].push(pair);
-            }
-            groups
-        };
+        // 7. Split (path, size) pairs into size-balanced bins using bin-packing.
+        // target_size_bytes: read from config or fall back to 256 MiB.
+        // max_bins: allow up to 3 tasks per worker so work is evenly spread
+        // even when file sizes vary widely.
+        let target_size_bytes = sqe_core::parse_memory_limit(
+            &self.config.query.target_task_size
+        ).unwrap_or(256 * 1024 * 1024) as u64;
+        let max_bins = num_workers * 3;
+        let file_groups = sqe_planner::bin_pack_files(file_info, target_size_bytes, max_bins);
 
         // 8. Build ScanTasks — paths and sizes are parallel vecs within each group
         let storage = &self.config.storage;
@@ -709,7 +709,7 @@ impl QueryHandler {
             .collect();
         self.query_tracker.set_fragments(query_id, fragment_infos);
 
-        // 11. Build fragment callback for progress tracking
+        // 11. Build fragment callback for progress tracking and straggler detection
         let tracker = self.query_tracker.clone();
         let qid = *query_id;
         let callback: crate::distributed_scan::FragmentCallback =
@@ -720,6 +720,50 @@ impl QueryHandler {
                     FragmentState::Failed
                 };
                 tracker.update_fragment(&qid, task_id, state, elapsed_ms, rows);
+
+                // Once all fragments are done, emit a summary and check for stragglers.
+                if let Some(timings) = tracker.all_fragments_done(&qid) {
+                    let durations: Vec<u64> = timings.iter().map(|(_, _, ms)| *ms).collect();
+                    let total_ms: u64 = durations.iter().sum();
+                    let max_ms = *durations.iter().max().unwrap_or(&0);
+                    let min_ms = *durations.iter().min().unwrap_or(&0);
+
+                    tracing::info!(
+                        query_id = %qid,
+                        fragment_count = durations.len(),
+                        total_ms,
+                        max_ms,
+                        min_ms,
+                        "Distributed scan complete"
+                    );
+
+                    // Straggler detection: warn when any fragment took >3× the median.
+                    if durations.len() >= 2 {
+                        let mut sorted = durations.clone();
+                        sorted.sort_unstable();
+                        let median = sorted[sorted.len() / 2];
+                        let threshold = median.saturating_mul(3);
+
+                        if median > 0 {
+                            for (i, (frag_id, worker_url, duration)) in timings.iter().enumerate() {
+                                if *duration > threshold {
+                                    let ratio = duration / median.max(1);
+                                    tracing::warn!(
+                                        query_id = %qid,
+                                        fragment_index = i,
+                                        fragment_id = %frag_id,
+                                        duration_ms = duration,
+                                        median_ms = median,
+                                        ratio,
+                                        worker = %worker_url,
+                                        "Straggler detected: fragment took {}x the median",
+                                        ratio,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             });
 
         // 12. Build the DistributedScanExec
