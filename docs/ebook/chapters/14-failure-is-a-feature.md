@@ -681,6 +681,150 @@ fair sharing. A single large scan shouldn't starve all other queries of memory.
 :::
 
 
+## When Every Error Looks the Same
+
+We fixed the gRPC hang. We fixed the empty schema. We fixed the S3 throttle. And then a dbt run failed, and the error message was: `INTERNAL_ERROR: Query execution failed`.
+
+Which query? What failed? Was it a syntax error in our model? A missing table in Polaris? An S3 credential that expired? A worker that crashed mid-scan? Every failure, regardless of cause, produced the same opaque string. dbt couldn't tell the difference between a user mistake and an infrastructure failure. Neither could we.
+
+### The Problem with Uniform Opacity
+
+When every error looks like `INTERNAL_ERROR(1) "Query execution failed"`, clients face an impossible retry decision. Should they retry? A syntax error will never succeed on retry. A transient S3 timeout will. But if the error code is always 1 and the message is always the same, the client has no signal to act on.
+
+dbt's retry logic is error-code-aware when talking to Trino. It knows that `TABLE_NOT_FOUND` means something is wrong with the model, not with the infrastructure. It knows that `INTERNAL_ERROR` with code 65536 might be a transient execution failure worth retrying. But we were returning `INTERNAL_ERROR(1)` for everything, so dbt had no way to apply that logic.
+
+A second problem was information leakage going the other direction. Some errors were too verbose. An S3 access failure might print the full bucket URL, the access key prefix, the STS endpoint. Polaris connectivity errors included hostnames and port numbers. None of that belongs in a client-facing error message. It belongs in the internal logs, where operators can see it.
+
+We had two opposite problems: user errors were indistinguishable from system errors (too little signal), and system errors leaked infrastructure details (too much signal).
+
+### The Solution: A 27-Code Taxonomy
+
+We introduced `SqeErrorCode` — a typed enum with 27 variants covering every error category the engine can produce:
+
+```rust
+pub enum SqeErrorCode {
+    // SQL parse / planning
+    SyntaxError, ParseError, SemanticError, TypeMismatch,
+    // Catalog / schema
+    TableNotFound, ColumnNotFound, SchemaNotFound,
+    CatalogNotFound, ViewNotFound,
+    // Query building
+    FunctionNotFound, InvalidArguments, DuplicateTable, DuplicateColumn,
+    // Runtime
+    DivisionByZero, InvalidCast,
+    // Auth
+    AuthenticationFailed, AccessDenied, SessionExpired,
+    // Execution
+    ExecutionFailed, QueryTimeout, QueryCancelled, ResourceExhausted,
+    // Infrastructure
+    CatalogError, StorageError, CommitConflict,
+    // Feature support
+    NotSupported,
+    // Catch-all
+    InternalError,
+}
+```
+
+Each code carries three things: a gRPC status code, a Trino-compatible integer code and type string, and a client message policy.
+
+The gRPC mapping is semantic. `TableNotFound` maps to `NOT_FOUND`. `SyntaxError` maps to `INVALID_ARGUMENT`. `AuthenticationFailed` maps to `UNAUTHENTICATED`. `StorageError` maps to `INTERNAL`. A client speaking Arrow Flight SQL can now dispatch on the gRPC status code alone, without parsing the message string.
+
+The Trino mapping is for compatibility. `TableNotFound` is code 11, `TypeMismatch` is 7, `SyntaxError` is 1. dbt's Trino adapter recognises these numbers and adjusts its retry and error-surfacing behaviour accordingly. We're not Trino — but we speak enough of Trino's error vocabulary that existing tooling works.
+
+The client message policy is the hardest part:
+
+```rust
+pub fn is_user_error(self) -> bool {
+    matches!(self,
+        SqeErrorCode::SyntaxError | SqeErrorCode::TableNotFound |
+        SqeErrorCode::TypeMismatch | SqeErrorCode::AuthenticationFailed |
+        // ... all user-actionable errors
+    )
+}
+```
+
+User errors — syntax errors, missing tables, auth failures, type mismatches — pass their detail through to the client. The message "table 'wh.ns.foo' not found" is useful; the user can act on it. System errors — storage failures, catalog connectivity, internal panics — return a generic message. "Storage operation failed" tells the user there's a problem. "s3://my-bucket/path?X-Amz-Security-Token=..." tells them too much.
+
+### The Classifier
+
+The error codes mean nothing without automatic classification. DataFusion errors arrive as strings. We had to map those strings to codes.
+
+The classifier lives in two functions: `classify_execution_error` and `classify_catalog_error`. They pattern-match against lowercased error messages. Most patterns are straightforward: "table" + "not found" → `TableNotFound`, "division by zero" → `DivisionByZero`.
+
+One pattern required care. DataFusion concatenates error messages when multiple failures are possible. A function call with wrong argument types produces something like: `"TypeSignatureClass(Exact([Int64, Int64])) does not match the function signature. No function matches the signature 'concat(Int64)'"`. That message contains both type signature information and "No function matches." If you check for `FunctionNotFound` before `TypeMismatch`, you classify it wrong. The comment in the code is explicit about this:
+
+```rust
+// TypeMismatch must be checked BEFORE FunctionNotFound because DataFusion
+// concatenates both messages: "TypeSignatureClass... No function matches..."
+if lower.contains("typesignatureclass") || lower.contains("type mismatch") {
+    SqeErrorCode::TypeMismatch
+} else if lower.contains("invalid function") || lower.contains("no function matches") {
+    SqeErrorCode::FunctionNotFound
+}
+```
+
+Order matters. The classifier is not a lookup table; it's a decision tree where earlier checks shadow later ones.
+
+### Before and After
+
+The difference is concrete. Here are three real failures, before and after the change.
+
+Missing table, before:
+```
+gRPC status: INTERNAL (13)
+Error code:  1
+Message:     Query execution failed
+```
+
+Missing table, after:
+```
+gRPC status: NOT_FOUND (5)
+Error code:  TABLE_NOT_FOUND (11)
+Message:     table 'wh.ns.orders' not found
+```
+
+Type mismatch in a dbt model, before:
+```
+gRPC status: INTERNAL (13)
+Error code:  1
+Message:     Query execution failed
+```
+
+Type mismatch, after:
+```
+gRPC status: INVALID_ARGUMENT (3)
+Error code:  TYPE_MISMATCH (7)
+Message:     No function matches the signature 'concat(Int64)'
+```
+
+S3 storage failure, before:
+```
+gRPC status: INTERNAL (13)
+Error code:  1
+Message:     Storage backend error: s3://my-bucket/ns/orders/data-0001.parquet
+             (credential: ASIA3EXAMPLE..., region: eu-west-1)
+```
+
+S3 storage failure, after:
+```
+gRPC status: INTERNAL (13)
+Error code:  STORAGE_ERROR
+Message:     Storage operation failed
+```
+
+The gRPC code for the storage failure didn't change — it's still `INTERNAL`. But the message no longer leaks the bucket path, the credential prefix, or the region. The internal logs still capture everything, attached to the query ID. The client gets a signal: something in the storage layer failed, and you should talk to your operator.
+
+### Error Handling Is an API
+
+The lesson is uncomfortable: we thought of error handling as an implementation detail. It turned out to be part of the contract with every client.
+
+dbt trusts error codes to decide whether to fail a model or retry it. JDBC clients parse error codes to provide user-facing messages. Monitoring systems count error codes to build dashboards. We were returning `1` for everything, so all of that infrastructure was blind.
+
+In a sovereign data platform, your error messages are part of your API. The moment you expose a query engine to external clients — even internal ones like dbt — you've committed to the semantics of your error responses. `TABLE_NOT_FOUND` is a promise: this query will never succeed until the table exists. `STORAGE_ERROR` is a different promise: the query might succeed if you try again, and it's not your fault.
+
+Getting that classification right — user error versus system error, retryable versus not — is harder than it looks. It took us a load test, a dbt failure, and a taxonomy of 27 codes to get there. We should have built it in phase one.
+
+
 ## The Cost of Not Testing
 
 We could have written the failure taxonomy before the load test. We could have implemented retry logic, credential refresh, and memory limits from the start. We didn't, because those features cost time, and we were building fast.

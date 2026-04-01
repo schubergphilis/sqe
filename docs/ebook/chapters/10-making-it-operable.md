@@ -437,6 +437,152 @@ The full configuration surface as of this writing has 12 sections and roughly 45
 The surface will grow. Each new feature -- pluggable auth backends, OPA integration, Cedar rules, compaction scheduling -- will add config keys. The pattern is established. The pattern scales.
 
 
+## The Enterprise Checklist
+
+We spent months adding the pieces that make an engine observable and configurable. Then we spent more months on the pieces that make it trustworthy in an enterprise context — the ones that matter when the security team asks for a review or when a production incident happens at 2am and you need to answer specific questions fast.
+
+None of these features were in the original design. They arrived one by one, each time someone asked a question we couldn't answer or revealed an assumption we hadn't examined.
+
+
+### Structured Error Codes
+
+The first version of error handling was honest about its limitations: errors came back as strings. A DataFusion parse error looked exactly like a catalog connection failure, which looked exactly like an OPA policy denial. All of them returned HTTP 500 or a generic gRPC INTERNAL status, because that was the path of least resistance.
+
+The problem surfaced during integration testing with the dbt adapter. When a model failed, dbt logged the error string. The string was useful for debugging but useless for automated handling. How do you distinguish "table not found" from "access denied" from "out of memory" if they all say `Internal error`?
+
+We introduced 27 `SqeErrorCode` variants that carry semantics rather than just messages:
+
+| Category | Examples | gRPC Status | Trino Code |
+|---|---|---|---|
+| Auth | `Unauthorized`, `Forbidden`, `SessionExpired` | UNAUTHENTICATED, PERMISSION_DENIED | 65536, 65537 |
+| Catalog | `TableNotFound`, `SchemaNotFound`, `CatalogUnavailable` | NOT_FOUND, UNAVAILABLE | 65540, 65541 |
+| Execution | `InvalidQuery`, `TypeMismatch`, `DivisionByZero` | INVALID_ARGUMENT | 65536+n |
+| Resources | `QueryTimeout`, `MemoryLimitExceeded`, `TooManyRequests` | RESOURCE_EXHAUSTED | 65550+n |
+| System | `InternalError`, `SerializationError`, `ConfigError` | INTERNAL | 65535 |
+
+The classifier that assigns codes is built around a simple principle: user errors get detail, system errors get redaction. If a table isn't found, the error message says which table. If Polaris returns a 503, the message says "catalog unavailable" — not the internal details of which HTTP call failed or what the retry sequence looked like. The user can't fix a Polaris outage. The operator can, and they have the logs.
+
+An auto-classifier parses DataFusion error message strings to assign error codes. DataFusion doesn't yet have a typed error enum stable enough to match on, so we pattern-match on the string representations. It's not elegant, but it's isolated to one module and tested against the actual error strings DataFusion produces. When DataFusion's error types stabilize, swapping the classifier for a type-match is a contained change.
+
+
+### Security Hardening at Startup
+
+We added startup warnings for three conditions: TLS disabled on the Flight SQL port, rate limiting disabled, and SSL certificate verification disabled. Each logs at `WARN` level during initialization, before accepting any connections.
+
+The philosophy is fail-open for development, fail-loud for production. We don't refuse to start without TLS — the quickstart stack runs over plain HTTP and that's intentional. But we print a warning that is hard to miss:
+
+```
+WARN sqe_coordinator: TLS is DISABLED on Flight SQL port 50051 -- do not use in production
+WARN sqe_coordinator: Rate limiting is DISABLED -- concurrent queries are unlimited
+WARN sqe_coordinator: SSL certificate verification is DISABLED -- catalog connections are insecure
+```
+
+These are the settings a developer enables for a local run against a self-signed cert and forgets to turn off before deploying. The warnings are there because that exact scenario happened during our first staging deployment. Everything worked. The security team noticed the unencrypted Flight SQL port during a network scan two weeks later.
+
+What we don't do yet: block startup on these conditions. We discussed it. The argument for blocking is that it prevents the accidental insecure deployment. The argument against is that it breaks legitimate airgapped deployments and internal-only environments. We landed on warning, with a documented `--allow-insecure` flag for environments where the operator has made a deliberate choice. The flag exists in the config schema. We haven't added it to the validation yet.
+
+
+### Client IP Logging
+
+Every request — Flight SQL and Trino HTTP — now logs the client IP address alongside the query audit entry. The implementation has two layers: `x-forwarded-for` header parsing for requests arriving through a reverse proxy or ingress, and TCP peer address fallback for direct connections.
+
+The ordering matters. A request arriving through an nginx ingress carries the real client IP in `x-forwarded-for`; the TCP peer address is the ingress pod. If we logged the TCP address, we'd have a perfect record of which ingress pod received the traffic and nothing about who sent the query.
+
+We take the leftmost address in `x-forwarded-for`, which is the one set by the client, not the one appended by intermediate proxies. This is correct when the ingress is trusted. In a deployment where the network perimeter isn't controlled, a client can spoof the header. The fix is to strip untrusted `x-forwarded-for` headers at the ingress level — not something the query engine can solve. We document this limitation.
+
+
+### Circuit Breaker for Polaris
+
+Catalog availability is not guaranteed. Polaris goes through rolling restarts. Network partitions happen. The default behavior — retry with backoff — has a failure mode that took us a while to fully appreciate: during a Polaris outage, the coordinator accumulates threads blocked waiting for HTTP responses. When Polaris returns, those threads all try to reconnect simultaneously. The thundering herd effect can cause a second outage immediately after recovery.
+
+The circuit breaker solves this by separating "is Polaris healthy?" from "should I try to reach Polaris?"
+
+```
+Closed  ──5 failures──▶  Open  ──30s──▶  Half-Open  ──success──▶  Closed
+                                                       ──failure──▶  Open
+```
+
+In the closed state, requests reach Polaris normally. Five consecutive failures open the circuit. In the open state, requests fail immediately without making a network call — fast failure rather than blocked threads. After 30 seconds, the circuit moves to half-open, allowing a single probe request. If the probe succeeds, the circuit closes. If it fails, the circuit reopens.
+
+The thresholds are configurable, but the defaults reflect what we found worked during outage testing: 5 failures is enough signal, 30 seconds is enough recovery time for a Polaris pod restart, a single probe avoids the thundering herd. The circuit breaker state is local to each coordinator process. In a multi-coordinator deployment, each coordinator makes its own circuit decisions. This is deliberate — a circuit that's shared across coordinators requires distributed state, which is a harder problem than the one the circuit breaker is solving.
+
+
+### PII Redaction in Audit Logs
+
+The audit log captures `query_hash` (SHA-256 of normalized SQL, safe to store) and optionally `query_text` (the raw SQL). The hash supports correlation without reconstruction — you can find all executions of a query pattern without storing the query itself. The text supports debugging.
+
+The problem with `query_text`: SQL WHERE clauses contain user data. `SELECT * FROM orders WHERE customer_email = 'alice@example.com'` is a realistic query. That email address doesn't belong in the audit log.
+
+We added regex-based stripping of four PII categories before writing `query_text` to the audit entry:
+
+| Pattern | What it strips |
+|---|---|
+| Email addresses | `\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z]{2,}\b` |
+| Phone numbers | Common formats: +1-555-0100, (555) 010-0100, etc. |
+| SSNs | `\b\d{3}-\d{2}-\d{4}\b` |
+| Credit card numbers | 13-16 digit sequences with Luhn-plausible formatting |
+
+Each match is replaced with `[REDACTED:<TYPE>]`. The redacted SQL is still readable. The pattern of the query is preserved. The personal data is not.
+
+This is not a complete solution. SQL can encode PII in ways that don't match these patterns — base64-encoded data, numeric IDs that happen to be SSNs without dashes, string constants in languages other than English. The redaction is best-effort defense-in-depth, not a compliance guarantee. The guarantee comes from having `query_text` configurable-off for high-sensitivity deployments. If you can't afford PII in audit logs at all, disable `query_text`. The hash is always safe.
+
+
+### Per-Query Resource Limits
+
+Multi-tenancy requires protecting the engine from individual queries that consume disproportionate resources. Four limits apply to every query:
+
+| Limit | Default | Enforcement |
+|---|---|---|
+| `max_result_rows` | 1,000,000 rows | Post-execution count; query cancelled if exceeded |
+| `max_concurrent_queries` | 100 | Semaphore at `QueryHandler::execute` entry |
+| `max_query_memory` | 256 MB | DataFusion `GreedyMemoryPool` |
+| `slow_query_threshold_secs` | 30 seconds | WARN log after threshold; query continues |
+
+The `max_result_rows` limit is intentionally post-execution because we can't know the result size before executing. The trade-off: a query that generates 2M rows uses the compute budget to produce them, then gets cancelled when we count the output. This wastes work. The alternative — stopping mid-scan — requires streaming result counting during execution, which DataFusion doesn't expose cleanly. We document this as a known limitation and recommend users add LIMIT clauses for exploratory queries.
+
+The concurrency semaphore has one subtle behavior: when the engine is at capacity, new queries wait rather than fail immediately. The wait timeout is 5 seconds. A query that can't acquire the semaphore in 5 seconds gets a `TooManyRequests` error. This gives burst capacity for genuine traffic spikes while protecting against indefinite queue growth.
+
+The `GreedyMemoryPool` in DataFusion allocates memory greedily and cancels the query if allocation would exceed the limit. "Cancel" means the next allocation attempt returns an error, which propagates up through the execution tree. The cancellation is clean — DataFusion unwinds the execution future — but it's abrupt. The user sees `MemoryLimitExceeded`. They don't see a partial result. For analytics workloads this is correct behavior. For streaming results (large Arrow batches delivered incrementally), we return what we have and signal cancellation on the next batch request.
+
+Slow query logging is the most operational of the four. A query that takes 31 seconds doesn't fail — it completes and produces results. But the coordinator logs a structured warning with the query ID, username, duration, and a truncated query text. This gives operators a passive alert that something is running long, without interrupting it. The alerts we removed from Prometheus included individual query duration; this replaced them. Prometheus tracks the distribution. The slow query log identifies the specific offenders.
+
+
+### Session Persistence
+
+Session state — authenticated users, open Flight SQL sessions, per-session settings — lives in memory on the coordinator. A coordinator restart means every active session is lost. Users see authentication failures and reconnection prompts. For a dbt job mid-run, this means the job fails and must restart.
+
+The initial implementation had a file-based snapshot: every 5 minutes (configurable), the coordinator serializes all sessions to a JSONL file at a configured path. On startup, if the file exists, sessions are restored. The user reconnection window is the restart duration, not the full re-authentication cycle.
+
+What we have is not HA. It's warm restart. The distinction matters: a crash still causes disruption; the persistence only helps with planned restarts (upgrades, config reloads). True HA requires session state in an external store — Redis being the obvious choice — and a leader election mechanism so multiple coordinators share state without conflicts. The `SessionStore` trait is defined and the file-based implementation is the first backend. A Redis implementation would follow the same trait. We're not there yet. We know what "there" looks like.
+
+
+### The `/readyz` Evolution
+
+The readiness probe started as a boolean: is initialization complete? That answered one question but not the one operators actually need: "Is this coordinator capable of serving queries right now?"
+
+A coordinator that has initialized but can't reach Polaris is not ready. It will accept connections and then fail every query with `CatalogUnavailable`. Kubernetes won't remove it from load balancer rotation because `/readyz` still returns 200.
+
+The evolved `/readyz` makes a lightweight Polaris reachability check — an HTTP HEAD to the catalog base URL — before returning success. If Polaris is unreachable, `/readyz` returns 503 with a JSON body describing which dependency failed:
+
+```json
+{
+  "status": "not_ready",
+  "checks": {
+    "initialized": true,
+    "polaris_reachable": false,
+    "workers_registered": true
+  },
+  "failed": ["polaris_reachable"]
+}
+```
+
+Kubernetes removes the pod from rotation on 503. Traffic stops flowing to a coordinator that can't serve it. When Polaris recovers, the check passes, the pod re-enters rotation.
+
+The cost: every readiness check makes a network call. With Kubernetes polling every 5 seconds, that's 12 catalog pings per minute per coordinator pod. We added a 10-second cache on the Polaris reachability result to reduce this to at most 6 pings per minute during normal operation, with a fresh check guaranteed when the cached result is "not reachable."
+
+What we don't have yet: leader election, so that only one coordinator is "primary" for write operations. For read-only query traffic this doesn't matter — all coordinators are equivalent. For session state and write coordination, it matters significantly. The HA story is the next chapter we haven't written yet.
+
+
 ## The Lesson
 
 We started with no observability and hardcoded constants. We added counters. Then histograms. Then traces. Then audit logs. Then trace propagation. Then health probes. Then a config file. Then environment overlays. Then validation. Each addition was prompted by a specific question we couldn't answer or a specific deployment we couldn't support.
