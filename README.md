@@ -159,10 +159,10 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 - [x] Complete data type formatting (all Arrow types → Trino, benchmark comparator, value serialization)
 - [x] system.runtime.* virtual tables (queries, nodes, tasks — query history and cluster topology)
 - [x] Distributed query execution wiring (coordinator→worker scan dispatch, fragment tracking, fallback)
-- [ ] MERGE INTO, DELETE (blocked on iceberg-rust Merge-on-Read, ETA Q3 2026)
+- [x] DELETE, UPDATE, MERGE INTO via Copy-on-Write (RisingWave iceberg-rust fork rewrite_files)
 - [ ] OPA/Cedar policy engine (row filters, column masks, GRANT/REVOKE SQL)
 - [x] OSS security hardening (TLS, rate limiting, query timeouts, session lifecycle, error sanitisation, vendor-neutral naming)
-- [ ] Pluggable auth providers (bearer token, API key, mTLS, anonymous)
+- [ ] Pluggable auth providers (bearer token ✅, API key, mTLS, anonymous)
 - [ ] Pluggable catalog backends (AWS Glue, Nessie, Hive Metastore, storage-only)
 - [ ] Semantic AI layer (RDF/SPARQL, property graph/GQL, vector search, agent interfaces)
 - [ ] dbt adapter (dbt-sqe via ADBC Flight SQL)
@@ -179,8 +179,8 @@ SQE ships with `sqe-bench`, a CLI tool for generating benchmark data, loading it
 | TPC-H | 22 | 8 tables | Star/snowflake, analytical reads |
 | TPC-DS | 99 | 24 tables | Complex SQL, advanced analytics |
 | SSB | 13 | 5 tables | Denormalized star, smoke testing |
-| TPC-C | 8 | 9 tables | OLTP mix (read queries; write queries require DELETE/MERGE) |
-| TPC-E | 11 | 33 tables | Brokerage OLTP (read queries) |
+| TPC-C | 17 | 9 tables | OLTP mix (read + write: DELETE, UPDATE via CoW) |
+| TPC-E | 18 | 33 tables | Brokerage OLTP (read + write: UPDATE, DELETE via CoW) |
 | TPC-BB | 10 | ~25 tables | SQL-only subset over TPC-DS data + web logs |
 
 ### Quick start
