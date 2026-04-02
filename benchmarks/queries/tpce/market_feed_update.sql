@@ -1,5 +1,5 @@
 -- name: Market Feed — Update last trade prices
--- requires: full_schema
+-- requires: write_via_benchmark
 -- description: Write portion of Market Feed: update last_trade with new prices from trade requests
 -- timeout: 30s
 

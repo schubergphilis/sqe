@@ -1,5 +1,5 @@
 -- name: Payment — Update warehouse year-to-date
--- requires: full_schema
+-- requires: write_via_benchmark
 -- description: Step 1 of Payment transaction: increment warehouse w_ytd by payment amount
 -- type: write
 -- timeout: 30s

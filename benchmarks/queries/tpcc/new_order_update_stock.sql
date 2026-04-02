@@ -1,5 +1,5 @@
 -- name: New Order — Decrement stock quantity
--- requires: full_schema
+-- requires: write_via_benchmark
 -- description: Step 2 of New Order transaction: decrement stock for ordered items
 -- type: write
 -- timeout: 30s

@@ -1,5 +1,5 @@
 -- name: Delivery — Delete fulfilled new_order rows
--- requires: full_schema
+-- requires: write_via_benchmark
 -- description: Step 1 of Delivery transaction: remove the oldest pending new_order per district
 -- type: write
 -- timeout: 30s
