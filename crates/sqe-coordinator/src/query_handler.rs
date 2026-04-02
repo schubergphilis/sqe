@@ -288,14 +288,16 @@ impl QueryHandler {
                     self.explain_handler.full(session, inner, &ctx).await
                 }
 
-                StatementKind::Delete(_) => Err(SqeError::NotImplemented(
-                    "DELETE FROM requires Iceberg overwrite transaction support (planned for Chunk 3)".to_string(),
-                )),
-                StatementKind::Update(_) => Err(SqeError::NotImplemented(
-                    "UPDATE requires Iceberg overwrite transaction support (planned for Chunk 3)".to_string(),
-                )),
+                StatementKind::Delete(stmt) => {
+                    self.write_handler.handle_delete(session, stmt).await
+                }
+
+                StatementKind::Update(stmt) => {
+                    self.write_handler.handle_update(session, stmt).await
+                }
+
                 StatementKind::Merge(_) => Err(SqeError::NotImplemented(
-                    "MERGE INTO requires Iceberg overwrite transaction support (planned for Chunk 3)".to_string(),
+                    "MERGE INTO is not yet supported".to_string(),
                 )),
             }
         };
