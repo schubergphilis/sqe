@@ -296,9 +296,34 @@ impl QueryHandler {
                     self.write_handler.handle_update(session, stmt).await
                 }
 
-                StatementKind::Merge(_) => Err(SqeError::NotImplemented(
-                    "MERGE INTO is not yet supported".to_string(),
-                )),
+                StatementKind::Merge(stmt) => {
+                    // Extract source SQL from the MERGE statement and execute it
+                    // to get the source batches, then pass them to the write handler.
+                    let source_sql = if let Statement::Merge { source, .. } = stmt.as_ref() {
+                        match source {
+                            sqlparser::ast::TableFactor::Table { name, .. } => {
+                                format!("SELECT * FROM {name}")
+                            }
+                            sqlparser::ast::TableFactor::Derived { subquery, .. } => {
+                                format!("{subquery}")
+                            }
+                            other => {
+                                return Err(SqeError::Execution(format!(
+                                    "Unsupported MERGE source: {other}"
+                                )));
+                            }
+                        }
+                    } else {
+                        return Err(SqeError::Execution(
+                            "Expected MERGE statement".into(),
+                        ));
+                    };
+                    let source_batches =
+                        self.execute_query(session, &source_sql, &query_id).await?;
+                    self.write_handler
+                        .handle_merge(session, stmt, source_batches)
+                        .await
+                }
             }
         };
 
