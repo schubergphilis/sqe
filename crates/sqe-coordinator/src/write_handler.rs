@@ -1,13 +1,18 @@
 use std::sync::Arc;
 
+use arrow::compute::filter_record_batch;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
+use datafusion::prelude::SessionContext as DFSessionContext;
 use iceberg::arrow::arrow_type_to_type;
-use iceberg::spec::{FormatVersion, NestedField, Schema as IcebergSchema};
+use iceberg::spec::{
+    DataContentType, DataFile, FormatVersion, ManifestStatus, NestedField, Schema as IcebergSchema,
+};
+use iceberg::table::Table as IcebergTable;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, TableCreation, TableIdent};
 use sqlparser::ast::Statement;
-use tracing::info;
+use tracing::{info, warn};
 
 use sqe_catalog::SessionCatalog;
 use sqe_core::{Session, SqeConfig, SqeError};
@@ -357,6 +362,522 @@ impl WriteHandler {
         }
 
         Ok(total_rows)
+    }
+
+    /// Handle DELETE FROM ns.table [WHERE ...]
+    ///
+    /// Uses Copy-on-Write: reads all data files, filters out rows matching
+    /// the WHERE predicate, writes new files with surviving rows, and
+    /// atomically swaps via rewrite_files().
+    ///
+    /// Without a WHERE clause, this is a truncate: commits a rewrite that
+    /// removes all data files.
+    #[instrument(skip(self, session, stmt), fields(username = %session.user.username))]
+    pub async fn handle_delete(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let delete = match stmt {
+            Statement::Delete(d) => d,
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected DELETE statement, got: {other}"
+                )));
+            }
+        };
+
+        let table_ref = &delete.from.relations[0];
+        let table_name = match table_ref {
+            sqlparser::ast::FromTable::WithFromKeyword(tables) => &tables[0].relation,
+            sqlparser::ast::FromTable::WithoutKeyword(tables) => &tables[0].relation,
+        };
+        let table_factor_name = match table_name {
+            sqlparser::ast::TableFactor::Table { name, .. } => name,
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected table name in DELETE, got: {other}"
+                )));
+            }
+        };
+
+        let (namespace, name) = parse_table_ref(table_factor_name)?;
+        let table_ident = TableIdent::new(namespace, name);
+
+        let catalog = self.create_catalog_bridge(session).await?;
+        let table = catalog
+            .load_table(&table_ident)
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
+
+        // Get all data files from current snapshot via manifest entries
+        let old_data_files = self.collect_data_files(&table).await?;
+
+        if old_data_files.is_empty() {
+            info!(table = %table_ident, "DELETE: table has no data files, nothing to delete");
+            return Ok(vec![]);
+        }
+
+        let where_clause = &delete.selection;
+
+        // No WHERE = truncate: remove all files, add none
+        if where_clause.is_none() {
+            info!(table = %table_ident, file_count = old_data_files.len(), "DELETE: truncating table (no WHERE clause)");
+            let tx = Transaction::new(&table);
+            let action = tx.rewrite_files().delete_files(old_data_files);
+            let tx = action.apply(tx).map_err(|e| {
+                SqeError::Execution(format!("Failed to apply truncate transaction: {e}"))
+            })?;
+            tx.commit(catalog.as_ref()).await.map_err(|e| {
+                SqeError::Execution(format!("Failed to commit truncate: {e}"))
+            })?;
+            info!(table = %table_ident, "DELETE: table truncated successfully");
+            return Ok(vec![]);
+        }
+
+        // WHERE clause present: CoW rewrite
+        let where_sql = format!("{}", where_clause.as_ref().unwrap());
+        info!(
+            table = %table_ident,
+            file_count = old_data_files.len(),
+            where_clause = %where_sql,
+            "DELETE: CoW rewrite"
+        );
+
+        let df_ctx = DFSessionContext::new();
+        let mut new_data_files = Vec::new();
+        let mut total_deleted = 0usize;
+
+        for data_file in &old_data_files {
+            let file_path = data_file.file_path();
+            let batches = self.read_parquet_via_table(&table, file_path).await?;
+
+            if batches.is_empty() {
+                continue;
+            }
+
+            // Evaluate WHERE predicate against each batch, keep rows that do NOT match
+            let mut surviving_batches = Vec::new();
+            for batch in &batches {
+                let filtered =
+                    self.filter_batch_negate(&df_ctx, batch, &where_sql, &table_ident)
+                        .await?;
+                total_deleted += batch.num_rows() - filtered.num_rows();
+                if filtered.num_rows() > 0 {
+                    surviving_batches.push(filtered);
+                }
+            }
+
+            // Write surviving rows as new data files (skip if all rows deleted)
+            if !surviving_batches.is_empty() {
+                let new_files = write_data_files(&table, surviving_batches, "delete").await?;
+                new_data_files.extend(new_files);
+            }
+        }
+
+        info!(
+            table = %table_ident,
+            deleted_rows = total_deleted,
+            old_files = old_data_files.len(),
+            new_files = new_data_files.len(),
+            "DELETE: committing CoW rewrite"
+        );
+
+        // Atomic commit: remove old files, add new files
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .add_data_files(new_data_files)
+            .delete_files(old_data_files);
+        let tx = action.apply(tx).map_err(|e| {
+            SqeError::Execution(format!("Failed to apply DELETE rewrite: {e}"))
+        })?;
+        tx.commit(catalog.as_ref()).await.map_err(|e| {
+            SqeError::Execution(format!("Failed to commit DELETE: {e}"))
+        })?;
+
+        info!(table = %table_ident, deleted_rows = total_deleted, "DELETE committed successfully");
+        Ok(vec![])
+    }
+
+    /// Handle UPDATE ns.table SET col = expr [WHERE ...]
+    ///
+    /// Uses Copy-on-Write: reads all data files, applies SET assignments to
+    /// rows matching WHERE, writes new files, atomically swaps.
+    #[instrument(skip(self, session, stmt), fields(username = %session.user.username))]
+    pub async fn handle_update(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let (table_factor, assignments, selection) = match stmt {
+            Statement::Update {
+                table,
+                assignments,
+                selection,
+                ..
+            } => (table, assignments, selection),
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected UPDATE statement, got: {other}"
+                )));
+            }
+        };
+
+        let table_name = match &table_factor.relation {
+            sqlparser::ast::TableFactor::Table { name, .. } => name,
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected table name in UPDATE, got: {other}"
+                )));
+            }
+        };
+
+        let (namespace, name) = parse_table_ref(table_name)?;
+        let table_ident = TableIdent::new(namespace, name);
+
+        let catalog = self.create_catalog_bridge(session).await?;
+        let table = catalog
+            .load_table(&table_ident)
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
+
+        // Get all data files
+        let old_data_files = self.collect_data_files(&table).await?;
+
+        if old_data_files.is_empty() {
+            info!(table = %table_ident, "UPDATE: table has no data files");
+            return Ok(vec![]);
+        }
+
+        // Build the SET clause as SQL CASE expressions for a SELECT rewrite
+        // UPDATE t SET col1 = expr1, col2 = expr2 WHERE cond
+        // becomes:
+        // SELECT CASE WHEN cond THEN expr1 ELSE col1 END AS col1,
+        //        CASE WHEN cond THEN expr2 ELSE col2 END AS col2,
+        //        col3, col4, ...  (unchanged columns)
+        // FROM t
+        let where_sql = selection
+            .as_ref()
+            .map(|w| format!("{w}"))
+            .unwrap_or_else(|| "TRUE".to_string());
+
+        info!(
+            table = %table_ident,
+            file_count = old_data_files.len(),
+            assignments = assignments.len(),
+            where_clause = %where_sql,
+            "UPDATE: CoW rewrite"
+        );
+
+        let df_ctx = DFSessionContext::new();
+        let mut new_data_files = Vec::new();
+        let mut total_updated = 0usize;
+
+        for data_file in &old_data_files {
+            let file_path = data_file.file_path();
+            let batches = self.read_parquet_via_table(&table, file_path).await?;
+
+            if batches.is_empty() {
+                continue;
+            }
+
+            let mut rewritten_batches = Vec::new();
+
+            for batch in &batches {
+                let rewritten = self
+                    .apply_update(&df_ctx, batch, assignments, &where_sql, &table_ident)
+                    .await?;
+                rewritten_batches.push(rewritten);
+            }
+
+            // Count updated rows by comparing before/after
+            for batch in &batches {
+                let count = self
+                    .count_matching_rows(&df_ctx, batch, &where_sql, &table_ident)
+                    .await?;
+                total_updated += count;
+            }
+
+            let new_files = write_data_files(&table, rewritten_batches, "update").await?;
+            new_data_files.extend(new_files);
+        }
+
+        info!(
+            table = %table_ident,
+            updated_rows = total_updated,
+            old_files = old_data_files.len(),
+            new_files = new_data_files.len(),
+            "UPDATE: committing CoW rewrite"
+        );
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .add_data_files(new_data_files)
+            .delete_files(old_data_files);
+        let tx = action.apply(tx).map_err(|e| {
+            SqeError::Execution(format!("Failed to apply UPDATE rewrite: {e}"))
+        })?;
+        tx.commit(catalog.as_ref()).await.map_err(|e| {
+            SqeError::Execution(format!("Failed to commit UPDATE: {e}"))
+        })?;
+
+        info!(table = %table_ident, updated_rows = total_updated, "UPDATE committed successfully");
+        Ok(vec![])
+    }
+
+    // -------------------------------------------------------------------------
+    // CoW helper methods
+    // -------------------------------------------------------------------------
+
+    /// Collect all current DataFile objects from the table's manifest entries.
+    ///
+    /// Reads the current snapshot's manifest list, loads each manifest, and
+    /// collects all data file entries that are Added or Existing (not Deleted).
+    async fn collect_data_files(
+        &self,
+        table: &IcebergTable,
+    ) -> sqe_core::Result<Vec<DataFile>> {
+        let metadata = table.metadata();
+        let snapshot = match metadata.current_snapshot() {
+            Some(s) => s,
+            None => return Ok(vec![]), // no snapshot = empty table
+        };
+
+        let manifest_list = snapshot
+            .load_manifest_list(table.file_io(), metadata)
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to load manifest list: {e}")))?;
+
+        let mut data_files = Vec::new();
+        for manifest_file in manifest_list.entries() {
+            let manifest = manifest_file
+                .load_manifest(table.file_io())
+                .await
+                .map_err(|e| {
+                    SqeError::Execution(format!("Failed to load manifest: {e}"))
+                })?;
+
+            for entry in manifest.entries() {
+                // Only include live data files (Added or Existing), skip Deleted
+                if entry.status() != ManifestStatus::Deleted
+                    && entry.data_file().content_type() == DataContentType::Data
+                {
+                    data_files.push(entry.data_file().clone());
+                }
+            }
+        }
+
+        Ok(data_files)
+    }
+
+    /// Read all RecordBatches from a Parquet data file using the table's FileIO.
+    ///
+    /// Uses iceberg-rust's scan infrastructure to read a single file via the
+    /// table's already-configured FileIO (which handles S3 credentials, region, etc.).
+    async fn read_parquet_via_table(
+        &self,
+        table: &IcebergTable,
+        file_path: &str,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        use futures::TryStreamExt;
+        use parquet::arrow::async_reader::ParquetObjectReader;
+        use parquet::arrow::ParquetRecordBatchStreamBuilder;
+
+        let file_io = table.file_io();
+        let input = file_io
+            .new_input(file_path)
+            .map_err(|e| SqeError::Execution(format!("Failed to open file '{file_path}': {e}")))?;
+
+        let input_file = input
+            .read()
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to read file '{file_path}': {e}")))?;
+
+        let reader = parquet::arrow::arrow_reader::ArrowReaderBuilder::try_new(input_file)
+            .map_err(|e| {
+                SqeError::Execution(format!(
+                    "Failed to create Parquet reader for '{file_path}': {e}"
+                ))
+            })?;
+
+        let reader = reader.build().map_err(|e| {
+            SqeError::Execution(format!(
+                "Failed to build Parquet reader for '{file_path}': {e}"
+            ))
+        })?;
+
+        let batches: Vec<RecordBatch> = reader
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                SqeError::Execution(format!("Failed to read Parquet file '{file_path}': {e}"))
+            })?;
+
+        Ok(batches)
+    }
+
+    /// Evaluate a WHERE clause against a RecordBatch and return rows that do NOT match.
+    /// Used for DELETE: we keep the rows that don't match the WHERE predicate.
+    async fn filter_batch_negate(
+        &self,
+        ctx: &DFSessionContext,
+        batch: &RecordBatch,
+        where_sql: &str,
+        table_ident: &TableIdent,
+    ) -> sqe_core::Result<RecordBatch> {
+        use arrow::compute::not;
+        use datafusion::arrow::array::BooleanArray;
+
+        // Register the batch as a temporary table so DataFusion can evaluate the predicate
+        let table_name = format!("__delete_{}", table_ident.name());
+        let mem_table = datafusion::datasource::MemTable::try_new(
+            batch.schema(),
+            vec![vec![batch.clone()]],
+        )
+        .map_err(|e| SqeError::Execution(format!("Failed to create MemTable: {e}")))?;
+        ctx.register_table(&table_name, Arc::new(mem_table))
+            .map_err(|e| SqeError::Execution(format!("Failed to register temp table: {e}")))?;
+
+        // Execute: SELECT <where_clause> AS __match FROM __delete_<table>
+        let eval_sql =
+            format!("SELECT CAST(({where_sql}) AS BOOLEAN) AS __match FROM {table_name}");
+        let df = ctx.sql(&eval_sql).await.map_err(|e| {
+            SqeError::Execution(format!("Failed to evaluate WHERE clause: {e}"))
+        })?;
+        let result_batches: Vec<RecordBatch> = df.collect().await.map_err(|e| {
+            SqeError::Execution(format!("Failed to collect WHERE evaluation: {e}"))
+        })?;
+
+        // Deregister temp table
+        let _ = ctx.deregister_table(&table_name);
+
+        if result_batches.is_empty() || result_batches[0].num_rows() == 0 {
+            return Ok(batch.clone());
+        }
+
+        // Build a boolean mask: NOT <predicate> (rows to keep)
+        let mask_batch = &result_batches[0];
+        let match_col = mask_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                SqeError::Execution("WHERE evaluation did not produce a boolean column".into())
+            })?;
+        let negated = not(match_col)
+            .map_err(|e| SqeError::Execution(format!("Failed to negate WHERE mask: {e}")))?;
+
+        // Apply the mask to the original batch
+        filter_record_batch(batch, &negated)
+            .map_err(|e| SqeError::Execution(format!("Failed to filter batch: {e}")))
+    }
+
+    /// Apply UPDATE SET assignments to a RecordBatch using DataFusion SQL evaluation.
+    ///
+    /// For each column, generates CASE WHEN <where> THEN <new_value> ELSE <old_value> END.
+    /// Unchanged columns pass through directly.
+    async fn apply_update(
+        &self,
+        ctx: &DFSessionContext,
+        batch: &RecordBatch,
+        assignments: &[sqlparser::ast::Assignment],
+        where_sql: &str,
+        table_ident: &TableIdent,
+    ) -> sqe_core::Result<RecordBatch> {
+        let table_name = format!("__update_{}", table_ident.name());
+        let mem_table = datafusion::datasource::MemTable::try_new(
+            batch.schema(),
+            vec![vec![batch.clone()]],
+        )
+        .map_err(|e| SqeError::Execution(format!("Failed to create MemTable: {e}")))?;
+        ctx.register_table(&table_name, Arc::new(mem_table))
+            .map_err(|e| SqeError::Execution(format!("Failed to register temp table: {e}")))?;
+
+        // Build assignment map: column_name -> expression_sql
+        let mut assignment_map = std::collections::HashMap::new();
+        for a in assignments {
+            let col_name = a
+                .target
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(".");
+            let expr_sql = format!("{}", a.value);
+            assignment_map.insert(col_name, expr_sql);
+        }
+
+        // Build SELECT with CASE expressions for assigned columns
+        let columns: Vec<String> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| {
+                let col = f.name().clone();
+                if let Some(expr) = assignment_map.get(&col) {
+                    format!(
+                        "CASE WHEN ({where_sql}) THEN ({expr}) ELSE \"{col}\" END AS \"{col}\""
+                    )
+                } else {
+                    format!("\"{col}\"")
+                }
+            })
+            .collect();
+
+        let select_sql = format!("SELECT {} FROM {table_name}", columns.join(", "));
+        let df = ctx.sql(&select_sql).await.map_err(|e| {
+            SqeError::Execution(format!("Failed to evaluate UPDATE: {e}"))
+        })?;
+        let result_batches: Vec<RecordBatch> = df.collect().await.map_err(|e| {
+            SqeError::Execution(format!("Failed to collect UPDATE results: {e}"))
+        })?;
+
+        let _ = ctx.deregister_table(&table_name);
+
+        // Return the first (and only) result batch
+        result_batches.into_iter().next().ok_or_else(|| {
+            SqeError::Execution("UPDATE produced no output batches".to_string())
+        })
+    }
+
+    /// Count rows matching a WHERE clause in a batch.
+    async fn count_matching_rows(
+        &self,
+        ctx: &DFSessionContext,
+        batch: &RecordBatch,
+        where_sql: &str,
+        table_ident: &TableIdent,
+    ) -> sqe_core::Result<usize> {
+        let table_name = format!("__count_{}", table_ident.name());
+        let mem_table = datafusion::datasource::MemTable::try_new(
+            batch.schema(),
+            vec![vec![batch.clone()]],
+        )
+        .map_err(|e| SqeError::Execution(format!("MemTable error: {e}")))?;
+        ctx.register_table(&table_name, Arc::new(mem_table))
+            .map_err(|e| SqeError::Execution(format!("Register error: {e}")))?;
+
+        let sql = format!("SELECT COUNT(*) AS cnt FROM {table_name} WHERE {where_sql}");
+        let df = ctx.sql(&sql).await.map_err(|e| {
+            SqeError::Execution(format!("Count query failed: {e}"))
+        })?;
+        let batches: Vec<RecordBatch> = df.collect().await.map_err(|e| {
+            SqeError::Execution(format!("Count collect failed: {e}"))
+        })?;
+
+        let _ = ctx.deregister_table(&table_name);
+
+        let count = batches
+            .first()
+            .and_then(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+            })
+            .map(|a| a.value(0) as usize)
+            .unwrap_or(0);
+        Ok(count)
     }
 
     fn format_version(&self) -> FormatVersion {
