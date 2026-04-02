@@ -1,5 +1,4 @@
 -- name: Web sales gross margin by item class with rollup rank
--- requires: rollup
 -- timeout: 60s
 SELECT SUM(ws_net_paid) AS total_sum,
        i_category,
