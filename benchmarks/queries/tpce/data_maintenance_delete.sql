@@ -1,4 +1,5 @@
 -- name: Data Maintenance — Delete stale news items
+-- requires: full_schema
 -- description: Write portion of Data Maintenance: purge old news items
 -- timeout: 30s
 

@@ -1,4 +1,5 @@
 -- name: Data Maintenance — Update zero-volume daily market rows
+-- requires: full_schema
 -- description: Write portion of Data Maintenance: set default volume on zero-volume market data
 -- timeout: 30s
 

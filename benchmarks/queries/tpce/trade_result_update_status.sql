@@ -1,4 +1,5 @@
 -- name: Trade Result — Mark trades as completed
+-- requires: full_schema
 -- description: Write portion of Trade Result: transition pending trades to completed status
 -- timeout: 30s
 

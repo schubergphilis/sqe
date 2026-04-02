@@ -1,4 +1,5 @@
 -- name: Delivery — Update carrier on orders
+-- requires: full_schema
 -- description: Step 2 of Delivery transaction: set carrier_id on delivered orders
 -- type: write
 -- timeout: 30s
