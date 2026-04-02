@@ -1,5 +1,4 @@
 -- name: Data Maintenance
--- requires: update, delete
 -- Read portion of the Data Maintenance transaction: identify stale or
 -- candidate rows across reference and transactional tables for maintenance.
 -- Note: the full TPC-E Data Maintenance transaction updates and deletes rows.

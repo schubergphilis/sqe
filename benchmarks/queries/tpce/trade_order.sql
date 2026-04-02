@@ -1,5 +1,4 @@
 -- name: Trade Order
--- requires: insert
 -- Read portion of the Trade Order transaction: validate account, security,
 -- and compute estimated charges before order submission.
 -- Note: the full TPC-E Trade Order transaction inserts into trade and trade_request.
@@ -20,8 +19,8 @@ SELECT
 FROM
     customer_account ca
     JOIN customer        c   ON c.c_id      = ca.ca_c_id
+    JOIN last_trade      lt  ON lt.lt_s_symb IS NOT NULL
     JOIN security        s   ON s.s_symb    = lt.lt_s_symb
-    JOIN last_trade      lt  ON lt.lt_s_symb = s.s_symb
     JOIN commission_rate cr  ON cr.cr_c_tier = c.c_tier
                              AND cr.cr_tt_id  = 'TMS'
                              AND cr.cr_ex_id  = s.s_ex_id
