@@ -137,6 +137,7 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                         audience: audience.clone(),
                         user_claim: user_claim.clone(),
                         roles_claim: roles_claim.clone(),
+                        accept_invalid_certs: !config.ssl_verification,
                     };
                     let provider = BearerTokenProvider::new(bt_config).map_err(|e| {
                         sqe_core::SqeError::Config(format!(

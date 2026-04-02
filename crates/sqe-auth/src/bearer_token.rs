@@ -41,6 +41,9 @@ pub struct BearerTokenProviderConfig {
     /// Dot-separated JSON path to the roles array in the JWT payload.
     /// Default: `"realm_access.roles"`.
     pub roles_claim: String,
+    /// Accept invalid TLS certificates (self-signed, expired, wrong hostname).
+    /// Set `true` for development/Docker environments with self-signed certs.
+    pub accept_invalid_certs: bool,
 }
 
 impl Default for BearerTokenProviderConfig {
@@ -51,6 +54,7 @@ impl Default for BearerTokenProviderConfig {
             audience: None,
             user_claim: "sub".to_string(),
             roles_claim: "realm_access.roles".to_string(),
+            accept_invalid_certs: false,
         }
     }
 }
@@ -99,6 +103,7 @@ impl BearerTokenProvider {
     pub fn new(config: BearerTokenProviderConfig) -> Result<Self, AuthError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
+            .danger_accept_invalid_certs(config.accept_invalid_certs)
             .build()
             .map_err(|e| {
                 AuthError::Internal(anyhow::anyhow!("Failed to build HTTP client: {e}"))
@@ -489,6 +494,7 @@ mod tests {
             audience: None,
             user_claim: "sub".to_string(),
             roles_claim: "realm_access.roles".to_string(),
+            accept_invalid_certs: false,
         }
     }
 
@@ -1200,6 +1206,7 @@ mod tests {
             audience: Some("sqe".to_string()),
             user_claim: "sub".to_string(),
             roles_claim: "realm_access.roles".to_string(),
+            accept_invalid_certs: false,
         };
         assert!(BearerTokenProvider::new(config).is_ok());
     }
