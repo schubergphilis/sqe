@@ -1,5 +1,4 @@
 -- name: Store sales gross margin ratio by item class and state with rollup
--- requires: rollup
 -- timeout: 60s
 SELECT SUM(ss_net_profit) / SUM(ss_ext_sales_price) AS gross_margin,
        i_category,

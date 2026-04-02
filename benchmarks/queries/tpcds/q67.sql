@@ -1,5 +1,4 @@
 -- name: Top selling items by store, category, and class with rollup rank
--- requires: rollup
 -- timeout: 60s
 SELECT *
 FROM (

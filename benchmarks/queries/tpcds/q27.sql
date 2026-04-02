@@ -1,5 +1,4 @@
 -- name: Store sales by item, store, and demographic with rollup
--- requires: rollup
 -- timeout: 60s
 SELECT i_item_id,
        s_state,
