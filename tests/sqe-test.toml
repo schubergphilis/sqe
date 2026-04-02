@@ -22,6 +22,10 @@ timeout_secs = 600
 polaris_url = "http://localhost:18181/api/catalog"
 warehouse = "test_warehouse"
 
+[query]
+# Benchmarks load large dimension tables (e.g. customer_demographics: 1.9M rows)
+max_result_rows = 0
+
 [storage]
 s3_endpoint = "http://localhost:19000"
 s3_access_key = "s3admin"
