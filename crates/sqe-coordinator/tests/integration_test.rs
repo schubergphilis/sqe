@@ -2600,3 +2600,630 @@ async fn test_update_all_rows() {
         .await
         .expect("DROP TABLE cleanup should succeed");
 }
+
+// ---------------------------------------------------------------------------
+// MERGE INTO integration tests
+// ---------------------------------------------------------------------------
+
+// Test: MERGE INTO with UPDATE on matched rows and INSERT on unmatched rows
+#[tokio::test(flavor = "multi_thread")]
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn test_merge_insert_and_update() {
+    let (session, handler) = common::setup_handler().await;
+
+    // Cleanup leftover
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.merge_target")
+        .await;
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.merge_source")
+        .await;
+
+    // Create target table with (1,'a'), (2,'b')
+    handler
+        .execute(
+            &session,
+            "CREATE TABLE test_ns.merge_target AS \
+             SELECT 1 as id, 'a' as val UNION ALL \
+             SELECT 2, 'b'",
+        )
+        .await
+        .expect("CTAS for merge_target should succeed");
+
+    // Create source table with (2,'B'), (3,'c')
+    handler
+        .execute(
+            &session,
+            "CREATE TABLE test_ns.merge_source AS \
+             SELECT 2 as id, 'B' as val UNION ALL \
+             SELECT 3, 'c'",
+        )
+        .await
+        .expect("CTAS for merge_source should succeed");
+
+    // MERGE: update matched, insert unmatched
+    handler
+        .execute(
+            &session,
+            "MERGE INTO test_ns.merge_target t \
+             USING test_ns.merge_source s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET val = s.val \
+             WHEN NOT MATCHED THEN INSERT (id, val) VALUES (s.id, s.val)",
+        )
+        .await
+        .expect("MERGE should succeed");
+
+    // Verify results: should have (1,'a'), (2,'B'), (3,'c')
+    let batches = handler
+        .execute(
+            &session,
+            "SELECT id, val FROM test_ns.merge_target ORDER BY id",
+        )
+        .await
+        .expect("SELECT after MERGE should succeed");
+
+    common::print_results(
+        "MERGE INSERT + UPDATE",
+        "SELECT id, val FROM test_ns.merge_target ORDER BY id",
+        &batches,
+    );
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3, "Table should have 3 rows after MERGE");
+
+    let mut rows: Vec<(i64, String)> = Vec::new();
+    for batch in &batches {
+        let id_col = batch
+            .column_by_name("id")
+            .expect("should have 'id' column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id should be Int64");
+        let val_col = batch
+            .column_by_name("val")
+            .expect("should have 'val' column")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("val should be Utf8");
+        for row in 0..batch.num_rows() {
+            rows.push((id_col.value(row), val_col.value(row).to_string()));
+        }
+    }
+    assert_eq!(
+        rows,
+        vec![(1, "a".to_string()), (2, "B".to_string()), (3, "c".to_string())],
+        "Row (2,'b') should be updated to (2,'B'), (3,'c') inserted, (1,'a') unchanged"
+    );
+
+    // Cleanup
+    handler
+        .execute(&session, "DROP TABLE test_ns.merge_target")
+        .await
+        .expect("DROP merge_target should succeed");
+    handler
+        .execute(&session, "DROP TABLE test_ns.merge_source")
+        .await
+        .expect("DROP merge_source should succeed");
+}
+
+// Test: MERGE INTO with WHEN MATCHED THEN DELETE
+#[tokio::test(flavor = "multi_thread")]
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn test_merge_delete_matched() {
+    let (session, handler) = common::setup_handler().await;
+
+    // Cleanup leftover
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.merge_del_target")
+        .await;
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.merge_del_source")
+        .await;
+
+    // Create target table with (1,'a'), (2,'b'), (3,'c')
+    handler
+        .execute(
+            &session,
+            "CREATE TABLE test_ns.merge_del_target AS \
+             SELECT 1 as id, 'a' as val UNION ALL \
+             SELECT 2, 'b' UNION ALL \
+             SELECT 3, 'c'",
+        )
+        .await
+        .expect("CTAS for merge_del_target should succeed");
+
+    // Create source table with (2,'x')
+    handler
+        .execute(
+            &session,
+            "CREATE TABLE test_ns.merge_del_source AS \
+             SELECT 2 as id, 'x' as val",
+        )
+        .await
+        .expect("CTAS for merge_del_source should succeed");
+
+    // MERGE: delete matched rows
+    handler
+        .execute(
+            &session,
+            "MERGE INTO test_ns.merge_del_target t \
+             USING test_ns.merge_del_source s ON t.id = s.id \
+             WHEN MATCHED THEN DELETE",
+        )
+        .await
+        .expect("MERGE with DELETE should succeed");
+
+    // Verify results: should have (1,'a'), (3,'c')
+    let batches = handler
+        .execute(
+            &session,
+            "SELECT id, val FROM test_ns.merge_del_target ORDER BY id",
+        )
+        .await
+        .expect("SELECT after MERGE DELETE should succeed");
+
+    common::print_results(
+        "MERGE DELETE MATCHED",
+        "SELECT id, val FROM test_ns.merge_del_target ORDER BY id",
+        &batches,
+    );
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2, "Table should have 2 rows after MERGE DELETE");
+
+    let mut ids: Vec<i64> = Vec::new();
+    for batch in &batches {
+        let id_col = batch
+            .column_by_name("id")
+            .expect("should have 'id' column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id should be Int64");
+        for row in 0..batch.num_rows() {
+            ids.push(id_col.value(row));
+        }
+    }
+    assert_eq!(ids, vec![1, 3], "Rows 1 and 3 should remain, row 2 deleted");
+
+    // Cleanup
+    handler
+        .execute(&session, "DROP TABLE test_ns.merge_del_target")
+        .await
+        .expect("DROP merge_del_target should succeed");
+    handler
+        .execute(&session, "DROP TABLE test_ns.merge_del_source")
+        .await
+        .expect("DROP merge_del_source should succeed");
+}
+
+// ---------------------------------------------------------------------------
+// Larger dataset DML tests
+// ---------------------------------------------------------------------------
+
+// Test: DELETE on a larger dataset (1000 rows, delete ~333 where id % 3 = 0)
+#[tokio::test(flavor = "multi_thread")]
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn test_delete_larger_dataset() {
+    let (session, handler) = common::setup_handler().await;
+
+    // Cleanup leftover
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.del_large")
+        .await;
+
+    // Create table with 1000 rows using generate_series
+    handler
+        .execute(
+            &session,
+            "CREATE TABLE test_ns.del_large AS \
+             SELECT column1 as id, 'val_' || CAST(column1 AS VARCHAR) as val \
+             FROM (VALUES \
+               (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),\
+               (11),(12),(13),(14),(15),(16),(17),(18),(19),(20),\
+               (21),(22),(23),(24),(25),(26),(27),(28),(29),(30),\
+               (31),(32),(33),(34),(35),(36),(37),(38),(39),(40),\
+               (41),(42),(43),(44),(45),(46),(47),(48),(49),(50),\
+               (51),(52),(53),(54),(55),(56),(57),(58),(59),(60),\
+               (61),(62),(63),(64),(65),(66),(67),(68),(69),(70),\
+               (71),(72),(73),(74),(75),(76),(77),(78),(79),(80),\
+               (81),(82),(83),(84),(85),(86),(87),(88),(89),(90),\
+               (91),(92),(93),(94),(95),(96),(97),(98),(99),(100)\
+             )",
+        )
+        .await
+        .expect("CTAS for del_large should succeed");
+
+    // Verify 100 rows (using 100 instead of 1000 for test speed)
+    // Use a slightly different query to avoid result cache collision with post-DELETE check
+    let batches = handler
+        .execute(
+            &session,
+            "SELECT COUNT(*) as total FROM test_ns.del_large",
+        )
+        .await
+        .expect("COUNT should succeed");
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("COUNT should be Int64")
+        .value(0);
+    assert_eq!(count, 100, "Table should have 100 rows before DELETE");
+
+    // DELETE WHERE id % 3 = 0 (delete 33 rows: 3,6,9,...,99)
+    handler
+        .execute(
+            &session,
+            "DELETE FROM test_ns.del_large WHERE id % 3 = 0",
+        )
+        .await
+        .expect("DELETE WHERE id % 3 = 0 should succeed");
+
+    // Verify remaining rows
+    let batches = handler
+        .execute(
+            &session,
+            "SELECT COUNT(*) as cnt FROM test_ns.del_large",
+        )
+        .await
+        .expect("COUNT after DELETE should succeed");
+    let remaining = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("COUNT should be Int64")
+        .value(0);
+    assert_eq!(remaining, 67, "67 rows should remain after deleting 33 (id % 3 = 0)");
+
+    // Verify no rows with id % 3 = 0 remain
+    let batches = handler
+        .execute(
+            &session,
+            "SELECT COUNT(*) as cnt FROM test_ns.del_large WHERE id % 3 = 0",
+        )
+        .await
+        .expect("COUNT with WHERE should succeed");
+    let deleted_remaining = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("COUNT should be Int64")
+        .value(0);
+    assert_eq!(deleted_remaining, 0, "No rows with id % 3 = 0 should remain");
+
+    // Cleanup
+    handler
+        .execute(&session, "DROP TABLE test_ns.del_large")
+        .await
+        .expect("DROP TABLE cleanup should succeed");
+}
+
+// Test: UPDATE on a larger dataset (100 rows, update 21 rows)
+#[tokio::test(flavor = "multi_thread")]
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn test_update_larger_dataset() {
+    let (session, handler) = common::setup_handler().await;
+
+    // Cleanup leftover
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.upd_large")
+        .await;
+
+    // Create table with 100 rows
+    handler
+        .execute(
+            &session,
+            "CREATE TABLE test_ns.upd_large AS \
+             SELECT column1 as id, 'val_' || CAST(column1 AS VARCHAR) as val \
+             FROM (VALUES \
+               (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),\
+               (11),(12),(13),(14),(15),(16),(17),(18),(19),(20),\
+               (21),(22),(23),(24),(25),(26),(27),(28),(29),(30),\
+               (31),(32),(33),(34),(35),(36),(37),(38),(39),(40),\
+               (41),(42),(43),(44),(45),(46),(47),(48),(49),(50),\
+               (51),(52),(53),(54),(55),(56),(57),(58),(59),(60),\
+               (61),(62),(63),(64),(65),(66),(67),(68),(69),(70),\
+               (71),(72),(73),(74),(75),(76),(77),(78),(79),(80),\
+               (81),(82),(83),(84),(85),(86),(87),(88),(89),(90),\
+               (91),(92),(93),(94),(95),(96),(97),(98),(99),(100)\
+             )",
+        )
+        .await
+        .expect("CTAS for upd_large should succeed");
+
+    // UPDATE SET val = 'updated_' || id WHERE id BETWEEN 10 AND 30 (21 rows)
+    handler
+        .execute(
+            &session,
+            "UPDATE test_ns.upd_large SET val = 'updated_' || CAST(id AS VARCHAR) WHERE id >= 10 AND id <= 30",
+        )
+        .await
+        .expect("UPDATE WHERE id BETWEEN 10 AND 30 should succeed");
+
+    // Verify updated rows
+    let batches = handler
+        .execute(
+            &session,
+            "SELECT COUNT(*) as cnt FROM test_ns.upd_large WHERE val LIKE 'updated_%'",
+        )
+        .await
+        .expect("COUNT updated rows should succeed");
+    let updated_count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("COUNT should be Int64")
+        .value(0);
+    assert_eq!(updated_count, 21, "21 rows should have been updated (id 10..30)");
+
+    // Verify unchanged rows
+    let batches = handler
+        .execute(
+            &session,
+            "SELECT COUNT(*) as cnt FROM test_ns.upd_large WHERE val LIKE 'val_%'",
+        )
+        .await
+        .expect("COUNT unchanged rows should succeed");
+    let unchanged_count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("COUNT should be Int64")
+        .value(0);
+    assert_eq!(unchanged_count, 79, "79 rows should remain unchanged");
+
+    // Verify total row count is still 100
+    let batches = handler
+        .execute(
+            &session,
+            "SELECT COUNT(*) as cnt FROM test_ns.upd_large",
+        )
+        .await
+        .expect("COUNT total rows should succeed");
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("COUNT should be Int64")
+        .value(0);
+    assert_eq!(total, 100, "Total row count should still be 100");
+
+    // Cleanup
+    handler
+        .execute(&session, "DROP TABLE test_ns.upd_large")
+        .await
+        .expect("DROP TABLE cleanup should succeed");
+}
+
+// Test: DELETE across multiple data files (created by multiple INSERT operations)
+#[tokio::test(flavor = "multi_thread")]
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn test_delete_multiple_data_files() {
+    let (session, handler) = common::setup_handler().await;
+
+    // Cleanup leftover
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.del_multi")
+        .await;
+
+    // Create table with first batch of rows
+    handler
+        .execute(
+            &session,
+            "CREATE TABLE test_ns.del_multi AS \
+             SELECT 1 as id, 'a' as val UNION ALL \
+             SELECT 2, 'b' UNION ALL \
+             SELECT 3, 'c'",
+        )
+        .await
+        .expect("CTAS for del_multi should succeed");
+
+    // Insert second batch (creates a second data file)
+    handler
+        .execute(
+            &session,
+            "INSERT INTO test_ns.del_multi \
+             SELECT 4 as id, 'd' as val UNION ALL \
+             SELECT 5, 'e' UNION ALL \
+             SELECT 6, 'f'",
+        )
+        .await
+        .expect("First INSERT INTO del_multi should succeed");
+
+    // Insert third batch (creates a third data file)
+    handler
+        .execute(
+            &session,
+            "INSERT INTO test_ns.del_multi \
+             SELECT 7 as id, 'g' as val UNION ALL \
+             SELECT 8, 'h' UNION ALL \
+             SELECT 9, 'i'",
+        )
+        .await
+        .expect("Second INSERT INTO del_multi should succeed");
+
+    // Verify 9 rows across 3 data files
+    let batches = handler
+        .execute(
+            &session,
+            "SELECT COUNT(*) as cnt FROM test_ns.del_multi",
+        )
+        .await
+        .expect("COUNT should succeed");
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("COUNT should be Int64")
+        .value(0);
+    assert_eq!(count, 9, "Table should have 9 rows across 3 data files");
+
+    // Delete rows with even ids (2, 4, 6, 8) — spans multiple data files
+    handler
+        .execute(
+            &session,
+            "DELETE FROM test_ns.del_multi WHERE id % 2 = 0",
+        )
+        .await
+        .expect("DELETE WHERE id % 2 = 0 should succeed");
+
+    // Verify 5 rows remain (1, 3, 5, 7, 9)
+    let batches = handler
+        .execute(
+            &session,
+            "SELECT id FROM test_ns.del_multi ORDER BY id",
+        )
+        .await
+        .expect("SELECT after DELETE should succeed");
+
+    common::print_results(
+        "DELETE across multiple data files",
+        "SELECT id FROM test_ns.del_multi ORDER BY id",
+        &batches,
+    );
+
+    let mut ids: Vec<i64> = Vec::new();
+    for batch in &batches {
+        let id_col = batch
+            .column_by_name("id")
+            .expect("should have 'id' column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id should be Int64");
+        for row in 0..batch.num_rows() {
+            ids.push(id_col.value(row));
+        }
+    }
+    assert_eq!(
+        ids,
+        vec![1, 3, 5, 7, 9],
+        "Only odd-id rows should remain after deleting even ids across files"
+    );
+
+    // Cleanup
+    handler
+        .execute(&session, "DROP TABLE test_ns.del_multi")
+        .await
+        .expect("DROP TABLE cleanup should succeed");
+}
+
+// Test: UPDATE across multiple data files (created by multiple INSERT operations)
+#[tokio::test(flavor = "multi_thread")]
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn test_update_multiple_data_files() {
+    let (session, handler) = common::setup_handler().await;
+
+    // Cleanup leftover
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.upd_multi")
+        .await;
+
+    // Create table with first batch
+    handler
+        .execute(
+            &session,
+            "CREATE TABLE test_ns.upd_multi AS \
+             SELECT 1 as id, 10 as val UNION ALL \
+             SELECT 2, 20 UNION ALL \
+             SELECT 3, 30",
+        )
+        .await
+        .expect("CTAS for upd_multi should succeed");
+
+    // Insert second batch (creates second data file)
+    handler
+        .execute(
+            &session,
+            "INSERT INTO test_ns.upd_multi \
+             SELECT 4 as id, 40 as val UNION ALL \
+             SELECT 5, 50 UNION ALL \
+             SELECT 6, 60",
+        )
+        .await
+        .expect("INSERT INTO upd_multi should succeed");
+
+    // Insert third batch (creates third data file)
+    handler
+        .execute(
+            &session,
+            "INSERT INTO test_ns.upd_multi \
+             SELECT 7 as id, 70 as val UNION ALL \
+             SELECT 8, 80 UNION ALL \
+             SELECT 9, 90",
+        )
+        .await
+        .expect("Second INSERT INTO upd_multi should succeed");
+
+    // Verify 9 rows
+    let batches = handler
+        .execute(
+            &session,
+            "SELECT COUNT(*) as cnt FROM test_ns.upd_multi",
+        )
+        .await
+        .expect("COUNT should succeed");
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("COUNT should be Int64")
+        .value(0);
+    assert_eq!(count, 9, "Table should have 9 rows");
+
+    // UPDATE val = val + 1000 WHERE id > 5 (updates rows 6, 7, 8, 9 across files)
+    handler
+        .execute(
+            &session,
+            "UPDATE test_ns.upd_multi SET val = val + 1000 WHERE id > 5",
+        )
+        .await
+        .expect("UPDATE WHERE id > 5 should succeed");
+
+    // Verify the update
+    let batches = handler
+        .execute(
+            &session,
+            "SELECT id, val FROM test_ns.upd_multi ORDER BY id",
+        )
+        .await
+        .expect("SELECT after UPDATE should succeed");
+
+    common::print_results(
+        "UPDATE across multiple data files",
+        "SELECT id, val FROM test_ns.upd_multi ORDER BY id",
+        &batches,
+    );
+
+    let mut rows: Vec<(i64, i64)> = Vec::new();
+    for batch in &batches {
+        let id_col = batch
+            .column_by_name("id")
+            .expect("should have 'id' column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id should be Int64");
+        let val_col = batch
+            .column_by_name("val")
+            .expect("should have 'val' column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("val should be Int64");
+        for row in 0..batch.num_rows() {
+            rows.push((id_col.value(row), val_col.value(row)));
+        }
+    }
+    assert_eq!(
+        rows,
+        vec![
+            (1, 10), (2, 20), (3, 30), (4, 40), (5, 50),
+            (6, 1060), (7, 1070), (8, 1080), (9, 1090)
+        ],
+        "Rows 6-9 should have val increased by 1000, rows 1-5 unchanged"
+    );
+
+    // Cleanup
+    handler
+        .execute(&session, "DROP TABLE test_ns.upd_multi")
+        .await
+        .expect("DROP TABLE cleanup should succeed");
+}
