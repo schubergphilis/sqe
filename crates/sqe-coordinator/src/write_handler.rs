@@ -12,7 +12,7 @@ use iceberg::table::Table as IcebergTable;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, TableCreation, TableIdent};
 use sqlparser::ast::Statement;
-use tracing::{info, warn};
+use tracing::info;
 
 use sqe_catalog::SessionCatalog;
 use sqe_core::{Session, SqeConfig, SqeError};
@@ -387,12 +387,11 @@ impl WriteHandler {
             }
         };
 
-        let table_ref = &delete.from.relations[0];
-        let table_name = match table_ref {
-            sqlparser::ast::FromTable::WithFromKeyword(tables) => &tables[0].relation,
-            sqlparser::ast::FromTable::WithoutKeyword(tables) => &tables[0].relation,
+        let tables = match &delete.from {
+            sqlparser::ast::FromTable::WithFromKeyword(tables) => tables,
+            sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
         };
-        let table_factor_name = match table_name {
+        let table_factor_name = match &tables[0].relation {
             sqlparser::ast::TableFactor::Table { name, .. } => name,
             other => {
                 return Err(SqeError::Execution(format!(
@@ -681,10 +680,6 @@ impl WriteHandler {
         table: &IcebergTable,
         file_path: &str,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        use futures::TryStreamExt;
-        use parquet::arrow::async_reader::ParquetObjectReader;
-        use parquet::arrow::ParquetRecordBatchStreamBuilder;
-
         let file_io = table.file_io();
         let input = file_io
             .new_input(file_path)
@@ -798,12 +793,13 @@ impl WriteHandler {
         // Build assignment map: column_name -> expression_sql
         let mut assignment_map = std::collections::HashMap::new();
         for a in assignments {
-            let col_name = a
-                .target
-                .iter()
-                .map(|p| p.to_string())
-                .collect::<Vec<_>>()
-                .join(".");
+            let col_name = match &a.target {
+                sqlparser::ast::AssignmentTarget::ColumnName(name) => format!("{name}"),
+                sqlparser::ast::AssignmentTarget::Tuple(names) => {
+                    // Tuple assignment (a, b) = ... — take first for simplicity
+                    names.first().map(|n| format!("{n}")).unwrap_or_default()
+                }
+            };
             let expr_sql = format!("{}", a.value);
             assignment_map.insert(col_name, expr_sql);
         }
