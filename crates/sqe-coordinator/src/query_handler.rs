@@ -390,6 +390,30 @@ impl QueryHandler {
                         let table = stmt.to_string();
                         cache.invalidate(&table);
                     }
+                    StatementKind::Delete(stmt) => {
+                        if let Statement::Delete(del) = stmt.as_ref() {
+                            let tables = match &del.from {
+                                sqlparser::ast::FromTable::WithFromKeyword(t)
+                                | sqlparser::ast::FromTable::WithoutKeyword(t) => t,
+                            };
+                            if let Some(first) = tables.first() {
+                                let table = first.relation.to_string();
+                                cache.invalidate(&table);
+                            }
+                        }
+                    }
+                    StatementKind::Update(stmt) => {
+                        if let Statement::Update { table, .. } = stmt.as_ref() {
+                            let table_name = table.relation.to_string();
+                            cache.invalidate(&table_name);
+                        }
+                    }
+                    StatementKind::Merge(stmt) => {
+                        if let Statement::Merge { table, .. } = stmt.as_ref() {
+                            let table_name = table.to_string();
+                            cache.invalidate(&table_name);
+                        }
+                    }
                     _ => {}
                 }
             }
