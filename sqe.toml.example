@@ -26,6 +26,26 @@ client_secret = ""
 token_refresh_buffer_secs = 60
 ssl_verification = false
 
+# ── Auth providers (explicit chain, overrides legacy keycloak_url/client_id) ──
+# When configured, the auth chain uses these providers in order.
+# First provider to accept the credentials wins.
+
+# OIDC password grant — for Trino JDBC / HTTP basic auth logins
+[[auth.providers]]
+type = "oidc_password"
+token_url = "https://auth.local/realms/iceberg/protocol/openid-connect/token"
+client_id = "sqe-client"
+client_secret = ""
+roles_claim = "realm_access.roles"
+
+# Bearer token (JWT) — for pre-authenticated clients (data platform, CI/CD, Airflow)
+[[auth.providers]]
+type = "bearer_token"
+jwks_url = "https://auth.local/realms/iceberg/protocol/openid-connect/certs"
+issuer = "https://auth.local/realms/iceberg"
+user_claim = "preferred_username"
+roles_claim = "realm_access.roles"
+
 # ── Interactive OIDC flows (Trino SSO + CLI device code) ────────
 # Uncomment to enable browser-based SSO for Trino JDBC and device code for CLI.
 # [auth.external]

@@ -67,6 +67,15 @@ pub struct TrinoClientHeaders {
 #[async_trait::async_trait]
 pub trait TrinoAuthenticator: Send + Sync + 'static {
     async fn authenticate(&self, username: &str, password: &str) -> Result<Session, String>;
+
+    /// Validate a Bearer token (JWT) and return an authenticated session.
+    ///
+    /// The default implementation rejects all bearer tokens. Implementors that
+    /// support bearer authentication (e.g. via JWKS validation) should override
+    /// this method.
+    async fn authenticate_bearer(&self, _token: &str) -> Result<Session, String> {
+        Err("Bearer token authentication is not configured".to_string())
+    }
 }
 
 #[async_trait::async_trait]
@@ -345,18 +354,18 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     let trino_headers = extract_trino_headers(&headers);
 
     let session = if let Some(token) = extract_bearer_token(&headers) {
-        // Bearer token auth: create session directly from the JWT.
-        let username = trino_headers
-            .user
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
-        Session::new(
-            username,
-            token,
-            None,
-            chrono::Utc::now() + chrono::Duration::hours(1),
-            vec![],
-        )
+        // Bearer token auth: validate JWT via JWKS before creating a session.
+        match state.authenticator.authenticate_bearer(&token).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    client_ip = %client_ip,
+                    "Trino bearer token authentication failed"
+                );
+                return error_response(StatusCode::UNAUTHORIZED, "Bearer token authentication failed");
+            }
+        }
     } else if let Some((user, pass)) = extract_basic_auth(&headers) {
         // Basic auth: authenticate via OIDC password grant
         let client_ip = extract_header(&headers, "x-forwarded-for")
