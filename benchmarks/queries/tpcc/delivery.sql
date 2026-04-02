@@ -1,7 +1,6 @@
 -- name: Delivery Transaction
 -- description: Process delivery of pending new orders (write transaction)
 -- type: write
--- requires: delete, update
 -- timeout: 10s
 
 -- This is a write transaction that cannot be expressed as a read-only SQL query.
