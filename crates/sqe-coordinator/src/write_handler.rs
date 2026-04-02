@@ -626,6 +626,496 @@ impl WriteHandler {
         Ok(vec![])
     }
 
+    /// Handle MERGE INTO target USING source ON condition WHEN ...
+    ///
+    /// Uses Copy-on-Write: reads all target data files, performs a FULL OUTER
+    /// JOIN with the provided source batches to classify rows as matched /
+    /// not-matched / target-only, applies the appropriate MERGE actions via
+    /// CASE WHEN SQL expressions, writes new data files, and atomically swaps
+    /// via rewrite_files().
+    ///
+    /// The caller is responsible for executing the source query and providing
+    /// the result batches. This follows the same pattern as `handle_ctas` and
+    /// `handle_insert`.
+    #[instrument(skip(self, session, stmt, source_batches), fields(username = %session.user.username))]
+    pub async fn handle_merge(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+        source_batches: Vec<RecordBatch>,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        use sqlparser::ast::{MergeAction, MergeClauseKind, MergeInsertKind, TableFactor};
+
+        let (table_factor, source_factor, on_expr, clauses) = match stmt {
+            Statement::Merge {
+                table,
+                source,
+                on,
+                clauses,
+                ..
+            } => (table, source, on, clauses),
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected MERGE statement, got: {other}"
+                )));
+            }
+        };
+
+        // Extract target table name and optional alias
+        let (target_table_name, target_alias) = match table_factor {
+            TableFactor::Table { name, alias, .. } => {
+                let alias_str = alias.as_ref().map(|a| a.name.value.clone());
+                (name, alias_str)
+            }
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected table name in MERGE target, got: {other}"
+                )));
+            }
+        };
+
+        let (namespace, name) = parse_table_ref(target_table_name)?;
+        let table_ident = TableIdent::new(namespace, name);
+
+        // Extract source alias (needed for column references in the JOIN)
+        let source_alias = match source_factor {
+            TableFactor::Table { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()),
+            TableFactor::Derived { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()),
+            _ => None,
+        };
+
+        let on_sql = format!("{on_expr}");
+
+        info!(
+            username = %session.user.username,
+            table = %table_ident,
+            on_condition = %on_sql,
+            clause_count = clauses.len(),
+            "Executing MERGE INTO"
+        );
+
+        // Load target table and read all data files
+        let catalog = self.create_catalog_bridge(session).await?;
+        let table = catalog
+            .load_table(&table_ident)
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
+
+        let old_data_files = self.collect_data_files(&table).await?;
+
+        // Read all target batches into memory
+        let mut target_batches: Vec<RecordBatch> = Vec::new();
+        for data_file in &old_data_files {
+            let file_path = data_file.file_path();
+            let batches = self.read_parquet_via_table(&table, file_path).await?;
+            target_batches.extend(batches);
+        }
+
+        // Get the target schema from existing data (or table metadata if empty)
+        let target_schema = if let Some(first) = target_batches.first() {
+            first.schema()
+        } else {
+            // Empty table — get the schema from the Iceberg table metadata
+            let iceberg_schema = table.metadata().current_schema();
+            let arrow_schema = iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
+                .map_err(|e| {
+                    SqeError::Execution(format!(
+                        "Failed to convert Iceberg schema to Arrow: {e}"
+                    ))
+                })?;
+            Arc::new(arrow_schema)
+        };
+
+        let target_columns: Vec<String> = target_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+
+        // Use the target alias (or a default) for the merge MemTable names
+        let t_alias = target_alias
+            .clone()
+            .unwrap_or_else(|| "t".to_string());
+        let s_alias = source_alias
+            .clone()
+            .unwrap_or_else(|| "s".to_string());
+        let target_table_ref = "__merge_target".to_string();
+        let source_table_ref = "__merge_source".to_string();
+
+        // Build a DataFusion context to execute the source and the merge query
+        let df_ctx = DFSessionContext::new();
+
+        // Register target data as a MemTable
+        let target_mem = if target_batches.is_empty() {
+            datafusion::datasource::MemTable::try_new(
+                target_schema.clone(),
+                vec![],
+            )
+        } else {
+            datafusion::datasource::MemTable::try_new(
+                target_schema.clone(),
+                vec![target_batches],
+            )
+        }
+        .map_err(|e| SqeError::Execution(format!("Failed to create target MemTable: {e}")))?;
+        df_ctx
+            .register_table(&target_table_ref, Arc::new(target_mem))
+            .map_err(|e| {
+                SqeError::Execution(format!("Failed to register target MemTable: {e}"))
+            })?;
+
+        // Use the pre-executed source batches (caller handles source query execution)
+        if source_batches.is_empty() {
+            info!(table = %table_ident, "MERGE: source returned no data, nothing to merge");
+            return Ok(vec![]);
+        }
+
+        let source_schema = source_batches[0].schema();
+
+        // Register source data as a MemTable
+        let source_mem = datafusion::datasource::MemTable::try_new(
+            source_schema.clone(),
+            vec![source_batches],
+        )
+        .map_err(|e| SqeError::Execution(format!("Failed to create source MemTable: {e}")))?;
+        df_ctx
+            .register_table(&source_table_ref, Arc::new(source_mem))
+            .map_err(|e| {
+                SqeError::Execution(format!("Failed to register source MemTable: {e}"))
+            })?;
+
+        // Rewrite the ON condition to use our MemTable names instead of aliases
+        let on_rewritten = on_sql
+            .replace(&format!("{t_alias}."), &format!("{target_table_ref}."))
+            .replace(&format!("{s_alias}."), &format!("{source_table_ref}."));
+
+        // Build a key column from the ON condition for matched/unmatched detection.
+        // We need a column from the target side that we can check IS NULL / IS NOT NULL
+        // to determine match status. Use the first target column as a sentinel.
+        let target_sentinel = format!("{target_table_ref}.\"{}\"", target_columns[0]);
+
+        // Also get a source sentinel for detecting not-matched rows
+        let source_columns: Vec<String> = source_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        let source_sentinel = format!("{source_table_ref}.\"{}\"", source_columns[0]);
+
+        // Classify clauses
+        let mut matched_update: Option<&[sqlparser::ast::Assignment]> = None;
+        let mut matched_delete = false;
+        let mut not_matched_insert: Option<(&[sqlparser::ast::Ident], &MergeInsertKind)> = None;
+
+        for clause in clauses {
+            match (&clause.clause_kind, &clause.action) {
+                (MergeClauseKind::Matched, MergeAction::Update { assignments }) => {
+                    matched_update = Some(assignments);
+                }
+                (MergeClauseKind::Matched, MergeAction::Delete) => {
+                    matched_delete = true;
+                }
+                (
+                    MergeClauseKind::NotMatched | MergeClauseKind::NotMatchedByTarget,
+                    MergeAction::Insert(insert_expr),
+                ) => {
+                    not_matched_insert = Some((&insert_expr.columns, &insert_expr.kind));
+                }
+                (MergeClauseKind::NotMatchedBySource, MergeAction::Delete) => {
+                    // Not-matched-by-source DELETE means remove target-only rows
+                    // This is handled below by omitting target-only rows from the output
+                    // For now, we don't support this clause
+                    return Err(SqeError::NotImplemented(
+                        "WHEN NOT MATCHED BY SOURCE THEN DELETE is not yet supported".to_string(),
+                    ));
+                }
+                _ => {
+                    return Err(SqeError::NotImplemented(format!(
+                        "Unsupported MERGE clause combination: {:?} / {:?}",
+                        clause.clause_kind, clause.action
+                    )));
+                }
+            }
+        }
+
+        // Build the SELECT query that implements the MERGE logic
+        // Uses FULL OUTER JOIN to classify rows into:
+        //   - matched (both target and source present): apply UPDATE or DELETE
+        //   - not-matched (source only): apply INSERT
+        //   - target-only (target only, no source match): pass through
+
+        let column_exprs: Vec<String> = if matched_delete {
+            // WHEN MATCHED THEN DELETE:
+            // - Matched rows are excluded (filtered out via WHERE)
+            // - Not-matched rows are inserted (if clause present)
+            // - Target-only rows pass through
+            //
+            // We use a WHERE clause to exclude matched rows instead of CASE
+            target_columns
+                .iter()
+                .map(|col| {
+                    if let Some((insert_cols, insert_kind)) = &not_matched_insert {
+                        let insert_expr = self.resolve_insert_expr(
+                            col,
+                            insert_cols,
+                            insert_kind,
+                            &source_table_ref,
+                            &source_columns,
+                            &s_alias,
+                            &t_alias,
+                            &target_table_ref,
+                        );
+                        format!(
+                            "CASE \
+                               WHEN {source_sentinel} IS NOT NULL AND {target_sentinel} IS NOT NULL THEN NULL \
+                               WHEN {target_sentinel} IS NULL THEN {insert_expr} \
+                               ELSE {target_table_ref}.\"{col}\" \
+                             END AS \"{col}\""
+                        )
+                    } else {
+                        format!(
+                            "CASE \
+                               WHEN {source_sentinel} IS NOT NULL AND {target_sentinel} IS NOT NULL THEN NULL \
+                               ELSE {target_table_ref}.\"{col}\" \
+                             END AS \"{col}\""
+                        )
+                    }
+                })
+                .collect()
+        } else {
+            // WHEN MATCHED THEN UPDATE (and optionally WHEN NOT MATCHED THEN INSERT):
+            target_columns
+                .iter()
+                .map(|col| {
+                    let update_expr = if let Some(assignments) = &matched_update {
+                        self.resolve_update_expr(
+                            col,
+                            assignments,
+                            &target_table_ref,
+                            &source_table_ref,
+                            &t_alias,
+                            &s_alias,
+                        )
+                    } else {
+                        format!("{target_table_ref}.\"{col}\"")
+                    };
+
+                    let insert_expr = if let Some((insert_cols, insert_kind)) = &not_matched_insert
+                    {
+                        self.resolve_insert_expr(
+                            col,
+                            insert_cols,
+                            insert_kind,
+                            &source_table_ref,
+                            &source_columns,
+                            &s_alias,
+                            &t_alias,
+                            &target_table_ref,
+                        )
+                    } else {
+                        "NULL".to_string()
+                    };
+
+                    format!(
+                        "CASE \
+                           WHEN {target_sentinel} IS NOT NULL AND {source_sentinel} IS NOT NULL THEN {update_expr} \
+                           WHEN {target_sentinel} IS NULL THEN {insert_expr} \
+                           ELSE {target_table_ref}.\"{col}\" \
+                         END AS \"{col}\""
+                    )
+                })
+                .collect()
+        };
+
+        let select_sql = format!(
+            "SELECT {} FROM {target_table_ref} FULL OUTER JOIN {source_table_ref} ON {on_rewritten}",
+            column_exprs.join(", ")
+        );
+
+        info!(
+            table = %table_ident,
+            merge_sql = %select_sql,
+            "MERGE: executing merge query"
+        );
+
+        let df = df_ctx.sql(&select_sql).await.map_err(|e| {
+            SqeError::Execution(format!("Failed to plan MERGE query: {e}"))
+        })?;
+        let mut result_batches: Vec<RecordBatch> = df.collect().await.map_err(|e| {
+            SqeError::Execution(format!("Failed to execute MERGE query: {e}"))
+        })?;
+
+        // For WHEN MATCHED THEN DELETE: filter out the rows where all columns are NULL
+        // (these are the matched rows we set to NULL above)
+        if matched_delete {
+            let mut filtered_batches = Vec::new();
+            for batch in &result_batches {
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                // A row is a "deleted matched" row if all columns are NULL
+                // (we set them to NULL for matched rows in the CASE expression).
+                // Filter: keep rows where at least one column is NOT NULL.
+                let mut keep = vec![true; batch.num_rows()];
+                for (row, flag) in keep.iter_mut().enumerate() {
+                    // Check if ALL columns are null (this is a deleted matched row)
+                    let all_null = (0..batch.num_columns()).all(|c| batch.column(c).is_null(row));
+                    if all_null {
+                        *flag = false;
+                    }
+                }
+                let keep_arr =
+                    arrow::array::BooleanArray::from(keep);
+                let filtered = filter_record_batch(batch, &keep_arr).map_err(|e| {
+                    SqeError::Execution(format!("Failed to filter MERGE DELETE results: {e}"))
+                })?;
+                if filtered.num_rows() > 0 {
+                    filtered_batches.push(filtered);
+                }
+            }
+            result_batches = filtered_batches;
+        }
+
+        // Write new data files from the merged results
+        let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
+        let new_data_files = if total_rows > 0 {
+            write_data_files(&table, result_batches, "merge").await?
+        } else {
+            vec![]
+        };
+
+        info!(
+            table = %table_ident,
+            old_files = old_data_files.len(),
+            new_files = new_data_files.len(),
+            total_rows,
+            "MERGE: committing CoW rewrite"
+        );
+
+        // Atomic commit: remove all old files, add new merged files
+        if old_data_files.is_empty() && new_data_files.is_empty() {
+            info!(table = %table_ident, "MERGE: no changes to commit");
+            return Ok(vec![]);
+        }
+
+        let tx = Transaction::new(&table);
+        let mut action = tx.rewrite_files();
+        if !new_data_files.is_empty() {
+            action = action.add_data_files(new_data_files);
+        }
+        if !old_data_files.is_empty() {
+            action = action.delete_files(old_data_files);
+        }
+        let tx = action.apply(tx).map_err(|e| {
+            SqeError::Execution(format!("Failed to apply MERGE rewrite: {e}"))
+        })?;
+        tx.commit(catalog.as_ref()).await.map_err(|e| {
+            SqeError::Execution(format!("Failed to commit MERGE: {e}"))
+        })?;
+
+        info!(table = %table_ident, total_rows, "MERGE committed successfully");
+        Ok(vec![])
+    }
+
+    /// Resolve an UPDATE SET expression for a single column in the MERGE context.
+    ///
+    /// Rewrites alias references (e.g., `t.col` or `s.col`) to point to the
+    /// MemTable names used in the FULL OUTER JOIN.
+    fn resolve_update_expr(
+        &self,
+        col: &str,
+        assignments: &[sqlparser::ast::Assignment],
+        target_table_ref: &str,
+        source_table_ref: &str,
+        t_alias: &str,
+        s_alias: &str,
+    ) -> String {
+        for a in assignments {
+            let col_name = match &a.target {
+                sqlparser::ast::AssignmentTarget::ColumnName(name) => {
+                    // Could be "t.col" or just "col"
+                    let parts: Vec<String> = name.0.iter().map(|i| i.value.clone()).collect();
+                    parts.last().cloned().unwrap_or_default()
+                }
+                sqlparser::ast::AssignmentTarget::Tuple(names) => {
+                    names.first().map(|n| {
+                        let parts: Vec<String> = n.0.iter().map(|i| i.value.clone()).collect();
+                        parts.last().cloned().unwrap_or_default()
+                    }).unwrap_or_default()
+                }
+            };
+            if col_name == col {
+                let expr_sql = format!("{}", a.value);
+                // Rewrite alias references to MemTable names
+                return expr_sql
+                    .replace(&format!("{t_alias}."), &format!("{target_table_ref}."))
+                    .replace(&format!("{s_alias}."), &format!("{source_table_ref}."));
+            }
+        }
+        // Column not in SET assignments — pass through from target
+        format!("{target_table_ref}.\"{col}\"")
+    }
+
+    /// Resolve an INSERT expression for a single column in the MERGE context.
+    ///
+    /// Maps the INSERT column list + VALUES to find the expression for the
+    /// given target column. Rewrites alias references (e.g., `s.col`) to
+    /// use the MemTable name.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_insert_expr(
+        &self,
+        col: &str,
+        insert_columns: &[sqlparser::ast::Ident],
+        insert_kind: &sqlparser::ast::MergeInsertKind,
+        source_table_ref: &str,
+        source_columns: &[String],
+        s_alias: &str,
+        t_alias: &str,
+        target_table_ref: &str,
+    ) -> String {
+        use sqlparser::ast::MergeInsertKind;
+
+        let rewrite_aliases = |expr: String| -> String {
+            expr.replace(&format!("{s_alias}."), &format!("{source_table_ref}."))
+                .replace(&format!("{t_alias}."), &format!("{target_table_ref}."))
+        };
+
+        match insert_kind {
+            MergeInsertKind::Values(values) => {
+                if insert_columns.is_empty() {
+                    // No explicit column list — positional mapping by source column name.
+                    if let Some(row) = values.rows.first() {
+                        if let Some(idx) = source_columns.iter().position(|sc| sc == col) {
+                            if idx < row.len() {
+                                return rewrite_aliases(format!("{}", row[idx]));
+                            }
+                        }
+                        return "NULL".to_string();
+                    }
+                    "NULL".to_string()
+                } else {
+                    // Explicit column list — find the column position
+                    if let Some(pos) = insert_columns.iter().position(|c| c.value == col) {
+                        if let Some(row) = values.rows.first() {
+                            if pos < row.len() {
+                                return rewrite_aliases(format!("{}", row[pos]));
+                            }
+                        }
+                    }
+                    "NULL".to_string()
+                }
+            }
+            MergeInsertKind::Row => {
+                // INSERT ROW: use the source column with the same name
+                if source_columns.contains(&col.to_string()) {
+                    format!("{source_table_ref}.\"{col}\"")
+                } else {
+                    "NULL".to_string()
+                }
+            }
+        }
+    }
+
     // -------------------------------------------------------------------------
     // CoW helper methods
     // -------------------------------------------------------------------------
