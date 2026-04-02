@@ -291,6 +291,9 @@ impl QueryHandler {
                 StatementKind::Delete(_) => Err(SqeError::NotImplemented(
                     "DELETE FROM requires Iceberg overwrite transaction support (planned for Chunk 3)".to_string(),
                 )),
+                StatementKind::Update(_) => Err(SqeError::NotImplemented(
+                    "UPDATE requires Iceberg overwrite transaction support (planned for Chunk 3)".to_string(),
+                )),
                 StatementKind::Merge(_) => Err(SqeError::NotImplemented(
                     "MERGE INTO requires Iceberg overwrite transaction support (planned for Chunk 3)".to_string(),
                 )),
