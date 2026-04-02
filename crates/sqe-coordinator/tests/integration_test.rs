@@ -2297,3 +2297,306 @@ async fn test_error_classification_live() {
     println!("\nError classification: {pass} passed, {fail} failed");
     assert_eq!(fail, 0, "{fail} error classification(s) wrong");
 }
+
+// ---------------------------------------------------------------------------
+// DELETE and UPDATE integration tests
+// ---------------------------------------------------------------------------
+
+// Test: DELETE FROM with WHERE clause — removes matching rows
+#[tokio::test(flavor = "multi_thread")]
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn test_delete_with_where() {
+    let (session, handler) = common::setup_handler().await;
+
+    // Cleanup leftover
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.delete_test")
+        .await;
+
+    // Create table with 3 rows
+    handler
+        .execute(
+            &session,
+            "CREATE TABLE test_ns.delete_test AS \
+             SELECT 1 as id, 'alice' as val UNION ALL \
+             SELECT 2, 'bob' UNION ALL \
+             SELECT 3, 'carol'",
+        )
+        .await
+        .expect("CTAS for delete_test should succeed");
+
+    // Verify 3 rows exist
+    let batches = handler
+        .execute(&session, "SELECT * FROM test_ns.delete_test")
+        .await
+        .expect("SELECT should succeed");
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3, "Table should have 3 rows before DELETE");
+
+    // Delete the row where id = 2
+    handler
+        .execute(&session, "DELETE FROM test_ns.delete_test WHERE id = 2")
+        .await
+        .expect("DELETE WHERE id = 2 should succeed");
+
+    // Verify 2 rows remain
+    let batches = handler
+        .execute(
+            &session,
+            "SELECT id, val FROM test_ns.delete_test ORDER BY id",
+        )
+        .await
+        .expect("SELECT after DELETE should succeed");
+
+    common::print_results(
+        "DELETE WHERE id = 2",
+        "SELECT id, val FROM test_ns.delete_test ORDER BY id",
+        &batches,
+    );
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2, "Table should have 2 rows after DELETE");
+
+    // Collect remaining ids
+    let mut ids: Vec<i64> = Vec::new();
+    for batch in &batches {
+        let id_col = batch
+            .column_by_name("id")
+            .expect("should have 'id' column");
+        let id_arr = id_col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id should be Int64");
+        for row in 0..batch.num_rows() {
+            ids.push(id_arr.value(row));
+        }
+    }
+    assert_eq!(ids, vec![1, 3], "Rows with id 1 and 3 should remain");
+
+    // Cleanup
+    handler
+        .execute(&session, "DROP TABLE test_ns.delete_test")
+        .await
+        .expect("DROP TABLE cleanup should succeed");
+}
+
+// Test: DELETE FROM without WHERE (truncate) — removes all rows
+#[tokio::test(flavor = "multi_thread")]
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn test_delete_all() {
+    let (session, handler) = common::setup_handler().await;
+
+    // Cleanup leftover
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.trunc_test")
+        .await;
+
+    // Create table with 3 rows
+    handler
+        .execute(
+            &session,
+            "CREATE TABLE test_ns.trunc_test AS \
+             SELECT 1 as id, 'alice' as val UNION ALL \
+             SELECT 2, 'bob' UNION ALL \
+             SELECT 3, 'carol'",
+        )
+        .await
+        .expect("CTAS for trunc_test should succeed");
+
+    // Delete all rows (no WHERE clause)
+    handler
+        .execute(&session, "DELETE FROM test_ns.trunc_test")
+        .await
+        .expect("DELETE without WHERE should succeed");
+
+    // Verify 0 rows remain
+    let batches = handler
+        .execute(
+            &session,
+            "SELECT COUNT(*) as cnt FROM test_ns.trunc_test",
+        )
+        .await
+        .expect("SELECT COUNT after DELETE ALL should succeed");
+
+    common::print_results(
+        "DELETE ALL (truncate)",
+        "SELECT COUNT(*) FROM test_ns.trunc_test",
+        &batches,
+    );
+
+    let count_col = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("COUNT should return Int64");
+    assert_eq!(count_col.value(0), 0, "Table should have 0 rows after DELETE ALL");
+
+    // Cleanup
+    handler
+        .execute(&session, "DROP TABLE test_ns.trunc_test")
+        .await
+        .expect("DROP TABLE cleanup should succeed");
+}
+
+// Test: UPDATE with WHERE clause — modifies matching rows
+#[tokio::test(flavor = "multi_thread")]
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn test_update_with_where() {
+    let (session, handler) = common::setup_handler().await;
+
+    // Cleanup leftover
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.update_test")
+        .await;
+
+    // Create table with 3 rows: (1,10), (2,20), (3,30)
+    handler
+        .execute(
+            &session,
+            "CREATE TABLE test_ns.update_test AS \
+             SELECT 1 as id, 10 as val UNION ALL \
+             SELECT 2, 20 UNION ALL \
+             SELECT 3, 30",
+        )
+        .await
+        .expect("CTAS for update_test should succeed");
+
+    // Update val to 99 where id = 2
+    handler
+        .execute(
+            &session,
+            "UPDATE test_ns.update_test SET val = 99 WHERE id = 2",
+        )
+        .await
+        .expect("UPDATE SET val = 99 WHERE id = 2 should succeed");
+
+    // Verify the update
+    let batches = handler
+        .execute(
+            &session,
+            "SELECT id, val FROM test_ns.update_test ORDER BY id",
+        )
+        .await
+        .expect("SELECT after UPDATE should succeed");
+
+    common::print_results(
+        "UPDATE SET val = 99 WHERE id = 2",
+        "SELECT id, val FROM test_ns.update_test ORDER BY id",
+        &batches,
+    );
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3, "Table should still have 3 rows after UPDATE");
+
+    // Collect (id, val) pairs
+    let mut rows: Vec<(i64, i64)> = Vec::new();
+    for batch in &batches {
+        let id_col = batch
+            .column_by_name("id")
+            .expect("should have 'id' column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id should be Int64");
+        let val_col = batch
+            .column_by_name("val")
+            .expect("should have 'val' column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("val should be Int64");
+        for row in 0..batch.num_rows() {
+            rows.push((id_col.value(row), val_col.value(row)));
+        }
+    }
+    assert_eq!(
+        rows,
+        vec![(1, 10), (2, 99), (3, 30)],
+        "Row (2,20) should be updated to (2,99), others unchanged"
+    );
+
+    // Cleanup
+    handler
+        .execute(&session, "DROP TABLE test_ns.update_test")
+        .await
+        .expect("DROP TABLE cleanup should succeed");
+}
+
+// Test: UPDATE all rows — modifies every row without WHERE clause
+#[tokio::test(flavor = "multi_thread")]
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn test_update_all_rows() {
+    let (session, handler) = common::setup_handler().await;
+
+    // Cleanup leftover
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.update_all")
+        .await;
+
+    // Create table with 2 rows: (1,10), (2,20)
+    handler
+        .execute(
+            &session,
+            "CREATE TABLE test_ns.update_all AS \
+             SELECT 1 as id, 10 as val UNION ALL \
+             SELECT 2, 20",
+        )
+        .await
+        .expect("CTAS for update_all should succeed");
+
+    // Update all rows: val = val + 100
+    handler
+        .execute(
+            &session,
+            "UPDATE test_ns.update_all SET val = val + 100",
+        )
+        .await
+        .expect("UPDATE SET val = val + 100 should succeed");
+
+    // Verify the update
+    let batches = handler
+        .execute(
+            &session,
+            "SELECT id, val FROM test_ns.update_all ORDER BY id",
+        )
+        .await
+        .expect("SELECT after UPDATE ALL should succeed");
+
+    common::print_results(
+        "UPDATE ALL SET val = val + 100",
+        "SELECT id, val FROM test_ns.update_all ORDER BY id",
+        &batches,
+    );
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2, "Table should still have 2 rows after UPDATE");
+
+    // Collect (id, val) pairs
+    let mut rows: Vec<(i64, i64)> = Vec::new();
+    for batch in &batches {
+        let id_col = batch
+            .column_by_name("id")
+            .expect("should have 'id' column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id should be Int64");
+        let val_col = batch
+            .column_by_name("val")
+            .expect("should have 'val' column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("val should be Int64");
+        for row in 0..batch.num_rows() {
+            rows.push((id_col.value(row), val_col.value(row)));
+        }
+    }
+    assert_eq!(
+        rows,
+        vec![(1, 110), (2, 120)],
+        "All rows should have val increased by 100"
+    );
+
+    // Cleanup
+    handler
+        .execute(&session, "DROP TABLE test_ns.update_all")
+        .await
+        .expect("DROP TABLE cleanup should succeed");
+}
