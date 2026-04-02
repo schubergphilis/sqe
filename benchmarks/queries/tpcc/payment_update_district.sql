@@ -1,4 +1,5 @@
 -- name: Payment — Update district year-to-date
+-- requires: full_schema
 -- description: Step 2 of Payment transaction: increment district d_ytd by payment amount
 -- type: write
 -- timeout: 30s

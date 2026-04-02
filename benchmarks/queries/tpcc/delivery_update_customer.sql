@@ -1,4 +1,5 @@
 -- name: Delivery — Update customer balance
+-- requires: full_schema
 -- description: Step 4 of Delivery transaction: credit customer balance and increment delivery count
 -- type: write
 -- timeout: 30s

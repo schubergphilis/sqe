@@ -1,4 +1,5 @@
 -- name: Trade Update — Correct settlement cash type
+-- requires: full_schema
 -- description: Write portion of Trade Update (Frame 2): fix settlement cash_type on completed trades
 -- timeout: 30s
 

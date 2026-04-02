@@ -1,4 +1,5 @@
 -- name: New Order — Increment district next order ID
+-- requires: full_schema
 -- description: Step 1 of New Order transaction: bump d_next_o_id for the district
 -- type: write
 -- timeout: 30s

@@ -1,4 +1,5 @@
 -- name: Delivery — Set delivery date on order lines
+-- requires: full_schema
 -- description: Step 3 of Delivery transaction: stamp delivery_d on order_line rows
 -- type: write
 -- timeout: 30s
