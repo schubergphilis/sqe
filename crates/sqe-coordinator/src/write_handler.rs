@@ -372,11 +372,12 @@ impl WriteHandler {
     ///
     /// Without a WHERE clause, this is a truncate: commits a rewrite that
     /// removes all data files.
-    #[instrument(skip(self, session, stmt), fields(username = %session.user.username))]
+    #[instrument(skip(self, session, stmt, catalog), fields(username = %session.user.username))]
     pub async fn handle_delete(
         &self,
         session: &Session,
         stmt: &Statement,
+        catalog: Arc<SessionCatalog>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let delete = match stmt {
             Statement::Delete(d) => d,
@@ -403,11 +404,7 @@ impl WriteHandler {
         let (namespace, name) = parse_table_ref(table_factor_name)?;
         let table_ident = TableIdent::new(namespace, name);
 
-        let catalog = self.create_catalog_bridge(session).await?;
-        let table = catalog
-            .load_table(&table_ident)
-            .await
-            .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
+        let table = catalog.load_table(&table_ident).await?;
 
         // Get all data files from current snapshot via manifest entries
         let old_data_files = self.collect_data_files(&table).await?;
@@ -427,7 +424,7 @@ impl WriteHandler {
             let tx = action.apply(tx).map_err(|e| {
                 SqeError::Execution(format!("Failed to apply truncate transaction: {e}"))
             })?;
-            tx.commit(catalog.as_ref()).await.map_err(|e| {
+            tx.commit(catalog.as_catalog().as_ref()).await.map_err(|e| {
                 SqeError::Execution(format!("Failed to commit truncate: {e}"))
             })?;
             info!(table = %table_ident, "DELETE: table truncated successfully");
@@ -491,7 +488,7 @@ impl WriteHandler {
         let tx = action.apply(tx).map_err(|e| {
             SqeError::Execution(format!("Failed to apply DELETE rewrite: {e}"))
         })?;
-        tx.commit(catalog.as_ref()).await.map_err(|e| {
+        tx.commit(catalog.as_catalog().as_ref()).await.map_err(|e| {
             SqeError::Execution(format!("Failed to commit DELETE: {e}"))
         })?;
 
@@ -503,11 +500,12 @@ impl WriteHandler {
     ///
     /// Uses Copy-on-Write: reads all data files, applies SET assignments to
     /// rows matching WHERE, writes new files, atomically swaps.
-    #[instrument(skip(self, session, stmt), fields(username = %session.user.username))]
+    #[instrument(skip(self, session, stmt, catalog), fields(username = %session.user.username))]
     pub async fn handle_update(
         &self,
         session: &Session,
         stmt: &Statement,
+        catalog: Arc<SessionCatalog>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let (table_factor, assignments, selection) = match stmt {
             Statement::Update {
@@ -535,11 +533,7 @@ impl WriteHandler {
         let (namespace, name) = parse_table_ref(table_name)?;
         let table_ident = TableIdent::new(namespace, name);
 
-        let catalog = self.create_catalog_bridge(session).await?;
-        let table = catalog
-            .load_table(&table_ident)
-            .await
-            .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
+        let table = catalog.load_table(&table_ident).await?;
 
         // Get all data files
         let old_data_files = self.collect_data_files(&table).await?;
@@ -618,7 +612,7 @@ impl WriteHandler {
         let tx = action.apply(tx).map_err(|e| {
             SqeError::Execution(format!("Failed to apply UPDATE rewrite: {e}"))
         })?;
-        tx.commit(catalog.as_ref()).await.map_err(|e| {
+        tx.commit(catalog.as_catalog().as_ref()).await.map_err(|e| {
             SqeError::Execution(format!("Failed to commit UPDATE: {e}"))
         })?;
 
@@ -637,12 +631,13 @@ impl WriteHandler {
     /// The caller is responsible for executing the source query and providing
     /// the result batches. This follows the same pattern as `handle_ctas` and
     /// `handle_insert`.
-    #[instrument(skip(self, session, stmt, source_batches), fields(username = %session.user.username))]
+    #[instrument(skip(self, session, stmt, source_batches, catalog), fields(username = %session.user.username))]
     pub async fn handle_merge(
         &self,
         session: &Session,
         stmt: &Statement,
         source_batches: Vec<RecordBatch>,
+        catalog: Arc<SessionCatalog>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         use sqlparser::ast::{MergeAction, MergeClauseKind, MergeInsertKind, TableFactor};
 
@@ -695,11 +690,7 @@ impl WriteHandler {
         );
 
         // Load target table and read all data files
-        let catalog = self.create_catalog_bridge(session).await?;
-        let table = catalog
-            .load_table(&table_ident)
-            .await
-            .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
+        let table = catalog.load_table(&table_ident).await?;
 
         let old_data_files = self.collect_data_files(&table).await?;
 
@@ -1009,7 +1000,7 @@ impl WriteHandler {
         let tx = action.apply(tx).map_err(|e| {
             SqeError::Execution(format!("Failed to apply MERGE rewrite: {e}"))
         })?;
-        tx.commit(catalog.as_ref()).await.map_err(|e| {
+        tx.commit(catalog.as_catalog().as_ref()).await.map_err(|e| {
             SqeError::Execution(format!("Failed to commit MERGE: {e}"))
         })?;
 
@@ -1390,6 +1381,11 @@ impl WriteHandler {
             )
             .await?,
         );
+
+        // Warm up the REST catalog by listing namespaces. The RisingWave fork's
+        // RestCatalog requires this initial API call to bootstrap its internal
+        // session state before load_table works correctly.
+        let _ = session_catalog.list_namespaces().await;
 
         Ok(session_catalog.as_catalog())
     }

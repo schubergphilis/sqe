@@ -200,7 +200,7 @@ impl QueryHandler {
                 StatementKind::Utility(stmt) => {
                     if let sqlparser::ast::Statement::Explain { analyze, statement, .. } = stmt.as_ref() {
                         let inner = statement.to_string();
-                        let ctx = self.create_session_context(session).await?;
+                        let (ctx, _) = self.create_session_context(session).await?;
                         if *analyze {
                             self.explain_handler.analyze(session, &inner, &ctx).await
                         } else {
@@ -284,16 +284,18 @@ impl QueryHandler {
                 }
 
                 StatementKind::ExplainFull(inner) => {
-                    let ctx = self.create_session_context(session).await?;
+                    let (ctx, _) = self.create_session_context(session).await?;
                     self.explain_handler.full(session, inner, &ctx).await
                 }
 
                 StatementKind::Delete(stmt) => {
-                    self.write_handler.handle_delete(session, stmt).await
+                    let (_, session_catalog) = self.create_session_context(session).await?;
+                    self.write_handler.handle_delete(session, stmt, session_catalog).await
                 }
 
                 StatementKind::Update(stmt) => {
-                    self.write_handler.handle_update(session, stmt).await
+                    let (_, session_catalog) = self.create_session_context(session).await?;
+                    self.write_handler.handle_update(session, stmt, session_catalog).await
                 }
 
                 StatementKind::Merge(stmt) => {
@@ -318,10 +320,11 @@ impl QueryHandler {
                             "Expected MERGE statement".into(),
                         ));
                     };
+                    let (_, session_catalog) = self.create_session_context(session).await?;
                     let source_batches =
                         self.execute_query(session, &source_sql, &query_id).await?;
                     self.write_handler
-                        .handle_merge(session, stmt, source_batches)
+                        .handle_merge(session, stmt, source_batches, session_catalog)
                         .await
                 }
             }
@@ -480,7 +483,7 @@ impl QueryHandler {
         let kind = parse_and_classify(sql)?;
 
         if matches!(kind, StatementKind::Query(_)) {
-            let ctx = self.create_session_context(session).await?;
+            let (ctx, _) = self.create_session_context(session).await?;
             let df = ctx
                 .sql(sql)
                 .await
@@ -506,7 +509,7 @@ impl QueryHandler {
         sql: &str,
         query_id: &uuid::Uuid,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let ctx = self.create_session_context(session).await?;
+        let (ctx, _) = self.create_session_context(session).await?;
 
         // Plan the query via DataFusion's SQL planner
         let df = ctx
@@ -878,7 +881,7 @@ impl QueryHandler {
     async fn create_session_context(
         &self,
         session: &Session,
-    ) -> sqe_core::Result<SessionContext> {
+    ) -> sqe_core::Result<(SessionContext, Arc<SessionCatalog>)> {
         crate::session_context::create_session_context(
             &self.config,
             session,
