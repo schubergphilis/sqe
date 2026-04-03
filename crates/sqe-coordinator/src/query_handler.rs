@@ -289,13 +289,13 @@ impl QueryHandler {
                 }
 
                 StatementKind::Delete(stmt) => {
-                    let (_, session_catalog) = self.create_session_context(session).await?;
-                    self.write_handler.handle_delete(session, stmt, session_catalog).await
+                    let (ctx, session_catalog) = self.create_session_context(session).await?;
+                    self.write_handler.handle_delete(session, stmt, session_catalog, &ctx).await
                 }
 
                 StatementKind::Update(stmt) => {
-                    let (_, session_catalog) = self.create_session_context(session).await?;
-                    self.write_handler.handle_update(session, stmt, session_catalog).await
+                    let (ctx, session_catalog) = self.create_session_context(session).await?;
+                    self.write_handler.handle_update(session, stmt, session_catalog, &ctx).await
                 }
 
                 StatementKind::Merge(stmt) => {
@@ -320,11 +320,11 @@ impl QueryHandler {
                             "Expected MERGE statement".into(),
                         ));
                     };
-                    let (_, session_catalog) = self.create_session_context(session).await?;
+                    let (ctx, session_catalog) = self.create_session_context(session).await?;
                     let source_batches =
                         self.execute_query(session, &source_sql, &query_id).await?;
                     self.write_handler
-                        .handle_merge(session, stmt, source_batches, session_catalog)
+                        .handle_merge(session, stmt, source_batches, session_catalog, &ctx)
                         .await
                 }
             }
