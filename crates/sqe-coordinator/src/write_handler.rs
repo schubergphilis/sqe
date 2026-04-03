@@ -372,12 +372,13 @@ impl WriteHandler {
     ///
     /// Without a WHERE clause, this is a truncate: commits a rewrite that
     /// removes all data files.
-    #[instrument(skip(self, session, stmt, catalog), fields(username = %session.user.username))]
+    #[instrument(skip(self, session, stmt, catalog, ctx), fields(username = %session.user.username))]
     pub async fn handle_delete(
         &self,
         session: &Session,
         stmt: &Statement,
         catalog: Arc<SessionCatalog>,
+        ctx: &DFSessionContext,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let delete = match stmt {
             Statement::Delete(d) => d,
@@ -440,7 +441,6 @@ impl WriteHandler {
             "DELETE: CoW rewrite"
         );
 
-        let df_ctx = DFSessionContext::new();
         let mut new_data_files = Vec::new();
         let mut total_deleted = 0usize;
 
@@ -456,7 +456,7 @@ impl WriteHandler {
             let mut surviving_batches = Vec::new();
             for batch in &batches {
                 let filtered =
-                    self.filter_batch_negate(&df_ctx, batch, &where_sql, &table_ident)
+                    self.filter_batch_negate(ctx, batch, &where_sql, &table_ident)
                         .await?;
                 total_deleted += batch.num_rows() - filtered.num_rows();
                 if filtered.num_rows() > 0 {
@@ -500,12 +500,13 @@ impl WriteHandler {
     ///
     /// Uses Copy-on-Write: reads all data files, applies SET assignments to
     /// rows matching WHERE, writes new files, atomically swaps.
-    #[instrument(skip(self, session, stmt, catalog), fields(username = %session.user.username))]
+    #[instrument(skip(self, session, stmt, catalog, ctx), fields(username = %session.user.username))]
     pub async fn handle_update(
         &self,
         session: &Session,
         stmt: &Statement,
         catalog: Arc<SessionCatalog>,
+        ctx: &DFSessionContext,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let (table_factor, assignments, selection) = match stmt {
             Statement::Update {
@@ -563,7 +564,6 @@ impl WriteHandler {
             "UPDATE: CoW rewrite"
         );
 
-        let df_ctx = DFSessionContext::new();
         let mut new_data_files = Vec::new();
         let mut total_updated = 0usize;
 
@@ -579,7 +579,7 @@ impl WriteHandler {
 
             for batch in &batches {
                 let rewritten = self
-                    .apply_update(&df_ctx, batch, assignments, &where_sql, &table_ident)
+                    .apply_update(ctx, batch, assignments, &where_sql, &table_ident)
                     .await?;
                 rewritten_batches.push(rewritten);
             }
@@ -587,7 +587,7 @@ impl WriteHandler {
             // Count updated rows by comparing before/after
             for batch in &batches {
                 let count = self
-                    .count_matching_rows(&df_ctx, batch, &where_sql, &table_ident)
+                    .count_matching_rows(ctx, batch, &where_sql, &table_ident)
                     .await?;
                 total_updated += count;
             }
@@ -631,13 +631,14 @@ impl WriteHandler {
     /// The caller is responsible for executing the source query and providing
     /// the result batches. This follows the same pattern as `handle_ctas` and
     /// `handle_insert`.
-    #[instrument(skip(self, session, stmt, source_batches, catalog), fields(username = %session.user.username))]
+    #[instrument(skip(self, session, stmt, source_batches, catalog, ctx), fields(username = %session.user.username))]
     pub async fn handle_merge(
         &self,
         session: &Session,
         stmt: &Statement,
         source_batches: Vec<RecordBatch>,
         catalog: Arc<SessionCatalog>,
+        ctx: &DFSessionContext,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         use sqlparser::ast::{MergeAction, MergeClauseKind, MergeInsertKind, TableFactor};
 
@@ -733,10 +734,8 @@ impl WriteHandler {
         let target_table_ref = "__merge_target".to_string();
         let source_table_ref = "__merge_source".to_string();
 
-        // Build a DataFusion context to execute the source and the merge query
-        let df_ctx = DFSessionContext::new();
-
-        // Register target data as a MemTable
+        // Register target data as a MemTable in the full session context
+        // (which has all catalog tables registered for cross-table subqueries)
         let target_mem = if target_batches.is_empty() {
             datafusion::datasource::MemTable::try_new(
                 target_schema.clone(),
@@ -749,7 +748,7 @@ impl WriteHandler {
             )
         }
         .map_err(|e| SqeError::Execution(format!("Failed to create target MemTable: {e}")))?;
-        df_ctx
+        ctx
             .register_table(&target_table_ref, Arc::new(target_mem))
             .map_err(|e| {
                 SqeError::Execution(format!("Failed to register target MemTable: {e}"))
@@ -769,7 +768,7 @@ impl WriteHandler {
             vec![source_batches],
         )
         .map_err(|e| SqeError::Execution(format!("Failed to create source MemTable: {e}")))?;
-        df_ctx
+        ctx
             .register_table(&source_table_ref, Arc::new(source_mem))
             .map_err(|e| {
                 SqeError::Execution(format!("Failed to register source MemTable: {e}"))
@@ -929,12 +928,16 @@ impl WriteHandler {
             "MERGE: executing merge query"
         );
 
-        let df = df_ctx.sql(&select_sql).await.map_err(|e| {
+        let df = ctx.sql(&select_sql).await.map_err(|e| {
             SqeError::Execution(format!("Failed to plan MERGE query: {e}"))
         })?;
         let mut result_batches: Vec<RecordBatch> = df.collect().await.map_err(|e| {
             SqeError::Execution(format!("Failed to execute MERGE query: {e}"))
         })?;
+
+        // Deregister temp tables to avoid polluting the shared session context
+        let _ = ctx.deregister_table(&target_table_ref);
+        let _ = ctx.deregister_table(&source_table_ref);
 
         // For WHEN MATCHED THEN DELETE: filter out the rows where all columns are NULL
         // (these are the matched rows we set to NULL above)
