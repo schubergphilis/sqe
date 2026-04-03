@@ -23,7 +23,7 @@ pub async fn create_session_context(
     session: &Session,
     policy_store: Option<&Arc<dyn PolicyStore>>,
     query_tracker: &Arc<QueryTracker>,
-) -> sqe_core::Result<SessionContext> {
+) -> sqe_core::Result<(SessionContext, Arc<SessionCatalog>)> {
     let catalog_name = if config.catalog.warehouse.is_empty() {
         "default".to_string()
     } else {
@@ -60,6 +60,7 @@ pub async fn create_session_context(
     );
 
     // Clone before moving into SqeCatalogProvider (which consumes the Arc)
+    let session_catalog_for_return = session_catalog.clone();
     let session_catalog_for_system = session_catalog.clone();
 
     // Create the DataFusion CatalogProvider from the session catalog,
@@ -170,5 +171,5 @@ pub async fn create_session_context(
         "Registered session catalog in DataFusion context"
     );
 
-    Ok(ctx)
+    Ok((ctx, session_catalog_for_return))
 }

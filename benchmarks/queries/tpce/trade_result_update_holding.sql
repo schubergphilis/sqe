@@ -1,5 +1,4 @@
 -- name: Trade Result — Update holding summary
--- requires: write_via_benchmark
 -- description: Write portion of Trade Result: update holding_summary quantities for settled trades
 -- timeout: 30s
 

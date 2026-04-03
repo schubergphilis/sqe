@@ -1,5 +1,4 @@
 -- name: Delivery — Update carrier on orders
--- requires: write_via_benchmark
 -- description: Step 2 of Delivery transaction: set carrier_id on delivered orders
 -- type: write
 -- timeout: 30s
