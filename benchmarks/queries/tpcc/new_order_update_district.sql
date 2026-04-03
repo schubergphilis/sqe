@@ -1,5 +1,4 @@
 -- name: New Order — Increment district next order ID
--- requires: write_via_benchmark
 -- description: Step 1 of New Order transaction: bump d_next_o_id for the district
 -- type: write
 -- timeout: 30s

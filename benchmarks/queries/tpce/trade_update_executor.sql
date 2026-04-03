@@ -1,5 +1,4 @@
 -- name: Trade Update — Correct executor name
--- requires: write_via_benchmark
 -- description: Write portion of Trade Update (Frame 1): update executor name on completed trades
 -- timeout: 30s
 

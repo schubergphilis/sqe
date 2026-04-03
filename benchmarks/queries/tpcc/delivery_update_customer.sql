@@ -1,5 +1,4 @@
 -- name: Delivery — Update customer balance
--- requires: write_via_benchmark
 -- description: Step 4 of Delivery transaction: credit customer balance and increment delivery count
 -- type: write
 -- timeout: 30s

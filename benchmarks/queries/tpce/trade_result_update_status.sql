@@ -1,5 +1,4 @@
 -- name: Trade Result — Mark trades as completed
--- requires: write_via_benchmark
 -- description: Write portion of Trade Result: transition pending trades to completed status
 -- timeout: 30s
 

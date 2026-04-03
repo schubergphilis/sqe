@@ -1,5 +1,4 @@
 -- name: Data Maintenance — Delete stale news items
--- requires: write_via_benchmark
 -- description: Write portion of Data Maintenance: purge old news items
 -- timeout: 30s
 

@@ -330,6 +330,7 @@ fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> String {
                     || upper_before.ends_with(" TABLE")
                     || upper_before.ends_with(" INTO")
                     || upper_before.ends_with(" UPDATE")
+                    || upper_before.ends_with("\nUPDATE")
                     || upper_before.ends_with(" EXISTS")
                     // Trailing comma means continuation of a table list
                     // (handles "FROM t1, t2", "FROM t1 a1,\n t2 a2", etc.)

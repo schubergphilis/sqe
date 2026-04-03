@@ -1,5 +1,4 @@
 -- name: Payment — Update customer balance and payment counters
--- requires: write_via_benchmark
 -- description: Step 3 of Payment transaction: debit customer balance, increment counters
 -- type: write
 -- timeout: 30s
