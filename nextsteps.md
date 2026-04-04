@@ -1,6 +1,6 @@
 # SQE — Next Steps
 
-> Status as of 2026-03-28. Step 0 dependency alignment complete. Step 2 core engine effectively complete (99/103 — 4 blocked on iceberg-rust MoR). Step 3 OSS security hardening complete (51/51). Benchmark suite (sqe-bench) complete. **Hardening pass complete:** all Arrow types mapped to Trino types, Trino value serialization extended (Utf8View, Decimal, Time, Binary), benchmark comparator extended (Timestamp, Utf8View, human-readable dates, decimal trailing-zero normalization), Flight SQL DoPut implemented (Arrow data ingestion + statement updates), GetTableTypes + GetXdbcTypeInfo added for JDBC/BI tool compatibility, all clippy errors fixed, token fingerprint hardened (hash instead of raw suffix). **Query history and cache complete:** `system.runtime.queries` virtual table (Flight SQL + Trino compat), in-memory query history store (moka TTL cache, max_entries cap), query result cache (`[query_cache]` config section, moka-backed, per-entry size cap), config sections added to `sqe.toml.example`. All feature branches merged into `main`.
+> Status as of 2026-04-02. Step 0 dependency alignment complete. Step 2 core engine: **DELETE, UPDATE, and MERGE INTO fully implemented via CoW rewrite_files** (RisingWave iceberg-rust fork). Bearer token (JWT/JWKS) auth provider added. Step 3 OSS security hardening complete (51/51). Benchmark suite (sqe-bench) complete with 16 new TPC-C/E write-path DML queries. **Hardening pass complete:** all Arrow types mapped to Trino types, Trino value serialization extended (Utf8View, Decimal, Time, Binary), benchmark comparator extended (Timestamp, Utf8View, human-readable dates, decimal trailing-zero normalization), Flight SQL DoPut implemented (Arrow data ingestion + statement updates), GetTableTypes + GetXdbcTypeInfo added for JDBC/BI tool compatibility, all clippy errors fixed, token fingerprint hardened (hash instead of raw suffix). **Query history and cache complete:** `system.runtime.queries` virtual table (Flight SQL + Trino compat), in-memory query history store (moka TTL cache, max_entries cap), query result cache (`[query_cache]` config section, moka-backed, per-entry size cap), config sections added to `sqe.toml.example`. All feature branches merged into `main`.
 
 > **Monitoring:** OPA SPI refactor in Polaris (PR #3999, still draft) will affect Phase 5 OPA integration when it lands — do not implement OPA against Polaris until this stabilises. Remote S3 signing (Iceberg 1.12, not yet released) will affect the pluggable-catalogs design.
 
@@ -63,12 +63,12 @@ Step 2 is effectively complete. All implementation and test tasks are done. Only
 
 | Task | Ref | Status |
 |---|---|---|
-| `DELETE FROM` — position delete files → commit snapshot | 8.4 | Blocked — iceberg-rust MoR (#2186, ETA Q3 2026) |
-| `MERGE INTO` — join target+source → position deletes + new data → atomic commit | 8.5 | Blocked — iceberg-rust MoR (#2186, ETA Q3 2026) |
-| Integration test: MERGE INTO | 8.13 | Blocked — depends on 8.5 |
-| Integration test: DELETE FROM | 8.14 | Blocked — depends on 8.4 |
+| ~~`DELETE FROM` — CoW rewrite_files~~ | 8.4 | ✅ Done — via RisingWave fork rewrite_files() |
+| ~~`MERGE INTO` — CoW full-outer-join rewrite~~ | 8.5 | ✅ Done — via RisingWave fork rewrite_files() |
+| ~~Integration test: MERGE INTO~~ | 8.13 | ✅ Done |
+| ~~Integration test: DELETE FROM~~ | 8.14 | ✅ Done |
 
-`OverwriteAction` (CoW, merged iceberg-rust PR #2185) is available in 0.9.0 and can be used for full-table `INSERT OVERWRITE` semantics as a partial substitute.
+All 103/103 tasks complete. DELETE, UPDATE, and MERGE INTO use Copy-on-Write via the RisingWave iceberg-rust fork's `rewrite_files()` transaction API.
 
 **Completed since last update (2026-03-22):** distributed execution (7.6, 7.10, 7.11, 9.5, 9.6, 9.7), predicate pushdown (6.3), Trino pagination + headers (11.3, 11.7), worker metrics (12.3), OTel trace propagation (12.6), sqe-auth unit tests (2.5), Keycloak realm registration (13.3), all integration tests (2.6, 3.10, 3.11, 7.12, 7.13, 8.11, 8.12, 8.15, 8.16, 9.8, 10.5, 11.10, 13.4, 13.5), e2e test script.
 
@@ -179,7 +179,7 @@ Four sub-systems that make SQE agent-native and semantically aware.
 
 ```
 Step 1: audit               (1–2 days — catches issues before they compound)
-Step 2: core engine gaps    ✅ DONE (99/103 — 4 blocked on iceberg-rust MoR Q3 2026)
+Step 2: core engine gaps    ✅ DONE (103/103 — DELETE, UPDATE, MERGE via CoW rewrite_files)
 Step 3: security hardening  ✅ DONE (51/51 — TLS, rate limiting, timeouts, cancellation, audit, error sanitisation)
 Step 3b: benchmark suite    ✅ DONE (sqe-bench: generate/load/test, 6 benchmarks, read_parquet() TVF, CI scripts)
 Step 3c: hardening pass     ✅ DONE (type formatting, Flight SQL DoPut + metadata, clippy, decimal DIFF, token fingerprint)
@@ -192,4 +192,4 @@ Step 6: semantic layer      (new crates; fully additive; no existing code broken
 
 Steps 4 and 5 can be worked in parallel by two engineers. Step 6 is independent of 3–5 and can start any time.
 
-> **Upstream watch list:** iceberg-rust MoR (Epic #2186, Q3 2026) unblocks DELETE/MERGE; Polaris OPA SPI refactor (PR #3999) must stabilise before Phase 5 OPA integration; remote S3 signing (Iceberg 1.12) will require revisiting pluggable-catalogs credential vending design.
+> **Upstream watch list:** iceberg-rust MoR (Epic #2186, Q3 2026) could replace CoW DELETE/MERGE with more efficient position-delete approach in the future; Polaris OPA SPI refactor (PR #3999) must stabilise before Phase 5 OPA integration; remote S3 signing (Iceberg 1.12) will require revisiting pluggable-catalogs credential vending design; DataFusion `IN (subquery)` not supported in physical plan for MemTable-referenced columns — blocks 5 TPC-E DML benchmark queries (market_feed_update, trade_result_update_holding, trade_result_update_status, trade_update_executor, trade_update_settlement). Workaround: rewrite as `EXISTS` or `JOIN`. Track upstream DataFusion for fix.

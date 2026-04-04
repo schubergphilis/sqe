@@ -190,7 +190,10 @@ async fn shutdown_signal() {
 }
 
 // ── Trino adapters ─────────────────────────────────────────────
-struct AuthenticatorAdapter(Arc<sqe_auth::Authenticator>);
+struct AuthenticatorAdapter {
+    authenticator: Arc<sqe_auth::Authenticator>,
+    bearer_provider: Option<Arc<dyn sqe_auth::AuthProvider>>,
+}
 
 #[async_trait::async_trait]
 impl TrinoAuthenticator for AuthenticatorAdapter {
@@ -199,10 +202,38 @@ impl TrinoAuthenticator for AuthenticatorAdapter {
         username: &str,
         password: &str,
     ) -> Result<sqe_core::Session, String> {
-        self.0
+        self.authenticator
             .authenticate(username, password)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    async fn authenticate_bearer(&self, token: &str) -> Result<sqe_core::Session, String> {
+        let provider = self
+            .bearer_provider
+            .as_ref()
+            .ok_or_else(|| "Bearer token authentication is not configured".to_string())?;
+
+        let credentials = sqe_auth::FlightCredentials {
+            bearer_token: Some(token.to_string()),
+            ..Default::default()
+        };
+
+        let identity = provider
+            .authenticate(&credentials)
+            .await
+            .map_err(|e| format!("Bearer token validation failed: {e}"))?;
+
+        // Convert Identity to Session: use the JWT itself as the catalog token
+        // (passthrough to Polaris), and the identity fields for user/roles.
+        let token_expiry = chrono::Utc::now() + chrono::Duration::hours(1);
+        Ok(sqe_core::Session::new(
+            identity.user_id,
+            identity.catalog_token.unwrap_or_else(|| token.to_string()),
+            None,
+            token_expiry,
+            identity.roles,
+        ))
     }
 }
 
@@ -435,9 +466,29 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         query_cache,
     ));
 
+    // Build bearer token auth chain for Trino-compat HTTP bearer token validation.
+    let bearer_provider: Option<Arc<dyn sqe_auth::AuthProvider>> =
+        match sqe_auth::build_auth_chain(&config.auth).await {
+            Ok(chain) => {
+                tracing::info!("Bearer token auth chain built for Trino-compat endpoint");
+                Some(Arc::new(chain))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to build bearer auth chain; bearer token auth will be disabled \
+                     for Trino-compat"
+                );
+                None
+            }
+        };
+
     // Trino compat
     if config.coordinator.trino_http_port > 0 {
-        let auth_adapter = Arc::new(AuthenticatorAdapter(authenticator.clone()));
+        let auth_adapter = Arc::new(AuthenticatorAdapter {
+            authenticator: authenticator.clone(),
+            bearer_provider: bearer_provider.clone(),
+        });
         let handler_adapter = Arc::new(QueryHandlerAdapter(query_handler.clone()));
         sqe_trino_compat::server::start_trino_server(
             auth_adapter,

@@ -77,8 +77,8 @@
 - [x] 8.1 Implement CTAS: execute SELECT → infer schema → create table in Polaris → write Parquet → commit snapshot
 - [x] 8.2 Implement CREATE OR REPLACE TABLE: new snapshot replacement, old snapshots retained
 - [x] 8.3 Implement INSERT INTO SELECT: execute SELECT → write new data files → append snapshot
-- [ ] 8.4 Implement DELETE FROM: scan with predicate → write position delete files → commit ⚠️ **BLOCKED** — requires iceberg-rust Merge-on-Read (Epic #2186, ETA Q3 2026)
-- [ ] 8.5 Implement MERGE INTO: scan target+source → join → classify → position deletes + new data → atomic commit ⚠️ **BLOCKED** — requires iceberg-rust Merge-on-Read (Epic #2186, ETA Q3 2026)
+- [x] 8.4 Implement DELETE FROM: CoW via rewrite_files — scan data files, filter out matching rows, write new files, atomic commit (RisingWave iceberg-rust fork)
+- [x] 8.5 Implement MERGE INTO: CoW via rewrite_files — full outer join target+source, apply WHEN MATCHED/NOT MATCHED clauses via CASE expressions, atomic commit
 - [x] 8.6 Implement DROP TABLE / DROP TABLE IF EXISTS: Polaris REST delete
 - [x] 8.7 Implement ALTER TABLE RENAME: Polaris REST rename
 - [x] 8.8 Implement CREATE VIEW: serialize SQL to Polaris REST view API
@@ -86,8 +86,8 @@
 - [x] 8.10 Implement view resolution on read: resolve view SQL → parse → inline into query plan
 - [x] 8.11 Integration test: CTAS → SELECT roundtrip
 - [x] 8.12 Integration test: INSERT INTO → verify appended data
-- [ ] 8.13 Integration test: MERGE INTO → verify upserted data
-- [ ] 8.14 Integration test: DELETE FROM → verify rows removed
+- [x] 8.13 Integration test: MERGE INTO → verify upserted data
+- [x] 8.14 Integration test: DELETE FROM → verify rows removed
 - [x] 8.15 Integration test: DROP TABLE → verify removed from Polaris
 - [x] 8.16 Integration test: CREATE VIEW → query view → verify results
 

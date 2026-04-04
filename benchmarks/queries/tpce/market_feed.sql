@@ -1,5 +1,4 @@
 -- name: Market Feed
--- requires: update
 -- Read-only view of the pending market feed: trade requests awaiting execution,
 -- joined with current last-trade data for price comparison.
 -- Note: the full TPC-E Market Feed transaction also updates last_trade prices.

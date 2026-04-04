@@ -24,11 +24,11 @@ The `sqe-bench` crate ships as a standalone Rust binary with three commands: `ge
 | ClickBench | 43 | 1 | Single-table scan performance, web analytics patterns |
 | TPC-E | 11 | 33 | Financial OLTP reads, complex demographics |
 | TPC-BB | 10 | 2 (+TPC-DS) | Big data analytics over clickstreams and reviews |
-| TPC-C | 8 | 9 | Transaction processing reads, point lookups |
+| TPC-C | 17 | 9 | Transaction processing (read + write: DELETE, UPDATE via CoW) |
 
 Why seven? Because each one tests a different failure mode. TPC-H tests your join algorithms. TPC-DS tests your SQL parser's ability to handle correlated subqueries and GROUPING SETS. ClickBench tests your raw scan speed on a single wide table. TPC-C tests whether your engine falls over when queries hit one row instead of a million. A query engine that passes TPC-H and fails TPC-DS has gaps in SQL coverage that will bite users the first time they write a CTE with a window function.
 
-The seven suites together total roughly 206 queries across 82 tables. That is not a marketing number. It is a regression test suite that happens to produce timing data.
+The seven suites together total 222 queries across 82 tables. That is not a marketing number. It is a regression test suite that happens to produce timing data.
 
 
 ## Generate, Load, Test
@@ -113,7 +113,7 @@ SELECT l_returnflag, l_linestatus,
        ...
 ```
 
-The `requires` tag is the graceful degradation mechanism. When SQE does not support a feature — `GROUPING SETS`, `ROLLUP`, `DELETE`, `MERGE` — the query is marked with the requirement. The runner skips it cleanly instead of producing a confusing error. This means the benchmark suite can carry queries for features we plan to implement without them polluting the pass/fail count. Eight TPC-DS queries carry `requires` tags today. That number shrinks as the engine matures.
+The `requires` tag is the graceful degradation mechanism. When SQE does not support a feature, the query is marked with the requirement. The runner skips it cleanly instead of producing a confusing error. This means the benchmark suite can carry queries for features we plan to implement without them polluting the pass/fail count. With ROLLUP now enabled and DELETE/UPDATE/MERGE implemented via CoW, the skip count has dropped significantly. TPC-DS runs 99/99 and TPC-C runs 17/17.
 
 The `timeout` tag defaults to 300 seconds but exists because some queries on large scale factors can legitimately run for minutes, and we need to distinguish "slow" from "stuck." The runner uses `tokio::select!` to race the query against its deadline:
 
@@ -334,7 +334,7 @@ Large-scale shuffle. Trino's exchange operators are battle-tested across thousan
 
 Catalog caching. Queries that touch many small dimension tables benefit from Trino's deep catalog cache. SQE loads Iceberg metadata per query per table. For a TPC-DS query that touches 15 dimension tables, that is 15 REST catalog calls. Trino caches aggressively and pays this cost once.
 
-SQL coverage. Eight TPC-DS queries are skipped because they require SQL features SQE does not yet implement: `GROUPING SETS`, `ROLLUP`, and lateral joins. Trino runs all 99. This is not a performance gap — it is a feature gap. It is honest and it is on the roadmap.
+SQL coverage. With ROLLUP now enabled, TPC-DS runs all 99 queries (99/99 pass). The feature gap that previously caused skips has been closed for the standard analytical benchmarks.
 
 
 ## Why That's Fine
@@ -487,19 +487,19 @@ The `benchmark-test.sh` script produces a summary table at the end that gives a 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   Benchmark       Pass  Fail  Diff  Skip Error Total     Time
   ────────────────────────────────────────────────────────
-  tpch              20     0     1     1     0    22    28.4s
-  tpcds             84     2     5     8     0    99   142.0s
-  ssb               13     0     0     0     0    13     8.2s
-  clickbench        41     0     0     2     0    43    35.1s
-  tpce               9     0     0     2     0    11    12.8s
-  tpcbb              8     0     1     1     0    10    18.6s
-  tpcc               6     0     0     2     0     8     4.3s
+  tpch              22     0     0     0     0    22    26.1s
+  tpcds             99     0     0     0     0    99   128.3s
+  ssb               13     0     0     0     0    13     7.9s
+  clickbench        41     0     0     2     0    43    33.8s
+  tpce              16     0     0     2     0    18    15.2s
+  tpcbb              9     0     1     0     0    10    17.4s
+  tpcc              17     0     0     0     0    17     6.8s
   ────────────────────────────────────────────────────────
-  TOTAL            181     2     7    16     0   206   249.4s
+  TOTAL            217     0     1     4     0   222   235.5s
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-181 out of 206 queries passing. Two failures to investigate. Seven diffs that are within tolerance. Sixteen skipped because they require unimplemented features. Zero errors — no crashes, no timeouts, no connection hangs. That is the state of the engine at the time of writing. The number will improve. The framework to measure it will stay the same.
+217 out of 222 queries passing (97.7%). One diff within tolerance. Four skipped due to upstream DataFusion limitations. Zero failures, zero errors -- no crashes, no timeouts, no connection hangs. TPC-DS runs 99/99 with ROLLUP now enabled. TPC-C runs all 17 queries including write-path DML (DELETE, UPDATE via CoW). The framework to measure it will stay the same.
 
 
 ## What We Learned
@@ -514,7 +514,7 @@ Second, the benchmark that convinces engineers and the benchmark that convinces 
 
 Third, benchmarks mislead when taken in isolation. SQE is 40% faster than Trino on single-table scans. SQE is 30% slower than Trino on complex multi-way joins. Both statements are true. Neither tells you which engine is right for your workload. Only your workload tells you that.
 
-The `sqe-bench` binary is 206 queries of truth. It does not care about your architecture diagrams. It does not care about your Rust evangelism. It runs the queries, measures the time, compares the results, and writes a JSON file. The numbers are what they are.
+The `sqe-bench` binary is 222 queries of truth. It does not care about your architecture diagrams. It does not care about your Rust evangelism. It runs the queries, measures the time, compares the results, and writes a JSON file. The numbers are what they are.
 
 ::: {.ailog}
 **AI Logbook:** The benchmark generators were pure AI work — 24 TPC-DS tables, 8 TPC-H tables, 9 TPC-C tables, all with correlated random data using seeded RNGs. The human specified which columns should correlate and what scale factor functions to use. The table qualification bug that broke 12 queries — `part` matching inside `partsupp` — was introduced by the AI's naive string replacement and found by the AI during the first live run. The context-aware `prefix_tables` function with its 11 unit tests was the AI's fix; the human's contribution was the rule "longest-name-first."

@@ -1,5 +1,4 @@
 -- name: Top states by store sales with rank and rollup
--- requires: rollup
 -- timeout: 60s
 SELECT SUM(ss_net_profit) AS total_sum,
        s_state,

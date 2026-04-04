@@ -1,7 +1,6 @@
 -- name: Payment Transaction
 -- description: Process a customer payment (write transaction)
 -- type: write
--- requires: update
 -- timeout: 10s
 
 -- This is a write transaction that cannot be expressed as a read-only SQL query.

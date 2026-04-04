@@ -200,7 +200,7 @@ impl QueryHandler {
                 StatementKind::Utility(stmt) => {
                     if let sqlparser::ast::Statement::Explain { analyze, statement, .. } = stmt.as_ref() {
                         let inner = statement.to_string();
-                        let ctx = self.create_session_context(session).await?;
+                        let (ctx, _) = self.create_session_context(session).await?;
                         if *analyze {
                             self.explain_handler.analyze(session, &inner, &ctx).await
                         } else {
@@ -284,16 +284,49 @@ impl QueryHandler {
                 }
 
                 StatementKind::ExplainFull(inner) => {
-                    let ctx = self.create_session_context(session).await?;
+                    let (ctx, _) = self.create_session_context(session).await?;
                     self.explain_handler.full(session, inner, &ctx).await
                 }
 
-                StatementKind::Delete(_) => Err(SqeError::NotImplemented(
-                    "DELETE FROM requires Iceberg overwrite transaction support (planned for Chunk 3)".to_string(),
-                )),
-                StatementKind::Merge(_) => Err(SqeError::NotImplemented(
-                    "MERGE INTO requires Iceberg overwrite transaction support (planned for Chunk 3)".to_string(),
-                )),
+                StatementKind::Delete(stmt) => {
+                    let (ctx, session_catalog) = self.create_session_context(session).await?;
+                    self.write_handler.handle_delete(session, stmt, session_catalog, &ctx).await
+                }
+
+                StatementKind::Update(stmt) => {
+                    let (ctx, session_catalog) = self.create_session_context(session).await?;
+                    self.write_handler.handle_update(session, stmt, session_catalog, &ctx).await
+                }
+
+                StatementKind::Merge(stmt) => {
+                    // Extract source SQL from the MERGE statement and execute it
+                    // to get the source batches, then pass them to the write handler.
+                    let source_sql = if let Statement::Merge { source, .. } = stmt.as_ref() {
+                        match source {
+                            sqlparser::ast::TableFactor::Table { name, .. } => {
+                                format!("SELECT * FROM {name}")
+                            }
+                            sqlparser::ast::TableFactor::Derived { subquery, .. } => {
+                                format!("{subquery}")
+                            }
+                            other => {
+                                return Err(SqeError::Execution(format!(
+                                    "Unsupported MERGE source: {other}"
+                                )));
+                            }
+                        }
+                    } else {
+                        return Err(SqeError::Execution(
+                            "Expected MERGE statement".into(),
+                        ));
+                    };
+                    let (ctx, session_catalog) = self.create_session_context(session).await?;
+                    let source_batches =
+                        self.execute_query(session, &source_sql, &query_id).await?;
+                    self.write_handler
+                        .handle_merge(session, stmt, source_batches, session_catalog, &ctx)
+                        .await
+                }
             }
         };
 
@@ -359,6 +392,30 @@ impl QueryHandler {
                     StatementKind::Drop(stmt) => {
                         let table = stmt.to_string();
                         cache.invalidate(&table);
+                    }
+                    StatementKind::Delete(stmt) => {
+                        if let Statement::Delete(del) = stmt.as_ref() {
+                            let tables = match &del.from {
+                                sqlparser::ast::FromTable::WithFromKeyword(t)
+                                | sqlparser::ast::FromTable::WithoutKeyword(t) => t,
+                            };
+                            if let Some(first) = tables.first() {
+                                let table = first.relation.to_string();
+                                cache.invalidate(&table);
+                            }
+                        }
+                    }
+                    StatementKind::Update(stmt) => {
+                        if let Statement::Update { table, .. } = stmt.as_ref() {
+                            let table_name = table.relation.to_string();
+                            cache.invalidate(&table_name);
+                        }
+                    }
+                    StatementKind::Merge(stmt) => {
+                        if let Statement::Merge { table, .. } = stmt.as_ref() {
+                            let table_name = table.to_string();
+                            cache.invalidate(&table_name);
+                        }
                     }
                     _ => {}
                 }
@@ -426,7 +483,7 @@ impl QueryHandler {
         let kind = parse_and_classify(sql)?;
 
         if matches!(kind, StatementKind::Query(_)) {
-            let ctx = self.create_session_context(session).await?;
+            let (ctx, _) = self.create_session_context(session).await?;
             let df = ctx
                 .sql(sql)
                 .await
@@ -452,7 +509,7 @@ impl QueryHandler {
         sql: &str,
         query_id: &uuid::Uuid,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let ctx = self.create_session_context(session).await?;
+        let (ctx, _) = self.create_session_context(session).await?;
 
         // Plan the query via DataFusion's SQL planner
         let df = ctx
@@ -824,7 +881,7 @@ impl QueryHandler {
     async fn create_session_context(
         &self,
         session: &Session,
-    ) -> sqe_core::Result<SessionContext> {
+    ) -> sqe_core::Result<(SessionContext, Arc<SessionCatalog>)> {
         crate::session_context::create_session_context(
             &self.config,
             session,

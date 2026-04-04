@@ -2112,6 +2112,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "gcp_auth"
+version = "0.12.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2b3d0b409a042a380111af38136310839af8ac1a0917fb6e84515ed1e4bf3ee"
+dependencies = [
+ "async-trait",
+ "base64",
+ "bytes",
+ "chrono",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "ring",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-futures",
+ "url",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2449,9 +2475,8 @@ dependencies = [
 
 [[package]]
 name = "iceberg"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b795ef2e2197596efad630c5e8cc4b4ebdfc488c02dadc709bef0416e1ffd49"
+version = "0.8.0"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=1978911ec4#1978911ec4765016154079e6be809958fe74f0cb"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -2461,6 +2486,7 @@ dependencies = [
  "arrow-buffer",
  "arrow-cast",
  "arrow-ord",
+ "arrow-row",
  "arrow-schema",
  "arrow-select",
  "arrow-string",
@@ -2471,6 +2497,7 @@ dependencies = [
  "bimap",
  "bytes",
  "chrono",
+ "crc32fast",
  "derive_builder",
  "expect-test",
  "fastnum",
@@ -2481,9 +2508,11 @@ dependencies = [
  "moka",
  "murmur3",
  "once_cell",
+ "opendal",
  "ordered-float 4.6.0",
  "parquet",
  "rand 0.8.5",
+ "reqsign",
  "reqwest",
  "roaring",
  "serde",
@@ -2494,6 +2523,7 @@ dependencies = [
  "serde_with",
  "strum",
  "tokio",
+ "tracing",
  "typed-builder",
  "typetag",
  "url",
@@ -2503,12 +2533,13 @@ dependencies = [
 
 [[package]]
 name = "iceberg-catalog-rest"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "892fe71df3f5d1707c7ede042545051aca659a8a4a8ca828c5a13064338f56fc"
+version = "0.8.0"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=1978911ec4#1978911ec4765016154079e6be809958fe74f0cb"
 dependencies = [
  "async-trait",
+ "base64",
  "chrono",
+ "gcp_auth",
  "http",
  "iceberg",
  "itertools 0.13.0",
@@ -2524,9 +2555,8 @@ dependencies = [
 
 [[package]]
 name = "iceberg-datafusion"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be3e981027526bdb23a4318b1016c1f68142ef11b414ba732eb7cd3f8313857f"
+version = "0.8.0"
+source = "git+https://github.com/risingwavelabs/iceberg-rust.git?rev=1978911ec4#1978911ec4765016154079e6be809958fe74f0cb"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2537,25 +2567,6 @@ dependencies = [
  "parquet",
  "tokio",
  "uuid",
-]
-
-[[package]]
-name = "iceberg-storage-opendal"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b8745ded8db2a4c2febc84ce2d5e9aaf5e2a1c0c9f6a82a1ea8134691e30a0b"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "cfg-if",
- "iceberg",
- "opendal",
- "reqsign",
- "reqwest",
- "serde",
- "typetag",
- "url",
 ]
 
 [[package]]
@@ -4681,7 +4692,6 @@ dependencies = [
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-datafusion",
- "iceberg-storage-opendal",
  "moka",
  "object_store",
  "reqwest",
@@ -5381,6 +5391,16 @@ checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
  "valuable",
+]
+
+[[package]]
+name = "tracing-futures"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97d095ae15e245a057c8e8451bab9b3ee1e1f68e9ba2b4fbc18d0ac5237835f2"
+dependencies = [
+ "pin-project",
+ "tracing",
 ]
 
 [[package]]

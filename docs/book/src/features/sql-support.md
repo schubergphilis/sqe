@@ -101,9 +101,22 @@ SELECT * FROM source_table WHERE condition;
 
 -- CTAS
 CREATE TABLE new_table AS SELECT * FROM existing_table;
+
+-- DELETE (Copy-on-Write)
+DELETE FROM orders WHERE status = 'cancelled';
+DELETE FROM orders WHERE customer_id IN (SELECT id FROM blacklist);
+
+-- UPDATE (Copy-on-Write)
+UPDATE orders SET status = 'shipped' WHERE tracking_id IS NOT NULL;
+UPDATE orders SET amount = CASE WHEN amount > 1000 THEN amount * 0.9 ELSE amount END;
+
+-- MERGE INTO (Copy-on-Write)
+MERGE INTO target USING source ON target.id = source.id
+WHEN MATCHED THEN UPDATE SET value = source.value
+WHEN NOT MATCHED THEN INSERT (id, value) VALUES (source.id, source.value);
 ```
 
-> **Coming soon:** `MERGE INTO`, `DELETE FROM`, `UPDATE` — blocked on iceberg-rust OverwriteAction support.
+All row-level write operations (DELETE, UPDATE, MERGE INTO) use Copy-on-Write via the RisingWave iceberg-rust fork's `rewrite_files()` transaction API. Affected data files are read, filtered/transformed, and rewritten as new files in a single atomic commit.
 
 ## Metadata Queries
 
@@ -138,8 +151,9 @@ EXPLAIN FULL SELECT * FROM orders WHERE amount > 100;
 | Set operations | Full | Full | Full |
 | CTAS | Yes | Yes | Yes |
 | INSERT INTO SELECT | Yes | Yes | Yes |
-| MERGE INTO | Planned | Yes | Yes |
-| DELETE FROM | Planned | Yes | Yes |
+| MERGE INTO | Yes (CoW) | Yes | Yes |
+| DELETE FROM | Yes (CoW) | Yes | Yes |
+| UPDATE | Yes (CoW) | Yes | Yes |
 | Views | Yes | Yes | Yes |
 | Arrow-native wire format | Yes | No (JSON) | No (Thrift) |
 | Row-level security | Planned | Plugin | Ranger |

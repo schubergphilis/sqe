@@ -31,11 +31,13 @@ arrow-array = "57"
 parquet = { version = "57", features = ["async", "object_store"] }
 object_store = { version = "0.12", features = ["aws"] }
 
-# Iceberg
-iceberg = "0.9"
-iceberg-catalog-rest = "0.9"
-iceberg-storage-opendal = "0.9"
-iceberg-datafusion = "0.9"
+# Iceberg — RisingWave fork for rewrite_files() / overwrite_files() transaction support.
+# Upstream apache/iceberg-rust 0.9 lacks OverwriteAction/RewriteFilesAction.
+# Pin to known-good rev used by nimtable/iceberg-compaction in production.
+# Note: iceberg-storage-opendal is folded into the core `iceberg` crate in this fork.
+iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "1978911ec4" }
+iceberg-catalog-rest = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "1978911ec4" }
+iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "1978911ec4" }
 
 # SQL parser — DataFusion 52 ships sqlparser 0.53
 sqlparser = "0.53"

@@ -12,6 +12,7 @@ pub enum StatementKind {
     Insert(Box<Statement>),
     Merge(Box<Statement>),
     Delete(Box<Statement>),
+    Update(Box<Statement>),
     Drop(Box<Statement>),
     Rename(Box<Statement>),
     CreateView(Box<Statement>),
@@ -36,6 +37,7 @@ impl StatementKind {
             StatementKind::Insert(_) => "insert",
             StatementKind::Merge(_) => "merge",
             StatementKind::Delete(_) => "delete",
+            StatementKind::Update(_) => "update",
             StatementKind::Drop(_) => "drop",
             StatementKind::Rename(_) => "rename",
             StatementKind::CreateView(_) => "createview",
@@ -213,8 +215,8 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
         | Statement::ShowCollation { .. }
         | Statement::ShowViews { .. } => Ok(StatementKind::Utility(Box::new(stmt))),
 
-        // UPDATE → Utility (not in the spec but common)
-        Statement::Update { .. } => Ok(StatementKind::Utility(Box::new(stmt))),
+        // UPDATE → dedicated variant for routing to the write handler
+        Statement::Update { .. } => Ok(StatementKind::Update(Box::new(stmt))),
 
         _ => Err(sqe_core::SqeError::NotImplemented(format!(
             "Statement type not supported: {stmt}"
@@ -274,6 +276,28 @@ mod tests {
     fn test_delete() {
         let result = parse_and_classify("DELETE FROM foo WHERE id = 1");
         assert!(matches!(result, Ok(StatementKind::Delete(_))));
+    }
+
+    #[test]
+    fn classify_update() {
+        let result = parse_and_classify("UPDATE ns.t SET col1 = 1 WHERE id = 5").unwrap();
+        assert!(matches!(result, StatementKind::Update(_)));
+    }
+
+    #[test]
+    fn classify_update_no_where() {
+        let result = parse_and_classify("UPDATE ns.t SET val = val + 1").unwrap();
+        assert!(matches!(result, StatementKind::Update(_)));
+    }
+
+    #[test]
+    fn classify_update_name() {
+        let kind = StatementKind::Update(Box::new(
+            Parser::parse_sql(&GenericDialect {}, "UPDATE t SET x = 1")
+                .unwrap()
+                .remove(0),
+        ));
+        assert_eq!(kind.name(), "update");
     }
 
     #[test]
