@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use tracing::debug;
 
@@ -46,6 +47,16 @@ pub async fn create_session_context(
     } else {
         SessionContext::new_with_config(session_config)
     };
+
+    // Register DataFusion's built-in in-memory catalog so DML helpers can register
+    // temporary MemTables under `datafusion.public.<name>` without hitting the
+    // Iceberg catalog which does not support dynamic table registration.
+    let df_catalog = Arc::new(MemoryCatalogProvider::new());
+    let df_schema = Arc::new(MemorySchemaProvider::new());
+    df_catalog
+        .register_schema("public", df_schema)
+        .expect("MemoryCatalogProvider always accepts schema registration");
+    ctx.register_catalog("datafusion", df_catalog);
 
     // Create a per-session catalog connected to Polaris with the user's bearer token
     let session_catalog = Arc::new(
