@@ -77,17 +77,48 @@ sequenceDiagram
     WH-->>QH: Success
 ```
 
-## Planned: Row-Level Operations
+## Row-Level Operations (Copy-on-Write)
 
-These operations are designed but blocked on iceberg-rust `OverwriteAction` support:
+Row-level write operations are implemented via Copy-on-Write using the RisingWave iceberg-rust fork's `rewrite_files()` transaction API. Affected data files are read, filtered/transformed, and rewritten as new files in a single atomic Iceberg commit.
 
 ### DELETE FROM
 
 ```sql
 DELETE FROM sales.orders WHERE status = 'cancelled';
+
+-- Cross-table subqueries in WHERE
+DELETE FROM sales.orders
+WHERE customer_id IN (SELECT id FROM blacklist);
+
+-- DELETE without WHERE = truncate
+DELETE FROM sales.orders;
 ```
 
-Strategy: Copy-on-Write — rewrite affected data files without the deleted rows.
+Flow:
+1. Scan table metadata to identify affected data files
+2. Read each affected file, apply the WHERE filter
+3. If all rows match: mark file for removal
+4. If partial match: rewrite file without matching rows
+5. Commit via `rewrite_files()` (remove old files, add rewritten files)
+
+### UPDATE
+
+```sql
+UPDATE sales.orders SET status = 'shipped' WHERE tracking_id IS NOT NULL;
+
+-- CASE WHEN transformations
+UPDATE sales.orders SET amount = CASE
+    WHEN amount > 1000 THEN amount * 0.9
+    ELSE amount
+END;
+```
+
+Flow:
+1. Scan table metadata to identify affected data files
+2. Read each affected file, apply the WHERE filter
+3. For matching rows: apply SET expressions
+4. Rewrite file with modified rows
+5. Commit via `rewrite_files()`
 
 ### MERGE INTO
 
@@ -97,15 +128,16 @@ WHEN MATCHED THEN UPDATE SET value = source.value
 WHEN NOT MATCHED THEN INSERT (id, value) VALUES (source.id, source.value);
 ```
 
-Strategy: Read matching rows, compute deltas, write new data files, commit with OverwriteAction.
+Flow:
+1. Execute a full outer join of source and target via DataFusion
+2. Classify each result row: matched (UPDATE/DELETE) or not matched (INSERT)
+3. Rewrite affected target data files with modifications applied
+4. Add new data files for INSERT rows
+5. Commit via `rewrite_files()` (remove old files, add new + rewritten files)
 
-### UPDATE
+### Iceberg Dependency
 
-```sql
-UPDATE sales.orders SET status = 'shipped' WHERE tracking_id IS NOT NULL;
-```
-
-Desugars internally to a MERGE-like operation.
+Row-level writes depend on the [risingwavelabs/iceberg-rust](https://github.com/risingwavelabs/iceberg-rust) fork (rev `1978911ec4`) which provides the `rewrite_files()` transaction support not yet available in upstream iceberg-rust. When upstream ships `OverwriteAction`, the dependency can be migrated back to the official crate.
 
 ## dbt Compatibility
 
@@ -115,6 +147,6 @@ The write path is designed to support [dbt Core](https://www.getdbt.com/) via a 
 |---|---|---|
 | `table` | `CREATE OR REPLACE TABLE AS SELECT` | Supported |
 | `incremental` (append) | `INSERT INTO SELECT` | Supported |
-| `incremental` (merge) | `MERGE INTO` | Planned |
+| `incremental` (merge) | `MERGE INTO` | Supported (CoW) |
 | `view` | `CREATE VIEW AS SELECT` | Supported |
 | `seed` | `INSERT INTO` (from CSV) | Supported |

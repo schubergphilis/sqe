@@ -170,16 +170,24 @@ CTAS and INSERT INTO are append-only. They only add files. The harder operations
 
 The practical question: does the delete ratio justify the complexity? If you delete 10 rows out of a million-row table once a day, CoW rewrites a handful of files and you never think about it. If you delete 10% of your data hourly, Merge-on-Read avoids catastrophic write amplification, but you need compaction to keep read performance from degrading.
 
-For SQE, the plan is to start with Copy-on-Write. It is simpler, and iceberg-rust's upstream development targets it first. Merge-on-Read with position deletes would follow when the upstream `RowDeltaAction` and `PositionDeleteFileWriter` land. The choice is pragmatic, not permanent.
+SQE uses Copy-on-Write. It is simpler, and the RisingWave iceberg-rust fork provides the `rewrite_files()` transaction primitive that makes it work. Merge-on-Read with position deletes would follow when upstream iceberg-rust ships `RowDeltaAction` and `PositionDeleteFileWriter`. The choice is pragmatic, not permanent.
 
 
-## What We Have Not Built
+## Row-Level Writes: Copy-on-Write
 
-The SQL classifier parses and classifies MERGE and DELETE statements. The routing works. The handler returns `NotImplemented`. This is honest, not aspirational.
+The SQL classifier parses and classifies MERGE, DELETE, and UPDATE statements. The routing works. And now the handlers deliver.
 
-We know how to execute the join logic -- DataFusion handles the SELECT side of a MERGE beautifully. We know how to write data files. What we cannot do is commit the result, because MERGE and DELETE require `OverwriteAction`, which iceberg-rust has not shipped yet. The architecture, the routing, the test harness, and the SELECT-side execution all exist. Only the commit path is missing. When the upstream ships, the implementation is estimated at two to three weeks -- integration cost, not invention cost.
+Upstream iceberg-rust had not shipped `OverwriteAction`, so we found another path: the [RisingWave iceberg-rust fork](https://github.com/risingwavelabs/iceberg-rust) (rev `1978911ec4`), which provides `rewrite_files()` -- a transaction API that atomically replaces a set of data files with new ones. This is exactly the primitive Copy-on-Write needs: read the affected files, rewrite them without the deleted or modified rows, commit the swap.
 
-Compaction is the other thing we have not built, and for append-only workloads we do not need it yet. File count grows linearly with write operations. A dbt pipeline running 50 models nightly creates 50 files per day. After a year, 18,250 files. Iceberg's manifest lists are designed for millions of entries. The compaction need becomes acute when row-level deletes land and Merge-on-Read accumulates delete files that degrade every scan. When we build it, compaction will run as a background task using the same bearer token passthrough model. No ambient credentials. No service account. The user who triggers compaction must have write permission on the table. Build the simple thing first. Measure. Then optimize.
+**DELETE FROM** reads each affected data file, applies the WHERE filter, and rewrites the file without matching rows. If all rows match, the file is simply removed. DELETE without a WHERE clause is a truncate. Cross-table subqueries work in the WHERE clause because DataFusion handles the subquery planning before the CoW rewrite step executes.
+
+**UPDATE** follows the same pattern: read affected files, apply the WHERE filter, apply the SET expressions to matching rows, rewrite the file. CASE WHEN transformations in SET clauses work naturally because DataFusion evaluates them as expressions.
+
+**MERGE INTO** is the most complex. It executes a full outer join between source and target via DataFusion, classifies each result row as matched (UPDATE or DELETE) or not matched (INSERT), then rewrites affected target files and appends new files for INSERT rows. The entire operation commits atomically via `rewrite_files()`.
+
+All three operations are atomic via Iceberg snapshot isolation. If the commit fails -- because another writer modified the same files -- the error surfaces to the client. Retry logic is left to the caller, which is adequate for batch workloads orchestrated by dbt.
+
+Compaction is the remaining thing we have not built. For CoW workloads, file count grows with each mutation -- every DELETE or UPDATE that touches a file produces a new file. A dbt pipeline running incremental models nightly accumulates files steadily. Iceberg's manifest lists handle millions of entries, so the urgency is low, but compaction will eventually matter for scan performance. When we build it, compaction will run as a background task using the same bearer token passthrough model. No ambient credentials. No service account. The user who triggers compaction must have write permission on the table.
 
 
 ## The Bearer Token and Writes
@@ -215,9 +223,9 @@ The write path took one day to implement and three days to debug. The ratio tell
 
 **Reading is a contract with storage. Writing is a contract with the world.** When you read, you depend on the storage layer delivering bytes. When you write, you depend on the storage layer accepting bytes, the catalog accepting your commit, no other writer conflicting with your commit, and the type system matching across three layers -- DataFusion Arrow, Iceberg schema, Parquet physical. Every additional party in the contract is a potential failure point.
 
-**Start with append-only.** CTAS and INSERT INTO cover 80% of what data pipelines need. dbt's `table` materialization uses CTAS. dbt's `incremental` materialization needs MERGE, but only for the incremental part -- the initial build is still CTAS. Shipping append-only first gave us a useful engine weeks before the row-level operations were even designable.
+**Start with append-only, then add mutations.** CTAS and INSERT INTO cover 80% of what data pipelines need. dbt's `table` materialization uses CTAS. dbt's `incremental` materialization needs MERGE, but only for the incremental part -- the initial build is still CTAS. Shipping append-only first gave us a useful engine weeks before row-level operations landed. When we added DELETE, UPDATE, and MERGE via the RisingWave fork's `rewrite_files()`, the architecture was already in place -- the handlers slotted into the existing classifier and write handler structure.
 
-**Upstream dependencies gate your timeline.** MERGE and DELETE are designed. The routing works. The test harness is ready. But iceberg-rust's `OverwriteAction` has not shipped, so the feature does not exist. This is the cost of building on an ecosystem rather than owning every layer. It is also the benefit -- when the upstream ships, we get the implementation for the cost of integration, not the cost of building the entire transaction protocol from scratch.
+**Upstream dependencies gate your timeline, but forks buy you time.** Upstream iceberg-rust had not shipped `OverwriteAction`. Rather than wait, we switched to the RisingWave fork that had the transaction primitive we needed. This is the cost and benefit of building on an ecosystem: you depend on others, but you can also leverage their parallel work. The RisingWave team needed the same primitive for their streaming engine and built it before the upstream community finalized the API. When upstream ships, we migrate back. Until then, the fork works.
 
 **The invisible bugs are the expensive ones.** A timestamp precision mismatch that displays identically in debug output. A nullable flag that is correct for the first batch but wrong for the third. A schema that matches by name and logical type but diverges in a nested enum variant. These are not hard problems. They are invisible problems. The fix is always one line. The debugging is always four hours.
 

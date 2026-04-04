@@ -29,7 +29,7 @@ Every query runs as the authenticated user. No service account.
 ## Features
 
 - **SQL**: Full ANSI SQL via DataFusion — window functions (LEAD, LAG, PARTITION BY, etc.), CTEs, subqueries, joins, aggregates, GROUPING SETS. See [docs/features.md](docs/features.md) for a detailed comparison with Trino and Spark.
-- **DDL**: CREATE TABLE AS SELECT, INSERT INTO, CREATE/DROP VIEW, DROP TABLE, ALTER TABLE RENAME
+- **DDL/DML**: CREATE TABLE AS SELECT, INSERT INTO, DELETE FROM, UPDATE, MERGE INTO (CoW), CREATE/DROP VIEW, DROP TABLE, ALTER TABLE RENAME
 - **Protocols**: Arrow Flight SQL (primary, gRPC) + Trino HTTP (compatibility layer)
 - **Auth**: OIDC password grant (any OIDC provider) with background token refresh
 - **Catalog**: Apache Polaris REST Catalog with per-session bearer token passthrough

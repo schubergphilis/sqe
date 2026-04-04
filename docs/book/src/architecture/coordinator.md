@@ -15,7 +15,7 @@ graph TB
         QH --> PLAN["Query Planner<br/>(DataFusion)"]
         QH --> PE["Policy Enforcer"]
         QH --> CAT["Catalog Ops<br/>(DDL)"]
-        QH --> WH["Write Handler<br/>(CTAS, INSERT)"]
+        QH --> WH["Write Handler<br/>(CTAS, INSERT,<br/>DELETE, UPDATE,<br/>MERGE — CoW)"]
 
         SM --> AUTH["Authenticator<br/>(Keycloak OIDC)"]
         SM --> TC["Token Cache"]
@@ -42,8 +42,10 @@ The coordinator classifies every SQL statement and routes it to the appropriate 
 | `CREATE SCHEMA` | `catalog_ops.create_schema` | Create namespace in Polaris |
 | `DROP SCHEMA` | `catalog_ops.drop_schema` | Drop namespace from Polaris |
 | `EXPLAIN` | `handle_explain` | Show query plan |
+| `DELETE FROM` | `handle_delete` | CoW: scan affected files, filter, rewrite via `rewrite_files()` |
+| `UPDATE` | `handle_update` | CoW: scan affected files, apply SET, rewrite via `rewrite_files()` |
+| `MERGE INTO` | `handle_merge` | CoW: full outer join, classify rows, rewrite via `rewrite_files()` |
 | `GRANT/REVOKE` | Policy (Phase 5) | Not yet implemented |
-| `MERGE/DELETE/UPDATE` | Write path (Phase 3) | Blocked on iceberg-rust |
 
 ## Session Context
 

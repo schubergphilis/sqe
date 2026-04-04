@@ -9,7 +9,7 @@ SQE ships with `sqe-bench`, a Rust CLI tool that generates benchmark data, loads
 | `tpch` | 22 | 8 | Star/snowflake schema, pure analytical reads |
 | `tpcds` | 99 | 24 | Complex SQL, correlated subqueries, window functions |
 | `ssb` | 13 | 5 | Denormalized star schema, fast smoke testing |
-| `tpcc` | 8 | 9 | OLTP read queries; write queries require DELETE/MERGE |
+| `tpcc` | 17 | 9 | OLTP read + write queries (DELETE/UPDATE via CoW) |
 | `tpce` | 11 | 33 | Brokerage OLTP, complex demographics and trade schema |
 | `tpcbb` | 10 | ~25 | SQL-only subset over TPC-DS data + web logs |
 
@@ -17,7 +17,7 @@ SQE ships with `sqe-bench`, a Rust CLI tool that generates benchmark data, loads
 
 - **TPC-H and SSB** validate the analytical core: joins, aggregates, GROUP BY, ORDER BY, date arithmetic. TPC-H is the standard first check for any SQL engine.
 - **TPC-DS** is the hardest. Its 99 queries exercise correlated subqueries, CTEs, window functions, GROUPING SETS, and complex multi-table joins. Passing TPC-DS well means the engine handles real analytical workloads.
-- **TPC-C and TPC-E** cover OLTP read patterns: point lookups, small aggregates, indexed access by key ranges. Their write queries are skipped until DELETE/MERGE land.
+- **TPC-C and TPC-E** cover OLTP patterns: point lookups, small aggregates, indexed access by key ranges, plus write operations (DELETE, UPDATE) exercised via Copy-on-Write.
 - **TPC-BB** exercises semi-structured data alongside the TPC-DS schema — useful for validating string functions and JSON handling.
 
 ## Generating Data
@@ -168,7 +168,7 @@ cargo run -p sqe-bench -- test tpch --scale 1 \
 | `PASS` | Result matches expected output exactly (within numeric tolerance) |
 | `DIFF` | Result matches in shape but has minor differences (e.g., decimal precision) |
 | `FAIL` | Result is wrong — wrong rows, wrong values, wrong schema |
-| `SKIP` | Query requires an unimplemented feature (e.g., DELETE/MERGE); counted but not failed |
+| `SKIP` | Query requires an unimplemented feature; counted but not failed |
 | `ERROR` | Query failed to execute (engine error, timeout, crash) |
 
 `DIFF` is not treated as a failure in CI — it is a signal for investigation. Decimal precision differences are expected when comparing float-heavy aggregates across different engines.
