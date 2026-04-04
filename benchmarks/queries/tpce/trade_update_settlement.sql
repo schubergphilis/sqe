@@ -1,4 +1,5 @@
 -- name: Trade Update — Correct settlement cash type
+-- requires: in_subquery_memtable
 -- description: Write portion of Trade Update (Frame 2): fix settlement cash_type on completed trades
 -- timeout: 30s
 

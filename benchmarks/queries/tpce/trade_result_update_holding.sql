@@ -1,4 +1,5 @@
 -- name: Trade Result — Update holding summary
+-- requires: in_subquery_memtable
 -- description: Write portion of Trade Result: update holding_summary quantities for settled trades
 -- timeout: 30s
 
