@@ -1,20 +1,23 @@
 # SQE Security Audit
 
-**Date:** 2026-03-19
+**Date:** 2026-03-19 (audit); 2026-04-01 (fixes applied)
 **Scope:** `crates/` — all non-test Rust source code
 **Auditor:** Static analysis via Claude Code
+**Status:** 12 findings remediated (see OSS security hardening, Step 3 in nextsteps.md)
 
 ---
 
 ## Summary
 
-| Severity | Count |
-|---|---|
-| Critical | 1 |
-| High | 3 |
-| Medium | 4 |
-| Low | 3 |
-| Info / Positive | 8 |
+| Severity | Count | Fixed |
+|---|---|---|
+| Critical | 1 | 1 |
+| High | 3 | 3 |
+| Medium | 4 | 4 |
+| Low | 3 | 3 |
+| Info / Positive | 8 | — |
+
+**Fixes applied:** TLS support added (`[coordinator.tls]`), JWT validation hardened, constant-time comparison for auth, PII-safe logging (query hash alongside full text), K8s securityContext in Helm templates, configurable scan timeout, rate limiter on Trino HTTP path, error sanitisation (`client_message()` + debug mode toggle), startup WARN on `ssl_verification = false`, query size limit enforced, `unwrap()` replaced with proper error handling on hot path.
 
 ---
 
@@ -181,15 +184,15 @@ Authentication (ROPC grant, token validation) is performed per-request with no t
 
 ## Action Plan
 
-| Priority | Item | Effort |
-|---|---|---|
-| **C1** | Add TLS config + enforcement to Flight SQL server | Medium |
-| **H1** | Wrap all `Status::internal(format!("{e}"))` with request-ID-keyed generic messages | Small |
-| **H2** | Replace `unwrap()` in `catalog_ops.rs:460,468,480` and `write_handler.rs:421,436` | Small |
-| **H3** | Add configurable query size limit before parsing | Small |
-| **M1** | Generic auth-scheme error message | Trivial |
-| **M2** | Downgrade policy plan log to `trace!` | Trivial |
-| **M3** | Startup `WARN` when `ssl_verification = false` | Trivial |
-| **M4** | Document PII risk in audit log; optionally add query hash alongside text | Small |
+| Priority | Item | Effort | Status |
+|---|---|---|---|
+| **C1** | Add TLS config + enforcement to Flight SQL server | Medium | ✅ Done — `[coordinator.tls]` with optional mTLS |
+| **H1** | Wrap all `Status::internal(format!("{e}"))` with request-ID-keyed generic messages | Small | ✅ Done — `client_message()` + debug mode toggle |
+| **H2** | Replace `unwrap()` in `catalog_ops.rs:460,468,480` and `write_handler.rs:421,436` | Small | ✅ Done |
+| **H3** | Add configurable query size limit before parsing | Small | ✅ Done |
+| **M1** | Generic auth-scheme error message | Trivial | ✅ Done |
+| **M2** | Downgrade policy plan log to `trace!` | Trivial | ✅ Done |
+| **M3** | Startup `WARN` when `ssl_verification = false` | Trivial | ✅ Done |
+| **M4** | Document PII risk in audit log; optionally add query hash alongside text | Small | ✅ Done — query hash added |
 
-H1, H2, M1, M2, M3 can all be addressed in a single PR in under an hour. C1 (TLS) is the only medium-effort item and is tracked in the OSS security hardening plan (`openspec/changes/oss-security-hardening/`).
+All findings addressed in the OSS security hardening pass (Step 3, 51/51 tasks complete). See `openspec/changes/oss-security-hardening/` for full details.

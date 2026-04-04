@@ -10,6 +10,14 @@ token_endpoint = "http://localhost:18181/api/catalog/v1/oauth/tokens"
 client_id = "root"
 client_secret = "s3cr3t"
 
+[query]
+# Benchmarks load large dimension tables (e.g. customer_demographics: 1.9M rows)
+max_result_rows = 0
+# SF1 TPC-H/DS queries need more memory for HashJoins on multi-million row tables
+max_query_memory = "2GB"
+# SF1 CTAS loads can take >5min for large fact tables (store_sales: 2.8M rows)
+timeout_secs = 600
+
 [catalog]
 polaris_url = "http://localhost:18181/api/catalog"
 warehouse = "test_warehouse"

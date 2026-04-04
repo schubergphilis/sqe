@@ -1,5 +1,4 @@
 -- name: Trade Result
--- requires: update, insert
 -- Read portion of the Trade Result transaction: retrieve pending trades
 -- and their holding impact for settlement computation.
 -- Note: the full TPC-E Trade Result transaction updates holdings and inserts settlement.

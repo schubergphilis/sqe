@@ -1,7 +1,6 @@
 -- name: New Order Transaction
 -- description: Create a new order for a customer (write transaction)
 -- type: write
--- requires: insert, update
 -- timeout: 10s
 
 -- This is a write transaction that cannot be expressed as a read-only SQL query.

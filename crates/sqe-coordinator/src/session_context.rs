@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use tracing::debug;
 
@@ -23,7 +24,7 @@ pub async fn create_session_context(
     session: &Session,
     policy_store: Option<&Arc<dyn PolicyStore>>,
     query_tracker: &Arc<QueryTracker>,
-) -> sqe_core::Result<SessionContext> {
+) -> sqe_core::Result<(SessionContext, Arc<SessionCatalog>)> {
     let catalog_name = if config.catalog.warehouse.is_empty() {
         "default".to_string()
     } else {
@@ -47,6 +48,16 @@ pub async fn create_session_context(
         SessionContext::new_with_config(session_config)
     };
 
+    // Register DataFusion's built-in in-memory catalog so DML helpers can register
+    // temporary MemTables under `datafusion.public.<name>` without hitting the
+    // Iceberg catalog which does not support dynamic table registration.
+    let df_catalog = Arc::new(MemoryCatalogProvider::new());
+    let df_schema = Arc::new(MemorySchemaProvider::new());
+    df_catalog
+        .register_schema("public", df_schema)
+        .expect("MemoryCatalogProvider always accepts schema registration");
+    ctx.register_catalog("datafusion", df_catalog);
+
     // Create a per-session catalog connected to Polaris with the user's bearer token
     let session_catalog = Arc::new(
         SessionCatalog::new(
@@ -60,6 +71,7 @@ pub async fn create_session_context(
     );
 
     // Clone before moving into SqeCatalogProvider (which consumes the Arc)
+    let session_catalog_for_return = session_catalog.clone();
     let session_catalog_for_system = session_catalog.clone();
 
     // Create the DataFusion CatalogProvider from the session catalog,
@@ -170,5 +182,5 @@ pub async fn create_session_context(
         "Registered session catalog in DataFusion context"
     );
 
-    Ok(ctx)
+    Ok((ctx, session_catalog_for_return))
 }

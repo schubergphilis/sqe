@@ -4,7 +4,6 @@ use std::sync::Arc;
 use iceberg::table::Table;
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogBuilder};
-use iceberg_storage_opendal::OpenDalStorageFactory;
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument};
 use uuid::Uuid;
@@ -119,13 +118,10 @@ impl SessionCatalog {
             props.insert("s3.path-style-access".to_string(), "true".to_string());
         }
 
-        // iceberg-rust 0.9 uses CatalogBuilder::load(name, props) pattern
-        // StorageFactory is required for write operations (CREATE TABLE, INSERT)
+        // RisingWave fork uses CatalogBuilder::load(name, props) pattern.
+        // Storage factory (OpenDAL S3) is configured automatically from the s3.*
+        // properties in the props HashMap — no explicit with_storage_factory() needed.
         let catalog = RestCatalogBuilder::default()
-            .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-                configured_scheme: "s3".to_string(),
-                customized_credential_load: None,
-            }))
             .load(
                 format!("sqe-session-{}", &token_fingerprint),
                 props,

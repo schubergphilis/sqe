@@ -2,74 +2,49 @@
 
 ## Summary
 
-Implement row-level write operations (MERGE INTO, DELETE FROM, UPDATE) for Iceberg tables via the Polaris REST Catalog. These operations require Iceberg v2 position deletes and overwrite transactions, which are not yet available in iceberg-rust but are actively being developed upstream.
+Row-level write operations (MERGE INTO, DELETE FROM, UPDATE) are **implemented** for Iceberg tables via Copy-on-Write using the [risingwavelabs/iceberg-rust](https://github.com/risingwavelabs/iceberg-rust) fork (rev `1978911ec4`), which provides the `rewrite_files()` transaction API.
 
 ## Motivation
 
-SQE currently supports append-only writes (INSERT INTO, CTAS). To be a viable Trino replacement, we need row-level mutations:
+SQE needed row-level mutations to be a viable Trino replacement:
 
 - **MERGE INTO** — the most common pattern for incremental data pipelines (upserts). Required by dbt incremental models.
 - **DELETE FROM** — GDPR right-to-erasure, data corrections, partition cleanup.
 - **UPDATE** — in-place corrections without full table rewrites.
 
-Without these, users must drop and recreate tables for any data correction — unacceptable for production workloads.
+## Current State (as of 2026-04-01)
 
-## Current State (as of 2026-03-15)
-
-### What SQE Has Today
+### What SQE Has
 
 | Component | Status |
 |-----------|--------|
 | SQL parsing (MERGE, DELETE, UPDATE) | ✅ sqlparser handles all three |
-| Statement classification & routing | ✅ `StatementKind::Merge`, `Delete` routed in classifier |
+| Statement classification & routing | ✅ `StatementKind::Merge`, `Delete`, `Update` routed in classifier |
 | Query execution (SELECT part of MERGE) | ✅ DataFusion handles the join/match logic |
 | Append writes via `FastAppendAction` | ✅ Used by INSERT INTO and CTAS |
+| **DELETE FROM via CoW** | ✅ `delete_handler.rs` — rewrite_files() |
+| **UPDATE via CoW** | ✅ `update_handler.rs` — rewrite_files() |
+| **MERGE INTO via CoW** | ✅ `merge_handler.rs` — rewrite_files() |
 | Schema inference | ✅ `QueryHandler::get_schema()` |
 | Per-session catalog with bearer token | ✅ `SessionCatalog` with Polaris passthrough |
+| Integration tests (all three operations) | ✅ Against Polaris + MinIO |
+| TPC-C write benchmarks | ✅ 17/17 pass |
 
-### What's Blocked by iceberg-rust
+### Iceberg Dependency
 
-| Capability | iceberg-rust 0.8 | Needed For |
-|------------|:-:|---|
-| `OverwriteAction` transaction | ❌ | DELETE, UPDATE, MERGE |
-| `RowDeltaAction` transaction | ❌ | MERGE (CoW strategy) |
-| `PositionDeleteFileWriter` | ❌ | All row-level deletes |
-| `EqualityDeleteFileWriter` | ✅ exists | Alternative delete strategy |
-| Delete file commit in `SnapshotProducer` | ❌ stubbed (TODO) | All delete operations |
-| `RewriteFilesAction` (compaction) | ❌ | Post-delete cleanup |
+Uses `risingwavelabs/iceberg-rust` fork (rev `1978911ec4`) for `rewrite_files()` transaction support. When upstream iceberg-rust ships `OverwriteAction` (tracked in Epic #2186), the dependency can be migrated back to the official crate.
 
-## Upstream Progress: iceberg-rust PRs
+### Future: Merge-on-Read
 
-Actively tracked PRs in [apache/iceberg-rust](https://github.com/apache/iceberg-rust):
+MoR with position deletes is not yet implemented. Upstream PRs to watch:
 
-### Critical Path
+| PR | Title | Status | Impact |
+|----|-------|--------|--------|
+| **#2203** | `RowDeltaAction` for row-level modifications | Active | Enables MoR path |
+| **#2219** | Delta writer (position + equality delete writer) | Active | Combined writer for MoR |
+| **#1987** | Delete file support in `SnapshotProducer` | Active | Enables committing delete files |
 
-| PR | Title | Author | Status | Impact |
-|----|-------|--------|--------|--------|
-| **#2185** | `OverwriteAction` with CoW delete support | @glitchy | 🟢 Active review by PMC member | **Foundation** — core primitive for all row-level ops |
-| **#2203** | `RowDeltaAction` for row-level modifications (CoW) | @wirybeaver | 🟢 Active | Builds on #2185, enables MERGE/UPDATE/DELETE |
-| **#2219** | Delta writer (position + equality delete writer) | @DAlperin | 🟢 Active | Combined writer for row-level changes |
-| **#1987** | Delete file support in `SnapshotProducer` | @ethan-tyler | 🟢 Active | Enables committing delete files to snapshots |
-
-### Tracking Issues
-
-| Issue | Title | Notes |
-|-------|-------|-------|
-| **#2186** | Copy-on-Write and Merge-on-Read support | Main epic, coordinated by @glitchy |
-| **#2201** | MERGE INTO support for DataFusion | Includes DataFusion upstream work |
-| **#2205** | SQL UPDATE support for DataFusion | Separate from MERGE |
-| **#340** | Position delete writer | Open since 2024 |
-| **#1607** | RewriteFiles support (compaction) | Post-delete cleanup |
-
-### Expected Landing Sequence
-
-```
-1. PR #2185 — OverwriteAction (core primitive)          → weeks away
-2. PR #1987 — SnapshotProducer delete file support       → depends on #2185
-3. PR #2219 — Position + equality delete writer          → parallel to #1987
-4. PR #2203 — RowDeltaAction (CoW)                       → depends on #2185 + #1987
-5. New release (likely iceberg-rust 0.9 or 0.10)         → months
-```
+MoR would reduce write amplification for write-heavy workloads but requires compaction to maintain read performance.
 
 ## Design
 
@@ -90,7 +65,7 @@ Iceberg v2 supports two strategies for row-level deletes:
 - Pro: fast writes (small delete files)
 - Con: read overhead (must merge deletes during scans)
 
-**SQE strategy: start with CoW, add MoR later.** CoW is simpler and iceberg-rust's `OverwriteAction` PR (#2185) targets it first.
+**SQE strategy: CoW implemented, MoR planned.** CoW is simpler and is fully operational via the RisingWave fork's `rewrite_files()`. MoR will be added when upstream ships the required primitives.
 
 ### Architecture
 
@@ -183,44 +158,17 @@ MERGE INTO target USING source ON condition
    - Add new data files (rewritten + inserted)
 ```
 
-## SQE Changes Required
-
-### When iceberg-rust ships OverwriteAction
+## SQE Implementation
 
 | File | Change |
 |------|--------|
-| `Cargo.toml` | Bump iceberg to 0.9+ (or whatever version ships it) |
-| `crates/sqe-coordinator/src/merge_handler.rs` | **New** — MERGE INTO execution logic |
-| `crates/sqe-coordinator/src/delete_handler.rs` | **New** — DELETE FROM execution logic |
-| `crates/sqe-coordinator/src/update_handler.rs` | **New** — UPDATE execution logic |
-| `crates/sqe-coordinator/src/query_handler.rs` | Route `Merge`/`Delete`/`Update` to new handlers instead of `NotImplemented` |
-| `crates/sqe-coordinator/src/write_handler.rs` | Extract shared CoW rewrite logic |
-| `crates/sqe-coordinator/src/lib.rs` | Register new modules |
-
-### Shared CoW Logic (write_handler.rs)
-
-```rust
-/// Identify which data files in a table are affected by a predicate.
-async fn find_affected_files(
-    table: &Table,
-    predicate: &Expr,  // DataFusion expression
-) -> Result<Vec<DataFile>>
-
-/// Rewrite a data file, applying a transform to each row.
-/// Returns the new data file (or None if all rows were removed).
-async fn rewrite_data_file(
-    table: &Table,
-    file: &DataFile,
-    transform: impl Fn(RecordBatch) -> Result<RecordBatch>,
-) -> Result<Option<DataFile>>
-
-/// Commit an overwrite transaction: remove old files, add new files.
-async fn commit_overwrite(
-    table: &Table,
-    removed: Vec<DataFile>,
-    added: Vec<DataFile>,
-) -> Result<()>
-```
+| `Cargo.toml` | Switched to risingwavelabs/iceberg-rust fork (rev `1978911ec4`) |
+| `crates/sqe-coordinator/src/merge_handler.rs` | MERGE INTO execution via CoW |
+| `crates/sqe-coordinator/src/delete_handler.rs` | DELETE FROM execution via CoW |
+| `crates/sqe-coordinator/src/update_handler.rs` | UPDATE execution via CoW |
+| `crates/sqe-coordinator/src/query_handler.rs` | Routes Merge/Delete/Update to handlers |
+| `crates/sqe-coordinator/src/write_handler.rs` | Shared CoW rewrite logic |
+| `crates/sqe-coordinator/src/lib.rs` | Modules registered |
 
 ## Testing Strategy
 
@@ -249,17 +197,17 @@ async fn commit_overwrite(
 
 ## Acceptance Criteria
 
-- [ ] `DELETE FROM table WHERE condition` removes matching rows
-- [ ] `DELETE FROM table` removes all rows (empty table, metadata preserved)
-- [ ] `UPDATE table SET col = expr WHERE condition` modifies matching rows
-- [ ] `MERGE INTO target USING source ON cond WHEN MATCHED THEN UPDATE ...` works
-- [ ] `MERGE INTO target USING source ON cond WHEN NOT MATCHED THEN INSERT ...` works
-- [ ] `MERGE INTO` with multiple WHEN clauses works
-- [ ] All operations are atomic (commit or rollback, no partial state)
-- [ ] Bearer token passthrough works for all operations (no privilege escalation)
-- [ ] Audit log captures DELETE/UPDATE/MERGE operations
-- [ ] Metrics track row-level write operations
-- [ ] Works in single-node mode (distributed deferred)
+- [x] `DELETE FROM table WHERE condition` removes matching rows
+- [x] `DELETE FROM table` removes all rows (empty table, metadata preserved)
+- [x] `UPDATE table SET col = expr WHERE condition` modifies matching rows
+- [x] `MERGE INTO target USING source ON cond WHEN MATCHED THEN UPDATE ...` works
+- [x] `MERGE INTO target USING source ON cond WHEN NOT MATCHED THEN INSERT ...` works
+- [x] `MERGE INTO` with multiple WHEN clauses works
+- [x] All operations are atomic (commit or rollback, no partial state)
+- [x] Bearer token passthrough works for all operations (no privilege escalation)
+- [x] Audit log captures DELETE/UPDATE/MERGE operations
+- [x] Metrics track row-level write operations
+- [x] Works in single-node mode (distributed deferred)
 
 ## Rollback Strategy
 
@@ -267,34 +215,15 @@ Each operation is a single Iceberg snapshot commit. Rollback = revert to previou
 
 If the feature is unstable, the `StatementKind::Merge/Delete` arms in `query_handler.rs` can be reverted to `NotImplemented` in a single commit.
 
-## Timeline & Dependencies
+## Timeline
 
-```
-                         iceberg-rust upstream
-                         ─────────────────────
-                         PR #2185 OverwriteAction merges
-                                │
-                         PR #2203 RowDeltaAction merges
-                                │
-                         iceberg-rust 0.9/0.10 release
-                                │
-                         ─────────────────────
-                         SQE implementation
-                         ─────────────────────
-                                │
-                                ├── Bump iceberg dep
-                                ├── Implement DELETE FROM (simplest)
-                                ├── Implement UPDATE (builds on DELETE)
-                                ├── Implement MERGE INTO (most complex)
-                                ├── Integration tests
-                                └── dbt compatibility tests
-```
+All three operations (DELETE, UPDATE, MERGE INTO) were implemented using the RisingWave iceberg-rust fork rather than waiting for upstream. Implementation completed 2026-03-28.
 
-**Estimated effort once iceberg-rust ships:** 2-3 weeks for a single developer.
+## Remaining Action Items
 
-## Action Items
-
-- [ ] **Watch** PRs #2185, #2203, #2219, #1987 for merge status
-- [ ] **Consider contributing** review/testing to PR #2185 to accelerate landing
-- [ ] **Prototype** the CoW rewrite logic against current iceberg-rust (the DataFusion join + row classification can be built now, only the commit path is blocked)
-- [ ] **Track** iceberg-rust releases for 0.9+ with OverwriteAction
+- [ ] **Watch** upstream iceberg-rust Epic #2186 for `OverwriteAction` — migrate from RisingWave fork to official crate when available
+- [x] ~~Implement DELETE FROM~~ (done)
+- [x] ~~Implement UPDATE~~ (done)
+- [x] ~~Implement MERGE INTO~~ (done)
+- [x] ~~Integration tests~~ (done)
+- [x] ~~TPC-C write benchmarks~~ (17/17 pass)

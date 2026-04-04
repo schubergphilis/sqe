@@ -14,8 +14,9 @@ SQE is built on **Apache DataFusion 51** which provides the SQL execution engine
 | Set operations | ✅ Full | ✅ Full | ✅ Full |
 | JSON | ⚠️ Partial | ✅ Full | ✅ Full |
 | Array/Map types | ⚠️ Partial | ✅ Full | ✅ Full |
-| MERGE INTO | 🔜 Planned | ✅ | ✅ |
-| DELETE | 🔜 Planned | ✅ | ✅ |
+| MERGE INTO | ✅ CoW | ✅ | ✅ |
+| DELETE | ✅ CoW | ✅ | ✅ |
+| UPDATE | ✅ CoW | ✅ | ✅ |
 | PIVOT/UNPIVOT | ❌ | ❌ | ⚠️ PIVOT only |
 | QUALIFY | ❌ | ❌ | ❌ |
 | Lambda expressions | ❌ | ✅ | ✅ |
@@ -321,9 +322,9 @@ FROM orders;
 | `DROP VIEW` | ✅ | ✅ | ✅ |
 | `DROP TABLE` | ✅ | ✅ | ✅ |
 | `ALTER TABLE RENAME` | ✅ | ✅ | ✅ |
-| `MERGE INTO` | 🔜 | ✅ | ✅ |
-| `DELETE FROM` | 🔜 | ✅ | ✅ |
-| `UPDATE` | 🔜 | ✅ | ✅ |
+| `MERGE INTO` | ✅ (CoW) | ✅ | ✅ |
+| `DELETE FROM` | ✅ (CoW) | ✅ | ✅ |
+| `UPDATE` | ✅ (CoW) | ✅ | ✅ |
 | `ALTER TABLE ADD COLUMN` | 🔜 | ✅ | ✅ |
 | `ALTER TABLE DROP COLUMN` | 🔜 | ✅ | ✅ |
 | `CREATE SCHEMA` | ✅ | ✅ | ✅ |
@@ -342,7 +343,7 @@ FROM orders;
 | Schema evolution | ✅ via Polaris | ✅ | ✅ |
 | Hidden partitioning | ✅ via metadata | ✅ | ✅ |
 | Merge-on-Read deletes | 🔜 | ✅ | ✅ |
-| Copy-on-Write deletes | ❌ | ✅ | ✅ |
+| Copy-on-Write deletes | ✅ | ✅ | ✅ |
 | Compaction | ❌ | ✅ OPTIMIZE | ✅ rewrite_data_files |
 | Manifest caching | 🔜 | ✅ | ✅ |
 | Row-level security | 🔜 OPA/Cedar | ❌ needs Ranger | ❌ needs Ranger |
@@ -406,4 +407,4 @@ FROM orders;
 2. **No UDFs in SQL** — custom functions require Rust; no CREATE FUNCTION support
 3. **No time travel** — snapshot/AS OF queries not yet implemented
 4. **Single-node only** — distributed execution is structurally in place but not wired
-5. **No MERGE/DELETE/UPDATE** — write path is append-only (CTAS + INSERT); in-place mutations planned
+5. **No Merge-on-Read** — row-level mutations use Copy-on-Write (full file rewrite); MoR with position deletes planned for write-heavy workloads

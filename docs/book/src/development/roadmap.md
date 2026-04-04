@@ -16,7 +16,7 @@ gantt
 
     section Scale
     Phase 2c - dbt Compat        :active, p2c, 2025-03, 2025-05
-    Phase 3 - Row-Level Writes   :p3, 2025-05, 2025-07
+    Phase 3 - Row-Level Writes   :done, p3, 2025-05, 2025-07
     Phase 4 - Iceberg v3         :p4, 2025-06, 2025-08
     Phase 5 - Distributed        :p5, 2025-07, 2025-10
 
@@ -66,52 +66,18 @@ Native dbt support via `dbt-sqe` adapter over ADBC Flight SQL.
 
 ---
 
-## Phase 3 — Row-Level Writes (Planned)
+## Phase 3 — Row-Level Writes (Done)
 
-Unblock `MERGE INTO`, `DELETE FROM`, and `UPDATE` by integrating upstream iceberg-rust changes.
+DELETE FROM, UPDATE, and MERGE INTO are implemented via Copy-on-Write using the [risingwavelabs/iceberg-rust](https://github.com/risingwavelabs/iceberg-rust) fork (rev `1978911ec4`), which provides `rewrite_files()` transaction support.
 
-### Upstream Dependencies
-
-SQE's row-level write operations are blocked on iceberg-rust PRs that are actively being reviewed:
-
-```mermaid
-graph LR
-    subgraph "iceberg-rust upstream"
-        OA["PR #2185<br/>OverwriteAction<br/>(foundation)"] --> RDA["PR #2203<br/>RowDeltaAction<br/>(CoW)"]
-        OA --> SP["PR #1987<br/>SnapshotProducer<br/>delete file support"]
-        DW["PR #2219<br/>Delta writer<br/>(position + equality)"] --> RDA
-        SP --> RDA
-    end
-
-    subgraph "SQE"
-        RDA --> BUMP["Bump to iceberg 0.9+"]
-        BUMP --> DEL["DELETE FROM"]
-        DEL --> UPD["UPDATE"]
-        UPD --> MERGE["MERGE INTO"]
-        MERGE --> DBT["dbt incremental<br/>(merge strategy)"]
-    end
-
-    style OA fill:#ff9,stroke:#333
-    style RDA fill:#ff9,stroke:#333
-    style SP fill:#ff9,stroke:#333
-    style DW fill:#ff9,stroke:#333
-```
-
-| PR | Title | Status | Impact |
-|---|---|---|---|
-| [#2185](https://github.com/apache/iceberg-rust/pull/2185) | `OverwriteAction` with CoW delete support | Active review | Foundation for all row-level ops |
-| [#2203](https://github.com/apache/iceberg-rust/pull/2203) | `RowDeltaAction` for row-level modifications | Active | Builds on #2185, enables MERGE/UPDATE/DELETE |
-| [#2219](https://github.com/apache/iceberg-rust/pull/2219) | Delta writer (position + equality delete) | Active | Combined writer for row-level changes |
-| [#1987](https://github.com/apache/iceberg-rust/pull/1987) | Delete file support in `SnapshotProducer` | Active | Enables committing delete files |
-
-### Strategy: Copy-on-Write First
+### Strategy: Copy-on-Write
 
 ```mermaid
 graph TB
-    subgraph "Copy-on-Write (Phase 3)"
+    subgraph "Copy-on-Write (Implemented)"
         READ["Read affected<br/>data files"] --> FILTER["Apply WHERE filter"]
         FILTER --> REWRITE["Rewrite without<br/>deleted/modified rows"]
-        REWRITE --> COMMIT["Commit via<br/>OverwriteAction"]
+        REWRITE --> COMMIT["Commit via<br/>rewrite_files()"]
     end
 
     subgraph "Merge-on-Read (Future)"
@@ -125,29 +91,32 @@ graph TB
     style COMMIT fill:#6f9
 ```
 
-CoW is simpler (no delete file reconciliation at read time) and aligns with iceberg-rust's initial implementation (#2185). MoR support can be added later for write-heavy workloads.
+CoW rewrites affected data files entirely. MoR support can be added later for write-heavy workloads when upstream iceberg-rust ships `RowDeltaAction`.
 
-### Deliverables
+### Delivered
 
-- `DELETE FROM table WHERE condition` — removes matching rows
-- `UPDATE table SET col = expr WHERE condition` — modifies matching rows
-- `MERGE INTO target USING source ON condition WHEN MATCHED/NOT MATCHED ...` — full upsert
+- `DELETE FROM table WHERE condition` — removes matching rows; supports cross-table subqueries; DELETE without WHERE = truncate
+- `UPDATE table SET col = expr WHERE condition` — modifies matching rows; supports CASE WHEN transformations and cross-table subqueries
+- `MERGE INTO target USING source ON condition WHEN MATCHED/NOT MATCHED ...` — full outer join approach with WHEN MATCHED/NOT MATCHED clauses
 - All operations atomic via Iceberg snapshot isolation
 - dbt `incremental` with `merge` strategy
 - Integration tests against Polaris + MinIO
+- TPC-C write queries (17/17 pass), TPC-E write queries enabled
+
+### Iceberg Dependency
+
+Uses `risingwavelabs/iceberg-rust` fork (rev `1978911ec4`) for `rewrite_files()`. When upstream iceberg-rust ships `OverwriteAction` (tracked in Epic #2186), the dependency can be migrated back to the official crate.
 
 ### SQE Changes
 
 | File | Change |
 |---|---|
-| `Cargo.toml` | Bump iceberg to 0.9+ |
-| `crates/sqe-coordinator/src/delete_handler.rs` | New — DELETE FROM execution |
-| `crates/sqe-coordinator/src/update_handler.rs` | New — UPDATE execution |
-| `crates/sqe-coordinator/src/merge_handler.rs` | New — MERGE INTO execution |
-| `crates/sqe-coordinator/src/query_handler.rs` | Route Merge/Delete/Update to new handlers |
-| `crates/sqe-coordinator/src/write_handler.rs` | Extract shared CoW rewrite logic |
-
-**Estimated effort:** 2-3 weeks once iceberg-rust ships OverwriteAction.
+| `Cargo.toml` | Switched to risingwavelabs/iceberg-rust fork |
+| `crates/sqe-coordinator/src/delete_handler.rs` | DELETE FROM execution via CoW |
+| `crates/sqe-coordinator/src/update_handler.rs` | UPDATE execution via CoW |
+| `crates/sqe-coordinator/src/merge_handler.rs` | MERGE INTO execution via CoW |
+| `crates/sqe-coordinator/src/query_handler.rs` | Routes Merge/Delete/Update to handlers |
+| `crates/sqe-coordinator/src/write_handler.rs` | Shared CoW rewrite logic |
 
 ---
 

@@ -1,5 +1,4 @@
 -- name: Trade Update
--- requires: update
 -- Read portion of the Trade Update transaction: retrieve completed trades
 -- eligible for executor-name or settlement corrections.
 -- Note: the full TPC-E Trade Update transaction modifies trade and settlement rows.
