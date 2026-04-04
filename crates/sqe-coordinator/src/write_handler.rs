@@ -733,6 +733,8 @@ impl WriteHandler {
             .unwrap_or_else(|| "s".to_string());
         let target_table_ref = "__merge_target".to_string();
         let source_table_ref = "__merge_source".to_string();
+        let qualified_target_ref = format!("datafusion.public.{target_table_ref}");
+        let qualified_source_ref = format!("datafusion.public.{source_table_ref}");
 
         // Register target data as a MemTable in the full session context
         // (which has all catalog tables registered for cross-table subqueries)
@@ -749,7 +751,7 @@ impl WriteHandler {
         }
         .map_err(|e| SqeError::Execution(format!("Failed to create target MemTable: {e}")))?;
         ctx
-            .register_table(&target_table_ref, Arc::new(target_mem))
+            .register_table(&qualified_target_ref, Arc::new(target_mem))
             .map_err(|e| {
                 SqeError::Execution(format!("Failed to register target MemTable: {e}"))
             })?;
@@ -769,7 +771,7 @@ impl WriteHandler {
         )
         .map_err(|e| SqeError::Execution(format!("Failed to create source MemTable: {e}")))?;
         ctx
-            .register_table(&source_table_ref, Arc::new(source_mem))
+            .register_table(&qualified_source_ref, Arc::new(source_mem))
             .map_err(|e| {
                 SqeError::Execution(format!("Failed to register source MemTable: {e}"))
             })?;
@@ -918,7 +920,7 @@ impl WriteHandler {
         };
 
         let select_sql = format!(
-            "SELECT {} FROM {target_table_ref} FULL OUTER JOIN {source_table_ref} ON {on_rewritten}",
+            "SELECT {} FROM {qualified_target_ref} AS {target_table_ref} FULL OUTER JOIN {qualified_source_ref} AS {source_table_ref} ON {on_rewritten}",
             column_exprs.join(", ")
         );
 
@@ -936,8 +938,8 @@ impl WriteHandler {
         })?;
 
         // Deregister temp tables to avoid polluting the shared session context
-        let _ = ctx.deregister_table(&target_table_ref);
-        let _ = ctx.deregister_table(&source_table_ref);
+        let _ = ctx.deregister_table(&qualified_target_ref);
+        let _ = ctx.deregister_table(&qualified_source_ref);
 
         // For WHEN MATCHED THEN DELETE: filter out the rows where all columns are NULL
         // (these are the matched rows we set to NULL above)
@@ -1216,12 +1218,12 @@ impl WriteHandler {
             vec![vec![batch.clone()]],
         )
         .map_err(|e| SqeError::Execution(format!("Failed to create MemTable: {e}")))?;
-        ctx.register_table(&table_name, Arc::new(mem_table))
+        ctx.register_table(&format!("datafusion.public.{table_name}"), Arc::new(mem_table))
             .map_err(|e| SqeError::Execution(format!("Failed to register temp table: {e}")))?;
 
         // Execute: SELECT <where_clause> AS __match FROM __delete_<table>
         let eval_sql =
-            format!("SELECT CAST(({where_sql}) AS BOOLEAN) AS __match FROM {table_name}");
+            format!("SELECT CAST(({where_sql}) AS BOOLEAN) AS __match FROM datafusion.public.{table_name}");
         let df = ctx.sql(&eval_sql).await.map_err(|e| {
             SqeError::Execution(format!("Failed to evaluate WHERE clause: {e}"))
         })?;
@@ -1230,7 +1232,7 @@ impl WriteHandler {
         })?;
 
         // Deregister temp table
-        let _ = ctx.deregister_table(&table_name);
+        let _ = ctx.deregister_table(&format!("datafusion.public.{table_name}"));
 
         if result_batches.is_empty() || result_batches[0].num_rows() == 0 {
             return Ok(batch.clone());
@@ -1271,7 +1273,7 @@ impl WriteHandler {
             vec![vec![batch.clone()]],
         )
         .map_err(|e| SqeError::Execution(format!("Failed to create MemTable: {e}")))?;
-        ctx.register_table(&table_name, Arc::new(mem_table))
+        ctx.register_table(&format!("datafusion.public.{table_name}"), Arc::new(mem_table))
             .map_err(|e| SqeError::Execution(format!("Failed to register temp table: {e}")))?;
 
         // Build assignment map: column_name -> expression_sql
@@ -1305,7 +1307,7 @@ impl WriteHandler {
             })
             .collect();
 
-        let select_sql = format!("SELECT {} FROM {table_name}", columns.join(", "));
+        let select_sql = format!("SELECT {} FROM datafusion.public.{table_name}", columns.join(", "));
         let df = ctx.sql(&select_sql).await.map_err(|e| {
             SqeError::Execution(format!("Failed to evaluate UPDATE: {e}"))
         })?;
@@ -1313,7 +1315,7 @@ impl WriteHandler {
             SqeError::Execution(format!("Failed to collect UPDATE results: {e}"))
         })?;
 
-        let _ = ctx.deregister_table(&table_name);
+        let _ = ctx.deregister_table(&format!("datafusion.public.{table_name}"));
 
         // Return the first (and only) result batch
         result_batches.into_iter().next().ok_or_else(|| {
@@ -1335,10 +1337,10 @@ impl WriteHandler {
             vec![vec![batch.clone()]],
         )
         .map_err(|e| SqeError::Execution(format!("MemTable error: {e}")))?;
-        ctx.register_table(&table_name, Arc::new(mem_table))
+        ctx.register_table(&format!("datafusion.public.{table_name}"), Arc::new(mem_table))
             .map_err(|e| SqeError::Execution(format!("Register error: {e}")))?;
 
-        let sql = format!("SELECT COUNT(*) AS cnt FROM {table_name} WHERE {where_sql}");
+        let sql = format!("SELECT COUNT(*) AS cnt FROM datafusion.public.{table_name} WHERE {where_sql}");
         let df = ctx.sql(&sql).await.map_err(|e| {
             SqeError::Execution(format!("Count query failed: {e}"))
         })?;
@@ -1346,7 +1348,7 @@ impl WriteHandler {
             SqeError::Execution(format!("Count collect failed: {e}"))
         })?;
 
-        let _ = ctx.deregister_table(&table_name);
+        let _ = ctx.deregister_table(&format!("datafusion.public.{table_name}"));
 
         let count = batches
             .first()
