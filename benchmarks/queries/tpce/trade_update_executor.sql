@@ -1,4 +1,5 @@
 -- name: Trade Update — Correct executor name
+-- requires: in_subquery_memtable
 -- description: Write portion of Trade Update (Frame 1): update executor name on completed trades
 -- timeout: 30s
 

@@ -1,4 +1,5 @@
 -- name: Trade Result — Mark trades as completed
+-- requires: in_subquery_memtable
 -- description: Write portion of Trade Result: transition pending trades to completed status
 -- timeout: 30s
 
