@@ -7,13 +7,16 @@ use datafusion::prelude::SessionContext;
 use object_store::aws::AmazonS3Builder;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
+use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
+use parquet::file::metadata::ParquetMetaData;
 use futures::TryStreamExt;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 use url::Url;
 
+use sqe_catalog::FooterCache;
 use sqe_metrics::WorkerMetricsRegistry;
 use sqe_planner::ScanTask;
 
@@ -36,12 +39,17 @@ use crate::credential_channel::RefreshableCredentials;
 /// before each file read. If new credentials are available, the S3 object store is
 /// rebuilt with the updated credentials so that long-running scans survive credential
 /// expiry.
-#[tracing::instrument(skip(task, metrics, session_ctx, credential_rx), fields(fragment_id = %task.fragment_id, file_count = task.data_file_paths.len()))]
+///
+/// When `footer_cache` is provided, parsed Parquet footers (metadata) are cached
+/// across files and queries using an LRU cache. On cache hit the footer is not
+/// re-fetched from S3, reducing latency for repeated scans of the same files.
+#[tracing::instrument(skip(task, metrics, session_ctx, credential_rx, footer_cache), fields(fragment_id = %task.fragment_id, file_count = task.data_file_paths.len()))]
 pub async fn execute_scan(
     task: &ScanTask,
     metrics: Option<&Arc<WorkerMetricsRegistry>>,
     session_ctx: &SessionContext,
     credential_rx: Option<watch::Receiver<Option<RefreshableCredentials>>>,
+    footer_cache: Option<&Arc<FooterCache>>,
 ) -> anyhow::Result<(SchemaRef, Vec<RecordBatch>)> {
     let start = std::time::Instant::now();
 
@@ -126,8 +134,41 @@ pub async fn execute_scan(
         total_bytes += meta.size as u64;
         let reader = ParquetObjectReader::new(store.clone(), meta.location)
             .with_file_size(meta.size);
+
+        // Use the footer cache if available: get_or_fetch returns cached
+        // metadata or fetches it via a temporary reader and caches the result.
         let mut builder: ParquetRecordBatchStreamBuilder<ParquetObjectReader> =
-            ParquetRecordBatchStreamBuilder::new(reader).await?;
+            if let Some(cache) = footer_cache {
+                let cache_key = file_path.clone();
+                let store_for_fetch = store.clone();
+                let path_for_fetch = path.clone();
+                let file_size = meta.size;
+
+                let cached_meta = cache
+                    .get_or_fetch(&cache_key, || {
+                        let s = store_for_fetch;
+                        let p = path_for_fetch;
+                        async move {
+                            let fetch_reader = ParquetObjectReader::new(s, p)
+                                .with_file_size(file_size);
+                            let tmp_builder =
+                                ParquetRecordBatchStreamBuilder::new(fetch_reader).await?;
+                            Ok::<ParquetMetaData, parquet::errors::ParquetError>(
+                                tmp_builder.metadata().as_ref().clone(),
+                            )
+                        }
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Footer cache error: {e}"))?;
+
+                let arrow_meta = ArrowReaderMetadata::try_new(
+                    cached_meta,
+                    Default::default(),
+                )?;
+                ParquetRecordBatchStreamBuilder::new_with_metadata(reader, arrow_meta)
+            } else {
+                ParquetRecordBatchStreamBuilder::new(reader).await?
+            };
 
         // Apply column projection if specified
         if !task.projected_columns.is_empty() {

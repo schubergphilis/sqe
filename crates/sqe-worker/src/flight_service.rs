@@ -13,6 +13,7 @@ use tracing::{debug, info, info_span, warn, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use datafusion::prelude::SessionContext;
+use sqe_catalog::FooterCache;
 use sqe_metrics::WorkerMetricsRegistry;
 use sqe_metrics::propagation::extract_trace_context;
 use sqe_planner::ScanTask;
@@ -35,6 +36,7 @@ pub struct WorkerFlightService {
     metrics: Arc<WorkerMetricsRegistry>,
     credential_store: CredentialStore,
     session_ctx: SessionContext,
+    footer_cache: Option<Arc<FooterCache>>,
 }
 
 impl WorkerFlightService {
@@ -43,6 +45,7 @@ impl WorkerFlightService {
             metrics,
             credential_store: CredentialStore::new(),
             session_ctx,
+            footer_cache: None,
         }
     }
 
@@ -59,7 +62,14 @@ impl WorkerFlightService {
             metrics,
             credential_store,
             session_ctx,
+            footer_cache: None,
         }
+    }
+
+    /// Set the Parquet footer cache for this service.
+    pub fn with_footer_cache(mut self, cache: Arc<FooterCache>) -> Self {
+        self.footer_cache = Some(cache);
+        self
     }
 
     /// Returns a reference to the credential store for use by executors.
@@ -109,6 +119,7 @@ impl FlightService for WorkerFlightService {
         let metrics = self.metrics.clone();
         let credential_store = self.credential_store.clone();
         let session_ctx = self.session_ctx.clone();
+        let footer_cache = self.footer_cache.clone();
         async move {
             info!(
                 fragment_id = %scan_task.fragment_id,
@@ -120,7 +131,13 @@ impl FlightService for WorkerFlightService {
             let cred_rx = credential_store.subscribe(&scan_task.fragment_id).await;
 
             let (schema, batches) =
-                executor::execute_scan(&scan_task, Some(&metrics), &session_ctx, Some(cred_rx))
+                executor::execute_scan(
+                    &scan_task,
+                    Some(&metrics),
+                    &session_ctx,
+                    Some(cred_rx),
+                    footer_cache.as_ref(),
+                )
                     .await
                     .map_err(|e| {
                         warn!(error = %e, "Scan task execution failed");
