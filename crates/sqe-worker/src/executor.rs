@@ -3,6 +3,7 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::execution::memory_pool::MemoryConsumer;
+use datafusion::physical_plan::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use object_store::aws::AmazonS3Builder;
 use object_store::ObjectStore;
@@ -12,6 +13,7 @@ use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::ParquetMetaData;
 use futures::TryStreamExt;
+use sqe_catalog::late_materialize;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 use url::Url;
@@ -43,13 +45,21 @@ use crate::credential_channel::RefreshableCredentials;
 /// When `footer_cache` is provided, parsed Parquet footers (metadata) are cached
 /// across files and queries using an LRU cache. On cache hit the footer is not
 /// re-fetched from S3, reducing latency for repeated scans of the same files.
-#[tracing::instrument(skip(task, metrics, session_ctx, credential_rx, footer_cache), fields(fragment_id = %task.fragment_id, file_count = task.data_file_paths.len()))]
+///
+/// When `filter_expr` is provided and late materialization is beneficial
+/// (predicate columns are a proper subset of projected columns), builds an
+/// arrow-rs `RowFilter` for two-phase Parquet scans: Phase 1 reads only
+/// predicate columns and evaluates the filter; Phase 2 reads remaining
+/// projection columns only for surviving rows. This can reduce S3 I/O by
+/// 10-50x for selective queries on wide tables.
+#[tracing::instrument(skip(task, metrics, session_ctx, credential_rx, footer_cache, filter_expr), fields(fragment_id = %task.fragment_id, file_count = task.data_file_paths.len()))]
 pub async fn execute_scan(
     task: &ScanTask,
     metrics: Option<&Arc<WorkerMetricsRegistry>>,
     session_ctx: &SessionContext,
     credential_rx: Option<watch::Receiver<Option<RefreshableCredentials>>>,
     footer_cache: Option<&Arc<FooterCache>>,
+    filter_expr: Option<Arc<dyn PhysicalExpr>>,
 ) -> anyhow::Result<(SchemaRef, Vec<RecordBatch>)> {
     let start = std::time::Instant::now();
 
@@ -190,6 +200,51 @@ pub async fn execute_scan(
                     indices,
                 );
                 builder = builder.with_projection(mask);
+            }
+        }
+
+        // Late materialization: apply RowFilter for two-phase Parquet scan
+        // when a filter expression is provided and there are projection-only
+        // columns that can be deferred to Phase 2.
+        if let Some(ref filter) = filter_expr {
+            if late_materialize::is_late_materialization_beneficial(
+                Some(filter.as_ref()),
+                &task.projected_columns,
+            ) {
+                let classification =
+                    late_materialize::classify_columns(filter.as_ref(), &task.projected_columns);
+
+                debug!(
+                    fragment_id = %task.fragment_id,
+                    predicate_columns = ?classification.predicate_columns,
+                    projection_only_columns = ?classification.projection_only_columns,
+                    "Applying late materialization RowFilter"
+                );
+
+                // Build the predicate schema from the full file schema
+                let file_schema = builder.schema().clone();
+                let predicate_schema =
+                    late_materialize::build_predicate_schema(&classification, &file_schema);
+
+                // Remap predicate column indices to the predicate-only schema
+                match late_materialize::remap_predicate_columns(filter, &predicate_schema) {
+                    Ok(remapped_predicate) => {
+                        let row_filter = late_materialize::build_row_filter(
+                            remapped_predicate,
+                            &predicate_schema,
+                            builder.parquet_schema(),
+                        );
+                        builder = builder.with_row_filter(row_filter);
+                    }
+                    Err(e) => {
+                        warn!(
+                            fragment_id = %task.fragment_id,
+                            error = %e,
+                            "Failed to remap predicate columns for late materialization, \
+                             falling back to full scan"
+                        );
+                    }
+                }
             }
         }
 

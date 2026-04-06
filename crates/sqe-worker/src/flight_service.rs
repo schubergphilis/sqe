@@ -137,6 +137,7 @@ impl FlightService for WorkerFlightService {
                     &session_ctx,
                     Some(cred_rx),
                     footer_cache.as_ref(),
+                    None, // Late materialization filter (not yet wired from coordinator)
                 )
                     .await
                     .map_err(|e| {

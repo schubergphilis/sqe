@@ -130,11 +130,12 @@ impl TableProvider for SqeTableProvider {
             debug!(predicate = %pred, "Pushing predicate down to Iceberg scan");
         }
 
-        Ok(Arc::new(crate::iceberg_scan::IcebergScanExec::new(
+        Ok(Arc::new(crate::iceberg_scan::IcebergScanExec::new_with_filters(
             self.table.clone(),
             projected_schema,
             projected_columns,
             predicates,
+            filters.to_vec(),
         )))
     }
 }
