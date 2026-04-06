@@ -43,7 +43,16 @@ impl IcebergScanExec {
     }
 
     pub fn new_with_filters(table: Table, projected_schema: SchemaRef, projection: Option<Vec<String>>, predicates: Option<Predicate>, df_filters: Vec<Expr>) -> Self {
-        let properties = PlanProperties::new(EquivalenceProperties::new(projected_schema.clone()), Partitioning::UnknownPartitioning(1), EmissionType::Incremental, Boundedness::Bounded);
+        // Detect sort order from Iceberg metadata and set EquivalenceProperties
+        let eq_props = {
+            let sort_order = table.metadata().default_sort_order();
+            let iceberg_schema = table.metadata().current_schema();
+            match crate::sort_order::iceberg_sort_to_physical(sort_order, iceberg_schema, &projected_schema) {
+                Some(sort_exprs) => crate::sort_order::equivalence_with_sort(projected_schema.clone(), sort_exprs),
+                None => EquivalenceProperties::new(projected_schema.clone()),
+            }
+        };
+        let properties = PlanProperties::new(eq_props, Partitioning::UnknownPartitioning(1), EmissionType::Incremental, Boundedness::Bounded);
         Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new() }
     }
 
