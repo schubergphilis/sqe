@@ -105,6 +105,26 @@ cargo audit
 - Remote: `origin` = GitLab (`sbp.gitlab.schubergphilis.com`)
 - Use `glab` CLI for MR creation
 
+## Benchmarks
+
+Benchmark JSON results in `benchmarks/results/` are **committed to the repo** for historical comparison. After running benchmarks (TPC-H, TPC-DS, SSB, etc.):
+
+1. **Commit the JSON report** — `git add benchmarks/results/*.json` — these files track performance over time
+2. **Compare against baselines** — Use historical results to detect regressions before merging
+3. **Key baselines** to compare against:
+   - `tpch-sf1-flight-2026-04-02T14:16:27.json` — single-node baseline (22/22, 37.5s)
+   - `tpch-sf1-flight-2026-04-06T20:57:10.json` — distributed baseline (22/22, 12.0s, 3.1x faster)
+4. **Run benchmarks after performance-sensitive changes** — spill, scan planning, I/O pipeline, distributed execution
+
+```bash
+# Quick smoke test: TPC-H SF1 single-node
+BENCH_SCALE=1 ./scripts/benchmark-mvp.sh tpch
+
+# Distributed test: requires docker-compose stack
+docker compose -f docker-compose.test.yml -f docker-compose.distributed.yml up --build -d
+./scripts/distributed-test.sh
+```
+
 ## After Completing Work
 
 When finishing a feature, bugfix, or any implementation task, **always update these files** before committing:
@@ -112,5 +132,6 @@ When finishing a feature, bugfix, or any implementation task, **always update th
 1. **`README.md`** — Update the roadmap checklist (mark items done, add new items)
 2. **`nextsteps.md`** — Update status line, mark completed steps, shift "← NEXT" pointer
 3. **`openspec/changes/*/tasks.md`** — Check off completed tasks (`- [ ]` → `- [x]`)
+4. **`benchmarks/results/`** — Commit benchmark JSON reports for historical tracking
 
 This ensures the project state is always visible to anyone reading the repo.

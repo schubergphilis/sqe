@@ -243,6 +243,58 @@ Reports are written to `benchmarks/results/<benchmark>-sf<N>-<protocol>-<timesta
 
 JSON reports are machine-readable and suitable for tracking regressions over time in CI.
 
+## Historical Performance Tracking
+
+Benchmark JSON results are committed to `benchmarks/results/` for historical comparison. This enables tracking performance regressions and improvements across releases.
+
+### TPC-H SF1 — Historical Comparison (Apr 2 baseline vs. Apr 6 streaming execution)
+
+After implementing the streaming execution engine (coordinator spill-to-disk, late materialization, file-level pruning, S3 I/O pipeline, distributed execution), TPC-H SF1 improved 3.1x on a distributed cluster (coordinator + 2 workers) compared to the single-node baseline:
+
+```
+Query   Apr 2 (single-node)   Apr 6 (distributed)   Speedup
+────────────────────────────────────────────────────────────
+q01               3.21s                1.29s     2.5x
+q02               0.89s                0.27s     3.3x
+q03               2.23s                0.94s     2.4x
+q04               1.14s                0.32s     3.6x
+q05               1.89s                0.55s     3.4x
+q06               1.13s                0.30s     3.7x
+q07               2.07s                0.85s     2.4x
+q08               1.81s                0.54s     3.4x
+q09               1.78s                0.60s     3.0x
+q10               2.47s                0.63s     3.9x
+q11               0.74s                0.11s     6.8x
+q12               1.71s                0.57s     3.0x
+q13               1.10s                0.18s     6.1x
+q14               1.46s                0.55s     2.7x
+q15               2.24s                0.72s     3.1x
+q16               0.75s                0.10s     7.4x
+q17               1.89s                0.63s     3.0x
+q18               3.19s                0.74s     4.3x
+q19               1.68s                0.79s     2.1x
+q20               1.39s                0.53s     2.6x
+q21               2.11s                0.68s     3.1x
+q22               0.67s                0.09s     7.7x
+────────────────────────────────────────────────────────────
+TOTAL             37.5s                12.0s     3.1x
+```
+
+Key observations:
+
+- **Metadata-light queries** (q11, q13, q16, q22) see 6-8x speedup — footer cache, file pruning, and scan distribution eliminate I/O overhead
+- **Scan-heavy queries** (q01, q03, q07) see 2-2.5x speedup — proportional to worker count (2 workers)
+- **q18** (the hardest TPC-H query) improved from 3.19s to 0.74s (4.3x) — benefits from distributed aggregation across workers
+- **Single-node with 512MB spill**: 21/22 pass — only q18 fails due to DataFusion hash aggregate memory limitation (DF#17334). With 1GB+ memory or with workers, all 22 pass.
+
+### Deployment configurations tested
+
+| Mode | Pass | Total | Notes |
+|---|---|---|---|
+| Single-node, 8GB (Apr 2 baseline) | 22/22 | 37.5s | Before streaming execution |
+| Single-node, 512MB + spill | 21/22 | 33.3s | q18 OOM on hash aggregate |
+| Distributed, coord + 2 workers | 22/22 | 12.0s | 3.1x faster, q18 passes |
+
 ## CI/CD Integration
 
 All three scripts support automated use without a TTY:
