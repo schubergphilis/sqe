@@ -483,6 +483,29 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             }
         };
 
+    // Construct OAuth2 external auth state from [auth.external] config (if present).
+    let oauth2_state: Option<Arc<sqe_trino_compat::oauth2::OAuth2State>> =
+        if let Some(ref ext) = config.auth.external {
+            match build_oauth2_state(ext, &config) {
+                Ok(state) => {
+                    tracing::info!(
+                        issuer = %ext.issuer,
+                        "External auth (OAuth2) enabled for Trino SSO"
+                    );
+                    Some(Arc::new(state))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to initialize external auth; Trino SSO will be disabled"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     // Trino compat
     if config.coordinator.trino_http_port > 0 {
         let auth_adapter = Arc::new(AuthenticatorAdapter {
@@ -499,7 +522,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
                 ready: ready.clone(),
                 started_at,
             },
-            None, // OAuth2 external auth — wired when [auth.external] is configured
+            oauth2_state,
         );
         tracing::info!("Trino-compat HTTP on port {}", config.coordinator.trino_http_port);
     }
@@ -585,6 +608,72 @@ async fn run_worker(config: SqeConfig) -> anyhow::Result<()> {
 
     tracing::info!("SQE worker shut down");
     Ok(())
+}
+
+// ── External auth (OAuth2) construction ───────────────────────
+
+/// Build the [`OAuth2State`] from the `[auth.external]` config section.
+///
+/// This creates:
+/// - An [`OidcDiscovery`] instance (lazy-fetches `.well-known/openid-configuration`)
+/// - An [`AuthCodeService`] for the Authorization Code + PKCE flow (Trino SSO)
+/// - A [`PendingAuthStore`] to track in-flight auth sessions
+///
+/// The base URL for redirect/token URLs is derived from the coordinator's
+/// Trino HTTP port (scheme defaults to `http`; in production, TLS termination
+/// or a reverse proxy provides HTTPS).
+fn build_oauth2_state(
+    ext: &sqe_core::config::ExternalAuthConfig,
+    config: &SqeConfig,
+) -> anyhow::Result<sqe_trino_compat::oauth2::OAuth2State> {
+    let discovery_config = sqe_auth::OidcDiscoveryConfig {
+        issuer: ext.issuer.clone(),
+        authorization_endpoint_override: ext.authorization_endpoint.clone(),
+        token_endpoint_override: ext.token_endpoint.clone(),
+        device_authorization_endpoint_override: ext.device_authorization_endpoint.clone(),
+        accept_invalid_certs: ext.accept_invalid_certs,
+    };
+
+    let discovery = Arc::new(
+        sqe_auth::OidcDiscovery::new(discovery_config)
+            .map_err(|e| anyhow::anyhow!("OIDC discovery init failed: {e}"))?,
+    );
+
+    let auth_code_service = Arc::new(sqe_auth::AuthCodeService::new(
+        discovery.clone(),
+        ext.client_id.clone(),
+        ext.client_secret.clone(),
+        ext.redirect_uri.clone(),
+        ext.scopes.clone(),
+    ));
+
+    let pending_store = Arc::new(sqe_auth::PendingAuthStore::new(
+        std::time::Duration::from_secs(ext.challenge_timeout_secs),
+    ));
+
+    // Derive the base URL from the Trino HTTP port. In production, a reverse
+    // proxy or TLS terminator provides the external HTTPS URL; for dev, use
+    // the configured redirect_uri's scheme+host or fall back to localhost.
+    let base_url = if ext.redirect_uri.contains("://") {
+        // Extract scheme + host from redirect_uri (e.g. "https://sqe.example.com")
+        let uri = ext.redirect_uri.trim_end_matches('/');
+        match uri.find("://") {
+            Some(idx) => {
+                let after_scheme = &uri[idx + 3..];
+                let host_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+                format!("{}://{}", &uri[..idx], &after_scheme[..host_end])
+            }
+            None => format!("http://localhost:{}", config.coordinator.trino_http_port),
+        }
+    } else {
+        format!("http://localhost:{}", config.coordinator.trino_http_port)
+    };
+
+    Ok(sqe_trino_compat::oauth2::OAuth2State {
+        auth_code_service,
+        pending_store,
+        base_url,
+    })
 }
 
 #[cfg(test)]

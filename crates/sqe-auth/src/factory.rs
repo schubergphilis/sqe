@@ -86,6 +86,7 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                         ssl_verification: config.ssl_verification,
                         providers: Vec::new(),
                         role_mappings: HashMap::new(),
+                        external: None,
                     };
                     let auth = Authenticator::new(&legacy_config).await?;
                     Arc::new(auth)
@@ -251,6 +252,7 @@ mod tests {
                 roles: vec!["admin".to_string()],
             }],
             role_mappings: HashMap::new(),
+            external: None,
         };
 
         let chain = build_auth_chain(&config).await.expect("should build chain");
@@ -285,6 +287,7 @@ mod tests {
                 roles_claim: "realm_access.roles".to_string(),
             }],
             role_mappings: HashMap::new(),
+            external: None,
         };
 
         let chain = build_auth_chain(&config).await.expect("should build chain");
@@ -318,6 +321,7 @@ mod tests {
                 },
             ],
             role_mappings: HashMap::new(),
+            external: None,
         };
 
         let chain = build_auth_chain(&config).await.expect("should build chain");
@@ -348,6 +352,7 @@ mod tests {
             ssl_verification: false,
             providers: Vec::new(),
             role_mappings: HashMap::new(),
+            external: None,
         };
 
         let chain = build_auth_chain(&config).await.expect("should build chain");
