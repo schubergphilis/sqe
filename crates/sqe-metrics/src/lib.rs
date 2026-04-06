@@ -44,6 +44,30 @@ pub struct MetricsRegistry {
     pub coordinator_memory_used_bytes: Gauge,
     pub coordinator_memory_limit_bytes: Gauge,
     pub coordinator_memory_pressure: Gauge,
+
+    // Spill metrics
+    pub sort_spill_count: Counter,
+    pub sort_spill_bytes: Counter,
+    pub join_spill_count: Counter,
+    pub join_spill_bytes: Counter,
+
+    // Shuffle metrics (Phase B — registered now, incremented when shuffle lands)
+    pub shuffle_bytes_sent: Counter,
+    pub shuffle_bytes_received: Counter,
+    pub shuffle_partitions: Counter,
+
+    // Late materialization metrics
+    pub late_mat_bytes_predicate: Counter,
+    pub late_mat_bytes_projection: Counter,
+    pub late_mat_selectivity: Histogram,
+
+    // Pruning metrics
+    pub files_pruned_minmax: Counter,
+    pub files_pruned_bloom: Counter,
+    pub pages_pruned_index: Counter,
+
+    // Latency
+    pub time_to_first_row: Histogram,
 }
 
 impl MetricsRegistry {
@@ -174,6 +198,115 @@ impl MetricsRegistry {
         .unwrap();
         registry.register(Box::new(coordinator_memory_pressure.clone())).unwrap();
 
+        // Spill metrics
+        let sort_spill_count = Counter::new(
+            "sqe_sort_spill_count_total",
+            "Number of sort spill events",
+        )
+        .unwrap();
+        registry.register(Box::new(sort_spill_count.clone())).unwrap();
+
+        let sort_spill_bytes = Counter::new(
+            "sqe_sort_spill_bytes_total",
+            "Bytes spilled for sorts",
+        )
+        .unwrap();
+        registry.register(Box::new(sort_spill_bytes.clone())).unwrap();
+
+        let join_spill_count = Counter::new(
+            "sqe_join_spill_count_total",
+            "Join spill events (SortMergeJoin)",
+        )
+        .unwrap();
+        registry.register(Box::new(join_spill_count.clone())).unwrap();
+
+        let join_spill_bytes = Counter::new(
+            "sqe_join_spill_bytes_total",
+            "Bytes spilled for joins",
+        )
+        .unwrap();
+        registry.register(Box::new(join_spill_bytes.clone())).unwrap();
+
+        // Shuffle metrics (Phase B — registered now, incremented when shuffle lands)
+        let shuffle_bytes_sent = Counter::new(
+            "sqe_shuffle_bytes_sent_total",
+            "Bytes sent via DoExchange",
+        )
+        .unwrap();
+        registry.register(Box::new(shuffle_bytes_sent.clone())).unwrap();
+
+        let shuffle_bytes_received = Counter::new(
+            "sqe_shuffle_bytes_received_total",
+            "Bytes received via DoExchange",
+        )
+        .unwrap();
+        registry.register(Box::new(shuffle_bytes_received.clone())).unwrap();
+
+        let shuffle_partitions = Counter::new(
+            "sqe_shuffle_partitions_total",
+            "Shuffle partitions created",
+        )
+        .unwrap();
+        registry.register(Box::new(shuffle_partitions.clone())).unwrap();
+
+        // Late materialization metrics
+        let late_mat_bytes_predicate = Counter::new(
+            "sqe_late_mat_bytes_predicate_total",
+            "Bytes read for predicate evaluation",
+        )
+        .unwrap();
+        registry.register(Box::new(late_mat_bytes_predicate.clone())).unwrap();
+
+        let late_mat_bytes_projection = Counter::new(
+            "sqe_late_mat_bytes_projection_total",
+            "Bytes read for projection",
+        )
+        .unwrap();
+        registry.register(Box::new(late_mat_bytes_projection.clone())).unwrap();
+
+        let late_mat_selectivity = Histogram::with_opts(
+            HistogramOpts::new(
+                "sqe_late_mat_selectivity",
+                "Late materialization selectivity (rows surviving / total rows)",
+            )
+            .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1.0]),
+        )
+        .unwrap();
+        registry.register(Box::new(late_mat_selectivity.clone())).unwrap();
+
+        // Pruning metrics
+        let files_pruned_minmax = Counter::new(
+            "sqe_files_pruned_minmax_total",
+            "Files skipped by min/max pruning",
+        )
+        .unwrap();
+        registry.register(Box::new(files_pruned_minmax.clone())).unwrap();
+
+        let files_pruned_bloom = Counter::new(
+            "sqe_files_pruned_bloom_total",
+            "Files skipped by bloom filter",
+        )
+        .unwrap();
+        registry.register(Box::new(files_pruned_bloom.clone())).unwrap();
+
+        let pages_pruned_index = Counter::new(
+            "sqe_pages_pruned_index_total",
+            "Pages skipped by page index",
+        )
+        .unwrap();
+        registry.register(Box::new(pages_pruned_index.clone())).unwrap();
+
+        // Latency
+        let time_to_first_row = Histogram::with_opts(
+            HistogramOpts::new(
+                "sqe_time_to_first_row_seconds",
+                "Time from query submit to first result row",
+            )
+            .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0]),
+        )
+        .unwrap();
+        registry.register(Box::new(time_to_first_row.clone())).unwrap();
+
         Self {
             registry,
             query_count,
@@ -196,6 +329,20 @@ impl MetricsRegistry {
             coordinator_memory_used_bytes,
             coordinator_memory_limit_bytes,
             coordinator_memory_pressure,
+            sort_spill_count,
+            sort_spill_bytes,
+            join_spill_count,
+            join_spill_bytes,
+            shuffle_bytes_sent,
+            shuffle_bytes_received,
+            shuffle_partitions,
+            late_mat_bytes_predicate,
+            late_mat_bytes_projection,
+            late_mat_selectivity,
+            files_pruned_minmax,
+            files_pruned_bloom,
+            pages_pruned_index,
+            time_to_first_row,
         }
     }
 }
@@ -327,7 +474,23 @@ mod tests {
         metrics.footer_cache_hits.inc_by(0.0);
         metrics.footer_cache_misses.inc_by(0.0);
         metrics.footer_cache_size_bytes.set(0.0);
-        assert!(metrics.registry.gather().len() >= 17);
+        // New streaming execution metrics
+        metrics.sort_spill_count.inc_by(0.0);
+        metrics.sort_spill_bytes.inc_by(0.0);
+        metrics.join_spill_count.inc_by(0.0);
+        metrics.join_spill_bytes.inc_by(0.0);
+        metrics.shuffle_bytes_sent.inc_by(0.0);
+        metrics.shuffle_bytes_received.inc_by(0.0);
+        metrics.shuffle_partitions.inc_by(0.0);
+        metrics.late_mat_bytes_predicate.inc_by(0.0);
+        metrics.late_mat_bytes_projection.inc_by(0.0);
+        metrics.late_mat_selectivity.observe(0.5);
+        metrics.files_pruned_minmax.inc_by(0.0);
+        metrics.files_pruned_bloom.inc_by(0.0);
+        metrics.pages_pruned_index.inc_by(0.0);
+        metrics.time_to_first_row.observe(0.1);
+        // 17 original + 14 new = 31 minimum
+        assert!(metrics.registry.gather().len() >= 31);
     }
 
     #[test]
@@ -354,6 +517,65 @@ mod tests {
         assert_eq!(metrics.active_sessions.get(), 2);
         metrics.active_sessions.dec();
         assert_eq!(metrics.active_sessions.get(), 1);
+    }
+
+    #[test]
+    fn test_spill_metrics() {
+        let metrics = MetricsRegistry::new();
+        metrics.sort_spill_count.inc_by(5.0);
+        metrics.sort_spill_bytes.inc_by(1024.0);
+        metrics.join_spill_count.inc_by(3.0);
+        metrics.join_spill_bytes.inc_by(2048.0);
+        assert_eq!(metrics.sort_spill_count.get(), 5.0);
+        assert_eq!(metrics.sort_spill_bytes.get(), 1024.0);
+        assert_eq!(metrics.join_spill_count.get(), 3.0);
+        assert_eq!(metrics.join_spill_bytes.get(), 2048.0);
+    }
+
+    #[test]
+    fn test_shuffle_metrics() {
+        let metrics = MetricsRegistry::new();
+        metrics.shuffle_bytes_sent.inc_by(4096.0);
+        metrics.shuffle_bytes_received.inc_by(8192.0);
+        metrics.shuffle_partitions.inc_by(10.0);
+        assert_eq!(metrics.shuffle_bytes_sent.get(), 4096.0);
+        assert_eq!(metrics.shuffle_bytes_received.get(), 8192.0);
+        assert_eq!(metrics.shuffle_partitions.get(), 10.0);
+    }
+
+    #[test]
+    fn test_late_materialization_metrics() {
+        let metrics = MetricsRegistry::new();
+        metrics.late_mat_bytes_predicate.inc_by(500.0);
+        metrics.late_mat_bytes_projection.inc_by(1500.0);
+        assert_eq!(metrics.late_mat_bytes_predicate.get(), 500.0);
+        assert_eq!(metrics.late_mat_bytes_projection.get(), 1500.0);
+
+        metrics.late_mat_selectivity.observe(0.25);
+        metrics.late_mat_selectivity.observe(0.75);
+        assert_eq!(metrics.late_mat_selectivity.get_sample_count(), 2);
+    }
+
+    #[test]
+    fn test_pruning_metrics() {
+        let metrics = MetricsRegistry::new();
+        metrics.files_pruned_minmax.inc_by(10.0);
+        metrics.files_pruned_bloom.inc_by(5.0);
+        metrics.pages_pruned_index.inc_by(20.0);
+        assert_eq!(metrics.files_pruned_minmax.get(), 10.0);
+        assert_eq!(metrics.files_pruned_bloom.get(), 5.0);
+        assert_eq!(metrics.pages_pruned_index.get(), 20.0);
+    }
+
+    #[test]
+    fn test_time_to_first_row_histogram() {
+        let metrics = MetricsRegistry::new();
+        metrics.time_to_first_row.observe(0.05);
+        metrics.time_to_first_row.observe(0.5);
+        metrics.time_to_first_row.observe(5.0);
+        assert_eq!(metrics.time_to_first_row.get_sample_count(), 3);
+        let sum = metrics.time_to_first_row.get_sample_sum();
+        assert!((sum - 5.55).abs() < 1e-9);
     }
 
     // ── WorkerMetricsRegistry tests ─────────────────────────────
