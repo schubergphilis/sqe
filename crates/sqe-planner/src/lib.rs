@@ -1,6 +1,7 @@
 pub mod distributed_join;
 pub mod distributed_sort;
 pub mod join_strategy;
+pub mod predicate_transfer;
 pub mod scan_task;
 pub mod shuffle_exec;
 pub mod splitter;
@@ -15,6 +16,10 @@ pub use distributed_sort::{
     DistributedSortRule, DEFAULT_DISTRIBUTED_SORT_THRESHOLD, MIN_EXECUTORS_FOR_DISTRIBUTED_SORT,
 };
 pub use join_strategy::JoinStrategyRule;
+pub use predicate_transfer::{
+    build_predicate_transfer, extract_distinct_from_batches, extract_distinct_values,
+    PredicateTransfer, MAX_PREDICATE_TRANSFER_VALUES,
+};
 pub use scan_task::ScanTask;
 pub use shuffle_exec::{ShufflePartitioning, ShuffleReaderExec, ShuffleWriterExec};
 pub use splitter::bin_pack_files;
