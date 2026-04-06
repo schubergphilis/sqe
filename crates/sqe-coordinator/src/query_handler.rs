@@ -141,6 +141,31 @@ impl QueryHandler {
         session: &Session,
         sql: &str,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // Memory pressure admission control: reject new queries when the
+        // coordinator's FairSpillPool is >95% utilized (Red).
+        let pressure = crate::memory::check_pressure(&self.runtime.memory_pool);
+        if let Some(ref metrics) = self.metrics {
+            metrics
+                .coordinator_memory_pressure
+                .set(pressure.as_gauge());
+            metrics
+                .coordinator_memory_used_bytes
+                .set(crate::memory::used_bytes(&self.runtime.memory_pool) as f64);
+            metrics
+                .coordinator_memory_limit_bytes
+                .set(crate::memory::limit_bytes(&self.runtime.memory_pool) as f64);
+        }
+        if !pressure.admits_new_query() {
+            warn!(
+                pressure = %pressure,
+                username = %session.user.username,
+                "Rejecting query due to memory pressure"
+            );
+            return Err(SqeError::Execution(
+                "Server under memory pressure (>95% utilized). Please retry later.".to_string(),
+            ));
+        }
+
         // Backpressure: reject if too many concurrent queries
         let _permit = if let Some(ref sem) = self.query_semaphore {
             match sem.try_acquire() {
