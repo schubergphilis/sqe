@@ -10,6 +10,8 @@
 //! - [`ColumnClassification`] classifies columns as predicate or projection-only
 //! - [`build_row_filter`] converts a DataFusion `PhysicalExpr` into a parquet `RowFilter`
 //! - [`is_late_materialization_beneficial`] decides whether to enable the optimization
+//! - [`PredicateOrderHint`] classifies individual predicates by evaluation cost
+//! - [`order_predicates`] reorders predicates for optimal RowFilter evaluation
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -266,6 +268,290 @@ fn remap_expr(
 // - No manual caching implementation is required.
 //
 // See `test_row_filter_construction` below for compile-time API verification.
+
+// ────────────────────────────────────────────────────────────────────
+// Task 23: Predicate ordering optimization
+// ────────────────────────────────────────────────────────────────────
+
+/// Classification of a predicate's evaluation cost tier.
+///
+/// When multiple predicates exist in a query's WHERE clause, evaluating the
+/// cheapest and most selective predicates first maximizes early row elimination
+/// and minimizes I/O. This enum defines the priority tiers from cheapest to
+/// most expensive.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PredicateCostTier {
+    /// Tier 0: Predicate on a partition column.
+    /// These are effectively free — they are evaluated at the manifest level
+    /// during file pruning, not at the row level. Including them in the
+    /// RowFilter is redundant but harmless and provides defense-in-depth.
+    PartitionColumn = 0,
+
+    /// Tier 1: Predicate on a column with bloom filter support.
+    /// Bloom filters allow skipping row groups without decoding column data.
+    /// Very cheap and often highly selective (e.g., point lookups on ID columns).
+    BloomFilter = 1,
+
+    /// Tier 2: Predicate on a sort-order column.
+    /// Sort-order columns have the best zone map (min/max) statistics because
+    /// data is clustered. Row group pruning via min/max is very effective.
+    SortOrderColumn = 2,
+
+    /// Tier 3: Predicate on a regular column with available statistics.
+    /// Uses generic min/max statistics for pruning. Less effective than
+    /// sort-order columns but still provides some benefit.
+    RegularWithStats = 3,
+
+    /// Tier 4: Predicate on a column with no special properties.
+    /// Must be evaluated by decoding column data — the most expensive tier.
+    Regular = 4,
+}
+
+/// A predicate annotated with its evaluation cost and estimated selectivity.
+#[derive(Debug, Clone)]
+pub struct OrderedPredicate {
+    /// The predicate expression.
+    pub expr: Arc<dyn PhysicalExpr>,
+    /// Column names referenced by this predicate.
+    pub columns: Vec<String>,
+    /// Cost tier for this predicate.
+    pub cost_tier: PredicateCostTier,
+    /// Estimated selectivity (0.0 = filters everything, 1.0 = keeps everything).
+    /// Lower is better (more selective). None if unknown.
+    pub estimated_selectivity: Option<f64>,
+}
+
+/// Metadata about the table's columns used for predicate ordering.
+///
+/// This struct carries information from Iceberg table metadata that helps
+/// classify predicates by their evaluation cost.
+#[derive(Debug, Clone, Default)]
+pub struct PredicateOrderingContext {
+    /// Names of partition columns (predicates on these are free).
+    pub partition_columns: HashSet<String>,
+    /// Names of columns with bloom filter support.
+    pub bloom_filter_columns: HashSet<String>,
+    /// Names of columns in the table's sort order (identity transform only).
+    pub sort_order_columns: Vec<String>,
+    /// Names of columns with available statistics (min/max/null_count).
+    pub columns_with_stats: HashSet<String>,
+    /// Optional estimated selectivity per column name (from column stats).
+    /// Values between 0.0 (filters everything) and 1.0 (keeps everything).
+    pub column_selectivity: Vec<(String, f64)>,
+}
+
+/// Decompose a conjunction (AND-connected) predicate into individual terms.
+///
+/// Walks the expression tree and splits at AND boundaries. Non-AND expressions
+/// are returned as a single-element vector.
+pub fn decompose_conjunction(expr: &Arc<dyn PhysicalExpr>) -> Vec<Arc<dyn PhysicalExpr>> {
+    let mut terms = Vec::new();
+    decompose_conjunction_inner(expr, &mut terms);
+    if terms.is_empty() {
+        // Not a conjunction — return the expression itself
+        terms.push(Arc::clone(expr));
+    }
+    terms
+}
+
+fn decompose_conjunction_inner(
+    expr: &Arc<dyn PhysicalExpr>,
+    terms: &mut Vec<Arc<dyn PhysicalExpr>>,
+) {
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_plan::expressions::BinaryExpr;
+
+    if let Some(binary) = expr.as_any().downcast_ref::<BinaryExpr>() {
+        if *binary.op() == Operator::And {
+            decompose_conjunction_inner(binary.left(), terms);
+            decompose_conjunction_inner(binary.right(), terms);
+            return;
+        }
+    }
+    // Not an AND — this is a leaf predicate term
+    terms.push(Arc::clone(expr));
+}
+
+/// Classify a predicate's cost tier based on which columns it references
+/// and the table's metadata context.
+fn classify_predicate_cost(
+    columns: &[String],
+    ctx: &PredicateOrderingContext,
+) -> PredicateCostTier {
+    // A predicate's tier is determined by the "best" column it references.
+    // If any referenced column is a partition column, it's tier 0, etc.
+
+    let mut best_tier = PredicateCostTier::Regular;
+
+    for col in columns {
+        let tier = if ctx.partition_columns.contains(col) {
+            PredicateCostTier::PartitionColumn
+        } else if ctx.bloom_filter_columns.contains(col) {
+            PredicateCostTier::BloomFilter
+        } else if ctx.sort_order_columns.contains(col) {
+            PredicateCostTier::SortOrderColumn
+        } else if ctx.columns_with_stats.contains(col) {
+            PredicateCostTier::RegularWithStats
+        } else {
+            PredicateCostTier::Regular
+        };
+
+        if tier < best_tier {
+            best_tier = tier.clone();
+        }
+    }
+
+    best_tier
+}
+
+/// Estimate selectivity for a predicate based on its referenced columns.
+///
+/// Uses the minimum selectivity of any referenced column (most selective wins).
+fn estimate_predicate_selectivity(
+    columns: &[String],
+    ctx: &PredicateOrderingContext,
+) -> Option<f64> {
+    let mut min_selectivity: Option<f64> = None;
+
+    for col in columns {
+        for (name, sel) in &ctx.column_selectivity {
+            if name == col {
+                min_selectivity = Some(match min_selectivity {
+                    Some(current) => current.min(*sel),
+                    None => *sel,
+                });
+            }
+        }
+    }
+
+    min_selectivity
+}
+
+/// Order predicates by evaluation cost and estimated selectivity.
+///
+/// When multiple predicates exist in a WHERE clause (connected by AND),
+/// this function determines the optimal evaluation order:
+///
+/// 1. **Partition column predicates** (free at manifest level)
+/// 2. **Predicates with bloom filter support** (very cheap)
+/// 3. **Predicates on sort-order columns** (best zone map pruning)
+/// 4. **Remaining predicates by estimated selectivity** (most selective first)
+///
+/// This ordering maximizes the filtering effect of early predicates in the
+/// RowFilter, reducing the number of rows that need to be evaluated by
+/// later (more expensive) predicates.
+///
+/// # Arguments
+/// - `predicate`: The combined filter expression (may be a conjunction of ANDs).
+/// - `ctx`: Metadata context about the table's columns.
+///
+/// # Returns
+/// A vector of [`OrderedPredicate`]s sorted from cheapest/most selective to
+/// most expensive/least selective.
+pub fn order_predicates(
+    predicate: &Arc<dyn PhysicalExpr>,
+    ctx: &PredicateOrderingContext,
+) -> Vec<OrderedPredicate> {
+    let terms = decompose_conjunction(predicate);
+
+    let mut ordered: Vec<OrderedPredicate> = terms
+        .into_iter()
+        .map(|expr| {
+            let columns: Vec<String> = collect_column_refs(expr.as_ref())
+                .into_iter()
+                .collect();
+            let cost_tier = classify_predicate_cost(&columns, ctx);
+            let estimated_selectivity = estimate_predicate_selectivity(&columns, ctx);
+
+            OrderedPredicate {
+                expr,
+                columns,
+                cost_tier,
+                estimated_selectivity,
+            }
+        })
+        .collect();
+
+    // Sort by: (1) cost tier ascending, (2) selectivity ascending (most selective first)
+    ordered.sort_by(|a, b| {
+        a.cost_tier.cmp(&b.cost_tier).then_with(|| {
+            match (a.estimated_selectivity, b.estimated_selectivity) {
+                (Some(sa), Some(sb)) => sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal),
+                (Some(_), None) => std::cmp::Ordering::Less, // known selectivity first
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+        })
+    });
+
+    ordered
+}
+
+/// Build a multi-stage `RowFilter` from ordered predicates.
+///
+/// Each predicate becomes a separate stage in the RowFilter, evaluated in
+/// order. The Parquet reader evaluates them sequentially: rows eliminated
+/// by stage N are not evaluated by stage N+1. This means putting the
+/// cheapest/most selective predicate first minimizes total I/O.
+///
+/// # Arguments
+/// - `ordered_predicates`: Predicates sorted by [`order_predicates`].
+/// - `predicate_schema`: Arrow schema containing only the predicate columns.
+/// - `parquet_schema`: The full Parquet file schema descriptor.
+///
+/// # Returns
+/// A `RowFilter` with one stage per predicate, in optimal evaluation order.
+pub fn build_ordered_row_filter(
+    ordered_predicates: &[OrderedPredicate],
+    _predicate_schema: &SchemaRef,
+    parquet_schema: &SchemaDescriptor,
+) -> RowFilter {
+    let stages: Vec<Box<dyn parquet::arrow::arrow_reader::ArrowPredicate>> = ordered_predicates
+        .iter()
+        .map(|op| {
+            let pred = Arc::clone(&op.expr);
+
+            // Build a ProjectionMask for this specific predicate's columns
+            let col_indices: Vec<usize> = op
+                .columns
+                .iter()
+                .filter_map(|col_name| {
+                    parquet_schema
+                        .columns()
+                        .iter()
+                        .position(|c| c.name() == col_name.as_str())
+                })
+                .collect();
+
+            let projection_mask = ProjectionMask::roots(parquet_schema, col_indices);
+
+            Box::new(ArrowPredicateFn::new(
+                projection_mask,
+                move |batch: RecordBatch| {
+                    let result = pred
+                        .evaluate(&batch)
+                        .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
+
+                    match result {
+                        ColumnarValue::Array(array) => {
+                            let bool_array = array.as_boolean().clone();
+                            Ok(bool_array)
+                        }
+                        ColumnarValue::Scalar(scalar) => {
+                            let bool_val = scalar
+                                .to_array_of_size(batch.num_rows())
+                                .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
+                            let bool_array = bool_val.as_boolean().clone();
+                            Ok(bool_array)
+                        }
+                    }
+                },
+            )) as Box<dyn parquet::arrow::arrow_reader::ArrowPredicate>
+        })
+        .collect();
+
+    RowFilter::new(stages)
+}
 
 #[cfg(test)]
 mod tests {
@@ -607,5 +893,335 @@ mod tests {
             .expect("create reader builder");
         let _builder = builder.with_max_predicate_cache_size(1024);
         // If we get here, the predicate cache API is available and functional.
+    }
+
+    // ── Task 23 tests: predicate ordering optimization ─────────────
+
+    #[test]
+    fn test_decompose_conjunction_single_predicate() {
+        let schema = test_schema(&["a"]);
+        let pred = expressions::binary(
+            col_expr("a", 0),
+            datafusion::logical_expr::Operator::Gt,
+            lit_i64(10),
+            &schema,
+        )
+        .expect("build a > 10");
+
+        let terms = decompose_conjunction(&pred);
+        assert_eq!(terms.len(), 1, "Single predicate should produce 1 term");
+    }
+
+    #[test]
+    fn test_decompose_conjunction_two_and() {
+        let schema = test_schema(&["a", "b"]);
+        let a_gt_10 = expressions::binary(
+            col_expr("a", 0),
+            datafusion::logical_expr::Operator::Gt,
+            lit_i64(10),
+            &schema,
+        )
+        .expect("build a > 10");
+
+        let b_eq_42 = expressions::binary(
+            col_expr("b", 1),
+            datafusion::logical_expr::Operator::Eq,
+            lit_i64(42),
+            &schema,
+        )
+        .expect("build b = 42");
+
+        let combined = expressions::binary(
+            a_gt_10,
+            datafusion::logical_expr::Operator::And,
+            b_eq_42,
+            &schema,
+        )
+        .expect("build AND");
+
+        let terms = decompose_conjunction(&combined);
+        assert_eq!(terms.len(), 2, "AND of two predicates should produce 2 terms");
+    }
+
+    #[test]
+    fn test_decompose_conjunction_nested_and() {
+        let schema = test_schema(&["a", "b", "c"]);
+        let a_pred = expressions::binary(
+            col_expr("a", 0),
+            datafusion::logical_expr::Operator::Gt,
+            lit_i64(10),
+            &schema,
+        )
+        .expect("build a > 10");
+
+        let b_pred = expressions::binary(
+            col_expr("b", 1),
+            datafusion::logical_expr::Operator::Eq,
+            lit_i64(42),
+            &schema,
+        )
+        .expect("build b = 42");
+
+        let c_pred = expressions::binary(
+            col_expr("c", 2),
+            datafusion::logical_expr::Operator::Lt,
+            lit_i64(100),
+            &schema,
+        )
+        .expect("build c < 100");
+
+        // (a > 10 AND b = 42) AND c < 100
+        let ab = expressions::binary(
+            a_pred,
+            datafusion::logical_expr::Operator::And,
+            b_pred,
+            &schema,
+        )
+        .expect("build a AND b");
+
+        let abc = expressions::binary(
+            ab,
+            datafusion::logical_expr::Operator::And,
+            c_pred,
+            &schema,
+        )
+        .expect("build (a AND b) AND c");
+
+        let terms = decompose_conjunction(&abc);
+        assert_eq!(
+            terms.len(),
+            3,
+            "Nested AND of 3 predicates should produce 3 terms"
+        );
+    }
+
+    #[test]
+    fn test_decompose_conjunction_or_not_split() {
+        let schema = test_schema(&["a", "b"]);
+        let a_pred = expressions::binary(
+            col_expr("a", 0),
+            datafusion::logical_expr::Operator::Gt,
+            lit_i64(10),
+            &schema,
+        )
+        .expect("build a > 10");
+
+        let b_pred = expressions::binary(
+            col_expr("b", 1),
+            datafusion::logical_expr::Operator::Eq,
+            lit_i64(42),
+            &schema,
+        )
+        .expect("build b = 42");
+
+        // a > 10 OR b = 42 -- OR should NOT be split
+        let or_pred = expressions::binary(
+            a_pred,
+            datafusion::logical_expr::Operator::Or,
+            b_pred,
+            &schema,
+        )
+        .expect("build OR");
+
+        let terms = decompose_conjunction(&or_pred);
+        assert_eq!(terms.len(), 1, "OR predicate should not be decomposed");
+    }
+
+    #[test]
+    fn test_predicate_cost_tier_ordering() {
+        // Verify the Ord implementation matches our priority
+        assert!(PredicateCostTier::PartitionColumn < PredicateCostTier::BloomFilter);
+        assert!(PredicateCostTier::BloomFilter < PredicateCostTier::SortOrderColumn);
+        assert!(PredicateCostTier::SortOrderColumn < PredicateCostTier::RegularWithStats);
+        assert!(PredicateCostTier::RegularWithStats < PredicateCostTier::Regular);
+    }
+
+    #[test]
+    fn test_order_predicates_partition_first() {
+        let schema = test_schema(&["part_col", "regular_col"]);
+
+        // Two predicates: one on partition column, one on regular column
+        let part_pred = expressions::binary(
+            col_expr("part_col", 0),
+            datafusion::logical_expr::Operator::Eq,
+            lit_i64(1),
+            &schema,
+        )
+        .expect("build part_col = 1");
+
+        let regular_pred = expressions::binary(
+            col_expr("regular_col", 1),
+            datafusion::logical_expr::Operator::Gt,
+            lit_i64(100),
+            &schema,
+        )
+        .expect("build regular_col > 100");
+
+        // Combine with regular first (wrong order)
+        let combined = expressions::binary(
+            regular_pred,
+            datafusion::logical_expr::Operator::And,
+            part_pred,
+            &schema,
+        )
+        .expect("build AND");
+
+        let ctx = PredicateOrderingContext {
+            partition_columns: HashSet::from(["part_col".to_string()]),
+            ..Default::default()
+        };
+
+        let ordered = order_predicates(&combined, &ctx);
+        assert_eq!(ordered.len(), 2);
+        // Partition column predicate should come first
+        assert_eq!(ordered[0].cost_tier, PredicateCostTier::PartitionColumn);
+        assert!(ordered[0].columns.contains(&"part_col".to_string()));
+        assert_eq!(ordered[1].cost_tier, PredicateCostTier::Regular);
+    }
+
+    #[test]
+    fn test_order_predicates_sort_order_before_regular() {
+        let schema = test_schema(&["sorted_col", "regular_col"]);
+
+        let sorted_pred = expressions::binary(
+            col_expr("sorted_col", 0),
+            datafusion::logical_expr::Operator::Gt,
+            lit_i64(50),
+            &schema,
+        )
+        .expect("build sorted_col > 50");
+
+        let regular_pred = expressions::binary(
+            col_expr("regular_col", 1),
+            datafusion::logical_expr::Operator::Eq,
+            lit_i64(42),
+            &schema,
+        )
+        .expect("build regular_col = 42");
+
+        // Put regular first
+        let combined = expressions::binary(
+            regular_pred,
+            datafusion::logical_expr::Operator::And,
+            sorted_pred,
+            &schema,
+        )
+        .expect("build AND");
+
+        let ctx = PredicateOrderingContext {
+            sort_order_columns: vec!["sorted_col".to_string()],
+            ..Default::default()
+        };
+
+        let ordered = order_predicates(&combined, &ctx);
+        assert_eq!(ordered.len(), 2);
+        // Sort-order column should come first
+        assert_eq!(ordered[0].cost_tier, PredicateCostTier::SortOrderColumn);
+        assert_eq!(ordered[1].cost_tier, PredicateCostTier::Regular);
+    }
+
+    #[test]
+    fn test_order_predicates_full_priority_chain() {
+        let schema = test_schema(&["part_col", "bloom_col", "sort_col", "stats_col", "plain_col"]);
+
+        let make_pred = |name: &str, idx: usize| {
+            expressions::binary(
+                col_expr(name, idx),
+                datafusion::logical_expr::Operator::Eq,
+                lit_i64(1),
+                &schema,
+            )
+            .expect("build pred")
+        };
+
+        // Build: plain AND stats AND sort AND bloom AND part (reverse order)
+        let p4 = make_pred("plain_col", 4);
+        let p3 = make_pred("stats_col", 3);
+        let p2 = make_pred("sort_col", 2);
+        let p1 = make_pred("bloom_col", 1);
+        let p0 = make_pred("part_col", 0);
+
+        let and1 = expressions::binary(p4, datafusion::logical_expr::Operator::And, p3, &schema).unwrap();
+        let and2 = expressions::binary(and1, datafusion::logical_expr::Operator::And, p2, &schema).unwrap();
+        let and3 = expressions::binary(and2, datafusion::logical_expr::Operator::And, p1, &schema).unwrap();
+        let combined = expressions::binary(and3, datafusion::logical_expr::Operator::And, p0, &schema).unwrap();
+
+        let ctx = PredicateOrderingContext {
+            partition_columns: HashSet::from(["part_col".to_string()]),
+            bloom_filter_columns: HashSet::from(["bloom_col".to_string()]),
+            sort_order_columns: vec!["sort_col".to_string()],
+            columns_with_stats: HashSet::from(["stats_col".to_string()]),
+            column_selectivity: vec![],
+        };
+
+        let ordered = order_predicates(&combined, &ctx);
+        assert_eq!(ordered.len(), 5);
+
+        assert_eq!(ordered[0].cost_tier, PredicateCostTier::PartitionColumn);
+        assert_eq!(ordered[1].cost_tier, PredicateCostTier::BloomFilter);
+        assert_eq!(ordered[2].cost_tier, PredicateCostTier::SortOrderColumn);
+        assert_eq!(ordered[3].cost_tier, PredicateCostTier::RegularWithStats);
+        assert_eq!(ordered[4].cost_tier, PredicateCostTier::Regular);
+    }
+
+    #[test]
+    fn test_order_predicates_selectivity_breaks_ties() {
+        let schema = test_schema(&["col_a", "col_b"]);
+
+        let a_pred = expressions::binary(
+            col_expr("col_a", 0),
+            datafusion::logical_expr::Operator::Gt,
+            lit_i64(10),
+            &schema,
+        )
+        .expect("build col_a > 10");
+
+        let b_pred = expressions::binary(
+            col_expr("col_b", 1),
+            datafusion::logical_expr::Operator::Gt,
+            lit_i64(10),
+            &schema,
+        )
+        .expect("build col_b > 10");
+
+        // Both are regular columns (same tier), but col_b is more selective
+        let combined = expressions::binary(
+            a_pred,
+            datafusion::logical_expr::Operator::And,
+            b_pred,
+            &schema,
+        )
+        .expect("build AND");
+
+        let ctx = PredicateOrderingContext {
+            column_selectivity: vec![
+                ("col_a".to_string(), 0.8), // 80% pass (not very selective)
+                ("col_b".to_string(), 0.1), // 10% pass (very selective)
+            ],
+            ..Default::default()
+        };
+
+        let ordered = order_predicates(&combined, &ctx);
+        assert_eq!(ordered.len(), 2);
+        // col_b should come first (lower selectivity = more selective)
+        assert!(ordered[0].columns.contains(&"col_b".to_string()));
+        assert!(ordered[1].columns.contains(&"col_a".to_string()));
+    }
+
+    #[test]
+    fn test_classify_predicate_cost_empty_context() {
+        let ctx = PredicateOrderingContext::default();
+        let tier = classify_predicate_cost(&["any_col".to_string()], &ctx);
+        assert_eq!(tier, PredicateCostTier::Regular);
+    }
+
+    #[test]
+    fn test_predicate_ordering_context_default() {
+        let ctx = PredicateOrderingContext::default();
+        assert!(ctx.partition_columns.is_empty());
+        assert!(ctx.bloom_filter_columns.is_empty());
+        assert!(ctx.sort_order_columns.is_empty());
+        assert!(ctx.columns_with_stats.is_empty());
+        assert!(ctx.column_selectivity.is_empty());
     }
 }
