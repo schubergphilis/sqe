@@ -36,6 +36,7 @@ url = { workspace = true }
 chrono = { workspace = true }
 opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }
+ahash = "0.8"
 
 [dev-dependencies]
 tokio = { workspace = true }

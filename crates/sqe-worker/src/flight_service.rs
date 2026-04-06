@@ -1,13 +1,14 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
+use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
-use futures::{Stream, TryStreamExt, stream};
+use futures::{Stream, StreamExt, TryStreamExt, stream};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, info_span, warn, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -20,6 +21,7 @@ use sqe_planner::ScanTask;
 
 use crate::credential_channel::{CredentialStore, RefreshableCredentials};
 use crate::executor;
+use crate::shuffle::{ExchangeDescriptor, ShuffleManager};
 
 /// Worker's Arrow Flight service.
 ///
@@ -37,6 +39,7 @@ pub struct WorkerFlightService {
     credential_store: CredentialStore,
     session_ctx: SessionContext,
     footer_cache: Option<Arc<FooterCache>>,
+    shuffle_manager: ShuffleManager,
 }
 
 impl WorkerFlightService {
@@ -46,6 +49,7 @@ impl WorkerFlightService {
             credential_store: CredentialStore::new(),
             session_ctx,
             footer_cache: None,
+            shuffle_manager: ShuffleManager::new(),
         }
     }
 
@@ -63,6 +67,7 @@ impl WorkerFlightService {
             credential_store,
             session_ctx,
             footer_cache: None,
+            shuffle_manager: ShuffleManager::new(),
         }
     }
 
@@ -75,6 +80,11 @@ impl WorkerFlightService {
     /// Returns a reference to the credential store for use by executors.
     pub fn credential_store(&self) -> &CredentialStore {
         &self.credential_store
+    }
+
+    /// Returns a reference to the shuffle manager.
+    pub fn shuffle_manager(&self) -> &ShuffleManager {
+        &self.shuffle_manager
     }
 
     pub fn into_server(self) -> FlightServiceServer<Self> {
@@ -256,9 +266,143 @@ impl FlightService for WorkerFlightService {
 
     async fn do_exchange(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        Err(Status::unimplemented("Workers don't support do_exchange"))
+        let mut stream = request.into_inner();
+
+        // 1. Read the first FlightData message to get the descriptor.
+        let first_msg = stream.next().await.ok_or_else(|| {
+            Status::invalid_argument("DoExchange stream ended before descriptor message")
+        })??;
+
+        let descriptor = first_msg
+            .flight_descriptor
+            .as_ref()
+            .ok_or_else(|| {
+                Status::invalid_argument(
+                    "First DoExchange message must contain a FlightDescriptor",
+                )
+            })?;
+
+        let exchange_desc =
+            ExchangeDescriptor::from_bytes(&descriptor.cmd).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "Failed to decode ExchangeDescriptor from descriptor cmd: {e}"
+                ))
+            })?;
+
+        let (query_id, stage_id) = exchange_desc.stage_key();
+        let partition_id = exchange_desc.partition_id();
+
+        info!(
+            query_id = %query_id,
+            stage_id = %stage_id,
+            partition_id = partition_id,
+            "DoExchange: receiving shuffle data"
+        );
+
+        // 2. Look up the ShuffleReceiver for this (query_id, stage_id).
+        let shuffle_receiver = self
+            .shuffle_manager
+            .get(&query_id, &stage_id)
+            .await
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "No shuffle receiver registered for query={query_id}, stage={stage_id}"
+                ))
+            })?;
+
+        let sender = shuffle_receiver
+            .sender(partition_id)
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "No sender for partition {partition_id} in query={query_id}, stage={stage_id}"
+                ))
+            })?
+            .clone();
+
+        // 3. Decode and buffer incoming RecordBatches.
+        //    Chain the first message (which may also contain data) with the rest.
+        let remaining_stream = stream.map_err(|e| {
+            arrow_flight::error::FlightError::Tonic(Box::new(e))
+        });
+        let first_stream = futures::stream::once(async move { Ok(first_msg) });
+        let combined =
+            first_stream.chain(remaining_stream);
+
+        let mut flight_batch_stream =
+            FlightRecordBatchStream::new_from_flight_data(combined);
+
+        let schema = shuffle_receiver.schema().clone();
+
+        // Spawn a task to receive batches and forward to the mpsc channel.
+        let query_id_clone = query_id.clone();
+        let stage_id_clone = stage_id.clone();
+        tokio::spawn(async move {
+            let mut batch_count = 0u64;
+            while let Some(batch_result) = flight_batch_stream.next().await {
+                match batch_result {
+                    Ok(batch) => {
+                        if batch.num_rows() == 0 {
+                            continue;
+                        }
+                        batch_count += 1;
+                        if sender.send(batch).await.is_err() {
+                            warn!(
+                                query_id = %query_id_clone,
+                                stage_id = %stage_id_clone,
+                                partition_id = partition_id,
+                                "Shuffle receiver channel closed, stopping intake"
+                            );
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            query_id = %query_id_clone,
+                            stage_id = %stage_id_clone,
+                            partition_id = partition_id,
+                            error = %e,
+                            "Error decoding flight data in DoExchange"
+                        );
+                        break;
+                    }
+                }
+            }
+            debug!(
+                query_id = %query_id_clone,
+                stage_id = %stage_id_clone,
+                partition_id = partition_id,
+                batch_count = batch_count,
+                "DoExchange intake complete"
+            );
+            // Sender is dropped here, closing the channel for the receiver side.
+        });
+
+        // 4. Return a stream that drains the partition channel.
+        let rx = shuffle_receiver
+            .take_receiver(partition_id)
+            .await
+            .ok_or_else(|| {
+                Status::already_exists(format!(
+                    "Receiver for partition {partition_id} already taken \
+                     (query={query_id}, stage={stage_id})"
+                ))
+            })?;
+
+        // Wrap the mpsc receiver as a futures::Stream of RecordBatch.
+        let output_stream = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|batch| (batch, rx))
+        });
+
+        let flight_stream = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(output_stream.map(Ok))
+            .map_err(Status::from);
+
+        Ok(Response::new(
+            Box::pin(flight_stream) as Self::DoExchangeStream
+        ))
     }
 
     async fn list_actions(

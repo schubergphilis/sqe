@@ -4889,6 +4889,7 @@ dependencies = [
 name = "sqe-worker"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "anyhow",
  "arrow",
  "arrow-array",
