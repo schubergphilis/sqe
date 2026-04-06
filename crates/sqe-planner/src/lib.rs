@@ -1,9 +1,19 @@
+pub mod distributed_join;
+pub mod distributed_sort;
 pub mod join_strategy;
 pub mod scan_task;
 pub mod shuffle_exec;
 pub mod splitter;
 pub mod stage_planner;
 
+pub use distributed_join::{
+    BroadcastJoinPlan, BroadcastJoinRule, BroadcastSide, JoinStrategy, PreSortedJoinRule,
+    ShuffleHashJoinPlan, DEFAULT_BROADCAST_THRESHOLD,
+};
+pub use distributed_sort::{
+    compute_range_boundaries, needs_sampling, sample_based_boundaries, DistributedSortExec,
+    DistributedSortRule, DEFAULT_DISTRIBUTED_SORT_THRESHOLD, MIN_EXECUTORS_FOR_DISTRIBUTED_SORT,
+};
 pub use join_strategy::JoinStrategyRule;
 pub use scan_task::ScanTask;
 pub use shuffle_exec::{ShufflePartitioning, ShuffleReaderExec, ShuffleWriterExec};
