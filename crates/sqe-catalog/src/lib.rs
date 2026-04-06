@@ -14,6 +14,7 @@ pub mod read_parquet;
 pub mod s3_io;
 pub mod sort_order;
 pub mod system_catalog;
+pub mod topk;
 pub mod system_jdbc;
 pub mod system_metadata;
 pub mod system_runtime;
