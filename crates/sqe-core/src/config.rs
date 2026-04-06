@@ -23,8 +23,6 @@ pub struct SqeConfig {
     pub query_cache: QueryCacheConfig,
     #[serde(default)]
     pub query_history: QueryHistoryConfig,
-    #[serde(default)]
-    pub external: Option<ExternalAuthConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -149,6 +147,21 @@ pub struct CoordinatorConfig {
     /// check (backwards compatible default).
     #[serde(default)]
     pub worker_secret: String,
+    /// Memory limit for the coordinator's DataFusion runtime.
+    /// Accepts human-readable sizes: "8GB", "512MB", "4096MB".
+    /// Default: "8GB". Applies to all query operator memory (sorts, joins, aggregates).
+    #[serde(default = "default_coordinator_memory")]
+    pub memory_limit: String,
+    /// Enable spill-to-disk when memory limit is reached. Default: true.
+    #[serde(default = "default_true")]
+    pub spill_to_disk: bool,
+    /// Directory for spill files. Must be on fast local storage (SSD recommended).
+    /// Default: "/tmp/sqe-coordinator-spill".
+    #[serde(default = "default_coordinator_spill_dir")]
+    pub spill_dir: String,
+    /// Compression for spill files. "none", "lz4" (default), or "zstd".
+    #[serde(default = "default_spill_compression")]
+    pub spill_compression: String,
 }
 
 /// TLS configuration for gRPC (Flight SQL) and worker listeners.
@@ -396,6 +409,10 @@ pub struct AuthConfig {
     /// Keys are group names or ARN patterns, values are role lists.
     #[serde(default)]
     pub role_mappings: std::collections::HashMap<String, Vec<String>>,
+    /// Interactive OIDC flows (auth code + PKCE, device code).
+    /// Maps to `[auth.external]` in TOML.
+    #[serde(default)]
+    pub external: Option<ExternalAuthConfig>,
 }
 
 impl std::fmt::Debug for AuthConfig {
@@ -410,6 +427,7 @@ impl std::fmt::Debug for AuthConfig {
             .field("ssl_verification", &self.ssl_verification)
             .field("providers", &format!("[{} provider(s)]", self.providers.len()))
             .field("role_mappings", &format!("[{} mapping(s)]", self.role_mappings.len()))
+            .field("external", &self.external.as_ref().map(|e| format!("issuer={}", e.issuer)))
             .finish()
     }
 }
@@ -468,7 +486,7 @@ pub struct CatalogConfig {
     pub default_table_format_version: u8,
 }
 
-#[derive(Deserialize, Clone, Default)]
+#[derive(Deserialize, Clone)]
 pub struct StorageConfig {
     #[serde(default)]
     pub s3_endpoint: String,
@@ -483,7 +501,47 @@ pub struct StorageConfig {
     /// Allow plaintext HTTP for S3 endpoints. Only enable for dev/test (e.g., MinIO).
     #[serde(default)]
     pub s3_allow_http: bool,
+    /// Byte-range coalescing threshold. Ranges separated by a gap of at most
+    /// this many bytes are merged into a single S3 GET request. Default: "1MB".
+    #[serde(default = "default_coalesce_threshold")]
+    pub coalesce_threshold: String,
+    /// Maximum size of the Parquet footer (metadata) cache. Default: "256MB".
+    #[serde(default = "default_footer_cache_size")]
+    pub footer_cache_size: String,
+    /// Maximum number of concurrent byte-range requests per file. Default: 4.
+    #[serde(default = "default_concurrent_requests_per_file")]
+    pub concurrent_requests_per_file: usize,
+    /// Maximum number of files fetched concurrently. Default: 8.
+    #[serde(default = "default_max_concurrent_files")]
+    pub max_concurrent_files: usize,
+    /// Prefetch buffer size for overlapping footer reads. Default: "32MB".
+    #[serde(default = "default_prefetch_buffer")]
+    pub prefetch_buffer: String,
 }
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            s3_endpoint: String::new(),
+            s3_region: String::new(),
+            s3_access_key: String::new(),
+            s3_secret_key: String::new(),
+            s3_path_style: false,
+            s3_allow_http: false,
+            coalesce_threshold: default_coalesce_threshold(),
+            footer_cache_size: default_footer_cache_size(),
+            concurrent_requests_per_file: default_concurrent_requests_per_file(),
+            max_concurrent_files: default_max_concurrent_files(),
+            prefetch_buffer: default_prefetch_buffer(),
+        }
+    }
+}
+
+fn default_coalesce_threshold() -> String { "1MB".to_string() }
+fn default_footer_cache_size() -> String { "256MB".to_string() }
+fn default_concurrent_requests_per_file() -> usize { 4 }
+fn default_max_concurrent_files() -> usize { 8 }
+fn default_prefetch_buffer() -> String { "32MB".to_string() }
 
 impl std::fmt::Debug for StorageConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -494,6 +552,11 @@ impl std::fmt::Debug for StorageConfig {
             .field("s3_secret_key", &"[REDACTED]")
             .field("s3_path_style", &self.s3_path_style)
             .field("s3_allow_http", &self.s3_allow_http)
+            .field("coalesce_threshold", &self.coalesce_threshold)
+            .field("footer_cache_size", &self.footer_cache_size)
+            .field("concurrent_requests_per_file", &self.concurrent_requests_per_file)
+            .field("max_concurrent_files", &self.max_concurrent_files)
+            .field("prefetch_buffer", &self.prefetch_buffer)
             .finish()
     }
 }
@@ -605,6 +668,10 @@ fn default_max_query_memory() -> String { "256MB".to_string() }
 fn default_distribution_threshold() -> String { "128MB".to_string() }
 fn default_distribution_file_threshold() -> usize { 4 }
 fn default_target_task_size() -> String { "256MB".to_string() }
+
+fn default_coordinator_memory() -> String { "8GB".to_string() }
+fn default_coordinator_spill_dir() -> String { "/tmp/sqe-coordinator-spill".to_string() }
+fn default_spill_compression() -> String { "lz4".to_string() }
 
 fn default_flight_port() -> u16 { 50051 }
 fn default_trino_port() -> u16 { 8080 }
@@ -923,6 +990,10 @@ mod tests {
                 debug: false,
                 tls: TlsConfig::default(),
                 worker_secret: String::new(),
+                memory_limit: default_coordinator_memory(),
+                spill_to_disk: true,
+                spill_dir: default_coordinator_spill_dir(),
+                spill_compression: default_spill_compression(),
             },
             worker: WorkerConfig::default(),
             auth: AuthConfig {
@@ -935,6 +1006,7 @@ mod tests {
                 ssl_verification: true,
                 providers: Vec::new(),
                 role_mappings: std::collections::HashMap::new(),
+                external: None,
             },
             catalog: CatalogConfig {
                 polaris_url: "https://polaris.example.com".to_string(),
@@ -950,7 +1022,6 @@ mod tests {
             query: QueryConfig::default(),
             query_cache: QueryCacheConfig::default(),
             query_history: QueryHistoryConfig::default(),
-            external: None,
         }
     }
 
