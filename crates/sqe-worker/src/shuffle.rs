@@ -714,4 +714,110 @@ mod tests {
 
         assert_eq!(received, (0..10).collect::<Vec<i32>>());
     }
+
+    // ─── Additional HashPartitioner tests (Task 17) ───
+
+    #[test]
+    fn test_hash_partitioner_multi_column_key() {
+        // Hash on both id and name columns
+        let batch = make_batch(
+            vec![1, 1, 2, 2],
+            vec!["a", "b", "a", "b"],
+        );
+        let partitioner = HashPartitioner::new(
+            vec!["id".to_string(), "name".to_string()],
+            4,
+        );
+        let result = partitioner.partition(&batch).unwrap();
+
+        let total_rows: usize = result.iter().map(|(_, b)| b.num_rows()).sum();
+        assert_eq!(total_rows, 4, "All rows accounted for with multi-column key");
+
+        // Rows with same (id, name) must land in same partition
+        // (1, "a") and (2, "a") have different id, may differ
+        // (1, "a") appears once, so nothing to pair-check here,
+        // but total must be preserved.
+        for (pid, _) in &result {
+            assert!(*pid < 4);
+        }
+    }
+
+    #[test]
+    fn test_hash_partitioner_missing_column_errors() {
+        let batch = make_batch(vec![1, 2], vec!["a", "b"]);
+        let partitioner = HashPartitioner::new(vec!["nonexistent".to_string()], 2);
+        let result = partitioner.partition(&batch);
+        assert!(result.is_err(), "Should error when key column is missing");
+    }
+
+    #[test]
+    fn test_hash_partitioner_same_key_same_partition() {
+        // All rows have the same key value — they must all land in one partition
+        let batch = make_batch(vec![42, 42, 42, 42, 42], vec!["a", "b", "c", "d", "e"]);
+        let partitioner = HashPartitioner::new(vec!["id".to_string()], 4);
+        let result = partitioner.partition(&batch).unwrap();
+
+        assert_eq!(result.len(), 1, "All identical keys → single partition");
+        assert_eq!(result[0].1.num_rows(), 5);
+    }
+
+    // ─── Additional RangePartitioner tests (Task 17) ───
+
+    #[test]
+    fn test_range_partitioner_negative_values() {
+        // Boundaries: [-10, 0, 10] → 4 partitions
+        let batch = make_range_batch(
+            vec![-20, -10, -5, 0, 5, 10, 20],
+            vec!["a", "b", "c", "d", "e", "f", "g"],
+        );
+        let partitioner = RangePartitioner::new("id".to_string(), vec![-10, 0, 10]);
+        let result = partitioner.partition(&batch).unwrap();
+
+        let mut partition_map: HashMap<u32, Vec<i64>> = HashMap::new();
+        for (pid, b) in &result {
+            let ids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let vals: Vec<i64> = (0..ids.len()).map(|i| ids.value(i)).collect();
+            partition_map.insert(*pid, vals);
+        }
+
+        // partition 0: key < -10 → [-20]
+        assert_eq!(partition_map.get(&0).unwrap(), &vec![-20]);
+        // partition 1: -10 <= key < 0 → [-10, -5]
+        assert_eq!(partition_map.get(&1).unwrap(), &vec![-10, -5]);
+        // partition 2: 0 <= key < 10 → [0, 5]
+        assert_eq!(partition_map.get(&2).unwrap(), &vec![0, 5]);
+        // partition 3: key >= 10 → [10, 20]
+        assert_eq!(partition_map.get(&3).unwrap(), &vec![10, 20]);
+    }
+
+    #[test]
+    fn test_range_partitioner_missing_column_errors() {
+        let batch = make_range_batch(vec![1], vec!["a"]);
+        let partitioner = RangePartitioner::new("nonexistent".to_string(), vec![10]);
+        let result = partitioner.partition(&batch);
+        assert!(result.is_err(), "Should error when key column is missing");
+    }
+
+    #[test]
+    fn test_range_partitioner_preserves_schema() {
+        let batch = make_range_batch(vec![1, 10, 20], vec!["a", "b", "c"]);
+        let partitioner = RangePartitioner::new("id".to_string(), vec![5, 15]);
+        let result = partitioner.partition(&batch).unwrap();
+
+        for (_, partition_batch) in &result {
+            assert_eq!(partition_batch.schema(), batch.schema());
+        }
+    }
+
+    #[test]
+    fn test_range_partitioner_all_in_last_partition() {
+        // All values >= last boundary
+        let batch = make_range_batch(vec![100, 200, 300], vec!["a", "b", "c"]);
+        let partitioner = RangePartitioner::new("id".to_string(), vec![10, 20]);
+
+        let result = partitioner.partition(&batch).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 2); // Last partition
+        assert_eq!(result[0].1.num_rows(), 3);
+    }
 }
