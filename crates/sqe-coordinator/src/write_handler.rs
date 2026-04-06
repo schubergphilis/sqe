@@ -1218,7 +1218,7 @@ impl WriteHandler {
             vec![vec![batch.clone()]],
         )
         .map_err(|e| SqeError::Execution(format!("Failed to create MemTable: {e}")))?;
-        ctx.register_table(&format!("datafusion.public.{table_name}"), Arc::new(mem_table))
+        ctx.register_table(format!("datafusion.public.{table_name}"), Arc::new(mem_table))
             .map_err(|e| SqeError::Execution(format!("Failed to register temp table: {e}")))?;
 
         // Execute: SELECT <where_clause> AS __match FROM __delete_<table>
@@ -1232,7 +1232,7 @@ impl WriteHandler {
         })?;
 
         // Deregister temp table
-        let _ = ctx.deregister_table(&format!("datafusion.public.{table_name}"));
+        let _ = ctx.deregister_table(format!("datafusion.public.{table_name}"));
 
         if result_batches.is_empty() || result_batches[0].num_rows() == 0 {
             return Ok(batch.clone());
@@ -1273,7 +1273,7 @@ impl WriteHandler {
             vec![vec![batch.clone()]],
         )
         .map_err(|e| SqeError::Execution(format!("Failed to create MemTable: {e}")))?;
-        ctx.register_table(&format!("datafusion.public.{table_name}"), Arc::new(mem_table))
+        ctx.register_table(format!("datafusion.public.{table_name}"), Arc::new(mem_table))
             .map_err(|e| SqeError::Execution(format!("Failed to register temp table: {e}")))?;
 
         // Build assignment map: column_name -> expression_sql
@@ -1315,7 +1315,7 @@ impl WriteHandler {
             SqeError::Execution(format!("Failed to collect UPDATE results: {e}"))
         })?;
 
-        let _ = ctx.deregister_table(&format!("datafusion.public.{table_name}"));
+        let _ = ctx.deregister_table(format!("datafusion.public.{table_name}"));
 
         // Return the first (and only) result batch
         result_batches.into_iter().next().ok_or_else(|| {
@@ -1337,7 +1337,7 @@ impl WriteHandler {
             vec![vec![batch.clone()]],
         )
         .map_err(|e| SqeError::Execution(format!("MemTable error: {e}")))?;
-        ctx.register_table(&format!("datafusion.public.{table_name}"), Arc::new(mem_table))
+        ctx.register_table(format!("datafusion.public.{table_name}"), Arc::new(mem_table))
             .map_err(|e| SqeError::Execution(format!("Register error: {e}")))?;
 
         let sql = format!("SELECT COUNT(*) AS cnt FROM datafusion.public.{table_name} WHERE {where_sql}");
@@ -1348,7 +1348,7 @@ impl WriteHandler {
             SqeError::Execution(format!("Count collect failed: {e}"))
         })?;
 
-        let _ = ctx.deregister_table(&format!("datafusion.public.{table_name}"));
+        let _ = ctx.deregister_table(format!("datafusion.public.{table_name}"));
 
         let count = batches
             .first()
