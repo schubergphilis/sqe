@@ -1,6 +1,6 @@
 # SQE — Next Steps
 
-> Status as of 2026-04-02. Step 0 dependency alignment complete. Step 2 core engine: **DELETE, UPDATE, and MERGE INTO fully implemented via CoW rewrite_files** (RisingWave iceberg-rust fork). Bearer token (JWT/JWKS) auth provider added. Step 3 OSS security hardening complete (51/51). Benchmark suite (sqe-bench) complete with 16 new TPC-C/E write-path DML queries. **Hardening pass complete:** all Arrow types mapped to Trino types, Trino value serialization extended (Utf8View, Decimal, Time, Binary), benchmark comparator extended (Timestamp, Utf8View, human-readable dates, decimal trailing-zero normalization), Flight SQL DoPut implemented (Arrow data ingestion + statement updates), GetTableTypes + GetXdbcTypeInfo added for JDBC/BI tool compatibility, all clippy errors fixed, token fingerprint hardened (hash instead of raw suffix). **Query history and cache complete:** `system.runtime.queries` virtual table (Flight SQL + Trino compat), in-memory query history store (moka TTL cache, max_entries cap), query result cache (`[query_cache]` config section, moka-backed, per-entry size cap), config sections added to `sqe.toml.example`. All feature branches merged into `main`.
+> Status as of 2026-04-05. Step 0 dependency alignment complete. Step 2 core engine complete (103/103). Step 3 OSS security hardening complete (51/51). Step 4 pluggable auth complete. **Step 4b (streaming execution Phase A) complete:** coordinator spill-to-disk (FairSpillPool, watermarks, admission control), late materialization (two-phase RowFilter scan), Iceberg scan planning (file pruning, sort-order detection, TopK), S3 I/O pipeline (coalescing, footer cache, prefetch), SortMergeJoin fallback -- 21/22 TPC-H SF1 on 512MB. **Step 4c (streaming execution Phase B) complete:** DoExchange shuffle, distributed range-partition sort, two-phase aggregation, distributed joins (broadcast, shuffle hash, pre-sorted merge, predicate transfer), multi-endpoint Flight SQL, stage decomposition, Trino function compatibility (date_format, date_parse, now, json_object, transaction stubs). 30 commits, 47 files changed, +14,120 lines, 1,188 tests.
 
 > **Monitoring:** OPA SPI refactor in Polaris (PR #3999, still draft) will affect Phase 5 OPA integration when it lands — do not implement OPA against Polaris until this stabilises. Remote S3 signing (Iceberg 1.12, not yet released) will affect the pluggable-catalogs design.
 
@@ -187,11 +187,11 @@ Step 3d: query history+cache ✅ DONE (system.runtime.queries, in-memory history
 Step 3e: distributed wiring ✅ DONE (try_distribute in execute_query, fragment tracking, system.runtime.tasks shows workers)
 Step 4: pluggable auth      ✅ DONE (all providers implemented, external auth wired)
 Step 4b: streaming exec A   ✅ DONE (coordinator spill, late materialization, scan planning, S3 I/O, SortMergeJoin fallback — 21/22 TPC-H SF1 on 512MB)
-Step 4c: streaming exec B   (DoExchange shuffle, distributed sort/join/aggregate, multi-endpoint Flight SQL) ← NEXT
-Step 5: pluggable catalogs  (independent; can run in parallel with Step 4c)
+Step 4c: streaming exec B   ✅ DONE (DoExchange shuffle, distributed sort/join/aggregate, multi-endpoint Flight SQL, Trino function compat)
+Step 5: pluggable catalogs  (AWS Glue, Nessie, Hive Metastore, storage-only, Delta Lake) ← NEXT
 Step 6: semantic layer      (new crates; fully additive; no existing code broken)
 ```
 
-Step 4c (Phase B) adds distributed computation via Arrow Flight DoExchange. Step 5 can run in parallel. Step 6 is independent.
+Step 5 (pluggable catalogs) is next. Step 6 is independent and fully additive.
 
 > **Upstream watch list:** iceberg-rust MoR (Epic #2186, Q3 2026) could replace CoW DELETE/MERGE with more efficient position-delete approach in the future; Polaris OPA SPI refactor (PR #3999) must stabilise before Phase 5 OPA integration; remote S3 signing (Iceberg 1.12) will require revisiting pluggable-catalogs credential vending design; DataFusion `IN (subquery)` not supported in physical plan for MemTable-referenced columns — blocks 5 TPC-E DML benchmark queries (market_feed_update, trade_result_update_holding, trade_result_update_status, trade_update_executor, trade_update_settlement). Workaround: rewrite as `EXISTS` or `JOIN`. Track upstream DataFusion for fix.
