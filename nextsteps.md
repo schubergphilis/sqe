@@ -185,11 +185,13 @@ Step 3b: benchmark suite    ✅ DONE (sqe-bench: generate/load/test, 6 benchmark
 Step 3c: hardening pass     ✅ DONE (type formatting, Flight SQL DoPut + metadata, clippy, decimal DIFF, token fingerprint)
 Step 3d: query history+cache ✅ DONE (system.runtime.queries, in-memory history store, query result cache, config sections)
 Step 3e: distributed wiring ✅ DONE (try_distribute in execute_query, fragment tracking, system.runtime.tasks shows workers)
-Step 4: pluggable auth      (depends on Step 3 renames being done first) ← NEXT
-Step 5: pluggable catalogs  (independent of auth; can run in parallel with Step 4) ← NEXT
+Step 4: pluggable auth      ✅ DONE (all providers implemented, external auth wired)
+Step 4b: streaming exec A   ✅ DONE (coordinator spill, late materialization, scan planning, S3 I/O, SortMergeJoin fallback — 21/22 TPC-H SF1 on 512MB)
+Step 4c: streaming exec B   (DoExchange shuffle, distributed sort/join/aggregate, multi-endpoint Flight SQL) ← NEXT
+Step 5: pluggable catalogs  (independent; can run in parallel with Step 4c)
 Step 6: semantic layer      (new crates; fully additive; no existing code broken)
 ```
 
-Steps 4 and 5 can be worked in parallel by two engineers. Step 6 is independent of 3–5 and can start any time.
+Step 4c (Phase B) adds distributed computation via Arrow Flight DoExchange. Step 5 can run in parallel. Step 6 is independent.
 
 > **Upstream watch list:** iceberg-rust MoR (Epic #2186, Q3 2026) could replace CoW DELETE/MERGE with more efficient position-delete approach in the future; Polaris OPA SPI refactor (PR #3999) must stabilise before Phase 5 OPA integration; remote S3 signing (Iceberg 1.12) will require revisiting pluggable-catalogs credential vending design; DataFusion `IN (subquery)` not supported in physical plan for MemTable-referenced columns — blocks 5 TPC-E DML benchmark queries (market_feed_update, trade_result_update_holding, trade_result_update_status, trade_update_executor, trade_update_settlement). Workaround: rewrite as `EXISTS` or `JOIN`. Track upstream DataFusion for fix.
