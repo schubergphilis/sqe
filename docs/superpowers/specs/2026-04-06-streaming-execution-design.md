@@ -134,7 +134,7 @@ impl PhysicalOptimizerRule for JoinStrategyRule {
 
 ### A3. Late Materialization
 
-> **Note:** DataFusion's `pushdown_filters=true` + `reorder_filters=true` (available on DF 52) may already provide late materialization through the Parquet reader's RowFilter API. If iceberg-datafusion passes predicates through to the Parquet reader correctly, this section reduces to enabling config flags + testing for regressions (DF#20324). Verify in Prereq 2 before building custom plumbing.
+> **Prereq 2 finding (2026-04-06):** `pushdown_filters=true` does NOT help here. SQE's custom `IcebergScanExec` calls iceberg-rust's `scan.to_arrow()` directly, bypassing DataFusion's `ParquetExec` entirely. The worker's `executor.rs` uses `ParquetRecordBatchStreamBuilder` but doesn't set `RowFilter`. Custom implementation required.
 
 **Problem:** Current Iceberg scan reads all projected columns in one pass. For a query like `SELECT * FROM events WHERE user_id = 42`, all 50 columns are decoded even though only `user_id` is needed for filtering. On a 1TB table, this means reading ~1TB from S3 when only ~20GB (the predicate column) needs to be read for filtering.
 

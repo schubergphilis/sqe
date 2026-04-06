@@ -402,7 +402,7 @@ Prometheus gauges."
 
 ## Stream 2: Late Materialization
 
-> **Scope depends on Prereq 2, Step 3 findings.** If `pushdown_filters=true` already works through iceberg-datafusion, Tasks 4-6 reduce to: enable the config flags, add metrics, and test for regressions. The custom RowFilter plumbing below is only needed if pushdown_filters does NOT propagate through Iceberg scans. Verify before building.
+> **Prereq 2 finding (2026-04-06):** `pushdown_filters=true` does NOT work for Iceberg scans. SQE's custom `IcebergScanExec` calls `scan.to_arrow()` directly, bypassing DataFusion's `ParquetExec` (which is where `pushdown_filters` takes effect). The worker's `executor.rs` uses `ParquetRecordBatchStreamBuilder` but doesn't set `RowFilter`. The full custom RowFilter implementation below is required.
 
 ### Task 4: Classify predicate vs projection columns
 
