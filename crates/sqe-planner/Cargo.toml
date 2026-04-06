@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 sqe-core = { path = "../sqe-core" }
+datafusion = { workspace = true }
 arrow-schema = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -12,3 +13,4 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+arrow = { workspace = true }
