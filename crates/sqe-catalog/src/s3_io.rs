@@ -1,10 +1,13 @@
 //! S3 I/O utilities for efficient Parquet column reads.
 //!
-//! This module provides byte-range coalescing and parallel fetching to reduce
-//! the number of S3 GET requests when reading Parquet column chunks. When
-//! multiple column chunks are close together in the file, their byte ranges
-//! are merged into a single request if the gap is within a configurable
-//! threshold (default: 1 MB).
+//! This module provides:
+//!
+//! - **Byte-range coalescing**: merge adjacent byte ranges within a configurable
+//!   threshold to reduce S3 GET request count.
+//! - **Parallel byte-range fetching**: fetch multiple ranges concurrently
+//!   with semaphore-bounded concurrency.
+//! - **File-level prefetch**: start fetching the footer of the next file while
+//!   the current file is being decoded, overlapping I/O with compute.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -13,6 +16,7 @@ use bytes::Bytes;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
 use tracing::debug;
 
 /// A contiguous byte range within a file.
@@ -195,6 +199,122 @@ pub async fn fetch_column_chunks(
     Ok(result)
 }
 
+// ---------------------------------------------------------------------------
+// File-level prefetch pipeline
+// ---------------------------------------------------------------------------
+
+/// Default number of concurrent byte-range requests per file.
+pub const DEFAULT_CONCURRENT_REQUESTS_PER_FILE: usize = 4;
+
+/// Default maximum number of files fetched concurrently.
+pub const DEFAULT_MAX_CONCURRENT_FILES: usize = 8;
+
+/// A handle to a prefetched footer read.
+///
+/// The caller spawns a background task that reads the last `n` bytes of a
+/// file (the Parquet footer / metadata section). When the caller is ready
+/// to decode the next file it awaits this handle to obtain the bytes.
+pub struct PrefetchHandle {
+    handle: JoinHandle<object_store::Result<Bytes>>,
+}
+
+impl PrefetchHandle {
+    /// Await the prefetched footer bytes.
+    pub async fn resolve(self) -> object_store::Result<Bytes> {
+        self.handle
+            .await
+            .map_err(|e| object_store::Error::JoinError { source: e })?
+    }
+}
+
+/// Start prefetching the footer of a file in the background.
+///
+/// Reads the last `footer_size` bytes from the given path. Typical Parquet
+/// footers are 4-64 KB, but rich statistics or large schemas can push this
+/// higher. A conservative default of 64 KB covers most cases.
+///
+/// Returns a [`PrefetchHandle`] that can be awaited when the caller is
+/// ready to parse the footer.
+pub fn prefetch_footer(
+    store: Arc<dyn ObjectStore>,
+    path: ObjectPath,
+    file_size: u64,
+    footer_size: u64,
+) -> PrefetchHandle {
+    let offset = file_size.saturating_sub(footer_size);
+
+    let handle = tokio::spawn(async move {
+        debug!(
+            path = %path,
+            offset = offset,
+            length = file_size - offset,
+            "Prefetching Parquet footer"
+        );
+        store.get_range(&path, offset..file_size).await
+    });
+
+    PrefetchHandle { handle }
+}
+
+/// Process multiple files with prefetch overlap.
+///
+/// For each file in `file_infos`, the provided `process_fn` closure is called
+/// with the file path and an optional prefetched footer `Bytes`. While the
+/// closure processes the current file, the next file's footer is prefetched in
+/// the background.
+///
+/// `file_infos` is a slice of `(path, file_size)` tuples.
+/// `footer_read_size` is how many bytes to read from the end of each file
+/// for the footer (default: 64 KB).
+pub async fn process_files_with_prefetch<F, Fut, T, E>(
+    store: Arc<dyn ObjectStore>,
+    file_infos: &[(ObjectPath, u64)],
+    footer_read_size: u64,
+    mut process_fn: F,
+) -> Result<Vec<T>, E>
+where
+    F: FnMut(ObjectPath, u64, Option<Bytes>) -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: From<object_store::Error>,
+{
+    if file_infos.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut results = Vec::with_capacity(file_infos.len());
+    let mut prefetch: Option<(ObjectPath, u64, PrefetchHandle)> = None;
+
+    for (i, (path, file_size)) in file_infos.iter().enumerate() {
+        // If we have a prefetch from the previous iteration, resolve it.
+        let footer_bytes = if let Some((_, _, handle)) = prefetch.take() {
+            Some(handle.resolve().await.map_err(E::from)?)
+        } else {
+            None
+        };
+
+        // Start prefetching the next file's footer (if there is one).
+        if i + 1 < file_infos.len() {
+            let (next_path, next_size) = &file_infos[i + 1];
+            prefetch = Some((
+                next_path.clone(),
+                *next_size,
+                prefetch_footer(
+                    Arc::clone(&store),
+                    next_path.clone(),
+                    *next_size,
+                    footer_read_size,
+                ),
+            ));
+        }
+
+        // Process the current file.
+        let result = process_fn(path.clone(), *file_size, footer_bytes).await?;
+        results.push(result);
+    }
+
+    Ok(results)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +438,168 @@ mod tests {
     fn test_byte_range_as_range() {
         let r = ByteRange::new(100, 200);
         assert_eq!(r.as_range(), 100u64..300u64);
+    }
+
+    // ── Parallel fetch + prefetch tests ────────────────────────────
+
+    use object_store::memory::InMemory;
+    use object_store::PutPayload;
+
+    /// Helper: create an in-memory object store with test files.
+    async fn make_test_store(files: Vec<(&str, Vec<u8>)>) -> Arc<dyn ObjectStore> {
+        let store = InMemory::new();
+        for (path, data) in files {
+            store
+                .put(
+                    &ObjectPath::from(path),
+                    PutPayload::from(Bytes::from(data)),
+                )
+                .await
+                .unwrap();
+        }
+        Arc::new(store)
+    }
+
+    #[tokio::test]
+    async fn test_fetch_byte_ranges_single() {
+        let data = b"Hello, World! This is test data for byte range reads.".to_vec();
+        let store = make_test_store(vec![("test.parquet", data)]).await;
+        let path = ObjectPath::from("test.parquet");
+
+        let ranges = vec![ByteRange::new(0, 5)];
+        let result = fetch_byte_ranges(&store, &path, &ranges, 4).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(&result[0][..], b"Hello");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_byte_ranges_multiple() {
+        let data = b"Hello, World! This is test data for byte range reads.".to_vec();
+        let store = make_test_store(vec![("test.parquet", data)]).await;
+        let path = ObjectPath::from("test.parquet");
+
+        let ranges = vec![
+            ByteRange::new(0, 5),
+            ByteRange::new(7, 6),
+        ];
+        let result = fetch_byte_ranges(&store, &path, &ranges, 4).await.unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(&result[0][..], b"Hello");
+        assert_eq!(&result[1][..], b"World!");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_byte_ranges_empty() {
+        let store = make_test_store(vec![("test.parquet", b"data".to_vec())]).await;
+        let path = ObjectPath::from("test.parquet");
+
+        let result = fetch_byte_ranges(&store, &path, &[], 4).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_column_chunks_with_coalescing() {
+        let data = vec![0xABu8; 2048];
+        let store = make_test_store(vec![("test.parquet", data)]).await;
+        let path = ObjectPath::from("test.parquet");
+
+        // Two ranges with a gap of 100 bytes -- should coalesce with threshold 200.
+        let ranges = vec![
+            ByteRange::new(0, 100),
+            ByteRange::new(200, 100),
+        ];
+        let result = fetch_column_chunks(&store, &path, &ranges, 200, 4)
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].len(), 100);
+        assert_eq!(result[1].len(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_footer() {
+        let data = b"file-header-data-and-then-the-FOOTER".to_vec();
+        let file_size = data.len() as u64;
+        let store = make_test_store(vec![("test.parquet", data)]).await;
+        let path = ObjectPath::from("test.parquet");
+
+        let handle = prefetch_footer(store, path, file_size, 6);
+        let footer = handle.resolve().await.unwrap();
+        assert_eq!(&footer[..], b"FOOTER");
+    }
+
+    #[tokio::test]
+    async fn test_process_files_with_prefetch() {
+        let file_a = vec![0u8; 1000];
+        let file_b = vec![1u8; 2000];
+        let file_c = vec![2u8; 500];
+
+        let store = make_test_store(vec![
+            ("a.parquet", file_a),
+            ("b.parquet", file_b),
+            ("c.parquet", file_c),
+        ])
+        .await;
+
+        let file_infos: Vec<(ObjectPath, u64)> = vec![
+            (ObjectPath::from("a.parquet"), 1000),
+            (ObjectPath::from("b.parquet"), 2000),
+            (ObjectPath::from("c.parquet"), 500),
+        ];
+
+        let results = process_files_with_prefetch(
+            store,
+            &file_infos,
+            64,
+            |_path, file_size, footer_bytes| async move {
+                Ok::<_, object_store::Error>((file_size, footer_bytes.is_some()))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 3);
+        // First file has no prefetch (None), subsequent files have prefetched footers.
+        assert_eq!(results[0], (1000, false));
+        assert_eq!(results[1], (2000, true));
+        assert_eq!(results[2], (500, true));
+    }
+
+    #[tokio::test]
+    async fn test_process_files_with_prefetch_empty() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let results = process_files_with_prefetch(
+            store,
+            &[],
+            64,
+            |_path, _size, _footer| async { Ok::<_, object_store::Error>(()) },
+        )
+        .await
+        .unwrap();
+
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_process_files_with_prefetch_single_file() {
+        let file_a = vec![0u8; 500];
+        let store = make_test_store(vec![("a.parquet", file_a)]).await;
+
+        let file_infos = vec![(ObjectPath::from("a.parquet"), 500u64)];
+
+        let results = process_files_with_prefetch(
+            store,
+            &file_infos,
+            64,
+            |_path, file_size, footer_bytes| async move {
+                Ok::<_, object_store::Error>((file_size, footer_bytes.is_some()))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], (500, false)); // single file: no prefetch
     }
 }
