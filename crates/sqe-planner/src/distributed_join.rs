@@ -1185,7 +1185,7 @@ mod tests {
 
     #[test]
     fn test_presorted_rule_default() {
-        let rule = PreSortedJoinRule::default();
+        let rule = PreSortedJoinRule;
         assert_eq!(rule.name(), "PreSortedJoinRule");
     }
 
