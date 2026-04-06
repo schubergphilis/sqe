@@ -479,6 +479,13 @@ impl QueryHandler {
                 .with_label_values(&[&kind_name])
                 .observe(duration.as_secs_f64());
             metrics.rows_returned.inc_by(rows as f64);
+
+            // Record time-to-first-row for successful queries that returned rows.
+            // In the current collect()-based model this equals total execution time;
+            // when streaming is wired in it will reflect true first-row latency.
+            if status == "success" && rows > 0 {
+                metrics.time_to_first_row.observe(duration.as_secs_f64());
+            }
         }
 
         if let Some(ref audit) = self.audit {
@@ -587,9 +594,25 @@ impl QueryHandler {
 
         // Execute the (possibly distributed) plan
         let output_schema = final_plan.schema();
-        let mut batches = collect(final_plan, ctx.task_ctx())
+        let mut batches = collect(final_plan.clone(), ctx.task_ctx())
             .await
             .map_err(|e| SqeError::Execution(format!("Query execution failed: {e}")))?;
+
+        // Aggregate spill metrics from the executed plan tree
+        if let Some(ref metrics) = self.metrics {
+            let (sort_spill_count, sort_spill_bytes, join_spill_count, join_spill_bytes) =
+                aggregate_spill_metrics(&final_plan);
+            if sort_spill_count > 0 {
+                metrics.sort_spill_count.inc_by(sort_spill_count as f64);
+                metrics.sort_spill_bytes.inc_by(sort_spill_bytes as f64);
+                debug!(sort_spill_count, sort_spill_bytes, "Sort spill detected");
+            }
+            if join_spill_count > 0 {
+                metrics.join_spill_count.inc_by(join_spill_count as f64);
+                metrics.join_spill_bytes.inc_by(join_spill_bytes as f64);
+                debug!(join_spill_count, join_spill_bytes, "Join spill detected");
+            }
+        }
 
         // Ensure we always return at least one batch so callers can infer the
         // output schema (e.g. CTAS with WHERE false that returns zero rows).
@@ -1140,6 +1163,52 @@ impl QueryHandler {
         Ok(())
     }
 
+}
+
+/// Walk a physical plan tree and aggregate spill metrics from all operators.
+///
+/// Returns `(sort_spill_count, sort_spill_bytes, join_spill_count, join_spill_bytes)`.
+///
+/// Sort operators (SortExec, SortPreservingMergeExec) contribute to sort spill
+/// metrics, while join operators (HashJoinExec, SortMergeJoinExec,
+/// NestedLoopJoinExec) contribute to join spill metrics. DataFusion's
+/// `MetricsSet` provides `spill_count()` and `spilled_bytes()` on each
+/// operator after execution.
+fn aggregate_spill_metrics(plan: &Arc<dyn ExecutionPlan>) -> (usize, usize, usize, usize) {
+    let mut sort_spill_count: usize = 0;
+    let mut sort_spill_bytes: usize = 0;
+    let mut join_spill_count: usize = 0;
+    let mut join_spill_bytes: usize = 0;
+
+    let mut stack: Vec<Arc<dyn ExecutionPlan>> = vec![Arc::clone(plan)];
+    while let Some(node) = stack.pop() {
+        let name = node.name();
+        if let Some(metrics) = node.metrics() {
+            let sc = metrics.spill_count().unwrap_or(0);
+            let sb = metrics.spilled_bytes().unwrap_or(0);
+
+            if sc > 0 || sb > 0 {
+                let is_sort = name.contains("Sort");
+                let is_join = name.contains("Join");
+                if is_sort {
+                    sort_spill_count += sc;
+                    sort_spill_bytes += sb;
+                } else if is_join {
+                    join_spill_count += sc;
+                    join_spill_bytes += sb;
+                } else {
+                    // Unknown operator that spills — attribute to sort as default
+                    sort_spill_count += sc;
+                    sort_spill_bytes += sb;
+                }
+            }
+        }
+        for child in node.children() {
+            stack.push(Arc::clone(child));
+        }
+    }
+
+    (sort_spill_count, sort_spill_bytes, join_spill_count, join_spill_bytes)
 }
 
 /// Walk a physical plan tree to find the first `IcebergScanExec` node.
