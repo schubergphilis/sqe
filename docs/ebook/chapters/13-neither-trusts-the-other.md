@@ -667,6 +667,48 @@ These constraints are also features. A compromised worker that cannot see the fu
 :::
 
 
+## Beyond the Scan Boundary: Streaming Execution
+
+The distribution model described above pushes only the scan to workers. Filters, aggregations, joins, and sorts all run on the coordinator. This works well when scans dominate wall-clock time and intermediate results fit in coordinator memory. It stops working when they don't.
+
+Streaming execution extends the trust boundary. Workers now perform computation, not just I/O.
+
+### Late Materialization
+
+Standard Parquet scans read all projected columns for every row. Late materialization splits the read into two phases. First, read only the columns referenced in the `WHERE` clause. Apply the filter. Produce a set of surviving row indices. Second, for survivors only, read the remaining columns.
+
+This is implemented in the Iceberg scan planner as a two-phase `RowFilter` scan. The predicate columns are read first, the `RowFilter` is applied, and then the projection columns are fetched only for rows that pass. For a query like `SELECT * FROM orders WHERE status = 'CLOSED'` on a 20-column table where 5% of rows match, late materialization avoids reading 19 columns for 95% of rows. The I/O reduction is dramatic: up to 19x fewer column-chunk reads on the non-predicate columns.
+
+The optimization is invisible to operators above the scan. The `TableScan` produces the same schema; the difference is entirely in bytes read from S3.
+
+### Memory Watermarks and Admission Control
+
+Workers and the coordinator use a four-level watermark system to manage memory:
+
+- **Green** (< 60% pool utilization): normal execution.
+- **Yellow** (60-75%): advisory warnings, increment metrics.
+- **Orange** (75-90%): spillable operators forced to spill immediately.
+- **Red** (> 90%): admission control -- new queries are queued until utilization drops.
+
+The watermarks prevent the cascade failure we saw in load testing: N concurrent queries each grab 1/N of memory, all hit the spill path simultaneously, and disk I/O saturates. With admission control, queries beyond the capacity wait rather than compete. The coordinator tracks pool utilization and exposes it via the `sqe_memory_utilization_ratio` Prometheus metric.
+
+### SortMergeJoin Fallback
+
+DataFusion's default join strategy is hash join, which builds an in-memory hash table from the build side. For large joins, this hash table can exceed the memory limit. DataFusion does not yet support hash join spill-to-disk upstream.
+
+SQE's optimizer inserts a `SortMergeJoin` when the estimated build-side size exceeds `hash_join_memory_threshold` (default: 256MB). Both sides are sorted -- spilling to disk via external merge sort if needed -- and then merged with constant memory. The sort-merge path is slower than an in-memory hash join on small inputs, but it completes reliably where a hash join would OOM.
+
+When DataFusion adds hash join spill upstream (tracked in the DataFusion issue tracker), SQE can adopt the hybrid hash join approach. Until then, sort-merge is the safe path.
+
+### DoExchange Shuffle
+
+The biggest architectural change in streaming execution is worker-to-worker communication via Arrow Flight `DoExchange`. In the scan-only model, data flows in one direction: worker to coordinator. With `DoExchange`, workers exchange hash-partitioned or range-partitioned data with each other.
+
+This enables distributed joins, distributed sorts, and distributed aggregations. The coordinator decomposes the physical plan into stages separated by shuffle boundaries. Each stage runs on workers. When a stage finishes, its output is partitioned and streamed to the next stage's workers via `DoExchange`. The coordinator orchestrates stages but does not touch the data.
+
+The trust model extends naturally: workers trust other workers to send correctly partitioned data matching the expected schema. The coordinator trusts workers to execute their stage correctly. Credentials are scoped per stage -- a worker in the join stage receives only the credentials it needs for its partition of the probe side.
+
+
 ## The Lesson
 
 Building distributed execution forced us to answer a question that single-node systems ignore: who knows what, and who trusts whom?

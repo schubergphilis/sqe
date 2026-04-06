@@ -549,6 +549,48 @@ reservation.try_grow(batch_mem)?;
 The spill-to-disk option provides a second safety net. When memory pressure is high but disk is available, DataFusion spills intermediate results to `/tmp/sqe-spill`. This is slower than in-memory execution but prevents the hard failure. We enable it by default but make it configurable because some environments (containers with ephemeral storage) can't afford the disk space.
 
 
+## Graceful Degradation: FairSpillPool and the Watermark Model
+
+The OOM kill from the load test exposed a deeper problem than "add memory limits." The question is: what should happen when memory runs out? The answer depends on the operator.
+
+### How Operators Cooperate on Memory
+
+`FairSpillPool` is not a simple ceiling. It divides total memory equally among all registered `MemoryConsumer` instances. When operator A calls `try_grow` and the pool is above the orange watermark (75% utilization), the pool asks other spillable operators to spill first. If operator B (a sort with buffered runs) spills 200MB to disk, operator A's allocation succeeds without the pool hitting the red zone.
+
+This cooperative model means operators do not need to know about each other. A hash aggregate and a sort running in parallel share the pool implicitly. When the aggregate grows, the sort may be asked to spill. When the sort is in its merge phase and releases memory, the aggregate can grow again. The pool mediates.
+
+The watermark levels drive behavior:
+
+| Level | Utilization | What Happens |
+|-------|-------------|-------------|
+| Green | < 60% | Allocations succeed without intervention |
+| Yellow | 60-75% | Metrics increment; log warnings; no action forced |
+| Orange | 75-90% | Pool asks spillable operators to spill before allowing new allocations |
+| Red | > 90% | Admission control: new queries queue; existing queries continue |
+
+The red zone prevents the worst failure mode: a cascade where every concurrent query spills simultaneously, saturating disk I/O and making all queries slow instead of just the large ones. By queuing new queries at the door, red-zone admission control preserves throughput for in-flight work.
+
+### External Merge Sort
+
+When a `SortExec` operator spills, it writes sorted runs to `spill_dir`. Each run is a file of Arrow IPC batches, sorted by the sort key and optionally compressed with zstd or lz4. The runs accumulate as the sort consumes its input.
+
+On final output, the sort opens all runs simultaneously and performs a k-way merge using a binary heap keyed on the sort column. Each step of the merge reads one batch from the run with the smallest current key. Memory consumption during the merge is bounded: one batch buffer per run, plus the heap. For a 1TB sort with 512MB of memory, this produces roughly 2,000 runs of 512KB each (after compression). The merge reads 2,000 buffers of one batch each -- a few hundred megabytes total.
+
+The k-way merge is the reason spill-to-disk works at all for large sorts. Without it, you would need to read all spilled data back into memory -- defeating the purpose. With it, memory stays bounded regardless of how much data was sorted.
+
+### The q18 Story
+
+TPC-H query 18 is the one that breaks on 512MB. It selects customers with large orders using a `GROUP BY` with `HAVING SUM(l_quantity) > 300`. The `GroupedHashAggregate` must maintain a hash table with one entry per group. At scale factor 1, this means hundreds of thousands of groups, each holding partial aggregate state. The hash table exceeds the memory limit.
+
+Unlike `SortExec`, DataFusion's `GroupedHashAggregate` does not yet support spill-to-disk. When `try_grow` fails, the operator returns `ResourceExhausted` and the query fails. This is a known upstream limitation -- hash aggregate spill is tracked in the DataFusion issue tracker and is an active area of development.
+
+SQE's Phase B solves q18 through two-phase aggregation. Instead of one coordinator computing all groups, each worker computes partial aggregates on its partition. The groups are hash-partitioned across workers via `DoExchange`, so each worker handles a subset of the total groups. The hash table per worker is 1/N the size (where N is the number of workers). With 8 workers, each hash table is roughly 1/8 the size -- well within the 512MB budget.
+
+Two-phase aggregation does not eliminate the fundamental limitation. A single worker with a single-phase aggregate on a high-cardinality group-by will still exceed memory. But by distributing the groups, the per-worker memory requirement drops below the threshold. This is the same trick that MapReduce uses for large aggregations, applied at the query operator level.
+
+For users running Phase A only (single-node), q18 at scale factor 1 requires increasing `memory_limit` above 512MB. At scale factor 0.1, it passes within 512MB. The relationship between scale factor, group cardinality, and memory requirement is roughly linear for hash aggregates.
+
+
 ## Heartbeat and Health
 
 The worker registry is the coordinator's view of which workers are alive. Workers start unhealthy and become healthy when their first heartbeat arrives:

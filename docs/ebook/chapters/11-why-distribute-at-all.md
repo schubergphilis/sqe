@@ -319,6 +319,39 @@ There are also limitations within what we did build:
 Each of these is a real limitation. Each has a workaround. And each is less important than getting the basic distribution model right and reliable, which is what Chapters 12 through 14 are about.
 
 
+## The 1TB Problem on Small Servers
+
+Everything above assumes you can give the coordinator enough memory to hold intermediate results. But what happens when the data doesn't fit?
+
+### The Memory Math
+
+Consider `SELECT * FROM lineitem ORDER BY l_shipdate` on a 1TB `lineitem` table. The sort operator must consume the entire input before producing any output. On a single coordinator, that means 1TB of intermediate data in memory -- or, with spill-to-disk, 1TB of sorted runs on local storage. Even with efficient external merge sort, the coordinator's NIC and disk bandwidth become the bottleneck.
+
+Now add eight workers. Each worker sorts its 125GB partition locally (spilling 125GB to its own local disk). The coordinator performs a k-way merge of eight pre-sorted streams, consuming only a small buffer per stream. Total spill per worker: 125GB. Total memory on the coordinator for the merge: 8 * buffer_size. The work and the spill are distributed.
+
+The same arithmetic applies to aggregation. A `GROUP BY` with millions of distinct groups requires a hash table proportional to the group count. On one coordinator, that hash table must fit in memory (or the engine OOMs -- DataFusion's `GroupedHashAggregate` does not spill today). With two-phase aggregation across eight workers, each worker handles 1/8 of the groups, and the hash table fits.
+
+### How Others Handle This
+
+**Trino** originally had no spill support at all -- the entire intermediate dataset had to fit in memory across the cluster. Presto/Trino added spill-to-disk in later versions, but it remains opt-in and the documentation warns about performance degradation. Trino's approach is "provision enough memory" first, spill as a safety net.
+
+**Spark** takes the opposite approach: it spills aggressively and early. Every shuffle writes to disk. Every sort writes to disk. The `tungsten` off-heap memory manager and `ExternalSorter` make this efficient, but the baseline cost of always writing to disk is non-trivial. Spark's model assumes disk I/O is cheap (true for local NVMe, less true for network-attached storage).
+
+**DuckDB** proves that a single-node engine can handle datasets far larger than memory. Its buffer manager pages data between memory and disk transparently, with out-of-core hash join and sort. DuckDB processes 1TB on 16GB machines by treating disk as an extension of memory. The limitation is single-node I/O bandwidth -- one machine, one NIC, one disk controller.
+
+**ClickHouse** avoids the problem for most workloads by using pre-aggregated materialized views and merge trees. For ad-hoc queries, it distributes across shards but each shard processes its partition independently. ClickHouse's model works well for append-heavy workloads but requires schema-level planning that Iceberg's schema-on-read approach doesn't impose.
+
+### SQE's Hybrid Approach
+
+SQE combines both strategies:
+
+**Phase A (spill first):** the coordinator uses `FairSpillPool` with watermarks to manage memory pressure. Sort operators spill sorted runs to disk. Join operators fall back to SortMergeJoin when the build side exceeds the memory threshold. Late materialization and file pruning reduce the amount of data that enters the pipeline in the first place. This handles the "survival" case: queries complete correctly, though large sorts and aggregations may be slow.
+
+**Phase B (push computation down):** the coordinator decomposes the physical plan into stages and pushes computation to workers via Arrow Flight `DoExchange`. Sorts are range-partitioned across workers. Aggregations run in two phases (partial on workers, final on coordinator or designated workers). Joins use broadcast, shuffle hash, or pre-sorted merge depending on input size. This handles the "performance" case: queries complete quickly because work and memory pressure are distributed.
+
+The key design choice is that Phase A is always active. Even in distributed mode, each worker uses `FairSpillPool` for its local execution. Phase B adds distribution on top of Phase A's memory safety. A worker that runs out of memory spills to disk rather than crashing -- the same safety net applies at every level.
+
+
 ## The Lesson
 
 Distribution is not a feature. It's a trade-off. You trade simplicity for throughput. You trade one failure mode (slow queries) for many failure modes (worker crashes, network partitions, gRPC hangs, S3 throttling, credential expiry, partial results). You trade a single process you can attach a debugger to for a fleet of processes communicating over the network.

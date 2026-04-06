@@ -162,11 +162,17 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 - [x] DELETE, UPDATE, MERGE INTO via Copy-on-Write (RisingWave iceberg-rust fork rewrite_files)
 - [ ] OPA/Cedar policy engine (row filters, column masks, GRANT/REVOKE SQL)
 - [x] OSS security hardening (TLS, rate limiting, query timeouts, session lifecycle, error sanitisation, vendor-neutral naming)
+- [x] Streaming execution Phase A: coordinator spill-to-disk (FairSpillPool, watermarks, admission control), late materialization, file-level min/max pruning, sort-order detection, PageIndex, S3 I/O pipeline (coalescing, footer cache, prefetch), SortMergeJoin fallback
+- [x] Streaming execution Phase B: DoExchange shuffle infrastructure, distributed sort (range-partition), distributed aggregation (two-phase), distributed joins (broadcast, shuffle hash, sort-merge, predicate transfer), multi-endpoint Flight SQL
+- [x] Observability metrics (spill, shuffle, late-mat, pruning, time-to-first-row)
+- [x] Trino function compatibility (date_format, date_parse, now, json_object, transaction stubs)
 - [ ] Pluggable auth providers (bearer token ✅, API key, mTLS, anonymous)
 - [ ] Pluggable catalog backends (AWS Glue, Nessie, Hive Metastore, storage-only)
 - [ ] Semantic AI layer (RDF/SPARQL, property graph/GQL, vector search, agent interfaces)
 - [ ] dbt adapter (dbt-sqe via ADBC Flight SQL)
 - [ ] Helm chart for Kubernetes deployment
+
+**Benchmark:** TPC-H SF1 -- 21/22 queries pass on a 512MB coordinator with spill-to-disk enabled.
 
 ## Benchmarks
 
