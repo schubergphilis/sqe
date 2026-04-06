@@ -20,5 +20,8 @@ pub use circuit_breaker::CircuitBreaker;
 pub use footer_cache::FooterCache;
 pub use iceberg_scan::IcebergScanExec;
 pub use rest_catalog::SessionCatalog;
-pub use s3_io::{ByteRange, coalesce_ranges, fetch_byte_ranges, fetch_column_chunks};
+pub use s3_io::{
+    ByteRange, PrefetchHandle, coalesce_ranges, fetch_byte_ranges, fetch_column_chunks,
+    prefetch_footer, process_files_with_prefetch,
+};
 pub use system_catalog::SystemCatalogProvider;
