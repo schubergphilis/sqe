@@ -25,6 +25,10 @@ pub enum StatementKind {
     Policy(Box<Statement>),
     Utility(Box<Statement>),
     ExplainFull(String), // inner SQL string (EXPLAIN FULL pre-processed)
+    // Transaction stubs — no-ops for JDBC tools that use setAutoCommit(false).
+    Begin,
+    Commit,
+    Rollback,
 }
 
 impl StatementKind {
@@ -50,6 +54,9 @@ impl StatementKind {
             StatementKind::Policy(_) => "policy",
             StatementKind::Utility(_) => "utility",
             StatementKind::ExplainFull(_) => "explain_full",
+            StatementKind::Begin => "begin",
+            StatementKind::Commit => "commit",
+            StatementKind::Rollback => "rollback",
         }
     }
 }
@@ -217,6 +224,11 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
 
         // UPDATE → dedicated variant for routing to the write handler
         Statement::Update { .. } => Ok(StatementKind::Update(Box::new(stmt))),
+
+        // Transaction stubs — no-ops so JDBC tools can call setAutoCommit(false)
+        Statement::StartTransaction { .. } => Ok(StatementKind::Begin),
+        Statement::Commit { .. } => Ok(StatementKind::Commit),
+        Statement::Rollback { .. } => Ok(StatementKind::Rollback),
 
         _ => Err(sqe_core::SqeError::NotImplemented(format!(
             "Statement type not supported: {stmt}"
@@ -430,6 +442,59 @@ mod tests {
     fn test_show_databases_is_show_catalogs() {
         let result = parse_and_classify("SHOW DATABASES");
         assert!(matches!(result, Ok(StatementKind::ShowCatalogs)));
+    }
+
+    // ── Transaction stub tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_begin_is_begin() {
+        let result = parse_and_classify("BEGIN");
+        assert!(
+            matches!(result, Ok(StatementKind::Begin)),
+            "Expected Begin, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_start_transaction_is_begin() {
+        let result = parse_and_classify("START TRANSACTION");
+        assert!(
+            matches!(result, Ok(StatementKind::Begin)),
+            "Expected Begin, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_commit_is_commit() {
+        let result = parse_and_classify("COMMIT");
+        assert!(
+            matches!(result, Ok(StatementKind::Commit)),
+            "Expected Commit, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_rollback_is_rollback() {
+        let result = parse_and_classify("ROLLBACK");
+        assert!(
+            matches!(result, Ok(StatementKind::Rollback)),
+            "Expected Rollback, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_begin_name() {
+        assert_eq!(StatementKind::Begin.name(), "begin");
+    }
+
+    #[test]
+    fn test_commit_name() {
+        assert_eq!(StatementKind::Commit.name(), "commit");
+    }
+
+    #[test]
+    fn test_rollback_name() {
+        assert_eq!(StatementKind::Rollback.name(), "rollback");
     }
 
     #[test]
