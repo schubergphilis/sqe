@@ -4,6 +4,7 @@ use std::time::Duration;
 use arrow_array::RecordBatch;
 use arrow_array::{ArrayRef, builder::StringBuilder};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion::prelude::SessionContext;
 use tracing::{debug, info, warn};
@@ -56,6 +57,9 @@ pub struct QueryHandler {
     query_cache: Option<Arc<ResultCache>>,
     /// Semaphore limiting concurrent query execution.
     query_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    /// Shared DataFusion runtime with FairSpillPool memory management.
+    /// Built once at startup and reused across all queries.
+    runtime: Arc<RuntimeEnv>,
 }
 
 impl QueryHandler {
@@ -79,6 +83,12 @@ impl QueryHandler {
         } else {
             None
         };
+
+        // Build shared DataFusion runtime with FairSpillPool for memory management
+        // and optional spill-to-disk. This is built once and shared across all queries.
+        let runtime = crate::runtime::build_coordinator_runtime(&config.coordinator)
+            .expect("Failed to build coordinator DataFusion runtime");
+
         Self {
             policy_enforcer,
             policy_store,
@@ -93,12 +103,21 @@ impl QueryHandler {
             query_tracker,
             query_cache,
             query_semaphore,
+            runtime,
         }
     }
 
     /// Returns a reference to the query tracker.
     pub fn query_tracker(&self) -> &Arc<QueryTracker> {
         &self.query_tracker
+    }
+
+    /// Returns a reference to the shared DataFusion runtime.
+    ///
+    /// The runtime contains the [`FairSpillPool`] memory pool shared across
+    /// all queries. Use this to check memory usage for admission control.
+    pub fn runtime(&self) -> &Arc<RuntimeEnv> {
+        &self.runtime
     }
 
     pub fn write_handler(&self) -> &WriteHandler {
@@ -887,6 +906,7 @@ impl QueryHandler {
             session,
             self.policy_store.as_ref(),
             &self.query_tracker,
+            Some(&self.runtime),
         )
         .await
     }
