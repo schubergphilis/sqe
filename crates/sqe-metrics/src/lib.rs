@@ -36,6 +36,14 @@ pub struct MetricsRegistry {
     pub scheduler_task_count: Histogram,
     pub scheduler_task_size_mb: Histogram,
     pub scheduler_stragglers: IntCounter,
+    // Footer cache metrics
+    pub footer_cache_hits: Counter,
+    pub footer_cache_misses: Counter,
+    pub footer_cache_size_bytes: Gauge,
+    // Coordinator memory pressure metrics
+    pub coordinator_memory_used_bytes: Gauge,
+    pub coordinator_memory_limit_bytes: Gauge,
+    pub coordinator_memory_pressure: Gauge,
 }
 
 impl MetricsRegistry {
@@ -124,6 +132,48 @@ impl MetricsRegistry {
         .unwrap();
         registry.register(Box::new(scheduler_stragglers.clone())).unwrap();
 
+        let footer_cache_hits = Counter::new(
+            "sqe_footer_cache_hits_total",
+            "Total Parquet footer cache hits",
+        )
+        .unwrap();
+        registry.register(Box::new(footer_cache_hits.clone())).unwrap();
+
+        let footer_cache_misses = Counter::new(
+            "sqe_footer_cache_misses_total",
+            "Total Parquet footer cache misses",
+        )
+        .unwrap();
+        registry.register(Box::new(footer_cache_misses.clone())).unwrap();
+
+        let footer_cache_size_bytes = Gauge::new(
+            "sqe_footer_cache_size_bytes",
+            "Current estimated size of Parquet footer cache in bytes",
+        )
+        .unwrap();
+        registry.register(Box::new(footer_cache_size_bytes.clone())).unwrap();
+
+        let coordinator_memory_used_bytes = Gauge::new(
+            "sqe_coordinator_memory_used_bytes",
+            "Current coordinator DataFusion memory pool usage in bytes",
+        )
+        .unwrap();
+        registry.register(Box::new(coordinator_memory_used_bytes.clone())).unwrap();
+
+        let coordinator_memory_limit_bytes = Gauge::new(
+            "sqe_coordinator_memory_limit_bytes",
+            "Coordinator DataFusion memory pool limit in bytes",
+        )
+        .unwrap();
+        registry.register(Box::new(coordinator_memory_limit_bytes.clone())).unwrap();
+
+        let coordinator_memory_pressure = Gauge::new(
+            "sqe_coordinator_memory_pressure",
+            "Coordinator memory pressure level (0=green, 1=yellow, 2=orange, 3=red)",
+        )
+        .unwrap();
+        registry.register(Box::new(coordinator_memory_pressure.clone())).unwrap();
+
         Self {
             registry,
             query_count,
@@ -140,6 +190,12 @@ impl MetricsRegistry {
             scheduler_task_count,
             scheduler_task_size_mb,
             scheduler_stragglers,
+            footer_cache_hits,
+            footer_cache_misses,
+            footer_cache_size_bytes,
+            coordinator_memory_used_bytes,
+            coordinator_memory_limit_bytes,
+            coordinator_memory_pressure,
         }
     }
 }
@@ -268,7 +324,10 @@ mod tests {
         metrics.scheduler_task_count.observe(0.0);
         metrics.scheduler_task_size_mb.observe(0.0);
         metrics.scheduler_stragglers.inc_by(0);
-        assert!(metrics.registry.gather().len() >= 14);
+        metrics.footer_cache_hits.inc_by(0.0);
+        metrics.footer_cache_misses.inc_by(0.0);
+        metrics.footer_cache_size_bytes.set(0.0);
+        assert!(metrics.registry.gather().len() >= 17);
     }
 
     #[test]

@@ -116,6 +116,14 @@ prometheus_port = 9090
 otlp_endpoint = ""
 audit_log_path = ""
 
+# ── Query execution ───────────────────────────────────────────
+[query]
+# Maximum estimated build-side size for hash join before falling back to
+# SortMergeJoin. SortMergeJoin spills to disk via external sort, preventing
+# OOM on large joins. Default: "2GB". Set to "0" to always use hash join.
+# Supports: B, KB, MB, GB, TB.
+hash_join_memory_threshold = "2GB"
+
 # ── Query result cache ────────────────────────────────────────
 [query_cache]
 # Enable/disable the query result cache.

@@ -6,6 +6,7 @@ pub mod distributed_scan;
 pub mod explain;
 pub mod flight_sql;
 pub mod flight_sql_helpers;
+pub mod memory;
 pub mod mode;
 pub mod query_handler;
 pub mod runtime;
