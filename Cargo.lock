@@ -4903,6 +4903,7 @@ dependencies = [
  "parquet",
  "serde",
  "serde_json",
+ "sqe-catalog",
  "sqe-core",
  "sqe-metrics",
  "sqe-planner",
