@@ -8,7 +8,7 @@ use datafusion::prelude::SessionContext;
 use object_store::aws::AmazonS3Builder;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
-use parquet::arrow::arrow_reader::ArrowReaderMetadata;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::ParquetMetaData;
@@ -171,13 +171,19 @@ pub async fn execute_scan(
                     .await
                     .map_err(|e| anyhow::anyhow!("Footer cache error: {e}"))?;
 
+                // Enable page-level min/max pruning via PageIndex.
+                // This lets the Parquet reader skip individual data pages
+                // within row groups whose min/max don't satisfy the predicate.
+                let reader_opts = ArrowReaderOptions::new().with_page_index(true);
                 let arrow_meta = ArrowReaderMetadata::try_new(
                     cached_meta,
-                    Default::default(),
+                    reader_opts,
                 )?;
                 ParquetRecordBatchStreamBuilder::new_with_metadata(reader, arrow_meta)
             } else {
-                ParquetRecordBatchStreamBuilder::new(reader).await?
+                // Enable page-level min/max pruning for direct reads too
+                let reader_opts = ArrowReaderOptions::new().with_page_index(true);
+                ParquetRecordBatchStreamBuilder::new_with_options(reader, reader_opts).await?
             };
 
         // Apply column projection if specified
