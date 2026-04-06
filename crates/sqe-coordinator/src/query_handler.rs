@@ -342,6 +342,12 @@ impl QueryHandler {
                     self.write_handler.handle_update(session, stmt, session_catalog, &ctx).await
                 }
 
+                // Transaction stubs — no-ops for JDBC tools that use setAutoCommit(false)
+                StatementKind::Begin | StatementKind::Commit | StatementKind::Rollback => {
+                    tracing::debug!("Transaction stubs: BEGIN/COMMIT/ROLLBACK are no-ops");
+                    Ok(vec![])
+                }
+
                 StatementKind::Merge(stmt) => {
                     // Extract source SQL from the MERGE statement and execute it
                     // to get the source batches, then pass them to the write handler.
