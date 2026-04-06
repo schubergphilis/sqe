@@ -1,3 +1,4 @@
+pub mod distributed_aggregate;
 pub mod distributed_join;
 pub mod distributed_sort;
 pub mod join_strategy;
@@ -7,6 +8,11 @@ pub mod shuffle_exec;
 pub mod splitter;
 pub mod stage_planner;
 
+pub use distributed_aggregate::{
+    AggregateStrategy, DistributedAggregateRule, FinalAggregateExec, PartialAggregateExec,
+    DEFAULT_DISTRIBUTED_AGGREGATE_THRESHOLD, DEFAULT_HIGH_CARDINALITY_THRESHOLD,
+    MIN_EXECUTORS_FOR_DISTRIBUTED_AGGREGATE,
+};
 pub use distributed_join::{
     BroadcastJoinPlan, BroadcastJoinRule, BroadcastSide, JoinStrategy, PreSortedJoinRule,
     ShuffleHashJoinPlan, DEFAULT_BROADCAST_THRESHOLD,
