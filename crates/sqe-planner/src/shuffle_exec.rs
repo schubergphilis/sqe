@@ -451,12 +451,12 @@ impl ExecutionPlan for ShuffleReaderExec {
 ///
 /// Used by `ShuffleWriterExec` since all output data is sent to remote
 /// executors rather than returned locally.
-struct EmptyRecordBatchStream {
+pub(crate) struct EmptyRecordBatchStream {
     schema: SchemaRef,
 }
 
 impl EmptyRecordBatchStream {
-    fn new(schema: SchemaRef) -> Self {
+    pub(crate) fn new(schema: SchemaRef) -> Self {
         Self { schema }
     }
 }
