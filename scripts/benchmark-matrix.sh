@@ -35,6 +35,7 @@ SUITES="$ALL_SUITES"
 CONFIGS="$ALL_CONFIGS"
 SKIP_LOAD=false
 QUICK=false
+AUTO_YES=false
 
 # Single-node connection (native coordinator, test stack ports)
 SINGLE_HOST="localhost"
@@ -59,6 +60,7 @@ while [[ $# -gt 0 ]]; do
         --scale)    SCALE="$2"; shift 2 ;;
         --skip-load) SKIP_LOAD=true; shift ;;
         --quick)    QUICK=true; shift ;;
+        --yes|-y)   AUTO_YES=true; shift ;;
         -h|--help)
             echo "Usage: $0 [--configs single-512mb,single-8gb,...] [--suites tpch,ssb,...] [--scale N] [--skip-load] [--quick]"
             echo ""
@@ -69,6 +71,7 @@ while [[ $# -gt 0 ]]; do
             echo "  $0                              # full matrix"
             echo "  $0 --quick                      # single-node configs, TPC-H only"
             echo "  $0 --configs single --suites tpch,ssb --scale 10"
+            echo "  $0 --yes                           # non-interactive (skip prompts)"
             exit 0 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -108,10 +111,12 @@ echo "System memory: ${TOTAL_RAM_GB}GB"
 DOCKER_MEM_MB=0
 if command -v docker &>/dev/null; then
     DOCKER_MEM_MB=$(docker stats --no-stream --format "{{.MemUsage}}" 2>/dev/null \
-        | grep -oE '[0-9.]+GiB|[0-9.]+MiB' \
+        | awk -F'/' '{print $1}' \
         | awk '{
-            if (index($0, "GiB")) { sum += $0 * 1024 }
-            else if (index($0, "MiB")) { sum += $0 }
+            gsub(/[^0-9.GiMB]/, "", $0)
+            if (index($0, "GiB")) { gsub(/GiB/, "", $0); sum += $0 * 1024 }
+            else if (index($0, "MiB")) { gsub(/MiB/, "", $0); sum += $0 }
+            else if (index($0, "B")) { gsub(/B/, "", $0); sum += $0 / 1024 / 1024 }
         } END { print int(sum) }' || echo "0")
 fi
 DOCKER_MEM_GB=$((DOCKER_MEM_MB / 1024))
@@ -144,7 +149,7 @@ if $NEEDS_DISTRIBUTED && [[ $AVAIL_GB -lt 12 ]]; then
         echo "Other Docker containers running:"
         echo "$OTHER_STACKS" | sed 's/^/  - /'
         echo ""
-        read -rp "Stop other Docker containers to free memory? [y/N] " STOP_OTHERS
+        if $AUTO_YES; then STOP_OTHERS="y"; else read -rp "Stop other Docker containers to free memory? [y/N] " STOP_OTHERS; fi
         if [[ "$STOP_OTHERS" =~ ^[Yy]$ ]]; then
             echo "Stopping non-SQE containers..."
             # Find compose projects that aren't ours
@@ -176,7 +181,7 @@ if $NEEDS_DISTRIBUTED && [[ $AVAIL_GB -lt 12 ]]; then
     if [[ $AVAIL_GB -lt 12 ]]; then
         echo ""
         echo "WARNING: Still only ${AVAIL_GB}GB free. Distributed benchmarks may be slow or OOM."
-        read -rp "Continue anyway? [y/N] " CONTINUE
+        if $AUTO_YES; then CONTINUE="y"; else read -rp "Continue anyway? [y/N] " CONTINUE; fi
         if [[ ! "$CONTINUE" =~ ^[Yy]$ ]]; then
             echo "Aborting. Free memory or use --configs single to skip distributed tests."
             exit 1
