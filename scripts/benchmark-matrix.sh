@@ -287,15 +287,68 @@ fi
 # ══════════════════════════════════════════════════════════════════════
 
 RESULTS_DIR="$ROOT_DIR/benchmarks/results"
-mkdir -p "$RESULTS_DIR"
+METRICS_DIR="$ROOT_DIR/benchmarks/metrics"
+mkdir -p "$RESULTS_DIR" "$METRICS_DIR"
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S")
 SUMMARY_FILE="$RESULTS_DIR/matrix-${TIMESTAMP}.txt"
+
+# ── Metrics snapshot helper ──────────────────────────────────────────
+# Captures Prometheus metrics endpoint and saves to file.
+# Usage: capture_metrics <port> <output_file>
+capture_metrics() {
+    local port="$1"
+    local outfile="$2"
+    curl -s "http://localhost:${port}/metrics" 2>/dev/null \
+        | grep "^sqe_" \
+        | sort > "$outfile" 2>/dev/null || true
+}
+
+# Computes delta between two metrics snapshots (before/after).
+# Usage: metrics_delta <before_file> <after_file> <output_file>
+metrics_delta() {
+    local before="$1"
+    local after="$2"
+    local delta="$3"
+    python3 -c "
+import sys
+before = {}
+after = {}
+for line in open('$before'):
+    parts = line.strip().split(' ')
+    if len(parts) == 2:
+        before[parts[0]] = float(parts[1])
+for line in open('$after'):
+    parts = line.strip().split(' ')
+    if len(parts) == 2:
+        after[parts[0]] = float(parts[1])
+with open('$delta', 'w') as f:
+    for key in sorted(after.keys()):
+        b = before.get(key, 0)
+        a = after[key]
+        d = a - b
+        if d != 0:
+            f.write(f'{key} {d:g}\n')
+" 2>/dev/null || true
+}
 
 echo "" | tee "$SUMMARY_FILE"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" | tee -a "$SUMMARY_FILE"
 echo "  Benchmark Matrix Results — $(date)" | tee -a "$SUMMARY_FILE"
 echo "  Scale factor: SF${SCALE}" | tee -a "$SUMMARY_FILE"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" | tee -a "$SUMMARY_FILE"
+
+# ── Start observability stack if available ────────────────────────────
+if docker info &>/dev/null && [[ -f docker-compose.observability.yml ]]; then
+    echo ""
+    echo "Starting observability stack (VictoriaMetrics + Grafana)..."
+    docker compose -f docker-compose.test.yml -f docker-compose.observability.yml up -d 2>&1 | tail -3
+    sleep 3
+    echo ""
+    echo "  Grafana dashboard: http://localhost:13000/d/sqe-benchmark"
+    echo "  VictoriaMetrics:   http://localhost:18428"
+    echo "  (login: admin / admin)"
+    echo ""
+fi
 
 run_single_config() {
     local CONFIG_NAME="$1"
@@ -333,6 +386,12 @@ run_single_config() {
     for SUITE in $SUITES; do
         echo -n "  $SUITE SF${SCALE}: " | tee -a "$SUMMARY_FILE"
 
+        # Capture metrics before
+        local METRICS_BEFORE="${METRICS_DIR}/${SUITE}-sf${SCALE}-${CONFIG_NAME}-before.txt"
+        local METRICS_AFTER="${METRICS_DIR}/${SUITE}-sf${SCALE}-${CONFIG_NAME}-after.txt"
+        local METRICS_DELTA="${METRICS_DIR}/${SUITE}-sf${SCALE}-${CONFIG_NAME}-${TIMESTAMP}-delta.txt"
+        capture_metrics 19090 "$METRICS_BEFORE"
+
         OUTPUT=$("$BENCH_BIN" test "$SUITE" \
             --scale "$SCALE" \
             --host "$SINGLE_HOST" \
@@ -341,11 +400,21 @@ run_single_config() {
             --password "$SINGLE_PASS" \
             --catalog "$SINGLE_CATALOG" 2>&1 || true)
 
+        # Capture metrics after and compute delta
+        capture_metrics 19090 "$METRICS_AFTER"
+        metrics_delta "$METRICS_BEFORE" "$METRICS_AFTER" "$METRICS_DELTA"
+
         # Extract summary line
         SUMMARY_LINE=$(echo "$OUTPUT" | grep "^BENCH_SUMMARY:" || echo "BENCH_SUMMARY:$SUITE:0:0:0:0:0:0:0")
         IFS=':' read -r _ _ PASS FAIL DIFF SKIP ERROR TOTAL TIME_MS <<< "$SUMMARY_LINE"
         TIME_S=$(echo "scale=1; ${TIME_MS:-0}/1000" | bc 2>/dev/null || echo "?")
         echo "${PASS:-0}/${TOTAL:-0} pass, ${ERROR:-0} error, ${TIME_S}s" | tee -a "$SUMMARY_FILE"
+
+        # Show key metric deltas
+        if [[ -s "$METRICS_DELTA" ]]; then
+            grep -E "spill_count|spill_bytes|pruned|cache_hits|cache_misses|late_mat|memory_used" "$METRICS_DELTA" 2>/dev/null \
+                | head -8 | sed 's/^/    /' | tee -a "$SUMMARY_FILE"
+        fi
 
         # Rename result file with config tag
         LATEST_RESULT=$(ls -t "$RESULTS_DIR/${SUITE}-sf${SCALE}-"*.json 2>/dev/null | head -1 || true)
@@ -403,6 +472,12 @@ run_distributed_config() {
     for SUITE in $SUITES; do
         echo -n "  $SUITE SF${SCALE}: " | tee -a "$SUMMARY_FILE"
 
+        # Capture metrics before
+        local METRICS_BEFORE="${METRICS_DIR}/${SUITE}-sf${SCALE}-${CONFIG_NAME}-before.txt"
+        local METRICS_AFTER="${METRICS_DIR}/${SUITE}-sf${SCALE}-${CONFIG_NAME}-after.txt"
+        local METRICS_DELTA="${METRICS_DIR}/${SUITE}-sf${SCALE}-${CONFIG_NAME}-${TIMESTAMP}-delta.txt"
+        capture_metrics "$DIST_METRICS_PORT" "$METRICS_BEFORE"
+
         OUTPUT=$("$BENCH_BIN" test "$SUITE" \
             --scale "$SCALE" \
             --host "$DIST_HOST" \
@@ -411,10 +486,20 @@ run_distributed_config() {
             --password "$DIST_PASS" \
             --catalog "$DIST_CATALOG" 2>&1 || true)
 
+        # Capture metrics after and compute delta
+        capture_metrics "$DIST_METRICS_PORT" "$METRICS_AFTER"
+        metrics_delta "$METRICS_BEFORE" "$METRICS_AFTER" "$METRICS_DELTA"
+
         SUMMARY_LINE=$(echo "$OUTPUT" | grep "^BENCH_SUMMARY:" || echo "BENCH_SUMMARY:$SUITE:0:0:0:0:0:0:0")
         IFS=':' read -r _ _ PASS FAIL DIFF SKIP ERROR TOTAL TIME_MS <<< "$SUMMARY_LINE"
         TIME_S=$(echo "scale=1; ${TIME_MS:-0}/1000" | bc 2>/dev/null || echo "?")
         echo "${PASS:-0}/${TOTAL:-0} pass, ${ERROR:-0} error, ${TIME_S}s" | tee -a "$SUMMARY_FILE"
+
+        # Show key metric deltas
+        if [[ -s "$METRICS_DELTA" ]]; then
+            grep -E "spill_count|spill_bytes|pruned|cache_hits|cache_misses|late_mat|memory_used" "$METRICS_DELTA" 2>/dev/null \
+                | head -8 | sed 's/^/    /' | tee -a "$SUMMARY_FILE"
+        fi
 
         LATEST_RESULT=$(ls -t "$RESULTS_DIR/${SUITE}-sf${SCALE}-"*.json 2>/dev/null | head -1 || true)
         if [[ -n "$LATEST_RESULT" ]]; then
@@ -423,15 +508,9 @@ run_distributed_config() {
         fi
     done
 
-    # Stop distributed stack (but keep test stack)
-    echo "  Stopping distributed stack..."
-    docker compose -f docker-compose.test.yml -f "$COMPOSE_FILE" stop coordinator worker-1 worker-2 2>/dev/null || true
-    if [[ "$NUM_WORKERS" -ge 3 ]]; then
-        docker compose -f docker-compose.test.yml -f "$COMPOSE_FILE" stop worker-3 2>/dev/null || true
-    fi
-    if [[ "$NUM_WORKERS" -ge 4 ]]; then
-        docker compose -f docker-compose.test.yml -f "$COMPOSE_FILE" stop worker-4 2>/dev/null || true
-    fi
+    # Don't stop distributed stack — leave running for inspection
+    echo "  Distributed stack left running for inspection."
+    echo "  Stop manually: docker compose -f docker-compose.test.yml -f $COMPOSE_FILE down"
 }
 
 # ── Run each config ──────────────────────────────────────────────────
@@ -453,12 +532,129 @@ done
 echo "" | tee -a "$SUMMARY_FILE"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" | tee -a "$SUMMARY_FILE"
 echo "  Matrix complete. Results in benchmarks/results/" | tee -a "$SUMMARY_FILE"
+echo "  Metrics deltas in benchmarks/metrics/" | tee -a "$SUMMARY_FILE"
 echo "  Summary:  $SUMMARY_FILE" | tee -a "$SUMMARY_FILE"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" | tee -a "$SUMMARY_FILE"
-echo ""
+
+# ── ASCII bar chart: total time per config ────────────────────────────
+echo "" | tee -a "$SUMMARY_FILE"
+echo "Total time per config:" | tee -a "$SUMMARY_FILE"
+
+# Collect timing data from tagged result files
+python3 -c "
+import json, glob, sys, os
+
+timestamp = '$TIMESTAMP'
+results_dir = '$RESULTS_DIR'
+configs = '$CONFIGS'.split()
+
+# Collect total time per config
+config_times = {}
+for config in configs:
+    total_ms = 0
+    total_pass = 0
+    total_queries = 0
+    for f in sorted(glob.glob(os.path.join(results_dir, f'*-{config}-{timestamp}.json'))):
+        try:
+            with open(f) as fh:
+                d = json.load(fh)
+            queries = d.get('results', d.get('queries', []))
+            for q in queries:
+                ms = q.get('elapsed_ms', q.get('duration_ms', 0))
+                total_ms += ms
+                total_queries += 1
+                if q.get('status') in ('PASS', 'pass', 'ok'):
+                    total_pass += 1
+        except:
+            pass
+    if total_queries > 0:
+        config_times[config] = (total_ms, total_pass, total_queries)
+
+if not config_times:
+    print('  (no results found)')
+    sys.exit(0)
+
+max_ms = max(t[0] for t in config_times.values()) if config_times else 1
+bar_width = 40
+
+for config, (ms, passed, total) in config_times.items():
+    secs = ms / 1000
+    bar_len = int((ms / max_ms) * bar_width) if max_ms > 0 else 0
+    bar = '#' * bar_len + '.' * (bar_width - bar_len)
+    print(f'  {config:20s} [{bar}] {secs:6.1f}s  ({passed}/{total} pass)')
+" 2>/dev/null | tee -a "$SUMMARY_FILE"
+
+# ── ASCII bar chart: per-suite comparison across configs ──────────────
+echo "" | tee -a "$SUMMARY_FILE"
+echo "Per-suite timing comparison:" | tee -a "$SUMMARY_FILE"
+
+python3 -c "
+import json, glob, os
+
+timestamp = '$TIMESTAMP'
+results_dir = '$RESULTS_DIR'
+configs = '$CONFIGS'.split()
+suites = '$SUITES'.split()
+
+for suite in suites:
+    times = {}
+    for config in configs:
+        pattern = os.path.join(results_dir, f'{suite}-sf*-{config}-{timestamp}.json')
+        for f in sorted(glob.glob(pattern)):
+            try:
+                with open(f) as fh:
+                    d = json.load(fh)
+                queries = d.get('results', d.get('queries', []))
+                ms = sum(q.get('elapsed_ms', q.get('duration_ms', 0)) for q in queries)
+                times[config] = ms / 1000
+            except:
+                pass
+    if not times:
+        continue
+    max_s = max(times.values()) if times else 1
+    print(f'  {suite}:')
+    for config in configs:
+        if config in times:
+            s = times[config]
+            bar_len = int((s / max_s) * 30) if max_s > 0 else 0
+            bar = '#' * bar_len
+            print(f'    {config:20s} {bar:30s} {s:6.1f}s')
+    print()
+" 2>/dev/null | tee -a "$SUMMARY_FILE"
+
+echo "" | tee -a "$SUMMARY_FILE"
 echo "Tagged results (config in filename):"
 ls -1 "$RESULTS_DIR"/*-"${TIMESTAMP}".json 2>/dev/null | sed 's|.*/||' | sed 's/^/  /'
 echo ""
+echo "Metrics deltas:"
+ls -1 "$METRICS_DIR"/*-"${TIMESTAMP}"-delta.txt 2>/dev/null | sed 's|.*/||' | sed 's/^/  /'
+
+echo ""
 echo "To commit results for historical tracking:"
-echo "  git add benchmarks/results/*-${TIMESTAMP}.json"
+echo "  git add benchmarks/results/*-${TIMESTAMP}.json benchmarks/metrics/*-${TIMESTAMP}-delta.txt"
 echo "  git commit -m 'bench: benchmark matrix SF${SCALE} $(date +%Y-%m-%d)'"
+echo ""
+
+# ── Grafana reminder ─────────────────────────────────────────────────
+if docker info &>/dev/null && docker ps --format "{{.Names}}" 2>/dev/null | grep -q "grafana"; then
+    echo "Grafana dashboard still running: http://localhost:13000/d/sqe-benchmark"
+    echo ""
+fi
+
+# ── Cleanup prompt ───────────────────────────────────────────────────
+echo "Services still running:"
+docker ps --format "  {{.Names}}: {{.Status}}" 2>/dev/null | grep -E "sqlengine|victoriametrics|grafana" || echo "  (none)"
+echo ""
+if ! $AUTO_YES; then
+    read -rp "Stop all benchmark services (SQE + observability)? [y/N] " STOP_ALL
+    if [[ "$STOP_ALL" =~ ^[Yy]$ ]]; then
+        echo "Stopping all benchmark services..."
+        lsof -ti :60051 2>/dev/null | xargs kill -9 2>/dev/null || true
+        docker compose -f docker-compose.test.yml -f docker-compose.observability.yml down 2>/dev/null || true
+        docker compose -f docker-compose.test.yml -f docker-compose.bench-2w.yml down 2>/dev/null || true
+        docker compose -f docker-compose.test.yml -f docker-compose.bench-4w.yml down 2>/dev/null || true
+        echo "Done."
+    else
+        echo "Services left running. Stop manually when done."
+    fi
+fi
