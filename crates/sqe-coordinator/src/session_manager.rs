@@ -28,6 +28,8 @@ pub struct SessionManager {
     /// Will be `None` when constructed via `with_provider`.
     legacy_authenticator: Option<Arc<Authenticator>>,
     sessions: DashMap<String, Arc<Session>>,
+    /// Optional Prometheus metrics for tracking token refreshes.
+    metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
 }
 
 impl SessionManager {
@@ -40,6 +42,7 @@ impl SessionManager {
             auth_provider: authenticator.clone() as Arc<dyn AuthProvider>,
             legacy_authenticator: Some(authenticator),
             sessions: DashMap::new(),
+            metrics: None,
         }
     }
 
@@ -53,7 +56,14 @@ impl SessionManager {
             auth_provider: provider,
             legacy_authenticator: None,
             sessions: DashMap::new(),
+            metrics: None,
         }
+    }
+
+    /// Attach Prometheus metrics registry for tracking token refresh events.
+    pub fn with_metrics(mut self, metrics: Arc<sqe_metrics::MetricsRegistry>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Authenticate using `FlightCredentials` via the configured provider chain.
@@ -135,6 +145,9 @@ impl SessionManager {
                     let updated = Arc::new(updated);
                     self.sessions.insert(session_id.to_string(), updated.clone());
                     debug!(session_id = %session_id, "Session updated with refreshed token");
+                    if let Some(ref metrics) = self.metrics {
+                        metrics.token_refresh_total.with_label_values(&["success"]).inc();
+                    }
                     return Some(updated);
                 }
                 // Token unchanged — just touch the session for idle tracking
@@ -292,6 +305,7 @@ mod tests {
             ssl_verification: false,
             providers: Vec::new(),
             role_mappings: std::collections::HashMap::new(),
+            external: None,
         }
     }
 

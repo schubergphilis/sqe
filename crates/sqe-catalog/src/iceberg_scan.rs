@@ -8,262 +8,212 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_optimizer::pruning::PruningPredicate;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{
+    BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
-use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use futures::{Stream, TryStreamExt};
 use iceberg::expr::Predicate;
+use iceberg::spec::{DataContentType, DataFile, ManifestStatus};
 use iceberg::table::Table;
-use tracing::{debug, info_span};
+use tracing::{debug, info_span, warn};
 
-/// Custom DataFusion `ExecutionPlan` that scans an Iceberg table using
-/// iceberg-rust's scan API. This replaces the `EmptyExec` placeholder
-/// in `SqeTableProvider` and provides actual data reads from S3.
-///
-/// The table's `FileIO` (configured with the user's vended S3 credentials)
-/// handles all data access -- no separate ObjectStore registration needed.
+use crate::pruning_stats::IcebergManifestStatistics;
+
 #[derive(Debug)]
 pub struct IcebergScanExec {
-    /// The Iceberg table to scan (contains FileIO with credentials).
     table: Table,
-    /// Arrow schema for the scan output (after projection).
     projected_schema: SchemaRef,
-    /// Column names to project (None = all columns).
     projection: Option<Vec<String>>,
-    /// Iceberg predicates to push down into the scan (manifest filtering + row-group pruning).
     predicates: Option<Predicate>,
-    /// Cached plan properties.
+    df_filters: Vec<Expr>,
     properties: PlanProperties,
-    /// Execution metrics (elapsed time, output rows).
     metrics: ExecutionPlanMetricsSet,
+    /// Optional Prometheus metrics registry for reporting file pruning,
+    /// footer cache, and S3 I/O counters.
+    #[allow(dead_code)]
+    prom_metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
 }
 
 impl IcebergScanExec {
-    /// Create a new Iceberg scan execution plan.
-    pub fn new(
-        table: Table,
-        projected_schema: SchemaRef,
-        projection: Option<Vec<String>>,
-        predicates: Option<Predicate>,
-    ) -> Self {
-        let properties = PlanProperties::new(
-            EquivalenceProperties::new(projected_schema.clone()),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        );
-
-        Self {
-            table,
-            projected_schema,
-            projection,
-            predicates,
-            properties,
-            metrics: ExecutionPlanMetricsSet::new(),
-        }
+    pub fn new(table: Table, projected_schema: SchemaRef, projection: Option<Vec<String>>, predicates: Option<Predicate>) -> Self {
+        Self::new_with_filters(table, projected_schema, projection, predicates, vec![])
     }
 
-    /// Returns the underlying Iceberg table.
-    pub fn table(&self) -> &Table {
-        &self.table
+    pub fn new_with_filters(table: Table, projected_schema: SchemaRef, projection: Option<Vec<String>>, predicates: Option<Predicate>, df_filters: Vec<Expr>) -> Self {
+        Self::new_with_filters_and_metrics(table, projected_schema, projection, predicates, df_filters, None)
     }
 
-    /// Returns the pushed-down predicates, if any.
-    pub fn predicates(&self) -> Option<&Predicate> {
-        self.predicates.as_ref()
+    pub fn new_with_filters_and_metrics(table: Table, projected_schema: SchemaRef, projection: Option<Vec<String>>, predicates: Option<Predicate>, df_filters: Vec<Expr>, prom_metrics: Option<Arc<sqe_metrics::MetricsRegistry>>) -> Self {
+        // Detect sort order from Iceberg metadata and set EquivalenceProperties
+        let eq_props = {
+            let sort_order = table.metadata().default_sort_order();
+            let iceberg_schema = table.metadata().current_schema();
+            match crate::sort_order::iceberg_sort_to_physical(sort_order, iceberg_schema, &projected_schema) {
+                Some(sort_exprs) => crate::sort_order::equivalence_with_sort(projected_schema.clone(), sort_exprs),
+                None => EquivalenceProperties::new(projected_schema.clone()),
+            }
+        };
+        let properties = PlanProperties::new(eq_props, Partitioning::UnknownPartitioning(1), EmissionType::Incremental, Boundedness::Bounded);
+        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), prom_metrics }
     }
 
-    /// List all data file paths from the table's current snapshot.
+    pub fn table(&self) -> &Table { &self.table }
+    pub fn predicates(&self) -> Option<&Predicate> { self.predicates.as_ref() }
+    pub fn df_filters(&self) -> &[Expr] { &self.df_filters }
+    pub fn projection(&self) -> Option<&[String]> { self.projection.as_deref() }
+
+    /// Returns the names of identity-transform partition columns from the
+    /// Iceberg table's default partition spec.
     ///
-    /// Uses the scan builder with the same projection and predicates as
-    /// the execution, then calls `plan_files()` to get the filtered
-    /// file scan tasks.
+    /// Bucket, truncate, date, and other derived transforms are excluded
+    /// because they don't map directly to sortable column values.
+    pub fn partition_column_names(&self) -> Vec<String> {
+        use iceberg::spec::Transform;
+        let spec = self.table.metadata().default_partition_spec();
+        let schema = self.table.metadata().current_schema();
+        spec.fields()
+            .iter()
+            .filter(|f| f.transform == Transform::Identity)
+            .filter_map(|f| {
+                schema
+                    .field_by_id(f.source_id)
+                    .map(|sf| sf.name.clone())
+            })
+            .collect()
+    }
+
     pub async fn data_file_paths(&self) -> Result<Vec<String>, iceberg::Error> {
         let info = self.data_file_info().await?;
         Ok(info.into_iter().map(|(path, _)| path).collect())
     }
 
-    /// List all data file paths and their sizes from the table's current snapshot.
-    ///
-    /// Returns a vec of `(path, size_bytes)` pairs in the same order as
-    /// `plan_files()` yields them. Size is taken from the Iceberg manifest
-    /// metadata (`file_size_in_bytes`) and does not require opening the file.
     pub async fn data_file_info(&self) -> Result<Vec<(String, u64)>, iceberg::Error> {
-        let mut scan_builder = self.table.scan();
-
-        if let Some(ref cols) = self.projection {
-            scan_builder = scan_builder.select(cols.iter().map(|s| s.as_str()));
-        }
-
-        if let Some(ref pred) = self.predicates {
-            scan_builder = scan_builder.with_filter(pred.clone());
-        }
-
-        let scan = scan_builder.build()?;
-
-        let tasks: Vec<_> = scan.plan_files().await?.try_collect().await?;
-
-        Ok(tasks
-            .iter()
-            .map(|t| {
-                let path = t.data_file_path().to_string();
-                let size = t.length;
-                (path, size)
-            })
-            .collect())
+        let (result, _) = self.data_file_info_with_pruning_stats().await?;
+        Ok(result)
     }
 
-    /// Returns the projected column names, if any.
-    pub fn projection(&self) -> Option<&[String]> {
-        self.projection.as_deref()
+    pub async fn data_file_info_with_pruning_stats(&self) -> Result<(Vec<(String, u64)>, usize), iceberg::Error> {
+        let mut sb = self.table.scan();
+        if let Some(ref cols) = self.projection { sb = sb.select(cols.iter().map(|s| s.as_str())); }
+        if let Some(ref pred) = self.predicates { sb = sb.with_filter(pred.clone()); }
+        let scan = sb.build()?;
+        let tasks: Vec<_> = scan.plan_files().await?.try_collect().await?;
+        let mut result: Vec<(String, u64)> = tasks.iter().map(|t| (t.data_file_path().to_string(), t.length)).collect();
+        let mut pruned_count = 0usize;
+        if !self.df_filters.is_empty() {
+            if let Ok(data_files) = self.collect_data_files().await {
+                let planned: std::collections::HashSet<String> = result.iter().map(|(p, _)| p.clone()).collect();
+                let relevant: Vec<DataFile> = data_files.into_iter().filter(|df| planned.contains(df.file_path())).collect();
+                if !relevant.is_empty() {
+                    let ischema = self.table.metadata().current_schema();
+                    let (kept, pc) = Self::prune_data_files(relevant, &self.df_filters, &self.projected_schema, ischema);
+                    pruned_count = pc;
+                    if pruned_count > 0 {
+                        debug!(pruned = pruned_count, remaining = kept.len(), "File-level min/max pruning");
+                        // Increment Prometheus file pruning counter
+                        if let Some(ref pm) = self.prom_metrics {
+                            pm.files_pruned_minmax.inc_by(pruned_count as f64);
+                        }
+                        let kept_paths: std::collections::HashSet<String> = kept.iter().map(|df| df.file_path().to_string()).collect();
+                        result.retain(|(path, _)| kept_paths.contains(path));
+                    }
+                }
+            }
+        }
+        Ok((result, pruned_count))
+    }
+
+    pub async fn collect_data_files(&self) -> Result<Vec<DataFile>, iceberg::Error> {
+        let metadata = self.table.metadata();
+        let snapshot = match metadata.current_snapshot() { Some(s) => s, None => return Ok(vec![]) };
+        let manifest_list = snapshot.load_manifest_list(self.table.file_io(), metadata).await?;
+        let mut data_files = Vec::new();
+        for mf in manifest_list.entries() {
+            let manifest = mf.load_manifest(self.table.file_io()).await?;
+            for entry in manifest.entries() {
+                if entry.status() != ManifestStatus::Deleted && entry.data_file().content_type() == DataContentType::Data {
+                    data_files.push(entry.data_file().clone());
+                }
+            }
+        }
+        Ok(data_files)
+    }
+
+    pub fn prune_data_files(data_files: Vec<DataFile>, df_filters: &[Expr], schema: &SchemaRef, iceberg_schema: &iceberg::spec::Schema) -> (Vec<DataFile>, usize) {
+        use datafusion::physical_expr::create_physical_expr;
+        use datafusion::prelude::SessionContext;
+        if data_files.is_empty() || df_filters.is_empty() { return (data_files, 0); }
+        let combined = match df_filters.iter().cloned().reduce(|a, b| a.and(b)) { Some(e) => e, None => return (data_files, 0) };
+        let df_schema = match datafusion::common::DFSchema::try_from(schema.as_ref().clone()) { Ok(s) => s, Err(e) => { warn!(error=%e, "DFSchema creation failed"); return (data_files, 0); } };
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let physical_expr = match create_physical_expr(&combined, &df_schema, state.execution_props()) { Ok(e) => e, Err(e) => { warn!(error=%e, "Physical expr failed"); return (data_files, 0); } };
+        let pruning_pred: PruningPredicate = match PruningPredicate::try_new(physical_expr, schema.clone()) { Ok(p) => p, Err(e) => { warn!(error=%e, "PruningPredicate failed"); return (data_files, 0); } };
+        let stats = IcebergManifestStatistics::new(data_files.clone(), schema.clone(), iceberg_schema);
+        match pruning_pred.prune(&stats) {
+            Ok(flags) => {
+                let total = data_files.len();
+                let kept: Vec<DataFile> = data_files.into_iter().zip(flags).filter_map(|(df, keep)| if keep { Some(df) } else { None }).collect();
+                let pruned = total - kept.len();
+                debug!(total_files = total, kept_files = kept.len(), pruned_files = pruned, "File-level min/max pruning applied");
+                (kept, pruned)
+            }
+            Err(e) => { warn!(error=%e, "PruningPredicate eval failed"); (data_files, 0) }
+        }
     }
 }
 
 impl DisplayAs for IcebergScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "IcebergScanExec: table={}, projection={:?}, predicate=[{}]",
-            self.table.identifier(),
-            self.projection,
-            self.predicates
-                .as_ref()
-                .map_or(String::new(), |p| format!("{p}")),
-        )
+        write!(f, "IcebergScanExec: table={}, projection={:?}, predicate=[{}], df_filters={}", self.table.identifier(), self.projection, self.predicates.as_ref().map_or(String::new(), |p| format!("{p}")), self.df_filters.len())
     }
 }
 
 impl ExecutionPlan for IcebergScanExec {
-    fn name(&self) -> &str {
-        "IcebergScanExec"
-    }
+    fn name(&self) -> &str { "IcebergScanExec" }
+    fn as_any(&self) -> &dyn Any { self }
+    fn schema(&self) -> SchemaRef { self.projected_schema.clone() }
+    fn properties(&self) -> &PlanProperties { &self.properties }
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![] }
+    fn with_new_children(self: Arc<Self>, _c: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> { Ok(self) }
+    fn metrics(&self) -> Option<MetricsSet> { Some(self.metrics.clone_inner()) }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.projected_schema.clone()
-    }
-
-    fn properties(&self) -> &PlanProperties {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![] // leaf node
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(self) // no children to replace
-    }
-
-    fn metrics(&self) -> Option<MetricsSet> {
-        Some(self.metrics.clone_inner())
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> DFResult<SendableRecordBatchStream> {
-        let span = info_span!(
-            "iceberg_scan",
-            table = %self.table.identifier(),
-            partition = partition,
-            predicates = ?self.predicates,
-        );
+    fn execute(&self, partition: usize, _context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
+        let span = info_span!("iceberg_scan", table=%self.table.identifier(), partition=partition, predicates=?self.predicates);
         let _guard = span.enter();
-
-        if partition != 0 {
-            return Err(DataFusionError::Internal(format!(
-                "IcebergScanExec only supports partition 0, got {partition}"
-            )));
-        }
-
+        if partition != 0 { return Err(DataFusionError::Internal(format!("IcebergScanExec only supports partition 0, got {partition}"))); }
         let table = self.table.clone();
         let schema = self.projected_schema.clone();
         let projection = self.projection.clone();
         let predicates = self.predicates.clone();
         let baseline = BaselineMetrics::new(&self.metrics, partition);
+        let _files_pruned_minmax = MetricBuilder::new(&self.metrics).counter("files_pruned_minmax", partition);
+        debug!(table=%table.identifier(), predicates=?predicates, "Executing IcebergScanExec");
 
-        debug!(
-            table = %table.identifier(),
-            predicates = ?predicates,
-            "Executing IcebergScanExec"
-        );
-
-        // If the table has no current snapshot (empty table, never written to),
-        // return an empty stream immediately — there are no data files to read.
         if table.metadata().current_snapshot().is_none() {
-            debug!(
-                table = %table.identifier(),
-                "Table has no snapshot — returning empty result"
-            );
             let empty_batch = RecordBatch::new_empty(schema.clone());
-            let stream = futures::stream::once(async move {
-                Ok::<_, DataFusionError>(empty_batch)
-            });
-            return Ok(Box::pin(IcebergRecordBatchStream {
-                schema,
-                inner: Box::pin(stream),
-                baseline,
-            }));
+            let stream = futures::stream::once(async move { Ok::<_, DataFusionError>(empty_batch) });
+            return Ok(Box::pin(IcebergRecordBatchStream { schema, inner: Box::pin(stream), baseline }));
         }
-
-        // Build the scan lazily -- to_arrow() is async, execute() is sync.
-        // We create a stream that initializes the scan on first poll.
         let stream = futures::stream::once(async move {
-            let mut scan_builder = table.scan();
-
-            // Apply column projection if specified
-            if let Some(ref cols) = projection {
-                scan_builder = scan_builder.select(cols.iter().map(|s| s.as_str()));
-            }
-
-            // Apply pushed-down predicates for manifest/row-group pruning
-            if let Some(pred) = predicates {
-                scan_builder = scan_builder.with_filter(pred);
-            }
-
-            let scan = scan_builder
-                .build()
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-            let arrow_stream = scan
-                .to_arrow()
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-            Ok::<_, DataFusionError>(
-                arrow_stream.map_err(|e| DataFusionError::External(Box::new(e))),
-            )
-        })
-        .try_flatten();
-
-        Ok(Box::pin(IcebergRecordBatchStream {
-            schema,
-            inner: Box::pin(stream),
-            baseline,
-        }))
+            let mut sb = table.scan();
+            if let Some(ref cols) = projection { sb = sb.select(cols.iter().map(|s| s.as_str())); }
+            if let Some(pred) = predicates { sb = sb.with_filter(pred); }
+            let scan = sb.build().map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let arrow_stream = scan.to_arrow().await.map_err(|e| DataFusionError::External(Box::new(e)))?;
+            Ok::<_, DataFusionError>(arrow_stream.map_err(|e| DataFusionError::External(Box::new(e))))
+        }).try_flatten();
+        Ok(Box::pin(IcebergRecordBatchStream { schema, inner: Box::pin(stream), baseline }))
     }
 }
 
-/// Wrapper stream that implements `RecordBatchStream` for DataFusion.
-///
-/// DataFusion requires that record batch streams implement both the
-/// `Stream<Item = DFResult<RecordBatch>>` trait and the `RecordBatchStream`
-/// trait (which adds a `schema()` method). This wrapper bridges the
-/// iceberg-rust arrow stream to satisfy both requirements.
-///
-/// The `baseline` field records elapsed wall-clock time and output row counts
-/// so that `EXPLAIN ANALYZE` and `EXPLAIN FULL` can report scan metrics.
 struct IcebergRecordBatchStream {
     schema: SchemaRef,
     inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>,
@@ -272,22 +222,14 @@ struct IcebergRecordBatchStream {
 
 impl Stream for IcebergRecordBatchStream {
     type Item = DFResult<RecordBatch>;
-
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        let poll = {
-            let _timer = this.baseline.elapsed_compute().timer();
-            this.inner.as_mut().poll_next(cx)
-        };
-        if let Poll::Ready(Some(Ok(ref batch))) = poll {
-            this.baseline.record_output(batch.num_rows());
-        }
+        let poll = { let _timer = this.baseline.elapsed_compute().timer(); this.inner.as_mut().poll_next(cx) };
+        if let Poll::Ready(Some(Ok(ref batch))) = poll { this.baseline.record_output(batch.num_rows()); }
         poll
     }
 }
 
 impl datafusion::physical_plan::RecordBatchStream for IcebergRecordBatchStream {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
+    fn schema(&self) -> SchemaRef { self.schema.clone() }
 }

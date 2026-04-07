@@ -19,7 +19,7 @@ use sqe_core::{Session, SqeConfig, SqeError};
 use tracing::instrument;
 
 use crate::catalog_ops::parse_table_ref;
-use crate::writer::write_data_files;
+use crate::writer::write_data_files_with_metrics;
 
 /// Handles write operations: CTAS (CREATE TABLE AS SELECT) and INSERT INTO SELECT.
 ///
@@ -28,11 +28,17 @@ use crate::writer::write_data_files;
 /// through the Iceberg REST catalog.
 pub struct WriteHandler {
     config: SqeConfig,
+    metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
 }
 
 impl WriteHandler {
     pub fn new(config: SqeConfig) -> Self {
-        Self { config }
+        Self { config, metrics: None }
+    }
+
+    pub fn with_metrics(mut self, metrics: Arc<sqe_metrics::MetricsRegistry>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Handle CREATE TABLE [OR REPLACE] ns.table AS SELECT ...
@@ -117,7 +123,7 @@ impl WriteHandler {
         // Write data files (skip if no data)
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         if total_rows > 0 {
-            let data_files = write_data_files(&table, batches, "ctas").await?;
+            let data_files = write_data_files_with_metrics(&table, batches, "ctas", self.metrics.as_ref()).await?;
 
             if !data_files.is_empty() {
                 // Commit data files via fast-append transaction
@@ -279,7 +285,7 @@ impl WriteHandler {
             .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
 
         // Write data files
-        let data_files = write_data_files(&table, batches, "insert").await?;
+        let data_files = write_data_files_with_metrics(&table, batches, "insert", self.metrics.as_ref()).await?;
 
         if !data_files.is_empty() {
             // Commit via fast-append
@@ -346,7 +352,7 @@ impl WriteHandler {
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
 
-        let data_files = write_data_files(&table, batches, "ingest").await?;
+        let data_files = write_data_files_with_metrics(&table, batches, "ingest", self.metrics.as_ref()).await?;
 
         if !data_files.is_empty() {
             let tx = Transaction::new(&table);
@@ -466,7 +472,7 @@ impl WriteHandler {
 
             // Write surviving rows as new data files (skip if all rows deleted)
             if !surviving_batches.is_empty() {
-                let new_files = write_data_files(&table, surviving_batches, "delete").await?;
+                let new_files = write_data_files_with_metrics(&table, surviving_batches, "delete", self.metrics.as_ref()).await?;
                 new_data_files.extend(new_files);
             }
         }
@@ -592,7 +598,7 @@ impl WriteHandler {
                 total_updated += count;
             }
 
-            let new_files = write_data_files(&table, rewritten_batches, "update").await?;
+            let new_files = write_data_files_with_metrics(&table, rewritten_batches, "update", self.metrics.as_ref()).await?;
             new_data_files.extend(new_files);
         }
 
@@ -975,7 +981,7 @@ impl WriteHandler {
         // Write new data files from the merged results
         let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
         let new_data_files = if total_rows > 0 {
-            write_data_files(&table, result_batches, "merge").await?
+            write_data_files_with_metrics(&table, result_batches, "merge", self.metrics.as_ref()).await?
         } else {
             vec![]
         };
@@ -1218,7 +1224,7 @@ impl WriteHandler {
             vec![vec![batch.clone()]],
         )
         .map_err(|e| SqeError::Execution(format!("Failed to create MemTable: {e}")))?;
-        ctx.register_table(&format!("datafusion.public.{table_name}"), Arc::new(mem_table))
+        ctx.register_table(format!("datafusion.public.{table_name}"), Arc::new(mem_table))
             .map_err(|e| SqeError::Execution(format!("Failed to register temp table: {e}")))?;
 
         // Execute: SELECT <where_clause> AS __match FROM __delete_<table>
@@ -1232,7 +1238,7 @@ impl WriteHandler {
         })?;
 
         // Deregister temp table
-        let _ = ctx.deregister_table(&format!("datafusion.public.{table_name}"));
+        let _ = ctx.deregister_table(format!("datafusion.public.{table_name}"));
 
         if result_batches.is_empty() || result_batches[0].num_rows() == 0 {
             return Ok(batch.clone());
@@ -1273,7 +1279,7 @@ impl WriteHandler {
             vec![vec![batch.clone()]],
         )
         .map_err(|e| SqeError::Execution(format!("Failed to create MemTable: {e}")))?;
-        ctx.register_table(&format!("datafusion.public.{table_name}"), Arc::new(mem_table))
+        ctx.register_table(format!("datafusion.public.{table_name}"), Arc::new(mem_table))
             .map_err(|e| SqeError::Execution(format!("Failed to register temp table: {e}")))?;
 
         // Build assignment map: column_name -> expression_sql
@@ -1315,7 +1321,7 @@ impl WriteHandler {
             SqeError::Execution(format!("Failed to collect UPDATE results: {e}"))
         })?;
 
-        let _ = ctx.deregister_table(&format!("datafusion.public.{table_name}"));
+        let _ = ctx.deregister_table(format!("datafusion.public.{table_name}"));
 
         // Return the first (and only) result batch
         result_batches.into_iter().next().ok_or_else(|| {
@@ -1337,7 +1343,7 @@ impl WriteHandler {
             vec![vec![batch.clone()]],
         )
         .map_err(|e| SqeError::Execution(format!("MemTable error: {e}")))?;
-        ctx.register_table(&format!("datafusion.public.{table_name}"), Arc::new(mem_table))
+        ctx.register_table(format!("datafusion.public.{table_name}"), Arc::new(mem_table))
             .map_err(|e| SqeError::Execution(format!("Register error: {e}")))?;
 
         let sql = format!("SELECT COUNT(*) AS cnt FROM datafusion.public.{table_name} WHERE {where_sql}");
@@ -1348,7 +1354,7 @@ impl WriteHandler {
             SqeError::Execution(format!("Count collect failed: {e}"))
         })?;
 
-        let _ = ctx.deregister_table(&format!("datafusion.public.{table_name}"));
+        let _ = ctx.deregister_table(format!("datafusion.public.{table_name}"));
 
         let count = batches
             .first()

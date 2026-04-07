@@ -196,6 +196,7 @@ mod tests {
             ssl_verification: false,
             providers: Vec::new(),
             role_mappings: std::collections::HashMap::new(),
+            external: None,
         }
     }
 

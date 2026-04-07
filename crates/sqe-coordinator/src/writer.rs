@@ -101,6 +101,35 @@ pub async fn write_data_files(
     Ok(data_files)
 }
 
+/// Write data files and record S3 write metrics.
+///
+/// Delegates to [`write_data_files`] and, when `metrics` is provided, increments
+/// `sqe_s3_bytes_written_total` and `sqe_s3_requests_total{operation="put"}` based
+/// on the sizes reported in the returned `DataFile` descriptors.
+pub async fn write_data_files_with_metrics(
+    table: &Table,
+    batches: Vec<RecordBatch>,
+    file_prefix: &str,
+    metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
+) -> sqe_core::Result<Vec<DataFile>> {
+    let data_files = write_data_files(table, batches, file_prefix).await?;
+
+    if let Some(m) = metrics {
+        let total_bytes: u64 = data_files.iter().map(|df| df.file_size_in_bytes()).sum();
+        let file_count = data_files.len() as u64;
+        if total_bytes > 0 {
+            m.s3_bytes_written_total.inc_by(total_bytes);
+        }
+        if file_count > 0 {
+            m.s3_requests_total
+                .with_label_values(&["put", "success"])
+                .inc_by(file_count);
+        }
+    }
+
+    Ok(data_files)
+}
+
 /// Add Iceberg field IDs to each Arrow field's metadata so the Parquet writer
 /// can map columns to the Iceberg schema, and cast columns to the Iceberg-expected
 /// Arrow types (e.g. Timestamp(ns) → Timestamp(µs)).

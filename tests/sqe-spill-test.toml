@@ -1,0 +1,33 @@
+# Spill test config: 512MB memory limit to force spill-to-disk on large queries
+[coordinator]
+flight_sql_port = 60051
+trino_http_port = 18080
+# Constrained memory — forces spill on TPC-H SF1 sorts and joins
+memory_limit = "512MB"
+spill_to_disk = true
+spill_dir = "/tmp/sqe-spill-test"
+spill_compression = "lz4"
+
+[metrics]
+prometheus_port = 19090
+
+[auth]
+token_endpoint = "http://localhost:18181/api/catalog/v1/oauth/tokens"
+client_id = "root"
+client_secret = "s3cr3t"
+
+[query]
+max_result_rows = 0
+max_query_memory = "0"
+timeout_secs = 600
+
+[catalog]
+polaris_url = "http://localhost:18181/api/catalog"
+warehouse = "test_warehouse"
+
+[storage]
+s3_endpoint = "http://localhost:19000"
+s3_access_key = "s3admin"
+s3_secret_key = "s3admin"
+s3_region = "us-east-1"
+s3_path_style = true

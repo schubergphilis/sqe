@@ -4,13 +4,16 @@ use std::time::Duration;
 use arrow_array::RecordBatch;
 use arrow_array::{ArrayRef, builder::StringBuilder};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion::prelude::SessionContext;
 use tracing::{debug, info, warn};
 
 use sqlparser::ast::Statement;
 use sqe_catalog::{IcebergScanExec, SessionCatalog};
-use sqe_core::{QueryConfig, Session, SqeConfig, SqeError};
+use sqe_core::{QueryConfig, Session, SortMode, SqeConfig, SqeError};
+
+use crate::adaptive_sort;
 use sqe_policy::{PolicyEnforcer, PolicyStore};
 use sqe_sql::{parse_and_classify, StatementKind};
 
@@ -56,6 +59,9 @@ pub struct QueryHandler {
     query_cache: Option<Arc<ResultCache>>,
     /// Semaphore limiting concurrent query execution.
     query_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    /// Shared DataFusion runtime with FairSpillPool memory management.
+    /// Built once at startup and reused across all queries.
+    runtime: Arc<RuntimeEnv>,
 }
 
 impl QueryHandler {
@@ -72,13 +78,22 @@ impl QueryHandler {
         query_cache: Option<Arc<ResultCache>>,
     ) -> Self {
         let catalog_ops = CatalogOps::new(config.clone());
-        let write_handler = WriteHandler::new(config.clone());
+        let mut write_handler = WriteHandler::new(config.clone());
+        if let Some(ref m) = metrics {
+            write_handler = write_handler.with_metrics(Arc::clone(m));
+        }
         let explain_handler = crate::explain::ExplainHandler::new(Arc::clone(&policy_enforcer));
         let query_semaphore = if config.query.max_concurrent_queries > 0 {
             Some(Arc::new(tokio::sync::Semaphore::new(config.query.max_concurrent_queries)))
         } else {
             None
         };
+
+        // Build shared DataFusion runtime with FairSpillPool for memory management
+        // and optional spill-to-disk. This is built once and shared across all queries.
+        let runtime = crate::runtime::build_coordinator_runtime(&config.coordinator)
+            .expect("Failed to build coordinator DataFusion runtime");
+
         Self {
             policy_enforcer,
             policy_store,
@@ -93,12 +108,21 @@ impl QueryHandler {
             query_tracker,
             query_cache,
             query_semaphore,
+            runtime,
         }
     }
 
     /// Returns a reference to the query tracker.
     pub fn query_tracker(&self) -> &Arc<QueryTracker> {
         &self.query_tracker
+    }
+
+    /// Returns a reference to the shared DataFusion runtime.
+    ///
+    /// The runtime contains the [`FairSpillPool`] memory pool shared across
+    /// all queries. Use this to check memory usage for admission control.
+    pub fn runtime(&self) -> &Arc<RuntimeEnv> {
+        &self.runtime
     }
 
     pub fn write_handler(&self) -> &WriteHandler {
@@ -122,6 +146,32 @@ impl QueryHandler {
         session: &Session,
         sql: &str,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // Memory pressure admission control: reject new queries when the
+        // coordinator's FairSpillPool is >95% utilized (Red).
+        let pressure = crate::memory::check_pressure(&self.runtime.memory_pool);
+        if let Some(ref metrics) = self.metrics {
+            metrics
+                .coordinator_memory_pressure
+                .set(pressure.as_gauge());
+            metrics
+                .coordinator_memory_used_bytes
+                .set(crate::memory::used_bytes(&self.runtime.memory_pool) as f64);
+            metrics
+                .coordinator_memory_limit_bytes
+                .set(crate::memory::limit_bytes(&self.runtime.memory_pool) as f64);
+        }
+        if !pressure.admits_new_query() {
+            warn!(
+                pressure = %pressure,
+                username = %session.user.username,
+                "Rejecting query due to memory pressure"
+            );
+            let sort_cols = extract_order_by_columns(sql);
+            return Err(SqeError::Execution(
+                adaptive_sort::format_pressure_rejection(&sort_cols, pressure),
+            ));
+        }
+
         // Backpressure: reject if too many concurrent queries
         let _permit = if let Some(ref sem) = self.query_semaphore {
             match sem.try_acquire() {
@@ -298,6 +348,12 @@ impl QueryHandler {
                     self.write_handler.handle_update(session, stmt, session_catalog, &ctx).await
                 }
 
+                // Transaction stubs — no-ops for JDBC tools that use setAutoCommit(false)
+                StatementKind::Begin | StatementKind::Commit | StatementKind::Rollback => {
+                    tracing::debug!("Transaction stubs: BEGIN/COMMIT/ROLLBACK are no-ops");
+                    Ok(vec![])
+                }
+
                 StatementKind::Merge(stmt) => {
                     // Extract source SQL from the MERGE statement and execute it
                     // to get the source batches, then pass them to the write handler.
@@ -435,6 +491,13 @@ impl QueryHandler {
                 .with_label_values(&[&kind_name])
                 .observe(duration.as_secs_f64());
             metrics.rows_returned.inc_by(rows as f64);
+
+            // Record time-to-first-row for successful queries that returned rows.
+            // In the current collect()-based model this equals total execution time;
+            // when streaming is wired in it will reflect true first-row latency.
+            if status == "success" && rows > 0 {
+                metrics.time_to_first_row.observe(duration.as_secs_f64());
+            }
         }
 
         if let Some(ref audit) = self.audit {
@@ -538,14 +601,43 @@ impl QueryHandler {
             .await
             .map_err(|e| SqeError::Execution(format!("Physical plan creation failed: {e}")))?;
 
+        // Apply adaptive sort stripping based on sort_mode config and memory pressure.
+        let sort_mode = SortMode::parse(&self.config.query.sort_mode);
+        let pressure = crate::memory::check_pressure(&self.runtime.memory_pool);
+        let (physical_plan, sort_decisions) = adaptive_sort::apply_adaptive_sort(
+            physical_plan,
+            sort_mode,
+            pressure,
+            self.metrics.as_ref(),
+        );
+        if let Some(warning) = adaptive_sort::format_sort_warning(&sort_decisions, sort_mode) {
+            debug!(warning = %warning, "Adaptive sort stripping applied");
+        }
+
         // Try to distribute scan work across workers
         let final_plan = self.try_distribute(physical_plan, session, query_id).await;
 
         // Execute the (possibly distributed) plan
         let output_schema = final_plan.schema();
-        let mut batches = collect(final_plan, ctx.task_ctx())
+        let mut batches = collect(final_plan.clone(), ctx.task_ctx())
             .await
             .map_err(|e| SqeError::Execution(format!("Query execution failed: {e}")))?;
+
+        // Aggregate spill metrics from the executed plan tree
+        if let Some(ref metrics) = self.metrics {
+            let (sort_spill_count, sort_spill_bytes, join_spill_count, join_spill_bytes) =
+                aggregate_spill_metrics(&final_plan);
+            if sort_spill_count > 0 {
+                metrics.sort_spill_count.inc_by(sort_spill_count as f64);
+                metrics.sort_spill_bytes.inc_by(sort_spill_bytes as f64);
+                debug!(sort_spill_count, sort_spill_bytes, "Sort spill detected");
+            }
+            if join_spill_count > 0 {
+                metrics.join_spill_count.inc_by(join_spill_count as f64);
+                metrics.join_spill_bytes.inc_by(join_spill_bytes as f64);
+                debug!(join_spill_count, join_spill_bytes, "Join spill detected");
+            }
+        }
 
         // Ensure we always return at least one batch so callers can infer the
         // output schema (e.g. CTAS with WHERE false that returns zero rows).
@@ -887,6 +979,8 @@ impl QueryHandler {
             session,
             self.policy_store.as_ref(),
             &self.query_tracker,
+            Some(&self.runtime),
+            self.metrics.as_ref(),
         )
         .await
     }
@@ -1095,6 +1189,75 @@ impl QueryHandler {
         Ok(())
     }
 
+}
+
+/// Best-effort extraction of ORDER BY column names from SQL text.
+fn extract_order_by_columns(sql: &str) -> Vec<String> {
+    let upper = sql.to_uppercase();
+    if let Some(idx) = upper.rfind("ORDER BY") {
+        let after = &sql[idx + 8..];
+        let end = after
+            .find([')' , ';'])
+            .or_else(|| {
+                let u = after.to_uppercase();
+                u.find("LIMIT").or_else(|| u.find("OFFSET")).or_else(|| u.find("FETCH"))
+            })
+            .unwrap_or(after.len());
+        let cols_str = &after[..end];
+        cols_str
+            .split(',')
+            .map(|s| s.split_whitespace().next().unwrap_or("").to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        vec![]
+    }
+}
+
+/// Walk a physical plan tree and aggregate spill metrics from all operators.
+///
+/// Returns `(sort_spill_count, sort_spill_bytes, join_spill_count, join_spill_bytes)`.
+///
+/// Sort operators (SortExec, SortPreservingMergeExec) contribute to sort spill
+/// metrics, while join operators (HashJoinExec, SortMergeJoinExec,
+/// NestedLoopJoinExec) contribute to join spill metrics. DataFusion's
+/// `MetricsSet` provides `spill_count()` and `spilled_bytes()` on each
+/// operator after execution.
+fn aggregate_spill_metrics(plan: &Arc<dyn ExecutionPlan>) -> (usize, usize, usize, usize) {
+    let mut sort_spill_count: usize = 0;
+    let mut sort_spill_bytes: usize = 0;
+    let mut join_spill_count: usize = 0;
+    let mut join_spill_bytes: usize = 0;
+
+    let mut stack: Vec<Arc<dyn ExecutionPlan>> = vec![Arc::clone(plan)];
+    while let Some(node) = stack.pop() {
+        let name = node.name();
+        if let Some(metrics) = node.metrics() {
+            let sc = metrics.spill_count().unwrap_or(0);
+            let sb = metrics.spilled_bytes().unwrap_or(0);
+
+            if sc > 0 || sb > 0 {
+                let is_sort = name.contains("Sort");
+                let is_join = name.contains("Join");
+                if is_sort {
+                    sort_spill_count += sc;
+                    sort_spill_bytes += sb;
+                } else if is_join {
+                    join_spill_count += sc;
+                    join_spill_bytes += sb;
+                } else {
+                    // Unknown operator that spills — attribute to sort as default
+                    sort_spill_count += sc;
+                    sort_spill_bytes += sb;
+                }
+            }
+        }
+        for child in node.children() {
+            stack.push(Arc::clone(child));
+        }
+    }
+
+    (sort_spill_count, sort_spill_bytes, join_spill_count, join_spill_bytes)
 }
 
 /// Walk a physical plan tree to find the first `IcebergScanExec` node.

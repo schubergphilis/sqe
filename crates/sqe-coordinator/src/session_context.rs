@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use tracing::debug;
 
@@ -18,12 +19,19 @@ use crate::query_tracker::QueryTracker;
 /// - The `sha256()` UDF for column masking
 /// - Trino-compatible function aliases (`year()`, `month()`, …)
 /// - The `read_parquet()` table-valued function
-#[tracing::instrument(skip(config, session, policy_store, query_tracker), fields(username = %session.user.username))]
+///
+/// When a shared `runtime` is provided (built once at coordinator startup via
+/// [`crate::runtime::build_coordinator_runtime`]), it is used for all sessions
+/// so the FairSpillPool memory limit is enforced globally. When `None`, a
+/// per-query runtime is created using the legacy `max_query_memory` setting.
+#[tracing::instrument(skip(config, session, policy_store, query_tracker, runtime, prom_metrics), fields(username = %session.user.username))]
 pub async fn create_session_context(
     config: &SqeConfig,
     session: &Session,
     policy_store: Option<&Arc<dyn PolicyStore>>,
     query_tracker: &Arc<QueryTracker>,
+    runtime: Option<&Arc<RuntimeEnv>>,
+    prom_metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
 ) -> sqe_core::Result<(SessionContext, Arc<SessionCatalog>)> {
     let catalog_name = if config.catalog.warehouse.is_empty() {
         "default".to_string()
@@ -31,21 +39,31 @@ pub async fn create_session_context(
         config.catalog.warehouse.clone()
     };
 
-    // Configure per-query memory limit via DataFusion's memory pool
-    let max_memory = sqe_core::parse_memory_limit(&config.query.max_query_memory).unwrap_or(256 * 1024 * 1024);
     let session_config = SessionConfig::new()
         .with_information_schema(true)
         .with_default_catalog_and_schema(&catalog_name, "default");
 
-    let ctx = if max_memory > 0 {
-        let pool = Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(max_memory));
-        let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
-            .with_memory_pool(pool)
-            .build_arc()
-            .map_err(|e| sqe_core::SqeError::Config(format!("Failed to create runtime env: {e}")))?;
-        SessionContext::new_with_config_rt(session_config, runtime)
+    let ctx = if let Some(rt) = runtime {
+        // Use the shared coordinator runtime (FairSpillPool with spill-to-disk)
+        SessionContext::new_with_config_rt(session_config, Arc::clone(rt))
     } else {
-        SessionContext::new_with_config(session_config)
+        // Legacy path: per-query GreedyMemoryPool (no spill)
+        let max_memory = sqe_core::parse_memory_limit(&config.query.max_query_memory)
+            .unwrap_or(256 * 1024 * 1024);
+        if max_memory > 0 {
+            let pool = Arc::new(
+                datafusion::execution::memory_pool::GreedyMemoryPool::new(max_memory),
+            );
+            let rt = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+                .with_memory_pool(pool)
+                .build_arc()
+                .map_err(|e| {
+                    sqe_core::SqeError::Config(format!("Failed to create runtime env: {e}"))
+                })?;
+            SessionContext::new_with_config_rt(session_config, rt)
+        } else {
+            SessionContext::new_with_config(session_config)
+        }
     };
 
     // Register DataFusion's built-in in-memory catalog so DML helpers can register
@@ -76,7 +94,7 @@ pub async fn create_session_context(
 
     // Create the DataFusion CatalogProvider from the session catalog,
     // passing policy store and session user for information_schema column filtering.
-    let catalog_provider = SqeCatalogProvider::try_new_with_policy(
+    let mut catalog_provider = SqeCatalogProvider::try_new_with_policy(
         session_catalog,
         config.storage.clone(),
         config.catalog.warehouse.clone(),
@@ -84,6 +102,9 @@ pub async fn create_session_context(
         Some(session.user.clone()),
     )
     .await?;
+    if let Some(m) = prom_metrics {
+        catalog_provider = catalog_provider.with_metrics(Arc::clone(m));
+    }
 
     ctx.register_catalog(&catalog_name, Arc::new(catalog_provider));
 

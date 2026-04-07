@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 sqe-core = { path = "../sqe-core" }
+sqe-catalog = { path = "../sqe-catalog" }
 sqe-planner = { path = "../sqe-planner" }
 sqe-metrics = { path = "../sqe-metrics" }
 datafusion = { workspace = true }
@@ -35,6 +36,7 @@ url = { workspace = true }
 chrono = { workspace = true }
 opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }
+ahash = "0.8"
 
 [dev-dependencies]
 tokio = { workspace = true }

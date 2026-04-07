@@ -162,11 +162,26 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 - [x] DELETE, UPDATE, MERGE INTO via Copy-on-Write (RisingWave iceberg-rust fork rewrite_files)
 - [ ] OPA/Cedar policy engine (row filters, column masks, GRANT/REVOKE SQL)
 - [x] OSS security hardening (TLS, rate limiting, query timeouts, session lifecycle, error sanitisation, vendor-neutral naming)
+- [x] Streaming execution Phase A: coordinator spill-to-disk (FairSpillPool, watermarks, admission control), late materialization, file-level min/max pruning, sort-order detection, PageIndex, S3 I/O pipeline (coalescing, footer cache, prefetch), SortMergeJoin fallback
+- [x] Streaming execution Phase B: DoExchange shuffle infrastructure, distributed sort (range-partition), distributed aggregation (two-phase), distributed joins (broadcast, shuffle hash, sort-merge, predicate transfer), multi-endpoint Flight SQL
+- [x] Observability metrics (spill, shuffle, late-mat, pruning, time-to-first-row)
+- [x] Trino function compatibility (date_format, date_parse, now, json_object, transaction stubs)
 - [ ] Pluggable auth providers (bearer token ✅, API key, mTLS, anonymous)
 - [ ] Pluggable catalog backends (AWS Glue, Nessie, Hive Metastore, storage-only)
 - [ ] Semantic AI layer (RDF/SPARQL, property graph/GQL, vector search, agent interfaces)
 - [ ] dbt adapter (dbt-sqe via ADBC Flight SQL)
 - [ ] Helm chart for Kubernetes deployment
+
+**Benchmark Matrix (SF1, Apr 7 2026):**
+
+| Suite | single-512mb | single-8gb | distributed-2w | Speedup |
+|---|---|---|---|---|
+| TPC-H (22) | 21/22 | 22/22 | 22/22 (13.5s) | 2.1x |
+| TPC-DS (99) | 92/99 | 99/99 | 98/99 (36.1s) | 2.8x |
+| SSB (13) | 4/13 | 13/13 | 13/13 (5.3s) | 2.7x |
+| TPC-C (17) | 17/17 | 17/17 | 17/17 (8.6s) | 2.6x |
+| TPC-E (18) | 12/18 | 13/18 | 10/18 (56.0s) | 2.3x |
+| **Total** | **146/169** | **164/169** | **162/169** | **2.4x avg** |
 
 ## Benchmarks
 

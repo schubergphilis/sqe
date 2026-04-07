@@ -1,0 +1,32 @@
+# Benchmark config: single-node, 8GB memory, spill enabled
+# Purpose: single-node performance baseline
+[coordinator]
+flight_sql_port = 60051
+trino_http_port = 18080
+memory_limit = "8GB"
+spill_to_disk = true
+spill_dir = "/tmp/sqe-bench-spill"
+spill_compression = "lz4"
+
+[metrics]
+prometheus_port = 19090
+
+[auth]
+token_endpoint = "http://localhost:18181/api/catalog/v1/oauth/tokens"
+client_id = "root"
+client_secret = "s3cr3t"
+
+[query]
+max_result_rows = 0
+timeout_secs = 600
+
+[catalog]
+polaris_url = "http://localhost:18181/api/catalog"
+warehouse = "test_warehouse"
+
+[storage]
+s3_endpoint = "http://localhost:19000"
+s3_access_key = "s3admin"
+s3_secret_key = "s3admin"
+s3_region = "us-east-1"
+s3_path_style = true

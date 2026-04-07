@@ -31,6 +31,8 @@ pub struct SqeTableProvider {
     table: Table,
     /// Arrow schema derived from the Iceberg table's current schema.
     schema: ArrowSchemaRef,
+    /// Optional Prometheus metrics for file pruning and S3 I/O counters.
+    prom_metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
 }
 
 impl SqeTableProvider {
@@ -51,7 +53,14 @@ impl SqeTableProvider {
         Ok(Self {
             table,
             schema: Arc::new(schema),
+            prom_metrics: None,
         })
+    }
+
+    /// Attach Prometheus metrics for file pruning and S3 I/O.
+    pub fn with_metrics(mut self, metrics: Arc<sqe_metrics::MetricsRegistry>) -> Self {
+        self.prom_metrics = Some(metrics);
+        self
     }
 
     /// Returns a reference to the underlying Iceberg table.
@@ -130,11 +139,13 @@ impl TableProvider for SqeTableProvider {
             debug!(predicate = %pred, "Pushing predicate down to Iceberg scan");
         }
 
-        Ok(Arc::new(crate::iceberg_scan::IcebergScanExec::new(
+        Ok(Arc::new(crate::iceberg_scan::IcebergScanExec::new_with_filters_and_metrics(
             self.table.clone(),
             projected_schema,
             projected_columns,
             predicates,
+            filters.to_vec(),
+            self.prom_metrics.clone(),
         )))
     }
 }

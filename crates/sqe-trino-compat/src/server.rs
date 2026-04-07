@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
 use dashmap::DashMap;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use sqe_core::Session;
@@ -354,16 +354,42 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     let trino_headers = extract_trino_headers(&headers);
 
     let session = if let Some(token) = extract_bearer_token(&headers) {
-        // Bearer token auth: validate JWT via JWKS before creating a session.
+        // Bearer token auth: try validated JWT via JWKS first.
         match state.authenticator.authenticate_bearer(&token).await {
             Ok(s) => s,
             Err(e) => {
-                warn!(
-                    error = %e,
-                    client_ip = %client_ip,
-                    "Trino bearer token authentication failed"
-                );
-                return error_response(StatusCode::UNAUTHORIZED, "Bearer token authentication failed");
+                // Fallback: if the token looks like a JWT, accept it as a
+                // passthrough — same behaviour as the Flight SQL BFF path.
+                if token.contains('.') {
+                    let username = trino_headers
+                        .user
+                        .as_deref()
+                        .unwrap_or("unknown")
+                        .to_string();
+                    debug!(
+                        username = %username,
+                        client_ip = %client_ip,
+                        error = %e,
+                        "Trino: bearer provider unavailable/rejected token, accepting raw JWT passthrough"
+                    );
+                    Session::new(
+                        username,
+                        token,
+                        None,
+                        chrono::Utc::now() + chrono::Duration::hours(1),
+                        vec![],
+                    )
+                } else {
+                    warn!(
+                        error = %e,
+                        client_ip = %client_ip,
+                        "Trino bearer token authentication failed"
+                    );
+                    return error_response(
+                        StatusCode::UNAUTHORIZED,
+                        "Bearer token authentication failed",
+                    );
+                }
             }
         }
     } else if let Some((user, pass)) = extract_basic_auth(&headers) {
@@ -1232,5 +1258,91 @@ mod tests {
         headers.insert("host", "myhost:9090".parse().unwrap());
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
         assert_eq!(extract_base_url(&headers, 8080), "https://myhost:9090");
+    }
+
+    // ── Bearer JWT passthrough tests ────────────────────────────
+
+    /// MockAuth has no bearer provider, so `authenticate_bearer` returns Err.
+    /// The passthrough fallback should accept a JWT-shaped token and create
+    /// an ad-hoc session using the x-trino-user header.
+    #[tokio::test]
+    async fn test_submit_query_bearer_jwt_passthrough() {
+        let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
+            authenticator: Arc::new(MockAuth),
+            query_handler: Arc::new(MockQuery),
+            results: DashMap::new(),
+            node: NodeContext {
+                version: "0.1.0".to_string(),
+                ready: Arc::new(AtomicBool::new(true)),
+                started_at: Instant::now(),
+            },
+            page_size: DEFAULT_PAGE_SIZE,
+            port: 8080,
+            oauth2: None,
+        });
+
+        let mut headers = HeaderMap::new();
+        // JWT-shaped bearer token (three dot-separated segments)
+        headers.insert(
+            "authorization",
+            "Bearer eyJhbGciOi.payload.signature".parse().unwrap(),
+        );
+        headers.insert("x-trino-user", "alice".parse().unwrap());
+
+        let response = submit_query::<MockAuth, MockQuery>(
+            State(state),
+            headers,
+            "SELECT 1".to_string(),
+        )
+        .await;
+
+        let resp = response.into_response();
+        // MockQuery returns Err("mock") so the query itself fails, but auth
+        // must have succeeded — a 401 would mean the passthrough didn't work.
+        assert_ne!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "JWT passthrough should not return 401"
+        );
+    }
+
+    /// A non-JWT bearer token (no dots) should still return 401 when the
+    /// bearer provider is not configured.
+    #[tokio::test]
+    async fn test_submit_query_bearer_opaque_token_rejected() {
+        let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
+            authenticator: Arc::new(MockAuth),
+            query_handler: Arc::new(MockQuery),
+            results: DashMap::new(),
+            node: NodeContext {
+                version: "0.1.0".to_string(),
+                ready: Arc::new(AtomicBool::new(true)),
+                started_at: Instant::now(),
+            },
+            page_size: DEFAULT_PAGE_SIZE,
+            port: 8080,
+            oauth2: None,
+        });
+
+        let mut headers = HeaderMap::new();
+        // Opaque token (no dots) — not a JWT, no fallback
+        headers.insert(
+            "authorization",
+            "Bearer some-opaque-token".parse().unwrap(),
+        );
+
+        let response = submit_query::<MockAuth, MockQuery>(
+            State(state),
+            headers,
+            "SELECT 1".to_string(),
+        )
+        .await;
+
+        let resp = response.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "Opaque bearer tokens must be rejected when no provider is configured"
+        );
     }
 }
