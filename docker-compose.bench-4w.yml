@@ -7,7 +7,7 @@
 services:
   coordinator:
     build: .
-    entrypoint: ["sqe-server", "/config/coordinator.toml"]
+    entrypoint: ["sqe-server", "--config", "/config/coordinator.toml"]
     volumes:
       - ./tests/benchmark-matrix/distributed-4w-coordinator.toml:/config/coordinator.toml:ro
     ports:
