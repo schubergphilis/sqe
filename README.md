@@ -172,7 +172,16 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 - [ ] dbt adapter (dbt-sqe via ADBC Flight SQL)
 - [ ] Helm chart for Kubernetes deployment
 
-**Benchmark:** TPC-H SF1 -- 21/22 queries pass on a 512MB coordinator with spill-to-disk enabled.
+**Benchmark Matrix (SF1, Apr 7 2026):**
+
+| Suite | single-512mb | single-8gb | distributed-2w | Speedup |
+|---|---|---|---|---|
+| TPC-H (22) | 21/22 | 22/22 | 22/22 (13.5s) | 2.1x |
+| TPC-DS (99) | 92/99 | 99/99 | 98/99 (36.1s) | 2.8x |
+| SSB (13) | 4/13 | 13/13 | 13/13 (5.3s) | 2.7x |
+| TPC-C (17) | 17/17 | 17/17 | 17/17 (8.6s) | 2.6x |
+| TPC-E (18) | 12/18 | 13/18 | 10/18 (56.0s) | 2.3x |
+| **Total** | **146/169** | **164/169** | **162/169** | **2.4x avg** |
 
 ## Benchmarks
 
