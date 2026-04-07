@@ -24,13 +24,14 @@ use crate::query_tracker::QueryTracker;
 /// [`crate::runtime::build_coordinator_runtime`]), it is used for all sessions
 /// so the FairSpillPool memory limit is enforced globally. When `None`, a
 /// per-query runtime is created using the legacy `max_query_memory` setting.
-#[tracing::instrument(skip(config, session, policy_store, query_tracker, runtime), fields(username = %session.user.username))]
+#[tracing::instrument(skip(config, session, policy_store, query_tracker, runtime, prom_metrics), fields(username = %session.user.username))]
 pub async fn create_session_context(
     config: &SqeConfig,
     session: &Session,
     policy_store: Option<&Arc<dyn PolicyStore>>,
     query_tracker: &Arc<QueryTracker>,
     runtime: Option<&Arc<RuntimeEnv>>,
+    prom_metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
 ) -> sqe_core::Result<(SessionContext, Arc<SessionCatalog>)> {
     let catalog_name = if config.catalog.warehouse.is_empty() {
         "default".to_string()
@@ -93,7 +94,7 @@ pub async fn create_session_context(
 
     // Create the DataFusion CatalogProvider from the session catalog,
     // passing policy store and session user for information_schema column filtering.
-    let catalog_provider = SqeCatalogProvider::try_new_with_policy(
+    let mut catalog_provider = SqeCatalogProvider::try_new_with_policy(
         session_catalog,
         config.storage.clone(),
         config.catalog.warehouse.clone(),
@@ -101,6 +102,9 @@ pub async fn create_session_context(
         Some(session.user.clone()),
     )
     .await?;
+    if let Some(m) = prom_metrics {
+        catalog_provider = catalog_provider.with_metrics(Arc::clone(m));
+    }
 
     ctx.register_catalog(&catalog_name, Arc::new(catalog_provider));
 

@@ -29,6 +29,8 @@ pub struct SqeCatalogProvider {
     policy_store: Option<Arc<dyn PolicyStore>>,
     /// Session user identity for policy resolution.
     session_user: Option<SessionUser>,
+    /// Optional Prometheus metrics propagated to schema/table providers.
+    prom_metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
 }
 
 impl std::fmt::Debug for SqeCatalogProvider {
@@ -84,7 +86,14 @@ impl SqeCatalogProvider {
             cached_namespaces,
             policy_store,
             session_user,
+            prom_metrics: None,
         })
+    }
+
+    /// Attach Prometheus metrics to be propagated to schema/table providers.
+    pub fn with_metrics(mut self, metrics: Arc<sqe_metrics::MetricsRegistry>) -> Self {
+        self.prom_metrics = Some(metrics);
+        self
     }
 
     /// Create a catalog provider with pre-populated namespace names.
@@ -102,6 +111,7 @@ impl SqeCatalogProvider {
             cached_namespaces: namespaces,
             policy_store: None,
             session_user: None,
+            prom_metrics: None,
         }
     }
 }
@@ -134,12 +144,15 @@ impl CatalogProvider for SqeCatalogProvider {
             return None;
         }
 
-        let provider = SqeSchemaProvider::new(
+        let mut provider = SqeSchemaProvider::new(
             self.session_catalog.clone(),
             name.to_string(),
             self.storage_config.clone(),
             self.warehouse.clone(),
         );
+        if let Some(ref m) = self.prom_metrics {
+            provider = provider.with_metrics(Arc::clone(m));
+        }
 
         Some(Arc::new(provider))
 

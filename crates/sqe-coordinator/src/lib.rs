@@ -1,3 +1,4 @@
+pub mod adaptive_sort;
 pub mod catalog_ops;
 pub mod tls;
 pub mod codec;

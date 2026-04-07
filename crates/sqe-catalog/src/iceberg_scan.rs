@@ -35,6 +35,10 @@ pub struct IcebergScanExec {
     df_filters: Vec<Expr>,
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
+    /// Optional Prometheus metrics registry for reporting file pruning,
+    /// footer cache, and S3 I/O counters.
+    #[allow(dead_code)]
+    prom_metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
 }
 
 impl IcebergScanExec {
@@ -43,6 +47,10 @@ impl IcebergScanExec {
     }
 
     pub fn new_with_filters(table: Table, projected_schema: SchemaRef, projection: Option<Vec<String>>, predicates: Option<Predicate>, df_filters: Vec<Expr>) -> Self {
+        Self::new_with_filters_and_metrics(table, projected_schema, projection, predicates, df_filters, None)
+    }
+
+    pub fn new_with_filters_and_metrics(table: Table, projected_schema: SchemaRef, projection: Option<Vec<String>>, predicates: Option<Predicate>, df_filters: Vec<Expr>, prom_metrics: Option<Arc<sqe_metrics::MetricsRegistry>>) -> Self {
         // Detect sort order from Iceberg metadata and set EquivalenceProperties
         let eq_props = {
             let sort_order = table.metadata().default_sort_order();
@@ -53,13 +61,33 @@ impl IcebergScanExec {
             }
         };
         let properties = PlanProperties::new(eq_props, Partitioning::UnknownPartitioning(1), EmissionType::Incremental, Boundedness::Bounded);
-        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new() }
+        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), prom_metrics }
     }
 
     pub fn table(&self) -> &Table { &self.table }
     pub fn predicates(&self) -> Option<&Predicate> { self.predicates.as_ref() }
     pub fn df_filters(&self) -> &[Expr] { &self.df_filters }
     pub fn projection(&self) -> Option<&[String]> { self.projection.as_deref() }
+
+    /// Returns the names of identity-transform partition columns from the
+    /// Iceberg table's default partition spec.
+    ///
+    /// Bucket, truncate, date, and other derived transforms are excluded
+    /// because they don't map directly to sortable column values.
+    pub fn partition_column_names(&self) -> Vec<String> {
+        use iceberg::spec::Transform;
+        let spec = self.table.metadata().default_partition_spec();
+        let schema = self.table.metadata().current_schema();
+        spec.fields()
+            .iter()
+            .filter(|f| f.transform == Transform::Identity)
+            .filter_map(|f| {
+                schema
+                    .field_by_id(f.source_id)
+                    .map(|sf| sf.name.clone())
+            })
+            .collect()
+    }
 
     pub async fn data_file_paths(&self) -> Result<Vec<String>, iceberg::Error> {
         let info = self.data_file_info().await?;
@@ -89,6 +117,10 @@ impl IcebergScanExec {
                     pruned_count = pc;
                     if pruned_count > 0 {
                         debug!(pruned = pruned_count, remaining = kept.len(), "File-level min/max pruning");
+                        // Increment Prometheus file pruning counter
+                        if let Some(ref pm) = self.prom_metrics {
+                            pm.files_pruned_minmax.inc_by(pruned_count as f64);
+                        }
                         let kept_paths: std::collections::HashSet<String> = kept.iter().map(|df| df.file_path().to_string()).collect();
                         result.retain(|(path, _)| kept_paths.contains(path));
                     }

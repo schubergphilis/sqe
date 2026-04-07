@@ -148,6 +148,7 @@ impl FlightService for WorkerFlightService {
                     Some(cred_rx),
                     footer_cache.as_ref(),
                     None, // Late materialization filter (not yet wired from coordinator)
+                    None, // Coordinator metrics (workers don't have coordinator registry)
                 )
                     .await
                     .map_err(|e| {

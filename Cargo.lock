@@ -4825,8 +4825,10 @@ name = "sqe-planner"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "arrow-array",
  "arrow-schema",
  "datafusion",
+ "futures",
  "serde",
  "serde_json",
  "sqe-core",

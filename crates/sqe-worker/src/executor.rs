@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 use sqe_catalog::FooterCache;
-use sqe_metrics::WorkerMetricsRegistry;
+use sqe_metrics::{MetricsRegistry, WorkerMetricsRegistry};
 use sqe_planner::ScanTask;
 
 use crate::credential_channel::RefreshableCredentials;
@@ -52,7 +52,7 @@ use crate::credential_channel::RefreshableCredentials;
 /// predicate columns and evaluates the filter; Phase 2 reads remaining
 /// projection columns only for surviving rows. This can reduce S3 I/O by
 /// 10-50x for selective queries on wide tables.
-#[tracing::instrument(skip(task, metrics, session_ctx, credential_rx, footer_cache, filter_expr), fields(fragment_id = %task.fragment_id, file_count = task.data_file_paths.len()))]
+#[tracing::instrument(skip(task, metrics, session_ctx, credential_rx, footer_cache, filter_expr, coordinator_metrics), fields(fragment_id = %task.fragment_id, file_count = task.data_file_paths.len()))]
 pub async fn execute_scan(
     task: &ScanTask,
     metrics: Option<&Arc<WorkerMetricsRegistry>>,
@@ -60,6 +60,7 @@ pub async fn execute_scan(
     credential_rx: Option<watch::Receiver<Option<RefreshableCredentials>>>,
     footer_cache: Option<&Arc<FooterCache>>,
     filter_expr: Option<Arc<dyn PhysicalExpr>>,
+    coordinator_metrics: Option<&Arc<MetricsRegistry>>,
 ) -> anyhow::Result<(SchemaRef, Vec<RecordBatch>)> {
     let start = std::time::Instant::now();
 
@@ -140,7 +141,12 @@ pub async fn execute_scan(
         let path = ObjectPath::from(object_key.as_str());
 
         // Use head() to get ObjectMeta (includes size) for bounded range requests
+        let s3_start = std::time::Instant::now();
         let meta = store.head(&path).await?;
+        // Record S3 HEAD request
+        if let Some(cm) = coordinator_metrics {
+            cm.s3_requests_total.with_label_values(&["head", "success"]).inc();
+        }
         total_bytes += meta.size as u64;
         let reader = ParquetObjectReader::new(store.clone(), meta.location)
             .with_file_size(meta.size);
@@ -174,6 +180,11 @@ pub async fn execute_scan(
                 // Enable page-level min/max pruning via PageIndex.
                 // This lets the Parquet reader skip individual data pages
                 // within row groups whose min/max don't satisfy the predicate.
+                //
+                // NOTE: sqe_pages_pruned_index_total remains at 0 because arrow-rs
+                // does not expose a page-skip counter from its internal PageIndex
+                // pruning. Instrumenting this requires upstream changes in arrow-rs
+                // or a custom ParquetExec wrapper. Tracked for future work.
                 let reader_opts = ArrowReaderOptions::new().with_page_index(true);
                 let arrow_meta = ArrowReaderMetadata::try_new(
                     cached_meta,
@@ -256,6 +267,32 @@ pub async fn execute_scan(
 
         let stream = builder.build()?;
         let batches: Vec<RecordBatch> = stream.try_collect().await?;
+
+        // Record S3 GET metrics for this file read
+        if let Some(cm) = coordinator_metrics {
+            let s3_elapsed = s3_start.elapsed();
+            cm.s3_requests_total.with_label_values(&["get", "success"]).inc();
+            cm.s3_bytes_read_total.inc_by(meta.size as u64);
+            cm.s3_request_duration_seconds.observe(s3_elapsed.as_secs_f64());
+
+            // Late materialization metrics: track bytes and selectivity when
+            // a RowFilter was applied. Approximate predicate bytes as the file
+            // size (full file was fetched from S3), and projection bytes as the
+            // in-memory batch size (which reflects only surviving/projected data).
+            if filter_expr.is_some() {
+                let batch_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                let batch_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+                cm.late_mat_bytes_predicate.inc_by(meta.size as f64);
+                cm.late_mat_bytes_projection.inc_by(batch_bytes as f64);
+                // Estimate selectivity from metadata: file_record_count vs surviving rows.
+                // We approximate the pre-filter row count from metadata row group info.
+                // For a simple estimate, use file_size ratio as a proxy.
+                if meta.size > 0 && batch_rows > 0 {
+                    let selectivity = batch_bytes as f64 / meta.size as f64;
+                    cm.late_mat_selectivity.observe(selectivity.min(1.0));
+                }
+            }
+        }
 
         if result_schema.is_none() && !batches.is_empty() {
             result_schema = Some(batches[0].schema());

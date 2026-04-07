@@ -58,6 +58,7 @@ pub struct SqeFlightSqlService {
     worker_registry: Option<Arc<WorkerRegistry>>,
     query_tracker: Arc<QueryTracker>,
     worker_secret: String,
+    metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
 }
 
 impl SqeFlightSqlService {
@@ -75,7 +76,13 @@ impl SqeFlightSqlService {
             worker_registry: None,
             query_tracker,
             worker_secret,
+            metrics: None,
         }
+    }
+
+    pub fn with_metrics(mut self, metrics: Arc<sqe_metrics::MetricsRegistry>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Returns a reference to the query tracker for external access
@@ -150,6 +157,9 @@ impl SqeFlightSqlService {
         // If the token looks like a JWT (contains dots), treat it as a raw
         // access token — create an ad-hoc session like Trino-compat does.
         if token.contains('.') {
+            if let Some(ref metrics) = self.metrics {
+                metrics.auth_attempts_total.with_label_values(&["bearer", "success"]).inc();
+            }
             let username = metadata
                 .get("x-trino-user")
                 .and_then(|v| v.to_str().ok())
@@ -342,19 +352,39 @@ impl FlightSqlService for SqeFlightSqlService {
             ..Default::default()
         };
 
+        let auth_start = std::time::Instant::now();
+
         let auth_result = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             self.session_manager.authenticate_credentials(&credentials),
         )
         .await;
 
+        let auth_elapsed = auth_start.elapsed();
+
+        // Record auth duration regardless of outcome
+        if let Some(ref metrics) = self.metrics {
+            metrics.auth_duration_seconds.observe(auth_elapsed.as_secs_f64());
+        }
+
         let session = match auth_result {
-            Ok(Ok(session)) => session,
+            Ok(Ok(session)) => {
+                if let Some(ref metrics) = self.metrics {
+                    metrics.auth_attempts_total.with_label_values(&["oidc", "success"]).inc();
+                }
+                session
+            }
             Ok(Err(e)) => {
+                if let Some(ref metrics) = self.metrics {
+                    metrics.auth_attempts_total.with_label_values(&["oidc", "failed"]).inc();
+                }
                 warn!(username = username, client_ip = %client_ip, error = %e, "Authentication failed");
                 return Err(Status::unauthenticated(format!("Authentication failed: {e}")));
             }
             Err(_) => {
+                if let Some(ref metrics) = self.metrics {
+                    metrics.auth_attempts_total.with_label_values(&["oidc", "failed"]).inc();
+                }
                 warn!(username = username, "Handshake timed out after 30s");
                 return Err(Status::deadline_exceeded("Authentication timed out"));
             }

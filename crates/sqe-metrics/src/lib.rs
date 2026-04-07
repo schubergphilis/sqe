@@ -68,6 +68,20 @@ pub struct MetricsRegistry {
 
     // Latency
     pub time_to_first_row: Histogram,
+
+    // S3 I/O metrics
+    pub s3_requests_total: IntCounterVec,
+    pub s3_bytes_read_total: IntCounter,
+    pub s3_bytes_written_total: IntCounter,
+    pub s3_request_duration_seconds: Histogram,
+
+    // Auth metrics
+    pub auth_attempts_total: IntCounterVec,
+    pub auth_duration_seconds: Histogram,
+    pub token_refresh_total: IntCounterVec,
+
+    // Adaptive sort metrics
+    pub sorts_stripped_total: IntCounterVec,
 }
 
 impl MetricsRegistry {
@@ -307,6 +321,80 @@ impl MetricsRegistry {
         .unwrap();
         registry.register(Box::new(time_to_first_row.clone())).unwrap();
 
+        // S3 I/O metrics
+        let s3_requests_total = IntCounterVec::new(
+            Opts::new("sqe_s3_requests_total", "Total S3 requests by operation and status"),
+            &["operation", "status"],
+        )
+        .unwrap();
+        registry.register(Box::new(s3_requests_total.clone())).unwrap();
+
+        let s3_bytes_read_total = IntCounter::new(
+            "sqe_s3_bytes_read_total",
+            "Total bytes fetched from S3",
+        )
+        .unwrap();
+        registry.register(Box::new(s3_bytes_read_total.clone())).unwrap();
+
+        let s3_bytes_written_total = IntCounter::new(
+            "sqe_s3_bytes_written_total",
+            "Total bytes written to S3",
+        )
+        .unwrap();
+        registry.register(Box::new(s3_bytes_written_total.clone())).unwrap();
+
+        let s3_request_duration_seconds = Histogram::with_opts(
+            HistogramOpts::new(
+                "sqe_s3_request_duration_seconds",
+                "S3 request latency in seconds",
+            )
+            .buckets(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]),
+        )
+        .unwrap();
+        registry.register(Box::new(s3_request_duration_seconds.clone())).unwrap();
+
+        // Auth metrics
+        let auth_attempts_total = IntCounterVec::new(
+            Opts::new(
+                "sqe_auth_attempts_total",
+                "Total authentication attempts by provider and status",
+            ),
+            &["provider", "status"],
+        )
+        .unwrap();
+        registry.register(Box::new(auth_attempts_total.clone())).unwrap();
+
+        let auth_duration_seconds = Histogram::with_opts(
+            HistogramOpts::new(
+                "sqe_auth_duration_seconds",
+                "Authentication handshake latency in seconds",
+            )
+            .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0]),
+        )
+        .unwrap();
+        registry.register(Box::new(auth_duration_seconds.clone())).unwrap();
+
+        let token_refresh_total = IntCounterVec::new(
+            Opts::new(
+                "sqe_token_refresh_total",
+                "Total token refresh attempts by status",
+            ),
+            &["status"],
+        )
+        .unwrap();
+        registry.register(Box::new(token_refresh_total.clone())).unwrap();
+
+        // Adaptive sort stripping metric
+        let sorts_stripped_total = IntCounterVec::new(
+            Opts::new(
+                "sqe_sorts_stripped_total",
+                "Total sort operations stripped by adaptive sort rule",
+            ),
+            &["mode", "reason"],
+        )
+        .unwrap();
+        registry.register(Box::new(sorts_stripped_total.clone())).unwrap();
+
         Self {
             registry,
             query_count,
@@ -343,6 +431,14 @@ impl MetricsRegistry {
             files_pruned_bloom,
             pages_pruned_index,
             time_to_first_row,
+            s3_requests_total,
+            s3_bytes_read_total,
+            s3_bytes_written_total,
+            s3_request_duration_seconds,
+            auth_attempts_total,
+            auth_duration_seconds,
+            token_refresh_total,
+            sorts_stripped_total,
         }
     }
 }
@@ -350,6 +446,12 @@ impl MetricsRegistry {
 impl Default for MetricsRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl std::fmt::Debug for MetricsRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetricsRegistry").finish_non_exhaustive()
     }
 }
 
@@ -489,8 +591,19 @@ mod tests {
         metrics.files_pruned_bloom.inc_by(0.0);
         metrics.pages_pruned_index.inc_by(0.0);
         metrics.time_to_first_row.observe(0.1);
-        // 17 original + 14 new = 31 minimum
-        assert!(metrics.registry.gather().len() >= 31);
+        // S3 I/O metrics
+        metrics.s3_requests_total.with_label_values(&["get", "success"]).inc_by(0);
+        metrics.s3_bytes_read_total.inc_by(0);
+        metrics.s3_bytes_written_total.inc_by(0);
+        metrics.s3_request_duration_seconds.observe(0.01);
+        // Auth metrics
+        metrics.auth_attempts_total.with_label_values(&["oidc", "success"]).inc_by(0);
+        metrics.auth_duration_seconds.observe(0.1);
+        metrics.token_refresh_total.with_label_values(&["success"]).inc_by(0);
+        // Adaptive sort metric
+        metrics.sorts_stripped_total.with_label_values(&["adaptive", "memory_pressure"]).inc_by(0);
+        // 17 original + 14 streaming + 7 new (S3 + auth) + 1 adaptive sort = 39 minimum
+        assert!(metrics.registry.gather().len() >= 39);
     }
 
     #[test]
@@ -576,6 +689,81 @@ mod tests {
         assert_eq!(metrics.time_to_first_row.get_sample_count(), 3);
         let sum = metrics.time_to_first_row.get_sample_sum();
         assert!((sum - 5.55).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_s3_metrics() {
+        let metrics = MetricsRegistry::new();
+        metrics.s3_requests_total.with_label_values(&["get", "success"]).inc();
+        metrics.s3_requests_total.with_label_values(&["get", "success"]).inc();
+        metrics.s3_requests_total.with_label_values(&["put", "success"]).inc();
+        metrics.s3_requests_total.with_label_values(&["get", "error"]).inc();
+        assert_eq!(
+            metrics.s3_requests_total.with_label_values(&["get", "success"]).get(),
+            2
+        );
+        assert_eq!(
+            metrics.s3_requests_total.with_label_values(&["put", "success"]).get(),
+            1
+        );
+        assert_eq!(
+            metrics.s3_requests_total.with_label_values(&["get", "error"]).get(),
+            1
+        );
+
+        metrics.s3_bytes_read_total.inc_by(4096);
+        metrics.s3_bytes_written_total.inc_by(2048);
+        assert_eq!(metrics.s3_bytes_read_total.get(), 4096);
+        assert_eq!(metrics.s3_bytes_written_total.get(), 2048);
+
+        metrics.s3_request_duration_seconds.observe(0.05);
+        metrics.s3_request_duration_seconds.observe(0.15);
+        assert_eq!(metrics.s3_request_duration_seconds.get_sample_count(), 2);
+    }
+
+    #[test]
+    fn test_auth_metrics() {
+        let metrics = MetricsRegistry::new();
+        metrics.auth_attempts_total.with_label_values(&["oidc", "success"]).inc();
+        metrics.auth_attempts_total.with_label_values(&["oidc", "failed"]).inc();
+        metrics.auth_attempts_total.with_label_values(&["bearer", "success"]).inc();
+        assert_eq!(
+            metrics.auth_attempts_total.with_label_values(&["oidc", "success"]).get(),
+            1
+        );
+        assert_eq!(
+            metrics.auth_attempts_total.with_label_values(&["oidc", "failed"]).get(),
+            1
+        );
+        assert_eq!(
+            metrics.auth_attempts_total.with_label_values(&["bearer", "success"]).get(),
+            1
+        );
+
+        metrics.auth_duration_seconds.observe(0.25);
+        metrics.auth_duration_seconds.observe(1.5);
+        assert_eq!(metrics.auth_duration_seconds.get_sample_count(), 2);
+
+        metrics.token_refresh_total.with_label_values(&["success"]).inc();
+        metrics.token_refresh_total.with_label_values(&["failed"]).inc();
+        assert_eq!(metrics.token_refresh_total.with_label_values(&["success"]).get(), 1);
+        assert_eq!(metrics.token_refresh_total.with_label_values(&["failed"]).get(), 1);
+    }
+
+    #[test]
+    fn test_sorts_stripped_metric() {
+        let metrics = MetricsRegistry::new();
+        metrics.sorts_stripped_total.with_label_values(&["adaptive", "memory_pressure"]).inc();
+        metrics.sorts_stripped_total.with_label_values(&["partition_only", "partition_only"]).inc();
+        metrics.sorts_stripped_total.with_label_values(&["adaptive", "memory_pressure"]).inc();
+        assert_eq!(
+            metrics.sorts_stripped_total.with_label_values(&["adaptive", "memory_pressure"]).get(),
+            2
+        );
+        assert_eq!(
+            metrics.sorts_stripped_total.with_label_values(&["partition_only", "partition_only"]).get(),
+            1
+        );
     }
 
     // ── WorkerMetricsRegistry tests ─────────────────────────────
