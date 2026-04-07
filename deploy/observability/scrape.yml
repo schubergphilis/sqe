@@ -1,0 +1,35 @@
+# VictoriaMetrics scrape config for SQE benchmarks
+# Scrapes all possible SQE endpoints (single-node + distributed)
+# Targets that are down are silently skipped.
+
+scrape_configs:
+  # Single-node coordinator (native, port 19090)
+  - job_name: sqe-coordinator-single
+    scrape_interval: 5s
+    static_configs:
+      - targets: ["host.docker.internal:19090"]
+        labels:
+          config: single-node
+          component: coordinator
+
+  # Distributed coordinator (Docker, port 29090)
+  - job_name: sqe-coordinator-distributed
+    scrape_interval: 5s
+    static_configs:
+      - targets: ["host.docker.internal:29090"]
+        labels:
+          config: distributed
+          component: coordinator
+
+  # Distributed workers (Docker, ports 29091-29094)
+  - job_name: sqe-workers
+    scrape_interval: 5s
+    static_configs:
+      - targets:
+          - "host.docker.internal:29091"
+          - "host.docker.internal:29092"
+          - "host.docker.internal:29093"
+          - "host.docker.internal:29094"
+        labels:
+          config: distributed
+          component: worker
