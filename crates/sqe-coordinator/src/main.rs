@@ -177,7 +177,7 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     // Spawn background memory metrics reporter (updates gauges every 1s for Grafana)
-    crate::memory::spawn_metrics_reporter(
+    sqe_coordinator::memory::spawn_metrics_reporter(
         query_handler.runtime().clone(),
         metrics.clone(),
     );
