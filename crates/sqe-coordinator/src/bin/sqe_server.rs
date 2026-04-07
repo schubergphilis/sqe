@@ -466,6 +466,12 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         query_cache,
     ));
 
+    // Spawn background memory metrics reporter (updates gauges every 1s for Grafana)
+    sqe_coordinator::memory::spawn_metrics_reporter(
+        query_handler.runtime().clone(),
+        metrics.clone(),
+    );
+
     // Build bearer token auth chain for Trino-compat HTTP bearer token validation.
     let bearer_provider: Option<Arc<dyn sqe_auth::AuthProvider>> =
         match sqe_auth::build_auth_chain(&config.auth).await {

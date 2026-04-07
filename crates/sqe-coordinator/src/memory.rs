@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool};
+use datafusion::execution::runtime_env::RuntimeEnv;
 
 /// Memory pressure classification based on pool utilization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +95,34 @@ pub fn limit_bytes(pool: &Arc<dyn MemoryPool>) -> usize {
         MemoryLimit::Finite(n) => n,
         _ => 0,
     }
+}
+
+/// Spawn a background task that updates memory metrics every second.
+///
+/// This ensures Prometheus/Grafana always sees current memory usage,
+/// even between queries. Without this, gauges only update at query start
+/// and show 0 between queries (because the 5s scrape interval misses
+/// the brief query execution window).
+pub fn spawn_metrics_reporter(
+    runtime: Arc<RuntimeEnv>,
+    metrics: Arc<sqe_metrics::MetricsRegistry>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            let pool = &runtime.memory_pool;
+            let used = pool.reserved();
+            let limit = match pool.memory_limit() {
+                MemoryLimit::Finite(n) => n,
+                _ => 0,
+            };
+            let pressure = MemoryPressure::from_usage(used, limit);
+            metrics.coordinator_memory_used_bytes.set(used as f64);
+            metrics.coordinator_memory_limit_bytes.set(limit as f64);
+            metrics.coordinator_memory_pressure.set(pressure.as_gauge());
+        }
+    })
 }
 
 #[cfg(test)]

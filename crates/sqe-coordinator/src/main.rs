@@ -176,6 +176,12 @@ async fn main() -> anyhow::Result<()> {
         query_cache,
     ));
 
+    // Spawn background memory metrics reporter (updates gauges every 1s for Grafana)
+    crate::memory::spawn_metrics_reporter(
+        query_handler.runtime().clone(),
+        metrics.clone(),
+    );
+
     // Build bearer token auth chain for Trino-compat HTTP bearer token validation.
     // This uses the same provider chain configured in [auth.providers], which may
     // include a BearerTokenProvider with JWKS validation.
