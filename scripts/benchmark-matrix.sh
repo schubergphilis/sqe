@@ -622,6 +622,133 @@ for suite in suites:
     print()
 " 2>/dev/null | tee -a "$SUMMARY_FILE"
 
+# ── Metrics analytics report per config ───────────────────────────────
+echo "" | tee -a "$SUMMARY_FILE"
+echo "Metrics Analytics:" | tee -a "$SUMMARY_FILE"
+echo "" | tee -a "$SUMMARY_FILE"
+
+for CONFIG in $CONFIGS; do
+    # Merge all suite deltas for this config into one
+    MERGED=""
+    for f in "$METRICS_DIR"/*-"${CONFIG}-${TIMESTAMP}"-delta.txt; do
+        [[ -f "$f" ]] && MERGED="$MERGED $f"
+    done
+    [[ -z "$MERGED" ]] && continue
+
+    python3 -c "
+import sys, os
+
+config = '$CONFIG'
+files = '$MERGED'.strip().split()
+
+# Sum all deltas across suites
+totals = {}
+for f in files:
+    if not os.path.exists(f):
+        continue
+    for line in open(f):
+        parts = line.strip().split(' ', 1)
+        if len(parts) == 2:
+            key, val = parts[0], float(parts[1])
+            totals[key] = totals.get(key, 0) + val
+
+if not totals:
+    sys.exit(0)
+
+def get(prefix):
+    return {k: v for k, v in totals.items() if prefix in k}
+
+def val(key, default=0):
+    return totals.get(key, default)
+
+def fmt_bytes(b):
+    if b >= 1024**3: return f'{b/1024**3:.1f} GB'
+    if b >= 1024**2: return f'{b/1024**2:.1f} MB'
+    if b >= 1024: return f'{b/1024:.1f} KB'
+    return f'{b:.0f} B'
+
+def bar(value, max_val, width=20):
+    if max_val <= 0: return '.' * width
+    filled = int((value / max_val) * width)
+    return '#' * min(filled, width) + '.' * max(width - filled, 0)
+
+print(f'  {config}')
+print(f'  {\"=\" * 60}')
+
+# Memory
+mem_used = val('sqe_coordinator_memory_used_bytes')
+mem_limit = val('sqe_coordinator_memory_limit_bytes')
+if mem_limit > 0:
+    pct = (mem_used / mem_limit) * 100
+    print(f'  Memory:  peak {fmt_bytes(mem_used)} / {fmt_bytes(mem_limit)} ({pct:.0f}%)')
+    print(f'           [{bar(mem_used, mem_limit, 30)}]')
+
+# Spill
+sort_spills = val('sqe_sort_spill_count_total')
+sort_bytes = val('sqe_sort_spill_bytes_total')
+join_spills = val('sqe_join_spill_count_total')
+join_bytes = val('sqe_join_spill_bytes_total')
+if sort_spills > 0 or join_spills > 0:
+    print(f'  Spill:   sort: {int(sort_spills)} events ({fmt_bytes(sort_bytes)})')
+    print(f'           join: {int(join_spills)} events ({fmt_bytes(join_bytes)})')
+else:
+    print(f'  Spill:   none (all in-memory)')
+
+# Cache
+q_hits = val('sqe_cache_hits_total')
+q_misses = val('sqe_cache_misses_total')
+f_hits = val('sqe_footer_cache_hits')
+f_misses = val('sqe_footer_cache_misses')
+if q_hits + q_misses > 0:
+    q_rate = q_hits / (q_hits + q_misses) * 100
+    print(f'  Cache:   query: {int(q_hits)} hits / {int(q_misses)} misses ({q_rate:.0f}% hit rate)')
+else:
+    print(f'  Cache:   query: no activity')
+if f_hits + f_misses > 0:
+    f_rate = f_hits / (f_hits + f_misses) * 100
+    print(f'           footer: {int(f_hits)} hits / {int(f_misses)} misses ({f_rate:.0f}% hit rate)')
+    total_reads = f_hits + f_misses
+    print(f'           [{bar(f_hits, total_reads, 30)}] footer cache')
+
+# Pruning
+minmax = val('sqe_files_pruned_minmax_total')
+bloom = val('sqe_files_pruned_bloom_total')
+pages = val('sqe_pages_pruned_index_total')
+if minmax > 0 or bloom > 0 or pages > 0:
+    print(f'  Pruning: {int(minmax)} files (min/max), {int(bloom)} files (bloom), {int(pages)} pages (index)')
+else:
+    print(f'  Pruning: none')
+
+# Late materialization
+pred_bytes = val('sqe_late_mat_bytes_predicate_total')
+proj_bytes = val('sqe_late_mat_bytes_projection_total')
+if pred_bytes > 0 or proj_bytes > 0:
+    total_io = pred_bytes + proj_bytes
+    savings = (1 - total_io / (total_io * 2)) * 100 if total_io > 0 else 0
+    print(f'  Late mat: predicate I/O: {fmt_bytes(pred_bytes)}, projection I/O: {fmt_bytes(proj_bytes)}')
+
+# Queries
+queries = val('sqe_query_count_total{status=\"success\"}', val('sqe_query_count_total'))
+rows = val('sqe_rows_returned_total')
+if queries > 0:
+    print(f'  Queries: {int(queries)} executed, {int(rows)} rows returned')
+
+# Workers
+frags = val('sqe_worker_fragments_executed_total')
+w_bytes = val('sqe_worker_bytes_read_total')
+if frags > 0:
+    print(f'  Workers: {int(frags)} fragments, {fmt_bytes(w_bytes)} read from S3')
+
+# Shuffle
+shuf_sent = val('sqe_shuffle_bytes_sent_total')
+shuf_recv = val('sqe_shuffle_bytes_received_total')
+if shuf_sent > 0 or shuf_recv > 0:
+    print(f'  Shuffle: {fmt_bytes(shuf_sent)} sent, {fmt_bytes(shuf_recv)} received')
+
+print()
+" 2>/dev/null | tee -a "$SUMMARY_FILE"
+done
+
 echo "" | tee -a "$SUMMARY_FILE"
 echo "Tagged results (config in filename):"
 ls -1 "$RESULTS_DIR"/*-"${TIMESTAMP}".json 2>/dev/null | sed 's|.*/||' | sed 's/^/  /'
