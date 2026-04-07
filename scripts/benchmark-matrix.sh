@@ -113,11 +113,12 @@ if command -v docker &>/dev/null; then
     DOCKER_MEM_MB=$(docker stats --no-stream --format "{{.MemUsage}}" 2>/dev/null \
         | awk -F'/' '{print $1}' \
         | awk '{
-            gsub(/[^0-9.GiMB]/, "", $0)
-            if (index($0, "GiB")) { gsub(/GiB/, "", $0); sum += $0 * 1024 }
-            else if (index($0, "MiB")) { gsub(/MiB/, "", $0); sum += $0 }
-            else if (index($0, "B")) { gsub(/B/, "", $0); sum += $0 / 1024 / 1024 }
-        } END { print int(sum) }' || echo "0")
+            val = $0
+            if (index(val, "GiB")) { gsub(/[^0-9.]/, "", val); sum += val * 1024 }
+            else if (index(val, "MiB")) { gsub(/[^0-9.]/, "", val); sum += val }
+            else if (index(val, "KiB")) { gsub(/[^0-9.]/, "", val); sum += val / 1024 }
+        } END { printf "%d", sum }' 2>/dev/null || echo "0")
+    DOCKER_MEM_MB=${DOCKER_MEM_MB:-0}
 fi
 DOCKER_MEM_GB=$((DOCKER_MEM_MB / 1024))
 AVAIL_GB=$((TOTAL_RAM_GB - DOCKER_MEM_GB - 4))  # 4GB OS overhead
@@ -141,8 +142,9 @@ if $NEEDS_DISTRIBUTED && [[ $AVAIL_GB -lt 12 ]]; then
     echo ""
 
     # Find non-essential Docker stacks
+    # Find containers NOT part of the SQE test/bench stack or Docker internals
     OTHER_STACKS=$(docker ps --format "{{.Names}}" 2>/dev/null \
-        | grep -v "sqlengine-\|buildx_" \
+        | grep -vE "^(sqlengine-|buildx_)" \
         | head -10 || true)
 
     if [[ -n "$OTHER_STACKS" ]]; then
@@ -153,15 +155,18 @@ if $NEEDS_DISTRIBUTED && [[ $AVAIL_GB -lt 12 ]]; then
         if [[ "$STOP_OTHERS" =~ ^[Yy]$ ]]; then
             echo "Stopping non-SQE containers..."
             # Find compose projects that aren't ours
+            # Collect unique compose projects to stop (never stop sqlengine project)
+            PROJECTS_TO_STOP=""
             for container in $OTHER_STACKS; do
                 project=$(docker inspect "$container" --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null || echo "")
                 if [[ -n "$project" && "$project" != "sqlengine" ]]; then
-                    echo "  Stopping project: $project"
-                    docker compose -p "$project" stop 2>/dev/null || docker stop "$container" 2>/dev/null || true
-                else
-                    echo "  Stopping: $container"
-                    docker stop "$container" 2>/dev/null || true
+                    PROJECTS_TO_STOP="$PROJECTS_TO_STOP $project"
                 fi
+            done
+            # Deduplicate and stop each project
+            for project in $(echo "$PROJECTS_TO_STOP" | tr ' ' '\n' | sort -u); do
+                echo "  Stopping project: $project"
+                docker compose -p "$project" stop 2>/dev/null || true
             done
             echo ""
             # Recheck
