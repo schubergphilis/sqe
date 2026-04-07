@@ -11,7 +11,9 @@ use tracing::{debug, info, warn};
 
 use sqlparser::ast::Statement;
 use sqe_catalog::{IcebergScanExec, SessionCatalog};
-use sqe_core::{QueryConfig, Session, SqeConfig, SqeError};
+use sqe_core::{QueryConfig, Session, SortMode, SqeConfig, SqeError};
+
+use crate::adaptive_sort;
 use sqe_policy::{PolicyEnforcer, PolicyStore};
 use sqe_sql::{parse_and_classify, StatementKind};
 
@@ -76,7 +78,10 @@ impl QueryHandler {
         query_cache: Option<Arc<ResultCache>>,
     ) -> Self {
         let catalog_ops = CatalogOps::new(config.clone());
-        let write_handler = WriteHandler::new(config.clone());
+        let mut write_handler = WriteHandler::new(config.clone());
+        if let Some(ref m) = metrics {
+            write_handler = write_handler.with_metrics(Arc::clone(m));
+        }
         let explain_handler = crate::explain::ExplainHandler::new(Arc::clone(&policy_enforcer));
         let query_semaphore = if config.query.max_concurrent_queries > 0 {
             Some(Arc::new(tokio::sync::Semaphore::new(config.query.max_concurrent_queries)))
@@ -161,8 +166,9 @@ impl QueryHandler {
                 username = %session.user.username,
                 "Rejecting query due to memory pressure"
             );
+            let sort_cols = extract_order_by_columns(sql);
             return Err(SqeError::Execution(
-                "Server under memory pressure (>95% utilized). Please retry later.".to_string(),
+                adaptive_sort::format_pressure_rejection(&sort_cols, pressure),
             ));
         }
 
@@ -595,6 +601,19 @@ impl QueryHandler {
             .await
             .map_err(|e| SqeError::Execution(format!("Physical plan creation failed: {e}")))?;
 
+        // Apply adaptive sort stripping based on sort_mode config and memory pressure.
+        let sort_mode = SortMode::parse(&self.config.query.sort_mode);
+        let pressure = crate::memory::check_pressure(&self.runtime.memory_pool);
+        let (physical_plan, sort_decisions) = adaptive_sort::apply_adaptive_sort(
+            physical_plan,
+            sort_mode,
+            pressure,
+            self.metrics.as_ref(),
+        );
+        if let Some(warning) = adaptive_sort::format_sort_warning(&sort_decisions, sort_mode) {
+            debug!(warning = %warning, "Adaptive sort stripping applied");
+        }
+
         // Try to distribute scan work across workers
         let final_plan = self.try_distribute(physical_plan, session, query_id).await;
 
@@ -961,6 +980,7 @@ impl QueryHandler {
             self.policy_store.as_ref(),
             &self.query_tracker,
             Some(&self.runtime),
+            self.metrics.as_ref(),
         )
         .await
     }
@@ -1169,6 +1189,29 @@ impl QueryHandler {
         Ok(())
     }
 
+}
+
+/// Best-effort extraction of ORDER BY column names from SQL text.
+fn extract_order_by_columns(sql: &str) -> Vec<String> {
+    let upper = sql.to_uppercase();
+    if let Some(idx) = upper.rfind("ORDER BY") {
+        let after = &sql[idx + 8..];
+        let end = after
+            .find([')' , ';'])
+            .or_else(|| {
+                let u = after.to_uppercase();
+                u.find("LIMIT").or_else(|| u.find("OFFSET")).or_else(|| u.find("FETCH"))
+            })
+            .unwrap_or(after.len());
+        let cols_str = &after[..end];
+        cols_str
+            .split(',')
+            .map(|s| s.split_whitespace().next().unwrap_or("").to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        vec![]
+    }
 }
 
 /// Walk a physical plan tree and aggregate spill metrics from all operators.

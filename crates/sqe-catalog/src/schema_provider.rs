@@ -27,6 +27,7 @@ pub struct SqeSchemaProvider {
     namespace: String,
     storage_config: StorageConfig,
     warehouse: String,
+    prom_metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
 }
 
 impl SqeSchemaProvider {
@@ -42,7 +43,14 @@ impl SqeSchemaProvider {
             namespace,
             storage_config,
             warehouse,
+            prom_metrics: None,
         }
+    }
+
+    /// Attach Prometheus metrics to propagate to table providers.
+    pub fn with_metrics(mut self, metrics: Arc<sqe_metrics::MetricsRegistry>) -> Self {
+        self.prom_metrics = Some(metrics);
+        self
     }
 }
 
@@ -114,7 +122,13 @@ impl SchemaProvider for SqeSchemaProvider {
         match self.session_catalog.load_table(&table_ident).await {
             Ok(table) => {
                 match SqeTableProvider::try_new(table).await {
-                    Ok(provider) => return Ok(Some(Arc::new(provider))),
+                    Ok(provider) => {
+                        let provider = match self.prom_metrics {
+                            Some(ref m) => provider.with_metrics(Arc::clone(m)),
+                            None => provider,
+                        };
+                        return Ok(Some(Arc::new(provider)));
+                    }
                     Err(e) => {
                         error!(table = name, error = %e, "Failed to create table provider");
                     }

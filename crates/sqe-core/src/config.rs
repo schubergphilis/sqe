@@ -25,6 +25,32 @@ pub struct SqeConfig {
     pub query_history: QueryHistoryConfig,
 }
 
+/// Controls adaptive sort stripping behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortMode {
+    /// Always sort. Spill to disk if needed.
+    Strict,
+    /// Only sort when keys match Iceberg partition columns.
+    PartitionOnly,
+    /// Sort when memory allows; strip non-partition sorts under pressure.
+    Adaptive,
+}
+
+impl SortMode {
+    /// Parse from config string. Returns `Adaptive` for unknown values.
+    pub fn parse(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "strict" => Self::Strict,
+            "partition_only" | "partition-only" => Self::PartitionOnly,
+            "adaptive" => Self::Adaptive,
+            _ => {
+                tracing::warn!(sort_mode = s, "Unknown sort_mode, defaulting to adaptive");
+                Self::Adaptive
+            }
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct QueryConfig {
     /// Maximum query execution time in seconds. Default: 300 (5 minutes).
@@ -57,6 +83,15 @@ pub struct QueryConfig {
     /// Target size per scan task for bin-packing. Default: "256MB".
     #[serde(default = "default_target_task_size")]
     pub target_task_size: String,
+    /// Controls when ORDER BY clauses are preserved vs stripped to save memory.
+    ///
+    /// - `"strict"`: Always sort. Spill to disk if needed. (backwards-compatible)
+    /// - `"partition_only"`: Only sort when keys match Iceberg partition columns.
+    /// - `"adaptive"`: Sort when memory is Green; strip non-partition sorts under pressure.
+    ///
+    /// Default: `"adaptive"`
+    #[serde(default = "default_sort_mode")]
+    pub sort_mode: String,
 }
 
 impl Default for QueryConfig {
@@ -71,6 +106,7 @@ impl Default for QueryConfig {
             distribution_threshold: default_distribution_threshold(),
             distribution_file_threshold: default_distribution_file_threshold(),
             target_task_size: default_target_task_size(),
+            sort_mode: default_sort_mode(),
         }
     }
 }
@@ -668,6 +704,7 @@ fn default_max_query_memory() -> String { "256MB".to_string() }
 fn default_distribution_threshold() -> String { "128MB".to_string() }
 fn default_distribution_file_threshold() -> usize { 4 }
 fn default_target_task_size() -> String { "256MB".to_string() }
+fn default_sort_mode() -> String { "adaptive".to_string() }
 
 fn default_coordinator_memory() -> String { "8GB".to_string() }
 fn default_coordinator_spill_dir() -> String { "/tmp/sqe-coordinator-spill".to_string() }
