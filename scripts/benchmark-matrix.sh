@@ -49,6 +49,7 @@ DIST_PORT="60051"
 DIST_USER="root"
 DIST_PASS="s3cr3t"
 DIST_CATALOG="test_warehouse"
+DIST_METRICS_PORT="29090"
 
 # ── Parse args ───────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -356,9 +357,12 @@ run_distributed_config() {
 
     local COMPOSE_FILE
     if [[ "$NUM_WORKERS" == "2" ]]; then
-        COMPOSE_FILE="docker-compose.distributed.yml"
-    else
+        COMPOSE_FILE="docker-compose.bench-2w.yml"
+    elif [[ "$NUM_WORKERS" == "4" ]]; then
         COMPOSE_FILE="docker-compose.bench-4w.yml"
+    else
+        echo "  UNSUPPORTED: ${NUM_WORKERS} workers" | tee -a "$SUMMARY_FILE"
+        return 1
     fi
 
     echo "" | tee -a "$SUMMARY_FILE"
@@ -375,7 +379,7 @@ run_distributed_config() {
     # Wait for coordinator
     echo -n "  Waiting for coordinator..."
     for i in $(seq 1 120); do
-        if curl -s -o /dev/null http://localhost:29090/metrics 2>/dev/null; then
+        if curl -s -o /dev/null "http://localhost:${DIST_METRICS_PORT}/metrics" 2>/dev/null; then
             echo " ready."
             break
         fi
