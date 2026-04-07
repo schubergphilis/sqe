@@ -1,3 +1,4 @@
+pub mod adaptive_sort;
 pub mod catalog_ops;
 pub mod tls;
 pub mod codec;
@@ -6,8 +7,10 @@ pub mod distributed_scan;
 pub mod explain;
 pub mod flight_sql;
 pub mod flight_sql_helpers;
+pub mod memory;
 pub mod mode;
 pub mod query_handler;
+pub mod runtime;
 pub mod session_context;
 pub mod query_cache;
 pub mod query_tracker;

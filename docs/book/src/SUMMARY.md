@@ -19,6 +19,8 @@
 - [Worker](./architecture/worker.md)
 - [Authentication Flow](./architecture/auth-flow.md)
 - [Security & Policy](./architecture/security.md)
+- [Streaming Execution](./architecture/streaming-execution.md)
+- [Research Papers](./architecture/research-papers.md)
 
 ---
 

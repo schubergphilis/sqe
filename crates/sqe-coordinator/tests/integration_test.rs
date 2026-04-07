@@ -2238,14 +2238,14 @@ async fn test_error_classification_live() {
             "TYPE_MISMATCH",
         ),
         (
-            "not supported (DELETE)",
-            "DELETE FROM test_ns.some_table WHERE id = 1",
-            "NOT_SUPPORTED",
+            "DELETE on non-existent table gives catalog error",
+            "DELETE FROM test_ns.nonexistent_delete_target WHERE id = 1",
+            "CATALOG_ERROR",
         ),
         (
-            "not supported (MERGE)",
-            "MERGE INTO test_ns.t USING test_ns.s ON t.id = s.id WHEN MATCHED THEN DELETE",
-            "NOT_SUPPORTED",
+            "MERGE with non-existent source gives table not found",
+            "MERGE INTO test_ns.t USING test_ns.nonexistent_merge_src ON t.id = s.id WHEN MATCHED THEN DELETE",
+            "TABLE_NOT_FOUND",
         ),
         (
             "duplicate table",

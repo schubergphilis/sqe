@@ -4684,6 +4684,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "async-trait",
+ "bytes",
  "chrono",
  "dashmap",
  "datafusion",
@@ -4694,6 +4695,8 @@ dependencies = [
  "iceberg-datafusion",
  "moka",
  "object_store",
+ "parquet",
+ "prometheus",
  "reqwest",
  "serde",
  "serde_json",
@@ -4821,7 +4824,11 @@ dependencies = [
 name = "sqe-planner"
 version = "0.1.0"
 dependencies = [
+ "arrow",
+ "arrow-array",
  "arrow-schema",
+ "datafusion",
+ "futures",
  "serde",
  "serde_json",
  "sqe-core",
@@ -4884,6 +4891,7 @@ dependencies = [
 name = "sqe-worker"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "anyhow",
  "arrow",
  "arrow-array",
@@ -4898,6 +4906,7 @@ dependencies = [
  "parquet",
  "serde",
  "serde_json",
+ "sqe-catalog",
  "sqe-core",
  "sqe-metrics",
  "sqe-planner",

@@ -4,6 +4,16 @@ trino_http_port = 8080
 mode = "hybrid"   # "local", "distributed", or "hybrid"
 # debug = false   # Set true for verbose error messages (dev only)
 
+# Memory limit for coordinator query processing (sorts, joins, aggregates).
+# Supports: B, KB, MB, GB, TB (e.g. "8GB", "4096MB").
+memory_limit = "8GB"
+# Spill to disk when memory limit is reached. Recommended: true for production.
+spill_to_disk = true
+# Directory for spill files. Use fast local SSD. Will be created if it doesn't exist.
+spill_dir = "/tmp/sqe-coordinator-spill"
+# Compression for spill files: "none", "lz4" (fast, recommended), "zstd" (smaller)
+spill_compression = "lz4"
+
 # Optional TLS for Flight SQL listener.
 # When cert_file + key_file are set, the server runs with TLS.
 # When omitted, the server runs in plaintext.
@@ -39,6 +49,8 @@ client_secret = ""
 roles_claim = "realm_access.roles"
 
 # Bearer token (JWT) — for pre-authenticated clients (data platform, CI/CD, Airflow)
+# IMPORTANT: issuer must match KC_HOSTNAME exactly. If KC_HOSTNAME includes a scheme
+# (e.g. "http://auth.local"), the issuer here must use the same scheme.
 [[auth.providers]]
 type = "bearer_token"
 jwks_url = "https://auth.local/realms/iceberg/protocol/openid-connect/certs"
@@ -48,14 +60,31 @@ roles_claim = "realm_access.roles"
 
 # ── Interactive OIDC flows (Trino SSO + CLI device code) ────────
 # Uncomment to enable browser-based SSO for Trino JDBC and device code for CLI.
+#
+# The Authorization Code + PKCE flow is used for Trino external authentication:
+#   1. Trino JDBC sends query without credentials
+#   2. SQE returns 401 with WWW-Authenticate: Bearer x_redirect_server="...", x_token_server="..."
+#   3. JDBC driver opens browser for IdP login
+#   4. User authenticates, SQE receives callback, JDBC polls for token
+#
+# The Device Code flow (RFC 8628) is used for CLI / headless environments:
+#   user runs `sqe auth login`, gets a URL + code, authenticates in browser.
+#
 # [auth.external]
 # issuer = "https://idp.example.com/realms/sqe"
 # client_id = "sqe"
-# client_secret = "your-client-secret"
+# client_secret = "your-client-secret"           # Optional: omit for public clients
 # redirect_uri = "https://sqe.example.com/oauth2/callback"
 # scopes = ["openid", "profile"]
-# challenge_timeout_secs = 900
+# challenge_timeout_secs = 900                    # How long auth sessions live (default: 900s)
+# accept_invalid_certs = false                    # Set true for dev with self-signed certs
 #
+# # Optional: override OIDC discovery endpoints (auto-discovered from issuer by default)
+# # authorization_endpoint = "https://idp.example.com/realms/sqe/protocol/openid-connect/auth"
+# # token_endpoint = "https://idp.example.com/realms/sqe/protocol/openid-connect/token"
+# # device_authorization_endpoint = "https://idp.example.com/realms/sqe/protocol/openid-connect/auth/device"
+#
+# # Device code flow — separate client_id allows different scopes (e.g. offline_access)
 # [auth.external.device]
 # client_id = "sqe-cli"
 # scopes = ["openid", "profile", "offline_access"]
@@ -86,6 +115,14 @@ prometheus_port = 9090
 # Leave empty to disable OpenTelemetry export (structured JSON logs only)
 otlp_endpoint = ""
 audit_log_path = ""
+
+# ── Query execution ───────────────────────────────────────────
+[query]
+# Maximum estimated build-side size for hash join before falling back to
+# SortMergeJoin. SortMergeJoin spills to disk via external sort, preventing
+# OOM on large joins. Default: "2GB". Set to "0" to always use hash join.
+# Supports: B, KB, MB, GB, TB.
+hash_join_memory_threshold = "2GB"
 
 # ── Query result cache ────────────────────────────────────────
 [query_cache]

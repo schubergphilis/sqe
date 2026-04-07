@@ -373,6 +373,7 @@ mod tests {
             ssl_verification: false,
             providers: Vec::new(),
             role_mappings: std::collections::HashMap::new(),
+            external: None,
         }
     }
 
@@ -388,6 +389,7 @@ mod tests {
             ssl_verification: true,
             providers: Vec::new(),
             role_mappings: std::collections::HashMap::new(),
+            external: None,
         }
     }
 

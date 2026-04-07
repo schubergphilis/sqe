@@ -29,3 +29,6 @@ dashmap = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 iceberg-datafusion = { workspace = true }
+parquet = { workspace = true }
+bytes = { workspace = true }
+prometheus = { workspace = true }
