@@ -451,6 +451,29 @@ run_distributed_config() {
     lsof -ti :60051 2>/dev/null | xargs kill -9 2>/dev/null || true
     sleep 1
 
+    # Check available memory before launching distributed stack
+    if command -v sysctl &>/dev/null; then
+        local SYS_RAM_GB=$(($(sysctl -n hw.memsize 2>/dev/null | awk '{print int($1/1024/1024/1024)}') ))
+        local DOCKER_USED_GB=$(docker stats --no-stream --format "{{.MemUsage}}" 2>/dev/null \
+            | awk -F'/' '{print $1}' \
+            | awk '{val=$0; if(index(val,"GiB")){gsub(/[^0-9.]/,"",val);sum+=val}} END{printf "%d",sum}' 2>/dev/null || echo "0")
+        local FREE_GB=$((SYS_RAM_GB - DOCKER_USED_GB - 8))
+        local NEEDED_GB=$(( (NUM_WORKERS + 1) * 4 ))  # rough: 4GB per container
+        if [[ $FREE_GB -lt $NEEDED_GB ]]; then
+            echo "  WARNING: ~${FREE_GB}GB free, need ~${NEEDED_GB}GB for ${NUM_WORKERS} workers"
+            echo "  Skipping $CONFIG_NAME to avoid Docker crash."
+            echo "  $CONFIG_NAME: SKIPPED (insufficient memory)" | tee -a "$SUMMARY_FILE"
+            return 0
+        fi
+    fi
+
+    # Stop any previous distributed stacks to free memory
+    echo "  Stopping any previous distributed stacks..."
+    docker compose -f docker-compose.test.yml -f docker-compose.bench-2w.yml stop coordinator worker-1 worker-2 2>/dev/null || true
+    docker compose -f docker-compose.test.yml -f docker-compose.bench-4w.yml stop coordinator worker-1 worker-2 worker-3 worker-4 2>/dev/null || true
+    docker compose -f docker-compose.test.yml -f docker-compose.distributed.yml stop coordinator worker-1 worker-2 2>/dev/null || true
+    sleep 2
+
     # Start distributed stack
     echo "  Starting distributed stack (${NUM_WORKERS} workers)..."
     docker compose -f docker-compose.test.yml -f "$COMPOSE_FILE" up -d --build 2>&1 | tail -3
