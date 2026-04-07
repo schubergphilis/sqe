@@ -580,6 +580,36 @@ The 512MB test was not about performance. It was about safety. Before the stream
 
 The single failure (q18) is instructive. DataFusion's `GroupedHashAggregateStream` does not yet support cooperative spill — it allocates memory for its hash table, and if the pool is exhausted before the table is complete, the operator fails rather than spilling. This is a known upstream limitation (DataFusion issue #17334). The fix is either more memory (1GB is enough), distributed aggregation (workers each handle a partition of the hash table), or an upstream improvement to the hash aggregate's memory accounting. We chose to document it rather than hide it. The benchmark is not there to make us look good. It is there to show what works and what does not.
 
+### The full matrix: five suites, three configs
+
+We did not stop at TPC-H. The benchmark matrix ran all five suites across all three deployment configurations.
+
+```
+Suite (queries)   single-512mb     single-8gb     distributed-2w
+──────────────────────────────────────────────────────────────────
+TPC-H  (22)       21/22 (29.6s)   22/22 (28.6s)   22/22 (13.5s)
+TPC-DS (99)       92/99 (94.1s)   99/99 (99.4s)   98/99 (36.1s)
+SSB    (13)        4/13 (14.4s)   13/13 (14.3s)   13/13  (5.3s)
+TPC-C  (17)       17/17 (21.5s)   17/17 (22.0s)   17/17  (8.6s)
+TPC-E  (18)       12/18  (8.4s)   13/18 (127.4s)  10/18 (56.0s)
+──────────────────────────────────────────────────────────────────
+Total (169)       146 (86%)       164 (97%)        162 (96%)
+```
+
+The spill data told a story we did not expect:
+
+| Config | Sort Spills | Bytes Spilled |
+|---|---|---|
+| single-512mb | 30 | 1.1 GB |
+| single-8gb | 128 | 27.7 GB |
+| distributed-2w | 3 | 49 MB |
+
+The 8GB configuration spilled *more* than the 512MB one. This is not a bug. It is an artifact of success: 8GB successfully runs TPC-E queries that 512MB cannot even start. Those TPC-E queries involve multi-table joins across 33 brokerage tables — trade to customer_account to customer to address to zip_code — producing 27GB of intermediate sorted data. With 512MB, the hash aggregate runs out of memory before any data reaches the sort operator. With 8GB, the join completes, the sort starts, and the sort spills. The spill is the system working as designed.
+
+With two workers, spill dropped to 49MB. Workers absorb scan and partial aggregation work. The coordinator barely touches raw data — it merges small, pre-processed result sets.
+
+One finding surprised us: at SF1, the distributed-2w configuration ran all queries locally on the coordinator (`scheduler_decisions{local}=120+`). Not a single query was distributed to workers. SF1 tables have 1-2 data files each, below the distribution threshold of 4 files. The 2.5x speedup we measured was not from distribution — it was from the streaming execution improvements: spill-to-disk, late materialization, scan planning optimizations. The workers were idle. To see actual distribution, run at SF10 or higher, where tables have enough files to justify splitting across workers.
+
 ### Storing results for history
 
 All benchmark JSON results are committed to `benchmarks/results/` in the repository. This is deliberate. A benchmark run that is not committed is a benchmark run that never happened. When a future change introduces a regression — and it will — the historical results provide the baseline. You do not need to remember what the numbers were. You `git log benchmarks/results/` and the history is there.

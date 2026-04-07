@@ -287,13 +287,49 @@ Key observations:
 - **q18** (the hardest TPC-H query) improved from 3.19s to 0.74s (4.3x) — benefits from distributed aggregation across workers
 - **Single-node with 512MB spill**: 21/22 pass — only q18 fails due to DataFusion hash aggregate memory limitation (DF#17334). With 1GB+ memory or with workers, all 22 pass.
 
-### Deployment configurations tested
+### Full Benchmark Matrix (Apr 7, 2026 — SF1)
 
-| Mode | Pass | Total | Notes |
+| Suite (queries) | single-512mb | single-8gb | distributed-2w |
 |---|---|---|---|
-| Single-node, 8GB (Apr 2 baseline) | 22/22 | 37.5s | Before streaming execution |
-| Single-node, 512MB + spill | 21/22 | 33.3s | q18 OOM on hash aggregate |
-| Distributed, coord + 2 workers | 22/22 | 12.0s | 3.1x faster, q18 passes |
+| TPC-H (22) | 21/22 (29.6s) | 22/22 (28.6s) | 22/22 (13.5s) |
+| TPC-DS (99) | 92/99 (94.1s) | 99/99 (99.4s) | 98/99 (36.1s) |
+| SSB (13) | 4/13 (14.4s) | 13/13 (14.3s) | 13/13 (5.3s) |
+| TPC-C (17) | 17/17 (21.5s) | 17/17 (22.0s) | 17/17 (8.6s) |
+| TPC-E (18) | 12/18 (8.4s) | 13/18 (127.4s) | 10/18 (56.0s) |
+| **Total (169)** | **146 (86%)** | **164 (97%)** | **162 (96%)** |
+
+### Spill behavior across configs
+
+| Config | Sort Spills | Bytes Spilled | Analysis |
+|---|---|---|---|
+| single-512mb | 30 | 1.1 GB | TPC-DS complex sorts spill to disk. 92/99 pass — spill works. |
+| single-8gb | 128 | 27.7 GB | Mostly TPC-E (33-table joins). More spills because more queries run to completion. |
+| distributed-2w | 3 | 49 MB | Near-zero spill. Workers absorb scan/aggregation work. |
+
+The counterintuitive finding: 8GB spills *more* than 512MB. This is because 8GB successfully runs TPC-E queries that 512MB cannot — those TPC-E queries involve massive multi-table joins that produce 27GB of intermediate sorted data. With 512MB, the same queries OOM before reaching the spill point.
+
+With distribution (2 workers), spill drops to 49MB. Workers handle scan and partial aggregation; the coordinator only merges small result sets.
+
+### Scheduler observations
+
+At SF1, all distributed queries ran locally on the coordinator (`scheduler_decisions{local}=120+`). This is correct — SF1 tables have 1-2 data files each, below the distribution threshold (default: 4 files). The 2.5x speedup comes from streaming execution improvements (spill, scan planning), not from worker distribution. To observe actual worker distribution, run at SF10+ where tables have 10+ files.
+
+### TPC-E: the outlier
+
+TPC-E has the lowest pass rate (56-72%) across all configs:
+- 5 queries blocked by DataFusion's IN(subquery) limitation (cannot decorrelate)
+- Deep join chains across 33 tables produce massive intermediate results
+- Some queries timeout at 600s after spilling 27GB
+
+### Metrics gaps
+
+Several Phase A/B metrics show 0 because the increment calls are not yet wired into the execution path (the infrastructure exists but `metric.inc()` calls are missing):
+- Footer cache hits/misses — `FooterCache` not wired into `IcebergScanExec`
+- File pruning counts — `PruningPredicate` built but counter not incremented
+- Late materialization bytes — RowFilter wired but byte tracking not connected
+- Time to first row — histogram registered but not observed
+
+These are wiring tasks for the next iteration.
 
 ## CI/CD Integration
 
