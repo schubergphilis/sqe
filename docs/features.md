@@ -1,10 +1,10 @@
 # SQL Feature Comparison: SQE vs Trino vs Spark SQL
 
-SQE is built on **Apache DataFusion 51** which provides the SQL execution engine. All standard SQL features come from DataFusion; SQE adds catalog integration (Polaris/Iceberg), auth (Keycloak), and DDL routing.
+SQE is built on **Apache DataFusion 52** which provides the SQL execution engine. All standard SQL features come from DataFusion; SQE adds catalog integration (Polaris/Iceberg), pluggable auth, distributed execution, and DDL routing.
 
 ## Quick Summary
 
-| Category | SQE (DataFusion 51) | Trino | Spark SQL |
+| Category | SQE (DataFusion 52) | Trino | Spark SQL |
 |----------|:---:|:---:|:---:|
 | Window functions | ✅ Full | ✅ Full | ✅ Full |
 | Aggregate functions | ✅ Full | ✅ Full | ✅ Full |
@@ -406,5 +406,4 @@ FROM orders;
 1. **No federated queries** — SQE reads only from Iceberg/Polaris (Trino has 50+ connectors)
 2. **No UDFs in SQL** — custom functions require Rust; no CREATE FUNCTION support
 3. **No time travel** — snapshot/AS OF queries not yet implemented
-4. **Single-node only** — distributed execution is structurally in place but not wired
-5. **No Merge-on-Read** — row-level mutations use Copy-on-Write (full file rewrite); MoR with position deletes planned for write-heavy workloads
+4. **No Merge-on-Read** — row-level mutations use Copy-on-Write (full file rewrite); MoR with position deletes planned for write-heavy workloads
