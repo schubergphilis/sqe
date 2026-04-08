@@ -1,0 +1,12 @@
+# cargo-deny configuration for SQE
+# https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+ignore = [
+    # paste (v1.0.15): unmaintained but feature-complete proc macro.
+    # Transitive dependency from arrow-flight, datafusion, parquet, tonic.
+    # No known vulnerability. Upstream migration pending.
+    "RUSTSEC-2024-0436",
+]
