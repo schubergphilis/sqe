@@ -168,6 +168,8 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 - [x] DELETE, UPDATE, MERGE INTO via Copy-on-Write (RisingWave iceberg-rust fork rewrite_files)
 - [ ] OPA/Cedar policy engine (row filters, column masks, GRANT/REVOKE SQL)
 - [x] OSS security hardening (TLS, rate limiting, query timeouts, session lifecycle, error sanitisation, vendor-neutral naming)
+- [x] OSS release readiness (Apache 2.0 license, CONTRIBUTING.md, cargo-deny, git-cliff, CI pipelines, retro-tagging, v0.15.0)
+- [x] Security & functional audit (AUDIT.md: 1,218 tests, rsa crate removed, all advisory checks clean)
 - [x] Streaming execution Phase A: spill-to-disk, late materialization, file pruning, S3 I/O pipeline, SortMergeJoin fallback
 - [x] Streaming execution Phase B: DoExchange shuffle, distributed sort/join/aggregate, multi-endpoint Flight SQL, stage decomposition
 - [x] Adaptive sort stripping and S3/auth/write Prometheus metrics

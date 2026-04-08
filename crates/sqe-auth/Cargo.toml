@@ -1,6 +1,6 @@
 [package]
 name = "sqe-auth"
-version = "0.1.0"
+version = "0.15.0"
 edition = "2021"
 
 [dependencies]
@@ -27,5 +27,3 @@ subtle = "2"
 rand = { workspace = true }
 
 [dev-dependencies]
-rsa = "0.9"
-pkcs1 = { version = "0.7", features = ["pem"] }
