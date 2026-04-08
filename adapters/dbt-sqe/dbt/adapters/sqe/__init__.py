@@ -1,4 +1,5 @@
-from dbt.adapters.sqe.connections import SQEConnectionManager, SQECredentials
+from dbt.adapters.sqe.connections import SQECredentials  # noqa: F401
+from dbt.adapters.sqe.connections import SQEConnectionManager  # noqa: F401
 from dbt.adapters.sqe.impl import SQEAdapter
 from dbt.adapters.base import AdapterPlugin
 from dbt.include.sqe import PACKAGE_PATH

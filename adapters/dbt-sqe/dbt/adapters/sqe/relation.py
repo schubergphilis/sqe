@@ -2,7 +2,6 @@
 
 from dataclasses import dataclass
 from dbt.adapters.base.relation import BaseRelation
-from dbt.adapters.contracts.relation import RelationType
 
 
 @dataclass(frozen=True, eq=False, repr=False)
