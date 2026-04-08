@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import agate
-import pyarrow as pa
+import pyarrow  # noqa: F401
 from dbt.adapters.contracts.connection import (
     AdapterResponse,
     Connection,
