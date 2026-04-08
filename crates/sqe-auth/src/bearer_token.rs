@@ -425,7 +425,6 @@ impl AuthProvider for BearerTokenProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine;
     use jsonwebtoken::{encode, EncodingKey, Header};
     use serde_json::json;
     use std::sync::LazyLock;
