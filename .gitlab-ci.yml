@@ -6,6 +6,7 @@ include:
   - template: Security/Secret-Detection.gitlab-ci.yml
 
 stages:
+  - check
   - test
   - secret-detection
   - discover
@@ -18,6 +19,37 @@ variables:
 
 secret_detection:
   stage: secret-detection
+
+# ── Static analysis + security ─────────────────────────────────
+cargo-check:
+  stage: check
+  image: rust:bookworm
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq cmake protobuf-compiler libssl-dev pkg-config > /dev/null
+    - cargo install cargo-deny 2>/dev/null || true
+  script:
+    - cargo clippy --all-targets --all-features -- -D warnings
+    - cargo audit
+    - cargo deny check advisories
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - crates/**/*
+        - Cargo.toml
+        - Cargo.lock
+        - deny.toml
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
+      changes:
+        - crates/**/*
+        - Cargo.toml
+        - Cargo.lock
+        - deny.toml
+  cache:
+    key: cargo-check-${CI_COMMIT_REF_SLUG}
+    paths:
+      - target/
+      - .cargo/registry/
+      - .cargo/bin/cargo-deny
 
 # ── Tests ──────────────────────────────────────────────────────
 cargo-test:
