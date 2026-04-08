@@ -1,6 +1,6 @@
 # SQE — Next Steps
 
-> Status as of 2026-04-05. Step 0 dependency alignment complete. Step 2 core engine complete (103/103). Step 3 OSS security hardening complete (51/51). Step 4 pluggable auth complete. **Step 4b (streaming execution Phase A) complete:** coordinator spill-to-disk (FairSpillPool, watermarks, admission control), late materialization (two-phase RowFilter scan), Iceberg scan planning (file pruning, sort-order detection, TopK), S3 I/O pipeline (coalescing, footer cache, prefetch), SortMergeJoin fallback -- 21/22 TPC-H SF1 on 512MB. **Step 4c (streaming execution Phase B) complete:** DoExchange shuffle, distributed range-partition sort, two-phase aggregation, distributed joins (broadcast, shuffle hash, pre-sorted merge, predicate transfer), multi-endpoint Flight SQL, stage decomposition, Trino function compatibility (date_format, date_parse, now, json_object, transaction stubs). 30 commits, 47 files changed, +14,120 lines, 1,188 tests.
+> Status as of 2026-04-08. All implementation steps through 4c complete. **Steps 1–4c done:** core engine (103/103), OSS security hardening (51/51), benchmark suite (6 suites), pluggable auth (11 providers), streaming execution Phase A (spill, late-mat, scan planning, S3 I/O) + Phase B (shuffle, distributed sort/join/aggregate, multi-endpoint Flight SQL, Trino function compat). Adaptive sort stripping and S3/auth/write metrics merged. Branch cleanup complete — all work consolidated on main. **Next: Step 5 (pluggable catalogs).**
 
 > **Monitoring:** OPA SPI refactor in Polaris (PR #3999, still draft) will affect Phase 5 OPA integration when it lands — do not implement OPA against Polaris until this stabilises. Remote S3 signing (Iceberg 1.12, not yet released) will affect the pluggable-catalogs design.
 
@@ -185,9 +185,12 @@ Step 3b: benchmark suite    ✅ DONE (sqe-bench: generate/load/test, 6 benchmark
 Step 3c: hardening pass     ✅ DONE (type formatting, Flight SQL DoPut + metadata, clippy, decimal DIFF, token fingerprint)
 Step 3d: query history+cache ✅ DONE (system.runtime.queries, in-memory history store, query result cache, config sections)
 Step 3e: distributed wiring ✅ DONE (try_distribute in execute_query, fragment tracking, system.runtime.tasks shows workers)
-Step 4: pluggable auth      ✅ DONE (all providers implemented, external auth wired)
-Step 4b: streaming exec A   ✅ DONE (coordinator spill, late materialization, scan planning, S3 I/O, SortMergeJoin fallback — 21/22 TPC-H SF1 on 512MB)
-Step 4c: streaming exec B   ✅ DONE (DoExchange shuffle, distributed sort/join/aggregate, multi-endpoint Flight SQL, Trino function compat)
+Step 4: pluggable auth      ✅ DONE (11 providers: OIDC, bearer, API key, anonymous, mTLS, token exchange, AWS IAM, device code, auth code, OIDC discovery, chain)
+Step 4b: streaming exec A   ✅ DONE (spill-to-disk, late materialization, scan planning, S3 I/O, SortMergeJoin — 21/22 TPC-H SF1 on 512MB)
+Step 4c: streaming exec B   ✅ DONE (shuffle, distributed sort/join/aggregate, multi-endpoint Flight SQL, Trino function compat)
+Step 4d: adaptive sort+metrics ✅ DONE (adaptive sort stripping, S3/auth/write Prometheus metrics)
+Step 7.1: dbt-sqe adapter   ✅ DONE (ADBC Flight SQL, table/view/incremental/seed materializations)
+Step 7.3: ALTER TABLE schema ✅ DONE (ADD/DROP/RENAME COLUMN, SET/DROP NOT NULL, type widening)
 Step 5: pluggable catalogs  (AWS Glue, Nessie, Hive Metastore, storage-only, Delta Lake) ← NEXT
 Step 6: semantic layer      (new crates; fully additive; no existing code broken)
 ```

@@ -1,6 +1,6 @@
 # SQE — Sovereign Query Engine
 
-A Rust-based SQL query engine for Apache Iceberg tables. Built on [DataFusion](https://datafusion.apache.org/) and [iceberg-rust](https://github.com/apache/iceberg-rust), with Keycloak OIDC authentication and bearer token passthrough to [Apache Polaris](https://polaris.apache.org/) REST Catalog.
+A Rust-based distributed SQL query engine for Apache Iceberg tables. Built on [DataFusion](https://datafusion.apache.org/) and [iceberg-rust](https://github.com/apache/iceberg-rust), with pluggable OIDC authentication and bearer token passthrough to [Apache Polaris](https://polaris.apache.org/) REST Catalog.
 
 Designed as a drop-in replacement for Trino in environments where all data lives in Iceberg and fine-grained security (row filters, column masks) is required.
 
@@ -10,16 +10,22 @@ Designed as a drop-in replacement for Trino in environments where all data lives
 Client (JDBC / Flight SQL / HTTP)
         │
         ▼
-   ┌──────────┐     Keycloak
-   │Coordinator│◄───  OIDC
-   │           │     (ROPC)
+   ┌──────────┐     OIDC Provider
+   │Coordinator│◄── (Keycloak, Auth0,
+   │           │     Okta, or any IdP)
    │ DataFusion│
    │  + Policy │──► OPA / Cedar (planned)
    └─────┬─────┘
          │ Bearer token passthrough
-         ▼
+    ┌────┼────┐
+    ▼    ▼    ▼
+  ┌───┐┌───┐┌───┐   Stateless workers
+  │ W1 ││ W2 ││ W3 │  (distributed mode)
+  └─┬──┘└─┬──┘└─┬──┘
+    │     │     │
+    ▼     ▼     ▼
    ┌──────────┐
-   │  Polaris  │──► S3 / MinIO
+   │  Polaris  │──► S3-compatible storage
    │REST Catalog│
    └──────────┘
 ```
@@ -31,9 +37,10 @@ Every query runs as the authenticated user. No service account.
 - **SQL**: Full ANSI SQL via DataFusion — window functions (LEAD, LAG, PARTITION BY, etc.), CTEs, subqueries, joins, aggregates, GROUPING SETS. See [docs/features.md](docs/features.md) for a detailed comparison with Trino and Spark.
 - **DDL/DML**: CREATE TABLE AS SELECT, INSERT INTO, DELETE FROM, UPDATE, MERGE INTO (CoW), CREATE/DROP VIEW, DROP TABLE, ALTER TABLE RENAME
 - **Protocols**: Arrow Flight SQL (primary, gRPC) + Trino HTTP (compatibility layer)
-- **Auth**: OIDC password grant (any OIDC provider) with background token refresh
+- **Auth**: Pluggable auth chain — OIDC password, bearer token, API key, mTLS, anonymous, AWS IAM, device code, token exchange
 - **Catalog**: Apache Polaris REST Catalog with per-session bearer token passthrough
 - **Storage**: S3-compatible storage via Iceberg's FileIO (credential vending or static config)
+- **Distributed**: Coordinator → worker architecture with shuffle, distributed sort/join/aggregate, spill-to-disk
 - **Observability**: OpenTelemetry (traces, metrics, logs via OTLP/gRPC), Prometheus metrics, JSON audit log
 - **Security**: Planned OPA/Cedar policy engine for row-level security and column masking
 - **CLI**: Interactive REPL and one-shot mode with Flight SQL and HTTP backends
@@ -44,7 +51,7 @@ Every query runs as the authenticated user. No service account.
 |-------|---------|
 | `sqe-core` | Shared types, config (TOML), errors |
 | `sqe-sql` | SQL parser (sqlparser-rs), statement classifier |
-| `sqe-auth` | OIDC password grant (Keycloak, Auth0, Okta, etc.), token cache, background refresh |
+| `sqe-auth` | Pluggable auth chain (OIDC, bearer, API key, mTLS, anonymous, AWS IAM, device code), token cache |
 | `sqe-catalog` | Iceberg REST catalog client, DataFusion catalog/schema providers, information_schema |
 | `sqe-policy` | PolicyEnforcer trait, passthrough implementation |
 | `sqe-planner` | LogicalPlan manipulation, distributed plan splitting |
@@ -81,8 +88,7 @@ flight_sql_port = 50051
 trino_http_port = 8080
 
 [auth]
-keycloak_url = "https://keycloak.example.com"
-realm = "my-realm"
+issuer_url = "https://idp.example.com/realms/my-realm"
 client_id = "sqe"
 
 [catalog]
@@ -162,14 +168,16 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 - [x] DELETE, UPDATE, MERGE INTO via Copy-on-Write (RisingWave iceberg-rust fork rewrite_files)
 - [ ] OPA/Cedar policy engine (row filters, column masks, GRANT/REVOKE SQL)
 - [x] OSS security hardening (TLS, rate limiting, query timeouts, session lifecycle, error sanitisation, vendor-neutral naming)
-- [x] Streaming execution Phase A: coordinator spill-to-disk (FairSpillPool, watermarks, admission control), late materialization, file-level min/max pruning, sort-order detection, PageIndex, S3 I/O pipeline (coalescing, footer cache, prefetch), SortMergeJoin fallback
-- [x] Streaming execution Phase B: DoExchange shuffle infrastructure, distributed sort (range-partition), distributed aggregation (two-phase), distributed joins (broadcast, shuffle hash, sort-merge, predicate transfer), multi-endpoint Flight SQL
+- [x] Streaming execution Phase A: spill-to-disk, late materialization, file pruning, S3 I/O pipeline, SortMergeJoin fallback
+- [x] Streaming execution Phase B: DoExchange shuffle, distributed sort/join/aggregate, multi-endpoint Flight SQL, stage decomposition
+- [x] Adaptive sort stripping and S3/auth/write Prometheus metrics
 - [x] Observability metrics (spill, shuffle, late-mat, pruning, time-to-first-row)
 - [x] Trino function compatibility (date_format, date_parse, now, json_object, transaction stubs)
-- [ ] Pluggable auth providers (bearer token ✅, API key, mTLS, anonymous)
-- [ ] Pluggable catalog backends (AWS Glue, Nessie, Hive Metastore, storage-only)
+- [x] Pluggable auth providers (OIDC, bearer token, API key, mTLS, anonymous, AWS IAM, device code, token exchange)
+- [ ] Pluggable catalog backends (AWS Glue, Nessie, Hive Metastore, storage-only) ← NEXT
+- [x] dbt adapter (dbt-sqe via ADBC Flight SQL — table, view, incremental, seed)
+- [x] ALTER TABLE schema evolution (ADD/DROP/RENAME COLUMN, SET/DROP NOT NULL, type widening)
 - [ ] Semantic AI layer (RDF/SPARQL, property graph/GQL, vector search, agent interfaces)
-- [ ] dbt adapter (dbt-sqe via ADBC Flight SQL)
 - [ ] Helm chart for Kubernetes deployment
 
 **Benchmark Matrix (SF1, Apr 7 2026):**
@@ -226,7 +234,7 @@ Results are written to the terminal and saved as a JSON report in `benchmarks/re
 | Query Engine | Apache DataFusion 52 |
 | Table Format | Apache Iceberg v2 (iceberg-rust 0.9) |
 | Catalog | Apache Polaris (Iceberg REST) |
-| Auth | OIDC (Keycloak, Auth0, Okta, or any OIDC provider) |
+| Auth | Pluggable chain (OIDC, bearer token, API key, mTLS, anonymous, AWS IAM) |
 | Wire Protocol | Arrow Flight SQL + Trino HTTP |
 | Storage | S3-compatible (AWS S3, Ceph, Garage, R2, etc.) |
 | Observability | OpenTelemetry + Prometheus |

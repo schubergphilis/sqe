@@ -1,0 +1,12 @@
+my_project:
+  target: dev
+  outputs:
+    dev:
+      type: sqe
+      host: localhost
+      port: 50051
+      user: admin
+      password: "{{ env_var('SQE_PASSWORD') }}"
+      catalog: warehouse
+      schema: analytics
+      threads: 4

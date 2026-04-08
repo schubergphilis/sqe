@@ -11,19 +11,20 @@ gantt
     axisFormat %b %Y
 
     section Core
-    Phase 1 - Single Node        :done, p1, 2025-01, 2025-03
-    Phase 2 - Write Path         :done, p2, 2025-02, 2025-04
+    Phase 1 - Single Node        :done, p1, 2026-01, 2026-02
+    Phase 2 - Write Path         :done, p2, 2026-02, 2026-03
+    Phase 3 - Row-Level Writes   :done, p3, 2026-03, 2026-04
 
     section Scale
-    Phase 2c - dbt Compat        :active, p2c, 2025-03, 2025-05
-    Phase 3 - Row-Level Writes   :done, p3, 2025-05, 2025-07
-    Phase 4 - Iceberg v3         :p4, 2025-06, 2025-08
-    Phase 5 - Distributed        :p5, 2025-07, 2025-10
+    Phase 3b - Benchmarks        :done, p3b, 2026-03, 2026-04
+    Phase 4 - Pluggable Auth     :done, p4, 2026-03, 2026-04
+    Phase 4b - Streaming/Distributed :done, p4b, 2026-04, 2026-04
 
-    section Production
-    Phase 6 - Security           :p6, 2025-08, 2025-11
-    Phase 7 - Perf & Reliability :p7, 2025-09, 2025-12
-    Phase 8 - Trino Decommission :p8, 2025-11, 2026-02
+    section Next
+    Phase 5 - Pluggable Catalogs :active, p5, 2026-04, 2026-06
+    Phase 6 - Security Policies  :p6, 2026-06, 2026-08
+    Phase 7 - dbt + Iceberg v3   :p7, 2026-07, 2026-09
+    Phase 8 - Trino Decommission :p8, 2026-09, 2026-11
 ```
 
 ---
@@ -120,9 +121,9 @@ Uses `risingwavelabs/iceberg-rust` fork (rev `1978911ec4`) for `rewrite_files()`
 
 ---
 
-## Phase 4 — Iceberg v3 & Fixes (Planned)
+## Phase 7 — Iceberg v3 & Fixes (Blocked)
 
-Upgrade to Iceberg table format v3 and address gaps found during Phase 2-3 usage.
+Upgrade to Iceberg table format v3 and address gaps found during Phase 2-3 usage. **Blocked:** iceberg-rust v3 format support not yet shipped; RisingWave fork pinned to 0.8.0/DF 52 for `rewrite_files()`. Track upstream apache/iceberg-rust for v3 and `OverwriteAction`.
 
 ### Iceberg v3 Features
 
@@ -156,35 +157,62 @@ Based on Phase 2/2c usage, expected fixes include:
 
 ---
 
-## Phase 5 — Distributed Execution (Planned)
+## Phase 4b/4c — Distributed Execution (Done)
 
-Scale-out query execution with stateless workers.
+Scale-out query execution with stateless workers. Implemented via streaming execution in two phases.
 
 ```mermaid
 graph TB
     subgraph Coordinator
-        PLAN["Query Planner"] --> SPLIT["Plan Splitter<br/>(partition-aware)"]
-        SPLIT --> SCHED["Scheduler"]
+        PLAN["Query Planner"] --> STAGE["Stage Decomposition"]
+        STAGE --> SCHED["Scheduler"]
     end
 
     subgraph Workers
-        SCHED -->|ScanTask| W1["Worker 1<br/>files 1-10"]
-        SCHED -->|ScanTask| W2["Worker 2<br/>files 11-20"]
-        SCHED -->|ScanTask| W3["Worker 3<br/>files 21-30"]
+        SCHED -->|ScanTask| W1["Worker 1"]
+        SCHED -->|ScanTask| W2["Worker 2"]
+        SCHED -->|ScanTask| W3["Worker 3"]
     end
 
-    W1 -->|Arrow stream| MERGE["Merge results"]
+    W1 <-->|DoExchange shuffle| W2
+    W2 <-->|DoExchange shuffle| W3
+    W1 -->|Arrow stream| MERGE["Multi-endpoint merge"]
     W2 -->|Arrow stream| MERGE
     W3 -->|Arrow stream| MERGE
     MERGE --> CLIENT["Client"]
 ```
 
-- Coordinator splits scan tasks by partition/file ranges
-- Workers read Parquet from S3, stream Arrow RecordBatches back
-- File-level parallelism with partition-aware assignment
-- Worker health monitoring with automatic failover (3 strikes)
-- Configurable worker pool (static URLs or K8s service discovery)
-- Shuffle for join/aggregate operations (later iteration)
+### Delivered
+
+- **Phase A (spill-to-disk):** FairSpillPool with watermarks, late materialization, file/page pruning, TopK, S3 I/O pipeline (coalescing, footer cache, prefetch), SortMergeJoin fallback
+- **Phase B (distributed):** DoExchange shuffle, distributed sort (range-partition with sampling), two-phase aggregation, distributed joins (broadcast, shuffle hash, pre-sorted merge, predicate transfer), multi-endpoint Flight SQL, stage decomposition
+- **Adaptive sort stripping** — memory-aware sort mode selection
+- **Metrics** — spill, shuffle, late-mat, pruning, time-to-first-row, S3 I/O, auth, write path
+
+### Benchmark Results (SF1, distributed 2-worker)
+
+| Suite | Pass Rate | Time | Speedup vs single |
+|---|---|---|---|
+| TPC-H | 22/22 | 13.5s | 2.1x |
+| TPC-DS | 98/99 | 36.1s | 2.8x |
+| SSB | 13/13 | 5.3s | 2.7x |
+| TPC-C | 17/17 | 8.6s | 2.6x |
+
+---
+
+## Phase 5 — Pluggable Catalogs (Next)
+
+Replace the hard-coded Polaris REST catalog with a `CatalogBackend` trait.
+
+| Backend | Notes |
+|---|---|
+| `IcebergRestBackend` | Current default — Polaris, Lakeformation REST |
+| `AwsGlueBackend` | AWS SDK; IAM auth |
+| `NessieBackend` | Project Nessie REST API; branch/tag awareness |
+| `HiveMetastoreBackend` | Thrift HMS; legacy warehouse migration |
+| `StorageOnlyBackend` | Scan base path for metadata; no catalog server |
+
+Multi-cloud storage via `object_store`: S3 (+ endpoint override for R2/Ceph/Garage), Azure ADLS Gen2/Blob, GCS, local filesystem. Delta Lake support (`delta-rs`) as optional Cargo feature.
 
 ---
 
