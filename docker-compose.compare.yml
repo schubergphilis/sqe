@@ -1,0 +1,41 @@
+# docker-compose.compare.yml
+# Side-by-side SQE + Trino stack for parity comparison.
+# Both engines connect to the same Polaris catalog and S3 storage.
+#
+# Usage:
+#   docker compose -f docker-compose.test.yml -f docker-compose.compare.yml up -d
+#   ./scripts/trino-parity-test.sh tpch
+
+services:
+  # SQE Coordinator
+  sqe:
+    build:
+      context: .
+      target: coordinator
+    ports:
+      - "60051:50051"   # Flight SQL
+      - "28080:8080"    # Trino HTTP compat
+    environment:
+      SQE_CONFIG: /etc/sqe/config.toml
+    volumes:
+      - ./tests/distributed/coordinator.toml:/etc/sqe/config.toml:ro
+    depends_on:
+      polaris:
+        condition: service_healthy
+
+  # Trino (single-node, Iceberg connector)
+  trino:
+    image: trinodb/trino:465
+    ports:
+      - "38080:8080"
+    volumes:
+      - ./tests/trino/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
+      - ./tests/trino/config.properties:/etc/trino/config.properties:ro
+    depends_on:
+      polaris:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "trino", "--execute", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
