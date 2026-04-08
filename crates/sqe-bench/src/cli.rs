@@ -182,6 +182,57 @@ pub enum Command {
         #[arg(long, env = "SQE_CLIENT_SECRET")]
         client_secret: Option<String>,
     },
+
+    /// Compare SQE vs Trino: run identical benchmark queries against both and diff results
+    Compare {
+        /// Benchmark suite (tpch, tpcds, ssb)
+        #[arg(value_name = "BENCHMARK")]
+        benchmark: String,
+
+        /// Scale factor
+        #[arg(long, default_value_t = 1.0)]
+        scale: f64,
+
+        /// SQE Flight SQL host
+        #[arg(long, default_value = "localhost")]
+        sqe_host: String,
+
+        /// SQE Flight SQL port
+        #[arg(long, default_value_t = 50051u16)]
+        sqe_port: u16,
+
+        /// SQE auth username
+        #[arg(long, env = "SQE_USER")]
+        sqe_username: Option<String>,
+
+        /// SQE auth password
+        #[arg(long, env = "SQE_PASSWORD")]
+        sqe_password: Option<String>,
+
+        /// Trino HTTP URL (e.g., http://localhost:8080)
+        #[arg(long)]
+        trino_url: String,
+
+        /// Trino user
+        #[arg(long, default_value = "admin")]
+        trino_user: String,
+
+        /// Trino catalog (default: same as benchmark namespace)
+        #[arg(long)]
+        trino_catalog: Option<String>,
+
+        /// Trino schema (default: same as benchmark namespace)
+        #[arg(long)]
+        trino_schema: Option<String>,
+
+        /// Single query to compare (e.g., "q1" or "1")
+        #[arg(long)]
+        query: Option<String>,
+
+        /// Output directory for comparison report
+        #[arg(long, default_value = "benchmarks/results")]
+        output: String,
+    },
 }
 
 #[derive(Clone, ValueEnum)]
@@ -190,4 +241,37 @@ pub enum Protocol {
     Flight,
     /// Trino-compat HTTP REST
     Http,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compare_subcommand_parses() {
+        let args = Cli::parse_from([
+            "sqe-bench", "compare", "tpch",
+            "--scale", "1",
+            "--sqe-host", "localhost",
+            "--sqe-port", "50051",
+            "--trino-url", "http://localhost:8080",
+        ]);
+        match args.command {
+            Command::Compare {
+                benchmark,
+                scale,
+                sqe_host,
+                sqe_port,
+                trino_url,
+                ..
+            } => {
+                assert_eq!(benchmark, "tpch");
+                assert_eq!(scale, 1.0);
+                assert_eq!(sqe_host, "localhost");
+                assert_eq!(sqe_port, 50051);
+                assert_eq!(trino_url, "http://localhost:8080");
+            }
+            _ => panic!("expected Compare command"),
+        }
+    }
 }

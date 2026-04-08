@@ -111,6 +111,10 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
 
+        cli::Command::Compare { .. } => {
+            anyhow::bail!("compare subcommand not yet implemented (Task 7)")
+        }
+
         cli::Command::Test {
             benchmark,
             scale,
