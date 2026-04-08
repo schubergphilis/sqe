@@ -427,13 +427,53 @@ mod tests {
     use super::*;
     use base64::Engine;
     use jsonwebtoken::{encode, EncodingKey, Header};
-    use rsa::traits::PublicKeyParts;
     use serde_json::json;
     use std::sync::LazyLock;
 
     const TEST_KID: &str = "test-key-1";
 
-    /// RSA key pair generated once at test-time (thread-safe lazy init).
+    // -----------------------------------------------------------------------
+    // Static RSA 2048-bit test keypair — NOT for production use.
+    // Generated with: openssl genrsa 2048
+    // Eliminates rsa crate dev-dependency (RUSTSEC-2023-0071).
+    // -----------------------------------------------------------------------
+
+    /// PKCS#1 PEM-encoded RSA private key for test JWT signing.
+    const TEST_RSA_PRIVATE_KEY_PEM: &str = "-----BEGIN RSA PRIVATE KEY-----
+MIIEowIBAAKCAQEAvX0NLGQkeecTCMwoDPx6Qkutsf0PWBEjZnNm4vkmTTvHD1F0
+NE1XHFBwxxm3eZYaEI59au96PkH5RZS0A7XivkKOj9xcmG4MtZLa4f0UKW6hWXBB
+RG7ilMaCLcBxSxp6aewxWvYfv5wu1VCfDZ55jYRTx9JMm0vHo89kHb5XMHX2jhVH
+XAqOaNG4EQLLxku8NsuCCft1M54WMKqx5VNdzpNh6jqESGEU3LDI3fNvvFbuXFzC
+PYqfVOiTk7DfSWx/IgKeFbQWuWXBixNg4l72AUlbGU3wcnHr7l3GMb+Es7wt0AlW
++CHdDzJgvZfvmS2u9vIhb7Qu54x3cBLFGSqGCQIDAQABAoIBAHQdjVUGiNOqph9d
++6z5inHVrjrDuANffTHqxcGQq8foObNJVsw2GIthP7rCJ4x6Tr6WkoRU+7Pq+bWJ
+ykX7z1aHspS1lIhT57XcqAST8SbyhC0qfNRSnsZMXrlqlAJR13HRKu1ypUHlk01k
+ehL+ab4uuKhaVldTuKLJE7CmUwd+MvJYxlEJO9ywI5mZ4Ks+Dc7uJw3A6IEbFeZK
+50HzLkve+7yy1RE771EllWm2y1i/VRycH2axUR8gZhdQNl39vi2FkMKokf4CCg0Q
+ZHSPaIdDkfsNMC5w3Luf9BeGrNVoPGm1QB+A5wl0i/01JLPNBRGT13wMBsHurC1q
+D+8Cc4ECgYEA8PNcEBUKFz0lNxXqXpfjLQg2IJv/laheK4S7Ek4Lgu8ELyb5pEP9
+91IhghIHPBcupj63QWBqhHPM5fJwgqOtuDPxSu3PGTUzteh6Xs3wd7+7y7vQ52b/
+HopK5A0Sri+mrJs5kh9T/pr9CyeRjHAxo2J3NbOrcGGuHZ45+ORaFaMCgYEAyVLY
+rR4bGu6bKdFLdYMR6Q5hOXmPanG6kYWU99WIAaLkNg3Rlys9X/Tn98HZgUOVu5i+
+NfvSCAIKttysLqkVst4iD/4eykZCuIRxhwu813ThPI5zLChoU/DYCSiVjlSgGawH
+mQ/fkunvb2D7XCrpUvu9xRSKddDMT3EEQ2CNuGMCgYEAiiOro1i8mUgn/uXkoWjJ
+CLdNePKW3HFT0/Vb3wm5lc58gqAAvclxYArJRS4a0bukthD8tVGWn+tYDHkrQeqf
+HR1CeCfQ9O3IgMEQ7yt4ct8MxqgeA5zMJPE6MHbCP/T3xLuVjQ3C9RRcgLmlu3NT
+Mg2wtKwWXO7TiQ1+xQ/+CasCgYByeYItRe4hrUVbTN/8bM/1VjDgboem/g4ZCvz+
+w1M3ovji546ix3p5opd4IKjdwKFWb27Q4WS3GvoeqnHZglmNQJPbxiKZ38O2idDH
++luho5sjRNimZj+UY2FkK8iGiwYSMuiLFySItC5qhZnH+bp8bhqlAp4MifJyxY+o
+BDHxgwKBgDlcrdCtPqUVy0gp+1NpboOFvbi9QBp3GV0g0hcu1dFyw7pB7ts0Tu7H
+1vJmTV7qtPF2vnSeNX+W42ZPGFbT9nswiQ8rMod5QFqywTyvuUUTqoxkEbhTPqQB
+fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
+-----END RSA PRIVATE KEY-----";
+
+    /// Base64url-encoded RSA modulus (n) for JWKS mock responses.
+    const TEST_RSA_N: &str = "vX0NLGQkeecTCMwoDPx6Qkutsf0PWBEjZnNm4vkmTTvHD1F0NE1XHFBwxxm3eZYaEI59au96PkH5RZS0A7XivkKOj9xcmG4MtZLa4f0UKW6hWXBBRG7ilMaCLcBxSxp6aewxWvYfv5wu1VCfDZ55jYRTx9JMm0vHo89kHb5XMHX2jhVHXAqOaNG4EQLLxku8NsuCCft1M54WMKqx5VNdzpNh6jqESGEU3LDI3fNvvFbuXFzCPYqfVOiTk7DfSWx_IgKeFbQWuWXBixNg4l72AUlbGU3wcnHr7l3GMb-Es7wt0AlW-CHdDzJgvZfvmS2u9vIhb7Qu54x3cBLFGSqGCQ";
+
+    /// Base64url-encoded RSA public exponent (e) for JWKS mock responses.
+    const TEST_RSA_E: &str = "AQAB";
+
+    /// RSA key pair loaded once at test-time (thread-safe lazy init).
     struct TestKeyPair {
         encoding_key: EncodingKey,
         /// Base64url-encoded RSA modulus (n) for JWKS.
@@ -443,25 +483,13 @@ mod tests {
     }
 
     static TEST_KEYS: LazyLock<TestKeyPair> = LazyLock::new(|| {
-        use rsa::pkcs1::EncodeRsaPrivateKey;
-
-        let mut rng = rand::thread_rng();
-        let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
-        let public_key = private_key.to_public_key();
-
-        // Encode private key as PKCS#1 PEM for jsonwebtoken.
-        let pem = private_key
-            .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
-            .unwrap();
-        let encoding_key = EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
-
-        // Extract n and e as base64url-encoded values for JWKS.
-        let n = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(public_key.n().to_bytes_be());
-        let e = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(public_key.e().to_bytes_be());
-
-        TestKeyPair { encoding_key, n, e }
+        let encoding_key =
+            EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY_PEM.as_bytes()).unwrap();
+        TestKeyPair {
+            encoding_key,
+            n: TEST_RSA_N.to_string(),
+            e: TEST_RSA_E.to_string(),
+        }
     });
 
     /// Build a valid JWT signed with the test RSA key.
