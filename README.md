@@ -175,8 +175,9 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 - [x] Trino function compatibility (date_format, date_parse, now, json_object, transaction stubs)
 - [x] Pluggable auth providers (OIDC, bearer token, API key, mTLS, anonymous, AWS IAM, device code, token exchange)
 - [ ] Pluggable catalog backends (AWS Glue, Nessie, Hive Metastore, storage-only) ← NEXT
+- [x] dbt adapter (dbt-sqe via ADBC Flight SQL — table, view, incremental, seed)
+- [x] ALTER TABLE schema evolution (ADD/DROP/RENAME COLUMN, SET/DROP NOT NULL, type widening)
 - [ ] Semantic AI layer (RDF/SPARQL, property graph/GQL, vector search, agent interfaces)
-- [ ] dbt adapter (dbt-sqe via ADBC Flight SQL)
 - [ ] Helm chart for Kubernetes deployment
 
 **Benchmark Matrix (SF1, Apr 7 2026):**
