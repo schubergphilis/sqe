@@ -101,6 +101,18 @@ pub struct BearerTokenProvider {
 impl BearerTokenProvider {
     /// Create a new bearer token provider with the given configuration.
     pub fn new(config: BearerTokenProviderConfig) -> Result<Self, AuthError> {
+        // Warn if audience validation is disabled — tokens from any service will be accepted
+        match &config.audience {
+            Some(aud) if !aud.is_empty() => {}
+            _ => {
+                tracing::warn!(
+                    "⚠ JWT audience validation is DISABLED (no 'audience' configured). \
+                     Tokens issued for other services will be accepted. \
+                     Set 'audience' in the bearer_token provider config to restrict access."
+                );
+            }
+        }
+
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .danger_accept_invalid_certs(config.accept_invalid_certs)
