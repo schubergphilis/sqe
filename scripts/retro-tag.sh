@@ -4,9 +4,19 @@
 # Reads the MR-to-version mapping, resolves each MR's merge commit SHA
 # via glab API, and creates annotated tags. Idempotent (skips existing tags).
 #
-# Requires: glab CLI authenticated with GitLab.
+# Requires: Bash 4+ (associative arrays), glab CLI authenticated with GitLab.
 #
 # Usage: ./scripts/retro-tag.sh [--dry-run] [--push]
+
+# Bash 4+ required for associative arrays
+if ((BASH_VERSINFO[0] < 4)); then
+    # Try homebrew bash on macOS
+    if [[ -x /opt/homebrew/bin/bash ]]; then
+        exec /opt/homebrew/bin/bash "$0" "$@"
+    fi
+    echo "ERROR: Bash 4+ required. Install with: brew install bash" >&2
+    exit 1
+fi
 
 set -euo pipefail
 
@@ -46,23 +56,24 @@ for mr_iid in $(printf '%s\n' "${!MR_VERSION[@]}" | sort -n); do
     # Skip if tag already exists
     if git rev-parse "$version" &>/dev/null; then
         echo "SKIP  $version (tag exists)"
-        ((SKIPPED++))
+        SKIPPED=$((SKIPPED + 1))
         continue
     fi
 
-    # Resolve merge commit SHA via glab API
-    sha=$(glab api "projects/:fullpath/merge_requests/$mr_iid" --jq '.merge_commit_sha' 2>/dev/null || true)
+    # Resolve merge commit SHA via glab API (parse JSON with python3)
+    sha=$(glab api "projects/:fullpath/merge_requests/$mr_iid" 2>/dev/null \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('merge_commit_sha',''))" 2>/dev/null || true)
 
     if [[ -z "$sha" || "$sha" == "null" ]]; then
         echo "FAIL  $version (!$mr_iid) — could not resolve merge commit"
-        ((FAILED++))
+        FAILED=$((FAILED + 1))
         continue
     fi
 
     # Verify the commit exists locally
     if ! git cat-file -e "$sha" 2>/dev/null; then
         echo "FAIL  $version (!$mr_iid) — commit $sha not found locally (run git fetch)"
-        ((FAILED++))
+        FAILED=$((FAILED + 1))
         continue
     fi
 
@@ -72,7 +83,7 @@ for mr_iid in $(printf '%s\n' "${!MR_VERSION[@]}" | sort -n); do
         git tag -a "$version" "$sha" -m "Release $version (MR !$mr_iid)"
         echo "TAG   $version → $sha (!$mr_iid)"
     fi
-    ((CREATED++))
+    CREATED=$((CREATED + 1))
 done
 
 echo ""
