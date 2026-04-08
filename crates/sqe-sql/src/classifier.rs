@@ -15,6 +15,7 @@ pub enum StatementKind {
     Update(Box<Statement>),
     Drop(Box<Statement>),
     Rename(Box<Statement>),
+    AlterSchema(Box<Statement>),
     CreateView(Box<Statement>),
     DropView(Box<Statement>),
     CreateSchema(Box<Statement>),
@@ -44,6 +45,7 @@ impl StatementKind {
             StatementKind::Update(_) => "update",
             StatementKind::Drop(_) => "drop",
             StatementKind::Rename(_) => "rename",
+            StatementKind::AlterSchema(_) => "alterschema",
             StatementKind::CreateView(_) => "createview",
             StatementKind::DropView(_) => "dropview",
             StatementKind::CreateSchema(_) => "createschema",
@@ -139,8 +141,19 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
             let is_rename = operations.iter().any(|op| {
                 matches!(op, AlterTableOperation::RenameTable { .. })
             });
+            let is_schema_change = operations.iter().any(|op| {
+                matches!(
+                    op,
+                    AlterTableOperation::AddColumn { .. }
+                        | AlterTableOperation::DropColumn { .. }
+                        | AlterTableOperation::RenameColumn { .. }
+                        | AlterTableOperation::AlterColumn { .. }
+                )
+            });
             if is_rename {
                 Ok(StatementKind::Rename(Box::new(stmt)))
+            } else if is_schema_change {
+                Ok(StatementKind::AlterSchema(Box::new(stmt)))
             } else {
                 Ok(StatementKind::Utility(Box::new(stmt)))
             }
@@ -400,18 +413,54 @@ mod tests {
     }
 
     #[test]
-    fn test_alter_table_add_column_is_utility() {
+    fn test_alter_table_add_column_is_alter_schema() {
         let result = parse_and_classify("ALTER TABLE foo ADD COLUMN bar INT");
-        assert!(matches!(result, Ok(StatementKind::Utility(_))));
+        assert!(matches!(result, Ok(StatementKind::AlterSchema(_))));
     }
 
     #[test]
-    fn test_alter_table_rename_column_is_utility() {
+    fn test_alter_table_rename_column_is_alter_schema() {
         let result = parse_and_classify("ALTER TABLE foo RENAME COLUMN old_col TO new_col");
         assert!(
-            matches!(result, Ok(StatementKind::Utility(_))),
-            "RENAME COLUMN should route to Utility, not Rename: {result:?}"
+            matches!(result, Ok(StatementKind::AlterSchema(_))),
+            "RENAME COLUMN should route to AlterSchema, not Rename: {result:?}"
         );
+    }
+
+    #[test]
+    fn test_alter_table_drop_column_is_alter_schema() {
+        let result = parse_and_classify("ALTER TABLE foo DROP COLUMN bar");
+        assert!(matches!(result, Ok(StatementKind::AlterSchema(_))));
+    }
+
+    #[test]
+    fn test_alter_table_alter_column_set_not_null() {
+        let result = parse_and_classify("ALTER TABLE foo ALTER COLUMN bar SET NOT NULL");
+        assert!(matches!(result, Ok(StatementKind::AlterSchema(_))));
+    }
+
+    #[test]
+    fn test_alter_table_alter_column_drop_not_null() {
+        let result = parse_and_classify("ALTER TABLE foo ALTER COLUMN bar DROP NOT NULL");
+        assert!(matches!(result, Ok(StatementKind::AlterSchema(_))));
+    }
+
+    #[test]
+    fn test_alter_table_alter_column_set_data_type() {
+        let result = parse_and_classify("ALTER TABLE foo ALTER COLUMN bar SET DATA TYPE BIGINT");
+        assert!(matches!(result, Ok(StatementKind::AlterSchema(_))));
+    }
+
+    #[test]
+    fn test_alter_table_rename_still_works() {
+        let result = parse_and_classify("ALTER TABLE foo RENAME TO bar");
+        assert!(matches!(result, Ok(StatementKind::Rename(_))));
+    }
+
+    #[test]
+    fn test_alter_schema_name() {
+        let kind = parse_and_classify("ALTER TABLE foo ADD COLUMN bar INT").unwrap();
+        assert_eq!(kind.name(), "alterschema");
     }
 
     #[test]

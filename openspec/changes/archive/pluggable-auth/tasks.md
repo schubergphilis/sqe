@@ -105,14 +105,14 @@
 - [x] 13.3 `GET /oauth2/callback?code=&state=` → exchange code, store tokens
 - [x] 13.4 `GET /oauth2/token/{auth_id}` → poll (pending/complete/error)
 - [x] 13.5 `DELETE /oauth2/token/{auth_id}` → cleanup
-- [ ] 13.6 Modify `submit_query` → 401 with `WWW-Authenticate: Bearer x_redirect_server, x_token_server`
-- [ ] 13.7 Integration test: full external auth cycle
+- [x] 13.6 Modify `submit_query` → 401 with `WWW-Authenticate: Bearer x_redirect_server, x_token_server`
+- [x] 13.7 Integration test: full external auth cycle
 
 ## 14. Config + Wiring
 
 - [x] 14.1 Add `ExternalAuthConfig` + `DeviceAuthConfig` to `sqe-core/src/config.rs`
-- [ ] 14.2 Add `[auth.external]` section to `sqe.toml.example`
-- [ ] 14.3 Construct services in coordinator startup from config
+- [x] 14.2 Add `[auth.external]` section to `sqe.toml.example`
+- [x] 14.3 Construct services in coordinator startup from config
 - [x] 14.4 Unit test: config parsing with and without `[auth.external]`
 
 ## 15. PendingAuthStore

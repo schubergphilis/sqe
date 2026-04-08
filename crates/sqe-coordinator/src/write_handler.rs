@@ -1410,7 +1410,7 @@ impl WriteHandler {
 /// individually using `arrow_type_to_type` and assign sequential field IDs
 /// starting from 1.
 /// Convert a sqlparser SQL data type to an Arrow DataType.
-fn sql_type_to_arrow(sql_type: &sqlparser::ast::DataType) -> sqe_core::Result<arrow_schema::DataType> {
+pub(crate) fn sql_type_to_arrow(sql_type: &sqlparser::ast::DataType) -> sqe_core::Result<arrow_schema::DataType> {
     use arrow_schema::DataType;
     use sqlparser::ast::DataType as SqlType;
 

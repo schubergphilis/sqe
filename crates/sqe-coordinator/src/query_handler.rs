@@ -275,6 +275,10 @@ impl QueryHandler {
                     self.catalog_ops.rename_table(session, stmt).await?;
                     Ok(vec![])
                 }
+                StatementKind::AlterSchema(stmt) => {
+                    self.catalog_ops.alter_table_schema(session, stmt).await?;
+                    Ok(vec![])
+                }
                 StatementKind::CreateView(stmt) => {
                     self.handle_create_view(session, stmt).await?;
                     Ok(vec![])
