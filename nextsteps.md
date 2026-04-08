@@ -189,6 +189,8 @@ Step 4: pluggable auth      ✅ DONE (11 providers: OIDC, bearer, API key, anony
 Step 4b: streaming exec A   ✅ DONE (spill-to-disk, late materialization, scan planning, S3 I/O, SortMergeJoin — 21/22 TPC-H SF1 on 512MB)
 Step 4c: streaming exec B   ✅ DONE (shuffle, distributed sort/join/aggregate, multi-endpoint Flight SQL, Trino function compat)
 Step 4d: adaptive sort+metrics ✅ DONE (adaptive sort stripping, S3/auth/write Prometheus metrics)
+Step 7.1: dbt-sqe adapter   ✅ DONE (ADBC Flight SQL, table/view/incremental/seed materializations)
+Step 7.3: ALTER TABLE schema ✅ DONE (ADD/DROP/RENAME COLUMN, SET/DROP NOT NULL, type widening)
 Step 5: pluggable catalogs  (AWS Glue, Nessie, Hive Metastore, storage-only, Delta Lake) ← NEXT
 Step 6: semantic layer      (new crates; fully additive; no existing code broken)
 ```
