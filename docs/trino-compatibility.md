@@ -21,9 +21,9 @@ noting semantic differences and gaps.
 | Scalar: Conversion | 10 | 3 | 0 | 7 | 30% |
 | Aggregate | 33 | 19 | 4 | 10 | 69.7% |
 | Window | 14 | 11 | 1 | 2 | 85.7% |
-| DDL/DML | — | — | — | — | —% |
-| Type System | — | — | — | — | —% |
-| Iceberg-Specific | — | — | — | — | —% |
+| DDL/DML | 31 + 1🔧 | 18 | 3 | 10 | 58.1% |
+| Type System | 27 | 18 | 2 | 7 | 74.1% |
+| Iceberg-Specific | 18 | 6 | 0 | 12 | 33.3% |
 
 ## How to Read This Document
 
@@ -276,15 +276,99 @@ Each section lists Trino functions with their SQE status:
 
 ## DDL / DML Statements
 
-_To be filled in Task 4_
+| Trino Statement | SQE Support | Status | Notes |
+|---|---|---|---|
+| `CREATE TABLE (cols) WITH (...)` | `CREATE TABLE (cols)` | ⚠️ | No WITH properties (Iceberg defaults) |
+| `CREATE TABLE AS SELECT` | Same | ✅ | |
+| `DROP TABLE` | Same | ✅ | |
+| `ALTER TABLE ... RENAME TO` | Same | ✅ | |
+| `ALTER TABLE ... ADD COLUMN` | Same | ✅ | |
+| `ALTER TABLE ... DROP COLUMN` | Same | ✅ | |
+| `ALTER TABLE ... RENAME COLUMN` | Same | ✅ | |
+| `ALTER TABLE ... SET/DROP NOT NULL` | Same | ✅ | |
+| `ALTER TABLE ... SET PROPERTIES` | — | ❌ | |
+| `CREATE VIEW` | Same | ✅ | Iceberg views |
+| `DROP VIEW` | Same | ✅ | |
+| `CREATE OR REPLACE VIEW` | — | ❌ | |
+| `CREATE MATERIALIZED VIEW` | — | ❌ | |
+| `INSERT INTO ... VALUES` | Same | ✅ | |
+| `INSERT INTO ... SELECT` | Same | ✅ | |
+| `DELETE FROM ... WHERE` | Same | ✅ | CoW rewrite_files |
+| `UPDATE ... SET ... WHERE` | Same | ✅ | CoW rewrite_files |
+| `MERGE INTO ... USING ...` | Same | ✅ | CoW full-outer-join rewrite |
+| `TRUNCATE TABLE` | — | ❌ | Use `DELETE FROM t` |
+| `COMMENT ON TABLE/COLUMN` | — | ❌ | |
+| `SHOW CATALOGS` | Same | ✅ | |
+| `SHOW SCHEMAS` | Same | ✅ | |
+| `SHOW TABLES` | Same | ✅ | |
+| `SHOW COLUMNS FROM` | `DESCRIBE` | ⚠️ | Different syntax |
+| `SHOW CREATE TABLE` | — | ❌ | |
+| `SHOW STATS FOR` | — | ❌ | |
+| `EXPLAIN` | Same | ✅ | DataFusion explain |
+| `EXPLAIN ANALYZE` | `EXPLAIN FULL` | ⚠️ | Different keyword, similar output |
+| `USE catalog.schema` | — | ❌ | Set via headers/session |
+| `PREPARE` / `EXECUTE` | — | ❌ | No prepared statements |
+| `CALL procedure(...)` | — | ❌ | No stored procedures |
+| `GRANT` / `REVOKE` | Planned (Plan C) | 🔧 | SQE-specific grant system |
 
 ## Type System
 
-_To be filled in Task 4_
+| Trino Type | SQE/Arrow Type | Status | Notes |
+|---|---|---|---|
+| `BOOLEAN` | `Boolean` | ✅ | |
+| `TINYINT` | `Int8` | ✅ | |
+| `SMALLINT` | `Int16` | ✅ | |
+| `INTEGER` | `Int32` | ✅ | |
+| `BIGINT` | `Int64` | ✅ | |
+| `REAL` | `Float32` | ✅ | |
+| `DOUBLE` | `Float64` | ✅ | |
+| `DECIMAL(p, s)` | `Decimal128(p, s)` | ✅ | Up to 38 digits |
+| `VARCHAR` / `VARCHAR(n)` | `Utf8` / `Utf8View` | ✅ | Length limit not enforced |
+| `CHAR(n)` | `Utf8` | ⚠️ | No fixed-length semantics |
+| `VARBINARY` | `Binary` | ✅ | |
+| `DATE` | `Date32` | ✅ | |
+| `TIME` | — | ❌ | No time-only type in Arrow |
+| `TIME WITH TIME ZONE` | — | ❌ | |
+| `TIMESTAMP` | `Timestamp(Microsecond, None)` | ✅ | |
+| `TIMESTAMP WITH TIME ZONE` | `Timestamp(Microsecond, Some(tz))` | ✅ | |
+| `INTERVAL YEAR TO MONTH` | `Interval(YearMonth)` | ✅ | |
+| `INTERVAL DAY TO SECOND` | `Interval(DayTime)` | ✅ | |
+| `ARRAY(T)` | `List(T)` | ✅ | |
+| `MAP(K, V)` | `Map(K, V)` | ✅ | |
+| `ROW(fields...)` | `Struct(fields...)` | ✅ | |
+| `JSON` | — | ❌ | No JSON type; use VARCHAR |
+| `UUID` | `Utf8` | ⚠️ | Stored as string, no UUID type |
+| `IPADDRESS` | — | ❌ | |
+| `HyperLogLog` | — | ❌ | Trino-specific sketch type |
+| `TDigest` | — | ❌ | Trino-specific sketch type |
+| `SetDigest` | — | ❌ | Trino-specific sketch type |
+
+**Type coercion:** DataFusion handles implicit coercion for numeric types (INT → BIGINT → DOUBLE) and string types. Trino has additional coercion rules for JSON, TIME, and sketch types that are not applicable in SQE.
 
 ## Iceberg-Specific SQL
 
-_To be filled in Task 4_
+| Feature | SQE Support | Trino Support | Status | Notes |
+|---|---|---|---|---|
+| Partition pruning | ✅ | ✅ | ✅ | DataFusion optimizer pass |
+| Hidden partitioning | ✅ | ✅ | ✅ | Via Iceberg transforms |
+| Schema evolution | ✅ | ✅ | ✅ | ADD/DROP/RENAME COLUMN |
+| Type widening | ✅ | ✅ | ✅ | INT→BIGINT, FLOAT→DOUBLE |
+| Time travel: `FOR VERSION AS OF` | — | ✅ | ❌ | Snapshot ID query |
+| Time travel: `FOR TIMESTAMP AS OF` | — | ✅ | ❌ | Temporal query |
+| `$snapshots` metadata table | — | ✅ | ❌ | |
+| `$manifests` metadata table | — | ✅ | ❌ | |
+| `$history` metadata table | — | ✅ | ❌ | |
+| `$partitions` metadata table | — | ✅ | ❌ | |
+| `$files` metadata table | — | ✅ | ❌ | |
+| `$refs` metadata table | — | ✅ | ❌ | |
+| Partition evolution | ✅ | ✅ | ✅ | Via ALTER TABLE |
+| Sort order | — | ✅ | ❌ | |
+| Write distribution mode | — | ✅ | ❌ | |
+| ORC file format | — | ✅ | ❌ | Parquet only |
+| Copy-on-Write (CoW) | ✅ | ✅ | ✅ | DELETE/UPDATE/MERGE |
+| Merge-on-Read (MoR) | — | ✅ | ❌ | Planned (iceberg-rust Epic #2186) |
+
+**Note:** Iceberg metadata tables (`$snapshots`, `$history`, etc.) are a significant usability gap. These are commonly used for debugging and operational monitoring. Implementation requires exposing iceberg-rust's `TableMetadata` as virtual table providers.
 
 ## Operational Comparison
 
