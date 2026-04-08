@@ -1,14 +1,16 @@
 # SQE — Next Steps
 
-> Status as of 2026-04-08. All implementation steps through 4c complete. **Steps 1–4c done:** core engine (103/103), OSS security hardening (51/51), benchmark suite (6 suites), pluggable auth (11 providers), streaming execution Phase A (spill, late-mat, scan planning, S3 I/O) + Phase B (shuffle, distributed sort/join/aggregate, multi-endpoint Flight SQL, Trino function compat). Adaptive sort stripping and S3/auth/write metrics merged. Branch cleanup complete — all work consolidated on main. **Next: Step 5 (pluggable catalogs).**
+> Status as of 2026-04-08. **Steps 1–4d + 7.1 + 7.3 + OSS Release done.** Step 1 (Security & Functional Audit) completed — see [AUDIT.md](AUDIT.md). OSS release readiness complete: Apache 2.0 [LICENSE](LICENSE), [CONTRIBUTING.md](CONTRIBUTING.md), cargo-deny ([deny.toml](deny.toml)), git-cliff ([cliff.toml](cliff.toml)), CI pipelines (clippy + audit + deny + release), retro-tagging (44 MRs → v0.1.0–v0.28.0), [CHANGELOG.md](CHANGELOG.md), crate versions bumped to 0.15.0. 1,218 tests passing, all advisory checks clean. **Next: Step 5 (pluggable catalogs).** ← NEXT
 
 > **Monitoring:** OPA SPI refactor in Polaris (PR #3999, still draft) will affect Phase 5 OPA integration when it lands — do not implement OPA against Polaris until this stabilises. Remote S3 signing (Iceberg 1.12, not yet released) will affect the pluggable-catalogs design.
 
 ---
 
-## Step 1: Security and Functional Audit
+## ~~Step 1: Security and Functional Audit~~ ✅
 
-Before starting new feature development, audit the current codebase against the design intent. Do this as a structured review, not just a code read.
+See [AUDIT.md](AUDIT.md) for the full report. Completed 2026-04-08.
+
+~~Before starting new feature development, audit the current codebase against the design intent. Do this as a structured review, not just a code read.~~
 
 ### 1a. Security Audit
 
@@ -178,7 +180,8 @@ Four sub-systems that make SQE agent-native and semantically aware.
 ## Implementation Order Rationale
 
 ```
-Step 1: audit               (1–2 days — catches issues before they compound)
+Step 1: audit               ✅ DONE (AUDIT.md: 1,218 tests, rsa removed, 5 config findings, no critical vulns)
+Step 1+: OSS release        ✅ DONE (LICENSE, CONTRIBUTING, deny.toml, cliff.toml, CI pipelines, retro-tags, CHANGELOG, v0.15.0)
 Step 2: core engine gaps    ✅ DONE (103/103 — DELETE, UPDATE, MERGE via CoW rewrite_files)
 Step 3: security hardening  ✅ DONE (51/51 — TLS, rate limiting, timeouts, cancellation, audit, error sanitisation)
 Step 3b: benchmark suite    ✅ DONE (sqe-bench: generate/load/test, 6 benchmarks, read_parquet() TVF, CI scripts)
