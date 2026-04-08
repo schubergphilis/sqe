@@ -1,13 +1,17 @@
 use std::collections::HashMap;
+use std::sync::Arc as StdArc;
 use std::sync::Arc;
 
-use iceberg::{Catalog, NamespaceIdent, TableIdent};
-use sqlparser::ast::{AlterTableOperation, ObjectName, ObjectType, SchemaName, Statement};
+use iceberg::spec::{NestedField, Schema as IcebergSchema};
+use iceberg::{Catalog, NamespaceIdent, TableIdent, TableRequirement, TableUpdate};
+use sqlparser::ast::{AlterColumnOperation, AlterTableOperation, ObjectName, ObjectType, SchemaName, Statement};
 use tracing::info;
 
 use sqe_catalog::SessionCatalog;
 use sqe_core::{Session, SqeConfig, SqeError};
 use tracing::instrument;
+
+use crate::write_handler::sql_type_to_arrow;
 
 /// Handles catalog DDL operations (DROP TABLE, ALTER TABLE RENAME, views).
 ///
@@ -341,6 +345,213 @@ impl CatalogOps {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Evolve a table schema via the Iceberg REST catalog.
+    ///
+    /// Handles `ALTER TABLE ... ADD/DROP/RENAME COLUMN` and `ALTER COLUMN` operations
+    /// by loading the current schema, applying each operation in order, then committing
+    /// the new schema via the Iceberg Transaction API.
+    #[instrument(skip(self, session, stmt), fields(username = %session.user.username))]
+    pub async fn alter_table_schema(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+    ) -> sqe_core::Result<()> {
+        let (table_name, operations) = match stmt {
+            Statement::AlterTable {
+                name, operations, ..
+            } => (name, operations),
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected ALTER TABLE statement, got: {other}"
+                )));
+            }
+        };
+
+        let (namespace, name) = parse_table_ref(table_name)?;
+        let table_ident = TableIdent::new(namespace, name);
+
+        info!(
+            username = %session.user.username,
+            table = %table_ident,
+            "Evolving table schema"
+        );
+
+        // Use SessionCatalog directly so we can call commit_schema_update, which
+        // bypasses the crate-private TableCommit::build() method.
+        let session_catalog = Arc::new(
+            SessionCatalog::new(
+                &self.config.catalog.polaris_url,
+                &self.config.catalog.warehouse,
+                &session.access_token,
+                &self.config.storage,
+                None, None,
+            )
+            .await?,
+        );
+
+        // Load the table via the catalog bridge (iceberg's load_table returns a Table)
+        let catalog = session_catalog.as_catalog();
+        let table = catalog
+            .load_table(&table_ident)
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to load table '{table_ident}': {e}")))?;
+
+        let metadata = table.metadata();
+        let current_schema = metadata.current_schema();
+        let last_assigned_field_id = metadata.last_column_id();
+        let current_schema_id = current_schema.schema_id();
+
+        // Get mutable copy of current fields
+        let mut fields: Vec<StdArc<NestedField>> = current_schema.as_struct().fields().to_vec();
+
+        // Track the maximum field ID so new fields get unique IDs
+        let mut max_field_id = last_assigned_field_id;
+
+        for op in operations {
+            match op {
+                AlterTableOperation::AddColumn { column_def, .. } => {
+                    let not_null = column_def
+                        .options
+                        .iter()
+                        .any(|opt| matches!(opt.option, sqlparser::ast::ColumnOption::NotNull));
+
+                    let arrow_type = sql_type_to_arrow(&column_def.data_type)?;
+                    let iceberg_type = iceberg::arrow::arrow_type_to_type(&arrow_type)
+                        .map_err(|e| SqeError::Execution(format!(
+                            "Cannot convert type for column '{}': {e}",
+                            column_def.name.value
+                        )))?;
+
+                    max_field_id += 1;
+                    let new_field = if not_null {
+                        NestedField::required(max_field_id, &column_def.name.value, iceberg_type)
+                    } else {
+                        NestedField::optional(max_field_id, &column_def.name.value, iceberg_type)
+                    };
+                    fields.push(StdArc::new(new_field));
+                }
+
+                AlterTableOperation::DropColumn { column_name, if_exists, .. } => {
+                    let col = column_name.value.as_str();
+                    let pos = fields.iter().position(|f| f.name == col);
+                    match pos {
+                        Some(idx) => { fields.remove(idx); }
+                        None if *if_exists => {}
+                        None => {
+                            return Err(SqeError::Execution(format!(
+                                "Column '{col}' not found in table '{table_ident}'"
+                            )));
+                        }
+                    }
+                }
+
+                AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
+                    let old_name = old_column_name.value.as_str();
+                    let pos = fields.iter().position(|f| f.name == old_name).ok_or_else(|| {
+                        SqeError::Execution(format!(
+                            "Column '{old_name}' not found in table '{table_ident}'"
+                        ))
+                    })?;
+                    let old_field = &fields[pos];
+                    let renamed = NestedField::new(
+                        old_field.id,
+                        new_column_name.value.clone(),
+                        *old_field.field_type.clone(),
+                        old_field.required,
+                    );
+                    fields[pos] = StdArc::new(renamed);
+                }
+
+                AlterTableOperation::AlterColumn { column_name, op } => {
+                    let col = column_name.value.as_str();
+                    let pos = fields.iter().position(|f| f.name == col).ok_or_else(|| {
+                        SqeError::Execution(format!(
+                            "Column '{col}' not found in table '{table_ident}'"
+                        ))
+                    })?;
+                    let old_field = &fields[pos];
+                    let new_field = match op {
+                        AlterColumnOperation::SetNotNull => NestedField::new(
+                            old_field.id,
+                            old_field.name.clone(),
+                            *old_field.field_type.clone(),
+                            true,
+                        ),
+                        AlterColumnOperation::DropNotNull => NestedField::new(
+                            old_field.id,
+                            old_field.name.clone(),
+                            *old_field.field_type.clone(),
+                            false,
+                        ),
+                        AlterColumnOperation::SetDataType { data_type, .. } => {
+                            let arrow_type = sql_type_to_arrow(data_type)?;
+                            let iceberg_type = iceberg::arrow::arrow_type_to_type(&arrow_type)
+                                .map_err(|e| SqeError::Execution(format!(
+                                    "Cannot convert type for column '{col}': {e}"
+                                )))?;
+                            NestedField::new(
+                                old_field.id,
+                                old_field.name.clone(),
+                                iceberg_type,
+                                old_field.required,
+                            )
+                        }
+                        other => {
+                            return Err(SqeError::NotImplemented(format!(
+                                "ALTER COLUMN operation not supported: {other}"
+                            )));
+                        }
+                    };
+                    fields[pos] = StdArc::new(new_field);
+                }
+
+                other => {
+                    return Err(SqeError::NotImplemented(format!(
+                        "ALTER TABLE operation not supported: {other}"
+                    )));
+                }
+            }
+        }
+
+        // Build new schema with incremented schema ID
+        let new_schema_id = metadata
+            .schemas_iter()
+            .map(|s| s.schema_id())
+            .max()
+            .unwrap_or(0)
+            + 1;
+
+        let new_schema = IcebergSchema::builder()
+            .with_schema_id(new_schema_id)
+            .with_fields(fields)
+            .with_identifier_field_ids(current_schema.identifier_field_ids())
+            .build()
+            .map_err(|e| SqeError::Execution(format!("Failed to build new schema: {e}")))?;
+
+        // Commit via SessionCatalog::commit_schema_update which makes a direct REST
+        // POST call. We use this rather than TableCommit::builder().build() because
+        // the TypedBuilder `build()` is pub(crate) in the upstream iceberg crate.
+        let updates = vec![
+            TableUpdate::AddSchema { schema: new_schema },
+            TableUpdate::SetCurrentSchema { schema_id: -1 },
+        ];
+        let requirements = vec![
+            TableRequirement::LastAssignedFieldIdMatch { last_assigned_field_id },
+            TableRequirement::CurrentSchemaIdMatch { current_schema_id },
+        ];
+
+        session_catalog
+            .commit_schema_update(&table_ident, updates, requirements)
+            .await?;
+
+        info!(
+            table = %table_ident,
+            "Schema evolution committed successfully"
+        );
+
+        Ok(())
     }
 
     /// Create a `SessionCatalogBridge` (which implements `iceberg::Catalog`)
