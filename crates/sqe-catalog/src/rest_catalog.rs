@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use iceberg::table::Table;
-use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent};
+use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent, TableRequirement, TableUpdate};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogBuilder};
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument};
@@ -505,6 +505,77 @@ impl SessionCatalog {
         }
 
         info!(view = name, namespace = ?namespace, "View dropped");
+        Ok(())
+    }
+
+    /// Commit a schema update to a table via the Polaris REST API.
+    ///
+    /// Sends `POST /v1/{warehouse}/namespaces/{namespace}/tables/{table}` with
+    /// the provided `TableRequirement` list and `TableUpdate` list. This is the
+    /// Iceberg REST Catalog table-commit endpoint used for schema evolution
+    /// (ADD/DROP/RENAME/ALTER COLUMN).
+    ///
+    /// `TableUpdate` and `TableRequirement` are serialized directly; we build the
+    /// JSON payload ourselves rather than going through `TableCommit::builder()`,
+    /// whose `build()` method is crate-private in the upstream iceberg crate.
+    #[instrument(skip(self, updates, requirements), fields(table = %table_ident, warehouse = %self.warehouse))]
+    pub async fn commit_schema_update(
+        &self,
+        table_ident: &TableIdent,
+        updates: Vec<TableUpdate>,
+        requirements: Vec<TableRequirement>,
+    ) -> sqe_core::Result<()> {
+        let ns_str = table_ident
+            .namespace()
+            .as_ref()
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\u{1F}");
+
+        let url = format!(
+            "{}/namespaces/{}/tables/{}",
+            self.rest_prefix(),
+            ns_str,
+            table_ident.name()
+        );
+
+        let body = serde_json::json!({
+            "identifier": {
+                "namespace": table_ident.namespace().as_ref(),
+                "name": table_ident.name(),
+            },
+            "requirements": serde_json::to_value(&requirements)
+                .map_err(|e| SqeError::Execution(format!("Failed to serialize requirements: {e}")))?,
+            "updates": serde_json::to_value(&updates)
+                .map_err(|e| SqeError::Execution(format!("Failed to serialize updates: {e}")))?,
+        });
+
+        debug!(url = %url, table = %table_ident, "Committing schema update via Polaris REST");
+
+        let mut req = self
+            .http_client
+            .post(&url)
+            .bearer_auth(&self.bearer_token)
+            .header("X-Request-ID", Uuid::new_v4().to_string())
+            .json(&body);
+        for (k, v) in trace_context_http_headers() {
+            req = req.header(k, v);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to commit schema update: {e}")))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(SqeError::Catalog(format!(
+                "Failed to commit schema update for '{table_ident}' (HTTP {status}): {text}"
+            )));
+        }
+
+        info!(table = %table_ident, "Schema update committed");
         Ok(())
     }
 
