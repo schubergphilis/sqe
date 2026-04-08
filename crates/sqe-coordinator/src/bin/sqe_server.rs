@@ -406,6 +406,13 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
 
     // File-based session persistence — optional, off by default
     if config.session.persistence == "file" {
+        tracing::warn!(
+            path = %config.session.persistence_path,
+            "⚠ Session file persistence writes access tokens to disk in plaintext. \
+             Ensure the persistence file has restrictive permissions (chmod 600). \
+             Consider using memory persistence in production unless restart recovery is required."
+        );
+
         // Try to restore sessions from the last snapshot on startup (best-effort)
         session_manager.restore_from_file(&config.session.persistence_path);
 

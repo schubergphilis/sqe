@@ -128,13 +128,13 @@ When the `audience` config field is absent or empty, `validation.validate_aud = 
 
 | # | Area | Severity | Description | Status |
 |---|---|---|---|---|
-| 1 | Auth | Medium | Session file persistence writes raw tokens to disk | Document + warn |
-| 2 | Token | Medium | JWT audience validation silently disabled when unconfigured | Document + warn |
-| 3 | Config | Low | S3 credentials use MinIO defaults in example | Replace with placeholders |
-| 4 | Config | Low | `ssl_verification = false` active in example | Comment out |
-| 5 | Auth | Info | Token fingerprint pattern not implemented | Nice-to-have |
+| 1 | Auth | Medium | Session file persistence writes raw tokens to disk | ✅ Fixed — startup WARNING emitted when file persistence enabled, advises chmod 600 |
+| 2 | Token | Medium | JWT audience validation silently disabled when unconfigured | ✅ Fixed — WARNING logged at `BearerTokenProvider::new()` when no audience configured; `audience` field added to sqe.toml.example (commented) |
+| 3 | Config | Low | S3 credentials use MinIO defaults in example | ✅ Fixed — replaced with `<your-s3-access-key>` / `<your-s3-secret-key>` placeholders |
+| 4 | Config | Low | `ssl_verification = false` active in example | ✅ Fixed — commented out with warning. Code default is `true` (via `default_true`); startup WARNING already emitted when disabled |
+| 5 | Auth | Info | Token fingerprint pattern not implemented | ✅ Already implemented — `Session::token_fingerprint()` (hash-based) used in `SessionCatalog` debug logging |
 
-**No critical security vulnerabilities found.** Issues 1-4 are configuration/documentation improvements. Issue 5 is an operational enhancement.
+**No critical security vulnerabilities found.** All 5 issues resolved.
 
 ---
 

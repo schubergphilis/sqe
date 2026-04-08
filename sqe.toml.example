@@ -34,7 +34,7 @@ realm = "iceberg"
 client_id = "sqe-client"
 client_secret = ""
 token_refresh_buffer_secs = 60
-ssl_verification = false
+# ssl_verification = false  # ⚠ Only set to false for local dev with self-signed certs
 
 # ── Auth providers (explicit chain, overrides legacy keycloak_url/client_id) ──
 # When configured, the auth chain uses these providers in order.
@@ -55,6 +55,8 @@ roles_claim = "realm_access.roles"
 type = "bearer_token"
 jwks_url = "https://auth.local/realms/iceberg/protocol/openid-connect/certs"
 issuer = "https://auth.local/realms/iceberg"
+# audience = "sqe"  # ⚠ Recommended: restrict accepted tokens to this audience claim.
+                     # Without this, tokens issued for ANY service by this IdP are accepted.
 user_claim = "preferred_username"
 roles_claim = "realm_access.roles"
 
@@ -98,8 +100,8 @@ default_table_format_version = 2  # 2 (default) or 3 for Iceberg v3 tables
 [storage]
 s3_endpoint = "http://s3:9000"
 s3_region = "us-east-1"
-s3_access_key = "s3admin"
-s3_secret_key = "s3admin"
+s3_access_key = "<your-s3-access-key>"
+s3_secret_key = "<your-s3-secret-key>"
 s3_path_style = true
 
 [policy]
