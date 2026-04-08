@@ -6,6 +6,7 @@ include:
   - template: Security/Secret-Detection.gitlab-ci.yml
 
 stages:
+  - check
   - test
   - secret-detection
   - discover
@@ -18,6 +19,37 @@ variables:
 
 secret_detection:
   stage: secret-detection
+
+# ── Static analysis + security ─────────────────────────────────
+cargo-check:
+  stage: check
+  image: rust:bookworm
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq cmake protobuf-compiler libssl-dev pkg-config > /dev/null
+    - cargo install cargo-deny 2>/dev/null || true
+  script:
+    - cargo clippy --all-targets --all-features -- -D warnings
+    - cargo audit
+    - cargo deny check advisories
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - crates/**/*
+        - Cargo.toml
+        - Cargo.lock
+        - deny.toml
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
+      changes:
+        - crates/**/*
+        - Cargo.toml
+        - Cargo.lock
+        - deny.toml
+  cache:
+    key: cargo-check-${CI_COMMIT_REF_SLUG}
+    paths:
+      - target/
+      - .cargo/registry/
+      - .cargo/bin/cargo-deny
 
 # ── Tests ──────────────────────────────────────────────────────
 cargo-test:
@@ -75,3 +107,33 @@ build-sqe:
         - Cargo.toml
         - Cargo.lock
         - Dockerfile
+
+# ── Release pipeline (triggered on tag push: v*) ──────────────
+
+changelog:
+  stage: test
+  image: rust:bookworm
+  script:
+    - cargo install git-cliff 2>/dev/null || true
+    - git-cliff --latest --output release-notes.md
+  artifacts:
+    paths:
+      - release-notes.md
+    expire_in: 1 hour
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+/'
+
+release:
+  stage: build
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    - job: changelog
+      artifacts: true
+  script:
+    - echo "Creating release for ${CI_COMMIT_TAG}"
+  release:
+    tag_name: ${CI_COMMIT_TAG}
+    name: "SQE ${CI_COMMIT_TAG}"
+    description: release-notes.md
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+/'
