@@ -1,23 +1,74 @@
 # Trino Client Compatibility
 
-> Last tested: 2026-04-08 against SQE v0.15.0
+> Last tested: 2026-04-08 against SQE v0.15.0 (binary from Apr 7)
 > SQE Trino HTTP endpoint: `http://localhost:8080`
+> Test stack: Polaris 1.3.0 (in-memory) + RustFS (S3-compatible)
 
 ## Summary
 
 | Client | Version | Connect | Browse | Query | Paginate | Status |
 |---|---|---|---|---|---|---|
-| trino-cli | 465 | — | — | — | — | — |
-| Trino JDBC | 465 | — | — | — | — | — |
-| DBeaver (Trino) | 24.x | — | — | — | — | — |
-| Superset (SQLAlchemy) | 4.x | — | — | — | — | — |
-| dbt-trino | 1.9.x | — | — | — | — | — |
+| curl (Trino HTTP) | — | ✅ | ✅ | ✅ | ⏭️ | ✅ 26/28 tests pass |
+| trino-cli | 465 | ⏭️ | ⏭️ | ⏭️ | ⏭️ | ⏭️ not tested |
+| Trino JDBC | 465 | ⏭️ | ⏭️ | ⏭️ | ⏭️ | ⏭️ not tested |
+| DBeaver (Trino) | 24.x | ⏭️ | ⏭️ | ⏭️ | ⏭️ | ⏭️ not tested |
+| Superset (SQLAlchemy) | 4.x | ⏭️ | ⏭️ | ⏭️ | ⏭️ | ⏭️ not tested |
+| dbt-trino | 1.9.x | ⏭️ | ⏭️ | ⏭️ | ⏭️ | ⏭️ not tested |
 
 Rating: ✅ works | ⚠️ partial (with workaround) | ❌ broken | ⏭️ not tested
 
+## Trino HTTP v1/statement Protocol (curl)
+
+**Tested: 2026-04-08** via `curl -X POST http://localhost:28080/v1/statement` with Bearer token auth.
+
+**Connection & Metadata:**
+- [x] `SHOW CATALOGS` returns results (1 row)
+- [x] `SHOW SCHEMAS IN <catalog>` returns results (2 rows: default, information_schema)
+- [x] `SELECT 1` succeeds
+- [x] `SELECT 1+1 AS result` succeeds with column alias
+
+**Trino Date/Time Functions (compat UDFs):**
+- [x] `now()` — returns current timestamp
+- [x] `year(CAST('2024-01-15' AS DATE))` — returns 2024
+- [x] `month(CAST('2024-03-15' AS DATE))` — returns 3
+- [x] `day_of_week(CAST('2024-01-15' AS DATE))` — returns day number
+- [x] `date_format(now(), '%Y-%m-%d')` — MySQL format codes work
+- [x] `date_trunc('month', ...)` — native DataFusion
+
+**String Functions:**
+- [x] `upper(concat('hello', ' ', 'world'))` — HELLO WORLD
+- [x] `length('hello')` — 5
+- [x] `substr('hello world', 1, 5)` — hello
+- [x] `replace('hello', 'l', 'r')` — herro
+- [x] `trim('  hello  ')` — hello
+
+**Conditional / Type:**
+- [x] `CASE WHEN 1=1 THEN 'yes' ELSE 'no' END` — yes
+- [x] `COALESCE(NULL, 42)` — 42
+- [x] `NULLIF(1, 1)` — NULL
+- [x] `GREATEST(1,2,3), LEAST(1,2,3)` — 3, 1
+- [x] `typeof(42)` — Int64
+- [x] `TRY_CAST('abc' AS INTEGER)` — NULL
+
+**Math:**
+- [x] `abs(-5), sqrt(16.0)` — 5, 4.0
+- [x] `round(3.14159, 2)` — 3.14
+- [x] `pi()` — 3.14159...
+- [x] `random()` — random float
+
+**JSON:**
+- [x] `json_format('{"a":1}')` — formatted JSON string
+
+**Known failures:**
+- [ ] `VALUES` clause — `SELECT count(*) FROM (VALUES 1,2,3) AS t(x)` fails (DataFusion parses but Trino endpoint doesn't handle inline VALUES)
+- [ ] Error detail — bad SQL returns generic `Query execution failed` instead of the underlying parse error message
+- [x] Missing table — correctly returns error with table name: `table 'test_warehouse.default.nonexistent_table' not found`
+
+**Results:** 26/28 pass. Core SQL functions, metadata, and Trino compat UDFs all work correctly over the Trino HTTP protocol.
+
 ## trino-cli
 
-**Version tested:** —
+**Version tested:** ⏭️ not yet tested
 **Command:**
 
 ```bash
@@ -37,8 +88,8 @@ trino --server http://localhost:8080 --user admin --catalog iceberg --schema tpc
 - [ ] Error messages display correctly for bad SQL
 - [ ] `\q` / Ctrl+D exits cleanly
 
-**Results:** _To be filled after testing_
-**Known issues:** _To be filled after testing_
+**Results:** _Requires trino-cli binary_
+**Known issues:** _To be tested_
 
 ## Trino JDBC Driver
 
@@ -109,8 +160,12 @@ trino --server http://localhost:8080 --user admin --catalog iceberg --schema tpc
 
 ## Common Issues & Workarounds
 
-_To be filled after testing. Expected areas:_
-- Pagination edge cases
-- Type mapping mismatches (decimal precision, timestamp format)
-- Metadata endpoint coverage (system.jdbc.* tables)
-- Auth flow differences (OAuth2 external auth flow)
+**Authentication:** SQE's Trino HTTP endpoint requires a Bearer token (OAuth2). The test stack uses Polaris client_credentials grant (`client_id=root`, `client_secret=s3cr3t`). The live stack uses Keycloak OIDC with OPA-enforced authorization.
+
+**Catalog context:** Unlike Trino, SQE requires explicit catalog context for most queries. Use `X-Trino-Catalog` header or fully-qualified table names (`catalog.schema.table`).
+
+**VALUES clause:** `SELECT ... FROM (VALUES ...) AS t(x)` fails. Use CTEs or temporary tables instead.
+
+**Error messages:** Trino HTTP error responses use a generic `Query execution failed` message instead of surfacing the underlying SQL parse/plan error. The `errorName` and `errorType` fields are populated but the user-facing `message` needs improvement.
+
+**DESCRIBE:** The `DESCRIBE <table>` statement is not supported via the Trino HTTP endpoint. Use `SHOW COLUMNS FROM <table>` or query `information_schema.columns` instead.
