@@ -12,16 +12,16 @@ noting semantic differences and gaps.
 | Category | Total | ✅ | ⚠️ | ❌ | Coverage |
 |---|---|---|---|---|---|
 | Scalar: String | 27 | 23 | 3 | 1 | 96.3% |
-| Scalar: Math | 29 | 24 | 4 | 1 | 96.6% |
-| Scalar: Date/Time | 38 | 35 | 1 | 2 | 94.7% |
-| Scalar: JSON | 12 | 8 | 0 | 4 | 66.7% |
+| Scalar: Math | 29 | 25 | 4 | 0 | 100% |
+| Scalar: Date/Time | 38 | 37 | 1 | 0 | 100% |
+| Scalar: JSON | 12 | 10 | 0 | 2 | 83.3% |
 | Scalar: URL | 8 | 8 | 0 | 0 | 100% |
 | Scalar: Regex | 6 | 4 | 2 | 0 | 100% |
 | Scalar: Conditional | 8 | 7 | 0 | 1 | 87.5% |
 | Scalar: Conversion | 10 | 9 | 0 | 1 | 90% |
-| Aggregate | 33 | 20 | 4 | 9 | 72.7% |
-| Window | 14 | 11 | 1 | 2 | 85.7% |
-| DDL/DML | 31 + 1🔧 | 18 | 3 | 10 | 58.1% |
+| Aggregate | 33 | 22 | 5 | 6 | 81.8% |
+| Window | 14 | 13 | 0 | 1 | 92.9% |
+| DDL/DML | 31 + 1🔧 | 18 | 5 | 8 | 74.2% |
 | Type System | 27 | 18 | 2 | 7 | 74.1% |
 | Iceberg-Specific | 18 | 6 | 0 | 12 | 33.3% |
 
@@ -101,7 +101,7 @@ Each section lists Trino functions with their SQE status:
 | `sqrt(x)` | `sqrt(x)` | ✅ | |
 | `to_base(n, radix)` | `to_base(n, radix)` | ✅ | Trino compat UDF |
 | `truncate(x)` | `trunc(x)` | ⚠️ | Different name |
-| `width_bucket(x, bound1, bound2, n)` | — | ❌ | |
+| `width_bucket(x, bound1, bound2, n)` | Same | ✅ | Native DataFusion (built-in in DF 52) |
 
 ## Scalar Functions: Date/Time
 
@@ -138,8 +138,8 @@ Each section lists Trino functions with their SQE status:
 | `minute(ts)` | `minute(ts)` | ✅ | Trino compat UDF |
 | `second(ts)` | `second(ts)` | ✅ | Trino compat UDF |
 | `millisecond(ts)` | `millisecond(ts)` | ✅ | Trino compat UDF |
-| `timezone_hour(ts)` | — | ❌ | |
-| `timezone_minute(ts)` | — | ❌ | |
+| `timezone_hour(ts)` | `timezone_hour(ts)` | ✅ | Trino compat UDF (returns 0, UTC-only) |
+| `timezone_minute(ts)` | `timezone_minute(ts)` | ✅ | Trino compat UDF (returns 0, UTC-only) |
 | `with_timezone(ts, tz)` | `with_timezone(ts, tz)` | ✅ | Trino compat UDF (chrono-tz) |
 | `at_timezone(ts, tz)` | `at_timezone(ts, tz)` | ✅ | Trino compat UDF (chrono-tz) |
 | `INTERVAL 'n' UNIT` | `INTERVAL 'n' UNIT` | ✅ | SQL standard |
@@ -155,9 +155,9 @@ Each section lists Trino functions with their SQE status:
 | `json_parse(s)` | `json_parse(s)` | ✅ | Trino compat UDF |
 | `json_extract(json, path)` | `json_extract(json, path)` | ✅ | Trino compat UDF (dot-path, not full JSONPath) |
 | `json_extract_scalar(json, path)` | `json_extract_scalar(json, path)` | ✅ | Trino compat UDF |
-| `json_size(json, path)` | — | ❌ | |
+| `json_size(json, path)` | `json_size(json, path)` | ✅ | Trino compat UDF |
 | `json_array_contains(json, val)` | `json_array_contains(json, val)` | ✅ | Trino compat UDF |
-| `json_array_get(json, idx)` | — | ❌ | |
+| `json_array_get(json, idx)` | `json_array_get(json, idx)` | ✅ | Trino compat UDF (supports negative index) |
 | `json_array_length(json)` | `json_array_length(json)` | ✅ | Trino compat UDF |
 | `is_json_scalar(json)` | `is_json_scalar(json)` | ✅ | Trino compat UDF |
 | `CAST(v AS JSON)` | — | ❌ | No JSON type |
@@ -244,13 +244,13 @@ Each section lists Trino functions with their SQE status:
 | `regr_slope(y, x)` | `regr_slope(y, x)` | ✅ | |
 | `bitwise_and_agg(x)` | `bit_and(x)` | ⚠️ | Different name |
 | `bitwise_or_agg(x)` | `bit_or(x)` | ⚠️ | Different name |
-| `arbitrary(x)` | — | ❌ | Returns any value from group |
-| `max_by(x, y)` / `min_by(x, y)` | — | ❌ | |
+| `arbitrary(x)` | `arbitrary(x)` | ✅ | Trino compat UDF (returns first non-null) |
+| `max_by(x, y)` / `min_by(x, y)` | `max_by(x, y)` / `min_by(x, y)` | ⚠️ | Scalar stub (aggregate behavior requires UDAF) |
 | `histogram(x)` | — | ❌ | |
 | `multimap_agg(k, v)` | — | ❌ | |
 | `map_agg(k, v)` | — | ❌ | |
 | `map_union(map)` | — | ❌ | |
-| `checksum(x)` | — | ❌ | |
+| `checksum(x)` | `checksum(x)` | ✅ | Trino compat UDF (hash-based) |
 | `approx_most_frequent(n, x, cap)` | — | ❌ | |
 | `merge(digest)` | — | ❌ | HyperLogLog/TDigest |
 | `GROUPING SETS / CUBE / ROLLUP` | Same | ✅ | Native DataFusion |
@@ -270,8 +270,8 @@ Each section lists Trino functions with their SQE status:
 | `first_value(x)` | Same | ✅ | |
 | `last_value(x)` | Same | ✅ | |
 | `nth_value(x, n)` | Same | ✅ | |
-| Frame specs: ROWS/RANGE/GROUPS | ROWS/RANGE ✅, GROUPS ❌ | ⚠️ | GROUPS not in DataFusion |
-| `QUALIFY` clause | — | ❌ | Use subquery with window |
+| Frame specs: ROWS/RANGE/GROUPS | All three supported | ✅ | Native DataFusion (GROUPS added in DF 19, 2022) |
+| `QUALIFY` clause | Same | ✅ | Native DataFusion + sqlparser 0.53 |
 | Lambda in window functions | — | ❌ | No lambda support |
 
 ## DDL / DML Statements
@@ -296,7 +296,7 @@ Each section lists Trino functions with their SQE status:
 | `DELETE FROM ... WHERE` | Same | ✅ | CoW rewrite_files |
 | `UPDATE ... SET ... WHERE` | Same | ✅ | CoW rewrite_files |
 | `MERGE INTO ... USING ...` | Same | ✅ | CoW full-outer-join rewrite |
-| `TRUNCATE TABLE` | — | ❌ | Use `DELETE FROM t` |
+| `TRUNCATE TABLE` | `DELETE FROM t` | ⚠️ | Workaround documented, not native |
 | `COMMENT ON TABLE/COLUMN` | — | ❌ | |
 | `SHOW CATALOGS` | Same | ✅ | |
 | `SHOW SCHEMAS` | Same | ✅ | |
@@ -307,7 +307,7 @@ Each section lists Trino functions with their SQE status:
 | `EXPLAIN` | Same | ✅ | DataFusion explain |
 | `EXPLAIN ANALYZE` | `EXPLAIN FULL` | ⚠️ | Different keyword, similar output |
 | `USE catalog.schema` | — | ❌ | Set via headers/session |
-| `PREPARE` / `EXECUTE` | — | ❌ | No prepared statements |
+| `PREPARE` / `EXECUTE` | Partial | ⚠️ | DataFusion has infrastructure, SQL integration incomplete |
 | `CALL procedure(...)` | — | ❌ | No stored procedures |
 | `GRANT` / `REVOKE` | Planned (Plan C) | 🔧 | SQE-specific grant system |
 
@@ -369,6 +369,23 @@ Each section lists Trino functions with their SQE status:
 | Merge-on-Read (MoR) | — | ✅ | ❌ | Planned (iceberg-rust Epic #2186) |
 
 **Note:** Iceberg metadata tables (`$snapshots`, `$history`, etc.) are a significant usability gap. These are commonly used for debugging and operational monitoring. Implementation requires exposing iceberg-rust's `TableMetadata` as virtual table providers.
+
+## Engine Limitations & Roadmap
+
+Features that cannot be implemented as UDFs and require engine-level changes:
+
+| Feature | Blocker | Path Forward |
+|---|---|---|
+| `TRY(expr)` | Needs custom expression node in DataFusion — UDFs receive already-evaluated args, can't catch runtime errors | Custom `Expr::Try` + physical evaluator (~500 lines). Alternative: rewrite common TRY patterns to CASE/WHEN during planning |
+| `CAST(v AS JSON)` / `CAST(json AS type)` | No native JSON type in Arrow/DataFusion. JSON is stored as VARCHAR | Wait for `datafusion-variant` (Iceberg v3 VARIANT type) or register custom CAST rules |
+| Time travel (`FOR VERSION AS OF`) | iceberg-rust has `TableScanBuilder.snapshot_id()`. Need SQL syntax + planner integration | Parse `VERSION AS OF` / `FOR SYSTEM_TIME AS OF` in sqe-sql, resolve snapshot from TableMetadata, pass to scan builder (~300 lines) |
+| Iceberg metadata tables (`$snapshots`, `$history`, `$partitions`, `$files`, `$refs`) | `$snapshots` and `$manifests` exist in iceberg-rust inspect module. Others need custom table providers | Register virtual TableProviders that project `TableMetadata` into Arrow batches (~200-400 lines each) |
+| `histogram(x)` / `map_agg` / `multimap_agg` | Map-producing aggregates need custom UDAF with `MapBuilder` output | Implement as UDAF using Arrow `MapBuilder` (~200-300 lines each) |
+| `approx_most_frequent(n, x, cap)` | Heavy hitters / Count-Min Sketch algorithm | Custom UDAF with sketch state (~400 lines) |
+| `merge(digest)` | HyperLogLog/TDigest state merging | Requires sketch type support — not planned |
+| ORC file format | `datafusion-orc` / `orc-rust` is read-only, experimental | Parquet-only is the strategic choice for Iceberg |
+| Sort order / Write distribution | Iceberg write-path enforcement | SQE planner + writer changes needed |
+| Lambda in window functions | DataFusion does not support lambda expressions | Not planned — use subqueries instead |
 
 ## Operational Comparison
 
