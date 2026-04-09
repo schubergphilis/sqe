@@ -173,11 +173,11 @@ impl FlightService for WorkerFlightService {
                             timeout_secs = scan_timeout.as_secs(),
                             "Scan task timed out"
                         );
-                        anyhow::anyhow!(
+                        Status::deadline_exceeded(format!(
                             "Scan task {} timed out after {}s",
                             scan_task.fragment_id,
                             scan_timeout.as_secs()
-                        )
+                        ))
                     })?
             }
             .map_err(|e| {
