@@ -1,5 +1,5 @@
 use crate::test::{QueryResult, TestStatus};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Report types
@@ -169,6 +169,58 @@ fn count_results(results: &[QueryResult]) -> (usize, usize, usize, usize, usize,
         .count();
     let total_ms: u64 = results.iter().map(|r| r.duration.as_millis() as u64).sum();
     (pass, fail, diff, skip, error, total_ms)
+}
+
+// ---------------------------------------------------------------------------
+// Comparison report types (SQE vs Trino)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QueryComparison {
+    pub query_name: String,
+    pub sqe_time_ms: u64,
+    pub trino_time_ms: u64,
+    pub speedup: f64,
+    pub sqe_rows: usize,
+    pub trino_rows: usize,
+    pub rows_match: bool,
+    pub sqe_error: Option<String>,
+    pub trino_error: Option<String>,
+    pub status: CompareStatusReport,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum CompareStatusReport {
+    Match,
+    RowDiff,
+    SqeFailed,
+    TrinoFailed,
+    BothFailed,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ComparisonReport {
+    pub benchmark: String,
+    pub scale: f64,
+    pub timestamp: String,
+    pub sqe_endpoint: String,
+    pub trino_endpoint: String,
+    pub queries: Vec<QueryComparison>,
+    pub summary: ComparisonSummary,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ComparisonSummary {
+    pub total: usize,
+    pub matched: usize,
+    pub row_diff: usize,
+    pub sqe_failed: usize,
+    pub trino_failed: usize,
+    pub both_failed: usize,
+    pub avg_speedup: f64,
+    pub median_speedup: f64,
+    pub sqe_total_ms: u64,
+    pub trino_total_ms: u64,
 }
 
 // ---------------------------------------------------------------------------
