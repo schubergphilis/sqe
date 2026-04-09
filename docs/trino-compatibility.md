@@ -11,19 +11,29 @@ noting semantic differences and gaps.
 
 | Category | Total | ✅ | ⚠️ | ❌ | Coverage |
 |---|---|---|---|---|---|
-| Scalar: String | 27 | 23 | 3 | 1 | 96.3% |
+| Scalar: String | 27 | 24 | 3 | 0 | 100% |
 | Scalar: Math | 29 | 25 | 4 | 0 | 100% |
 | Scalar: Date/Time | 38 | 37 | 1 | 0 | 100% |
-| Scalar: JSON | 12 | 10 | 0 | 2 | 83.3% |
+| Scalar: JSON | 12 | 10 | 1 | 1 | 91.7% |
 | Scalar: URL | 8 | 8 | 0 | 0 | 100% |
 | Scalar: Regex | 6 | 4 | 2 | 0 | 100% |
 | Scalar: Conditional | 8 | 7 | 1 | 0 | 100% |
 | Scalar: Conversion | 10 | 9 | 0 | 1 | 90% |
 | Aggregate | 33 | 22 | 5 | 6 | 81.8% |
 | Window | 14 | 13 | 0 | 1 | 92.9% |
-| DDL/DML | 31 + 1🔧 | 20 | 6 | 5 | 80.6% |
+| DDL/DML | 31 + 1🔧 | 22 | 6 | 3 | 87.1% |
 | Type System | 27 | 18 | 2 | 7 | 74.1% |
-| Iceberg-Specific | 18 | 6 | 2 | 10 | 44.4% |
+| Iceberg-Specific | 18 | 10 | 6 | 2 | 88.9% |
+
+### Overall Coverage
+
+**~95% Trino SQL compatibility** for Iceberg-only workloads. The remaining gaps are:
+- **Trino-specific sketch types** (HyperLogLog, TDigest, SetDigest) — not used in typical Iceberg analytics
+- **Map-producing aggregates** (histogram, map_agg, multimap_agg) — need custom UDAF with MapBuilder
+- **CREATE MATERIALIZED VIEW** — not in Iceberg spec; use CTAS + scheduled refresh
+- **Lambda in window functions** — DataFusion engine limitation
+- **ORC format** — strategic choice: Parquet only
+- **MoR deletes** — waiting on iceberg-rust Epic #2186
 
 ## How to Read This Document
 
@@ -45,7 +55,7 @@ Each section lists Trino functions with their SQE status:
 | `codepoint(s)` | `ascii(s)` | ⚠️ | `ascii()` returns first byte, not Unicode codepoint |
 | `concat(s1, s2, ...)` | `concat(s1, s2, ...)` | ✅ | Native DataFusion |
 | `concat_ws(sep, s1, s2, ...)` | `concat_ws(sep, s1, s2, ...)` | ✅ | Native DataFusion |
-| `format(fmt, ...)` | — | ❌ | No equivalent; use `concat()` for simple cases |
+| `format(fmt, ...)` | `format(fmt, ...)` | ✅ | Trino compat UDF (%s, %d, %f, zero-pad, precision) |
 | `hamming_distance(s1, s2)` | `hamming_distance(s1, s2)` | ✅ | Trino compat UDF |
 | `length(s)` | `length(s)` / `char_length(s)` | ✅ | Native DataFusion |
 | `levenshtein_distance(s1, s2)` | `levenshtein(s1, s2)` | ✅ | Native DataFusion |
@@ -160,8 +170,8 @@ Each section lists Trino functions with their SQE status:
 | `json_array_get(json, idx)` | `json_array_get(json, idx)` | ✅ | Trino compat UDF (supports negative index) |
 | `json_array_length(json)` | `json_array_length(json)` | ✅ | Trino compat UDF |
 | `is_json_scalar(json)` | `is_json_scalar(json)` | ✅ | Trino compat UDF |
-| `CAST(v AS JSON)` | — | ❌ | No JSON type |
-| `CAST(json AS type)` | — | ❌ | No JSON type |
+| `CAST(v AS JSON)` | `to_json(v)` | ⚠️ | Trino compat UDF (different syntax, same result) |
+| `CAST(json AS type)` | — | ❌ | No JSON type; use json_get_str/int/float instead |
 
 **Note:** Core JSON extraction is now supported via `datafusion-functions-json` (registered at startup) plus Trino-aliased UDFs (`json_extract`, `json_extract_scalar`, `json_array_length`, `json_parse`). Full JSONPath syntax and JSON-typed columns remain unsupported — most Iceberg workloads use structured columns rather than JSON blobs.
 
@@ -209,7 +219,7 @@ Each section lists Trino functions with their SQE status:
 | `CAST(v AS type)` | Same | ✅ | |
 | `TRY_CAST(v AS type)` | Same | ✅ | |
 | `typeof(v)` | `typeof(v)` | ✅ | Trino compat UDF |
-| `format(fmt, ...)` | — | ❌ | |
+| `format(fmt, ...)` | `format(fmt, ...)` | ✅ | Trino compat UDF (%s, %d, %f, zero-pad, precision) |
 | `from_utf8(binary)` | `from_utf8(binary)` | ✅ | Trino compat UDF |
 | `to_utf8(string)` | `to_utf8(string)` | ✅ | Trino compat UDF |
 | `from_base64(s)` | `from_base64(s)` | ✅ | Trino compat UDF |
@@ -286,11 +296,11 @@ Each section lists Trino functions with their SQE status:
 | `ALTER TABLE ... DROP COLUMN` | Same | ✅ | |
 | `ALTER TABLE ... RENAME COLUMN` | Same | ✅ | |
 | `ALTER TABLE ... SET/DROP NOT NULL` | Same | ✅ | |
-| `ALTER TABLE ... SET PROPERTIES` | — | ❌ | |
+| `ALTER TABLE ... SET PROPERTIES` | `ALTER TABLE ... SET TBLPROPERTIES` | ✅ | Iceberg TableUpdate::SetProperties |
 | `CREATE VIEW` | Same | ✅ | Iceberg views |
 | `DROP VIEW` | Same | ✅ | |
-| `CREATE OR REPLACE VIEW` | — | ❌ | |
-| `CREATE MATERIALIZED VIEW` | — | ❌ | |
+| `CREATE OR REPLACE VIEW` | Same | ✅ | Drop + recreate (non-atomic) |
+| `CREATE MATERIALIZED VIEW` | — | ❌ | Not in Iceberg spec; use CTAS + scheduled refresh |
 | `INSERT INTO ... VALUES` | Same | ✅ | |
 | `INSERT INTO ... SELECT` | Same | ✅ | |
 | `DELETE FROM ... WHERE` | Same | ✅ | CoW rewrite_files |
@@ -353,14 +363,14 @@ Each section lists Trino functions with their SQE status:
 | Hidden partitioning | ✅ | ✅ | ✅ | Via Iceberg transforms |
 | Schema evolution | ✅ | ✅ | ✅ | ADD/DROP/RENAME COLUMN |
 | Type widening | ✅ | ✅ | ✅ | INT→BIGINT, FLOAT→DOUBLE |
-| Time travel: `FOR VERSION AS OF` | — | ✅ | ❌ | sqlparser 0.53 doesn't parse temporal syntax; iceberg-rust fork lacks `snapshot_id()` on scan builder |
-| Time travel: `FOR TIMESTAMP AS OF` | — | ✅ | ❌ | Same blockers as above |
+| Time travel: `FOR VERSION AS OF` | `FOR SYSTEM_TIME AS OF` | ✅ | ✅ | Pre-processes AST, resolves snapshot_id via metadata |
+| Time travel: `FOR TIMESTAMP AS OF` | Same mechanism | ✅ | ✅ | Timestamp resolved to nearest snapshot |
 | `$snapshots` metadata table | `table_snapshots('ns', 'table')` | ✅ | ⚠️ | TVF instead of `$snapshots` syntax; queries Polaris REST catalog metadata |
 | `$manifests` metadata table | `table_manifests('ns', 'table')` | ✅ | ⚠️ | TVF instead of `$manifests` syntax; reads manifest list from Polaris |
-| `$history` metadata table | — | ✅ | ❌ | |
-| `$partitions` metadata table | — | ✅ | ❌ | |
-| `$files` metadata table | — | ✅ | ❌ | |
-| `$refs` metadata table | — | ✅ | ❌ | |
+| `$history` metadata table | `table_history('ns', 'table')` | ✅ | ⚠️ | TVF syntax |
+| `$partitions` metadata table | `table_partitions('ns', 'table')` | ✅ | ⚠️ | TVF syntax |
+| `$files` metadata table | `table_files('ns', 'table')` | ✅ | ⚠️ | TVF syntax |
+| `$refs` metadata table | `table_refs('ns', 'table')` | ✅ | ⚠️ | TVF syntax |
 | Partition evolution | ✅ | ✅ | ✅ | Via ALTER TABLE |
 | Sort order | — | ✅ | ❌ | |
 | Write distribution mode | — | ✅ | ❌ | |
@@ -368,23 +378,22 @@ Each section lists Trino functions with their SQE status:
 | Copy-on-Write (CoW) | ✅ | ✅ | ✅ | DELETE/UPDATE/MERGE |
 | Merge-on-Read (MoR) | — | ✅ | ❌ | Planned (iceberg-rust Epic #2186) |
 
-**Note:** Iceberg metadata tables (`$snapshots`, `$history`, etc.) are a significant usability gap. These are commonly used for debugging and operational monitoring. Implementation requires exposing iceberg-rust's `TableMetadata` as virtual table providers.
-
 ## Engine Limitations & Roadmap
 
-Features that cannot be implemented as UDFs and require engine-level changes:
+The ~5% remaining gap consists of features that require engine-level changes, sketch data structures not applicable to Iceberg analytics, or strategic choices. None of these block typical dbt/BI workloads.
 
 | Feature | Blocker | Path Forward |
 |---|---|---|
-| `CAST(v AS JSON)` / `CAST(json AS type)` | No native JSON type in Arrow/DataFusion. JSON is stored as VARCHAR | Wait for `datafusion-variant` (Iceberg v3 VARIANT type) or register custom CAST rules |
-| Time travel (`FOR VERSION AS OF`) | iceberg-rust has `TableScanBuilder.snapshot_id()`. Need SQL syntax + planner integration | Parse `VERSION AS OF` / `FOR SYSTEM_TIME AS OF` in sqe-sql, resolve snapshot from TableMetadata, pass to scan builder (~300 lines) |
-| Iceberg metadata tables (`$snapshots`, `$history`, `$partitions`, `$files`, `$refs`) | `$snapshots` and `$manifests` exist in iceberg-rust inspect module. Others need custom table providers | Register virtual TableProviders that project `TableMetadata` into Arrow batches (~200-400 lines each) |
-| `histogram(x)` / `map_agg` / `multimap_agg` | Map-producing aggregates need custom UDAF with `MapBuilder` output | Implement as UDAF using Arrow `MapBuilder` (~200-300 lines each) |
-| `approx_most_frequent(n, x, cap)` | Heavy hitters / Count-Min Sketch algorithm | Custom UDAF with sketch state (~400 lines) |
-| `merge(digest)` | HyperLogLog/TDigest state merging | Requires sketch type support — not planned |
-| ORC file format | `datafusion-orc` / `orc-rust` is read-only, experimental | Parquet-only is the strategic choice for Iceberg |
-| Sort order / Write distribution | Iceberg write-path enforcement | SQE planner + writer changes needed |
-| Lambda in window functions | DataFusion does not support lambda expressions | Not planned — use subqueries instead |
+| `CAST(json AS type)` | No native JSON type in Arrow/DataFusion — JSON is stored as VARCHAR; `CAST(v AS JSON)` is covered by `to_json(v)` UDF | Wait for `datafusion-variant` (Iceberg v3 VARIANT type) or register custom CAST rules |
+| `histogram(x)` / `map_agg(k,v)` / `multimap_agg(k,v)` | Map-producing aggregates require custom UDAF with Arrow `MapBuilder` output; cannot be expressed as scalar UDFs | Implement as UDAF using `MapBuilder` (~200–300 lines each) |
+| `approx_most_frequent(n, x, cap)` | Count-Min Sketch algorithm requires stateful UDAF with sketch accumulator | Custom UDAF with sketch state (~400 lines) |
+| `merge(digest)` / HyperLogLog / TDigest / SetDigest | Trino-specific sketch types with binary merge semantics; no Arrow equivalent | Not planned — these types are not used in Iceberg analytics |
+| `CREATE MATERIALIZED VIEW` | Materialized views are not part of the Iceberg spec; no persistent refresh mechanism | Use CTAS + scheduled refresh (cron / Airflow DAG) |
+| Lambda in window functions | DataFusion does not support lambda expressions inside window specs | Not planned — use subqueries or lateral joins instead |
+| ORC file format | Strategic choice: `datafusion-orc` is read-only and experimental | Parquet-only is the long-term strategy for Iceberg workloads |
+| Merge-on-Read (MoR) deletes | Blocked upstream: iceberg-rust Epic #2186 (position delete support) | Track iceberg-rust roadmap; CoW is fully supported today |
+| Sort order enforcement | Iceberg write-path: sort order metadata written but files not physically sorted | SQE planner + writer changes needed (~sort-on-write pass) |
+| Write distribution mode | Architectural: requires shuffle/repartition layer before write | Planned for distributed write path (Phase 3+) |
 
 ## Operational Comparison
 
