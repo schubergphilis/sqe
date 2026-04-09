@@ -38,6 +38,8 @@ pub enum StatementKind {
     Truncate(String),
     /// CALL procedure — not supported, returns informative error
     Call(Box<Statement>),
+    /// ALTER TABLE ... SET TBLPROPERTIES (...) — update Iceberg table properties
+    AlterTableProps(Box<Statement>),
 }
 
 impl StatementKind {
@@ -71,6 +73,7 @@ impl StatementKind {
             StatementKind::ShowCreateTable(_) => "showcreatetable",
             StatementKind::Truncate(_) => "truncate",
             StatementKind::Call(_) => "call",
+            StatementKind::AlterTableProps(_) => "altertableprops",
         }
     }
 }
@@ -162,10 +165,15 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
                         | AlterTableOperation::AlterColumn { .. }
                 )
             });
+            let is_set_properties = operations.iter().any(|op| {
+                matches!(op, AlterTableOperation::SetTblProperties { .. })
+            });
             if is_rename {
                 Ok(StatementKind::Rename(Box::new(stmt)))
             } else if is_schema_change {
                 Ok(StatementKind::AlterSchema(Box::new(stmt)))
+            } else if is_set_properties {
+                Ok(StatementKind::AlterTableProps(Box::new(stmt)))
             } else {
                 Ok(StatementKind::Utility(Box::new(stmt)))
             }
@@ -714,5 +722,37 @@ mod tests {
             .remove(0);
         let kind = StatementKind::Call(Box::new(stmt));
         assert_eq!(kind.name(), "call");
+    }
+
+    #[test]
+    fn test_create_or_replace_view_is_create_view() {
+        let result = parse_and_classify("CREATE OR REPLACE VIEW v AS SELECT 1");
+        assert!(
+            matches!(result, Ok(StatementKind::CreateView(_))),
+            "Expected CreateView for CREATE OR REPLACE VIEW, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_alter_table_set_tblproperties_is_alter_table_props() {
+        let result = parse_and_classify(
+            "ALTER TABLE my_table SET TBLPROPERTIES ('write.format.default' = 'parquet')",
+        );
+        assert!(
+            matches!(result, Ok(StatementKind::AlterTableProps(_))),
+            "Expected AlterTableProps for SET TBLPROPERTIES, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_alter_table_props_name() {
+        let stmt = Parser::parse_sql(
+            &GenericDialect {},
+            "ALTER TABLE t SET TBLPROPERTIES ('k' = 'v')",
+        )
+        .unwrap()
+        .remove(0);
+        let kind = StatementKind::AlterTableProps(Box::new(stmt));
+        assert_eq!(kind.name(), "altertableprops");
     }
 }

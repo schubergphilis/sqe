@@ -176,6 +176,7 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 - [x] Observability metrics (spill, shuffle, late-mat, pruning, time-to-first-row)
 - [x] Trino function compatibility — 60+ UDFs across all categories (see `docs/trino-compatibility.md`): String 96%, Math 100%, Date/Time 100%, JSON 83%, URL 100%, Regex 100%, Conditional 88%, Conversion 90%, Aggregate 82%, Window 93%, DDL/DML 74%
 - [x] Engine-level Trino SQL compat: `USE catalog.schema`, `SHOW CREATE TABLE`, `TRUNCATE TABLE` (→ DELETE), `CALL` (informative error), `TRY(expr)` passthrough UDF
+- [x] Trino SQL compat batch 2: `format()` printf-style UDF, `to_json()` UDF, `CREATE OR REPLACE VIEW`, `ALTER TABLE SET TBLPROPERTIES`
 - [x] Pluggable auth providers (OIDC, bearer token, API key, mTLS, anonymous, AWS IAM, device code, token exchange)
 - [x] Iceberg metadata TVFs (`table_snapshots()`, `table_manifests()`, `table_history()`, `table_files()`, `table_partitions()`, `table_refs()` — snapshot/manifest/partition/ref introspection via SQL)
 - [x] Iceberg time travel (`SELECT * FROM t FOR SYSTEM_TIME AS OF TIMESTAMP '2026-01-01'` — snapshot resolution + per-session provider registration)
