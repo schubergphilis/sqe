@@ -187,6 +187,9 @@ pub async fn create_session_context(
     // so Trino SQL and dbt models work without modification.
     crate::trino_functions::register_trino_functions(&ctx);
 
+    // Register extended Trino-compatible functions (soundex, regexp_extract, word_stem, etc.)
+    crate::trino_functions_ext::register_extended_trino_functions(&ctx);
+
     // Register JSON functions from datafusion-functions-json crate.
     // Provides: json_get, json_get_str, json_get_int, json_get_float, json_get_bool,
     //           json_get_json, json_get_array, json_contains, json_as_text, json_length

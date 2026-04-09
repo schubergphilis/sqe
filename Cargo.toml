@@ -103,6 +103,15 @@ uuid = { version = "1", features = ["v4", "v7"] }
 chrono = { version = "0.4", features = ["serde"] }
 url = "2"
 bytes = "1"
+
+# Unicode normalization for Trino normalize() function
+unicode-normalization = "0.1"
+# Stemming for Trino word_stem() function
+rust-stemmers = "1"
+# Timezone support for with_timezone/at_timezone
+chrono-tz = "0.10"
+# Regex for Trino regexp_extract/extract_all/split
+regex = "1"
 futures = "0.3"
 tokio-util = "0.7"
 
