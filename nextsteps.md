@@ -197,6 +197,7 @@ Step 7.3: ALTER TABLE schema ✅ DONE (ADD/DROP/RENAME COLUMN, SET/DROP NOT NULL
 Step 8: Trino parity        ✅ DONE (compatibility matrix, sqe-bench compare, client testing scaffold, operational comparison)
 Step 8b: Trino UDF blitz    ✅ DONE (70+ UDFs + engine features — ~95% SQL coverage)
 Step 8c: Iceberg time travel ✅ DONE (FOR SYSTEM_TIME AS OF + 6 metadata TVFs + COMMENT ON + SHOW STATS)
+Step 8d: MoR DELETE path    ✅ DONE (PositionDeleteFileWriter + FastAppendAction, alongside existing CoW)
 Step 5: pluggable catalogs  (AWS Glue, Nessie, Hive Metastore, storage-only, Delta Lake) ← NEXT
 Step 6: semantic layer      (new crates; fully additive; no existing code broken)
 ```
