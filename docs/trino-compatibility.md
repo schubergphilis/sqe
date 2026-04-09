@@ -307,13 +307,13 @@ Each section lists Trino functions with their SQE status:
 | `UPDATE ... SET ... WHERE` | Same | ✅ | CoW rewrite_files |
 | `MERGE INTO ... USING ...` | Same | ✅ | CoW full-outer-join rewrite |
 | `TRUNCATE TABLE` | `TRUNCATE TABLE t` | ✅ | Routes to DELETE FROM (no WHERE) |
-| `COMMENT ON TABLE/COLUMN` | — | ❌ | |
+| `COMMENT ON TABLE/COLUMN` | Same | ✅ | Stored as Iceberg table property (`comment` / `comment.<col>`) |
 | `SHOW CATALOGS` | Same | ✅ | |
 | `SHOW SCHEMAS` | Same | ✅ | |
 | `SHOW TABLES` | Same | ✅ | |
 | `SHOW COLUMNS FROM` | `DESCRIBE` | ⚠️ | Different syntax |
 | `SHOW CREATE TABLE` | Same | ✅ | Reconstructs DDL from information_schema |
-| `SHOW STATS FOR` | — | ❌ | |
+| `SHOW STATS FOR` | Same | ✅ | Returns row_count, data_file_count, total_size from snapshot summary |
 | `EXPLAIN` | Same | ✅ | DataFusion explain |
 | `EXPLAIN ANALYZE` | `EXPLAIN FULL` | ⚠️ | Different keyword, similar output |
 | `USE catalog.schema` | Same | ✅ | Parsed and accepted (session-level, sets default catalog/schema) |
@@ -348,7 +348,7 @@ Each section lists Trino functions with their SQE status:
 | `ROW(fields...)` | `Struct(fields...)` | ✅ | |
 | `JSON` | — | ❌ | No JSON type; use VARCHAR |
 | `UUID` | `Utf8` | ⚠️ | Stored as string, no UUID type |
-| `IPADDRESS` | — | ❌ | |
+| `IPADDRESS` | `VARCHAR` | ⚠️ | Stored as VARCHAR, no IP-specific functions (subnet containment, etc.) |
 | `HyperLogLog` | — | ❌ | Trino-specific sketch type |
 | `TDigest` | — | ❌ | Trino-specific sketch type |
 | `SetDigest` | — | ❌ | Trino-specific sketch type |
