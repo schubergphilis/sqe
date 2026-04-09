@@ -1,6 +1,6 @@
 # SQE — Next Steps
 
-> Status as of 2026-04-08. **Steps 1–4d + 7.1 + 7.3 + OSS Release done.** Step 1 (Security & Functional Audit) completed — see [AUDIT.md](AUDIT.md). OSS release readiness complete: Apache 2.0 [LICENSE](LICENSE), [CONTRIBUTING.md](CONTRIBUTING.md), cargo-deny ([deny.toml](deny.toml)), git-cliff ([cliff.toml](cliff.toml)), CI pipelines (clippy + audit + deny + release), retro-tagging (44 MRs → v0.1.0–v0.28.0), [CHANGELOG.md](CHANGELOG.md), crate versions bumped to 0.15.0. 1,218 tests passing, all advisory checks clean. **Next: Step 5 (pluggable catalogs).** ← NEXT
+> Status as of 2026-04-08. **Steps 1–4d + 7.1 + 7.3 + OSS Release + Iceberg metadata TVFs done.** Step 1 (Security & Functional Audit) completed — see [AUDIT.md](AUDIT.md). OSS release readiness complete: Apache 2.0 [LICENSE](LICENSE), [CONTRIBUTING.md](CONTRIBUTING.md), cargo-deny ([deny.toml](deny.toml)), git-cliff ([cliff.toml](cliff.toml)), CI pipelines (clippy + audit + deny + release), retro-tagging (44 MRs → v0.1.0–v0.28.0), [CHANGELOG.md](CHANGELOG.md), crate versions bumped to 0.15.0. Iceberg metadata TVFs: `table_snapshots()` and `table_manifests()` registered on every session. 1,232 tests passing, all advisory checks clean. **Next: Step 5 (pluggable catalogs).** ← NEXT
 
 > **Monitoring:** OPA SPI refactor in Polaris (PR #3999, still draft) will affect Phase 5 OPA integration when it lands — do not implement OPA against Polaris until this stabilises. Remote S3 signing (Iceberg 1.12, not yet released) will affect the pluggable-catalogs design.
 
