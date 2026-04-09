@@ -19,7 +19,7 @@ use sqe_core::{Session, SqeConfig, SqeError};
 use tracing::instrument;
 
 use crate::catalog_ops::parse_table_ref;
-use crate::writer::write_data_files_with_metrics;
+use crate::writer::{write_data_files_with_metrics, write_position_delete_files};
 
 /// Handles write operations: CTAS (CREATE TABLE AS SELECT) and INSERT INTO SELECT.
 ///
@@ -499,6 +499,147 @@ impl WriteHandler {
         })?;
 
         info!(table = %table_ident, deleted_rows = total_deleted, "DELETE committed successfully");
+        Ok(vec![])
+    }
+
+    /// Handle DELETE FROM using Merge-on-Read (position deletes).
+    ///
+    /// Instead of rewriting data files (CoW), this method writes position delete files
+    /// that mark specific row positions for deletion. This is more efficient for small
+    /// deletes on large tables — the cost is O(deleted rows) vs O(total rows) for CoW —
+    /// but increases read amplification until the table is compacted.
+    ///
+    /// The position delete files are committed via `FastAppendAction`, which auto-routes
+    /// `DataFile`s with `content_type = PositionDeletes` into the delete manifest.
+    ///
+    /// Without a WHERE clause this falls back to the CoW truncate path (same as
+    /// `handle_delete`), since there is no efficiency benefit to writing delete files
+    /// for every row.
+    #[instrument(skip(self, session, stmt, catalog, ctx), fields(username = %session.user.username))]
+    pub async fn handle_delete_mor(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+        catalog: Arc<SessionCatalog>,
+        ctx: &DFSessionContext,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let delete = match stmt {
+            Statement::Delete(d) => d,
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected DELETE statement, got: {other}"
+                )));
+            }
+        };
+
+        let tables = match &delete.from {
+            sqlparser::ast::FromTable::WithFromKeyword(tables) => tables,
+            sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
+        };
+        let table_factor_name = match &tables[0].relation {
+            sqlparser::ast::TableFactor::Table { name, .. } => name,
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected table name in DELETE, got: {other}"
+                )));
+            }
+        };
+
+        let (namespace, name) = parse_table_ref(table_factor_name)?;
+        let table_ident = TableIdent::new(namespace, name);
+
+        let table = catalog.load_table(&table_ident).await?;
+
+        let old_data_files = self.collect_data_files(&table).await?;
+
+        if old_data_files.is_empty() {
+            info!(table = %table_ident, "MoR DELETE: table has no data files, nothing to delete");
+            return Ok(vec![]);
+        }
+
+        let where_clause = &delete.selection;
+
+        // No WHERE clause: fall back to CoW truncate (remove all files atomically).
+        // Writing a position delete for every row would be wasteful and serves no purpose.
+        if where_clause.is_none() {
+            info!(
+                table = %table_ident,
+                file_count = old_data_files.len(),
+                "MoR DELETE: no WHERE clause, truncating table via CoW"
+            );
+            let tx = Transaction::new(&table);
+            let action = tx.rewrite_files().delete_files(old_data_files);
+            let tx = action.apply(tx).map_err(|e| {
+                SqeError::Execution(format!("Failed to apply truncate transaction: {e}"))
+            })?;
+            tx.commit(catalog.as_catalog().as_ref()).await.map_err(|e| {
+                SqeError::Execution(format!("Failed to commit truncate: {e}"))
+            })?;
+            info!(table = %table_ident, "MoR DELETE: table truncated successfully");
+            return Ok(vec![]);
+        }
+
+        let where_sql = format!("{}", where_clause.as_ref().unwrap());
+        info!(
+            table = %table_ident,
+            file_count = old_data_files.len(),
+            where_clause = %where_sql,
+            "MoR DELETE: collecting row positions to delete"
+        );
+
+        // Scan each data file and collect (file_path, row_position) pairs for matching rows.
+        let mut position_deletes: Vec<(String, i64)> = Vec::new();
+
+        for data_file in &old_data_files {
+            let file_path = data_file.file_path().to_string();
+            let batches = self.read_parquet_via_table(&table, &file_path).await?;
+
+            if batches.is_empty() {
+                continue;
+            }
+
+            // Row positions are 0-based and contiguous across all batches in the file.
+            let mut row_offset: i64 = 0;
+            for batch in &batches {
+                let match_mask = self
+                    .filter_batch_match(ctx, batch, &where_sql, &table_ident)
+                    .await?;
+
+                for row_idx in 0..batch.num_rows() {
+                    if match_mask.value(row_idx) {
+                        position_deletes.push((file_path.clone(), row_offset + row_idx as i64));
+                    }
+                }
+                row_offset += batch.num_rows() as i64;
+            }
+        }
+
+        if position_deletes.is_empty() {
+            info!(table = %table_ident, "MoR DELETE: no matching rows, nothing to commit");
+            return Ok(vec![]);
+        }
+
+        info!(
+            table = %table_ident,
+            delete_count = position_deletes.len(),
+            "MoR DELETE: writing position delete files"
+        );
+
+        // Write position delete files (sorted by (file_path, pos) inside the helper).
+        let delete_files = write_position_delete_files(&table, position_deletes).await?;
+
+        // Commit: append position delete files. FastAppendAction auto-routes DataFiles
+        // with content_type=PositionDeletes into the delete manifest entry.
+        let tx = Transaction::new(&table);
+        let action = tx.fast_append().add_data_files(delete_files);
+        let tx = action.apply(tx).map_err(|e| {
+            SqeError::Execution(format!("Failed to apply MoR DELETE fast-append: {e}"))
+        })?;
+        tx.commit(catalog.as_catalog().as_ref()).await.map_err(|e| {
+            SqeError::Execution(format!("Failed to commit MoR DELETE: {e}"))
+        })?;
+
+        info!(table = %table_ident, "MoR DELETE committed successfully");
         Ok(vec![])
     }
 
@@ -1259,6 +1400,59 @@ impl WriteHandler {
         // Apply the mask to the original batch
         filter_record_batch(batch, &negated)
             .map_err(|e| SqeError::Execution(format!("Failed to filter batch: {e}")))
+    }
+
+    /// Evaluate a WHERE clause against a RecordBatch and return a BooleanArray indicating
+    /// which rows MATCH the predicate (i.e., rows to be deleted in a MoR DELETE).
+    ///
+    /// Unlike `filter_batch_negate`, this returns the raw match mask rather than the
+    /// filtered batch, so the caller can record which row positions matched.
+    async fn filter_batch_match(
+        &self,
+        ctx: &DFSessionContext,
+        batch: &RecordBatch,
+        where_sql: &str,
+        table_ident: &TableIdent,
+    ) -> sqe_core::Result<arrow_array::BooleanArray> {
+        use arrow_array::BooleanArray;
+
+        let table_name = format!("__mor_delete_{}", table_ident.name());
+        let mem_table = datafusion::datasource::MemTable::try_new(
+            batch.schema(),
+            vec![vec![batch.clone()]],
+        )
+        .map_err(|e| SqeError::Execution(format!("Failed to create MemTable: {e}")))?;
+        ctx.register_table(format!("datafusion.public.{table_name}"), Arc::new(mem_table))
+            .map_err(|e| SqeError::Execution(format!("Failed to register temp table: {e}")))?;
+
+        let eval_sql = format!(
+            "SELECT CAST(({where_sql}) AS BOOLEAN) AS __match FROM datafusion.public.{table_name}"
+        );
+        let df = ctx.sql(&eval_sql).await.map_err(|e| {
+            SqeError::Execution(format!("Failed to evaluate WHERE clause: {e}"))
+        })?;
+        let result_batches: Vec<RecordBatch> = df.collect().await.map_err(|e| {
+            SqeError::Execution(format!("Failed to collect WHERE evaluation: {e}"))
+        })?;
+
+        let _ = ctx.deregister_table(format!("datafusion.public.{table_name}"));
+
+        if result_batches.is_empty() || result_batches[0].num_rows() == 0 {
+            // No rows matched
+            return Ok(BooleanArray::from(vec![false; batch.num_rows()]));
+        }
+
+        let mask_batch = &result_batches[0];
+        let match_col = mask_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                SqeError::Execution("WHERE evaluation did not produce a boolean column".into())
+            })?
+            .clone();
+
+        Ok(match_col)
     }
 
     /// Apply UPDATE SET assignments to a RecordBatch using DataFusion SQL evaluation.
