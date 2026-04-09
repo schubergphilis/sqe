@@ -45,6 +45,9 @@ uuid = { workspace = true }
 prost = { workspace = true }
 anyhow = { workspace = true }
 base64 = "0.22"
+datafusion-functions-json = { workspace = true }
+datafusion-expr = { workspace = true }
+url = { workspace = true }
 sqlparser = { workspace = true }
 iceberg = { workspace = true }
 parquet = { workspace = true }

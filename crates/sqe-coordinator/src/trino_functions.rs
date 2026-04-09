@@ -64,6 +64,30 @@ pub fn register_trino_functions(ctx: &datafusion::prelude::SessionContext) {
     // delegate to DataFusion built-ins already available.
     ctx.register_udf(ScalarUDF::from(LocalTime));
     ctx.register_udf(ScalarUDF::from(LocalTimestamp));
+
+    // URL extraction functions
+    ctx.register_udf(ScalarUDF::from(UrlExtractHost));
+    ctx.register_udf(ScalarUDF::from(UrlExtractPath));
+    ctx.register_udf(ScalarUDF::from(UrlExtractPort));
+    ctx.register_udf(ScalarUDF::from(UrlExtractProtocol));
+    ctx.register_udf(ScalarUDF::from(UrlExtractQuery));
+    ctx.register_udf(ScalarUDF::from(UrlExtractParameter));
+    ctx.register_udf(ScalarUDF::from(UrlEncode));
+    ctx.register_udf(ScalarUDF::from(UrlDecode));
+
+    // Encoding functions
+    ctx.register_udf(ScalarUDF::from(FromBase64));
+    ctx.register_udf(ScalarUDF::from(ToBase64));
+    ctx.register_udf(ScalarUDF::from(FromHex));
+    ctx.register_udf(ScalarUDF::from(ToHex));
+    ctx.register_udf(ScalarUDF::from(FromUtf8));
+    ctx.register_udf(ScalarUDF::from(ToUtf8));
+
+    // Trino JSON aliases — map Trino names to lightweight serde_json-based impls
+    ctx.register_udf(ScalarUDF::from(JsonExtract));
+    ctx.register_udf(ScalarUDF::from(JsonExtractScalar));
+    ctx.register_udf(ScalarUDF::from(JsonArrayLength));
+    ctx.register_udf(ScalarUDF::from(JsonParse));
 }
 
 /// Extract a chrono component from a Date32 or Timestamp array.
@@ -1357,6 +1381,524 @@ impl ScalarUDFImpl for LocalTimestamp {
             Some(us),
             None,
         )))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared string-transform helpers
+// ---------------------------------------------------------------------------
+
+fn string_transform(arg: &ColumnarValue, f: impl Fn(&str) -> String) -> DFResult<ColumnarValue> {
+    use datafusion::common::ScalarValue;
+    match arg {
+        ColumnarValue::Scalar(v) => {
+            let s = match v {
+                ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => s.as_str().to_owned(),
+                ScalarValue::Utf8(None) | ScalarValue::LargeUtf8(None) => {
+                    return Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None)));
+                }
+                other => other.to_string(),
+            };
+            Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(f(&s)))))
+        }
+        ColumnarValue::Array(arr) => {
+            let str_arr = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| DataFusionError::Internal("Expected string array".into()))?;
+            let results: StringArray = str_arr.iter().map(|opt| opt.map(|s| f(s))).collect();
+            Ok(ColumnarValue::Array(Arc::new(results)))
+        }
+    }
+}
+
+fn string_transform_2(
+    args: &[ColumnarValue],
+    f: impl Fn(&str, &str) -> Option<String>,
+) -> DFResult<ColumnarValue> {
+    use datafusion::common::ScalarValue;
+    match (&args[0], &args[1]) {
+        (ColumnarValue::Scalar(v1), ColumnarValue::Scalar(v2)) => {
+            let s1 = match v1 {
+                ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => s.clone(),
+                _ => return Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None))),
+            };
+            let s2 = match v2 {
+                ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => s.clone(),
+                _ => return Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None))),
+            };
+            Ok(ColumnarValue::Scalar(ScalarValue::Utf8(f(&s1, &s2))))
+        }
+        (ColumnarValue::Array(arr1), ColumnarValue::Scalar(v2)) => {
+            let str_arr = arr1
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| DataFusionError::Internal("Expected string array".into()))?;
+            let s2 = match v2 {
+                ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => s.clone(),
+                _ => {
+                    let nulls: StringArray = str_arr.iter().map(|_| None::<&str>).collect();
+                    return Ok(ColumnarValue::Array(Arc::new(nulls)));
+                }
+            };
+            let results: StringArray = str_arr.iter().map(|opt| opt.and_then(|s| f(s, &s2))).collect();
+            Ok(ColumnarValue::Array(Arc::new(results)))
+        }
+        _ => Err(DataFusionError::Internal(
+            "Unsupported arg combination for 2-arg string transform".into(),
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// URL extraction functions
+// ---------------------------------------------------------------------------
+
+use url::Url;
+
+fn extract_url_component(
+    url_str: &str,
+    component: &str,
+    param_arg: Option<&ColumnarValue>,
+) -> Option<String> {
+    use datafusion::common::ScalarValue;
+    let parsed = Url::parse(url_str).ok()?;
+    match component {
+        "host" => parsed.host_str().map(|s| s.to_string()),
+        "path" => Some(parsed.path().to_string()),
+        "port" => parsed.port().map(|p| p.to_string()),
+        "protocol" => Some(parsed.scheme().to_string()),
+        "query" => parsed.query().map(|s| s.to_string()),
+        "parameter" => {
+            let param_cv = param_arg?;
+            let param_name = match param_cv {
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))
+                | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s))) => s.clone(),
+                _ => return None,
+            };
+            parsed
+                .query_pairs()
+                .find(|(k, _)| k == param_name.as_str())
+                .map(|(_, v)| v.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn parse_url_component(args: &[ColumnarValue], component: &str) -> DFResult<ColumnarValue> {
+    use datafusion::common::ScalarValue;
+    match &args[0] {
+        ColumnarValue::Scalar(v) => {
+            let s = match v {
+                ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => s.clone(),
+                _ => return Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None))),
+            };
+            let result = extract_url_component(&s, component, args.get(1));
+            Ok(ColumnarValue::Scalar(ScalarValue::Utf8(result)))
+        }
+        ColumnarValue::Array(arr) => {
+            let str_arr = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| DataFusionError::Internal("Expected string array".into()))?;
+            let results: StringArray = str_arr
+                .iter()
+                .map(|opt| opt.and_then(|u| extract_url_component(u, component, args.get(1))))
+                .collect();
+            Ok(ColumnarValue::Array(Arc::new(results)))
+        }
+    }
+}
+
+macro_rules! url_extract_udf {
+    ($name:ident, $func_name:expr, $component:expr, $nargs:expr) => {
+        #[derive(Debug, PartialEq, Eq, Hash)]
+        struct $name;
+
+        impl ScalarUDFImpl for $name {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn name(&self) -> &str {
+                $func_name
+            }
+            fn signature(&self) -> &Signature {
+                static SIG: std::sync::LazyLock<Signature> =
+                    std::sync::LazyLock::new(|| {
+                        Signature::new(
+                            TypeSignature::Exact(vec![DataType::Utf8; $nargs]),
+                            Volatility::Immutable,
+                        )
+                    });
+                &SIG
+            }
+            fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+                Ok(DataType::Utf8)
+            }
+            fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+                parse_url_component(&args.args, $component)
+            }
+        }
+    };
+}
+
+url_extract_udf!(UrlExtractHost, "url_extract_host", "host", 1);
+url_extract_udf!(UrlExtractPath, "url_extract_path", "path", 1);
+url_extract_udf!(UrlExtractPort, "url_extract_port", "port", 1);
+url_extract_udf!(UrlExtractProtocol, "url_extract_protocol", "protocol", 1);
+url_extract_udf!(UrlExtractQuery, "url_extract_query", "query", 1);
+url_extract_udf!(UrlExtractParameter, "url_extract_parameter", "parameter", 2);
+
+// url_encode / url_decode
+
+fn percent_decode(input: &[u8]) -> String {
+    let mut result = Vec::new();
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'%' && i + 2 < input.len() {
+            if let Ok(byte) = u8::from_str_radix(
+                std::str::from_utf8(&input[i + 1..i + 3]).unwrap_or(""),
+                16,
+            ) {
+                result.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(input[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&result).to_string()
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct UrlEncode;
+
+impl ScalarUDFImpl for UrlEncode {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "url_encode"
+    }
+    fn signature(&self) -> &Signature {
+        static SIG: std::sync::LazyLock<Signature> = std::sync::LazyLock::new(|| {
+            Signature::uniform(1, vec![DataType::Utf8], Volatility::Immutable)
+        });
+        &SIG
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        string_transform(&args.args[0], |s| {
+            use std::fmt::Write;
+            let mut result = String::new();
+            for b in s.bytes() {
+                if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'~' {
+                    result.push(b as char);
+                } else {
+                    write!(result, "%{:02X}", b).unwrap();
+                }
+            }
+            result
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct UrlDecode;
+
+impl ScalarUDFImpl for UrlDecode {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "url_decode"
+    }
+    fn signature(&self) -> &Signature {
+        static SIG: std::sync::LazyLock<Signature> = std::sync::LazyLock::new(|| {
+            Signature::uniform(1, vec![DataType::Utf8], Volatility::Immutable)
+        });
+        &SIG
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        string_transform(&args.args[0], |s| percent_decode(s.as_bytes()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Encoding functions: base64, hex, utf8
+// ---------------------------------------------------------------------------
+
+use base64::Engine as _;
+
+macro_rules! encoding_udf {
+    ($name:ident, $func_name:expr, $transform:expr) => {
+        #[derive(Debug, PartialEq, Eq, Hash)]
+        struct $name;
+
+        impl ScalarUDFImpl for $name {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn name(&self) -> &str {
+                $func_name
+            }
+            fn signature(&self) -> &Signature {
+                static SIG: std::sync::LazyLock<Signature> = std::sync::LazyLock::new(|| {
+                    Signature::uniform(1, vec![DataType::Utf8], Volatility::Immutable)
+                });
+                &SIG
+            }
+            fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+                Ok(DataType::Utf8)
+            }
+            fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+                string_transform(&args.args[0], $transform)
+            }
+        }
+    };
+}
+
+encoding_udf!(ToBase64, "to_base64", |s: &str| {
+    base64::engine::general_purpose::STANDARD.encode(s.as_bytes())
+});
+
+encoding_udf!(FromBase64, "from_base64", |s: &str| {
+    base64::engine::general_purpose::STANDARD
+        .decode(s.as_bytes())
+        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+        .unwrap_or_default()
+});
+
+encoding_udf!(ToHex, "to_hex", |s: &str| {
+    s.bytes().map(|b| format!("{:02X}", b)).collect::<String>()
+});
+
+encoding_udf!(FromHex, "from_hex", |s: &str| {
+    let bytes: Vec<u8> = (0..s.len())
+        .step_by(2)
+        .filter_map(|i| {
+            if i + 2 <= s.len() {
+                u8::from_str_radix(&s[i..i + 2], 16).ok()
+            } else {
+                None
+            }
+        })
+        .collect();
+    String::from_utf8_lossy(&bytes).to_string()
+});
+
+encoding_udf!(ToUtf8, "to_utf8", |s: &str| {
+    // Trino to_utf8 converts VARCHAR → VARBINARY; we return hex-encoded for string compat.
+    s.bytes().map(|b| format!("{:02X}", b)).collect::<String>()
+});
+
+encoding_udf!(FromUtf8, "from_utf8", |s: &str| {
+    // Trino from_utf8 converts VARBINARY → VARCHAR; we accept hex-encoded string.
+    let bytes: Vec<u8> = (0..s.len())
+        .step_by(2)
+        .filter_map(|i| {
+            if i + 2 <= s.len() {
+                u8::from_str_radix(&s[i..i + 2], 16).ok()
+            } else {
+                None
+            }
+        })
+        .collect();
+    if bytes.is_empty() {
+        s.to_string()
+    } else {
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Trino JSON aliases — thin wrappers backed by serde_json
+// ---------------------------------------------------------------------------
+
+fn navigate_json<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let mut current = value;
+    for key in path.split('.') {
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        if let Some(obj) = current.as_object() {
+            current = obj.get(key)?;
+        } else if let Some(arr) = current.as_array() {
+            let idx: usize = key.parse().ok()?;
+            current = arr.get(idx)?;
+        } else {
+            return None;
+        }
+    }
+    Some(current)
+}
+
+fn extract_json_value(json: &str, key: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let result = navigate_json(&v, key)?;
+    Some(result.to_string())
+}
+
+fn extract_json_scalar(json: &str, key: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let result = navigate_json(&v, key)?;
+    match result {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Null => None,
+        _ => Some(result.to_string()),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct JsonExtract;
+
+impl ScalarUDFImpl for JsonExtract {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "json_extract"
+    }
+    fn signature(&self) -> &Signature {
+        static SIG: std::sync::LazyLock<Signature> = std::sync::LazyLock::new(|| {
+            Signature::new(
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8]),
+                Volatility::Immutable,
+            )
+        });
+        &SIG
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        string_transform_2(&args.args, |json, path| {
+            let key = path.trim_start_matches("$.");
+            let key = if key == "$" { "" } else { key };
+            extract_json_value(json, key)
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct JsonExtractScalar;
+
+impl ScalarUDFImpl for JsonExtractScalar {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "json_extract_scalar"
+    }
+    fn signature(&self) -> &Signature {
+        static SIG: std::sync::LazyLock<Signature> = std::sync::LazyLock::new(|| {
+            Signature::new(
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8]),
+                Volatility::Immutable,
+            )
+        });
+        &SIG
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        string_transform_2(&args.args, |json, path| {
+            let key = path.trim_start_matches("$.");
+            let key = if key == "$" { "" } else { key };
+            extract_json_scalar(json, key)
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct JsonArrayLength;
+
+impl ScalarUDFImpl for JsonArrayLength {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "json_array_length"
+    }
+    fn signature(&self) -> &Signature {
+        static SIG: std::sync::LazyLock<Signature> = std::sync::LazyLock::new(|| {
+            Signature::uniform(1, vec![DataType::Utf8], Volatility::Immutable)
+        });
+        &SIG
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Int64)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        use datafusion::common::ScalarValue;
+        match &args.args[0] {
+            ColumnarValue::Scalar(v) => {
+                let s = match v {
+                    ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => s.clone(),
+                    _ => return Ok(ColumnarValue::Scalar(ScalarValue::Int64(None))),
+                };
+                let len = serde_json::from_str::<serde_json::Value>(&s)
+                    .ok()
+                    .and_then(|v| v.as_array().map(|a| a.len() as i64));
+                Ok(ColumnarValue::Scalar(ScalarValue::Int64(len)))
+            }
+            ColumnarValue::Array(arr) => {
+                let str_arr = arr
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| DataFusionError::Internal("Expected string array".into()))?;
+                let results: Int64Array = str_arr
+                    .iter()
+                    .map(|opt| {
+                        opt.and_then(|s| {
+                            serde_json::from_str::<serde_json::Value>(s)
+                                .ok()
+                                .and_then(|v| v.as_array().map(|a| a.len() as i64))
+                        })
+                    })
+                    .collect();
+                Ok(ColumnarValue::Array(Arc::new(results)))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct JsonParse;
+
+impl ScalarUDFImpl for JsonParse {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "json_parse"
+    }
+    fn signature(&self) -> &Signature {
+        static SIG: std::sync::LazyLock<Signature> = std::sync::LazyLock::new(|| {
+            Signature::uniform(1, vec![DataType::Utf8], Volatility::Immutable)
+        });
+        &SIG
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        // json_parse validates and normalises the JSON string (compact form).
+        string_transform(&args.args[0], |s| {
+            serde_json::from_str::<serde_json::Value>(s)
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| "null".to_string())
+        })
     }
 }
 
