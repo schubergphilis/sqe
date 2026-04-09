@@ -7,6 +7,9 @@ use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::spec::{DataFile, Schema as IcebergSchema};
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::base_writer::position_delete_file_writer::{
+    PositionDeleteFileWriterBuilder, PositionDeleteInput, POSITION_DELETE_SCHEMA,
+};
 use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
@@ -128,6 +131,86 @@ pub async fn write_data_files_with_metrics(
     }
 
     Ok(data_files)
+}
+
+/// Write position delete files for an Iceberg table.
+///
+/// Takes a list of `(file_path, row_position)` pairs and writes them as Iceberg
+/// position delete Parquet files. Inputs are sorted by `(file_path, pos)` before
+/// writing, as required by the Iceberg specification.
+///
+/// Returns `DataFile` descriptors with `content_type = PositionDeletes`, ready to
+/// be passed to `FastAppendAction::add_data_files()` which auto-routes them into the
+/// delete manifest.
+pub async fn write_position_delete_files(
+    table: &Table,
+    deletes: Vec<(String, i64)>,
+) -> sqe_core::Result<Vec<DataFile>> {
+    if deletes.is_empty() {
+        return Ok(vec![]);
+    }
+
+    info!(
+        table = %table.identifier(),
+        delete_count = deletes.len(),
+        "Writing position delete files"
+    );
+
+    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
+        .map_err(|e| SqeError::Execution(format!("Location generator error: {e}")))?;
+
+    let write_id = Uuid::now_v7();
+    let file_name_generator = DefaultFileNameGenerator::new(
+        format!("{write_id}-delete"),
+        None,
+        iceberg::spec::DataFileFormat::Parquet,
+    );
+
+    // ParquetWriterBuilder for position delete files uses the fixed position-delete
+    // schema (file_path, pos), not the table's data schema.
+    let parquet_writer_builder = ParquetWriterBuilder::new(
+        WriterProperties::builder().build(),
+        Arc::new(POSITION_DELETE_SCHEMA.clone()),
+    );
+
+    let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_writer_builder,
+        table.file_io().clone(),
+        location_generator,
+        file_name_generator,
+    );
+
+    let pos_delete_builder = PositionDeleteFileWriterBuilder::new(rolling_writer_builder);
+
+    let mut writer = pos_delete_builder
+        .build(None)
+        .await
+        .map_err(|e| SqeError::Execution(format!("Failed to build position delete writer: {e}")))?;
+
+    // Convert to PositionDeleteInput and sort by (file_path, pos) as required by spec.
+    let mut inputs: Vec<PositionDeleteInput> = deletes
+        .into_iter()
+        .map(|(path, pos)| PositionDeleteInput::new(Arc::from(path.as_str()), pos))
+        .collect();
+    inputs.sort();
+
+    writer
+        .write(inputs)
+        .await
+        .map_err(|e| SqeError::Execution(format!("Failed to write position deletes: {e}")))?;
+
+    let delete_files = writer
+        .close()
+        .await
+        .map_err(|e| SqeError::Execution(format!("Failed to close position delete writer: {e}")))?;
+
+    info!(
+        table = %table.identifier(),
+        delete_file_count = delete_files.len(),
+        "Position delete files written"
+    );
+
+    Ok(delete_files)
 }
 
 /// Add Iceberg field IDs to each Arrow field's metadata so the Parquet writer

@@ -324,6 +324,525 @@ async fn build_manifests_table(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// table_history
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Schema for `table_history()` output.
+fn history_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("made_current_at", DataType::Int64, false),
+        Field::new("snapshot_id", DataType::Int64, false),
+        Field::new("parent_id", DataType::Int64, true),
+        Field::new("is_current_ancestor", DataType::Boolean, false),
+    ]))
+}
+
+/// DataFusion TVF: `table_history('namespace', 'table_name')`
+///
+/// Returns one row per entry in the Iceberg snapshot log (the history of which
+/// snapshot was current at each point in time). Mirrors the output of Trino's
+/// `$history` metadata table.
+#[derive(Debug)]
+pub struct TableHistoryFunction {
+    session_catalog: Arc<SessionCatalog>,
+}
+
+impl TableHistoryFunction {
+    pub fn new(session_catalog: Arc<SessionCatalog>) -> Self {
+        Self { session_catalog }
+    }
+}
+
+impl TableFunctionImpl for TableHistoryFunction {
+    fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
+        let (namespace, table_name) = parse_two_string_args("table_history", exprs)?;
+        let catalog = Arc::clone(&self.session_catalog);
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                build_history_table(&catalog, &namespace, &table_name).await
+            })
+        })
+    }
+}
+
+async fn build_history_table(
+    catalog: &SessionCatalog,
+    namespace: &str,
+    table_name: &str,
+) -> DFResult<Arc<dyn TableProvider>> {
+    let schema = history_schema();
+
+    let ns = NamespaceIdent::new(namespace.to_string());
+    let ident = TableIdent::new(ns, table_name.to_string());
+
+    let table = catalog.load_table(&ident).await.map_err(|e| {
+        datafusion::error::DataFusionError::Plan(format!(
+            "table_history: failed to load table '{namespace}.{table_name}': {e}"
+        ))
+    })?;
+
+    let metadata = table.metadata();
+
+    // Build a set of snapshot IDs that are ancestors of the current snapshot.
+    // Walk the parent chain from the current snapshot to the root.
+    let ancestor_ids: std::collections::HashSet<i64> = {
+        let mut ids = std::collections::HashSet::new();
+        let mut cursor = metadata.current_snapshot().map(|s| s.snapshot_id());
+        while let Some(sid) = cursor {
+            ids.insert(sid);
+            cursor = metadata
+                .snapshot_by_id(sid)
+                .and_then(|s| s.parent_snapshot_id());
+        }
+        ids
+    };
+
+    let mut made_current_at_b = Int64Builder::new();
+    let mut snapshot_id_b = Int64Builder::new();
+    let mut parent_id_b = Int64Builder::new();
+    let mut is_current_ancestor_b = arrow_array::builder::BooleanBuilder::new();
+
+    // The snapshot log records when each snapshot became current.
+    for log_entry in metadata.history() {
+        let sid = log_entry.snapshot_id;
+        made_current_at_b.append_value(log_entry.timestamp_ms);
+        snapshot_id_b.append_value(sid);
+
+        let parent_id = metadata
+            .snapshot_by_id(sid)
+            .and_then(|s| s.parent_snapshot_id());
+        match parent_id {
+            Some(pid) => parent_id_b.append_value(pid),
+            None => parent_id_b.append_null(),
+        }
+
+        is_current_ancestor_b.append_value(ancestor_ids.contains(&sid));
+    }
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(made_current_at_b.finish()) as ArrayRef,
+            Arc::new(snapshot_id_b.finish()) as ArrayRef,
+            Arc::new(parent_id_b.finish()) as ArrayRef,
+            Arc::new(is_current_ancestor_b.finish()) as ArrayRef,
+        ],
+    )?;
+
+    Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// table_files
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Schema for `table_files()` output.
+fn files_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("file_path", DataType::Utf8, false),
+        Field::new("file_format", DataType::Utf8, false),
+        Field::new("record_count", DataType::Int64, false),
+        Field::new("file_size_in_bytes", DataType::Int64, false),
+        Field::new("column_sizes", DataType::Utf8, true),
+        Field::new("value_counts", DataType::Utf8, true),
+        Field::new("null_value_counts", DataType::Utf8, true),
+        Field::new("partition", DataType::Utf8, false),
+    ]))
+}
+
+/// DataFusion TVF: `table_files('namespace', 'table_name')`
+///
+/// Returns one row per data file in the current snapshot. Column-level
+/// statistics (sizes, value counts) are serialised as JSON strings.
+#[derive(Debug)]
+pub struct TableFilesFunction {
+    session_catalog: Arc<SessionCatalog>,
+}
+
+impl TableFilesFunction {
+    pub fn new(session_catalog: Arc<SessionCatalog>) -> Self {
+        Self { session_catalog }
+    }
+}
+
+impl TableFunctionImpl for TableFilesFunction {
+    fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
+        let (namespace, table_name) = parse_two_string_args("table_files", exprs)?;
+        let catalog = Arc::clone(&self.session_catalog);
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                build_files_table(&catalog, &namespace, &table_name).await
+            })
+        })
+    }
+}
+
+/// Serialize a `HashMap<i32, u64>` to a compact JSON string like `{"1":100,"2":200}`.
+fn int_map_to_json(map: &std::collections::HashMap<i32, u64>) -> String {
+    if map.is_empty() {
+        return "{}".to_string();
+    }
+    let pairs: Vec<String> = map.iter().map(|(k, v)| format!("\"{}\":{}", k, v)).collect();
+    format!("{{{}}}", pairs.join(","))
+}
+
+async fn build_files_table(
+    catalog: &SessionCatalog,
+    namespace: &str,
+    table_name: &str,
+) -> DFResult<Arc<dyn TableProvider>> {
+    use iceberg::spec::{DataContentType, ManifestStatus};
+
+    let schema = files_schema();
+
+    let ns = NamespaceIdent::new(namespace.to_string());
+    let ident = TableIdent::new(ns, table_name.to_string());
+
+    let table = catalog.load_table(&ident).await.map_err(|e| {
+        datafusion::error::DataFusionError::Plan(format!(
+            "table_files: failed to load table '{namespace}.{table_name}': {e}"
+        ))
+    })?;
+
+    let metadata = table.metadata();
+
+    let mut file_path_b = StringBuilder::new();
+    let mut file_format_b = StringBuilder::new();
+    let mut record_count_b = Int64Builder::new();
+    let mut file_size_b = Int64Builder::new();
+    let mut column_sizes_b = StringBuilder::new();
+    let mut value_counts_b = StringBuilder::new();
+    let mut null_value_counts_b = StringBuilder::new();
+    let mut partition_b = StringBuilder::new();
+
+    if let Some(snapshot) = metadata.current_snapshot() {
+        match snapshot.load_manifest_list(table.file_io(), metadata).await {
+            Ok(manifest_list) => {
+                for mf in manifest_list.entries() {
+                    match mf.load_manifest(table.file_io()).await {
+                        Ok(manifest) => {
+                            for entry in manifest.entries() {
+                                if entry.status() == ManifestStatus::Deleted {
+                                    continue;
+                                }
+                                let df = entry.data_file();
+                                if df.content_type() != DataContentType::Data {
+                                    continue;
+                                }
+
+                                file_path_b.append_value(df.file_path());
+                                file_format_b.append_value(format!("{:?}", df.file_format()));
+                                record_count_b.append_value(df.record_count() as i64);
+                                file_size_b.append_value(df.file_size_in_bytes() as i64);
+
+                                column_sizes_b.append_value(int_map_to_json(df.column_sizes()));
+                                value_counts_b.append_value(int_map_to_json(df.value_counts()));
+                                null_value_counts_b.append_value(int_map_to_json(df.null_value_counts()));
+
+                                // Represent partition as a simple string of field values
+                                let parts: Vec<String> = df
+                                    .partition()
+                                    .fields()
+                                    .iter()
+                                    .map(|f| f.as_ref().map_or("null".to_string(), |v| format!("{v:?}")))
+                                    .collect();
+                                partition_b.append_value(format!("[{}]", parts.join(",")));
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                namespace = namespace,
+                                table = table_name,
+                                error = %e,
+                                "table_files: failed to load manifest; skipping"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    namespace = namespace,
+                    table = table_name,
+                    error = %e,
+                    "table_files: failed to load manifest list; returning empty result"
+                );
+            }
+        }
+    }
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(file_path_b.finish()) as ArrayRef,
+            Arc::new(file_format_b.finish()) as ArrayRef,
+            Arc::new(record_count_b.finish()) as ArrayRef,
+            Arc::new(file_size_b.finish()) as ArrayRef,
+            Arc::new(column_sizes_b.finish()) as ArrayRef,
+            Arc::new(value_counts_b.finish()) as ArrayRef,
+            Arc::new(null_value_counts_b.finish()) as ArrayRef,
+            Arc::new(partition_b.finish()) as ArrayRef,
+        ],
+    )?;
+
+    Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// table_partitions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Schema for `table_partitions()` output.
+fn partitions_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("partition", DataType::Utf8, false),
+        Field::new("record_count", DataType::Int64, false),
+        Field::new("file_count", DataType::Int64, false),
+        Field::new("total_size", DataType::Int64, false),
+    ]))
+}
+
+/// DataFusion TVF: `table_partitions('namespace', 'table_name')`
+///
+/// Returns one row per distinct partition in the current snapshot, with
+/// aggregated record count, file count, and total size.
+#[derive(Debug)]
+pub struct TablePartitionsFunction {
+    session_catalog: Arc<SessionCatalog>,
+}
+
+impl TablePartitionsFunction {
+    pub fn new(session_catalog: Arc<SessionCatalog>) -> Self {
+        Self { session_catalog }
+    }
+}
+
+impl TableFunctionImpl for TablePartitionsFunction {
+    fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
+        let (namespace, table_name) = parse_two_string_args("table_partitions", exprs)?;
+        let catalog = Arc::clone(&self.session_catalog);
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                build_partitions_table(&catalog, &namespace, &table_name).await
+            })
+        })
+    }
+}
+
+async fn build_partitions_table(
+    catalog: &SessionCatalog,
+    namespace: &str,
+    table_name: &str,
+) -> DFResult<Arc<dyn TableProvider>> {
+    use iceberg::spec::{DataContentType, ManifestStatus};
+
+    let schema = partitions_schema();
+
+    let ns = NamespaceIdent::new(namespace.to_string());
+    let ident = TableIdent::new(ns, table_name.to_string());
+
+    let table = catalog.load_table(&ident).await.map_err(|e| {
+        datafusion::error::DataFusionError::Plan(format!(
+            "table_partitions: failed to load table '{namespace}.{table_name}': {e}"
+        ))
+    })?;
+
+    let metadata = table.metadata();
+
+    // Aggregate stats per partition key (serialised as string)
+    let mut partition_stats: std::collections::BTreeMap<String, (i64, i64, i64)> =
+        std::collections::BTreeMap::new(); // key → (record_count, file_count, total_size)
+
+    if let Some(snapshot) = metadata.current_snapshot() {
+        match snapshot.load_manifest_list(table.file_io(), metadata).await {
+            Ok(manifest_list) => {
+                for mf in manifest_list.entries() {
+                    match mf.load_manifest(table.file_io()).await {
+                        Ok(manifest) => {
+                            for entry in manifest.entries() {
+                                if entry.status() == ManifestStatus::Deleted {
+                                    continue;
+                                }
+                                let df = entry.data_file();
+                                if df.content_type() != DataContentType::Data {
+                                    continue;
+                                }
+
+                                let parts: Vec<String> = df
+                                    .partition()
+                                    .fields()
+                                    .iter()
+                                    .map(|f| f.as_ref().map_or("null".to_string(), |v| format!("{v:?}")))
+                                    .collect();
+                                let partition_key = format!("[{}]", parts.join(","));
+
+                                let entry_stats = partition_stats
+                                    .entry(partition_key)
+                                    .or_insert((0, 0, 0));
+                                entry_stats.0 += df.record_count() as i64;
+                                entry_stats.1 += 1;
+                                entry_stats.2 += df.file_size_in_bytes() as i64;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                namespace = namespace,
+                                table = table_name,
+                                error = %e,
+                                "table_partitions: failed to load manifest; skipping"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    namespace = namespace,
+                    table = table_name,
+                    error = %e,
+                    "table_partitions: failed to load manifest list; returning empty result"
+                );
+            }
+        }
+    }
+
+    let mut partition_b = StringBuilder::new();
+    let mut record_count_b = Int64Builder::new();
+    let mut file_count_b = Int64Builder::new();
+    let mut total_size_b = Int64Builder::new();
+
+    for (key, (records, files, size)) in &partition_stats {
+        partition_b.append_value(key);
+        record_count_b.append_value(*records);
+        file_count_b.append_value(*files);
+        total_size_b.append_value(*size);
+    }
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(partition_b.finish()) as ArrayRef,
+            Arc::new(record_count_b.finish()) as ArrayRef,
+            Arc::new(file_count_b.finish()) as ArrayRef,
+            Arc::new(total_size_b.finish()) as ArrayRef,
+        ],
+    )?;
+
+    Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// table_refs
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Schema for `table_refs()` output.
+fn refs_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("name", DataType::Utf8, false),
+        Field::new("type", DataType::Utf8, false),
+        Field::new("snapshot_id", DataType::Int64, false),
+        Field::new("max_reference_age_in_ms", DataType::Int64, true),
+    ]))
+}
+
+/// DataFusion TVF: `table_refs('namespace', 'table_name')`
+///
+/// Returns one row per named reference (branch or tag) on the table.
+/// Since `refs` is not publicly iterable in this iceberg-rust fork, we
+/// expose the well-known reference names by probing `snapshot_for_ref`.
+/// At minimum the `main` branch is always reported when it exists.
+#[derive(Debug)]
+pub struct TableRefsFunction {
+    session_catalog: Arc<SessionCatalog>,
+}
+
+impl TableRefsFunction {
+    pub fn new(session_catalog: Arc<SessionCatalog>) -> Self {
+        Self { session_catalog }
+    }
+}
+
+impl TableFunctionImpl for TableRefsFunction {
+    fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
+        let (namespace, table_name) = parse_two_string_args("table_refs", exprs)?;
+        let catalog = Arc::clone(&self.session_catalog);
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                build_refs_table(&catalog, &namespace, &table_name).await
+            })
+        })
+    }
+}
+
+async fn build_refs_table(
+    catalog: &SessionCatalog,
+    namespace: &str,
+    table_name: &str,
+) -> DFResult<Arc<dyn TableProvider>> {
+    let schema = refs_schema();
+
+    let ns = NamespaceIdent::new(namespace.to_string());
+    let ident = TableIdent::new(ns, table_name.to_string());
+
+    let table = catalog.load_table(&ident).await.map_err(|e| {
+        datafusion::error::DataFusionError::Plan(format!(
+            "table_refs: failed to load table '{namespace}.{table_name}': {e}"
+        ))
+    })?;
+
+    let metadata = table.metadata();
+
+    let mut name_b = StringBuilder::new();
+    let mut type_b = StringBuilder::new();
+    let mut snapshot_id_b = Int64Builder::new();
+    let mut max_age_b = Int64Builder::new();
+
+    // The iceberg-rust fork exposes `snapshot_for_ref(name)` which returns
+    // Arc<Snapshot> but does not expose the retention policy. We probe well-known
+    // ref names and report "BRANCH" for everything (the main use case).
+    // Iceberg's default branch is always "main".
+    let well_known_refs = ["main", "trunk", "master", "branch-0", "v1", "v2", "latest"];
+    let mut found = false;
+    for ref_name in &well_known_refs {
+        if let Some(snap_ref) = metadata.snapshot_for_ref(ref_name) {
+            name_b.append_value(ref_name);
+            // We can't distinguish branches from tags without the private `refs` map,
+            // so report BRANCH for all named refs (branches are the common case).
+            type_b.append_value("BRANCH");
+            snapshot_id_b.append_value(snap_ref.snapshot_id());
+            max_age_b.append_null();
+            found = true;
+        }
+    }
+
+    // If no refs found from probing, fall back to reporting the current snapshot as "main".
+    if !found {
+        if let Some(current) = metadata.current_snapshot() {
+            name_b.append_value("main");
+            type_b.append_value("BRANCH");
+            snapshot_id_b.append_value(current.snapshot_id());
+            max_age_b.append_null();
+        }
+    }
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(name_b.finish()) as ArrayRef,
+            Arc::new(type_b.finish()) as ArrayRef,
+            Arc::new(snapshot_id_b.finish()) as ArrayRef,
+            Arc::new(max_age_b.finish()) as ArrayRef,
+        ],
+    )?;
+
+    Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 

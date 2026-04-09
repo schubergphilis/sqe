@@ -2,14 +2,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow_array::RecordBatch;
-use arrow_array::{ArrayRef, builder::StringBuilder};
+use arrow_array::{ArrayRef, Int64Array, builder::StringBuilder};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion::prelude::SessionContext;
 use tracing::{debug, info, warn};
 
-use sqlparser::ast::Statement;
+use sqlparser::ast::{Statement, TableFactor};
 use sqe_catalog::{IcebergScanExec, SessionCatalog};
 use sqe_core::{QueryConfig, Session, SortMode, SqeConfig, SqeError};
 
@@ -279,6 +279,10 @@ impl QueryHandler {
                     self.catalog_ops.alter_table_schema(session, stmt).await?;
                     Ok(vec![])
                 }
+                StatementKind::AlterTableProps(stmt) => {
+                    self.catalog_ops.set_table_properties(session, stmt).await?;
+                    Ok(vec![])
+                }
                 StatementKind::CreateView(stmt) => {
                     self.handle_create_view(session, stmt).await?;
                     Ok(vec![])
@@ -391,6 +395,18 @@ impl QueryHandler {
                         "CALL is not supported. SQE does not have stored procedures. \
                          Use SQL statements directly instead.".into(),
                     ))
+                }
+
+                // COMMENT ON TABLE/COLUMN — store as Iceberg table property
+                StatementKind::Comment(ref stmt) => {
+                    let (_, session_catalog) = self.create_session_context(session).await?;
+                    self.handle_comment_on(session, stmt, &session_catalog).await
+                }
+
+                // SHOW STATS FOR table — return snapshot summary stats
+                StatementKind::ShowStats(ref table_name) => {
+                    let (_, session_catalog) = self.create_session_context(session).await?;
+                    self.handle_show_stats(session, table_name, &session_catalog).await
                 }
 
                 StatementKind::Merge(stmt) => {
@@ -611,7 +627,12 @@ impl QueryHandler {
         sql: &str,
         query_id: &uuid::Uuid,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let (ctx, _) = self.create_session_context(session).await?;
+        let (ctx, session_catalog) = self.create_session_context(session).await?;
+
+        // Pre-process time travel: detect FOR SYSTEM_TIME AS OF, resolve snapshot IDs,
+        // register snapshot-specific table providers, and strip the temporal clause.
+        let sql = self.handle_time_travel(sql, &ctx, &session_catalog).await?;
+        let sql = sql.as_str();
 
         // Plan the query via DataFusion's SQL planner
         let df = ctx
@@ -1271,6 +1292,283 @@ impl QueryHandler {
             .await
     }
 
+    /// Pre-process SQL for time travel: detect `FOR SYSTEM_TIME AS OF`, resolve
+    /// timestamps to snapshot IDs, register snapshot-specific table providers,
+    /// and return the rewritten SQL with the temporal clause stripped.
+    ///
+    /// When no time travel is found the original SQL is returned unchanged.
+    async fn handle_time_travel(
+        &self,
+        sql: &str,
+        ctx: &SessionContext,
+        session_catalog: &Arc<SessionCatalog>,
+    ) -> sqe_core::Result<String> {
+        use sqlparser::ast::SetExpr;
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let dialect = GenericDialect {};
+        let mut statements = Parser::parse_sql(&dialect, sql)
+            .map_err(|e| SqeError::Execution(format!("Parse error in time travel detection: {e}")))?;
+
+        if statements.is_empty() {
+            return Ok(sql.to_string());
+        }
+
+        let stmt = &mut statements[0];
+        let mut found_time_travel = false;
+
+        if let sqlparser::ast::Statement::Query(ref mut query) = stmt {
+            if let SetExpr::Select(ref mut select) = *query.body {
+                for twj in &mut select.from {
+                    if Self::process_time_travel_table_factor(
+                        &mut twj.relation,
+                        ctx,
+                        session_catalog,
+                    ).await? {
+                        found_time_travel = true;
+                    }
+                    for join in &mut twj.joins {
+                        if Self::process_time_travel_table_factor(
+                            &mut join.relation,
+                            ctx,
+                            session_catalog,
+                        ).await? {
+                            found_time_travel = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if found_time_travel {
+            Ok(statements[0].to_string())
+        } else {
+            Ok(sql.to_string())
+        }
+    }
+
+    /// Process a single `TableFactor` for `FOR SYSTEM_TIME AS OF`.
+    ///
+    /// When a time travel clause is found:
+    /// 1. Resolves the timestamp to a snapshot ID
+    /// 2. Loads the Iceberg table and creates a snapshot-pinned provider
+    /// 3. Registers it in the DataFusion context
+    /// 4. Strips the `version` field so DataFusion doesn't see it
+    ///
+    /// Returns `true` if a time travel clause was processed.
+    async fn process_time_travel_table_factor(
+        relation: &mut TableFactor,
+        ctx: &SessionContext,
+        session_catalog: &Arc<SessionCatalog>,
+    ) -> sqe_core::Result<bool> {
+        use sqlparser::ast::TableVersion;
+
+        if let TableFactor::Table { ref name, ref mut version, .. } = relation {
+            if let Some(TableVersion::ForSystemTimeAsOf(ref expr)) = version {
+                let table_name = name.to_string();
+                let timestamp_ms = resolve_timestamp_expr(expr)?;
+
+                // Extract namespace and table from the (possibly qualified) name
+                let parts: Vec<&str> = table_name.split('.').collect();
+                let (namespace, bare_table) = match parts.len() {
+                    1 => ("default", parts[0]),
+                    2 => (parts[0], parts[1]),
+                    3 => (parts[1], parts[2]), // catalog.schema.table — skip catalog
+                    _ => return Err(SqeError::Execution(format!(
+                        "Unsupported table name format for time travel: {table_name}"
+                    ))),
+                };
+
+                let ns_ident = iceberg::NamespaceIdent::new(namespace.to_string());
+                let table_ident = iceberg::TableIdent::new(ns_ident, bare_table.to_string());
+                let iceberg_table = session_catalog.load_table(&table_ident).await?;
+
+                let snapshot_id = find_snapshot_at_timestamp(iceberg_table.metadata(), timestamp_ms)?;
+
+                tracing::info!(
+                    table = %table_name,
+                    timestamp_ms,
+                    snapshot_id,
+                    "Time travel: resolved timestamp to snapshot"
+                );
+
+                // Build a snapshot-pinned SqeTableProvider and register it
+                let provider = sqe_catalog::table_provider::SqeTableProvider::try_new(iceberg_table)
+                    .await?
+                    .with_snapshot_id(snapshot_id);
+
+                ctx.register_table(bare_table, Arc::new(provider))
+                    .map_err(|e| SqeError::Execution(format!(
+                        "Failed to register time-travel provider for {bare_table}: {e}"
+                    )))?;
+
+                // Strip the temporal clause so DataFusion doesn't reject it
+                *version = None;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Handle `COMMENT ON TABLE/COLUMN` by storing the comment as an Iceberg table property.
+    ///
+    /// - `COMMENT ON TABLE t IS 'text'` → sets property `"comment"` = text
+    /// - `COMMENT ON COLUMN t.col IS 'text'` → sets property `"comment.<col>"` = text
+    /// - `IS NULL` removes the comment (stores empty string)
+    async fn handle_comment_on(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+        session_catalog: &Arc<SessionCatalog>,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        use sqlparser::ast::CommentObject;
+        use iceberg::TableIdent;
+        use crate::catalog_ops::parse_table_ref;
+
+        let (object_type, object_name, comment_text) = match stmt {
+            Statement::Comment {
+                object_type,
+                object_name,
+                comment,
+                ..
+            } => (object_type, object_name, comment),
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected COMMENT statement, got: {other}"
+                )));
+            }
+        };
+
+        // For COLUMN comments the object_name is "table.column" — split off the column part.
+        let (table_ref_parts, prop_key) = match object_type {
+            CommentObject::Table => {
+                // object_name is the table name
+                (object_name.clone(), "comment".to_string())
+            }
+            CommentObject::Column => {
+                // object_name is table.column — last ident is the column name
+                let parts: Vec<_> = object_name.0.iter().collect();
+                if parts.len() < 2 {
+                    return Err(SqeError::Execution(
+                        "COMMENT ON COLUMN requires table.column format".to_string(),
+                    ));
+                }
+                let col_name = parts.last().map(|i| i.value.clone()).unwrap_or_default();
+                let table_parts = sqlparser::ast::ObjectName(
+                    object_name.0[..object_name.0.len() - 1].to_vec(),
+                );
+                (table_parts, format!("comment.{col_name}"))
+            }
+            other => {
+                return Err(SqeError::NotImplemented(format!(
+                    "COMMENT ON {other} is not supported; only TABLE and COLUMN are supported"
+                )));
+            }
+        };
+
+        let (namespace, table_name) = parse_table_ref(&table_ref_parts)?;
+        let table_ident = TableIdent::new(namespace, table_name);
+
+        let comment_value = comment_text.clone().unwrap_or_default();
+
+        tracing::info!(
+            username = %session.user.username,
+            table = %table_ident,
+            property = %prop_key,
+            "COMMENT ON — storing as Iceberg table property"
+        );
+
+        let updates = vec![iceberg::TableUpdate::SetProperties {
+            updates: std::collections::HashMap::from([(prop_key, comment_value)]),
+        }];
+
+        session_catalog
+            .commit_schema_update(&table_ident, updates, vec![])
+            .await?;
+
+        Ok(vec![])
+    }
+
+    /// Handle `SHOW STATS FOR <table>` by reading the current snapshot summary.
+    ///
+    /// Returns a single-row RecordBatch with columns:
+    /// - `column_name`   — `"<all columns>"` (aggregate row)
+    /// - `row_count`     — total-records from snapshot summary
+    /// - `data_file_count` — total-data-files from snapshot summary
+    /// - `total_size`    — total-files-size from snapshot summary (bytes)
+    async fn handle_show_stats(
+        &self,
+        session: &Session,
+        table_name: &str,
+        session_catalog: &Arc<SessionCatalog>,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        use iceberg::{NamespaceIdent, TableIdent};
+
+        // Parse "schema.table" or "table"
+        let parts: Vec<&str> = table_name.splitn(3, '.').collect();
+        let (namespace, bare_table) = match parts.len() {
+            1 => ("default", parts[0]),
+            2 => (parts[0], parts[1]),
+            _ => (parts[1], parts[2]), // catalog.schema.table
+        };
+
+        let ns_ident = NamespaceIdent::new(namespace.to_string());
+        let table_ident = TableIdent::new(ns_ident, bare_table.to_string());
+
+        let table = session_catalog.load_table(&table_ident).await?;
+        let metadata = table.metadata();
+
+        // Extract stats from the current snapshot summary (empty table has no snapshot)
+        let (row_count, file_count, total_size) = if let Some(snapshot) = metadata.current_snapshot() {
+            let summary = snapshot.summary();
+            let props = &summary.additional_properties;
+            let rows = props
+                .get("total-records")
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0);
+            let files = props
+                .get("total-data-files")
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0);
+            let size = props
+                .get("total-files-size")
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0);
+            (rows, files, size)
+        } else {
+            (0_i64, 0_i64, 0_i64)
+        };
+
+        tracing::info!(
+            username = %session.user.username,
+            table = %table_ident,
+            row_count,
+            file_count,
+            total_size,
+            "SHOW STATS FOR — returning snapshot summary"
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("column_name", DataType::Utf8, false),
+            Field::new("row_count", DataType::Int64, true),
+            Field::new("data_file_count", DataType::Int64, true),
+            Field::new("total_size", DataType::Int64, true),
+        ]));
+
+        let mut name_builder = StringBuilder::new();
+        name_builder.append_value("<all columns>");
+        let name_array: ArrayRef = Arc::new(name_builder.finish());
+        let row_array: ArrayRef = Arc::new(Int64Array::from(vec![row_count]));
+        let file_array: ArrayRef = Arc::new(Int64Array::from(vec![file_count]));
+        let size_array: ArrayRef = Arc::new(Int64Array::from(vec![total_size]));
+
+        let batch = RecordBatch::try_new(schema, vec![name_array, row_array, file_array, size_array])
+            .map_err(|e| SqeError::Execution(format!("Failed to build SHOW STATS result: {e}")))?;
+
+        Ok(vec![batch])
+    }
+
     /// Drop a table if it exists — used for CREATE OR REPLACE TABLE.
     async fn drop_table_if_exists(
         &self,
@@ -1314,6 +1612,91 @@ impl QueryHandler {
         Ok(())
     }
 
+}
+
+/// Resolve a SQL timestamp expression to epoch milliseconds.
+///
+/// Supports:
+/// - `TIMESTAMP '2026-01-01 00:00:00'` (TypedString)
+/// - `'2026-01-01'` (bare string literal)
+/// - `CAST('...' AS TIMESTAMP)` (Cast)
+/// - Raw integer literals (treated as epoch ms directly)
+fn resolve_timestamp_expr(expr: &sqlparser::ast::Expr) -> sqe_core::Result<i64> {
+    use sqlparser::ast::{Expr, Value};
+
+    match expr {
+        Expr::TypedString { value, .. } => {
+            parse_timestamp_str(value)
+        }
+        Expr::Value(Value::SingleQuotedString(s)) | Expr::Value(Value::DoubleQuotedString(s)) => {
+            parse_timestamp_str(s)
+        }
+        Expr::Value(Value::Number(n, _)) => {
+            n.parse::<i64>().map_err(|_| SqeError::Execution(
+                format!("Cannot parse time travel integer expression: {n}")
+            ))
+        }
+        Expr::Cast { expr: inner, .. } => {
+            resolve_timestamp_expr(inner)
+        }
+        other => Err(SqeError::Execution(format!(
+            "Unsupported time travel expression: {other}. \
+             Use TIMESTAMP '2026-01-01 00:00:00' or epoch milliseconds."
+        ))),
+    }
+}
+
+/// Parse a timestamp string into epoch milliseconds.
+///
+/// Tries common formats: `YYYY-MM-DD HH:MM:SS`, `YYYY-MM-DDTHH:MM:SS`, `YYYY-MM-DD`.
+fn parse_timestamp_str(s: &str) -> sqe_core::Result<i64> {
+    // Try as raw epoch milliseconds
+    if let Ok(n) = s.parse::<i64>() {
+        return Ok(n);
+    }
+    // Try ISO datetime with space separator
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Ok(dt.and_utc().timestamp_millis());
+    }
+    // Try ISO datetime with T separator
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+        return Ok(dt.and_utc().timestamp_millis());
+    }
+    // Try date-only (midnight)
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        if let Some(dt) = d.and_hms_opt(0, 0, 0) {
+            return Ok(dt.and_utc().timestamp_millis());
+        }
+    }
+    Err(SqeError::Execution(format!(
+        "Cannot parse time travel timestamp '{s}'. \
+         Use format 'YYYY-MM-DD HH:MM:SS', 'YYYY-MM-DD', or epoch milliseconds."
+    )))
+}
+
+/// Find the latest Iceberg snapshot with `timestamp_ms <= target_ms`.
+///
+/// Returns an error when the table has no snapshot at or before the given timestamp.
+fn find_snapshot_at_timestamp(
+    metadata: &iceberg::spec::TableMetadata,
+    target_ms: i64,
+) -> sqe_core::Result<i64> {
+    let mut best: Option<(i64, i64)> = None; // (snapshot_id, timestamp_ms)
+
+    for snap in metadata.snapshots() {
+        let snap_ts = snap.timestamp_ms();
+        if snap_ts <= target_ms && (best.is_none() || snap_ts > best.unwrap().1) {
+            best = Some((snap.snapshot_id(), snap_ts));
+        }
+    }
+
+    best.map(|(id, _)| id).ok_or_else(|| {
+        SqeError::Execution(format!(
+            "No Iceberg snapshot found at or before timestamp {}ms. \
+             The table may not have existed yet at that point in time.",
+            target_ms
+        ))
+    })
 }
 
 /// Best-effort extraction of ORDER BY column names from SQL text.

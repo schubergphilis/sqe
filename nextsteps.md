@@ -1,6 +1,6 @@
 # SQE — Next Steps
 
-> Status as of 2026-04-08. **Steps 1–4d + 7.1 + 7.3 + OSS Release + Iceberg metadata TVFs done.** Step 1 (Security & Functional Audit) completed — see [AUDIT.md](AUDIT.md). OSS release readiness complete: Apache 2.0 [LICENSE](LICENSE), [CONTRIBUTING.md](CONTRIBUTING.md), cargo-deny ([deny.toml](deny.toml)), git-cliff ([cliff.toml](cliff.toml)), CI pipelines (clippy + audit + deny + release), retro-tagging (44 MRs → v0.1.0–v0.28.0), [CHANGELOG.md](CHANGELOG.md), crate versions bumped to 0.15.0. Iceberg metadata TVFs: `table_snapshots()` and `table_manifests()` registered on every session. 1,232 tests passing, all advisory checks clean. **Next: Step 5 (pluggable catalogs).** ← NEXT
+> Status as of 2026-04-08. **Steps 1–4d + 7.1 + 7.3 + OSS Release + Iceberg metadata TVFs + Time Travel done.** Step 1 (Security & Functional Audit) completed — see [AUDIT.md](AUDIT.md). OSS release readiness complete: Apache 2.0 [LICENSE](LICENSE), [CONTRIBUTING.md](CONTRIBUTING.md), cargo-deny ([deny.toml](deny.toml)), git-cliff ([cliff.toml](cliff.toml)), CI pipelines (clippy + audit + deny + release), retro-tagging (44 MRs → v0.1.0–v0.28.0), [CHANGELOG.md](CHANGELOG.md), crate versions bumped to 0.15.0. Iceberg metadata TVFs: `table_snapshots()`, `table_manifests()`, `table_history()`, `table_files()`, `table_partitions()`, `table_refs()` registered on every session. `FOR SYSTEM_TIME AS OF` time travel implemented (AST rewrite + snapshot provider registration). 1,232+ tests passing, all advisory checks clean. **Next: Step 5 (pluggable catalogs).** ← NEXT
 
 > **Monitoring:** OPA SPI refactor in Polaris (PR #3999, still draft) will affect Phase 5 OPA integration when it lands — do not implement OPA against Polaris until this stabilises. Remote S3 signing (Iceberg 1.12, not yet released) will affect the pluggable-catalogs design.
 
@@ -195,8 +195,9 @@ Step 4d: adaptive sort+metrics ✅ DONE (adaptive sort stripping, S3/auth/write 
 Step 7.1: dbt-sqe adapter   ✅ DONE (ADBC Flight SQL, table/view/incremental/seed materializations)
 Step 7.3: ALTER TABLE schema ✅ DONE (ADD/DROP/RENAME COLUMN, SET/DROP NOT NULL, type widening)
 Step 8: Trino parity        ✅ DONE (compatibility matrix, sqe-bench compare, client testing scaffold, operational comparison)
-Step 8b: Trino UDF blitz    ✅ DONE (60+ UDFs: JSON/URL/encoding/regex/string/math/date/aggregate — overall SQL coverage ~91%)
-Step 8c: engine-level compat ✅ DONE (USE catalog.schema, SHOW CREATE TABLE, TRUNCATE TABLE→DELETE, CALL error, TRY() passthrough UDF)
+Step 8b: Trino UDF blitz    ✅ DONE (70+ UDFs + engine features — ~95% SQL coverage)
+Step 8c: Iceberg time travel ✅ DONE (FOR SYSTEM_TIME AS OF + 6 metadata TVFs + COMMENT ON + SHOW STATS)
+Step 8d: MoR DELETE path    ✅ DONE (PositionDeleteFileWriter + FastAppendAction, alongside existing CoW)
 Step 5: pluggable catalogs  (AWS Glue, Nessie, Hive Metastore, storage-only, Delta Lake) ← NEXT
 Step 6: semantic layer      (new crates; fully additive; no existing code broken)
 ```
