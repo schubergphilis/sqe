@@ -57,9 +57,6 @@ pub fn register_trino_functions(ctx: &datafusion::prelude::SessionContext) {
     ctx.register_udf(ScalarUDF::from(JsonObject));
     ctx.register_udf(ScalarUDF::from(JsonFormat));
 
-    // String functions: strpos(string, substring) → integer position
-    ctx.register_udf(ScalarUDF::from(Strpos));
-
     // Trino time aliases — these are registered as lightweight UDFs that
     // delegate to DataFusion built-ins already available.
     ctx.register_udf(ScalarUDF::from(LocalTime));
@@ -79,7 +76,10 @@ pub fn register_trino_functions(ctx: &datafusion::prelude::SessionContext) {
     ctx.register_udf(ScalarUDF::from(FromBase64));
     ctx.register_udf(ScalarUDF::from(ToBase64));
     ctx.register_udf(ScalarUDF::from(FromHex));
-    ctx.register_udf(ScalarUDF::from(ToHex));
+    // Note: ToHex intentionally NOT registered — DataFusion 52 has a built-in
+    // to_hex(integer) that formats integers as hex strings. Registering our
+    // string-byte variant would shadow it and break integer callers. Users can
+    // use encode(s, 'hex') for binary→hex conversion.
     ctx.register_udf(ScalarUDF::from(FromUtf8));
     ctx.register_udf(ScalarUDF::from(ToUtf8));
 
@@ -1245,78 +1245,6 @@ impl ScalarUDFImpl for JsonFormat {
     }
 }
 
-// ─── strpos(string, substring) → Int64 ─────────────────────────────────────
-
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct Strpos;
-
-impl ScalarUDFImpl for Strpos {
-    fn as_any(&self) -> &dyn std::any::Any { self }
-    fn name(&self) -> &str { "strpos" }
-
-    fn signature(&self) -> &Signature {
-        static SIG: std::sync::LazyLock<Signature> = std::sync::LazyLock::new(|| {
-            Signature::any(2, Volatility::Immutable)
-        });
-        &SIG
-    }
-
-    fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Int64)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        use datafusion::common::ScalarValue;
-
-        fn find_pos(haystack: &str, needle: &str) -> i64 {
-            // Trino strpos returns 1-based position, 0 if not found.
-            haystack
-                .find(needle)
-                .map(|idx| idx as i64 + 1)
-                .unwrap_or(0)
-        }
-
-        let needle = match &args.args[1] {
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))
-            | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s))) => s.clone(),
-            other => return Err(DataFusionError::Internal(format!(
-                "strpos: second arg must be a string, got {other:?}"
-            ))),
-        };
-
-        match &args.args[0] {
-            ColumnarValue::Scalar(sv) => {
-                let result = match sv {
-                    ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => {
-                        Some(find_pos(s, &needle))
-                    }
-                    ScalarValue::Utf8(None) | ScalarValue::LargeUtf8(None) => None,
-                    other => return Err(DataFusionError::Internal(format!(
-                        "strpos: first arg must be a string, got {other:?}"
-                    ))),
-                };
-                Ok(ColumnarValue::Scalar(ScalarValue::Int64(result)))
-            }
-            ColumnarValue::Array(array) => {
-                let str_arr = array
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        DataFusionError::Internal(format!(
-                            "strpos: expected string array, got {:?}",
-                            array.data_type()
-                        ))
-                    })?;
-                let result: Int64Array = str_arr
-                    .iter()
-                    .map(|opt| opt.map(|s| find_pos(s, &needle)))
-                    .collect();
-                Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
-            }
-        }
-    }
-}
-
 // ─── localtime → alias for CURRENT_TIME (returns Time64) ───────────────────
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -1675,9 +1603,8 @@ encoding_udf!(FromBase64, "from_base64", |s: &str| {
         .unwrap_or_default()
 });
 
-encoding_udf!(ToHex, "to_hex", |s: &str| {
-    s.bytes().map(|b| format!("{:02X}", b)).collect::<String>()
-});
+// Note: ToHex removed — DataFusion 52 has a built-in to_hex(integer) and
+// shadowing it breaks integer hex formatting. Use encode(s, 'hex') instead.
 
 encoding_udf!(FromHex, "from_hex", |s: &str| {
     let bytes: Vec<u8> = (0..s.len())

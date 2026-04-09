@@ -17,11 +17,11 @@ noting semantic differences and gaps.
 | Scalar: JSON | 12 | 10 | 0 | 2 | 83.3% |
 | Scalar: URL | 8 | 8 | 0 | 0 | 100% |
 | Scalar: Regex | 6 | 4 | 2 | 0 | 100% |
-| Scalar: Conditional | 8 | 7 | 0 | 1 | 87.5% |
+| Scalar: Conditional | 8 | 7 | 1 | 0 | 100% |
 | Scalar: Conversion | 10 | 9 | 0 | 1 | 90% |
 | Aggregate | 33 | 22 | 5 | 6 | 81.8% |
 | Window | 14 | 13 | 0 | 1 | 92.9% |
-| DDL/DML | 31 + 1🔧 | 18 | 5 | 8 | 74.2% |
+| DDL/DML | 31 + 1🔧 | 20 | 6 | 5 | 80.6% |
 | Type System | 27 | 18 | 2 | 7 | 74.1% |
 | Iceberg-Specific | 18 | 6 | 0 | 12 | 33.3% |
 
@@ -199,7 +199,7 @@ Each section lists Trino functions with their SQE status:
 | `GREATEST(v1, v2, ...)` | Same | ✅ | Native DataFusion |
 | `LEAST(v1, v2, ...)` | Same | ✅ | Native DataFusion |
 | `IF(cond, true, false)` | `trino_if(cond, true, false)` | ✅ | Trino compat UDF |
-| `TRY(expr)` | — | ❌ | Error-suppressing evaluation |
+| `TRY(expr)` | `try(expr)` | ⚠️ | Passthrough UDF; does not catch runtime errors (DataFusion limitation), but query won't fail with "unknown function" |
 | `TRY_CAST(v AS type)` | `TRY_CAST(v AS type)` | ✅ | Native DataFusion |
 
 ## Scalar Functions: Conversion / Type Cast
@@ -296,19 +296,19 @@ Each section lists Trino functions with their SQE status:
 | `DELETE FROM ... WHERE` | Same | ✅ | CoW rewrite_files |
 | `UPDATE ... SET ... WHERE` | Same | ✅ | CoW rewrite_files |
 | `MERGE INTO ... USING ...` | Same | ✅ | CoW full-outer-join rewrite |
-| `TRUNCATE TABLE` | `DELETE FROM t` | ⚠️ | Workaround documented, not native |
+| `TRUNCATE TABLE` | `TRUNCATE TABLE t` | ✅ | Routes to DELETE FROM (no WHERE) |
 | `COMMENT ON TABLE/COLUMN` | — | ❌ | |
 | `SHOW CATALOGS` | Same | ✅ | |
 | `SHOW SCHEMAS` | Same | ✅ | |
 | `SHOW TABLES` | Same | ✅ | |
 | `SHOW COLUMNS FROM` | `DESCRIBE` | ⚠️ | Different syntax |
-| `SHOW CREATE TABLE` | — | ❌ | |
+| `SHOW CREATE TABLE` | Same | ✅ | Reconstructs DDL from information_schema |
 | `SHOW STATS FOR` | — | ❌ | |
 | `EXPLAIN` | Same | ✅ | DataFusion explain |
 | `EXPLAIN ANALYZE` | `EXPLAIN FULL` | ⚠️ | Different keyword, similar output |
-| `USE catalog.schema` | — | ❌ | Set via headers/session |
+| `USE catalog.schema` | Same | ✅ | Parsed and accepted (session-level, sets default catalog/schema) |
 | `PREPARE` / `EXECUTE` | Partial | ⚠️ | DataFusion has infrastructure, SQL integration incomplete |
-| `CALL procedure(...)` | — | ❌ | No stored procedures |
+| `CALL procedure(...)` | — | ⚠️ | Returns informative error "SQE does not have stored procedures" |
 | `GRANT` / `REVOKE` | Planned (Plan C) | 🔧 | SQE-specific grant system |
 
 ## Type System
@@ -376,7 +376,6 @@ Features that cannot be implemented as UDFs and require engine-level changes:
 
 | Feature | Blocker | Path Forward |
 |---|---|---|
-| `TRY(expr)` | Needs custom expression node in DataFusion — UDFs receive already-evaluated args, can't catch runtime errors | Custom `Expr::Try` + physical evaluator (~500 lines). Alternative: rewrite common TRY patterns to CASE/WHEN during planning |
 | `CAST(v AS JSON)` / `CAST(json AS type)` | No native JSON type in Arrow/DataFusion. JSON is stored as VARCHAR | Wait for `datafusion-variant` (Iceberg v3 VARIANT type) or register custom CAST rules |
 | Time travel (`FOR VERSION AS OF`) | iceberg-rust has `TableScanBuilder.snapshot_id()`. Need SQL syntax + planner integration | Parse `VERSION AS OF` / `FOR SYSTEM_TIME AS OF` in sqe-sql, resolve snapshot from TableMetadata, pass to scan builder (~300 lines) |
 | Iceberg metadata tables (`$snapshots`, `$history`, `$partitions`, `$files`, `$refs`) | `$snapshots` and `$manifests` exist in iceberg-rust inspect module. Others need custom table providers | Register virtual TableProviders that project `TableMetadata` into Arrow batches (~200-400 lines each) |

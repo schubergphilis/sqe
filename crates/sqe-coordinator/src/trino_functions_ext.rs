@@ -62,6 +62,9 @@ pub fn register_extended_trino_functions(ctx: &datafusion::prelude::SessionConte
     ctx.register_udf(ScalarUDF::from(TimezoneMinute));
     ctx.register_udf(ScalarUDF::from(JsonSize));
     ctx.register_udf(ScalarUDF::from(JsonArrayGet));
+
+    // TRY(expr) — error-suppressing wrapper
+    ctx.register_udf(ScalarUDF::from(Try));
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1569,4 +1572,43 @@ fn json_array_get_impl(json: &str, idx: i64) -> Option<String> {
         idx as usize
     };
     arr.get(actual_idx).map(|v| v.to_string())
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// TRY(expr) — Trino error-suppressing wrapper
+// ═══════════════════════════════════════════════════════════════════
+
+/// try(expr) — Trino error-suppressing wrapper.
+///
+/// In SQE this is a passthrough UDF: DataFusion evaluates arguments before
+/// calling UDFs, so by the time try() runs, the argument already succeeded.
+/// This implementation ensures queries using TRY() are recognised rather than
+/// failing with "unknown function". For type-conversion errors, use TRY_CAST.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct Try;
+
+impl ScalarUDFImpl for Try {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "try"
+    }
+
+    fn signature(&self) -> &Signature {
+        static SIG: LazyLock<Signature> =
+            LazyLock::new(|| Signature::any(1, Volatility::Volatile));
+        &SIG
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
+        // TRY wraps any expression — return the same type as the argument.
+        Ok(arg_types[0].clone())
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        // Passthrough: the argument was already successfully evaluated.
+        Ok(args.args[0].clone())
+    }
 }

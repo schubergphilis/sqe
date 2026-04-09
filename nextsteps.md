@@ -196,6 +196,7 @@ Step 7.1: dbt-sqe adapter   ✅ DONE (ADBC Flight SQL, table/view/incremental/se
 Step 7.3: ALTER TABLE schema ✅ DONE (ADD/DROP/RENAME COLUMN, SET/DROP NOT NULL, type widening)
 Step 8: Trino parity        ✅ DONE (compatibility matrix, sqe-bench compare, client testing scaffold, operational comparison)
 Step 8b: Trino UDF blitz    ✅ DONE (60+ UDFs: JSON/URL/encoding/regex/string/math/date/aggregate — overall SQL coverage ~91%)
+Step 8c: engine-level compat ✅ DONE (USE catalog.schema, SHOW CREATE TABLE, TRUNCATE TABLE→DELETE, CALL error, TRY() passthrough UDF)
 Step 5: pluggable catalogs  (AWS Glue, Nessie, Hive Metastore, storage-only, Delta Lake) ← NEXT
 Step 6: semantic layer      (new crates; fully additive; no existing code broken)
 ```
