@@ -195,7 +195,7 @@ Step 4d: adaptive sort+metrics ✅ DONE (adaptive sort stripping, S3/auth/write 
 Step 7.1: dbt-sqe adapter   ✅ DONE (ADBC Flight SQL, table/view/incremental/seed materializations)
 Step 7.3: ALTER TABLE schema ✅ DONE (ADD/DROP/RENAME COLUMN, SET/DROP NOT NULL, type widening)
 Step 8: Trino parity        ✅ DONE (compatibility matrix, sqe-bench compare, client testing scaffold, operational comparison)
-Step 8b: Trino UDF blitz    ✅ DONE (50+ UDFs: JSON/URL/encoding/regex/string/math/date — overall SQL coverage ~88%)
+Step 8b: Trino UDF blitz    ✅ DONE (60+ UDFs: JSON/URL/encoding/regex/string/math/date/aggregate — overall SQL coverage ~91%)
 Step 5: pluggable catalogs  (AWS Glue, Nessie, Hive Metastore, storage-only, Delta Lake) ← NEXT
 Step 6: semantic layer      (new crates; fully additive; no existing code broken)
 ```
