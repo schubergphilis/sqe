@@ -116,9 +116,9 @@ impl SqeFlightSqlService {
     ///
     /// Supports two token types:
     /// 1. SQE session ID (from do_handshake) — looked up in session manager
-    /// 2. Raw JWT (from backend BFF pass-through) — wrapped into an ad-hoc session,
-    ///    same pattern as the Trino-compat HTTP endpoint
-    fn get_session_from_request<T>(
+    /// 2. Raw JWT (from backend BFF pass-through) — validated via the auth
+    ///    provider chain (JWKS signature check) and converted into a session
+    async fn get_session_from_request<T: Send + Sync>(
         &self,
         request: &Request<T>,
     ) -> Result<Arc<sqe_core::Session>, Status> {
@@ -154,30 +154,34 @@ impl SqeFlightSqlService {
             return Ok(session);
         }
 
-        // If the token looks like a JWT (contains dots), treat it as a raw
-        // access token — create an ad-hoc session like Trino-compat does.
+        // If the token looks like a JWT (contains dots), validate it through
+        // the auth provider chain (JWKS signature verification) and create a
+        // proper session. The username comes from the validated JWT claims,
+        // not from a client-supplied header.
         if token.contains('.') {
-            if let Some(ref metrics) = self.metrics {
-                metrics.auth_attempts_total.with_label_values(&["bearer", "success"]).inc();
-            }
-            let username = metadata
-                .get("x-trino-user")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("unknown")
-                .to_string();
+            let credentials = sqe_auth::FlightCredentials {
+                bearer_token: Some(token.to_string()),
+                ..Default::default()
+            };
+            let session = self
+                .session_manager
+                .authenticate_credentials(&credentials)
+                .await
+                .map_err(|e| {
+                    warn!(
+                        client_ip = %client_ip,
+                        error = %e,
+                        "Flight: JWT bearer token validation failed"
+                    );
+                    Status::unauthenticated("Invalid or expired bearer token")
+                })?;
             debug!(
-                username = %username,
+                username = %session.user.username,
                 client_ip = %client_ip,
-                "Flight: accepting raw JWT as bearer token"
+                session_id = %session.id,
+                "Flight: authenticated via validated JWT bearer token"
             );
-            let session = sqe_core::Session::new(
-                username,
-                token.to_string(),
-                None,
-                chrono::Utc::now() + chrono::Duration::hours(1),
-                vec![],
-            );
-            return Ok(Arc::new(session));
+            return Ok(session);
         }
 
         warn!(client_ip = %client_ip, "Invalid or expired session token");
@@ -422,7 +426,7 @@ impl FlightSqlService for SqeFlightSqlService {
         query: CommandStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        let session = self.get_session_from_request(&request)?;
+        let session = self.get_session_from_request(&request).await?;
         let sql = &query.query;
 
         debug!(
@@ -470,7 +474,7 @@ impl FlightSqlService for SqeFlightSqlService {
         ticket: TicketStatementQuery,
         request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let session = self.get_session_from_request(&request)?;
+        let session = self.get_session_from_request(&request).await?;
         let sql = &ticket.statement_handle;
 
         debug!(
@@ -497,7 +501,7 @@ impl FlightSqlService for SqeFlightSqlService {
         request: Request<Ticket>,
         message: Any,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let session = self.get_session_from_request(&request)?;
+        let session = self.get_session_from_request(&request).await?;
 
         // Try to decode as our FetchResults message
         if message.type_url == FetchResults::type_url() {
@@ -588,7 +592,7 @@ impl FlightSqlService for SqeFlightSqlService {
         request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         info!("Flight SQL: do_get_schemas called");
-        let session = self.get_session_from_request(&request)?;
+        let session = self.get_session_from_request(&request).await?;
 
         let catalog_name = if self.config.catalog.warehouse.is_empty() {
             "default".to_string()
@@ -647,7 +651,7 @@ impl FlightSqlService for SqeFlightSqlService {
         request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         info!("Flight SQL: do_get_tables called");
-        let session = self.get_session_from_request(&request)?;
+        let session = self.get_session_from_request(&request).await?;
 
         let catalog_name = if self.config.catalog.warehouse.is_empty() {
             "default".to_string()
@@ -683,7 +687,7 @@ impl FlightSqlService for SqeFlightSqlService {
 
         // For each schema, list its tables
         for ns in &schema_names {
-            let sql = format!("SHOW TABLES IN {}", ns);
+            let sql = format!("SHOW TABLES IN \"{}\"", ns.replace('"', "\"\""));
             match self.query_handler.execute(&session, &sql).await {
                 Ok(table_batches) => {
                     for batch in &table_batches {
@@ -739,7 +743,7 @@ impl FlightSqlService for SqeFlightSqlService {
         cmd: CommandPreparedStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        let session = self.get_session_from_request(&request)?;
+        let session = self.get_session_from_request(&request).await?;
 
         // Decode the SQL from the prepared statement handle
         let fetch: FetchResults =
@@ -887,7 +891,7 @@ impl FlightSqlService for SqeFlightSqlService {
         query: CommandPreparedStatementQuery,
         request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let session = self.get_session_from_request(&request)?;
+        let session = self.get_session_from_request(&request).await?;
 
         // Decode the SQL from the prepared statement handle
         let fetch: FetchResults =
@@ -1151,7 +1155,7 @@ impl FlightSqlService for SqeFlightSqlService {
         ticket: CommandStatementUpdate,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
-        let session = self.get_session_from_request(&request)?;
+        let session = self.get_session_from_request(&request).await?;
         let batches = self
             .query_handler
             .execute(&session, &ticket.query)
@@ -1167,7 +1171,7 @@ impl FlightSqlService for SqeFlightSqlService {
         ticket: CommandStatementIngest,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
-        let session = self.get_session_from_request(&request)?;
+        let session = self.get_session_from_request(&request).await?;
 
         // Build qualified table name from catalog + schema + table
         let mut qualified = String::new();
@@ -1234,7 +1238,7 @@ impl FlightSqlService for SqeFlightSqlService {
         query: CommandPreparedStatementUpdate,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
-        let session = self.get_session_from_request(&request)?;
+        let session = self.get_session_from_request(&request).await?;
 
         // Decode the SQL from the prepared statement handle
         let fetch: FetchResults =
@@ -1256,10 +1260,10 @@ impl FlightSqlService for SqeFlightSqlService {
         query: ActionCreatePreparedStatementRequest,
         request: Request<Action>,
     ) -> Result<ActionCreatePreparedStatementResult, Status> {
-        let session = self.get_session_from_request(&request)?;
+        let session = self.get_session_from_request(&request).await?;
         let sql = &query.query;
 
-        debug!(username = %session.user.username, sql = %sql, "Creating prepared statement");
+        debug!(username = %session.user.username, sql_len = sql.len(), "Creating prepared statement");
 
         // Get schema by planning the query
         let schema = self
@@ -1408,11 +1412,16 @@ impl FlightSqlService for SqeFlightSqlService {
             "heartbeat" => {
                 // Validate the worker secret when one is configured.
                 if !self.worker_secret.is_empty() {
+                    use subtle::ConstantTimeEq;
                     let provided = metadata
                         .get("x-sqe-worker-secret")
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("");
-                    if provided != self.worker_secret {
+                    let provided_bytes = provided.as_bytes();
+                    let secret_bytes = self.worker_secret.as_bytes();
+                    if provided_bytes.len() != secret_bytes.len()
+                        || !bool::from(provided_bytes.ct_eq(secret_bytes))
+                    {
                         return Err(Status::unauthenticated("Invalid worker secret"));
                     }
                 }

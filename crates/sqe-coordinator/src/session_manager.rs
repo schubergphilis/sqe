@@ -176,7 +176,9 @@ impl SessionManager {
 
     /// Save current sessions to a JSON file for crash recovery.
     ///
-    /// Only key fields are serialized (id, username, access_token, expires_at).
+    /// Only non-sensitive fields are serialized (id, username, expires_at).
+    /// Access tokens are deliberately excluded — on restore, sessions must
+    /// re-authenticate via the OIDC provider.
     /// Failure is non-fatal: errors are logged and the caller receives an `Err`.
     pub fn snapshot_to_file(&self, path: &str) -> Result<(), String> {
         let sessions: Vec<_> = self
@@ -187,7 +189,6 @@ impl SessionManager {
                 serde_json::json!({
                     "id": session.id,
                     "username": session.user.username,
-                    "access_token": session.access_token,
                     "expires_at": session.token_expiry.to_rfc3339(),
                 })
             })

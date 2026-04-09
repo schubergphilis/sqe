@@ -237,7 +237,10 @@ impl TrinoAuthenticator for AuthenticatorAdapter {
     }
 }
 
-struct QueryHandlerAdapter(Arc<QueryHandler>);
+struct QueryHandlerAdapter {
+    handler: Arc<QueryHandler>,
+    rate_limiter: Arc<sqe_coordinator::rate_limiter::QueryRateLimiter>,
+}
 
 #[async_trait::async_trait]
 impl TrinoQueryExecutor for QueryHandlerAdapter {
@@ -246,7 +249,10 @@ impl TrinoQueryExecutor for QueryHandlerAdapter {
         session: &sqe_core::Session,
         sql: &str,
     ) -> Result<Vec<arrow_array::RecordBatch>, String> {
-        self.0
+        self.rate_limiter
+            .check(&session.user.username)
+            .map_err(|e| e.to_string())?;
+        self.handler
             .execute(session, sql)
             .await
             .map_err(|e| e.to_string())
@@ -519,13 +525,21 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             None
         };
 
+    // Rate limiter — shared between Flight SQL and Trino paths
+    let rate_limiter = Arc::new(sqe_coordinator::rate_limiter::QueryRateLimiter::new(
+        &config.rate_limit,
+    ));
+
     // Trino compat
     if config.coordinator.trino_http_port > 0 {
         let auth_adapter = Arc::new(AuthenticatorAdapter {
             authenticator: authenticator.clone(),
             bearer_provider: bearer_provider.clone(),
         });
-        let handler_adapter = Arc::new(QueryHandlerAdapter(query_handler.clone()));
+        let handler_adapter = Arc::new(QueryHandlerAdapter {
+            handler: query_handler.clone(),
+            rate_limiter: Arc::clone(&rate_limiter),
+        });
         sqe_trino_compat::server::start_trino_server(
             auth_adapter,
             handler_adapter,
@@ -597,7 +611,8 @@ async fn run_worker(config: SqeConfig) -> anyhow::Result<()> {
 
     let session_ctx = sqe_worker::runtime::build_session_context(&config.worker)?;
     let flight_service =
-        sqe_worker::flight_service::WorkerFlightService::new(worker_metrics, session_ctx);
+        sqe_worker::flight_service::WorkerFlightService::new(worker_metrics, session_ctx)
+            .with_scan_timeout(config.worker.scan_timeout_secs);
 
     // Mark ready
     ready.store(true, Ordering::Relaxed);

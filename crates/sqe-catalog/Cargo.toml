@@ -28,6 +28,7 @@ url = { workspace = true }
 dashmap = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+sha2 = { workspace = true }
 iceberg-datafusion = { workspace = true }
 parquet = { workspace = true }
 bytes = { workspace = true }

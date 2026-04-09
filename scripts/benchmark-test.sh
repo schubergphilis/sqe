@@ -136,11 +136,44 @@ RESULTS=()
 # Collect per-benchmark summary lines: "name:pass:fail:diff:skip:error:total:ms"
 SUMMARIES=()
 
+# Track whether TPC-DS tables have been loaded (needed by TPC-BB)
+TPCDS_LOADED=""
+
 for BENCH in "${BENCHMARKS[@]}"; do
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "  Benchmark: $(echo "$BENCH" | tr '[:lower:]' '[:upper:]') (SF${BENCH_SCALE})"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # TPC-BB reuses all TPC-DS tables.  Ensure they are generated and loaded
+    # before the TPC-BB-specific tables are added.
+    if [ "$BENCH" = "tpcbb" ] && [ -z "$TPCDS_LOADED" ]; then
+        echo ""
+        echo "  [pre] TPC-BB requires TPC-DS tables — generating and loading..."
+        "$BENCH_BIN" generate tpcds \
+            --scale "$BENCH_SCALE" \
+            --output "$BENCH_DATA_DIR" 2>&1 || true
+        "$BENCH_BIN" load tpcds \
+            --scale "$BENCH_SCALE" \
+            --data "$BENCH_DATA_DIR" \
+            --protocol "$BENCH_PROTOCOL" \
+            --host "$BENCH_HOST" \
+            --port "$BENCH_PORT" \
+            --username "$SQE_USERNAME" \
+            --password "$SQE_PASSWORD" \
+            --s3-access-key "$S3_ACCESS_KEY" \
+            --s3-secret-key "$S3_SECRET_KEY" \
+            --s3-endpoint "$S3_ENDPOINT" \
+            --s3-region "$S3_REGION" \
+            --clean 2>&1 || {
+            echo "  ✗ Failed to load TPC-DS prerequisite tables for TPC-BB"
+            RESULTS+=("$BENCH: PREREQ_FAILED")
+            TOTAL_ERROR=$((TOTAL_ERROR + 1))
+            continue
+        }
+        TPCDS_LOADED=1
+        echo "  ✓ TPC-DS tables loaded for TPC-BB"
+    fi
 
     # ── Step 1: Generate ──────────────────────────────────────
     echo ""
@@ -181,6 +214,7 @@ for BENCH in "${BENCHMARKS[@]}"; do
     fi
     LOAD_END=$(date +%s)
     echo "  ✓ Loaded in $((LOAD_END - LOAD_START))s"
+    if [ "$BENCH" = "tpcds" ]; then TPCDS_LOADED=1; fi
 
     # ── Step 3: Test ──────────────────────────────────────────
     echo ""
@@ -210,7 +244,12 @@ for BENCH in "${BENCHMARKS[@]}"; do
     fi
 
     # ── Clean up generated data for this benchmark ────────────
-    rm -rf "${BENCH_DATA_DIR:?}/$BENCH"
+    # Keep tpcds data if tpcbb still needs it (tpcbb loads into tpcds namespace)
+    if [ "$BENCH" = "tpcds" ] && [[ " ${BENCHMARKS[*]} " =~ " tpcbb " ]]; then
+        echo "  (keeping tpcds data — needed by tpcbb)"
+    else
+        rm -rf "${BENCH_DATA_DIR:?}/$BENCH"
+    fi
 done
 
 # ── Summary table ─────────────────────────────────────────────
@@ -223,7 +262,7 @@ echo "  ────────────────────────
 
 SUM_PASS=0; SUM_FAIL=0; SUM_DIFF=0; SUM_SKIP=0; SUM_ERROR=0; SUM_TOTAL=0; SUM_MS=0
 
-for S in "${SUMMARIES[@]}"; do
+for S in "${SUMMARIES[@]+"${SUMMARIES[@]}"}"; do
     # Parse BENCH_SUMMARY:name:pass:fail:diff:skip:error:total:ms
     IFS=':' read -r _ NAME PASS FAIL DIFF SKIP ERR TOTAL MS <<< "$S"
     TIME_S=$(echo "scale=1; $MS / 1000" | bc 2>/dev/null || echo "0.0")
