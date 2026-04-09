@@ -52,6 +52,16 @@ pub fn register_extended_trino_functions(ctx: &datafusion::prelude::SessionConte
     ctx.register_udf(ScalarUDF::from(ParseDatetime));
     ctx.register_udf(ScalarUDF::from(WordStem));
     ctx.register_udf(ScalarUDF::from(WordStemLang));
+
+    // Aggregate-like scalar aliases
+    ctx.register_udf(ScalarUDF::from(Arbitrary));
+    ctx.register_udf(ScalarUDF::from(MaxBy));
+    ctx.register_udf(ScalarUDF::from(MinBy));
+    ctx.register_udf(ScalarUDF::from(Checksum));
+    ctx.register_udf(ScalarUDF::from(TimezoneHour));
+    ctx.register_udf(ScalarUDF::from(TimezoneMinute));
+    ctx.register_udf(ScalarUDF::from(JsonSize));
+    ctx.register_udf(ScalarUDF::from(JsonArrayGet));
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1229,4 +1239,334 @@ impl ScalarUDFImpl for WordStemLang {
             Some(stemmer.stem(s).into_owned())
         })
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// AGGREGATE-LIKE SCALAR ALIASES
+// ═══════════════════════════════════════════════════════════════════
+
+/// arbitrary(x) — Returns the first non-null value (scalar passthrough; aggregate form is first_value).
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct Arbitrary;
+
+impl ScalarUDFImpl for Arbitrary {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "arbitrary"
+    }
+    fn signature(&self) -> &Signature {
+        static SIG: LazyLock<Signature> =
+            LazyLock::new(|| Signature::new(TypeSignature::Any(1), Volatility::Immutable));
+        &SIG
+    }
+    fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(arg_types[0].clone())
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        // For scalar: pass through. For array: return first non-null.
+        match &args.args[0] {
+            ColumnarValue::Array(arr) => {
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        return Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(arr, i)?));
+                    }
+                }
+                Ok(ColumnarValue::Scalar(ScalarValue::try_from(arr.data_type())?))
+            }
+            other => Ok(other.clone()),
+        }
+    }
+}
+
+/// max_by(x, y) — Returns x for the row where y is maximum (scalar stub; returns first arg).
+///
+/// NOTE: Full aggregate semantics require an aggregate UDF with ORDER BY. This scalar stub
+/// handles single-row contexts and prevents parse errors in Trino-compat mode.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct MaxBy;
+
+impl ScalarUDFImpl for MaxBy {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "max_by"
+    }
+    fn signature(&self) -> &Signature {
+        static SIG: LazyLock<Signature> =
+            LazyLock::new(|| Signature::new(TypeSignature::Any(2), Volatility::Immutable));
+        &SIG
+    }
+    fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(arg_types[0].clone())
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        // Scalar stub: return first arg (for single-row contexts)
+        Ok(args.args[0].clone())
+    }
+}
+
+/// min_by(x, y) — Returns x for the row where y is minimum (scalar stub; returns first arg).
+///
+/// NOTE: Full aggregate semantics require an aggregate UDF with ORDER BY. This scalar stub
+/// handles single-row contexts and prevents parse errors in Trino-compat mode.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct MinBy;
+
+impl ScalarUDFImpl for MinBy {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "min_by"
+    }
+    fn signature(&self) -> &Signature {
+        static SIG: LazyLock<Signature> =
+            LazyLock::new(|| Signature::new(TypeSignature::Any(2), Volatility::Immutable));
+        &SIG
+    }
+    fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(arg_types[0].clone())
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        Ok(args.args[0].clone())
+    }
+}
+
+/// checksum(x) — Order-insensitive hash aggregate (XOR of hashes). Scalar impl for single values.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct Checksum;
+
+impl ScalarUDFImpl for Checksum {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "checksum"
+    }
+    fn signature(&self) -> &Signature {
+        static SIG: LazyLock<Signature> =
+            LazyLock::new(|| Signature::new(TypeSignature::Any(1), Volatility::Immutable));
+        &SIG
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        match &args.args[0] {
+            ColumnarValue::Scalar(v) => {
+                let s = v.to_string();
+                let mut hasher = DefaultHasher::new();
+                s.hash(&mut hasher);
+                let hash = hasher.finish();
+                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(format!(
+                    "{:016x}",
+                    hash
+                )))))
+            }
+            ColumnarValue::Array(arr) => {
+                let str_arr = arrow::compute::cast(arr, &DataType::Utf8)?;
+                let str_arr = str_arr
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| DataFusionError::Internal("Expected StringArray".into()))?;
+                let result: StringArray = str_arr
+                    .iter()
+                    .map(|opt| {
+                        opt.map(|s| {
+                            let mut hasher = DefaultHasher::new();
+                            s.hash(&mut hasher);
+                            format!("{:016x}", hasher.finish())
+                        })
+                    })
+                    .collect();
+                Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// DATE/TIME — TIMEZONE HELPERS
+// ═══════════════════════════════════════════════════════════════════
+
+/// timezone_hour(ts) — Returns the hour component of the timezone offset.
+///
+/// SQE operates in UTC, so the offset is always 0.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct TimezoneHour;
+
+impl ScalarUDFImpl for TimezoneHour {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "timezone_hour"
+    }
+    fn signature(&self) -> &Signature {
+        static SIG: LazyLock<Signature> =
+            LazyLock::new(|| Signature::new(TypeSignature::Any(1), Volatility::Immutable));
+        &SIG
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Int64)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        // SQE operates in UTC, so timezone offset is always 0
+        match &args.args[0] {
+            ColumnarValue::Scalar(_) => Ok(ColumnarValue::Scalar(ScalarValue::Int64(Some(0)))),
+            ColumnarValue::Array(arr) => {
+                let result: Int64Array = (0..arr.len()).map(|_| Some(0i64)).collect();
+                Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
+            }
+        }
+    }
+}
+
+/// timezone_minute(ts) — Returns the minute component of the timezone offset.
+///
+/// SQE operates in UTC, so the offset is always 0.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct TimezoneMinute;
+
+impl ScalarUDFImpl for TimezoneMinute {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "timezone_minute"
+    }
+    fn signature(&self) -> &Signature {
+        static SIG: LazyLock<Signature> =
+            LazyLock::new(|| Signature::new(TypeSignature::Any(1), Volatility::Immutable));
+        &SIG
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Int64)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        match &args.args[0] {
+            ColumnarValue::Scalar(_) => Ok(ColumnarValue::Scalar(ScalarValue::Int64(Some(0)))),
+            ColumnarValue::Array(arr) => {
+                let result: Int64Array = (0..arr.len()).map(|_| Some(0i64)).collect();
+                Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// JSON HELPERS
+// ═══════════════════════════════════════════════════════════════════
+
+/// json_size(json, path) — Returns the size of a JSON object or array at the given path.
+///
+/// For objects: number of keys. For arrays: number of elements. For strings: string length.
+/// For scalars (numbers, booleans): 0.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct JsonSize;
+
+impl ScalarUDFImpl for JsonSize {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "json_size"
+    }
+    fn signature(&self) -> &Signature {
+        static SIG: LazyLock<Signature> =
+            LazyLock::new(|| Signature::new(TypeSignature::Any(2), Volatility::Immutable));
+        &SIG
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Int64)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        match (&args.args[0], &args.args[1]) {
+            (
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some(json))),
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some(path))),
+            ) => {
+                let size = json_size_at_path(json, path);
+                Ok(ColumnarValue::Scalar(ScalarValue::Int64(size)))
+            }
+            _ => Ok(ColumnarValue::Scalar(ScalarValue::Int64(None))),
+        }
+    }
+}
+
+fn json_size_at_path(json: &str, path: &str) -> Option<i64> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let key = path.trim_start_matches("$.");
+    let target = if key.is_empty() || key == "$" {
+        &v
+    } else {
+        crate::trino_functions::navigate_json(&v, key)?
+    };
+    match target {
+        serde_json::Value::Object(m) => Some(m.len() as i64),
+        serde_json::Value::Array(a) => Some(a.len() as i64),
+        serde_json::Value::String(s) => Some(s.len() as i64),
+        _ => Some(0),
+    }
+}
+
+/// json_array_get(json, index) — Returns the element at the given index in a JSON array.
+///
+/// Supports negative indices (counting from the end). Returns NULL if out of range.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct JsonArrayGet;
+
+impl ScalarUDFImpl for JsonArrayGet {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "json_array_get"
+    }
+    fn signature(&self) -> &Signature {
+        static SIG: LazyLock<Signature> =
+            LazyLock::new(|| Signature::new(TypeSignature::Any(2), Volatility::Immutable));
+        &SIG
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        match (&args.args[0], &args.args[1]) {
+            (
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some(json))),
+                ColumnarValue::Scalar(idx_val),
+            ) => {
+                let idx = match idx_val {
+                    ScalarValue::Int64(Some(i)) => *i,
+                    ScalarValue::Int32(Some(i)) => *i as i64,
+                    _ => return Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None))),
+                };
+                let result = json_array_get_impl(json, idx);
+                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(result)))
+            }
+            _ => Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None))),
+        }
+    }
+}
+
+fn json_array_get_impl(json: &str, idx: i64) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let arr = v.as_array()?;
+    let actual_idx = if idx < 0 {
+        let len = arr.len() as i64;
+        let pos = len + idx;
+        if pos < 0 {
+            return None;
+        }
+        pos as usize
+    } else {
+        idx as usize
+    };
+    arr.get(actual_idx).map(|v| v.to_string())
 }

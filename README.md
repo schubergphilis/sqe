@@ -174,7 +174,7 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 - [x] Streaming execution Phase B: DoExchange shuffle, distributed sort/join/aggregate, multi-endpoint Flight SQL, stage decomposition
 - [x] Adaptive sort stripping and S3/auth/write Prometheus metrics
 - [x] Observability metrics (spill, shuffle, late-mat, pruning, time-to-first-row)
-- [x] Trino function compatibility — 50+ UDFs: date/time (year, month, date_format, with_timezone, etc.), JSON (json_extract, json_array_contains, json_format + datafusion-functions-json), URL (all 8 url_extract_*), regex (regexp_extract/all/split), encoding (base64, hex, utf8), string (soundex, normalize, word_stem), math (infinity, nan, from/to_base), Joda format translation
+- [x] Trino function compatibility — 60+ UDFs across all categories (see `docs/trino-compatibility.md`): String 96%, Math 100%, Date/Time 100%, JSON 83%, URL 100%, Regex 100%, Conditional 88%, Conversion 90%, Aggregate 82%, Window 93%, DDL/DML 74%
 - [x] Pluggable auth providers (OIDC, bearer token, API key, mTLS, anonymous, AWS IAM, device code, token exchange)
 - [ ] Pluggable catalog backends (AWS Glue, Nessie, Hive Metastore, storage-only) ← NEXT
 - [x] dbt adapter (dbt-sqe via ADBC Flight SQL — table, view, incremental, seed)
