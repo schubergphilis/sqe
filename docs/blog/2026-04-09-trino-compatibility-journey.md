@@ -134,7 +134,7 @@ Some gaps are genuine limitations, not laziness:
 - **CREATE MATERIALIZED VIEW** is not in the Iceberg spec. Use `CREATE TABLE AS SELECT` with scheduled refreshes instead.
 - **Lambda in window functions** is a DataFusion engine limitation. Use subqueries instead.
 - **ORC file format** is a strategic choice: SQE is Parquet-only. This aligns with the modern lakehouse direction.
-- **Merge-on-Read deletes** are waiting on iceberg-rust Epic #2186 (estimated Q3 2026). SQE uses Copy-on-Write for DELETE/UPDATE/MERGE, which is correct but less efficient for small changes on large tables.
+- **Merge-on-Read writes** are blocked on the `RowDeltaAction` transaction API. The RisingWave iceberg-rust fork has individual writers for position deletes, equality deletes, and V3 deletion vectors, but no atomic commit API. SQE uses Copy-on-Write for writes, which is correct but less efficient for small changes on large tables. Importantly, SQE can already READ MoR tables written by Trino or Spark -- position deletes, equality deletes, and deletion vectors are all handled in the scan path.
 
 ## Test coverage
 
