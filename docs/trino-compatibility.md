@@ -23,7 +23,7 @@ noting semantic differences and gaps.
 | Window | 14 | 13 | 0 | 1 | 92.9% |
 | DDL/DML | 31 + 1🔧 | 20 | 6 | 5 | 80.6% |
 | Type System | 27 | 18 | 2 | 7 | 74.1% |
-| Iceberg-Specific | 18 | 6 | 0 | 12 | 33.3% |
+| Iceberg-Specific | 18 | 6 | 2 | 10 | 44.4% |
 
 ## How to Read This Document
 
@@ -353,10 +353,10 @@ Each section lists Trino functions with their SQE status:
 | Hidden partitioning | ✅ | ✅ | ✅ | Via Iceberg transforms |
 | Schema evolution | ✅ | ✅ | ✅ | ADD/DROP/RENAME COLUMN |
 | Type widening | ✅ | ✅ | ✅ | INT→BIGINT, FLOAT→DOUBLE |
-| Time travel: `FOR VERSION AS OF` | — | ✅ | ❌ | Snapshot ID query |
-| Time travel: `FOR TIMESTAMP AS OF` | — | ✅ | ❌ | Temporal query |
-| `$snapshots` metadata table | — | ✅ | ❌ | |
-| `$manifests` metadata table | — | ✅ | ❌ | |
+| Time travel: `FOR VERSION AS OF` | — | ✅ | ❌ | sqlparser 0.53 doesn't parse temporal syntax; iceberg-rust fork lacks `snapshot_id()` on scan builder |
+| Time travel: `FOR TIMESTAMP AS OF` | — | ✅ | ❌ | Same blockers as above |
+| `$snapshots` metadata table | `table_snapshots('ns', 'table')` | ✅ | ⚠️ | TVF instead of `$snapshots` syntax; queries Polaris REST catalog metadata |
+| `$manifests` metadata table | `table_manifests('ns', 'table')` | ✅ | ⚠️ | TVF instead of `$manifests` syntax; reads manifest list from Polaris |
 | `$history` metadata table | — | ✅ | ❌ | |
 | `$partitions` metadata table | — | ✅ | ❌ | |
 | `$files` metadata table | — | ✅ | ❌ | |

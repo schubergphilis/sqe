@@ -206,6 +206,22 @@ pub async fn create_session_context(
         )),
     );
 
+    // Register Iceberg metadata TVFs:
+    //   SELECT * FROM table_snapshots('schema', 'table')
+    //   SELECT * FROM table_manifests('schema', 'table')
+    ctx.register_udtf(
+        "table_snapshots",
+        Arc::new(sqe_catalog::iceberg_metadata_tvf::TableSnapshotsFunction::new(
+            Arc::clone(&session_catalog_for_return),
+        )),
+    );
+    ctx.register_udtf(
+        "table_manifests",
+        Arc::new(sqe_catalog::iceberg_metadata_tvf::TableManifestsFunction::new(
+            Arc::clone(&session_catalog_for_return),
+        )),
+    );
+
     debug!(
         catalog_name = %catalog_name,
         username = %session.user.username,
