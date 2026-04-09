@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use iceberg::spec::{NestedField, Schema as IcebergSchema};
 use iceberg::{Catalog, NamespaceIdent, TableIdent, TableRequirement, TableUpdate};
-use sqlparser::ast::{AlterColumnOperation, AlterTableOperation, ObjectName, ObjectType, SchemaName, Statement};
+use sqlparser::ast::{AlterColumnOperation, AlterTableOperation, Expr, ObjectName, ObjectType, SchemaName, SqlOption, Statement, Value};
 use tracing::info;
 
 use sqe_catalog::SessionCatalog;
@@ -246,6 +246,11 @@ impl CatalogOps {
     /// Extracts the view name and SELECT query from a `CREATE VIEW` statement,
     /// infers the output schema by planning the SELECT via DataFusion, converts
     /// it to the Iceberg REST API schema format, and calls `SessionCatalog::create_view()`.
+    ///
+    /// When `or_replace` is `true` (i.e. `CREATE OR REPLACE VIEW`), the existing
+    /// view is dropped first if it exists, then the new view is created. This is
+    /// the simple non-atomic approach — there is a brief window between drop and
+    /// create where the view does not exist.
     #[instrument(skip(self, session, stmt, schema_json), fields(username = %session.user.username))]
     pub async fn create_view(
         &self,
@@ -253,8 +258,8 @@ impl CatalogOps {
         stmt: &Statement,
         schema_json: &serde_json::Value,
     ) -> sqe_core::Result<()> {
-        let (view_name, query) = match stmt {
-            Statement::CreateView { name, query, .. } => (name, query),
+        let (view_name, query, or_replace) = match stmt {
+            Statement::CreateView { name, query, or_replace, .. } => (name, query, *or_replace),
             other => {
                 return Err(SqeError::Execution(format!(
                     "Expected CREATE VIEW statement, got: {other}"
@@ -269,6 +274,7 @@ impl CatalogOps {
             username = %session.user.username,
             view = %name,
             namespace = ?namespace,
+            or_replace = or_replace,
             "Creating view"
         );
 
@@ -280,6 +286,19 @@ impl CatalogOps {
             None, None,
         )
         .await?;
+
+        // For CREATE OR REPLACE VIEW: drop the existing view first (if it exists).
+        if or_replace {
+            match session_catalog.drop_view(&namespace, &name).await {
+                Ok(()) => {
+                    info!(view = %name, "Dropped existing view for CREATE OR REPLACE VIEW");
+                }
+                Err(e) if e.is_not_found() => {
+                    // View didn't exist — nothing to drop
+                }
+                Err(e) => return Err(e),
+            }
+        }
 
         session_catalog
             .create_view(&namespace, &name, &select_sql, schema_json)
@@ -554,6 +573,83 @@ impl CatalogOps {
         Ok(())
     }
 
+    /// Set table properties via the Iceberg REST catalog.
+    ///
+    /// Handles `ALTER TABLE ... SET TBLPROPERTIES (...)` by extracting the
+    /// key-value pairs and committing them as `TableUpdate::SetProperties`.
+    #[instrument(skip(self, session, stmt), fields(username = %session.user.username))]
+    pub async fn set_table_properties(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+    ) -> sqe_core::Result<()> {
+        let (table_name, operations) = match stmt {
+            Statement::AlterTable {
+                name, operations, ..
+            } => (name, operations),
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected ALTER TABLE statement, got: {other}"
+                )));
+            }
+        };
+
+        let (namespace, name) = parse_table_ref(table_name)?;
+        let table_ident = TableIdent::new(namespace, name);
+
+        // Extract SET TBLPROPERTIES key-value pairs
+        let mut updates: HashMap<String, String> = HashMap::new();
+        for op in operations {
+            if let AlterTableOperation::SetTblProperties { table_properties } = op {
+                for prop in table_properties {
+                    if let SqlOption::KeyValue { key, value } = prop {
+                        let k = key.value.clone();
+                        let v = sql_expr_to_string(value);
+                        updates.insert(k, v);
+                    }
+                }
+            }
+        }
+
+        if updates.is_empty() {
+            return Err(SqeError::Execution(
+                "ALTER TABLE SET TBLPROPERTIES: no valid key-value properties found".to_string(),
+            ));
+        }
+
+        info!(
+            username = %session.user.username,
+            table = %table_ident,
+            num_props = updates.len(),
+            "Setting table properties"
+        );
+
+        let session_catalog = Arc::new(
+            SessionCatalog::new(
+                &self.config.catalog.polaris_url,
+                &self.config.catalog.warehouse,
+                &session.access_token,
+                &self.config.storage,
+                None, None,
+            )
+            .await?,
+        );
+
+        let table_updates = vec![TableUpdate::SetProperties { updates }];
+        let requirements = vec![];
+
+        session_catalog
+            .commit_schema_update(&table_ident, table_updates, requirements)
+            .await?;
+
+        info!(
+            table = %table_ident,
+            "Table properties committed successfully"
+        );
+
+        Ok(())
+    }
+
     /// Create a `SessionCatalogBridge` (which implements `iceberg::Catalog`)
     /// for the given session.
     async fn create_catalog_bridge(
@@ -572,6 +668,18 @@ impl CatalogOps {
         );
 
         Ok(session_catalog.as_catalog())
+    }
+}
+
+/// Convert a sqlparser `Expr` (used as a property value) to a plain String.
+///
+/// For quoted string literals (single or double quoted) the inner string is
+/// returned directly. For everything else the Display representation is used.
+fn sql_expr_to_string(expr: &Expr) -> String {
+    match expr {
+        Expr::Value(Value::SingleQuotedString(s)) => s.clone(),
+        Expr::Value(Value::DoubleQuotedString(s)) => s.clone(),
+        other => format!("{other}"),
     }
 }
 

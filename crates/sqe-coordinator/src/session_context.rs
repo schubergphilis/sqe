@@ -209,6 +209,10 @@ pub async fn create_session_context(
     // Register Iceberg metadata TVFs:
     //   SELECT * FROM table_snapshots('schema', 'table')
     //   SELECT * FROM table_manifests('schema', 'table')
+    //   SELECT * FROM table_history('schema', 'table')
+    //   SELECT * FROM table_files('schema', 'table')
+    //   SELECT * FROM table_partitions('schema', 'table')
+    //   SELECT * FROM table_refs('schema', 'table')
     ctx.register_udtf(
         "table_snapshots",
         Arc::new(sqe_catalog::iceberg_metadata_tvf::TableSnapshotsFunction::new(
@@ -218,6 +222,30 @@ pub async fn create_session_context(
     ctx.register_udtf(
         "table_manifests",
         Arc::new(sqe_catalog::iceberg_metadata_tvf::TableManifestsFunction::new(
+            Arc::clone(&session_catalog_for_return),
+        )),
+    );
+    ctx.register_udtf(
+        "table_history",
+        Arc::new(sqe_catalog::iceberg_metadata_tvf::TableHistoryFunction::new(
+            Arc::clone(&session_catalog_for_return),
+        )),
+    );
+    ctx.register_udtf(
+        "table_files",
+        Arc::new(sqe_catalog::iceberg_metadata_tvf::TableFilesFunction::new(
+            Arc::clone(&session_catalog_for_return),
+        )),
+    );
+    ctx.register_udtf(
+        "table_partitions",
+        Arc::new(sqe_catalog::iceberg_metadata_tvf::TablePartitionsFunction::new(
+            Arc::clone(&session_catalog_for_return),
+        )),
+    );
+    ctx.register_udtf(
+        "table_refs",
+        Arc::new(sqe_catalog::iceberg_metadata_tvf::TableRefsFunction::new(
             Arc::clone(&session_catalog_for_return),
         )),
     );
