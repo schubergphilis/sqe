@@ -1406,7 +1406,7 @@ fn string_transform(arg: &ColumnarValue, f: impl Fn(&str) -> String) -> DFResult
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| DataFusionError::Internal("Expected string array".into()))?;
-            let results: StringArray = str_arr.iter().map(|opt| opt.map(|s| f(s))).collect();
+            let results: StringArray = str_arr.iter().map(|opt| opt.map(&f)).collect();
             Ok(ColumnarValue::Array(Arc::new(results)))
         }
     }

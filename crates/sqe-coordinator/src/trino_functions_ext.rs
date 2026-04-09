@@ -377,8 +377,10 @@ fn compute_soundex(s: &str) -> String {
     let mut last_code = code(first);
     for c in chars {
         let c_code = code(c);
-        if c_code.is_some() && c_code != last_code {
-            result.push(c_code.unwrap());
+        if let Some(cc) = c_code {
+            if c_code != last_code {
+                result.push(cc);
+            }
             if result.len() == 4 {
                 break;
             }
