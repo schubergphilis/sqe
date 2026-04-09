@@ -61,6 +61,10 @@ sha2 = "0.10"
 sqe-worker = { path = "../sqe-worker" }
 opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }
+unicode-normalization = { workspace = true }
+rust-stemmers = { workspace = true }
+chrono-tz = { workspace = true }
+regex = { workspace = true }
 
 [dev-dependencies]
 toml = { workspace = true }
