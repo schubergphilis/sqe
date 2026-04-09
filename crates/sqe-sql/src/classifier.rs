@@ -40,6 +40,10 @@ pub enum StatementKind {
     Call(Box<Statement>),
     /// ALTER TABLE ... SET TBLPROPERTIES (...) — update Iceberg table properties
     AlterTableProps(Box<Statement>),
+    /// COMMENT ON TABLE/COLUMN — store comment as Iceberg table property
+    Comment(Box<Statement>),
+    /// SHOW STATS FOR table — return row/file/size stats from snapshot summary
+    ShowStats(String),
 }
 
 impl StatementKind {
@@ -74,6 +78,8 @@ impl StatementKind {
             StatementKind::Truncate(_) => "truncate",
             StatementKind::Call(_) => "call",
             StatementKind::AlterTableProps(_) => "altertableprops",
+            StatementKind::Comment(_) => "comment",
+            StatementKind::ShowStats(_) => "showstats",
         }
     }
 }
@@ -93,6 +99,16 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
     if upper.starts_with("EXPLAIN FULL ") {
         let inner = trimmed["EXPLAIN FULL ".len()..].trim().to_string();
         return Ok(StatementKind::ExplainFull(inner));
+    }
+
+    // Pre-scan for SHOW STATS FOR — sqlparser parses this as ShowVariable,
+    // but we intercept it here for direct table name extraction.
+    if upper.starts_with("SHOW STATS FOR ") {
+        let table = trimmed["SHOW STATS FOR ".len()..]
+            .trim()
+            .trim_end_matches(';')
+            .to_string();
+        return Ok(StatementKind::ShowStats(table));
     }
 
     let dialect = GenericDialect {};
@@ -284,6 +300,9 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
 
         // CALL procedure — not supported, returns informative error
         Statement::Call(_) => Ok(StatementKind::Call(Box::new(stmt))),
+
+        // COMMENT ON TABLE/COLUMN — store as Iceberg table property
+        Statement::Comment { .. } => Ok(StatementKind::Comment(Box::new(stmt))),
 
         _ => Err(sqe_core::SqeError::NotImplemented(format!(
             "Statement type not supported: {stmt}"
@@ -754,5 +773,92 @@ mod tests {
         .remove(0);
         let kind = StatementKind::AlterTableProps(Box::new(stmt));
         assert_eq!(kind.name(), "altertableprops");
+    }
+
+    // ── COMMENT ON tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_comment_on_table() {
+        let result = parse_and_classify("COMMENT ON TABLE my_schema.my_table IS 'A description'");
+        assert!(
+            matches!(result, Ok(StatementKind::Comment(_))),
+            "Expected Comment, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_comment_on_column() {
+        let result = parse_and_classify("COMMENT ON COLUMN my_table.my_col IS 'Col description'");
+        assert!(
+            matches!(result, Ok(StatementKind::Comment(_))),
+            "Expected Comment, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_comment_on_table_null() {
+        // IS NULL removes an existing comment
+        let result = parse_and_classify("COMMENT ON TABLE my_table IS NULL");
+        assert!(
+            matches!(result, Ok(StatementKind::Comment(_))),
+            "Expected Comment, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_comment_name() {
+        let stmt = Parser::parse_sql(
+            &GenericDialect {},
+            "COMMENT ON TABLE t IS 'desc'",
+        )
+        .unwrap()
+        .remove(0);
+        let kind = StatementKind::Comment(Box::new(stmt));
+        assert_eq!(kind.name(), "comment");
+    }
+
+    // ── SHOW STATS FOR tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_show_stats_for() {
+        let result = parse_and_classify("SHOW STATS FOR orders");
+        assert!(
+            matches!(result, Ok(StatementKind::ShowStats(_))),
+            "Expected ShowStats, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_show_stats_for_qualified() {
+        let result = parse_and_classify("SHOW STATS FOR my_schema.orders");
+        assert!(
+            matches!(result, Ok(StatementKind::ShowStats(_))),
+            "Expected ShowStats, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_show_stats_extracts_table_name() {
+        let result = parse_and_classify("SHOW STATS FOR orders").unwrap();
+        if let StatementKind::ShowStats(name) = result {
+            assert_eq!(name, "orders");
+        } else {
+            panic!("Expected ShowStats");
+        }
+    }
+
+    #[test]
+    fn test_show_stats_name() {
+        let kind = StatementKind::ShowStats("orders".to_string());
+        assert_eq!(kind.name(), "showstats");
+    }
+
+    #[test]
+    fn test_show_stats_case_insensitive() {
+        let result = parse_and_classify("show stats for orders");
+        assert!(
+            matches!(result, Ok(StatementKind::ShowStats(_))),
+            "Expected ShowStats, got: {result:?}"
+        );
     }
 }
