@@ -279,6 +279,10 @@ impl QueryHandler {
                     self.catalog_ops.alter_table_schema(session, stmt).await?;
                     Ok(vec![])
                 }
+                StatementKind::AlterTableProps(stmt) => {
+                    self.catalog_ops.set_table_properties(session, stmt).await?;
+                    Ok(vec![])
+                }
                 StatementKind::CreateView(stmt) => {
                     self.handle_create_view(session, stmt).await?;
                     Ok(vec![])

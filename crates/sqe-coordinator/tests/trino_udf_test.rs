@@ -622,3 +622,85 @@ async fn test_strpos_builtin() {
     let pos: i64 = v.unwrap().parse().expect("strpos result should be numeric");
     assert!(pos > 0, "strpos should return positive 1-based position, got {pos}");
 }
+
+// ═══════════════════════════════════════════════════════════════
+// format() — printf-style string formatting
+// ═══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_format_basic() {
+    let v = eval_str("SELECT format('%s has %d items', 'cart', 5)").await;
+    assert_eq!(v, Some("cart has 5 items".to_string()));
+}
+
+#[tokio::test]
+async fn test_format_float_precision() {
+    let v = eval_str("SELECT format('%.2f', 3.14159)").await;
+    assert_eq!(v, Some("3.14".to_string()));
+}
+
+#[tokio::test]
+async fn test_format_zero_pad() {
+    let v = eval_str("SELECT format('%03d', 8)").await;
+    assert_eq!(v, Some("008".to_string()));
+}
+
+#[tokio::test]
+async fn test_format_percent_literal() {
+    let v = eval_str("SELECT format('%d%%', 100)").await;
+    assert_eq!(v, Some("100%".to_string()));
+}
+
+#[tokio::test]
+async fn test_format_string_only() {
+    let v = eval_str("SELECT format('hello %s', 'world')").await;
+    assert_eq!(v, Some("hello world".to_string()));
+}
+
+#[tokio::test]
+async fn test_format_no_args() {
+    // format() with only a format string and no substitution args
+    let v = eval_str("SELECT format('no substitutions here')").await;
+    assert_eq!(v, Some("no substitutions here".to_string()));
+}
+
+// ═══════════════════════════════════════════════════════════════
+// to_json() — scalar-to-JSON conversion
+// ═══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_to_json_string() {
+    let v = eval_str("SELECT to_json('hello')").await;
+    assert_eq!(v, Some("\"hello\"".to_string()));
+}
+
+#[tokio::test]
+async fn test_to_json_number() {
+    let v = eval_str("SELECT to_json(42)").await;
+    assert_eq!(v, Some("42".to_string()));
+}
+
+#[tokio::test]
+async fn test_to_json_boolean() {
+    let v = eval_str("SELECT to_json(true)").await;
+    assert_eq!(v, Some("true".to_string()));
+}
+
+#[tokio::test]
+async fn test_to_json_string_with_quotes() {
+    // Strings with special characters should be JSON-escaped
+    let v = eval_str(r#"SELECT to_json('say "hello"')"#).await;
+    assert!(v.is_some(), "to_json returned None for string with quotes");
+    let s = v.unwrap();
+    // The result should be a valid JSON string with escaped inner quotes
+    assert!(s.starts_with('"'), "Expected JSON string to start with quote");
+    assert!(s.ends_with('"'), "Expected JSON string to end with quote");
+}
+
+#[tokio::test]
+async fn test_to_json_float() {
+    let v = eval_str("SELECT to_json(3.14)").await;
+    assert!(v.is_some(), "to_json returned None for float");
+    let s = v.unwrap();
+    assert!(s.contains("3.14"), "Expected '3.14' in to_json output, got: {s}");
+}

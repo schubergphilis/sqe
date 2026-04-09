@@ -6,6 +6,8 @@
 use std::any::Any;
 use std::sync::{Arc, LazyLock};
 
+use serde_json;
+
 use arrow::array::{Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::DataType;
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
@@ -65,6 +67,10 @@ pub fn register_extended_trino_functions(ctx: &datafusion::prelude::SessionConte
 
     // TRY(expr) — error-suppressing wrapper
     ctx.register_udf(ScalarUDF::from(Try));
+
+    // Format / JSON
+    ctx.register_udf(ScalarUDF::from(Format));
+    ctx.register_udf(ScalarUDF::from(ToJson));
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1610,5 +1616,272 @@ impl ScalarUDFImpl for Try {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         // Passthrough: the argument was already successfully evaluated.
         Ok(args.args[0].clone())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// format() — printf-style string formatting
+// ═══════════════════════════════════════════════════════════════════
+
+/// format(fmt, ...) — Trino printf-style string formatting.
+///
+/// Supports: `%s` (string), `%d` (integer), `%f` (float), `%03d` (zero-padded
+/// integer), `%.2f` (float with precision), `%-7s` (left-aligned string), `%%`
+/// (literal percent). Covers the vast majority of real-world `format()` usage.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct Format;
+
+impl ScalarUDFImpl for Format {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "format"
+    }
+
+    fn signature(&self) -> &Signature {
+        static SIG: LazyLock<Signature> = LazyLock::new(|| {
+            Signature::new(TypeSignature::VariadicAny, Volatility::Immutable)
+        });
+        &SIG
+    }
+
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        if args.args.is_empty() {
+            return Err(DataFusionError::Execution(
+                "format() requires at least 1 argument".into(),
+            ));
+        }
+
+        let fmt_str = match &args.args[0] {
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => s.clone(),
+            _ => {
+                return Err(DataFusionError::Execution(
+                    "format() first argument must be a string literal".into(),
+                ))
+            }
+        };
+
+        // Collect remaining args as strings for substitution
+        let arg_strs: Vec<String> = args.args[1..]
+            .iter()
+            .map(|a| match a {
+                ColumnarValue::Scalar(v) => format_scalar_value(v),
+                ColumnarValue::Array(_) => "?".to_string(),
+            })
+            .collect();
+
+        let result = apply_format(&fmt_str, &arg_strs)?;
+        Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(result))))
+    }
+}
+
+/// Convert a `ScalarValue` to its string representation for format() substitution.
+fn format_scalar_value(v: &ScalarValue) -> String {
+    match v {
+        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => s.clone(),
+        ScalarValue::Int8(Some(n)) => n.to_string(),
+        ScalarValue::Int16(Some(n)) => n.to_string(),
+        ScalarValue::Int32(Some(n)) => n.to_string(),
+        ScalarValue::Int64(Some(n)) => n.to_string(),
+        ScalarValue::UInt8(Some(n)) => n.to_string(),
+        ScalarValue::UInt16(Some(n)) => n.to_string(),
+        ScalarValue::UInt32(Some(n)) => n.to_string(),
+        ScalarValue::UInt64(Some(n)) => n.to_string(),
+        ScalarValue::Float32(Some(f)) => f.to_string(),
+        ScalarValue::Float64(Some(f)) => f.to_string(),
+        ScalarValue::Boolean(Some(b)) => b.to_string(),
+        ScalarValue::Null => "NULL".to_string(),
+        other => format!("{other}"),
+    }
+}
+
+/// Apply printf-style format string substitution.
+///
+/// Supported specifiers: `%s`, `%d`, `%f`, `%%`,
+/// `%<width>d`, `%0<width>d`, `%.<prec>f`, `%-<width>s`.
+fn apply_format(fmt: &str, args: &[String]) -> DFResult<String> {
+    let mut result = String::new();
+    let mut chars = fmt.chars().peekable();
+    let mut arg_idx = 0;
+
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            result.push(c);
+            continue;
+        }
+
+        match chars.peek() {
+            None => {
+                result.push('%');
+            }
+            Some('%') => {
+                chars.next();
+                result.push('%');
+            }
+            Some('s') => {
+                chars.next();
+                if arg_idx < args.len() {
+                    result.push_str(&args[arg_idx]);
+                    arg_idx += 1;
+                }
+            }
+            Some('d') => {
+                chars.next();
+                if arg_idx < args.len() {
+                    let val = args[arg_idx].parse::<i64>().unwrap_or(0);
+                    result.push_str(&val.to_string());
+                    arg_idx += 1;
+                }
+            }
+            Some('f') => {
+                chars.next();
+                if arg_idx < args.len() {
+                    let val = args[arg_idx].parse::<f64>().unwrap_or(0.0);
+                    result.push_str(&format!("{val:.6}"));
+                    arg_idx += 1;
+                }
+            }
+            Some(&ch) if ch.is_ascii_digit() || ch == '.' || ch == '-' => {
+                // Width/precision specifier: %03d, %.2f, %-7s, %7d, etc.
+                let mut spec = String::new();
+                while let Some(&next_ch) = chars.peek() {
+                    if next_ch.is_ascii_digit() || next_ch == '.' || next_ch == '-' {
+                        spec.push(next_ch);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                let type_char = chars.next().unwrap_or('s');
+                if arg_idx < args.len() {
+                    match type_char {
+                        'd' => {
+                            let val = args[arg_idx].parse::<i64>().unwrap_or(0);
+                            if let Some(rest) = spec.strip_prefix('0') {
+                                // Zero-padding: %03d → 008
+                                let width: usize = rest.parse().unwrap_or(0);
+                                result.push_str(&format!("{val:0>width$}"));
+                            } else if let Some(rest) = spec.strip_prefix('-') {
+                                let width: usize = rest.parse().unwrap_or(0);
+                                result.push_str(&format!("{val:<width$}"));
+                            } else {
+                                let width: usize = spec.parse().unwrap_or(0);
+                                result.push_str(&format!("{val:>width$}"));
+                            }
+                        }
+                        'f' => {
+                            let val = args[arg_idx].parse::<f64>().unwrap_or(0.0);
+                            if let Some(rest) = spec.strip_prefix('.') {
+                                let prec: usize = rest.parse().unwrap_or(6);
+                                result.push_str(&format!("{val:.prec$}"));
+                            } else {
+                                result.push_str(&format!("{val}"));
+                            }
+                        }
+                        's' => {
+                            if let Some(rest) = spec.strip_prefix('-') {
+                                let width: usize = rest.parse().unwrap_or(0);
+                                result.push_str(&format!("{:<width$}", args[arg_idx]));
+                            } else {
+                                let width: usize = spec.parse().unwrap_or(0);
+                                result.push_str(&format!("{:>width$}", args[arg_idx]));
+                            }
+                        }
+                        _ => {
+                            result.push_str(&args[arg_idx]);
+                        }
+                    }
+                    arg_idx += 1;
+                }
+            }
+            _ => {
+                result.push('%');
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// to_json() — convert scalar value to JSON string
+// ═══════════════════════════════════════════════════════════════════
+
+/// to_json(x) — converts a scalar value to its JSON string representation.
+///
+/// Strings are JSON-encoded (i.e. wrapped in double quotes and escaped).
+/// Numbers and booleans are rendered as JSON primitives.
+/// NULL → `"null"`.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct ToJson;
+
+impl ScalarUDFImpl for ToJson {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "to_json"
+    }
+
+    fn signature(&self) -> &Signature {
+        static SIG: LazyLock<Signature> =
+            LazyLock::new(|| Signature::new(TypeSignature::Any(1), Volatility::Immutable));
+        &SIG
+    }
+
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        match &args.args[0] {
+            ColumnarValue::Scalar(v) => {
+                let json = scalar_to_json_string(v);
+                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(json))))
+            }
+            ColumnarValue::Array(arr) => {
+                let result: StringArray = (0..arr.len())
+                    .map(|i| {
+                        if arr.is_null(i) {
+                            Some("null".to_string())
+                        } else {
+                            ScalarValue::try_from_array(arr.as_ref(), i)
+                                .ok()
+                                .map(|sv| scalar_to_json_string(&sv))
+                        }
+                    })
+                    .collect();
+                Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
+            }
+        }
+    }
+}
+
+/// Convert a `ScalarValue` to its JSON string representation.
+fn scalar_to_json_string(v: &ScalarValue) -> String {
+    match v {
+        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => {
+            serde_json::to_string(s.as_str()).unwrap_or_else(|_| format!("\"{s}\""))
+        }
+        ScalarValue::Int8(Some(n)) => n.to_string(),
+        ScalarValue::Int16(Some(n)) => n.to_string(),
+        ScalarValue::Int32(Some(n)) => n.to_string(),
+        ScalarValue::Int64(Some(n)) => n.to_string(),
+        ScalarValue::UInt8(Some(n)) => n.to_string(),
+        ScalarValue::UInt16(Some(n)) => n.to_string(),
+        ScalarValue::UInt32(Some(n)) => n.to_string(),
+        ScalarValue::UInt64(Some(n)) => n.to_string(),
+        ScalarValue::Float32(Some(f)) => f.to_string(),
+        ScalarValue::Float64(Some(f)) => f.to_string(),
+        ScalarValue::Boolean(Some(b)) => b.to_string(),
+        ScalarValue::Null => "null".to_string(),
+        other => format!("\"{other}\""),
     }
 }
