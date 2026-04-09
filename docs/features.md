@@ -2,6 +2,8 @@
 
 SQE is built on **Apache DataFusion 52** which provides the SQL execution engine. All standard SQL features come from DataFusion; SQE adds catalog integration (Polaris/Iceberg), pluggable auth, distributed execution, and DDL routing.
 
+> For a detailed function-by-function Trino compatibility matrix, see [trino-compatibility.md](trino-compatibility.md).
+
 ## Quick Summary
 
 | Category | SQE (DataFusion 52) | Trino | Spark SQL |

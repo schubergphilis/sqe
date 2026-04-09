@@ -1,6 +1,7 @@
 mod cli;
 mod client;
 mod compare;
+mod comparison;
 mod generate;
 mod load;
 
@@ -109,6 +110,53 @@ async fn main() -> anyhow::Result<()> {
                 },
             )
             .await
+        }
+
+        cli::Command::Compare {
+            benchmark,
+            scale,
+            sqe_host,
+            sqe_port,
+            sqe_username,
+            sqe_password,
+            trino_url,
+            trino_user,
+            trino_catalog: _,
+            trino_schema: _,
+            query,
+            output,
+        } => {
+            let sqe_endpoint = format!("http://{sqe_host}:{sqe_port}");
+            let sqe_client = client::create_client(
+                "flight",
+                &sqe_endpoint,
+                sqe_username.as_deref(),
+                sqe_password.as_deref(),
+                None,
+                None,
+                None,
+            )
+            .await?;
+
+            let trino_client = client::trino::TrinoBenchClient::new(
+                &trino_url,
+                Some(&trino_user),
+                None,
+            );
+
+            comparison::run_comparison(
+                &benchmark,
+                scale,
+                sqe_client.as_ref(),
+                &trino_client,
+                &sqe_endpoint,
+                &trino_url,
+                query.as_deref(),
+                &output,
+            )
+            .await?;
+
+            Ok(())
         }
 
         cli::Command::Test {

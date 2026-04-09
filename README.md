@@ -179,6 +179,8 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 - [ ] Pluggable catalog backends (AWS Glue, Nessie, Hive Metastore, storage-only) ← NEXT
 - [x] dbt adapter (dbt-sqe via ADBC Flight SQL — table, view, incremental, seed)
 - [x] ALTER TABLE schema evolution (ADD/DROP/RENAME COLUMN, SET/DROP NOT NULL, type widening)
+- [x] Trino SQL compatibility matrix (`docs/trino-compatibility.md`)
+- [x] Side-by-side benchmark tooling (`sqe-bench compare`)
 - [ ] Semantic AI layer (RDF/SPARQL, property graph/GQL, vector search, agent interfaces)
 - [ ] Helm chart for Kubernetes deployment
 
