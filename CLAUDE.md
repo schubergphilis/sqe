@@ -101,9 +101,13 @@ cargo audit
 
 ## Git Workflow
 
-- All changes go through branches + GitLab MRs (never push directly to main)
+- **NEVER push directly to main** — all changes go through feature branches + GitLab MRs
+- Workflow: `git checkout -b feat/<name>` → commit → `git push -u origin feat/<name>` → `glab mr create`
+- No git worktrees — use simple branches
 - Remote: `origin` = GitLab (`sbp.gitlab.schubergphilis.com`)
-- Use `glab` CLI for MR creation
+- Use `glab` CLI for MR creation (`glab mr create --title "..." --description "..."`)
+- Branch naming: `feat/`, `fix/`, `refactor/`, `docs/`, `test/` prefixes
+- Keep MRs focused — one logical change per MR, not mega-branches
 
 ## Benchmarks
 
