@@ -177,7 +177,8 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 - [x] Trino function compatibility — 60+ UDFs across all categories (see `docs/trino-compatibility.md`): String 96%, Math 100%, Date/Time 100%, JSON 83%, URL 100%, Regex 100%, Conditional 88%, Conversion 90%, Aggregate 82%, Window 93%, DDL/DML 74%
 - [x] Engine-level Trino SQL compat: `USE catalog.schema`, `SHOW CREATE TABLE`, `TRUNCATE TABLE` (→ DELETE), `CALL` (informative error), `TRY(expr)` passthrough UDF
 - [x] Pluggable auth providers (OIDC, bearer token, API key, mTLS, anonymous, AWS IAM, device code, token exchange)
-- [x] Iceberg metadata TVFs (`table_snapshots()`, `table_manifests()` — snapshot/manifest introspection via SQL)
+- [x] Iceberg metadata TVFs (`table_snapshots()`, `table_manifests()`, `table_history()`, `table_files()`, `table_partitions()`, `table_refs()` — snapshot/manifest/partition/ref introspection via SQL)
+- [x] Iceberg time travel (`SELECT * FROM t FOR SYSTEM_TIME AS OF TIMESTAMP '2026-01-01'` — snapshot resolution + per-session provider registration)
 - [ ] Pluggable catalog backends (AWS Glue, Nessie, Hive Metastore, storage-only) ← NEXT
 - [x] dbt adapter (dbt-sqe via ADBC Flight SQL — table, view, incremental, seed)
 - [x] ALTER TABLE schema evolution (ADD/DROP/RENAME COLUMN, SET/DROP NOT NULL, type widening)
