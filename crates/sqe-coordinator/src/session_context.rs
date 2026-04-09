@@ -43,7 +43,7 @@ pub async fn create_session_context(
         .with_information_schema(true)
         .with_default_catalog_and_schema(&catalog_name, "default");
 
-    let ctx = if let Some(rt) = runtime {
+    let mut ctx = if let Some(rt) = runtime {
         // Use the shared coordinator runtime (FairSpillPool with spill-to-disk)
         SessionContext::new_with_config_rt(session_config, Arc::clone(rt))
     } else {
@@ -186,6 +186,15 @@ pub async fn create_session_context(
     // Register Trino-compatible function aliases (year(), month(), day_of_week(), etc.)
     // so Trino SQL and dbt models work without modification.
     crate::trino_functions::register_trino_functions(&ctx);
+
+    // Register extended Trino-compatible functions (soundex, regexp_extract, word_stem, etc.)
+    crate::trino_functions_ext::register_extended_trino_functions(&ctx);
+
+    // Register JSON functions from datafusion-functions-json crate.
+    // Provides: json_get, json_get_str, json_get_int, json_get_float, json_get_bool,
+    //           json_get_json, json_get_array, json_contains, json_as_text, json_length
+    datafusion_functions_json::register_all(&mut ctx)
+        .expect("Failed to register JSON functions");
 
     // Register the read_parquet() table-valued function so users can
     // query external Parquet files directly from SQL:
