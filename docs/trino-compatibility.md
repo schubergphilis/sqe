@@ -11,15 +11,15 @@ noting semantic differences and gaps.
 
 | Category | Total | ✅ | ⚠️ | ❌ | Coverage |
 |---|---|---|---|---|---|
-| Scalar: String | 27 | 19 | 2 | 6 | 77.8% |
-| Scalar: Math | 29 | 19 | 4 | 6 | 79.3% |
-| Scalar: Date/Time | 38 | 23 | 1 | 14 | 63.2% |
-| Scalar: JSON | 12 | 6 | 0 | 6 | 50.0% |
+| Scalar: String | 27 | 23 | 3 | 1 | 96.3% |
+| Scalar: Math | 29 | 24 | 4 | 1 | 96.6% |
+| Scalar: Date/Time | 38 | 35 | 1 | 2 | 94.7% |
+| Scalar: JSON | 12 | 8 | 0 | 4 | 66.7% |
 | Scalar: URL | 8 | 8 | 0 | 0 | 100% |
-| Scalar: Regex | 6 | 3 | 0 | 3 | 50% |
+| Scalar: Regex | 6 | 4 | 2 | 0 | 100% |
 | Scalar: Conditional | 8 | 7 | 0 | 1 | 87.5% |
 | Scalar: Conversion | 10 | 9 | 0 | 1 | 90% |
-| Aggregate | 33 | 19 | 4 | 10 | 69.7% |
+| Aggregate | 33 | 20 | 4 | 9 | 72.7% |
 | Window | 14 | 11 | 1 | 2 | 85.7% |
 | DDL/DML | 31 + 1🔧 | 18 | 3 | 10 | 58.1% |
 | Type System | 27 | 18 | 2 | 7 | 74.1% |
@@ -46,19 +46,19 @@ Each section lists Trino functions with their SQE status:
 | `concat(s1, s2, ...)` | `concat(s1, s2, ...)` | ✅ | Native DataFusion |
 | `concat_ws(sep, s1, s2, ...)` | `concat_ws(sep, s1, s2, ...)` | ✅ | Native DataFusion |
 | `format(fmt, ...)` | — | ❌ | No equivalent; use `concat()` for simple cases |
-| `hamming_distance(s1, s2)` | — | ❌ | |
+| `hamming_distance(s1, s2)` | `hamming_distance(s1, s2)` | ✅ | Trino compat UDF |
 | `length(s)` | `length(s)` / `char_length(s)` | ✅ | Native DataFusion |
 | `levenshtein_distance(s1, s2)` | `levenshtein(s1, s2)` | ✅ | Native DataFusion |
 | `lower(s)` | `lower(s)` | ✅ | Native DataFusion |
 | `lpad(s, size, pad)` | `lpad(s, size, pad)` | ✅ | Native DataFusion |
 | `ltrim(s)` | `ltrim(s)` | ✅ | Native DataFusion |
-| `normalize(s, form)` | — | ❌ | Unicode normalization not available |
+| `normalize(s, form)` | `normalize(s, form)` | ✅ | Trino compat UDF (NFC/NFD/NFKC/NFKD) |
 | `position(sub IN s)` | `position(sub IN s)` / `strpos(s, sub)` | ✅ | Both syntaxes work |
 | `replace(s, from, to)` | `replace(s, from, to)` | ✅ | Native DataFusion |
 | `reverse(s)` | `reverse(s)` | ✅ | Native DataFusion |
 | `rpad(s, size, pad)` | `rpad(s, size, pad)` | ✅ | Native DataFusion |
 | `rtrim(s)` | `rtrim(s)` | ✅ | Native DataFusion |
-| `soundex(s)` | — | ❌ | |
+| `soundex(s)` | `soundex(s)` | ✅ | Trino compat UDF |
 | `split(s, delim)` | `string_to_array(s, delim)` | ⚠️ | Different name, same semantics |
 | `split_part(s, delim, idx)` | `split_part(s, delim, idx)` | ✅ | Native DataFusion |
 | `strpos(s, sub)` | `strpos(s, sub)` | ✅ | Trino compat UDF |
@@ -66,8 +66,8 @@ Each section lists Trino functions with their SQE status:
 | `translate(s, from, to)` | `translate(s, from, to)` | ✅ | Native DataFusion |
 | `trim(s)` | `trim(s)` | ✅ | Native DataFusion |
 | `upper(s)` | `upper(s)` | ✅ | Native DataFusion |
-| `word_stem(s)` | — | ❌ | NLP function |
-| `word_stem(s, lang)` | — | ❌ | NLP function |
+| `word_stem(s)` | `word_stem(s)` | ✅ | Trino compat UDF (English default) |
+| `word_stem(s, lang)` | `word_stem_lang(s, lang)` | ⚠️ | Different name, 17 languages |
 
 ## Scalar Functions: Math
 
@@ -79,19 +79,19 @@ Each section lists Trino functions with their SQE status:
 | `cbrt(x)` | `cbrt(x)` | ✅ | |
 | `ceil(x)` / `ceiling(x)` | `ceil(x)` | ✅ | |
 | `cos(x)` / `sin(x)` / `tan(x)` | `cos(x)` / `sin(x)` / `tan(x)` | ✅ | |
-| `cosh(x)` / `sinh(x)` / `tanh(x)` | — | ❌ | Hyperbolic functions not in DataFusion |
+| `cosh(x)` / `sinh(x)` / `tanh(x)` | Same | ✅ | Native DataFusion (already built-in) |
 | `degrees(x)` | `degrees(x)` | ✅ | |
 | `e()` | `exp(1)` | ⚠️ | No standalone `e()`, use `exp(1)` |
 | `exp(x)` | `exp(x)` | ✅ | |
 | `floor(x)` | `floor(x)` | ✅ | |
-| `from_base(s, radix)` | — | ❌ | |
-| `infinity()` | — | ❌ | Use `CAST('Infinity' AS DOUBLE)` |
+| `from_base(s, radix)` | `from_base(s, radix)` | ✅ | Trino compat UDF |
+| `infinity()` | `infinity()` | ✅ | Trino compat UDF |
 | `ln(x)` | `ln(x)` | ✅ | |
 | `log(b, x)` | `log(b, x)` | ✅ | |
 | `log2(x)` | `log2(x)` | ✅ | |
 | `log10(x)` | `log10(x)` | ✅ | |
 | `mod(n, m)` | `n % m` | ⚠️ | Operator syntax, no `mod()` function |
-| `nan()` | — | ❌ | Use `CAST('NaN' AS DOUBLE)` |
+| `nan()` | `nan()` | ✅ | Trino compat UDF |
 | `pi()` | `pi()` | ✅ | |
 | `pow(x, p)` / `power(x, p)` | `power(x, p)` | ✅ | |
 | `radians(x)` | `radians(x)` | ✅ | |
@@ -99,7 +99,7 @@ Each section lists Trino functions with their SQE status:
 | `round(x)` / `round(x, d)` | `round(x, d)` | ✅ | |
 | `sign(x)` | `signum(x)` | ⚠️ | Different name |
 | `sqrt(x)` | `sqrt(x)` | ✅ | |
-| `to_base(n, radix)` | — | ❌ | |
+| `to_base(n, radix)` | `to_base(n, radix)` | ✅ | Trino compat UDF |
 | `truncate(x)` | `trunc(x)` | ⚠️ | Different name |
 | `width_bucket(x, bound1, bound2, n)` | — | ❌ | |
 
@@ -108,25 +108,25 @@ Each section lists Trino functions with their SQE status:
 | Trino Function | SQE Equivalent | Status | Notes |
 |---|---|---|---|
 | `current_date` | `current_date` | ✅ | SQL standard |
-| `current_time` | — | ❌ | Time-only type not supported |
+| `current_time` | `current_time` | ✅ | Native DataFusion (already built-in) |
 | `current_timestamp` | `current_timestamp` / `now()` | ✅ | |
-| `current_timezone()` | — | ❌ | |
+| `current_timezone()` | `current_timezone()` | ✅ | Trino compat UDF (returns "UTC") |
 | `now()` | `now()` | ✅ | Trino compat UDF |
 | `localtime` | `localtime()` | ✅ | Trino compat UDF |
 | `localtimestamp` | `localtimestamp()` | ✅ | Trino compat UDF |
 | `date(s)` | `trino_date(s)` | ✅ | Trino compat UDF |
-| `from_iso8601_date(s)` | — | ❌ | Use `CAST(s AS DATE)` |
-| `from_iso8601_timestamp(s)` | — | ❌ | Use `CAST(s AS TIMESTAMP)` |
+| `from_iso8601_date(s)` | `from_iso8601_date(s)` | ✅ | Trino compat UDF |
+| `from_iso8601_timestamp(s)` | `from_iso8601_timestamp(s)` | ✅ | Trino compat UDF |
 | `from_unixtime(n)` | `from_unixtime(n)` | ✅ | Trino compat UDF |
 | `to_unixtime(ts)` | `to_unixtime(ts)` | ✅ | Trino compat UDF |
-| `to_iso8601(ts)` | — | ❌ | Use `date_format()` |
+| `to_iso8601(ts)` | `to_iso8601(ts)` | ✅ | Trino compat UDF |
 | `date_add(unit, n, ts)` | `date_add(ts, unit, n)` | ⚠️ | Different argument order |
 | `date_diff(unit, ts1, ts2)` | `date_diff(unit, ts1, ts2)` | ✅ | Trino compat UDF |
 | `date_trunc(unit, ts)` | `date_trunc(unit, ts)` | ✅ | Native DataFusion |
 | `date_format(ts, fmt)` | `date_format(ts, fmt)` | ✅ | Trino compat UDF (MySQL format codes) |
 | `date_parse(s, fmt)` | `date_parse(s, fmt)` | ✅ | Trino compat UDF (MySQL format codes) |
-| `format_datetime(ts, fmt)` | — | ❌ | Joda format codes |
-| `parse_datetime(s, fmt)` | — | ❌ | Joda format codes |
+| `format_datetime(ts, fmt)` | `format_datetime(ts, fmt)` | ✅ | Trino compat UDF (Joda→chrono translation) |
+| `parse_datetime(s, fmt)` | `parse_datetime(s, fmt)` | ✅ | Trino compat UDF (Joda→chrono translation) |
 | `year(d)` | `year(d)` | ✅ | Trino compat UDF |
 | `quarter(d)` | `quarter(d)` | ✅ | Trino compat UDF |
 | `month(d)` | `month(d)` | ✅ | Trino compat UDF |
@@ -137,14 +137,14 @@ Each section lists Trino functions with their SQE status:
 | `hour(ts)` | `hour(ts)` | ✅ | Trino compat UDF |
 | `minute(ts)` | `minute(ts)` | ✅ | Trino compat UDF |
 | `second(ts)` | `second(ts)` | ✅ | Trino compat UDF |
-| `millisecond(ts)` | — | ❌ | |
+| `millisecond(ts)` | `millisecond(ts)` | ✅ | Trino compat UDF |
 | `timezone_hour(ts)` | — | ❌ | |
 | `timezone_minute(ts)` | — | ❌ | |
-| `with_timezone(ts, tz)` | — | ❌ | |
-| `at_timezone(ts, tz)` | — | ❌ | |
+| `with_timezone(ts, tz)` | `with_timezone(ts, tz)` | ✅ | Trino compat UDF (chrono-tz) |
+| `at_timezone(ts, tz)` | `at_timezone(ts, tz)` | ✅ | Trino compat UDF (chrono-tz) |
 | `INTERVAL 'n' UNIT` | `INTERVAL 'n' UNIT` | ✅ | SQL standard |
-| `human_readable_seconds(n)` | — | ❌ | |
-| `last_day_of_month(d)` | — | ❌ | |
+| `human_readable_seconds(n)` | `human_readable_seconds(n)` | ✅ | Trino compat UDF |
+| `last_day_of_month(d)` | `last_day_of_month(d)` | ✅ | Trino compat UDF |
 
 ## Scalar Functions: JSON
 
@@ -156,10 +156,10 @@ Each section lists Trino functions with their SQE status:
 | `json_extract(json, path)` | `json_extract(json, path)` | ✅ | Trino compat UDF (dot-path, not full JSONPath) |
 | `json_extract_scalar(json, path)` | `json_extract_scalar(json, path)` | ✅ | Trino compat UDF |
 | `json_size(json, path)` | — | ❌ | |
-| `json_array_contains(json, val)` | — | ❌ | Different from json_contains which checks key existence |
+| `json_array_contains(json, val)` | `json_array_contains(json, val)` | ✅ | Trino compat UDF |
 | `json_array_get(json, idx)` | — | ❌ | |
 | `json_array_length(json)` | `json_array_length(json)` | ✅ | Trino compat UDF |
-| `is_json_scalar(json)` | — | ❌ | |
+| `is_json_scalar(json)` | `is_json_scalar(json)` | ✅ | Trino compat UDF |
 | `CAST(v AS JSON)` | — | ❌ | No JSON type |
 | `CAST(json AS type)` | — | ❌ | No JSON type |
 
@@ -183,11 +183,11 @@ Each section lists Trino functions with their SQE status:
 | Trino Function | SQE Equivalent | Status | Notes |
 |---|---|---|---|
 | `regexp_count(s, pattern)` | `regexp_count(s, pattern)` | ✅ | Native DataFusion |
-| `regexp_extract(s, pattern)` | — | ❌ | Use `regexp_match()` |
-| `regexp_extract_all(s, pattern)` | — | ❌ | |
+| `regexp_extract(s, pattern)` | `regexp_extract(s, pattern)` | ✅ | Trino compat UDF |
+| `regexp_extract_all(s, pattern)` | `regexp_extract_all(s, pattern)` | ⚠️ | Returns JSON array string, not ARRAY type |
 | `regexp_like(s, pattern)` | `regexp_like(s, pattern)` | ✅ | Native DataFusion |
 | `regexp_replace(s, pattern, repl)` | `regexp_replace(s, pattern, repl)` | ✅ | |
-| `regexp_split(s, pattern)` | — | ❌ | |
+| `regexp_split(s, pattern)` | `regexp_split(s, pattern)` | ⚠️ | Returns JSON array string, not ARRAY type |
 
 ## Scalar Functions: Conditional
 
@@ -227,7 +227,7 @@ Each section lists Trino functions with their SQE status:
 | `avg(x)` | Same | ✅ | |
 | `min(x)` / `max(x)` | Same | ✅ | |
 | `bool_and(x)` / `bool_or(x)` | `bool_and(x)` / `bool_or(x)` | ✅ | |
-| `every(x)` | — | ❌ | Use `bool_and(x)` |
+| `every(x)` | `every(x)` | ✅ | Trino compat UDF (scalar alias for bool_and) |
 | `array_agg(x)` | `array_agg(x)` | ✅ | |
 | `array_agg(x ORDER BY y)` | Same | ✅ | DataFusion supports ordered agg |
 | `string_agg(x, sep)` | `string_agg(x, sep)` | ✅ | |
