@@ -14,11 +14,11 @@ noting semantic differences and gaps.
 | Scalar: String | 27 | 19 | 2 | 6 | 77.8% |
 | Scalar: Math | 29 | 19 | 4 | 6 | 79.3% |
 | Scalar: Date/Time | 38 | 23 | 1 | 14 | 63.2% |
-| Scalar: JSON | 12 | 2 | 0 | 10 | 16.7% |
-| Scalar: URL | 8 | 0 | 0 | 8 | 0% |
+| Scalar: JSON | 12 | 6 | 0 | 6 | 50.0% |
+| Scalar: URL | 8 | 8 | 0 | 0 | 100% |
 | Scalar: Regex | 6 | 3 | 0 | 3 | 50% |
 | Scalar: Conditional | 8 | 7 | 0 | 1 | 87.5% |
-| Scalar: Conversion | 10 | 3 | 0 | 7 | 30% |
+| Scalar: Conversion | 10 | 9 | 0 | 1 | 90% |
 | Aggregate | 33 | 19 | 4 | 10 | 69.7% |
 | Window | 14 | 11 | 1 | 2 | 85.7% |
 | DDL/DML | 31 + 1🔧 | 18 | 3 | 10 | 58.1% |
@@ -152,31 +152,31 @@ Each section lists Trino functions with their SQE status:
 |---|---|---|---|
 | `json_object(k1, v1, k2, v2, ...)` | `json_object(k1, v1, ...)` | ✅ | Trino compat UDF |
 | `json_format(json)` | `json_format(json)` | ✅ | Trino compat UDF |
-| `json_parse(s)` | — | ❌ | |
-| `json_extract(json, path)` | — | ❌ | JSONPath extraction |
-| `json_extract_scalar(json, path)` | — | ❌ | |
+| `json_parse(s)` | `json_parse(s)` | ✅ | Trino compat UDF |
+| `json_extract(json, path)` | `json_extract(json, path)` | ✅ | Trino compat UDF (dot-path, not full JSONPath) |
+| `json_extract_scalar(json, path)` | `json_extract_scalar(json, path)` | ✅ | Trino compat UDF |
 | `json_size(json, path)` | — | ❌ | |
-| `json_array_contains(json, val)` | — | ❌ | |
+| `json_array_contains(json, val)` | — | ❌ | Different from json_contains which checks key existence |
 | `json_array_get(json, idx)` | — | ❌ | |
-| `json_array_length(json)` | — | ❌ | |
+| `json_array_length(json)` | `json_array_length(json)` | ✅ | Trino compat UDF |
 | `is_json_scalar(json)` | — | ❌ | |
 | `CAST(v AS JSON)` | — | ❌ | No JSON type |
 | `CAST(json AS type)` | — | ❌ | No JSON type |
 
-**Note:** JSON support is the largest gap. DataFusion has `arrow_cast` and some JSON functions via extensions, but Trino's full JSONPath-based extraction model is not available. This is a known limitation — most Iceberg workloads use structured columns rather than JSON blobs.
+**Note:** Core JSON extraction is now supported via `datafusion-functions-json` (registered at startup) plus Trino-aliased UDFs (`json_extract`, `json_extract_scalar`, `json_array_length`, `json_parse`). Full JSONPath syntax and JSON-typed columns remain unsupported — most Iceberg workloads use structured columns rather than JSON blobs.
 
 ## Scalar Functions: URL
 
 | Trino Function | SQE Equivalent | Status | Notes |
 |---|---|---|---|
-| `url_extract_host(url)` | — | ❌ | |
-| `url_extract_path(url)` | — | ❌ | |
-| `url_extract_port(url)` | — | ❌ | |
-| `url_extract_protocol(url)` | — | ❌ | |
-| `url_extract_query(url)` | — | ❌ | |
-| `url_extract_parameter(url, name)` | — | ❌ | |
-| `url_encode(s)` | — | ❌ | |
-| `url_decode(s)` | — | ❌ | |
+| `url_extract_host(url)` | `url_extract_host(url)` | ✅ | Trino compat UDF |
+| `url_extract_path(url)` | `url_extract_path(url)` | ✅ | Trino compat UDF |
+| `url_extract_port(url)` | `url_extract_port(url)` | ✅ | Trino compat UDF |
+| `url_extract_protocol(url)` | `url_extract_protocol(url)` | ✅ | Trino compat UDF |
+| `url_extract_query(url)` | `url_extract_query(url)` | ✅ | Trino compat UDF |
+| `url_extract_parameter(url, name)` | `url_extract_parameter(url, name)` | ✅ | Trino compat UDF |
+| `url_encode(s)` | `url_encode(s)` | ✅ | Trino compat UDF |
+| `url_decode(s)` | `url_decode(s)` | ✅ | Trino compat UDF |
 
 ## Scalar Functions: Regex
 
@@ -210,12 +210,12 @@ Each section lists Trino functions with their SQE status:
 | `TRY_CAST(v AS type)` | Same | ✅ | |
 | `typeof(v)` | `typeof(v)` | ✅ | Trino compat UDF |
 | `format(fmt, ...)` | — | ❌ | |
-| `from_utf8(binary)` | — | ❌ | |
-| `to_utf8(string)` | — | ❌ | |
-| `from_base64(s)` | — | ❌ | |
-| `to_base64(binary)` | — | ❌ | |
-| `from_hex(s)` | — | ❌ | |
-| `to_hex(binary)` | — | ❌ | |
+| `from_utf8(binary)` | `from_utf8(binary)` | ✅ | Trino compat UDF |
+| `to_utf8(string)` | `to_utf8(string)` | ✅ | Trino compat UDF |
+| `from_base64(s)` | `from_base64(s)` | ✅ | Trino compat UDF |
+| `to_base64(binary)` | `to_base64(binary)` | ✅ | Trino compat UDF |
+| `from_hex(s)` | `from_hex(s)` | ✅ | Trino compat UDF |
+| `to_hex(binary)` | `to_hex(binary)` | ✅ | Trino compat UDF (named to_hex_binary to avoid conflict with DataFusion's integer to_hex) |
 
 ## Aggregate Functions
 
