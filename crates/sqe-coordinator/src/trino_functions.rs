@@ -1721,7 +1721,7 @@ encoding_udf!(FromUtf8, "from_utf8", |s: &str| {
 // Trino JSON aliases — thin wrappers backed by serde_json
 // ---------------------------------------------------------------------------
 
-fn navigate_json<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+pub(crate) fn navigate_json<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
     let mut current = value;
     for key in path.split('.') {
         let key = key.trim();
