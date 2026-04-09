@@ -8,6 +8,7 @@ use std::time::Instant;
 use tracing::info;
 
 /// Run comparison benchmark.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_comparison(
     benchmark: &str,
     scale: f64,
@@ -22,7 +23,7 @@ pub async fn run_comparison(
     let query_dir = format!("crates/sqe-bench/queries/{}", benchmark);
     let mut query_files: Vec<_> = std::fs::read_dir(&query_dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "sql"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "sql"))
         .collect();
     query_files.sort_by_key(|e| e.file_name());
 
