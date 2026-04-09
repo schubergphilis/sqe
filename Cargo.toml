@@ -42,6 +42,9 @@ iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git
 # SQL parser — DataFusion 52 ships sqlparser 0.53
 sqlparser = "0.53"
 
+# JSON functions for DataFusion (Trino json_extract compat)
+datafusion-functions-json = "0.52"
+
 # Async — use only what is needed; avoid ["full"] which includes fs/process/io-std
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
 
