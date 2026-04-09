@@ -40,6 +40,8 @@ pub struct WorkerFlightService {
     session_ctx: SessionContext,
     footer_cache: Option<Arc<FooterCache>>,
     shuffle_manager: ShuffleManager,
+    /// Maximum duration for a single scan task. 0 means no timeout.
+    scan_timeout: std::time::Duration,
 }
 
 impl WorkerFlightService {
@@ -50,6 +52,7 @@ impl WorkerFlightService {
             session_ctx,
             footer_cache: None,
             shuffle_manager: ShuffleManager::new(),
+            scan_timeout: std::time::Duration::from_secs(600),
         }
     }
 
@@ -68,12 +71,19 @@ impl WorkerFlightService {
             session_ctx,
             footer_cache: None,
             shuffle_manager: ShuffleManager::new(),
+            scan_timeout: std::time::Duration::from_secs(600),
         }
     }
 
     /// Set the Parquet footer cache for this service.
     pub fn with_footer_cache(mut self, cache: Arc<FooterCache>) -> Self {
         self.footer_cache = Some(cache);
+        self
+    }
+
+    /// Set the scan timeout from config.
+    pub fn with_scan_timeout(mut self, timeout_secs: u64) -> Self {
+        self.scan_timeout = std::time::Duration::from_secs(timeout_secs);
         self
     }
 
@@ -130,6 +140,7 @@ impl FlightService for WorkerFlightService {
         let credential_store = self.credential_store.clone();
         let session_ctx = self.session_ctx.clone();
         let footer_cache = self.footer_cache.clone();
+        let scan_timeout = self.scan_timeout;
         async move {
             info!(
                 fragment_id = %scan_task.fragment_id,
@@ -140,21 +151,39 @@ impl FlightService for WorkerFlightService {
             // Subscribe to credential updates for this fragment
             let cred_rx = credential_store.subscribe(&scan_task.fragment_id).await;
 
-            let (schema, batches) =
-                executor::execute_scan(
-                    &scan_task,
-                    Some(&metrics),
-                    &session_ctx,
-                    Some(cred_rx),
-                    footer_cache.as_ref(),
-                    None, // Late materialization filter (not yet wired from coordinator)
-                    None, // Coordinator metrics (workers don't have coordinator registry)
-                )
+            let scan_future = executor::execute_scan(
+                &scan_task,
+                Some(&metrics),
+                &session_ctx,
+                Some(cred_rx),
+                footer_cache.as_ref(),
+                None, // Late materialization filter (not yet wired from coordinator)
+                None, // Coordinator metrics (workers don't have coordinator registry)
+            );
+
+            let (schema, batches) = if scan_timeout.is_zero() {
+                // No timeout configured
+                scan_future.await
+            } else {
+                tokio::time::timeout(scan_timeout, scan_future)
                     .await
-                    .map_err(|e| {
-                        warn!(error = %e, "Scan task execution failed");
-                        Status::internal(format!("Scan execution failed: {e}"))
-                    })?;
+                    .map_err(|_| {
+                        warn!(
+                            fragment_id = %scan_task.fragment_id,
+                            timeout_secs = scan_timeout.as_secs(),
+                            "Scan task timed out"
+                        );
+                        anyhow::anyhow!(
+                            "Scan task {} timed out after {}s",
+                            scan_task.fragment_id,
+                            scan_timeout.as_secs()
+                        )
+                    })?
+            }
+            .map_err(|e| {
+                warn!(error = %e, "Scan task execution failed");
+                Status::internal(format!("Scan execution failed: {e}"))
+            })?;
 
             // Clean up the credential channel now that the scan is complete
             credential_store.remove(&scan_task.fragment_id).await;

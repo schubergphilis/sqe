@@ -240,6 +240,10 @@ pub struct WorkerConfig {
     pub spill_to_disk: bool,
     #[serde(default = "default_spill_dir")]
     pub spill_dir: String,
+    /// Maximum duration in seconds for a single scan task. Default: 600 (10 minutes).
+    /// Set to 0 to disable the timeout.
+    #[serde(default = "default_scan_timeout")]
+    pub scan_timeout_secs: u64,
 }
 
 impl Default for WorkerConfig {
@@ -251,6 +255,7 @@ impl Default for WorkerConfig {
             memory_limit: default_memory(),
             spill_to_disk: true,
             spill_dir: default_spill_dir(),
+            scan_timeout_secs: default_scan_timeout(),
         }
     }
 }
@@ -717,6 +722,7 @@ fn default_worker_flight_port() -> u16 { 50052 }
 fn default_heartbeat() -> u64 { 5 }
 fn default_memory() -> String { "8GB".to_string() }
 fn default_spill_dir() -> String { "/tmp/sqe-spill".to_string() }
+fn default_scan_timeout() -> u64 { 600 }         // 10 minutes
 fn default_refresh_buffer() -> u64 { 60 }
 fn default_true() -> bool { true }
 fn default_cache_ttl() -> u64 { 30 }
@@ -835,6 +841,7 @@ impl SqeConfig {
         env_override_str("SQE_WORKER__MEMORY_LIMIT", &mut self.worker.memory_limit);
         env_override_bool("SQE_WORKER__SPILL_TO_DISK", &mut self.worker.spill_to_disk);
         env_override_str("SQE_WORKER__SPILL_DIR", &mut self.worker.spill_dir);
+        env_override_u64("SQE_WORKER__SCAN_TIMEOUT_SECS", &mut self.worker.scan_timeout_secs);
 
         // Auth
         env_override_str("SQE_AUTH__KEYCLOAK_URL", &mut self.auth.keycloak_url);

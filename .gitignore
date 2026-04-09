@@ -5,3 +5,15 @@
 tests/.test-env
 .worktrees/
 benchmarks/results/
+
+# Secrets & certs
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+
+# Logs
+*.log
+*.jsonl

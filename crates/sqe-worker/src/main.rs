@@ -53,7 +53,8 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let flight_service = WorkerFlightService::new(worker_metrics, session_ctx);
+    let flight_service = WorkerFlightService::new(worker_metrics, session_ctx)
+        .with_scan_timeout(config.worker.scan_timeout_secs);
 
     tonic::transport::Server::builder()
         .add_service(flight_service.into_server())
