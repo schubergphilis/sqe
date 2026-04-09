@@ -84,3 +84,5 @@ tokio-util = { workspace = true }
 reqwest = { workspace = true }
 base64 = "0.22"
 tempfile = "3"
+datafusion-functions-json = { workspace = true }
+datafusion = { workspace = true }
