@@ -358,6 +358,41 @@ impl QueryHandler {
                     Ok(vec![])
                 }
 
+                // USE catalog.schema — session context switching stub.
+                // The actual session mutation happens in the Trino HTTP layer via
+                // X-Trino-Set-Catalog / X-Trino-Set-Schema response headers.
+                StatementKind::Use(ref target) => {
+                    tracing::info!("USE {target} — session catalog/schema switch (no-op at engine level)");
+                    Ok(vec![])
+                }
+
+                // SHOW CREATE TABLE — reconstruct DDL from information_schema
+                StatementKind::ShowCreateTable(ref stmt) => {
+                    let (ctx, _session_catalog) = self.create_session_context(session).await?;
+                    self.handle_show_create_table(session, stmt, &ctx).await
+                }
+
+                // TRUNCATE TABLE — rewrite as DELETE FROM (no WHERE clause)
+                StatementKind::Truncate(ref table_name) => {
+                    tracing::info!("TRUNCATE TABLE {table_name} → DELETE FROM {table_name}");
+                    let delete_sql = format!("DELETE FROM {table_name}");
+                    let delete_kind = sqe_sql::parse_and_classify(&delete_sql)?;
+                    if let StatementKind::Delete(delete_stmt) = delete_kind {
+                        let (ctx, session_catalog) = self.create_session_context(session).await?;
+                        self.write_handler.handle_delete(session, &delete_stmt, session_catalog, &ctx).await
+                    } else {
+                        Err(SqeError::Execution("Failed to rewrite TRUNCATE as DELETE".into()))
+                    }
+                }
+
+                // CALL procedure — not supported
+                StatementKind::Call(_) => {
+                    Err(SqeError::NotImplemented(
+                        "CALL is not supported. SQE does not have stored procedures. \
+                         Use SQL statements directly instead.".into(),
+                    ))
+                }
+
                 StatementKind::Merge(stmt) => {
                     // Extract source SQL from the MERGE statement and execute it
                     // to get the source batches, then pass them to the write handler.
@@ -987,6 +1022,92 @@ impl QueryHandler {
             self.metrics.as_ref(),
         )
         .await
+    }
+
+    /// Handle SHOW CREATE TABLE by querying information_schema and reconstructing DDL.
+    async fn handle_show_create_table(
+        &self,
+        _session: &Session,
+        stmt: &Statement,
+        ctx: &SessionContext,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        use arrow_array::StringArray as ArrowStringArray;
+
+        // Extract object name from the ShowCreate statement
+        let table_name = match stmt {
+            Statement::ShowCreate { obj_name, .. } => obj_name.to_string(),
+            _ => {
+                return Err(SqeError::Execution(
+                    "Expected ShowCreate statement".into(),
+                ))
+            }
+        };
+
+        // Query information_schema.columns for the table's column definitions.
+        // Use only the last part of a qualified name for the WHERE filter.
+        let bare_name = table_name.split('.').next_back().unwrap_or(&table_name);
+        let col_sql = format!(
+            "SELECT column_name, data_type, is_nullable \
+             FROM information_schema.columns \
+             WHERE table_name = '{bare_name}' \
+             ORDER BY ordinal_position"
+        );
+
+        let df = ctx.sql(&col_sql).await.map_err(|e| {
+            SqeError::Execution(format!("Failed to query column metadata: {e}"))
+        })?;
+        let batches = df.collect().await.map_err(|e| {
+            SqeError::Execution(format!("Failed to collect column metadata: {e}"))
+        })?;
+
+        // Reconstruct CREATE TABLE DDL
+        let mut ddl = format!("CREATE TABLE {table_name} (\n");
+        let mut first = true;
+        for batch in &batches {
+            let names = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<ArrowStringArray>()
+                .ok_or_else(|| SqeError::Execution("Unexpected column_name type".into()))?;
+            let types = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<ArrowStringArray>()
+                .ok_or_else(|| SqeError::Execution("Unexpected data_type type".into()))?;
+            let nullables = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<ArrowStringArray>()
+                .ok_or_else(|| SqeError::Execution("Unexpected is_nullable type".into()))?;
+
+            for i in 0..batch.num_rows() {
+                if !first {
+                    ddl.push_str(",\n");
+                }
+                first = false;
+                let col_name = names.value(i);
+                let col_type = types.value(i);
+                let nullable = nullables.value(i);
+                ddl.push_str(&format!("   {col_name} {col_type}"));
+                if nullable == "NO" {
+                    ddl.push_str(" NOT NULL");
+                }
+            }
+        }
+        ddl.push_str("\n)");
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "Create Table",
+            DataType::Utf8,
+            false,
+        )]));
+        let result = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(ArrowStringArray::from(vec![ddl.as_str()])) as ArrayRef],
+        )
+        .map_err(|e| SqeError::Execution(format!("Failed to build result batch: {e}")))?;
+
+        Ok(vec![result])
     }
 
     /// Handle SHOW CATALOGS by returning the configured warehouse name.

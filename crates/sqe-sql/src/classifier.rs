@@ -30,6 +30,14 @@ pub enum StatementKind {
     Begin,
     Commit,
     Rollback,
+    /// USE catalog.schema — switch default catalog/schema for session
+    Use(String),
+    /// SHOW CREATE TABLE name — reconstruct DDL from metadata
+    ShowCreateTable(Box<Statement>),
+    /// TRUNCATE TABLE name — routes to DELETE FROM without WHERE
+    Truncate(String),
+    /// CALL procedure — not supported, returns informative error
+    Call(Box<Statement>),
 }
 
 impl StatementKind {
@@ -59,6 +67,10 @@ impl StatementKind {
             StatementKind::Begin => "begin",
             StatementKind::Commit => "commit",
             StatementKind::Rollback => "rollback",
+            StatementKind::Use(_) => "use",
+            StatementKind::ShowCreateTable(_) => "showcreatetable",
+            StatementKind::Truncate(_) => "truncate",
+            StatementKind::Call(_) => "call",
         }
     }
 }
@@ -226,11 +238,13 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
             }
         }
 
+        // SHOW CREATE TABLE — reconstruct DDL from metadata
+        Statement::ShowCreate { .. } => Ok(StatementKind::ShowCreateTable(Box::new(stmt))),
+
         // Other SHOW variants → Utility
         Statement::ShowFunctions { .. }
         | Statement::ShowStatus { .. }
         | Statement::ShowVariables { .. }
-        | Statement::ShowCreate { .. }
         | Statement::ShowColumns { .. }
         | Statement::ShowCollation { .. }
         | Statement::ShowViews { .. } => Ok(StatementKind::Utility(Box::new(stmt))),
@@ -242,6 +256,26 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
         Statement::StartTransaction { .. } => Ok(StatementKind::Begin),
         Statement::Commit { .. } => Ok(StatementKind::Commit),
         Statement::Rollback { .. } => Ok(StatementKind::Rollback),
+
+        // USE catalog.schema — session context switching
+        Statement::Use(ref use_stmt) => {
+            let target = use_stmt.to_string();
+            // Strip the "USE " prefix that Display adds
+            let target = target.strip_prefix("USE ").unwrap_or(&target).to_string();
+            Ok(StatementKind::Use(target))
+        }
+
+        // TRUNCATE TABLE — routes to DELETE FROM without WHERE
+        Statement::Truncate { ref table_names, .. } => {
+            let name = table_names
+                .first()
+                .map(|t| t.name.to_string())
+                .unwrap_or_default();
+            Ok(StatementKind::Truncate(name))
+        }
+
+        // CALL procedure — not supported, returns informative error
+        Statement::Call(_) => Ok(StatementKind::Call(Box::new(stmt))),
 
         _ => Err(sqe_core::SqeError::NotImplemented(format!(
             "Statement type not supported: {stmt}"
@@ -593,5 +627,92 @@ mod tests {
     fn test_explain_full_name() {
         let kind = StatementKind::ExplainFull("SELECT 1".to_string());
         assert_eq!(kind.name(), "explain_full");
+    }
+
+    // ── USE / ShowCreateTable / Truncate / Call tests ──────────────────────
+
+    #[test]
+    fn test_use_catalog_schema() {
+        let result = parse_and_classify("USE my_catalog.my_schema");
+        assert!(
+            matches!(result, Ok(StatementKind::Use(_))),
+            "Expected Use, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_use_schema_only() {
+        let result = parse_and_classify("USE my_schema");
+        assert!(
+            matches!(result, Ok(StatementKind::Use(_))),
+            "Expected Use, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_use_name() {
+        let kind = StatementKind::Use("catalog.schema".to_string());
+        assert_eq!(kind.name(), "use");
+    }
+
+    #[test]
+    fn test_show_create_table() {
+        let result = parse_and_classify("SHOW CREATE TABLE my_schema.my_table");
+        assert!(
+            matches!(result, Ok(StatementKind::ShowCreateTable(_))),
+            "Expected ShowCreateTable, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_show_create_table_name() {
+        let stmt = Parser::parse_sql(&GenericDialect {}, "SHOW CREATE TABLE foo")
+            .unwrap()
+            .remove(0);
+        let kind = StatementKind::ShowCreateTable(Box::new(stmt));
+        assert_eq!(kind.name(), "showcreatetable");
+    }
+
+    #[test]
+    fn test_truncate_table() {
+        let result = parse_and_classify("TRUNCATE TABLE my_schema.my_table");
+        assert!(
+            matches!(result, Ok(StatementKind::Truncate(_))),
+            "Expected Truncate, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_truncate_table_name_extracted() {
+        let result = parse_and_classify("TRUNCATE TABLE orders").unwrap();
+        if let StatementKind::Truncate(name) = result {
+            assert_eq!(name, "orders");
+        } else {
+            panic!("Expected Truncate");
+        }
+    }
+
+    #[test]
+    fn test_truncate_name() {
+        let kind = StatementKind::Truncate("orders".to_string());
+        assert_eq!(kind.name(), "truncate");
+    }
+
+    #[test]
+    fn test_call_is_call() {
+        let result = parse_and_classify("CALL my_procedure()");
+        assert!(
+            matches!(result, Ok(StatementKind::Call(_))),
+            "Expected Call, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_call_name() {
+        let stmt = Parser::parse_sql(&GenericDialect {}, "CALL foo()")
+            .unwrap()
+            .remove(0);
+        let kind = StatementKind::Call(Box::new(stmt));
+        assert_eq!(kind.name(), "call");
     }
 }
