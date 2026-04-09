@@ -33,7 +33,7 @@ noting semantic differences and gaps.
 - **CREATE MATERIALIZED VIEW** — not in Iceberg spec; use CTAS + scheduled refresh
 - **Lambda in window functions** — DataFusion engine limitation
 - **ORC format** — strategic choice: Parquet only
-- **MoR writes** — read path works (position/equality/DVs), write path needs RowDeltaAction transaction API
+- **MoR writes** — feasible (all writers + transaction APIs exist), but SQE currently uses CoW. MoR would improve efficiency for small deletes on large tables
 
 ## How to Read This Document
 
@@ -377,7 +377,7 @@ Each section lists Trino functions with their SQE status:
 | ORC file format | — | ✅ | ❌ | Parquet only |
 | Copy-on-Write (CoW) | ✅ | ✅ | ✅ | DELETE/UPDATE/MERGE |
 | Merge-on-Read (MoR) reads | ✅ | ✅ | ✅ | Position deletes, equality deletes, and V3 deletion vectors all readable (RW fork has full read support) |
-| Merge-on-Read (MoR) writes | — | ✅ | ❌ | Writers exist in RW fork but no RowDeltaAction transaction API yet. SQE uses CoW writes which is correct but less efficient for small changes on large tables |
+| Merge-on-Read (MoR) writes | CoW only | ✅ | ⚠️ | RW fork has position/equality/DV writers + FastAppendAction auto-routes delete files. MoR writes are FEASIBLE but SQE currently uses CoW. MoR would improve efficiency for small changes on large tables |
 
 ## Engine Limitations & Roadmap
 
@@ -392,7 +392,7 @@ The ~5% remaining gap consists of features that require engine-level changes, sk
 | `CREATE MATERIALIZED VIEW` | Materialized views are not part of the Iceberg spec; no persistent refresh mechanism | Use CTAS + scheduled refresh (cron / Airflow DAG) |
 | Lambda in window functions | DataFusion does not support lambda expressions inside window specs | Not planned — use subqueries or lateral joins instead |
 | ORC file format | Strategic choice: `datafusion-orc` is read-only and experimental | Parquet-only is the long-term strategy for Iceberg workloads |
-| Merge-on-Read (MoR) writes | Read path works (position + equality + V3 DVs). Write path blocked: RW fork has individual writers but no `RowDeltaAction` transaction API | Track iceberg-rust Epic #2186; CoW writes are fully supported today. MoR tables from Trino/Spark are already readable |
+| Merge-on-Read (MoR) writes | RW fork has `PositionDeleteFileWriter`, `EqualityDeltaWriter`, `DeletionVectorWriter` + `FastAppendAction` auto-routes by `DataContentType`. MoR writes are feasible without `RowDeltaAction` | Implement MoR DELETE path: write position delete file, append via `FastAppendAction`. ~400 lines. CoW works today as fallback |
 | Sort order enforcement | Iceberg write-path: sort order metadata written but files not physically sorted | SQE planner + writer changes needed (~sort-on-write pass) |
 | Write distribution mode | Architectural: requires shuffle/repartition layer before write | Planned for distributed write path (Phase 3+) |
 
