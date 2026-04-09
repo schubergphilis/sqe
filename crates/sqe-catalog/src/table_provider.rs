@@ -33,6 +33,8 @@ pub struct SqeTableProvider {
     schema: ArrowSchemaRef,
     /// Optional Prometheus metrics for file pruning and S3 I/O counters.
     prom_metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
+    /// Optional snapshot ID for time travel queries.
+    snapshot_id: Option<i64>,
 }
 
 impl SqeTableProvider {
@@ -54,12 +56,19 @@ impl SqeTableProvider {
             table,
             schema: Arc::new(schema),
             prom_metrics: None,
+            snapshot_id: None,
         })
     }
 
     /// Attach Prometheus metrics for file pruning and S3 I/O.
     pub fn with_metrics(mut self, metrics: Arc<sqe_metrics::MetricsRegistry>) -> Self {
         self.prom_metrics = Some(metrics);
+        self
+    }
+
+    /// Pin this provider to a specific Iceberg snapshot for time travel queries.
+    pub fn with_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.snapshot_id = Some(snapshot_id);
         self
     }
 
@@ -139,13 +148,17 @@ impl TableProvider for SqeTableProvider {
             debug!(predicate = %pred, "Pushing predicate down to Iceberg scan");
         }
 
-        Ok(Arc::new(crate::iceberg_scan::IcebergScanExec::new_with_filters_and_metrics(
+        let mut exec = crate::iceberg_scan::IcebergScanExec::new_with_filters_and_metrics(
             self.table.clone(),
             projected_schema,
             projected_columns,
             predicates,
             filters.to_vec(),
             self.prom_metrics.clone(),
-        )))
+        );
+        if let Some(sid) = self.snapshot_id {
+            exec = exec.with_snapshot_id(sid);
+        }
+        Ok(Arc::new(exec))
     }
 }

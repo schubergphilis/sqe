@@ -39,6 +39,8 @@ pub struct IcebergScanExec {
     /// footer cache, and S3 I/O counters.
     #[allow(dead_code)]
     prom_metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
+    /// Optional snapshot ID for time travel queries.
+    snapshot_id: Option<i64>,
 }
 
 impl IcebergScanExec {
@@ -61,7 +63,13 @@ impl IcebergScanExec {
             }
         };
         let properties = PlanProperties::new(eq_props, Partitioning::UnknownPartitioning(1), EmissionType::Incremental, Boundedness::Bounded);
-        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), prom_metrics }
+        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), prom_metrics, snapshot_id: None }
+    }
+
+    /// Set the snapshot ID for time travel queries.
+    pub fn with_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.snapshot_id = Some(snapshot_id);
+        self
     }
 
     pub fn table(&self) -> &Table { &self.table }
@@ -101,6 +109,7 @@ impl IcebergScanExec {
 
     pub async fn data_file_info_with_pruning_stats(&self) -> Result<(Vec<(String, u64)>, usize), iceberg::Error> {
         let mut sb = self.table.scan();
+        if let Some(sid) = self.snapshot_id { sb = sb.snapshot_id(sid); }
         if let Some(ref cols) = self.projection { sb = sb.select(cols.iter().map(|s| s.as_str())); }
         if let Some(ref pred) = self.predicates { sb = sb.with_filter(pred.clone()); }
         let scan = sb.build()?;
@@ -132,7 +141,11 @@ impl IcebergScanExec {
 
     pub async fn collect_data_files(&self) -> Result<Vec<DataFile>, iceberg::Error> {
         let metadata = self.table.metadata();
-        let snapshot = match metadata.current_snapshot() { Some(s) => s, None => return Ok(vec![]) };
+        let snapshot = if let Some(sid) = self.snapshot_id {
+            match metadata.snapshot_by_id(sid) { Some(s) => s, None => return Ok(vec![]) }
+        } else {
+            match metadata.current_snapshot() { Some(s) => s, None => return Ok(vec![]) }
+        };
         let manifest_list = snapshot.load_manifest_list(self.table.file_io(), metadata).await?;
         let mut data_files = Vec::new();
         for mf in manifest_list.entries() {
@@ -172,7 +185,7 @@ impl IcebergScanExec {
 
 impl DisplayAs for IcebergScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "IcebergScanExec: table={}, projection={:?}, predicate=[{}], df_filters={}", self.table.identifier(), self.projection, self.predicates.as_ref().map_or(String::new(), |p| format!("{p}")), self.df_filters.len())
+        write!(f, "IcebergScanExec: table={}, projection={:?}, predicate=[{}], df_filters={}, snapshot_id={:?}", self.table.identifier(), self.projection, self.predicates.as_ref().map_or(String::new(), |p| format!("{p}")), self.df_filters.len(), self.snapshot_id)
     }
 }
 
@@ -193,17 +206,25 @@ impl ExecutionPlan for IcebergScanExec {
         let schema = self.projected_schema.clone();
         let projection = self.projection.clone();
         let predicates = self.predicates.clone();
+        let snapshot_id = self.snapshot_id;
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         let _files_pruned_minmax = MetricBuilder::new(&self.metrics).counter("files_pruned_minmax", partition);
-        debug!(table=%table.identifier(), predicates=?predicates, "Executing IcebergScanExec");
+        debug!(table=%table.identifier(), predicates=?predicates, snapshot_id=?snapshot_id, "Executing IcebergScanExec");
 
-        if table.metadata().current_snapshot().is_none() {
+        // For time-travel: check the specified snapshot exists; for current: check current snapshot.
+        let has_snapshot = if let Some(sid) = snapshot_id {
+            table.metadata().snapshot_by_id(sid).is_some()
+        } else {
+            table.metadata().current_snapshot().is_some()
+        };
+        if !has_snapshot {
             let empty_batch = RecordBatch::new_empty(schema.clone());
             let stream = futures::stream::once(async move { Ok::<_, DataFusionError>(empty_batch) });
             return Ok(Box::pin(IcebergRecordBatchStream { schema, inner: Box::pin(stream), baseline }));
         }
         let stream = futures::stream::once(async move {
             let mut sb = table.scan();
+            if let Some(sid) = snapshot_id { sb = sb.snapshot_id(sid); }
             if let Some(ref cols) = projection { sb = sb.select(cols.iter().map(|s| s.as_str())); }
             if let Some(pred) = predicates { sb = sb.with_filter(pred); }
             let scan = sb.build().map_err(|e| DataFusionError::External(Box::new(e)))?;
