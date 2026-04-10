@@ -183,6 +183,7 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 - [x] ALTER TABLE schema evolution (ADD/DROP/RENAME COLUMN, SET/DROP NOT NULL, type widening)
 - [x] Trino SQL compatibility matrix (`docs/trino-compatibility.md`)
 - [x] Side-by-side benchmark tooling (`sqe-bench compare`)
+- [x] Streaming CTAS and INSERT INTO (constant-memory write path — `df.execute_stream()` instead of `df.collect()`, eliminates OOM on SF1+ loads)
 - [ ] Semantic AI layer (RDF/SPARQL, property graph/GQL, vector search, agent interfaces)
 - [ ] Helm chart for Kubernetes deployment
 
