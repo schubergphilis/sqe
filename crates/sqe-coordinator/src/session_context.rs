@@ -44,7 +44,12 @@ pub async fn create_session_context(
 
     let session_config = SessionConfig::new()
         .with_information_schema(true)
-        .with_default_catalog_and_schema(&catalog_name, "default");
+        .with_default_catalog_and_schema(&catalog_name, "default")
+        // Parse numeric literals like 0.06 as DECIMAL instead of DOUBLE.
+        // Matches Trino/SQL standard behavior: 0.06 - 0.01 = 0.05 (exact),
+        // not 0.049999999999999996 (floating-point). Critical for correct
+        // BETWEEN predicates and aggregate precision.
+        .set_bool("datafusion.sql_parser.parse_float_as_decimal", true);
 
     let mut ctx = if let Some(rt) = runtime {
         // Use the shared coordinator runtime (FairSpillPool with spill-to-disk)

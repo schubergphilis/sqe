@@ -158,3 +158,39 @@ After implementing each cache:
 | Cold TPC-H q01 | SQE 785ms, Trino 1846ms | SQE ~785ms (unchanged) | SQE still 2.4x faster cold |
 | Warm TPC-H q06 | SQE 557ms, Trino 113ms | SQE ~200ms | From 0.2x to ~0.6x Trino |
 | Warm TPC-H total | SQE 14.2s, Trino 7.1s | SQE ~8-9s | From 0.5x to ~0.8x Trino |
+
+---
+
+## Appendix: Decimal Literal Precision Fix
+
+### Discovery
+
+During value-level comparison of TPC-H q06, we found SQE and Trino return different results:
+
+```
+Query: SELECT sum(l_extendedprice * l_discount) FROM lineitem
+       WHERE l_discount BETWEEN 0.06 - 0.01 AND 0.06 + 0.01
+
+SQE:   40,723,667  (758 matching rows)
+Trino: 68,170,401  (1138 matching rows)
+```
+
+### Root cause
+
+| Engine | typeof(0.06) | 0.06 - 0.01 | Behavior |
+|---|---|---|---|
+| Trino | decimal(2,2) | 0.05 (exact) | SQL standard |
+| DataFusion | Float64 | 0.049999999999999996 | IEEE 754 |
+
+Trino treats numeric literals as DECIMAL (exact arithmetic). DataFusion treats them as DOUBLE (floating-point). This causes BETWEEN predicates to exclude boundary values.
+
+### Fix
+
+DataFusion has `parse_float_as_decimal` config (default false). Setting it to true makes `0.06` parse as `Decimal128(2,2)` instead of `Float64`, matching Trino/SQL standard behavior.
+
+```rust
+SessionConfig::new()
+    .set_bool("datafusion.sql_parser.parse_float_as_decimal", true)
+```
+
+This is a one-line fix with enormous impact: all numeric predicates, arithmetic, and aggregates now use exact decimal arithmetic, matching Trino's SQL standard compliance.
