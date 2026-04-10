@@ -52,6 +52,9 @@ pub async fn run_comparison(
         // (same as sqe-bench test does via prefix_tables)
         let namespace = crate::bench_namespace(benchmark, scale);
         let sql = crate::test::prefix_tables(&raw_sql, &namespace, benchmark);
+        // Strip trailing semicolons -- Trino HTTP protocol rejects them.
+        // Trim whitespace first (files end with \n after ;)
+        let sql = sql.trim().trim_end_matches(';').trim().to_string();
 
         info!("  {} ...", query_name);
 
