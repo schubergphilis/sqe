@@ -5,7 +5,7 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use tracing::debug;
 
-use sqe_catalog::{SessionCatalog, SqeCatalogProvider};
+use sqe_catalog::{ManifestCache, SessionCatalog, SqeCatalogProvider};
 use sqe_core::{Session, SqeConfig};
 use sqe_policy::PolicyStore;
 
@@ -24,7 +24,7 @@ use crate::query_tracker::QueryTracker;
 /// [`crate::runtime::build_coordinator_runtime`]), it is used for all sessions
 /// so the FairSpillPool memory limit is enforced globally. When `None`, a
 /// per-query runtime is created using the legacy `max_query_memory` setting.
-#[tracing::instrument(skip(config, session, policy_store, query_tracker, runtime, prom_metrics), fields(username = %session.user.username))]
+#[tracing::instrument(skip(config, session, policy_store, query_tracker, runtime, prom_metrics, manifest_cache), fields(username = %session.user.username))]
 pub async fn create_session_context(
     config: &SqeConfig,
     session: &Session,
@@ -32,6 +32,7 @@ pub async fn create_session_context(
     query_tracker: &Arc<QueryTracker>,
     runtime: Option<&Arc<RuntimeEnv>>,
     prom_metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
+    manifest_cache: Option<&ManifestCache>,
 ) -> sqe_core::Result<(SessionContext, Arc<SessionCatalog>)> {
     let catalog_name = if config.catalog.warehouse.is_empty() {
         "default".to_string()
@@ -83,6 +84,7 @@ pub async fn create_session_context(
             &config.catalog.warehouse,
             &session.access_token,
             &config.storage,
+            config.catalog.metadata_cache_ttl_secs,
             None, None,
         )
         .await?,
@@ -104,6 +106,9 @@ pub async fn create_session_context(
     .await?;
     if let Some(m) = prom_metrics {
         catalog_provider = catalog_provider.with_metrics(Arc::clone(m));
+    }
+    if let Some(mc) = manifest_cache {
+        catalog_provider = catalog_provider.with_manifest_cache(mc.clone());
     }
 
     ctx.register_catalog(&catalog_name, Arc::new(catalog_provider));

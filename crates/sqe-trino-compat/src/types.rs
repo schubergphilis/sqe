@@ -105,7 +105,7 @@ pub fn arrow_value_to_json(
             let abs_v = v.abs();
             if !v.is_finite() {
                 serde_json::json!(v)
-            } else if v == 0.0 || (abs_v >= 1e-3 && abs_v < 1e7) {
+            } else if v == 0.0 || (1e-3..1e7).contains(&abs_v) {
                 // Normal range: decimal notation (3.14, 1000.0)
                 serde_json::json!(v)
             } else {

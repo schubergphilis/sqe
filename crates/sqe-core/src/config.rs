@@ -522,6 +522,11 @@ pub struct CatalogConfig {
     pub warehouse: String,
     #[serde(default = "default_cache_ttl")]
     pub metadata_cache_ttl_secs: u64,
+    /// Memory budget for the global Iceberg manifest file cache in megabytes.
+    /// Manifest files are immutable by Iceberg spec so no TTL is needed.
+    /// Set to 0 to disable. Default: 512 MB.
+    #[serde(default = "default_manifest_cache_mb")]
+    pub manifest_cache_mb: u64,
     /// Default Iceberg table format version for new tables (2 or 3).
     #[serde(default = "default_table_format_version")]
     pub default_table_format_version: u8,
@@ -733,6 +738,7 @@ fn default_refresh_buffer() -> u64 { 60 }
 fn default_true() -> bool { true }
 fn default_cache_ttl() -> u64 { 30 }
 fn default_table_format_version() -> u8 { 2 }
+fn default_manifest_cache_mb() -> u64 { 512 }
 fn default_passthrough() -> String { "passthrough".to_string() }
 fn default_prometheus_port() -> u16 { 9090 }
 fn default_per_user_rpm() -> u32 { 60 }
@@ -862,6 +868,7 @@ impl SqeConfig {
         env_override_str("SQE_CATALOG__POLARIS_URL", &mut self.catalog.polaris_url);
         env_override_str("SQE_CATALOG__WAREHOUSE", &mut self.catalog.warehouse);
         env_override_u64("SQE_CATALOG__METADATA_CACHE_TTL_SECS", &mut self.catalog.metadata_cache_ttl_secs);
+        env_override_u64("SQE_CATALOG__MANIFEST_CACHE_MB", &mut self.catalog.manifest_cache_mb);
         env_override_u8("SQE_CATALOG__DEFAULT_TABLE_FORMAT_VERSION", &mut self.catalog.default_table_format_version);
 
         // Storage
@@ -1062,7 +1069,9 @@ mod tests {
                 polaris_url: "https://polaris.example.com".to_string(),
                 warehouse: "wh".to_string(),
                 metadata_cache_ttl_secs: 30,
+                manifest_cache_mb: 512,
                 default_table_format_version: 2,
+                trust_sort_order: false,
             },
             storage: StorageConfig::default(),
             policy: PolicyConfig::default(),

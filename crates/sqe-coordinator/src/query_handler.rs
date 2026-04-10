@@ -62,6 +62,9 @@ pub struct QueryHandler {
     /// Shared DataFusion runtime with FairSpillPool memory management.
     /// Built once at startup and reused across all queries.
     runtime: Arc<RuntimeEnv>,
+    /// Optional shared manifest file cache. Passed to every session context so
+    /// that warm queries avoid re-fetching immutable Iceberg manifest files from S3.
+    manifest_cache: Option<sqe_catalog::ManifestCache>,
 }
 
 impl QueryHandler {
@@ -109,7 +112,18 @@ impl QueryHandler {
             query_cache,
             query_semaphore,
             runtime,
+            manifest_cache: None,
         }
+    }
+
+    /// Attach a shared manifest file cache used to accelerate repeated scans.
+    ///
+    /// The cache is propagated to every session context and down to each
+    /// `IcebergScanExec`. Call once at coordinator startup with a globally
+    /// shared `ManifestCache` instance.
+    pub fn with_manifest_cache(mut self, cache: sqe_catalog::ManifestCache) -> Self {
+        self.manifest_cache = Some(cache);
+        self
     }
 
     /// Returns a reference to the query tracker.
@@ -1043,6 +1057,7 @@ impl QueryHandler {
             &self.query_tracker,
             Some(&self.runtime),
             self.metrics.as_ref(),
+            self.manifest_cache.as_ref(),
         )
         .await
     }
@@ -1170,6 +1185,7 @@ impl QueryHandler {
             &self.config.catalog.warehouse,
             &session.access_token,
             &self.config.storage,
+            self.config.catalog.metadata_cache_ttl_secs,
             None, None,
         )
         .await?;
@@ -1207,6 +1223,7 @@ impl QueryHandler {
             &self.config.catalog.warehouse,
             &session.access_token,
             &self.config.storage,
+            self.config.catalog.metadata_cache_ttl_secs,
             None, None,
         )
         .await?;
@@ -1589,7 +1606,8 @@ impl QueryHandler {
                 &self.config.catalog.warehouse,
                 &session.access_token,
                 &self.config.storage,
-            None, None,
+                self.config.catalog.metadata_cache_ttl_secs,
+                None, None,
             )
             .await?,
         );

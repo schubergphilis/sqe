@@ -1917,6 +1917,7 @@ impl WriteHandler {
                 &self.config.catalog.warehouse,
                 &session.access_token,
                 &self.config.storage,
+                self.config.catalog.metadata_cache_ttl_secs,
                 None, None,
             )
             .await?,
@@ -1987,6 +1988,7 @@ fn collect_and_replace_in_subqueries(
 ///
 /// `idx` tracks which entry in `subqueries`/`value_lists` we are currently visiting.
 /// Must be called with the same `expr` that `collect_and_replace_in_subqueries` modified.
+#[allow(clippy::only_used_in_recursion)]
 fn substitute_in_subquery_placeholders(
     expr: &mut sqlparser::ast::Expr,
     subqueries: &[(String, bool)],

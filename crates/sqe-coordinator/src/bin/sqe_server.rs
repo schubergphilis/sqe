@@ -458,6 +458,13 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         "Initialized query tracker and result cache"
     );
 
+    // Build the global shared manifest file cache (immutable Iceberg manifests — no TTL).
+    let manifest_cache = sqe_catalog::ManifestCache::new(config.catalog.manifest_cache_mb);
+    tracing::info!(
+        manifest_cache_mb = config.catalog.manifest_cache_mb,
+        "Initialized global Iceberg manifest cache"
+    );
+
     // Query handler
     let query_handler = Arc::new(QueryHandler::new(
         policy_enforcer,
@@ -477,7 +484,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         Some(audit.clone()),
         query_tracker,
         query_cache,
-    ));
+    ).with_manifest_cache(manifest_cache));
 
     // Spawn background memory metrics reporter (updates gauges every 1s for Grafana)
     sqe_coordinator::memory::spawn_metrics_reporter(

@@ -283,6 +283,7 @@ impl CatalogOps {
             &self.config.catalog.warehouse,
             &session.access_token,
             &self.config.storage,
+            self.config.catalog.metadata_cache_ttl_secs,
             None, None,
         )
         .await?;
@@ -349,6 +350,7 @@ impl CatalogOps {
             &self.config.catalog.warehouse,
             &session.access_token,
             &self.config.storage,
+            self.config.catalog.metadata_cache_ttl_secs,
             None, None,
         )
         .await?;
@@ -405,6 +407,7 @@ impl CatalogOps {
                 &self.config.catalog.warehouse,
                 &session.access_token,
                 &self.config.storage,
+                self.config.catalog.metadata_cache_ttl_secs,
                 None, None,
             )
             .await?,
@@ -630,6 +633,7 @@ impl CatalogOps {
                 &self.config.catalog.warehouse,
                 &session.access_token,
                 &self.config.storage,
+                self.config.catalog.metadata_cache_ttl_secs,
                 None, None,
             )
             .await?,
@@ -662,7 +666,8 @@ impl CatalogOps {
                 &self.config.catalog.warehouse,
                 &session.access_token,
                 &self.config.storage,
-            None, None,
+                self.config.catalog.metadata_cache_ttl_secs,
+                None, None,
             )
             .await?,
         );
