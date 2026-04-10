@@ -313,8 +313,10 @@ impl QueryHandler {
                                 self.drop_table_if_exists(session, &ct.name).await?;
                             }
                             let select_sql = format!("{query}");
-                            let batches = self.execute_query(session, &select_sql, &query_id).await?;
-                            self.write_handler.handle_ctas(session, stmt, batches).await
+                            let (ctx, _) = self.create_session_context(session).await?;
+                            self.write_handler
+                                .handle_ctas_streaming(session, stmt, &ctx, &select_sql)
+                                .await
                         } else {
                             Err(SqeError::Execution("CTAS without SELECT query".into()))
                         }
@@ -332,9 +334,9 @@ impl QueryHandler {
                             .ok_or_else(|| {
                                 SqeError::Execution("INSERT without SELECT source".into())
                             })?;
-                        let batches = self.execute_query(session, &select_sql, &query_id).await?;
+                        let (ctx, _) = self.create_session_context(session).await?;
                         self.write_handler
-                            .handle_insert(session, stmt, batches)
+                            .handle_insert_streaming(session, stmt, &ctx, &select_sql)
                             .await
                     } else {
                         Err(SqeError::Execution("Expected Insert statement".into()))

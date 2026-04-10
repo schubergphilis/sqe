@@ -19,7 +19,10 @@ use sqe_core::{Session, SqeConfig, SqeError};
 use tracing::instrument;
 
 use crate::catalog_ops::parse_table_ref;
-use crate::writer::{write_data_files_with_metrics, write_position_delete_files};
+use crate::writer::{
+    write_data_files_streaming_with_metrics, write_data_files_with_metrics,
+    write_position_delete_files,
+};
 
 /// Handles write operations: CTAS (CREATE TABLE AS SELECT) and INSERT INTO SELECT.
 ///
@@ -152,6 +155,196 @@ impl WriteHandler {
         }
 
         Ok(vec![]) // DDL success, no result rows
+    }
+
+    /// Handle CREATE TABLE [OR REPLACE] ns.table AS SELECT ... — streaming variant.
+    ///
+    /// Instead of buffering the full SELECT result in memory, this method:
+    /// 1. Plans the SELECT via DataFusion and derives the Iceberg schema from the
+    ///    DataFrame schema (before execution — no data buffered yet).
+    /// 2. Creates the table in the catalog.
+    /// 3. Streams batches directly to the Parquet writer via `df.execute_stream()`.
+    /// 4. Commits the data files via a fast-append transaction.
+    ///
+    /// Peak memory is O(batch_size) instead of O(total_rows). Critical for large
+    /// CTAS loads (SF1 lineorder, store_sales, etc.) that OOM with `df.collect()`.
+    #[instrument(skip(self, session, stmt, ctx, select_sql), fields(username = %session.user.username))]
+    pub async fn handle_ctas_streaming(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+        ctx: &DFSessionContext,
+        select_sql: &str,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let (table_name, _or_replace) = match stmt {
+            Statement::CreateTable(ct) => {
+                if ct.query.is_none() {
+                    return Err(SqeError::Execution(
+                        "CTAS statement has no SELECT query".into(),
+                    ));
+                }
+                (&ct.name, ct.or_replace)
+            }
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected CreateTable statement, got: {other}"
+                )));
+            }
+        };
+
+        let (namespace, name) = parse_table_ref(table_name)?;
+
+        // Plan the SELECT without executing it — gives us the output schema cheaply.
+        let df = ctx
+            .sql(select_sql)
+            .await
+            .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
+
+        let arrow_schema = Arc::new(df.schema().as_arrow().clone());
+        let iceberg_schema = arrow_schema_to_iceberg(&arrow_schema)?;
+
+        info!(
+            username = %session.user.username,
+            namespace = %namespace,
+            table = %name,
+            "Executing CTAS (streaming)"
+        );
+
+        let catalog = self.create_catalog_bridge(session).await?;
+
+        let table_creation = TableCreation::builder()
+            .name(name.clone())
+            .schema(iceberg_schema)
+            .format_version(self.format_version())
+            .build();
+
+        let _created_table = catalog
+            .create_table(&namespace, table_creation)
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to create table: {e}")))?;
+
+        let table_ident = TableIdent::new(namespace, name);
+        let table = catalog
+            .load_table(&table_ident)
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to load created table: {e}")))?;
+
+        // Execute the SELECT and stream batches directly to the Parquet writer.
+        let stream = df
+            .execute_stream()
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to start execution stream: {e}")))?;
+
+        let (data_files, total_rows) = write_data_files_streaming_with_metrics(
+            &table,
+            stream,
+            "ctas",
+            self.metrics.as_ref(),
+        )
+        .await?;
+
+        if !data_files.is_empty() {
+            let tx = Transaction::new(&table);
+            let action = tx.fast_append().add_data_files(data_files);
+            let tx = action.apply(tx).map_err(|e| {
+                SqeError::Execution(format!("Failed to apply fast append: {e}"))
+            })?;
+            tx.commit(catalog.as_ref()).await.map_err(|e| {
+                SqeError::Execution(format!("Failed to commit CTAS transaction: {e}"))
+            })?;
+
+            info!(
+                table = %table_ident,
+                total_rows,
+                "CTAS committed successfully (streaming)"
+            );
+        } else {
+            info!(
+                table = %table_ident,
+                "CTAS created empty table (no data to write)"
+            );
+        }
+
+        Ok(vec![])
+    }
+
+    /// Handle INSERT INTO ns.table SELECT ... — streaming variant.
+    ///
+    /// Streams batches from the SELECT directly to the Parquet writer without
+    /// buffering the full result set. Peak memory is O(batch_size).
+    #[instrument(skip(self, session, stmt, ctx, select_sql), fields(username = %session.user.username))]
+    pub async fn handle_insert_streaming(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+        ctx: &DFSessionContext,
+        select_sql: &str,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let table_name = match stmt {
+            Statement::Insert(ins) => &ins.table_name,
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected Insert statement, got: {other}"
+                )));
+            }
+        };
+
+        let (namespace, name) = parse_table_ref(table_name)?;
+        let table_ident = TableIdent::new(namespace, name);
+
+        info!(
+            username = %session.user.username,
+            table = %table_ident,
+            "Executing INSERT INTO SELECT (streaming)"
+        );
+
+        let catalog = self.create_catalog_bridge(session).await?;
+        let table = catalog
+            .load_table(&table_ident)
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
+
+        let df = ctx
+            .sql(select_sql)
+            .await
+            .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
+
+        let stream = df
+            .execute_stream()
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to start execution stream: {e}")))?;
+
+        let (data_files, total_rows) = write_data_files_streaming_with_metrics(
+            &table,
+            stream,
+            "insert",
+            self.metrics.as_ref(),
+        )
+        .await?;
+
+        if total_rows == 0 {
+            info!(table = %table_ident, "INSERT SELECT returned no rows — nothing to write");
+            return Ok(vec![]);
+        }
+
+        if !data_files.is_empty() {
+            let tx = Transaction::new(&table);
+            let action = tx.fast_append().add_data_files(data_files);
+            let tx = action.apply(tx).map_err(|e| {
+                SqeError::Execution(format!("Failed to apply fast append: {e}"))
+            })?;
+            tx.commit(catalog.as_ref()).await.map_err(|e| {
+                SqeError::Execution(format!("Failed to commit INSERT transaction: {e}"))
+            })?;
+
+            info!(
+                table = %table_ident,
+                total_rows,
+                "INSERT INTO committed successfully (streaming)"
+            );
+        }
+
+        Ok(vec![])
     }
 
     /// Handle CREATE TABLE [IF NOT EXISTS] ns.table (column definitions)
