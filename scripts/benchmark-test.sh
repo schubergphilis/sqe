@@ -362,7 +362,16 @@ REFRESHEOF
                 if curl -sf "http://localhost:${TRINO_PORT}/v1/info" >/dev/null 2>&1; then echo " ready"; break; fi
                 sleep 2
             done
-            sleep 5  # Extra init time
+            # Wait for Trino's Iceberg catalog connector to fully initialize.
+            # The /v1/info endpoint returns "starting":false before the catalog is ready.
+            echo -n "  Waiting for Trino catalog..."
+            for i in $(seq 1 30); do
+                RESULT=$(trino --server "http://localhost:${TRINO_PORT}" --user admin --catalog iceberg \
+                    --execute "SHOW SCHEMAS" --output-format CSV_UNQUOTED 2>/dev/null | head -1)
+                if [ -n "$RESULT" ]; then echo " catalog ready"; break; fi
+                if [ "$i" -eq 30 ]; then echo " TIMEOUT (catalog may not be ready)"; fi
+                sleep 2
+            done
         fi
 
         "$BENCH_BIN" compare "$BENCH" \
