@@ -1,5 +1,4 @@
 -- name: Market Feed — Update last trade prices
--- requires: in_subquery_memtable
 -- description: Write portion of Market Feed: update last_trade with new prices from trade requests
 -- timeout: 30s
 
