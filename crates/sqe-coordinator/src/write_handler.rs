@@ -1847,7 +1847,12 @@ impl WriteHandler {
         }
 
         // Execute each collected subquery and gather the literal value lists.
-        let mut value_lists: Vec<Vec<Expr>> = Vec::with_capacity(subqueries.len());
+        //
+        // `value_lists` is Vec<rows> where each row is Vec<column_values>.
+        // For single-column IN subqueries each row has exactly one element.
+        // For multi-column (tuple) IN subqueries each row has N elements,
+        // one per column of the subquery result, enabling the OR-of-ANDs rewrite.
+        let mut value_lists: Vec<Vec<Vec<Expr>>> = Vec::with_capacity(subqueries.len());
         for (subquery_sql, _negated) in &subqueries {
             let df = ctx.sql(subquery_sql).await.map_err(|e| {
                 SqeError::Execution(format!(
@@ -1860,39 +1865,46 @@ impl WriteHandler {
                 ))
             })?;
 
-            let mut values: Vec<Expr> = Vec::new();
+            let mut rows: Vec<Vec<Expr>> = Vec::new();
             for batch in &batches {
-                let col = batch.column(0);
-                for row in 0..batch.num_rows() {
-                    if col.is_null(row) {
-                        continue;
+                let num_cols = batch.num_columns();
+                'row: for row in 0..batch.num_rows() {
+                    let mut col_literals: Vec<Expr> = Vec::with_capacity(num_cols);
+                    for col_idx in 0..num_cols {
+                        let col = batch.column(col_idx);
+                        // Skip entire row if any column is NULL.
+                        if col.is_null(row) {
+                            continue 'row;
+                        }
+                        let val_str = arrow::util::display::array_value_to_string(col, row)
+                            .unwrap_or_default();
+                        let literal = match col.data_type() {
+                            arrow::datatypes::DataType::Int8
+                            | arrow::datatypes::DataType::Int16
+                            | arrow::datatypes::DataType::Int32
+                            | arrow::datatypes::DataType::Int64
+                            | arrow::datatypes::DataType::UInt8
+                            | arrow::datatypes::DataType::UInt16
+                            | arrow::datatypes::DataType::UInt32
+                            | arrow::datatypes::DataType::UInt64 => {
+                                Expr::Value(SqlValue::Number(val_str, false))
+                            }
+                            arrow::datatypes::DataType::Float32
+                            | arrow::datatypes::DataType::Float64 => {
+                                Expr::Value(SqlValue::Number(val_str, false))
+                            }
+                            _ => Expr::Value(SqlValue::SingleQuotedString(val_str)),
+                        };
+                        col_literals.push(literal);
                     }
-                    let val_str = arrow::util::display::array_value_to_string(col, row)
-                        .unwrap_or_default();
-                    let literal = match col.data_type() {
-                        arrow::datatypes::DataType::Int8
-                        | arrow::datatypes::DataType::Int16
-                        | arrow::datatypes::DataType::Int32
-                        | arrow::datatypes::DataType::Int64
-                        | arrow::datatypes::DataType::UInt8
-                        | arrow::datatypes::DataType::UInt16
-                        | arrow::datatypes::DataType::UInt32
-                        | arrow::datatypes::DataType::UInt64 => {
-                            Expr::Value(SqlValue::Number(val_str, false))
-                        }
-                        arrow::datatypes::DataType::Float32
-                        | arrow::datatypes::DataType::Float64 => {
-                            Expr::Value(SqlValue::Number(val_str, false))
-                        }
-                        _ => Expr::Value(SqlValue::SingleQuotedString(val_str)),
-                    };
-                    values.push(literal);
+                    rows.push(col_literals);
                 }
             }
-            value_lists.push(values);
+            value_lists.push(rows);
         }
 
-        // Second pass: substitute the sentinel placeholders with InList / Boolean.
+        // Second pass: substitute the sentinel placeholders with InList / Boolean
+        // (single-column) or OR-of-ANDs (multi-column / tuple IN).
         let mut idx = 0usize;
         substitute_in_subquery_placeholders(&mut expr, &subqueries, &value_lists, &mut idx);
 
@@ -1901,7 +1913,7 @@ impl WriteHandler {
             original = %where_sql,
             rewritten = %&rewritten[..rewritten.len().min(300)],
             subquery_count = subqueries.len(),
-            "Rewrote IN (subquery) to IN (literal_list) for DML WHERE clause"
+            "Rewrote IN (subquery) to literal predicate(s) for DML WHERE clause"
         );
         Ok(rewritten)
     }
@@ -1992,8 +2004,16 @@ fn collect_and_replace_in_subqueries(
 }
 
 /// Walk `expr` and substitute every sentinel `InList` with a single `Placeholder("?N")`
-/// list element with the real `InList` (using the collected values) or a `Boolean`
+/// list element with the real expression (using the collected values) or a `Boolean`
 /// constant when the value list is empty.
+///
+/// For single-column IN subqueries the sentinel's `col_expr` is a plain column reference
+/// and the result is `col IN (v1, v2, ...)` (or `NOT IN`).
+///
+/// For multi-column (tuple) IN subqueries the sentinel's `col_expr` is `Expr::Tuple`
+/// and the result is an OR chain of AND conditions:
+///   `(col1=v1 AND col2=v2) OR (col1=v3 AND col2=v4) OR ...`
+/// This avoids DataFusion's lack of support for tuple-IN in DML context.
 ///
 /// `idx` tracks which entry in `subqueries`/`value_lists` we are currently visiting.
 /// Must be called with the same `expr` that `collect_and_replace_in_subqueries` modified.
@@ -2001,10 +2021,10 @@ fn collect_and_replace_in_subqueries(
 fn substitute_in_subquery_placeholders(
     expr: &mut sqlparser::ast::Expr,
     subqueries: &[(String, bool)],
-    value_lists: &[Vec<sqlparser::ast::Expr>],
+    value_lists: &[Vec<Vec<sqlparser::ast::Expr>>],
     idx: &mut usize,
 ) {
-    use sqlparser::ast::{Expr, Value as SqlValue};
+    use sqlparser::ast::{BinaryOperator, Expr, Value as SqlValue};
 
     match expr {
         // Sentinel pattern: Nested(InList { list: [Placeholder("?N")], .. })
@@ -2015,16 +2035,73 @@ fn substitute_in_subquery_placeholders(
                         if p.starts_with('?') {
                             let current_idx = *idx;
                             *idx += 1;
-                            let values = &value_lists[current_idx];
+                            let rows = &value_lists[current_idx];
                             let neg = *negated;
-                            let col = std::mem::replace(col_expr, Box::new(Expr::Value(SqlValue::Null)));
-                            if values.is_empty() {
+                            let col =
+                                std::mem::replace(col_expr, Box::new(Expr::Value(SqlValue::Null)));
+
+                            if rows.is_empty() {
                                 // IN () → FALSE; NOT IN () → TRUE
                                 *expr = Expr::Value(SqlValue::Boolean(!neg));
+                                return;
+                            }
+
+                            // Determine whether this is a tuple IN by checking if the
+                            // sentinel's col_expr (now in `col`) is an Expr::Tuple.
+                            if let Expr::Tuple(col_refs) = col.as_ref() {
+                                // Multi-column (tuple) IN rewrite:
+                                // (col1, col2) IN (SELECT c1, c2 ...) becomes
+                                // (col1=v1 AND col2=v2) OR (col1=v3 AND col2=v4) OR ...
+                                // NOT IN becomes the negation of that OR chain.
+                                let col_refs = col_refs.clone();
+                                let mut or_chain: Option<Expr> = None;
+                                for row in rows {
+                                    // Build AND chain for this row: col1=v1 AND col2=v2 ...
+                                    let mut and_chain: Option<Expr> = None;
+                                    for (col_ref, val) in col_refs.iter().zip(row.iter()) {
+                                        let eq = Expr::BinaryOp {
+                                            left: Box::new(col_ref.clone()),
+                                            op: BinaryOperator::Eq,
+                                            right: Box::new(val.clone()),
+                                        };
+                                        and_chain = Some(match and_chain {
+                                            Some(prev) => Expr::BinaryOp {
+                                                left: Box::new(prev),
+                                                op: BinaryOperator::And,
+                                                right: Box::new(eq),
+                                            },
+                                            None => eq,
+                                        });
+                                    }
+                                    if let Some(and_expr) = and_chain {
+                                        or_chain = Some(match or_chain {
+                                            Some(prev) => Expr::BinaryOp {
+                                                left: Box::new(prev),
+                                                op: BinaryOperator::Or,
+                                                right: Box::new(Expr::Nested(Box::new(and_expr))),
+                                            },
+                                            None => and_expr,
+                                        });
+                                    }
+                                }
+                                let or_expr = or_chain
+                                    .unwrap_or(Expr::Value(SqlValue::Boolean(false)));
+                                *expr = if neg {
+                                    // NOT IN → wrap in NOT
+                                    Expr::UnaryOp {
+                                        op: sqlparser::ast::UnaryOperator::Not,
+                                        expr: Box::new(Expr::Nested(Box::new(or_expr))),
+                                    }
+                                } else {
+                                    Expr::Nested(Box::new(or_expr))
+                                };
                             } else {
+                                // Single-column IN: flatten rows to a value list and use InList.
+                                let flat: Vec<Expr> =
+                                    rows.iter().filter_map(|r| r.first().cloned()).collect();
                                 *expr = Expr::InList {
                                     expr: col,
-                                    list: values.clone(),
+                                    list: flat,
                                     negated: neg,
                                 };
                             }
