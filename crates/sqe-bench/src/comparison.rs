@@ -20,7 +20,7 @@ pub async fn run_comparison(
     output_dir: &str,
 ) -> anyhow::Result<ComparisonReport> {
     // Load query files
-    let query_dir = format!("crates/sqe-bench/queries/{}", benchmark);
+    let query_dir = format!("benchmarks/queries/{}", benchmark);
     let mut query_files: Vec<_> = std::fs::read_dir(&query_dir)?
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "sql"))
