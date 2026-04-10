@@ -14,7 +14,7 @@ use iceberg::{Catalog, TableCreation, TableIdent};
 use sqlparser::ast::Statement;
 use tracing::info;
 
-use sqe_catalog::SessionCatalog;
+use sqe_catalog::{SessionCatalog, TableMetadataCache};
 use sqe_core::{Session, SqeConfig, SqeError};
 use tracing::instrument;
 
@@ -46,15 +46,24 @@ fn affected_rows_batch(count: usize) -> Vec<RecordBatch> {
 pub struct WriteHandler {
     config: SqeConfig,
     metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
+    /// Shared global table metadata cache. Used so write-path SessionCatalog
+    /// instances hit the warm cache and invalidate the right entry on commit.
+    table_cache: Option<TableMetadataCache>,
 }
 
 impl WriteHandler {
     pub fn new(config: SqeConfig) -> Self {
-        Self { config, metrics: None }
+        Self { config, metrics: None, table_cache: None }
     }
 
     pub fn with_metrics(mut self, metrics: Arc<sqe_metrics::MetricsRegistry>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Attach a global table metadata cache shared across all sessions.
+    pub fn with_table_cache(mut self, cache: TableMetadataCache) -> Self {
+        self.table_cache = Some(cache);
         self
     }
 
@@ -1917,7 +1926,7 @@ impl WriteHandler {
                 &self.config.catalog.warehouse,
                 &session.access_token,
                 &self.config.storage,
-                self.config.catalog.metadata_cache_ttl_secs,
+                self.table_cache.clone(),
                 None, None,
             )
             .await?,

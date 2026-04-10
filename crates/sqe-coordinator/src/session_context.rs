@@ -5,7 +5,7 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use tracing::debug;
 
-use sqe_catalog::{ManifestCache, SessionCatalog, SqeCatalogProvider};
+use sqe_catalog::{ManifestCache, SessionCatalog, SqeCatalogProvider, TableMetadataCache};
 use sqe_core::{Session, SqeConfig};
 use sqe_policy::PolicyStore;
 
@@ -24,7 +24,8 @@ use crate::query_tracker::QueryTracker;
 /// [`crate::runtime::build_coordinator_runtime`]), it is used for all sessions
 /// so the FairSpillPool memory limit is enforced globally. When `None`, a
 /// per-query runtime is created using the legacy `max_query_memory` setting.
-#[tracing::instrument(skip(config, session, policy_store, query_tracker, runtime, prom_metrics, manifest_cache), fields(username = %session.user.username))]
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip(config, session, policy_store, query_tracker, runtime, prom_metrics, manifest_cache, table_cache), fields(username = %session.user.username))]
 pub async fn create_session_context(
     config: &SqeConfig,
     session: &Session,
@@ -33,6 +34,7 @@ pub async fn create_session_context(
     runtime: Option<&Arc<RuntimeEnv>>,
     prom_metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
     manifest_cache: Option<&ManifestCache>,
+    table_cache: Option<&TableMetadataCache>,
 ) -> sqe_core::Result<(SessionContext, Arc<SessionCatalog>)> {
     let catalog_name = if config.catalog.warehouse.is_empty() {
         "default".to_string()
@@ -77,14 +79,16 @@ pub async fn create_session_context(
         .expect("MemoryCatalogProvider always accepts schema registration");
     ctx.register_catalog("datafusion", df_catalog);
 
-    // Create a per-session catalog connected to Polaris with the user's bearer token
+    // Create a per-session catalog connected to Polaris with the user's bearer token.
+    // Pass the shared global table metadata cache so Polaris REST round-trips are
+    // skipped for tables that have already been loaded within the TTL window.
     let session_catalog = Arc::new(
         SessionCatalog::new(
             &config.catalog.polaris_url,
             &config.catalog.warehouse,
             &session.access_token,
             &config.storage,
-            config.catalog.metadata_cache_ttl_secs,
+            table_cache.cloned(),
             None, None,
         )
         .await?,
