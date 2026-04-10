@@ -329,6 +329,42 @@ for BENCH in "${BENCHMARKS[@]}"; do
     if [ -n "$COMPARE_TRINO" ]; then
         echo ""
         echo "  [4/4] Comparing SQE vs Trino..."
+
+        # Refresh the Trino Polaris token (JWT tokens expire quickly).
+        # Restart the container with a fresh token to avoid auth failures.
+        FRESH_TOKEN=$(curl -sf -X POST "http://localhost:18181/api/catalog/v1/oauth/tokens" \
+            -d "grant_type=client_credentials&client_id=root&client_secret=s3cr3t&scope=PRINCIPAL_ROLE:ALL" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])" 2>/dev/null)
+        if [ -n "$FRESH_TOKEN" ]; then
+            POLARIS_IP=$(docker inspect sqlengine-polaris-1 --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+            RUSTFS_IP=$(docker inspect sqlengine-rustfs-1 --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+            cat > /tmp/trino-bench/catalog/iceberg.properties << REFRESHEOF
+connector.name=iceberg
+iceberg.catalog.type=rest
+iceberg.rest-catalog.uri=http://${POLARIS_IP}:8181/api/catalog
+iceberg.rest-catalog.warehouse=test_warehouse
+iceberg.rest-catalog.security=OAUTH2
+iceberg.rest-catalog.oauth2.token=${FRESH_TOKEN}
+fs.native-s3.enabled=true
+s3.endpoint=http://${RUSTFS_IP}:9000
+s3.region=${S3_REGION}
+s3.path-style-access=true
+s3.aws-access-key=${S3_ACCESS_KEY}
+s3.aws-secret-key=${S3_SECRET_KEY}
+REFRESHEOF
+            docker stop trino-bench 2>/dev/null; sleep 2
+            docker run -d --rm --name trino-bench -p "${TRINO_PORT}:8080" \
+                -v /tmp/trino-bench/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro \
+                -v /tmp/trino-bench/config.properties:/etc/trino/config.properties:ro \
+                "$TRINO_IMAGE" >/dev/null
+            echo -n "  Refreshing Trino token..."
+            for i in $(seq 1 30); do
+                if curl -sf "http://localhost:${TRINO_PORT}/v1/info" >/dev/null 2>&1; then echo " ready"; break; fi
+                sleep 2
+            done
+            sleep 5  # Extra init time
+        fi
+
         "$BENCH_BIN" compare "$BENCH" \
             --scale "$BENCH_SCALE" \
             --sqe-host "$BENCH_HOST" \
