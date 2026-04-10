@@ -1,6 +1,11 @@
 [coordinator]
 flight_sql_port = 60051
 trino_http_port = 18080
+# Memory and spill for SF1 benchmark loads (lineorder: 6M rows, store_sales: 2.8M)
+memory_limit = "8GB"
+spill_to_disk = true
+spill_dir = "/tmp/sqe-bench-spill"
+spill_compression = "lz4"
 
 [metrics]
 prometheus_port = 19090
@@ -13,18 +18,14 @@ client_secret = "s3cr3t"
 [query]
 # Benchmarks load large dimension tables (e.g. customer_demographics: 1.9M rows)
 max_result_rows = 0
-# SF1 TPC-H/DS queries need more memory for HashJoins on multi-million row tables
-max_query_memory = "2GB"
-# SF1 CTAS loads can take >5min for large fact tables (store_sales: 2.8M rows)
+# SF1 loads need enough memory for large CTAS + HashJoins
+max_query_memory = "6GB"
+# SF1 CTAS loads can take >5min for large fact tables
 timeout_secs = 600
 
 [catalog]
 polaris_url = "http://localhost:18181/api/catalog"
 warehouse = "test_warehouse"
-
-[query]
-# Benchmarks load large dimension tables (e.g. customer_demographics: 1.9M rows)
-max_result_rows = 0
 
 [storage]
 s3_endpoint = "http://localhost:19000"

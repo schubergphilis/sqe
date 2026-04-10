@@ -13,6 +13,7 @@ pub struct TrinoBenchClient {
     base_url: String,
     username: Option<String>,
     password: Option<String>,
+    catalog: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -54,7 +55,14 @@ impl TrinoBenchClient {
             base_url,
             username: username.map(str::to_string),
             password: password.map(str::to_string),
+            catalog: None,
         }
+    }
+
+    /// Set the default Trino catalog for queries.
+    pub fn with_catalog(mut self, catalog: &str) -> Self {
+        self.catalog = Some(catalog.to_string());
+        self
     }
 
     /// Apply credentials to a request builder.
@@ -88,9 +96,12 @@ impl TrinoBenchClient {
 
         req = self.apply_auth(req);
 
-        // Add standard Trino protocol headers if we have a username.
+        // Add standard Trino protocol headers.
         if let Some(user) = &self.username {
             req = req.header("X-Trino-User", user);
+        }
+        if let Some(catalog) = &self.catalog {
+            req = req.header("X-Trino-Catalog", catalog);
         }
 
         // Execute the first request.
@@ -145,8 +156,6 @@ impl TrinoBenchClient {
             }
 
             // Stop if the query finished, even if `nextUri` is still present
-            // (defensive — the protocol says nextUri is absent on FINISHED,
-            // but we guard both conditions).
             if page.stats.state == "FINISHED" {
                 break;
             }

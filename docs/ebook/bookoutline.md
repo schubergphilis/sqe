@@ -60,6 +60,10 @@ Mar 27  — Distributed docker-compose: coordinator + 2 workers
 Mar 28  — Distributed execution wired into query pipeline
 Mar 29  — Concurrent client load test, schema projection fix
 Mar 30  — dbt hardening: file collision fix, 17 Trino function aliases, structured error codes
+Apr 07  — Distributed benchmarks: TPC-H 22/22, TPC-DS 98/99, 2.4x avg speedup
+Apr 08  — OSS release: Apache 2.0 license, AUDIT.md, v0.15.0
+Apr 09  — Trino compat blitz: 63% to 95% in one day (70+ UDFs, time travel, 6 metadata TVFs)
+Apr 10  — Streaming writes, sort order safety, IN-subquery rewrite, Trino comparison benchmarks
 ```
 
 Each chapter in this book connects to this journey. The callout boxes reference specific commits, articles, and experiences.
@@ -113,7 +117,7 @@ Features that turn a prototype into something teams trust with production data.
 
 | Ch | Title | Pages | Topics |
 |----|-------|-------|--------|
-| 7 | **The Write Path** | 25 | INSERT INTO, CTAS, MERGE, DELETE. Merge-on-Read with position deletes. DataFusion write providers. Iceberg commit protocol. Conflict resolution. Why compaction comes later. |
+| 7 | **The Write Path** | 28 | INSERT INTO, CTAS, MERGE, DELETE via Copy-on-Write (rewrite_files). Streaming writes: why `df.collect()` kills you at scale and how `df.execute_stream()` fixes it. Merge-on-Read with position deletes (PositionDeleteFileWriter + FastAppendAction auto-routing by DataContentType). The IN (subquery) workaround for UPDATE/DELETE. Iceberg commit protocol. Conflict resolution. Why compaction comes later. |
 | 8 | **What You Can't See Can't Hurt You** | 22 | Policy-as-plan-rewriting. Row filters injected above TableScan. Column masks that block predicate pushdown. The PostgreSQL RLS model applied to DataFusion LogicalPlans. OPA and Cedar as pluggable backends. The connection to Collibra Protect / governance platforms. |
 | 9 | **Observability Without Surprise** | 18 | Prometheus metrics on every query stage. OpenTelemetry traces from SQL parse to Arrow batch. Health endpoints. What to alert on. The dashboard that paged oncall at 3am. |
 | 10 | **Configuration Is the Product** | 22 | TOML config design. The move from hardcoded to fully configurable. Environment variable overlay. Feature toggles that aren't flags. The journey from "works on my machine" to "works in any environment". Twelve-Factor applied to a query engine. Plugin points: custom catalog, custom policy backend, custom auth provider. |
@@ -144,7 +148,7 @@ Shipping it. Running it. Keeping it running.
 | Ch | Title | Pages | Topics |
 |----|-------|-------|--------|
 | 15 | **Deploying Sovereignty** | 22 | Docker multi-stage build (2.3GB → 47MB). Helm chart: coordinator Deployment + worker StatefulSet. Rolling upgrades with zero query interruption. Resource requests that make sense. The Kubernetes topology for a sovereign engine. |
-| 16 | **Benchmarks Don't Lie (But They Mislead)** | 20 | TPC-H and TPC-DS on Iceberg. SQE vs Trino on same hardware. Where SQE wins (scan, auth overhead, column projection), where Trino wins (complex joins, shuffle). Why that's fine. The benchmark that mattered: 50 dbt models, nightly batch, wall-clock time. |
+| 16 | **Benchmarks Don't Lie (But They Mislead)** | 22 | TPC-H, TPC-DS, SSB, TPC-C, TPC-E, TPC-BB on Iceberg. SQE vs Trino on same hardware via `--compare-trino` flag (identical queries, same Polaris catalog, diff results). Where SQE wins (scan, auth overhead, cold start, memory). The sort order correctness trap: why trusting Iceberg sort metadata can silently corrupt results. The benchmark that mattered: 50 dbt models, nightly batch, wall-clock time. |
 | 17 | **What We'd Do Differently** | 22 | The AI-assisted build: honest assessment — what the AI did well (implementation, debugging, test generation), what it didn't (architecture, security trade-offs). The human reviewed every big turn. Decisions we'd change. What Rust taught us (including: compile times at scale are real). The open-source goal. Where this goes next. Build-vs-buy honest accounting. |
 
 **Art of Agents crossover:** Chapter 17 maps to *Use of Spies* (Ch 13: Feedback Loops) — the retrospective that closes the build cycle.
@@ -157,7 +161,7 @@ Shipping it. Running it. Keeping it running.
 |-----|-------|-------|---------|
 | A | **Crate Map** | 6 | All 10 crates, responsibilities, dependency graph, public API surface |
 | B | **Iceberg REST Catalog Comparison** | 8 | Polaris vs Unity vs Gravitino vs Nessie: features, auth models, deployment, Iceberg REST compliance |
-| C | **SQL Compatibility Matrix** | 6 | SQE vs Trino: what's supported, what's not, workarounds |
+| C | **SQL Compatibility Matrix** | 10 | SQE vs Trino: ~95% coverage across 13 categories. 70+ UDFs, engine-level features (USE, SHOW CREATE TABLE, TRUNCATE, TRY, time travel). The full `docs/trino-compatibility.md` with exact gap reasons. How we went from 63% to 95% in two days. |
 | D | **Flight SQL Client Cookbook** | 6 | Connection recipes for Python, Java, Go, Rust, DBeaver, dbt |
 | E | **The OpenSpec That Started It All** | 6 | The original proposal annotated with what changed and why |
 | F | **Art of Agents Quick Reference** | 3 | The Five Constants, Promote/Pivot/Compost, and how they applied |
@@ -172,8 +176,8 @@ The book is honest about what's built vs what's planned. Chapters cover both.
 |---------|--------|
 | Ch 0-2 (Why Build, Catalogs, Iceberg) | Written from experience — articles, experiments, decisions |
 | Ch 3-5 (DataFusion, Auth, Flight SQL) | **Implemented** — core engine works |
-| Ch 6 (Catalog/dbt) | **Partially implemented** — information_schema done, dbt adapter in progress |
-| Ch 7 (Write Path) | **Implemented** — INSERT, CTAS working |
+| Ch 6 (Catalog/dbt) | **Implemented** — information_schema, dbt-sqe adapter (table/view/incremental/seed), 6 metadata TVFs |
+| Ch 7 (Write Path) | **Implemented** — INSERT, CTAS (streaming), DELETE/UPDATE/MERGE (CoW + MoR), time travel, IN-subquery rewrite |
 | Ch 8 (Security/Policy) | **Implemented** — PolicyPlanRewriter, OPA backend, policy cache, SQL extensions |
 | Ch 9 (Observability) | **Implemented** — Prometheus + health endpoints |
 | Ch 10 (Configuration) | **Implemented** — TOML config, env overlay, trait-based plugin points |

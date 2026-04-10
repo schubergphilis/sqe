@@ -3,6 +3,8 @@ use std::sync::Arc;
 use arrow::compute::cast;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
+use datafusion::execution::SendableRecordBatchStream;
+use futures::StreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::spec::{DataFile, Schema as IcebergSchema};
 use iceberg::table::Table;
@@ -131,6 +133,123 @@ pub async fn write_data_files_with_metrics(
     }
 
     Ok(data_files)
+}
+
+/// Write data files from a [`SendableRecordBatchStream`] (streaming, constant memory).
+///
+/// Instead of buffering all batches in memory, writes each batch to the Parquet
+/// writer as it arrives from the DataFusion execution stream. This is critical
+/// for large CTAS / INSERT loads (millions of rows) where `df.collect()` would OOM.
+///
+/// The caller must supply the Iceberg schema upfront (from `df.schema()`) so the
+/// table can be created and the Parquet writer initialised before the first batch
+/// arrives. Field IDs and type casts are applied per-batch.
+///
+/// Returns `(data_files, total_rows)` on success.
+pub async fn write_data_files_streaming(
+    table: &Table,
+    mut stream: SendableRecordBatchStream,
+    file_prefix: &str,
+) -> sqe_core::Result<(Vec<DataFile>, usize)> {
+    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
+        .map_err(|e| SqeError::Execution(format!("Location generator error: {e}")))?;
+
+    let _ = file_prefix; // kept for parity with non-streaming API; not used in file names
+    let write_id = Uuid::now_v7();
+    let file_name_generator = DefaultFileNameGenerator::new(
+        format!("{write_id}"),
+        None,
+        iceberg::spec::DataFileFormat::Parquet,
+    );
+
+    let parquet_writer_builder = ParquetWriterBuilder::new(
+        WriterProperties::builder().build(),
+        table.metadata().current_schema().clone(),
+    );
+
+    let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_writer_builder,
+        table.file_io().clone(),
+        location_generator,
+        file_name_generator,
+    );
+
+    let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
+
+    let mut writer = data_file_writer_builder
+        .build(None)
+        .await
+        .map_err(|e| SqeError::Execution(format!("Failed to build data file writer: {e}")))?;
+
+    // Build the stamped schema once from the Iceberg schema so it can be reused
+    // for every batch without re-deriving it on each iteration.
+    let iceberg_schema = table.metadata().current_schema();
+    let stamped_schema = build_stamped_schema(iceberg_schema)?;
+
+    let mut total_rows = 0usize;
+
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result
+            .map_err(|e| SqeError::Execution(format!("Stream error: {e}")))?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let stamped = apply_stamped_schema(batch, &stamped_schema)?;
+        total_rows += stamped.num_rows();
+        writer
+            .write(stamped)
+            .await
+            .map_err(|e| SqeError::Execution(format!("Write error: {e}")))?;
+    }
+
+    if total_rows == 0 {
+        // No rows streamed — close the writer cleanly and return empty.
+        let _ = writer.close().await;
+        return Ok((vec![], 0));
+    }
+
+    let data_files = writer
+        .close()
+        .await
+        .map_err(|e| SqeError::Execution(format!("Close writer error: {e}")))?;
+
+    info!(
+        file_count = data_files.len(),
+        total_rows,
+        file_prefix,
+        "Data files written successfully (streaming)"
+    );
+
+    Ok((data_files, total_rows))
+}
+
+/// Write streaming data files and record S3 write metrics.
+///
+/// Delegates to [`write_data_files_streaming`] and, when `metrics` is provided,
+/// increments `sqe_s3_bytes_written_total` and `sqe_s3_requests_total{operation="put"}`.
+pub async fn write_data_files_streaming_with_metrics(
+    table: &Table,
+    stream: SendableRecordBatchStream,
+    file_prefix: &str,
+    metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
+) -> sqe_core::Result<(Vec<DataFile>, usize)> {
+    let (data_files, total_rows) =
+        write_data_files_streaming(table, stream, file_prefix).await?;
+
+    if let Some(m) = metrics {
+        let total_bytes: u64 = data_files.iter().map(|df| df.file_size_in_bytes()).sum();
+        let file_count = data_files.len() as u64;
+        if total_bytes > 0 {
+            m.s3_bytes_written_total.inc_by(total_bytes);
+        }
+        if file_count > 0 {
+            m.s3_requests_total
+                .with_label_values(&["put", "success"])
+                .inc_by(file_count);
+        }
+    }
+
+    Ok((data_files, total_rows))
 }
 
 /// Write position delete files for an Iceberg table.
@@ -296,4 +415,72 @@ fn stamp_field_ids(
                 .map_err(|e| SqeError::Execution(format!("Failed to stamp field IDs: {e}")))
         })
         .collect()
+}
+
+/// Build a stamped Arrow schema from an Iceberg schema.
+///
+/// Used by the streaming write path: derive the target schema once, then reuse
+/// it for every batch via [`apply_stamped_schema`]. Unlike [`stamp_field_ids`]
+/// this function does not require all batches to be present — it marks all
+/// columns as nullable (the safe default for Iceberg) and takes types from the
+/// Iceberg schema directly.
+fn build_stamped_schema(iceberg_schema: &IcebergSchema) -> sqe_core::Result<Arc<ArrowSchema>> {
+    let expected_arrow_schema =
+        schema_to_arrow_schema(iceberg_schema).map_err(|e| {
+            SqeError::Execution(format!("Failed to derive expected Arrow schema: {e}"))
+        })?;
+
+    let iceberg_fields = iceberg_schema.as_struct().fields();
+    let new_fields: Vec<Arc<arrow_schema::Field>> = expected_arrow_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, arrow_field)| {
+            let field_id = iceberg_fields
+                .get(i)
+                .map(|f| f.id)
+                .unwrap_or((i + 1) as i32);
+            let mut meta = arrow_field.metadata().clone();
+            meta.insert("PARQUET:field_id".to_string(), field_id.to_string());
+            // Mark all columns nullable — safe default; avoids cross-batch null scan.
+            Arc::new(
+                arrow_schema::Field::new(arrow_field.name(), arrow_field.data_type().clone(), true)
+                    .with_metadata(meta),
+            )
+        })
+        .collect();
+
+    Ok(Arc::new(ArrowSchema::new(new_fields)))
+}
+
+/// Apply a pre-built stamped schema to a single [`RecordBatch`].
+///
+/// Casts columns whose type differs from the target schema (e.g. Timestamp(ns)
+/// → Timestamp(µs)) and re-wraps the batch with the stamped schema.
+fn apply_stamped_schema(
+    batch: RecordBatch,
+    stamped_schema: &Arc<ArrowSchema>,
+) -> sqe_core::Result<RecordBatch> {
+    let new_columns: Result<Vec<_>, _> = batch
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(i, col)| {
+            let target = stamped_schema.field(i).data_type();
+            if col.data_type() == target {
+                Ok(col.clone())
+            } else {
+                cast(col, target).map_err(|e| {
+                    SqeError::Execution(format!(
+                        "Failed to cast column '{}' from {:?} to {:?}: {e}",
+                        stamped_schema.field(i).name(),
+                        col.data_type(),
+                        target,
+                    ))
+                })
+            }
+        })
+        .collect();
+    RecordBatch::try_new(stamped_schema.clone(), new_columns?)
+        .map_err(|e| SqeError::Execution(format!("Failed to apply stamped schema: {e}")))
 }

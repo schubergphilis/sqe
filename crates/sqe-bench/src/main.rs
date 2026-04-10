@@ -142,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
                 &trino_url,
                 Some(&trino_user),
                 None,
-            );
+            ).with_catalog("iceberg");
 
             comparison::run_comparison(
                 &benchmark,
