@@ -333,6 +333,8 @@ for BENCH in "${BENCHMARKS[@]}"; do
             --scale "$BENCH_SCALE" \
             --sqe-host "$BENCH_HOST" \
             --sqe-port "$BENCH_PORT_FLIGHT" \
+            --sqe-username "$SQE_USERNAME" \
+            --sqe-password "${SQE_PASSWORD:-}" \
             --trino-url "http://localhost:${TRINO_PORT}" \
             --trino-user admin \
             --output "benchmarks/results" 2>&1 || {
