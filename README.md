@@ -183,7 +183,10 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 - [x] ALTER TABLE schema evolution (ADD/DROP/RENAME COLUMN, SET/DROP NOT NULL, type widening)
 - [x] Trino SQL compatibility matrix (`docs/trino-compatibility.md`)
 - [x] Side-by-side benchmark tooling (`sqe-bench compare`)
-- [x] Streaming CTAS and INSERT INTO (constant-memory write path — `df.execute_stream()` instead of `df.collect()`, eliminates OOM on SF1+ loads)
+- [x] Streaming CTAS and INSERT INTO (constant-memory write path, eliminates OOM on SF1+ loads)
+- [x] Auto-rewrite `IN (subquery)` for UPDATE/DELETE (DataFusion physical planner workaround, unblocks 5 TPC-E queries)
+- [x] Safe Iceberg sort order handling (only partition columns trusted by default, `trust_sort_order` config for opt-in)
+- [x] Trino comparison benchmarks (`--compare-trino` flag runs identical queries against SQE + Trino, diffs results)
 - [ ] Semantic AI layer (RDF/SPARQL, property graph/GQL, vector search, agent interfaces)
 - [ ] Helm chart for Kubernetes deployment
 

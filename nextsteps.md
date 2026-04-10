@@ -198,6 +198,7 @@ Step 8: Trino parity        ✅ DONE (compatibility matrix, sqe-bench compare, c
 Step 8b: Trino UDF blitz    ✅ DONE (70+ UDFs + engine features — ~95% SQL coverage)
 Step 8c: Iceberg time travel ✅ DONE (FOR SYSTEM_TIME AS OF + 6 metadata TVFs + COMMENT ON + SHOW STATS)
 Step 8d: MoR DELETE path    ✅ DONE (PositionDeleteFileWriter + FastAppendAction, alongside existing CoW)
+Step 9: streaming + perf    ✅ DONE (streaming CTAS/INSERT, IN-subquery rewrite, safe sort order, --compare-trino benchmarks)
 Step 5: pluggable catalogs  (AWS Glue, Nessie, Hive Metastore, storage-only, Delta Lake) ← NEXT
 Step 6: semantic layer      (new crates; fully additive; no existing code broken)
 ```
