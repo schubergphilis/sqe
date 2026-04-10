@@ -187,25 +187,21 @@ TRINOEOF
         echo -n "."
         sleep 2
     done
-    # Wait for Trino's Iceberg catalog to actually respond (not just HTTP)
+    # Wait for Trino's Iceberg catalog to fully initialize.
+    # The /v1/info endpoint returns ready before the catalog connector finishes.
+    # Use trino-cli for a reliable end-to-end check.
     echo -n "  Waiting for Trino catalog..."
-    for i in $(seq 1 60); do
-        SCHEMAS=$(curl -s -X POST "http://localhost:${TRINO_PORT}/v1/statement" \
-            -H "X-Trino-User: admin" -H "X-Trino-Catalog: iceberg" \
-            -H "Content-Type: text/plain" -d "SHOW SCHEMAS" 2>/dev/null)
-        # Follow one nextUri if QUEUED
-        NEXT=$(echo "$SCHEMAS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('nextUri',''))" 2>/dev/null)
-        if [ -n "$NEXT" ]; then
-            sleep 1
-            SCHEMAS=$(curl -s "$NEXT" -H "X-Trino-User: admin" 2>/dev/null)
-        fi
-        HAS_DATA=$(echo "$SCHEMAS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('data',[])) if d.get('data') else 0)" 2>/dev/null)
-        if [ "${HAS_DATA:-0}" -gt 0 ]; then
-            echo " ready ($HAS_DATA schemas)"
+    for i in $(seq 1 30); do
+        RESULT=$(trino --server "http://localhost:${TRINO_PORT}" --user admin \
+            --catalog iceberg --execute "SHOW SCHEMAS" \
+            --output-format CSV_UNQUOTED 2>/dev/null | head -1)
+        if [ -n "$RESULT" ]; then
+            echo " ready"
             break
         fi
-        if [ "$i" -eq 60 ]; then echo " TIMEOUT (catalog may not be ready)"; fi
-        sleep 2
+        if [ "$i" -eq 30 ]; then echo " TIMEOUT"; fi
+        echo -n "."
+        sleep 3
     done
     echo "  Trino ${TRINO_IMAGE} on port ${TRINO_PORT}"
 fi
