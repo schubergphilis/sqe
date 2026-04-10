@@ -189,13 +189,36 @@ impl SessionCatalog {
         // RisingWave fork uses CatalogBuilder::load(name, props) pattern.
         // Storage factory (OpenDAL S3) is configured automatically from the s3.*
         // properties in the props HashMap — no explicit with_storage_factory() needed.
-        let catalog = RestCatalogBuilder::default()
-            .load(
-                format!("sqe-session-{}", &token_fingerprint),
-                props,
-            )
-            .await
-            .map_err(|e| SqeError::Catalog(format!("Failed to create REST catalog: {e}")))?;
+        //
+        // Cache RestCatalog instances by token fingerprint to avoid the expensive
+        // (~250ms) per-query creation cost. The catalog is safe to reuse because
+        // iceberg-rust's RestCatalog is stateless (each loadTable call goes to Polaris).
+        static REST_CATALOG_CACHE: std::sync::LazyLock<
+            moka::future::Cache<String, Arc<RwLock<RestCatalog>>>
+        > = std::sync::LazyLock::new(|| {
+            moka::future::Cache::builder()
+                .max_capacity(100)
+                .time_to_live(std::time::Duration::from_secs(300)) // 5 min
+                .build()
+        });
+
+        let catalog_key = format!("{}-{}", polaris_url, token_fingerprint);
+        let inner = if let Some(cached) = REST_CATALOG_CACHE.get(&catalog_key).await {
+            debug!(token_fingerprint = %token_fingerprint, "REST catalog cache hit");
+            cached
+        } else {
+            debug!(token_fingerprint = %token_fingerprint, "REST catalog cache miss, creating");
+            let catalog = RestCatalogBuilder::default()
+                .load(
+                    format!("sqe-session-{}", &token_fingerprint),
+                    props,
+                )
+                .await
+                .map_err(|e| SqeError::Catalog(format!("Failed to create REST catalog: {e}")))?;
+            let arc_catalog = Arc::new(RwLock::new(catalog));
+            REST_CATALOG_CACHE.insert(catalog_key, arc_catalog.clone()).await;
+            arc_catalog
+        };
 
         let http_client = http_client.unwrap_or_default();
         let circuit_breaker = circuit_breaker.unwrap_or_else(|| {
@@ -212,7 +235,7 @@ impl SessionCatalog {
         let table_cache = table_cache.unwrap_or_else(|| TableMetadataCache::new(0));
 
         Ok(Self {
-            inner: Arc::new(RwLock::new(catalog)),
+            inner,
             polaris_url: polaris_url.to_string(),
             warehouse: warehouse.to_string(),
             bearer_token: bearer_token.to_string(),
