@@ -187,22 +187,10 @@ TRINOEOF
         echo -n "."
         sleep 2
     done
-    # Wait for Trino's Iceberg catalog to fully initialize.
-    # The /v1/info endpoint returns ready before the catalog connector finishes.
-    # Use trino-cli for a reliable end-to-end check.
-    echo -n "  Waiting for Trino catalog..."
-    for i in $(seq 1 30); do
-        RESULT=$(trino --server "http://localhost:${TRINO_PORT}" --user admin \
-            --catalog iceberg --execute "SHOW SCHEMAS" \
-            --output-format CSV_UNQUOTED 2>/dev/null | head -1)
-        if [ -n "$RESULT" ]; then
-            echo " ready"
-            break
-        fi
-        if [ "$i" -eq 30 ]; then echo " TIMEOUT"; fi
-        echo -n "."
-        sleep 3
-    done
+    # Wait for Trino's Iceberg catalog to fully initialize (needs ~15-20s after HTTP ready)
+    echo -n "  Waiting for Trino catalog (20s)..."
+    sleep 20
+    echo " done"
     echo "  Trino ${TRINO_IMAGE} on port ${TRINO_PORT}"
 fi
 
