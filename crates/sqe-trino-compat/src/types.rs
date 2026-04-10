@@ -98,9 +98,24 @@ pub fn arrow_value_to_json(
         DataType::Float64 => {
             let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
             let v = arr.value(row);
-            // Match Trino formatting: DOUBLE always has decimal point (300.0, 4.0)
-            // serde_json preserves this for whole numbers
-            serde_json::json!(v)
+            // Match Trino's DOUBLE formatting: Java's Double.toString() uses
+            // scientific notation for abs(v) >= 1e7 or abs(v) < 1e-3 (except 0).
+            // JSON allows 1.23E8 as a valid number literal.
+            // serde_json uses decimal notation; we override for Trino compat.
+            let abs_v = v.abs();
+            if !v.is_finite() {
+                serde_json::json!(v)
+            } else if v == 0.0 || (abs_v >= 1e-3 && abs_v < 1e7) {
+                // Normal range: decimal notation (3.14, 1000.0)
+                serde_json::json!(v)
+            } else {
+                // Large/small values: scientific notation to match Trino
+                // serde_json::Number doesn't support E notation directly,
+                // so we use a raw JSON value via from_str
+                let formatted = format!("{:E}", v);
+                serde_json::from_str::<serde_json::Value>(&formatted)
+                    .unwrap_or_else(|_| serde_json::json!(v))
+            }
         }
         DataType::Utf8 => {
             let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
