@@ -53,12 +53,54 @@ impl IcebergScanExec {
     }
 
     pub fn new_with_filters_and_metrics(table: Table, projected_schema: SchemaRef, projection: Option<Vec<String>>, predicates: Option<Predicate>, df_filters: Vec<Expr>, prom_metrics: Option<Arc<sqe_metrics::MetricsRegistry>>) -> Self {
-        // Detect sort order from Iceberg metadata and set EquivalenceProperties
+        // Sort order from Iceberg metadata.
+        //
+        // IMPORTANT: Iceberg sort order is a HINT about how files should be
+        // written, NOT a guarantee that existing data files are sorted. Writers
+        // (Spark, Trino, SQE CTAS) may not enforce sort order. Declaring
+        // pre-sorted data when it isn't causes incorrect query results
+        // (DataFusion skips the sort and uses SortPreservingMergeExec).
+        //
+        // We only declare sort order for identity-transform partition columns,
+        // which ARE guaranteed to be clustered by Iceberg's file organization.
+        // Non-partition sort columns emit a warning and are ignored.
         let eq_props = {
             let sort_order = table.metadata().default_sort_order();
             let iceberg_schema = table.metadata().current_schema();
+            let partition_cols = {
+                use iceberg::spec::Transform;
+                let spec = table.metadata().default_partition_spec();
+                spec.fields()
+                    .iter()
+                    .filter(|f| f.transform == Transform::Identity)
+                    .filter_map(|f| iceberg_schema.field_by_id(f.source_id).map(|sf| sf.name.clone()))
+                    .collect::<std::collections::HashSet<_>>()
+            };
+
             match crate::sort_order::iceberg_sort_to_physical(sort_order, iceberg_schema, &projected_schema) {
-                Some(sort_exprs) => crate::sort_order::equivalence_with_sort(projected_schema.clone(), sort_exprs),
+                Some(sort_exprs) => {
+                    // Only keep sort expressions for partition columns
+                    let safe_exprs: Vec<_> = sort_exprs.into_iter().filter(|expr| {
+                        let col_name = expr.expr.to_string();
+                        if partition_cols.contains(&col_name) {
+                            true
+                        } else {
+                            warn!(
+                                table = %table.identifier(),
+                                column = %col_name,
+                                "Ignoring non-partition sort order -- data may not be physically sorted. \
+                                 Use ORDER BY explicitly for correctness."
+                            );
+                            false
+                        }
+                    }).collect();
+
+                    if safe_exprs.is_empty() {
+                        EquivalenceProperties::new(projected_schema.clone())
+                    } else {
+                        crate::sort_order::equivalence_with_sort(projected_schema.clone(), safe_exprs)
+                    }
+                }
                 None => EquivalenceProperties::new(projected_schema.clone()),
             }
         };
