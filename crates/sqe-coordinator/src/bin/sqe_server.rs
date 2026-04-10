@@ -465,6 +465,15 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         "Initialized global Iceberg manifest cache"
     );
 
+    // Build the global table metadata cache (shared across all sessions and queries).
+    // Table metadata is user-independent — schema, partitions, and snapshots are the
+    // same regardless of who queries. The cache is invalidated on DDL/DML operations.
+    let table_cache = sqe_catalog::TableMetadataCache::new(config.catalog.metadata_cache_ttl_secs);
+    tracing::info!(
+        metadata_cache_ttl_secs = config.catalog.metadata_cache_ttl_secs,
+        "Initialized global table metadata cache (shared across all sessions)"
+    );
+
     // Query handler
     let query_handler = Arc::new(QueryHandler::new(
         policy_enforcer,
@@ -484,7 +493,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         Some(audit.clone()),
         query_tracker,
         query_cache,
-    ).with_manifest_cache(manifest_cache));
+    ).with_manifest_cache(manifest_cache).with_table_cache(table_cache));
 
     // Spawn background memory metrics reporter (updates gauges every 1s for Grafana)
     sqe_coordinator::memory::spawn_metrics_reporter(

@@ -65,6 +65,9 @@ pub struct QueryHandler {
     /// Optional shared manifest file cache. Passed to every session context so
     /// that warm queries avoid re-fetching immutable Iceberg manifest files from S3.
     manifest_cache: Option<sqe_catalog::ManifestCache>,
+    /// Shared global table metadata cache. Persists across sessions and queries so
+    /// that repeated `load_table()` calls skip the Polaris REST round-trip.
+    table_cache: Option<sqe_catalog::TableMetadataCache>,
 }
 
 impl QueryHandler {
@@ -113,6 +116,7 @@ impl QueryHandler {
             query_semaphore,
             runtime,
             manifest_cache: None,
+            table_cache: None,
         }
     }
 
@@ -123,6 +127,22 @@ impl QueryHandler {
     /// shared `ManifestCache` instance.
     pub fn with_manifest_cache(mut self, cache: sqe_catalog::ManifestCache) -> Self {
         self.manifest_cache = Some(cache);
+        self
+    }
+
+    /// Attach a global table metadata cache shared across all sessions and queries.
+    ///
+    /// The cache is created once at coordinator startup and passed here so that
+    /// every `SessionCatalog` constructed during query execution shares the same
+    /// backing store. This eliminates the per-query Polaris REST round-trip for
+    /// tables that have already been loaded within the TTL window.
+    ///
+    /// Propagates the cache into the sub-handlers (`CatalogOps`, `WriteHandler`)
+    /// so that DDL and write paths also share the same global cache.
+    pub fn with_table_cache(mut self, cache: sqe_catalog::TableMetadataCache) -> Self {
+        self.catalog_ops = self.catalog_ops.with_table_cache(cache.clone());
+        self.write_handler = self.write_handler.with_table_cache(cache.clone());
+        self.table_cache = Some(cache);
         self
     }
 
@@ -1058,6 +1078,7 @@ impl QueryHandler {
             Some(&self.runtime),
             self.metrics.as_ref(),
             self.manifest_cache.as_ref(),
+            self.table_cache.as_ref(),
         )
         .await
     }
@@ -1185,7 +1206,7 @@ impl QueryHandler {
             &self.config.catalog.warehouse,
             &session.access_token,
             &self.config.storage,
-            self.config.catalog.metadata_cache_ttl_secs,
+            self.table_cache.clone(),
             None, None,
         )
         .await?;
@@ -1223,7 +1244,7 @@ impl QueryHandler {
             &self.config.catalog.warehouse,
             &session.access_token,
             &self.config.storage,
-            self.config.catalog.metadata_cache_ttl_secs,
+            self.table_cache.clone(),
             None, None,
         )
         .await?;
@@ -1606,7 +1627,7 @@ impl QueryHandler {
                 &self.config.catalog.warehouse,
                 &session.access_token,
                 &self.config.storage,
-                self.config.catalog.metadata_cache_ttl_secs,
+                self.table_cache.clone(),
                 None, None,
             )
             .await?,

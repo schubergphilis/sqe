@@ -15,6 +15,58 @@ use sqe_metrics::propagation::trace_context_http_headers;
 
 use crate::circuit_breaker::CircuitBreaker;
 
+/// Global table metadata cache shared across all sessions.
+///
+/// Table metadata (schema, partitions, snapshots) is user-independent — the same
+/// table has the same structure regardless of which user queries it. User-level
+/// authorization is enforced by Polaris at load time; we cache the result here
+/// so subsequent queries within the TTL window skip the REST round-trip entirely.
+///
+/// The cache is created once at coordinator startup and passed into every
+/// `SessionCatalog` via [`SessionCatalog::new`]. Each session falls through to
+/// Polaris on a miss and populates the shared cache on success.
+///
+/// Use [`TableMetadataCache::invalidate`] after any DDL/DML that changes table
+/// structure (DROP TABLE, ALTER TABLE, INSERT, MERGE, DELETE).
+#[derive(Clone)]
+pub struct TableMetadataCache {
+    inner: MokaCache<String, Table>,
+}
+
+impl TableMetadataCache {
+    /// Create a global table metadata cache with the given TTL.
+    ///
+    /// Pass `ttl_secs = 0` to disable the cache (entries are never stored).
+    pub fn new(ttl_secs: u64) -> Self {
+        let inner = if ttl_secs == 0 {
+            MokaCache::builder().max_capacity(0).build()
+        } else {
+            MokaCache::builder()
+                .max_capacity(1000)
+                .time_to_live(std::time::Duration::from_secs(ttl_secs))
+                .build()
+        };
+        Self { inner }
+    }
+
+    pub async fn get(&self, key: &str) -> Option<Table> {
+        self.inner.get(key).await
+    }
+
+    pub async fn insert(&self, key: String, table: Table) {
+        self.inner.insert(key, table).await;
+    }
+
+    pub async fn invalidate(&self, key: &str) {
+        self.inner.invalidate(key).await;
+    }
+
+    /// Number of entries currently held in the cache.
+    pub fn entry_count(&self) -> u64 {
+        self.inner.entry_count()
+    }
+}
+
 /// Per-session Iceberg REST catalog wrapper.
 ///
 /// Each authenticated user session gets its own `SessionCatalog` instance
@@ -37,12 +89,15 @@ pub struct SessionCatalog {
     http_client: reqwest::Client,
     /// Shared circuit breaker for Polaris REST calls.
     circuit_breaker: Arc<CircuitBreaker>,
-    /// In-memory cache for loaded `Table` objects, keyed by `"namespace.table_name"`.
+    /// Shared table metadata cache.
     ///
-    /// Avoids a Polaris REST round-trip on repeated `load_table()` calls within
-    /// the TTL window. Invalidated on DDL/DML operations (drop, create, schema update).
-    /// TTL is configured via `CatalogConfig::metadata_cache_ttl_secs` (default 30 s).
-    table_cache: MokaCache<String, Table>,
+    /// When a global `TableMetadataCache` is provided at construction time it is
+    /// used directly (shared across all sessions). Otherwise a private per-session
+    /// cache is created as a fallback (used in tests / when the caller passes `None`).
+    ///
+    /// Cache is keyed by `"namespace.table_name"`. TTL and capacity are configured
+    /// when the global cache is created (see `TableMetadataCache::new`).
+    table_cache: TableMetadataCache,
 }
 
 impl std::fmt::Debug for SessionCatalog {
@@ -70,15 +125,15 @@ impl SessionCatalog {
     /// once at startup) so that TCP connections and failure state are pooled globally.
     /// Pass `None` for either to fall back to per-instance defaults (suitable for tests).
     ///
-    /// `metadata_cache_ttl_secs` controls how long a loaded `Table` object is kept in the
-    /// per-session in-memory cache before the next `load_table()` call goes to Polaris.
-    /// Pass `0` to disable the cache.
+    /// `table_cache` is the shared global `TableMetadataCache` created once at coordinator
+    /// startup. When `Some`, all sessions share the same cache so cache misses are amortised
+    /// across users. When `None` a private cache is built locally (used in tests).
     pub async fn new(
         polaris_url: &str,
         warehouse: &str,
         bearer_token: &str,
         storage_config: &StorageConfig,
-        metadata_cache_ttl_secs: u64,
+        table_cache: Option<TableMetadataCache>,
         http_client: Option<reqwest::Client>,
         circuit_breaker: Option<Arc<CircuitBreaker>>,
     ) -> sqe_core::Result<Self> {
@@ -151,16 +206,10 @@ impl SessionCatalog {
             ))
         });
 
-        // Build the table metadata cache. A TTL of 0 means "disabled": we set
-        // max_capacity to 0 so that moka never stores anything.
-        let table_cache = if metadata_cache_ttl_secs == 0 {
-            MokaCache::builder().max_capacity(0).build()
-        } else {
-            MokaCache::builder()
-                .max_capacity(1000)
-                .time_to_live(std::time::Duration::from_secs(metadata_cache_ttl_secs))
-                .build()
-        };
+        // Use the shared global cache when provided; fall back to a private
+        // per-session cache (disabled — max_capacity 0) so that call sites that
+        // pass `None` (tests, one-shot DDL helpers) don't pollute a global state.
+        let table_cache = table_cache.unwrap_or_else(|| TableMetadataCache::new(0));
 
         Ok(Self {
             inner: Arc::new(RwLock::new(catalog)),
@@ -264,8 +313,8 @@ impl SessionCatalog {
     /// The returned `Table` includes metadata and a FileIO configured with
     /// vended credentials (if Polaris provides them) or static S3 config.
     ///
-    /// Results are cached for `metadata_cache_ttl_secs` seconds (configured at
-    /// construction time). Use [`invalidate_table`] to evict an entry after DDL/DML.
+    /// Results are cached in the shared global `TableMetadataCache` (passed at construction
+    /// time). Use [`invalidate_table`] to evict an entry after DDL/DML.
     #[instrument(skip(self), fields(table = %table_ident, warehouse = %self.warehouse))]
     pub async fn load_table(&self, table_ident: &TableIdent) -> sqe_core::Result<Table> {
         let cache_key = format!("{}.{}", table_ident.namespace(), table_ident.name());
