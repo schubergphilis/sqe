@@ -156,8 +156,6 @@ impl TrinoBenchClient {
             }
 
             // Stop if the query finished, even if `nextUri` is still present
-            // (defensive — the protocol says nextUri is absent on FINISHED,
-            // but we guard both conditions).
             if page.stats.state == "FINISHED" {
                 break;
             }
