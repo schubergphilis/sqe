@@ -46,7 +46,12 @@ pub async fn run_comparison(
             .to_string_lossy()
             .trim_end_matches(".sql")
             .to_string();
-        let sql = std::fs::read_to_string(entry.path())?;
+        let raw_sql = std::fs::read_to_string(entry.path())?;
+
+        // Qualify bare table names with the benchmark namespace
+        // (same as sqe-bench test does via prefix_tables)
+        let namespace = crate::bench_namespace(benchmark, scale);
+        let sql = crate::test::prefix_tables(&raw_sql, &namespace, benchmark);
 
         info!("  {} ...", query_name);
 
