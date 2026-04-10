@@ -35,6 +35,8 @@ pub struct SqeTableProvider {
     prom_metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
     /// Optional snapshot ID for time travel queries.
     snapshot_id: Option<i64>,
+    /// Trust Iceberg sort order for all columns (not just partition keys).
+    trust_sort_order: bool,
 }
 
 impl SqeTableProvider {
@@ -56,6 +58,7 @@ impl SqeTableProvider {
             table,
             schema: Arc::new(schema),
             prom_metrics: None,
+            trust_sort_order: false,
             snapshot_id: None,
         })
     }
@@ -69,6 +72,13 @@ impl SqeTableProvider {
     /// Pin this provider to a specific Iceberg snapshot for time travel queries.
     pub fn with_snapshot_id(mut self, snapshot_id: i64) -> Self {
         self.snapshot_id = Some(snapshot_id);
+        self
+    }
+
+    /// Trust Iceberg sort order for all columns, not just partition keys.
+    /// Only enable when data files are known to be physically sorted.
+    pub fn with_trust_sort_order(mut self, trust: bool) -> Self {
+        self.trust_sort_order = trust;
         self
     }
 
@@ -158,6 +168,9 @@ impl TableProvider for SqeTableProvider {
         );
         if let Some(sid) = self.snapshot_id {
             exec = exec.with_snapshot_id(sid);
+        }
+        if self.trust_sort_order {
+            exec = exec.with_trust_sort_order(true);
         }
         Ok(Arc::new(exec))
     }
