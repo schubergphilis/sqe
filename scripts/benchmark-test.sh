@@ -363,13 +363,15 @@ REFRESHEOF
                 sleep 2
             done
             # Wait for Trino's Iceberg catalog connector to fully initialize.
-            # The /v1/info endpoint returns "starting":false before the catalog is ready.
+            # Use curl against v1/statement (not trino-cli which has Java startup overhead).
             echo -n "  Waiting for Trino catalog..."
-            for i in $(seq 1 30); do
-                RESULT=$(trino --server "http://localhost:${TRINO_PORT}" --user admin --catalog iceberg \
-                    --execute "SHOW SCHEMAS" --output-format CSV_UNQUOTED 2>/dev/null | head -1)
-                if [ -n "$RESULT" ]; then echo " catalog ready"; break; fi
-                if [ "$i" -eq 30 ]; then echo " TIMEOUT (catalog may not be ready)"; fi
+            for i in $(seq 1 60); do
+                TRINO_RESULT=$(curl -s -X POST "http://localhost:${TRINO_PORT}/v1/statement" \
+                    -H "X-Trino-User: admin" -H "X-Trino-Catalog: iceberg" \
+                    -H "Content-Type: text/plain" -d "SHOW SCHEMAS" 2>/dev/null \
+                    | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('data',[])) if d.get('data') else 0)" 2>/dev/null)
+                if [ "${TRINO_RESULT:-0}" -gt 0 ]; then echo " catalog ready ($TRINO_RESULT schemas)"; break; fi
+                if [ "$i" -eq 60 ]; then echo " TIMEOUT"; fi
                 sleep 2
             done
         fi
