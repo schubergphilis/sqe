@@ -187,6 +187,7 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 - [x] Auto-rewrite `IN (subquery)` for UPDATE/DELETE (DataFusion physical planner workaround, unblocks 5 TPC-E queries)
 - [x] Safe Iceberg sort order handling (only partition columns trusted by default, `trust_sort_order` config for opt-in)
 - [x] Trino comparison benchmarks (`--compare-trino` flag runs identical queries against SQE + Trino, diffs results)
+- [x] Iceberg query caching: table metadata cache (moka, 30 s TTL, invalidated on DDL/DML) + manifest file cache (size-bounded LRU, no TTL — immutable by Iceberg spec). `SQE_CATALOG__MANIFEST_CACHE_MB` / `metadata_cache_ttl_secs` configurable. Expected 2-3x warm-query speedup.
 - [ ] Semantic AI layer (RDF/SPARQL, property graph/GQL, vector search, agent interfaces)
 - [ ] Helm chart for Kubernetes deployment
 

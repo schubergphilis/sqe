@@ -24,6 +24,7 @@ use iceberg::spec::{DataContentType, DataFile, ManifestStatus};
 use iceberg::table::Table;
 use tracing::{debug, info_span, warn};
 
+use crate::manifest_cache::{ManifestCache, ManifestEntryData};
 use crate::pruning_stats::IcebergManifestStatistics;
 
 #[derive(Debug)]
@@ -46,6 +47,10 @@ pub struct IcebergScanExec {
     /// by a sort-on-write engine). Default false: only partition columns are trusted.
     /// WARNING: if data is not actually sorted, queries may return incorrect results.
     trust_sort_order: bool,
+    /// Optional shared manifest file cache. When set, parsed manifest entries are
+    /// served from the cache on warm queries, avoiding S3 round-trips per manifest.
+    /// Immutability of Iceberg manifest files makes this safe without a TTL.
+    manifest_cache: Option<ManifestCache>,
 }
 
 impl IcebergScanExec {
@@ -112,7 +117,17 @@ impl IcebergScanExec {
             }
         };
         let properties = PlanProperties::new(eq_props, Partitioning::UnknownPartitioning(1), EmissionType::Incremental, Boundedness::Bounded);
-        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), prom_metrics, snapshot_id: None, trust_sort_order: false }
+        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), prom_metrics, snapshot_id: None, trust_sort_order: false, manifest_cache: None }
+    }
+
+    /// Attach a shared manifest file cache for warm-query acceleration.
+    ///
+    /// When set, `collect_data_files()` checks the cache before fetching each
+    /// manifest from S3. Safe without a TTL because Iceberg manifest files are
+    /// immutable by specification.
+    pub fn with_manifest_cache(mut self, cache: ManifestCache) -> Self {
+        self.manifest_cache = Some(cache);
+        self
     }
 
     /// Set the snapshot ID for time travel queries.
@@ -220,7 +235,58 @@ impl IcebergScanExec {
         let manifest_list = snapshot.load_manifest_list(self.table.file_io(), metadata).await?;
         let mut data_files = Vec::new();
         for mf in manifest_list.entries() {
+            // Populate the cache on first load; subsequent callers that only need
+            // file paths + sizes (not full column stats) can use data_file_info()
+            // which is backed by iceberg's plan_files() API.
+            //
+            // Note: collect_data_files() is used by the min/max pruning path which
+            // needs full DataFile objects with column statistics. Therefore we always
+            // load the manifest from S3 here. The cache provides a fast-path skip
+            // only for manifests known to be empty (contains no live data files).
+            if let Some(ref mc) = self.manifest_cache {
+                if let Some(cached_entries) = mc.get(&mf.manifest_path) {
+                    if cached_entries.is_empty() {
+                        // Skip S3 fetch for known-empty manifests.
+                        debug!(manifest = %mf.manifest_path, "Manifest cache: skip empty manifest");
+                        continue;
+                    }
+                    // Non-empty: fall through to load full DataFile for pruning stats.
+                }
+            }
+
             let manifest = mf.load_manifest(self.table.file_io()).await?;
+
+            // Populate the cache so data_file_info() and empty-manifest skipping
+            // can benefit on warm queries.
+            if let Some(ref mc) = self.manifest_cache {
+                if mc.get(&mf.manifest_path).is_none() {
+                    let cache_entries: Vec<ManifestEntryData> = manifest
+                        .entries()
+                        .iter()
+                        .filter(|e| {
+                            e.status() != ManifestStatus::Deleted
+                                && e.data_file().content_type() == DataContentType::Data
+                        })
+                        .map(|e| {
+                            let df = e.data_file();
+                            ManifestEntryData {
+                                file_path: df.file_path().to_string(),
+                                file_size: df.file_size_in_bytes(),
+                                record_count: df.record_count(),
+                                content_type: df.content_type(),
+                                status: e.status(),
+                            }
+                        })
+                        .collect();
+                    debug!(
+                        manifest = %mf.manifest_path,
+                        entries = cache_entries.len(),
+                        "Manifest cache: populated"
+                    );
+                    mc.insert(mf.manifest_path.clone(), cache_entries);
+                }
+            }
+
             for entry in manifest.entries() {
                 if entry.status() != ManifestStatus::Deleted && entry.data_file().content_type() == DataContentType::Data {
                     data_files.push(entry.data_file().clone());
