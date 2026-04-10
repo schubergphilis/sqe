@@ -19,13 +19,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Configuration
-SQE_HOST="${SQE_HOST:-http://localhost:8080}"
+# Configuration -- defaults to test stack (no OPA, simple auth)
+SQE_HOST="${SQE_HOST:-http://localhost:28080}"
+SQE_CATALOG="${SQE_CATALOG:-test_warehouse}"
 TRINO_HOST="${TRINO_HOST:-http://localhost:38080}"
 TRINO_USER="${TRINO_USER:-admin}"
-CATALOG="${CATALOG:-main_warehouse}"
-SCHEMA="${SCHEMA:-analytics_db}"
-KEYCLOAK_URL="${KEYCLOAK_URL:-}"  # auto-detect from SQE container
+TRINO_CATALOG="${TRINO_CATALOG:-iceberg}"
+SCHEMA="${SCHEMA:-default}"
 
 # Colors
 RED='\033[0;31m'
@@ -46,11 +46,19 @@ get_sqe_token() {
     if [ -n "${SQE_TOKEN:-}" ]; then return; fi
 
     echo -n "Getting SQE auth token... "
-    SQE_TOKEN=$(docker exec sqe-sqe-1 sh -c \
-        'curl -s -X POST "http://keycloak:8080/realms/iceberg/protocol/openid-connect/token" \
-         -H "Content-Type: application/x-www-form-urlencoded" \
-         -d "grant_type=password&client_id=polaris-frontend-client&username=root&password=root123"' \
-        | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+    # Try test stack Polaris OAuth (simple, no Keycloak)
+    SQE_TOKEN=$(curl -sf -X POST "http://localhost:18181/api/catalog/v1/oauth/tokens" \
+        -d "grant_type=client_credentials&client_id=root&client_secret=s3cr3t&scope=PRINCIPAL_ROLE:ALL" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])" 2>/dev/null)
+
+    if [ -z "$SQE_TOKEN" ]; then
+        # Fallback: Keycloak token from live stack
+        SQE_TOKEN=$(docker exec sqe-sqe-1 sh -c \
+            'curl -s -X POST "http://keycloak:8080/realms/iceberg/protocol/openid-connect/token" \
+             -H "Content-Type: application/x-www-form-urlencoded" \
+             -d "grant_type=password&client_id=polaris-frontend-client&username=root&password=root123"' \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+    fi
     echo "done (${#SQE_TOKEN} chars)"
 }
 
@@ -60,9 +68,9 @@ get_sqe_token() {
 sqe_query() {
     local sql="$1"
     local result=$(curl -s -X POST "$SQE_HOST/v1/statement" \
-        -H "Authorization: Bearer $SQE_TOKEN" \
-        -H "X-Trino-User: root" \
-        -H "X-Trino-Catalog: $CATALOG" \
+        -u "${SQE_USER:-root}:${SQE_PASS:-s3cr3t}" \
+        -H "X-Trino-User: ${SQE_USER:-root}" \
+        -H "X-Trino-Catalog: $SQE_CATALOG" \
         -H "Content-Type: text/plain" \
         -d "$sql" 2>&1)
 
@@ -89,7 +97,7 @@ trino_query() {
     # Redirect stderr to /dev/null to suppress Java warnings
     local result=$(trino --server "$TRINO_HOST" \
         --user "$TRINO_USER" \
-        --catalog iceberg \
+        --catalog "$TRINO_CATALOG" \
         --schema "$SCHEMA" \
         --execute "$sql" \
         --output-format CSV_UNQUOTED 2>/dev/null)
@@ -144,6 +152,10 @@ compare_query() {
         PASS=$((PASS + 1))
         return
     fi
+
+    # Normalize NULL in multi-column rows (e.g., "Alice,NULL" vs "Alice,")
+    sqe_norm=$(echo "$sqe_norm" | sed 's/,NULL/,/g; s/NULL,/,/g')
+    trino_norm=$(echo "$trino_norm" | sed 's/,$/,/g')
 
     # Check for errors
     if echo "$sqe_out" | grep -q "^ERROR:"; then
@@ -259,20 +271,24 @@ run_json_tests() {
 
 run_table_tests() {
     echo ""
-    echo "=== Table Queries (analytics_db) ==="
+    echo "=== Table Queries (compat_test) ==="
 
+    # Both engines use schema-qualified names for SQE, bare names for Trino (schema set in session)
     compare_query "SELECT count(*)" \
-        "SELECT count(*) FROM analytics_db.product_sales" \
-        "SELECT count(*) FROM product_sales"
+        "SELECT count(*) FROM default.compat_test" \
+        "SELECT count(*) FROM compat_test"
     compare_query "SELECT with WHERE" \
-        "SELECT product_name, quantity FROM analytics_db.product_sales WHERE quantity > 10 ORDER BY product_name" \
-        "SELECT product_name, quantity FROM product_sales WHERE quantity > 10 ORDER BY product_name"
-    compare_query "GROUP BY sum" \
-        "SELECT product_name, CAST(sum(quantity) AS BIGINT) FROM analytics_db.product_sales GROUP BY product_name ORDER BY product_name" \
-        "SELECT product_name, sum(quantity) FROM product_sales GROUP BY product_name ORDER BY product_name"
+        "SELECT name, amount FROM default.compat_test WHERE amount > 100 ORDER BY name" \
+        "SELECT name, amount FROM compat_test WHERE amount > 100 ORDER BY name"
+    compare_query "GROUP BY" \
+        "SELECT name, sum(amount) FROM default.compat_test GROUP BY name ORDER BY name" \
+        "SELECT name, sum(amount) FROM compat_test GROUP BY name ORDER BY name"
     compare_query "ORDER BY LIMIT" \
-        "SELECT product_name, price FROM analytics_db.product_sales ORDER BY price DESC LIMIT 3" \
-        "SELECT product_name, price FROM product_sales ORDER BY price DESC LIMIT 3"
+        "SELECT name, amount FROM default.compat_test ORDER BY amount DESC LIMIT 3" \
+        "SELECT name, amount FROM compat_test ORDER BY amount DESC LIMIT 3"
+    compare_query "DISTINCT" \
+        "SELECT DISTINCT created_date FROM default.compat_test ORDER BY created_date" \
+        "SELECT DISTINCT created_date FROM compat_test ORDER BY created_date"
 }
 
 run_aggregate_tests() {
@@ -280,18 +296,21 @@ run_aggregate_tests() {
     echo "=== Aggregate Functions ==="
 
     compare_query "count(*)" \
-        "SELECT count(*) FROM analytics_db.product_sales" \
-        "SELECT count(*) FROM product_sales"
+        "SELECT count(*) FROM default.compat_test" \
+        "SELECT count(*) FROM compat_test"
     compare_query "sum()" \
-        "SELECT sum(quantity) FROM analytics_db.product_sales" \
-        "SELECT sum(quantity) FROM product_sales"
+        "SELECT sum(amount) FROM default.compat_test" \
+        "SELECT sum(amount) FROM compat_test"
     compare_query "avg()" \
-        "SELECT avg(price) FROM analytics_db.product_sales" \
-        "SELECT avg(price) FROM product_sales" \
+        "SELECT avg(amount) FROM default.compat_test" \
+        "SELECT avg(amount) FROM compat_test" \
         "yes"  # precision may differ
     compare_query "min() / max()" \
-        "SELECT min(price), max(price) FROM analytics_db.product_sales" \
-        "SELECT min(price), max(price) FROM product_sales"
+        "SELECT min(amount), max(amount) FROM default.compat_test" \
+        "SELECT min(amount), max(amount) FROM compat_test"
+    compare_query "count(DISTINCT)" \
+        "SELECT count(DISTINCT name) FROM default.compat_test" \
+        "SELECT count(DISTINCT name) FROM compat_test"
 }
 
 run_window_tests() {
@@ -299,11 +318,14 @@ run_window_tests() {
     echo "=== Window Functions ==="
 
     compare_query "row_number()" \
-        "SELECT product_name, row_number() OVER (ORDER BY price DESC) AS rn FROM analytics_db.product_sales" \
-        "SELECT product_name, row_number() OVER (ORDER BY price DESC) AS rn FROM product_sales"
+        "SELECT name, row_number() OVER (ORDER BY amount DESC) AS rn FROM default.compat_test" \
+        "SELECT name, row_number() OVER (ORDER BY amount DESC) AS rn FROM compat_test"
     compare_query "rank()" \
-        "SELECT product_name, rank() OVER (ORDER BY quantity DESC) AS rnk FROM analytics_db.product_sales" \
-        "SELECT product_name, rank() OVER (ORDER BY quantity DESC) AS rnk FROM product_sales"
+        "SELECT name, rank() OVER (ORDER BY amount DESC) AS rnk FROM default.compat_test" \
+        "SELECT name, rank() OVER (ORDER BY amount DESC) AS rnk FROM compat_test"
+    compare_query "lag()" \
+        "SELECT name, lag(amount) OVER (ORDER BY id) AS prev_amount FROM default.compat_test" \
+        "SELECT name, lag(amount) OVER (ORDER BY id) AS prev_amount FROM compat_test"
 }
 
 run_ddl_tests() {
@@ -311,11 +333,11 @@ run_ddl_tests() {
     echo "=== DDL/DML ==="
 
     compare_query "SHOW SCHEMAS" \
-        "SHOW SCHEMAS IN main_warehouse" \
+        "SHOW SCHEMAS IN test_warehouse" \
         "SHOW SCHEMAS IN iceberg"
     compare_query "SHOW TABLES" \
-        "SHOW TABLES IN main_warehouse.analytics_db" \
-        "SHOW TABLES IN iceberg.analytics_db"
+        "SHOW TABLES IN test_warehouse.default" \
+        "SHOW TABLES IN iceberg.default"
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -325,9 +347,8 @@ run_ddl_tests() {
 echo "============================================="
 echo "  SQE vs Trino SQL Compatibility Test"
 echo "============================================="
-echo "SQE:   $SQE_HOST (Trino HTTP)"
-echo "Trino: $TRINO_HOST"
-echo "Catalog: $CATALOG / iceberg"
+echo "SQE:   $SQE_HOST (catalog: $SQE_CATALOG)"
+echo "Trino: $TRINO_HOST (catalog: $TRINO_CATALOG)"
 echo "Schema: $SCHEMA"
 echo ""
 

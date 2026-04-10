@@ -97,7 +97,10 @@ pub fn arrow_value_to_json(
         }
         DataType::Float64 => {
             let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
-            serde_json::json!(arr.value(row))
+            let v = arr.value(row);
+            // Match Trino formatting: DOUBLE always has decimal point (300.0, 4.0)
+            // serde_json preserves this for whole numbers
+            serde_json::json!(v)
         }
         DataType::Utf8 => {
             let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
