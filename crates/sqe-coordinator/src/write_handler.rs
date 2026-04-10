@@ -24,6 +24,20 @@ use crate::writer::{
     write_position_delete_files,
 };
 
+/// Build a single-row RecordBatch reporting affected row count.
+/// Matches Trino's DML response which returns the update count.
+fn affected_rows_batch(count: usize) -> Vec<RecordBatch> {
+    use arrow_array::Int64Array;
+    use arrow_schema::{DataType, Field};
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("rows_affected", DataType::Int64, false),
+    ]));
+    match RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![count as i64]))]) {
+        Ok(batch) => vec![batch],
+        Err(_) => vec![],
+    }
+}
+
 /// Handles write operations: CTAS (CREATE TABLE AS SELECT) and INSERT INTO SELECT.
 ///
 /// Write handlers receive already-executed RecordBatches from the query pipeline
@@ -500,7 +514,7 @@ impl WriteHandler {
             );
         }
 
-        Ok(vec![]) // DML success, no result rows
+        Ok(affected_rows_batch(total_rows)) // DML success with affected row count
     }
 
     /// Handle a Flight SQL DoPut ingest — write streamed Arrow batches to an Iceberg table.
@@ -695,7 +709,7 @@ impl WriteHandler {
         })?;
 
         info!(table = %table_ident, deleted_rows = total_deleted, "DELETE committed successfully");
-        Ok(vec![])
+        Ok(affected_rows_batch(total_deleted))
     }
 
     /// Handle DELETE FROM using Merge-on-Read (position deletes).
@@ -818,9 +832,10 @@ impl WriteHandler {
             return Ok(vec![]);
         }
 
+        let deleted_count = position_deletes.len();
         info!(
             table = %table_ident,
-            delete_count = position_deletes.len(),
+            delete_count = deleted_count,
             "MoR DELETE: writing position delete files"
         );
 
@@ -838,8 +853,8 @@ impl WriteHandler {
             SqeError::Execution(format!("Failed to commit MoR DELETE: {e}"))
         })?;
 
-        info!(table = %table_ident, "MoR DELETE committed successfully");
-        Ok(vec![])
+        info!(table = %table_ident, deleted_rows = deleted_count, "MoR DELETE committed successfully");
+        Ok(affected_rows_batch(deleted_count))
     }
 
     /// Handle UPDATE ns.table SET col = expr [WHERE ...]
@@ -966,7 +981,7 @@ impl WriteHandler {
         })?;
 
         info!(table = %table_ident, updated_rows = total_updated, "UPDATE committed successfully");
-        Ok(vec![])
+        Ok(affected_rows_batch(total_updated))
     }
 
     /// Handle MERGE INTO target USING source ON condition WHEN ...
@@ -1359,7 +1374,7 @@ impl WriteHandler {
         })?;
 
         info!(table = %table_ident, total_rows, "MERGE committed successfully");
-        Ok(vec![])
+        Ok(affected_rows_batch(total_rows))
     }
 
     /// Resolve an UPDATE SET expression for a single column in the MERGE context.
