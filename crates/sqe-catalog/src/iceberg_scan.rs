@@ -41,6 +41,11 @@ pub struct IcebergScanExec {
     prom_metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
     /// Optional snapshot ID for time travel queries.
     snapshot_id: Option<i64>,
+    /// Trust Iceberg sort order metadata for ALL columns, not just partition keys.
+    /// Set to true when you know data files are physically sorted (e.g., written
+    /// by a sort-on-write engine). Default false: only partition columns are trusted.
+    /// WARNING: if data is not actually sorted, queries may return incorrect results.
+    trust_sort_order: bool,
 }
 
 impl IcebergScanExec {
@@ -53,22 +58,88 @@ impl IcebergScanExec {
     }
 
     pub fn new_with_filters_and_metrics(table: Table, projected_schema: SchemaRef, projection: Option<Vec<String>>, predicates: Option<Predicate>, df_filters: Vec<Expr>, prom_metrics: Option<Arc<sqe_metrics::MetricsRegistry>>) -> Self {
-        // Detect sort order from Iceberg metadata and set EquivalenceProperties
+        // Sort order from Iceberg metadata.
+        //
+        // IMPORTANT: Iceberg sort order is a HINT about how files should be
+        // written, NOT a guarantee that existing data files are sorted. Writers
+        // (Spark, Trino, SQE CTAS) may not enforce sort order. Declaring
+        // pre-sorted data when it isn't causes incorrect query results
+        // (DataFusion skips the sort and uses SortPreservingMergeExec).
+        //
+        // We only declare sort order for identity-transform partition columns,
+        // which ARE guaranteed to be clustered by Iceberg's file organization.
+        // Non-partition sort columns emit a warning and are ignored.
         let eq_props = {
             let sort_order = table.metadata().default_sort_order();
             let iceberg_schema = table.metadata().current_schema();
+            let partition_cols = {
+                use iceberg::spec::Transform;
+                let spec = table.metadata().default_partition_spec();
+                spec.fields()
+                    .iter()
+                    .filter(|f| f.transform == Transform::Identity)
+                    .filter_map(|f| iceberg_schema.field_by_id(f.source_id).map(|sf| sf.name.clone()))
+                    .collect::<std::collections::HashSet<_>>()
+            };
+
             match crate::sort_order::iceberg_sort_to_physical(sort_order, iceberg_schema, &projected_schema) {
-                Some(sort_exprs) => crate::sort_order::equivalence_with_sort(projected_schema.clone(), sort_exprs),
+                Some(sort_exprs) => {
+                    // Filter sort expressions: only trust partition columns by default.
+                    // For TB-scale data, trusting non-partition sort order is dangerous
+                    // because writers may not enforce it, causing silent incorrect results.
+                    let safe_exprs: Vec<_> = sort_exprs.into_iter().filter(|expr| {
+                        let col_name = expr.expr.to_string();
+                        if partition_cols.contains(&col_name) {
+                            true
+                        } else {
+                            warn!(
+                                table = %table.identifier(),
+                                column = %col_name,
+                                "Ignoring non-partition sort order -- data may not be physically sorted. \
+                                 Set [catalog] trust_sort_order = true to trust Iceberg sort metadata."
+                            );
+                            false
+                        }
+                    }).collect();
+
+                    if safe_exprs.is_empty() {
+                        EquivalenceProperties::new(projected_schema.clone())
+                    } else {
+                        crate::sort_order::equivalence_with_sort(projected_schema.clone(), safe_exprs)
+                    }
+                }
                 None => EquivalenceProperties::new(projected_schema.clone()),
             }
         };
         let properties = PlanProperties::new(eq_props, Partitioning::UnknownPartitioning(1), EmissionType::Incremental, Boundedness::Bounded);
-        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), prom_metrics, snapshot_id: None }
+        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), prom_metrics, snapshot_id: None, trust_sort_order: false }
     }
 
     /// Set the snapshot ID for time travel queries.
     pub fn with_snapshot_id(mut self, snapshot_id: i64) -> Self {
         self.snapshot_id = Some(snapshot_id);
+        self
+    }
+
+    /// Trust Iceberg sort order metadata for ALL columns, not just partition keys.
+    /// When true, DataFusion may skip redundant sorts based on Iceberg metadata.
+    /// WARNING: only enable when you know all data files are physically sorted
+    /// (e.g., written by a sort-on-write engine). Incorrect for mixed-writer tables.
+    pub fn with_trust_sort_order(mut self, trust: bool) -> Self {
+        if trust {
+            // Rebuild equivalence properties with full sort order
+            let sort_order = self.table.metadata().default_sort_order();
+            let iceberg_schema = self.table.metadata().current_schema();
+            if let Some(sort_exprs) = crate::sort_order::iceberg_sort_to_physical(sort_order, iceberg_schema, &self.projected_schema) {
+                self.properties = PlanProperties::new(
+                    crate::sort_order::equivalence_with_sort(self.projected_schema.clone(), sort_exprs),
+                    Partitioning::UnknownPartitioning(1),
+                    EmissionType::Incremental,
+                    Boundedness::Bounded,
+                );
+            }
+        }
+        self.trust_sort_order = trust;
         self
     }
 

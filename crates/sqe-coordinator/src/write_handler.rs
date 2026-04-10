@@ -19,7 +19,24 @@ use sqe_core::{Session, SqeConfig, SqeError};
 use tracing::instrument;
 
 use crate::catalog_ops::parse_table_ref;
-use crate::writer::{write_data_files_with_metrics, write_position_delete_files};
+use crate::writer::{
+    write_data_files_streaming_with_metrics, write_data_files_with_metrics,
+    write_position_delete_files,
+};
+
+/// Build a single-row RecordBatch reporting affected row count.
+/// Matches Trino's DML response which returns the update count.
+fn affected_rows_batch(count: usize) -> Vec<RecordBatch> {
+    use arrow_array::Int64Array;
+    use arrow_schema::{DataType, Field};
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("rows_affected", DataType::Int64, false),
+    ]));
+    match RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![count as i64]))]) {
+        Ok(batch) => vec![batch],
+        Err(_) => vec![],
+    }
+}
 
 /// Handles write operations: CTAS (CREATE TABLE AS SELECT) and INSERT INTO SELECT.
 ///
@@ -152,6 +169,196 @@ impl WriteHandler {
         }
 
         Ok(vec![]) // DDL success, no result rows
+    }
+
+    /// Handle CREATE TABLE [OR REPLACE] ns.table AS SELECT ... — streaming variant.
+    ///
+    /// Instead of buffering the full SELECT result in memory, this method:
+    /// 1. Plans the SELECT via DataFusion and derives the Iceberg schema from the
+    ///    DataFrame schema (before execution — no data buffered yet).
+    /// 2. Creates the table in the catalog.
+    /// 3. Streams batches directly to the Parquet writer via `df.execute_stream()`.
+    /// 4. Commits the data files via a fast-append transaction.
+    ///
+    /// Peak memory is O(batch_size) instead of O(total_rows). Critical for large
+    /// CTAS loads (SF1 lineorder, store_sales, etc.) that OOM with `df.collect()`.
+    #[instrument(skip(self, session, stmt, ctx, select_sql), fields(username = %session.user.username))]
+    pub async fn handle_ctas_streaming(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+        ctx: &DFSessionContext,
+        select_sql: &str,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let (table_name, _or_replace) = match stmt {
+            Statement::CreateTable(ct) => {
+                if ct.query.is_none() {
+                    return Err(SqeError::Execution(
+                        "CTAS statement has no SELECT query".into(),
+                    ));
+                }
+                (&ct.name, ct.or_replace)
+            }
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected CreateTable statement, got: {other}"
+                )));
+            }
+        };
+
+        let (namespace, name) = parse_table_ref(table_name)?;
+
+        // Plan the SELECT without executing it — gives us the output schema cheaply.
+        let df = ctx
+            .sql(select_sql)
+            .await
+            .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
+
+        let arrow_schema = Arc::new(df.schema().as_arrow().clone());
+        let iceberg_schema = arrow_schema_to_iceberg(&arrow_schema)?;
+
+        info!(
+            username = %session.user.username,
+            namespace = %namespace,
+            table = %name,
+            "Executing CTAS (streaming)"
+        );
+
+        let catalog = self.create_catalog_bridge(session).await?;
+
+        let table_creation = TableCreation::builder()
+            .name(name.clone())
+            .schema(iceberg_schema)
+            .format_version(self.format_version())
+            .build();
+
+        let _created_table = catalog
+            .create_table(&namespace, table_creation)
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to create table: {e}")))?;
+
+        let table_ident = TableIdent::new(namespace, name);
+        let table = catalog
+            .load_table(&table_ident)
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to load created table: {e}")))?;
+
+        // Execute the SELECT and stream batches directly to the Parquet writer.
+        let stream = df
+            .execute_stream()
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to start execution stream: {e}")))?;
+
+        let (data_files, total_rows) = write_data_files_streaming_with_metrics(
+            &table,
+            stream,
+            "ctas",
+            self.metrics.as_ref(),
+        )
+        .await?;
+
+        if !data_files.is_empty() {
+            let tx = Transaction::new(&table);
+            let action = tx.fast_append().add_data_files(data_files);
+            let tx = action.apply(tx).map_err(|e| {
+                SqeError::Execution(format!("Failed to apply fast append: {e}"))
+            })?;
+            tx.commit(catalog.as_ref()).await.map_err(|e| {
+                SqeError::Execution(format!("Failed to commit CTAS transaction: {e}"))
+            })?;
+
+            info!(
+                table = %table_ident,
+                total_rows,
+                "CTAS committed successfully (streaming)"
+            );
+        } else {
+            info!(
+                table = %table_ident,
+                "CTAS created empty table (no data to write)"
+            );
+        }
+
+        Ok(vec![])
+    }
+
+    /// Handle INSERT INTO ns.table SELECT ... — streaming variant.
+    ///
+    /// Streams batches from the SELECT directly to the Parquet writer without
+    /// buffering the full result set. Peak memory is O(batch_size).
+    #[instrument(skip(self, session, stmt, ctx, select_sql), fields(username = %session.user.username))]
+    pub async fn handle_insert_streaming(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+        ctx: &DFSessionContext,
+        select_sql: &str,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let table_name = match stmt {
+            Statement::Insert(ins) => &ins.table_name,
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected Insert statement, got: {other}"
+                )));
+            }
+        };
+
+        let (namespace, name) = parse_table_ref(table_name)?;
+        let table_ident = TableIdent::new(namespace, name);
+
+        info!(
+            username = %session.user.username,
+            table = %table_ident,
+            "Executing INSERT INTO SELECT (streaming)"
+        );
+
+        let catalog = self.create_catalog_bridge(session).await?;
+        let table = catalog
+            .load_table(&table_ident)
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
+
+        let df = ctx
+            .sql(select_sql)
+            .await
+            .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
+
+        let stream = df
+            .execute_stream()
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to start execution stream: {e}")))?;
+
+        let (data_files, total_rows) = write_data_files_streaming_with_metrics(
+            &table,
+            stream,
+            "insert",
+            self.metrics.as_ref(),
+        )
+        .await?;
+
+        if total_rows == 0 {
+            info!(table = %table_ident, "INSERT SELECT returned no rows — nothing to write");
+            return Ok(vec![]);
+        }
+
+        if !data_files.is_empty() {
+            let tx = Transaction::new(&table);
+            let action = tx.fast_append().add_data_files(data_files);
+            let tx = action.apply(tx).map_err(|e| {
+                SqeError::Execution(format!("Failed to apply fast append: {e}"))
+            })?;
+            tx.commit(catalog.as_ref()).await.map_err(|e| {
+                SqeError::Execution(format!("Failed to commit INSERT transaction: {e}"))
+            })?;
+
+            info!(
+                table = %table_ident,
+                total_rows,
+                "INSERT INTO committed successfully (streaming)"
+            );
+        }
+
+        Ok(vec![])
     }
 
     /// Handle CREATE TABLE [IF NOT EXISTS] ns.table (column definitions)
@@ -307,7 +514,7 @@ impl WriteHandler {
             );
         }
 
-        Ok(vec![]) // DML success, no result rows
+        Ok(affected_rows_batch(total_rows)) // DML success with affected row count
     }
 
     /// Handle a Flight SQL DoPut ingest — write streamed Arrow batches to an Iceberg table.
@@ -439,7 +646,10 @@ impl WriteHandler {
         }
 
         // WHERE clause present: CoW rewrite
-        let where_sql = format!("{}", where_clause.as_ref().unwrap());
+        let raw_where = format!("{}", where_clause.as_ref().unwrap());
+        // Rewrite IN (subquery) → IN (literal_list) before per-file evaluation.
+        // DataFusion's physical planner rejects InSubquery in DML context.
+        let where_sql = self.rewrite_in_subquery_where(&raw_where, ctx).await?;
         info!(
             table = %table_ident,
             file_count = old_data_files.len(),
@@ -499,7 +709,7 @@ impl WriteHandler {
         })?;
 
         info!(table = %table_ident, deleted_rows = total_deleted, "DELETE committed successfully");
-        Ok(vec![])
+        Ok(affected_rows_batch(total_deleted))
     }
 
     /// Handle DELETE FROM using Merge-on-Read (position deletes).
@@ -579,7 +789,10 @@ impl WriteHandler {
             return Ok(vec![]);
         }
 
-        let where_sql = format!("{}", where_clause.as_ref().unwrap());
+        let raw_where = format!("{}", where_clause.as_ref().unwrap());
+        // Rewrite IN (subquery) → IN (literal_list) before per-file evaluation.
+        // DataFusion's physical planner rejects InSubquery in DML context.
+        let where_sql = self.rewrite_in_subquery_where(&raw_where, ctx).await?;
         info!(
             table = %table_ident,
             file_count = old_data_files.len(),
@@ -619,9 +832,10 @@ impl WriteHandler {
             return Ok(vec![]);
         }
 
+        let deleted_count = position_deletes.len();
         info!(
             table = %table_ident,
-            delete_count = position_deletes.len(),
+            delete_count = deleted_count,
             "MoR DELETE: writing position delete files"
         );
 
@@ -639,8 +853,8 @@ impl WriteHandler {
             SqeError::Execution(format!("Failed to commit MoR DELETE: {e}"))
         })?;
 
-        info!(table = %table_ident, "MoR DELETE committed successfully");
-        Ok(vec![])
+        info!(table = %table_ident, deleted_rows = deleted_count, "MoR DELETE committed successfully");
+        Ok(affected_rows_batch(deleted_count))
     }
 
     /// Handle UPDATE ns.table SET col = expr [WHERE ...]
@@ -698,10 +912,13 @@ impl WriteHandler {
         //        CASE WHEN cond THEN expr2 ELSE col2 END AS col2,
         //        col3, col4, ...  (unchanged columns)
         // FROM t
-        let where_sql = selection
+        let raw_where = selection
             .as_ref()
             .map(|w| format!("{w}"))
             .unwrap_or_else(|| "TRUE".to_string());
+        // Rewrite IN (subquery) → IN (literal_list) before per-file evaluation.
+        // DataFusion's physical planner rejects InSubquery in DML context.
+        let where_sql = self.rewrite_in_subquery_where(&raw_where, ctx).await?;
 
         info!(
             table = %table_ident,
@@ -764,7 +981,7 @@ impl WriteHandler {
         })?;
 
         info!(table = %table_ident, updated_rows = total_updated, "UPDATE committed successfully");
-        Ok(vec![])
+        Ok(affected_rows_batch(total_updated))
     }
 
     /// Handle MERGE INTO target USING source ON condition WHEN ...
@@ -1157,7 +1374,7 @@ impl WriteHandler {
         })?;
 
         info!(table = %table_ident, total_rows, "MERGE committed successfully");
-        Ok(vec![])
+        Ok(affected_rows_batch(total_rows))
     }
 
     /// Resolve an UPDATE SET expression for a single column in the MERGE context.
@@ -1562,6 +1779,124 @@ impl WriteHandler {
         Ok(count)
     }
 
+    /// Rewrite `IN (SELECT ...)` to `IN (val1, val2, ...)` in a WHERE-clause string.
+    ///
+    /// DataFusion's physical planner rejects `InSubquery` in UPDATE/DELETE context
+    /// with "Physical plan does not support logical expression InSubquery(...)".
+    /// SELECT works fine; only DML fails.
+    ///
+    /// Workaround: before executing DML, detect any `IN (subquery)` in the WHERE
+    /// clause, execute each subquery as a standalone SELECT (using the same session
+    /// context / Iceberg snapshot), collect the result values, and rewrite the
+    /// WHERE clause to use `IN (literal_list)`.  The rewritten SQL is semantically
+    /// identical and DataFusion handles it without issues.
+    ///
+    /// Returns the original string unchanged when no subqueries are present, so
+    /// the fast path has zero overhead.
+    async fn rewrite_in_subquery_where(
+        &self,
+        where_sql: &str,
+        ctx: &DFSessionContext,
+    ) -> sqe_core::Result<String> {
+        use sqlparser::ast::{Expr, Value as SqlValue};
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        // Quick bail-out: most WHERE clauses don't contain subqueries.
+        if !where_sql.to_uppercase().contains("SELECT") {
+            return Ok(where_sql.to_string());
+        }
+
+        // Parse the WHERE expression by wrapping it in a dummy SELECT.
+        let dummy_sql = format!("SELECT * FROM __dummy WHERE {where_sql}");
+        let mut stmts = Parser::parse_sql(&GenericDialect {}, &dummy_sql)
+            .map_err(|e| SqeError::Execution(format!("IN-subquery rewrite parse error: {e}")))?;
+
+        let where_expr = match stmts.first_mut() {
+            Some(sqlparser::ast::Statement::Query(q)) => {
+                match q.body.as_mut() {
+                    sqlparser::ast::SetExpr::Select(sel) => sel.selection.take(),
+                    _ => return Ok(where_sql.to_string()),
+                }
+            }
+            _ => return Ok(where_sql.to_string()),
+        };
+
+        let mut expr = match where_expr {
+            Some(e) => e,
+            None => return Ok(where_sql.to_string()),
+        };
+
+        // Collect all InSubquery occurrences and replace them with sentinel
+        // placeholder expressions. We store the extracted subquery SQL strings
+        // and the `negated` flag so we can execute them asynchronously.
+        let mut subqueries: Vec<(String, bool)> = Vec::new();
+        collect_and_replace_in_subqueries(&mut expr, &mut subqueries);
+
+        if subqueries.is_empty() {
+            return Ok(where_sql.to_string());
+        }
+
+        // Execute each collected subquery and gather the literal value lists.
+        let mut value_lists: Vec<Vec<Expr>> = Vec::with_capacity(subqueries.len());
+        for (subquery_sql, _negated) in &subqueries {
+            let df = ctx.sql(subquery_sql).await.map_err(|e| {
+                SqeError::Execution(format!(
+                    "IN-subquery execution failed for `{subquery_sql}`: {e}"
+                ))
+            })?;
+            let batches = df.collect().await.map_err(|e| {
+                SqeError::Execution(format!(
+                    "IN-subquery collect failed for `{subquery_sql}`: {e}"
+                ))
+            })?;
+
+            let mut values: Vec<Expr> = Vec::new();
+            for batch in &batches {
+                let col = batch.column(0);
+                for row in 0..batch.num_rows() {
+                    if col.is_null(row) {
+                        continue;
+                    }
+                    let val_str = arrow::util::display::array_value_to_string(col, row)
+                        .unwrap_or_default();
+                    let literal = match col.data_type() {
+                        arrow::datatypes::DataType::Int8
+                        | arrow::datatypes::DataType::Int16
+                        | arrow::datatypes::DataType::Int32
+                        | arrow::datatypes::DataType::Int64
+                        | arrow::datatypes::DataType::UInt8
+                        | arrow::datatypes::DataType::UInt16
+                        | arrow::datatypes::DataType::UInt32
+                        | arrow::datatypes::DataType::UInt64 => {
+                            Expr::Value(SqlValue::Number(val_str, false))
+                        }
+                        arrow::datatypes::DataType::Float32
+                        | arrow::datatypes::DataType::Float64 => {
+                            Expr::Value(SqlValue::Number(val_str, false))
+                        }
+                        _ => Expr::Value(SqlValue::SingleQuotedString(val_str)),
+                    };
+                    values.push(literal);
+                }
+            }
+            value_lists.push(values);
+        }
+
+        // Second pass: substitute the sentinel placeholders with InList / Boolean.
+        let mut idx = 0usize;
+        substitute_in_subquery_placeholders(&mut expr, &subqueries, &value_lists, &mut idx);
+
+        let rewritten = format!("{expr}");
+        tracing::info!(
+            original = %where_sql,
+            rewritten = %&rewritten[..rewritten.len().min(300)],
+            subquery_count = subqueries.len(),
+            "Rewrote IN (subquery) to IN (literal_list) for DML WHERE clause"
+        );
+        Ok(rewritten)
+    }
+
     fn format_version(&self) -> FormatVersion {
         match self.config.catalog.default_table_format_version {
             3 => FormatVersion::V3,
@@ -1593,6 +1928,115 @@ impl WriteHandler {
         let _ = session_catalog.list_namespaces().await;
 
         Ok(session_catalog.as_catalog())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IN-subquery rewrite helpers (free functions, sync, no async_recursion needed)
+// ---------------------------------------------------------------------------
+
+/// Walk `expr` recursively, replacing every `InSubquery { expr, subquery, negated }` node
+/// with a sentinel `Expr::Value(Value::Placeholder("?N"))`.
+///
+/// The extracted `(subquery_sql, negated)` tuples are pushed into `out` in the
+/// order they are encountered (depth-first, left-to-right), which must match
+/// the order used by `substitute_in_subquery_placeholders`.
+fn collect_and_replace_in_subqueries(
+    expr: &mut sqlparser::ast::Expr,
+    out: &mut Vec<(String, bool)>,
+) {
+    use sqlparser::ast::{Expr, Value as SqlValue};
+
+    match expr {
+        Expr::InSubquery { expr: inner, subquery, negated } => {
+            let subquery_sql = format!("SELECT * FROM ({subquery}) AS __sq");
+            let neg = *negated;
+            out.push((subquery_sql, neg));
+            let idx = out.len() - 1;
+            // Replace this node with a sentinel placeholder.
+            // We keep `inner` to use later; stash its current value.
+            let inner_box = std::mem::replace(inner, Box::new(Expr::Value(SqlValue::Null)));
+            *expr = Expr::Nested(Box::new(Expr::InList {
+                expr: inner_box,
+                list: vec![Expr::Value(SqlValue::Placeholder(format!("?{idx}")))],
+                negated: neg,
+            }));
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_and_replace_in_subqueries(left, out);
+            collect_and_replace_in_subqueries(right, out);
+        }
+        Expr::UnaryOp { expr: inner, .. } => {
+            collect_and_replace_in_subqueries(inner, out);
+        }
+        Expr::Nested(inner) => {
+            collect_and_replace_in_subqueries(inner, out);
+        }
+        Expr::Between { expr: e, low, high, .. } => {
+            collect_and_replace_in_subqueries(e, out);
+            collect_and_replace_in_subqueries(low, out);
+            collect_and_replace_in_subqueries(high, out);
+        }
+        _ => {}
+    }
+}
+
+/// Walk `expr` and substitute every sentinel `InList` with a single `Placeholder("?N")`
+/// list element with the real `InList` (using the collected values) or a `Boolean`
+/// constant when the value list is empty.
+///
+/// `idx` tracks which entry in `subqueries`/`value_lists` we are currently visiting.
+/// Must be called with the same `expr` that `collect_and_replace_in_subqueries` modified.
+fn substitute_in_subquery_placeholders(
+    expr: &mut sqlparser::ast::Expr,
+    subqueries: &[(String, bool)],
+    value_lists: &[Vec<sqlparser::ast::Expr>],
+    idx: &mut usize,
+) {
+    use sqlparser::ast::{Expr, Value as SqlValue};
+
+    match expr {
+        // Sentinel pattern: Nested(InList { list: [Placeholder("?N")], .. })
+        Expr::Nested(inner) => {
+            if let Expr::InList { list, negated, expr: col_expr } = inner.as_mut() {
+                if list.len() == 1 {
+                    if let Expr::Value(SqlValue::Placeholder(p)) = &list[0] {
+                        if p.starts_with('?') {
+                            let current_idx = *idx;
+                            *idx += 1;
+                            let values = &value_lists[current_idx];
+                            let neg = *negated;
+                            let col = std::mem::replace(col_expr, Box::new(Expr::Value(SqlValue::Null)));
+                            if values.is_empty() {
+                                // IN () → FALSE; NOT IN () → TRUE
+                                *expr = Expr::Value(SqlValue::Boolean(!neg));
+                            } else {
+                                *expr = Expr::InList {
+                                    expr: col,
+                                    list: values.clone(),
+                                    negated: neg,
+                                };
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+            substitute_in_subquery_placeholders(inner, subqueries, value_lists, idx);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            substitute_in_subquery_placeholders(left, subqueries, value_lists, idx);
+            substitute_in_subquery_placeholders(right, subqueries, value_lists, idx);
+        }
+        Expr::UnaryOp { expr: inner, .. } => {
+            substitute_in_subquery_placeholders(inner, subqueries, value_lists, idx);
+        }
+        Expr::Between { expr: e, low, high, .. } => {
+            substitute_in_subquery_placeholders(e, subqueries, value_lists, idx);
+            substitute_in_subquery_placeholders(low, subqueries, value_lists, idx);
+            substitute_in_subquery_placeholders(high, subqueries, value_lists, idx);
+        }
+        _ => {}
     }
 }
 

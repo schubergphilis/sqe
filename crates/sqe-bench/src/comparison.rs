@@ -20,7 +20,7 @@ pub async fn run_comparison(
     output_dir: &str,
 ) -> anyhow::Result<ComparisonReport> {
     // Load query files
-    let query_dir = format!("crates/sqe-bench/queries/{}", benchmark);
+    let query_dir = format!("benchmarks/queries/{}", benchmark);
     let mut query_files: Vec<_> = std::fs::read_dir(&query_dir)?
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "sql"))
@@ -46,7 +46,15 @@ pub async fn run_comparison(
             .to_string_lossy()
             .trim_end_matches(".sql")
             .to_string();
-        let sql = std::fs::read_to_string(entry.path())?;
+        let raw_sql = std::fs::read_to_string(entry.path())?;
+
+        // Qualify bare table names with the benchmark namespace
+        // (same as sqe-bench test does via prefix_tables)
+        let namespace = crate::bench_namespace(benchmark, scale);
+        let sql = crate::test::prefix_tables(&raw_sql, &namespace, benchmark);
+        // Strip trailing semicolons -- Trino HTTP protocol rejects them.
+        // Trim whitespace first (files end with \n after ;)
+        let sql = sql.trim().trim_end_matches(';').trim().to_string();
 
         info!("  {} ...", query_name);
 

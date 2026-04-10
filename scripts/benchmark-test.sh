@@ -12,6 +12,8 @@ set -euo pipefail
 #   ./scripts/benchmark-test.sh tpch ssb           # run TPC-H and SSB
 #   BENCH_SCALE=0.01 ./scripts/benchmark-test.sh   # use SF0.01 (faster)
 #   BENCH_PROTOCOL=trino ./scripts/benchmark-test.sh  # use Trino HTTP
+#   ./scripts/benchmark-test.sh --compare-trino tpch  # compare SQE vs Trino output
+#   ./scripts/benchmark-test.sh --compare-trino       # compare all benchmarks
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -25,6 +27,11 @@ BENCH_HOST="localhost"
 BENCH_PORT_FLIGHT="60051"
 BENCH_PORT_TRINO="18080"
 
+# Trino comparison mode: start a Trino container and validate results against it
+COMPARE_TRINO="${COMPARE_TRINO:-}"
+TRINO_PORT="38080"
+TRINO_IMAGE="${TRINO_IMAGE:-trinodb/trino:465}"
+
 # S3 credentials (match test stack)
 S3_ACCESS_KEY="${S3_ACCESS_KEY:-s3admin}"
 S3_SECRET_KEY="${S3_SECRET_KEY:-s3admin}"
@@ -35,11 +42,16 @@ S3_REGION="${S3_REGION:-us-east-1}"
 SQE_USERNAME="${SQE_USERNAME:-root}"
 SQE_PASSWORD="${SQE_PASSWORD:-}"
 
-# Benchmarks to run (default: all)
+# Parse options
 ALL_BENCHMARKS=(tpch ssb tpcds tpcc tpce tpcbb clickbench)
-if [ $# -gt 0 ]; then
-    BENCHMARKS=("$@")
-else
+BENCHMARKS=()
+for arg in "$@"; do
+    case "$arg" in
+        --compare-trino) COMPARE_TRINO=1 ;;
+        *) BENCHMARKS+=("$arg") ;;
+    esac
+done
+if [ ${#BENCHMARKS[@]} -eq 0 ]; then
     BENCHMARKS=("${ALL_BENCHMARKS[@]}")
 fi
 
@@ -113,6 +125,75 @@ for i in $(seq 1 300); do
 done
 echo ""
 
+# ── Start Trino container (if --compare-trino) ──────────────
+TRINO_CONTAINER=""
+if [ -n "$COMPARE_TRINO" ]; then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  Starting Trino container for comparison..."
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # Get a Polaris OAuth token for Trino
+    POLARIS_TOKEN=$(curl -sf -X POST "http://localhost:18181/api/catalog/v1/oauth/tokens" \
+        -d "grant_type=client_credentials&client_id=root&client_secret=s3cr3t&scope=PRINCIPAL_ROLE:ALL" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+
+    # Get Polaris and RustFS container IPs on the test stack network
+    POLARIS_IP=$(docker inspect sqlengine-polaris-1 --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+    RUSTFS_IP=$(docker inspect sqlengine-rustfs-1 --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+
+    # Create Trino catalog config
+    mkdir -p /tmp/trino-bench/catalog
+    cat > /tmp/trino-bench/catalog/iceberg.properties << TRINOEOF
+connector.name=iceberg
+iceberg.catalog.type=rest
+iceberg.rest-catalog.uri=http://${POLARIS_IP}:8181/api/catalog
+iceberg.rest-catalog.warehouse=test_warehouse
+iceberg.rest-catalog.security=OAUTH2
+iceberg.rest-catalog.oauth2.token=${POLARIS_TOKEN}
+fs.native-s3.enabled=true
+s3.endpoint=http://${RUSTFS_IP}:9000
+s3.region=${S3_REGION}
+s3.path-style-access=true
+s3.aws-access-key=${S3_ACCESS_KEY}
+s3.aws-secret-key=${S3_SECRET_KEY}
+TRINOEOF
+
+    cat > /tmp/trino-bench/config.properties << 'TRINOEOF'
+coordinator=true
+node-scheduler.include-coordinator=true
+http-server.http.port=8080
+discovery.uri=http://localhost:8080
+TRINOEOF
+
+    # Stop any existing Trino container
+    docker stop trino-bench 2>/dev/null || true
+    sleep 1
+
+    TRINO_CONTAINER=$(docker run -d --rm \
+        --name trino-bench \
+        -p "${TRINO_PORT}:8080" \
+        -v /tmp/trino-bench/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro \
+        -v /tmp/trino-bench/config.properties:/etc/trino/config.properties:ro \
+        "$TRINO_IMAGE")
+
+    echo -n "Waiting for Trino..."
+    for i in $(seq 1 60); do
+        if curl -sf "http://localhost:${TRINO_PORT}/v1/info" >/dev/null 2>&1; then
+            echo " ready"
+            break
+        fi
+        if [ "$i" -eq 60 ]; then echo " TIMEOUT"; COMPARE_TRINO=""; fi
+        echo -n "."
+        sleep 2
+    done
+    # Wait for Trino's Iceberg catalog to fully initialize (needs ~15-20s after HTTP ready)
+    echo -n "  Waiting for Trino catalog (20s)..."
+    sleep 20
+    echo " done"
+    echo "  Trino ${TRINO_IMAGE} on port ${TRINO_PORT}"
+fi
+
 # ── Cleanup handler ───────────────────────────────────────────
 cleanup() {
     echo ""
@@ -122,6 +203,9 @@ cleanup() {
     kill "$SQE_PID" 2>/dev/null || true
     wait "$SQE_PID" 2>/dev/null || true
     rm -f "$SQE_LOG_FILE"
+    if [ -n "$TRINO_CONTAINER" ]; then
+        docker stop trino-bench 2>/dev/null || true
+    fi
     # Don't tear down docker — leave it for subsequent runs
     echo "Done."
 }
@@ -243,6 +327,29 @@ for BENCH in "${BENCHMARKS[@]}"; do
         TOTAL_FAIL=$((TOTAL_FAIL + 1))
     fi
 
+    # ── Step 4 (optional): Compare with Trino ────────────────
+    if [ -n "$COMPARE_TRINO" ]; then
+        echo ""
+        echo "  [4/4] Comparing SQE vs Trino..."
+
+        # Verify Trino is still running and responsive.
+        if ! curl -sf "http://localhost:${TRINO_PORT}/v1/info" >/dev/null 2>&1; then
+            echo "  ⚠ Trino not reachable, skipping comparison"
+        else
+            "$BENCH_BIN" compare "$BENCH" \
+                --scale "$BENCH_SCALE" \
+                --sqe-host "$BENCH_HOST" \
+                --sqe-port "$BENCH_PORT_FLIGHT" \
+                --sqe-username "${SQE_USERNAME:-root}" \
+                --sqe-password "${SQE_PASSWORD:-s3cr3t}" \
+                --trino-url "http://localhost:${TRINO_PORT}" \
+                --trino-user admin \
+                --output "benchmarks/results" 2>&1 || {
+                echo "  ⚠ Comparison had errors (some queries may differ)"
+            }
+        fi
+    fi
+
     # ── Clean up generated data for this benchmark ────────────
     # Keep tpcds data if tpcbb still needs it (tpcbb loads into tpcds namespace)
     if [ "$BENCH" = "tpcds" ] && [[ " ${BENCHMARKS[*]} " =~ " tpcbb " ]]; then
@@ -254,8 +361,10 @@ done
 
 # ── Summary table ─────────────────────────────────────────────
 echo ""
+COMPARE_LABEL=""
+if [ -n "$COMPARE_TRINO" ]; then COMPARE_LABEL=" + Trino comparison"; fi
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  Benchmark Results (SF${BENCH_SCALE}, $(echo "$BENCH_PROTOCOL" | tr '[:lower:]' '[:upper:]'))"
+echo "  Benchmark Results (SF${BENCH_SCALE}, $(echo "$BENCH_PROTOCOL" | tr '[:lower:]' '[:upper:]')${COMPARE_LABEL})"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 printf "  %-14s %5s %5s %5s %5s %5s %5s %8s\n" "Benchmark" "Pass" "Fail" "Diff" "Skip" "Error" "Total" "Time"
 echo "  ─────────────────────────────────────────────────────────────────"

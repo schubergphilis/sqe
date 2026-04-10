@@ -91,6 +91,7 @@ pub fn register_trino_functions(ctx: &datafusion::prelude::SessionContext) {
 }
 
 /// Extract a chrono component from a Date32 or Timestamp array.
+/// Returns Int64 to match Trino's BIGINT return type for date extraction functions.
 fn extract_component(
     arg: &ColumnarValue,
     f_date: fn(NaiveDate) -> f64,
@@ -99,15 +100,15 @@ fn extract_component(
 ) -> DFResult<ColumnarValue> {
     match arg {
         ColumnarValue::Array(array) => {
-            let result: Float64Array = if let Some(date_arr) = array.as_any().downcast_ref::<Date32Array>() {
+            let result: Int64Array = if let Some(date_arr) = array.as_any().downcast_ref::<Date32Array>() {
                 date_arr.iter().map(|opt| opt.map(|days| {
                     let date = temporal_conversions::date32_to_datetime(days).unwrap().date();
-                    f_date(date)
+                    f_date(date) as i64
                 })).collect()
             } else if let Some(ts_arr) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-                ts_arr.iter().map(|opt| opt.map(f_ts)).collect()
+                ts_arr.iter().map(|opt| opt.map(|v| f_ts(v) as i64)).collect()
             } else if let Some(ts_arr) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
-                ts_arr.iter().map(|opt| opt.map(f_ts_ns)).collect()
+                ts_arr.iter().map(|opt| opt.map(|v| f_ts_ns(v) as i64)).collect()
             } else {
                 return Err(DataFusionError::Internal(format!(
                     "Expected Date32 or Timestamp, got {:?}", array.data_type()
@@ -120,15 +121,15 @@ fn extract_component(
             let val = match scalar {
                 ScalarValue::Date32(Some(days)) => {
                     let date = temporal_conversions::date32_to_datetime(*days).unwrap().date();
-                    f_date(date)
+                    f_date(date) as i64
                 }
-                ScalarValue::TimestampMicrosecond(Some(us), _) => f_ts(*us),
-                ScalarValue::TimestampNanosecond(Some(ns), _) => f_ts_ns(*ns),
+                ScalarValue::TimestampMicrosecond(Some(us), _) => f_ts(*us) as i64,
+                ScalarValue::TimestampNanosecond(Some(ns), _) => f_ts_ns(*ns) as i64,
                 _ => return Err(DataFusionError::Internal(format!(
                     "Expected date or timestamp scalar, got {scalar:?}"
                 ))),
             };
-            Ok(ColumnarValue::Scalar(ScalarValue::Float64(Some(val))))
+            Ok(ColumnarValue::Scalar(ScalarValue::Int64(Some(val))))
         }
     }
 }
@@ -162,7 +163,7 @@ macro_rules! trino_extract_fn {
             }
 
             fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
-                Ok(DataType::Float64)
+                Ok(DataType::Int64)  // Trino returns BIGINT for date extraction functions
             }
 
             fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {

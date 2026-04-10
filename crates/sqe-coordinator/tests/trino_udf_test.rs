@@ -91,72 +91,72 @@ async fn eval_bool(sql: &str) -> Option<bool> {
 
 #[tokio::test]
 async fn test_year() {
-    let v = eval_f64("SELECT year(CAST('2024-03-15' AS DATE))").await;
-    assert_eq!(v, Some(2024.0));
+    let v = eval_i64("SELECT year(CAST('2024-03-15' AS DATE))").await;
+    assert_eq!(v, Some(2024));
 }
 
 #[tokio::test]
 async fn test_month() {
-    let v = eval_f64("SELECT month(CAST('2024-03-15' AS DATE))").await;
-    assert_eq!(v, Some(3.0));
+    let v = eval_i64("SELECT month(CAST('2024-03-15' AS DATE))").await;
+    assert_eq!(v, Some(3));
 }
 
 #[tokio::test]
 async fn test_day() {
-    let v = eval_f64("SELECT day(CAST('2024-03-15' AS DATE))").await;
-    assert_eq!(v, Some(15.0));
+    let v = eval_i64("SELECT day(CAST('2024-03-15' AS DATE))").await;
+    assert_eq!(v, Some(15));
 }
 
 #[tokio::test]
 async fn test_quarter() {
-    let v = eval_f64("SELECT quarter(CAST('2024-08-15' AS DATE))").await;
-    assert_eq!(v, Some(3.0));
+    let v = eval_i64("SELECT quarter(CAST('2024-08-15' AS DATE))").await;
+    assert_eq!(v, Some(3));
 }
 
 #[tokio::test]
 async fn test_week() {
-    let v = eval_f64("SELECT week(CAST('2024-01-08' AS DATE))").await;
+    let v = eval_i64("SELECT week(CAST('2024-01-08' AS DATE))").await;
     assert!(v.is_some(), "week() returned None");
     let w = v.unwrap();
-    assert!((1.0..=53.0).contains(&w), "Week {w} out of range");
+    assert!((1..=53).contains(&w), "Week {w} out of range");
 }
 
 #[tokio::test]
 async fn test_day_of_week() {
     // 2024-01-15 is a Monday
-    let v = eval_f64("SELECT day_of_week(CAST('2024-01-15' AS DATE))").await;
+    let v = eval_i64("SELECT day_of_week(CAST('2024-01-15' AS DATE))").await;
     assert!(v.is_some(), "day_of_week returned None");
     let d = v.unwrap();
-    assert!((0.0..=7.0).contains(&d), "day_of_week {d} out of [0,7]");
+    assert!((0..=7).contains(&d), "day_of_week {d} out of [0,7]");
 }
 
 #[tokio::test]
 async fn test_day_of_year() {
     // 2024-02-01 is the 32nd day of the year (Jan has 31 days)
-    let v = eval_f64("SELECT day_of_year(CAST('2024-02-01' AS DATE))").await;
-    assert_eq!(v, Some(32.0));
+    let v = eval_i64("SELECT day_of_year(CAST('2024-02-01' AS DATE))").await;
+    assert_eq!(v, Some(32));
 }
 
 #[tokio::test]
 async fn test_hour() {
     // Use TimestampMicrosecond explicitly via CAST to microsecond precision
     let v =
-        eval_f64("SELECT hour(CAST('2024-03-15 14:30:00' AS TIMESTAMP(6)))").await;
-    assert_eq!(v, Some(14.0));
+        eval_i64("SELECT hour(CAST('2024-03-15 14:30:00' AS TIMESTAMP(6)))").await;
+    assert_eq!(v, Some(14));
 }
 
 #[tokio::test]
 async fn test_minute() {
     let v =
-        eval_f64("SELECT minute(CAST('2024-03-15 14:30:00' AS TIMESTAMP(6)))").await;
-    assert_eq!(v, Some(30.0));
+        eval_i64("SELECT minute(CAST('2024-03-15 14:30:00' AS TIMESTAMP(6)))").await;
+    assert_eq!(v, Some(30));
 }
 
 #[tokio::test]
 async fn test_second() {
     let v =
-        eval_f64("SELECT second(CAST('2024-03-15 14:30:45' AS TIMESTAMP(6)))").await;
-    assert_eq!(v, Some(45.0));
+        eval_i64("SELECT second(CAST('2024-03-15 14:30:45' AS TIMESTAMP(6)))").await;
+    assert_eq!(v, Some(45));
 }
 
 // ═══════════════════════════════════════════════════════════════
