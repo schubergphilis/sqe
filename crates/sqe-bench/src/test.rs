@@ -264,7 +264,7 @@ fn normalize_query_id(id: &str) -> String {
 /// Uses word-boundary matching: a table name is qualified when it appears
 /// as a standalone word (not preceded/followed by `_` or `.`).
 /// Tables are processed longest-name-first to avoid partial replacements.
-fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> String {
+pub(crate) fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> String {
     let gen = match crate::generate::get_generator(benchmark) {
         Ok(g) => g,
         Err(_) => return sql.to_string(),
