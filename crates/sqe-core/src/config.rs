@@ -525,6 +525,12 @@ pub struct CatalogConfig {
     /// Default Iceberg table format version for new tables (2 or 3).
     #[serde(default = "default_table_format_version")]
     pub default_table_format_version: u8,
+    /// Trust Iceberg sort order metadata for ALL columns, not just partition keys.
+    /// When true, DataFusion may skip redundant sorts based on Iceberg metadata.
+    /// Default false: safer for mixed-writer environments (Spark, Trino, SQE).
+    /// Only enable when you know all data files are physically sorted.
+    #[serde(default)]
+    pub trust_sort_order: bool,
 }
 
 #[derive(Deserialize, Clone)]
