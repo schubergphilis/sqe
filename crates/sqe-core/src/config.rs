@@ -536,6 +536,18 @@ pub struct CatalogConfig {
     /// Only enable when you know all data files are physically sorted.
     #[serde(default)]
     pub trust_sort_order: bool,
+    /// Maximum file size in MB for the direct-read fast path.
+    ///
+    /// When all data files in a scan are smaller than this threshold, SQE reads
+    /// each file entirely in a single S3 GET and parses Parquet from memory,
+    /// bypassing iceberg-rust's `scan.to_arrow()` pipeline (which issues
+    /// additional HEAD, footer, and manifest requests). For ClickBench-style
+    /// queries this reduces per-query S3 overhead from 5–7 requests to 1.
+    ///
+    /// Set to 0 to disable the fast path and always use iceberg-rust's pipeline.
+    /// Default: 3 MB.
+    #[serde(default = "default_small_file_threshold_mb")]
+    pub small_file_threshold_mb: u64,
 }
 
 #[derive(Deserialize, Clone)]
@@ -739,6 +751,7 @@ fn default_true() -> bool { true }
 fn default_cache_ttl() -> u64 { 30 }
 fn default_table_format_version() -> u8 { 2 }
 fn default_manifest_cache_mb() -> u64 { 512 }
+fn default_small_file_threshold_mb() -> u64 { 3 }
 fn default_passthrough() -> String { "passthrough".to_string() }
 fn default_prometheus_port() -> u16 { 9090 }
 fn default_per_user_rpm() -> u32 { 60 }
@@ -1072,6 +1085,7 @@ mod tests {
                 manifest_cache_mb: 512,
                 default_table_format_version: 2,
                 trust_sort_order: false,
+                small_file_threshold_mb: 3,
             },
             storage: StorageConfig::default(),
             policy: PolicyConfig::default(),
