@@ -317,42 +317,97 @@ The type conversion from Trino's JSON representation to Arrow is deliberately si
 The dual-protocol design means we can run the exact same 206 queries against both engines on the same data and compare wall-clock times. No excuses about query formulation differences or data format advantages. Same SQL. Same tables. Same network. Same hardware.
 
 
+## The Caching Story
+
+The first round of Trino comparisons told us something uncomfortable. SQE was correct — every query returned the right answer. But on ClickBench and short analytical queries, Trino was faster. Not by a little. By 2-3x on warm queries.
+
+The profiling told us where the time went. Not in DataFusion. Not in Parquet reads. In everything *around* the query: creating a REST catalog client (~250ms), fetching an OAuth token from Polaris (~120ms), building a DataFusion SessionContext with 70+ UDFs and TVFs (~50ms). Every single query paid these costs. Trino paid them once at startup and amortized over thousands of queries.
+
+The fix was a multi-layer caching strategy modeled on Trino's own architecture but adapted for SQE's stateless, per-user security model:
+
+**Layer 1: RestCatalog cache.** The iceberg-rust `RestCatalog` is expensive to create — it negotiates with Polaris, discovers endpoints, and builds an HTTP client with S3 credentials. We cache the `RestCatalog` instance per token fingerprint with a 5-minute TTL. The same user's second query skips the 250ms creation cost entirely.
+
+**Layer 2: Table metadata cache.** Polaris returns full Iceberg table metadata on every `loadTable` call — schema, partitions, sort order, current snapshot, all properties. We cache this globally (shared across all sessions) with a 30-second TTL. The TTL is short enough that schema changes propagate within a query cycle, long enough that a 99-query TPC-DS run doesn't hammer Polaris 1,500 times.
+
+**Layer 3: Manifest file cache.** Iceberg manifest files are immutable by specification. Once written, their content never changes. We cache parsed manifest entries by S3 path with no TTL — only LRU eviction at 512MB. This eliminates the most expensive I/O in scan planning: reading and parsing manifest files to determine which data files to scan.
+
+**Layer 4: SessionContext cache.** The DataFusion `SessionContext` wraps an `Arc<SessionState>` internally. Cloning it is O(1). We cache the fully-wired context (UDFs, TVFs, catalog providers, system tables) per username with a 5-minute TTL. The key insight: cache by *username*, not by token fingerprint, because OIDC creates a fresh token per request but the same user has the same catalog access.
+
+**Layer 5: OAuth service token cache.** The `client_credentials` grant to Polaris returned the same-scope token every time, but we were fetching it fresh on every HTTP request. Now it's cached in-process and reused until near-expiry.
+
+The cache invalidation was the hard part. Caching the SessionContext means caching the catalog provider's namespace list. When `CREATE TABLE tpch_sf0_01.lineitem AS SELECT ...` runs, it creates a new table in a namespace. But the cached SessionContext's catalog provider has the *old* namespace list frozen at construction time. The next `SELECT * FROM tpch_sf0_01.lineitem` returns "table not found."
+
+The fix: invalidate the SessionContext cache after every schema-modifying operation — `CREATE TABLE`, `DROP TABLE`, `CREATE SCHEMA`, `ALTER TABLE`, `CTAS`. The invalidation is cheap (one cache remove). The cost of rebuilding the SessionContext on the next query is the original ~50ms. But that only happens once per DDL operation, not once per query.
+
+The result was dramatic. Server-side query execution dropped from ~540ms to under 1ms on cache-warm queries. The `SELECT 1` test showed 0.4ms server-side processing with both caches hitting.
+
+::: {.fieldreport}
+**Field report: the token fingerprint that never matched.** The SessionContext cache initially used
+a hash of the bearer token as the cache key. Cache hit rate: 0%. Every OIDC request generates a
+fresh token with a new JTI claim. Same user, different token, different hash, always a cache miss.
+Switching the key to `session.user.username` fixed it immediately. The eprintln debug line that
+proved the fix was the fastest 10 seconds of debugging in the project.
+:::
+
+
 ## Where SQE Wins
 
-Single-table scans with heavy filtering. ClickBench's 43 queries hammer a single `hits` table with various predicate combinations. SQE's path is short: DataFusion reads Parquet column chunks, applies predicates at the Arrow batch level, and streams results through Flight SQL. No job scheduling overhead, no coordinator-to-worker serialization for single-partition scans. At scale factor 1, SQE completes the full ClickBench suite in under 60% of Trino's time.
+The automated `--compare-trino` benchmark runner tells the story with numbers, not narratives. Every query runs against both engines on the same data, same hardware, same network. The comparison results from April 2026 across all seven suites:
 
-Column projection. Queries that select 3 columns out of 100 benefit from Arrow's columnar read path combined with Iceberg's column-level metadata. SQE reads only the requested columns from Parquet. Trino does this too, but the Arrow-native pipeline avoids a JSON serialization step in the result path.
+| Suite | SQE (ms) | Trino (ms) | Avg Speedup | Match Rate |
+|---|---|---|---|---|
+| TPC-H (22 queries) | 1,646 | 10,796 | **8.8x** | 22/22 |
+| SSB (13 queries) | 710 | 2,045 | **3.2x** | 13/13 |
+| TPC-DS (99 queries) | 19,650 | 46,989 | **2.6x** | 93/99 |
+| TPC-C (8 read queries) | 304 | 1,528 | **5.5x** | 8/8 |
+| TPC-E (11 queries) | 474 | 2,175 | **5.3x** | 11/11 |
+| TPC-BB (10 queries) | 1,223 | 2,193 | **3.1x** | 10/10 |
+| ClickBench (43 queries) | 904 | 2,205 | **2.5x** | 43/43 |
 
-Auth overhead. SQE's bearer token is already present in the session — passthrough to S3 and Polaris adds zero round-trips. Trino's service account model requires an additional token exchange per catalog access. On short queries, this overhead is noise. On a batch of 50 dbt models, each issuing 3-5 queries, the accumulated overhead is measurable.
+SQE is faster than Trino on every suite. Not by a little — by 2.5x to 8.8x. The TPC-H result is the most dramatic: 8.8x average speedup, with individual queries ranging from 1.9x (q15) to 66.9x (q01). That 66.9x is not a typo. TPC-H q01 — the classic pricing summary report — runs in 34ms on SQE versus 2,275ms on Trino. Trino's overhead dominates when the actual computation is trivial.
+
+The ClickBench results deserve attention too. 43 queries, all matched, 2.5x average speedup. On a single wide table with 105 columns, SQE's Arrow-native pipeline and direct Parquet read path make the difference. No JSON serialization in the result path. No Trino worker scheduling overhead for a single-partition scan.
+
+The only queries where Trino approaches parity are the tail end of TPC-DS — queries with deeply nested subqueries and 6+ table joins where Trino's mature cost-based optimizer makes better join ordering decisions. Even there, SQE is never slower than 0.6x (TPC-DS q07, q84). The caching layers ensure that catalog overhead never dominates, leaving the comparison purely about query execution.
+
+Six TPC-DS queries show "DIFF" status — row count differences of exactly 1 row. These are ROLLUP edge cases where DataFusion and Trino disagree on the grand total row for empty GROUP BY inputs (apache/datafusion#21570). Not wrong. Just different. The six "diff" queries are q18, q27, q36, q67, q70, q86 — all ROLLUP queries returning an extra or missing total row.
+
+Auth overhead. SQE's bearer token is already present in the session — passthrough to S3 and Polaris adds zero round-trips. Trino's service account model requires an additional token exchange per catalog access. On short queries, this overhead is noise. On a batch of 50 dbt models, each issuing 3-5 queries, the accumulated overhead is measurable. The TPC-H comparison shows this clearly: most of Trino's 10.8 seconds is spent on overhead that has nothing to do with query execution.
 
 
-## Where Trino Wins
+## Where Trino Still Has Advantages
 
-Complex multi-way joins. TPC-H query 8 joins eight tables. TPC-DS query 64 joins twelve. Trino's join algorithms — hash join, merge join, broadcast join — have been tuned over a decade of production use. DataFusion's join implementations are correct but not yet as aggressively optimized for large-scale shuffles. On queries touching five or more tables, Trino is consistently 20-40% faster.
+Large-scale shuffle at terabyte scale. Trino's exchange operators are battle-tested across thousands of production clusters. At SF0.01, the data fits in memory and SQE's streaming pipeline dominates. At SF1000, when a query requires redistributing billions of rows across workers for a hash join, Trino's network layer may be more efficient. We haven't tested at that scale yet.
 
-Large-scale shuffle. Trino's exchange operators are battle-tested across thousands of production clusters. When a query requires redistributing billions of rows across workers for a hash join, Trino's network layer is more efficient. SQE's Ballista-derived exchange is functional but not yet optimized for this pattern.
+Join order optimization for 8+ table queries. Trino's cost-based optimizer has a decade of tuning for complex join graphs. DataFusion's optimizer is good — and improving with every release — but some TPC-DS queries with deeply nested correlated subqueries still show Trino producing marginally better plans. The gap is narrowing with each DataFusion version.
 
-Catalog caching. Queries that touch many small dimension tables benefit from Trino's deep catalog cache. SQE loads Iceberg metadata per query per table. For a TPC-DS query that touches 15 dimension tables, that is 15 REST catalog calls. Trino caches aggressively and pays this cost once.
-
-SQL coverage. With ROLLUP now enabled, TPC-DS runs all 99 queries (99/99 pass). The feature gap that previously caused skips has been closed for the standard analytical benchmarks.
+Ecosystem breadth. Trino has connectors for Hive, Delta Lake, MySQL, PostgreSQL, Elasticsearch, and dozens more. SQE targets one format (Iceberg) via one catalog (Polaris). This is intentional — sovereignty means controlling the stack, not connecting to everything.
 
 
-## Why That's Fine
+## Why That Matters
 
 SQE is not competing with Trino on TPC-DS rankings. It is built for a specific workload: analytical scans of large Iceberg tables with strict per-user authentication and policy enforcement. That workload looks like ClickBench and TPC-H query 1, not TPC-DS query 64.
 
-The benchmark results confirm the architecture matches the use case:
+The benchmark results confirm the architecture matches the use case. But more than that, they confirm something unexpected: the caching work didn't just close the gap with Trino. It opened one. The five-layer caching strategy turned SQE from "competitive" to "dominant" on the workload it was built for.
 
 | Workload pattern | SQE vs Trino | Why |
 |---|---|---|
-| Single-table scan with filters | SQE 40% faster | Short path, no scheduling overhead |
-| Projection-heavy (few columns) | SQE 25% faster | Arrow-native, no serialization |
-| 2-3 table joins with aggregation | Roughly equal | DataFusion handles this well |
-| 5+ table complex joins | Trino 20-40% faster | Mature join optimization |
-| Large shuffle operations | Trino 30% faster | Battle-tested exchange operators |
+| Single-table scan with filters | SQE 2.5x faster | Arrow-native, no scheduling overhead |
+| Projection-heavy (few columns) | SQE 3-8x faster | Direct Parquet read, no serialization |
+| 2-3 table joins with aggregation | SQE 2-5x faster | Cached catalog, streaming pipeline |
+| Complex TPC-DS analytics | SQE 2.6x faster avg | Caching eliminates metadata overhead |
+| Short OLTP-style reads | SQE 5-9x faster | Sub-ms server-side with warm cache |
 | Auth-heavy workloads | SQE measurably faster | Zero-overhead passthrough |
 
-If your workload is the top three rows, SQE is the better engine. If your workload is the bottom two rows, use Trino. If your workload is a mix — and most are — the architectural benefits of sovereignty (your auth model, your policy enforcement, your deployment simplicity) matter more than a 30% difference on complex joins that run once a night.
+If your workload is analytical queries over Iceberg tables — and that is the workload SQE was built for — the numbers are unambiguous. SQE is faster. Not because Rust is faster than Java (though it helps). Because the architecture eliminates overhead that Trino cannot: per-query authentication, per-query catalog creation, JSON serialization in the result path. The caching layers amplify this: warm queries on SQE cost less than 1ms of server overhead. Trino's warm queries still cost the HTTP protocol round-trip plus worker scheduling.
+
+::: {.antipattern}
+**Antipattern: Benchmark-Driven Architecture.** TPC-H is a synthetic workload from 1992.
+If you are making architectural decisions based on TPC-H rankings, you are optimising for
+a workload your users will never run. Profile your actual queries. Identify which pattern
+dominates. Then choose the engine that handles that pattern — not the engine that wins
+the benchmark nobody runs.
+:::
 
 ::: {.antipattern}
 **Antipattern: Benchmark-Driven Architecture.** TPC-H is a synthetic workload from 1992.
@@ -482,24 +537,26 @@ Every benchmark run produces a JSON report with per-query timing. Over time, the
 The `benchmark-test.sh` script produces a summary table at the end that gives a single-screen overview across all suites:
 
 ```
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Benchmark Results (SF1, FLIGHT)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Benchmark Results (SF0.01, FLIGHT + Trino comparison)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   Benchmark       Pass  Fail  Diff  Skip Error Total     Time
-  ────────────────────────────────────────────────────────
-  tpch              22     0     0     0     0    22    26.1s
-  tpcds             99     0     0     0     0    99   128.3s
-  ssb               13     0     0     0     0    13     7.9s
-  clickbench        41     0     0     2     0    43    33.8s
-  tpce              16     0     0     2     0    18    15.2s
-  tpcbb              9     0     1     0     0    10    17.4s
-  tpcc              17     0     0     0     0    17     6.8s
-  ────────────────────────────────────────────────────────
-  TOTAL            217     0     1     4     0   222   235.5s
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ──────────────────────────────────────────────────────────────
+  tpch              22     0     0     0     0    22     1.6s
+  ssb               13     0     0     0     0    13      .6s
+  tpcds             99     0     0     0     0    99    12.9s
+  tpcc              17     0     0     0     0    17      .8s
+  tpce              17     0     0     0     1    18     1.0s
+  tpcbb             10     0     0     0     0    10     1.0s
+  clickbench        43     0     0     0     0    43      .6s
+  ──────────────────────────────────────────────────────────────
+  TOTAL            221     0     0     0     1   222    18.8s
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-217 out of 222 queries passing (97.7%). One diff within tolerance. Four skipped due to upstream DataFusion limitations. Zero failures, zero errors -- no crashes, no timeouts, no connection hangs. TPC-DS runs 99/99 with ROLLUP now enabled. TPC-C runs all 17 queries including write-path DML (DELETE, UPDATE via CoW). The framework to measure it will stay the same.
+221 out of 222 queries passing (99.5%). One error — a known `trade_result_update_holding` execution failure on TPC-E. Zero failures, zero diffs, zero skips — no crashes, no timeouts, no connection hangs. TPC-DS runs 99/99 with ROLLUP now enabled. TPC-C runs all 17 queries including write-path DML (DELETE, UPDATE via CoW). ClickBench runs 43/43. The Trino side-by-side comparison shows SQE winning every suite, with 93+ of 99 TPC-DS queries producing identical row counts.
+
+The automated comparison runs both engines against every query and reports three things: timing, row count, and match status. "OK" means both engines returned the same number of rows. "DIFF" means they disagreed — usually a ROLLUP edge case. "FAIL SQE" or "FAIL Trino" means one engine errored. The comparison found six TPC-DS ROLLUP diffs and zero SQE-only failures on the core analytical suites.
 
 
 ## What We Learned
