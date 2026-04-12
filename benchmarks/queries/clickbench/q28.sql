@@ -8,7 +8,7 @@ SELECT
     MIN("Referer")
 FROM hits
 WHERE "Referer" <> ''
-GROUP BY key
+GROUP BY REGEXP_REPLACE("Referer", '^https?://(?:www\.)?([^/]+)/.*$', '\1')
 HAVING COUNT(*) > 100000
 ORDER BY l DESC
 LIMIT 25;

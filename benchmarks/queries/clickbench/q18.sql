@@ -8,6 +8,6 @@ SELECT
     "SearchPhrase",
     COUNT(*)
 FROM hits
-GROUP BY "UserID", m, "SearchPhrase"
+GROUP BY "UserID", CAST("EventTime" / 60 % 60 AS INT), "SearchPhrase"
 ORDER BY COUNT(*) DESC
 LIMIT 10;

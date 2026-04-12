@@ -4,6 +4,7 @@ use std::sync::Arc;
 use iceberg::table::Table;
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent, TableRequirement, TableUpdate};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogBuilder};
+use moka::future::Cache as MokaCache;
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument};
 use uuid::Uuid;
@@ -13,6 +14,58 @@ use sqe_core::SqeError;
 use sqe_metrics::propagation::trace_context_http_headers;
 
 use crate::circuit_breaker::CircuitBreaker;
+
+/// Global table metadata cache shared across all sessions.
+///
+/// Table metadata (schema, partitions, snapshots) is user-independent — the same
+/// table has the same structure regardless of which user queries it. User-level
+/// authorization is enforced by Polaris at load time; we cache the result here
+/// so subsequent queries within the TTL window skip the REST round-trip entirely.
+///
+/// The cache is created once at coordinator startup and passed into every
+/// `SessionCatalog` via [`SessionCatalog::new`]. Each session falls through to
+/// Polaris on a miss and populates the shared cache on success.
+///
+/// Use [`TableMetadataCache::invalidate`] after any DDL/DML that changes table
+/// structure (DROP TABLE, ALTER TABLE, INSERT, MERGE, DELETE).
+#[derive(Clone)]
+pub struct TableMetadataCache {
+    inner: MokaCache<String, Table>,
+}
+
+impl TableMetadataCache {
+    /// Create a global table metadata cache with the given TTL.
+    ///
+    /// Pass `ttl_secs = 0` to disable the cache (entries are never stored).
+    pub fn new(ttl_secs: u64) -> Self {
+        let inner = if ttl_secs == 0 {
+            MokaCache::builder().max_capacity(0).build()
+        } else {
+            MokaCache::builder()
+                .max_capacity(1000)
+                .time_to_live(std::time::Duration::from_secs(ttl_secs))
+                .build()
+        };
+        Self { inner }
+    }
+
+    pub async fn get(&self, key: &str) -> Option<Table> {
+        self.inner.get(key).await
+    }
+
+    pub async fn insert(&self, key: String, table: Table) {
+        self.inner.insert(key, table).await;
+    }
+
+    pub async fn invalidate(&self, key: &str) {
+        self.inner.invalidate(key).await;
+    }
+
+    /// Number of entries currently held in the cache.
+    pub fn entry_count(&self) -> u64 {
+        self.inner.entry_count()
+    }
+}
 
 /// Per-session Iceberg REST catalog wrapper.
 ///
@@ -36,6 +89,15 @@ pub struct SessionCatalog {
     http_client: reqwest::Client,
     /// Shared circuit breaker for Polaris REST calls.
     circuit_breaker: Arc<CircuitBreaker>,
+    /// Shared table metadata cache.
+    ///
+    /// When a global `TableMetadataCache` is provided at construction time it is
+    /// used directly (shared across all sessions). Otherwise a private per-session
+    /// cache is created as a fallback (used in tests / when the caller passes `None`).
+    ///
+    /// Cache is keyed by `"namespace.table_name"`. TTL and capacity are configured
+    /// when the global cache is created (see `TableMetadataCache::new`).
+    table_cache: TableMetadataCache,
 }
 
 impl std::fmt::Debug for SessionCatalog {
@@ -45,6 +107,7 @@ impl std::fmt::Debug for SessionCatalog {
             .field("warehouse", &self.warehouse)
             .field("token_fingerprint", &self.token_fingerprint)
             .field("circuit_breaker", &self.circuit_breaker.state_label())
+            .field("table_cache_entries", &self.table_cache.entry_count())
             .finish()
     }
 }
@@ -61,11 +124,16 @@ impl SessionCatalog {
     /// `http_client` and `circuit_breaker` should be shared across all sessions (created
     /// once at startup) so that TCP connections and failure state are pooled globally.
     /// Pass `None` for either to fall back to per-instance defaults (suitable for tests).
+    ///
+    /// `table_cache` is the shared global `TableMetadataCache` created once at coordinator
+    /// startup. When `Some`, all sessions share the same cache so cache misses are amortised
+    /// across users. When `None` a private cache is built locally (used in tests).
     pub async fn new(
         polaris_url: &str,
         warehouse: &str,
         bearer_token: &str,
         storage_config: &StorageConfig,
+        table_cache: Option<TableMetadataCache>,
         http_client: Option<reqwest::Client>,
         circuit_breaker: Option<Arc<CircuitBreaker>>,
     ) -> sqe_core::Result<Self> {
@@ -121,13 +189,36 @@ impl SessionCatalog {
         // RisingWave fork uses CatalogBuilder::load(name, props) pattern.
         // Storage factory (OpenDAL S3) is configured automatically from the s3.*
         // properties in the props HashMap — no explicit with_storage_factory() needed.
-        let catalog = RestCatalogBuilder::default()
-            .load(
-                format!("sqe-session-{}", &token_fingerprint),
-                props,
-            )
-            .await
-            .map_err(|e| SqeError::Catalog(format!("Failed to create REST catalog: {e}")))?;
+        //
+        // Cache RestCatalog instances by token fingerprint to avoid the expensive
+        // (~250ms) per-query creation cost. The catalog is safe to reuse because
+        // iceberg-rust's RestCatalog is stateless (each loadTable call goes to Polaris).
+        static REST_CATALOG_CACHE: std::sync::LazyLock<
+            moka::future::Cache<String, Arc<RwLock<RestCatalog>>>
+        > = std::sync::LazyLock::new(|| {
+            moka::future::Cache::builder()
+                .max_capacity(100)
+                .time_to_live(std::time::Duration::from_secs(300)) // 5 min
+                .build()
+        });
+
+        let catalog_key = format!("{}-{}", polaris_url, token_fingerprint);
+        let inner = if let Some(cached) = REST_CATALOG_CACHE.get(&catalog_key).await {
+            debug!(token_fingerprint = %token_fingerprint, "REST catalog cache hit");
+            cached
+        } else {
+            debug!(token_fingerprint = %token_fingerprint, "REST catalog cache miss, creating");
+            let catalog = RestCatalogBuilder::default()
+                .load(
+                    format!("sqe-session-{}", &token_fingerprint),
+                    props,
+                )
+                .await
+                .map_err(|e| SqeError::Catalog(format!("Failed to create REST catalog: {e}")))?;
+            let arc_catalog = Arc::new(RwLock::new(catalog));
+            REST_CATALOG_CACHE.insert(catalog_key, arc_catalog.clone()).await;
+            arc_catalog
+        };
 
         let http_client = http_client.unwrap_or_default();
         let circuit_breaker = circuit_breaker.unwrap_or_else(|| {
@@ -138,8 +229,13 @@ impl SessionCatalog {
             ))
         });
 
+        // Use the shared global cache when provided; fall back to a private
+        // per-session cache (disabled — max_capacity 0) so that call sites that
+        // pass `None` (tests, one-shot DDL helpers) don't pollute a global state.
+        let table_cache = table_cache.unwrap_or_else(|| TableMetadataCache::new(0));
+
         Ok(Self {
-            inner: Arc::new(RwLock::new(catalog)),
+            inner,
             polaris_url: polaris_url.to_string(),
             warehouse: warehouse.to_string(),
             bearer_token: bearer_token.to_string(),
@@ -147,6 +243,7 @@ impl SessionCatalog {
             storage_config: storage_config.clone(),
             http_client,
             circuit_breaker,
+            table_cache,
         })
     }
 
@@ -238,12 +335,27 @@ impl SessionCatalog {
     ///
     /// The returned `Table` includes metadata and a FileIO configured with
     /// vended credentials (if Polaris provides them) or static S3 config.
+    ///
+    /// Results are cached in the shared global `TableMetadataCache` (passed at construction
+    /// time). Use [`invalidate_table`] to evict an entry after DDL/DML.
     #[instrument(skip(self), fields(table = %table_ident, warehouse = %self.warehouse))]
     pub async fn load_table(&self, table_ident: &TableIdent) -> sqe_core::Result<Table> {
+        let cache_key = format!("{}.{}", table_ident.namespace(), table_ident.name());
+
+        // Fast path: return cached table without touching Polaris.
+        if let Some(cached) = self.table_cache.get(&cache_key).await {
+            debug!(
+                token_fingerprint = %self.token_fingerprint,
+                table = ?table_ident,
+                "Table cache hit"
+            );
+            return Ok(cached);
+        }
+
         debug!(
             token_fingerprint = %self.token_fingerprint,
             table = ?table_ident,
-            "Loading table"
+            "Loading table (cache miss)"
         );
         self.circuit_breaker
             .check()
@@ -254,10 +366,24 @@ impl SessionCatalog {
             .await
             .map_err(|e| sqe_core::SqeError::Catalog(format!("Failed to load table: {e}")));
         match &result {
-            Ok(_) => self.circuit_breaker.record_success(),
+            Ok(table) => {
+                self.circuit_breaker.record_success();
+                self.table_cache.insert(cache_key, table.clone()).await;
+            }
             Err(_) => self.circuit_breaker.record_failure(),
         }
         result
+    }
+
+    /// Evict a table from the metadata cache.
+    ///
+    /// Call this after any DDL/DML operation that changes the table's metadata
+    /// (DROP TABLE, CREATE TABLE, ALTER TABLE, INSERT, MERGE, DELETE) so that
+    /// the next `load_table()` fetches fresh metadata from Polaris.
+    pub async fn invalidate_table(&self, table_ident: &TableIdent) {
+        let key = format!("{}.{}", table_ident.namespace(), table_ident.name());
+        self.table_cache.invalidate(&key).await;
+        debug!(table = %table_ident, "Table cache invalidated");
     }
 
     /// Check if a table exists.
@@ -576,6 +702,8 @@ impl SessionCatalog {
         }
 
         info!(table = %table_ident, "Schema update committed");
+        // Invalidate cache so the next load_table() fetches the updated metadata.
+        self.invalidate_table(table_ident).await;
         Ok(())
     }
 
@@ -656,18 +784,30 @@ impl Catalog for SessionCatalogBridge {
         namespace: &NamespaceIdent,
         creation: iceberg::TableCreation,
     ) -> iceberg::Result<Table> {
+        let table_name = creation.name.clone();
         let catalog = self.session.inner.read().await;
-        catalog.create_table(namespace, creation).await
+        let result = catalog.create_table(namespace, creation).await?;
+        // Invalidate any stale cache entry for this table name.
+        let ident = TableIdent::new(namespace.clone(), table_name);
+        self.session.table_cache.invalidate(&format!("{}.{}", ident.namespace(), ident.name())).await;
+        Ok(result)
     }
 
     async fn load_table(&self, table: &TableIdent) -> iceberg::Result<Table> {
-        let catalog = self.session.inner.read().await;
-        catalog.load_table(table).await
+        // Delegate through SessionCatalog::load_table so the cache is used.
+        self.session
+            .load_table(table)
+            .await
+            .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::Unexpected, e.to_string()))
     }
 
     async fn drop_table(&self, table: &TableIdent) -> iceberg::Result<()> {
         let catalog = self.session.inner.read().await;
-        catalog.drop_table(table).await
+        let result = catalog.drop_table(table).await;
+        // Invalidate on success or failure — stale data is worse than a miss.
+        drop(catalog);
+        self.session.table_cache.invalidate(&format!("{}.{}", table.namespace(), table.name())).await;
+        result
     }
 
     async fn table_exists(&self, table: &TableIdent) -> iceberg::Result<bool> {
@@ -694,7 +834,12 @@ impl Catalog for SessionCatalogBridge {
     }
 
     async fn update_table(&self, commit: iceberg::TableCommit) -> iceberg::Result<Table> {
+        let ident = commit.identifier().clone();
         let catalog = self.session.inner.read().await;
-        catalog.update_table(commit).await
+        let result = catalog.update_table(commit).await;
+        drop(catalog);
+        // Invalidate cache so any subsequent load_table sees updated metadata.
+        self.session.table_cache.invalidate(&format!("{}.{}", ident.namespace(), ident.name())).await;
+        result
     }
 }

@@ -1,15 +1,33 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use moka::future::Cache;
 use tracing::debug;
 
-use sqe_catalog::{SessionCatalog, SqeCatalogProvider};
+use sqe_catalog::{ManifestCache, SessionCatalog, SqeCatalogProvider, TableMetadataCache};
 use sqe_core::{Session, SqeConfig};
 use sqe_policy::PolicyStore;
 
 use crate::query_tracker::QueryTracker;
+
+/// Per-user SessionContext cache keyed by token fingerprint.
+///
+/// The cache holds `(SessionContext, Arc<SessionCatalog>)` pairs so that warm
+/// queries skip the ~50 ms registration overhead (UDFs, TVFs, catalog setup).
+/// Entries expire after 5 minutes (matching default idle session TTL) and the
+/// cache holds at most 100 entries to bound memory usage.
+///
+/// DataFusion's `SessionContext` is `Clone` and wraps an `Arc<SessionState>`
+/// internally, so a clone is O(1) — only the Arc ref-count changes.
+static SESSION_CONTEXT_CACHE: LazyLock<Cache<String, (SessionContext, Arc<SessionCatalog>)>> =
+    LazyLock::new(|| {
+        Cache::builder()
+            .max_capacity(100)
+            .time_to_live(std::time::Duration::from_secs(300))
+            .build()
+    });
 
 /// Build a DataFusion [`SessionContext`] for the given session.
 ///
@@ -24,7 +42,12 @@ use crate::query_tracker::QueryTracker;
 /// [`crate::runtime::build_coordinator_runtime`]), it is used for all sessions
 /// so the FairSpillPool memory limit is enforced globally. When `None`, a
 /// per-query runtime is created using the legacy `max_query_memory` setting.
-#[tracing::instrument(skip(config, session, policy_store, query_tracker, runtime, prom_metrics), fields(username = %session.user.username))]
+///
+/// Results are cached per token fingerprint (5-minute TTL, max 100 entries).
+/// On a cache hit the `SessionContext` and `SessionCatalog` are cloned in O(1)
+/// and returned immediately, skipping all registration work.
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip(config, session, policy_store, query_tracker, runtime, prom_metrics, manifest_cache, table_cache), fields(username = %session.user.username))]
 pub async fn create_session_context(
     config: &SqeConfig,
     session: &Session,
@@ -32,7 +55,23 @@ pub async fn create_session_context(
     query_tracker: &Arc<QueryTracker>,
     runtime: Option<&Arc<RuntimeEnv>>,
     prom_metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
+    manifest_cache: Option<&ManifestCache>,
+    table_cache: Option<&TableMetadataCache>,
 ) -> sqe_core::Result<(SessionContext, Arc<SessionCatalog>)> {
+    // --- Cache lookup ---
+    // Cache by username. Each HTTP request may produce a different bearer token
+    // via OIDC password grant, but the same user has the same catalog access.
+    // The SessionCatalog inside uses the user's access token for Polaris, which
+    // is refreshed via the RestCatalog cache independently.
+    let cache_key = session.user.username.clone();
+    if let Some((cached_ctx, cached_catalog)) = SESSION_CONTEXT_CACHE.get(&cache_key).await {
+        debug!(
+            username = %session.user.username,
+            "SessionContext cache hit — skipping registration"
+        );
+        return Ok((cached_ctx.clone(), cached_catalog.clone()));
+    }
+
     let catalog_name = if config.catalog.warehouse.is_empty() {
         "default".to_string()
     } else {
@@ -41,7 +80,12 @@ pub async fn create_session_context(
 
     let session_config = SessionConfig::new()
         .with_information_schema(true)
-        .with_default_catalog_and_schema(&catalog_name, "default");
+        .with_default_catalog_and_schema(&catalog_name, "default")
+        // Parse numeric literals like 0.06 as DECIMAL instead of DOUBLE.
+        // Matches Trino/SQL standard behavior: 0.06 - 0.01 = 0.05 (exact),
+        // not 0.049999999999999996 (floating-point). Critical for correct
+        // BETWEEN predicates and aggregate precision.
+        .set_bool("datafusion.sql_parser.parse_float_as_decimal", true);
 
     let mut ctx = if let Some(rt) = runtime {
         // Use the shared coordinator runtime (FairSpillPool with spill-to-disk)
@@ -76,13 +120,16 @@ pub async fn create_session_context(
         .expect("MemoryCatalogProvider always accepts schema registration");
     ctx.register_catalog("datafusion", df_catalog);
 
-    // Create a per-session catalog connected to Polaris with the user's bearer token
+    // Create a per-session catalog connected to Polaris with the user's bearer token.
+    // Pass the shared global table metadata cache so Polaris REST round-trips are
+    // skipped for tables that have already been loaded within the TTL window.
     let session_catalog = Arc::new(
         SessionCatalog::new(
             &config.catalog.polaris_url,
             &config.catalog.warehouse,
             &session.access_token,
             &config.storage,
+            table_cache.cloned(),
             None, None,
         )
         .await?,
@@ -105,6 +152,14 @@ pub async fn create_session_context(
     if let Some(m) = prom_metrics {
         catalog_provider = catalog_provider.with_metrics(Arc::clone(m));
     }
+    if let Some(mc) = manifest_cache {
+        catalog_provider = catalog_provider.with_manifest_cache(mc.clone());
+    }
+    // Apply the small-file direct-read threshold from catalog config.
+    // Convert MB to bytes; 0 MB disables the fast path.
+    let small_file_threshold_bytes = config.catalog.small_file_threshold_mb
+        .saturating_mul(1024 * 1024);
+    catalog_provider = catalog_provider.with_small_file_threshold(small_file_threshold_bytes);
 
     ctx.register_catalog(&catalog_name, Arc::new(catalog_provider));
 
@@ -256,5 +311,30 @@ pub async fn create_session_context(
         "Registered session catalog in DataFusion context"
     );
 
+    // --- Cache insert ---
+    // Store the newly built context so subsequent queries from the same user
+    // (same bearer token) skip all registration work. The TTL ensures the entry
+    // is evicted before the token expires (5-min TTL ≤ 15-min idle timeout).
+    SESSION_CONTEXT_CACHE
+        .insert(cache_key, (ctx.clone(), session_catalog_for_return.clone()))
+        .await;
+
     Ok((ctx, session_catalog_for_return))
+}
+
+/// Invalidate the cached SessionContext for a specific user.
+///
+/// Must be called after DDL/DML operations (CTAS, DROP TABLE, INSERT, etc.)
+/// that modify the catalog so subsequent queries see the new schema state.
+pub async fn invalidate_session_cache(username: &str) {
+    SESSION_CONTEXT_CACHE.remove(username).await;
+    debug!(username = %username, "SessionContext cache invalidated after schema change");
+}
+
+/// Invalidate all cached SessionContexts.
+///
+/// Used when a global catalog change affects all users (e.g., namespace creation).
+pub async fn invalidate_all_session_caches() {
+    SESSION_CONTEXT_CACHE.invalidate_all();
+    debug!("All SessionContext caches invalidated");
 }

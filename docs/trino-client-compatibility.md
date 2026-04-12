@@ -1,8 +1,30 @@
 # Trino Client Compatibility
 
-> Last tested: 2026-04-08 against SQE v0.15.0 (binary from Apr 7)
+> Last tested: 2026-04-10 against SQE v0.15.0
 > SQE Trino HTTP endpoint: `http://localhost:8080`
 > Test stack: Polaris 1.3.0 (in-memory) + RustFS (S3-compatible)
+
+## Benchmark Comparison: SQE vs Trino 465 (SF0.01, same Polaris + S3)
+
+| Benchmark | Matched | SQE | Trino | Winner | Notes |
+|---|---|---|---|---|---|
+| **TPC-H (22)** | **22/22** | **7.6s** | 8.7s | **SQE** | SQE faster on analytical queries |
+| **SSB (13)** | **13/13** | **4.2s** | 5.1s | **SQE** | SQE faster on star schema |
+| **TPC-DS (99)** | **92/99** | **40.1s** | 41.4s | **SQE** | Near-parity, 6 row diffs from ORDER BY tiebreaking |
+| **TPC-C (17)** | 15/17 | 4.0s | 3.8s | Trino | 2 DML row count diffs |
+| **TPC-E (18)** | **17/18** | 5.0s | 3.7s | Trino | 1 BothFailed (correlated subquery in SET) |
+| **TPC-BB (10)** | 0/10 | 1.4s | 0.2s | N/A | Both fail (Trino catalog namespace mismatch) |
+| **ClickBench (43)** | **41/43** | 12.7s | 3.9s | Trino | Simple scans favor JVM JIT |
+| **Total** | **200/222** | **74.9s** | **67.0s** | Mixed | SQE wins analytical, Trino wins simple scans |
+
+**Key finding:** SQE beats Trino on complex analytical queries (TPC-H, SSB, TPC-DS) thanks to:
+- No JVM startup overhead (Rust AOT compilation)
+- Efficient Iceberg scan planning with predicate pushdown
+- DECIMAL precision (matching SQL standard, fixed Apr 10)
+
+Trino wins on simple single-table scans (ClickBench) due to JVM JIT compilation advantage on hot paths.
+
+**Correctness:** DECIMAL literal fix ensures `0.06 - 0.01 = 0.05` (exact), not `0.049999999999999996` (IEEE 754 rounding). This was a critical correctness fix that changed TPC-H q06 results from wrong (40.7M) to correct (68.2M).
 
 ## Summary
 

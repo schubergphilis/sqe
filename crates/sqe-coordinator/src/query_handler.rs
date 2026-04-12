@@ -62,6 +62,12 @@ pub struct QueryHandler {
     /// Shared DataFusion runtime with FairSpillPool memory management.
     /// Built once at startup and reused across all queries.
     runtime: Arc<RuntimeEnv>,
+    /// Optional shared manifest file cache. Passed to every session context so
+    /// that warm queries avoid re-fetching immutable Iceberg manifest files from S3.
+    manifest_cache: Option<sqe_catalog::ManifestCache>,
+    /// Shared global table metadata cache. Persists across sessions and queries so
+    /// that repeated `load_table()` calls skip the Polaris REST round-trip.
+    table_cache: Option<sqe_catalog::TableMetadataCache>,
 }
 
 impl QueryHandler {
@@ -109,7 +115,35 @@ impl QueryHandler {
             query_cache,
             query_semaphore,
             runtime,
+            manifest_cache: None,
+            table_cache: None,
         }
+    }
+
+    /// Attach a shared manifest file cache used to accelerate repeated scans.
+    ///
+    /// The cache is propagated to every session context and down to each
+    /// `IcebergScanExec`. Call once at coordinator startup with a globally
+    /// shared `ManifestCache` instance.
+    pub fn with_manifest_cache(mut self, cache: sqe_catalog::ManifestCache) -> Self {
+        self.manifest_cache = Some(cache);
+        self
+    }
+
+    /// Attach a global table metadata cache shared across all sessions and queries.
+    ///
+    /// The cache is created once at coordinator startup and passed here so that
+    /// every `SessionCatalog` constructed during query execution shares the same
+    /// backing store. This eliminates the per-query Polaris REST round-trip for
+    /// tables that have already been loaded within the TTL window.
+    ///
+    /// Propagates the cache into the sub-handlers (`CatalogOps`, `WriteHandler`)
+    /// so that DDL and write paths also share the same global cache.
+    pub fn with_table_cache(mut self, cache: sqe_catalog::TableMetadataCache) -> Self {
+        self.catalog_ops = self.catalog_ops.with_table_cache(cache.clone());
+        self.write_handler = self.write_handler.with_table_cache(cache.clone());
+        self.table_cache = Some(cache);
+        self
     }
 
     /// Returns a reference to the query tracker.
@@ -269,39 +303,49 @@ impl QueryHandler {
 
                 StatementKind::Drop(stmt) => {
                     self.catalog_ops.drop_table(session, stmt).await?;
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
                 StatementKind::Rename(stmt) => {
                     self.catalog_ops.rename_table(session, stmt).await?;
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
                 StatementKind::AlterSchema(stmt) => {
                     self.catalog_ops.alter_table_schema(session, stmt).await?;
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
                 StatementKind::AlterTableProps(stmt) => {
                     self.catalog_ops.set_table_properties(session, stmt).await?;
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
                 StatementKind::CreateView(stmt) => {
                     self.handle_create_view(session, stmt).await?;
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
                 StatementKind::DropView(stmt) => {
                     self.catalog_ops.drop_view(session, stmt).await?;
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
                 StatementKind::CreateSchema(stmt) => {
                     self.catalog_ops.create_schema(session, stmt).await?;
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
                 StatementKind::DropSchema(stmt) => {
                     self.catalog_ops.drop_schema(session, stmt).await?;
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
 
                 StatementKind::CreateTable(stmt) => {
-                    self.write_handler.handle_create_table(session, stmt).await
+                    let result = self.write_handler.handle_create_table(session, stmt).await;
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
+                    result
                 }
 
                 StatementKind::Ctas(stmt) => {
@@ -314,9 +358,11 @@ impl QueryHandler {
                             }
                             let select_sql = format!("{query}");
                             let (ctx, _) = self.create_session_context(session).await?;
-                            self.write_handler
+                            let result = self.write_handler
                                 .handle_ctas_streaming(session, stmt, &ctx, &select_sql)
-                                .await
+                                .await;
+                            crate::session_context::invalidate_session_cache(&session.user.username).await;
+                            result
                         } else {
                             Err(SqeError::Execution("CTAS without SELECT query".into()))
                         }
@@ -1043,6 +1089,8 @@ impl QueryHandler {
             &self.query_tracker,
             Some(&self.runtime),
             self.metrics.as_ref(),
+            self.manifest_cache.as_ref(),
+            self.table_cache.as_ref(),
         )
         .await
     }
@@ -1170,6 +1218,7 @@ impl QueryHandler {
             &self.config.catalog.warehouse,
             &session.access_token,
             &self.config.storage,
+            self.table_cache.clone(),
             None, None,
         )
         .await?;
@@ -1207,6 +1256,7 @@ impl QueryHandler {
             &self.config.catalog.warehouse,
             &session.access_token,
             &self.config.storage,
+            self.table_cache.clone(),
             None, None,
         )
         .await?;
@@ -1589,7 +1639,8 @@ impl QueryHandler {
                 &self.config.catalog.warehouse,
                 &session.access_token,
                 &self.config.storage,
-            None, None,
+                self.table_cache.clone(),
+                None, None,
             )
             .await?,
         );

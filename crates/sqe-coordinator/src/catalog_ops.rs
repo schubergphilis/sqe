@@ -7,7 +7,7 @@ use iceberg::{Catalog, NamespaceIdent, TableIdent, TableRequirement, TableUpdate
 use sqlparser::ast::{AlterColumnOperation, AlterTableOperation, Expr, ObjectName, ObjectType, SchemaName, SqlOption, Statement, Value};
 use tracing::info;
 
-use sqe_catalog::SessionCatalog;
+use sqe_catalog::{SessionCatalog, TableMetadataCache};
 use sqe_core::{Session, SqeConfig, SqeError};
 use tracing::instrument;
 
@@ -19,11 +19,19 @@ use crate::write_handler::sql_type_to_arrow;
 /// rather than through DataFusion's query engine.
 pub struct CatalogOps {
     config: SqeConfig,
+    /// Shared global table metadata cache threaded from the coordinator.
+    table_cache: Option<TableMetadataCache>,
 }
 
 impl CatalogOps {
     pub fn new(config: SqeConfig) -> Self {
-        Self { config }
+        Self { config, table_cache: None }
+    }
+
+    /// Attach a global table metadata cache so DDL operations invalidate the right entry.
+    pub fn with_table_cache(mut self, cache: TableMetadataCache) -> Self {
+        self.table_cache = Some(cache);
+        self
     }
 
     /// Drop a table via the Iceberg REST catalog.
@@ -283,6 +291,7 @@ impl CatalogOps {
             &self.config.catalog.warehouse,
             &session.access_token,
             &self.config.storage,
+            self.table_cache.clone(),
             None, None,
         )
         .await?;
@@ -349,6 +358,7 @@ impl CatalogOps {
             &self.config.catalog.warehouse,
             &session.access_token,
             &self.config.storage,
+            self.table_cache.clone(),
             None, None,
         )
         .await?;
@@ -405,6 +415,7 @@ impl CatalogOps {
                 &self.config.catalog.warehouse,
                 &session.access_token,
                 &self.config.storage,
+                self.table_cache.clone(),
                 None, None,
             )
             .await?,
@@ -630,6 +641,7 @@ impl CatalogOps {
                 &self.config.catalog.warehouse,
                 &session.access_token,
                 &self.config.storage,
+                self.table_cache.clone(),
                 None, None,
             )
             .await?,
@@ -662,7 +674,8 @@ impl CatalogOps {
                 &self.config.catalog.warehouse,
                 &session.access_token,
                 &self.config.storage,
-            None, None,
+                self.table_cache.clone(),
+                None, None,
             )
             .await?,
         );

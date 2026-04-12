@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
+use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
 use sqe_core::config::AuthConfig;
@@ -22,10 +23,19 @@ enum AuthBackend {
     ClientCredentials(OAuthClient),
 }
 
+/// Cached service token for client_credentials backend.
+/// Reused across all requests until near-expiry.
+struct ServiceToken {
+    access_token: String,
+    expiry: DateTime<Utc>,
+}
+
 pub struct Authenticator {
     backend: AuthBackend,
     cache: TokenCache,
     refresh_buffer_secs: u64,
+    /// Cached client_credentials token — avoids Polaris round-trip on every query.
+    service_token: RwLock<Option<ServiceToken>>,
 }
 
 impl Authenticator {
@@ -64,6 +74,7 @@ impl Authenticator {
             backend,
             cache,
             refresh_buffer_secs,
+            service_token: RwLock::new(None),
         })
     }
 
@@ -105,9 +116,41 @@ impl Authenticator {
                 Ok(session)
             }
             AuthBackend::ClientCredentials(oauth) => {
+                // Reuse the cached service token if it's still valid (with buffer).
+                let buffer = Duration::seconds(self.refresh_buffer_secs as i64);
+                {
+                    let guard = self.service_token.read().await;
+                    if let Some(ref st) = *guard {
+                        if st.expiry > Utc::now() + buffer {
+                            let session = Session::new(
+                                username.to_string(),
+                                st.access_token.clone(),
+                                None,
+                                st.expiry,
+                                Vec::new(),
+                            );
+                            debug!(
+                                username = username,
+                                "Reusing cached client_credentials token"
+                            );
+                            return Ok(session);
+                        }
+                    }
+                }
+
+                // Token missing or near-expiry — fetch a fresh one.
                 let token_response = oauth.get_token().await?;
                 let token_expiry =
                     Utc::now() + Duration::seconds(token_response.expires_in as i64);
+
+                // Cache the service token for reuse.
+                {
+                    let mut guard = self.service_token.write().await;
+                    *guard = Some(ServiceToken {
+                        access_token: token_response.access_token.clone(),
+                        expiry: token_expiry,
+                    });
+                }
 
                 // client_credentials mode: username is informational only, no
                 // refresh_token (we re-fetch via client_credentials when needed).
@@ -131,7 +174,7 @@ impl Authenticator {
                 debug!(
                     session_id = session.id,
                     username = username,
-                    "Session created and cached (client_credentials)"
+                    "Session created with fresh client_credentials token"
                 );
 
                 Ok(session)
