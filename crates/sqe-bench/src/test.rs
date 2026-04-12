@@ -300,13 +300,15 @@ pub(crate) fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> Stri
 
             // Check character after the match
             let end = pos + table.len();
-            let after_ok = if end >= remaining.len() {
-                true
-            } else {
-                let after = remaining.as_bytes()[end];
-                // Not followed by alphanumeric or underscore (would be part of a longer identifier)
-                !after.is_ascii_alphanumeric() && after != b'_'
+            let after_char = if end < remaining.len() { Some(remaining.as_bytes()[end]) } else { None };
+            let after_ok = match after_char {
+                None => true,
+                Some(c) if c.is_ascii_alphanumeric() || c == b'_' => false, // Part of longer identifier
+                _ => true,
             };
+            // If followed by '.', this is a column reference (store.item_sk).
+            // Only qualify if in FROM/JOIN context (table definition), not in expression context.
+            let is_column_ref = after_char == Some(b'.');
 
             if before_ok && after_ok {
                 let before_str = &remaining[..pos];
@@ -345,6 +347,15 @@ pub(crate) fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> Stri
                             u == "FROM" || u == "JOIN" || u == "TABLE" || u == "INTO"
                         }).unwrap_or(false)
                     };
+
+                // If followed by '.', this is a column reference (store.item_sk)
+                // or alias reference (store.cume_sales). Never qualify these --
+                // they reference an alias or already-qualified table, not a bare table.
+                if is_column_ref {
+                    output.push_str(&remaining[..end]);
+                    remaining = &remaining[end..];
+                    continue;
+                }
 
                 if !in_table_context {
                     output.push_str(&remaining[..end]);
