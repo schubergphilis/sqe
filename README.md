@@ -188,6 +188,7 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 - [x] Safe Iceberg sort order handling (only partition columns trusted by default, `trust_sort_order` config for opt-in)
 - [x] Trino comparison benchmarks (`--compare-trino` flag runs identical queries against SQE + Trino, diffs results)
 - [x] Iceberg query caching (table metadata + manifest files + RestCatalog instances) -- SQE beats Trino on TPC-H, SSB, TPC-DS
+- [x] Direct Parquet read path for small files (≤3 MB, configurable) -- single S3 GET, bypasses `scan.to_arrow()` redundant requests
 - [x] DECIMAL precision fix (`parse_float_as_decimal = true`) -- matches Trino/SQL standard, fixes incorrect query results
 - [x] Tuple IN-subquery rewrite (`(col1,col2) IN (SELECT ...)` -> OR of ANDs)
 - [ ] Semantic AI layer (RDF/SPARQL, property graph/GQL, vector search, agent interfaces)

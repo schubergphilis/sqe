@@ -34,6 +34,9 @@ pub struct SqeCatalogProvider {
     prom_metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
     /// Optional shared manifest cache propagated to schema and table providers.
     manifest_cache: Option<ManifestCache>,
+    /// Small-file threshold in bytes for the direct-read fast path.
+    /// Propagated to schema and table providers.
+    small_file_threshold_bytes: u64,
 }
 
 impl std::fmt::Debug for SqeCatalogProvider {
@@ -91,6 +94,7 @@ impl SqeCatalogProvider {
             session_user,
             prom_metrics: None,
             manifest_cache: None,
+            small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
         })
     }
 
@@ -103,6 +107,13 @@ impl SqeCatalogProvider {
     /// Attach a shared manifest cache to be propagated to schema/table providers.
     pub fn with_manifest_cache(mut self, cache: ManifestCache) -> Self {
         self.manifest_cache = Some(cache);
+        self
+    }
+
+    /// Set the small-file threshold (bytes) for the direct-read fast path.
+    /// Propagated to all schema and table providers.
+    pub fn with_small_file_threshold(mut self, threshold_bytes: u64) -> Self {
+        self.small_file_threshold_bytes = threshold_bytes;
         self
     }
 
@@ -123,6 +134,7 @@ impl SqeCatalogProvider {
             session_user: None,
             prom_metrics: None,
             manifest_cache: None,
+            small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
         }
     }
 }
@@ -167,6 +179,7 @@ impl CatalogProvider for SqeCatalogProvider {
         if let Some(ref mc) = self.manifest_cache {
             provider = provider.with_manifest_cache(mc.clone());
         }
+        provider = provider.with_small_file_threshold(self.small_file_threshold_bytes);
 
         Some(Arc::new(provider))
 

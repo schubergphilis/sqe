@@ -119,6 +119,11 @@ pub async fn create_session_context(
     if let Some(mc) = manifest_cache {
         catalog_provider = catalog_provider.with_manifest_cache(mc.clone());
     }
+    // Apply the small-file direct-read threshold from catalog config.
+    // Convert MB to bytes; 0 MB disables the fast path.
+    let small_file_threshold_bytes = config.catalog.small_file_threshold_mb
+        .saturating_mul(1024 * 1024);
+    catalog_provider = catalog_provider.with_small_file_threshold(small_file_threshold_bytes);
 
     ctx.register_catalog(&catalog_name, Arc::new(catalog_provider));
 

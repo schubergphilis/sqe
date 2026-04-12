@@ -18,14 +18,22 @@ use datafusion::physical_plan::metrics::{
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
-use futures::{Stream, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use iceberg::expr::Predicate;
 use iceberg::spec::{DataContentType, DataFile, ManifestStatus};
 use iceberg::table::Table;
+use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::ProjectionMask;
 use tracing::{debug, info_span, warn};
 
 use crate::manifest_cache::{ManifestCache, ManifestEntryData};
 use crate::pruning_stats::IcebergManifestStatistics;
+
+/// Default small-file threshold: 3 MB.
+///
+/// Files below this size are read entirely in a single S3 GET and parsed
+/// from memory, bypassing iceberg-rust's `scan.to_arrow()` pipeline.
+pub const DEFAULT_SMALL_FILE_THRESHOLD_BYTES: u64 = 3 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct IcebergScanExec {
@@ -51,6 +59,15 @@ pub struct IcebergScanExec {
     /// served from the cache on warm queries, avoiding S3 round-trips per manifest.
     /// Immutability of Iceberg manifest files makes this safe without a TTL.
     manifest_cache: Option<ManifestCache>,
+    /// Maximum file size in bytes for the direct-read fast path.
+    ///
+    /// When all data files in the scan are smaller than this threshold, SQE reads
+    /// each file entirely in one S3 GET via `FileIO::new_input().read()` and parses
+    /// the Parquet from memory, bypassing iceberg-rust's `scan.to_arrow()` pipeline
+    /// which issues redundant manifest, footer, and HEAD requests per file.
+    ///
+    /// Set to 0 to disable the fast path. Default: [`DEFAULT_SMALL_FILE_THRESHOLD_BYTES`].
+    small_file_threshold_bytes: u64,
 }
 
 impl IcebergScanExec {
@@ -117,7 +134,7 @@ impl IcebergScanExec {
             }
         };
         let properties = PlanProperties::new(eq_props, Partitioning::UnknownPartitioning(1), EmissionType::Incremental, Boundedness::Bounded);
-        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), prom_metrics, snapshot_id: None, trust_sort_order: false, manifest_cache: None }
+        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), prom_metrics, snapshot_id: None, trust_sort_order: false, manifest_cache: None, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES }
     }
 
     /// Attach a shared manifest file cache for warm-query acceleration.
@@ -133,6 +150,19 @@ impl IcebergScanExec {
     /// Set the snapshot ID for time travel queries.
     pub fn with_snapshot_id(mut self, snapshot_id: i64) -> Self {
         self.snapshot_id = Some(snapshot_id);
+        self
+    }
+
+    /// Set the small-file threshold for the direct-read fast path.
+    ///
+    /// Files whose size (from the Iceberg manifest) is below `threshold_bytes`
+    /// will be read in a single S3 GET and parsed from memory, skipping the
+    /// iceberg-rust `scan.to_arrow()` pipeline that issues redundant HEAD,
+    /// footer, and manifest-list requests.
+    ///
+    /// Pass `0` to disable the fast path for all files.
+    pub fn with_small_file_threshold(mut self, threshold_bytes: u64) -> Self {
+        self.small_file_threshold_bytes = threshold_bytes;
         self
     }
 
@@ -344,6 +374,8 @@ impl ExecutionPlan for IcebergScanExec {
         let projection = self.projection.clone();
         let predicates = self.predicates.clone();
         let snapshot_id = self.snapshot_id;
+        let manifest_cache = self.manifest_cache.clone();
+        let small_file_threshold = self.small_file_threshold_bytes;
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         let _files_pruned_minmax = MetricBuilder::new(&self.metrics).counter("files_pruned_minmax", partition);
         debug!(table=%table.identifier(), predicates=?predicates, snapshot_id=?snapshot_id, "Executing IcebergScanExec");
@@ -359,17 +391,223 @@ impl ExecutionPlan for IcebergScanExec {
             let stream = futures::stream::once(async move { Ok::<_, DataFusionError>(empty_batch) });
             return Ok(Box::pin(IcebergRecordBatchStream { schema, inner: Box::pin(stream), baseline }));
         }
+
+        // Type alias to avoid repeating the full BoxStream type in early-returns.
+        type BatchStream = futures::stream::BoxStream<'static, DFResult<RecordBatch>>;
+
+        // `schema` is also needed after the stream is created (for IcebergRecordBatchStream),
+        // so clone it before moving it into the async block.
+        let schema_for_stream = schema.clone();
         let stream = futures::stream::once(async move {
+            let schema = schema_for_stream;
+            // ── Collect data file list from our cache-backed path ────────────
+            //
+            // `collect_data_files_cached` reads the snapshot's manifest list (1 S3 GET
+            // on first call) and then serves each manifest's entries from the
+            // ManifestCache, avoiding redundant S3 fetches on warm queries.
+            let file_entries = collect_data_files_cached(&table, snapshot_id, manifest_cache.as_ref()).await?;
+
+            if file_entries.is_empty() {
+                let empty = RecordBatch::new_empty(schema.clone());
+                let s: BatchStream = futures::stream::once(async move { Ok(empty) }).boxed();
+                return Ok::<BatchStream, DataFusionError>(s);
+            }
+
+            // ── Direct-read fast path ────────────────────────────────────────
+            //
+            // When the threshold is non-zero and ALL data files are below it, read
+            // each file entirely in one S3 GET and parse Parquet from memory. This
+            // eliminates the extra HEAD, footer, and manifest-re-read requests that
+            // iceberg-rust's `scan.to_arrow()` pipeline issues per file.
+            let use_direct = small_file_threshold > 0
+                && file_entries.iter().all(|(_, size)| *size <= small_file_threshold);
+
+            if use_direct {
+                debug!(
+                    file_count = file_entries.len(),
+                    threshold_bytes = small_file_threshold,
+                    "IcebergScanExec: using direct-read fast path"
+                );
+
+                let file_io = table.file_io().clone();
+                let mut all_batches: Vec<RecordBatch> = Vec::new();
+
+                for (path, size) in &file_entries {
+                    debug!(path = %path, size = size, "Direct-read: reading file");
+
+                    let input = file_io
+                        .new_input(path)
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                    let bytes = input
+                        .read()
+                        .await
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+                    // Parse Parquet from the in-memory bytes.
+                    // `bytes::Bytes` implements `ChunkReader` so this works directly.
+                    let reader_opts = ArrowReaderOptions::new().with_page_index(true);
+                    let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(bytes, reader_opts)
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+                    // Apply column projection by mapping column names to Parquet indices.
+                    let builder = if let Some(ref cols) = projection {
+                        let parquet_schema = builder.parquet_schema().clone();
+                        let arrow_schema = builder.schema().clone();
+                        let indices: Vec<usize> = cols
+                            .iter()
+                            .filter_map(|col| {
+                                arrow_schema.fields().iter().position(|f| f.name() == col)
+                            })
+                            .collect();
+                        if indices.is_empty() {
+                            builder
+                        } else {
+                            let mask = ProjectionMask::roots(&parquet_schema, indices);
+                            builder.with_projection(mask)
+                        }
+                    } else {
+                        builder
+                    };
+
+                    let reader = builder
+                        .with_batch_size(8192)
+                        .build()
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+                    for batch_result in reader {
+                        all_batches.push(
+                            batch_result.map_err(|e| DataFusionError::External(Box::new(e)))?,
+                        );
+                    }
+                }
+
+                debug!(batch_count = all_batches.len(), "Direct-read: scan complete");
+                let s: BatchStream = futures::stream::iter(
+                    all_batches.into_iter().map(Ok::<RecordBatch, DataFusionError>)
+                ).boxed();
+                return Ok::<BatchStream, DataFusionError>(s);
+            }
+
+            // ── Fallback: iceberg-rust scan.to_arrow() pipeline ──────────────
+            //
+            // Used when the small-file fast path is disabled (`threshold = 0`) or
+            // any file exceeds the threshold. This is the original path and handles
+            // predicate pushdown via the Iceberg scan API.
+            debug!(
+                file_count = file_entries.len(),
+                "IcebergScanExec: using iceberg-rust scan.to_arrow() path"
+            );
             let mut sb = table.scan();
             if let Some(sid) = snapshot_id { sb = sb.snapshot_id(sid); }
             if let Some(ref cols) = projection { sb = sb.select(cols.iter().map(|s| s.as_str())); }
             if let Some(pred) = predicates { sb = sb.with_filter(pred); }
             let scan = sb.build().map_err(|e| DataFusionError::External(Box::new(e)))?;
             let arrow_stream = scan.to_arrow().await.map_err(|e| DataFusionError::External(Box::new(e)))?;
-            Ok::<_, DataFusionError>(arrow_stream.map_err(|e| DataFusionError::External(Box::new(e))))
+            let s: BatchStream = arrow_stream
+                .map_err(|e: iceberg::Error| DataFusionError::External(Box::new(e)))
+                .boxed();
+            Ok::<BatchStream, DataFusionError>(s)
         }).try_flatten();
         Ok(Box::pin(IcebergRecordBatchStream { schema, inner: Box::pin(stream), baseline }))
     }
+}
+
+// ── Internal helpers ─────────────────────────────────────────────────────────
+
+/// Collect the set of live data files for the given snapshot using
+/// the ManifestCache where possible.
+///
+/// Returns `(file_path, file_size_bytes)` pairs.  The function loads the
+/// snapshot's manifest *list* from S3 (one unavoidable GET on the first query
+/// for a given snapshot) and then serves each individual manifest's entries
+/// from the cache, avoiding per-manifest S3 fetches on warm queries.
+async fn collect_data_files_cached(
+    table: &Table,
+    snapshot_id: Option<i64>,
+    manifest_cache: Option<&ManifestCache>,
+) -> DFResult<Vec<(String, u64)>> {
+    let metadata = table.metadata();
+    let snapshot = if let Some(sid) = snapshot_id {
+        match metadata.snapshot_by_id(sid) {
+            Some(s) => s,
+            None => return Ok(Vec::new()),
+        }
+    } else {
+        match metadata.current_snapshot() {
+            Some(s) => s,
+            None => return Ok(Vec::new()),
+        }
+    };
+
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), metadata)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    let mut file_entries: Vec<(String, u64)> = Vec::new();
+
+    for mf in manifest_list.entries() {
+        // Fast path: serve from cache when available.
+        if let Some(mc) = manifest_cache {
+            if let Some(cached) = mc.get(&mf.manifest_path) {
+                for entry in cached.iter() {
+                    if entry.status != ManifestStatus::Deleted
+                        && entry.content_type == DataContentType::Data
+                    {
+                        file_entries.push((entry.file_path.clone(), entry.file_size));
+                    }
+                }
+                continue; // Cache hit — skip S3 read for this manifest.
+            }
+        }
+
+        // Cache miss (or no cache): load manifest from S3.
+        let manifest = mf
+            .load_manifest(table.file_io())
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // Populate the cache so subsequent calls are served from memory.
+        if let Some(mc) = manifest_cache {
+            if mc.get(&mf.manifest_path).is_none() {
+                let cache_entries: Vec<ManifestEntryData> = manifest
+                    .entries()
+                    .iter()
+                    .filter(|e| {
+                        e.status() != ManifestStatus::Deleted
+                            && e.data_file().content_type() == DataContentType::Data
+                    })
+                    .map(|e| {
+                        let df = e.data_file();
+                        ManifestEntryData {
+                            file_path: df.file_path().to_string(),
+                            file_size: df.file_size_in_bytes(),
+                            record_count: df.record_count(),
+                            content_type: df.content_type(),
+                            status: e.status(),
+                        }
+                    })
+                    .collect();
+                debug!(
+                    manifest = %mf.manifest_path,
+                    entries = cache_entries.len(),
+                    "collect_data_files_cached: populated manifest cache"
+                );
+                mc.insert(mf.manifest_path.clone(), cache_entries);
+            }
+        }
+
+        for entry in manifest.entries() {
+            if entry.status() != ManifestStatus::Deleted
+                && entry.data_file().content_type() == DataContentType::Data
+            {
+                let df = entry.data_file();
+                file_entries.push((df.file_path().to_string(), df.file_size_in_bytes()));
+            }
+        }
+    }
+
+    Ok(file_entries)
 }
 
 struct IcebergRecordBatchStream {
