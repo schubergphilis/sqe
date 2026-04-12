@@ -13,6 +13,7 @@ use tracing::{debug, error};
 use sqe_core::config::StorageConfig;
 
 use crate::catalog_provider::SqeCatalogProvider;
+use crate::manifest_cache::ManifestCache;
 use crate::rest_catalog::SessionCatalog;
 use crate::table_provider::SqeTableProvider;
 
@@ -28,6 +29,10 @@ pub struct SqeSchemaProvider {
     storage_config: StorageConfig,
     warehouse: String,
     prom_metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
+    /// Optional shared manifest cache propagated to each `SqeTableProvider`.
+    manifest_cache: Option<ManifestCache>,
+    /// Small-file threshold in bytes for the direct-read fast path.
+    small_file_threshold_bytes: u64,
 }
 
 impl SqeSchemaProvider {
@@ -44,7 +49,21 @@ impl SqeSchemaProvider {
             storage_config,
             warehouse,
             prom_metrics: None,
+            manifest_cache: None,
+            small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
         }
+    }
+
+    /// Attach a shared manifest cache to propagate to table providers.
+    pub fn with_manifest_cache(mut self, cache: ManifestCache) -> Self {
+        self.manifest_cache = Some(cache);
+        self
+    }
+
+    /// Set the small-file threshold (bytes) for the direct-read fast path.
+    pub fn with_small_file_threshold(mut self, threshold_bytes: u64) -> Self {
+        self.small_file_threshold_bytes = threshold_bytes;
+        self
     }
 
     /// Attach Prometheus metrics to propagate to table providers.
@@ -127,6 +146,11 @@ impl SchemaProvider for SqeSchemaProvider {
                             Some(ref m) => provider.with_metrics(Arc::clone(m)),
                             None => provider,
                         };
+                        let provider = match self.manifest_cache {
+                            Some(ref mc) => provider.with_manifest_cache(mc.clone()),
+                            None => provider,
+                        };
+                        let provider = provider.with_small_file_threshold(self.small_file_threshold_bytes);
                         return Ok(Some(Arc::new(provider)));
                     }
                     Err(e) => {

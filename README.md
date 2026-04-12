@@ -187,6 +187,11 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 - [x] Auto-rewrite `IN (subquery)` for UPDATE/DELETE (DataFusion physical planner workaround, unblocks 5 TPC-E queries)
 - [x] Safe Iceberg sort order handling (only partition columns trusted by default, `trust_sort_order` config for opt-in)
 - [x] Trino comparison benchmarks (`--compare-trino` flag runs identical queries against SQE + Trino, diffs results)
+- [x] Iceberg query caching (table metadata + manifest files + RestCatalog instances) -- SQE beats Trino on TPC-H, SSB, TPC-DS
+- [x] Direct Parquet read path for small files (≤3 MB, configurable) -- single S3 GET, bypasses `scan.to_arrow()` redundant requests
+- [x] DECIMAL precision fix (`parse_float_as_decimal = true`) -- matches Trino/SQL standard, fixes incorrect query results
+- [x] Tuple IN-subquery rewrite (`(col1,col2) IN (SELECT ...)` -> OR of ANDs)
+- [x] SessionContext caching per user (token fingerprint, 5-min TTL, 100-entry cap) -- eliminates ~50 ms per-query UDF/catalog registration on warm queries
 - [ ] Semantic AI layer (RDF/SPARQL, property graph/GQL, vector search, agent interfaces)
 - [ ] Helm chart for Kubernetes deployment
 

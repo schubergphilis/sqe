@@ -1238,8 +1238,8 @@ mod tests {
     // ── Bearer JWT passthrough tests ────────────────────────────
 
     /// MockAuth has no bearer provider, so `authenticate_bearer` returns Err.
-    /// The passthrough fallback should accept a JWT-shaped token and create
-    /// an ad-hoc session using the x-trino-user header.
+    /// An invalid bearer token (not validated by any provider) should be rejected
+    /// with 401 Unauthorized.
     #[tokio::test]
     async fn test_submit_query_bearer_jwt_passthrough() {
         let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
@@ -1272,12 +1272,11 @@ mod tests {
         .await;
 
         let resp = response.into_response();
-        // MockQuery returns Err("mock") so the query itself fails, but auth
-        // must have succeeded — a 401 would mean the passthrough didn't work.
-        assert_ne!(
+        // No bearer provider configured → token validation fails → 401
+        assert_eq!(
             resp.status(),
             StatusCode::UNAUTHORIZED,
-            "JWT passthrough should not return 401"
+            "Invalid bearer token should return 401"
         );
     }
 
