@@ -1,15 +1,33 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use tracing::debug;
+use moka::future::Cache;
+use tracing::{debug, info};
 
 use sqe_catalog::{ManifestCache, SessionCatalog, SqeCatalogProvider, TableMetadataCache};
 use sqe_core::{Session, SqeConfig};
 use sqe_policy::PolicyStore;
 
 use crate::query_tracker::QueryTracker;
+
+/// Per-user SessionContext cache keyed by token fingerprint.
+///
+/// The cache holds `(SessionContext, Arc<SessionCatalog>)` pairs so that warm
+/// queries skip the ~50 ms registration overhead (UDFs, TVFs, catalog setup).
+/// Entries expire after 5 minutes (matching default idle session TTL) and the
+/// cache holds at most 100 entries to bound memory usage.
+///
+/// DataFusion's `SessionContext` is `Clone` and wraps an `Arc<SessionState>`
+/// internally, so a clone is O(1) — only the Arc ref-count changes.
+static SESSION_CONTEXT_CACHE: LazyLock<Cache<String, (SessionContext, Arc<SessionCatalog>)>> =
+    LazyLock::new(|| {
+        Cache::builder()
+            .max_capacity(100)
+            .time_to_live(std::time::Duration::from_secs(300))
+            .build()
+    });
 
 /// Build a DataFusion [`SessionContext`] for the given session.
 ///
@@ -24,6 +42,10 @@ use crate::query_tracker::QueryTracker;
 /// [`crate::runtime::build_coordinator_runtime`]), it is used for all sessions
 /// so the FairSpillPool memory limit is enforced globally. When `None`, a
 /// per-query runtime is created using the legacy `max_query_memory` setting.
+///
+/// Results are cached per token fingerprint (5-minute TTL, max 100 entries).
+/// On a cache hit the `SessionContext` and `SessionCatalog` are cloned in O(1)
+/// and returned immediately, skipping all registration work.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip(config, session, policy_store, query_tracker, runtime, prom_metrics, manifest_cache, table_cache), fields(username = %session.user.username))]
 pub async fn create_session_context(
@@ -36,6 +58,18 @@ pub async fn create_session_context(
     manifest_cache: Option<&ManifestCache>,
     table_cache: Option<&TableMetadataCache>,
 ) -> sqe_core::Result<(SessionContext, Arc<SessionCatalog>)> {
+    // --- Cache lookup ---
+    // The cache key combines the username and a hash of the bearer token so that
+    // two different users (or the same user after token refresh) never share a context.
+    let cache_key = session.token_fingerprint();
+    if let Some((cached_ctx, cached_catalog)) = SESSION_CONTEXT_CACHE.get(&cache_key).await {
+        info!(
+            username = %session.user.username,
+            "SessionContext cache hit — skipping registration"
+        );
+        return Ok((cached_ctx.clone(), cached_catalog.clone()));
+    }
+
     let catalog_name = if config.catalog.warehouse.is_empty() {
         "default".to_string()
     } else {
@@ -274,6 +308,14 @@ pub async fn create_session_context(
         username = %session.user.username,
         "Registered session catalog in DataFusion context"
     );
+
+    // --- Cache insert ---
+    // Store the newly built context so subsequent queries from the same user
+    // (same bearer token) skip all registration work. The TTL ensures the entry
+    // is evicted before the token expires (5-min TTL ≤ 15-min idle timeout).
+    SESSION_CONTEXT_CACHE
+        .insert(cache_key, (ctx.clone(), session_catalog_for_return.clone()))
+        .await;
 
     Ok((ctx, session_catalog_for_return))
 }
