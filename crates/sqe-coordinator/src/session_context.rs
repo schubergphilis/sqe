@@ -321,3 +321,20 @@ pub async fn create_session_context(
 
     Ok((ctx, session_catalog_for_return))
 }
+
+/// Invalidate the cached SessionContext for a specific user.
+///
+/// Must be called after DDL/DML operations (CTAS, DROP TABLE, INSERT, etc.)
+/// that modify the catalog so subsequent queries see the new schema state.
+pub async fn invalidate_session_cache(username: &str) {
+    SESSION_CONTEXT_CACHE.remove(username).await;
+    debug!(username = %username, "SessionContext cache invalidated after schema change");
+}
+
+/// Invalidate all cached SessionContexts.
+///
+/// Used when a global catalog change affects all users (e.g., namespace creation).
+pub async fn invalidate_all_session_caches() {
+    SESSION_CONTEXT_CACHE.invalidate_all();
+    debug!("All SessionContext caches invalidated");
+}
