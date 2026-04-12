@@ -450,6 +450,8 @@ impl ExecutionPlan for IcebergScanExec {
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
                     // Apply column projection by mapping column names to Parquet indices.
+                    // For COUNT(*) queries, projection is Some([]) (empty list) -- we read
+                    // just the first column to get the row count, then discard the data.
                     let builder = if let Some(ref cols) = projection {
                         let parquet_schema = builder.parquet_schema().clone();
                         let arrow_schema = builder.schema().clone();
@@ -460,7 +462,10 @@ impl ExecutionPlan for IcebergScanExec {
                             })
                             .collect();
                         if indices.is_empty() {
-                            builder
+                            // COUNT(*) or similar: no columns needed, just row count.
+                            // Read the smallest column (first one) to get the row count.
+                            let mask = ProjectionMask::roots(&parquet_schema, vec![0]);
+                            builder.with_projection(mask)
                         } else {
                             let mask = ProjectionMask::roots(&parquet_schema, indices);
                             builder.with_projection(mask)
@@ -474,10 +479,20 @@ impl ExecutionPlan for IcebergScanExec {
                         .build()
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
+                    let is_count_star = projection.as_ref().map_or(false, |cols| cols.is_empty());
                     for batch_result in reader {
-                        all_batches.push(
-                            batch_result.map_err(|e| DataFusionError::External(Box::new(e)))?,
-                        );
+                        let batch = batch_result.map_err(|e| DataFusionError::External(Box::new(e)))?;
+                        if is_count_star {
+                            // For COUNT(*): return empty-column batch with correct row count.
+                            // DataFusion only needs the row count, not the data.
+                            all_batches.push(RecordBatch::try_new_with_options(
+                                schema.clone(),
+                                vec![],
+                                &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+                            ).map_err(|e| DataFusionError::External(Box::new(e)))?);
+                        } else {
+                            all_batches.push(batch);
+                        }
                     }
                 }
 
