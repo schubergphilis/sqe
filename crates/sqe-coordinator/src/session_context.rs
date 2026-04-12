@@ -4,7 +4,7 @@ use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaPr
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use moka::future::Cache;
-use tracing::{debug, info};
+use tracing::debug;
 
 use sqe_catalog::{ManifestCache, SessionCatalog, SqeCatalogProvider, TableMetadataCache};
 use sqe_core::{Session, SqeConfig};
@@ -59,11 +59,13 @@ pub async fn create_session_context(
     table_cache: Option<&TableMetadataCache>,
 ) -> sqe_core::Result<(SessionContext, Arc<SessionCatalog>)> {
     // --- Cache lookup ---
-    // The cache key combines the username and a hash of the bearer token so that
-    // two different users (or the same user after token refresh) never share a context.
-    let cache_key = session.token_fingerprint();
+    // Cache by username. Each HTTP request may produce a different bearer token
+    // via OIDC password grant, but the same user has the same catalog access.
+    // The SessionCatalog inside uses the user's access token for Polaris, which
+    // is refreshed via the RestCatalog cache independently.
+    let cache_key = session.user.username.clone();
     if let Some((cached_ctx, cached_catalog)) = SESSION_CONTEXT_CACHE.get(&cache_key).await {
-        info!(
+        debug!(
             username = %session.user.username,
             "SessionContext cache hit — skipping registration"
         );

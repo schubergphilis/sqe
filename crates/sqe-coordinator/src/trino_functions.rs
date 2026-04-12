@@ -1836,75 +1836,8 @@ mod tests {
     use arrow::array::StringArray;
     use datafusion::prelude::SessionContext;
 
-    async fn run_query(sql: &str) -> f64 {
-        let ctx = SessionContext::new();
-        register_trino_functions(&ctx);
-        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
-        let col = batches[0].column(0);
-        col.as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .value(0)
-    }
-
-    #[tokio::test]
-    async fn year_returns_correct_value() {
-        assert_eq!(run_query("SELECT year(DATE '2026-03-30')").await, 2026.0);
-    }
-
-    #[tokio::test]
-    async fn month_returns_correct_value() {
-        assert_eq!(run_query("SELECT month(DATE '2026-03-30')").await, 3.0);
-    }
-
-    #[tokio::test]
-    async fn day_returns_correct_value() {
-        assert_eq!(run_query("SELECT day(DATE '2026-03-30')").await, 30.0);
-    }
-
-    #[tokio::test]
-    async fn day_of_week_monday() {
-        // 2026-03-30 is Monday. num_days_from_sunday: Sunday=0, Monday=1
-        assert_eq!(run_query("SELECT day_of_week(DATE '2026-03-30')").await, 1.0);
-    }
-
-    #[tokio::test]
-    async fn quarter_returns_correct_value() {
-        assert_eq!(run_query("SELECT quarter(DATE '2026-03-30')").await, 1.0);
-        assert_eq!(run_query("SELECT quarter(DATE '2026-06-15')").await, 2.0);
-    }
-
-    #[tokio::test]
-    async fn day_of_year_returns_correct_value() {
-        // 2026-03-30: Jan=31 + Feb=28 + 30 = 89
-        assert_eq!(run_query("SELECT day_of_year(DATE '2026-03-30')").await, 89.0);
-    }
-
-    #[tokio::test]
-    async fn year_works_with_timestamp() {
-        assert_eq!(
-            run_query("SELECT year(TIMESTAMP '2026-03-30 14:30:00')").await,
-            2026.0,
-        );
-    }
-
-    #[tokio::test]
-    async fn hour_works_with_timestamp() {
-        assert_eq!(
-            run_query("SELECT hour(TIMESTAMP '2026-03-30 14:30:00')").await,
-            14.0,
-        );
-    }
-
-    #[tokio::test]
-    async fn week_iso() {
-        // 2026-01-05 is Monday of ISO week 2
-        assert_eq!(run_query("SELECT week(DATE '2026-01-05')").await, 2.0);
-    }
-
-    // ── Helpers for new function tests ────────────────────────────────────────
-
-    async fn run_query_i64(sql: &str) -> i64 {
+    /// Helper: run SQL returning an Int64 result (date extraction functions now return Int64).
+    async fn run_query(sql: &str) -> i64 {
         let ctx = SessionContext::new();
         register_trino_functions(&ctx);
         let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
@@ -1913,6 +1846,83 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap()
             .value(0)
+    }
+
+    #[tokio::test]
+    async fn year_returns_correct_value() {
+        assert_eq!(run_query("SELECT year(DATE '2026-03-30')").await, 2026);
+    }
+
+    #[tokio::test]
+    async fn month_returns_correct_value() {
+        assert_eq!(run_query("SELECT month(DATE '2026-03-30')").await, 3);
+    }
+
+    #[tokio::test]
+    async fn day_returns_correct_value() {
+        assert_eq!(run_query("SELECT day(DATE '2026-03-30')").await, 30);
+    }
+
+    #[tokio::test]
+    async fn day_of_week_monday() {
+        // 2026-03-30 is Monday. Trino: Monday=1
+        assert_eq!(run_query("SELECT day_of_week(DATE '2026-03-30')").await, 1);
+    }
+
+    #[tokio::test]
+    async fn quarter_returns_correct_value() {
+        assert_eq!(run_query("SELECT quarter(DATE '2026-03-30')").await, 1);
+        assert_eq!(run_query("SELECT quarter(DATE '2026-06-15')").await, 2);
+    }
+
+    #[tokio::test]
+    async fn day_of_year_returns_correct_value() {
+        // 2026-03-30: Jan=31 + Feb=28 + 30 = 89
+        assert_eq!(run_query("SELECT day_of_year(DATE '2026-03-30')").await, 89);
+    }
+
+    #[tokio::test]
+    async fn year_works_with_timestamp() {
+        assert_eq!(
+            run_query("SELECT year(TIMESTAMP '2026-03-30 14:30:00')").await,
+            2026,
+        );
+    }
+
+    #[tokio::test]
+    async fn hour_works_with_timestamp() {
+        assert_eq!(
+            run_query("SELECT hour(TIMESTAMP '2026-03-30 14:30:00')").await,
+            14,
+        );
+    }
+
+    #[tokio::test]
+    async fn week_iso() {
+        // 2026-01-05 is Monday of ISO week 2
+        assert_eq!(run_query("SELECT week(DATE '2026-01-05')").await, 2);
+    }
+
+    // ── Helpers for new function tests ────────────────────────────────────────
+
+    /// Run SQL returning an i64 result, handling both Int64 and UInt64 return types.
+    async fn run_query_i64(sql: &str) -> i64 {
+        let ctx = SessionContext::new();
+        register_trino_functions(&ctx);
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let col = batches[0].column(0);
+        if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+            arr.value(0)
+        } else if let Some(arr) = col.as_any().downcast_ref::<arrow::array::UInt64Array>() {
+            arr.value(0) as i64
+        } else if let Some(arr) = col.as_any().downcast_ref::<arrow::array::Int32Array>() {
+            arr.value(0) as i64
+        } else {
+            panic!(
+                "Expected Int64/UInt64/Int32 array, got {:?}",
+                col.data_type()
+            );
+        }
     }
 
     async fn run_query_string(sql: &str) -> String {
@@ -1932,83 +1942,32 @@ mod tests {
     #[tokio::test]
     async fn date_add_days() {
         // date_add('day', 5, DATE '2026-01-01') → DATE '2026-01-06'
-        // We verify by reading the year component back out.
-        let ctx = SessionContext::new();
-        register_trino_functions(&ctx);
-        let batches = ctx
-            .sql("SELECT year(date_add('day', 5, DATE '2026-01-01'))")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        let col = batches[0].column(0);
-        let year = col
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .value(0);
-        assert_eq!(year, 2026.0);
-
-        // Verify the day moved by checking day() component
-        let ctx2 = SessionContext::new();
-        register_trino_functions(&ctx2);
-        let batches2 = ctx2
-            .sql("SELECT day(date_add('day', 5, DATE '2026-01-01'))")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        let day = batches2[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .value(0);
-        assert_eq!(day, 6.0);
+        assert_eq!(
+            run_query("SELECT year(date_add('day', 5, DATE '2026-01-01'))").await,
+            2026,
+        );
+        assert_eq!(
+            run_query("SELECT day(date_add('day', 5, DATE '2026-01-01'))").await,
+            6,
+        );
     }
 
     #[tokio::test]
     async fn date_add_months() {
         // date_add('month', 2, DATE '2026-01-15') → month 3
-        let ctx = SessionContext::new();
-        register_trino_functions(&ctx);
-        let batches = ctx
-            .sql("SELECT month(date_add('month', 2, DATE '2026-01-15'))")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        let m = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .value(0);
-        assert_eq!(m, 3.0);
+        assert_eq!(
+            run_query("SELECT month(date_add('month', 2, DATE '2026-01-15'))").await,
+            3,
+        );
     }
 
     #[tokio::test]
     async fn date_add_years() {
         // date_add('year', 1, DATE '2026-03-30') → year 2027
-        let ctx = SessionContext::new();
-        register_trino_functions(&ctx);
-        let batches = ctx
-            .sql("SELECT year(date_add('year', 1, DATE '2026-03-30'))")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        let y = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .value(0);
-        assert_eq!(y, 2027.0);
+        assert_eq!(
+            run_query("SELECT year(date_add('year', 1, DATE '2026-03-30'))").await,
+            2027,
+        );
     }
 
     // ── date_diff tests ───────────────────────────────────────────────────────
@@ -2045,22 +2004,10 @@ mod tests {
     #[tokio::test]
     async fn from_unixtime_produces_timestamp() {
         // epoch 0 → timestamp 1970-01-01 00:00:00; year() should return 1970
-        let ctx = SessionContext::new();
-        register_trino_functions(&ctx);
-        let batches = ctx
-            .sql("SELECT year(from_unixtime(0))")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        let y = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .value(0);
-        assert_eq!(y, 1970.0);
+        assert_eq!(
+            run_query("SELECT year(from_unixtime(0))").await,
+            1970,
+        );
     }
 
     // ── to_unixtime tests ─────────────────────────────────────────────────────
@@ -2089,22 +2036,10 @@ mod tests {
     #[tokio::test]
     async fn to_unixtime_roundtrip() {
         // from_unixtime(to_unixtime(ts)) should give back year 2026
-        let ctx = SessionContext::new();
-        register_trino_functions(&ctx);
-        let batches = ctx
-            .sql("SELECT year(from_unixtime(to_unixtime(TIMESTAMP '2026-03-30 12:00:00')))")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        let y = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .value(0);
-        assert_eq!(y, 2026.0);
+        assert_eq!(
+            run_query("SELECT year(from_unixtime(to_unixtime(TIMESTAMP '2026-03-30 12:00:00')))").await,
+            2026,
+        );
     }
 
     // ── typeof tests ──────────────────────────────────────────────────────────
@@ -2207,42 +2142,18 @@ mod tests {
     #[tokio::test]
     async fn date_parse_iso_date() {
         // date_parse('2024-01-15', '%Y-%m-%d') → timestamp; extract year to verify
-        let ctx = SessionContext::new();
-        register_trino_functions(&ctx);
-        let batches = ctx
-            .sql("SELECT year(date_parse('2024-01-15', '%Y-%m-%d'))")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        let y = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .value(0);
-        assert_eq!(y, 2024.0);
+        assert_eq!(
+            run_query("SELECT year(date_parse('2024-01-15', '%Y-%m-%d'))").await,
+            2024,
+        );
     }
 
     #[tokio::test]
     async fn date_parse_with_time() {
-        let ctx = SessionContext::new();
-        register_trino_functions(&ctx);
-        let batches = ctx
-            .sql("SELECT hour(date_parse('2024-01-15 14:30:00', '%Y-%m-%d %H:%i:%s'))")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        let h = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .value(0);
-        assert_eq!(h, 14.0);
+        assert_eq!(
+            run_query("SELECT hour(date_parse('2024-01-15 14:30:00', '%Y-%m-%d %H:%i:%s'))").await,
+            14,
+        );
     }
 
     #[tokio::test]
@@ -2259,23 +2170,8 @@ mod tests {
 
     #[tokio::test]
     async fn now_returns_current_year() {
-        let ctx = SessionContext::new();
-        register_trino_functions(&ctx);
-        let batches = ctx
-            .sql("SELECT year(now())")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        let y = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .value(0);
-        // Should be at least 2025 (test will keep working for years)
-        assert!(y >= 2025.0, "expected current year, got {y}");
+        let y = run_query("SELECT year(now())").await;
+        assert!(y >= 2025, "expected current year, got {y}");
     }
 
     // ── json_object tests ────────────────────────────────────────────────────
@@ -2337,42 +2233,14 @@ mod tests {
 
     #[tokio::test]
     async fn localtimestamp_returns_current_year() {
-        let ctx = SessionContext::new();
-        register_trino_functions(&ctx);
-        let batches = ctx
-            .sql("SELECT year(localtimestamp())")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        let y = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .value(0);
-        assert!(y >= 2025.0, "expected current year, got {y}");
+        let y = run_query("SELECT year(localtimestamp())").await;
+        assert!(y >= 2025, "expected current year, got {y}");
     }
 
     #[tokio::test]
     async fn localtime_returns_current_year() {
-        let ctx = SessionContext::new();
-        register_trino_functions(&ctx);
-        let batches = ctx
-            .sql("SELECT year(localtime())")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        let y = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .value(0);
-        assert!(y >= 2025.0, "expected current year, got {y}");
+        let y = run_query("SELECT year(localtime())").await;
+        assert!(y >= 2025, "expected current year, got {y}");
     }
 
     // ── date_trunc (DataFusion built-in, verify Trino compat) ────────────────

@@ -479,7 +479,7 @@ impl ExecutionPlan for IcebergScanExec {
                         .build()
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                    let is_count_star = projection.as_ref().map_or(false, |cols| cols.is_empty());
+                    let is_count_star = projection.as_ref().is_some_and(|cols| cols.is_empty());
                     for batch_result in reader {
                         let batch = batch_result.map_err(|e| DataFusionError::External(Box::new(e)))?;
                         if is_count_star {
