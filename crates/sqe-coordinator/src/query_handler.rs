@@ -303,39 +303,49 @@ impl QueryHandler {
 
                 StatementKind::Drop(stmt) => {
                     self.catalog_ops.drop_table(session, stmt).await?;
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
                 StatementKind::Rename(stmt) => {
                     self.catalog_ops.rename_table(session, stmt).await?;
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
                 StatementKind::AlterSchema(stmt) => {
                     self.catalog_ops.alter_table_schema(session, stmt).await?;
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
                 StatementKind::AlterTableProps(stmt) => {
                     self.catalog_ops.set_table_properties(session, stmt).await?;
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
                 StatementKind::CreateView(stmt) => {
                     self.handle_create_view(session, stmt).await?;
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
                 StatementKind::DropView(stmt) => {
                     self.catalog_ops.drop_view(session, stmt).await?;
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
                 StatementKind::CreateSchema(stmt) => {
                     self.catalog_ops.create_schema(session, stmt).await?;
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
                 StatementKind::DropSchema(stmt) => {
                     self.catalog_ops.drop_schema(session, stmt).await?;
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
 
                 StatementKind::CreateTable(stmt) => {
-                    self.write_handler.handle_create_table(session, stmt).await
+                    let result = self.write_handler.handle_create_table(session, stmt).await;
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
+                    result
                 }
 
                 StatementKind::Ctas(stmt) => {
@@ -348,9 +358,11 @@ impl QueryHandler {
                             }
                             let select_sql = format!("{query}");
                             let (ctx, _) = self.create_session_context(session).await?;
-                            self.write_handler
+                            let result = self.write_handler
                                 .handle_ctas_streaming(session, stmt, &ctx, &select_sql)
-                                .await
+                                .await;
+                            crate::session_context::invalidate_session_cache(&session.user.username).await;
+                            result
                         } else {
                             Err(SqeError::Execution("CTAS without SELECT query".into()))
                         }
