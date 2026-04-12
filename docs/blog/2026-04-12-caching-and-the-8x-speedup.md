@@ -71,12 +71,60 @@ One config line fixed it:
 
 Now `0.06` parses as `Decimal128(2, 2)`. Exact arithmetic. Correct results. This is the kind of bug that benchmarks find and unit tests don't — because you have to run TPC-H q06 with the actual data to trigger it.
 
+## One week, start to finish
+
+The transformation is easier to understand in a table. All numbers are SF0.01, same hardware, same Polaris, same S3.
+
+### SQE solo performance
+
+| Suite | Apr 2 | Apr 10 | **Apr 12** | **Speedup** |
+|---|---|---|---|---|
+| TPC-H | 13.6s (22/22) | 18.5s (22/22) | **1.6s** (22/22) | **8.5x** |
+| SSB | 7.7s (13/13) | 8.6s (13/13) | **0.7s** (13/13) | **11x** |
+| TPC-DS | 68.3s (93/99) | 77.1s (99/99) | **13.0s** (99/99) | **5.3x** |
+| ClickBench | 23.5s (43/43) | 24.3s (43/43) | **0.6s** (43/43) | **39x** |
+| TPC-C | 2.8s (5/8) | 7.6s (17/17) | **0.9s** (17/17) | **3.1x** |
+| TPC-E | 3.6s (6/11) | 9.1s (17/18) | **1.0s** (17/18) | **3.6x** |
+| TPC-BB | 6.9s (10/10) | 7.4s (10/10) | **1.1s** (10/10) | **6.3x** |
+| **Total** | **126.4s** (192) | **153.6s** (218) | **18.9s** (221) | **6.7x** |
+
+Note that Apr 10 is *slower* than Apr 2 on some suites. That's because we added 70+ UDFs, streaming writes, and sort-order safety checks that week — correctness before speed. The pass count went from 192 to 218. Then caching made everything fast.
+
+### SQE vs Trino — the reversal
+
+| Suite | Apr 10 | **Apr 12** |
+|---|---|---|
+| TPC-H | SQE 0.6x Trino (lost) | **SQE 8.8x Trino** |
+| SSB | SQE 0.3x Trino (3x slower) | **SQE 3.2x Trino** |
+| TPC-DS | SQE 0.5x Trino (2x slower) | **SQE 2.6x Trino** |
+| ClickBench | SQE 0.1x Trino (10x slower) | **SQE 2.5x Trino** |
+| TPC-C | SQE 0.5x Trino | **SQE 5.5x Trino** |
+| TPC-E | SQE 0.4x Trino | **SQE 5.3x Trino** |
+| TPC-BB | broken (0/10 match) | **SQE 3.1x Trino** |
+
+On April 10, we lost every comparison. On April 12, we won every one.
+
+### What changed, day by day
+
+- **Apr 6**: Distributed execution landed (coordinator + 2 workers, 3.1x on SF1 TPC-H)
+- **Apr 10**: Streaming writes, sort-order safety, IN-subquery rewrite, 70+ Trino-compat UDFs. Correctness went from 192/222 to 218/222. Slower overall because every query now did more setup work.
+- **Apr 12 morning**: RestCatalog cache, table metadata cache, manifest file cache. SQE reached parity with Trino (~1.0-1.4x).
+- **Apr 12 afternoon**: SessionContext cache + OAuth token cache + cache invalidation + DECIMAL fix. SQE blew past Trino on every suite.
+
+The inflection point was the SessionContext cache. Eliminating 540ms of per-query overhead turned a 0.6x deficit into an 8.8x lead. The query execution was always fast. The infrastructure around it was not.
+
 ## What we learned
 
 The performance gap between SQE and Trino was never about query execution. DataFusion's execution engine was always competitive. The gap was infrastructure overhead — catalog creation, token management, session setup — that Trino amortizes across its JVM lifecycle and SQE was paying per-query.
 
 Caching fixed the overhead. But caching introduced a correctness risk (stale catalogs) that required careful invalidation. And the process of building automated Trino comparisons surfaced a precision bug that had been silently producing wrong results since day one.
 
-The lesson: you can't optimize what you don't measure, and you can't trust measurements that don't verify correctness. The `--compare-trino` flag does both. Same queries. Same data. Same network. Row-count verification on every query.
+Three lessons:
+
+First, you can't optimize what you don't measure. The `--compare-trino` flag made every improvement — and every regression — immediately visible. Same queries, same data, same network, row-count verification on every query.
+
+Second, correctness before speed. We spent April 6-10 making things slower but more correct (192 → 218 pass). Then April 12 made them fast (218 → 221 pass, 6.7x faster). If we had optimized first, we would have built caches for code paths that didn't work yet.
+
+Third, the hardest bugs hide in the infrastructure. The DECIMAL precision bug had been silently corrupting TPC-H q06 results since day one. The SessionContext cache invalidation bug only appeared under the exact load/query pattern that benchmarks produce. Neither would have surfaced from unit tests. Both required running real SQL against real data with real comparisons.
 
 221 out of 222. We'll take it.

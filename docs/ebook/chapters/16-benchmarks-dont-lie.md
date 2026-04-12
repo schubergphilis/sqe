@@ -511,11 +511,53 @@ The operational simplicity was the argument.
 :::
 
 
+## One Week: From Losing to Dominant
+
+The benchmark JSON reports accumulate in `benchmarks/results/`. They are not a dashboard. They are a historical record. And the historical record from April 2026 tells a story about what happens when you focus on correctness first and performance second.
+
+On April 2, SQE ran 192 out of 222 benchmark queries. Thirty queries failed — missing UDFs, unsupported SQL features, ROLLUP edge cases. The queries that passed took 126 seconds total. Respectable for a single-node engine, but not competitive with Trino.
+
+On April 10, SQE ran 218 out of 222 queries. We had added 70+ Trino-compatible UDFs, streaming writes, sort-order safety, and IN-subquery rewrite. The pass count jumped from 192 to 218. But the total time *increased* to 154 seconds. Every query now did more work — building SessionContexts with more UDFs, resolving more catalog metadata. We were more correct and slower. The first Trino comparison runs showed SQE losing on every suite. ClickBench: 0.1x Trino. TPC-H: 0.6x Trino. The numbers were discouraging.
+
+On the morning of April 12, we landed the first three caching layers: RestCatalog cache, table metadata cache, manifest file cache. SQE reached rough parity with Trino — 1.0x to 1.4x depending on the suite. Competitive, not dominant.
+
+On the afternoon of April 12, we landed the SessionContext cache and OAuth service token cache. The effect was immediate:
+
+| Suite | Apr 2 | Apr 10 | **Apr 12** | Speedup |
+|---|---|---|---|---|
+| TPC-H | 13.6s | 18.5s | **1.6s** | 8.5x |
+| SSB | 7.7s | 8.6s | **0.7s** | 11x |
+| TPC-DS | 68.3s | 77.1s | **13.0s** | 5.3x |
+| ClickBench | 23.5s | 24.3s | **0.6s** | 39x |
+| TPC-C | 2.8s | 7.6s | **0.9s** | 3.1x |
+| TPC-E | 3.6s | 9.1s | **1.0s** | 3.6x |
+| TPC-BB | 6.9s | 7.4s | **1.1s** | 6.3x |
+| **Total** | **126s** (192/222) | **154s** (218/222) | **19s** (221/222) | **6.7x** |
+
+The Trino comparison reversed completely:
+
+| Suite | Apr 10 vs Trino | **Apr 12 vs Trino** |
+|---|---|---|
+| TPC-H | SQE 0.6x (lost) | **SQE 8.8x** |
+| SSB | SQE 0.3x (3x slower) | **SQE 3.2x** |
+| TPC-DS | SQE 0.5x (2x slower) | **SQE 2.6x** |
+| ClickBench | SQE 0.1x (10x slower) | **SQE 2.5x** |
+| TPC-C | SQE 0.5x | **SQE 5.5x** |
+| TPC-E | SQE 0.4x | **SQE 5.3x** |
+| TPC-BB | 0/10 match (broken) | **SQE 3.1x** (10/10) |
+
+On April 10, SQE lost every Trino comparison. On April 12, it won every one. The query execution engine did not change between those dates. The five caching layers eliminated overhead that was invisible in profiling but dominant in wall-clock time.
+
+::: {.fieldreport}
+**Field report: correctness before speed.** We spent April 6-10 making SQE slower but more correct. Adding UDFs increased SessionContext build time. Adding streaming writes increased CTAS overhead. Adding sort-order safety added metadata checks. Every feature made the pass count go up and the runtime go up with it. Then caching made everything fast. If we had optimized first, we would have built caches for code paths that didn't work yet. Correctness first, speed second. The order matters.
+:::
+
+
 ## The Benchmark as Regression Suite
 
 The seven suites serve double duty. On commit, CI runs TPC-H at scale factor 0.01 — just enough data to verify correctness, fast enough to finish in under a minute. The test is not "is SQE fast?" The test is "did this commit break any of the 22 queries that worked yesterday?"
 
-Nightly, CI runs the full suite: all seven benchmarks at scale factor 1. This catches performance regressions that the correctness suite misses. A query that used to take 2 seconds and now takes 20 seconds is not wrong — it still returns the right answer. But the JSON report shows the timing, and a simple script can flag queries whose duration increased by more than 3x.
+Nightly, CI runs the full suite at scale factor 0.01 with the `--compare-trino` flag. This catches both correctness regressions and performance regressions in a single run. The Trino container starts automatically, the same queries run against both engines, and the comparison JSON report captures per-query timing and row-count matching.
 
 The shell scripts orchestrate the full pipeline:
 
@@ -526,13 +568,16 @@ The shell scripts orchestrate the full pipeline:
 # Just TPC-H and SSB at scale factor 10
 BENCH_SCALE=10 ./scripts/benchmark-test.sh tpch ssb
 
-# Test against Trino instead of SQE
-BENCH_PROTOCOL=trino ./scripts/benchmark-test.sh tpch
+# Compare SQE vs Trino on all suites
+./scripts/benchmark-test.sh --compare-trino
+
+# Compare on a single suite
+BENCH_SCALE=0.01 ./scripts/benchmark-test.sh --compare-trino tpch
 ```
 
 The exit code is 0 if every query passes or is skipped. Non-zero if any query fails or errors. CI gates on this. You cannot merge a commit that breaks a benchmark query.
 
-Every benchmark run produces a JSON report with per-query timing. Over time, these reports build a performance history. We do not have a fancy dashboard. We have a directory of JSON files and a grep command. It is enough.
+Every benchmark run produces a JSON report with per-query timing. The comparison runs produce a second JSON report with SQE-vs-Trino speedup per query. Over time, these reports build a performance history. We do not have a fancy dashboard. We have a directory of JSON files and a grep command. It is enough.
 
 The `benchmark-test.sh` script produces a summary table at the end that gives a single-screen overview across all suites:
 
