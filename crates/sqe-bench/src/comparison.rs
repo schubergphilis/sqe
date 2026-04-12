@@ -48,13 +48,42 @@ pub async fn run_comparison(
             .to_string();
         let raw_sql = std::fs::read_to_string(entry.path())?;
 
-        // Qualify bare table names with the benchmark namespace
-        // (same as sqe-bench test does via prefix_tables)
-        let namespace = crate::bench_namespace(benchmark, scale);
+        // Qualify bare table names with the benchmark namespace.
+        // TPC-BB uses TPC-DS namespace (same as sqe-bench test).
+        let namespace = if benchmark == "tpcbb" {
+            crate::bench_namespace("tpcds", scale)
+        } else {
+            crate::bench_namespace(benchmark, scale)
+        };
         let sql = crate::test::prefix_tables(&raw_sql, &namespace, benchmark);
         // Strip trailing semicolons -- Trino HTTP protocol rejects them.
         // Trim whitespace first (files end with \n after ;)
         let sql = sql.trim().trim_end_matches(';').trim().to_string();
+
+        // Skip DML queries (UPDATE, DELETE, INSERT, MERGE) in comparison mode.
+        // Both engines would modify the same table, causing data corruption.
+        // DML correctness is verified by the regular sqe-bench test, not compare.
+        let sql_upper = sql.trim().to_uppercase();
+        let is_dml = sql_upper.starts_with("UPDATE ")
+            || sql_upper.starts_with("DELETE ")
+            || sql_upper.starts_with("INSERT ")
+            || sql_upper.starts_with("MERGE ");
+        // Also check after stripping comments (-- name: ...)
+        let first_stmt = sql.lines()
+            .find(|l| !l.trim().starts_with("--") && !l.trim().is_empty())
+            .unwrap_or("")
+            .trim()
+            .to_uppercase();
+        let is_dml = is_dml
+            || first_stmt.starts_with("UPDATE ")
+            || first_stmt.starts_with("DELETE ")
+            || first_stmt.starts_with("INSERT ")
+            || first_stmt.starts_with("MERGE ");
+
+        if is_dml {
+            info!("  {} ... SKIPPED (DML)", query_name);
+            continue;
+        }
 
         info!("  {} ...", query_name);
 
