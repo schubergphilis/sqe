@@ -87,12 +87,13 @@ pub struct QueryConfig {
     ///
     /// - `"strict"`: Always sort. Spill to disk if needed.
     /// - `"partition_only"`: Only sort when keys match Iceberg partition columns.
-    ///   Safe default for TB-scale data from mixed writers (Spark, Trino, SQE).
-    /// - `"adaptive"`: Sort when memory is Green; strip non-partition sorts under pressure.
+    ///   Safest for TB-scale data from mixed writers (Spark, Trino, SQE).
+    /// - `"adaptive"`: Sort when memory is available (Green); strip non-partition
+    ///   sorts under memory pressure. Best default: correct for small data,
+    ///   safe for large data.
     ///
-    /// Default: `"partition_only"` — prevents OOM from unbounded sorts on
-    /// non-partition columns in large tables. Set to `"strict"` if your data is
-    /// known to be small enough to sort in memory + spill.
+    /// Default: `"adaptive"` — tries to sort in memory, falls back to
+    /// partition-only under pressure. Never crashes from unbounded sorts.
     #[serde(default = "default_sort_mode")]
     pub sort_mode: String,
 }
@@ -751,7 +752,7 @@ fn default_max_query_memory() -> String { "256MB".to_string() }
 fn default_distribution_threshold() -> String { "128MB".to_string() }
 fn default_distribution_file_threshold() -> usize { 4 }
 fn default_target_task_size() -> String { "256MB".to_string() }
-fn default_sort_mode() -> String { "partition_only".to_string() }
+fn default_sort_mode() -> String { "adaptive".to_string() }
 
 fn default_coordinator_memory() -> String { "8GB".to_string() }
 fn default_coordinator_spill_dir() -> String { "/tmp/sqe-coordinator-spill".to_string() }
