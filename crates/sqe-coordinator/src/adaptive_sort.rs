@@ -13,7 +13,7 @@ use std::sync::Arc;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::ExecutionPlan;
-use tracing::debug;
+use tracing::{debug, info};
 
 use sqe_catalog::IcebergScanExec;
 use sqe_core::SortMode;
@@ -147,11 +147,12 @@ pub fn apply_adaptive_sort(
                         .inc();
                 }
 
-                debug!(
+                info!(
                     sort_columns = ?sort_cols,
                     sort_mode = ?sort_mode,
                     pressure = %pressure,
-                    "Stripped SortExec — non-partition sort removed"
+                    "ORDER BY stripped — sort keys are not partition columns. \
+                     Set sort_mode = \"strict\" to force all sorts."
                 );
 
                 Ok(Transformed::yes(input))

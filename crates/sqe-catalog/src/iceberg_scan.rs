@@ -109,20 +109,24 @@ impl IcebergScanExec {
                     // Filter sort expressions: only trust partition columns by default.
                     // For TB-scale data, trusting non-partition sort order is dangerous
                     // because writers may not enforce it, causing silent incorrect results.
+                    let mut stripped_cols = Vec::new();
                     let safe_exprs: Vec<_> = sort_exprs.into_iter().filter(|expr| {
                         let col_name = expr.expr.to_string();
                         if partition_cols.contains(&col_name) {
                             true
                         } else {
-                            warn!(
-                                table = %table.identifier(),
-                                column = %col_name,
-                                "Ignoring non-partition sort order -- data may not be physically sorted. \
-                                 Set [catalog] trust_sort_order = true to trust Iceberg sort metadata."
-                            );
+                            stripped_cols.push(col_name);
                             false
                         }
                     }).collect();
+                    if !stripped_cols.is_empty() {
+                        debug!(
+                            table = %table.identifier(),
+                            stripped_columns = ?stripped_cols,
+                            "Ignoring non-partition sort order — data may not be physically sorted. \
+                             Set [catalog] trust_sort_order = true to override."
+                        );
+                    }
 
                     if safe_exprs.is_empty() {
                         EquivalenceProperties::new(projected_schema.clone())
