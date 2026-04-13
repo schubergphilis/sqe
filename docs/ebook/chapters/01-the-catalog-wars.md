@@ -349,7 +349,7 @@ Control the catalog, and you control what data exists (namespace and table manag
 
 ## What We Actually Built
 
-The `sqe-catalog` crate is the result of everything in this chapter. It's about 1,400 lines of Rust across eight modules:
+The `sqe-catalog` crate is the result of everything in this chapter. It's several thousand lines of Rust across eight core modules:
 
 - **`rest_catalog.rs`** — The `SessionCatalog` struct: one per user session, wraps `iceberg-rust`'s `RestCatalog` with the user's bearer token. Handles tables, views, namespaces.
 - **`catalog_provider.rs`** — The DataFusion bridge: implements `CatalogProvider` using cached namespace snapshots. Maps Iceberg namespaces to DataFusion schemas.
@@ -359,6 +359,8 @@ The `sqe-catalog` crate is the result of everything in this chapter. It's about 
 - **`info_schema.rs`** — Virtual `information_schema` tables (tables, columns, schemata) for SQL standard compliance.
 - **`system_catalog.rs`** — Virtual `system` tables for runtime introspection.
 - **`iceberg_scan.rs`** — The physical scan operator that reads Iceberg data via the table's `FileIO` and vended credentials.
+
+Since then, the crate has grown to include `manifest_cache`, `footer_cache`, `circuit_breaker`, `s3_io`, `sort_order`, `read_parquet`, `iceberg_metadata_tvf`, `pruning_stats`, and several more — the caching and I/O layers that made SQE competitive with Trino.
 
 The crate depends on `iceberg` and `iceberg-catalog-rest` from iceberg-rust, `datafusion` for the trait implementations, `moka` for caching, and `reqwest` for direct REST calls (views, which iceberg-rust doesn't support natively yet).
 

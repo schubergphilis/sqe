@@ -223,10 +223,9 @@ The rewriter receives a plan and does three things:
 
 ```rust
 pub struct ResolvedPolicy {
-    pub allowed_columns: Option<HashSet<String>>,   // None = all columns allowed
-    pub column_masks: HashMap<String, MaskType>,
-    pub row_filters: Vec<Expr>,                     // combined with AND
-    pub deny: bool,                                 // hard deny
+    pub row_filters: Vec<datafusion::logical_expr::Expr>,
+    pub column_masks: std::collections::HashMap<String, MaskType>,
+    pub restricted_columns: Vec<String>,
 }
 ```
 
@@ -238,9 +237,6 @@ let rewritten = plan.transform_down(|node| {
         LogicalPlan::TableScan(scan) => {
             let policy = policies.get(&scan.table_name);
             if let Some(p) = policy {
-                if p.deny {
-                    return Err(access_denied_error(scan));
-                }
                 let mut node = node;
                 // Inject row filters above the scan
                 for filter in &p.row_filters {
@@ -250,9 +246,9 @@ let rewritten = plan.transform_down(|node| {
                 }
                 // Replace column references with mask expressions
                 node = apply_column_masks(node, &p.column_masks)?;
-                // Remove denied columns from the projection
-                if let Some(allowed) = &p.allowed_columns {
-                    node = restrict_projection(node, allowed)?;
+                // Remove restricted columns from the projection
+                if !p.restricted_columns.is_empty() {
+                    node = restrict_projection(node, &p.restricted_columns)?;
                 }
                 Ok(Transformed::yes(node))
             } else {
@@ -275,8 +271,7 @@ Column masking replaces raw column values with transformed versions. The mask ty
 |-----------|-------|--------|----------|
 | Redact | `123-45-6789` | `***` | PII that should be completely hidden |
 | Hash | `john@example.com` | `a3f2b7c9...` | Consistent pseudonymization (same input = same hash) |
-| Null | `150000` | `NULL` | Numeric data that shouldn't be visible |
-| Range(10000) | `153000` | `150000` | Salary bands, approximate values |
+| Nullify | `150000` | `NULL` | Numeric data that shouldn't be visible |
 | Custom | `john@example.com` | `j***@example.com` | Arbitrary SQL expression |
 
 Each mask type translates to a DataFusion expression:
@@ -290,10 +285,7 @@ fn mask_expression(col: &Column, mask: &MaskType) -> Expr {
                 "sha256", vec![cast(col.clone(), DataType::Utf8)]  // requires registered UDF
             ))
         }
-        MaskType::Null => lit(ScalarValue::Null),
-        MaskType::Range(bucket) => {
-            floor(col.clone() / lit(*bucket)) * lit(*bucket)
-        }
+        MaskType::Nullify => lit(ScalarValue::Null),
         MaskType::Custom(expr_str) => parse_sql_expr(expr_str),
     }
 }
@@ -341,7 +333,7 @@ Multiple row filters for the same table are combined with AND. If the policy has
 
 Column restriction is the most aggressive form of policy enforcement. A masked column is visible but transformed. A restricted column is invisible.
 
-When the policy says Alice's role has `allowed_columns = {id, name, department}` for the `employees` table, the rewriter modifies the projection to exclude every other column. When Alice runs `SELECT *`, she gets `id`, `name`, and `department`. When she runs `SELECT salary`, she gets "column not found."
+When the policy says Alice's role has `restricted_columns = [salary, ssn]` for the `employees` table, the rewriter modifies the projection to exclude those columns. When Alice runs `SELECT *`, she gets every column except `salary` and `ssn`. When she runs `SELECT salary`, she gets "column not found."
 
 This is the PostgreSQL RLS model applied to columns. In PostgreSQL, if a column is denied by a policy, it doesn't appear in `\d` (describe table) and references to it return "column does not exist." We follow the same pattern. The denied column doesn't appear in `information_schema.columns` for that user. It doesn't appear in `SELECT *`. It's as if the column was never defined.
 
@@ -546,7 +538,7 @@ This is one of the advantages of trait-based design in Rust. The interface is a 
 
 This section is worth dwelling on because it's the most subtle security property in the system.
 
-Consider a table with columns `id`, `name`, `ssn`, and `salary`. The policy says: `ssn` is masked with REDACT, `salary` is masked with Range(10000). Alice writes:
+Consider a table with columns `id`, `name`, `ssn`, and `salary`. The policy says: `ssn` is masked with REDACT, `salary` is masked with NULLIFY. Alice writes:
 
 ```sql
 SELECT * FROM employees WHERE salary = 153000
@@ -557,12 +549,12 @@ Without masks, the optimizer would push `salary = 153000` into the TableScan as 
 With masks, the plan after rewriting looks like:
 
 ```
-Projection [id, name, '***' AS ssn, floor(salary/10000)*10000 AS salary]
-  Filter [floor(salary/10000)*10000 = 153000]
+Projection [id, name, '***' AS ssn, NULL AS salary]
+  Filter [NULL = 153000]
     TableScan [employees]
 ```
 
-Alice's predicate is evaluated against the masked value. `floor(153000/10000)*10000 = 150000`, which doesn't equal 153000. She gets zero rows. She can't distinguish between "no employees earn exactly 153000" and "employees earn 153000 but the mask rounds it to 150000."
+Alice's predicate is evaluated against the masked value. `NULL = 153000` evaluates to NULL (falsy), so she gets zero rows. She can't distinguish between "no employees earn exactly 153000" and "employees earn 153000 but the mask nullifies the value."
 
 If the optimizer could push the predicate below the mask, it would evaluate `salary = 153000` against the raw value, returning the matching rows (with masked output). The number of rows returned would leak information: "there are 3 employees earning exactly 153000." The mask hides the value but the row count reveals it.
 

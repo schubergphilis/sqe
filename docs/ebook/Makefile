@@ -19,10 +19,29 @@ diagrams:
 	done
 
 # --- PDF (A4, print-quality) ---
-# Uses xelatex if available, falls back to weasyprint
+# Uses xelatex if available, falls back to weasyprint.
+# xelatex cannot render SVG natively, so we convert SVGs to PDFs first
+# using rsvg-convert (from librsvg). Falls back to cairosvg if available.
 PDF_ENGINE := $(shell command -v xelatex >/dev/null 2>&1 && echo xelatex || echo weasyprint)
+SVG_TO_PDF := $(shell command -v rsvg-convert >/dev/null 2>&1 && echo "rsvg-convert -f pdf" || echo "cairosvg")
 
-pdf: $(OUT)/sovereign-by-design.pdf
+pdf: svg2pdf $(OUT)/sovereign-by-design.pdf
+
+svg2pdf:
+	@echo "==> Converting SVG diagrams to PDF for xelatex"
+	@for f in diagrams/rendered/*.svg; do \
+		out="diagrams/rendered/$$(basename $$f .svg).pdf"; \
+		if [ "$$f" -nt "$$out" ] || [ ! -f "$$out" ]; then \
+			echo "  $$f -> $$out"; \
+			if command -v rsvg-convert >/dev/null 2>&1; then \
+				rsvg-convert -f pdf -o "$$out" "$$f"; \
+			elif command -v cairosvg >/dev/null 2>&1; then \
+				cairosvg "$$f" -o "$$out"; \
+			else \
+				echo "  WARNING: no SVG-to-PDF converter found (install librsvg or cairosvg)"; \
+			fi; \
+		fi; \
+	done
 
 $(OUT)/sovereign-by-design.pdf: $(META) $(CHAPTERS) | $(OUT)
 	@echo "==> Building PDF (engine: $(PDF_ENGINE))"
@@ -31,6 +50,7 @@ $(OUT)/sovereign-by-design.pdf: $(META) $(CHAPTERS) | $(OUT)
 		--filter pandoc-crossref \
 		--top-level-division=chapter \
 		--resource-path=.:diagrams/rendered \
+		--default-image-extension=pdf \
 		-o $@
 
 # --- EPUB (e-reader optimised) ---

@@ -180,24 +180,20 @@ The lightweight test stack -- Polaris in-memory mode plus RustFS (a Rust-native 
 :::
 
 
-## The Abstraction That Was Premature
+## The Abstraction That Has a Ceiling
 
 The `ScanTask` protocol.
 
-The original design had the coordinator decomposing queries into `ScanTask` objects -- one per partition -- and shipping them individually to workers. Each `ScanTask` contained a file path, a predicate, a column projection, and a reference to the user's credentials. Workers would receive a `ScanTask`, build a local `ExecutionPlan` to scan that specific file, and stream results back.
+The `ScanTask` model works well for distributed scans. Each task carries file paths, projected columns, and filter predicates. The worker executes them independently -- build a local `ExecutionPlan` to scan those specific files, apply the predicate, project the columns, and stream results back. It is clean, simple, and correct for the workload it was designed for.
 
-It was clean. It was elegant. It was wrong.
+But `ScanTask` only describes scans -- it cannot represent local aggregation, sort, or join nodes above the scan. When we attempted distributed aggregation, we hit this wall: the coordinator could not express "scan these files, then group by region" as a single `ScanTask`. It needs a plan subtree. The coordinator ends up reassembling intermediate results and performing all the post-scan operations itself. That works for scan-only queries. It falls apart the moment you have a `GROUP BY` that should be partially evaluated on the worker.
 
-The problem: a query isn't a bag of independent scans. It's a plan tree. The scans are leaves, but above them are filters, projections, aggregations, and joins. Shipping individual scans means the coordinator must reassemble intermediate results and perform the post-scan operations itself. That works for simple scan-only queries. It falls apart the moment you have a `GROUP BY` that should be partially evaluated on the worker.
+The future architecture ships `PlanFragment` objects -- serialised subtrees of the physical plan that include scan, filter, projection, and partial aggregation. Workers would execute the full subtree locally and return partial results to the coordinator for final aggregation. The `ScanTask` model was not premature -- it was the right starting point. But it is a subset of what full distributed execution requires.
 
-We replaced `ScanTask` with `PlanFragment` -- a subtree of the physical plan that includes not just the scan but also the local aggregation, filter, and projection nodes above it. Workers execute the whole fragment and stream the partially-aggregated results back. The coordinator does the final merge.
-
-The refactoring took a day. The `ScanTask` protocol lasted about a week. What we learned: don't decompose the plan into its smallest atoms. Ship meaningful subtrees. The worker is a DataFusion runtime, not a file reader. Let it do real work.
-
-The AI implemented both versions without complaint. It didn't flag that the `ScanTask` approach would limit worker-side computation. That was a human insight, born from staring at EXPLAIN output and realising that the coordinator was doing all the aggregation work while two workers sat idle after their scans completed.
+The AI implemented the `ScanTask` protocol without complaint. It didn't flag that the approach would limit worker-side computation. That was a human insight, born from staring at EXPLAIN output and realising that the coordinator was doing all the aggregation work while two workers sat idle after their scans completed.
 
 ::: {.deadend}
-**Dead end: per-file ScanTask dispatch.** Each worker got one file at a time. Clean separation of concerns. Terrible performance for aggregation queries, because all the compute-heavy work happened on the coordinator after the scans returned. The fix was shipping plan fragments (subtrees) instead of individual scan tasks. Workers went from "file readers" to "local query engines" and throughput doubled.
+**Dead end: per-file ScanTask dispatch.** Each worker got one file at a time. Clean separation of concerns. Terrible performance for aggregation queries, because all the compute-heavy work happened on the coordinator after the scans returned. The future fix is shipping plan fragments (subtrees) instead of individual scan tasks -- turning workers from "file readers" into "local query engines."
 :::
 
 

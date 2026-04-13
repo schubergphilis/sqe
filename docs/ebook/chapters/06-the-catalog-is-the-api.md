@@ -165,6 +165,23 @@ The `information_schema` appears alongside real namespaces in `schema_names()`. 
 One subtlety: the `SessionCatalog` inside the provider carries the user's bearer token. When Alice queries `information_schema.tables`, Polaris returns only the tables Alice can access. When Bob queries the same view, he sees his tables. The metadata view is per-user by construction, not by post-filtering. This falls out naturally from the bearer passthrough architecture described in Chapter 4.
 
 
+### The Caching Layers
+
+The initial catalog implementation made a Polaris REST call for every table load. At scale factor 1, a TPC-DS query touching 15 dimension tables meant 15 network round-trips before execution started. The fix was a multi-layer caching strategy:
+
+**TableMetadataCache.** A global moka cache shared across all sessions, keyed by table identifier and token fingerprint. TTL is 30 seconds — short enough that schema changes propagate within a query cycle, long enough that a 99-query benchmark run does not hammer Polaris 1,500 times.
+
+**ManifestCache.** Iceberg manifest files are immutable by specification. Once written, their content never changes. We cache parsed manifest entries by S3 path with a 512 MB size limit and a 1-hour TTL backstop (for disaster recovery scenarios where a manifest is overwritten at the same path). This eliminates the most expensive I/O in scan planning.
+
+**FooterCache.** Parquet file footers contain schema, row group metadata, and column statistics. We cache them by file path with size-weighted eviction and Prometheus hit/miss counters.
+
+**RestCatalog instance cache.** The iceberg-rust `RestCatalog` is expensive to create (~250 ms). We cache instances by token fingerprint with a 5-minute TTL.
+
+**SessionContext cache.** The DataFusion `SessionContext` with all registered UDFs, TVFs, and catalog providers is cached per token fingerprint (SHA-256). Atomic population via moka's `try_get_with` eliminates the TOCTOU race where concurrent requests build redundant contexts. Invalidated after every DDL operation.
+
+Together, these five layers reduced warm-query overhead from ~540 ms to under 1 ms.
+
+
 ## Beyond information_schema: The system Catalog
 
 Standard metadata tables tell tools what data exists. But an engine operator needs to know what the engine is doing. Which queries are running? How many workers are active? Where is time being spent?
