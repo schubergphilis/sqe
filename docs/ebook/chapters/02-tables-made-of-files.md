@@ -360,11 +360,11 @@ The `SqeCatalogProvider` fetches namespace names at construction time and caches
 The chain of construction follows the user's credentials:
 
 ```
-User authenticates → SessionCatalog (with bearer token)
-    → SqeCatalogProvider (cached namespace list)
-        → SqeSchemaProvider (lazy table loading)
-            → SqeTableProvider (Iceberg table with vended S3 credentials)
-                → IcebergScanExec (reads Parquet from S3)
+User authenticates -> SessionCatalog (with bearer token)
+    -> SqeCatalogProvider (cached namespace list)
+        -> SqeSchemaProvider (lazy table loading)
+            -> SqeTableProvider (Iceberg table with vended S3 credentials)
+                -> IcebergScanExec (reads Parquet from S3)
 ```
 
 Every link in this chain carries the user's identity. The `SessionCatalog` holds the bearer token. When it loads a table, Polaris validates the token and returns metadata only if the user has access. The vended S3 credentials in the table response are scoped to that user's permissions. The scan reads Parquet files using those scoped credentials. At no point does the engine use a service account.
