@@ -162,7 +162,7 @@ fn start_health_server(port: u16, state: Arc<HealthState>) {
             .await
             .expect("Failed to bind health server");
         tracing::info!("Health endpoints on port {port} (/healthz, /readyz, /api/v1/status)");
-        axum::serve(listener, app).await.ok();
+        axum::serve(listener, app).await.unwrap_or_else(|e| tracing::error!(error = %e, "Health server terminated unexpectedly"));
     });
 }
 
@@ -284,6 +284,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if !config.auth.ssl_verification {
         tracing::warn!("WARNING: SSL certificate verification is DISABLED for auth endpoints -- vulnerable to MITM. Set auth.ssl_verification = true for production.");
+    }
+    if !config.coordinator.worker_urls.is_empty() && config.coordinator.worker_secret.is_empty() {
+        tracing::error!("SECURITY: worker_urls configured but worker_secret is empty -- any client can register as a worker. Set worker_secret for distributed mode.");
     }
 
     // Priority: --mode flag > SQE_MODE env > config file mode
@@ -419,8 +422,13 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
              Consider using memory persistence in production unless restart recovery is required."
         );
 
-        // Try to restore sessions from the last snapshot on startup (best-effort)
-        session_manager.restore_from_file(&config.session.persistence_path);
+        // Try to restore sessions from the last snapshot on startup (best-effort).
+        // Runs in spawn_blocking to avoid blocking the Tokio worker thread with std::fs I/O.
+        {
+            let sm = session_manager.clone();
+            let restore_path = config.session.persistence_path.clone();
+            let _ = tokio::task::spawn_blocking(move || sm.restore_from_file(&restore_path)).await;
+        }
 
         // Spawn background task to periodically snapshot sessions to disk
         let sm = session_manager.clone();
@@ -431,8 +439,15 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             ticker.tick().await; // skip first immediate tick
             loop {
                 ticker.tick().await;
-                if let Err(e) = sm.snapshot_to_file(&path) {
-                    tracing::warn!(error = %e, "Session snapshot failed");
+                let sm_inner = sm.clone();
+                let path_inner = path.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    sm_inner.snapshot_to_file(&path_inner)
+                }).await;
+                match result {
+                    Ok(Err(e)) => tracing::warn!(error = %e, "Session snapshot failed"),
+                    Err(e) => tracing::warn!(error = %e, "Session snapshot task panicked"),
+                    Ok(Ok(())) => {}
                 }
             }
         });
@@ -493,7 +508,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         Some(audit.clone()),
         query_tracker,
         query_cache,
-    ).with_manifest_cache(manifest_cache).with_table_cache(table_cache));
+    )?.with_manifest_cache(manifest_cache).with_table_cache(table_cache));
 
     // Spawn background memory metrics reporter (updates gauges every 1s for Grafana)
     sqe_coordinator::memory::spawn_metrics_reporter(
@@ -575,7 +590,8 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
 
     // Flight SQL server with graceful shutdown
     let flight_service =
-        SqeFlightSqlService::new(session_manager, query_handler, config.clone());
+        SqeFlightSqlService::new(session_manager, query_handler, config.clone())
+            .with_rate_limiter(rate_limiter);
     let addr = format!("0.0.0.0:{}", config.coordinator.flight_sql_port).parse()?;
 
     // Optional TLS

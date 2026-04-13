@@ -466,6 +466,12 @@ impl SessionCatalog {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(SqeError::Catalog(format!("Rate limited by Polaris catalog: {text}")));
+            }
+            if status == reqwest::StatusCode::CONFLICT {
+                return Err(SqeError::Execution(format!("Catalog commit conflict: {text}")));
+            }
             return Err(SqeError::Catalog(format!(
                 "Failed to create view (HTTP {status}): {text}"
             )));
@@ -505,6 +511,12 @@ impl SessionCatalog {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(SqeError::Catalog(format!("Rate limited by Polaris catalog: {text}")));
+            }
+            if status == reqwest::StatusCode::CONFLICT {
+                return Err(SqeError::Execution(format!("Catalog commit conflict: {text}")));
+            }
             return Err(SqeError::Catalog(format!(
                 "Failed to list views (HTTP {status}): {text}"
             )));
@@ -563,6 +575,12 @@ impl SessionCatalog {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(SqeError::Catalog(format!("Rate limited by Polaris catalog: {text}")));
+            }
+            if status == reqwest::StatusCode::CONFLICT {
+                return Err(SqeError::Execution(format!("Catalog commit conflict: {text}")));
+            }
             return Err(SqeError::Catalog(format!(
                 "Failed to load view '{name}' (HTTP {status}): {text}"
             )));
@@ -625,6 +643,12 @@ impl SessionCatalog {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(SqeError::Catalog(format!("Rate limited by Polaris catalog: {text}")));
+            }
+            if status == reqwest::StatusCode::CONFLICT {
+                return Err(SqeError::Execution(format!("Catalog commit conflict: {text}")));
+            }
             return Err(SqeError::Catalog(format!(
                 "Failed to drop view (HTTP {status}): {text}"
             )));
@@ -696,6 +720,12 @@ impl SessionCatalog {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(SqeError::Catalog(format!("Rate limited by Polaris catalog: {text}")));
+            }
+            if status == reqwest::StatusCode::CONFLICT {
+                return Err(SqeError::Execution(format!("Catalog commit conflict: {text}")));
+            }
             return Err(SqeError::Catalog(format!(
                 "Failed to commit schema update for '{table_ident}' (HTTP {status}): {text}"
             )));

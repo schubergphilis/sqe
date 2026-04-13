@@ -188,7 +188,7 @@ pub async fn fetch_column_chunks(
             .iter()
             .enumerate()
             .find(|(_, cr)| cr.offset <= range.offset && cr.end() >= range.end())
-            .expect("every original range must be covered by a coalesced range");
+            .ok_or_else(|| object_store::Error::Generic { store: "s3", source: Box::new(std::io::Error::other("range not covered by coalesced range")) })?;
 
         let local_offset = (range.offset - coalesced_range.offset) as usize;
         let local_end = local_offset + range.length as usize;

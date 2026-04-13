@@ -115,9 +115,10 @@ impl OidcPasswordProvider {
             } else {
                 body
             };
-            return Err(AuthError::AuthFailed(format!(
-                "OIDC provider returned {status}: {body}"
-            )));
+            warn!(status = %status, body = %body, "OIDC provider rejected credentials");
+            return Err(AuthError::AuthFailed(
+                "Authentication failed".to_string(),
+            ));
         }
 
         response
@@ -163,9 +164,10 @@ impl OidcPasswordProvider {
             } else {
                 body
             };
-            return Err(AuthError::AuthFailed(format!(
-                "OIDC refresh returned {status}: {body}"
-            )));
+            warn!(status = %status, body = %body, "OIDC provider rejected token refresh");
+            return Err(AuthError::AuthFailed(
+                "Authentication failed".to_string(),
+            ));
         }
 
         response

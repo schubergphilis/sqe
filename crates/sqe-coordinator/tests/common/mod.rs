@@ -60,7 +60,7 @@ pub async fn setup_handler() -> (sqe_core::Session, sqe_coordinator::QueryHandle
     };
     let handler = sqe_coordinator::QueryHandler::new(
         policy, None, config, None, None, None, None, query_tracker, query_cache,
-    );
+    ).expect("Failed to create QueryHandler");
     (session, handler)
 }
 
