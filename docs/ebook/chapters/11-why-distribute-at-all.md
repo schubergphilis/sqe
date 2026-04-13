@@ -180,17 +180,13 @@ We built SQE so that the same binary runs in both modes. The config file control
 
 ```toml
 [coordinator]
-mode = "hybrid"  # "local", "distributed", or "hybrid"
+mode = "coordinator"
 worker_urls = ["http://worker-1:50052", "http://worker-2:50052"]
 ```
 
-Three modes. Each has a purpose.
+The legacy values `hybrid`, `local`, and `distributed` are accepted as aliases but resolve to `coordinator` mode internally. The coordinator automatically falls back to local execution when no workers are healthy.
 
-**Local mode.** No workers. Every query executes on the coordinator using DataFusion's built-in parallelism. This is how SQE ran for the first two weeks of development. It's how it runs in integration tests. It's how it should run when your data fits on one machine.
-
-**Distributed mode.** Workers are required. The coordinator plans and schedules; workers execute. If no healthy workers are available, queries fail. This is the production mode for large datasets.
-
-**Hybrid mode.** The default, and the one we recommend. Workers are optional. If workers are registered and healthy, the coordinator distributes scan work to them. If no workers are available -- because none are configured, or because they've all crashed -- the coordinator falls back to local execution.
+The behavior is straightforward. Workers are optional. If workers are registered and healthy, the coordinator distributes scan work to them. If no workers are available -- because none are configured, or because they've all crashed -- the coordinator falls back to local execution. This is how SQE ran for the first two weeks of development, how it runs in integration tests, and how it should run when your data fits on one machine. When workers are present and healthy, the coordinator plans and schedules; workers execute.
 
 The fallback logic lives in `try_distribute`:
 
@@ -220,7 +216,7 @@ async fn try_distribute(
     };
 
     // Fewer files than workers? Not worth distributing.
-    let file_paths = iceberg_scan.data_file_paths().await;
+    let file_paths = scan_node.data_file_paths().await;
     if file_paths.len() < healthy.len() {
         return plan;
     }

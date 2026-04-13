@@ -116,7 +116,7 @@ impl FlightService for WorkerFlightService {
 }
 ```
 
-Three actions. `do_get` executes a scan. `health_check` tells the coordinator the worker is alive. `refresh_credentials` accepts updated S3 credentials mid-scan. Everything else returns `UNIMPLEMENTED`. Workers do not support handshake, `do_put`, `do_exchange`, or any other Flight operation. They are executors, not servers.
+Three actions. `do_get` executes a scan. `health_check` tells the coordinator the worker is alive. `refresh_credentials` accepts updated S3 credentials mid-scan. Workers also implement `do_exchange` for shuffle data ingestion in distributed aggregation -- hash-partitioned or range-partitioned batches flow between workers during multi-stage execution. Everything else returns `UNIMPLEMENTED`. Workers do not support handshake, `do_put`, or any other Flight operation. They are executors, not servers.
 
 
 ## What We Replaced
@@ -195,6 +195,8 @@ impl FragmentScheduler for WeightedScheduler {
 
 This is a largest-first bin-packing heuristic. The heaviest tasks get assigned first, to the least-loaded worker. It produces balanced distributions even when tasks have wildly different costs (one scan task covering 10 files vs another covering 1 file). It also accounts for workers that already have in-flight work from previous queries.
 
+The scheduler also uses consistent hashing on file paths to prefer a "home" worker for each task. If the preferred worker's accumulated load exceeds the minimum-load worker by more than 20%, the task falls back to minimum-load assignment. This balances two goals: cache locality (a worker that has recently read a file may still have its Parquet footer cached) and load balance (no single worker becomes a bottleneck).
+
 Ballista's scheduler is far more sophisticated. It handles multi-stage execution with shuffles, work stealing, and speculative execution. We don't need any of that -- SQE's distributed execution is scan-parallel only. Every scan task is independent. There's no shuffle stage. The coordinator handles final aggregation, sorting, and projection locally.
 
 **Authentication.** Ballista has no concept of user identity. Its scheduler accepts queries anonymously. Its executors run with whatever ambient credentials the process has. This is the fundamental incompatibility.
@@ -205,6 +207,7 @@ SQE's distributed execution carries the user's bearer token through to every wor
 pub struct ScanTask {
     pub fragment_id: String,
     pub data_file_paths: Vec<String>,
+    pub file_sizes_bytes: Vec<u64>,
     pub projected_columns: Vec<String>,
     pub s3_endpoint: String,
     pub s3_region: String,
@@ -216,7 +219,7 @@ pub struct ScanTask {
 }
 ```
 
-Every field after `projected_columns` is about credentials. The worker never contacts Polaris. The worker never assumes a role. The worker reads the files it's told to read, with the credentials it's given, and returns the results. The coordinator is the only component that talks to the catalog.
+The `file_sizes_bytes` field enables byte-accurate cost estimation in the scheduler -- file count is a rough proxy, but actual file sizes let the `WeightedScheduler` balance I/O load precisely. Every field after `projected_columns` is about credentials. The worker never contacts Polaris. The worker never assumes a role. The worker reads the files it's told to read, with the credentials it's given, and returns the results. The coordinator is the only component that talks to the catalog.
 
 Notice the `Debug` implementation on this struct. It redacts credentials:
 

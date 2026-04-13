@@ -33,7 +33,7 @@ This three-stage protocol gives the write path its natural structure: execute th
 
 We started with CREATE TABLE AS SELECT. Not because it was the most important write operation, but because it was the simplest to reason about. No existing table to contend with. No concurrent writers. No schema to match. The SELECT defines the schema, the data, and the table all at once.
 
-The coordinator classifies `CREATE TABLE ns.target AS SELECT ...` and routes it to the write handler. The query handler extracts the inner SELECT, executes it through DataFusion, and collects the results as `Vec<RecordBatch>`. The write handler then converts the Arrow schema to an Iceberg schema, creates the table in Polaris, writes the batches as Parquet data files, and commits them via a fast-append transaction.
+The coordinator classifies `CREATE TABLE ns.target AS SELECT ...` and routes it to the write handler. The streaming write path processes DataFusion output one batch at a time via `SendableRecordBatchStream`. The `write_data_files_streaming` function in the writer module passes each `RecordBatch` directly to the Iceberg `RollingFileWriter` without buffering. Peak memory drops from O(total rows) to O(batch size) -- typically 8,000 rows. The six-million-row lineorder table at scale factor 1 now loads with the same memory footprint as a fifty-row dimension table. The write handler then converts the Arrow schema to an Iceberg schema, creates the table in Polaris, writes the batches as Parquet data files, and commits them via a fast-append transaction.
 
 The schema conversion is where the first real problem appeared. Arrow schemas from DataFusion queries do not carry Parquet field-ID metadata -- the `PARQUET:field_id` key that Iceberg uses to map columns to schema fields is absent. Without that key, iceberg-rust's `arrow_schema_to_schema` rejects the schema outright. No graceful fallback. No warning. Just a hard error with a message that took some squinting to connect back to the missing metadata.
 
@@ -104,7 +104,7 @@ INSERT INTO follows the same structure as CTAS, with one difference: the table a
 
 The `stamp_field_ids` function becomes critical here. For CTAS, we control the schema -- the Iceberg schema is derived from the Arrow schema, so the types match by construction. For INSERT INTO, the target table's schema was defined previously, possibly with different precision or nullability. The type casting ensures the new data matches the table's expectations.
 
-The same code path also handles Flight SQL's DoPut ingest, where a client streams Arrow batches directly via the Flight protocol instead of sending SQL. Three write entry points -- CTAS, INSERT, DoPut ingest -- all converging on the same `write_data_files` and `Transaction::fast_append` primitives. One code path for producing Parquet files, one for committing them, regardless of how the data arrived.
+The same code path also handles Flight SQL's DoPut ingest, where a client streams Arrow batches directly via the Flight protocol instead of sending SQL. Three write entry points -- CTAS, INSERT, DoPut ingest -- all converging on the same `write_data_files_streaming` and `Transaction::fast_append` primitives. One code path for producing Parquet files, one for committing them, regardless of how the data arrived.
 
 ::: {.deadend}
 **Dead end: letting DataFusion handle the full INSERT.** DataFusion has its own `InsertExec`
@@ -170,7 +170,7 @@ CTAS and INSERT INTO are append-only. They only add files. The harder operations
 
 The practical question: does the delete ratio justify the complexity? If you delete 10 rows out of a million-row table once a day, CoW rewrites a handful of files and you never think about it. If you delete 10% of your data hourly, Merge-on-Read avoids catastrophic write amplification, but you need compaction to keep read performance from degrading.
 
-SQE uses Copy-on-Write. It is simpler, and the RisingWave iceberg-rust fork provides the `rewrite_files()` transaction primitive that makes it work. Merge-on-Read with position deletes would follow when upstream iceberg-rust ships `RowDeltaAction` and `PositionDeleteFileWriter`. The choice is pragmatic, not permanent.
+SQE uses Copy-on-Write. It is simpler, and the RisingWave iceberg-rust fork provides the `rewrite_files()` transaction primitive that makes it work. The RisingWave fork also ships `PositionDeleteFileWriter`, and position delete support is partially implemented in SQE. Full Merge-on-Read with `RowDeltaAction` will follow as the upstream iceberg-rust API stabilizes. The choice of Copy-on-Write as the default is pragmatic, not permanent.
 
 
 ## Row-Level Writes: Copy-on-Write

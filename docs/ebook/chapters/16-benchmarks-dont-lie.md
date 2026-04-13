@@ -22,7 +22,7 @@ The `sqe-bench` crate ships as a standalone Rust binary with three commands: `ge
 | TPC-DS | 99 | 24 | Complex retail analytics: subqueries, CTEs, window functions |
 | SSB | 13 | 5 | Star schema joins, denormalized scans |
 | ClickBench | 43 | 1 | Single-table scan performance, web analytics patterns |
-| TPC-E | 11 | 33 | Financial OLTP reads, complex demographics |
+| TPC-E | 18 | 33 | Financial OLTP reads, complex demographics |
 | TPC-BB | 10 | 2 (+TPC-DS) | Big data analytics over clickstreams and reviews |
 | TPC-C | 17 | 9 | Transaction processing (read + write: DELETE, UPDATE via CoW) |
 
@@ -214,7 +214,7 @@ let in_table_context = upper_before.ends_with(" FROM")
     };
 ```
 
-This is not elegant. It is a hand-rolled SQL-aware string replacer. A proper solution would parse the SQL into an AST, walk the tree, and qualify `TableReference` nodes. We considered it. The effort would have been a full day for marginal correctness improvement. The heuristic handles all 206 queries across all seven suites. Sometimes the pragmatic solution is the right one.
+This is not elegant. It is a hand-rolled SQL-aware string replacer. A proper solution would parse the SQL into an AST, walk the tree, and qualify `TableReference` nodes. We considered it. The effort would have been a full day for marginal correctness improvement. The heuristic handles all 222 queries across all seven suites. Sometimes the pragmatic solution is the right one.
 
 ::: {.deadend}
 **Dead end: AST-based table qualification.** We started building a proper SQL parser pass
@@ -314,7 +314,7 @@ if columns.is_none() {
 
 The type conversion from Trino's JSON representation to Arrow is deliberately simplified. Trino's `decimal(18,2)` becomes Arrow `Float64` because building a proper fixed-point mapping was not worth the effort for a benchmark comparator. The precision loss is within our epsilon tolerance. If we ever needed exact Trino-to-Arrow conversion, we would use the Trino Flight SQL endpoint instead of the HTTP REST protocol.
 
-The dual-protocol design means we can run the exact same 206 queries against both engines on the same data and compare wall-clock times. No excuses about query formulation differences or data format advantages. Same SQL. Same tables. Same network. Same hardware.
+The dual-protocol design means we can run the exact same 222 queries against both engines on the same data and compare wall-clock times. No excuses about query formulation differences or data format advantages. Same SQL. Same tables. Same network. Same hardware.
 
 
 ## The Caching Story
@@ -400,14 +400,6 @@ The benchmark results confirm the architecture matches the use case. But more th
 | Auth-heavy workloads | SQE measurably faster | Zero-overhead passthrough |
 
 If your workload is analytical queries over Iceberg tables — and that is the workload SQE was built for — the numbers are unambiguous. SQE is faster. Not because Rust is faster than Java (though it helps). Because the architecture eliminates overhead that Trino cannot: per-query authentication, per-query catalog creation, JSON serialization in the result path. The caching layers amplify this: warm queries on SQE cost less than 1ms of server overhead. Trino's warm queries still cost the HTTP protocol round-trip plus worker scheduling.
-
-::: {.antipattern}
-**Antipattern: Benchmark-Driven Architecture.** TPC-H is a synthetic workload from 1992.
-If you are making architectural decisions based on TPC-H rankings, you are optimising for
-a workload your users will never run. Profile your actual queries. Identify which pattern
-dominates. Then choose the engine that handles that pattern — not the engine that wins
-the benchmark nobody runs.
-:::
 
 ::: {.antipattern}
 **Antipattern: Benchmark-Driven Architecture.** TPC-H is a synthetic workload from 1992.
@@ -521,7 +513,9 @@ On April 10, SQE ran 218 out of 222 queries. We had added 70+ Trino-compatible U
 
 On the morning of April 12, we landed the first three caching layers: RestCatalog cache, table metadata cache, manifest file cache. SQE reached rough parity with Trino — 1.0x to 1.4x depending on the suite. Competitive, not dominant.
 
-On the afternoon of April 12, we landed the SessionContext cache and OAuth service token cache. The effect was immediate:
+On the afternoon of April 12, we landed the SessionContext cache and OAuth service token cache. The effect was immediate.
+
+The speedups below are SQE's own improvement over time (April 2 baseline to April 12 final), not SQE vs Trino.
 
 | Suite | Apr 2 | Apr 10 | **Apr 12** | Speedup |
 |---|---|---|---|---|

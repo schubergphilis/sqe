@@ -515,8 +515,8 @@ datafusion-sql = "52"
 arrow = { version = "57", features = ["prettyprint"] }
 arrow-flight = { version = "57", features = ["flight-sql-experimental"] }
 
-iceberg = "0.9"
-iceberg-catalog-rest = "0.9"
+iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "1978911ec4" }
+iceberg-catalog-rest = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "1978911ec4" }
 ```
 
 DataFusion 52, Arrow 57, Iceberg 0.9. Three version numbers that represent tens of thousands of hours of engineering by communities we will never have to hire. The SQL parsing, the columnar memory layout, the table format -- all solved problems. SQE's contribution is the glue: how these pieces fit together under a sovereign auth model.

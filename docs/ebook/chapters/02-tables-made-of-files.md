@@ -137,10 +137,17 @@ Third, the path from "can read Iceberg tables" to "is a query engine" is longer 
 When we decided to build SQE in Rust, the Iceberg library choice was straightforward. There is one: iceberg-rust, the official Apache Iceberg implementation for Rust. At the time we started, it was at version 0.8. By the time we reached production integration tests, it was at 0.9. The version delta matters — 0.9 changed the catalog builder API significantly.
 
 ::: {.iceberg}
-**Iceberg deep dive:** The workspace Cargo.toml pins `iceberg = "0.9"`, `iceberg-catalog-rest = "0.9"`,
-`iceberg-storage-opendal = "0.9"`, and `iceberg-datafusion = "0.9"`. The storage layer uses
-OpenDAL rather than iceberg-rust's native FileIO for S3 access, because OpenDAL handles
-credential refresh and path-style addressing more reliably.
+**Iceberg deep dive:** The workspace Cargo.toml pins specific iceberg-rust dependencies:
+
+```toml
+iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "1978911ec4" }
+iceberg-catalog-rest = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "1978911ec4" }
+iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "1978911ec4" }
+```
+
+We use the RisingWave Labs fork of iceberg-rust, pinned to a specific commit. The fork provides `OverwriteAction` for Copy-on-Write DELETE/UPDATE and `PositionDeleteFileWriter` for Merge-on-Read. Migration to upstream Apache iceberg-rust is planned once these features are merged.
+
+The storage layer uses OpenDAL rather than iceberg-rust's native FileIO for S3 access, because OpenDAL handles credential refresh and path-style addressing more reliably.
 :::
 
 ### What works well
@@ -479,7 +486,7 @@ The engine is disposable. The data is not.
 
 iceberg-rust made this real in Rust: a scan planner that prunes intelligently, a schema converter that handles the edge cases, and a REST catalog client that passes through user credentials. We built the bridge — table provider, catalog provider, scan executor — and DataFusion became an Iceberg query engine.
 
-The bridge was about 1,200 lines of Rust across six files. That is all it takes to connect a query engine to the entire Iceberg ecosystem. The ratio matters. We wrote 1,200 lines. We got access to every table, in every namespace, in every catalog that speaks the Iceberg REST protocol.
+The bridge was about 1,200 lines of Rust across six files. That is all it takes to connect a query engine to the entire Iceberg ecosystem. The ratio matters. We wrote the initial catalog integration in about 1,200 lines. We got access to every table, in every namespace, in every catalog that speaks the Iceberg REST protocol.
 
 ::: {.ailog}
 **AI Logbook:** The AI implemented `SqeTableProvider`, `SqeCatalogProvider`, `IcebergScanExec`, and the predicate translation module — including the subtle AND-vs-OR partial pushdown asymmetry — from a design doc that described the DataFusion trait interfaces. The human specified the `Inexact` vs `Exact` pushdown semantics and the security implication of getting them wrong. The `stream::once().try_flatten()` pattern for deferring async scan initialization inside a synchronous `execute()` method was the AI's solution; it worked on the first attempt.

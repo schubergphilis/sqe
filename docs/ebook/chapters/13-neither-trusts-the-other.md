@@ -131,6 +131,7 @@ File splitting determines which files go together. The scheduler determines whic
 pub struct ScanTask {
     pub fragment_id: String,
     pub data_file_paths: Vec<String>,
+    pub file_sizes_bytes: Vec<u64>,
     pub projected_columns: Vec<String>,
     pub s3_endpoint: String,
     pub s3_region: String,
@@ -255,14 +256,14 @@ impl FlightService for WorkerFlightService {
 }
 ```
 
-Three actions. `do_get` executes a scan. `health_check` tells the coordinator the worker is alive. `refresh_credentials` accepts updated S3 credentials mid-scan. Everything else returns `UNIMPLEMENTED`. Workers do not support handshake, `do_put`, `do_exchange`, or any other Flight operation. They are executors, not servers.
+Three actions. `do_get` executes a scan. `health_check` tells the coordinator the worker is alive. `refresh_credentials` accepts updated S3 credentials mid-scan. Workers also implement `do_exchange` for shuffle data ingestion in distributed aggregation. Everything else returns `UNIMPLEMENTED`. Workers do not support handshake, `do_put`, or any other Flight operation. They are executors, not servers.
 
 The worker does not see the full query. It does not know about filters, aggregations, or projections that the coordinator will apply to its output. It reads the files it was told to read, in the columns it was told to project, and sends back Arrow batches. This is the fundamental contract: the coordinator thinks, the worker does.
 
 
 ## Executing the Scan
 
-The executor is where Parquet bytes become Arrow batches. The `execute_scan` function walks through each file in the task, builds an S3 object store with the provided credentials, reads Parquet data, applies column projection, and collects the results.
+The executor is where Parquet bytes become Arrow batches. The `execute_scan` function walks through each file in the task, builds an S3 object store with the provided credentials, reads Parquet data, applies column projection, and collects the results. The actual signature includes additional parameters for the Parquet footer cache and late materialization configuration, but the core contract shown here captures the essential flow.
 
 ```rust
 pub async fn execute_scan(

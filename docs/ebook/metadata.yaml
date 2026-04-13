@@ -34,11 +34,15 @@ geometry:
   - marginparwidth=0mm
 linestretch: 1.3       # slightly more line spacing for A4 readability
 toc: true
-toc-depth: 1           # show chapters + top-level sections in TOC
+toc-depth: 0           # chapters only in TOC
 number-sections: true
 
 header-includes:
-  - \setcounter{tocdepth}{1}
+  - \setcounter{tocdepth}{0}
+  # Scale oversized images/floats to fit within text width
+  - \usepackage[export]{adjustbox}
+  - \let\oldincludegraphics\includegraphics
+  - \renewcommand{\includegraphics}[2][]{\oldincludegraphics[max width=\linewidth,max height=0.85\textheight,keepaspectratio,#1]{#2}}
   - \usepackage{graphicx}
   - \usepackage{xcolor}
   - \usepackage{tikz}
