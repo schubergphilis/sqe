@@ -170,6 +170,7 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 - [x] OSS security hardening (TLS, rate limiting, query timeouts, session lifecycle, error sanitisation, vendor-neutral naming)
 - [x] OSS release readiness (Apache 2.0 license, CONTRIBUTING.md, cargo-deny, git-cliff, CI pipelines, retro-tagging, v0.15.0)
 - [x] Security & functional audit (AUDIT.md: 1,218 tests, rsa crate removed, all advisory checks clean)
+- [x] Production security hardening (43/43 audit findings resolved: token-fingerprint session cache, Flight SQL auth on all endpoints, OIDC error sanitization, OPA role-aware cache, CTAS orphan cleanup, 16 panic-to-error conversions, adaptive sort default)
 - [x] Streaming execution Phase A: spill-to-disk, late materialization, file pruning, S3 I/O pipeline, SortMergeJoin fallback
 - [x] Streaming execution Phase B: DoExchange shuffle, distributed sort/join/aggregate, multi-endpoint Flight SQL, stage decomposition
 - [x] Adaptive sort stripping and S3/auth/write Prometheus metrics
@@ -191,7 +192,7 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 - [x] Direct Parquet read path for small files (≤3 MB, configurable) -- single S3 GET, bypasses `scan.to_arrow()` redundant requests
 - [x] DECIMAL precision fix (`parse_float_as_decimal = true`) -- matches Trino/SQL standard, fixes incorrect query results
 - [x] Tuple IN-subquery rewrite (`(col1,col2) IN (SELECT ...)` -> OR of ANDs)
-- [x] SessionContext caching per user (token fingerprint, 5-min TTL, 100-entry cap) -- eliminates ~50 ms per-query UDF/catalog registration on warm queries
+- [x] SessionContext caching per token fingerprint (SHA-256, 5-min TTL, 100-entry, atomic via moka `try_get_with`) -- eliminates ~50 ms per-query overhead, invalidated after all DDL
 - [ ] Semantic AI layer (RDF/SPARQL, property graph/GQL, vector search, agent interfaces)
 - [ ] Helm chart for Kubernetes deployment
 
@@ -244,6 +245,22 @@ cargo run -p sqe-bench -- test tpch --scale 1 --host localhost --port 60051 --us
 Results are written to the terminal and saved as a JSON report in `benchmarks/results/`.
 
 ---
+
+## Security
+
+SQE has completed a 43-finding production sign-off audit (see `docs/issues.md`). All findings resolved:
+
+| Category | Findings | Status |
+|---|---|---|
+| Auth & access control | Session cache keyed by token SHA-256, all Flight SQL endpoints authenticated, cancel-query owner verification, AnonymousProvider/ClientCredentials startup warnings | Resolved |
+| Information leaking | OIDC error bodies sanitized (7 files), generic errors to clients | Resolved |
+| Panic safety | 16 date `.unwrap()` removed, all `[0]` index guards, startup panics converted to `Result` | Resolved |
+| Policy | OPA cache key includes user roles (role changes enforced immediately) | Resolved |
+| Data integrity | CTAS orphan table cleanup on failure, adaptive sort (never OOM, never silent wrong results) | Resolved |
+| Crypto | Token fingerprints use SHA-256 (stable, deterministic), `checksum()` UDF uses SHA-256 | Resolved |
+| Supply chain | Third-party iceberg-rust fork pinned by rev, documented in `deny.toml` | Mitigated |
+
+Rate limiting applies to both Flight SQL and Trino HTTP paths. Worker secret is validated at startup in distributed mode. TLS skip is configurable via `tls_skip_verify` (unambiguous) or legacy `ssl_verification`.
 
 ## Tech Stack
 
