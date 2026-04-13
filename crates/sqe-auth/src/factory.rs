@@ -55,7 +55,7 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                         client_id: client_id.clone(),
                         client_secret: client_secret.clone(),
                         roles_claim: roles_claim.clone(),
-                        accept_invalid_certs: !config.ssl_verification,
+                        accept_invalid_certs: config.should_skip_tls_verify(),
                     };
                     let provider = OidcPasswordProvider::new(oidc_config).map_err(|e| {
                         sqe_core::SqeError::Config(format!(
@@ -84,6 +84,7 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                         token_endpoint: token_endpoint.clone(),
                         token_refresh_buffer_secs: config.token_refresh_buffer_secs,
                         ssl_verification: config.ssl_verification,
+                        tls_skip_verify: config.tls_skip_verify,
                         providers: Vec::new(),
                         role_mappings: HashMap::new(),
                         external: None,
@@ -111,7 +112,7 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                         audience: audience.clone(),
                         user_claim: user_claim.clone(),
                         roles_claim: roles_claim.clone(),
-                        accept_invalid_certs: !config.ssl_verification,
+                        accept_invalid_certs: config.should_skip_tls_verify(),
                     };
                     let provider = TokenExchangeProvider::new(te_config).map_err(|e| {
                         sqe_core::SqeError::Config(format!(
@@ -138,7 +139,7 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                         audience: audience.clone(),
                         user_claim: user_claim.clone(),
                         roles_claim: roles_claim.clone(),
-                        accept_invalid_certs: !config.ssl_verification,
+                        accept_invalid_certs: config.should_skip_tls_verify(),
                     };
                     let provider = BearerTokenProvider::new(bt_config).map_err(|e| {
                         sqe_core::SqeError::Config(format!(
@@ -248,6 +249,7 @@ mod tests {
             token_endpoint: String::new(),
             token_refresh_buffer_secs: 60,
             ssl_verification: true,
+            tls_skip_verify: false,
             providers: vec![AuthProviderConfig::Anonymous {
                 user: "dev-user".to_string(),
                 roles: vec!["admin".to_string()],
@@ -281,6 +283,7 @@ mod tests {
             token_endpoint: String::new(),
             token_refresh_buffer_secs: 60,
             ssl_verification: true,
+            tls_skip_verify: false,
             providers: vec![AuthProviderConfig::OidcPassword {
                 token_url: "http://localhost:8080/token".to_string(),
                 client_id: "sqe".to_string(),
@@ -309,6 +312,7 @@ mod tests {
             token_endpoint: String::new(),
             token_refresh_buffer_secs: 60,
             ssl_verification: true,
+            tls_skip_verify: false,
             providers: vec![
                 AuthProviderConfig::OidcPassword {
                     token_url: "http://localhost:8080/token".to_string(),
@@ -351,6 +355,7 @@ mod tests {
             token_endpoint: String::new(),
             token_refresh_buffer_secs: 60,
             ssl_verification: false,
+            tls_skip_verify: false,
             providers: Vec::new(),
             role_mappings: HashMap::new(),
             external: None,

@@ -443,8 +443,15 @@ pub struct AuthConfig {
     pub token_endpoint: String,
     #[serde(default = "default_refresh_buffer")]
     pub token_refresh_buffer_secs: u64,
+    /// Verify TLS certificates for OIDC/OAuth endpoints.
+    /// Deprecated: use `tls_skip_verify = true` instead of `ssl_verification = false`.
     #[serde(default = "default_true")]
     pub ssl_verification: bool,
+    /// Skip TLS certificate verification (default: false).
+    /// When true, equivalent to `ssl_verification = false`.
+    /// Clearer naming: `true` means "skip verification" (insecure).
+    #[serde(default)]
+    pub tls_skip_verify: bool,
     /// Explicit provider chain. When non-empty, takes precedence over the
     /// legacy `keycloak_url` / `token_endpoint` fields.
     #[serde(default)]
@@ -457,6 +464,15 @@ pub struct AuthConfig {
     /// Maps to `[auth.external]` in TOML.
     #[serde(default)]
     pub external: Option<ExternalAuthConfig>,
+}
+
+impl AuthConfig {
+    /// Returns true if TLS certificate verification should be skipped.
+    /// Combines `tls_skip_verify` (new, clear) with `ssl_verification` (legacy, inverted).
+    /// Either `tls_skip_verify = true` OR `ssl_verification = false` triggers skip.
+    pub fn should_skip_tls_verify(&self) -> bool {
+        self.tls_skip_verify || !self.ssl_verification
+    }
 }
 
 impl std::fmt::Debug for AuthConfig {
@@ -1077,6 +1093,7 @@ mod tests {
                 token_endpoint: String::new(),
                 token_refresh_buffer_secs: 60,
                 ssl_verification: true,
+                tls_skip_verify: false,
                 providers: Vec::new(),
                 role_mappings: std::collections::HashMap::new(),
                 external: None,

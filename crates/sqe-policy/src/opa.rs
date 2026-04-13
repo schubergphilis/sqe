@@ -45,19 +45,18 @@ pub struct OpaStore {
 }
 
 impl OpaStore {
-    pub fn new(opa_url: &str, policy_path: &str, cache_ttl_secs: u64) -> Self {
-        Self {
+    pub fn new(opa_url: &str, policy_path: &str, cache_ttl_secs: u64) -> Result<Self, reqwest::Error> {
+        Ok(Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
-                .build()
-                .expect("Failed to build HTTP client"),
+                .build()?,
             opa_url: opa_url.trim_end_matches('/').to_string(),
             policy_path: policy_path.to_string(),
             cache: Cache::builder()
                 .time_to_live(Duration::from_secs(cache_ttl_secs))
                 .max_capacity(10_000)
                 .build(),
-        }
+        })
     }
 
     fn cache_key(user: &SessionUser, table: &str, namespace: &str) -> String {

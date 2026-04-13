@@ -1,0 +1,73 @@
+# syntax=docker/dockerfile:1
+# ── sqe-bench: benchmark data generator ──────────────────────────
+# Minimal image containing only the sqe-bench binary.
+# Used by the data platform to generate TPC benchmark data.
+
+# ── Stage 1: Base builder with tools ──────────────────────────
+FROM lukemathwalker/cargo-chef:latest-rust-bookworm AS chef
+
+ARG TARGETARCH
+ARG SCCACHE_VERSION=0.9.0
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake protobuf-compiler libssl-dev pkg-config clang lld curl && \
+    rm -rf /var/lib/apt/lists/* && \
+    case "$TARGETARCH" in \
+        amd64) SCCACHE_ARCH=x86_64 ;; \
+        arm64) SCCACHE_ARCH=aarch64 ;; \
+        *) echo "unsupported arch: $TARGETARCH" && exit 1 ;; \
+    esac && \
+    curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz" \
+    | tar xz --strip-components=1 -C /usr/local/bin \
+        "sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl/sccache"
+
+ENV RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=lld"
+ENV RUSTC_WRAPPER=sccache
+ENV SCCACHE_DIR=/sccache
+ENV SCCACHE_CACHE_SIZE=2G
+
+WORKDIR /build
+
+# ── Stage 2: Compute recipe ──────────────────────────────────
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ── Stage 3: Build dependencies ──────────────────────────────
+FROM chef AS deps
+ARG TARGETARCH
+COPY --from=planner /build/recipe.json recipe.json
+RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
+    --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},target=/usr/local/cargo/git \
+    --mount=type=cache,id=sqe-sccache-${TARGETARCH},target=/sccache \
+    cargo chef cook --release --recipe-path recipe.json && \
+    sccache --show-stats
+
+# ── Stage 4: Build sqe-bench only ────────────────────────────
+FROM deps AS builder
+ARG TARGETARCH
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
+    --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},target=/usr/local/cargo/git \
+    --mount=type=cache,id=sqe-sccache-${TARGETARCH},target=/sccache \
+    cargo build --release --bin sqe-bench && \
+    sccache --show-stats
+
+# ── Stage 5: Minimal runtime ─────────────────────────────────
+FROM debian:bookworm-slim
+
+LABEL org.opencontainers.image.title="sqe-bench" \
+      org.opencontainers.image.description="TPC benchmark data generator for SQE"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 && \
+    rm -rf /var/lib/apt/lists/* && \
+    groupadd -r sqe && useradd -r -g sqe -u 1000 sqe
+
+COPY --from=builder /build/target/release/sqe-bench /usr/local/bin/
+
+USER sqe
+
+ENTRYPOINT ["sqe-bench"]

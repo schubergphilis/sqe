@@ -27,7 +27,7 @@ impl OidcPasswordClient {
         );
 
         let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(!config.ssl_verification)
+            .danger_accept_invalid_certs(config.should_skip_tls_verify())
             .build()
             .map_err(|e| sqe_core::SqeError::Auth(format!("Failed to build HTTP client: {e}")))?;
 
@@ -196,6 +196,7 @@ mod tests {
             token_endpoint: String::new(),
             token_refresh_buffer_secs: 60,
             ssl_verification: false,
+            tls_skip_verify: false,
             providers: Vec::new(),
             role_mappings: std::collections::HashMap::new(),
             external: None,

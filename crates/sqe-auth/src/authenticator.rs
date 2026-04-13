@@ -53,7 +53,7 @@ impl Authenticator {
                 &config.token_endpoint,
                 &config.client_id,
                 &config.client_secret,
-                !config.ssl_verification,
+                config.should_skip_tls_verify(),
             )?;
             AuthBackend::ClientCredentials(oauth)
         } else {
@@ -416,6 +416,7 @@ mod tests {
             token_endpoint: String::new(),
             token_refresh_buffer_secs: 60,
             ssl_verification: false,
+            tls_skip_verify: false,
             providers: Vec::new(),
             role_mappings: std::collections::HashMap::new(),
             external: None,
@@ -432,6 +433,7 @@ mod tests {
             token_endpoint: "http://localhost:8181/api/catalog/v1/oauth/tokens".to_string(),
             token_refresh_buffer_secs: 120,
             ssl_verification: true,
+            tls_skip_verify: false,
             providers: Vec::new(),
             role_mappings: std::collections::HashMap::new(),
             external: None,
