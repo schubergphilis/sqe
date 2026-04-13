@@ -18,7 +18,7 @@ diagrams:
 		[ -f "$$f" ] && mmdc -i "$$f" -o "diagrams/rendered/$$(basename $$f .mmd).svg" || true; \
 	done
 
-# --- PDF (print-quality) ---
+# --- PDF (A4, print-quality) ---
 # Uses xelatex if available, falls back to weasyprint
 PDF_ENGINE := $(shell command -v xelatex >/dev/null 2>&1 && echo xelatex || echo weasyprint)
 
@@ -33,16 +33,18 @@ $(OUT)/sovereign-by-design.pdf: $(META) $(CHAPTERS) | $(OUT)
 		--resource-path=.:diagrams/rendered \
 		-o $@
 
-# --- EPUB ---
+# --- EPUB (e-reader optimised) ---
 epub: $(OUT)/sovereign-by-design.epub
 
-$(OUT)/sovereign-by-design.epub: $(META) $(CHAPTERS) | $(OUT)
+$(OUT)/sovereign-by-design.epub: $(META) $(CHAPTERS) epub.css | $(OUT)
 	@echo "==> Building EPUB"
 	pandoc $(META) $(CHAPTERS) \
 		--filter pandoc-crossref \
 		--top-level-division=chapter \
 		--resource-path=.:diagrams/rendered \
-		--epub-chapter-level=1 \
+		--split-level=1 \
+		--css=epub.css \
+		--epub-cover-image=diagrams/cover.png \
 		-o $@
 
 # --- HTML (single page) ---

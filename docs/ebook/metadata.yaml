@@ -15,27 +15,42 @@ rights: "Copyright 2026 Jacob Verhoeks. All rights reserved."
 publisher: Self-published
 cover-image: diagrams/cover.png
 
-# Pandoc settings
+# ── PDF settings (A4, print-optimised) ──────────────────────────────
 documentclass: book
-papersize: a5
-fontsize: 11pt
+classoption:
+  - openright          # chapters always start on a right-hand (odd) page
+papersize: a4
+fontsize: 10pt         # 10pt on A4 gives ~70 chars/line — ideal for readability
 mainfont: "Georgia"
 sansfont: "Helvetica Neue"
 monofont: "Menlo"
+monofontoptions:
+  - Scale=0.85         # monospace slightly smaller so code blocks fit
 geometry:
-  - top=25mm
-  - bottom=25mm
-  - left=20mm
-  - right=20mm
-linestretch: 1.25
+  - top=30mm
+  - bottom=30mm
+  - left=30mm
+  - right=25mm
+  - marginparwidth=0mm
+linestretch: 1.3       # slightly more line spacing for A4 readability
 toc: true
-toc-depth: 0
+toc-depth: 1           # show chapters + top-level sections in TOC
 number-sections: true
+
 header-includes:
-  - \setcounter{tocdepth}{0}
+  - \setcounter{tocdepth}{1}
   - \usepackage{graphicx}
   - \usepackage{xcolor}
   - \usepackage{tikz}
+  # Reduce code block font size so wide listings fit within A4 margins
+  - \usepackage{fancyvrb}
+  - \DefineVerbatimEnvironment{Highlighting}{Verbatim}{fontsize=\small,commandchars=\\\{\}}
+  # Every chapter starts on a new page (openright in book class does this,
+  # but we also add \clearpage before chapter headings for safety)
+  - |
+    \let\originalchapter\chapter
+    \renewcommand{\chapter}{\clearpage\originalchapter}
+  # Full-bleed cover page
   - |
     \renewcommand{\maketitle}{%
       \thispagestyle{empty}%
@@ -44,20 +59,29 @@ header-includes:
         \node[anchor=center] at (current page.center) {%
           \includegraphics[width=\paperwidth,height=\paperheight]{diagrams/cover.png}%
         };
-        \fill[black,opacity=0.5] ([yshift=20mm]current page.west) rectangle ([yshift=-25mm]current page.east);
-        \node[anchor=center,text width=0.85\paperwidth,align=center] at ([yshift=2mm]current page.center) {%
-          {\fontsize{28}{34}\selectfont\bfseries\color{white}\textsf{Sovereign by Design}\par}%
-          \vspace{5pt}%
-          {\fontsize{10}{14}\selectfont\color{white!85}\textsf{Building a Production Query Engine on DataFusion}\par}%
-          \vspace{8pt}%
-          {\fontsize{11}{15}\selectfont\color{white}\textsf{Jacob Verhoeks}\par}%
+        \fill[black,opacity=0.5] ([yshift=25mm]current page.west) rectangle ([yshift=-30mm]current page.east);
+        \node[anchor=center,text width=0.80\paperwidth,align=center] at ([yshift=3mm]current page.center) {%
+          {\fontsize{36}{42}\selectfont\bfseries\color{white}\textsf{Sovereign by Design}\par}%
+          \vspace{6pt}%
+          {\fontsize{13}{17}\selectfont\color{white!85}\textsf{Building a Production Query Engine on DataFusion}\par}%
+          \vspace{10pt}%
+          {\fontsize{14}{18}\selectfont\color{white}\textsf{Jacob Verhoeks}\par}%
         };
       \end{tikzpicture}%
       \restoregeometry%
       \clearpage%
     }
+
 colorlinks: true
 linkcolor: NavyBlue
 urlcolor: NavyBlue
 highlight-style: tango
+
+# ── EPUB settings ───────────────────────────────────────────────────
+# These are picked up only for EPUB output; PDF ignores them.
+epub-metadata: |
+  <dc:language>en-GB</dc:language>
+  <dc:rights>Copyright 2026 Jacob Verhoeks. All rights reserved.</dc:rights>
+css:
+  - epub.css
 ---
