@@ -791,7 +791,7 @@ User errors — syntax errors, missing tables, auth failures, type mismatches �
 
 The error codes mean nothing without automatic classification. DataFusion errors arrive as strings. We had to map those strings to codes.
 
-The classifier lives in two functions: `classify_execution_error` and `classify_catalog_error`. They pattern-match against lowercased error messages. Most patterns are straightforward: "table" + "not found" → `TableNotFound`, "division by zero" → `DivisionByZero`.
+The classifier lives in two functions: `classify_execution_error` and `classify_catalog_error`. They pattern-match against lowercased error messages. Most patterns are straightforward: "table" + "not found" becomes `TableNotFound`, "division by zero" becomes `DivisionByZero`.
 
 One pattern required care. DataFusion concatenates error messages when multiple failures are possible. A function call with wrong argument types produces something like: `"TypeSignatureClass(Exact([Int64, Int64])) does not match the function signature. No function matches the signature 'concat(Int64)'"`. That message contains both type signature information and "No function matches." If you check for `FunctionNotFound` before `TypeMismatch`, you classify it wrong. The comment in the code is explicit about this:
 
