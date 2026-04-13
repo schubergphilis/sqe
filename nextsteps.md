@@ -1,6 +1,6 @@
 # SQE — Next Steps
 
-> Status as of 2026-04-13. **Steps 1–4d + 7.1 + 7.3 + OSS Release + all performance/caching work done. SQE beats Trino 2.5–8.8x across all 7 benchmark suites.** 221/222 queries pass. 1,334+ tests, clippy clean, all advisory checks clean. 5-layer caching stack: RestCatalog, table metadata, manifest files, SessionContext (per-user, invalidated after DDL/DML), OAuth service token. Safe defaults: `sort_mode = partition_only`, `spill_to_disk = true`, `parse_float_as_decimal = true`. **Next: Step 5 (pluggable catalogs).** ← NEXT
+> Status as of 2026-04-13. **Steps 1–4d + 7.1 + 7.3 + OSS Release + all performance/caching + security hardening done. SQE beats Trino 2.5–8.8x across all 7 benchmark suites.** 221/222 queries pass. 1,334+ tests, 60/60 integration tests, clippy clean, all advisory checks clean. 43/43 security audit findings resolved (see `docs/issues.md`). 5-layer caching stack: RestCatalog, table metadata, manifest files, SessionContext (per-token-fingerprint, invalidated after all DDL), OAuth service token. Safe defaults: `sort_mode = adaptive`, `spill_to_disk = true`, `parse_float_as_decimal = true`. **Next: Step 5 (pluggable catalogs).** ← NEXT
 
 > **Monitoring:** OPA SPI refactor in Polaris (PR #3999, still draft) will affect Phase 5 OPA integration when it lands — do not implement OPA against Polaris until this stabilises. Remote S3 signing (Iceberg 1.12, not yet released) will affect the pluggable-catalogs design.
 

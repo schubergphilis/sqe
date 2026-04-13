@@ -4,6 +4,8 @@
 **Auditor:** Automated security & architecture review
 **Scope:** Full codebase across 10 crates
 **Standard:** Production readiness for regulated financial services
+**Status:** **ALL 43 FINDINGS RESOLVED** (MR !61, commit `ae4c301`)
+**Tests:** 1,334 unit tests pass, 60/60 integration tests pass, clippy clean
 
 ---
 
