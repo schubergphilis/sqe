@@ -91,12 +91,13 @@ pub async fn create_session_context(
         // Use the shared coordinator runtime (FairSpillPool with spill-to-disk)
         SessionContext::new_with_config_rt(session_config, Arc::clone(rt))
     } else {
-        // Legacy path: per-query GreedyMemoryPool (no spill)
+        // Fallback path (tests, one-shot helpers): FairSpillPool with spill disabled.
+        // Still prevents OOM by dividing memory fairly among operators.
         let max_memory = sqe_core::parse_memory_limit(&config.query.max_query_memory)
             .unwrap_or(256 * 1024 * 1024);
         if max_memory > 0 {
             let pool = Arc::new(
-                datafusion::execution::memory_pool::GreedyMemoryPool::new(max_memory),
+                datafusion::execution::memory_pool::FairSpillPool::new(max_memory),
             );
             let rt = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
                 .with_memory_pool(pool)
