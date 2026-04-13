@@ -46,7 +46,7 @@ sqlparser = "0.53"
 datafusion-functions-json = "0.52"
 
 # Async — use only what is needed; avoid ["full"] which includes fs/process/io-std
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "fs"] }
 
 # HTTP
 axum = "0.8"

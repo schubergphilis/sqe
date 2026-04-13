@@ -61,7 +61,16 @@ impl OpaStore {
     }
 
     fn cache_key(user: &SessionUser, table: &str, namespace: &str) -> String {
-        format!("{}:{}:{}", user.username, namespace, table)
+        {
+        let mut roles_sorted = user.roles.clone();
+        roles_sorted.sort();
+        let roles_hash = {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(roles_sorted.join(",").as_bytes());
+            format!("{:x}", digest).chars().take(16).collect::<String>()
+        };
+        format!("{}:{}:{}:{}", user.username, namespace, table, roles_hash)
+    }
     }
 }
 

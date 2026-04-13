@@ -205,6 +205,7 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                     Arc::new(MtlsProvider::new(mtls_config))
                 }
                 AuthProviderConfig::Anonymous { user, roles } => {
+                    tracing::error!("SECURITY: AnonymousProvider is active — all unauthenticated requests will be accepted. Remove for production.");
                     info!(
                         index = i,
                         user = %user,

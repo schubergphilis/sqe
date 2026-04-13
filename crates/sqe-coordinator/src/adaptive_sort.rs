@@ -13,7 +13,7 @@ use std::sync::Arc;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::ExecutionPlan;
-use tracing::{debug, info};
+use tracing::info;
 
 use sqe_catalog::IcebergScanExec;
 use sqe_core::SortMode;
@@ -84,7 +84,7 @@ pub fn apply_adaptive_sort(
         return (plan, vec![]);
     }
 
-    let decisions = std::sync::Mutex::new(Vec::new());
+    let decisions = std::cell::RefCell::new(Vec::new());
     let fallback = Arc::clone(&plan);
 
     let result = plan.transform_down(|node| {
@@ -121,7 +121,7 @@ pub fn apply_adaptive_sort(
                 }
             };
 
-            decisions.lock().unwrap().push(SortDecision {
+            decisions.borrow_mut().push(SortDecision {
                 sort_columns: sort_cols.clone(),
                 kept: keep,
                 reason,
@@ -167,7 +167,7 @@ pub fn apply_adaptive_sort(
         Err(_) => fallback,
     };
 
-    let decisions = decisions.into_inner().unwrap();
+    let decisions = decisions.into_inner();
     (final_plan, decisions)
 }
 

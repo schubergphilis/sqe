@@ -73,9 +73,10 @@ impl OidcPasswordClient {
             } else {
                 body
             };
-            return Err(sqe_core::SqeError::Auth(format!(
-                "OIDC provider returned {status}: {body}"
-            )));
+            warn!(status = %status, body = %body, "OIDC provider rejected credentials");
+            return Err(sqe_core::SqeError::Auth(
+                "Authentication failed".to_string(),
+            ));
         }
 
         response
@@ -116,9 +117,10 @@ impl OidcPasswordClient {
             } else {
                 body
             };
-            return Err(sqe_core::SqeError::Auth(format!(
-                "OIDC refresh returned {status}: {body}"
-            )));
+            warn!(status = %status, body = %body, "OIDC provider rejected token refresh");
+            return Err(sqe_core::SqeError::Auth(
+                "Authentication failed".to_string(),
+            ));
         }
 
         response

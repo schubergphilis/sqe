@@ -43,9 +43,17 @@ async fn metrics_handler<R: HasRegistry>(
     let encoder = prometheus::TextEncoder::new();
     let metric_families = metrics.prometheus_registry().gather();
     let mut buffer = Vec::new();
-    encoder.encode(&metric_families, &mut buffer).unwrap();
+    if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
+        error!(error = %e, "Failed to encode Prometheus metrics");
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            format!("Failed to encode metrics: {e}").into_bytes(),
+        );
+    }
 
     (
+        axum::http::StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         buffer,
     )

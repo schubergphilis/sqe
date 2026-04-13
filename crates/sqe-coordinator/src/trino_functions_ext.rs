@@ -1364,18 +1364,14 @@ impl ScalarUDFImpl for Checksum {
         Ok(DataType::Utf8)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+        use sha2::{Digest, Sha256};
         match &args.args[0] {
             ColumnarValue::Scalar(v) => {
-                let s = v.to_string();
-                let mut hasher = DefaultHasher::new();
-                s.hash(&mut hasher);
-                let hash = hasher.finish();
-                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(format!(
-                    "{:016x}",
-                    hash
-                )))))
+                let mut hasher = Sha256::new();
+                hasher.update(format!("{:?}", v).as_bytes());
+                let result = hasher.finalize();
+                let hex = format!("{:x}", result).chars().take(16).collect::<String>();
+                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(hex))))
             }
             ColumnarValue::Array(arr) => {
                 let str_arr = arrow::compute::cast(arr, &DataType::Utf8)?;
@@ -1387,9 +1383,10 @@ impl ScalarUDFImpl for Checksum {
                     .iter()
                     .map(|opt| {
                         opt.map(|s| {
-                            let mut hasher = DefaultHasher::new();
-                            s.hash(&mut hasher);
-                            format!("{:016x}", hasher.finish())
+                            let mut hasher = Sha256::new();
+                            hasher.update(format!("{:?}", s).as_bytes());
+                            let digest = hasher.finalize();
+                            format!("{:x}", digest).chars().take(16).collect::<String>()
                         })
                     })
                     .collect();

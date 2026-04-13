@@ -845,7 +845,7 @@ impl SqeConfig {
     /// Log warnings for deprecated config keys that still work but will be removed.
     fn log_deprecation_warnings(&self) {
         if !self.auth.keycloak_url.is_empty() {
-            eprintln!("WARN: config key 'auth.keycloak_url' is deprecated — the OIDC password grant provider works with any OIDC-compliant endpoint, not just Keycloak. This key will continue to work but may be renamed in a future release.");
+            tracing::warn!("config key 'auth.keycloak_url' is deprecated — the OIDC password grant provider works with any OIDC-compliant endpoint, not just Keycloak. This key will continue to work but may be renamed in a future release.");
         }
     }
 

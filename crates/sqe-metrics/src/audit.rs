@@ -100,7 +100,7 @@ impl AuditLogger {
             let mut w = match writer.lock() {
                 Ok(w) => w,
                 Err(e) => {
-                    eprintln!("AUDIT: mutex poisoned, audit entry lost: {e}");
+                    tracing::error!("AUDIT: mutex poisoned, audit entry lost: {e}");
                     return;
                 }
             };
@@ -127,15 +127,15 @@ impl AuditLogger {
             let json = match serde_json::to_string(entry) {
                 Ok(j) => j,
                 Err(e) => {
-                    eprintln!("AUDIT: serialization failed: {e}");
+                    tracing::error!("AUDIT: serialization failed: {e}");
                     return;
                 }
             };
             if let Err(e) = writeln!(w, "{json}") {
-                eprintln!("AUDIT: write failed: {e}");
+                tracing::error!("AUDIT: write failed: {e}");
             }
             if let Err(e) = w.flush() {
-                eprintln!("AUDIT: flush failed: {e}");
+                tracing::error!("AUDIT: flush failed: {e}");
             }
         }
     }

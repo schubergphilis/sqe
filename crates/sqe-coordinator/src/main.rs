@@ -101,6 +101,9 @@ async fn main() -> anyhow::Result<()> {
     if !config.auth.ssl_verification {
         tracing::warn!("WARNING: SSL certificate verification is DISABLED for auth endpoints -- vulnerable to MITM. Set auth.ssl_verification = true for production.");
     }
+    if !config.coordinator.worker_urls.is_empty() && config.coordinator.worker_secret.is_empty() {
+        tracing::error!("SECURITY: worker_urls configured but worker_secret is empty -- any client can register as a worker. Set worker_secret for distributed mode.");
+    }
 
     // Initialize tracing + OTel (traces, metrics, logs via OTLP when configured)
     let _otel_guard = sqe_metrics::otel::init_telemetry_with_sampling(
@@ -196,7 +199,7 @@ async fn main() -> anyhow::Result<()> {
         Some(audit.clone()),
         query_tracker,
         query_cache,
-    ).with_manifest_cache(manifest_cache).with_table_cache(table_cache));
+    )?.with_manifest_cache(manifest_cache).with_table_cache(table_cache));
 
     // Spawn background memory metrics reporter (updates gauges every 1s for Grafana)
     sqe_coordinator::memory::spawn_metrics_reporter(

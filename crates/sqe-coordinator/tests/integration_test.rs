@@ -70,7 +70,7 @@ async fn test_simple_select() {
     );
     let handler = sqe_coordinator::QueryHandler::new(
         policy, None, config, None, None, None, None, query_tracker, None,
-    );
+    ).expect("Failed to create QueryHandler");
 
     let batches = handler
         .execute(&session, "SELECT 1")
@@ -396,7 +396,7 @@ async fn test_distributed_select() {
     );
     let handler = sqe_coordinator::QueryHandler::new(
         policy, None, config, Some(registry), None, None, None, query_tracker, None,
-    );
+    ).expect("Failed to create QueryHandler");
 
     // First create a test table
     let _ = handler
@@ -1706,7 +1706,7 @@ async fn test_different_user_catalog_visibility() {
             None, None, None, None,
             Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history)),
             None,
-        );
+        ).expect("Failed to create QueryHandler");
 
     // adminuser has catalog_admin + table_reader + data_writer roles
     let admin_session = authenticator
@@ -1813,7 +1813,7 @@ async fn test_trino_http_query() {
         None,
         query_tracker,
         None,
-    ));
+    ).expect("Failed to create QueryHandler"));
 
     // Bind to port 0 to get an OS-assigned free port
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to ephemeral port");

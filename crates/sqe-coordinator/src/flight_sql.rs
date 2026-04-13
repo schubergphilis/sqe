@@ -59,6 +59,7 @@ pub struct SqeFlightSqlService {
     query_tracker: Arc<QueryTracker>,
     worker_secret: String,
     metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
+    rate_limiter: Option<Arc<crate::rate_limiter::QueryRateLimiter>>,
 }
 
 impl SqeFlightSqlService {
@@ -77,6 +78,7 @@ impl SqeFlightSqlService {
             query_tracker,
             worker_secret,
             metrics: None,
+            rate_limiter: None,
         }
     }
 
@@ -93,6 +95,11 @@ impl SqeFlightSqlService {
 
     pub fn with_worker_registry(mut self, registry: Arc<WorkerRegistry>) -> Self {
         self.worker_registry = Some(registry);
+        self
+    }
+
+    pub fn with_rate_limiter(mut self, limiter: Arc<crate::rate_limiter::QueryRateLimiter>) -> Self {
+        self.rate_limiter = Some(limiter);
         self
     }
 
@@ -475,6 +482,14 @@ impl FlightSqlService for SqeFlightSqlService {
         request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let session = self.get_session_from_request(&request).await?;
+
+        // Rate limiting: reject if the user has exceeded their query rate.
+        if let Some(ref limiter) = self.rate_limiter {
+            limiter
+                .check(&session.user.username)
+                .map_err(|e| Status::resource_exhausted(e.to_string()))?;
+        }
+
         let sql = &ticket.statement_handle;
 
         debug!(
@@ -537,6 +552,7 @@ impl FlightSqlService for SqeFlightSqlService {
         query: CommandGetCatalogs,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
+        let _session = self.get_session_from_request(&request).await?;
         let flight_descriptor = request.into_inner();
         let ticket = Ticket {
             ticket: query.as_any().encode_to_vec().into(),
@@ -553,8 +569,9 @@ impl FlightSqlService for SqeFlightSqlService {
     async fn do_get_catalogs(
         &self,
         query: CommandGetCatalogs,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let _session = self.get_session_from_request(&request).await?;
         info!("Flight SQL: do_get_catalogs called");
         let catalog_name = if self.config.catalog.warehouse.is_empty() {
             "default".to_string()
@@ -916,8 +933,9 @@ impl FlightSqlService for SqeFlightSqlService {
     async fn do_get_table_types(
         &self,
         _query: CommandGetTableTypes,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let _session = self.get_session_from_request(&request).await?;
         let mut builder = arrow_array::builder::StringBuilder::new();
         builder.append_value("TABLE");
         builder.append_value("VIEW");
@@ -933,8 +951,9 @@ impl FlightSqlService for SqeFlightSqlService {
     async fn do_get_sql_info(
         &self,
         query: CommandGetSqlInfo,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let _session = self.get_session_from_request(&request).await?;
         let mut sql_info_builder = SqlInfoDataBuilder::new();
         sql_info_builder.append(SqlInfo::FlightSqlServerName, "SQE Coordinator");
         sql_info_builder.append(SqlInfo::FlightSqlServerVersion, "0.1.0");
@@ -956,8 +975,9 @@ impl FlightSqlService for SqeFlightSqlService {
     async fn do_get_primary_keys(
         &self,
         _query: CommandGetPrimaryKeys,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let _session = self.get_session_from_request(&request).await?;
         // Iceberg tables have no primary keys — return empty stream
         Self::batches_to_stream(vec![])
     }
@@ -965,32 +985,36 @@ impl FlightSqlService for SqeFlightSqlService {
     async fn do_get_exported_keys(
         &self,
         _query: CommandGetExportedKeys,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let _session = self.get_session_from_request(&request).await?;
         Self::batches_to_stream(vec![])
     }
 
     async fn do_get_imported_keys(
         &self,
         _query: CommandGetImportedKeys,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let _session = self.get_session_from_request(&request).await?;
         Self::batches_to_stream(vec![])
     }
 
     async fn do_get_cross_reference(
         &self,
         _query: CommandGetCrossReference,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let _session = self.get_session_from_request(&request).await?;
         Self::batches_to_stream(vec![])
     }
 
     async fn do_get_xdbc_type_info(
         &self,
         query: CommandGetXdbcTypeInfo,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let _session = self.get_session_from_request(&request).await?;
         let mut builder = XdbcTypeInfoDataBuilder::new();
 
         builder.append(XdbcTypeInfo {

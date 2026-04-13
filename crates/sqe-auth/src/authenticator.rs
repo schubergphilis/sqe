@@ -48,6 +48,7 @@ impl Authenticator {
                 token_endpoint = config.token_endpoint,
                 "Using OAuth2 client_credentials backend"
             );
+            tracing::warn!("ClientCredentials mode active — all users share a single service token. Not suitable for multi-user access control.");
             let oauth = OAuthClient::new(
                 &config.token_endpoint,
                 &config.client_id,
@@ -260,6 +261,7 @@ impl Authenticator {
     pub fn start_refresh_task(self: &Arc<Self>) {
         let this = Arc::clone(self);
 
+        // TODO(security-hardening): store JoinHandle and add CancellationToken
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
 
