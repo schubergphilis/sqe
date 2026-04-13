@@ -1,5 +1,12 @@
 # cargo-deny configuration for SQE
 # https://embarkstudios.github.io/cargo-deny/
+#
+# SUPPLY CHAIN NOTE: Three iceberg crates are sourced from a third-party fork:
+#   github.com/risingwavelabs/iceberg-rust.git rev=1978911ec4
+# cargo-deny's advisory database does NOT cover git dependencies.
+# The pinned rev mitigates force-push attacks. Verify the SHA matches:
+#   git ls-remote https://github.com/risingwavelabs/iceberg-rust.git | grep 1978911
+# Migration to upstream apache/iceberg-rust planned once OverwriteAction is merged.
 
 [advisories]
 db-path = "~/.cargo/advisory-db"

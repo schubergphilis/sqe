@@ -97,13 +97,12 @@ impl AuditLogger {
 
     pub fn log(&self, entry: &AuditEntry) {
         if let Some(ref writer) = self.writer {
-            let mut w = match writer.lock() {
-                Ok(w) => w,
-                Err(e) => {
-                    tracing::error!("AUDIT: mutex poisoned, audit entry lost: {e}");
-                    return;
-                }
-            };
+            // Recover from poison: a prior panic should not prevent future audit writes.
+            // Audit log integrity is more important than the panic's side effects.
+            let mut w = writer.lock().unwrap_or_else(|poisoned| {
+                tracing::error!("AUDIT: mutex was poisoned — recovering writer");
+                poisoned.into_inner()
+            });
             // Redact PII from query_text before writing to the audit log.
             // query_hash is a non-reversible hash and is left untouched.
             let redacted_entry;

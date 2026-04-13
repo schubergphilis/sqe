@@ -282,8 +282,8 @@ async fn main() -> anyhow::Result<()> {
     if !config.rate_limit.enabled {
         tracing::warn!("WARNING: Rate limiting is DISABLED -- no protection against query flooding. Set [rate_limit] enabled = true for production.");
     }
-    if !config.auth.ssl_verification {
-        tracing::warn!("WARNING: SSL certificate verification is DISABLED for auth endpoints -- vulnerable to MITM. Set auth.ssl_verification = true for production.");
+    if config.auth.should_skip_tls_verify() {
+        tracing::warn!("WARNING: TLS certificate verification is DISABLED for auth endpoints -- vulnerable to MITM. Set auth.tls_skip_verify = false (or auth.ssl_verification = true) for production.");
     }
     if !config.coordinator.worker_urls.is_empty() && config.coordinator.worker_secret.is_empty() {
         tracing::error!("SECURITY: worker_urls configured but worker_secret is empty -- any client can register as a worker. Set worker_secret for distributed mode.");

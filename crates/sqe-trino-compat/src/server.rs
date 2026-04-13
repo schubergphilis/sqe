@@ -130,12 +130,31 @@ where
     });
 
     tokio::spawn(async move {
+        // Restrictive CORS: no cross-origin by default. The Trino compat endpoint
+        // is designed for JDBC/CLI clients, not browsers. An explicit empty
+        // Access-Control-Allow-Origin blocks browser-based cross-origin requests.
+        let cors_layer = axum::middleware::from_fn(|req: axum::extract::Request, next: axum::middleware::Next| async move {
+            if req.method() == axum::http::Method::OPTIONS {
+                // Preflight: respond with 204 and restrictive headers.
+                return axum::response::Response::builder()
+                    .status(204)
+                    .header("Access-Control-Allow-Methods", "GET, POST, DELETE")
+                    .header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Trino-User, X-Trino-Catalog, X-Trino-Schema, X-Trino-Source")
+                    .header("Access-Control-Max-Age", "3600")
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+                    .into_response();
+            }
+            next.run(req).await
+        });
+
         let mut app = Router::new()
             .route("/v1/info", get(server_info::<A, Q>))
             .route("/v1/info/state", get(server_state::<A, Q>))
             .route("/v1/statement", post(submit_query::<A, Q>))
             .route("/v1/statement/{id}/{token}", get(get_results::<A, Q>))
             .route("/v1/statement/{id}", delete(cancel_query::<A, Q>))
+            .layer(cors_layer)
             .with_state(state);
 
         if let Some(oauth2_state) = oauth2 {
