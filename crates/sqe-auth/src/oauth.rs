@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Token response from a generic OAuth2 token endpoint (client_credentials grant).
 ///
@@ -77,9 +77,10 @@ impl OAuthClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "unable to read body".to_string());
-            return Err(sqe_core::SqeError::Auth(format!(
-                "OAuth token endpoint returned {status}: {body}"
-            )));
+            warn!(status = %status, body = %body, "OAuth token endpoint rejected credentials");
+            return Err(sqe_core::SqeError::Auth(
+                "Authentication failed".to_string(),
+            ));
         }
 
         response

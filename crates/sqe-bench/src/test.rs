@@ -363,10 +363,14 @@ pub(crate) fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> Stri
                     continue;
                 }
 
-                // Check it's not inside a quoted string (simple heuristic:
-                // count double quotes before this position — odd means inside quotes)
-                let quotes_before = remaining[..pos].matches('"').count();
-                if quotes_before.is_multiple_of(2) {
+                // Check it's not inside a quoted string (heuristic:
+                // count unescaped quotes before this position — odd means inside quotes).
+                // Check both single quotes (SQL string literals) and double quotes (identifiers).
+                let single_quotes_before = remaining[..pos].matches('\'').count();
+                let double_quotes_before = remaining[..pos].matches('"').count();
+                let inside_string = !single_quotes_before.is_multiple_of(2);
+                let inside_identifier = !double_quotes_before.is_multiple_of(2);
+                if !inside_string && !inside_identifier {
                     output.push_str(&remaining[..pos]);
                     output.push_str(&qualified);
                     remaining = &remaining[end..];

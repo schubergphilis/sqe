@@ -78,9 +78,10 @@ impl ManifestCache {
         let cache = MokaCache::builder()
             .weigher(|_key: &String, value: &Arc<Vec<ManifestEntryData>>| {
                 // Approximate weight: ~100 bytes per entry, minimum 256.
-                ((value.len() * 100).max(256)) as u32
+                value.len().saturating_mul(100).max(256).min(u32::MAX as usize) as u32
             })
             .max_capacity(max_bytes)
+            .time_to_live(std::time::Duration::from_secs(3600))
             .build();
         Self { cache }
     }

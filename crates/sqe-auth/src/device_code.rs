@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use serde::Deserialize;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::oidc_discovery::OidcDiscovery;
 use crate::pending_auth::TokenSet;
@@ -150,8 +150,9 @@ impl DeviceCodeService {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            warn!(status = %status, body = %body, "Device authorization endpoint rejected request");
             return Err(AuthError::Internal(anyhow::anyhow!(
-                "device_authorization endpoint returned HTTP {status}: {body}"
+                "device_authorization endpoint returned HTTP {status}"
             )));
         }
 

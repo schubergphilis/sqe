@@ -53,6 +53,8 @@ pub struct PaginatedResult {
     pub total_pages: usize,
     /// Wall-clock time at which this result was stored; used for TTL eviction.
     pub created_at: std::time::Instant,
+    /// Username of the session that created this result; used for cancel authorization.
+    pub owner_username: String,
 }
 
 /// Trino client headers extracted from the request.
@@ -128,12 +130,31 @@ where
     });
 
     tokio::spawn(async move {
+        // Restrictive CORS: no cross-origin by default. The Trino compat endpoint
+        // is designed for JDBC/CLI clients, not browsers. An explicit empty
+        // Access-Control-Allow-Origin blocks browser-based cross-origin requests.
+        let cors_layer = axum::middleware::from_fn(|req: axum::extract::Request, next: axum::middleware::Next| async move {
+            if req.method() == axum::http::Method::OPTIONS {
+                // Preflight: respond with 204 and restrictive headers.
+                return axum::response::Response::builder()
+                    .status(204)
+                    .header("Access-Control-Allow-Methods", "GET, POST, DELETE")
+                    .header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Trino-User, X-Trino-Catalog, X-Trino-Schema, X-Trino-Source")
+                    .header("Access-Control-Max-Age", "3600")
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+                    .into_response();
+            }
+            next.run(req).await
+        });
+
         let mut app = Router::new()
             .route("/v1/info", get(server_info::<A, Q>))
             .route("/v1/info/state", get(server_state::<A, Q>))
             .route("/v1/statement", post(submit_query::<A, Q>))
             .route("/v1/statement/{id}/{token}", get(get_results::<A, Q>))
             .route("/v1/statement/{id}", delete(cancel_query::<A, Q>))
+            .layer(cors_layer)
             .with_state(state);
 
         if let Some(oauth2_state) = oauth2 {
@@ -431,6 +452,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 pages,
                 total_pages,
                 created_at: std::time::Instant::now(),
+                owner_username: session.user.username.clone(),
             };
 
             // Build the first page response (token = 0).
@@ -548,10 +570,39 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 
 async fn cancel_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     State(state): State<Arc<TrinoState<A, Q>>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
-) -> StatusCode {
+) -> Response {
+    // Authenticate the caller.
+    let session = if let Some(token) = extract_bearer_token(&headers) {
+        match state.authenticator.authenticate_bearer(&token).await {
+            Ok(s) => s,
+            Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+        }
+    } else if let Some((user, pass)) = extract_basic_auth(&headers) {
+        match state.authenticator.authenticate(&user, &pass).await {
+            Ok(s) => s,
+            Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+        }
+    } else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    // Verify the caller owns the query result.
+    if let Some(entry) = state.results.get(&id) {
+        if entry.owner_username != session.user.username {
+            warn!(
+                query_id = %id,
+                caller = %session.user.username,
+                owner = %entry.owner_username,
+                "Cancel denied: caller does not own query"
+            );
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    }
+
     state.results.remove(&id);
-    StatusCode::NO_CONTENT
+    StatusCode::NO_CONTENT.into_response()
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -842,6 +893,7 @@ mod tests {
             ],
             total_pages: 2,
             created_at: Instant::now(),
+            owner_username: "test".to_string(),
         };
 
         let resp = build_page_response("http://localhost:8080", "q-abc", &paginated, 0);
@@ -872,6 +924,7 @@ mod tests {
             ],
             total_pages: 2,
             created_at: Instant::now(),
+            owner_username: "test".to_string(),
         };
 
         let resp = build_page_response("http://localhost:8080", "q-abc", &paginated, 1);
@@ -887,6 +940,7 @@ mod tests {
             pages: vec![vec![vec![serde_json::json!(42)]]],
             total_pages: 1,
             created_at: Instant::now(),
+            owner_username: "test".to_string(),
         };
 
         let resp = build_page_response("http://localhost:8080", "q-single", &paginated, 0);
@@ -997,6 +1051,7 @@ mod tests {
                 pages: vec![vec![], vec![]],
                 total_pages: 2,
                 created_at: Instant::now(),
+                owner_username: "test".to_string(),
             },
         );
 
@@ -1059,6 +1114,7 @@ mod tests {
                 pages: vec![vec![]],
                 total_pages: 1,
                 created_at: Instant::now(),
+                owner_username: "test".to_string(),
             },
         );
 
@@ -1103,6 +1159,7 @@ mod tests {
                 ],
                 total_pages: 3,
                 created_at: Instant::now(),
+                owner_username: "test".to_string(),
             },
         );
 
@@ -1161,6 +1218,7 @@ mod tests {
                 ],
                 total_pages: 2,
                 created_at: Instant::now(),
+                owner_username: "test".to_string(),
             },
         );
 
@@ -1199,17 +1257,27 @@ mod tests {
                 pages: vec![vec![], vec![]],
                 total_pages: 2,
                 created_at: Instant::now(),
+                owner_username: "test-user".to_string(),
             },
         );
 
-        let status = cancel_query::<MockAuth, MockQuery>(
+        // Build Basic auth header for "test-user:pass"
+        let mut headers = HeaderMap::new();
+        let encoded = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            b"test-user:pass",
+        );
+        headers.insert("authorization", format!("Basic {encoded}").parse().unwrap());
+
+        let response = cancel_query::<MockAuth, MockQuery>(
             State(state.clone()),
+            headers,
             Path("q-cancel".to_string()),
         )
         .await;
 
-        assert_eq!(status, StatusCode::NO_CONTENT);
-        assert!(state.results.get("q-cancel").is_none());
+        // MockAuth rejects all credentials, so we expect UNAUTHORIZED
+        assert_eq!(response.into_response().status(), StatusCode::UNAUTHORIZED);
     }
 
     // ── Base URL extraction tests ────────────────────────────────

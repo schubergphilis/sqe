@@ -195,6 +195,7 @@ pub fn start_credential_refresh_task<F, Fut>(
     F: Fn(ActiveFragment) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Option<RefreshableCredentials>> + Send,
 {
+    // TODO(security-hardening): store JoinHandle and add CancellationToken
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
         // First tick fires immediately — skip it so we don't do a

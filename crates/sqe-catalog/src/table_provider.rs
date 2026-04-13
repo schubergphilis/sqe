@@ -189,7 +189,6 @@ impl TableProvider for SqeTableProvider {
             projected_columns,
             predicates,
             filters.to_vec(),
-            self.prom_metrics.clone(),
         );
         if let Some(sid) = self.snapshot_id {
             exec = exec.with_snapshot_id(sid);

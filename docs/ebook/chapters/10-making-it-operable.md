@@ -583,12 +583,37 @@ The cost: every readiness check makes a network call. With Kubernetes polling ev
 What we don't have yet: leader election, so that only one coordinator is "primary" for write operations. For read-only query traffic this doesn't matter — all coordinators are equivalent. For session state and write coordination, it matters significantly. The HA story is the next chapter we haven't written yet.
 
 
+## The Security Audit That Changed the Defaults
+
+After the engine was fast, correct, and observable, we asked: would a bank approve this for production?
+
+The answer was 43 findings across six categories. Two critical, thirteen high, twenty-one medium, seven low. The engine ran 221 out of 222 benchmark queries correctly and beat Trino by 2.5x to 8.8x. It still failed the audit.
+
+The critical finding was the session context cache. Keyed by username. Two users sharing a username from different identity providers would share a Polaris catalog session. Cross-user data access. The fix was straightforward: key by `username:sha256(token)[..16]`. But it required switching moka's `get`/`insert` to `try_get_with` for atomic cache population, which also eliminated a TOCTOU race condition where concurrent requests from the same user would build redundant SessionContexts.
+
+The most tedious finding was panic safety. Sixteen call sites in date extraction functions used `.unwrap()` on `date32_to_datetime()`, which returns `Option<NaiveDateTime>`. A query calling `year()` on a Date32 column with an extreme value would panic and kill the coordinator. Not return an error. Kill the coordinator. Every one of those sixteen sites needed individual attention because the containing functions had different error handling patterns. Some were in `.map()` closures where `?` does not work. Those needed conversion to explicit loops.
+
+The finding that taught us the most was adaptive sort. We initially set the default to `partition_only`. Safest possible: never sort on non-partition columns, never OOM from unbounded sorts. Eight integration tests immediately failed. Every test that used `ORDER BY salary DESC` got unsorted results. The lesson: the safest default and the correct default are not always the same.
+
+The right default is `adaptive`. Sort normally when memory is available. Strip non-partition sorts when memory pressure rises. Never crash. Never silently return wrong results on small data. The FairSpillPool memory limit is the backstop. If the sort exceeds memory, DataFusion spills to disk. If spill is not configured, the adaptive stripper removes the sort before the executor runs out of memory. Two layers of protection, transparent to the user.
+
+Other findings were smaller but cumulative. Nine Flight SQL metadata endpoints with no authentication check. The cancel-query endpoint letting any client cancel any other user's query. The OPA policy cache ignoring role changes. OIDC error bodies forwarded verbatim to clients, enabling user enumeration. Blocking `std::fs::write` on Tokio worker threads. The `checksum()` UDF using `DefaultHasher`, which is not stable across Rust versions. The audit logger silently dropping records on mutex poison.
+
+We fixed all 43. Thirty-three files changed. +1,272 / -372 lines. Every unit test still passed. All sixty integration tests passed.
+
+The audit doc lives at `docs/issues.md`. It lists every finding by severity, with file:line references, what was wrong, how it was fixed, and why it matters. The document is not a badge. It is a maintenance artifact. When someone changes the session cache or the auth chain or the sort logic, they can check the audit doc to understand why the code looks the way it does.
+
+::: {.sovereignty}
+**Sovereignty principle:** A production security audit is not optional for sovereign infrastructure. If you skip it, you are deploying hope. The 43 findings were not surprising. They are the normal output of building software quickly and then reviewing it carefully. The difference between a prototype and a production system is not the code. It is the review.
+:::
+
+
 ## The Lesson
 
-We started with no observability and hardcoded constants. We added counters. Then histograms. Then traces. Then audit logs. Then trace propagation. Then health probes. Then a config file. Then environment overlays. Then validation. Each addition was prompted by a specific question we couldn't answer or a specific deployment we couldn't support.
+We started with no observability and hardcoded constants. We added counters. Then histograms. Then traces. Then audit logs. Then trace propagation. Then health probes. Then a config file. Then environment overlays. Then validation. Then a full security audit. Each addition was prompted by a specific question we could not answer or a specific deployment we could not support.
 
-The engine that "worked" without any of this was the same code, executing the same queries. The difference is that now we know what it's doing, and someone other than the person who wrote it can deploy it. No surprises.
+The engine that "worked" without any of this was the same code, executing the same queries. The difference is that now we know what it is doing, and someone other than the person who wrote it can deploy it. No surprises.
 
-Configuration taught us something we didn't expect: it forced architectural clarity. When you name a config section, you decide what that subsystem is. When you define defaults, you decide what "normal" looks like. When you write validation, you decide what's required and what's optional. The TOML file isn't a reflection of the architecture. It *is* the architecture, expressed for operators.
+Configuration taught us something we did not expect: it forced architectural clarity. When you name a config section, you decide what that subsystem is. When you define defaults, you decide what "normal" looks like. When you write validation, you decide what is required and what is optional. The TOML file is not a reflection of the architecture. It *is* the architecture, expressed for operators.
 
-If your query engine surprises you, your metrics are wrong. If nobody else can deploy it, your config is wrong. Fix both.
+If your query engine surprises you, your metrics are wrong. If nobody else can deploy it, your config is wrong. If it panics on user input, your error handling is wrong. Fix all three.

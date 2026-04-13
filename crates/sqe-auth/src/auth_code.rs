@@ -16,7 +16,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::Rng;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::oidc_discovery::OidcDiscovery;
 use crate::pending_auth::TokenSet;
@@ -200,9 +200,10 @@ impl AuthCodeService {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(AuthError::AuthFailed(format!(
-                "token endpoint returned HTTP {status}: {body}"
-            )));
+            warn!(status = %status, body = %body, "Token endpoint rejected auth code exchange");
+            return Err(AuthError::AuthFailed(
+                "Authentication failed".to_string(),
+            ));
         }
 
         let token_response: TokenResponse = response

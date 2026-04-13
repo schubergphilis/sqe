@@ -89,7 +89,12 @@ pub fn arrow_value_to_json(
         }
         DataType::UInt64 => {
             let arr = array.as_any().downcast_ref::<UInt64Array>().unwrap();
-            serde_json::json!(arr.value(row))
+            let v = arr.value(row);
+            if v > i64::MAX as u64 {
+                serde_json::json!(v.to_string())  // Serialize as string to avoid precision loss
+            } else {
+                serde_json::json!(v)
+            }
         }
         DataType::Float32 => {
             let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
@@ -112,7 +117,7 @@ pub fn arrow_value_to_json(
                 // Large/small values: scientific notation to match Trino
                 // serde_json::Number doesn't support E notation directly,
                 // so we use a raw JSON value via from_str
-                let formatted = format!("{:E}", v);
+                let formatted = format!("{:e}", v);
                 serde_json::from_str::<serde_json::Value>(&formatted)
                     .unwrap_or_else(|_| serde_json::json!(v))
             }

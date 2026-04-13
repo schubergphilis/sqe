@@ -44,10 +44,6 @@ pub struct IcebergScanExec {
     df_filters: Vec<Expr>,
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
-    /// Optional Prometheus metrics registry for reporting file pruning,
-    /// footer cache, and S3 I/O counters.
-    #[allow(dead_code)]
-    prom_metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
     /// Optional snapshot ID for time travel queries.
     snapshot_id: Option<i64>,
     /// Trust Iceberg sort order metadata for ALL columns, not just partition keys.
@@ -76,10 +72,10 @@ impl IcebergScanExec {
     }
 
     pub fn new_with_filters(table: Table, projected_schema: SchemaRef, projection: Option<Vec<String>>, predicates: Option<Predicate>, df_filters: Vec<Expr>) -> Self {
-        Self::new_with_filters_and_metrics(table, projected_schema, projection, predicates, df_filters, None)
+        Self::new_with_filters_and_metrics(table, projected_schema, projection, predicates, df_filters)
     }
 
-    pub fn new_with_filters_and_metrics(table: Table, projected_schema: SchemaRef, projection: Option<Vec<String>>, predicates: Option<Predicate>, df_filters: Vec<Expr>, prom_metrics: Option<Arc<sqe_metrics::MetricsRegistry>>) -> Self {
+    pub fn new_with_filters_and_metrics(table: Table, projected_schema: SchemaRef, projection: Option<Vec<String>>, predicates: Option<Predicate>, df_filters: Vec<Expr>) -> Self {
         // Sort order from Iceberg metadata.
         //
         // IMPORTANT: Iceberg sort order is a HINT about how files should be
@@ -138,7 +134,7 @@ impl IcebergScanExec {
             }
         };
         let properties = PlanProperties::new(eq_props, Partitioning::UnknownPartitioning(1), EmissionType::Incremental, Boundedness::Bounded);
-        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), prom_metrics, snapshot_id: None, trust_sort_order: false, manifest_cache: None, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES }
+        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, manifest_cache: None, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES }
     }
 
     /// Attach a shared manifest file cache for warm-query acceleration.
@@ -246,10 +242,6 @@ impl IcebergScanExec {
                     pruned_count = pc;
                     if pruned_count > 0 {
                         debug!(pruned = pruned_count, remaining = kept.len(), "File-level min/max pruning");
-                        // Increment Prometheus file pruning counter
-                        if let Some(ref pm) = self.prom_metrics {
-                            pm.files_pruned_minmax.inc_by(pruned_count as f64);
-                        }
                         let kept_paths: std::collections::HashSet<String> = kept.iter().map(|df| df.file_path().to_string()).collect();
                         result.retain(|(path, _)| kept_paths.contains(path));
                     }

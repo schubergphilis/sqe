@@ -151,6 +151,7 @@ impl WorkerRegistry {
 
     pub fn start_health_check_task(self: &Arc<Self>, interval: Duration) {
         let registry = self.clone();
+        // TODO(security-hardening): store JoinHandle and add CancellationToken
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             loop {

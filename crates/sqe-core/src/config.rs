@@ -87,12 +87,13 @@ pub struct QueryConfig {
     ///
     /// - `"strict"`: Always sort. Spill to disk if needed.
     /// - `"partition_only"`: Only sort when keys match Iceberg partition columns.
-    ///   Safe default for TB-scale data from mixed writers (Spark, Trino, SQE).
-    /// - `"adaptive"`: Sort when memory is Green; strip non-partition sorts under pressure.
+    ///   Safest for TB-scale data from mixed writers (Spark, Trino, SQE).
+    /// - `"adaptive"`: Sort when memory is available (Green); strip non-partition
+    ///   sorts under memory pressure. Best default: correct for small data,
+    ///   safe for large data.
     ///
-    /// Default: `"partition_only"` — prevents OOM from unbounded sorts on
-    /// non-partition columns in large tables. Set to `"strict"` if your data is
-    /// known to be small enough to sort in memory + spill.
+    /// Default: `"adaptive"` — tries to sort in memory, falls back to
+    /// partition-only under pressure. Never crashes from unbounded sorts.
     #[serde(default = "default_sort_mode")]
     pub sort_mode: String,
 }
@@ -443,8 +444,15 @@ pub struct AuthConfig {
     pub token_endpoint: String,
     #[serde(default = "default_refresh_buffer")]
     pub token_refresh_buffer_secs: u64,
+    /// Verify TLS certificates for OIDC/OAuth endpoints.
+    /// Deprecated: use `tls_skip_verify = true` instead of `ssl_verification = false`.
     #[serde(default = "default_true")]
     pub ssl_verification: bool,
+    /// Skip TLS certificate verification (default: false).
+    /// When true, equivalent to `ssl_verification = false`.
+    /// Clearer naming: `true` means "skip verification" (insecure).
+    #[serde(default)]
+    pub tls_skip_verify: bool,
     /// Explicit provider chain. When non-empty, takes precedence over the
     /// legacy `keycloak_url` / `token_endpoint` fields.
     #[serde(default)]
@@ -457,6 +465,15 @@ pub struct AuthConfig {
     /// Maps to `[auth.external]` in TOML.
     #[serde(default)]
     pub external: Option<ExternalAuthConfig>,
+}
+
+impl AuthConfig {
+    /// Returns true if TLS certificate verification should be skipped.
+    /// Combines `tls_skip_verify` (new, clear) with `ssl_verification` (legacy, inverted).
+    /// Either `tls_skip_verify = true` OR `ssl_verification = false` triggers skip.
+    pub fn should_skip_tls_verify(&self) -> bool {
+        self.tls_skip_verify || !self.ssl_verification
+    }
 }
 
 impl std::fmt::Debug for AuthConfig {
@@ -735,7 +752,7 @@ fn default_max_query_memory() -> String { "256MB".to_string() }
 fn default_distribution_threshold() -> String { "128MB".to_string() }
 fn default_distribution_file_threshold() -> usize { 4 }
 fn default_target_task_size() -> String { "256MB".to_string() }
-fn default_sort_mode() -> String { "partition_only".to_string() }
+fn default_sort_mode() -> String { "adaptive".to_string() }
 
 fn default_coordinator_memory() -> String { "8GB".to_string() }
 fn default_coordinator_spill_dir() -> String { "/tmp/sqe-coordinator-spill".to_string() }
@@ -845,7 +862,7 @@ impl SqeConfig {
     /// Log warnings for deprecated config keys that still work but will be removed.
     fn log_deprecation_warnings(&self) {
         if !self.auth.keycloak_url.is_empty() {
-            eprintln!("WARN: config key 'auth.keycloak_url' is deprecated — the OIDC password grant provider works with any OIDC-compliant endpoint, not just Keycloak. This key will continue to work but may be renamed in a future release.");
+            tracing::warn!("config key 'auth.keycloak_url' is deprecated — the OIDC password grant provider works with any OIDC-compliant endpoint, not just Keycloak. This key will continue to work but may be renamed in a future release.");
         }
     }
 
@@ -1077,6 +1094,7 @@ mod tests {
                 token_endpoint: String::new(),
                 token_refresh_buffer_secs: 60,
                 ssl_verification: true,
+                tls_skip_verify: false,
                 providers: Vec::new(),
                 role_mappings: std::collections::HashMap::new(),
                 external: None,
