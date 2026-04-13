@@ -1,16 +1,28 @@
-# When Your SQL Engine Understands Meaning
+---
+title: "When Your SQL Engine Understands Meaning"
+description: "SQL engines know table shapes. We're adding ontologies, property graphs, vector search, and AI-native interfaces."
+pubDate: "2026-03-22"
+author: "Jacob Verhoeks"
+tags:
+  - "ai"
+  - "ontology"
+  - "vector-search"
+  - "future"
+---
 
-*SQL engines know table shapes. They don't know what the data means. We're changing that — with ontologies on Iceberg, property graphs, vector search, and AI-native interfaces. All in one engine.*
+
+
+*SQL engines know table shapes. They don't know what the data means. We're changing that with ontologies on Iceberg, property graphs, vector search, and AI-native interfaces. All in one engine.*
 
 ---
 
 ## The schema introspection problem
 
-An AI agent connects to your data lake. It runs `SHOW TABLES` and gets back 400 tables. It picks one and runs `DESCRIBE orders` — 47 columns. `ord_typ_cd`. `cust_sgmt_flg`. `rev_adj_amt`. The agent has no idea what any of this means.
+An AI agent connects to your data lake. It runs `SHOW TABLES` and gets back 400 tables. It picks one and runs `DESCRIBE orders`. 47 columns. `ord_typ_cd`. `cust_sgmt_flg`. `rev_adj_amt`. The agent has no idea what any of this means.
 
 This is the fundamental gap between a SQL engine and a useful data tool. SQL engines are excellent at executing queries. They're terrible at helping you figure out which query to write.
 
-Schema introspection tells you the shape of the data: column names, types, nullability. It doesn't tell you the meaning: "this column is the customer lifetime value," "this table is the primary source for churn analysis," "these two tables are related through the customer_id foreign key but only for orders placed after 2024."
+Schema introspection tells you the shape of the data: column names, types, nullability. It doesn't tell you the meaning. "This column is the customer lifetime value." "This table is the primary source for churn analysis." "These two tables are related through the customer_id foreign key but only for orders placed after 2024."
 
 Today, that knowledge lives in documentation wikis, tribal knowledge, dbt YAML files, and the heads of senior data engineers. AI agents can't access any of it.
 
@@ -18,11 +30,11 @@ Today, that knowledge lives in documentation wikis, tribal knowledge, dbt YAML f
 
 ## The idea: meaning as data
 
-What if semantic knowledge — ontologies, relationships, descriptions — lived alongside the data, in the same Iceberg tables, versioned by the same snapshots, secured by the same access controls?
+Semantic knowledge, ontologies, relationships, descriptions, could live alongside the data. In the same Iceberg tables, versioned by the same snapshots, secured by the same access controls.
 
 That's what SQE's semantic layer does. It's not a separate metadata service. It's not an external knowledge graph. It's data in Iceberg, queryable in SQL, SPARQL, and ISO GQL, accessible through the same auth and policy enforcement as everything else.
 
-Three types of semantic data, all stored in Iceberg:
+Three types of semantic data, all stored in Iceberg.
 
 ### 1. Ontologies as RDF triples
 
@@ -39,7 +51,7 @@ CREATE TABLE rdf.triples (
 ) PARTITIONED BY (predicate);
 ```
 
-Partitioning by predicate is the key design choice. Most ontology queries ask "what is related by this predicate?" — all `rdf:type` triples in one partition, all `schema:description` triples in another. Fast scan, no full-table read.
+Partitioning by predicate is the key design choice. Most ontology queries ask "what is related by this predicate?" All `rdf:type` triples in one partition, all `schema:description` triples in another. Fast scan, no full-table read.
 
 You populate it with standard SQL:
 
@@ -64,7 +76,7 @@ WHERE {
 }
 ```
 
-SQE compiles SPARQL to DataFusion's `LogicalPlan` via the `rdf-fusion` library. No separate triple store, no SPARQL endpoint to maintain. The SPARQL query becomes a regular DataFusion query against the `rdf.triples` table — with predicate pushdown, partition pruning, and the same query optimizer as SQL.
+SQE compiles SPARQL to DataFusion's `LogicalPlan` via the `rdf-fusion` library. No separate triple store, no SPARQL endpoint to maintain. The SPARQL query becomes a regular DataFusion query against the `rdf.triples` table, with predicate pushdown, partition pruning, and the same query optimizer as SQL.
 
 And because it's Iceberg: **time travel works.** "What did we know about the `orders` table six months ago?" is just a snapshot query. The ontology evolves with the data.
 
@@ -91,7 +103,7 @@ CREATE TABLE graph.edges (
 ) PARTITIONED BY (label);
 ```
 
-Queried with ISO GQL (the new international standard, ISO 39075:2024 — not Cypher, which is proprietary to Neo4j):
+Queried with ISO GQL (the new international standard, ISO 39075:2024, not Cypher, which is proprietary to Neo4j):
 
 ```
 MATCH (c:Customer {segment: 'VIP'})-[:PLACED_ORDER]->(o:Order)
@@ -101,20 +113,20 @@ ORDER BY total_orders DESC
 
 The execution is dual-mode:
 - **Small graphs** (under 10 million nodes): load into `graphlite` (an embedded graph engine) in memory, execute GQL natively, return Arrow results.
-- **Large graphs**: compile MATCH patterns to DataFusion recursive CTEs. The graph traversal becomes a SQL query plan — joining `graph.edges` against itself for each hop, with cycle detection.
+- **Large graphs**: compile MATCH patterns to DataFusion recursive CTEs. The graph traversal becomes a SQL query plan, joining `graph.edges` against itself for each hop, with cycle detection.
 
 The threshold is configurable. The choice is automatic.
 
 ### 3. Vector search alongside structured data
 
-Unstructured content — documents, support tickets, product descriptions — often lives alongside structured tables. SQE adds vector search via Apache Lance, an Arrow-native columnar format designed for ML workloads.
+Unstructured content, documents, support tickets, product descriptions, often lives alongside structured tables. SQE adds vector search via Apache Lance, an Arrow-native columnar format designed for ML workloads.
 
 Lance datasets sit on the same object storage as Iceberg tables:
 
 ```
 s3://my-lake/
-    iceberg/orders/            ← structured data (Iceberg)
-    lance/support_embeddings/  ← vector embeddings (Lance)
+    iceberg/orders/            <- structured data (Iceberg)
+    lance/support_embeddings/  <- vector embeddings (Lance)
 ```
 
 Two new DataFusion functions make vector search feel like SQL:
@@ -130,9 +142,9 @@ ORDER BY score
 LIMIT 10;
 ```
 
-`embed()` is an async UDF that sends text to a configurable HTTP endpoint (your embedding model — OpenAI, Cohere, local model, anything) and caches results by SHA-256 hash. `vec_distance()` computes cosine, L2, or dot product similarity.
+`embed()` is an async UDF that sends text to a configurable HTTP endpoint (your embedding model, OpenAI, Cohere, local model, anything) and caches results by SHA-256 hash. `vec_distance()` computes cosine, L2, or dot product similarity.
 
-The real power is hybrid queries — combining structured SQL, ontology SPARQL, and vector search in one query:
+The real power is hybrid queries. Combining structured SQL, ontology SPARQL, and vector search in one query:
 
 ```sql
 -- Find support tickets about order disputes for VIP customers
@@ -155,11 +167,11 @@ One query. Three data modalities. One engine.
 
 ## AI-native interfaces
 
-Having semantic data is useless if AI agents can't access it. SQE is designed for four interface modalities, ordered by priority:
+Having semantic data is useless if AI agents can't access it. SQE is designed for four interface modalities, ordered by priority.
 
 ### CLI-first (works with any agent)
 
-The CLI is the primary agent interface — not an afterthought. Every command has structured output and a `--describe` flag that returns a JSON description of what the command does, its parameters, and example output.
+The CLI is the primary agent interface, not an afterthought. Every command has structured output and a `--describe` flag that returns a JSON description of what the command does, its parameters, and example output.
 
 ```bash
 # Semantic search across all tables and ontology
@@ -197,17 +209,17 @@ This works with Claude Code, GPT function calling, LangChain, or a simple shell 
 An OpenAPI 3.1 spec at `/api/v1/openapi.json` that any AI agent can fetch and immediately understand every operation:
 
 ```
-POST /api/v1/query         — execute SQL, SPARQL, or GQL (auto-detected)
-GET  /api/v1/schema/search — semantic search across tables and ontology
-GET  /api/v1/schema/tables/{name} — table metadata with ontology context
-POST /api/v1/explore       — natural language → suggested queries
+POST /api/v1/query         - execute SQL, SPARQL, or GQL (auto-detected)
+GET  /api/v1/schema/search - semantic search across tables and ontology
+GET  /api/v1/schema/tables/{name} - table metadata with ontology context
+POST /api/v1/explore       - natural language to suggested queries
 ```
 
 The OpenAPI spec is the key artifact. AI agents that understand OpenAPI (which is most of them) can self-discover capabilities without documentation.
 
 ### MCP (for MCP-capable agents)
 
-A thin wrapper over the REST API. MCP tool calls map directly to HTTP requests. Tool descriptions are auto-generated from the OpenAPI spec at startup — no hand-written tool definitions that drift from the actual API.
+A thin wrapper over the REST API. MCP tool calls map directly to HTTP requests. Tool descriptions are auto-generated from the OpenAPI spec at startup. No hand-written tool definitions that drift from the actual API.
 
 ### TypeScript client (for web and Node.js)
 
@@ -228,7 +240,7 @@ const ontology = await client.query(
   { dialect: 'sparql' }
 );
 
-// Returns Apache Arrow Tables — zero-copy in Node.js
+// Returns Apache Arrow Tables - zero-copy in Node.js
 const result = await client.query('SELECT * FROM orders LIMIT 100');
 ```
 
@@ -238,26 +250,26 @@ Auto-selects Arrow Flight (gRPC, high performance) in Node.js and REST (fetch AP
 
 ## Why this matters
 
-The data industry has spent a decade building storage (data lakes), catalogs (Iceberg, Delta), and query engines (Trino, Spark, DataFusion). What's missing is the semantic layer — the part that knows what the data means, not just where it lives.
+The data industry has spent a decade building storage (data lakes), catalogs (Iceberg, Delta), and query engines (Trino, Spark, DataFusion). What's missing is the semantic layer. The part that knows what the data means, not just where it lives.
 
 Today, that semantic layer is either:
-- **Manual** — documentation wikis, tribal knowledge, dbt YAML descriptions
-- **Proprietary** — vendor-specific knowledge graphs separate from the data
-- **Absent** — AI agents brute-force their way through schema introspection
+- **Manual.** Documentation wikis, tribal knowledge, dbt YAML descriptions.
+- **Proprietary.** Vendor-specific knowledge graphs separate from the data.
+- **Absent.** AI agents brute-force their way through schema introspection.
 
-SQE's approach is different: **the semantic layer is data.** Ontologies are Iceberg tables. Graph relationships are Iceberg tables. Vector embeddings are Lance datasets on the same storage. Everything is versioned, secured, and queryable through the same engine.
+SQE's approach is different. **The semantic layer is data.** Ontologies are Iceberg tables. Graph relationships are Iceberg tables. Vector embeddings are Lance datasets on the same storage. Everything is versioned, secured, and queryable through the same engine.
 
 This means:
 - **No separate infrastructure.** No triple store to maintain, no graph database to sync, no vector database to keep in sync with your data lake.
 - **Unified security.** The same bearer token passthrough and policy enforcement that protects your sales data also protects your ontology. Row-level security on triples works the same as row-level security on tables.
 - **Time travel for knowledge.** When someone asks "what did we understand about customer churn last quarter?" the answer is an Iceberg snapshot query, not an archaeology expedition through wiki edit history.
-- **One query, multiple modalities.** SQL for structured data, SPARQL for ontologies, GQL for graphs, vector search for unstructured content — all in one query plan, one engine, one result set.
+- **One query, multiple modalities.** SQL for structured data, SPARQL for ontologies, GQL for graphs, vector search for unstructured content. All in one query plan, one engine, one result set.
 
 ---
 
 ## The shape of the roadmap
 
-The semantic AI layer is Step 6 in SQE's roadmap — the most ambitious and the most additive. It doesn't change existing SQL functionality. It adds new capabilities on top:
+The semantic AI layer is Step 6 in SQE's roadmap. The most ambitious and the most additive. It doesn't change existing SQL functionality. It adds new capabilities on top.
 
 | Component | What | How |
 |-----------|------|-----|
@@ -270,15 +282,15 @@ The semantic AI layer is Step 6 in SQE's roadmap — the most ambitious and the 
 | MCP | MCP-capable agents | Thin wrapper over REST, auto-generated tools |
 | TypeScript | Web and Node.js | Arrow Flight (Node) + REST (browser) |
 
-89 tasks across 9 phases. Fully additive — new crates (`sqe-semantic`, `sqe-vector`, `sqe-rest`, `sqe-mcp`), no existing code broken.
+89 tasks across 9 phases. Fully additive. New crates (`sqe-semantic`, `sqe-vector`, `sqe-rest`, `sqe-mcp`), no existing code broken.
 
-The design is intentionally layered: you can use SQE as a pure SQL engine and ignore everything above. Or you can populate an ontology and get semantic search. Or you can go all-in with graphs, vectors, and AI interfaces. Each layer adds value without requiring the others.
+The design is intentionally layered. You can use SQE as a pure SQL engine and ignore everything above. Or you can populate an ontology and get semantic search. Or you can go all-in with graphs, vectors, and AI interfaces. Each layer adds value without requiring the others.
 
 ---
 
 ## The bet
 
-We're betting that the next generation of data tools won't just execute queries — they'll understand what the data means and help users (human and AI) find and combine the right information.
+We're betting that the next generation of data tools won't just execute queries. They'll understand what the data means and help users, human and AI, find and combine the right information.
 
 The foundation is in place: a fast Rust query engine with Iceberg-native data access, bearer token security, and distributed execution. The semantic layer is the capability that turns it from infrastructure into intelligence.
 

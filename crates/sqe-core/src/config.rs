@@ -44,8 +44,8 @@ impl SortMode {
             "partition_only" | "partition-only" => Self::PartitionOnly,
             "adaptive" => Self::Adaptive,
             _ => {
-                tracing::warn!(sort_mode = s, "Unknown sort_mode, defaulting to adaptive");
-                Self::Adaptive
+                tracing::warn!(sort_mode = s, "Unknown sort_mode, defaulting to partition_only");
+                Self::PartitionOnly
             }
         }
     }
@@ -85,11 +85,14 @@ pub struct QueryConfig {
     pub target_task_size: String,
     /// Controls when ORDER BY clauses are preserved vs stripped to save memory.
     ///
-    /// - `"strict"`: Always sort. Spill to disk if needed. (backwards-compatible)
+    /// - `"strict"`: Always sort. Spill to disk if needed.
     /// - `"partition_only"`: Only sort when keys match Iceberg partition columns.
+    ///   Safe default for TB-scale data from mixed writers (Spark, Trino, SQE).
     /// - `"adaptive"`: Sort when memory is Green; strip non-partition sorts under pressure.
     ///
-    /// Default: `"adaptive"`
+    /// Default: `"partition_only"` — prevents OOM from unbounded sorts on
+    /// non-partition columns in large tables. Set to `"strict"` if your data is
+    /// known to be small enough to sort in memory + spill.
     #[serde(default = "default_sort_mode")]
     pub sort_mode: String,
 }
@@ -732,7 +735,7 @@ fn default_max_query_memory() -> String { "256MB".to_string() }
 fn default_distribution_threshold() -> String { "128MB".to_string() }
 fn default_distribution_file_threshold() -> usize { 4 }
 fn default_target_task_size() -> String { "256MB".to_string() }
-fn default_sort_mode() -> String { "adaptive".to_string() }
+fn default_sort_mode() -> String { "partition_only".to_string() }
 
 fn default_coordinator_memory() -> String { "8GB".to_string() }
 fn default_coordinator_spill_dir() -> String { "/tmp/sqe-coordinator-spill".to_string() }
