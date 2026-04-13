@@ -48,11 +48,12 @@ impl Authenticator {
                 token_endpoint = config.token_endpoint,
                 "Using OAuth2 client_credentials backend"
             );
+            tracing::warn!("ClientCredentials mode active — all users share a single service token. Not suitable for multi-user access control.");
             let oauth = OAuthClient::new(
                 &config.token_endpoint,
                 &config.client_id,
                 &config.client_secret,
-                !config.ssl_verification,
+                config.should_skip_tls_verify(),
             )?;
             AuthBackend::ClientCredentials(oauth)
         } else {
@@ -260,6 +261,7 @@ impl Authenticator {
     pub fn start_refresh_task(self: &Arc<Self>) {
         let this = Arc::clone(self);
 
+        // TODO(security-hardening): store JoinHandle and add CancellationToken
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
 
@@ -414,6 +416,7 @@ mod tests {
             token_endpoint: String::new(),
             token_refresh_buffer_secs: 60,
             ssl_verification: false,
+            tls_skip_verify: false,
             providers: Vec::new(),
             role_mappings: std::collections::HashMap::new(),
             external: None,
@@ -430,6 +433,7 @@ mod tests {
             token_endpoint: "http://localhost:8181/api/catalog/v1/oauth/tokens".to_string(),
             token_refresh_buffer_secs: 120,
             ssl_verification: true,
+            tls_skip_verify: false,
             providers: Vec::new(),
             role_mappings: std::collections::HashMap::new(),
             external: None,

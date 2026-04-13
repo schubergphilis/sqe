@@ -27,7 +27,7 @@ impl OidcPasswordClient {
         );
 
         let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(!config.ssl_verification)
+            .danger_accept_invalid_certs(config.should_skip_tls_verify())
             .build()
             .map_err(|e| sqe_core::SqeError::Auth(format!("Failed to build HTTP client: {e}")))?;
 
@@ -73,9 +73,10 @@ impl OidcPasswordClient {
             } else {
                 body
             };
-            return Err(sqe_core::SqeError::Auth(format!(
-                "OIDC provider returned {status}: {body}"
-            )));
+            warn!(status = %status, body = %body, "OIDC provider rejected credentials");
+            return Err(sqe_core::SqeError::Auth(
+                "Authentication failed".to_string(),
+            ));
         }
 
         response
@@ -116,9 +117,10 @@ impl OidcPasswordClient {
             } else {
                 body
             };
-            return Err(sqe_core::SqeError::Auth(format!(
-                "OIDC refresh returned {status}: {body}"
-            )));
+            warn!(status = %status, body = %body, "OIDC provider rejected token refresh");
+            return Err(sqe_core::SqeError::Auth(
+                "Authentication failed".to_string(),
+            ));
         }
 
         response
@@ -194,6 +196,7 @@ mod tests {
             token_endpoint: String::new(),
             token_refresh_buffer_secs: 60,
             ssl_verification: false,
+            tls_skip_verify: false,
             providers: Vec::new(),
             role_mappings: std::collections::HashMap::new(),
             external: None,

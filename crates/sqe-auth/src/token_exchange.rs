@@ -194,9 +194,10 @@ impl TokenExchangeProvider {
             } else {
                 body
             };
-            return Err(AuthError::AuthFailed(format!(
-                "Token exchange returned {status}: {body}"
-            )));
+            warn!(status = %status, body = %body, "Token exchange endpoint rejected credentials");
+            return Err(AuthError::AuthFailed(
+                "Authentication failed".to_string(),
+            ));
         }
 
         response

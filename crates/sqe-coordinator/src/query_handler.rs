@@ -82,7 +82,7 @@ impl QueryHandler {
         audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
         query_tracker: Arc<QueryTracker>,
         query_cache: Option<Arc<ResultCache>>,
-    ) -> Self {
+    ) -> sqe_core::Result<Self> {
         let catalog_ops = CatalogOps::new(config.clone());
         let mut write_handler = WriteHandler::new(config.clone());
         if let Some(ref m) = metrics {
@@ -98,9 +98,9 @@ impl QueryHandler {
         // Build shared DataFusion runtime with FairSpillPool for memory management
         // and optional spill-to-disk. This is built once and shared across all queries.
         let runtime = crate::runtime::build_coordinator_runtime(&config.coordinator)
-            .expect("Failed to build coordinator DataFusion runtime");
+            .map_err(|e| sqe_core::SqeError::Config(format!("Failed to build runtime: {e}")))?;
 
-        Self {
+        Ok(Self {
             policy_enforcer,
             policy_store,
             config,
@@ -117,7 +117,7 @@ impl QueryHandler {
             runtime,
             manifest_cache: None,
             table_cache: None,
-        }
+        })
     }
 
     /// Attach a shared manifest file cache used to accelerate repeated scans.
@@ -161,16 +161,6 @@ impl QueryHandler {
 
     pub fn write_handler(&self) -> &WriteHandler {
         &self.write_handler
-    }
-
-    /// Check if distributed execution should be used for a query.
-    #[allow(dead_code)] // Will be used when distributed query routing is wired in
-    async fn should_distribute(&self) -> bool {
-        if let Some(ref registry) = self.worker_registry {
-            !registry.healthy_workers().await.is_empty()
-        } else {
-            false
-        }
     }
 
     /// Execute a SQL statement for the given session and return collected RecordBatches.
@@ -303,48 +293,48 @@ impl QueryHandler {
 
                 StatementKind::Drop(stmt) => {
                     self.catalog_ops.drop_table(session, stmt).await?;
-                    crate::session_context::invalidate_session_cache(&session.user.username).await;
+                    crate::session_context::invalidate_all_session_caches();
                     Ok(vec![])
                 }
                 StatementKind::Rename(stmt) => {
                     self.catalog_ops.rename_table(session, stmt).await?;
-                    crate::session_context::invalidate_session_cache(&session.user.username).await;
+                    crate::session_context::invalidate_all_session_caches();
                     Ok(vec![])
                 }
                 StatementKind::AlterSchema(stmt) => {
                     self.catalog_ops.alter_table_schema(session, stmt).await?;
-                    crate::session_context::invalidate_session_cache(&session.user.username).await;
+                    crate::session_context::invalidate_all_session_caches();
                     Ok(vec![])
                 }
                 StatementKind::AlterTableProps(stmt) => {
                     self.catalog_ops.set_table_properties(session, stmt).await?;
-                    crate::session_context::invalidate_session_cache(&session.user.username).await;
+                    crate::session_context::invalidate_all_session_caches();
                     Ok(vec![])
                 }
                 StatementKind::CreateView(stmt) => {
                     self.handle_create_view(session, stmt).await?;
-                    crate::session_context::invalidate_session_cache(&session.user.username).await;
+                    crate::session_context::invalidate_all_session_caches();
                     Ok(vec![])
                 }
                 StatementKind::DropView(stmt) => {
                     self.catalog_ops.drop_view(session, stmt).await?;
-                    crate::session_context::invalidate_session_cache(&session.user.username).await;
+                    crate::session_context::invalidate_all_session_caches();
                     Ok(vec![])
                 }
                 StatementKind::CreateSchema(stmt) => {
                     self.catalog_ops.create_schema(session, stmt).await?;
-                    crate::session_context::invalidate_session_cache(&session.user.username).await;
+                    crate::session_context::invalidate_all_session_caches();
                     Ok(vec![])
                 }
                 StatementKind::DropSchema(stmt) => {
                     self.catalog_ops.drop_schema(session, stmt).await?;
-                    crate::session_context::invalidate_session_cache(&session.user.username).await;
+                    crate::session_context::invalidate_all_session_caches();
                     Ok(vec![])
                 }
 
                 StatementKind::CreateTable(stmt) => {
                     let result = self.write_handler.handle_create_table(session, stmt).await;
-                    crate::session_context::invalidate_session_cache(&session.user.username).await;
+                    crate::session_context::invalidate_all_session_caches();
                     result
                 }
 
@@ -361,7 +351,7 @@ impl QueryHandler {
                             let result = self.write_handler
                                 .handle_ctas_streaming(session, stmt, &ctx, &select_sql)
                                 .await;
-                            crate::session_context::invalidate_session_cache(&session.user.username).await;
+                            crate::session_context::invalidate_all_session_caches();
                             result
                         } else {
                             Err(SqeError::Execution("CTAS without SELECT query".into()))
@@ -812,10 +802,13 @@ impl QueryHandler {
             }
         };
 
-        let iceberg_scan = scan_node
-            .as_any()
-            .downcast_ref::<IcebergScanExec>()
-            .expect("find_iceberg_scan returned a non-IcebergScanExec node");
+        let iceberg_scan = match scan_node.as_any().downcast_ref::<IcebergScanExec>() {
+            Some(s) => s,
+            None => {
+                tracing::warn!("find_iceberg_scan returned unexpected node type, falling back to local");
+                return plan;
+            }
+        };
 
         // 4. Get data file paths and sizes from the scan manifest metadata
         let file_info = match iceberg_scan.data_file_info().await {

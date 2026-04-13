@@ -136,7 +136,7 @@ impl ApiKeyProvider {
                 tokio::time::sleep(interval).await;
                 let current_mtime = file_mtime(&path);
                 if current_mtime != last_modified {
-                    match load_keys_from_file(&path) {
+                    match load_keys_from_file_async(&path).await {
                         Ok(new_keys) => {
                             info!(
                                 keys_file = %path.display(),
@@ -221,9 +221,19 @@ impl AuthProvider for ApiKeyProvider {
     // refresh_catalog_token: returns Ok(None) — API keys have no catalog token.
 }
 
-/// Load and parse keys from a TOML file.
+/// Load and parse keys from a TOML file (blocking -- use for startup only).
 fn load_keys_from_file(path: &Path) -> Result<Vec<ApiKeyEntry>, anyhow::Error> {
     let content = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("cannot read keys file {}: {e}", path.display()))?;
+    let keys_file: KeysFile = toml::from_str(&content)
+        .map_err(|e| anyhow::anyhow!("cannot parse keys file {}: {e}", path.display()))?;
+    Ok(keys_file.keys)
+}
+
+/// Async variant of [`load_keys_from_file`] -- safe to call from Tokio worker threads.
+async fn load_keys_from_file_async(path: &Path) -> Result<Vec<ApiKeyEntry>, anyhow::Error> {
+    let content = tokio::fs::read_to_string(path)
+        .await
         .map_err(|e| anyhow::anyhow!("cannot read keys file {}: {e}", path.display()))?;
     let keys_file: KeysFile = toml::from_str(&content)
         .map_err(|e| anyhow::anyhow!("cannot parse keys file {}: {e}", path.display()))?;
