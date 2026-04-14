@@ -209,6 +209,9 @@ pub const DEFAULT_CONCURRENT_REQUESTS_PER_FILE: usize = 4;
 /// Default maximum number of files fetched concurrently.
 pub const DEFAULT_MAX_CONCURRENT_FILES: usize = 8;
 
+/// Default prefetch depth: how many files ahead to prefetch.
+pub const DEFAULT_PREFETCH_DEPTH: usize = 4;
+
 /// A handle to a prefetched footer read.
 ///
 /// The caller spawns a background task that reads the last `n` bytes of a
@@ -260,16 +263,39 @@ pub fn prefetch_footer(
 ///
 /// For each file in `file_infos`, the provided `process_fn` closure is called
 /// with the file path and an optional prefetched footer `Bytes`. While the
-/// closure processes the current file, the next file's footer is prefetched in
-/// the background.
+/// closure processes the current file, upcoming files' footers are prefetched
+/// in the background up to `prefetch_depth` files ahead.
 ///
 /// `file_infos` is a slice of `(path, file_size)` tuples.
 /// `footer_read_size` is how many bytes to read from the end of each file
 /// for the footer (default: 64 KB).
+/// `prefetch_depth` controls how many files ahead to prefetch. Default: 1
+/// (legacy behaviour). Set to 4-8 for high-latency S3 connections.
 pub async fn process_files_with_prefetch<F, Fut, T, E>(
     store: Arc<dyn ObjectStore>,
     file_infos: &[(ObjectPath, u64)],
     footer_read_size: u64,
+    process_fn: F,
+) -> Result<Vec<T>, E>
+where
+    F: FnMut(ObjectPath, u64, Option<Bytes>) -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: From<object_store::Error>,
+{
+    process_files_with_prefetch_depth(store, file_infos, footer_read_size, 1, process_fn).await
+}
+
+/// Like [`process_files_with_prefetch`] but with configurable prefetch depth.
+///
+/// `prefetch_depth` controls how many upcoming files' footers are prefetched
+/// concurrently. A depth of 1 prefetches the next file only (original behavior).
+/// Higher values (4-8) improve throughput on high-latency S3 connections by
+/// overlapping more I/O with compute.
+pub async fn process_files_with_prefetch_depth<F, Fut, T, E>(
+    store: Arc<dyn ObjectStore>,
+    file_infos: &[(ObjectPath, u64)],
+    footer_read_size: u64,
+    prefetch_depth: usize,
     mut process_fn: F,
 ) -> Result<Vec<T>, E>
 where
@@ -277,33 +303,46 @@ where
     Fut: std::future::Future<Output = Result<T, E>>,
     E: From<object_store::Error>,
 {
+    use std::collections::VecDeque;
+
     if file_infos.is_empty() {
         return Ok(Vec::new());
     }
 
+    let depth = prefetch_depth.max(1);
     let mut results = Vec::with_capacity(file_infos.len());
-    let mut prefetch: Option<(ObjectPath, u64, PrefetchHandle)> = None;
+    let mut prefetch_queue: VecDeque<PrefetchHandle> = VecDeque::new();
+
+    // Seed the prefetch queue with up to `depth` upcoming files.
+    for j in 1..=depth.min(file_infos.len().saturating_sub(1)) {
+        let (next_path, next_size) = &file_infos[j];
+        prefetch_queue.push_back(prefetch_footer(
+            Arc::clone(&store),
+            next_path.clone(),
+            *next_size,
+            footer_read_size,
+        ));
+    }
 
     for (i, (path, file_size)) in file_infos.iter().enumerate() {
-        // If we have a prefetch from the previous iteration, resolve it.
-        let footer_bytes = if let Some((_, _, handle)) = prefetch.take() {
+        // Resolve the front of the prefetch queue (if any) for the current file.
+        // The first file (i=0) was not prefetched; subsequent files have a handle.
+        let footer_bytes = if i > 0 && !prefetch_queue.is_empty() {
+            let handle = prefetch_queue.pop_front().unwrap();
             Some(handle.resolve().await.map_err(E::from)?)
         } else {
             None
         };
 
-        // Start prefetching the next file's footer (if there is one).
-        if i + 1 < file_infos.len() {
-            let (next_path, next_size) = &file_infos[i + 1];
-            prefetch = Some((
+        // Enqueue the next file beyond our current prefetch window.
+        let next_to_prefetch = i + 1 + prefetch_queue.len();
+        if next_to_prefetch < file_infos.len() {
+            let (next_path, next_size) = &file_infos[next_to_prefetch];
+            prefetch_queue.push_back(prefetch_footer(
+                Arc::clone(&store),
                 next_path.clone(),
                 *next_size,
-                prefetch_footer(
-                    Arc::clone(&store),
-                    next_path.clone(),
-                    *next_size,
-                    footer_read_size,
-                ),
+                footer_read_size,
             ));
         }
 

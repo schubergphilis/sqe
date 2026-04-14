@@ -90,7 +90,17 @@ pub async fn create_session_context(
                 // Matches Trino/SQL standard behavior: 0.06 - 0.01 = 0.05 (exact),
                 // not 0.049999999999999996 (floating-point). Critical for correct
                 // BETWEEN predicates and aggregate precision.
-                .set_bool("datafusion.sql_parser.parse_float_as_decimal", true);
+                .set_bool("datafusion.sql_parser.parse_float_as_decimal", true)
+                // Enable Parquet filter pushdown: DataFusion pushes predicates into
+                // the Parquet reader as RowFilters, enabling late materialization
+                // (two-phase scan: read predicate columns first, then remaining
+                // columns only for surviving rows). Reduces I/O 10-50x for
+                // selective queries on wide tables.
+                .set_bool("datafusion.execution.parquet.pushdown_filters", true)
+                // Enable Parquet filter reordering: DataFusion reorders pushed-down
+                // filters by cost so the cheapest/most selective predicates run
+                // first, maximizing early row elimination.
+                .set_bool("datafusion.execution.parquet.reorder_filters", true);
 
             let mut ctx = if let Some(rt) = runtime {
                 // Use the shared coordinator runtime (FairSpillPool with spill-to-disk)
