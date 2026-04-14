@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arrow_array::RecordBatch;
-use arrow_array::{ArrayRef, Int64Array, builder::StringBuilder};
+use arrow_array::{ArrayRef, BooleanArray, Int64Array, builder::StringBuilder};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::{collect, ExecutionPlan};
@@ -10,7 +10,7 @@ use datafusion::prelude::SessionContext;
 use tracing::{debug, info, warn, Span};
 
 use sqlparser::ast::{Statement, TableFactor};
-use sqe_catalog::{IcebergScanExec, SessionCatalog};
+use sqe_catalog::{AccessControlClient, IcebergScanExec, SessionCatalog};
 use sqe_core::{QueryConfig, Session, SortMode, SqeConfig, SqeError};
 
 use crate::adaptive_sort;
@@ -77,6 +77,9 @@ pub struct QueryHandler {
     /// Shared global table metadata cache. Persists across sessions and queries so
     /// that repeated `load_table()` calls skip the Polaris REST round-trip.
     table_cache: Option<sqe_catalog::TableMetadataCache>,
+    /// HTTP client for the platform access control API (GRANT/REVOKE/SHOW GRANTS).
+    /// Initialized when `config.catalog.platform_api_url` is non-empty.
+    access_control_client: Option<Arc<AccessControlClient>>,
 }
 
 impl QueryHandler {
@@ -109,6 +112,15 @@ impl QueryHandler {
         let runtime = crate::runtime::build_coordinator_runtime(&config.coordinator)
             .map_err(|e| sqe_core::SqeError::Config(format!("Failed to build runtime: {e}")))?;
 
+        // Initialize access control client when platform_api_url is configured.
+        let access_control_client = if !config.catalog.platform_api_url.is_empty() {
+            Some(Arc::new(
+                AccessControlClient::new(&config.catalog.platform_api_url)?,
+            ))
+        } else {
+            None
+        };
+
         Ok(Self {
             policy_enforcer,
             policy_store,
@@ -126,6 +138,7 @@ impl QueryHandler {
             runtime,
             manifest_cache: None,
             table_cache: None,
+            access_control_client,
         })
     }
 
@@ -320,9 +333,11 @@ impl QueryHandler {
                     }
                 }
 
-                StatementKind::Policy(_) => Err(SqeError::NotImplemented(
-                    "Policy management not configured".to_string(),
-                )),
+                StatementKind::Grant(ref stmt) => self.handle_grant(session, stmt).await,
+                StatementKind::Revoke(ref stmt) => self.handle_revoke(session, stmt).await,
+                StatementKind::ShowGrants(ref target) => self.handle_show_grants(session, target).await,
+                StatementKind::ShowEffectiveGrants(ref user) => self.handle_show_effective_grants(session, user).await,
+                StatementKind::CheckAccess(ref params) => self.handle_check_access(session, params).await,
 
                 StatementKind::Drop(stmt) => {
                     self.catalog_ops.drop_table(session, stmt).await?;
@@ -1514,6 +1529,293 @@ impl QueryHandler {
             }
         }
         Ok(false)
+    }
+
+    // ── Access control handlers ──────────────────────────────────────────
+
+    /// Return the access control client or a `NotImplemented` error.
+    fn require_access_control(&self) -> sqe_core::Result<&AccessControlClient> {
+        self.access_control_client
+            .as_deref()
+            .ok_or_else(|| {
+                SqeError::NotImplemented(
+                    "Access control is not configured. Set catalog.platform_api_url in the config."
+                        .to_string(),
+                )
+            })
+    }
+
+    /// Extract privilege, resource parts, grantee type, and grantee name from a
+    /// sqlparser `Statement::Grant` or `Statement::Revoke`.
+    #[allow(clippy::type_complexity)]
+    fn extract_grant_fields(
+        stmt: &Statement,
+    ) -> sqe_core::Result<(String, Option<String>, Option<String>, Option<String>, String, String)>
+    {
+        let (privileges, objects, grantees) = match stmt {
+            Statement::Grant {
+                privileges,
+                objects,
+                grantees,
+                ..
+            } => (privileges, objects, grantees),
+            Statement::Revoke {
+                privileges,
+                objects,
+                grantees,
+                ..
+            } => (privileges, objects, grantees),
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected GRANT/REVOKE statement, got: {other}"
+                )));
+            }
+        };
+
+        // Extract privilege string
+        let privilege = format!("{privileges}");
+
+        // Extract resource parts (catalog, namespace, table) from the grant object.
+        // Objects follow the pattern: [catalog.][namespace.]table
+        let (catalog, namespace, table) = match objects {
+            sqlparser::ast::GrantObjects::Tables(tables) if !tables.is_empty() => {
+                let name = &tables[0];
+                let parts: Vec<String> = name.0.iter().map(|p| p.value.clone()).collect();
+                match parts.len() {
+                    1 => (None, None, Some(parts[0].clone())),
+                    2 => (None, Some(parts[0].clone()), Some(parts[1].clone())),
+                    3 => (
+                        Some(parts[0].clone()),
+                        Some(parts[1].clone()),
+                        Some(parts[2].clone()),
+                    ),
+                    _ => (None, None, Some(name.to_string())),
+                }
+            }
+            sqlparser::ast::GrantObjects::Schemas(schemas) if !schemas.is_empty() => {
+                let name = &schemas[0];
+                let parts: Vec<String> = name.0.iter().map(|p| p.value.clone()).collect();
+                match parts.len() {
+                    1 => (None, Some(parts[0].clone()), None),
+                    2 => (Some(parts[0].clone()), Some(parts[1].clone()), None),
+                    _ => (None, Some(name.to_string()), None),
+                }
+            }
+            sqlparser::ast::GrantObjects::AllTablesInSchema { schemas }
+                if !schemas.is_empty() =>
+            {
+                let name = &schemas[0];
+                let parts: Vec<String> = name.0.iter().map(|p| p.value.clone()).collect();
+                match parts.len() {
+                    1 => (None, Some(parts[0].clone()), None),
+                    2 => (Some(parts[0].clone()), Some(parts[1].clone()), None),
+                    _ => (None, Some(name.to_string()), None),
+                }
+            }
+            _ => (None, None, None),
+        };
+
+        // Extract grantee type and name
+        let grantee = grantees.first().ok_or_else(|| {
+            SqeError::Execution("GRANT/REVOKE requires at least one grantee".to_string())
+        })?;
+        let grantee_type = format!("{:?}", grantee.grantee_type).to_uppercase();
+        let grantee_name = grantee
+            .name
+            .as_ref()
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+
+        Ok((privilege, catalog, namespace, table, grantee_type, grantee_name))
+    }
+
+    /// Handle GRANT by forwarding to the platform access control API.
+    async fn handle_grant(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let client = self.require_access_control()?;
+        let (privilege, catalog, namespace, table, grantee_type, grantee_name) =
+            Self::extract_grant_fields(stmt)?;
+
+        let req = sqe_catalog::access_control::GrantRequest {
+            privilege,
+            catalog,
+            namespace,
+            table,
+            grantee_type,
+            grantee_name,
+            effect: None, // default = ALLOW
+        };
+
+        client.grant(&session.access_token, &req).await?;
+        Ok(vec![])
+    }
+
+    /// Handle REVOKE by forwarding to the platform access control API.
+    async fn handle_revoke(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let client = self.require_access_control()?;
+        let (privilege, catalog, namespace, table, grantee_type, grantee_name) =
+            Self::extract_grant_fields(stmt)?;
+
+        let req = sqe_catalog::access_control::GrantRequest {
+            privilege,
+            catalog,
+            namespace,
+            table,
+            grantee_type,
+            grantee_name,
+            effect: None,
+        };
+
+        client.revoke(&session.access_token, &req).await?;
+        Ok(vec![])
+    }
+
+    /// Handle SHOW GRANTS by querying the platform access control API.
+    async fn handle_show_grants(
+        &self,
+        session: &Session,
+        target: &sqe_sql::ShowGrantsTarget,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let client = self.require_access_control()?;
+
+        let params = match target {
+            sqe_sql::ShowGrantsTarget::OnResource {
+                catalog,
+                namespace,
+                table,
+            } => sqe_catalog::access_control::ShowGrantsParams {
+                catalog: catalog.clone(),
+                namespace: namespace.clone(),
+                table: table.clone(),
+                grantee_type: None,
+                grantee_name: None,
+            },
+            sqe_sql::ShowGrantsTarget::ToGrantee {
+                grantee_type,
+                grantee_name,
+            } => sqe_catalog::access_control::ShowGrantsParams {
+                catalog: None,
+                namespace: None,
+                table: None,
+                grantee_type: Some(grantee_type.clone()),
+                grantee_name: Some(grantee_name.clone()),
+            },
+        };
+
+        let entries = client.show_grants(&session.access_token, &params).await?;
+        Self::grants_to_record_batch(&entries)
+    }
+
+    /// Handle SHOW EFFECTIVE GRANTS by querying the platform access control API.
+    async fn handle_show_effective_grants(
+        &self,
+        session: &Session,
+        user: &str,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let client = self.require_access_control()?;
+        let entries = client
+            .show_effective(&session.access_token, user)
+            .await?;
+        Self::grants_to_record_batch(&entries)
+    }
+
+    /// Handle CHECK ACCESS by querying the platform access control API.
+    async fn handle_check_access(
+        &self,
+        session: &Session,
+        params: &sqe_sql::CheckAccessParams,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let client = self.require_access_control()?;
+
+        let req = sqe_catalog::access_control::CheckAccessRequest {
+            user: params.user.clone(),
+            privilege: params.privilege.clone(),
+            catalog: params.catalog.clone(),
+            namespace: params.namespace.clone(),
+            table: params.table.clone(),
+        };
+
+        let resp = client.check_access(&session.access_token, &req).await?;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("allowed", DataType::Boolean, false),
+            Field::new("reason", DataType::Utf8, true),
+        ]));
+
+        let allowed_array: ArrayRef = Arc::new(BooleanArray::from(vec![resp.allowed]));
+        let mut reason_builder = StringBuilder::new();
+        match resp.reason {
+            Some(ref r) => reason_builder.append_value(r),
+            None => reason_builder.append_null(),
+        }
+        let reason_array: ArrayRef = Arc::new(reason_builder.finish());
+
+        let batch = RecordBatch::try_new(schema, vec![allowed_array, reason_array])
+            .map_err(|e| SqeError::Execution(format!("Failed to build result batch: {e}")))?;
+
+        Ok(vec![batch])
+    }
+
+    /// Convert a list of `GrantEntry` values into a `RecordBatch` for the client.
+    fn grants_to_record_batch(
+        entries: &[sqe_catalog::access_control::GrantEntry],
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("privilege", DataType::Utf8, false),
+            Field::new("resource", DataType::Utf8, false),
+            Field::new("grantee_type", DataType::Utf8, false),
+            Field::new("grantee_name", DataType::Utf8, false),
+            Field::new("effect", DataType::Utf8, false),
+            Field::new("granted_by", DataType::Utf8, true),
+            Field::new("granted_at", DataType::Utf8, true),
+        ]));
+
+        let mut priv_builder = StringBuilder::new();
+        let mut resource_builder = StringBuilder::new();
+        let mut type_builder = StringBuilder::new();
+        let mut name_builder = StringBuilder::new();
+        let mut effect_builder = StringBuilder::new();
+        let mut by_builder = StringBuilder::new();
+        let mut at_builder = StringBuilder::new();
+
+        for entry in entries {
+            priv_builder.append_value(&entry.privilege);
+            resource_builder.append_value(&entry.resource);
+            type_builder.append_value(&entry.grantee_type);
+            name_builder.append_value(&entry.grantee_name);
+            effect_builder.append_value(&entry.effect);
+            match entry.granted_by {
+                Some(ref v) => by_builder.append_value(v),
+                None => by_builder.append_null(),
+            }
+            match entry.granted_at {
+                Some(ref v) => at_builder.append_value(v),
+                None => at_builder.append_null(),
+            }
+        }
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(priv_builder.finish()) as ArrayRef,
+                Arc::new(resource_builder.finish()) as ArrayRef,
+                Arc::new(type_builder.finish()) as ArrayRef,
+                Arc::new(name_builder.finish()) as ArrayRef,
+                Arc::new(effect_builder.finish()) as ArrayRef,
+                Arc::new(by_builder.finish()) as ArrayRef,
+                Arc::new(at_builder.finish()) as ArrayRef,
+            ],
+        )
+        .map_err(|e| SqeError::Execution(format!("Failed to build result batch: {e}")))?;
+
+        Ok(vec![batch])
     }
 
     /// Handle `COMMENT ON TABLE/COLUMN` by storing the comment as an Iceberg table property.

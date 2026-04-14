@@ -1,3 +1,4 @@
+pub mod access_control;
 pub mod circuit_breaker;
 pub mod rest_catalog;
 pub mod catalog_provider;
@@ -21,6 +22,7 @@ pub mod system_jdbc;
 pub mod system_metadata;
 pub mod system_runtime;
 
+pub use access_control::AccessControlClient;
 pub use catalog_provider::SqeCatalogProvider;
 pub use circuit_breaker::CircuitBreaker;
 pub use footer_cache::FooterCache;
