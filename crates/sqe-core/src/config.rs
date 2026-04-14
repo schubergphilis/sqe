@@ -612,6 +612,11 @@ pub struct CatalogConfig {
     /// compression ratio vs. speed for S3.
     #[serde(default = "default_parquet_compression")]
     pub parquet_compression: String,
+    /// Platform API URL for access control (GRANT/REVOKE).
+    /// When set, the engine forwards GRANT/REVOKE SQL to this endpoint.
+    /// Typically the same host as polaris_url but under /api/platform/v1/access/.
+    #[serde(default)]
+    pub platform_api_url: String,
 }
 
 #[derive(Deserialize, Clone)]
@@ -1167,6 +1172,7 @@ mod tests {
                 trust_sort_order: false,
                 small_file_threshold_mb: 3,
                 parquet_compression: "zstd".to_string(),
+                platform_api_url: String::new(),
             },
             storage: StorageConfig::default(),
             policy: PolicyConfig::default(),
