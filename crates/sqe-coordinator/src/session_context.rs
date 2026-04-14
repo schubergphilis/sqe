@@ -210,6 +210,10 @@ pub async fn create_session_context(
                         output_rows: r.output_rows,
                         error_type: r.error_type.clone(),
                         error_code: r.error_code.clone(),
+                        bytes_scanned: r.bytes_scanned,
+                        rows_scanned: r.rows_scanned,
+                        spill_bytes: r.spill_bytes,
+                        peak_memory_bytes: r.peak_memory_bytes,
                         fragments: r
                             .fragments
                             .iter()

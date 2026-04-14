@@ -571,6 +571,23 @@ We went from zero to a working single-node query engine -- parsing SQL, authenti
 
 The next three months were the 20%.
 
+
+## The Upgrade That Required a Fork
+
+DataFusion 53 shipped on April 2, 2026 with features we wanted badly: hash join dynamic filters (5-25x for star-schema joins), LIMIT-aware Parquet pruning (skip entire row groups once the LIMIT is satisfied), and 40x faster query planning. The problem was the dependency chain.
+
+SQE depends on iceberg-rust for Iceberg table reads and writes. Upstream apache/iceberg-rust (v0.9.0) lacks two features SQE needs: `RewriteFilesAction` for Copy-on-Write DELETE/UPDATE, and `PositionDeleteFileWriter` for Merge-on-Read position deletes. The RisingWave Labs fork has both. It is the fork that multiple production systems use.
+
+The RisingWave fork targets DataFusion 52. Upstream merged the DF 53 upgrade on March 25. The fork had not rebased. No timeline.
+
+We forked the fork. Applied the same API migration that upstream PR #2206 documented: `PlanProperties` wrapped in `Arc`, Parquet writer API renames, Arrow 58 type changes. Ten files in the fork, forty-four sites in SQE. Vendored the result into `vendor/iceberg-rust/` (4.6 MB). Single `git clone` gets everything.
+
+The result: TPC-DS dropped from 19.3 seconds to 12.2 seconds. TPC-H from 1.8 to 1.1. Every suite faster. The upgrade was mechanical. The decision to stop waiting and do it ourselves was not.
+
+::: {.sovereignty}
+**Sovereignty principle:** When your critical dependency is a fork of a fork, you have two choices: wait for someone else to maintain your supply chain, or own it. We chose to own it. The vendored fork is 4.6 MB. The maintenance burden is one rebase per upstream release. The alternative -- staying on DF 52 indefinitely -- would have left us without hash join dynamic filters, LIMIT-aware pruning, and a year of optimizer improvements. Dependencies are sovereignty decisions.
+:::
+
 ::: {.fieldreport}
 **Field report:** The first integration test -- authenticate via OIDC, query an Iceberg table
 through Polaris, receive Arrow batches over Flight SQL -- passed on March 14, 2025. The same

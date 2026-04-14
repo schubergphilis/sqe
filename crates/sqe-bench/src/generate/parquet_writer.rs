@@ -25,7 +25,9 @@ pub fn write_parquet_files(
     fs::create_dir_all(&dir)?;
 
     let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
+        .set_compression(parquet::basic::Compression::ZSTD(
+            parquet::basic::ZstdLevel::try_new(3).unwrap(),
+        ))
         .build();
 
     let mut file_idx = 0usize;

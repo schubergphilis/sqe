@@ -78,6 +78,10 @@ pub struct QueryRecord {
     pub error_code: Option<String>,
     pub error_message: Option<String>,
     pub tables_touched: Vec<String>,
+    pub bytes_scanned: u64,
+    pub rows_scanned: u64,
+    pub spill_bytes: u64,
+    pub peak_memory_bytes: u64,
     pub fragments: Vec<FragmentInfo>,
 }
 
@@ -130,6 +134,10 @@ impl QueryTracker {
             error_code: None,
             error_message: None,
             tables_touched: Vec::new(),
+            bytes_scanned: 0,
+            rows_scanned: 0,
+            spill_bytes: 0,
+            peak_memory_bytes: 0,
             fragments: Vec::new(),
         };
         self.history.insert(query_id, Arc::new(record));
@@ -150,12 +158,17 @@ impl QueryTracker {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn complete(
         &self,
         query_id: &Uuid,
         rows: usize,
         execution_ms: u64,
         tables_touched: Vec<String>,
+        bytes_scanned: u64,
+        rows_scanned: u64,
+        spill_bytes: u64,
+        peak_memory_bytes: u64,
     ) {
         if let Some(old) = self.history.get(query_id) {
             let mut record = (*old).clone();
@@ -164,6 +177,10 @@ impl QueryTracker {
             record.output_rows = rows;
             record.execution_ms = execution_ms;
             record.tables_touched = tables_touched;
+            record.bytes_scanned = bytes_scanned;
+            record.rows_scanned = rows_scanned;
+            record.spill_bytes = spill_bytes;
+            record.peak_memory_bytes = peak_memory_bytes;
             self.history.insert(*query_id, Arc::new(record));
         }
         self.active.remove(query_id);
@@ -296,7 +313,7 @@ mod tests {
         let id = Uuid::now_v7();
         tracker.start(id, "bob", None, "SELECT *", "s2", None, vec![]);
         tracker.running(&id, 10);
-        tracker.complete(&id, 42, 150, vec!["ns.table1".to_string()]);
+        tracker.complete(&id, 42, 150, vec!["ns.table1".to_string()], 0, 0, 0, 0);
         let rec = tracker.history.get(&id).unwrap();
         assert_eq!(rec.state, QueryState::Finished);
         assert_eq!(rec.output_rows, 42);
@@ -368,7 +385,7 @@ mod tests {
                 tracker.running(&id, (i * 5) as u64);
                 // Simulate some work
                 tokio::task::yield_now().await;
-                tracker.complete(&id, i as usize, (i * 10) as u64, vec![format!("table{i}")]);
+                tracker.complete(&id, i as usize, (i * 10) as u64, vec![format!("table{i}")], 0, 0, 0, 0);
                 id
             });
         }
@@ -412,7 +429,7 @@ mod tests {
                 tokio::task::yield_now().await;
 
                 match i % 3 {
-                    0 => tracker.complete(&id, 10, 100, vec![]),
+                    0 => tracker.complete(&id, 10, 100, vec![], 0, 0, 0, 0),
                     1 => tracker.failed(&id, &sqe_core::SqeError::Execution("test error".to_string())),
                     _ => { tracker.cancel(&id); }
                 }
@@ -588,7 +605,7 @@ mod tests {
         for i in 0..10 {
             let id = Uuid::now_v7();
             tracker.start(id, &format!("user{i}"), None, "SELECT 1", "s", None, vec![]);
-            tracker.complete(&id, 0, 0, vec![]);
+            tracker.complete(&id, 0, 0, vec![], 0, 0, 0, 0);
             ids.push(id);
         }
 

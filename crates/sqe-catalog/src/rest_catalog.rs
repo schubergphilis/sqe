@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use iceberg::table::Table;
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent, TableRequirement, TableUpdate};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogBuilder};
 use moka::future::Cache as MokaCache;
 use tokio::sync::RwLock;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 use sqe_core::config::StorageConfig;
@@ -15,12 +16,28 @@ use sqe_metrics::propagation::trace_context_http_headers;
 
 use crate::circuit_breaker::CircuitBreaker;
 
+/// A cached table entry holding metadata, an optional ETag, and the time it was
+/// last validated against Polaris.
+#[derive(Clone)]
+struct CachedTableEntry {
+    table: Table,
+    etag: Option<String>,
+    /// When this entry was last confirmed fresh (inserted or revalidated via 304).
+    validated_at: Instant,
+}
+
 /// Global table metadata cache shared across all sessions.
 ///
 /// Table metadata (schema, partitions, snapshots) is user-independent — the same
 /// table has the same structure regardless of which user queries it. User-level
 /// authorization is enforced by Polaris at load time; we cache the result here
 /// so subsequent queries within the TTL window skip the REST round-trip entirely.
+///
+/// When a cached entry's soft TTL expires, the cache performs an ETag-based
+/// conditional request (`If-None-Match`) to Polaris. If Polaris returns
+/// `304 Not Modified`, the cached metadata is reused without re-downloading.
+/// This avoids the full metadata fetch (~50-200 KB JSON) when only a freshness
+/// check is needed.
 ///
 /// The cache is created once at coordinator startup and passed into every
 /// `SessionCatalog` via [`SessionCatalog::new`]. Each session falls through to
@@ -30,31 +47,88 @@ use crate::circuit_breaker::CircuitBreaker;
 /// structure (DROP TABLE, ALTER TABLE, INSERT, MERGE, DELETE).
 #[derive(Clone)]
 pub struct TableMetadataCache {
-    inner: MokaCache<String, Table>,
+    /// Long-lived cache (1 hour hard TTL) holding table metadata + ETag.
+    /// Soft freshness is checked via `CachedTableEntry::validated_at`.
+    inner: MokaCache<String, CachedTableEntry>,
+    /// Soft TTL: entries older than this are revalidated via conditional GET.
+    soft_ttl: std::time::Duration,
 }
 
 impl TableMetadataCache {
     /// Create a global table metadata cache with the given TTL.
     ///
+    /// `ttl_secs` is the *soft* TTL — after this period, cached entries are
+    /// revalidated via `If-None-Match`. The *hard* TTL (moka eviction) is set
+    /// to 1 hour to keep stale entries available for conditional revalidation.
+    ///
     /// Pass `ttl_secs = 0` to disable the cache (entries are never stored).
     pub fn new(ttl_secs: u64) -> Self {
-        let inner = if ttl_secs == 0 {
-            MokaCache::builder().max_capacity(0).build()
+        let (inner, soft_ttl) = if ttl_secs == 0 {
+            (
+                MokaCache::builder().max_capacity(0).build(),
+                std::time::Duration::ZERO,
+            )
         } else {
-            MokaCache::builder()
-                .max_capacity(1000)
-                .time_to_live(std::time::Duration::from_secs(ttl_secs))
-                .build()
+            (
+                MokaCache::builder()
+                    .max_capacity(1000)
+                    // Hard TTL: keep entries for 1 hour so ETag revalidation can work
+                    // even if the soft TTL is much shorter (e.g. 30s).
+                    .time_to_live(std::time::Duration::from_secs(3600))
+                    .build(),
+                std::time::Duration::from_secs(ttl_secs),
+            )
         };
-        Self { inner }
+        Self { inner, soft_ttl }
     }
 
+    /// Get a cached entry if it exists and is still fresh (within soft TTL).
+    /// Returns `None` if no entry exists or if the entry has expired.
+    pub async fn get_fresh(&self, key: &str) -> Option<Table> {
+        let entry = self.inner.get(key).await?;
+        if entry.validated_at.elapsed() < self.soft_ttl {
+            Some(entry.table)
+        } else {
+            None
+        }
+    }
+
+    /// Get a stale cached entry for conditional revalidation.
+    /// Returns the table and its ETag if the entry exists (regardless of soft TTL).
+    pub async fn get_stale(&self, key: &str) -> Option<(Table, Option<String>)> {
+        let entry = self.inner.get(key).await?;
+        Some((entry.table, entry.etag))
+    }
+
+    /// Refresh the soft TTL on an existing entry (called after a 304 revalidation).
+    pub async fn revalidate(&self, key: &str) {
+        if let Some(mut entry) = self.inner.get(key).await {
+            entry.validated_at = Instant::now();
+            self.inner.insert(key.to_string(), entry).await;
+        }
+    }
+
+    /// Backwards-compatible `get` — returns fresh entries only.
     pub async fn get(&self, key: &str) -> Option<Table> {
-        self.inner.get(key).await
+        self.get_fresh(key).await
     }
 
     pub async fn insert(&self, key: String, table: Table) {
-        self.inner.insert(key, table).await;
+        self.insert_with_etag(key, table, None).await;
+    }
+
+    /// Insert a table with an optional ETag from the response headers.
+    pub async fn insert_with_etag(&self, key: String, table: Table, etag: Option<String>) {
+        self.inner
+            .insert(
+                key,
+                CachedTableEntry {
+                    table,
+                    etag,
+                    validated_at: Instant::now(),
+                },
+            )
+            .await;
     }
 
     pub async fn invalidate(&self, key: &str) {
@@ -337,26 +411,108 @@ impl SessionCatalog {
     /// vended credentials (if Polaris provides them) or static S3 config.
     ///
     /// Results are cached in the shared global `TableMetadataCache` (passed at construction
-    /// time). Use [`invalidate_table`] to evict an entry after DDL/DML.
+    /// time). When a cached entry's soft TTL expires, the cache sends a conditional
+    /// `If-None-Match` request using the stored ETag. If Polaris returns 304, the
+    /// cached metadata is reused without re-downloading.
+    ///
+    /// Use [`invalidate_table`] to evict an entry after DDL/DML.
     #[instrument(skip(self), fields(table = %table_ident, warehouse = %self.warehouse))]
     pub async fn load_table(&self, table_ident: &TableIdent) -> sqe_core::Result<Table> {
         let cache_key = format!("{}.{}", table_ident.namespace(), table_ident.name());
 
-        // Fast path: return cached table without touching Polaris.
-        if let Some(cached) = self.table_cache.get(&cache_key).await {
+        // Fast path: return cached table that is still within the soft TTL.
+        if let Some(cached) = self.table_cache.get_fresh(&cache_key).await {
             debug!(
                 token_fingerprint = %self.token_fingerprint,
                 table = ?table_ident,
-                "Table cache hit"
+                "Table cache hit (fresh)"
             );
             return Ok(cached);
         }
 
-        debug!(
-            token_fingerprint = %self.token_fingerprint,
-            table = ?table_ident,
-            "Loading table (cache miss)"
-        );
+        // Check for a stale entry with an ETag for conditional revalidation.
+        if let Some((stale_table, Some(etag))) = self.table_cache.get_stale(&cache_key).await {
+            debug!(
+                token_fingerprint = %self.token_fingerprint,
+                table = ?table_ident,
+                etag = %etag,
+                "Table cache stale, attempting ETag revalidation"
+            );
+
+            self.circuit_breaker
+                .check()
+                .map_err(sqe_core::SqeError::Catalog)?;
+
+            // Build the REST URL for the loadTable endpoint.
+            let ns_str = table_ident
+                .namespace()
+                .as_ref()
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join("\u{1F}");
+            let url = format!(
+                "{}/namespaces/{}/tables/{}",
+                self.rest_prefix(),
+                ns_str,
+                table_ident.name()
+            );
+
+            let mut req = self
+                .http_client
+                .get(&url)
+                .bearer_auth(&self.bearer_token)
+                .header("If-None-Match", &etag)
+                .header("X-Request-ID", Uuid::new_v4().to_string());
+            for (k, v) in trace_context_http_headers() {
+                req = req.header(k, v);
+            }
+
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status == reqwest::StatusCode::NOT_MODIFIED {
+                        // 304: metadata unchanged, refresh the soft TTL.
+                        debug!(
+                            table = ?table_ident,
+                            "ETag revalidation: 304 Not Modified, reusing cached metadata"
+                        );
+                        self.circuit_breaker.record_success();
+                        self.table_cache.revalidate(&cache_key).await;
+                        return Ok(stale_table);
+                    }
+                    // Non-304: fall through to the full load path below.
+                    // The response body from this GET could in theory be parsed,
+                    // but the Polaris loadTable response is complex (includes
+                    // credential vending, FileIO config, etc.) and is best handled
+                    // by iceberg-rust's RestCatalog. So we discard this response
+                    // and let the normal path handle it.
+                    debug!(
+                        table = ?table_ident,
+                        status = %status,
+                        "ETag revalidation: metadata changed, performing full reload"
+                    );
+                    self.circuit_breaker.record_success();
+                }
+                Err(e) => {
+                    // Network error during revalidation — fall through to normal load.
+                    warn!(
+                        table = ?table_ident,
+                        error = %e,
+                        "ETag revalidation request failed, falling back to full load"
+                    );
+                    self.circuit_breaker.record_failure();
+                }
+            }
+        } else {
+            debug!(
+                token_fingerprint = %self.token_fingerprint,
+                table = ?table_ident,
+                "Loading table (cache miss)"
+            );
+        }
+
+        // Full load via iceberg-rust's RestCatalog.
         self.circuit_breaker
             .check()
             .map_err(sqe_core::SqeError::Catalog)?;
@@ -368,11 +524,70 @@ impl SessionCatalog {
         match &result {
             Ok(table) => {
                 self.circuit_breaker.record_success();
-                self.table_cache.insert(cache_key, table.clone()).await;
+                // After loading via iceberg-rust, we don't have the ETag from
+                // that request (iceberg-rust doesn't expose response headers).
+                // Do a lightweight HEAD to capture the ETag for future
+                // conditional revalidation.
+                let etag = self.fetch_table_etag(table_ident).await;
+                self.table_cache
+                    .insert_with_etag(cache_key, table.clone(), etag)
+                    .await;
             }
             Err(_) => self.circuit_breaker.record_failure(),
         }
         result
+    }
+
+    /// Fetch the ETag for a table from Polaris via a HEAD request.
+    ///
+    /// Returns `None` if the request fails or Polaris doesn't return an ETag.
+    /// This is a best-effort operation — the table metadata is already loaded,
+    /// we just want the ETag for future conditional requests.
+    async fn fetch_table_etag(&self, table_ident: &TableIdent) -> Option<String> {
+        let ns_str = table_ident
+            .namespace()
+            .as_ref()
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\u{1F}");
+        let url = format!(
+            "{}/namespaces/{}/tables/{}",
+            self.rest_prefix(),
+            ns_str,
+            table_ident.name()
+        );
+
+        let mut req = self
+            .http_client
+            .head(&url)
+            .bearer_auth(&self.bearer_token)
+            .header("X-Request-ID", Uuid::new_v4().to_string());
+        for (k, v) in trace_context_http_headers() {
+            req = req.header(k, v);
+        }
+
+        match req.send().await {
+            Ok(resp) => {
+                let etag = resp
+                    .headers()
+                    .get("etag")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                if let Some(ref e) = etag {
+                    debug!(table = %table_ident, etag = %e, "Captured ETag for table");
+                }
+                etag
+            }
+            Err(e) => {
+                debug!(
+                    table = %table_ident,
+                    error = %e,
+                    "Failed to fetch ETag (non-fatal)"
+                );
+                None
+            }
+        }
     }
 
     /// Evict a table from the metadata cache.

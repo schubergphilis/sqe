@@ -18,22 +18,55 @@ use iceberg::writer::file_writer::location_generator::{
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
+use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use sqe_core::SqeError;
 use tracing::{info, instrument};
 use uuid::Uuid;
+
+/// Parse a compression config string into a Parquet `Compression` value.
+///
+/// Supported values (case-insensitive): `"zstd"`, `"lz4"`, `"snappy"`, `"none"`.
+/// Defaults to ZSTD(3) if the value is unrecognised.
+pub fn parse_parquet_compression(s: &str) -> Compression {
+    match s.to_lowercase().as_str() {
+        "zstd" => Compression::ZSTD(ZstdLevel::try_new(3).unwrap()),
+        "lz4" => Compression::LZ4_RAW,
+        "snappy" => Compression::SNAPPY,
+        "none" => Compression::UNCOMPRESSED,
+        _ => {
+            tracing::warn!(
+                compression = s,
+                "Unknown parquet compression '{}', defaulting to ZSTD(3)",
+                s
+            );
+            Compression::ZSTD(ZstdLevel::try_new(3).unwrap())
+        }
+    }
+}
+
+/// Build `WriterProperties` with the given compression codec.
+fn writer_props(compression: Compression) -> WriterProperties {
+    WriterProperties::builder()
+        .set_compression(compression)
+        .build()
+}
 
 /// Write RecordBatches as Parquet data files for an Iceberg table.
 ///
 /// Uses iceberg-rust's writer infrastructure to produce properly formatted
 /// Iceberg data files with correct metadata (file path, size, record count, etc.)
 ///
+/// `compression` controls the Parquet compression codec. Use [`parse_parquet_compression`]
+/// to convert a config string (e.g. `"zstd"`) into a [`Compression`] value.
+///
 /// Returns the DataFile descriptors needed for Iceberg transaction commits.
-#[instrument(skip(table, batches), fields(table = %table.identifier(), file_prefix, total_rows))]
+#[instrument(skip(table, batches, compression), fields(table = %table.identifier(), file_prefix, total_rows))]
 pub async fn write_data_files(
     table: &Table,
     batches: Vec<RecordBatch>,
     file_prefix: &str,
+    compression: Compression,
 ) -> sqe_core::Result<Vec<DataFile>> {
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     if total_rows == 0 {
@@ -65,7 +98,7 @@ pub async fn write_data_files(
     );
 
     let parquet_writer_builder = ParquetWriterBuilder::new(
-        WriterProperties::builder().build(),
+        writer_props(compression),
         table.metadata().current_schema().clone(),
     );
 
@@ -116,8 +149,9 @@ pub async fn write_data_files_with_metrics(
     batches: Vec<RecordBatch>,
     file_prefix: &str,
     metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
+    compression: Compression,
 ) -> sqe_core::Result<Vec<DataFile>> {
-    let data_files = write_data_files(table, batches, file_prefix).await?;
+    let data_files = write_data_files(table, batches, file_prefix, compression).await?;
 
     if let Some(m) = metrics {
         let total_bytes: u64 = data_files.iter().map(|df| df.file_size_in_bytes()).sum();
@@ -150,6 +184,7 @@ pub async fn write_data_files_streaming(
     table: &Table,
     mut stream: SendableRecordBatchStream,
     file_prefix: &str,
+    compression: Compression,
 ) -> sqe_core::Result<(Vec<DataFile>, usize)> {
     let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
         .map_err(|e| SqeError::Execution(format!("Location generator error: {e}")))?;
@@ -163,7 +198,7 @@ pub async fn write_data_files_streaming(
     );
 
     let parquet_writer_builder = ParquetWriterBuilder::new(
-        WriterProperties::builder().build(),
+        writer_props(compression),
         table.metadata().current_schema().clone(),
     );
 
@@ -232,9 +267,10 @@ pub async fn write_data_files_streaming_with_metrics(
     stream: SendableRecordBatchStream,
     file_prefix: &str,
     metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
+    compression: Compression,
 ) -> sqe_core::Result<(Vec<DataFile>, usize)> {
     let (data_files, total_rows) =
-        write_data_files_streaming(table, stream, file_prefix).await?;
+        write_data_files_streaming(table, stream, file_prefix, compression).await?;
 
     if let Some(m) = metrics {
         let total_bytes: u64 = data_files.iter().map(|df| df.file_size_in_bytes()).sum();
@@ -264,6 +300,7 @@ pub async fn write_data_files_streaming_with_metrics(
 pub async fn write_position_delete_files(
     table: &Table,
     deletes: Vec<(String, i64)>,
+    compression: Compression,
 ) -> sqe_core::Result<Vec<DataFile>> {
     if deletes.is_empty() {
         return Ok(vec![]);
@@ -288,7 +325,7 @@ pub async fn write_position_delete_files(
     // ParquetWriterBuilder for position delete files uses the fixed position-delete
     // schema (file_path, pos), not the table's data schema.
     let parquet_writer_builder = ParquetWriterBuilder::new(
-        WriterProperties::builder().build(),
+        writer_props(compression),
         Arc::new(POSITION_DELETE_SCHEMA.clone()),
     );
 

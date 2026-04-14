@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arrow_array::RecordBatch;
@@ -7,7 +7,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion::prelude::SessionContext;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, Span};
 
 use sqlparser::ast::{Statement, TableFactor};
 use sqe_catalog::{IcebergScanExec, SessionCatalog};
@@ -22,6 +22,15 @@ use crate::credential_refresh::CredentialRefreshTracker;
 use crate::query_cache::ResultCache;
 use crate::query_tracker::{FragmentState, QueryTracker};
 use crate::write_handler::WriteHandler;
+
+/// Per-query resource metrics extracted from the executed physical plan tree.
+#[derive(Debug, Clone, Default)]
+struct PlanMetrics {
+    bytes_scanned: u64,
+    rows_scanned: u64,
+    spill_bytes: u64,
+    peak_memory_bytes: u64,
+}
 
 /// Determine the effective query timeout for a session.
 ///
@@ -164,7 +173,18 @@ impl QueryHandler {
     }
 
     /// Execute a SQL statement for the given session and return collected RecordBatches.
-    #[tracing::instrument(skip(self, session, sql), fields(username = %session.user.username, statement_type))]
+    #[tracing::instrument(
+        skip(self, session, sql),
+        fields(
+            db.system.name = "sqe",
+            db.operation.name = tracing::field::Empty,
+            db.namespace = tracing::field::Empty,
+            db.collection.name = tracing::field::Empty,
+            username = %session.user.username,
+            statement_type,
+        ),
+        name = "execute",
+    )]
     pub async fn execute(
         &self,
         session: &Session,
@@ -214,7 +234,19 @@ impl QueryHandler {
         let start = std::time::Instant::now();
         let kind = parse_and_classify(sql)?;
         let kind_name = kind.name().to_string();
-        tracing::Span::current().record("statement_type", kind_name.as_str());
+        let span = Span::current();
+        span.record("statement_type", kind_name.as_str());
+        span.record("db.operation.name", kind_name.as_str());
+
+        // Best-effort: extract schema and table names for OTel conventions.
+        if let Some((schema_name, table_name)) = extract_otel_table_info(&kind) {
+            if let Some(ref s) = schema_name {
+                span.record("db.namespace", s.as_str());
+            }
+            if let Some(ref t) = table_name {
+                span.record("db.collection.name", t.as_str());
+            }
+        }
 
         // Generate a query ID for lifecycle tracking
         let query_id = uuid::Uuid::now_v7();
@@ -240,7 +272,7 @@ impl QueryHandler {
                 if let Some(cached) = cache.lookup(&session.user.username, sql) {
                     debug!(username = %session.user.username, "Cache hit");
                     let rows: usize = cached.batches.iter().map(|b| b.num_rows()).sum();
-                    self.query_tracker.complete(&query_id, rows, 0, cached.tables_touched.clone());
+                    self.query_tracker.complete(&query_id, rows, 0, cached.tables_touched.clone(), 0, 0, 0, 0);
                     if let Some(ref metrics) = self.metrics {
                         metrics.query_count.with_label_values(&["success", &kind_name]).inc();
                         metrics.rows_returned.inc_by(rows as f64);
@@ -257,9 +289,10 @@ impl QueryHandler {
         let timeout_secs = timeout_for_session(&self.config.query, session);
         let timeout_duration = Duration::from_secs(timeout_secs);
 
+        let plan_metrics = Arc::new(Mutex::new(PlanMetrics::default()));
         let execution_future = async {
             match &kind {
-                StatementKind::Query(_) => self.execute_query(session, sql, &query_id).await,
+                StatementKind::Query(_) => self.execute_query(session, sql, &query_id, &plan_metrics).await,
 
                 StatementKind::ShowCatalogs => self.handle_show_catalogs(session).await,
 
@@ -471,7 +504,7 @@ impl QueryHandler {
                     };
                     let (ctx, session_catalog) = self.create_session_context(session).await?;
                     let source_batches =
-                        self.execute_query(session, &source_sql, &query_id).await?;
+                        self.execute_query(session, &source_sql, &query_id, &plan_metrics).await?;
                     self.write_handler
                         .handle_merge(session, stmt, source_batches, session_catalog, &ctx)
                         .await
@@ -506,7 +539,17 @@ impl QueryHandler {
         // Update query tracker with final state
         let execution_ms = duration.as_millis() as u64;
         if result.is_ok() {
-            self.query_tracker.complete(&query_id, rows, execution_ms, vec![]);
+            let pm = plan_metrics.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            self.query_tracker.complete(
+                &query_id,
+                rows,
+                execution_ms,
+                vec![],
+                pm.bytes_scanned,
+                pm.rows_scanned,
+                pm.spill_bytes,
+                pm.peak_memory_bytes,
+            );
 
             // Store successful read query results in cache
             if let Some(ref cache) = self.query_cache {
@@ -528,7 +571,7 @@ impl QueryHandler {
                 match &kind {
                     StatementKind::Insert(stmt) => {
                         if let Statement::Insert(ins) = stmt.as_ref() {
-                            let table = ins.table_name.to_string();
+                            let table = ins.table.to_string();
                             cache.invalidate(&table);
                         }
                     }
@@ -658,12 +701,13 @@ impl QueryHandler {
     /// distribute the scan work across available workers via [`try_distribute`].
     /// If distribution is not possible (single-node mode, no healthy workers,
     /// too few files, or complex multi-table plans), the query executes locally.
-    #[tracing::instrument(skip(self, session, sql, query_id), fields(username = %session.user.username))]
+    #[tracing::instrument(skip(self, session, sql, query_id, plan_metrics), fields(username = %session.user.username))]
     async fn execute_query(
         &self,
         session: &Session,
         sql: &str,
         query_id: &uuid::Uuid,
+        plan_metrics: &Arc<Mutex<PlanMetrics>>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
 
@@ -734,6 +778,22 @@ impl QueryHandler {
                 metrics.join_spill_count.inc_by(join_spill_count as f64);
                 metrics.join_spill_bytes.inc_by(join_spill_bytes as f64);
                 debug!(join_spill_count, join_spill_bytes, "Join spill detected");
+            }
+        }
+
+        // Extract per-query resource metrics from the executed plan tree and
+        // store them so that the caller (execute()) can record them on the
+        // QueryTracker when the query completes.
+        {
+            let mut extracted = extract_plan_metrics(&final_plan);
+            // Snapshot the memory pool usage as a best-effort proxy for peak
+            // memory. This is the pool-wide value (shared across concurrent
+            // queries), so it overestimates per-query usage, but it's the best
+            // signal available without per-query reservation tracking.
+            extracted.peak_memory_bytes =
+                crate::memory::used_bytes(&self.runtime.memory_pool) as u64;
+            if let Ok(mut pm) = plan_metrics.lock() {
+                *pm = extracted;
             }
         }
 
@@ -1768,6 +1828,56 @@ fn extract_order_by_columns(sql: &str) -> Vec<String> {
     }
 }
 
+/// Walk a physical plan tree and extract per-query resource metrics.
+///
+/// Sums `OutputBytes` and `output_rows` on scan nodes (`IcebergScanExec`,
+/// `ParquetExec`, `CsvExec`) to approximate bytes/rows scanned, and sums
+/// `spilled_bytes` across all nodes. `peak_memory_bytes` is left at 0 here
+/// and filled by the caller from the runtime memory pool snapshot.
+fn extract_plan_metrics(plan: &Arc<dyn ExecutionPlan>) -> PlanMetrics {
+    use datafusion::physical_plan::metrics::MetricValue;
+
+    let mut bytes_scanned: u64 = 0;
+    let mut rows_scanned: u64 = 0;
+    let mut spill_bytes: u64 = 0;
+
+    let mut stack: Vec<Arc<dyn ExecutionPlan>> = vec![Arc::clone(plan)];
+    while let Some(node) = stack.pop() {
+        let name = node.name();
+        let is_scan = name.contains("Scan")
+            || name.contains("Parquet")
+            || name.contains("Csv");
+
+        if let Some(metrics) = node.metrics() {
+            // Scan nodes: accumulate bytes/rows scanned
+            if is_scan {
+                if let Some(ob) = metrics.sum(|m| matches!(m.value(), MetricValue::OutputBytes(_))) {
+                    bytes_scanned += ob.as_usize() as u64;
+                }
+                if let Some(or) = metrics.output_rows() {
+                    rows_scanned += or as u64;
+                }
+            }
+
+            // All nodes: accumulate spill bytes
+            if let Some(sb) = metrics.spilled_bytes() {
+                spill_bytes += sb as u64;
+            }
+        }
+
+        for child in node.children() {
+            stack.push(Arc::clone(child));
+        }
+    }
+
+    PlanMetrics {
+        bytes_scanned,
+        rows_scanned,
+        spill_bytes,
+        peak_memory_bytes: 0,
+    }
+}
+
 /// Walk a physical plan tree and aggregate spill metrics from all operators.
 ///
 /// Returns `(sort_spill_count, sort_spill_bytes, join_spill_count, join_spill_bytes)`.
@@ -1974,6 +2084,74 @@ fn arrow_type_to_iceberg(dt: &DataType) -> serde_json::Value {
             tracing::warn!(arrow_type = ?other, "Unmapped Arrow type, falling back to string");
             serde_json::json!("string")
         }
+    }
+}
+
+/// Best-effort extraction of schema and table names from a classified SQL statement
+/// for OTel `db.namespace` and `db.collection.name` attributes.
+fn extract_otel_table_info(kind: &StatementKind) -> Option<(Option<String>, Option<String>)> {
+    let from_object_name = |name: &sqlparser::ast::ObjectName| -> (Option<String>, Option<String>) {
+        let parts: Vec<String> = name.0.iter().map(|p| p.value.clone()).collect();
+        match parts.len() {
+            1 => (None, Some(parts[0].clone())),
+            2 => (Some(parts[0].clone()), Some(parts[1].clone())),
+            3 => (Some(parts[1].clone()), Some(parts[2].clone())),
+            _ => (None, None),
+        }
+    };
+
+    fn from_table_tables(ft: &sqlparser::ast::FromTable) -> Option<&Vec<sqlparser::ast::TableWithJoins>> {
+        match ft {
+            sqlparser::ast::FromTable::WithFromKeyword(tables) => Some(tables),
+            sqlparser::ast::FromTable::WithoutKeyword(tables) => Some(tables),
+        }
+    }
+
+    match kind {
+        StatementKind::Query(stmt) => {
+            if let Statement::Query(query) = stmt.as_ref() {
+                if let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() {
+                    if let Some(first_from) = select.from.first() {
+                        if let TableFactor::Table { name, .. } = &first_from.relation {
+                            return Some(from_object_name(name));
+                        }
+                    }
+                }
+            }
+            None
+        }
+        StatementKind::Insert(stmt) => {
+            if let Statement::Insert(insert) = stmt.as_ref() {
+                if let sqlparser::ast::TableObject::TableName(name) = &insert.table {
+                    return Some(from_object_name(name));
+                }
+            }
+            None
+        }
+        StatementKind::Delete(stmt) => {
+            if let Statement::Delete(delete) = stmt.as_ref() {
+                if let Some(tables) = from_table_tables(&delete.from) {
+                    if let Some(first_from) = tables.first() {
+                        if let TableFactor::Table { name, .. } = &first_from.relation {
+                            return Some(from_object_name(name));
+                        }
+                    }
+                }
+            }
+            None
+        }
+        StatementKind::CreateTable(stmt) | StatementKind::Ctas(stmt) | StatementKind::Drop(stmt) => {
+            if let Statement::CreateTable(ct) = stmt.as_ref() {
+                return Some(from_object_name(&ct.name));
+            }
+            if let Statement::Drop { names, .. } = stmt.as_ref() {
+                if let Some(first) = names.first() {
+                    return Some(from_object_name(first));
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }
 

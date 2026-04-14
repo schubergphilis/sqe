@@ -642,9 +642,15 @@ async fn run_worker(config: SqeConfig) -> anyhow::Result<()> {
     );
 
     let session_ctx = sqe_worker::runtime::build_session_context(&config.worker)?;
+    let shuffle_compression = sqe_core::FlightCompression::from_config(
+        &config.coordinator.shuffle_compression,
+    )
+    .unwrap_or(sqe_core::FlightCompression::Zstd);
     let flight_service =
         sqe_worker::flight_service::WorkerFlightService::new(worker_metrics, session_ctx)
-            .with_scan_timeout(config.worker.scan_timeout_secs);
+            .with_scan_timeout(config.worker.scan_timeout_secs)
+            .with_flight_compression(shuffle_compression)
+            .with_shuffle_compression(shuffle_compression);
 
     // Mark ready
     ready.store(true, Ordering::Relaxed);

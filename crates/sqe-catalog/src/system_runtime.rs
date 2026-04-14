@@ -71,6 +71,10 @@ pub struct RuntimeQueryRecord {
     pub output_rows: usize,
     pub error_type: Option<String>,
     pub error_code: Option<String>,
+    pub bytes_scanned: u64,
+    pub rows_scanned: u64,
+    pub spill_bytes: u64,
+    pub peak_memory_bytes: u64,
     pub fragments: Vec<RuntimeFragmentInfo>,
 }
 
@@ -163,7 +167,7 @@ impl SchemaProvider for RuntimeSchemaProvider {
 }
 
 // ---------------------------------------------------------------------------
-// queries table — 17 columns
+// queries table — 21 columns
 // ---------------------------------------------------------------------------
 
 fn ts_type() -> DataType {
@@ -187,6 +191,10 @@ fn queries_schema() -> Schema {
         Field::new("last_heartbeat", ts_type(), true),
         Field::new("end", ts_type(), true),
         Field::new("output_rows", DataType::Int64, false),
+        Field::new("bytes_scanned", DataType::Int64, false),
+        Field::new("rows_scanned", DataType::Int64, false),
+        Field::new("spill_bytes", DataType::Int64, false),
+        Field::new("peak_memory_bytes", DataType::Int64, false),
         Field::new("error_type", DataType::Utf8, true),
         Field::new("error_code", DataType::Utf8, true),
     ])
@@ -212,6 +220,10 @@ fn build_queries_table(records: &[RuntimeQueryRecord]) -> DFResult<Arc<dyn Table
     let mut heartbeat_b = TimestampMillisecondBuilder::new().with_timezone(tz.clone());
     let mut end_b = TimestampMillisecondBuilder::new().with_timezone(tz);
     let mut output_rows_b = Int64Builder::new();
+    let mut bytes_scanned_b = Int64Builder::new();
+    let mut rows_scanned_b = Int64Builder::new();
+    let mut spill_bytes_b = Int64Builder::new();
+    let mut peak_memory_bytes_b = Int64Builder::new();
     let mut error_type_b = StringBuilder::new();
     let mut error_code_b = StringBuilder::new();
 
@@ -244,6 +256,10 @@ fn build_queries_table(records: &[RuntimeQueryRecord]) -> DFResult<Arc<dyn Table
             None => end_b.append_null(),
         }
         output_rows_b.append_value(rec.output_rows as i64);
+        bytes_scanned_b.append_value(rec.bytes_scanned as i64);
+        rows_scanned_b.append_value(rec.rows_scanned as i64);
+        spill_bytes_b.append_value(rec.spill_bytes as i64);
+        peak_memory_bytes_b.append_value(rec.peak_memory_bytes as i64);
         match &rec.error_type {
             Some(s) => error_type_b.append_value(s),
             None => error_type_b.append_null(),
@@ -272,6 +288,10 @@ fn build_queries_table(records: &[RuntimeQueryRecord]) -> DFResult<Arc<dyn Table
             Arc::new(heartbeat_b.finish()) as ArrayRef,
             Arc::new(end_b.finish()) as ArrayRef,
             Arc::new(output_rows_b.finish()) as ArrayRef,
+            Arc::new(bytes_scanned_b.finish()) as ArrayRef,
+            Arc::new(rows_scanned_b.finish()) as ArrayRef,
+            Arc::new(spill_bytes_b.finish()) as ArrayRef,
+            Arc::new(peak_memory_bytes_b.finish()) as ArrayRef,
             Arc::new(error_type_b.finish()) as ArrayRef,
             Arc::new(error_code_b.finish()) as ArrayRef,
         ],
@@ -437,6 +457,10 @@ mod tests {
                 output_rows: 1,
                 error_type: None,
                 error_code: None,
+                bytes_scanned: 1024,
+                rows_scanned: 10,
+                spill_bytes: 0,
+                peak_memory_bytes: 2048,
                 fragments: vec![],
             },
             RuntimeQueryRecord {
@@ -454,6 +478,10 @@ mod tests {
                 output_rows: 0,
                 error_type: Some("SyntaxError".to_string()),
                 error_code: Some("42000".to_string()),
+                bytes_scanned: 0,
+                rows_scanned: 0,
+                spill_bytes: 0,
+                peak_memory_bytes: 0,
                 fragments: vec![],
             },
             RuntimeQueryRecord {
@@ -471,6 +499,10 @@ mod tests {
                 output_rows: 0,
                 error_type: None,
                 error_code: None,
+                bytes_scanned: 0,
+                rows_scanned: 0,
+                spill_bytes: 0,
+                peak_memory_bytes: 0,
                 fragments: vec![],
             },
         ]
@@ -481,12 +513,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_queries_table_has_17_columns() {
+    fn test_queries_table_has_21_columns() {
         let table = build_queries_table(&sample_records()).unwrap();
         assert_eq!(
             table.schema().fields().len(),
-            17,
-            "queries table must have exactly 17 columns"
+            21,
+            "queries table must have exactly 21 columns"
         );
     }
 
@@ -510,6 +542,10 @@ mod tests {
             "last_heartbeat",
             "end",
             "output_rows",
+            "bytes_scanned",
+            "rows_scanned",
+            "spill_bytes",
+            "peak_memory_bytes",
             "error_type",
             "error_code",
         ];
@@ -525,7 +561,7 @@ mod tests {
     #[test]
     fn test_queries_table_empty_records() {
         let table = build_queries_table(&[]).unwrap();
-        assert_eq!(table.schema().fields().len(), 17);
+        assert_eq!(table.schema().fields().len(), 21);
     }
 
     #[test]
@@ -652,6 +688,10 @@ mod tests {
             output_rows: 42,
             error_type: None,
             error_code: None,
+            bytes_scanned: 0,
+            rows_scanned: 0,
+            spill_bytes: 0,
+            peak_memory_bytes: 0,
             fragments: vec![
                 RuntimeFragmentInfo {
                     task_id: "frag-0".to_string(),
@@ -696,6 +736,10 @@ mod tests {
             output_rows: 5,
             error_type: None,
             error_code: None,
+            bytes_scanned: 0,
+            rows_scanned: 0,
+            spill_bytes: 0,
+            peak_memory_bytes: 0,
             fragments: vec![],
         }];
 

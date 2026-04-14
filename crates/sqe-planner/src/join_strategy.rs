@@ -122,11 +122,8 @@ fn estimate_build_side_size(hash_join: &HashJoinExec) -> usize {
     // In DataFusion's HashJoinExec, the left side is the build side.
     let build_side = hash_join.left();
 
-    // Use the (deprecated but functional) statistics() method which returns
-    // aggregated stats across all partitions. partition_statistics(None) is
-    // the non-deprecated replacement but returns per-partition stats.
-    #[allow(deprecated)]
-    let stats = match build_side.statistics() {
+    // partition_statistics(None) returns aggregated stats across all partitions.
+    let stats = match build_side.partition_statistics(None) {
         Ok(stats) => stats,
         Err(_) => return 0,
     };
@@ -283,6 +280,7 @@ mod tests {
                 None, // projection
                 PartitionMode::CollectLeft,
                 NullEquality::NullEqualsNothing,
+                false,
             )
             .unwrap(),
         )
@@ -352,6 +350,7 @@ mod tests {
             None,
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
+            false,
         )
         .unwrap();
 
@@ -391,6 +390,7 @@ mod tests {
                 None,
                 PartitionMode::CollectLeft,
                 NullEquality::NullEqualsNothing,
+                false,
             )
             .unwrap();
 
@@ -428,6 +428,7 @@ mod tests {
             None,
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
+            false,
         )
         .unwrap();
 
