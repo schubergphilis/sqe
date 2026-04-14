@@ -21,11 +21,11 @@ use arrow_flight::sql::{
     SqlInfo, TicketStatementQuery, XdbcDataType,
 };
 use arrow_flight::sql::metadata::{SqlInfoDataBuilder, XdbcTypeInfo, XdbcTypeInfoDataBuilder};
-use arrow_flight::utils::batches_to_flight_data;
 use arrow_flight::{
     Action, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest,
     HandshakeResponse, Ticket,
 };
+use arrow_ipc::writer::IpcWriteOptions;
 use base64::Engine;
 use futures::{Stream, TryStreamExt, stream};
 use prost::Message;
@@ -44,6 +44,49 @@ use crate::worker_registry::WorkerRegistry;
 // keep working without changes.
 pub use crate::flight_sql_helpers::FetchResults;
 use crate::flight_sql_helpers::{FlightStream, sqe_error_to_status};
+
+/// Build [`IpcWriteOptions`] for a given compression setting.
+///
+/// Used by both the coordinator (client-facing DoGet) and shared with workers
+/// for shuffle DoExchange encoding.
+pub fn ipc_options_for(
+    compression: sqe_core::FlightCompression,
+) -> Result<IpcWriteOptions, Status> {
+    let codec = match compression {
+        sqe_core::FlightCompression::None => None,
+        sqe_core::FlightCompression::Lz4 => Some(arrow_ipc::CompressionType::LZ4_FRAME),
+        sqe_core::FlightCompression::Zstd => Some(arrow_ipc::CompressionType::ZSTD),
+    };
+    IpcWriteOptions::default()
+        .try_with_compression(codec)
+        .map_err(|e| Status::internal(format!("Failed to set IPC compression: {e}")))
+}
+
+/// Encode `RecordBatch`es into a streaming Flight response using the given IPC options.
+///
+/// Standalone function so that tests and other callers can use it without
+/// constructing a full `SqeFlightSqlService`.
+pub fn encode_batches_to_stream(
+    batches: Vec<RecordBatch>,
+    options: IpcWriteOptions,
+) -> Result<Response<FlightStream>, Status> {
+    if batches.is_empty() {
+        let stream = futures::stream::empty();
+        let flight_stream: FlightStream = Box::pin(stream);
+        return Ok(Response::new(flight_stream));
+    }
+
+    let schema = batches[0].schema();
+    let batch_stream = stream::iter(batches.into_iter().map(Ok));
+    let flight_stream = FlightDataEncoderBuilder::new()
+        .with_schema(schema)
+        .with_options(options)
+        .build(batch_stream)
+        .map_err(Status::from);
+
+    Ok(Response::new(Box::pin(flight_stream)))
+}
+
 
 /// Flight SQL service implementation for SQE.
 ///
@@ -195,30 +238,21 @@ impl SqeFlightSqlService {
         Err(Status::unauthenticated("Invalid or expired session token"))
     }
 
-    /// Convert RecordBatches into a streaming Flight response.
+    /// Parse the `[coordinator] flight_compression` config into IPC write options.
+    fn flight_ipc_options(&self) -> Result<IpcWriteOptions, Status> {
+        let compression = sqe_core::FlightCompression::from_config(&self.config.coordinator.flight_compression)
+            .map_err(|e| Status::internal(format!("Invalid flight_compression config: {e}")))?;
+        ipc_options_for(compression)
+    }
+
+    /// Convert RecordBatches into a streaming Flight response with IPC compression.
     #[allow(clippy::type_complexity)]
     fn batches_to_stream(
+        &self,
         batches: Vec<RecordBatch>,
     ) -> Result<Response<FlightStream>, Status> {
-        if batches.is_empty() {
-            // Return an empty stream with a proper schema.
-            // Using Schema::empty() here caused clients to hang because
-            // get_flight_info sends the real query schema but do_get sent
-            // a 0-column schema, confusing the FlightRecordBatchStream decoder.
-            let stream = futures::stream::empty();
-            let flight_stream: FlightStream = Box::pin(stream);
-            return Ok(Response::new(flight_stream));
-        }
-
-        let schema = batches[0].schema();
-        let flight_data = batches_to_flight_data(&schema, batches)
-            .map_err(|e| Status::internal(format!("Failed to encode flight data: {e}")))?
-            .into_iter()
-            .map(Ok);
-
-        let stream: FlightStream = Box::pin(stream::iter(flight_data));
-
-        Ok(Response::new(stream))
+        let options = self.flight_ipc_options()?;
+        encode_batches_to_stream(batches, options)
     }
 
     // -----------------------------------------------------------------
@@ -507,7 +541,7 @@ impl FlightSqlService for SqeFlightSqlService {
             .await
             .map_err(|e| sqe_error_to_status(&e, None))?;
 
-        Self::batches_to_stream(batches)
+        self.batches_to_stream(batches)
     }
 
     /// Handle fallback do_get for tickets that don't match known Flight SQL types.
@@ -534,7 +568,7 @@ impl FlightSqlService for SqeFlightSqlService {
                 .await
                 .map_err(|e| sqe_error_to_status(&e, None))?;
 
-            return Self::batches_to_stream(batches);
+            return self.batches_to_stream(batches);
         }
 
         Err(Status::unimplemented(format!(
@@ -582,7 +616,7 @@ impl FlightSqlService for SqeFlightSqlService {
         let mut builder = query.into_builder();
         builder.append(&catalog_name);
         let batch = builder.build().map_err(|e| Status::internal(format!("Failed to build batch: {e}")))?;
-        Self::batches_to_stream(vec![batch])
+        self.batches_to_stream(vec![batch])
     }
 
     async fn get_flight_info_schemas(
@@ -641,7 +675,7 @@ impl FlightSqlService for SqeFlightSqlService {
 
         let _schema = builder.schema();
         let batch = builder.build().map_err(|e| Status::internal(format!("Failed to build batch: {e}")))?;
-        Self::batches_to_stream(vec![batch])
+        self.batches_to_stream(vec![batch])
     }
 
     async fn get_flight_info_tables(
@@ -740,7 +774,7 @@ impl FlightSqlService for SqeFlightSqlService {
         }
 
         let batch = builder.build().map_err(|e| Status::internal(format!("Failed to build batch: {e}")))?;
-        Self::batches_to_stream(vec![batch])
+        self.batches_to_stream(vec![batch])
     }
 
     // ------------------------------------------------------------------
@@ -927,7 +961,7 @@ impl FlightSqlService for SqeFlightSqlService {
             .await
             .map_err(|e| sqe_error_to_status(&e, None))?;
 
-        Self::batches_to_stream(batches)
+        self.batches_to_stream(batches)
     }
 
     async fn do_get_table_types(
@@ -945,7 +979,7 @@ impl FlightSqlService for SqeFlightSqlService {
         ]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)])
             .map_err(|e| Status::internal(format!("Failed to build table types: {e}")))?;
-        Self::batches_to_stream(vec![batch])
+        self.batches_to_stream(vec![batch])
     }
 
     async fn do_get_sql_info(
@@ -965,8 +999,10 @@ impl FlightSqlService for SqeFlightSqlService {
         let builder = query.into_builder(&sql_info_data);
         let schema = builder.schema();
         let batch = builder.build();
+        let options = self.flight_ipc_options()?;
         let stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
+            .with_options(options)
             .build(futures::stream::once(async { batch }))
             .map_err(Status::from);
         Ok(Response::new(Box::pin(stream)))
@@ -979,7 +1015,7 @@ impl FlightSqlService for SqeFlightSqlService {
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let _session = self.get_session_from_request(&request).await?;
         // Iceberg tables have no primary keys — return empty stream
-        Self::batches_to_stream(vec![])
+        self.batches_to_stream(vec![])
     }
 
     async fn do_get_exported_keys(
@@ -988,7 +1024,7 @@ impl FlightSqlService for SqeFlightSqlService {
         request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let _session = self.get_session_from_request(&request).await?;
-        Self::batches_to_stream(vec![])
+        self.batches_to_stream(vec![])
     }
 
     async fn do_get_imported_keys(
@@ -997,7 +1033,7 @@ impl FlightSqlService for SqeFlightSqlService {
         request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let _session = self.get_session_from_request(&request).await?;
-        Self::batches_to_stream(vec![])
+        self.batches_to_stream(vec![])
     }
 
     async fn do_get_cross_reference(
@@ -1006,7 +1042,7 @@ impl FlightSqlService for SqeFlightSqlService {
         request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let _session = self.get_session_from_request(&request).await?;
-        Self::batches_to_stream(vec![])
+        self.batches_to_stream(vec![])
     }
 
     async fn do_get_xdbc_type_info(
@@ -1171,7 +1207,7 @@ impl FlightSqlService for SqeFlightSqlService {
             Status::internal(format!("Failed to filter XDBC type info: {e}"))
         })?;
 
-        Self::batches_to_stream(vec![batch])
+        self.batches_to_stream(vec![batch])
     }
 
     async fn do_put_statement_update(
@@ -1510,9 +1546,8 @@ mod tests {
 
     #[test]
     fn batches_to_stream_empty_returns_ok() {
-        // batches_to_stream is a pure synchronous function (no async) — just
-        // verify it returns Ok for an empty vec.
-        let result = SqeFlightSqlService::batches_to_stream(vec![]);
+        let options = arrow_ipc::writer::IpcWriteOptions::default();
+        let result = super::encode_batches_to_stream(vec![], options);
         assert!(result.is_ok(), "empty batches should produce Ok response");
     }
 
@@ -1524,7 +1559,8 @@ mod tests {
     fn batches_to_stream_single_batch_returns_ok() {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
         let batch = RecordBatch::new_empty(schema);
-        let result = SqeFlightSqlService::batches_to_stream(vec![batch]);
+        let options = arrow_ipc::writer::IpcWriteOptions::default();
+        let result = super::encode_batches_to_stream(vec![batch], options);
         assert!(result.is_ok(), "single batch should produce Ok response");
     }
 

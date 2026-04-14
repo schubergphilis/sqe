@@ -28,8 +28,9 @@ datafusion-sql = "53"
 datafusion-proto = "53"
 
 # Arrow 58 / Parquet 58 — aligned with DataFusion 53
-arrow = { version = "58", features = ["prettyprint"] }
+arrow = { version = "58", features = ["prettyprint", "ipc_compression"] }
 arrow-flight = { version = "58", features = ["flight-sql-experimental"] }
+arrow-ipc = { version = "58", features = ["lz4", "zstd"] }
 arrow-schema = "58"
 arrow-array = "58"
 parquet = { version = "58", features = ["async", "object_store"] }

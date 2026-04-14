@@ -26,6 +26,7 @@ datafusion = { workspace = true }
 datafusion-proto = { workspace = true }
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
+arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
 tonic = { workspace = true, features = ["tls-ring"] }

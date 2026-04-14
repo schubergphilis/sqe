@@ -62,11 +62,14 @@ pub fn init_telemetry_with_sampling(
         .build()
         .expect("Failed to create OTLP span exporter");
 
-    // TODO: configure sampling rate via .with_sampler() when API stabilises in this opentelemetry_sdk version.
-    // For now the sampling rate is accepted as a parameter and stored for future use.
-    let _ = trace_sample_rate; // suppress unused warning until sampler API is wired in
+    // Use ParentBased sampling: if the parent span is sampled, always sample
+    // the child; otherwise use the configured ratio for root spans.
+    let sampler = opentelemetry_sdk::trace::Sampler::ParentBased(Box::new(
+        opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(trace_sample_rate),
+    ));
     let tracer_provider = SdkTracerProvider::builder()
         .with_resource(resource.clone())
+        .with_sampler(sampler)
         .with_batch_exporter(trace_exporter)
         .build();
 

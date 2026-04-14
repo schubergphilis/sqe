@@ -202,6 +202,43 @@ pub struct CoordinatorConfig {
     /// Compression for spill files. "none", "lz4" (default), or "zstd".
     #[serde(default = "default_spill_compression")]
     pub spill_compression: String,
+    /// Arrow Flight IPC compression for client-facing DoGet responses.
+    /// Supported values: `"lz4"` (default), `"zstd"`, `"none"`.
+    #[serde(default = "default_flight_compression")]
+    pub flight_compression: String,
+    /// Arrow Flight IPC compression for internal shuffle (DoExchange) transfers.
+    /// Supported values: `"zstd"` (default), `"lz4"`, `"none"`.
+    #[serde(default = "default_shuffle_compression")]
+    pub shuffle_compression: String,
+}
+
+/// IPC body compression codec for Arrow Flight transfers.
+///
+/// Maps directly to `arrow_ipc::CompressionType` values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlightCompression {
+    /// No compression.
+    None,
+    /// LZ4 Frame -- fast decompression, good for client-facing responses.
+    Lz4,
+    /// Zstandard -- better compression ratio, good for internal shuffle.
+    Zstd,
+}
+
+impl FlightCompression {
+    /// Parse a config string into a `FlightCompression`.
+    ///
+    /// Accepted values (case-insensitive): `"lz4"`, `"zstd"`, `"none"`.
+    pub fn from_config(s: &str) -> crate::error::Result<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "lz4" | "lz4_frame" => Ok(Self::Lz4),
+            "zstd" | "zstandard" => Ok(Self::Zstd),
+            "none" | "" => Ok(Self::None),
+            other => Err(crate::error::SqeError::Config(format!(
+                "Unknown Flight compression codec '{other}'. Expected: lz4, zstd, or none"
+            ))),
+        }
+    }
 }
 
 /// TLS configuration for gRPC (Flight SQL) and worker listeners.
@@ -568,6 +605,13 @@ pub struct CatalogConfig {
     /// Default: 3 MB.
     #[serde(default = "default_small_file_threshold_mb")]
     pub small_file_threshold_mb: u64,
+    /// Parquet compression codec for writes (CTAS, INSERT, etc.).
+    ///
+    /// Supported values: `"zstd"` (default), `"lz4"`, `"snappy"`, `"none"`.
+    /// ZSTD level 3 is used when `"zstd"` is selected — a good balance of
+    /// compression ratio vs. speed for S3.
+    #[serde(default = "default_parquet_compression")]
+    pub parquet_compression: String,
 }
 
 #[derive(Deserialize, Clone)]
@@ -757,6 +801,8 @@ fn default_sort_mode() -> String { "adaptive".to_string() }
 fn default_coordinator_memory() -> String { "8GB".to_string() }
 fn default_coordinator_spill_dir() -> String { "/tmp/sqe-coordinator-spill".to_string() }
 fn default_spill_compression() -> String { "lz4".to_string() }
+fn default_flight_compression() -> String { "lz4".to_string() }
+fn default_shuffle_compression() -> String { "zstd".to_string() }
 
 fn default_flight_port() -> u16 { 50051 }
 fn default_trino_port() -> u16 { 8080 }
@@ -772,6 +818,7 @@ fn default_cache_ttl() -> u64 { 30 }
 fn default_table_format_version() -> u8 { 2 }
 fn default_manifest_cache_mb() -> u64 { 512 }
 fn default_small_file_threshold_mb() -> u64 { 3 }
+fn default_parquet_compression() -> String { "zstd".to_string() }
 fn default_passthrough() -> String { "passthrough".to_string() }
 fn default_prometheus_port() -> u16 { 9090 }
 fn default_per_user_rpm() -> u32 { 60 }
@@ -838,6 +885,16 @@ impl SqeConfig {
             if !tls.ca_file.is_empty() && !std::path::Path::new(&tls.ca_file).exists() {
                 errors.push(format!("tls.ca_file '{}' not found", tls.ca_file));
             }
+        }
+
+        // Parquet compression validation
+        let valid_compressions = ["zstd", "lz4", "snappy", "none"];
+        if !valid_compressions.contains(&self.catalog.parquet_compression.to_lowercase().as_str()) {
+            errors.push(format!(
+                "catalog.parquet_compression '{}' is not supported; valid options: {}",
+                self.catalog.parquet_compression,
+                valid_compressions.join(", ")
+            ));
         }
 
         if errors.is_empty() {
@@ -1084,6 +1141,8 @@ mod tests {
                 spill_to_disk: true,
                 spill_dir: default_coordinator_spill_dir(),
                 spill_compression: default_spill_compression(),
+                flight_compression: default_flight_compression(),
+                shuffle_compression: default_shuffle_compression(),
             },
             worker: WorkerConfig::default(),
             auth: AuthConfig {
@@ -1107,6 +1166,7 @@ mod tests {
                 default_table_format_version: 2,
                 trust_sort_order: false,
                 small_file_threshold_mb: 3,
+                parquet_compression: "zstd".to_string(),
             },
             storage: StorageConfig::default(),
             policy: PolicyConfig::default(),

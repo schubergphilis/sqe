@@ -19,6 +19,7 @@ sqe-metrics = { path = "../sqe-metrics" }
 datafusion = { workspace = true }
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
+arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
 parquet = { workspace = true }
