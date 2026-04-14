@@ -4,13 +4,16 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use arrow::array::BooleanArray;
 use arrow::datatypes::SchemaRef;
+use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use datafusion::common::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion::physical_optimizer::pruning::PruningPredicate;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::filter_pushdown::{
@@ -23,11 +26,14 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr,
     PlanProperties,
 };
+use datafusion_expr::ColumnarValue;
 use futures::{Stream, StreamExt, TryStreamExt};
 use iceberg::expr::Predicate;
 use iceberg::spec::{DataContentType, DataFile, ManifestStatus};
 use iceberg::table::Table;
-use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::arrow_reader::{
+    ArrowPredicate, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowFilter,
+};
 use parquet::arrow::ProjectionMask;
 use tracing::{debug, info_span, warn};
 
@@ -415,8 +421,6 @@ impl ExecutionPlan for IcebergScanExec {
         child_pushdown_result: ChildPushdownResult,
         _config: &ConfigOptions,
     ) -> DFResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
-        use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
-
         // As a leaf node, we selectively accept pushed-down filters:
         // - Dynamic filters (from hash join build side): ACCEPT — we store them
         //   and will evaluate them at scan time for file/row-group pruning.
@@ -467,9 +471,10 @@ impl ExecutionPlan for IcebergScanExec {
         let snapshot_id = self.snapshot_id;
         let manifest_cache = self.manifest_cache.clone();
         let small_file_threshold = self.small_file_threshold_bytes;
+        let pushed_down_filters = self.pushed_down_filters.clone();
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         let _files_pruned_minmax = MetricBuilder::new(&self.metrics).counter("files_pruned_minmax", partition);
-        debug!(table=%table.identifier(), predicates=?predicates, snapshot_id=?snapshot_id, "Executing IcebergScanExec");
+        debug!(table=%table.identifier(), predicates=?predicates, snapshot_id=?snapshot_id, pushed_filters=pushed_down_filters.len(), "Executing IcebergScanExec");
 
         // For time-travel: check the specified snapshot exists; for current: check current snapshot.
         let has_snapshot = if let Some(sid) = snapshot_id {
@@ -502,6 +507,39 @@ impl ExecutionPlan for IcebergScanExec {
                 let empty = RecordBatch::new_empty(schema.clone());
                 let s: BatchStream = futures::stream::once(async move { Ok(empty) }).boxed();
                 return Ok::<BatchStream, DataFusionError>(s);
+            }
+
+            // ── Resolve dynamic filters ─────────────────────────────────────
+            //
+            // Dynamic filters are pushed down from parent operators (e.g., hash
+            // join build side). We wait for the build side to complete, then
+            // extract the resolved filter expression which typically contains
+            // min/max bounds (e.g., `col >= 5 AND col <= 100`).
+            let mut resolved_filters: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
+            for filter in &pushed_down_filters {
+                if let Some(dynamic) = filter.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
+                    // Block until the hash join build side has finished and
+                    // populated the dynamic filter with actual bounds.
+                    dynamic.wait_complete().await;
+                    match dynamic.current() {
+                        Ok(expr) => {
+                            debug!(filter = %expr, "Resolved dynamic filter");
+                            resolved_filters.push(expr);
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to resolve dynamic filter, skipping");
+                        }
+                    }
+                } else {
+                    // Static pushed filter — use directly.
+                    resolved_filters.push(Arc::clone(filter));
+                }
+            }
+            if !resolved_filters.is_empty() {
+                debug!(
+                    count = resolved_filters.len(),
+                    "Dynamic filters resolved for Parquet row filtering"
+                );
             }
 
             // ── Direct-read fast path ────────────────────────────────────────
@@ -565,6 +603,31 @@ impl ExecutionPlan for IcebergScanExec {
                         builder
                     };
 
+                    // Apply resolved dynamic filters as Parquet row filters.
+                    //
+                    // Each resolved filter becomes an ArrowPredicate that the Parquet
+                    // reader evaluates per row group / page. Rows that fail the
+                    // predicate are skipped before full decoding, reducing I/O and CPU.
+                    //
+                    // We use ProjectionMask::all() so the predicate receives all
+                    // columns. This is simpler than computing the minimal column set
+                    // for the filter expression. For an MVP this is acceptable; a
+                    // future optimisation can intersect filter columns with the
+                    // Parquet schema to build a tighter mask.
+                    let builder = if !resolved_filters.is_empty() {
+                        let mut predicates: Vec<Box<dyn ArrowPredicate>> = Vec::new();
+                        for filter_expr in &resolved_filters {
+                            let mask = ProjectionMask::all();
+                            predicates.push(Box::new(PhysicalExprPredicate {
+                                expr: Arc::clone(filter_expr),
+                                projection: mask,
+                            }));
+                        }
+                        builder.with_row_filter(RowFilter::new(predicates))
+                    } else {
+                        builder
+                    };
+
                     let reader = builder
                         .with_batch_size(8192)
                         .build()
@@ -599,6 +662,21 @@ impl ExecutionPlan for IcebergScanExec {
             // Used when the small-file fast path is disabled (`threshold = 0`) or
             // any file exceeds the threshold. This is the original path and handles
             // predicate pushdown via the Iceberg scan API.
+            //
+            // TODO: Dynamic filter row-level filtering is not yet applied in this
+            // path. The iceberg-rust `scan.to_arrow()` pipeline does not expose a
+            // hook for injecting Parquet RowFilters. To support dynamic filters
+            // here, we would need to either:
+            //   (a) Post-filter the arrow stream with a FilterExec-style operator, or
+            //   (b) Switch this path to also use direct file reads with row filters.
+            // For now, dynamic filters only benefit the direct-read fast path above.
+            if !resolved_filters.is_empty() {
+                warn!(
+                    count = resolved_filters.len(),
+                    "Dynamic filters resolved but cannot be applied in iceberg-rust fallback path; \
+                     filtering will happen in parent FilterExec"
+                );
+            }
             debug!(
                 file_count = file_entries.len(),
                 "IcebergScanExec: using iceberg-rust scan.to_arrow() path"
@@ -714,6 +792,50 @@ async fn collect_data_files_cached(
     }
 
     Ok(file_entries)
+}
+
+/// Wraps a DataFusion `PhysicalExpr` as a Parquet `ArrowPredicate` for row-level
+/// filtering during Parquet decoding.
+///
+/// This is used to apply resolved dynamic filters (e.g., hash join build-side
+/// min/max bounds) directly during Parquet record batch reading, allowing the
+/// reader to skip rows that cannot match before they are fully decoded.
+struct PhysicalExprPredicate {
+    expr: Arc<dyn PhysicalExpr>,
+    projection: ProjectionMask,
+}
+
+impl ArrowPredicate for PhysicalExprPredicate {
+    fn projection(&self) -> &ProjectionMask {
+        &self.projection
+    }
+
+    fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, ArrowError> {
+        let result = self
+            .expr
+            .evaluate(&batch)
+            .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
+
+        match result {
+            ColumnarValue::Array(array) => array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .cloned()
+                .ok_or_else(|| {
+                    ArrowError::ExternalError(Box::new(std::io::Error::other(
+                        "Dynamic filter must return BooleanArray",
+                    )))
+                }),
+            ColumnarValue::Scalar(scalar) => {
+                // Extract boolean value: true only for ScalarValue::Boolean(Some(true)).
+                let bool_val = matches!(
+                    scalar,
+                    datafusion::common::ScalarValue::Boolean(Some(true))
+                );
+                Ok(BooleanArray::from(vec![bool_val; batch.num_rows()]))
+            }
+        }
+    }
 }
 
 struct IcebergRecordBatchStream {
