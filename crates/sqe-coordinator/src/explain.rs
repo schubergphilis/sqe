@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use datafusion::physical_plan::metrics::MetricValue;
 use datafusion::physical_plan::{collect, displayable, ExecutionPlan};
 use datafusion::prelude::SessionContext;
 
@@ -67,7 +68,9 @@ impl ExplainHandler {
     }
 
     /// EXPLAIN ANALYZE <query> — executes the query and returns per-operator metrics.
-    /// Output schema: (step INT32, operation TEXT, output_rows INT64, elapsed_ms FLOAT64)
+    /// Output schema: (step INT32, operation TEXT, output_rows INT64, elapsed_ms FLOAT64,
+    ///                 output_bytes INT64, output_batches INT64,
+    ///                 spill_count INT64, spilled_bytes INT64, spilled_rows INT64)
     pub async fn analyze(
         &self,
         session: &Session,
@@ -103,6 +106,11 @@ impl ExplainHandler {
             Field::new("operation", DataType::Utf8, false),
             Field::new("output_rows", DataType::Int64, true),
             Field::new("elapsed_ms", DataType::Float64, true),
+            Field::new("output_bytes", DataType::Int64, true),
+            Field::new("output_batches", DataType::Int64, true),
+            Field::new("spill_count", DataType::Int64, true),
+            Field::new("spilled_bytes", DataType::Int64, true),
+            Field::new("spilled_rows", DataType::Int64, true),
         ]));
 
         let steps: ArrayRef = Arc::new(Int32Array::from(
@@ -112,14 +120,20 @@ impl ExplainHandler {
             rows.iter().map(|r| r.operation.as_str()).collect::<Vec<_>>(),
         ));
 
-        let mut output_rows_b = arrow_array::builder::Int64Builder::new();
-        for r in &rows {
-            match r.output_rows {
-                Some(v) => output_rows_b.append_value(v),
-                None => output_rows_b.append_null(),
-            }
+        macro_rules! nullable_i64 {
+            ($rows:expr, $field:ident) => {{
+                let mut b = arrow_array::builder::Int64Builder::new();
+                for r in $rows {
+                    match r.$field {
+                        Some(v) => b.append_value(v),
+                        None => b.append_null(),
+                    }
+                }
+                Arc::new(b.finish()) as ArrayRef
+            }};
         }
-        let output_rows_arr: ArrayRef = Arc::new(output_rows_b.finish());
+
+        let output_rows_arr = nullable_i64!(&rows, output_rows);
 
         let mut elapsed_b = arrow_array::builder::Float64Builder::new();
         for r in &rows {
@@ -130,8 +144,27 @@ impl ExplainHandler {
         }
         let elapsed_arr: ArrayRef = Arc::new(elapsed_b.finish());
 
-        let batch = RecordBatch::try_new(schema, vec![steps, ops, output_rows_arr, elapsed_arr])
-            .map_err(|e| SqeError::Execution(format!("Failed to build analyze batch: {e}")))?;
+        let output_bytes_arr = nullable_i64!(&rows, output_bytes);
+        let output_batches_arr = nullable_i64!(&rows, output_batches);
+        let spill_count_arr = nullable_i64!(&rows, spill_count);
+        let spilled_bytes_arr = nullable_i64!(&rows, spilled_bytes);
+        let spilled_rows_arr = nullable_i64!(&rows, spilled_rows);
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                steps,
+                ops,
+                output_rows_arr,
+                elapsed_arr,
+                output_bytes_arr,
+                output_batches_arr,
+                spill_count_arr,
+                spilled_bytes_arr,
+                spilled_rows_arr,
+            ],
+        )
+        .map_err(|e| SqeError::Execution(format!("Failed to build analyze batch: {e}")))?;
 
         Ok(vec![batch])
     }
@@ -140,7 +173,9 @@ impl ExplainHandler {
     /// combined with actual per-operator metrics.
     /// Output schema: (step INT32, operation TEXT, estimated_rows INT64,
     ///                 estimated_bytes INT64, files_scanned INT32, files_total INT32,
-    ///                 output_rows INT64, elapsed_ms FLOAT64)
+    ///                 output_rows INT64, elapsed_ms FLOAT64, output_bytes INT64,
+    ///                 output_batches INT64, spill_count INT64, spilled_bytes INT64,
+    ///                 spilled_rows INT64)
     pub async fn full(
         &self,
         session: &Session,
@@ -180,6 +215,11 @@ impl ExplainHandler {
             Field::new("files_total", DataType::Int32, true),
             Field::new("output_rows", DataType::Int64, true),
             Field::new("elapsed_ms", DataType::Float64, true),
+            Field::new("output_bytes", DataType::Int64, true),
+            Field::new("output_batches", DataType::Int64, true),
+            Field::new("spill_count", DataType::Int64, true),
+            Field::new("spilled_bytes", DataType::Int64, true),
+            Field::new("spilled_rows", DataType::Int64, true),
         ]));
 
         let steps: ArrayRef = Arc::new(Int32Array::from(
@@ -208,10 +248,18 @@ impl ExplainHandler {
         let f_total = nullable_array!(arrow_array::builder::Int32Builder, &rows, files_total);
         let out_rows = nullable_array!(arrow_array::builder::Int64Builder, &rows, output_rows);
         let elapsed = nullable_array!(arrow_array::builder::Float64Builder, &rows, elapsed_ms);
+        let out_bytes = nullable_array!(arrow_array::builder::Int64Builder, &rows, output_bytes);
+        let out_batches = nullable_array!(arrow_array::builder::Int64Builder, &rows, output_batches);
+        let spill_cnt = nullable_array!(arrow_array::builder::Int64Builder, &rows, spill_count);
+        let spill_bytes = nullable_array!(arrow_array::builder::Int64Builder, &rows, spilled_bytes);
+        let spill_rows = nullable_array!(arrow_array::builder::Int64Builder, &rows, spilled_rows);
 
         let batch = RecordBatch::try_new(
             schema,
-            vec![steps, ops, est_rows, est_bytes, f_scanned, f_total, out_rows, elapsed],
+            vec![
+                steps, ops, est_rows, est_bytes, f_scanned, f_total, out_rows, elapsed,
+                out_bytes, out_batches, spill_cnt, spill_bytes, spill_rows,
+            ],
         )
         .map_err(|e| SqeError::Execution(format!("Failed to build full explain batch: {e}")))?;
 
@@ -228,6 +276,11 @@ struct AnalyzeRow {
     operation: String,
     output_rows: Option<i64>,
     elapsed_ms: Option<f64>,
+    output_bytes: Option<i64>,
+    output_batches: Option<i64>,
+    spill_count: Option<i64>,
+    spilled_bytes: Option<i64>,
+    spilled_rows: Option<i64>,
 }
 
 struct FullRow {
@@ -239,6 +292,11 @@ struct FullRow {
     files_total: Option<i32>,
     output_rows: Option<i64>,
     elapsed_ms: Option<f64>,
+    output_bytes: Option<i64>,
+    output_batches: Option<i64>,
+    spill_count: Option<i64>,
+    spilled_bytes: Option<i64>,
+    spilled_rows: Option<i64>,
 }
 
 fn walk_analyze(node: &Arc<dyn ExecutionPlan>, rows: &mut Vec<AnalyzeRow>) {
@@ -256,7 +314,37 @@ fn walk_analyze(node: &Arc<dyn ExecutionPlan>, rows: &mut Vec<AnalyzeRow>) {
         .as_ref()
         .and_then(|m| m.elapsed_compute())
         .map(|ns| ns as f64 / 1_000_000.0);
-    rows.push(AnalyzeRow { step, operation, output_rows, elapsed_ms });
+    let output_bytes = metrics
+        .as_ref()
+        .and_then(|m| m.sum(|metric| matches!(metric.value(), MetricValue::OutputBytes(_))))
+        .map(|v| v.as_usize() as i64);
+    let output_batches = metrics
+        .as_ref()
+        .and_then(|m| m.sum(|metric| matches!(metric.value(), MetricValue::OutputBatches(_))))
+        .map(|v| v.as_usize() as i64);
+    let spill_count = metrics
+        .as_ref()
+        .and_then(|m| m.spill_count())
+        .map(|v| v as i64);
+    let spilled_bytes = metrics
+        .as_ref()
+        .and_then(|m| m.spilled_bytes())
+        .map(|v| v as i64);
+    let spilled_rows = metrics
+        .as_ref()
+        .and_then(|m| m.spilled_rows())
+        .map(|v| v as i64);
+    rows.push(AnalyzeRow {
+        step,
+        operation,
+        output_rows,
+        elapsed_ms,
+        output_bytes,
+        output_batches,
+        spill_count,
+        spilled_bytes,
+        spilled_rows,
+    });
 }
 
 fn walk_full(node: &Arc<dyn ExecutionPlan>, rows: &mut Vec<FullRow>) {
@@ -270,6 +358,26 @@ fn walk_full(node: &Arc<dyn ExecutionPlan>, rows: &mut Vec<FullRow>) {
     let metrics = node.metrics();
     let output_rows = metrics.as_ref().and_then(|m| m.output_rows()).map(|r| r as i64);
     let elapsed_ms = metrics.as_ref().and_then(|m| m.elapsed_compute()).map(|ns| ns as f64 / 1_000_000.0);
+    let output_bytes = metrics
+        .as_ref()
+        .and_then(|m| m.sum(|metric| matches!(metric.value(), MetricValue::OutputBytes(_))))
+        .map(|v| v.as_usize() as i64);
+    let output_batches = metrics
+        .as_ref()
+        .and_then(|m| m.sum(|metric| matches!(metric.value(), MetricValue::OutputBatches(_))))
+        .map(|v| v.as_usize() as i64);
+    let spill_count = metrics
+        .as_ref()
+        .and_then(|m| m.spill_count())
+        .map(|v| v as i64);
+    let spilled_bytes = metrics
+        .as_ref()
+        .and_then(|m| m.spilled_bytes())
+        .map(|v| v as i64);
+    let spilled_rows = metrics
+        .as_ref()
+        .and_then(|m| m.spilled_rows())
+        .map(|v| v as i64);
 
     if let Some(scan) = node.as_any().downcast_ref::<IcebergScanExec>() {
         let table = scan.table();
@@ -292,7 +400,11 @@ fn walk_full(node: &Arc<dyn ExecutionPlan>, rows: &mut Vec<FullRow>) {
         let files_total = parse_i32("total-data-files");
         let files_scanned = files_total;
 
-        rows.push(FullRow { step, operation, estimated_rows, estimated_bytes, files_scanned, files_total, output_rows, elapsed_ms });
+        rows.push(FullRow {
+            step, operation, estimated_rows, estimated_bytes, files_scanned, files_total,
+            output_rows, elapsed_ms, output_bytes, output_batches,
+            spill_count, spilled_bytes, spilled_rows,
+        });
     } else {
         use datafusion::common::stats::Precision;
         let estimated_rows = node
@@ -303,6 +415,11 @@ fn walk_full(node: &Arc<dyn ExecutionPlan>, rows: &mut Vec<FullRow>) {
                 Precision::Absent => None,
             });
 
-        rows.push(FullRow { step, operation, estimated_rows, estimated_bytes: None, files_scanned: None, files_total: None, output_rows, elapsed_ms });
+        rows.push(FullRow {
+            step, operation, estimated_rows, estimated_bytes: None,
+            files_scanned: None, files_total: None,
+            output_rows, elapsed_ms, output_bytes, output_batches,
+            spill_count, spilled_bytes, spilled_rows,
+        });
     }
 }

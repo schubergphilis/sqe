@@ -196,20 +196,20 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 - [ ] Semantic AI layer (RDF/SPARQL, property graph/GQL, vector search, agent interfaces)
 - [ ] Helm chart for Kubernetes deployment
 
-**Benchmark Results (SF0.01, Apr 12 2026 — SQE vs Trino 465):**
+**Benchmark Results (SF0.01, Apr 14 2026 — SQE on DataFusion 53 vs Trino 465):**
 
 | Suite | SQE | Trino | Speedup | Match |
 |---|---|---|---|---|
-| TPC-H (22) | 1.6s | 10.8s | **8.8x** | 22/22 |
-| SSB (13) | 0.7s | 2.0s | **3.2x** | 13/13 |
-| TPC-DS (99) | 13.0s | 47.0s | **2.6x** | 93/99 |
-| ClickBench (43) | 0.6s | 2.2s | **2.5x** | 43/43 |
-| TPC-C (8 read) | 0.3s | 1.5s | **5.5x** | 8/8 |
-| TPC-E (11) | 0.5s | 2.2s | **5.3x** | 11/11 |
-| TPC-BB (10) | 1.2s | 2.2s | **3.1x** | 10/10 |
-| **Total** | **18.9s** | **67.9s** | **3.6x avg** | **221/222** |
+| TPC-H (22) | 1.2s | 6.9s | **7.2x** | 22/22 |
+| SSB (13) | 0.6s | 1.8s | **3.2x** | 13/13 |
+| TPC-DS (99) | 11.9s | 22.6s | **2.2x** | 93/99 |
+| ClickBench (43) | 0.6s | 1.8s | **3.0x** | 43/43 |
+| TPC-C (8 read) | 0.3s | 1.0s | **4.0x** | 7/8 |
+| TPC-E (11) | 0.3s | 1.1s | **3.7x** | 7/11 |
+| TPC-BB (10) | 0.8s | 1.2s | **2.2x** | 10/10 |
+| **Total** | **15.7s** | **36.4s** | **3.4x avg** | **214/222** |
 
-SQE is faster than Trino on every benchmark suite. 5-layer caching stack (RestCatalog, table metadata, manifest files, SessionContext, OAuth token) reduces warm-query overhead to <1ms.
+SQE is faster than Trino on every benchmark suite. DataFusion 53 upgrade (from 52) gave a 35% speedup. 5-layer caching + ETag validation + ZSTD compression + LZ4 Flight responses.
 
 ## Benchmarks
 

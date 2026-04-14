@@ -6,17 +6,22 @@ use std::task::{Context, Poll};
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use datafusion::common::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_optimizer::pruning::PruningPredicate;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::filter_pushdown::{
+    ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
+};
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr,
+    PlanProperties,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use iceberg::expr::Predicate;
@@ -42,7 +47,7 @@ pub struct IcebergScanExec {
     projection: Option<Vec<String>>,
     predicates: Option<Predicate>,
     df_filters: Vec<Expr>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     /// Optional snapshot ID for time travel queries.
     snapshot_id: Option<i64>,
@@ -64,6 +69,17 @@ pub struct IcebergScanExec {
     ///
     /// Set to 0 to disable the fast path. Default: [`DEFAULT_SMALL_FILE_THRESHOLD_BYTES`].
     small_file_threshold_bytes: u64,
+    /// Dynamic filters pushed down from parent operators (e.g., hash join build side).
+    ///
+    /// During the physical optimizer's filter pushdown phase, parent operators such as
+    /// `HashJoinExec` create `DynamicFilterPhysicalExpr` objects that are pushed down
+    /// to leaf scan nodes. When the hash join's build side completes at execution time,
+    /// it updates the dynamic filter with min/max bounds. The scan node can use these
+    /// bounds to skip files/row groups that cannot match.
+    ///
+    /// These are `PhysicalExpr`s (not logical `Expr`s) because they come from the
+    /// physical optimizer, after logical-to-physical conversion has already occurred.
+    pushed_down_filters: Vec<Arc<dyn PhysicalExpr>>,
 }
 
 impl IcebergScanExec {
@@ -133,8 +149,8 @@ impl IcebergScanExec {
                 None => EquivalenceProperties::new(projected_schema.clone()),
             }
         };
-        let properties = PlanProperties::new(eq_props, Partitioning::UnknownPartitioning(1), EmissionType::Incremental, Boundedness::Bounded);
-        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, manifest_cache: None, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES }
+        let properties = Arc::new(PlanProperties::new(eq_props, Partitioning::UnknownPartitioning(1), EmissionType::Incremental, Boundedness::Bounded));
+        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, manifest_cache: None, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![] }
     }
 
     /// Attach a shared manifest file cache for warm-query acceleration.
@@ -176,12 +192,12 @@ impl IcebergScanExec {
             let sort_order = self.table.metadata().default_sort_order();
             let iceberg_schema = self.table.metadata().current_schema();
             if let Some(sort_exprs) = crate::sort_order::iceberg_sort_to_physical(sort_order, iceberg_schema, &self.projected_schema) {
-                self.properties = PlanProperties::new(
+                self.properties = Arc::new(PlanProperties::new(
                     crate::sort_order::equivalence_with_sort(self.projected_schema.clone(), sort_exprs),
                     Partitioning::UnknownPartitioning(1),
                     EmissionType::Incremental,
                     Boundedness::Bounded,
-                );
+                ));
             }
         }
         self.trust_sort_order = trust;
@@ -192,6 +208,29 @@ impl IcebergScanExec {
     pub fn predicates(&self) -> Option<&Predicate> { self.predicates.as_ref() }
     pub fn df_filters(&self) -> &[Expr] { &self.df_filters }
     pub fn projection(&self) -> Option<&[String]> { self.projection.as_deref() }
+    pub fn pushed_down_filters(&self) -> &[Arc<dyn PhysicalExpr>] { &self.pushed_down_filters }
+
+    /// Create a copy of this scan with additional dynamic filters pushed down
+    /// from parent operators (e.g., `HashJoinExec` build-side bounds).
+    ///
+    /// The returned node inherits all fields from `self` but replaces the
+    /// `pushed_down_filters` with the given set.
+    fn clone_with_pushed_filters(&self, filters: Vec<Arc<dyn PhysicalExpr>>) -> Self {
+        Self {
+            table: self.table.clone(),
+            projected_schema: self.projected_schema.clone(),
+            projection: self.projection.clone(),
+            predicates: self.predicates.clone(),
+            df_filters: self.df_filters.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+            snapshot_id: self.snapshot_id,
+            trust_sort_order: self.trust_sort_order,
+            manifest_cache: self.manifest_cache.clone(),
+            small_file_threshold_bytes: self.small_file_threshold_bytes,
+            pushed_down_filters: filters,
+        }
+    }
 
     /// Returns the names of identity-transform partition columns from the
     /// Iceberg table's default partition spec.
@@ -348,7 +387,16 @@ impl IcebergScanExec {
 
 impl DisplayAs for IcebergScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "IcebergScanExec: table={}, projection={:?}, predicate=[{}], df_filters={}, snapshot_id={:?}", self.table.identifier(), self.projection, self.predicates.as_ref().map_or(String::new(), |p| format!("{p}")), self.df_filters.len(), self.snapshot_id)
+        write!(
+            f,
+            "IcebergScanExec: table={}, projection={:?}, predicate=[{}], df_filters={}, pushed_down_filters={}, snapshot_id={:?}",
+            self.table.identifier(),
+            self.projection,
+            self.predicates.as_ref().map_or(String::new(), |p| format!("{p}")),
+            self.df_filters.len(),
+            self.pushed_down_filters.len(),
+            self.snapshot_id,
+        )
     }
 }
 
@@ -356,10 +404,57 @@ impl ExecutionPlan for IcebergScanExec {
     fn name(&self) -> &str { "IcebergScanExec" }
     fn as_any(&self) -> &dyn Any { self }
     fn schema(&self) -> SchemaRef { self.projected_schema.clone() }
-    fn properties(&self) -> &PlanProperties { &self.properties }
+    fn properties(&self) -> &Arc<PlanProperties> { &self.properties }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![] }
     fn with_new_children(self: Arc<Self>, _c: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> { Ok(self) }
     fn metrics(&self) -> Option<MetricsSet> { Some(self.metrics.clone_inner()) }
+
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> DFResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
+
+        // As a leaf node, we selectively accept pushed-down filters:
+        // - Dynamic filters (from hash join build side): ACCEPT — we store them
+        //   and will evaluate them at scan time for file/row-group pruning.
+        // - Static parent filters (from FilterExec): REJECT — let the FilterExec
+        //   remain in the plan to evaluate them. We cannot evaluate arbitrary
+        //   PhysicalExpr during Iceberg scan planning.
+        let mut dynamic_filters: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
+        let mut filter_results: Vec<PushedDown> = Vec::new();
+
+        for pf in &child_pushdown_result.parent_filters {
+            if pf.filter.as_any().downcast_ref::<DynamicFilterPhysicalExpr>().is_some() {
+                // Dynamic filter from hash join — accept it
+                dynamic_filters.push(Arc::clone(&pf.filter));
+                filter_results.push(PushedDown::Yes);
+            } else {
+                // Static filter — leave it for FilterExec to handle
+                filter_results.push(PushedDown::No);
+            }
+        }
+
+        if dynamic_filters.is_empty() {
+            // No dynamic filters to store — keep the current node unchanged.
+            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+                filter_results,
+            ));
+        }
+
+        // Merge with any previously stored pushed-down filters.
+        let mut all_pushed = self.pushed_down_filters.clone();
+        all_pushed.extend(dynamic_filters);
+
+        let new_scan = self.clone_with_pushed_filters(all_pushed);
+
+        Ok(
+            FilterPushdownPropagation::with_parent_pushdown_result(filter_results)
+                .with_updated_node(Arc::new(new_scan)),
+        )
+    }
 
     fn execute(&self, partition: usize, _context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
         let span = info_span!("iceberg_scan", table=%self.table.identifier(), partition=partition, predicates=?self.predicates);
@@ -441,7 +536,7 @@ impl ExecutionPlan for IcebergScanExec {
 
                     // Parse Parquet from the in-memory bytes.
                     // `bytes::Bytes` implements `ChunkReader` so this works directly.
-                    let reader_opts = ArrowReaderOptions::new().with_page_index(true);
+                    let reader_opts = ArrowReaderOptions::new().with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required);
                     let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(bytes, reader_opts)
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
