@@ -415,20 +415,30 @@ impl ExecutionPlan for IcebergScanExec {
         child_pushdown_result: ChildPushdownResult,
         _config: &ConfigOptions,
     ) -> DFResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
-        // As a leaf node we have no children, so child_results on each parent
-        // filter is empty.  We accept ALL parent filters — they will be
-        // evaluated at execution time (e.g., for dynamic hash-join bounds).
-        let mut accepted_filters: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
+        use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
+
+        // As a leaf node, we selectively accept pushed-down filters:
+        // - Dynamic filters (from hash join build side): ACCEPT — we store them
+        //   and will evaluate them at scan time for file/row-group pruning.
+        // - Static parent filters (from FilterExec): REJECT — let the FilterExec
+        //   remain in the plan to evaluate them. We cannot evaluate arbitrary
+        //   PhysicalExpr during Iceberg scan planning.
+        let mut dynamic_filters: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
         let mut filter_results: Vec<PushedDown> = Vec::new();
 
         for pf in &child_pushdown_result.parent_filters {
-            // Accept every filter the parent wants to push down.
-            accepted_filters.push(Arc::clone(&pf.filter));
-            filter_results.push(PushedDown::Yes);
+            if pf.filter.as_any().downcast_ref::<DynamicFilterPhysicalExpr>().is_some() {
+                // Dynamic filter from hash join — accept it
+                dynamic_filters.push(Arc::clone(&pf.filter));
+                filter_results.push(PushedDown::Yes);
+            } else {
+                // Static filter — leave it for FilterExec to handle
+                filter_results.push(PushedDown::No);
+            }
         }
 
-        if accepted_filters.is_empty() {
-            // Nothing new to store — keep the current node unchanged.
+        if dynamic_filters.is_empty() {
+            // No dynamic filters to store — keep the current node unchanged.
             return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
                 filter_results,
             ));
@@ -436,7 +446,7 @@ impl ExecutionPlan for IcebergScanExec {
 
         // Merge with any previously stored pushed-down filters.
         let mut all_pushed = self.pushed_down_filters.clone();
-        all_pushed.extend(accepted_filters);
+        all_pushed.extend(dynamic_filters);
 
         let new_scan = self.clone_with_pushed_filters(all_pushed);
 
