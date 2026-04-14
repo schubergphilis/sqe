@@ -304,7 +304,14 @@ impl WriteHandler {
         select_sql: &str,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_name = match stmt {
-            Statement::Insert(ins) => &ins.table_name,
+            Statement::Insert(ins) => match &ins.table {
+                sqlparser::ast::TableObject::TableName(name) => name,
+                other => {
+                    return Err(SqeError::Execution(format!(
+                        "INSERT INTO table functions not supported: {other}"
+                    )));
+                }
+            },
             other => {
                 return Err(SqeError::Execution(format!(
                     "Expected Insert statement, got: {other}"
@@ -467,7 +474,14 @@ impl WriteHandler {
         batches: Vec<RecordBatch>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_name = match stmt {
-            Statement::Insert(ins) => &ins.table_name,
+            Statement::Insert(ins) => match &ins.table {
+                sqlparser::ast::TableObject::TableName(name) => name,
+                other => {
+                    return Err(SqeError::Execution(format!(
+                        "INSERT INTO table functions not supported: {other}"
+                    )));
+                }
+            },
             other => {
                 return Err(SqeError::Execution(format!(
                     "Expected Insert statement, got: {other}"
@@ -2147,7 +2161,7 @@ pub(crate) fn sql_type_to_arrow(sql_type: &sqlparser::ast::DataType) -> sqe_core
         SqlType::Int(_) | SqlType::Integer(_) | SqlType::Int32 => Ok(DataType::Int32),
         SqlType::BigInt(_) | SqlType::Int64 => Ok(DataType::Int64),
         SqlType::Float(_) | SqlType::Real => Ok(DataType::Float32),
-        SqlType::Double | SqlType::DoublePrecision => Ok(DataType::Float64),
+        SqlType::Double(_) | SqlType::DoublePrecision => Ok(DataType::Float64),
         SqlType::Varchar(_) | SqlType::CharVarying(_) | SqlType::Text | SqlType::String(_) => {
             Ok(DataType::Utf8)
         }
@@ -2447,7 +2461,7 @@ mod tests {
             DataType::Float32
         );
         assert_eq!(
-            sql_type_to_arrow(&SqlType::Double).unwrap(),
+            sql_type_to_arrow(&SqlType::Double(sqlparser::ast::ExactNumberInfo::None)).unwrap(),
             DataType::Float64
         );
         assert_eq!(

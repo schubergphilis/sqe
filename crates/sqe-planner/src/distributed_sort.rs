@@ -231,7 +231,7 @@ pub struct DistributedSortExec {
     /// Optional LIMIT (fetch first N rows).
     fetch: Option<usize>,
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl DistributedSortExec {
@@ -258,12 +258,12 @@ impl DistributedSortExec {
         // Build equivalence properties with output ordering matching the sort exprs.
         let ordering_vec: Vec<PhysicalSortExpr> =
             sort_exprs.iter().cloned().collect();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new_with_orderings(schema, vec![ordering_vec]),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             input,
@@ -322,7 +322,7 @@ impl ExecutionPlan for DistributedSortExec {
         self.input.schema()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -488,8 +488,7 @@ impl PhysicalOptimizerRule for DistributedSortRule {
 /// Returns 0 if statistics are unavailable, which means the rule will
 /// conservatively keep the local sort.
 fn estimate_data_size(plan: &Arc<dyn ExecutionPlan>) -> usize {
-    #[allow(deprecated)]
-    let stats = match plan.statistics() {
+    let stats = match plan.partition_statistics(None) {
         Ok(stats) => stats,
         Err(_) => return 0,
     };

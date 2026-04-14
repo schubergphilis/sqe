@@ -441,17 +441,17 @@ mod tests {
     #[derive(Debug)]
     struct MockScanExec {
         schema: SchemaRef,
-        properties: PlanProperties,
+        properties: Arc<PlanProperties>,
     }
 
     impl MockScanExec {
         fn new(schema: SchemaRef, num_partitions: usize) -> Self {
-            let properties = PlanProperties::new(
+            let properties = Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(schema.clone()),
                 Partitioning::UnknownPartitioning(num_partitions),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            );
+            ));
             Self { schema, properties }
         }
     }
@@ -472,7 +472,7 @@ mod tests {
         fn schema(&self) -> SchemaRef {
             self.schema.clone()
         }
-        fn properties(&self) -> &PlanProperties {
+        fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -514,6 +514,7 @@ mod tests {
                 None,
                 PartitionMode::CollectLeft,
                 NullEquality::NullEqualsNothing,
+                false,
             )
             .unwrap(),
         )
@@ -802,6 +803,7 @@ mod tests {
             None,
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
+            false,
         )
         .unwrap();
 

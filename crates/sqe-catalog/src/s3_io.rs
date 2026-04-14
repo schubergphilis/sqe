@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use object_store::path::Path as ObjectPath;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tracing::debug;

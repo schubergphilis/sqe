@@ -119,7 +119,7 @@ pub struct PartialAggregateExec {
     /// Strategy for the merge phase.
     strategy: AggregateStrategy,
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl PartialAggregateExec {
@@ -129,12 +129,12 @@ impl PartialAggregateExec {
     pub fn new(inner: Arc<AggregateExec>, strategy: AggregateStrategy) -> Self {
         let schema = inner.schema();
         let input_partitions = inner.properties().partitioning.partition_count();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),
             Partitioning::UnknownPartitioning(input_partitions),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             inner,
@@ -190,7 +190,7 @@ impl ExecutionPlan for PartialAggregateExec {
         self.inner.schema()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -250,7 +250,7 @@ pub struct FinalAggregateExec {
     /// Strategy that was used (for display/debugging).
     strategy: AggregateStrategy,
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl FinalAggregateExec {
@@ -261,12 +261,12 @@ impl FinalAggregateExec {
     pub fn new(inner: Arc<AggregateExec>, strategy: AggregateStrategy) -> Self {
         let schema = inner.schema();
         let input_partitions = inner.properties().partitioning.partition_count();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),
             Partitioning::UnknownPartitioning(input_partitions),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             inner,
@@ -322,7 +322,7 @@ impl ExecutionPlan for FinalAggregateExec {
         self.inner.schema()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -522,8 +522,7 @@ impl PhysicalOptimizerRule for DistributedAggregateRule {
 
 /// Estimate the total data size (bytes) from a plan's statistics.
 fn estimate_data_size(plan: &Arc<dyn ExecutionPlan>) -> usize {
-    #[allow(deprecated)]
-    let stats = match plan.statistics() {
+    let stats = match plan.partition_statistics(None) {
         Ok(stats) => stats,
         Err(_) => return 0,
     };
@@ -543,8 +542,7 @@ fn estimate_group_cardinality(agg: &AggregateExec) -> Option<usize> {
 
     // Try to get distinct count from the first group-by column's statistics
     let input = &agg.children()[0];
-    #[allow(deprecated)]
-    let stats = input.statistics().ok()?;
+    let stats = input.partition_statistics(None).ok()?;
 
     // Check column statistics for the first group-by expression
     let col_stats = stats.column_statistics.first()?;
