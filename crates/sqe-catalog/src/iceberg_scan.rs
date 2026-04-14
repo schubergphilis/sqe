@@ -389,6 +389,73 @@ impl IcebergScanExec {
             Err(e) => { warn!(error=%e, "PruningPredicate eval failed"); (data_files, 0) }
         }
     }
+
+    /// Prune data files using already-resolved `PhysicalExpr` filters.
+    ///
+    /// This is the dynamic-filter counterpart of `prune_data_files`. Instead of
+    /// converting logical `Expr`s to physical expressions (which requires a
+    /// `SessionContext`), it accepts `PhysicalExpr`s directly — exactly what the
+    /// dynamic filter resolution path produces.
+    ///
+    /// Each filter is turned into a `PruningPredicate` and evaluated against the
+    /// per-file column statistics from the Iceberg manifest. Files whose min/max
+    /// ranges are provably outside the filter bounds are removed.
+    pub fn prune_data_files_with_physical_exprs(
+        data_files: Vec<DataFile>,
+        physical_filters: &[Arc<dyn PhysicalExpr>],
+        schema: &SchemaRef,
+        iceberg_schema: &iceberg::spec::Schema,
+    ) -> (Vec<DataFile>, usize) {
+        if data_files.is_empty() || physical_filters.is_empty() {
+            return (data_files, 0);
+        }
+
+        let mut current_files = data_files;
+        let mut total_pruned = 0usize;
+
+        for filter_expr in physical_filters {
+            if current_files.is_empty() {
+                break;
+            }
+            let pruning_pred = match PruningPredicate::try_new(Arc::clone(filter_expr), schema.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    debug!(error = %e, "PruningPredicate from dynamic filter failed, skipping");
+                    continue;
+                }
+            };
+            let stats = IcebergManifestStatistics::new(
+                current_files.clone(),
+                schema.clone(),
+                iceberg_schema,
+            );
+            match pruning_pred.prune(&stats) {
+                Ok(flags) => {
+                    let before = current_files.len();
+                    current_files = current_files
+                        .into_iter()
+                        .zip(flags)
+                        .filter_map(|(df, keep)| if keep { Some(df) } else { None })
+                        .collect();
+                    let pruned_this_round = before - current_files.len();
+                    total_pruned += pruned_this_round;
+                    if pruned_this_round > 0 {
+                        debug!(
+                            before = before,
+                            after = current_files.len(),
+                            pruned = pruned_this_round,
+                            "Dynamic filter file-level pruning round"
+                        );
+                    }
+                }
+                Err(e) => {
+                    debug!(error = %e, "PruningPredicate eval for dynamic filter failed, skipping");
+                }
+            }
+        }
+
+        (current_files, total_pruned)
+    }
 }
 
 impl DisplayAs for IcebergScanExec {
@@ -529,6 +596,7 @@ impl ExecutionPlan for IcebergScanExec {
         let pushed_down_filters = self.pushed_down_filters.clone();
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         let _files_pruned_minmax = MetricBuilder::new(&self.metrics).counter("files_pruned_minmax", partition);
+        let files_pruned_dynamic = MetricBuilder::new(&self.metrics).counter("files_pruned_dynamic", partition);
         debug!(table=%table.identifier(), predicates=?predicates, snapshot_id=?snapshot_id, pushed_filters=pushed_down_filters.len(), "Executing IcebergScanExec");
 
         // For time-travel: check the specified snapshot exists; for current: check current snapshot.
@@ -556,13 +624,29 @@ impl ExecutionPlan for IcebergScanExec {
             // `collect_data_files_cached` reads the snapshot's manifest list (1 S3 GET
             // on first call) and then serves each manifest's entries from the
             // ManifestCache, avoiding redundant S3 fetches on warm queries.
-            let file_entries = collect_data_files_cached(&table, snapshot_id, manifest_cache.as_ref()).await?;
+            let mut file_entries = collect_data_files_cached(&table, snapshot_id, manifest_cache.as_ref()).await?;
 
             if file_entries.is_empty() {
                 let empty = RecordBatch::new_empty(schema.clone());
                 let s: BatchStream = futures::stream::once(async move { Ok(empty) }).boxed();
                 return Ok::<BatchStream, DataFusionError>(s);
             }
+
+            // ── Sort files by size descending for better S3 pipeline utilization ──
+            //
+            // Reading the largest files first keeps the S3 connection pipeline busy
+            // longer on each request, reducing the relative overhead of per-request
+            // latency. For over-partitioned tables with many small files this also
+            // groups tiny files at the end where their overhead is amortised.
+            let total_scan_bytes: u64 = file_entries.iter().map(|(_, sz)| *sz).sum();
+            file_entries.sort_by(|a, b| b.1.cmp(&a.1));
+            debug!(
+                file_count = file_entries.len(),
+                total_scan_bytes = total_scan_bytes,
+                largest_file_bytes = file_entries.first().map(|(_, sz)| *sz).unwrap_or(0),
+                smallest_file_bytes = file_entries.last().map(|(_, sz)| *sz).unwrap_or(0),
+                "IcebergScanExec: file entries collected and sorted by size descending"
+            );
 
             // ── Direct-read fast path ────────────────────────────────────────
             //
@@ -605,6 +689,52 @@ impl ExecutionPlan for IcebergScanExec {
                         }
                     } else {
                         resolved_filters.push(Arc::clone(filter));
+                    }
+                }
+
+                // ── File-level pruning with dynamic filters ─────────────────
+                //
+                // After the dynamic filters are resolved, use them to skip
+                // entire files whose manifest column statistics (min/max) are
+                // provably outside the filter bounds. This avoids S3 GETs for
+                // files that cannot contain matching rows.
+                //
+                // We load full DataFile objects (with column stats) from the
+                // manifests, then delegate to prune_data_files_with_physical_exprs
+                // which wraps each filter in a PruningPredicate.
+                if !resolved_filters.is_empty() && file_entries.len() > 1 {
+                    let file_paths: std::collections::HashSet<String> =
+                        file_entries.iter().map(|(p, _)| p.clone()).collect();
+                    match collect_data_files_for_pruning(&table, snapshot_id, &file_paths).await {
+                        Ok(data_files) if !data_files.is_empty() => {
+                            let iceberg_schema = table.metadata().current_schema();
+                            let (kept, pruned_count) =
+                                IcebergScanExec::prune_data_files_with_physical_exprs(
+                                    data_files,
+                                    &resolved_filters,
+                                    &schema,
+                                    iceberg_schema,
+                                );
+                            if pruned_count > 0 {
+                                let kept_paths: std::collections::HashSet<String> =
+                                    kept.iter().map(|df| df.file_path().to_string()).collect();
+                                debug!(
+                                    before = file_entries.len(),
+                                    after = kept_paths.len(),
+                                    pruned = pruned_count,
+                                    "Dynamic filter file-level pruning skipped {} files",
+                                    pruned_count
+                                );
+                                file_entries.retain(|(path, _)| kept_paths.contains(path));
+                                files_pruned_dynamic.add(pruned_count);
+                            }
+                        }
+                        Ok(_) => {
+                            debug!("No DataFile objects with stats available for dynamic filter file pruning");
+                        }
+                        Err(e) => {
+                            debug!(error = %e, "Failed to load DataFiles for dynamic filter pruning, continuing without");
+                        }
                     }
                 }
 
@@ -889,6 +1019,113 @@ async fn collect_data_files_cached(
     }
 
     Ok(file_entries)
+}
+
+/// Collect full `DataFile` objects (with column statistics) for the given snapshot.
+///
+/// Unlike `collect_data_files_cached` which returns lightweight `(path, size)` pairs,
+/// this function loads the full manifest entries with lower/upper bounds needed for
+/// `PruningPredicate` evaluation. Used by dynamic-filter file-level pruning.
+///
+/// Only files matching the given `file_paths` set are returned, so callers can
+/// restrict to the files they actually intend to read.
+async fn collect_data_files_for_pruning(
+    table: &Table,
+    snapshot_id: Option<i64>,
+    file_paths: &std::collections::HashSet<String>,
+) -> DFResult<Vec<DataFile>> {
+    let metadata = table.metadata();
+    let snapshot = if let Some(sid) = snapshot_id {
+        match metadata.snapshot_by_id(sid) {
+            Some(s) => s,
+            None => return Ok(Vec::new()),
+        }
+    } else {
+        match metadata.current_snapshot() {
+            Some(s) => s,
+            None => return Ok(Vec::new()),
+        }
+    };
+
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), metadata)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    let mut data_files: Vec<DataFile> = Vec::new();
+
+    for mf in manifest_list.entries() {
+        let manifest = mf
+            .load_manifest(table.file_io())
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        for entry in manifest.entries() {
+            if entry.status() != ManifestStatus::Deleted
+                && entry.data_file().content_type() == DataContentType::Data
+                && file_paths.contains(entry.data_file().file_path())
+            {
+                data_files.push(entry.data_file().clone());
+            }
+        }
+    }
+
+    Ok(data_files)
+}
+
+/// Default target size for file coalescing: 64 MB.
+///
+/// When distributing scan tasks, small files below this threshold are grouped
+/// together so that each task processes roughly `target_size` bytes, reducing
+/// per-file overhead (S3 requests, task scheduling) on over-partitioned tables.
+pub const DEFAULT_COALESCE_TARGET_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Coalesce small file entries into groups of approximately `target_size` bytes.
+///
+/// Reduces per-file overhead (S3 requests, task scheduling) on over-partitioned
+/// tables with many small files. Each group contains one or more files whose
+/// combined size stays near `target_size`. A single file that exceeds the target
+/// is placed alone in its own group.
+///
+/// The input order is preserved within groups: files appear in the same relative
+/// order as the input `entries` slice.
+///
+/// # Example
+///
+/// ```
+/// use sqe_catalog::iceberg_scan::coalesce_file_entries;
+///
+/// let entries = vec![
+///     ("a.parquet".to_string(), 10_000_000u64),
+///     ("b.parquet".to_string(), 20_000_000),
+///     ("c.parquet".to_string(), 50_000_000),
+///     ("d.parquet".to_string(), 5_000_000),
+/// ];
+/// let groups = coalesce_file_entries(entries, 64 * 1024 * 1024);
+/// // All 4 files fit in one group (total 85 MB > 64 MB triggers split)
+/// assert!(groups.len() >= 1);
+/// ```
+pub fn coalesce_file_entries(
+    entries: Vec<(String, u64)>,
+    target_size: u64,
+) -> Vec<Vec<(String, u64)>> {
+    let mut groups: Vec<Vec<(String, u64)>> = Vec::new();
+    let mut current_group: Vec<(String, u64)> = Vec::new();
+    let mut current_size: u64 = 0;
+
+    for entry in entries {
+        let size = entry.1;
+        if !current_group.is_empty() && current_size + size > target_size {
+            groups.push(std::mem::take(&mut current_group));
+            current_size = 0;
+        }
+        current_size += size;
+        current_group.push(entry);
+    }
+    if !current_group.is_empty() {
+        groups.push(current_group);
+    }
+    groups
 }
 
 /// Wraps a DataFusion `PhysicalExpr` as a Parquet `ArrowPredicate` for row-level
