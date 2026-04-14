@@ -33,11 +33,15 @@ object_store = { version = "0.12", features = ["aws"] }
 
 # Iceberg — RisingWave fork for rewrite_files() / overwrite_files() transaction support.
 # Upstream apache/iceberg-rust 0.9 lacks OverwriteAction/RewriteFilesAction.
-# Pin to known-good rev used by nimtable/iceberg-compaction in production.
-# Note: iceberg-storage-opendal is folded into the core `iceberg` crate in this fork.
-iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "1978911ec4" }
-iceberg-catalog-rest = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "1978911ec4" }
-iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "1978911ec4" }
+# RisingWave fork provides: rewrite_files, PositionDeleteFileWriter, DeletionVectorWriter.
+# Pin to latest rev on dev_rebase_main_20260303 (Apr 13 2026).
+# Gains over previous pin (1978911ec4): parallel manifest loading, sort ID support,
+# delete vector exposure. API-compatible, no breaking changes.
+# Next step: fork this branch and rebase to DF 53 / Arrow 58 for hash join dynamic
+# filters, LIMIT-aware pruning, and 40x faster planning.
+iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "645f02a4b533" }
+iceberg-catalog-rest = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "645f02a4b533" }
+iceberg-datafusion = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "645f02a4b533" }
 
 # SQL parser — DataFusion 52 ships sqlparser 0.53
 sqlparser = "0.53"
