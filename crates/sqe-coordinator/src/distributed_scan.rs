@@ -51,7 +51,7 @@ pub struct DistributedScanExec {
     scan_tasks: Vec<ScanTask>,
     worker_urls: Vec<String>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     /// Optional credential expiry for the vended credentials included in scan tasks.
     credential_expiry: Option<DateTime<Utc>>,
     /// Optional tracker for coordinating credential refresh pushes.
@@ -119,12 +119,12 @@ impl DistributedScanExec {
         assert_eq!(scan_tasks.len(), worker_urls.len());
         let num_partitions = scan_tasks.len();
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(num_partitions),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             scan_tasks,
@@ -209,7 +209,7 @@ impl ExecutionPlan for DistributedScanExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

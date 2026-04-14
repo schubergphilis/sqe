@@ -110,7 +110,7 @@ pub struct ShuffleWriterExec {
     /// Stage identifier (for exchange descriptor routing).
     stage_id: String,
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl ShuffleWriterExec {
@@ -134,14 +134,14 @@ impl ShuffleWriterExec {
         let input_partitions = input.properties().partitioning.partition_count();
         let schema = input.schema();
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),
             // Output partitioning matches the input — each input partition
             // independently writes to ALL target partitions.
             Partitioning::UnknownPartitioning(input_partitions),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             input,
@@ -200,7 +200,7 @@ impl ExecutionPlan for ShuffleWriterExec {
         self.input.schema()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -295,7 +295,7 @@ pub struct ShuffleReaderExec {
     /// Stage identifier (for tracing/debugging).
     stage_id: String,
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl ShuffleReaderExec {
@@ -319,12 +319,12 @@ impl ShuffleReaderExec {
             .map(|rx| Arc::new(Mutex::new(Some(rx))))
             .collect();
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(num_partitions),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             schema,
@@ -380,7 +380,7 @@ impl ExecutionPlan for ShuffleReaderExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -549,17 +549,17 @@ mod tests {
     #[derive(Debug)]
     struct SinglePartitionPlan {
         schema: SchemaRef,
-        properties: PlanProperties,
+        properties: Arc<PlanProperties>,
     }
 
     impl SinglePartitionPlan {
         fn new(schema: SchemaRef) -> Self {
-            let properties = PlanProperties::new(
+            let properties = Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(schema.clone()),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            );
+            ));
             Self { schema, properties }
         }
     }
@@ -580,7 +580,7 @@ mod tests {
         fn schema(&self) -> SchemaRef {
             self.schema.clone()
         }
-        fn properties(&self) -> &PlanProperties {
+        fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

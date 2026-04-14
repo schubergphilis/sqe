@@ -204,18 +204,11 @@ impl BroadcastJoinPlan {
             BroadcastSide::Right => estimate_side_size(hash_join.right()),
         };
 
-        // Clone the HashJoinExec by reconstructing it.
-        let inner = HashJoinExec::try_new(
-            Arc::clone(hash_join.left()),
-            Arc::clone(hash_join.right()),
-            hash_join.on().to_vec(),
-            hash_join.filter().cloned(),
-            hash_join.join_type(),
-            None, // projection
-            *hash_join.partition_mode(),
-            hash_join.null_equality(),
-        )
-        .expect("BroadcastJoinPlan: failed to reconstruct HashJoinExec");
+        // Clone the HashJoinExec via its builder, which preserves all fields.
+        let inner = hash_join
+            .builder()
+            .build()
+            .expect("BroadcastJoinPlan: failed to reconstruct HashJoinExec");
 
         let inner_join = Arc::new(inner);
         let inner_as_plan = Arc::clone(&inner_join) as Arc<dyn ExecutionPlan>;
@@ -279,7 +272,7 @@ impl ExecutionPlan for BroadcastJoinPlan {
         self.inner_join.schema()
     }
 
-    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
         self.inner_join.properties()
     }
 
@@ -356,7 +349,7 @@ pub struct ShuffleHashJoinPlan {
     /// Number of shuffle partitions (typically = number of executors).
     num_partitions: usize,
     /// Cached plan properties from the underlying join.
-    properties: datafusion::physical_plan::PlanProperties,
+    properties: Arc<datafusion::physical_plan::PlanProperties>,
 }
 
 impl ShuffleHashJoinPlan {
@@ -384,12 +377,12 @@ impl ShuffleHashJoinPlan {
         fields.extend(probe_schema.fields().iter().cloned());
         let output_schema = Arc::new(arrow_schema::Schema::new(fields));
 
-        let properties = datafusion::physical_plan::PlanProperties::new(
+        let properties = Arc::new(datafusion::physical_plan::PlanProperties::new(
             datafusion::physical_expr::EquivalenceProperties::new(output_schema),
             datafusion::physical_plan::Partitioning::UnknownPartitioning(num_partitions),
             datafusion::physical_plan::execution_plan::EmissionType::Incremental,
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
-        );
+        ));
 
         Self {
             build_side,
@@ -532,7 +525,7 @@ impl ExecutionPlan for ShuffleHashJoinPlan {
         self.properties.eq_properties.schema().clone()
     }
 
-    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
         &self.properties
     }
 
@@ -708,8 +701,7 @@ impl PhysicalOptimizerRule for PreSortedJoinRule {
 /// Uses `total_byte_size` from the plan's statistics if available.
 /// Returns `0` if statistics are unavailable.
 fn estimate_side_size(plan: &Arc<dyn ExecutionPlan>) -> usize {
-    #[allow(deprecated)]
-    let stats = match plan.statistics() {
+    let stats = match plan.partition_statistics(None) {
         Ok(stats) => stats,
         Err(_) => return 0,
     };
@@ -855,6 +847,7 @@ mod tests {
             None,
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
+            false,
         )
         .unwrap()
     }

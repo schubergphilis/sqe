@@ -528,7 +528,7 @@ impl QueryHandler {
                 match &kind {
                     StatementKind::Insert(stmt) => {
                         if let Statement::Insert(ins) = stmt.as_ref() {
-                            let table = ins.table_name.to_string();
+                            let table = ins.table.to_string();
                             cache.invalidate(&table);
                         }
                     }

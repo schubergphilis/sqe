@@ -6,7 +6,7 @@ use datafusion::execution::memory_pool::MemoryConsumer;
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use object_store::aws::AmazonS3Builder;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use object_store::path::Path as ObjectPath;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::ParquetObjectReader;
@@ -92,7 +92,7 @@ pub async fn execute_scan(
     // allocations are tracked and the worker memory limit is enforced.
     let pool = session_ctx.runtime_env().memory_pool.clone();
     let consumer = MemoryConsumer::new(format!("scan:{}", task.fragment_id));
-    let mut reservation = consumer.register(&pool);
+    let reservation = consumer.register(&pool);
 
     let mut all_batches = Vec::new();
     let mut result_schema: Option<SchemaRef> = None;
@@ -185,7 +185,7 @@ pub async fn execute_scan(
                 // does not expose a page-skip counter from its internal PageIndex
                 // pruning. Instrumenting this requires upstream changes in arrow-rs
                 // or a custom ParquetExec wrapper. Tracked for future work.
-                let reader_opts = ArrowReaderOptions::new().with_page_index(true);
+                let reader_opts = ArrowReaderOptions::new().with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required);
                 let arrow_meta = ArrowReaderMetadata::try_new(
                     cached_meta,
                     reader_opts,
@@ -193,7 +193,7 @@ pub async fn execute_scan(
                 ParquetRecordBatchStreamBuilder::new_with_metadata(reader, arrow_meta)
             } else {
                 // Enable page-level min/max pruning for direct reads too
-                let reader_opts = ArrowReaderOptions::new().with_page_index(true);
+                let reader_opts = ArrowReaderOptions::new().with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required);
                 ParquetRecordBatchStreamBuilder::new_with_options(reader, reader_opts).await?
             };
 

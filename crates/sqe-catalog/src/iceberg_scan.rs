@@ -42,7 +42,7 @@ pub struct IcebergScanExec {
     projection: Option<Vec<String>>,
     predicates: Option<Predicate>,
     df_filters: Vec<Expr>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     /// Optional snapshot ID for time travel queries.
     snapshot_id: Option<i64>,
@@ -133,7 +133,7 @@ impl IcebergScanExec {
                 None => EquivalenceProperties::new(projected_schema.clone()),
             }
         };
-        let properties = PlanProperties::new(eq_props, Partitioning::UnknownPartitioning(1), EmissionType::Incremental, Boundedness::Bounded);
+        let properties = Arc::new(PlanProperties::new(eq_props, Partitioning::UnknownPartitioning(1), EmissionType::Incremental, Boundedness::Bounded));
         Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, manifest_cache: None, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES }
     }
 
@@ -176,12 +176,12 @@ impl IcebergScanExec {
             let sort_order = self.table.metadata().default_sort_order();
             let iceberg_schema = self.table.metadata().current_schema();
             if let Some(sort_exprs) = crate::sort_order::iceberg_sort_to_physical(sort_order, iceberg_schema, &self.projected_schema) {
-                self.properties = PlanProperties::new(
+                self.properties = Arc::new(PlanProperties::new(
                     crate::sort_order::equivalence_with_sort(self.projected_schema.clone(), sort_exprs),
                     Partitioning::UnknownPartitioning(1),
                     EmissionType::Incremental,
                     Boundedness::Bounded,
-                );
+                ));
             }
         }
         self.trust_sort_order = trust;
@@ -356,7 +356,7 @@ impl ExecutionPlan for IcebergScanExec {
     fn name(&self) -> &str { "IcebergScanExec" }
     fn as_any(&self) -> &dyn Any { self }
     fn schema(&self) -> SchemaRef { self.projected_schema.clone() }
-    fn properties(&self) -> &PlanProperties { &self.properties }
+    fn properties(&self) -> &Arc<PlanProperties> { &self.properties }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![] }
     fn with_new_children(self: Arc<Self>, _c: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> { Ok(self) }
     fn metrics(&self) -> Option<MetricsSet> { Some(self.metrics.clone_inner()) }
@@ -441,7 +441,7 @@ impl ExecutionPlan for IcebergScanExec {
 
                     // Parse Parquet from the in-memory bytes.
                     // `bytes::Bytes` implements `ChunkReader` so this works directly.
-                    let reader_opts = ArrowReaderOptions::new().with_page_index(true);
+                    let reader_opts = ArrowReaderOptions::new().with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required);
                     let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(bytes, reader_opts)
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
