@@ -6,17 +6,22 @@ use std::task::{Context, Poll};
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use datafusion::common::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_optimizer::pruning::PruningPredicate;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::filter_pushdown::{
+    ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
+};
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr,
+    PlanProperties,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use iceberg::expr::Predicate;
@@ -64,6 +69,17 @@ pub struct IcebergScanExec {
     ///
     /// Set to 0 to disable the fast path. Default: [`DEFAULT_SMALL_FILE_THRESHOLD_BYTES`].
     small_file_threshold_bytes: u64,
+    /// Dynamic filters pushed down from parent operators (e.g., hash join build side).
+    ///
+    /// During the physical optimizer's filter pushdown phase, parent operators such as
+    /// `HashJoinExec` create `DynamicFilterPhysicalExpr` objects that are pushed down
+    /// to leaf scan nodes. When the hash join's build side completes at execution time,
+    /// it updates the dynamic filter with min/max bounds. The scan node can use these
+    /// bounds to skip files/row groups that cannot match.
+    ///
+    /// These are `PhysicalExpr`s (not logical `Expr`s) because they come from the
+    /// physical optimizer, after logical-to-physical conversion has already occurred.
+    pushed_down_filters: Vec<Arc<dyn PhysicalExpr>>,
 }
 
 impl IcebergScanExec {
@@ -134,7 +150,7 @@ impl IcebergScanExec {
             }
         };
         let properties = Arc::new(PlanProperties::new(eq_props, Partitioning::UnknownPartitioning(1), EmissionType::Incremental, Boundedness::Bounded));
-        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, manifest_cache: None, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES }
+        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, manifest_cache: None, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![] }
     }
 
     /// Attach a shared manifest file cache for warm-query acceleration.
@@ -192,6 +208,29 @@ impl IcebergScanExec {
     pub fn predicates(&self) -> Option<&Predicate> { self.predicates.as_ref() }
     pub fn df_filters(&self) -> &[Expr] { &self.df_filters }
     pub fn projection(&self) -> Option<&[String]> { self.projection.as_deref() }
+    pub fn pushed_down_filters(&self) -> &[Arc<dyn PhysicalExpr>] { &self.pushed_down_filters }
+
+    /// Create a copy of this scan with additional dynamic filters pushed down
+    /// from parent operators (e.g., `HashJoinExec` build-side bounds).
+    ///
+    /// The returned node inherits all fields from `self` but replaces the
+    /// `pushed_down_filters` with the given set.
+    fn clone_with_pushed_filters(&self, filters: Vec<Arc<dyn PhysicalExpr>>) -> Self {
+        Self {
+            table: self.table.clone(),
+            projected_schema: self.projected_schema.clone(),
+            projection: self.projection.clone(),
+            predicates: self.predicates.clone(),
+            df_filters: self.df_filters.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+            snapshot_id: self.snapshot_id,
+            trust_sort_order: self.trust_sort_order,
+            manifest_cache: self.manifest_cache.clone(),
+            small_file_threshold_bytes: self.small_file_threshold_bytes,
+            pushed_down_filters: filters,
+        }
+    }
 
     /// Returns the names of identity-transform partition columns from the
     /// Iceberg table's default partition spec.
@@ -348,7 +387,16 @@ impl IcebergScanExec {
 
 impl DisplayAs for IcebergScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "IcebergScanExec: table={}, projection={:?}, predicate=[{}], df_filters={}, snapshot_id={:?}", self.table.identifier(), self.projection, self.predicates.as_ref().map_or(String::new(), |p| format!("{p}")), self.df_filters.len(), self.snapshot_id)
+        write!(
+            f,
+            "IcebergScanExec: table={}, projection={:?}, predicate=[{}], df_filters={}, pushed_down_filters={}, snapshot_id={:?}",
+            self.table.identifier(),
+            self.projection,
+            self.predicates.as_ref().map_or(String::new(), |p| format!("{p}")),
+            self.df_filters.len(),
+            self.pushed_down_filters.len(),
+            self.snapshot_id,
+        )
     }
 }
 
@@ -360,6 +408,43 @@ impl ExecutionPlan for IcebergScanExec {
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![] }
     fn with_new_children(self: Arc<Self>, _c: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> { Ok(self) }
     fn metrics(&self) -> Option<MetricsSet> { Some(self.metrics.clone_inner()) }
+
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> DFResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        // As a leaf node we have no children, so child_results on each parent
+        // filter is empty.  We accept ALL parent filters — they will be
+        // evaluated at execution time (e.g., for dynamic hash-join bounds).
+        let mut accepted_filters: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
+        let mut filter_results: Vec<PushedDown> = Vec::new();
+
+        for pf in &child_pushdown_result.parent_filters {
+            // Accept every filter the parent wants to push down.
+            accepted_filters.push(Arc::clone(&pf.filter));
+            filter_results.push(PushedDown::Yes);
+        }
+
+        if accepted_filters.is_empty() {
+            // Nothing new to store — keep the current node unchanged.
+            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+                filter_results,
+            ));
+        }
+
+        // Merge with any previously stored pushed-down filters.
+        let mut all_pushed = self.pushed_down_filters.clone();
+        all_pushed.extend(accepted_filters);
+
+        let new_scan = self.clone_with_pushed_filters(all_pushed);
+
+        Ok(
+            FilterPushdownPropagation::with_parent_pushdown_result(filter_results)
+                .with_updated_node(Arc::new(new_scan)),
+        )
+    }
 
     fn execute(&self, partition: usize, _context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
         let span = info_span!("iceberg_scan", table=%self.table.identifier(), partition=partition, predicates=?self.predicates);
