@@ -179,6 +179,16 @@ The lightweight test stack -- Polaris in-memory mode plus RustFS (a Rust-native 
 **Dead end: mocking the Iceberg catalog for integration tests.** We tried. We built mock implementations of the catalog traits that returned canned responses. The unit tests passed. Then we connected to a real Polaris instance and discovered that our mock didn't simulate Polaris's credential vending flow, which meant our S3 client configuration was wrong in production even though tests were green. Mock what you must, but test against the real thing as early as you can afford to.
 :::
 
+**Depending on a fork without a maintenance plan.** SQE depended on RisingWave's iceberg-rust fork from day one. The fork had features upstream lacked. It worked. We pinned to a specific commit and moved on.
+
+Then DataFusion 53 shipped with hash join dynamic filters and 40x faster planning. We wanted it. The fork had not rebased. No timeline. No issue filed. No communication channel to ask.
+
+The fix took two days: fork the fork, apply the DF 53 delta using upstream PR #2206 as a template, vendor the result into the repo. Mechanical work, zero creativity required. But we could have avoided the scramble by establishing the maintenance plan earlier: who rebases the fork, when, and what happens if they do not.
+
+The lesson is not "do not depend on forks." Sometimes forks are the only option. The lesson is: treat fork dependencies like you treat third-party SLAs. Define what happens when the upstream moves and the fork does not. For SQE, the answer was vendoring. For other projects, it might be contributing the missing features to upstream, or maintaining a patch series, or accepting the version lag.
+
+We vendored the fork into `vendor/iceberg-rust/` (4.6 MB). One directory, three crates, its own workspace Cargo.toml. When upstream merges the features SQE needs (tracked via issues #2185 and #2203), we delete the vendor directory and switch to the official crate. The exit plan is documented. The cost is one rebase per DataFusion release.
+
 
 ## The Abstraction That Has a Ceiling
 
