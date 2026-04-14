@@ -652,23 +652,15 @@ impl ExecutionPlan for IcebergScanExec {
             // ── Fallback: iceberg-rust scan.to_arrow() pipeline ──────────────
             //
             // Used when the small-file fast path is disabled (`threshold = 0`) or
-            // any file exceeds the threshold. This is the original path and handles
-            // predicate pushdown via the Iceberg scan API.
+            // any file exceeds the threshold. This path handles predicate pushdown
+            // via the Iceberg scan API.
             //
-            // TODO: Dynamic filter row-level filtering is not yet applied in this
-            // path. The iceberg-rust `scan.to_arrow()` pipeline does not expose a
-            // hook for injecting Parquet RowFilters. To support dynamic filters
-            // here, we would need to either:
-            //   (a) Post-filter the arrow stream with a FilterExec-style operator, or
-            //   (b) Switch this path to also use direct file reads with row filters.
-            // For now, dynamic filters only benefit the direct-read fast path above.
-            if !pushed_down_filters.is_empty() {
-                debug!(
-                    count = pushed_down_filters.len(),
-                    "Dynamic filters present but not applied in iceberg-rust fallback path; \
-                     filtering will happen in parent FilterExec"
-                );
-            }
+            // Dynamic filters are applied as a post-scan filter on the arrow stream.
+            // We don't wait_complete() here (would deadlock if this scan is the
+            // hash join probe side). Instead, we snapshot the current filter state
+            // per batch — by the time batches flow, the build side has likely
+            // finished and updated the filter. Batches that arrive before the filter
+            // is ready pass through unfiltered (same as no dynamic filter).
             debug!(
                 file_count = file_entries.len(),
                 "IcebergScanExec: using iceberg-rust scan.to_arrow() path"
@@ -679,9 +671,67 @@ impl ExecutionPlan for IcebergScanExec {
             if let Some(pred) = predicates { sb = sb.with_filter(pred); }
             let scan = sb.build().map_err(|e| DataFusionError::External(Box::new(e)))?;
             let arrow_stream = scan.to_arrow().await.map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let s: BatchStream = arrow_stream
-                .map_err(|e: iceberg::Error| DataFusionError::External(Box::new(e)))
-                .boxed();
+
+            // Wrap the stream with dynamic filter evaluation if filters are present.
+            let s: BatchStream = if !pushed_down_filters.is_empty() {
+                debug!(
+                    count = pushed_down_filters.len(),
+                    "Applying dynamic filters as post-scan filter on fallback path"
+                );
+                let filters = pushed_down_filters.clone();
+                let filtered_schema = schema.clone();
+                arrow_stream
+                    .map_err(|e: iceberg::Error| DataFusionError::External(Box::new(e)))
+                    .and_then(move |batch| {
+                        let filters = filters.clone();
+                        let filtered_schema = filtered_schema.clone();
+                        async move {
+                            let mut result = batch;
+                            for filter in &filters {
+                                // For DynamicFilterPhysicalExpr, get the current snapshot
+                                // (non-blocking — returns the latest filter or lit(true) if
+                                // the build side hasn't finished yet).
+                                let expr: Arc<dyn PhysicalExpr> = if let Some(dynamic) = filter.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
+                                    match dynamic.current() {
+                                        Ok(e) => e,
+                                        Err(_) => continue,
+                                    }
+                                } else {
+                                    Arc::clone(filter)
+                                };
+
+                                // Evaluate the filter on the batch
+                                let predicate = match expr.evaluate(&result) {
+                                    Ok(ColumnarValue::Array(arr)) => {
+                                        match arr.as_any().downcast_ref::<BooleanArray>() {
+                                            Some(bool_arr) => bool_arr.clone(),
+                                            None => continue,
+                                        }
+                                    }
+                                    Ok(ColumnarValue::Scalar(s)) => {
+                                        if s == datafusion::common::ScalarValue::Boolean(Some(true)) {
+                                            continue; // All rows pass
+                                        } else {
+                                            // No rows pass — return empty batch
+                                            return Ok(RecordBatch::new_empty(filtered_schema));
+                                        }
+                                    }
+                                    Err(_) => continue, // Skip filter on error
+                                };
+
+                                // Apply the boolean mask
+                                result = arrow::compute::filter_record_batch(&result, &predicate)
+                                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                            }
+                            Ok(result)
+                        }
+                    })
+                    .boxed()
+            } else {
+                arrow_stream
+                    .map_err(|e: iceberg::Error| DataFusionError::External(Box::new(e)))
+                    .boxed()
+            };
             Ok::<BatchStream, DataFusionError>(s)
         }).try_flatten();
         Ok(Box::pin(IcebergRecordBatchStream { schema, inner: Box::pin(stream), baseline }))
