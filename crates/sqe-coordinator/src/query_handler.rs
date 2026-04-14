@@ -2579,4 +2579,141 @@ mod tests {
         assert_eq!(result["value"], "int");
         assert_eq!(result["value-required"], false);
     }
+
+    // ── extract_grant_fields tests ──────────────────────────────────
+
+    #[test]
+    fn extract_grant_fields_basic_table() {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let sql = "GRANT SELECT ON my_catalog.my_schema.my_table TO alice";
+        let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+        let (privilege, catalog, namespace, table, _grantee_type, grantee_name) =
+            QueryHandler::extract_grant_fields(&stmts[0]).unwrap();
+
+        assert_eq!(privilege, "SELECT");
+        assert_eq!(catalog.as_deref(), Some("my_catalog"));
+        assert_eq!(namespace.as_deref(), Some("my_schema"));
+        assert_eq!(table.as_deref(), Some("my_table"));
+        assert_eq!(grantee_name, "alice");
+    }
+
+    #[test]
+    fn extract_grant_fields_two_part_name() {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let sql = "GRANT INSERT ON my_schema.my_table TO bob";
+        let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+        let (privilege, catalog, namespace, table, _, grantee_name) =
+            QueryHandler::extract_grant_fields(&stmts[0]).unwrap();
+
+        assert_eq!(privilege, "INSERT");
+        assert!(catalog.is_none());
+        assert_eq!(namespace.as_deref(), Some("my_schema"));
+        assert_eq!(table.as_deref(), Some("my_table"));
+        assert_eq!(grantee_name, "bob");
+    }
+
+    #[test]
+    fn extract_grant_fields_single_table_name() {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let sql = "GRANT DELETE ON my_table TO charlie";
+        let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+        let (privilege, catalog, namespace, table, _, grantee_name) =
+            QueryHandler::extract_grant_fields(&stmts[0]).unwrap();
+
+        assert_eq!(privilege, "DELETE");
+        assert!(catalog.is_none());
+        assert!(namespace.is_none());
+        assert_eq!(table.as_deref(), Some("my_table"));
+        assert_eq!(grantee_name, "charlie");
+    }
+
+    #[test]
+    fn extract_grant_fields_revoke() {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let sql = "REVOKE SELECT ON prod.analytics.events FROM alice";
+        let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+        let (privilege, catalog, namespace, table, _, grantee_name) =
+            QueryHandler::extract_grant_fields(&stmts[0]).unwrap();
+
+        assert_eq!(privilege, "SELECT");
+        assert_eq!(catalog.as_deref(), Some("prod"));
+        assert_eq!(namespace.as_deref(), Some("analytics"));
+        assert_eq!(table.as_deref(), Some("events"));
+        assert_eq!(grantee_name, "alice");
+    }
+
+    #[test]
+    fn extract_grant_fields_all_tables_in_schema() {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let sql = "GRANT SELECT ON ALL TABLES IN SCHEMA my_schema TO analyst";
+        let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+        let (privilege, catalog, namespace, table, _, grantee_name) =
+            QueryHandler::extract_grant_fields(&stmts[0]).unwrap();
+
+        assert_eq!(privilege, "SELECT");
+        assert!(catalog.is_none());
+        assert_eq!(namespace.as_deref(), Some("my_schema"));
+        assert!(table.is_none(), "ALL TABLES IN SCHEMA should not set table");
+        assert_eq!(grantee_name, "analyst");
+    }
+
+    #[test]
+    fn extract_grant_fields_rejects_non_grant_statement() {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let sql = "SELECT 1";
+        let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+        let result = QueryHandler::extract_grant_fields(&stmts[0]);
+
+        assert!(result.is_err(), "Should reject non-GRANT/REVOKE statements");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Expected GRANT/REVOKE"),
+            "Error message should mention GRANT/REVOKE, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn extract_grant_fields_grantee_type_for_bare_identifier() {
+        // sqlparser 0.54 parses `TO alice` as GranteesType::None (bare identifier,
+        // no explicit ROLE/USER prefix). Our code formats this via Debug as "NONE".
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let sql = "GRANT SELECT ON t TO alice";
+        let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+        let (_, _, _, _, grantee_type, _) =
+            QueryHandler::extract_grant_fields(&stmts[0]).unwrap();
+
+        assert_eq!(grantee_type, "NONE");
+    }
+
+    /// DENY is not a standard SQL keyword recognized by sqlparser.
+    /// It cannot be parsed as a Statement::Grant or Statement::Revoke.
+    /// SQE would need custom pre-scan logic to handle DENY syntax.
+    /// This test documents the current behavior: DENY is a parse error.
+    #[test]
+    fn deny_is_not_parseable_by_sqlparser() {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let sql = "DENY SELECT ON my_table TO alice";
+        let result = Parser::parse_sql(&GenericDialect {}, sql);
+
+        assert!(
+            result.is_err(),
+            "DENY should not parse as valid SQL in sqlparser 0.54"
+        );
+    }
 }

@@ -415,6 +415,61 @@ impl ExecutionPlan for IcebergScanExec {
     fn with_new_children(self: Arc<Self>, _c: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> { Ok(self) }
     fn metrics(&self) -> Option<MetricsSet> { Some(self.metrics.clone_inner()) }
 
+    /// Provide table statistics from Iceberg snapshot metadata for cost-based optimization.
+    ///
+    /// DataFusion's JoinSelection optimizer uses these to:
+    /// 1. Put the smaller table on the build side of hash joins
+    /// 2. Choose CollectLeft mode for small tables (broadcast)
+    ///
+    /// Statistics come from the current snapshot's summary (synchronous — metadata
+    /// is already loaded in the Table object, no S3 I/O needed).
+    fn partition_statistics(&self, _partition: Option<usize>) -> DFResult<datafusion::common::Statistics> {
+        use datafusion::common::{stats::Precision, ColumnStatistics, Statistics};
+
+        let metadata = self.table.metadata();
+        let snapshot = match metadata.current_snapshot() {
+            Some(s) => s,
+            None => return Ok(Statistics::new_unknown(&self.projected_schema)),
+        };
+
+        // Extract total-records and total-file-size from snapshot summary.
+        // These are maintained by Iceberg writers and available without reading manifests.
+        let summary = &snapshot.summary().additional_properties;
+        let total_records = summary
+            .get("total-records")
+            .and_then(|v| v.parse::<usize>().ok());
+        let total_file_size = summary
+            .get("total-files-size")
+            .and_then(|v| v.parse::<usize>().ok());
+
+        let num_rows = match total_records {
+            Some(n) => Precision::Inexact(n),
+            None => Precision::Absent,
+        };
+        let total_byte_size = match total_file_size {
+            Some(n) => Precision::Inexact(n),
+            None => Precision::Absent,
+        };
+
+        // Per-column statistics: provide Absent for now.
+        // Full column-level stats (min/max/null_count) require reading manifests
+        // which is async and cannot be done here synchronously.
+        // The row count and byte size alone are sufficient for JoinSelection
+        // to make correct build-side decisions.
+        let column_statistics = self
+            .projected_schema
+            .fields()
+            .iter()
+            .map(|_| ColumnStatistics::new_unknown())
+            .collect();
+
+        Ok(Statistics {
+            num_rows,
+            total_byte_size,
+            column_statistics,
+        })
+    }
+
     fn handle_child_pushdown_result(
         &self,
         _phase: FilterPushdownPhase,
