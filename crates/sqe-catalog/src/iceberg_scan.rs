@@ -509,39 +509,6 @@ impl ExecutionPlan for IcebergScanExec {
                 return Ok::<BatchStream, DataFusionError>(s);
             }
 
-            // ── Resolve dynamic filters ─────────────────────────────────────
-            //
-            // Dynamic filters are pushed down from parent operators (e.g., hash
-            // join build side). We wait for the build side to complete, then
-            // extract the resolved filter expression which typically contains
-            // min/max bounds (e.g., `col >= 5 AND col <= 100`).
-            let mut resolved_filters: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
-            for filter in &pushed_down_filters {
-                if let Some(dynamic) = filter.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
-                    // Block until the hash join build side has finished and
-                    // populated the dynamic filter with actual bounds.
-                    dynamic.wait_complete().await;
-                    match dynamic.current() {
-                        Ok(expr) => {
-                            debug!(filter = %expr, "Resolved dynamic filter");
-                            resolved_filters.push(expr);
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "Failed to resolve dynamic filter, skipping");
-                        }
-                    }
-                } else {
-                    // Static pushed filter — use directly.
-                    resolved_filters.push(Arc::clone(filter));
-                }
-            }
-            if !resolved_filters.is_empty() {
-                debug!(
-                    count = resolved_filters.len(),
-                    "Dynamic filters resolved for Parquet row filtering"
-                );
-            }
-
             // ── Direct-read fast path ────────────────────────────────────────
             //
             // When the threshold is non-zero and ALL data files are below it, read
@@ -560,6 +527,31 @@ impl ExecutionPlan for IcebergScanExec {
 
                 let file_io = table.file_io().clone();
                 let mut all_batches: Vec<RecordBatch> = Vec::new();
+
+                // Resolve dynamic filters ONLY in the direct-read path.
+                // Do NOT call wait_complete() before determining the path —
+                // it would deadlock when the hash join probe side IS this scan
+                // (probe waits for build, build waits for probe to stream).
+                let mut resolved_filters: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
+                for filter in &pushed_down_filters {
+                    if let Some(dynamic) = filter.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
+                        // Wait for the hash join build side to finish.
+                        // Safe here: direct-read is for small files, so the scan
+                        // starts quickly after the build side completes.
+                        dynamic.wait_complete().await;
+                        match dynamic.current() {
+                            Ok(expr) => {
+                                debug!(filter = %expr, "Resolved dynamic filter for direct-read");
+                                resolved_filters.push(expr);
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Failed to resolve dynamic filter, skipping");
+                            }
+                        }
+                    } else {
+                        resolved_filters.push(Arc::clone(filter));
+                    }
+                }
 
                 for (path, size) in &file_entries {
                     debug!(path = %path, size = size, "Direct-read: reading file");
@@ -670,10 +662,10 @@ impl ExecutionPlan for IcebergScanExec {
             //   (a) Post-filter the arrow stream with a FilterExec-style operator, or
             //   (b) Switch this path to also use direct file reads with row filters.
             // For now, dynamic filters only benefit the direct-read fast path above.
-            if !resolved_filters.is_empty() {
-                warn!(
-                    count = resolved_filters.len(),
-                    "Dynamic filters resolved but cannot be applied in iceberg-rust fallback path; \
+            if !pushed_down_filters.is_empty() {
+                debug!(
+                    count = pushed_down_filters.len(),
+                    "Dynamic filters present but not applied in iceberg-rust fallback path; \
                      filtering will happen in parent FilterExec"
                 );
             }
