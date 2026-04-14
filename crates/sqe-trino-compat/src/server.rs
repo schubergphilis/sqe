@@ -353,7 +353,15 @@ fn build_page_response(
 
 // ── Handlers ──────────────────────────────────────────────────
 
-#[tracing::instrument(skip_all, name = "trino.submit_query")]
+#[tracing::instrument(
+    skip_all,
+    fields(
+        db.system.name = "sqe",
+        db.operation.name = tracing::field::Empty,
+        db.namespace = tracing::field::Empty,
+    ),
+    name = "trino.submit_query",
+)]
 async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     State(state): State<Arc<TrinoState<A, Q>>>,
     headers: HeaderMap,
@@ -421,6 +429,21 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 
     // Apply Trino client headers (catalog, schema, source) to the session.
     let session = apply_trino_headers(session, &trino_headers);
+
+    // Record OTel semantic convention attributes on the current span.
+    {
+        let span = tracing::Span::current();
+        // Best-effort: classify the SQL to get the operation name.
+        let op = sql
+            .split_whitespace()
+            .next()
+            .unwrap_or("unknown")
+            .to_uppercase();
+        span.record("db.operation.name", op.as_str());
+        if let Some(ref schema) = session.default_schema {
+            span.record("db.namespace", schema.as_str());
+        }
+    }
 
     let sql_hash = {
         use sha2::{Digest, Sha256};

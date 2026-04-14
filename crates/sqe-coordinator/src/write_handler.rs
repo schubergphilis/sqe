@@ -20,8 +20,8 @@ use tracing::instrument;
 
 use crate::catalog_ops::parse_table_ref;
 use crate::writer::{
-    write_data_files_streaming_with_metrics, write_data_files_with_metrics,
-    write_position_delete_files,
+    parse_parquet_compression, write_data_files_streaming_with_metrics,
+    write_data_files_with_metrics, write_position_delete_files,
 };
 
 /// Build a single-row RecordBatch reporting affected row count.
@@ -65,6 +65,11 @@ impl WriteHandler {
     pub fn with_table_cache(mut self, cache: TableMetadataCache) -> Self {
         self.table_cache = Some(cache);
         self
+    }
+
+    /// Return the Parquet compression codec from config.
+    fn compression(&self) -> parquet::basic::Compression {
+        parse_parquet_compression(&self.config.catalog.parquet_compression)
     }
 
     /// Handle CREATE TABLE [OR REPLACE] ns.table AS SELECT ...
@@ -149,7 +154,7 @@ impl WriteHandler {
         // Write data files (skip if no data)
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         if total_rows > 0 {
-            let data_files = write_data_files_with_metrics(&table, batches, "ctas", self.metrics.as_ref()).await?;
+            let data_files = write_data_files_with_metrics(&table, batches, "ctas", self.metrics.as_ref(), self.compression()).await?;
 
             if !data_files.is_empty() {
                 // Commit data files via fast-append transaction
@@ -263,6 +268,7 @@ impl WriteHandler {
             stream,
             "ctas",
             self.metrics.as_ref(),
+            self.compression(),
         )
         .await?;
 
@@ -349,6 +355,7 @@ impl WriteHandler {
             stream,
             "insert",
             self.metrics.as_ref(),
+            self.compression(),
         )
         .await?;
 
@@ -515,7 +522,7 @@ impl WriteHandler {
             .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
 
         // Write data files
-        let data_files = write_data_files_with_metrics(&table, batches, "insert", self.metrics.as_ref()).await?;
+        let data_files = write_data_files_with_metrics(&table, batches, "insert", self.metrics.as_ref(), self.compression()).await?;
 
         if !data_files.is_empty() {
             // Commit via fast-append
@@ -582,7 +589,7 @@ impl WriteHandler {
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
 
-        let data_files = write_data_files_with_metrics(&table, batches, "ingest", self.metrics.as_ref()).await?;
+        let data_files = write_data_files_with_metrics(&table, batches, "ingest", self.metrics.as_ref(), self.compression()).await?;
 
         if !data_files.is_empty() {
             let tx = Transaction::new(&table);
@@ -705,7 +712,7 @@ impl WriteHandler {
 
             // Write surviving rows as new data files (skip if all rows deleted)
             if !surviving_batches.is_empty() {
-                let new_files = write_data_files_with_metrics(&table, surviving_batches, "delete", self.metrics.as_ref()).await?;
+                let new_files = write_data_files_with_metrics(&table, surviving_batches, "delete", self.metrics.as_ref(), self.compression()).await?;
                 new_data_files.extend(new_files);
             }
         }
@@ -863,7 +870,7 @@ impl WriteHandler {
         );
 
         // Write position delete files (sorted by (file_path, pos) inside the helper).
-        let delete_files = write_position_delete_files(&table, position_deletes).await?;
+        let delete_files = write_position_delete_files(&table, position_deletes, self.compression()).await?;
 
         // Commit: append position delete files. FastAppendAction auto-routes DataFiles
         // with content_type=PositionDeletes into the delete manifest entry.
@@ -979,7 +986,7 @@ impl WriteHandler {
                 total_updated += count;
             }
 
-            let new_files = write_data_files_with_metrics(&table, rewritten_batches, "update", self.metrics.as_ref()).await?;
+            let new_files = write_data_files_with_metrics(&table, rewritten_batches, "update", self.metrics.as_ref(), self.compression()).await?;
             new_data_files.extend(new_files);
         }
 
@@ -1362,7 +1369,7 @@ impl WriteHandler {
         // Write new data files from the merged results
         let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
         let new_data_files = if total_rows > 0 {
-            write_data_files_with_metrics(&table, result_batches, "merge", self.metrics.as_ref()).await?
+            write_data_files_with_metrics(&table, result_batches, "merge", self.metrics.as_ref(), self.compression()).await?
         } else {
             vec![]
         };

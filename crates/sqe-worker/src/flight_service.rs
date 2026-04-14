@@ -8,6 +8,7 @@ use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
+use arrow_ipc::writer::IpcWriteOptions;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, info_span, warn, Instrument};
@@ -15,6 +16,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use datafusion::prelude::SessionContext;
 use sqe_catalog::FooterCache;
+use sqe_core::FlightCompression;
 use sqe_metrics::WorkerMetricsRegistry;
 use sqe_metrics::propagation::extract_trace_context;
 use sqe_planner::ScanTask;
@@ -22,6 +24,18 @@ use sqe_planner::ScanTask;
 use crate::credential_channel::{CredentialStore, RefreshableCredentials};
 use crate::executor;
 use crate::shuffle::{ExchangeDescriptor, ShuffleManager};
+
+/// Build [`IpcWriteOptions`] for a given compression setting.
+fn ipc_options_for(compression: FlightCompression) -> Result<IpcWriteOptions, Status> {
+    let codec = match compression {
+        FlightCompression::None => None,
+        FlightCompression::Lz4 => Some(arrow_ipc::CompressionType::LZ4_FRAME),
+        FlightCompression::Zstd => Some(arrow_ipc::CompressionType::ZSTD),
+    };
+    IpcWriteOptions::default()
+        .try_with_compression(codec)
+        .map_err(|e| Status::internal(format!("Failed to set IPC compression: {e}")))
+}
 
 /// Worker's Arrow Flight service.
 ///
@@ -42,6 +56,12 @@ pub struct WorkerFlightService {
     shuffle_manager: ShuffleManager,
     /// Maximum duration for a single scan task. 0 means no timeout.
     scan_timeout: std::time::Duration,
+    /// IPC compression for DoGet responses (worker -> coordinator).
+    /// Default: ZSTD (internal traffic benefits from better ratio).
+    flight_compression: FlightCompression,
+    /// IPC compression for DoExchange shuffle responses.
+    /// Default: ZSTD.
+    shuffle_compression: FlightCompression,
 }
 
 impl WorkerFlightService {
@@ -53,6 +73,8 @@ impl WorkerFlightService {
             footer_cache: None,
             shuffle_manager: ShuffleManager::new(),
             scan_timeout: std::time::Duration::from_secs(600),
+            flight_compression: FlightCompression::Zstd,
+            shuffle_compression: FlightCompression::Zstd,
         }
     }
 
@@ -72,6 +94,8 @@ impl WorkerFlightService {
             footer_cache: None,
             shuffle_manager: ShuffleManager::new(),
             scan_timeout: std::time::Duration::from_secs(600),
+            flight_compression: FlightCompression::Zstd,
+            shuffle_compression: FlightCompression::Zstd,
         }
     }
 
@@ -84,6 +108,18 @@ impl WorkerFlightService {
     /// Set the scan timeout from config.
     pub fn with_scan_timeout(mut self, timeout_secs: u64) -> Self {
         self.scan_timeout = std::time::Duration::from_secs(timeout_secs);
+        self
+    }
+
+    /// Set the IPC compression for DoGet responses.
+    pub fn with_flight_compression(mut self, compression: FlightCompression) -> Self {
+        self.flight_compression = compression;
+        self
+    }
+
+    /// Set the IPC compression for DoExchange shuffle responses.
+    pub fn with_shuffle_compression(mut self, compression: FlightCompression) -> Self {
+        self.shuffle_compression = compression;
         self
     }
 
@@ -141,6 +177,7 @@ impl FlightService for WorkerFlightService {
         let session_ctx = self.session_ctx.clone();
         let footer_cache = self.footer_cache.clone();
         let scan_timeout = self.scan_timeout;
+        let flight_compression = self.flight_compression;
         async move {
             info!(
                 fragment_id = %scan_task.fragment_id,
@@ -189,9 +226,11 @@ impl FlightService for WorkerFlightService {
             credential_store.remove(&scan_task.fragment_id).await;
 
             let schema = Arc::new((*schema).clone());
+            let ipc_opts = ipc_options_for(flight_compression)?;
             let batch_stream = stream::iter(batches.into_iter().map(Ok));
             let flight_stream = FlightDataEncoderBuilder::new()
                 .with_schema(schema)
+                .with_options(ipc_opts)
                 .build(batch_stream)
                 .map_err(Status::from);
 
@@ -425,8 +464,10 @@ impl FlightService for WorkerFlightService {
             rx.recv().await.map(|batch| (batch, rx))
         });
 
+        let shuffle_opts = ipc_options_for(self.shuffle_compression)?;
         let flight_stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
+            .with_options(shuffle_opts)
             .build(output_stream.map(Ok))
             .map_err(Status::from);
 
