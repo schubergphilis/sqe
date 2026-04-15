@@ -331,7 +331,7 @@ for attempt in 0..=max_retries {
 
     match dispatch_to_worker(&task, &current_worker_url, &parent_cx).await {
         Ok(flight_stream) => {
-            // Success — wrap the stream and return
+            // Success -- wrap the stream and return
             return Ok(wrapped_stream);
         }
         Err(e) => {
@@ -381,7 +381,7 @@ Third, the `failed_workers` list prevents retry loops. If worker-1 fails, the re
 When all remote workers are exhausted, the system has one more option: local execution on the coordinator itself. The `local_executor` fallback runs the scan task using the coordinator's own DataFusion runtime. It's slower (no parallelism), but it means a single unhealthy worker doesn't kill a query.
 
 ```rust
-// All remote attempts exhausted — try local fallback
+// All remote attempts exhausted -- try local fallback
 if let Some(ref executor) = local_executor {
     warn!(
         fragment_id = %task.fragment_id,
@@ -741,7 +741,7 @@ We had two opposite problems: user errors were indistinguishable from system err
 
 ### The Solution: A 27-Code Taxonomy
 
-We introduced `SqeErrorCode` — a typed enum with 27 variants covering every error category the engine can produce:
+We introduced `SqeErrorCode`, a typed enum with 27 variants covering every error category the engine can produce:
 
 ```rust
 pub enum SqeErrorCode {
@@ -771,7 +771,7 @@ Each code carries three things: a gRPC status code, a Trino-compatible integer c
 
 The gRPC mapping is semantic. `TableNotFound` maps to `NOT_FOUND`. `SyntaxError` maps to `INVALID_ARGUMENT`. `AuthenticationFailed` maps to `UNAUTHENTICATED`. `StorageError` maps to `INTERNAL`. A client speaking Arrow Flight SQL can now dispatch on the gRPC status code alone, without parsing the message string.
 
-The Trino mapping is for compatibility. `TableNotFound` is code 11, `TypeMismatch` is 7, `SyntaxError` is 1. dbt's Trino adapter recognises these numbers and adjusts its retry and error-surfacing behaviour accordingly. We're not Trino — but we speak enough of Trino's error vocabulary that existing tooling works.
+The Trino mapping is for compatibility. `TableNotFound` is code 11, `TypeMismatch` is 7, `SyntaxError` is 1. dbt's Trino adapter recognises these numbers and adjusts its retry and error-surfacing behaviour accordingly. We're not Trino, but we speak enough of Trino's error vocabulary that existing tooling works.
 
 The client message policy is the hardest part:
 
@@ -785,7 +785,7 @@ pub fn is_user_error(self) -> bool {
 }
 ```
 
-User errors — syntax errors, missing tables, auth failures, type mismatches — pass their detail through to the client. The message "table 'wh.ns.foo' not found" is useful; the user can act on it. System errors — storage failures, catalog connectivity, internal panics — return a generic message. "Storage operation failed" tells the user there's a problem. "s3://my-bucket/path?X-Amz-Security-Token=..." tells them too much.
+User errors (syntax errors, missing tables, auth failures, type mismatches) pass their detail through to the client. The message "table 'wh.ns.foo' not found" is useful; the user can act on it. System errors (storage failures, catalog connectivity, internal panics) return a generic message. "Storage operation failed" tells the user there's a problem. "s3://my-bucket/path?X-Amz-Security-Token=..." tells them too much.
 
 ### The Classifier
 
@@ -854,7 +854,7 @@ Error code:  STORAGE_ERROR
 Message:     Storage operation failed
 ```
 
-The gRPC code for the storage failure didn't change — it's still `INTERNAL`. But the message no longer leaks the bucket path, the credential prefix, or the region. The internal logs still capture everything, attached to the query ID. The client gets a signal: something in the storage layer failed, and you should talk to your operator.
+The gRPC code for the storage failure didn't change. It's still `INTERNAL`. But the message no longer leaks the bucket path, the credential prefix, or the region. The internal logs still capture everything, attached to the query ID. The client gets a signal: something in the storage layer failed, and you should talk to your operator.
 
 ### Error Handling Is an API
 
@@ -862,9 +862,9 @@ The lesson is uncomfortable: we thought of error handling as an implementation d
 
 dbt trusts error codes to decide whether to fail a model or retry it. JDBC clients parse error codes to provide user-facing messages. Monitoring systems count error codes to build dashboards. We were returning `1` for everything, so all of that infrastructure was blind.
 
-In a sovereign data platform, your error messages are part of your API. The moment you expose a query engine to external clients — even internal ones like dbt — you've committed to the semantics of your error responses. `TABLE_NOT_FOUND` is a promise: this query will never succeed until the table exists. `STORAGE_ERROR` is a different promise: the query might succeed if you try again, and it's not your fault.
+In a sovereign data platform, your error messages are part of your API. The moment you expose a query engine to external clients, even internal ones like dbt, you've committed to the semantics of your error responses. `TABLE_NOT_FOUND` is a promise: this query will never succeed until the table exists. `STORAGE_ERROR` is a different promise: the query might succeed if you try again, and it's not your fault.
 
-Getting that classification right — user error versus system error, retryable versus not — is harder than it looks. It took us a load test, a dbt failure, and a taxonomy of 27 codes to get there. We should have built it in phase one.
+Getting that classification right (user error versus system error, retryable versus not) is harder than it looks. It took us a load test, a dbt failure, and a taxonomy of 27 codes to get there. We should have built it in phase one.
 
 
 ## The Cost of Not Testing
@@ -887,5 +887,5 @@ every single query returned the correct result. That's the point.
 :::
 
 ::: {.ailog}
-**AI Logbook:** The AI generated the step-by-step tracing instrumentation that diagnosed the gRPC stream accumulation hang — wrapping every Flight call with timing logs until the hang point was isolated. The human diagnosed the root cause (HTTP/2 stream state accumulation on a reused connection) from those logs. The `FlightSqlBenchClient` with fresh-connection-per-query, the `tokio::select!` deadline pattern, the fragment retry logic with `failed_workers` exclusion list, and the `FairSpillPool` memory management were all AI-implemented from failure descriptions the human wrote after the 50-client load test broke everything.
+**AI Logbook:** The AI generated the step-by-step tracing instrumentation that diagnosed the gRPC stream accumulation hang, wrapping every Flight call with timing logs until the hang point was isolated. The human diagnosed the root cause (HTTP/2 stream state accumulation on a reused connection) from those logs. The `FlightSqlBenchClient` with fresh-connection-per-query, the `tokio::select!` deadline pattern, the fragment retry logic with `failed_workers` exclusion list, and the `FairSpillPool` memory management were all AI-implemented from failure descriptions the human wrote after the 50-client load test broke everything.
 :::
