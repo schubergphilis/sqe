@@ -12,6 +12,8 @@ pub struct SqeConfig {
     #[serde(default)]
     pub policy: PolicyConfig,
     #[serde(default)]
+    pub access_control: AccessControlConfig,
+    #[serde(default)]
     pub metrics: MetricsConfig,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
@@ -623,11 +625,6 @@ pub struct CatalogConfig {
     /// compression ratio vs. speed for S3.
     #[serde(default = "default_parquet_compression")]
     pub parquet_compression: String,
-    /// Platform API URL for access control (GRANT/REVOKE).
-    /// When set, the engine forwards GRANT/REVOKE SQL to this endpoint.
-    /// Typically the same host as polaris_url but under /api/platform/v1/access/.
-    #[serde(default)]
-    pub platform_api_url: String,
 }
 
 #[derive(Deserialize, Clone)]
@@ -712,6 +709,46 @@ impl std::fmt::Debug for StorageConfig {
             .finish()
     }
 }
+
+/// Access control backend for GRANT/REVOKE/SHOW GRANTS SQL.
+///
+/// Supports multiple backends:
+/// - `"chameleon"` -- Chameleon platform API (GROUP/USER grantees)
+/// - `"polaris"` -- Apache Polaris 1.3 native (PRINCIPAL/PRINCIPAL_ROLE/CATALOG_ROLE)
+/// - `"none"` -- disabled (default)
+///
+/// ```toml
+/// [access_control]
+/// backend = "chameleon"
+/// url = "http://backend:8080/api/platform/v1/access"
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct AccessControlConfig {
+    /// Backend type: "chameleon", "polaris", or "none" (disabled).
+    #[serde(default = "default_access_control_backend")]
+    pub backend: String,
+    /// Backend API URL.
+    /// Chameleon: http://backend:port/api/platform/v1/access
+    /// Polaris: http://polaris:8181/api/management/v1 (Polaris management API)
+    #[serde(default)]
+    pub url: String,
+    /// Request timeout in seconds.
+    #[serde(default = "default_access_control_timeout")]
+    pub timeout_secs: u64,
+}
+
+impl Default for AccessControlConfig {
+    fn default() -> Self {
+        Self {
+            backend: "none".to_string(),
+            url: String::new(),
+            timeout_secs: 30,
+        }
+    }
+}
+
+fn default_access_control_backend() -> String { "none".to_string() }
+fn default_access_control_timeout() -> u64 { 30 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct PolicyConfig {
@@ -1203,10 +1240,10 @@ mod tests {
                 trust_sort_order: false,
                 small_file_threshold_mb: 3,
                 parquet_compression: "zstd".to_string(),
-                platform_api_url: String::new(),
             },
             storage: StorageConfig::default(),
             policy: PolicyConfig::default(),
+            access_control: AccessControlConfig::default(),
             metrics: MetricsConfig::default(),
             rate_limit: RateLimitConfig::default(),
             session: SessionConfig::default(),

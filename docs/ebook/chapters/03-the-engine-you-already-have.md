@@ -396,7 +396,7 @@ Here is what we did:
 ```toml
 [profile.dev]
 debug = 1                       # Line-tables only, not full debug info
-split-debuginfo = "unpacked"    # Skip dsymutil on macOS -- saves 20-30% link time
+split-debuginfo = "unpacked"    # Skip dsymutil on macOS — saves 20-30% link time
 
 [profile.release]
 codegen-units = 4               # More parallelism during codegen
