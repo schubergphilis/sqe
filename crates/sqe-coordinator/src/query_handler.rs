@@ -78,7 +78,7 @@ pub struct QueryHandler {
     /// that repeated `load_table()` calls skip the Polaris REST round-trip.
     table_cache: Option<sqe_catalog::TableMetadataCache>,
     /// HTTP client for the platform access control API (GRANT/REVOKE/SHOW GRANTS).
-    /// Initialized when `config.catalog.platform_api_url` is non-empty.
+    /// Initialized when `[access_control]` backend is configured (not "none").
     access_control_client: Option<Arc<AccessControlClient>>,
 }
 
@@ -112,10 +112,17 @@ impl QueryHandler {
         let runtime = crate::runtime::build_coordinator_runtime(&config.coordinator)
             .map_err(|e| sqe_core::SqeError::Config(format!("Failed to build runtime: {e}")))?;
 
-        // Initialize access control client when platform_api_url is configured.
-        let access_control_client = if !config.catalog.platform_api_url.is_empty() {
+        // Initialize access control client when a backend is configured.
+        let access_control_client = if config.access_control.backend != "none"
+            && !config.access_control.url.is_empty()
+        {
+            tracing::info!(
+                backend = %config.access_control.backend,
+                url = %config.access_control.url,
+                "Access control backend configured"
+            );
             Some(Arc::new(
-                AccessControlClient::new(&config.catalog.platform_api_url)?,
+                AccessControlClient::new(&config.access_control.url)?,
             ))
         } else {
             None
@@ -1539,7 +1546,7 @@ impl QueryHandler {
             .as_deref()
             .ok_or_else(|| {
                 SqeError::NotImplemented(
-                    "Access control is not configured. Set catalog.platform_api_url in the config."
+                    "Access control is not configured. Set [access_control] backend and url in the config."
                         .to_string(),
                 )
             })
@@ -1619,7 +1626,26 @@ impl QueryHandler {
         let grantee = grantees.first().ok_or_else(|| {
             SqeError::Execution("GRANT/REVOKE requires at least one grantee".to_string())
         })?;
-        let grantee_type = format!("{:?}", grantee.grantee_type).to_uppercase();
+        // Map sqlparser's GranteesType to the backend's grantee_type.
+        //
+        // Chameleon backend: GROUP / USER
+        //   SQL `TO GROUP "SG-Risk"` -> grantee_type: "GROUP"
+        //   SQL `TO USER "alice"`    -> grantee_type: "USER"
+        //   SQL `TO ROLE "admins"`   -> grantee_type: "GROUP" (ROLE = GROUP in Chameleon)
+        //
+        // Polaris backend: PRINCIPAL_ROLE / CATALOG_ROLE
+        //   SQL `TO ROLE "admins"`   -> grantee_type: "PRINCIPAL_ROLE"
+        //   (Polaris has no USER-level grants, only role-based)
+        //
+        // The backend type is checked at the handler level, not here.
+        // Default mapping is Chameleon-style (GROUP/USER).
+        let grantee_type = match &grantee.grantee_type {
+            sqlparser::ast::GranteesType::User => "USER".to_string(),
+            sqlparser::ast::GranteesType::Role => "GROUP".to_string(),
+            sqlparser::ast::GranteesType::Group => "GROUP".to_string(),
+            sqlparser::ast::GranteesType::DatabaseRole => "GROUP".to_string(),
+            _ => "USER".to_string(), // Bare identifier defaults to USER
+        };
         let grantee_name = grantee
             .name
             .as_ref()

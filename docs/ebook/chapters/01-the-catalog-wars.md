@@ -276,7 +276,7 @@ Every catalog we evaluated had opinions. Glue has opinions about identity (IAM).
 
 Polaris has one primary opinion: tables have names and metadata locations. It does have its own role-based access control (catalog roles, principal roles, and privilege grants) which is a real governance layer. But it's a thin one. It controls who can see which tables and namespaces. It does not control what happens to the data after the table is loaded. It does not inject row filters. It does not mask columns. It does not rewrite queries.
 
-This is a meaningful distinction. A catalog that controls access to table metadata is doing its job. A catalog that controls what happens inside your query engine is doing your job. Polaris stays in its lane. Your governance. row-level security, column masking, audit policies. can be OPA. Or Cedar. Or a custom policy engine built into your query engine (which is what we did in Chapter 8). Your versioning can be handled by Iceberg's own snapshot semantics. Your federation isn't needed because you have one catalog.
+This is a meaningful distinction. A catalog that controls access to table metadata is doing its job. A catalog that controls what happens inside your query engine is doing your job. Polaris stays in its lane. Your governance (row-level security, column masking, audit policies) can be OPA. Or Cedar. Or a custom policy engine built into your query engine (which is what we did in Chapter 8). Your versioning can be handled by Iceberg's own snapshot semantics. Your federation isn't needed because you have one catalog.
 
 ![Catalog landscape: comparing REST spec compliance, auth models, and governance opinions across Glue, Unity, Polaris, Gravitino, and Nessie](diagrams/rendered/01-catalog-landscape.svg)
 
@@ -311,13 +311,13 @@ polaris:
     - "8181:8181"
 ```
 
-The entire catalog starts in under two seconds. No database to provision. No persistent volume to mount. For integration testing, this is transformative. every test run gets a clean catalog, and there's no cleanup needed.
+The entire catalog starts in under two seconds. No database to provision. No persistent volume to mount. For integration testing, this is transformative: every test run gets a clean catalog, and there's no cleanup needed.
 
-For production, Polaris backs its metadata to a relational database (PostgreSQL is the typical choice). The metadata is small. table names, schema definitions, partition specs, snapshot references. The heavy lifting is in the Iceberg metadata files themselves, which live in object storage. The catalog is a pointer to those files, not a copy of them.
+For production, Polaris backs its metadata to a relational database (PostgreSQL is the typical choice). The metadata is small: table names, schema definitions, partition specs, snapshot references. The heavy lifting is in the Iceberg metadata files themselves, which live in object storage. The catalog is a pointer to those files, not a copy of them.
 
-This architectural clarity. the catalog points, storage holds. is what makes the system composable. You can inspect the Iceberg metadata files directly with a tool like PyIceberg or `iceberg-rust` without going through the catalog at all. The catalog is the preferred path, but it's not the only path. Your data is never locked behind a catalog API.
+This architectural clarity (the catalog points, storage holds) is what makes the system composable. You can inspect the Iceberg metadata files directly with a tool like PyIceberg or `iceberg-rust` without going through the catalog at all. The catalog is the preferred path, but it's not the only path. Your data is never locked behind a catalog API.
 
-One thing we learned quickly: Polaris's in-memory mode is not just a convenience for testing. It became the foundation of our entire integration test suite. Every test starts a fresh Polaris instance, creates namespaces and tables, runs queries through the full SQE stack, and tears everything down. No shared state between tests. No flaky failures from leftover metadata. The entire test stack. Polaris in-memory plus RustFS for S3-compatible storage. starts in under five seconds and requires no cloud credentials. We went from "integration tests need a running AWS environment" to "integration tests run on a laptop at an airport."
+One thing we learned quickly: Polaris's in-memory mode is not just a convenience for testing. It became the foundation of our entire integration test suite. Every test starts a fresh Polaris instance, creates namespaces and tables, runs queries through the full SQE stack, and tears everything down. No shared state between tests. No flaky failures from leftover metadata. The entire test stack (Polaris in-memory plus RustFS for S3-compatible storage) starts in under five seconds and requires no cloud credentials. We went from "integration tests need a running AWS environment" to "integration tests run on a laptop at an airport."
 
 That shift in development velocity is hard to overstate. When testing the catalog integration is cheap, you test it more. When you test it more, you find problems earlier. When you find problems earlier, the catalog code is better. The tool shaped the practice.
 
@@ -332,17 +332,17 @@ I made a claim at the start of this chapter: the catalog is the centre of the da
 
 When a user runs `SELECT * FROM production.events` in SQE, the catalog answers four questions:
 
-1. **Does this table exist?** The catalog resolves `production.events` to a metadata location. an S3 path pointing to an Iceberg metadata JSON file.
+1. **Does this table exist?** The catalog resolves `production.events` to a metadata location, an S3 path pointing to an Iceberg metadata JSON file.
 
 2. **What does it look like?** The metadata file (fetched from S3 using vended credentials) contains the schema, partition spec, sort order, and current snapshot.
 
-3. **Can this user read it?** The catalog's auth layer. OIDC token validation. determines whether the user's identity has permission to load this table's metadata. If not, the table doesn't exist (not an access denied error, just absence. no information leakage).
+3. **Can this user read it?** The catalog's auth layer (OIDC token validation) determines whether the user's identity has permission to load this table's metadata. If not, the table doesn't exist (not an access denied error, just absence, no information leakage).
 
 4. **How does the engine access the files?** The catalog vends temporary S3 credentials scoped to this table's storage location. The engine uses these credentials to read Parquet files.
 
 Four questions. Every one answered by the catalog. If the catalog is wrong about any of them, the query fails. If the catalog is unavailable, no query can run. If the catalog is compromised, table visibility and storage credentials are both compromised.
 
-This is why the catalog is the centre, even though it holds very little data itself. It holds the pointers, the permissions, and the credentials. Everything else. the actual data, the query execution, the result delivery. depends on those three things.
+This is why the catalog is the centre, even though it holds very little data itself. It holds the pointers, the permissions, and the credentials. Everything else (the actual data, the query execution, the result delivery) depends on those three things.
 
 Control the catalog, and you control what data exists (namespace and table management), who can see it (authentication and authorization), and how it's accessed (credential vending). That's the data platform.
 
@@ -360,11 +360,11 @@ The `sqe-catalog` crate is the result of everything in this chapter. It's severa
 - **`system_catalog.rs`**. Virtual `system` tables for runtime introspection.
 - **`iceberg_scan.rs`**. The physical scan operator that reads Iceberg data via the table's `FileIO` and vended credentials.
 
-Since then, the crate has grown to include `manifest_cache`, `footer_cache`, `circuit_breaker`, `s3_io`, `sort_order`, `read_parquet`, `iceberg_metadata_tvf`, `pruning_stats`, and several more. the caching and I/O layers that made SQE competitive with Trino.
+Since then, the crate has grown to include `manifest_cache`, `footer_cache`, `circuit_breaker`, `s3_io`, `sort_order`, `read_parquet`, `iceberg_metadata_tvf`, `pruning_stats`, and several more, the caching and I/O layers that made SQE competitive with Trino.
 
 The crate depends on `iceberg` and `iceberg-catalog-rest` from iceberg-rust, `datafusion` for the trait implementations, `moka` for caching, and `reqwest` for direct REST calls (views, which iceberg-rust doesn't support natively yet).
 
-None of these modules knows or cares that the catalog is Polaris. They speak the Iceberg REST protocol. If we swapped Polaris for a compliant Nessie instance, or a future version of Unity's REST endpoint, or a catalog that doesn't exist yet. the code wouldn't change. The config file would change. That's it.
+None of these modules knows or cares that the catalog is Polaris. They speak the Iceberg REST protocol. If we swapped Polaris for a compliant Nessie instance, or a future version of Unity's REST endpoint, or a catalog that doesn't exist yet, the code wouldn't change. The config file would change. That's it.
 
 
 ## The Lesson
@@ -375,12 +375,12 @@ The pattern was always the same. Start with the managed option. It works quickly
 
 The catalog wars aren't about features. Every major catalog can list tables and return metadata. The wars are about control. Every catalog vendor wants the catalog to be the gravitational centre of their ecosystem. Glue pulls you toward AWS. Unity pulls you toward Databricks. Snowflake's catalog pulls you toward Snowflake. They provide genuine value in exchange for that gravity.
 
-Polaris has no ecosystem to pull you toward. It's a catalog. It stores table metadata. It validates tokens. It vends credentials. It does nothing else. For a project whose entire premise is sovereignty. running independently of any vendor's platform. that absence of ambition is the feature.
+Polaris has no ecosystem to pull you toward. It's a catalog. It stores table metadata. It validates tokens. It vends credentials. It does nothing else. For a project whose entire premise is sovereignty, running independently of any vendor's platform, that absence of ambition is the feature.
 
-The Iceberg REST specification is the real winner. Not Polaris specifically, but the protocol. The protocol means your catalog choice is reversible. It means your engine doesn't know or care which catalog implementation answers its HTTP calls. It means the most important component in your data platform. the one that answers "what tables exist and where are their files". is a standard interface that you can implement, replace, or self-host without touching a line of engine code.
+The Iceberg REST specification is the real winner. Not Polaris specifically, but the protocol. The protocol means your catalog choice is reversible. It means your engine doesn't know or care which catalog implementation answers its HTTP calls. It means the most important component in your data platform, the one that answers "what tables exist and where are their files," is a standard interface that you can implement, replace, or self-host without touching a line of engine code.
 
 ::: {.ailog}
-**AI Logbook:** The AI produced the `SessionCatalog`, `CredentialCache`, and all eight `sqe-catalog` modules in a single session from a spec that named each module and its purpose. The human chose Polaris over Unity, Glue, and Nessie after months of hands-on evaluation that the AI never saw. The credential vending extraction code. parsing `s3.access-key-id` from the REST response config map. was correct on the first pass; the three days of debugging Polaris 0.9-vs-1.0 timestamp format differences were entirely human detective work.
+**AI Logbook:** The AI produced the `SessionCatalog`, `CredentialCache`, and all eight `sqe-catalog` modules in a single session from a spec that named each module and its purpose. The human chose Polaris over Unity, Glue, and Nessie after months of hands-on evaluation that the AI never saw. The credential vending extraction code (parsing `s3.access-key-id` from the REST response config map) was correct on the first pass; the three days of debugging Polaris 0.9-vs-1.0 timestamp format differences were entirely human detective work.
 :::
 
-The next chapter covers what happens after the catalog tells you where the data is. The data itself. Apache Iceberg's table format, from metadata trees to manifest files to the Parquet files at the bottom. The catalog is the index. Iceberg is the book.
+The next chapter covers what happens after the catalog tells you where the data is. The data itself: Apache Iceberg's table format, from metadata trees to manifest files to the Parquet files at the bottom. The catalog is the index. Iceberg is the book.

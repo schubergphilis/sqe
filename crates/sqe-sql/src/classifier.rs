@@ -192,7 +192,7 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
             }));
         }
         return Err(sqe_core::SqeError::Execution(
-            "SHOW GRANTS TO requires: SHOW GRANTS TO ROLE|USER \"name\"".to_string(),
+            "SHOW GRANTS TO requires: SHOW GRANTS TO GROUP|USER \"name\"".to_string(),
         ));
     }
 
@@ -572,6 +572,20 @@ mod tests {
             matches!(result, Ok(StatementKind::ShowGrants(ShowGrantsTarget::OnResource { .. }))),
             "Expected ShowGrants OnResource, got: {result:?}"
         );
+    }
+
+    #[test]
+    #[test]
+    fn test_show_grants_to_group() {
+        let result = parse_and_classify("SHOW GRANTS TO GROUP \"SG-Risk-Analysts\"");
+        assert!(result.is_ok());
+        match result.unwrap() {
+            StatementKind::ShowGrants(ShowGrantsTarget::ToGrantee { grantee_type, grantee_name }) => {
+                assert_eq!(grantee_type, "GROUP");
+                assert_eq!(grantee_name, "SG-Risk-Analysts");
+            }
+            other => panic!("Expected ShowGrants(ToGrantee), got {other:?}"),
+        }
     }
 
     #[test]
