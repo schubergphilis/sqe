@@ -160,7 +160,7 @@ Database Error in seed file seeds/customers.csv
   Cannot add files that are already referenced by table
 ```
 
-The products seed had 500 rows. The customers seed had 2,000. That threshold was the clue. DataFusion's write path batches rows internally — at some threshold, a single seed operation becomes multiple batch writes. Each batch wrote a Parquet file. Each file was named with a static prefix: `insert-00000.parquet`. The counter reset per batch. The second batch tried to write `insert-00000.parquet` into the same Iceberg snapshot that already contained `insert-00000.parquet` from the first batch.
+The products seed had 500 rows. The customers seed had 2,000. That threshold was the clue. DataFusion's write path batches rows internally, and at some threshold, a single seed operation becomes multiple batch writes. Each batch wrote a Parquet file. Each file was named with a static prefix: `insert-00000.parquet`. The counter reset per batch. The second batch tried to write `insert-00000.parquet` into the same Iceberg snapshot that already contained `insert-00000.parquet` from the first batch.
 
 The Iceberg commit protocol rejected it. You can't add a file that's already referenced. The table format was doing exactly what it was designed to do.
 
@@ -178,9 +178,9 @@ With seeds working, the silver layer models ran next. `stg_orders` failed immedi
 Error: Invalid function 'year'
 ```
 
-The model used `year(order_date)`, `month(order_date)`, `day_of_week(order_date)` — standard Trino date extraction functions. DataFusion has `date_part()` and `extract()`, but not standalone `year()`, `month()`, or `day_of_week()`. They're different names for the same operation, and dbt projects written for Trino use the Trino names.
+The model used `year(order_date)`, `month(order_date)`, `day_of_week(order_date)`, all standard Trino date extraction functions. DataFusion has `date_part()` and `extract()`, but not standalone `year()`, `month()`, or `day_of_week()`. They're different names for the same operation, and dbt projects written for Trino use the Trino names.
 
-We added 17 Trino-compatible UDFs: date extraction (`year`, `month`, `day`, `hour`, `minute`, `second`, `day_of_week`, `day_of_year`, `week_of_year`, `quarter`), date arithmetic (`date_add`, `date_diff`, `date_trunc`), conditionals (`if`, `nullif`, `coalesce` — DataFusion has these, but the Trino aliases needed wiring), and introspection (`typeof`, `version`). Each one delegates to the DataFusion equivalent under the hood. The registration is mechanical; the value is compatibility without forking.
+We added 17 Trino-compatible UDFs: date extraction (`year`, `month`, `day`, `hour`, `minute`, `second`, `day_of_week`, `day_of_year`, `week_of_year`, `quarter`), date arithmetic (`date_add`, `date_diff`, `date_trunc`), conditionals (`if`, `nullif`, `coalesce`; DataFusion has these, but the Trino aliases needed wiring), and introspection (`typeof`, `version`). Each one delegates to the DataFusion equivalent under the hood. The registration is mechanical; the value is compatibility without forking.
 
 While fixing the date functions, a second type error surfaced in a different model. The error message was:
 
@@ -189,7 +189,7 @@ TypeSignatureClass::Native(LogicalType::Boolean) is not compatible
 with TypeSignatureClass::Scalar(DataType::Utf8)
 ```
 
-The model was calling `lower(is_active)` where `is_active` was a boolean column. `lower()` expects a string. The SQL was wrong — but the error was gibberish. It referenced internal DataFusion type names that have no meaning to someone writing SQL. The error was technically correct and practically useless.
+The model was calling `lower(is_active)` where `is_active` was a boolean column. `lower()` expects a string. The SQL was wrong, but the error was gibberish. It referenced internal DataFusion type names that have no meaning to someone writing SQL. The error was technically correct and practically useless.
 
 That observation planted a seed.
 
@@ -202,11 +202,11 @@ TrinoQueryError(type=INTERNAL_ERROR, name=INTERNAL_ERROR,
   message="Query execution failed", error_code=1)
 ```
 
-We'd seen this before and dismissed it. Now it was the only error visible when a model failed. Every failure — missing table, wrong type, auth problem, S3 timeout, syntax error — returned the same response: `INTERNAL_ERROR(1)`, `"Query execution failed"`. The Trino compat layer was swallowing every DataFusion error and replacing it with the most generic possible response.
+We'd seen this before and dismissed it. Now it was the only error visible when a model failed. Every failure (missing table, wrong type, auth problem, S3 timeout, syntax error) returned the same response: `INTERNAL_ERROR(1)`, `"Query execution failed"`. The Trino compat layer was swallowing every DataFusion error and replacing it with the most generic possible response.
 
 dbt's error output showed us what we'd built: a black box. Something failed. We had no idea what. We had to add logging at the engine layer, trace back through coordinator logs, correlate timestamps, and find the real error buried several layers down. That's acceptable for debugging one failure. It's unworkable when dbt runs 50 models and a third of them fail.
 
-The fix was structural. We defined 27 error codes — `SqeErrorCode` — covering the full taxonomy of query engine failures: `TABLE_NOT_FOUND(11)`, `COLUMN_NOT_FOUND(12)`, `TYPE_MISMATCH(21)`, `PERMISSION_DENIED(31)`, `CATALOG_ERROR(41)`, `STORAGE_ERROR(51)`, and so on. Each code maps to both a Trino error type (for the compat layer) and a gRPC status code (for the Flight SQL layer). An auto-classifier inspects DataFusion error messages and pattern-matches them to the right code: messages containing "table not found" map to `TABLE_NOT_FOUND`, messages containing "permission denied" map to `PERMISSION_DENIED`.
+The fix was structural. We defined 27 error codes (`SqeErrorCode`) covering the full taxonomy of query engine failures: `TABLE_NOT_FOUND(11)`, `COLUMN_NOT_FOUND(12)`, `TYPE_MISMATCH(21)`, `PERMISSION_DENIED(31)`, `CATALOG_ERROR(41)`, `STORAGE_ERROR(51)`, and so on. Each code maps to both a Trino error type (for the compat layer) and a gRPC status code (for the Flight SQL layer). An auto-classifier inspects DataFusion error messages and pattern-matches them to the right code: messages containing "table not found" map to `TABLE_NOT_FOUND`, messages containing "permission denied" map to `PERMISSION_DENIED`.
 
 After the fix:
 
@@ -222,7 +222,7 @@ The three bugs weren't independent. The file collision only became visible when 
 Each fix revealed the next problem. That's how real integration testing works. You can't write a unit test for "what breaks when a dbt analyst writes their first real project against your engine." You can only run the project and read what happens.
 
 ::: {.fieldreport}
-**Field report:** The three fixes together — UUID file naming, 17 Trino function aliases, 27 structured error codes — were roughly 600 lines of Rust. None of them were architecturally interesting. They were all "this thing doesn't work the way the ecosystem expects it to." That's most of what makes an engine usable.
+**Field report:** The three fixes together (UUID file naming, 17 Trino function aliases, 27 structured error codes) were roughly 600 lines of Rust. None of them were architecturally interesting. They were all "this thing doesn't work the way the ecosystem expects it to." That's most of what makes an engine usable.
 :::
 
 
