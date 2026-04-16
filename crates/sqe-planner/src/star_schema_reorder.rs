@@ -148,9 +148,14 @@ impl PhysicalOptimizerRule for StarSchemaReorderRule {
 
         let min_ratio = self.min_ratio;
         let transformed = plan.transform_down(|node| {
-            // Only process the root of a HashJoinExec chain (i.e., a HashJoinExec
-            // whose parent is not a HashJoinExec — we handle the whole chain at once).
-            if node.as_any().downcast_ref::<HashJoinExec>().is_none() {
+            // Only process INNER HashJoinExec nodes. Skip non-HashJoin nodes and
+            // non-INNER joins (LEFT, RIGHT, FULL) — transform_down will recurse
+            // into their children, where we'll find the INNER chain.
+            let is_inner_hash = node
+                .as_any()
+                .downcast_ref::<HashJoinExec>()
+                .is_some_and(|hj| *hj.join_type() == JoinType::Inner);
+            if !is_inner_hash {
                 return Ok(Transformed::no(node));
             }
 
