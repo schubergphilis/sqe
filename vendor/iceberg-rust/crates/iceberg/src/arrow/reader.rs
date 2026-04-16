@@ -1058,7 +1058,7 @@ fn build_field_id_map(parquet_schema: &SchemaDescriptor) -> Result<Option<HashMa
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     format!(
-                        "Leave column in schema should be primitive type but got {field_type:?}"
+                        "Leaf column in schema should be primitive type but got {field_type:?}"
                     ),
                 ));
             }
@@ -1069,14 +1069,36 @@ fn build_field_id_map(parquet_schema: &SchemaDescriptor) -> Result<Option<HashMa
 }
 
 /// Build a fallback field ID map for Parquet files without embedded field IDs.
-/// Position-based (1, 2, 3, ...) for compatibility with iceberg-java migrations.
+///
+/// Returns the number of primitive (leaf) columns in a Parquet type, recursing into groups.
+fn leaf_count(ty: &parquet::schema::types::Type) -> usize {
+    if ty.is_primitive() {
+        1
+    } else {
+        ty.get_fields().iter().map(|f| leaf_count(f)).sum()
+    }
+}
+
+/// Builds a mapping from fallback field IDs to leaf column indices for Parquet files
+/// without embedded field IDs. Returns entries only for primitive top-level fields.
+///
+/// Must use top-level field positions (not leaf column positions) to stay consistent
+/// with `add_fallback_field_ids_to_arrow_schema`, which assigns ordinal IDs to
+/// top-level Arrow fields. Using leaf positions instead would produce wrong indices
+/// when nested types (struct/list/map) expand into multiple leaf columns.
+///
+/// Mirrors iceberg-java's ParquetSchemaUtil.addFallbackIds() which iterates
+/// fileSchema.getFields() assigning ordinal IDs to top-level fields.
 fn build_fallback_field_id_map(parquet_schema: &SchemaDescriptor) -> HashMap<i32, usize> {
     let mut column_map = HashMap::new();
+    let mut leaf_idx = 0;
 
-    // 1-indexed to match iceberg-java's convention
-    for (idx, _field) in parquet_schema.columns().iter().enumerate() {
-        let field_id = (idx + 1) as i32;
-        column_map.insert(field_id, idx);
+    for (top_pos, field) in parquet_schema.root_schema().get_fields().iter().enumerate() {
+        let field_id = (top_pos + 1) as i32;
+        if field.is_primitive() {
+            column_map.insert(field_id, leaf_idx);
+        }
+        leaf_idx += leaf_count(field);
     }
 
     column_map
@@ -1367,7 +1389,7 @@ impl PredicateConverter<'_> {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     format!(
-                        "Leave column `{}` in predicates isn't a root column in Parquet schema.",
+                        "Leaf column `{}` in predicates isn't a root column in Parquet schema.",
                         reference.field().name
                     ),
                 ));
