@@ -667,24 +667,23 @@ impl ExecutionPlan for IcebergScanExec {
                 let file_io = table.file_io().clone();
                 let mut all_batches: Vec<RecordBatch> = Vec::new();
 
-                // Resolve dynamic filters ONLY in the direct-read path.
-                // Do NOT call wait_complete() before determining the path —
-                // it would deadlock when the hash join probe side IS this scan
-                // (probe waits for build, build waits for probe to stream).
+                // Snapshot dynamic filters NON-BLOCKING.
+                // Never call wait_complete() — it deadlocks when this scan is
+                // the hash join probe side (probe waits for build, build waits
+                // for probe to stream). Instead, use .current() which returns
+                // the latest filter snapshot immediately (lit(true) if the build
+                // hasn't finished yet). Early batches pass unfiltered; later
+                // batches get the actual bounds once the build side completes.
                 let mut resolved_filters: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
                 for filter in &pushed_down_filters {
                     if let Some(dynamic) = filter.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
-                        // Wait for the hash join build side to finish.
-                        // Safe here: direct-read is for small files, so the scan
-                        // starts quickly after the build side completes.
-                        dynamic.wait_complete().await;
                         match dynamic.current() {
                             Ok(expr) => {
-                                debug!(filter = %expr, "Resolved dynamic filter for direct-read");
+                                debug!(filter = %expr, "Snapshot dynamic filter for direct-read");
                                 resolved_filters.push(expr);
                             }
                             Err(e) => {
-                                warn!(error = %e, "Failed to resolve dynamic filter, skipping");
+                                debug!(error = %e, "Dynamic filter not ready yet, skipping");
                             }
                         }
                     } else {
