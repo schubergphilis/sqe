@@ -90,7 +90,22 @@ pub async fn create_session_context(
                 // Matches Trino/SQL standard behavior: 0.06 - 0.01 = 0.05 (exact),
                 // not 0.049999999999999996 (floating-point). Critical for correct
                 // BETWEEN predicates and aggregate precision.
-                .set_bool("datafusion.sql_parser.parse_float_as_decimal", true);
+                .set_bool("datafusion.sql_parser.parse_float_as_decimal", true)
+                // Broadcast threshold for hash joins: dimension tables below this
+                // size use CollectLeft mode (build entire table in memory, broadcast
+                // to probe side). Default 1MB is too low for TPC-DS dimension tables
+                // like date_dim (73K rows ~5MB), customer_demographics (1.9M ~80MB).
+                // 64MB matches Trino/Spark's broadcast join threshold.
+                .set_usize("datafusion.optimizer.hash_join_single_partition_threshold", 64 * 1024 * 1024)
+                // Dynamic filter pushdown: hash join build-side min/max values
+                // pushed to probe-side scans at runtime.
+                .set_bool("datafusion.optimizer.enable_dynamic_filter_pushdown", true)
+                // Parquet filter pushdown: DataFusion pushes predicates into
+                // the Parquet reader as RowFilters. Type mismatches (Utf8 >= Int32)
+                // are handled gracefully by PhysicalExprPredicate (returns all-true
+                // on error, lets parent FilterExec handle the coercion).
+                .set_bool("datafusion.execution.parquet.pushdown_filters", true)
+                .set_bool("datafusion.execution.parquet.reorder_filters", true);
 
             let mut ctx = if let Some(rt) = runtime {
                 // Use the shared coordinator runtime (FairSpillPool with spill-to-disk)

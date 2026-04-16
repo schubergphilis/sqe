@@ -664,7 +664,7 @@ The worker cannot see the full query. It cannot modify the plan it received. It 
 These constraints are also features. A compromised worker that cannot see the full query cannot reconstruct what the user asked. A worker that cannot contact other workers cannot be used as a pivot point in a lateral network movement. A worker that cannot exceed its memory limit cannot destabilize the host.
 
 ::: {.sovereignty}
-**Sovereignty principle:** In a distributed system, every trust boundary is an attack surface. The coordinator-worker boundary is designed so that compromising either side gives the attacker the least possible leverage. The coordinator cannot read data. The worker cannot see plans. Neither holds credentials beyond what the current query requires. This is not paranoia -- it is the minimum viable security posture for a system that handles production data.
+**Sovereignty principle:** In a distributed system, every trust boundary is an attack surface. The coordinator-worker boundary is designed so that compromising either side gives the attacker the least possible advantage. The coordinator cannot read data. The worker cannot see plans. Neither holds credentials beyond what the current query requires. This is not paranoia -- it is the minimum viable security posture for a system that handles production data.
 :::
 
 
@@ -705,7 +705,7 @@ When DataFusion adds hash join spill upstream (tracked in the DataFusion issue t
 
 The biggest architectural change in streaming execution is worker-to-worker communication via Arrow Flight `DoExchange`. In the scan-only model, data flows in one direction: worker to coordinator. With `DoExchange`, workers exchange hash-partitioned or range-partitioned data with each other.
 
-This enables distributed joins, distributed sorts, and distributed aggregations. The coordinator decomposes the physical plan into stages separated by shuffle boundaries. Each stage runs on workers. When a stage finishes, its output is partitioned and streamed to the next stage's workers via `DoExchange`. The coordinator orchestrates stages but does not touch the data.
+`DoExchange` enables distributed joins, distributed sorts, and distributed aggregations. The coordinator decomposes the physical plan into stages separated by shuffle boundaries. Each stage runs on workers. When a stage finishes, its output is partitioned and streamed to the next stage's workers via `DoExchange`. The coordinator orchestrates stages but does not touch the data.
 
 The trust model extends naturally: workers trust other workers to send correctly partitioned data matching the expected schema. The coordinator trusts workers to execute their stage correctly. Credentials are scoped per stage -- a worker in the join stage receives only the credentials it needs for its partition of the probe side.
 
@@ -725,5 +725,5 @@ This is more code than a naive implementation where the coordinator ships the en
 The coordinator decides. The worker executes. Neither trusts the other more than necessary. That is the contract. Everything else follows from it.
 
 ::: {.ailog}
-**AI Logbook:** The AI implemented the `DistributedScanExec`, `WorkerFlightService`, `execute_scan`, the credential refresh push mechanism with `tokio::sync::watch` channels, and the `CredentialRefreshTracker` — all from a design doc that explicitly stated the trust boundary between coordinator and worker. The human drew that trust boundary; the AI couldn't derive it from the code. The `COUNT(*)` schema projection bug — workers returning five columns where the parent `AggregateExec` expected zero — produced silently wrong results that the human found by checking the numbers; the AI's fix was the `expected_cols == 0` branch in the stream adapter.
+**AI Logbook:** The AI implemented the `DistributedScanExec`, `WorkerFlightService`, `execute_scan`, the credential refresh push mechanism with `tokio::sync::watch` channels, and the `CredentialRefreshTracker`, all from a design doc that explicitly stated the trust boundary between coordinator and worker. The human drew that trust boundary; the AI couldn't derive it from the code. The `COUNT(*)` schema projection bug (workers returning five columns where the parent `AggregateExec` expected zero) produced silently wrong results that the human found by checking the numbers; the AI's fix was the `expected_cols == 0` branch in the stream adapter.
 :::
