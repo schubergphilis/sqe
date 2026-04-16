@@ -2,7 +2,7 @@
 
 ## Goal
 
-Rebuild the Chameleon Trino fork (DCAF branch) as a purpose-built distributed SQL query engine in Rust. The core requirement: every query runs as the authenticated user — the user's Keycloak token is passed through to Polaris (Iceberg REST catalog) and S3 (via credential vending). No service accounts.
+Rebuild the patched Trino fork as a purpose-built distributed SQL query engine in Rust. The core requirement: every query runs as the authenticated user — the user's Keycloak token is passed through to Polaris (Iceberg REST catalog) and S3 (via credential vending). No service accounts.
 
 Built on DataFusion for query execution, with a custom Ballista-inspired coordinator/worker architecture for distributed scale from single-node to petabyte.
 

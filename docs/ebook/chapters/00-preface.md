@@ -118,7 +118,7 @@ The iceberg-rust maintainers built the table format library that handles the Ice
 
 Rafael Herrero has been the other half of this project from the start. While I was deep in the query engine internals (DataFusion plans, Arrow batches, Iceberg commits) Rafael was building the deployment and operational layer that makes SQE actually runnable in production. The Kubernetes deployment, the Helm operator, the security hardening, the network policies, the mTLS configuration between coordinator and workers: that's Rafael's work. He's the person who took a binary that runs on a laptop and turned it into something that deploys securely across namespaces with proper RBAC, pod security standards, and automated rollouts. Many of the architectural decisions in this book (pluggable auth, TLS everywhere, the separation between coordinator and worker configs) exist because Rafael was asking the right deployment questions while I was writing Rust. Building a query engine is one thing. Operating it at the security standard Schuberg Philis demands is another, and that's where Rafael's expertise shaped the project.
 
-The VPF Data & AI team at Schuberg Philis ran the queries, filed the bugs, and never once asked "why don't we just use Trino?" after the first week.
+The data platform team ran the queries, filed the bugs, and never once asked "why don't we just use Trino?" after the first week.
 
 And to everyone who looked at this project and asked "why would you build a SQL engine?", this book is the answer.
 
