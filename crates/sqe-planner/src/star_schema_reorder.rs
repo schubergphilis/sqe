@@ -281,13 +281,26 @@ fn flatten_join_chain(
         return true;
     };
 
-    // Only reorder INNER joins.
+    // Non-INNER joins (LEFT, RIGHT, FULL, CROSS): treat as a boundary.
+    // We don't reorder across them, but we DO reorder the INNER chain
+    // below them. This handles q72-style plans where a LEFT JOIN promotion
+    // sits on top of a chain of INNER joins.
     if *hash_join.join_type() != JoinType::Inner {
         trace!(
             join_type = ?hash_join.join_type(),
-            "StarSchemaReorderRule: non-inner join in chain, aborting"
+            "StarSchemaReorderRule: non-inner join, treating as leaf (not reordering across)"
         );
-        return false;
+        // Treat this entire subtree as a single opaque input.
+        // The reorder rule will be applied recursively to children
+        // via the top-level optimize() walk.
+        let row_count = estimate_row_count(plan);
+        let idx = inputs.len();
+        inputs.push(JoinInput {
+            plan: Arc::clone(plan),
+            row_count,
+            original_index: idx,
+        });
+        return true;
     }
 
     // Only handle equi-joins without complex filter conditions that reference
@@ -722,10 +735,12 @@ mod tests {
         let plan = make_inner_hash_join(left_join, c, "id", "id");
 
         let result = rule.optimize(plan.clone(), &config).unwrap();
-        // Should remain unchanged because chain contains a non-inner join.
+        // The LEFT join is treated as an opaque leaf. The top INNER join
+        // has only 2 inputs (LEFT subtree + C), so it doesn't reorder
+        // (needs 3+ inputs). Plan remains unchanged.
         assert!(
             result.as_any().downcast_ref::<HashJoinExec>().is_some(),
-            "Expected unchanged plan when chain contains LEFT join"
+            "Expected unchanged plan: LEFT join treated as leaf, only 2 inputs at INNER level"
         );
     }
 
