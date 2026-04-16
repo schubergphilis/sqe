@@ -1,6 +1,6 @@
 ## Why
 
-The Chameleon platform currently runs a patched Trino fork (DCAF branch) to pass user Keycloak tokens through to Polaris (Iceberg REST catalog) and S3. Maintaining patches against Trino's Java monolith is expensive and fragile — every Trino upgrade risks breaking the auth passthrough. SQE replaces this with a purpose-built Rust engine where per-user auth is the core design, not a bolt-on.
+The platform currently runs a patched Trino fork to pass user Keycloak tokens through to Polaris (Iceberg REST catalog) and S3. Maintaining patches against Trino's Java monolith is expensive and fragile — every Trino upgrade risks breaking the auth passthrough. SQE replaces this with a purpose-built Rust engine where per-user auth is the core design, not a bolt-on.
 
 ## What Changes
 
