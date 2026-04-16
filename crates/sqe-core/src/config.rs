@@ -12,6 +12,8 @@ pub struct SqeConfig {
     #[serde(default)]
     pub policy: PolicyConfig,
     #[serde(default)]
+    pub access_control: AccessControlConfig,
+    #[serde(default)]
     pub metrics: MetricsConfig,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
@@ -96,6 +98,30 @@ pub struct QueryConfig {
     /// partition-only under pressure. Never crashes from unbounded sorts.
     #[serde(default = "default_sort_mode")]
     pub sort_mode: String,
+    /// Minimum number of projection-only columns required for late materialization
+    /// to be applied. Late materialization uses a two-phase Parquet scan: Phase 1
+    /// reads only predicate columns, Phase 2 reads remaining columns for surviving
+    /// rows. When the number of deferrable columns is below this threshold, the
+    /// overhead of two-phase scanning may exceed the I/O savings.
+    ///
+    /// Default: 1 (apply whenever there is at least one projection-only column).
+    /// Set to 0 to disable late materialization entirely.
+    #[serde(default = "default_late_mat_min_projection_cols")]
+    pub late_materialization_min_projection_cols: usize,
+    /// Enable star-schema join reordering. When enabled, chains of inner
+    /// equi-joins are reordered so small dimension tables are joined first
+    /// (building small hash tables) and the large fact table is probed last.
+    ///
+    /// Default: true.
+    #[serde(default = "default_true")]
+    pub star_schema_reorder: bool,
+    /// Minimum ratio between the largest and smallest table row counts
+    /// required to trigger star-schema join reordering. Only applies when
+    /// `star_schema_reorder` is enabled.
+    ///
+    /// Default: 10 (fact table must be at least 10x larger than the smallest dimension).
+    #[serde(default = "default_star_schema_min_ratio")]
+    pub star_schema_min_ratio: usize,
 }
 
 impl Default for QueryConfig {
@@ -111,6 +137,9 @@ impl Default for QueryConfig {
             distribution_file_threshold: default_distribution_file_threshold(),
             target_task_size: default_target_task_size(),
             sort_mode: default_sort_mode(),
+            late_materialization_min_projection_cols: default_late_mat_min_projection_cols(),
+            star_schema_reorder: default_true(),
+            star_schema_min_ratio: default_star_schema_min_ratio(),
         }
     }
 }
@@ -645,6 +674,11 @@ pub struct StorageConfig {
     /// Prefetch buffer size for overlapping footer reads. Default: "32MB".
     #[serde(default = "default_prefetch_buffer")]
     pub prefetch_buffer: String,
+    /// Maximum number of S3 files to prefetch concurrently during scan.
+    /// Higher values improve throughput on high-latency S3 connections.
+    /// Default: 4. Set higher (8-16) for WAN or high-latency storage.
+    #[serde(default = "default_prefetch_concurrency")]
+    pub prefetch_concurrency: usize,
 }
 
 impl Default for StorageConfig {
@@ -661,6 +695,7 @@ impl Default for StorageConfig {
             concurrent_requests_per_file: default_concurrent_requests_per_file(),
             max_concurrent_files: default_max_concurrent_files(),
             prefetch_buffer: default_prefetch_buffer(),
+            prefetch_concurrency: default_prefetch_concurrency(),
         }
     }
 }
@@ -670,6 +705,7 @@ fn default_footer_cache_size() -> String { "256MB".to_string() }
 fn default_concurrent_requests_per_file() -> usize { 4 }
 fn default_max_concurrent_files() -> usize { 8 }
 fn default_prefetch_buffer() -> String { "32MB".to_string() }
+fn default_prefetch_concurrency() -> usize { 4 }
 
 impl std::fmt::Debug for StorageConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -685,9 +721,50 @@ impl std::fmt::Debug for StorageConfig {
             .field("concurrent_requests_per_file", &self.concurrent_requests_per_file)
             .field("max_concurrent_files", &self.max_concurrent_files)
             .field("prefetch_buffer", &self.prefetch_buffer)
+            .field("prefetch_concurrency", &self.prefetch_concurrency)
             .finish()
     }
 }
+
+/// Access control backend for GRANT/REVOKE/SHOW GRANTS SQL.
+///
+/// Supports multiple backends:
+/// - `"chameleon"` -- Chameleon platform API (GROUP/USER grantees)
+/// - `"polaris"` -- Apache Polaris 1.3 native (PRINCIPAL/PRINCIPAL_ROLE/CATALOG_ROLE)
+/// - `"none"` -- disabled (default)
+///
+/// ```toml
+/// [access_control]
+/// backend = "chameleon"
+/// url = "http://backend:8080/api/platform/v1/access"
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct AccessControlConfig {
+    /// Backend type: "chameleon", "polaris", or "none" (disabled).
+    #[serde(default = "default_access_control_backend")]
+    pub backend: String,
+    /// Backend API URL.
+    /// Chameleon: http://backend:port/api/platform/v1/access
+    /// Polaris: http://polaris:8181/api/management/v1 (Polaris management API)
+    #[serde(default)]
+    pub url: String,
+    /// Request timeout in seconds.
+    #[serde(default = "default_access_control_timeout")]
+    pub timeout_secs: u64,
+}
+
+impl Default for AccessControlConfig {
+    fn default() -> Self {
+        Self {
+            backend: "none".to_string(),
+            url: String::new(),
+            timeout_secs: 30,
+        }
+    }
+}
+
+fn default_access_control_backend() -> String { "none".to_string() }
+fn default_access_control_timeout() -> u64 { 30 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct PolicyConfig {
@@ -797,6 +874,8 @@ fn default_distribution_threshold() -> String { "128MB".to_string() }
 fn default_distribution_file_threshold() -> usize { 4 }
 fn default_target_task_size() -> String { "256MB".to_string() }
 fn default_sort_mode() -> String { "adaptive".to_string() }
+fn default_late_mat_min_projection_cols() -> usize { 1 }
+fn default_star_schema_min_ratio() -> usize { 10 }
 
 fn default_coordinator_memory() -> String { "8GB".to_string() }
 fn default_coordinator_spill_dir() -> String { "/tmp/sqe-coordinator-spill".to_string() }
@@ -968,6 +1047,7 @@ impl SqeConfig {
         env_override_str("SQE_STORAGE__S3_SECRET_KEY", &mut self.storage.s3_secret_key);
         env_override_bool("SQE_STORAGE__S3_PATH_STYLE", &mut self.storage.s3_path_style);
         env_override_bool("SQE_STORAGE__S3_ALLOW_HTTP", &mut self.storage.s3_allow_http);
+        env_override_usize("SQE_STORAGE__PREFETCH_CONCURRENCY", &mut self.storage.prefetch_concurrency);
 
         // Policy
         env_override_str("SQE_POLICY__ENGINE", &mut self.policy.engine);
@@ -1043,6 +1123,16 @@ fn env_override_bool(key: &str, target: &mut bool) {
             "true" | "1" | "yes" => *target = true,
             "false" | "0" | "no" => *target = false,
             _ => tracing::warn!("{key}={val:?} is not a valid bool, ignoring"),
+        }
+    }
+}
+
+fn env_override_usize(key: &str, target: &mut usize) {
+    if let Ok(val) = std::env::var(key) {
+        if let Ok(parsed) = val.parse() {
+            *target = parsed;
+        } else {
+            tracing::warn!("{key}={val:?} is not a valid usize, ignoring");
         }
     }
 }
@@ -1170,6 +1260,7 @@ mod tests {
             },
             storage: StorageConfig::default(),
             policy: PolicyConfig::default(),
+            access_control: AccessControlConfig::default(),
             metrics: MetricsConfig::default(),
             rate_limit: RateLimitConfig::default(),
             session: SessionConfig::default(),

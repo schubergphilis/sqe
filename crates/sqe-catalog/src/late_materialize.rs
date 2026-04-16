@@ -23,6 +23,7 @@ use datafusion::physical_plan::{ColumnarValue, PhysicalExpr};
 use parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter};
 use parquet::arrow::ProjectionMask;
 use parquet::schema::types::SchemaDescriptor;
+use tracing::debug;
 
 /// Classification of projected columns into predicate and projection-only groups.
 ///
@@ -111,19 +112,59 @@ pub fn classify_columns(
 /// Returns `false` when:
 /// - There is no predicate (nothing to filter on)
 /// - All projected columns are predicate columns (no columns to defer)
-/// - There are fewer than 2 projection-only columns (overhead may exceed benefit)
+/// - The number of projection-only columns is below `min_projection_cols`
+///
+/// The `min_projection_cols` parameter controls the minimum number of
+/// deferrable (projection-only) columns required. Pass `1` to apply late
+/// materialization whenever there is at least one deferrable column (default).
+/// Pass `0` to disable late materialization entirely.
 pub fn is_late_materialization_beneficial(
     predicate: Option<&dyn PhysicalExpr>,
     projection: &[String],
 ) -> bool {
+    is_late_materialization_beneficial_with_threshold(predicate, projection, 1)
+}
+
+/// Like [`is_late_materialization_beneficial`] but with a configurable minimum
+/// projection-only column threshold.
+pub fn is_late_materialization_beneficial_with_threshold(
+    predicate: Option<&dyn PhysicalExpr>,
+    projection: &[String],
+    min_projection_cols: usize,
+) -> bool {
     let Some(pred) = predicate else {
+        debug!("Late materialization skipped: no predicate");
         return false;
     };
 
+    if min_projection_cols == 0 {
+        debug!("Late materialization disabled via config (min_projection_cols=0)");
+        return false;
+    }
+
     let classification = classify_columns(pred, projection);
-    // Only beneficial when there are deferred columns to skip in Phase 1
-    // and at least one predicate column to filter on.
-    classification.is_beneficial()
+
+    if classification.predicate_columns.is_empty() {
+        debug!("Late materialization skipped: no predicate columns identified");
+        return false;
+    }
+
+    if classification.projection_only_columns.len() < min_projection_cols {
+        debug!(
+            predicate_cols = classification.predicate_columns.len(),
+            projection_only_cols = classification.projection_only_columns.len(),
+            min_required = min_projection_cols,
+            "Late materialization skipped: too few projection-only columns"
+        );
+        return false;
+    }
+
+    debug!(
+        predicate_cols = classification.predicate_columns.len(),
+        projection_only_cols = classification.projection_only_columns.len(),
+        "Late materialization applied: two-phase scan enabled"
+    );
+    true
 }
 
 /// Build a parquet `RowFilter` from a DataFusion `PhysicalExpr` predicate.
