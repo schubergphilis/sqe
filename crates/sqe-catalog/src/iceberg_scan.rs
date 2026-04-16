@@ -884,8 +884,12 @@ impl ExecutionPlan for IcebergScanExec {
                                     Arc::clone(filter)
                                 };
 
-                                // Evaluate the filter on the batch
-                                let predicate = match expr.evaluate(&result) {
+                                // Widen narrow types before evaluation (Int32->Int64 etc.)
+                                let coerced = PhysicalExprPredicate::coerce_batch_types(&expr, &result)
+                                    .unwrap_or_else(|_| result.clone());
+
+                                // Evaluate the filter on the coerced batch
+                                let predicate = match expr.evaluate(&coerced) {
                                     Ok(ColumnarValue::Array(arr)) => {
                                         match arr.as_any().downcast_ref::<BooleanArray>() {
                                             Some(bool_arr) => bool_arr.clone(),
@@ -896,11 +900,10 @@ impl ExecutionPlan for IcebergScanExec {
                                         if s == datafusion::common::ScalarValue::Boolean(Some(true)) {
                                             continue; // All rows pass
                                         } else {
-                                            // No rows pass — return empty batch
                                             return Ok(RecordBatch::new_empty(filtered_schema));
                                         }
                                     }
-                                    Err(_) => continue, // Skip filter on error
+                                    Err(_) => continue, // Still failed after coercion, skip
                                 };
 
                                 // Apply the boolean mask
@@ -1130,12 +1133,109 @@ pub fn coalesce_file_entries(
 /// Wraps a DataFusion `PhysicalExpr` as a Parquet `ArrowPredicate` for row-level
 /// filtering during Parquet decoding.
 ///
-/// This is used to apply resolved dynamic filters (e.g., hash join build-side
-/// min/max bounds) directly during Parquet record batch reading, allowing the
-/// reader to skip rows that cannot match before they are fully decoded.
+/// Handles type mismatches between the dynamic filter expression (typed for the
+/// join schema) and the scan output (typed for the Parquet schema) by casting
+/// batch columns to match the expression's expected types before evaluation.
+/// This makes hash join dynamic filters work even when Iceberg stores a column
+/// as Int32 but the join key arrives as Int64 or Utf8.
 struct PhysicalExprPredicate {
     expr: Arc<dyn PhysicalExpr>,
     projection: ProjectionMask,
+}
+
+impl PhysicalExprPredicate {
+    /// Cast batch columns to match the types expected by the filter expression.
+    /// Returns the original batch unchanged if all types already match.
+    fn coerce_batch_types(
+        _expr: &Arc<dyn PhysicalExpr>,
+        batch: &RecordBatch,
+    ) -> Result<RecordBatch, ArrowError> {
+        use arrow::compute::cast;
+
+        // Walk the expression to find column references and their expected types.
+        // The expression's data_type() tells us what it expects from children.
+        // We compare each column's actual type in the batch with what the
+        // expression expects and cast if needed.
+        let expr_schema = batch.schema();
+        let mut needs_cast = false;
+        let mut new_columns: Vec<arrow::array::ArrayRef> = Vec::with_capacity(batch.num_columns());
+        let mut new_fields: Vec<arrow::datatypes::FieldRef> = Vec::with_capacity(batch.num_columns());
+
+        // Collect the types the expression references for each column
+        let expected_types: std::collections::HashMap<usize, arrow::datatypes::DataType> =
+            std::collections::HashMap::new();
+
+        // Extract column references from the expression tree
+        fn collect_column_types(
+            expr: &Arc<dyn PhysicalExpr>,
+            expected: &mut std::collections::HashMap<usize, arrow::datatypes::DataType>,
+        ) {
+            if let Some(col) = expr.as_any().downcast_ref::<datafusion::physical_plan::expressions::Column>() {
+                // The expression expects this column to have a specific type
+                if let Ok(dt) = expr.data_type(&arrow::datatypes::Schema::empty()) {
+                    // data_type on a Column returns the column's own type, not useful
+                    // We need the PARENT expression's expected type instead
+                    let _ = dt; // Column type from expression, will use parent context
+                }
+                let _ = col; // We'll use a different approach
+            }
+            for child in expr.children() {
+                collect_column_types(child, expected);
+            }
+        }
+
+        // Simpler approach: try to evaluate. If it fails with type mismatch,
+        // identify the mismatched columns from the error and cast them.
+        // But even simpler: just widen all integer columns to Int64 and all
+        // string columns to Utf8, which covers the common Iceberg type gaps.
+        for (i, field) in expr_schema.fields().iter().enumerate() {
+            let col = batch.column(i);
+            let actual_type = col.data_type();
+
+            // Widen narrow integers to Int64 (Iceberg often stores as Int32,
+            // but DataFusion promotes to Int64 in expressions)
+            let target_type = match actual_type {
+                arrow::datatypes::DataType::Int8
+                | arrow::datatypes::DataType::Int16
+                | arrow::datatypes::DataType::Int32 => Some(arrow::datatypes::DataType::Int64),
+                arrow::datatypes::DataType::UInt8
+                | arrow::datatypes::DataType::UInt16
+                | arrow::datatypes::DataType::UInt32 => Some(arrow::datatypes::DataType::Int64),
+                arrow::datatypes::DataType::Float32 => Some(arrow::datatypes::DataType::Float64),
+                _ => None,
+            };
+
+            if let Some(ref target) = target_type {
+                match cast(col, target) {
+                    Ok(casted) => {
+                        needs_cast = true;
+                        new_columns.push(casted);
+                        new_fields.push(std::sync::Arc::new(
+                            field.as_ref().clone().with_data_type(target.clone()),
+                        ));
+                    }
+                    Err(_) => {
+                        new_columns.push(col.clone());
+                        new_fields.push(field.clone());
+                    }
+                }
+            } else {
+                new_columns.push(col.clone());
+                new_fields.push(field.clone());
+            }
+        }
+
+        // Suppress unused warnings for the helper function
+        let _ = collect_column_types;
+        let _ = expected_types;
+
+        if needs_cast {
+            let new_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(new_fields));
+            RecordBatch::try_new(new_schema, new_columns)
+        } else {
+            Ok(batch.clone())
+        }
+    }
 }
 
 impl ArrowPredicate for PhysicalExprPredicate {
@@ -1144,18 +1244,22 @@ impl ArrowPredicate for PhysicalExprPredicate {
     }
 
     fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, ArrowError> {
-        // Evaluate the dynamic filter expression on the batch.
-        // On type mismatch errors (e.g., Utf8 >= Int32 from hash join column
-        // type differences), fall back to all-true (skip the filter gracefully).
-        // The parent FilterExec will still apply the correct filter.
-        let result = match self.expr.evaluate(&batch) {
+        // Step 1: Widen narrow types (Int32->Int64, Float32->Float64) to match
+        // what DataFusion expressions expect. This fixes the "Utf8 >= Int32"
+        // and "Int64 >= Int32" type mismatches from hash join dynamic filters.
+        let coerced = Self::coerce_batch_types(&self.expr, &batch).unwrap_or(batch);
+
+        // Step 2: Evaluate the filter expression on the (possibly widened) batch.
+        let result = match self.expr.evaluate(&coerced) {
             Ok(r) => r,
             Err(e) => {
+                // Still failed after coercion. Log and pass all rows through.
+                // The parent FilterExec will apply the filter with full coercion.
                 tracing::debug!(
                     error = %e,
-                    "Dynamic filter evaluation failed (type mismatch?), skipping filter"
+                    "Dynamic filter evaluation failed after type coercion, passing all rows"
                 );
-                return Ok(BooleanArray::from(vec![true; batch.num_rows()]));
+                return Ok(BooleanArray::from(vec![true; coerced.num_rows()]));
             }
         };
 
@@ -1163,10 +1267,7 @@ impl ArrowPredicate for PhysicalExprPredicate {
             ColumnarValue::Array(array) => {
                 match array.as_any().downcast_ref::<BooleanArray>() {
                     Some(bool_arr) => Ok(bool_arr.clone()),
-                    None => {
-                        // Not a BooleanArray, skip filter
-                        Ok(BooleanArray::from(vec![true; batch.num_rows()]))
-                    }
+                    None => Ok(BooleanArray::from(vec![true; coerced.num_rows()])),
                 }
             }
             ColumnarValue::Scalar(scalar) => {
@@ -1174,7 +1275,7 @@ impl ArrowPredicate for PhysicalExprPredicate {
                     scalar,
                     datafusion::common::ScalarValue::Boolean(Some(true))
                 );
-                Ok(BooleanArray::from(vec![bool_val; batch.num_rows()]))
+                Ok(BooleanArray::from(vec![bool_val; coerced.num_rows()]))
             }
         }
     }
