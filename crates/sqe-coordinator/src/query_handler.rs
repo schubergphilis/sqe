@@ -5,6 +5,7 @@ use arrow_array::RecordBatch;
 use arrow_array::{ArrayRef, BooleanArray, Int64Array, builder::StringBuilder};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion::prelude::SessionContext;
 use tracing::{debug, info, warn, Span};
@@ -764,6 +765,27 @@ impl QueryHandler {
             .create_physical_plan()
             .await
             .map_err(|e| SqeError::Execution(format!("Physical plan creation failed: {e}")))?;
+
+        // Apply star-schema join reordering: reorder inner equi-join chains so
+        // small dimension tables are joined first and the large fact table is
+        // probed last.
+        let physical_plan = if self.config.query.star_schema_reorder {
+            let rule = sqe_planner::StarSchemaReorderRule::new(
+                self.config.query.star_schema_min_ratio,
+            );
+            match rule.optimize(physical_plan.clone(), &datafusion::config::ConfigOptions::new()) {
+                Ok(optimized) => optimized,
+                Err(e) => {
+                    debug!(
+                        error = %e,
+                        "Star-schema join reorder failed, using original plan"
+                    );
+                    physical_plan
+                }
+            }
+        } else {
+            physical_plan
+        };
 
         // Apply adaptive sort stripping based on sort_mode config and memory pressure.
         let sort_mode = SortMode::parse(&self.config.query.sort_mode);

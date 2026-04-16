@@ -108,6 +108,20 @@ pub struct QueryConfig {
     /// Set to 0 to disable late materialization entirely.
     #[serde(default = "default_late_mat_min_projection_cols")]
     pub late_materialization_min_projection_cols: usize,
+    /// Enable star-schema join reordering. When enabled, chains of inner
+    /// equi-joins are reordered so small dimension tables are joined first
+    /// (building small hash tables) and the large fact table is probed last.
+    ///
+    /// Default: true.
+    #[serde(default = "default_true")]
+    pub star_schema_reorder: bool,
+    /// Minimum ratio between the largest and smallest table row counts
+    /// required to trigger star-schema join reordering. Only applies when
+    /// `star_schema_reorder` is enabled.
+    ///
+    /// Default: 10 (fact table must be at least 10x larger than the smallest dimension).
+    #[serde(default = "default_star_schema_min_ratio")]
+    pub star_schema_min_ratio: usize,
 }
 
 impl Default for QueryConfig {
@@ -124,6 +138,8 @@ impl Default for QueryConfig {
             target_task_size: default_target_task_size(),
             sort_mode: default_sort_mode(),
             late_materialization_min_projection_cols: default_late_mat_min_projection_cols(),
+            star_schema_reorder: default_true(),
+            star_schema_min_ratio: default_star_schema_min_ratio(),
         }
     }
 }
@@ -859,6 +875,7 @@ fn default_distribution_file_threshold() -> usize { 4 }
 fn default_target_task_size() -> String { "256MB".to_string() }
 fn default_sort_mode() -> String { "adaptive".to_string() }
 fn default_late_mat_min_projection_cols() -> usize { 1 }
+fn default_star_schema_min_ratio() -> usize { 10 }
 
 fn default_coordinator_memory() -> String { "8GB".to_string() }
 fn default_coordinator_spill_dir() -> String { "/tmp/sqe-coordinator-spill".to_string() }
