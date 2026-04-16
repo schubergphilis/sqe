@@ -48,6 +48,7 @@ use parquet::file::metadata::{
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
+use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::{arrow_schema_to_schema, get_arrow_datum};
 use crate::delete_vector::DeleteVector;
@@ -326,6 +327,31 @@ impl ArrowReader {
             // Branch 1: File has embedded field IDs - trust them
             initial_stream_builder
         };
+
+        // Coerce INT96 timestamp columns to the resolution specified by the Iceberg schema.
+        // This must happen before building the stream reader to avoid i64 overflow in arrow-rs.
+        let arrow_metadata = if let Some(coerced_schema) =
+            coerce_int96_timestamps(arrow_metadata.schema(), &task.schema)
+        {
+            let options = ArrowReaderOptions::new().with_schema(Arc::clone(&coerced_schema));
+            ArrowReaderMetadata::try_new(Arc::clone(arrow_metadata.metadata()), options).map_err(
+                |e| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!(
+                            "Failed to create ArrowReaderMetadata with INT96-coerced schema: {coerced_schema}"
+                        ),
+                    )
+                    .with_source(e)
+                },
+            )?
+        } else {
+            arrow_metadata
+        };
+
+        // Build the stream reader, reusing the already-opened file reader
+        let mut record_batch_stream_builder =
+            ParquetRecordBatchStreamBuilder::new_with_metadata(parquet_file_reader, arrow_metadata);
 
         // Filter out metadata fields for Parquet projection (they don't exist in files)
         let project_field_ids_without_metadata: Vec<i32> = task
