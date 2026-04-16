@@ -1145,23 +1145,32 @@ impl ArrowPredicate for PhysicalExprPredicate {
     }
 
     fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, ArrowError> {
-        let result = self
-            .expr
-            .evaluate(&batch)
-            .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
+        // Evaluate the dynamic filter expression on the batch.
+        // On type mismatch errors (e.g., Utf8 >= Int32 from hash join column
+        // type differences), fall back to all-true (skip the filter gracefully).
+        // The parent FilterExec will still apply the correct filter.
+        let result = match self.expr.evaluate(&batch) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "Dynamic filter evaluation failed (type mismatch?), skipping filter"
+                );
+                return Ok(BooleanArray::from(vec![true; batch.num_rows()]));
+            }
+        };
 
         match result {
-            ColumnarValue::Array(array) => array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .cloned()
-                .ok_or_else(|| {
-                    ArrowError::ExternalError(Box::new(std::io::Error::other(
-                        "Dynamic filter must return BooleanArray",
-                    )))
-                }),
+            ColumnarValue::Array(array) => {
+                match array.as_any().downcast_ref::<BooleanArray>() {
+                    Some(bool_arr) => Ok(bool_arr.clone()),
+                    None => {
+                        // Not a BooleanArray, skip filter
+                        Ok(BooleanArray::from(vec![true; batch.num_rows()]))
+                    }
+                }
+            }
             ColumnarValue::Scalar(scalar) => {
-                // Extract boolean value: true only for ScalarValue::Boolean(Some(true)).
                 let bool_val = matches!(
                     scalar,
                     datafusion::common::ScalarValue::Boolean(Some(true))
