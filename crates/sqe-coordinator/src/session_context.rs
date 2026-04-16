@@ -91,17 +91,12 @@ pub async fn create_session_context(
                 // not 0.049999999999999996 (floating-point). Critical for correct
                 // BETWEEN predicates and aggregate precision.
                 .set_bool("datafusion.sql_parser.parse_float_as_decimal", true)
-                // Parquet filter pushdown is DISABLED due to DF epic #20324:
-                // type coercion failures when pushing mixed-type predicates
-                // (e.g., Utf8 >= Int32) into the Parquet row filter evaluator.
-                // This causes "Invalid comparison operation" errors on TPC-H
-                // join queries at SF1. SQE's own late materialization path
-                // (late_materialize.rs) handles filter pushdown safely via
-                // IcebergScanExec's custom RowFilter integration.
-                // Re-enable when DF fixes #20324 (expected DF 54+).
-                // .set_bool("datafusion.execution.parquet.pushdown_filters", true)
-                // .set_bool("datafusion.execution.parquet.reorder_filters", true)
-                ;
+                // Parquet filter pushdown: DataFusion pushes predicates into
+                // the Parquet reader as RowFilters. Type mismatches (Utf8 >= Int32)
+                // are handled gracefully by PhysicalExprPredicate (returns all-true
+                // on error, lets parent FilterExec handle the coercion).
+                .set_bool("datafusion.execution.parquet.pushdown_filters", true)
+                .set_bool("datafusion.execution.parquet.reorder_filters", true);
 
             let mut ctx = if let Some(rt) = runtime {
                 // Use the shared coordinator runtime (FairSpillPool with spill-to-disk)
