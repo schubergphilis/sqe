@@ -159,25 +159,34 @@ impl PhysicalOptimizerRule for StarSchemaReorderRule {
             let mut conditions: Vec<JoinCondition> = Vec::new();
 
             if !flatten_join_chain(&node, &mut inputs, &mut conditions) {
-                trace!(
-                    "StarSchemaReorderRule: join chain not eligible (non-inner join or missing stats)"
+                debug!(
+                    "StarSchemaReorderRule: join chain not eligible (missing stats or cross join)"
                 );
                 return Ok(Transformed::no(node));
             }
 
             // Need at least 3 inputs (2 joins) for star-schema reordering to matter.
             if inputs.len() < 3 {
-                trace!(
+                debug!(
                     inputs = inputs.len(),
                     "StarSchemaReorderRule: too few inputs for star-schema pattern"
                 );
                 return Ok(Transformed::no(node));
             }
 
+            // Log what we found
+            let row_counts: Vec<usize> = inputs.iter().map(|i| i.row_count).collect();
+            info!(
+                inputs = inputs.len(),
+                conditions = conditions.len(),
+                row_counts = ?row_counts,
+                "StarSchemaReorderRule: evaluating join chain"
+            );
+
             // Check that all inputs have row count stats.
             if inputs.iter().any(|i| i.row_count == 0) {
-                trace!(
-                    "StarSchemaReorderRule: some inputs have no row count statistics"
+                info!(
+                    "StarSchemaReorderRule: some inputs have no row count statistics, skipping"
                 );
                 return Ok(Transformed::no(node));
             }
@@ -187,7 +196,7 @@ impl PhysicalOptimizerRule for StarSchemaReorderRule {
             let min_rows = inputs.iter().map(|i| i.row_count).min().unwrap_or(0);
 
             if min_rows == 0 || max_rows / min_rows < min_ratio {
-                trace!(
+                debug!(
                     max_rows,
                     min_rows,
                     min_ratio,
