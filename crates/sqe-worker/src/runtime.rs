@@ -53,11 +53,10 @@ pub fn build_session_context(config: &WorkerConfig) -> anyhow::Result<SessionCon
 
     let runtime = Arc::new(builder.build()?);
     let session_config = SessionConfig::new()
-        // Enable Parquet filter pushdown: push predicates into the Parquet
-        // reader as RowFilters for late materialization (two-phase scan).
-        .set_bool("datafusion.execution.parquet.pushdown_filters", true)
-        // Enable Parquet filter reordering: cheapest/most selective first.
-        .set_bool("datafusion.execution.parquet.reorder_filters", true);
+        // Parquet filter pushdown DISABLED: DF epic #20324 causes
+        // "Invalid comparison: Utf8 >= Int32" on mixed-type predicates.
+        // SQE's own late materialization path handles this safely.
+        ;
     let ctx = SessionContext::new_with_config_rt(session_config, runtime);
 
     Ok(ctx)
