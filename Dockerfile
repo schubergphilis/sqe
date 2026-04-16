@@ -33,12 +33,15 @@ WORKDIR /build
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
+COPY vendor/ vendor/
 RUN cargo chef prepare --recipe-path recipe.json
 
 # ── Stage 3: Build dependencies (cached unless recipe changes) ─
 FROM chef AS deps
 ARG TARGETARCH
 COPY --from=planner /build/recipe.json recipe.json
+# Vendored iceberg-rust crates (path dependencies in Cargo.toml)
+COPY vendor/ vendor/
 RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
     --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},target=/usr/local/cargo/git \
     --mount=type=cache,id=sqe-sccache-${TARGETARCH},target=/sccache \
@@ -50,6 +53,7 @@ FROM deps AS builder
 ARG TARGETARCH
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
+COPY vendor/ vendor/
 RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
     --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},target=/usr/local/cargo/git \
     --mount=type=cache,id=sqe-sccache-${TARGETARCH},target=/sccache \
