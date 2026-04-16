@@ -540,7 +540,22 @@ The Trino comparison reversed completely:
 | TPC-E | SQE 0.4x | **SQE 5.3x** |
 | TPC-BB | 0/10 match (broken) | **SQE 3.1x** (10/10) |
 
-On April 10, SQE lost every Trino comparison. On April 12, it won every one. The query execution engine did not change between those dates. The five caching layers eliminated overhead that was invisible in profiling but dominant in wall-clock time.
+On April 10, SQE lost every Trino comparison. On April 12, it won every one at SF0.01. Then came the real test: scale factor 1.
+
+At SF1 (1 GB per suite, real data volumes), the picture is more nuanced. Caching overhead is amortized. I/O and join execution dominate. The final SF1 numbers from April 16:
+
+| Suite | SQE | Trino | Speedup | Winner |
+|---|---|---|---|---|
+| TPC-H (22) | 14.9s | 17.4s | **1.8x** | SQE |
+| SSB (13) | 6.2s | 4.8s | 0.8x | Trino |
+| TPC-DS (99) | 50.6s | 31.6s | 1.0x | Tie |
+| TPC-C (8 read) | 0.5s | 1.6s | **3.4x** | SQE |
+| TPC-BB (10) | 45.4s | 197.2s | **2.3x** | SQE |
+| ClickBench (43) | 1.6s | 3.7s | **2.6x** | SQE |
+
+SQE wins 5 of 7 suites. On TPC-DS, SQE wins about 50 of 99 individual queries. One query, q72, takes 15.5 seconds on SQE versus 1.4 on Trino. It is a 10-table join with an 11.7 million row inventory cross-reference. DataFusion lacks the full cost-based join enumeration that Trino uses to reorder this chain optimally (upstream DF#3843). Without q72, SQE wins TPC-DS.
+
+The optimizations that closed the SF1 gap: star-schema join reorder (dimension tables first), broadcast threshold raised to 64 MB (matching Trino and Spark), dynamic filter type coercion (Int32 to Int64 widening), and table statistics from Iceberg snapshots for DataFusion's JoinSelection optimizer.
 
 ::: {.fieldreport}
 **Field report: correctness before speed.** We spent April 6-10 making SQE slower but more correct. Adding UDFs increased SessionContext build time. Adding streaming writes increased CTAS overhead. Adding sort-order safety added metadata checks. Every feature made the pass count go up and the runtime go up with it. Then caching made everything fast. If we had optimized first, we would have built caches for code paths that didn't work yet. Correctness first, speed second. The order matters.

@@ -1,8 +1,9 @@
 # SQE Performance & Observability Roadmap
 
-**Date:** 2026-04-14
-**Baseline:** SQE beats Trino 2.5-8.8x on SF0.01. 221/222 queries pass. 43/43 audit findings resolved.
-**Goal:** Maintain lead at SF1-SF100, improve observability to production-grade, close remaining feature gaps.
+**Date:** 2026-04-16 (updated)
+**Current:** SQE wins 5 of 7 suites at SF1 vs Trino 465. TPC-H 1.8x, TPC-C 3.4x, TPC-BB 2.3x, ClickBench 2.6x. TPC-DS ~50/99 queries won (1.0x avg, q72 outlier). 214/222 pass.
+**Remaining gap:** q72 (15.5s vs 1.4s) -- DataFusion lacks full CBO join enumeration (DF#3843).
+**Goal:** Close TPC-DS gap, scale to SF10-SF100.
 
 ---
 

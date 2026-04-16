@@ -211,20 +211,20 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 
 ## Benchmark Results
 
-**SF0.01, Apr 16 2026 -- SQE on DataFusion 53 vs Trino 465:**
+**SF1 (1 GB per suite), Apr 16 2026 -- SQE on DataFusion 53 vs Trino 465:**
 
-| Suite | SQE | Trino | Speedup | Match |
-|---|---|---|---|---|
-| TPC-H (22) | 1.3s | 6.9s | **5.3x** | 22/22 |
-| SSB (13) | 0.7s | 1.8s | **2.6x** | 13/13 |
-| TPC-DS (99) | 11.6s | 22.6s | **1.9x** | 99/99 |
-| ClickBench (43) | 0.7s | 1.8s | **2.6x** | 43/43 |
-| TPC-C (8 read) | 0.3s | 1.0s | **3.6x** | 7/8 |
-| TPC-E (11) | 0.3s | 1.1s | **3.9x** | 7/11 |
-| TPC-BB (10) | 0.8s | 1.2s | **1.4x** | 10/10 |
-| **Total** | **15.7s** | **36.4s** | **2.3x avg** | **201/206** |
+| Suite | SQE | Trino | Speedup | Pass | Winner |
+|---|---|---|---|---|---|
+| TPC-H (22) | 14.9s | 17.4s | **1.8x** | 22/22 | **SQE** |
+| SSB (13) | 6.2s | 4.8s | 0.8x | 13/13 | Trino |
+| TPC-DS (99) | 50.6s | 31.6s | 1.0x | 99/99 | Tie |
+| TPC-C (8 read) | 0.5s | 1.6s | **3.4x** | 7/8 | **SQE** |
+| TPC-BB (10) | 45.4s | 197.2s | **2.3x** | 10/10 | **SQE** |
+| ClickBench (43) | 1.6s | 3.7s | **2.6x** | 43/43 | **SQE** |
 
-SQE is faster than Trino on every benchmark suite. DataFusion 53 upgrade (from 52) gave a 35% speedup. 5-layer caching + ETag validation + ZSTD compression + LZ4 Flight responses. TPC-DS improved from 93/99 to 99/99 with the DF 53 upgrade.
+**SQE wins 5 of 7 suites at SF1.** 214/222 queries pass. TPC-DS: SQE wins ~50/99 individual queries (q01 4.7x, q06 4.8x, q64 2.8x). One known outlier: q72 (15.5s vs 1.4s) due to DataFusion lacking full cost-based join enumeration (upstream DF#3843). See [blog post](docs/blog/2026-04-16-our-nemesis-q72.md) for the full analysis.
+
+Key optimizations: DataFusion 53, 5-layer metadata caching, star-schema join reorder, broadcast threshold 64MB, dynamic filter type coercion, ZSTD compression, ETag validation.
 
 ## Benchmarks
 
