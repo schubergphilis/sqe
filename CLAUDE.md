@@ -4,22 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**SQE (Sovereign Query Engine)** — A Rust-based distributed SQL query engine replacing patched Trino (DCAF branch). Built on DataFusion + iceberg-rust for querying Apache Iceberg tables via Polaris REST Catalog, with OIDC auth passthrough and OPA/Cedar-based fine-grained security.
+**SQE (Sovereign Query Engine)** -- A Rust-based distributed SQL query engine for Apache Iceberg tables. Built on DataFusion + iceberg-rust for querying via Polaris REST Catalog, with OIDC auth passthrough and OPA/Cedar-based fine-grained security.
 
-This repository contains the full engine implementation across 10 crates.
+This repository contains the full engine implementation across 10 crates. Licensed under Apache 2.0.
 
 ## Architecture
 
 ```
-Client (JDBC/Flight SQL) → Coordinator → Workers (DataFusion) → Iceberg (Polaris + S3)
+Client (JDBC/Flight SQL) -> Coordinator -> Workers (DataFusion) -> Iceberg (Polaris + S3)
 ```
 
 - **Coordinator**: SQL parsing, auth, policy enforcement (plan rewriting), optimization, distributed scheduling
 - **Workers**: Stateless DataFusion executors receiving secured plan fragments + user bearer tokens
-- **Auth model**: No service account — every query runs as the authenticated user via OIDC password grant → bearer token passthrough to Polaris/S3
+- **Auth model**: No service account -- every query runs as the authenticated user via OIDC password grant -> bearer token passthrough to Polaris/S3
 - **Security**: Policy enforcement via LogicalPlan rewriting *before* DataFusion optimization (row filters, column masks, column restriction). Pluggable backend: OPA, Cedar, or passthrough
 
-## Planned Crate Structure
+## Crate Structure
 
 | Crate | Purpose |
 |---|---|
@@ -28,7 +28,7 @@ Client (JDBC/Flight SQL) → Coordinator → Workers (DataFusion) → Iceberg (P
 | `sqe-auth` | OIDC password grant, session manager, JWT validation |
 | `sqe-policy` | PolicyEnforcer trait, PolicyStore trait (OPA/Cedar/InMemory), PlanRewriter, policy cache (moka) |
 | `sqe-catalog` | Iceberg REST catalog client (wraps iceberg-rust), information_schema virtual providers |
-| `sqe-planner` | LogicalPlan → PhysicalPlan, partition-aware splitting |
+| `sqe-planner` | LogicalPlan -> PhysicalPlan, partition-aware splitting |
 | `sqe-coordinator` | Scheduler, Flight SQL server, session management, statement routing |
 | `sqe-worker` | Executor, DataFusion runtime, Flight client |
 | `sqe-trino-compat` | Optional Trino wire protocol adapter |
@@ -38,7 +38,7 @@ Client (JDBC/Flight SQL) → Coordinator → Workers (DataFusion) → Iceberg (P
 
 - **Parser extension strategy**: Wrap sqlparser-rs, don't fork. Standard GRANT/REVOKE parsed normally, then post-parse transform detects `MASKED WITH`/`ROWS WHERE` extensions and converts to custom `PolicyStatement` AST nodes
 - **Plan rewriting before optimization**: Security filters injected above TableScan; DataFusion optimizer can push user predicates through row filters but not through masked columns
-- **No information leakage**: Denied columns are invisible (not errors), row filters are transparent, masked columns block predicate pushdown on raw values — follows PostgreSQL RLS model
+- **No information leakage**: Denied columns are invisible (not errors), row filters are transparent, masked columns block predicate pushdown on raw values -- follows PostgreSQL RLS model
 - **Write path**: Merge-on-Read with position deletes first (simpler); compaction added later
 - **dbt compatibility**: Native dbt-sqe Python adapter over ADBC Flight SQL (Path A), not Trino compat layer
 
@@ -46,25 +46,24 @@ Client (JDBC/Flight SQL) → Coordinator → Workers (DataFusion) → Iceberg (P
 
 Design docs use the **openspec** format with three tiers per phase:
 
-- `proposal.md` — Summary, motivation, what changes, success criteria, rollback strategy
-- `design.md` — Architecture diagrams, Rust trait definitions, data flows, key design decisions
-- `tasks.md` — Numbered task checklist broken into sub-phases
-- `specs/` — GIVEN/WHEN/THEN requirement scenarios per domain (e.g., `sql-extensions/spec.md`, `security-policy/spec.md`)
+- `proposal.md` -- Summary, motivation, what changes, success criteria, rollback strategy
+- `design.md` -- Architecture diagrams, Rust trait definitions, data flows, key design decisions
+- `tasks.md` -- Numbered task checklist broken into sub-phases
+- `specs/` -- GIVEN/WHEN/THEN requirement scenarios per domain (e.g., `sql-extensions/spec.md`, `security-policy/spec.md`)
 
 Key docs:
-- `docs/datafusion-architecture.md` — Overall SQE architecture, component breakdown, tech choices, implementation phases
-- `docs/openspec.md` — Phase 5 policy SQL extensions (parser, policy store, plan rewriter, coordinator integration)
-- `docs/dbt-sqe.md` — Phase 2c dbt compatibility (write path, information_schema, dbt-sqe adapter)
-- `docs/polciy-extend.md` — Duplicate of openspec.md (same content)
+- `docs/datafusion-architecture.md` -- Overall SQE architecture, component breakdown, tech choices, implementation phases
+- `docs/openspec.md` -- Phase 5 policy SQL extensions (parser, policy store, plan rewriter, coordinator integration)
+- `docs/dbt-sqe.md` -- Phase 2c dbt compatibility (write path, information_schema, dbt-sqe adapter)
 
 ## Implementation Phases
 
-1. **Phase 1** — Single-node: DataFusion + iceberg-rust + OIDC auth + Flight SQL
-2. **Phase 2** — Views, INSERT INTO, manifest caching, audit logging
-3. **Phase 2c** — dbt compatibility: write path (CTAS, MERGE, DELETE), information_schema, dbt-sqe adapter
-4. **Phase 3** — Distributed execution: Ballista-derived scheduler + workers
-5. **Phase 4** — Production hardening: metrics, benchmarks, Helm, Trino compat
-6. **Phase 5** — Security: OPA/Cedar policy engine, GRANT/REVOKE SQL, column masks, row filters
+1. **Phase 1** -- Single-node: DataFusion + iceberg-rust + OIDC auth + Flight SQL
+2. **Phase 2** -- Views, INSERT INTO, manifest caching, audit logging
+3. **Phase 2c** -- dbt compatibility: write path (CTAS, MERGE, DELETE), information_schema, dbt-sqe adapter
+4. **Phase 3** -- Distributed execution: Ballista-derived scheduler + workers
+5. **Phase 4** -- Production hardening: metrics, benchmarks, Helm, Trino compat
+6. **Phase 5** -- Security: OPA/Cedar policy engine, GRANT/REVOKE SQL, column masks, row filters
 
 ## Tech Stack
 
@@ -79,6 +78,7 @@ Key docs:
 - **Storage**: S3-compatible (AWS S3, Ceph, Garage, R2, etc.)
 - **Policy cache**: moka (async TTL cache)
 - **Deployment**: Kubernetes (Helm)
+- **License**: Apache 2.0
 
 ## Common Commands
 
@@ -101,28 +101,26 @@ cargo audit
 
 ## Git Workflow
 
-- **NEVER push directly to main** — all changes go through feature branches + GitLab MRs
-- Workflow: `git checkout -b feat/<name>` → commit → `git push -u origin feat/<name>` → `glab mr create`
-- No git worktrees — use simple branches
-- Remote: `origin` = GitLab (`sbp.gitlab.schubergphilis.com`)
-- Use `glab` CLI for MR creation (`glab mr create --title "..." --description "..."`)
+- **NEVER push directly to main** -- all changes go through feature branches + pull requests
+- Workflow: `git checkout -b feat/<name>` -> commit -> `git push -u origin feat/<name>` -> open a pull request
+- No git worktrees -- use simple branches
 - Branch naming: `feat/`, `fix/`, `refactor/`, `docs/`, `test/` prefixes
-- Keep MRs focused — one logical change per MR, not mega-branches
+- Keep PRs focused -- one logical change per PR, not mega-branches
 
 ## Benchmarks
 
 Benchmark JSON results in `benchmarks/results/` are **committed to the repo** for historical comparison. After running benchmarks (TPC-H, TPC-DS, SSB, etc.):
 
-1. **Commit the JSON report** — `git add benchmarks/results/*.json` — these files track performance over time
-2. **Compare against baselines** — Use historical results to detect regressions before merging
+1. **Commit the JSON report** -- `git add benchmarks/results/*.json` -- these files track performance over time
+2. **Compare against baselines** -- Use historical results to detect regressions before merging
 3. **Key baselines** to compare against:
-   - `tpch-sf1-flight-2026-04-02T14:16:27.json` — single-node baseline (22/22, 37.5s)
-   - `tpch-sf1-flight-2026-04-06T20:57:10.json` — distributed baseline (22/22, 12.0s, 3.1x faster)
-4. **Run benchmarks after performance-sensitive changes** — spill, scan planning, I/O pipeline, distributed execution
+   - `tpch-sf1-flight-2026-04-02T14:16:27.json` -- single-node baseline (22/22, 37.5s)
+   - `tpch-sf1-flight-2026-04-06T20:57:10.json` -- distributed baseline (22/22, 12.0s, 3.1x faster)
+4. **Run benchmarks after performance-sensitive changes** -- spill, scan planning, I/O pipeline, distributed execution
 
 ```bash
 # Quick smoke test: TPC-H SF1 single-node
-BENCH_SCALE=1 ./scripts/benchmark-mvp.sh tpch
+BENCH_SCALE=1 ./scripts/benchmark-test.sh tpch
 
 # Distributed test: requires docker-compose stack
 docker compose -f docker-compose.test.yml -f docker-compose.distributed.yml up --build -d
@@ -133,9 +131,9 @@ docker compose -f docker-compose.test.yml -f docker-compose.distributed.yml up -
 
 When finishing a feature, bugfix, or any implementation task, **always update these files** before committing:
 
-1. **`README.md`** — Update the roadmap checklist (mark items done, add new items)
-2. **`nextsteps.md`** — Update status line, mark completed steps, shift "← NEXT" pointer
-3. **`openspec/changes/*/tasks.md`** — Check off completed tasks (`- [ ]` → `- [x]`)
-4. **`benchmarks/results/`** — Commit benchmark JSON reports for historical tracking
+1. **`README.md`** -- Update the roadmap checklist (mark items done, add new items)
+2. **`nextsteps.md`** -- Update status line, mark completed steps, shift "NEXT" pointer
+3. **`openspec/changes/*/tasks.md`** -- Check off completed tasks (`- [ ]` -> `- [x]`)
+4. **`benchmarks/results/`** -- Commit benchmark JSON reports for historical tracking
 
 This ensures the project state is always visible to anyone reading the repo.

@@ -189,4 +189,4 @@ We went from maintaining a Trino fork to shipping a purpose-built engine in Rust
 
 ---
 
-*SQE is being open-sourced under Apache 2.0. Built by the data platform team at Schuberg Philis for the Chameleon sovereign data platform.*
+*SQE is open-sourced under Apache 2.0.*

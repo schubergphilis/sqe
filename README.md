@@ -1,46 +1,86 @@
-# SQE — Sovereign Query Engine
+# SQE -- Sovereign Query Engine
+
+![Build](badge_url) ![License](badge_url)
 
 A Rust-based distributed SQL query engine for Apache Iceberg tables. Built on [DataFusion](https://datafusion.apache.org/) and [iceberg-rust](https://github.com/apache/iceberg-rust), with pluggable OIDC authentication and bearer token passthrough to [Apache Polaris](https://polaris.apache.org/) REST Catalog.
 
 Designed as a drop-in replacement for Trino in environments where all data lives in Iceberg and fine-grained security (row filters, column masks) is required.
 
+Licensed under the [Apache License 2.0](LICENSE).
+
+## Getting Started
+
+### Prerequisites
+
+- **Rust 1.88+** (install via [rustup](https://rustup.rs/))
+- **Docker** and Docker Compose
+- **Apache Polaris** (included in the Docker Compose stack)
+- S3-compatible storage (MinIO is included in the Docker Compose stack)
+
+### Quick start
+
+```bash
+# Start the full stack (Polaris, MinIO, SQE coordinator)
+docker compose -f docker-compose.test.yml up --build -d
+
+# Or build and run locally
+cargo build --release
+SQE_CONFIG=config.toml cargo run --bin sqe-coordinator
+```
+
+### First query
+
+Connect with the CLI and run a query against an Iceberg table:
+
+```bash
+# Start the interactive SQL client
+cargo run --bin sqe-cli -- --host localhost --port 50051 --username admin --protocol flight
+
+# Inside the REPL
+SHOW CATALOGS;
+SHOW SCHEMAS;
+SELECT * FROM warehouse.sales.orders LIMIT 10;
+```
+
 ## Architecture
 
 ```
 Client (JDBC / Flight SQL / HTTP)
-        │
-        ▼
-   ┌──────────┐     OIDC Provider
-   │Coordinator│◄── (Keycloak, Auth0,
-   │           │     Okta, or any IdP)
-   │ DataFusion│
-   │  + Policy │──► OPA / Cedar (planned)
-   └─────┬─────┘
-         │ Bearer token passthrough
-    ┌────┼────┐
-    ▼    ▼    ▼
-  ┌───┐┌───┐┌───┐   Stateless workers
-  │ W1 ││ W2 ││ W3 │  (distributed mode)
-  └─┬──┘└─┬──┘└─┬──┘
-    │     │     │
-    ▼     ▼     ▼
-   ┌──────────┐
-   │  Polaris  │──► S3-compatible storage
-   │REST Catalog│
-   └──────────┘
+        |
+        v
+   +-----------+     OIDC Provider
+   |Coordinator|<-- (Keycloak, Auth0,
+   |           |     Okta, or any IdP)
+   | DataFusion|
+   |  + Policy |---> OPA / Cedar (planned)
+   +-----+-----+
+         | Bearer token passthrough
+    +----+----+
+    v    v    v
+  +---++---++---+   Stateless workers
+  | W1 || W2 || W3 |  (distributed mode)
+  +-+--++-+--++-+--+
+    |     |     |
+    v     v     v
+   +-----------+
+   |  Polaris  |---> S3-compatible storage
+   |REST Catalog|
+   +-----------+
 ```
 
 Every query runs as the authenticated user. No service account.
 
+For detailed architecture diagrams, component breakdown, and design decisions, see [docs/datafusion-architecture.md](docs/datafusion-architecture.md).
+
 ## Features
 
-- **SQL**: Full ANSI SQL via DataFusion — window functions (LEAD, LAG, PARTITION BY, etc.), CTEs, subqueries, joins, aggregates, GROUPING SETS. See [docs/features.md](docs/features.md) for a detailed comparison with Trino and Spark.
+- **SQL**: Full ANSI SQL via DataFusion -- window functions (LEAD, LAG, PARTITION BY, etc.), CTEs, subqueries, joins, aggregates, GROUPING SETS. See [docs/features.md](docs/features.md) for a detailed comparison with Trino and Spark.
 - **DDL/DML**: CREATE TABLE AS SELECT, INSERT INTO, DELETE FROM, UPDATE, MERGE INTO (CoW), CREATE/DROP VIEW, DROP TABLE, ALTER TABLE RENAME
 - **Protocols**: Arrow Flight SQL (primary, gRPC) + Trino HTTP (compatibility layer)
-- **Auth**: Pluggable auth chain — OIDC password, bearer token, API key, mTLS, anonymous, AWS IAM, device code, token exchange
+- **Auth**: Pluggable auth chain -- OIDC password, bearer token, API key, mTLS, anonymous, AWS IAM, device code, token exchange
 - **Catalog**: Apache Polaris REST Catalog with per-session bearer token passthrough
 - **Storage**: S3-compatible storage via Iceberg's FileIO (credential vending or static config)
-- **Distributed**: Coordinator → worker architecture with shuffle, distributed sort/join/aggregate, spill-to-disk
+- **Distributed**: Coordinator to worker architecture with shuffle, distributed sort/join/aggregate, spill-to-disk
 - **Observability**: OpenTelemetry (traces, metrics, logs via OTLP/gRPC), Prometheus metrics, JSON audit log
 - **Security**: Planned OPA/Cedar policy engine for row-level security and column masking
 - **CLI**: Interactive REPL and one-shot mode with Flight SQL and HTTP backends
@@ -61,24 +101,7 @@ Every query runs as the authenticated user. No service account.
 | `sqe-metrics` | Prometheus registry, OpenTelemetry setup, audit logger |
 | `sqe-trino-compat` | Trino wire protocol types and HTTP handlers |
 
-## Quick Start
-
-### Build
-
-```bash
-cargo build --release
-```
-
-### Docker
-
-```bash
-# Build all images
-docker build --target coordinator -t sqe-coordinator .
-docker build --target worker -t sqe-worker .
-docker build --target cli -t sqe-cli .
-```
-
-### Configuration
+## Configuration
 
 SQE uses a TOML config file:
 
@@ -104,17 +127,7 @@ prometheus_port = 9090
 otlp_endpoint = "http://otel-collector:4317"
 ```
 
-### Run
-
-```bash
-# Coordinator
-SQE_CONFIG=config.toml cargo run --bin sqe-coordinator
-
-# CLI
-cargo run --bin sqe-cli -- --host localhost --port 50051 --username admin --protocol flight
-```
-
-### Example Queries
+## Example Queries
 
 ```sql
 -- Window functions
@@ -155,21 +168,21 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 
 ## Roadmap
 
-- [x] Distributed execution (coordinator → worker plan shipping, fragment scheduler, heartbeat, credential refresh)
+- [x] Distributed execution (coordinator to worker plan shipping, fragment scheduler, heartbeat, credential refresh)
 - [x] Iceberg predicate pushdown (DataFusion 52 optimizer pass)
 - [x] Trino HTTP compatibility (pagination, header handling, dual auth, infoUri, system.jdbc.* metadata)
 - [x] Worker observability (metrics, OTel trace propagation, memory limits, spill-to-disk)
-- [x] Integration & E2E test suite
+- [x] Integration and E2E test suite
 - [x] Benchmark suite (sqe-bench: TPC-H, TPC-DS, SSB, TPC-C, TPC-E, TPC-BB; `read_parquet()` TVF)
 - [x] Flight SQL DoPut (Arrow data ingestion, statement updates, GetTableTypes, GetXdbcTypeInfo)
-- [x] Complete data type formatting (all Arrow types → Trino, benchmark comparator, value serialization)
-- [x] system.runtime.* virtual tables (queries, nodes, tasks — query history and cluster topology)
-- [x] Distributed query execution wiring (coordinator→worker scan dispatch, fragment tracking, fallback)
+- [x] Complete data type formatting (all Arrow types to Trino, benchmark comparator, value serialization)
+- [x] system.runtime.* virtual tables (queries, nodes, tasks -- query history and cluster topology)
+- [x] Distributed query execution wiring (coordinator to worker scan dispatch, fragment tracking, fallback)
 - [x] DELETE, UPDATE, MERGE INTO via Copy-on-Write (RisingWave iceberg-rust fork rewrite_files)
 - [ ] OPA/Cedar policy engine (row filters, column masks, GRANT/REVOKE SQL)
-- [x] OSS security hardening (TLS, rate limiting, query timeouts, session lifecycle, error sanitisation, vendor-neutral naming)
+- [x] OSS security hardening (TLS, rate limiting, query timeouts, session lifecycle, error sanitization, vendor-neutral naming)
 - [x] OSS release readiness (Apache 2.0 license, CONTRIBUTING.md, cargo-deny, git-cliff, CI pipelines, retro-tagging, v0.15.0)
-- [x] Security & functional audit (AUDIT.md: 1,218 tests, rsa crate removed, all advisory checks clean)
+- [x] Security and functional audit (AUDIT.md: 1,218 tests, rsa crate removed, all advisory checks clean)
 - [x] Production security hardening (43/43 audit findings resolved: token-fingerprint session cache, Flight SQL auth on all endpoints, OIDC error sanitization, OPA role-aware cache, CTAS orphan cleanup, 16 panic-to-error conversions, adaptive sort default)
 - [x] Streaming execution Phase A: spill-to-disk, late materialization, file pruning, S3 I/O pipeline, SortMergeJoin fallback
 - [x] Streaming execution Phase B: DoExchange shuffle, distributed sort/join/aggregate, multi-endpoint Flight SQL, stage decomposition
@@ -177,10 +190,10 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 - [x] Observability metrics (spill, shuffle, late-mat, pruning, time-to-first-row)
 - [x] Trino SQL compatibility ~95% (see `docs/trino-compatibility.md`): 70+ UDFs, engine-level features (USE, SHOW CREATE TABLE, TRUNCATE, COMMENT ON, SHOW STATS, TRY, format, to_json), Iceberg time travel, 6 metadata TVFs
 - [x] Pluggable auth providers (OIDC, bearer token, API key, mTLS, anonymous, AWS IAM, device code, token exchange)
-- [x] Iceberg metadata TVFs (`table_snapshots()`, `table_manifests()`, `table_history()`, `table_files()`, `table_partitions()`, `table_refs()` — snapshot/manifest/partition/ref introspection via SQL)
-- [x] Iceberg time travel (`SELECT * FROM t FOR SYSTEM_TIME AS OF TIMESTAMP '2026-01-01'` — snapshot resolution + per-session provider registration)
-- [ ] Pluggable catalog backends (AWS Glue, Nessie, Hive Metastore, storage-only) ← NEXT
-- [x] dbt adapter (dbt-sqe via ADBC Flight SQL — table, view, incremental, seed)
+- [x] Iceberg metadata TVFs (`table_snapshots()`, `table_manifests()`, `table_history()`, `table_files()`, `table_partitions()`, `table_refs()` -- snapshot/manifest/partition/ref introspection via SQL)
+- [x] Iceberg time travel (`SELECT * FROM t FOR SYSTEM_TIME AS OF TIMESTAMP '2026-01-01'` -- snapshot resolution + per-session provider registration)
+- [ ] Pluggable catalog backends (AWS Glue, Nessie, Hive Metastore, storage-only)
+- [x] dbt adapter (dbt-sqe via ADBC Flight SQL -- table, view, incremental, seed)
 - [x] ALTER TABLE schema evolution (ADD/DROP/RENAME COLUMN, SET/DROP NOT NULL, type widening)
 - [x] Trino SQL compatibility matrix (`docs/trino-compatibility.md`)
 - [x] Side-by-side benchmark tooling (`sqe-bench compare`)
@@ -189,27 +202,29 @@ SELECT * FROM warehouse.information_schema.columns WHERE table_name = 'orders';
 - [x] Safe Iceberg sort order handling (only partition columns trusted by default, `trust_sort_order` config for opt-in)
 - [x] Trino comparison benchmarks (`--compare-trino` flag runs identical queries against SQE + Trino, diffs results)
 - [x] Iceberg query caching (table metadata + manifest files + RestCatalog instances) -- SQE beats Trino on TPC-H, SSB, TPC-DS
-- [x] Direct Parquet read path for small files (≤3 MB, configurable) -- single S3 GET, bypasses `scan.to_arrow()` redundant requests
+- [x] Direct Parquet read path for small files (3 MB or less, configurable) -- single S3 GET, bypasses `scan.to_arrow()` redundant requests
 - [x] DECIMAL precision fix (`parse_float_as_decimal = true`) -- matches Trino/SQL standard, fixes incorrect query results
-- [x] Tuple IN-subquery rewrite (`(col1,col2) IN (SELECT ...)` -> OR of ANDs)
+- [x] Tuple IN-subquery rewrite (`(col1,col2) IN (SELECT ...)` to OR of ANDs)
 - [x] SessionContext caching per token fingerprint (SHA-256, 5-min TTL, 100-entry, atomic via moka `try_get_with`) -- eliminates ~50 ms per-query overhead, invalidated after all DDL
 - [ ] Semantic AI layer (RDF/SPARQL, property graph/GQL, vector search, agent interfaces)
 - [ ] Helm chart for Kubernetes deployment
 
-**Benchmark Results (SF0.01, Apr 14 2026 — SQE on DataFusion 53 vs Trino 465):**
+## Benchmark Results
+
+**SF0.01, Apr 16 2026 -- SQE on DataFusion 53 vs Trino 465:**
 
 | Suite | SQE | Trino | Speedup | Match |
 |---|---|---|---|---|
-| TPC-H (22) | 1.2s | 6.9s | **7.2x** | 22/22 |
-| SSB (13) | 0.6s | 1.8s | **3.2x** | 13/13 |
-| TPC-DS (99) | 11.9s | 22.6s | **2.2x** | 93/99 |
-| ClickBench (43) | 0.6s | 1.8s | **3.0x** | 43/43 |
-| TPC-C (8 read) | 0.3s | 1.0s | **4.0x** | 7/8 |
-| TPC-E (11) | 0.3s | 1.1s | **3.7x** | 7/11 |
-| TPC-BB (10) | 0.8s | 1.2s | **2.2x** | 10/10 |
-| **Total** | **15.7s** | **36.4s** | **3.4x avg** | **214/222** |
+| TPC-H (22) | 1.3s | 6.9s | **5.3x** | 22/22 |
+| SSB (13) | 0.7s | 1.8s | **2.6x** | 13/13 |
+| TPC-DS (99) | 11.6s | 22.6s | **1.9x** | 99/99 |
+| ClickBench (43) | 0.7s | 1.8s | **2.6x** | 43/43 |
+| TPC-C (8 read) | 0.3s | 1.0s | **3.6x** | 7/8 |
+| TPC-E (11) | 0.3s | 1.1s | **3.9x** | 7/11 |
+| TPC-BB (10) | 0.8s | 1.2s | **1.4x** | 10/10 |
+| **Total** | **15.7s** | **36.4s** | **2.3x avg** | **201/206** |
 
-SQE is faster than Trino on every benchmark suite. DataFusion 53 upgrade (from 52) gave a 35% speedup. 5-layer caching + ETag validation + ZSTD compression + LZ4 Flight responses.
+SQE is faster than Trino on every benchmark suite. DataFusion 53 upgrade (from 52) gave a 35% speedup. 5-layer caching + ETag validation + ZSTD compression + LZ4 Flight responses. TPC-DS improved from 93/99 to 99/99 with the DF 53 upgrade.
 
 ## Benchmarks
 
@@ -248,11 +263,11 @@ Results are written to the terminal and saved as a JSON report in `benchmarks/re
 
 ## Security
 
-SQE has completed a 43-finding production sign-off audit (see `docs/issues.md`). All findings resolved:
+SQE has completed a 43-finding production security audit (see `docs/issues.md`). All 43 findings resolved:
 
 | Category | Findings | Status |
 |---|---|---|
-| Auth & access control | Session cache keyed by token SHA-256, all Flight SQL endpoints authenticated, cancel-query owner verification, AnonymousProvider/ClientCredentials startup warnings | Resolved |
+| Auth and access control | Session cache keyed by token SHA-256, all Flight SQL endpoints authenticated, cancel-query owner verification, AnonymousProvider/ClientCredentials startup warnings | Resolved |
 | Information leaking | OIDC error bodies sanitized (7 files), generic errors to clients | Resolved |
 | Panic safety | 16 date `.unwrap()` removed, all `[0]` index guards, startup panics converted to `Result` | Resolved |
 | Policy | OPA cache key includes user roles (role changes enforced immediately) | Resolved |
@@ -267,10 +282,18 @@ Rate limiting applies to both Flight SQL and Trino HTTP paths. Worker secret is 
 | Component | Technology |
 |-----------|-----------|
 | Language | Rust |
-| Query Engine | Apache DataFusion 52 |
+| Query Engine | Apache DataFusion 53 |
 | Table Format | Apache Iceberg v2 (iceberg-rust 0.9) |
 | Catalog | Apache Polaris (Iceberg REST) |
 | Auth | Pluggable chain (OIDC, bearer token, API key, mTLS, anonymous, AWS IAM) |
 | Wire Protocol | Arrow Flight SQL + Trino HTTP |
 | Storage | S3-compatible (AWS S3, Ceph, Garage, R2, etc.) |
 | Observability | OpenTelemetry + Prometheus |
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to report issues, submit pull requests, and run the test suite.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE) for the full text.

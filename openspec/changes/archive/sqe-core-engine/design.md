@@ -1,6 +1,6 @@
 ## Context
 
-Replacing the Chameleon Trino fork (DCAF branch) with a purpose-built Rust SQL engine. The trino-fork implements Keycloak password auth → token passthrough to Polaris/S3 via custom SPI (`CredentialCarryingPrincipal`) and Iceberg REST catalog session injection. SQE rebuilds this as first-class architecture rather than patches.
+Replacing the patched Trino fork with a purpose-built Rust SQL engine. The trino-fork implements Keycloak password auth → token passthrough to Polaris/S3 via custom SPI (`CredentialCarryingPrincipal`) and Iceberg REST catalog session injection. SQE rebuilds this as first-class architecture rather than patches.
 
 Full design spec: `docs/superpowers/specs/2026-03-14-sqe-core-engine-design.md`
 
