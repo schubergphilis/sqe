@@ -421,7 +421,7 @@ rm -f /tmp/sqe-test-rsa.pem
 - [ ] **Step 1: Bump all crate versions**
 
 ```bash
-cd /Users/jjverhoeks/git/schuberg/vpf-data-ai/chameleon/Applications/sqlengine
+cd "$(git rev-parse --show-toplevel)"
 for toml in crates/*/Cargo.toml; do
     sed -i '' 's/^version = "0\.1\.0"/version = "0.15.0"/' "$toml"
 done
@@ -838,7 +838,7 @@ Verify that bearer tokens are never logged or stored beyond session lifetime.
 
 ```bash
 # Search for any tracing/log macro that might include token values
-cd /Users/jjverhoeks/git/schuberg/vpf-data-ai/chameleon/Applications/sqlengine
+cd "$(git rev-parse --show-toplevel)"
 grep -rn "access_token\|bearer_token\|refresh_token" crates/ \
     | grep -i "info!\|warn!\|error!\|debug!\|trace!\|println!\|eprintln!" \
     | grep -v "#\[cfg(test)\]" \
