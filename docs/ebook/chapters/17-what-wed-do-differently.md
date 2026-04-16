@@ -355,7 +355,7 @@ Fifteen days. Three hundred and sixteen commits. Twelve crates. One principal en
 That ratio -- one human, one AI, clear roles -- is the thing I'd keep above all else.
 
 ::: {.ailog}
-**AI Logbook:** This chapter is the one the AI could not have written alone. The retrospective required evaluating which decisions were right, which were wrong, and why — judgments that depend on context the AI never had. The AI drafted the prose from the human's structural outline and specific commit references. The honest assessment of AI limitations (three wrong distributed execution designs, inability to evaluate its own output, the security trade-off it missed twice) was the human's observation; the AI would have reported its own work as successful at every stage.
+**AI Logbook:** This chapter is the one the AI could not have written alone. The retrospective required evaluating which decisions were right, which were wrong, and why. These are judgments that depend on context the AI never had. The AI drafted the prose from the human's structural outline and specific commit references. The honest assessment of AI limitations (three wrong distributed execution designs, inability to evaluate its own output, the security trade-off it missed twice) was the human's observation; the AI would have reported its own work as successful at every stage.
 :::
 
 ::: {.sovereignty}

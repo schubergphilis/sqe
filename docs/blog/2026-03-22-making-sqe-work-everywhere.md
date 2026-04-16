@@ -157,7 +157,7 @@ One more thing. Delta Lake support via `delta-rs`, gated behind a `delta` featur
 
 ---
 
-## What this enables
+## What SQE unlocks
 
 With pluggable auth and catalogs, SQE stops being "the query engine for our stack" and becomes "a query engine that fits your stack." Concretely:
 

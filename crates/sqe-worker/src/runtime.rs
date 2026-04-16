@@ -52,7 +52,9 @@ pub fn build_session_context(config: &WorkerConfig) -> anyhow::Result<SessionCon
     }
 
     let runtime = Arc::new(builder.build()?);
-    let session_config = SessionConfig::new();
+    let session_config = SessionConfig::new()
+        .set_bool("datafusion.execution.parquet.pushdown_filters", true)
+        .set_bool("datafusion.execution.parquet.reorder_filters", true);
     let ctx = SessionContext::new_with_config_rt(session_config, runtime);
 
     Ok(ctx)

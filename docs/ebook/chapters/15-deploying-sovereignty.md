@@ -14,14 +14,14 @@ The first Docker image was a single-stage build. `FROM rust:latest`, copy the so
 
 That size is not academic. A 2.3GB image means 45-second cold starts on a Kubernetes node that does not have it cached. It means saturating the pull bandwidth on a 1Gbps registry link during a rolling upgrade. It means CI pipelines that spend more time pushing images than running tests. And it means every developer on the team needs to pull 2.3GB the first time they run the test stack.
 
-The Rust toolchain is the culprit. The `rust:latest` image carries the full compiler, standard library source, documentation, and every build tool. The compiled SQE binaries — `sqe-server`, `sqe-worker`, `sqe-cli` — total about 40MB. The other 2.26GB is build infrastructure that has no business being in a runtime image.
+The Rust toolchain is the culprit. The `rust:latest` image carries the full compiler, standard library source, documentation, and every build tool. The compiled SQE binaries (`sqe-server`, `sqe-worker`, `sqe-cli`) total about 40MB. The other 2.26GB is build infrastructure that has no business being in a runtime image.
 
 The fix is a multi-stage build. But a naive multi-stage build still has a problem: every code change triggers a full recompile of all 400+ dependencies. On a CI runner, that is 15 to 25 minutes. On a developer laptop behind a VPN, it is the moment when you go make coffee and consider whether you chose the right profession.
 
 
 ## Cargo-Chef and the Layer Cache
 
-cargo-chef solves the dependency caching problem by separating the build into two phases: cook the dependencies, then build the application. The dependency layer only changes when `Cargo.toml` or `Cargo.lock` changes — which is infrequent compared to source code changes. Docker's layer cache keeps the cooked dependencies warm, and subsequent builds only recompile the workspace crates.
+cargo-chef solves the dependency caching problem by separating the build into two phases: cook the dependencies, then build the application. The dependency layer only changes when `Cargo.toml` or `Cargo.lock` changes, which is infrequent compared to source code changes. Docker's layer cache keeps the cooked dependencies warm, and subsequent builds only recompile the workspace crates.
 
 The Dockerfile has five stages:
 
@@ -54,7 +54,7 @@ ENV SCCACHE_CACHE_SIZE=2G
 WORKDIR /build
 ```
 
-Stage 1 installs the build toolchain once. The `lld` linker is significantly faster than the default `ld` on both amd64 and aarch64. sccache adds a compilation cache that survives across Docker builds via BuildKit cache mounts. These two choices — fast linker, persistent compile cache — cut incremental build times from 15 minutes to under 3.
+Stage 1 installs the build toolchain once. The `lld` linker is significantly faster than the default `ld` on both amd64 and aarch64. sccache adds a compilation cache that survives across Docker builds via BuildKit cache mounts. These two choices (fast linker, persistent compile cache) cut incremental build times from 15 minutes to under 3.
 
 ```dockerfile
 # ── Stage 2: Compute recipe ──────────────────────────────────
@@ -74,7 +74,7 @@ RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},target=/usr/local/car
     sccache --show-stats
 ```
 
-Stage 2 computes the "recipe" — a manifest of all dependencies without the actual source code. Stage 3 builds those dependencies using the recipe. The `--mount=type=cache` directives keep the Cargo registry, git checkouts, and sccache artifacts in BuildKit's persistent cache. When you change application code but not dependencies, Stage 3 is a complete cache hit. Zero work.
+Stage 2 computes the "recipe," a manifest of all dependencies without the actual source code. Stage 3 builds those dependencies using the recipe. The `--mount=type=cache` directives keep the Cargo registry, git checkouts, and sccache artifacts in BuildKit's persistent cache. When you change application code but not dependencies, Stage 3 is a complete cache hit. Zero work.
 
 ```dockerfile
 # ── Stage 4: Build application ───────────────────────────────
@@ -117,13 +117,13 @@ Stage 5 is the runtime. The `debian:bookworm-slim` base carries only what the bi
 
 From 2.3GB to 47MB. A 98% reduction. Cold pulls on a Kubernetes node take 3 seconds instead of 45.
 
-We use `debian:bookworm-slim` instead of `scratch` for the runtime. The original plan was a fully static musl build running on scratch — zero runtime dependencies, zero attack surface. In practice, the Rust TLS ecosystem still has rough edges with musl static linking. OpenSSL bindings, which iceberg-rust pulls in transitively, resist static compilation on some architectures. The bookworm-slim base adds 25MB but eliminates a class of linking headaches that were consuming more debugging time than the size savings justified.
+We use `debian:bookworm-slim` instead of `scratch` for the runtime. The original plan was a fully static musl build running on scratch: zero runtime dependencies, zero attack surface. In practice, the Rust TLS ecosystem still has rough edges with musl static linking. OpenSSL bindings, which iceberg-rust pulls in transitively, resist static compilation on some architectures. The bookworm-slim base adds 25MB but eliminates a class of linking headaches that were consuming more debugging time than the size savings justified.
 
 ::: {.antipattern}
-**Antipattern: scratch images for Rust services that use OpenSSL.** It sounds clean — no base OS, just your binary. But if any dependency in your tree links dynamically against libssl, the binary will fail with a cryptic "not found" error at startup. Either commit to rustls throughout your entire dependency tree, or accept the slim base. We chose the latter and moved on.
+**Antipattern: scratch images for Rust services that use OpenSSL.** It sounds clean: no base OS, just your binary. But if any dependency in your tree links dynamically against libssl, the binary will fail with a cryptic "not found" error at startup. Either commit to rustls throughout your entire dependency tree, or accept the slim base. We chose the latter and moved on.
 :::
 
-The non-root user matters. SQE runs as UID 1000 in the `sqe` group. This is not security theater — Kubernetes `PodSecurityStandard` policies (and the older PodSecurityPolicy) can enforce non-root containers. Running as root means your deployment will be rejected by any cluster with basic security hygiene enabled.
+The non-root user matters. SQE runs as UID 1000 in the `sqe` group. This is not security theater. Kubernetes `PodSecurityStandard` policies (and the older PodSecurityPolicy) can enforce non-root containers. Running as root means your deployment will be rejected by any cluster with basic security hygiene enabled.
 
 
 ## Helm Chart: Two Topologies, One Chart
@@ -144,9 +144,9 @@ The chart has seven templates:
 | `servicemonitor.yaml` | Prometheus Operator ServiceMonitor |
 | `NOTES.txt` | Post-install connection instructions |
 
-The coordinator is a Deployment, not a StatefulSet. It holds session state in memory, but that state is transient — if the coordinator restarts, clients reconnect and re-authenticate. There is nothing on disk that needs to survive a pod replacement.
+The coordinator is a Deployment, not a StatefulSet. It holds session state in memory, but that state is transient. If the coordinator restarts, clients reconnect and re-authenticate. There is nothing on disk that needs to survive a pod replacement.
 
-Workers are also Deployments in the current chart. The original design called for a StatefulSet with stable network identities so the coordinator could address workers by predictable DNS names (`sqe-worker-0`, `sqe-worker-1`). In practice, the worker registration protocol — heartbeat-based, with the coordinator maintaining a live worker list — made stable identities unnecessary. Workers register themselves on startup. The coordinator discovers them. Stable DNS names would be nice for debugging but are not required for correctness.
+Workers are also Deployments in the current chart. The original design called for a StatefulSet with stable network identities so the coordinator could address workers by predictable DNS names (`sqe-worker-0`, `sqe-worker-1`). In practice, the worker registration protocol (heartbeat-based, with the coordinator maintaining a live worker list) made stable identities unnecessary. Workers register themselves on startup. The coordinator discovers them. Stable DNS names would be nice for debugging but are not required for correctness.
 
 The ConfigMap renders the TOML configuration directly from Helm values:
 
@@ -198,7 +198,7 @@ annotations:
 
 This forces a pod restart when the ConfigMap content changes. Without it, a `helm upgrade` that only changes configuration would update the ConfigMap but leave the running pods on the old config. Kubernetes does not restart pods when a mounted ConfigMap changes. The checksum annotation converts a config change into a template change, which triggers a rolling restart.
 
-Secrets follow the external pattern. The chart either references an existing Kubernetes Secret (`existingSecret`) or creates one from inline values. Sensitive fields — the OIDC client secret, S3 credentials — are injected as environment variables that override the TOML file. The TOML file never contains secrets. This keeps the ConfigMap safe to log, inspect, and version-control.
+Secrets follow the external pattern. The chart either references an existing Kubernetes Secret (`existingSecret`) or creates one from inline values. Sensitive fields (the OIDC client secret, S3 credentials) are injected as environment variables that override the TOML file. The TOML file never contains secrets. This keeps the ConfigMap safe to log, inspect, and version-control.
 
 ```yaml
 existingSecret: ""
@@ -255,7 +255,7 @@ The request-to-limit ratio matters. A 1:8 ratio (512Mi request, 4Gi limit) means
 We settled on a 1:4 ratio for workers (1Gi request, 4Gi limit in moderate environments, 2Gi request, 8Gi limit in production). This gives enough breathing room for burst workloads without overcommitting the node to the point where the OOM killer becomes a scheduling strategy.
 
 ::: {.antipattern}
-**Antipattern: setting requests equal to limits for query workers.** This guarantees your resource allocation (QoS class Guaranteed), but it also means you pay for peak capacity at all times. A worker sitting idle between queries still holds 8Gi of reserved memory. For bursty workloads — which describes every interactive SQL engine — Burstable QoS with a sensible request:limit ratio is the pragmatic choice.
+**Antipattern: setting requests equal to limits for query workers.** This guarantees your resource allocation (QoS class Guaranteed), but it also means you pay for peak capacity at all times. A worker sitting idle between queries still holds 8Gi of reserved memory. For bursty workloads (which describes every interactive SQL engine) Burstable QoS with a sensible request:limit ratio is the pragmatic choice.
 :::
 
 
@@ -265,7 +265,7 @@ Deploying a new version of SQE should not kill in-flight queries. This sounds ob
 
 The problem has two parts. First, the coordinator holds session state and in-progress query context. Replacing the coordinator pod means those sessions disappear. Second, workers may be executing plan fragments when a rolling update replaces them. Killing a worker mid-fragment means the coordinator receives a gRPC error instead of Arrow batches.
 
-For the coordinator, the strategy is readiness-gate-driven. The coordinator exposes two health endpoints: `/healthz` (liveness — "am I running") and `/readyz` (readiness — "should I receive traffic"). During shutdown, the coordinator enters a draining state: it stops accepting new queries by returning `503` on `/readyz`, waits for in-flight queries to complete (with a configurable timeout), then exits cleanly. Kubernetes removes the pod from the Service endpoints as soon as the readiness probe fails, so new client connections go to the replacement pod while existing connections drain on the old one.
+For the coordinator, the strategy is readiness-gate-driven. The coordinator exposes two health endpoints: `/healthz` (liveness: "am I running") and `/readyz` (readiness: "should I receive traffic"). During shutdown, the coordinator enters a draining state: it stops accepting new queries by returning `503` on `/readyz`, waits for in-flight queries to complete (with a configurable timeout), then exits cleanly. Kubernetes removes the pod from the Service endpoints as soon as the readiness probe fails, so new client connections go to the replacement pod while existing connections drain on the old one.
 
 ```yaml
 livenessProbe:
@@ -284,7 +284,7 @@ readinessProbe:
 
 The `terminationGracePeriodSeconds` (default 30 in Kubernetes) needs to be long enough for the longest expected query to finish. For interactive workloads with a 30-second timeout, the default is fine. For batch workloads running TPC-H Q9 (which can take minutes), increase it.
 
-For workers, the mechanism is simpler because the coordinator manages retries. When a worker disappears — whether from a rolling update, a crash, or a node drain — the coordinator detects the missing heartbeat and reschedules the fragment to another worker. The query does not fail; it gets slower because one fragment is re-executed. The coordinator's fragment scheduler already handles this for crash recovery (Chapter 14). Rolling updates are just a graceful version of a crash.
+For workers, the mechanism is simpler because the coordinator manages retries. When a worker disappears (whether from a rolling update, a crash, or a node drain) the coordinator detects the missing heartbeat and reschedules the fragment to another worker. The query does not fail; it gets slower because one fragment is re-executed. The coordinator's fragment scheduler already handles this for crash recovery (Chapter 14). Rolling updates are just a graceful version of a crash.
 
 A PodDisruptionBudget ensures Kubernetes does not drain too many workers simultaneously:
 
@@ -351,13 +351,13 @@ services:
       - "19000:9000"
 ```
 
-Polaris in-memory mode stores all catalog metadata in the JVM heap. No PostgreSQL. No MySQL. No JDBC configuration. It starts in 8 seconds and provides the full Iceberg REST catalog API. The `POLARIS_BOOTSTRAP_CREDENTIALS` environment variable creates a root principal automatically — no manual setup required.
+Polaris in-memory mode stores all catalog metadata in the JVM heap. No PostgreSQL. No MySQL. No JDBC configuration. It starts in 8 seconds and provides the full Iceberg REST catalog API. The `POLARIS_BOOTSTRAP_CREDENTIALS` environment variable creates a root principal automatically, no manual setup required.
 
 RustFS replaces MinIO for local development. It is a single binary that speaks S3v4 auth, supports the operations Iceberg needs (PutObject, GetObject, ListObjectsV2, DeleteObject), and starts in under a second. The total memory footprint for both containers is about 400MB. Compare this to a full quickstart stack with Keycloak, PostgreSQL, and MinIO, which consumes 2GB before you run a single query.
 
 Port offsets keep the test stack from colliding with any production services or other development environments running on the same machine. Polaris on 18181 instead of 8181. RustFS on 19000 instead of 9000. The bootstrap script knows these offsets and configures everything accordingly.
 
-The bootstrap script (`scripts/bootstrap-test.sh`) is idempotent. It waits for Polaris and RustFS to be healthy, creates the S3 bucket, obtains an OAuth2 token from Polaris, creates the warehouse catalog, grants access, and creates the default namespace. Run it once or ten times — the result is the same.
+The bootstrap script (`scripts/bootstrap-test.sh`) is idempotent. It waits for Polaris and RustFS to be healthy, creates the S3 bucket, obtains an OAuth2 token from Polaris, creates the warehouse catalog, grants access, and creates the default namespace. Run it once or ten times. The result is the same.
 
 ```bash
 docker compose -f docker-compose.test.yml up -d
@@ -374,9 +374,9 @@ Three commands. From zero to running integration tests. No cloud account. No VPN
 
 ## The Distributed Test Stack
 
-The test stack validates single-node behavior. The distributed test stack validates the coordinator-worker protocol, fragment distribution, and system tables — the full distributed topology from Chapters 12 through 14.
+The test stack validates single-node behavior. The distributed test stack validates the coordinator-worker protocol, fragment distribution, and system tables, the full distributed topology from Chapters 12 through 14.
 
-Running the full distributed stack on localhost is not a luxury. It is the only way to catch the class of bugs that live between processes — serialization mismatches, heartbeat timeouts, fragment routing errors — before they reach a shared environment where six other people are trying to get their own work done.
+Running the full distributed stack on localhost is not a luxury. It is the only way to catch the class of bugs that live between processes (serialization mismatches, heartbeat timeouts, fragment routing errors) before they reach a shared environment where six other people are trying to get their own work done.
 
 It extends the test stack with three additional containers: one coordinator and two workers.
 
@@ -457,7 +457,7 @@ docker compose -f docker-compose.test.yml \
 
 The distributed test script runs 14 assertions: basic connectivity, system.runtime.nodes (verifying the coordinator sees both workers), query history, catalog metadata, table creation, distributed execution, the result cache, Trino HTTP compatibility, and information_schema. It is not a benchmark. It is a smoke test that the distributed topology works end-to-end.
 
-The concurrent load test script (`scripts/concurrent-test.sh`) goes further. It launches N parallel clients — default 10, configurable up to 50 or more — each running queries against the coordinator simultaneously. It measures per-query latency, tracks pass/fail rates, and queries `system.runtime.tasks` afterward to verify that work was actually distributed across both workers.
+The concurrent load test script (`scripts/concurrent-test.sh`) goes further. It launches N parallel clients (default 10, configurable up to 50 or more) each running queries against the coordinator simultaneously. It measures per-query latency, tracks pass/fail rates, and queries `system.runtime.tasks` afterward to verify that work was actually distributed across both workers.
 
 ```bash
 ./scripts/concurrent-test.sh 20 mixed
@@ -509,9 +509,9 @@ services:
       replicas: 0
 ```
 
-The `security_opt` and `cap_drop` settings enforce container hardening. `no-new-privileges` prevents privilege escalation through setuid binaries. `cap_drop: ALL` removes all Linux capabilities. The SQE binary does not need any capabilities — it binds to non-privileged ports (all above 1024), runs as a non-root user, and performs no privileged system calls.
+The `security_opt` and `cap_drop` settings enforce container hardening. `no-new-privileges` prevents privilege escalation through setuid binaries. `cap_drop: ALL` removes all Linux capabilities. The SQE binary does not need any capabilities. It binds to non-privileged ports (all above 1024), runs as a non-root user, and performs no privileged system calls.
 
-The Trino replacement is clean. The backend service points at SQE's Trino-compatible HTTP endpoint on port 8080. SQE speaks enough of the Trino wire protocol for existing tools — dashboards, notebooks, scheduled reports — to connect without modification. Trino is scaled to zero replicas — not removed from the compose file, so reverting is a one-line change. This matters more than it looks. Adoption that cannot be reversed will not be attempted. The compose overlay makes the decision reversible, and reversible decisions get approved faster.
+The Trino replacement is clean. The backend service points at SQE's Trino-compatible HTTP endpoint on port 8080. SQE speaks enough of the Trino wire protocol for existing tools (dashboards, notebooks, scheduled reports) to connect without modification. Trino is scaled to zero replicas, not removed from the compose file, so reverting is a one-line change. This matters more than it looks. Adoption that cannot be reversed will not be attempted. The compose overlay makes the decision reversible, and reversible decisions get approved faster.
 
 
 ## The Service Topology
@@ -537,7 +537,7 @@ spec:
 
 Flight SQL (gRPC on 50051) is the primary protocol for JDBC clients, Python via ADBC, and dbt-sqe. Trino HTTP (8080) provides backward compatibility for tools that speak the Trino wire protocol. Metrics (9090) is the Prometheus scrape target.
 
-Workers do not have a public Service. The coordinator talks to workers directly via their pod IPs (resolved through the headless service or the worker_urls configuration). This is intentional. Workers should never be addressable from outside the cluster. They execute plan fragments with the user's bearer token — exposing them would create a vector for token replay attacks.
+Workers do not have a public Service. The coordinator talks to workers directly via their pod IPs (resolved through the headless service or the worker_urls configuration). This is intentional. Workers should never be addressable from outside the cluster. They execute plan fragments with the user's bearer token. Exposing them would create a vector for token replay attacks.
 
 The ServiceMonitor integration is optional and conditional:
 
@@ -601,18 +601,18 @@ It is not clever. It does not need to be. The person running `helm upgrade` at 1
 
 ## The Deployment as a Product Decision
 
-Every technical choice in this chapter — the multi-stage build, the Helm topology, the test stack, the resource defaults — is a product decision disguised as infrastructure.
+Every technical choice in this chapter (the multi-stage build, the Helm topology, the test stack, the resource defaults) is a product decision disguised as infrastructure.
 
-A 47MB image means a platform team can adopt SQE without filing a ticket to increase their registry quota. A two-container test stack means a data engineer can run integration tests without a cloud account. A Helm chart with sensible defaults means the first deployment is `helm install sqe ./deploy/helm/sqe` — not a 40-page runbook.
+A 47MB image means a platform team can adopt SQE without filing a ticket to increase their registry quota. A two-container test stack means a data engineer can run integration tests without a cloud account. A Helm chart with sensible defaults means the first deployment is `helm install sqe ./deploy/helm/sqe`, not a 40-page runbook.
 
 The Trino replacement overlay means adoption is not all-or-nothing. Run SQE alongside Trino. Route one workload to SQE. Compare. If it works, route more. If it does not, scale SQE to zero and Trino back to one. The rollback path is a single line in a compose file.
 
-These choices are sovereignty choices. An engine that requires a dedicated infrastructure team to deploy is an engine that is controlled by whoever has access to that team's calendar. An engine that a single engineer can deploy, test, and upgrade — with `docker compose up` or `helm install` — is an engine that the people who need it can actually run.
+These choices are sovereignty choices. An engine that requires a dedicated infrastructure team to deploy is an engine that is controlled by whoever has access to that team's calendar. An engine that a single engineer can deploy, test, and upgrade (with `docker compose up` or `helm install`) is an engine that the people who need it can actually run.
 
 The best query engine is the one people actually run. And people run engines they can deploy, test, break, fix, and upgrade without calling a meeting first.
 
 ::: {.ailog}
-**AI Logbook:** The AI wrote the five-stage Dockerfile with cargo-chef, sccache, and lld — reducing the image from 2.3GB to 47MB — and generated all seven Helm chart templates including the config checksum annotation trick for triggering rolling restarts on ConfigMap changes. The human decided the deployment topology (Deployment not StatefulSet, workers-first upgrade order) and the port allocation scheme. The `no-new-privileges` and `cap_drop: ALL` security hardening on the production compose overlay was the human's specification; the AI applied it without understanding why it mattered.
+**AI Logbook:** The AI wrote the five-stage Dockerfile with cargo-chef, sccache, and lld (reducing the image from 2.3GB to 47MB) and generated all seven Helm chart templates including the config checksum annotation trick for triggering rolling restarts on ConfigMap changes. The human decided the deployment topology (Deployment not StatefulSet, workers-first upgrade order) and the port allocation scheme. The `no-new-privileges` and `cap_drop: ALL` security hardening on the production compose overlay was the human's specification; the AI applied it without understanding why it mattered.
 :::
 
 A sovereign engine that is hard to deploy is just a sovereign engine that nobody runs.

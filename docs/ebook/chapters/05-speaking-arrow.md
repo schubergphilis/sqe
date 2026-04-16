@@ -666,5 +666,5 @@ just worked.
 :::
 
 ::: {.ailog}
-**AI Logbook:** The AI implemented all 24 `FlightSqlService` trait methods — including the metadata surface for catalogs, schemas, tables, and XDBC type info — across two sessions. The human decided which methods to implement and which to leave as `Unimplemented` (Substrait, transactions). The `do_get_fallback` handler that turned out to be the actual path JDBC clients use was discovered during the first DBeaver test by the human; the AI had implemented the standard `do_get_statement` path first, which no real client hit.
+**AI Logbook:** The AI implemented all 24 `FlightSqlService` trait methods, including the metadata surface for catalogs, schemas, tables, and XDBC type info, across two sessions. The human decided which methods to implement and which to leave as `Unimplemented` (Substrait, transactions). The `do_get_fallback` handler that turned out to be the actual path JDBC clients use was discovered during the first DBeaver test by the human; the AI had implemented the standard `do_get_statement` path first, which no real client hit.
 :::

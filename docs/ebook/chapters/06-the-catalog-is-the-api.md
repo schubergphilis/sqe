@@ -169,7 +169,7 @@ One subtlety: the `SessionCatalog` inside the provider carries the user's bearer
 
 The initial catalog implementation made a Polaris REST call for every table load. At scale factor 1, a TPC-DS query touching 15 dimension tables meant 15 network round-trips before execution started. The fix was a multi-layer caching strategy:
 
-**TableMetadataCache.** A global moka cache shared across all sessions, keyed by table identifier and token fingerprint. TTL is 30 seconds — short enough that schema changes propagate within a query cycle, long enough that a 99-query benchmark run does not hammer Polaris 1,500 times.
+**TableMetadataCache.** A global moka cache shared across all sessions, keyed by table identifier and token fingerprint. TTL is 30 seconds: short enough that schema changes propagate within a query cycle, long enough that a 99-query benchmark run does not hammer Polaris 1,500 times.
 
 **ManifestCache.** Iceberg manifest files are immutable by specification. Once written, their content never changes. We cache parsed manifest entries by S3 path with a 512 MB size limit and a 1-hour TTL backstop (for disaster recovery scenarios where a manifest is overwritten at the same path). This eliminates the most expensive I/O in scan planning.
 

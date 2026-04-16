@@ -124,7 +124,64 @@ impl SchemaProvider for SqeSchemaProvider {
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        self.table_names().contains(&name.to_string())
+        // Optimized path: check existence directly via the catalog's table_exists()
+        // API instead of listing ALL tables and searching client-side. This avoids
+        // fetching the entire table list just to check if one table exists —
+        // a significant improvement for namespaces with many tables.
+        let catalog = self.session_catalog.clone();
+        let ns = self.namespace.clone();
+        let table_name = name.to_string();
+
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                error!(namespace = %ns, table = %table_name, "No tokio runtime available for table_exist()");
+                return false;
+            }
+        };
+
+        let ns_ident = NamespaceIdent::new(ns.clone());
+        let table_ident = iceberg::TableIdent::new(ns_ident.clone(), table_name.clone());
+
+        // Try table_exists() first (single REST call to Polaris HEAD endpoint)
+        let table_exists = tokio::task::block_in_place(|| {
+            handle.block_on(catalog.table_exists(&table_ident))
+        });
+        match table_exists {
+            Ok(true) => {
+                debug!(namespace = %ns, table = %table_name, "table_exist: found as table");
+                return true;
+            }
+            Ok(false) => {
+                // Not a table — check if it is a view
+            }
+            Err(e) => {
+                debug!(namespace = %ns, table = %table_name, error = %e,
+                    "table_exist: table_exists() failed, falling back to list");
+                // Fall through to view check
+            }
+        }
+
+        // Check views: load_view_sql is cheaper than listing all views
+        let view_result = tokio::task::block_in_place(|| {
+            handle.block_on(catalog.load_view_sql(&ns_ident, &table_name))
+        });
+        match view_result {
+            Ok(Some(_)) => {
+                debug!(namespace = %ns, table = %table_name, "table_exist: found as view");
+                true
+            }
+            Ok(None) => {
+                debug!(namespace = %ns, table = %table_name, "table_exist: not found as table or view");
+                false
+            }
+            Err(e) => {
+                debug!(namespace = %ns, table = %table_name, error = %e,
+                    "table_exist: view check failed, falling back to table_names()");
+                // Final fallback: list all names (original behavior)
+                self.table_names().contains(&table_name)
+            }
+        }
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
