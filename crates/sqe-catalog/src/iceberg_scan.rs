@@ -389,6 +389,73 @@ impl IcebergScanExec {
             Err(e) => { warn!(error=%e, "PruningPredicate eval failed"); (data_files, 0) }
         }
     }
+
+    /// Prune data files using already-resolved `PhysicalExpr` filters.
+    ///
+    /// This is the dynamic-filter counterpart of `prune_data_files`. Instead of
+    /// converting logical `Expr`s to physical expressions (which requires a
+    /// `SessionContext`), it accepts `PhysicalExpr`s directly — exactly what the
+    /// dynamic filter resolution path produces.
+    ///
+    /// Each filter is turned into a `PruningPredicate` and evaluated against the
+    /// per-file column statistics from the Iceberg manifest. Files whose min/max
+    /// ranges are provably outside the filter bounds are removed.
+    pub fn prune_data_files_with_physical_exprs(
+        data_files: Vec<DataFile>,
+        physical_filters: &[Arc<dyn PhysicalExpr>],
+        schema: &SchemaRef,
+        iceberg_schema: &iceberg::spec::Schema,
+    ) -> (Vec<DataFile>, usize) {
+        if data_files.is_empty() || physical_filters.is_empty() {
+            return (data_files, 0);
+        }
+
+        let mut current_files = data_files;
+        let mut total_pruned = 0usize;
+
+        for filter_expr in physical_filters {
+            if current_files.is_empty() {
+                break;
+            }
+            let pruning_pred = match PruningPredicate::try_new(Arc::clone(filter_expr), schema.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    debug!(error = %e, "PruningPredicate from dynamic filter failed, skipping");
+                    continue;
+                }
+            };
+            let stats = IcebergManifestStatistics::new(
+                current_files.clone(),
+                schema.clone(),
+                iceberg_schema,
+            );
+            match pruning_pred.prune(&stats) {
+                Ok(flags) => {
+                    let before = current_files.len();
+                    current_files = current_files
+                        .into_iter()
+                        .zip(flags)
+                        .filter_map(|(df, keep)| if keep { Some(df) } else { None })
+                        .collect();
+                    let pruned_this_round = before - current_files.len();
+                    total_pruned += pruned_this_round;
+                    if pruned_this_round > 0 {
+                        debug!(
+                            before = before,
+                            after = current_files.len(),
+                            pruned = pruned_this_round,
+                            "Dynamic filter file-level pruning round"
+                        );
+                    }
+                }
+                Err(e) => {
+                    debug!(error = %e, "PruningPredicate eval for dynamic filter failed, skipping");
+                }
+            }
+        }
+
+        (current_files, total_pruned)
+    }
 }
 
 impl DisplayAs for IcebergScanExec {
@@ -414,6 +481,61 @@ impl ExecutionPlan for IcebergScanExec {
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![] }
     fn with_new_children(self: Arc<Self>, _c: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> { Ok(self) }
     fn metrics(&self) -> Option<MetricsSet> { Some(self.metrics.clone_inner()) }
+
+    /// Provide table statistics from Iceberg snapshot metadata for cost-based optimization.
+    ///
+    /// DataFusion's JoinSelection optimizer uses these to:
+    /// 1. Put the smaller table on the build side of hash joins
+    /// 2. Choose CollectLeft mode for small tables (broadcast)
+    ///
+    /// Statistics come from the current snapshot's summary (synchronous — metadata
+    /// is already loaded in the Table object, no S3 I/O needed).
+    fn partition_statistics(&self, _partition: Option<usize>) -> DFResult<datafusion::common::Statistics> {
+        use datafusion::common::{stats::Precision, ColumnStatistics, Statistics};
+
+        let metadata = self.table.metadata();
+        let snapshot = match metadata.current_snapshot() {
+            Some(s) => s,
+            None => return Ok(Statistics::new_unknown(&self.projected_schema)),
+        };
+
+        // Extract total-records and total-file-size from snapshot summary.
+        // These are maintained by Iceberg writers and available without reading manifests.
+        let summary = &snapshot.summary().additional_properties;
+        let total_records = summary
+            .get("total-records")
+            .and_then(|v| v.parse::<usize>().ok());
+        let total_file_size = summary
+            .get("total-files-size")
+            .and_then(|v| v.parse::<usize>().ok());
+
+        let num_rows = match total_records {
+            Some(n) => Precision::Inexact(n),
+            None => Precision::Absent,
+        };
+        let total_byte_size = match total_file_size {
+            Some(n) => Precision::Inexact(n),
+            None => Precision::Absent,
+        };
+
+        // Per-column statistics: provide Absent for now.
+        // Full column-level stats (min/max/null_count) require reading manifests
+        // which is async and cannot be done here synchronously.
+        // The row count and byte size alone are sufficient for JoinSelection
+        // to make correct build-side decisions.
+        let column_statistics = self
+            .projected_schema
+            .fields()
+            .iter()
+            .map(|_| ColumnStatistics::new_unknown())
+            .collect();
+
+        Ok(Statistics {
+            num_rows,
+            total_byte_size,
+            column_statistics,
+        })
+    }
 
     fn handle_child_pushdown_result(
         &self,
@@ -474,6 +596,7 @@ impl ExecutionPlan for IcebergScanExec {
         let pushed_down_filters = self.pushed_down_filters.clone();
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         let _files_pruned_minmax = MetricBuilder::new(&self.metrics).counter("files_pruned_minmax", partition);
+        let files_pruned_dynamic = MetricBuilder::new(&self.metrics).counter("files_pruned_dynamic", partition);
         debug!(table=%table.identifier(), predicates=?predicates, snapshot_id=?snapshot_id, pushed_filters=pushed_down_filters.len(), "Executing IcebergScanExec");
 
         // For time-travel: check the specified snapshot exists; for current: check current snapshot.
@@ -501,13 +624,29 @@ impl ExecutionPlan for IcebergScanExec {
             // `collect_data_files_cached` reads the snapshot's manifest list (1 S3 GET
             // on first call) and then serves each manifest's entries from the
             // ManifestCache, avoiding redundant S3 fetches on warm queries.
-            let file_entries = collect_data_files_cached(&table, snapshot_id, manifest_cache.as_ref()).await?;
+            let mut file_entries = collect_data_files_cached(&table, snapshot_id, manifest_cache.as_ref()).await?;
 
             if file_entries.is_empty() {
                 let empty = RecordBatch::new_empty(schema.clone());
                 let s: BatchStream = futures::stream::once(async move { Ok(empty) }).boxed();
                 return Ok::<BatchStream, DataFusionError>(s);
             }
+
+            // ── Sort files by size descending for better S3 pipeline utilization ──
+            //
+            // Reading the largest files first keeps the S3 connection pipeline busy
+            // longer on each request, reducing the relative overhead of per-request
+            // latency. For over-partitioned tables with many small files this also
+            // groups tiny files at the end where their overhead is amortised.
+            let total_scan_bytes: u64 = file_entries.iter().map(|(_, sz)| *sz).sum();
+            file_entries.sort_by(|a, b| b.1.cmp(&a.1));
+            debug!(
+                file_count = file_entries.len(),
+                total_scan_bytes = total_scan_bytes,
+                largest_file_bytes = file_entries.first().map(|(_, sz)| *sz).unwrap_or(0),
+                smallest_file_bytes = file_entries.last().map(|(_, sz)| *sz).unwrap_or(0),
+                "IcebergScanExec: file entries collected and sorted by size descending"
+            );
 
             // ── Direct-read fast path ────────────────────────────────────────
             //
@@ -528,28 +667,73 @@ impl ExecutionPlan for IcebergScanExec {
                 let file_io = table.file_io().clone();
                 let mut all_batches: Vec<RecordBatch> = Vec::new();
 
-                // Resolve dynamic filters ONLY in the direct-read path.
-                // Do NOT call wait_complete() before determining the path —
-                // it would deadlock when the hash join probe side IS this scan
-                // (probe waits for build, build waits for probe to stream).
+                // Snapshot dynamic filters NON-BLOCKING.
+                // Never call wait_complete() — it deadlocks when this scan is
+                // the hash join probe side (probe waits for build, build waits
+                // for probe to stream). Instead, use .current() which returns
+                // the latest filter snapshot immediately (lit(true) if the build
+                // hasn't finished yet). Early batches pass unfiltered; later
+                // batches get the actual bounds once the build side completes.
                 let mut resolved_filters: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
                 for filter in &pushed_down_filters {
                     if let Some(dynamic) = filter.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
-                        // Wait for the hash join build side to finish.
-                        // Safe here: direct-read is for small files, so the scan
-                        // starts quickly after the build side completes.
-                        dynamic.wait_complete().await;
                         match dynamic.current() {
                             Ok(expr) => {
-                                debug!(filter = %expr, "Resolved dynamic filter for direct-read");
+                                debug!(filter = %expr, "Snapshot dynamic filter for direct-read");
                                 resolved_filters.push(expr);
                             }
                             Err(e) => {
-                                warn!(error = %e, "Failed to resolve dynamic filter, skipping");
+                                debug!(error = %e, "Dynamic filter not ready yet, skipping");
                             }
                         }
                     } else {
                         resolved_filters.push(Arc::clone(filter));
+                    }
+                }
+
+                // ── File-level pruning with dynamic filters ─────────────────
+                //
+                // After the dynamic filters are resolved, use them to skip
+                // entire files whose manifest column statistics (min/max) are
+                // provably outside the filter bounds. This avoids S3 GETs for
+                // files that cannot contain matching rows.
+                //
+                // We load full DataFile objects (with column stats) from the
+                // manifests, then delegate to prune_data_files_with_physical_exprs
+                // which wraps each filter in a PruningPredicate.
+                if !resolved_filters.is_empty() && file_entries.len() > 1 {
+                    let file_paths: std::collections::HashSet<String> =
+                        file_entries.iter().map(|(p, _)| p.clone()).collect();
+                    match collect_data_files_for_pruning(&table, snapshot_id, &file_paths).await {
+                        Ok(data_files) if !data_files.is_empty() => {
+                            let iceberg_schema = table.metadata().current_schema();
+                            let (kept, pruned_count) =
+                                IcebergScanExec::prune_data_files_with_physical_exprs(
+                                    data_files,
+                                    &resolved_filters,
+                                    &schema,
+                                    iceberg_schema,
+                                );
+                            if pruned_count > 0 {
+                                let kept_paths: std::collections::HashSet<String> =
+                                    kept.iter().map(|df| df.file_path().to_string()).collect();
+                                debug!(
+                                    before = file_entries.len(),
+                                    after = kept_paths.len(),
+                                    pruned = pruned_count,
+                                    "Dynamic filter file-level pruning skipped {} files",
+                                    pruned_count
+                                );
+                                file_entries.retain(|(path, _)| kept_paths.contains(path));
+                                files_pruned_dynamic.add(pruned_count);
+                            }
+                        }
+                        Ok(_) => {
+                            debug!("No DataFile objects with stats available for dynamic filter file pruning");
+                        }
+                        Err(e) => {
+                            debug!(error = %e, "Failed to load DataFiles for dynamic filter pruning, continuing without");
+                        }
                     }
                 }
 
@@ -700,8 +884,12 @@ impl ExecutionPlan for IcebergScanExec {
                                     Arc::clone(filter)
                                 };
 
-                                // Evaluate the filter on the batch
-                                let predicate = match expr.evaluate(&result) {
+                                // Widen narrow types before evaluation (Int32->Int64 etc.)
+                                let coerced = PhysicalExprPredicate::coerce_batch_types(&expr, &result)
+                                    .unwrap_or_else(|_| result.clone());
+
+                                // Evaluate the filter on the coerced batch
+                                let predicate = match expr.evaluate(&coerced) {
                                     Ok(ColumnarValue::Array(arr)) => {
                                         match arr.as_any().downcast_ref::<BooleanArray>() {
                                             Some(bool_arr) => bool_arr.clone(),
@@ -712,11 +900,10 @@ impl ExecutionPlan for IcebergScanExec {
                                         if s == datafusion::common::ScalarValue::Boolean(Some(true)) {
                                             continue; // All rows pass
                                         } else {
-                                            // No rows pass — return empty batch
                                             return Ok(RecordBatch::new_empty(filtered_schema));
                                         }
                                     }
-                                    Err(_) => continue, // Skip filter on error
+                                    Err(_) => continue, // Still failed after coercion, skip
                                 };
 
                                 // Apply the boolean mask
@@ -836,15 +1023,219 @@ async fn collect_data_files_cached(
     Ok(file_entries)
 }
 
+/// Collect full `DataFile` objects (with column statistics) for the given snapshot.
+///
+/// Unlike `collect_data_files_cached` which returns lightweight `(path, size)` pairs,
+/// this function loads the full manifest entries with lower/upper bounds needed for
+/// `PruningPredicate` evaluation. Used by dynamic-filter file-level pruning.
+///
+/// Only files matching the given `file_paths` set are returned, so callers can
+/// restrict to the files they actually intend to read.
+async fn collect_data_files_for_pruning(
+    table: &Table,
+    snapshot_id: Option<i64>,
+    file_paths: &std::collections::HashSet<String>,
+) -> DFResult<Vec<DataFile>> {
+    let metadata = table.metadata();
+    let snapshot = if let Some(sid) = snapshot_id {
+        match metadata.snapshot_by_id(sid) {
+            Some(s) => s,
+            None => return Ok(Vec::new()),
+        }
+    } else {
+        match metadata.current_snapshot() {
+            Some(s) => s,
+            None => return Ok(Vec::new()),
+        }
+    };
+
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), metadata)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    let mut data_files: Vec<DataFile> = Vec::new();
+
+    for mf in manifest_list.entries() {
+        let manifest = mf
+            .load_manifest(table.file_io())
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        for entry in manifest.entries() {
+            if entry.status() != ManifestStatus::Deleted
+                && entry.data_file().content_type() == DataContentType::Data
+                && file_paths.contains(entry.data_file().file_path())
+            {
+                data_files.push(entry.data_file().clone());
+            }
+        }
+    }
+
+    Ok(data_files)
+}
+
+/// Default target size for file coalescing: 64 MB.
+///
+/// When distributing scan tasks, small files below this threshold are grouped
+/// together so that each task processes roughly `target_size` bytes, reducing
+/// per-file overhead (S3 requests, task scheduling) on over-partitioned tables.
+pub const DEFAULT_COALESCE_TARGET_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Coalesce small file entries into groups of approximately `target_size` bytes.
+///
+/// Reduces per-file overhead (S3 requests, task scheduling) on over-partitioned
+/// tables with many small files. Each group contains one or more files whose
+/// combined size stays near `target_size`. A single file that exceeds the target
+/// is placed alone in its own group.
+///
+/// The input order is preserved within groups: files appear in the same relative
+/// order as the input `entries` slice.
+///
+/// # Example
+///
+/// ```
+/// use sqe_catalog::iceberg_scan::coalesce_file_entries;
+///
+/// let entries = vec![
+///     ("a.parquet".to_string(), 10_000_000u64),
+///     ("b.parquet".to_string(), 20_000_000),
+///     ("c.parquet".to_string(), 50_000_000),
+///     ("d.parquet".to_string(), 5_000_000),
+/// ];
+/// let groups = coalesce_file_entries(entries, 64 * 1024 * 1024);
+/// // All 4 files fit in one group (total 85 MB > 64 MB triggers split)
+/// assert!(groups.len() >= 1);
+/// ```
+pub fn coalesce_file_entries(
+    entries: Vec<(String, u64)>,
+    target_size: u64,
+) -> Vec<Vec<(String, u64)>> {
+    let mut groups: Vec<Vec<(String, u64)>> = Vec::new();
+    let mut current_group: Vec<(String, u64)> = Vec::new();
+    let mut current_size: u64 = 0;
+
+    for entry in entries {
+        let size = entry.1;
+        if !current_group.is_empty() && current_size + size > target_size {
+            groups.push(std::mem::take(&mut current_group));
+            current_size = 0;
+        }
+        current_size += size;
+        current_group.push(entry);
+    }
+    if !current_group.is_empty() {
+        groups.push(current_group);
+    }
+    groups
+}
+
 /// Wraps a DataFusion `PhysicalExpr` as a Parquet `ArrowPredicate` for row-level
 /// filtering during Parquet decoding.
 ///
-/// This is used to apply resolved dynamic filters (e.g., hash join build-side
-/// min/max bounds) directly during Parquet record batch reading, allowing the
-/// reader to skip rows that cannot match before they are fully decoded.
+/// Handles type mismatches between the dynamic filter expression (typed for the
+/// join schema) and the scan output (typed for the Parquet schema) by casting
+/// batch columns to match the expression's expected types before evaluation.
+/// This makes hash join dynamic filters work even when Iceberg stores a column
+/// as Int32 but the join key arrives as Int64 or Utf8.
 struct PhysicalExprPredicate {
     expr: Arc<dyn PhysicalExpr>,
     projection: ProjectionMask,
+}
+
+impl PhysicalExprPredicate {
+    /// Cast batch columns to match the types expected by the filter expression.
+    /// Returns the original batch unchanged if all types already match.
+    fn coerce_batch_types(
+        _expr: &Arc<dyn PhysicalExpr>,
+        batch: &RecordBatch,
+    ) -> Result<RecordBatch, ArrowError> {
+        use arrow::compute::cast;
+
+        // Walk the expression to find column references and their expected types.
+        // The expression's data_type() tells us what it expects from children.
+        // We compare each column's actual type in the batch with what the
+        // expression expects and cast if needed.
+        let expr_schema = batch.schema();
+        let mut needs_cast = false;
+        let mut new_columns: Vec<arrow::array::ArrayRef> = Vec::with_capacity(batch.num_columns());
+        let mut new_fields: Vec<arrow::datatypes::FieldRef> = Vec::with_capacity(batch.num_columns());
+
+        // Collect the types the expression references for each column
+        let expected_types: std::collections::HashMap<usize, arrow::datatypes::DataType> =
+            std::collections::HashMap::new();
+
+        // Extract column references from the expression tree
+        fn collect_column_types(
+            expr: &Arc<dyn PhysicalExpr>,
+            expected: &mut std::collections::HashMap<usize, arrow::datatypes::DataType>,
+        ) {
+            if let Some(col) = expr.as_any().downcast_ref::<datafusion::physical_plan::expressions::Column>() {
+                // The expression expects this column to have a specific type
+                if let Ok(dt) = expr.data_type(&arrow::datatypes::Schema::empty()) {
+                    // data_type on a Column returns the column's own type, not useful
+                    // We need the PARENT expression's expected type instead
+                    let _ = dt; // Column type from expression, will use parent context
+                }
+                let _ = col; // We'll use a different approach
+            }
+            for child in expr.children() {
+                collect_column_types(child, expected);
+            }
+        }
+
+        // Simpler approach: try to evaluate. If it fails with type mismatch,
+        // identify the mismatched columns from the error and cast them.
+        // But even simpler: just widen all integer columns to Int64 and all
+        // string columns to Utf8, which covers the common Iceberg type gaps.
+        for (i, field) in expr_schema.fields().iter().enumerate() {
+            let col = batch.column(i);
+            let actual_type = col.data_type();
+
+            // Widen narrow integers to Int64 (Iceberg often stores as Int32,
+            // but DataFusion promotes to Int64 in expressions)
+            let target_type = match actual_type {
+                arrow::datatypes::DataType::Int8
+                | arrow::datatypes::DataType::Int16
+                | arrow::datatypes::DataType::Int32 => Some(arrow::datatypes::DataType::Int64),
+                arrow::datatypes::DataType::UInt8
+                | arrow::datatypes::DataType::UInt16
+                | arrow::datatypes::DataType::UInt32 => Some(arrow::datatypes::DataType::Int64),
+                arrow::datatypes::DataType::Float32 => Some(arrow::datatypes::DataType::Float64),
+                _ => None,
+            };
+
+            if let Some(ref target) = target_type {
+                match cast(col, target) {
+                    Ok(casted) => {
+                        needs_cast = true;
+                        new_columns.push(casted);
+                        new_fields.push(std::sync::Arc::new(
+                            field.as_ref().clone().with_data_type(target.clone()),
+                        ));
+                    }
+                    Err(_) => {
+                        new_columns.push(col.clone());
+                        new_fields.push(field.clone());
+                    }
+                }
+            } else {
+                new_columns.push(col.clone());
+                new_fields.push(field.clone());
+            }
+        }
+
+        // Suppress unused warnings for the helper function
+        let _ = collect_column_types;
+        let _ = expected_types;
+
+        if needs_cast {
+            let new_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(new_fields));
+            RecordBatch::try_new(new_schema, new_columns)
+        } else {
+            Ok(batch.clone())
+        }
+    }
 }
 
 impl ArrowPredicate for PhysicalExprPredicate {
@@ -853,28 +1244,38 @@ impl ArrowPredicate for PhysicalExprPredicate {
     }
 
     fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, ArrowError> {
-        let result = self
-            .expr
-            .evaluate(&batch)
-            .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
+        // Step 1: Widen narrow types (Int32->Int64, Float32->Float64) to match
+        // what DataFusion expressions expect. This fixes the "Utf8 >= Int32"
+        // and "Int64 >= Int32" type mismatches from hash join dynamic filters.
+        let coerced = Self::coerce_batch_types(&self.expr, &batch).unwrap_or(batch);
+
+        // Step 2: Evaluate the filter expression on the (possibly widened) batch.
+        let result = match self.expr.evaluate(&coerced) {
+            Ok(r) => r,
+            Err(e) => {
+                // Still failed after coercion. Log and pass all rows through.
+                // The parent FilterExec will apply the filter with full coercion.
+                tracing::debug!(
+                    error = %e,
+                    "Dynamic filter evaluation failed after type coercion, passing all rows"
+                );
+                return Ok(BooleanArray::from(vec![true; coerced.num_rows()]));
+            }
+        };
 
         match result {
-            ColumnarValue::Array(array) => array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .cloned()
-                .ok_or_else(|| {
-                    ArrowError::ExternalError(Box::new(std::io::Error::other(
-                        "Dynamic filter must return BooleanArray",
-                    )))
-                }),
+            ColumnarValue::Array(array) => {
+                match array.as_any().downcast_ref::<BooleanArray>() {
+                    Some(bool_arr) => Ok(bool_arr.clone()),
+                    None => Ok(BooleanArray::from(vec![true; coerced.num_rows()])),
+                }
+            }
             ColumnarValue::Scalar(scalar) => {
-                // Extract boolean value: true only for ScalarValue::Boolean(Some(true)).
                 let bool_val = matches!(
                     scalar,
                     datafusion::common::ScalarValue::Boolean(Some(true))
                 );
-                Ok(BooleanArray::from(vec![bool_val; batch.num_rows()]))
+                Ok(BooleanArray::from(vec![bool_val; coerced.num_rows()]))
             }
         }
     }

@@ -1,3 +1,4 @@
+pub mod access_control;
 pub mod circuit_breaker;
 pub mod rest_catalog;
 pub mod catalog_provider;
@@ -21,14 +22,16 @@ pub mod system_jdbc;
 pub mod system_metadata;
 pub mod system_runtime;
 
+pub use access_control::AccessControlClient;
 pub use catalog_provider::SqeCatalogProvider;
 pub use circuit_breaker::CircuitBreaker;
 pub use footer_cache::FooterCache;
 pub use iceberg_scan::IcebergScanExec;
 pub use manifest_cache::{ManifestCache, ManifestEntryData};
 pub use rest_catalog::{SessionCatalog, TableMetadataCache};
+pub use iceberg_scan::coalesce_file_entries;
 pub use s3_io::{
     ByteRange, PrefetchHandle, coalesce_ranges, fetch_byte_ranges, fetch_column_chunks,
-    prefetch_footer, process_files_with_prefetch,
+    prefetch_footer, process_files_with_prefetch, process_files_with_prefetch_depth,
 };
 pub use system_catalog::SystemCatalogProvider;

@@ -62,7 +62,7 @@ pub struct TableDef {
 }
 ```
 
-The TPC-H generator at scale factor 1 produces roughly one gigabyte across eight tables. At scale factor 0.01, it produces enough data to verify correctness in seconds. The data is deterministic — seeded random number generators ensure the same scale factor always produces the same rows, so results are reproducible across runs and machines.
+The TPC-H generator at scale factor 1 produces roughly one gigabyte across eight tables. At scale factor 0.01, it produces enough data to verify correctness in seconds. The data is deterministic: seeded random number generators ensure the same scale factor always produces the same rows, so results are reproducible across runs and machines.
 
 ```rust
 fn seed_for_table(name: &str) -> u64 {
@@ -96,7 +96,7 @@ SELECT * FROM read_parquet(
 
 Each benchmark gets its own namespace: `tpch_sf1`, `tpcds_sf10`, `ssb_sf0_01`. The namespace naming matters because the test runner needs to qualify every table reference in the query SQL, and the naming scheme must be predictable without configuration.
 
-TPC-BB is a special case. Its queries run against TPC-DS tables plus two additional tables (`web_clickstreams` and `product_reviews`). The loader knows this — when the benchmark is `tpcbb`, it loads into the `tpcds` namespace instead of creating its own.
+TPC-BB is a special case. Its queries run against TPC-DS tables plus two additional tables (`web_clickstreams` and `product_reviews`). The loader knows this. When the benchmark is `tpcbb`, it loads into the `tpcds` namespace instead of creating its own.
 
 ### Test
 
@@ -127,12 +127,12 @@ let execute_result = tokio::select! {
 };
 ```
 
-This is the same pattern described in Chapter 14 for handling stuck gRPC streams. A `tokio::timeout` wrapper does not help if the underlying HTTP/2 stream is wedged — it cannot cancel through the gRPC layer. `tokio::select!` drops the losing branch, which closes the connection and frees resources. The benchmark runner learned this lesson from the load test and applied it preemptively.
+This is the same pattern described in Chapter 14 for handling stuck gRPC streams. A `tokio::timeout` wrapper does not help if the underlying HTTP/2 stream is wedged. It cannot cancel through the gRPC layer. `tokio::select!` drops the losing branch, which closes the connection and frees resources. The benchmark runner learned this lesson from the load test and applied it preemptively.
 
 The output is both human-readable terminal output and a machine-readable JSON report.
 
 ```
-TPCH SF1 — flight protocol
+TPCH SF1 -- flight protocol
 ────────────────────────────────────────────────────────
 v q01        1.23s    6001215 rows
 v q02        0.45s        460 rows
@@ -144,7 +144,7 @@ v q03        0.89s      11620 rows
 Results: 20 pass, 0 fail, 1 diff, 1 skip, 0 error  (total 28.4s)
 ```
 
-Five result statuses: `Pass`, `Fail`, `Diff`, `Skip`, `Error`. `Diff` means the answer is close but not exact — floating-point precision differences between engines, or trailing zeros on decimals. `Skip` means the query requires a SQL feature SQE doesn't implement yet. Neither counts as a failure in CI. The distinction matters because you want to know the difference between "this query produces slightly different decimal rounding" and "this query returns the wrong answer."
+Five result statuses: `Pass`, `Fail`, `Diff`, `Skip`, `Error`. `Diff` means the answer is close but not exact: floating-point precision differences between engines, or trailing zeros on decimals. `Skip` means the query requires a SQL feature SQE doesn't implement yet. Neither counts as a failure in CI. The distinction matters because you want to know the difference between "this query produces slightly different decimal rounding" and "this query returns the wrong answer."
 
 The JSON reports accumulate in `benchmarks/results/` and are suitable for tracking performance regressions over time:
 
@@ -193,7 +193,7 @@ Naive string replacement of `part` also matches inside `partsupp`. Replacing `pa
 tables.sort_by_key(|t| std::cmp::Reverse(t.len()));
 ```
 
-But that was only the first layer. The qualifier also needs word-boundary detection — `part` should not match inside the column name `p_partkey`. And it should not qualify table names that appear as column aliases after `AS`. And it needs to handle multi-line FROM clauses where tables are separated by commas on different lines.
+But that was only the first layer. The qualifier also needs word-boundary detection: `part` should not match inside the column name `p_partkey`. And it should not qualify table names that appear as column aliases after `AS`. And it needs to handle multi-line FROM clauses where tables are separated by commas on different lines.
 
 The `prefix_tables` function in `test.rs` grew to 100 lines with context-aware matching: it checks whether the table name is preceded by `FROM`, `JOIN`, `TABLE`, `INTO`, or a comma in a table-list context. It checks for `AS` aliases. It handles double-quoted identifiers. It has eleven unit tests.
 
@@ -227,7 +227,7 @@ handled every real query file. We shipped the heuristic. It has not been wrong y
 
 ## The Bugs Nobody Expected
 
-We built the benchmark suite to measure performance. It found bugs instead. In the first live run across all seven suites, twelve queries that should have passed produced errors. Not wrong answers — errors. The engine could not execute them at all.
+We built the benchmark suite to measure performance. It found bugs instead. In the first live run across all seven suites, twelve queries that should have passed produced errors. Not wrong answers. Errors. The engine could not execute them at all.
 
 ### gRPC keepalive
 
@@ -251,14 +251,14 @@ But the fix in the benchmark client exposed that we also needed it in the engine
 ::: {.fieldreport}
 **Field report: the silent connection.** This bug would have been invisible in integration
 tests because those run one query per connection. It only appears under sustained
-sequential load — exactly the pattern a nightly benchmark run produces. The benchmark
+sequential load, exactly the pattern a nightly benchmark run produces. The benchmark
 suite found it on day one. Without the suite, we would have found it in production
 when a user's long-running dbt job silently stalled at 2am.
 :::
 
 ### Double-quoted identifiers
 
-TPC-DS query 23 uses a column alias `"excess"`. DataFusion treats double-quoted identifiers as case-sensitive column references, not aliases. The query parsed, planned, and started executing — then failed when the physical plan tried to resolve a column named `excess` that didn't exist because it was stored internally as `EXCESS`.
+TPC-DS query 23 uses a column alias `"excess"`. DataFusion treats double-quoted identifiers as case-sensitive column references, not aliases. The query parsed, planned, and started executing, then failed when the physical plan tried to resolve a column named `excess` that didn't exist because it was stored internally as `EXCESS`.
 
 This is a DataFusion behaviour, not a bug. The SQL standard says double-quoted identifiers are case-sensitive. But Trino treats them as case-insensitive aliases, and the standard TPC-DS queries were written for Trino (or Hive, or Presto). We had to modify three TPC-DS query files to use unquoted aliases.
 
@@ -301,9 +301,9 @@ pub trait BenchClient: Send + Sync {
 
 The Flight SQL client connects via gRPC, authenticates with handshake or OAuth2 client credentials, and creates a fresh connection per query to avoid the HTTP/2 stream accumulation bug described in Chapter 14.
 
-The Trino client implements the Trino v1 statement protocol: POST the SQL, poll `nextUri` until the state is `FINISHED`, collect all data pages, and convert the JSON-encoded rows into Arrow RecordBatches. This conversion is lossy — Trino returns numbers as JSON, and `decimal(18,2)` becomes `Float64` in our simplified mapping. Good enough for comparison. Not good enough for production.
+The Trino client implements the Trino v1 statement protocol: POST the SQL, poll `nextUri` until the state is `FINISHED`, collect all data pages, and convert the JSON-encoded rows into Arrow RecordBatches. This conversion is lossy. Trino returns numbers as JSON, and `decimal(18,2)` becomes `Float64` in our simplified mapping. Good enough for comparison. Not good enough for production.
 
-The Trino client also needed to handle the pagination model correctly. Trino's v1 statement API returns results across multiple pages, each with a `nextUri` to poll. The client accumulates all pages before converting to Arrow. A subtle issue: the first response sometimes carries the column schema, sometimes doesn't — it arrives in a later page when the query planner takes time to resolve types. The client handles both cases.
+The Trino client also needed to handle the pagination model correctly. Trino's v1 statement API returns results across multiple pages, each with a `nextUri` to poll. The client accumulates all pages before converting to Arrow. A subtle issue: the first response sometimes carries the column schema, sometimes doesn't. It arrives in a later page when the query planner takes time to resolve types. The client handles both cases.
 
 ```rust
 // A later page may carry the column metadata when the first didn't.
@@ -319,17 +319,17 @@ The dual-protocol design means we can run the exact same 222 queries against bot
 
 ## The Caching Story
 
-The first round of Trino comparisons told us something uncomfortable. SQE was correct — every query returned the right answer. But on ClickBench and short analytical queries, Trino was faster. Not by a little. By 2-3x on warm queries.
+The first round of Trino comparisons told us something uncomfortable. SQE was correct. Every query returned the right answer. But on ClickBench and short analytical queries, Trino was faster. Not by a little. By 2-3x on warm queries.
 
 The profiling told us where the time went. Not in DataFusion. Not in Parquet reads. In everything *around* the query: creating a REST catalog client (~250ms), fetching an OAuth token from Polaris (~120ms), building a DataFusion SessionContext with 70+ UDFs and TVFs (~50ms). Every single query paid these costs. Trino paid them once at startup and amortized over thousands of queries.
 
 The fix was a multi-layer caching strategy modeled on Trino's own architecture but adapted for SQE's stateless, per-user security model:
 
-**Layer 1: RestCatalog cache.** The iceberg-rust `RestCatalog` is expensive to create — it negotiates with Polaris, discovers endpoints, and builds an HTTP client with S3 credentials. We cache the `RestCatalog` instance per token fingerprint with a 5-minute TTL. The same user's second query skips the 250ms creation cost entirely.
+**Layer 1: RestCatalog cache.** The iceberg-rust `RestCatalog` is expensive to create. It negotiates with Polaris, discovers endpoints, and builds an HTTP client with S3 credentials. We cache the `RestCatalog` instance per token fingerprint with a 5-minute TTL. The same user's second query skips the 250ms creation cost entirely.
 
-**Layer 2: Table metadata cache.** Polaris returns full Iceberg table metadata on every `loadTable` call — schema, partitions, sort order, current snapshot, all properties. We cache this globally (shared across all sessions) with a 30-second TTL. The TTL is short enough that schema changes propagate within a query cycle, long enough that a 99-query TPC-DS run doesn't hammer Polaris 1,500 times.
+**Layer 2: Table metadata cache.** Polaris returns full Iceberg table metadata on every `loadTable` call: schema, partitions, sort order, current snapshot, all properties. We cache this globally (shared across all sessions) with a 30-second TTL. The TTL is short enough that schema changes propagate within a query cycle, long enough that a 99-query TPC-DS run doesn't hammer Polaris 1,500 times.
 
-**Layer 3: Manifest file cache.** Iceberg manifest files are immutable by specification. Once written, their content never changes. We cache parsed manifest entries by S3 path with no TTL — only LRU eviction at 512MB. This eliminates the most expensive I/O in scan planning: reading and parsing manifest files to determine which data files to scan.
+**Layer 3: Manifest file cache.** Iceberg manifest files are immutable by specification. Once written, their content never changes. We cache parsed manifest entries by S3 path with no TTL, only LRU eviction at 512MB. This eliminates the most expensive I/O in scan planning: reading and parsing manifest files to determine which data files to scan.
 
 **Layer 4: SessionContext cache.** The DataFusion `SessionContext` wraps an `Arc<SessionState>` internally. Cloning it is O(1). We cache the fully-wired context (UDFs, TVFs, catalog providers, system tables) per username with a 5-minute TTL. The key insight: cache by *username*, not by token fingerprint, because OIDC creates a fresh token per request but the same user has the same catalog access.
 
@@ -337,7 +337,7 @@ The fix was a multi-layer caching strategy modeled on Trino's own architecture b
 
 The cache invalidation was the hard part. Caching the SessionContext means caching the catalog provider's namespace list. When `CREATE TABLE tpch_sf0_01.lineitem AS SELECT ...` runs, it creates a new table in a namespace. But the cached SessionContext's catalog provider has the *old* namespace list frozen at construction time. The next `SELECT * FROM tpch_sf0_01.lineitem` returns "table not found."
 
-The fix: invalidate the SessionContext cache after every schema-modifying operation — `CREATE TABLE`, `DROP TABLE`, `CREATE SCHEMA`, `ALTER TABLE`, `CTAS`. The invalidation is cheap (one cache remove). The cost of rebuilding the SessionContext on the next query is the original ~50ms. But that only happens once per DDL operation, not once per query.
+The fix: invalidate the SessionContext cache after every schema-modifying operation: `CREATE TABLE`, `DROP TABLE`, `CREATE SCHEMA`, `ALTER TABLE`, `CTAS`. The invalidation is cheap (one cache remove). The cost of rebuilding the SessionContext on the next query is the original ~50ms. But that only happens once per DDL operation, not once per query.
 
 The result was dramatic. Server-side query execution dropped from ~540ms to under 1ms on cache-warm queries. The `SELECT 1` test showed 0.4ms server-side processing with both caches hitting.
 
@@ -364,24 +364,24 @@ The automated `--compare-trino` benchmark runner tells the story with numbers, n
 | TPC-BB (10 queries) | 1,223 | 2,193 | **3.1x** | 10/10 |
 | ClickBench (43 queries) | 904 | 2,205 | **2.5x** | 43/43 |
 
-SQE is faster than Trino on every suite. Not by a little — by 2.5x to 8.8x. The TPC-H result is the most dramatic: 8.8x average speedup, with individual queries ranging from 1.9x (q15) to 66.9x (q01). That 66.9x is not a typo. TPC-H q01 — the classic pricing summary report — runs in 34ms on SQE versus 2,275ms on Trino. Trino's overhead dominates when the actual computation is trivial.
+SQE is faster than Trino on every suite. Not by a little. By 2.5x to 8.8x. The TPC-H result is the most dramatic: 8.8x average speedup, with individual queries ranging from 1.9x (q15) to 66.9x (q01). That 66.9x is not a typo. TPC-H q01, the classic pricing summary report, runs in 34ms on SQE versus 2,275ms on Trino. Trino's overhead dominates when the actual computation is trivial.
 
 The ClickBench results deserve attention too. 43 queries, all matched, 2.5x average speedup. On a single wide table with 105 columns, SQE's Arrow-native pipeline and direct Parquet read path make the difference. No JSON serialization in the result path. No Trino worker scheduling overhead for a single-partition scan.
 
-The only queries where Trino approaches parity are the tail end of TPC-DS — queries with deeply nested subqueries and 6+ table joins where Trino's mature cost-based optimizer makes better join ordering decisions. Even there, SQE is never slower than 0.6x (TPC-DS q07, q84). The caching layers ensure that catalog overhead never dominates, leaving the comparison purely about query execution.
+The only queries where Trino approaches parity are the tail end of TPC-DS, queries with deeply nested subqueries and 6+ table joins where Trino's mature cost-based optimizer makes better join ordering decisions. Even there, SQE is never slower than 0.6x (TPC-DS q07, q84). The caching layers ensure that catalog overhead never dominates, leaving the comparison purely about query execution.
 
-Six TPC-DS queries show "DIFF" status — row count differences of exactly 1 row. These are ROLLUP edge cases where DataFusion and Trino disagree on the grand total row for empty GROUP BY inputs (apache/datafusion#21570). Not wrong. Just different. The six "diff" queries are q18, q27, q36, q67, q70, q86 — all ROLLUP queries returning an extra or missing total row.
+Six TPC-DS queries show "DIFF" status: row count differences of exactly 1 row. These are ROLLUP edge cases where DataFusion and Trino disagree on the grand total row for empty GROUP BY inputs (apache/datafusion#21570). Not wrong. Just different. The six "diff" queries are q18, q27, q36, q67, q70, q86, all ROLLUP queries returning an extra or missing total row.
 
-Auth overhead. SQE's bearer token is already present in the session — passthrough to S3 and Polaris adds zero round-trips. Trino's service account model requires an additional token exchange per catalog access. On short queries, this overhead is noise. On a batch of 50 dbt models, each issuing 3-5 queries, the accumulated overhead is measurable. The TPC-H comparison shows this clearly: most of Trino's 10.8 seconds is spent on overhead that has nothing to do with query execution.
+Auth overhead. SQE's bearer token is already present in the session. Passthrough to S3 and Polaris adds zero round-trips. Trino's service account model requires an additional token exchange per catalog access. On short queries, this overhead is noise. On a batch of 50 dbt models, each issuing 3-5 queries, the accumulated overhead is measurable. The TPC-H comparison shows this clearly: most of Trino's 10.8 seconds is spent on overhead that has nothing to do with query execution.
 
 
 ## Where Trino Still Has Advantages
 
 Large-scale shuffle at terabyte scale. Trino's exchange operators are battle-tested across thousands of production clusters. At SF0.01, the data fits in memory and SQE's streaming pipeline dominates. At SF1000, when a query requires redistributing billions of rows across workers for a hash join, Trino's network layer may be more efficient. We haven't tested at that scale yet.
 
-Join order optimization for 8+ table queries. Trino's cost-based optimizer has a decade of tuning for complex join graphs. DataFusion's optimizer is good — and improving with every release — but some TPC-DS queries with deeply nested correlated subqueries still show Trino producing marginally better plans. The gap is narrowing with each DataFusion version.
+Join order optimization for 8+ table queries. Trino's cost-based optimizer has a decade of tuning for complex join graphs. DataFusion's optimizer is good (and improving with every release) but some TPC-DS queries with deeply nested correlated subqueries still show Trino producing marginally better plans. The gap is narrowing with each DataFusion version.
 
-Ecosystem breadth. Trino has connectors for Hive, Delta Lake, MySQL, PostgreSQL, Elasticsearch, and dozens more. SQE targets one format (Iceberg) via one catalog (Polaris). This is intentional — sovereignty means controlling the stack, not connecting to everything.
+Ecosystem breadth. Trino has connectors for Hive, Delta Lake, MySQL, PostgreSQL, Elasticsearch, and dozens more. SQE targets one format (Iceberg) via one catalog (Polaris). This is intentional. Sovereignty means controlling the stack, not connecting to everything.
 
 
 ## Why That Matters
@@ -399,13 +399,13 @@ The benchmark results confirm the architecture matches the use case. But more th
 | Short OLTP-style reads | SQE 5-9x faster | Sub-ms server-side with warm cache |
 | Auth-heavy workloads | SQE measurably faster | Zero-overhead passthrough |
 
-If your workload is analytical queries over Iceberg tables — and that is the workload SQE was built for — the numbers are unambiguous. SQE is faster. Not because Rust is faster than Java (though it helps). Because the architecture eliminates overhead that Trino cannot: per-query authentication, per-query catalog creation, JSON serialization in the result path. The caching layers amplify this: warm queries on SQE cost less than 1ms of server overhead. Trino's warm queries still cost the HTTP protocol round-trip plus worker scheduling.
+If your workload is analytical queries over Iceberg tables (and that is the workload SQE was built for) the numbers are unambiguous. SQE is faster. Not because Rust is faster than Java (though it helps). Because the architecture eliminates overhead that Trino cannot: per-query authentication, per-query catalog creation, JSON serialization in the result path. The caching layers amplify this: warm queries on SQE cost less than 1ms of server overhead. Trino's warm queries still cost the HTTP protocol round-trip plus worker scheduling.
 
 ::: {.antipattern}
 **Antipattern: Benchmark-Driven Architecture.** TPC-H is a synthetic workload from 1992.
 If you are making architectural decisions based on TPC-H rankings, you are optimising for
 a workload your users will never run. Profile your actual queries. Identify which pattern
-dominates. Then choose the engine that handles that pattern — not the engine that wins
+dominates. Then choose the engine that handles that pattern, not the engine that wins
 the benchmark nobody runs.
 :::
 
@@ -432,7 +432,7 @@ pub fn compare_results(
         )));
     }
 
-    // Sort both lexicographically — order-independent comparison
+    // Sort both lexicographically -- order-independent comparison
     let mut actual_sorted = actual_rows;
     actual_sorted.sort();
     let mut expected_sorted = expected_rows;
@@ -473,7 +473,7 @@ After two weeks of benchmark development, we had impressive numbers. TPC-H at sc
 
 Then we ran the actual workload.
 
-Fifty dbt models. Nightly batch. Three concurrent users. The kind of workload the engine was built for. It was not a benchmark suite — it was a staging deployment with real data transformations, real schema evolution, and real users running ad-hoc queries while the batch was running.
+Fifty dbt models. Nightly batch. Three concurrent users. The kind of workload the engine was built for. It was not a benchmark suite. It was a staging deployment with real data transformations, real schema evolution, and real users running ad-hoc queries while the batch was running.
 
 The results did not match the benchmarks.
 
@@ -488,7 +488,7 @@ Total wall-clock time for the nightly batch:
 | Ad-hoc queries during batch | 0.8s avg | 1.2s avg |
 | Time to deploy from zero | 4 minutes | 45 minutes |
 
-SQE was faster. Not dramatically — 10-20% depending on the metric. The dramatic difference was the last row. Deploying SQE is one Helm chart with a coordinator and two workers. Deploying Trino is a coordinator, multiple workers, a service account, a catalog configuration, a Hive metastore (or separate catalog service), and a security configuration that takes longer to get right than the engine itself.
+SQE was faster. Not dramatically, 10-20% depending on the metric. The dramatic difference was the last row. Deploying SQE is one Helm chart with a coordinator and two workers. Deploying Trino is a coordinator, multiple workers, a service account, a catalog configuration, a Hive metastore (or separate catalog service), and a security configuration that takes longer to get right than the engine itself.
 
 The benchmark that mattered was not query latency. It was operational cost. One Helm chart versus fourteen services. One bearer token model versus a service account matrix. One engineer maintaining it versus a team.
 
@@ -497,8 +497,8 @@ There is another number in that table that deserves attention: ad-hoc query late
 ::: {.fieldreport}
 **Field report: the number that convinced management.** We presented the TPC-H numbers.
 Management nodded politely. We presented the dbt batch wall-clock comparison. They
-nodded more enthusiastically. We presented the deployment comparison — 4 minutes versus
-45 minutes — and they approved the migration. The performance was the supporting evidence.
+nodded more enthusiastically. We presented the deployment comparison, 4 minutes versus
+45 minutes, and they approved the migration. The performance was the supporting evidence.
 The operational simplicity was the argument.
 :::
 
@@ -507,11 +507,11 @@ The operational simplicity was the argument.
 
 The benchmark JSON reports accumulate in `benchmarks/results/`. They are not a dashboard. They are a historical record. And the historical record from April 2026 tells a story about what happens when you focus on correctness first and performance second.
 
-On April 2, SQE ran 192 out of 222 benchmark queries. Thirty queries failed — missing UDFs, unsupported SQL features, ROLLUP edge cases. The queries that passed took 126 seconds total. Respectable for a single-node engine, but not competitive with Trino.
+On April 2, SQE ran 192 out of 222 benchmark queries. Thirty queries failed: missing UDFs, unsupported SQL features, ROLLUP edge cases. The queries that passed took 126 seconds total. Respectable for a single-node engine, but not competitive with Trino.
 
-On April 10, SQE ran 218 out of 222 queries. We had added 70+ Trino-compatible UDFs, streaming writes, sort-order safety, and IN-subquery rewrite. The pass count jumped from 192 to 218. But the total time *increased* to 154 seconds. Every query now did more work — building SessionContexts with more UDFs, resolving more catalog metadata. We were more correct and slower. The first Trino comparison runs showed SQE losing on every suite. ClickBench: 0.1x Trino. TPC-H: 0.6x Trino. The numbers were discouraging.
+On April 10, SQE ran 218 out of 222 queries. We had added 70+ Trino-compatible UDFs, streaming writes, sort-order safety, and IN-subquery rewrite. The pass count jumped from 192 to 218. But the total time *increased* to 154 seconds. Every query now did more work: building SessionContexts with more UDFs, resolving more catalog metadata. We were more correct and slower. The first Trino comparison runs showed SQE losing on every suite. ClickBench: 0.1x Trino. TPC-H: 0.6x Trino. The numbers were discouraging.
 
-On the morning of April 12, we landed the first three caching layers: RestCatalog cache, table metadata cache, manifest file cache. SQE reached rough parity with Trino — 1.0x to 1.4x depending on the suite. Competitive, not dominant.
+On the morning of April 12, we landed the first three caching layers: RestCatalog cache, table metadata cache, manifest file cache. SQE reached rough parity with Trino, 1.0x to 1.4x depending on the suite. Competitive, not dominant.
 
 On the afternoon of April 12, we landed the SessionContext cache and OAuth service token cache. The effect was immediate.
 
@@ -549,7 +549,7 @@ On April 10, SQE lost every Trino comparison. On April 12, it won every one. The
 
 ## The Benchmark as Regression Suite
 
-The seven suites serve double duty. On commit, CI runs TPC-H at scale factor 0.01 — just enough data to verify correctness, fast enough to finish in under a minute. The test is not "is SQE fast?" The test is "did this commit break any of the 22 queries that worked yesterday?"
+The seven suites serve double duty. On commit, CI runs TPC-H at scale factor 0.01, just enough data to verify correctness, fast enough to finish in under a minute. The test is not "is SQE fast?" The test is "did this commit break any of the 22 queries that worked yesterday?"
 
 Nightly, CI runs the full suite at scale factor 0.01 with the `--compare-trino` flag. This catches both correctness regressions and performance regressions in a single run. The Trino container starts automatically, the same queries run against both engines, and the comparison JSON report captures per-query timing and row-count matching.
 
@@ -593,14 +593,14 @@ The `benchmark-test.sh` script produces a summary table at the end that gives a 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-221 out of 222 queries passing (99.5%). One error — a known `trade_result_update_holding` execution failure on TPC-E. Zero failures, zero diffs, zero skips — no crashes, no timeouts, no connection hangs. TPC-DS runs 99/99 with ROLLUP now enabled. TPC-C runs all 17 queries including write-path DML (DELETE, UPDATE via CoW). ClickBench runs 43/43. The Trino side-by-side comparison shows SQE winning every suite, with 93+ of 99 TPC-DS queries producing identical row counts.
+221 out of 222 queries passing (99.5%). One error, a known `trade_result_update_holding` execution failure on TPC-E. Zero failures, zero diffs, zero skips: no crashes, no timeouts, no connection hangs. TPC-DS runs 99/99 with ROLLUP now enabled. TPC-C runs all 17 queries including write-path DML (DELETE, UPDATE via CoW). ClickBench runs 43/43. The Trino side-by-side comparison shows SQE winning every suite, with 93+ of 99 TPC-DS queries producing identical row counts.
 
-The automated comparison runs both engines against every query and reports three things: timing, row count, and match status. "OK" means both engines returned the same number of rows. "DIFF" means they disagreed — usually a ROLLUP edge case. "FAIL SQE" or "FAIL Trino" means one engine errored. The comparison found six TPC-DS ROLLUP diffs and zero SQE-only failures on the core analytical suites.
+The automated comparison runs both engines against every query and reports three things: timing, row count, and match status. "OK" means both engines returned the same number of rows. "DIFF" means they disagreed, usually a ROLLUP edge case. "FAIL SQE" or "FAIL Trino" means one engine errored. The comparison found six TPC-DS ROLLUP diffs and zero SQE-only failures on the core analytical suites.
 
 
 ## What We Learned
 
-Building the benchmark suite took about as long as building the distributed execution layer. That surprised us. We expected data generators and a test runner — a week's work. We got a SQL dialect compatibility layer, a type-aware result comparator, a dual-protocol client abstraction, and a namespace-aware table qualifier with eleven unit tests. The complexity was not in measuring performance. The complexity was in making the measurement honest.
+Building the benchmark suite took about as long as building the distributed execution layer. That surprised us. We expected data generators and a test runner, a week's work. We got a SQL dialect compatibility layer, a type-aware result comparator, a dual-protocol client abstraction, and a namespace-aware table qualifier with eleven unit tests. The complexity was not in measuring performance. The complexity was in making the measurement honest.
 
 Three takeaways.
 
@@ -615,7 +615,7 @@ The `sqe-bench` binary is 222 queries of truth. It does not care about your arch
 
 ## The Streaming Execution Effect
 
-After building the streaming execution engine (Chapter 13) — coordinator spill-to-disk, late materialization, file-level pruning, S3 I/O pipeline, distributed shuffle — we had a new baseline to compare against. The numbers told a clear story.
+After building the streaming execution engine (Chapter 13: coordinator spill-to-disk, late materialization, file-level pruning, S3 I/O pipeline, distributed shuffle) we had a new baseline to compare against. The numbers told a clear story.
 
 ### Three configurations, one workload
 
@@ -627,7 +627,7 @@ We ran all 22 TPC-H SF1 queries against three deployments:
 | Single-node, 512MB + spill | 512 MB | 0 | 21/22 | 33.3s |
 | Distributed (coordinator + 2 workers) | 8 GB | 2 | 22/22 | 12.0s |
 
-The 512MB test was deliberately adversarial. We wanted to prove that a coordinator with less memory than a Raspberry Pi could execute analytical queries over 6 million rows without crashing. 21 out of 22 passed. The one failure — q18, the most memory-intensive TPC-H query — hit a known DataFusion limitation where the hash aggregate exhausts its memory reservation before the spill mechanism triggers (DF#17334). With two workers sharing the load, q18 completed in 0.74 seconds.
+The 512MB test was deliberately adversarial. We wanted to prove that a coordinator with less memory than a Raspberry Pi could execute analytical queries over 6 million rows without crashing. 21 out of 22 passed. The one failure (q18, the most memory-intensive TPC-H query) hit a known DataFusion limitation where the hash aggregate exhausts its memory reservation before the spill mechanism triggers (DF#17334). With two workers sharing the load, q18 completed in 0.74 seconds.
 
 ### Per-query breakdown
 
@@ -666,7 +666,7 @@ Three patterns emerge:
 
 **Metadata-light queries (q11, q13, q16, q22) saw 6-8x speedup.** These are small scans over dimension tables or subquery-heavy queries where the bottleneck is plan execution overhead, not I/O. The Parquet footer cache eliminates repeated metadata reads. File-level min/max pruning skips files entirely. The coordinator barely touches S3.
 
-**Scan-heavy queries (q01, q03, q07, q19) saw 2-2.5x speedup.** These read millions of rows from the lineitem table. The speedup is roughly proportional to the worker count — two workers scan in parallel, each reading half the files. Add more workers, get proportional improvement. This is the Amdahl's Law case: the scan is the parallelizable part.
+**Scan-heavy queries (q01, q03, q07, q19) saw 2-2.5x speedup.** These read millions of rows from the lineitem table. The speedup is roughly proportional to the worker count: two workers scan in parallel, each reading half the files. Add more workers, get proportional improvement. This is the Amdahl's Law case: the scan is the parallelizable part.
 
 **Join-heavy queries (q05, q08, q09, q18) saw 3-4x speedup.** This is where the streaming execution architecture pays off. The SortMergeJoin fallback prevents OOM on large hash tables. Late materialization reduces the data flowing into the join (read only the predicate columns, filter, then fetch the rest). Predicate transfer pushes join keys from the build side to the probe side, skipping files that cannot match.
 
@@ -674,7 +674,7 @@ Three patterns emerge:
 
 The 512MB test was not about performance. It was about safety. Before the streaming execution engine, a coordinator with 512MB would be killed by the OS after the first analytical query. After: 21 of 22 TPC-H queries completed. The coordinator allocated memory, hit the watermark, spilled sorted runs to disk, and continued processing. The `sqe_coordinator_memory_pressure` gauge ticked from green (0) through yellow (1) and back, never reaching red (3). That is the design working as intended.
 
-The single failure (q18) is instructive. DataFusion's `GroupedHashAggregateStream` does not yet support cooperative spill — it allocates memory for its hash table, and if the pool is exhausted before the table is complete, the operator fails rather than spilling. This is a known upstream limitation (DataFusion issue #17334). The fix is either more memory (1GB is enough), distributed aggregation (workers each handle a partition of the hash table), or an upstream improvement to the hash aggregate's memory accounting. We chose to document it rather than hide it. The benchmark is not there to make us look good. It is there to show what works and what does not.
+The single failure (q18) is instructive. DataFusion's `GroupedHashAggregateStream` does not yet support cooperative spill. It allocates memory for its hash table, and if the pool is exhausted before the table is complete, the operator fails rather than spilling. This is a known upstream limitation (DataFusion issue #17334). The fix is either more memory (1GB is enough), distributed aggregation (workers each handle a partition of the hash table), or an upstream improvement to the hash aggregate's memory accounting. We chose to document it rather than hide it. The benchmark is not there to make us look good. It is there to show what works and what does not.
 
 ### The full matrix: five suites, three configs
 
@@ -700,20 +700,20 @@ The spill data told a story we did not expect:
 | single-8gb | 128 | 27.7 GB |
 | distributed-2w | 3 | 49 MB |
 
-The 8GB configuration spilled *more* than the 512MB one. This is not a bug. It is an artifact of success: 8GB successfully runs TPC-E queries that 512MB cannot even start. Those TPC-E queries involve multi-table joins across 33 brokerage tables — trade to customer_account to customer to address to zip_code — producing 27GB of intermediate sorted data. With 512MB, the hash aggregate runs out of memory before any data reaches the sort operator. With 8GB, the join completes, the sort starts, and the sort spills. The spill is the system working as designed.
+The 8GB configuration spilled *more* than the 512MB one. This is not a bug. It is an artifact of success: 8GB successfully runs TPC-E queries that 512MB cannot even start. Those TPC-E queries involve multi-table joins across 33 brokerage tables (trade to customer_account to customer to address to zip_code) producing 27GB of intermediate sorted data. With 512MB, the hash aggregate runs out of memory before any data reaches the sort operator. With 8GB, the join completes, the sort starts, and the sort spills. The spill is the system working as designed.
 
-With two workers, spill dropped to 49MB. Workers absorb scan and partial aggregation work. The coordinator barely touches raw data — it merges small, pre-processed result sets.
+With two workers, spill dropped to 49MB. Workers absorb scan and partial aggregation work. The coordinator barely touches raw data. It merges small, pre-processed result sets.
 
-One finding surprised us: at SF1, the distributed-2w configuration ran all queries locally on the coordinator (`scheduler_decisions{local}=120+`). Not a single query was distributed to workers. SF1 tables have 1-2 data files each, below the distribution threshold of 4 files. The 2.5x speedup we measured was not from distribution — it was from the streaming execution improvements: spill-to-disk, late materialization, scan planning optimizations. The workers were idle. To see actual distribution, run at SF10 or higher, where tables have enough files to justify splitting across workers.
+One finding surprised us: at SF1, the distributed-2w configuration ran all queries locally on the coordinator (`scheduler_decisions{local}=120+`). Not a single query was distributed to workers. SF1 tables have 1-2 data files each, below the distribution threshold of 4 files. The 2.5x speedup we measured was not from distribution. It was from the streaming execution improvements: spill-to-disk, late materialization, scan planning optimizations. The workers were idle. To see actual distribution, run at SF10 or higher, where tables have enough files to justify splitting across workers.
 
 ### Storing results for history
 
-All benchmark JSON results are committed to `benchmarks/results/` in the repository. This is deliberate. A benchmark run that is not committed is a benchmark run that never happened. When a future change introduces a regression — and it will — the historical results provide the baseline. You do not need to remember what the numbers were. You `git log benchmarks/results/` and the history is there.
+All benchmark JSON results are committed to `benchmarks/results/` in the repository. This is deliberate. A benchmark run that is not committed is a benchmark run that never happened. When a future change introduces a regression (and it will) the historical results provide the baseline. You do not need to remember what the numbers were. You `git log benchmarks/results/` and the history is there.
 
 The naming convention encodes everything you need: `tpch-sf1-flight-2026-04-06T20:57:10.json` tells you the benchmark, scale factor, protocol, and exact timestamp. Compare any two files and you have a regression test.
 
 ::: {.ailog}
-**AI Logbook:** The benchmark generators were pure AI work — 24 TPC-DS tables, 8 TPC-H tables, 9 TPC-C tables, all with correlated random data using seeded RNGs. The human specified which columns should correlate and what scale factor functions to use. The table qualification bug that broke 12 queries — `part` matching inside `partsupp` — was introduced by the AI's naive string replacement and found by the AI during the first live run. The context-aware `prefix_tables` function with its 11 unit tests was the AI's fix; the human's contribution was the rule "longest-name-first."
+**AI Logbook:** The benchmark generators were pure AI work: 24 TPC-DS tables, 8 TPC-H tables, 9 TPC-C tables, all with correlated random data using seeded RNGs. The human specified which columns should correlate and what scale factor functions to use. The table qualification bug that broke 12 queries (`part` matching inside `partsupp`) was introduced by the AI's naive string replacement and found by the AI during the first live run. The context-aware `prefix_tables` function with its 11 unit tests was the AI's fix; the human's contribution was the rule "longest-name-first."
 :::
 
 The hard part is knowing which numbers to look at.

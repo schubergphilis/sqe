@@ -284,7 +284,11 @@ fn classify_execution_error(msg: &str) -> SqeErrorCode {
     let lower = msg.to_lowercase();
     // TypeMismatch must be checked BEFORE FunctionNotFound because DataFusion
     // concatenates both messages: "TypeSignatureClass... No function matches..."
-    if lower.contains("typesignatureclass") || lower.contains("type mismatch") {
+    if lower.contains("typesignatureclass")
+        || lower.contains("type mismatch")
+        || lower.contains("invalid comparison operation")
+        || lower.contains("invalid argument error")
+    {
         SqeErrorCode::TypeMismatch
     } else if lower.contains("table") && lower.contains("not found") {
         SqeErrorCode::TableNotFound
@@ -325,10 +329,17 @@ fn classify_execution_error(msg: &str) -> SqeErrorCode {
 /// prefixes and cleans up those annotations.
 fn clean_error_message(msg: &str) -> String {
     let prefixes = [
+        "Query execution failed: ",
+        "Query execution error: ",
         "SQL planning failed: Error during planning: ",
         "SQL planning failed: ",
         "Error during planning: ",
         "DataFusion error: ",
+        "External error: External: External error: ",
+        "External error: External: ",
+        "External error: ",
+        "Arrow error: ",
+        "Invalid argument error: ",
     ];
     let mut cleaned = msg;
     for prefix in &prefixes {

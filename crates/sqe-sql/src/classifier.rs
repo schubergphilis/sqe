@@ -2,6 +2,32 @@ use sqlparser::ast::{AlterTableOperation, ObjectType, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
+/// Target for SHOW GRANTS statements.
+#[derive(Debug)]
+pub enum ShowGrantsTarget {
+    /// SHOW GRANTS ON [catalog.]namespace[.table]
+    OnResource {
+        catalog: Option<String>,
+        namespace: Option<String>,
+        table: Option<String>,
+    },
+    /// SHOW GRANTS TO ROLE/USER "name"
+    ToGrantee {
+        grantee_type: String,
+        grantee_name: String,
+    },
+}
+
+/// Parameters for CHECK ACCESS statements.
+#[derive(Debug)]
+pub struct CheckAccessParams {
+    pub privilege: String,
+    pub catalog: Option<String>,
+    pub namespace: Option<String>,
+    pub table: Option<String>,
+    pub user: String,
+}
+
 /// Classifies a parsed SQL statement into a high-level kind
 /// for routing to the appropriate handler in the coordinator.
 #[derive(Debug)]
@@ -23,7 +49,16 @@ pub enum StatementKind {
     ShowCatalogs,
     ShowSchemas(String),
     ShowTables(String),
-    Policy(Box<Statement>),
+    /// GRANT or DENY privilege statement
+    Grant(Box<Statement>),
+    /// REVOKE privilege statement
+    Revoke(Box<Statement>),
+    /// SHOW GRANTS ON resource / SHOW GRANTS TO grantee
+    ShowGrants(ShowGrantsTarget),
+    /// SHOW EFFECTIVE GRANTS FOR USER "name"
+    ShowEffectiveGrants(String),
+    /// CHECK ACCESS privilege ON resource FOR USER "name"
+    CheckAccess(CheckAccessParams),
     Utility(Box<Statement>),
     ExplainFull(String), // inner SQL string (EXPLAIN FULL pre-processed)
     // Transaction stubs — no-ops for JDBC tools that use setAutoCommit(false).
@@ -67,7 +102,11 @@ impl StatementKind {
             StatementKind::ShowCatalogs => "showcatalogs",
             StatementKind::ShowSchemas(_) => "showschemas",
             StatementKind::ShowTables(_) => "showtables",
-            StatementKind::Policy(_) => "policy",
+            StatementKind::Grant(_) => "grant",
+            StatementKind::Revoke(_) => "revoke",
+            StatementKind::ShowGrants(_) => "showgrants",
+            StatementKind::ShowEffectiveGrants(_) => "showeffectivegrants",
+            StatementKind::CheckAccess(_) => "checkaccess",
             StatementKind::Utility(_) => "utility",
             StatementKind::ExplainFull(_) => "explain_full",
             StatementKind::Begin => "begin",
@@ -109,6 +148,58 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
             .trim_end_matches(';')
             .to_string();
         return Ok(StatementKind::ShowStats(table));
+    }
+
+    // Pre-scan for SHOW EFFECTIVE GRANTS FOR USER "name"
+    if upper.starts_with("SHOW EFFECTIVE GRANTS FOR USER ") {
+        let user = trimmed["SHOW EFFECTIVE GRANTS FOR USER ".len()..]
+            .trim()
+            .trim_end_matches(';')
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
+        return Ok(StatementKind::ShowEffectiveGrants(user));
+    }
+
+    // Pre-scan for SHOW GRANTS ON resource / SHOW GRANTS TO type "name"
+    if upper.starts_with("SHOW GRANTS ON ") {
+        let rest = trimmed["SHOW GRANTS ON ".len()..]
+            .trim()
+            .trim_end_matches(';')
+            .to_string();
+        let target = parse_resource_reference(&rest);
+        return Ok(StatementKind::ShowGrants(ShowGrantsTarget::OnResource {
+            catalog: target.0,
+            namespace: target.1,
+            table: target.2,
+        }));
+    }
+    if upper.starts_with("SHOW GRANTS TO ") {
+        let rest = trimmed["SHOW GRANTS TO ".len()..]
+            .trim()
+            .trim_end_matches(';');
+        let parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
+        if parts.len() == 2 {
+            let grantee_type = parts[0].to_uppercase();
+            let grantee_name = parts[1]
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string();
+            return Ok(StatementKind::ShowGrants(ShowGrantsTarget::ToGrantee {
+                grantee_type,
+                grantee_name,
+            }));
+        }
+        return Err(sqe_core::SqeError::Execution(
+            "SHOW GRANTS TO requires: SHOW GRANTS TO GROUP|USER \"name\"".to_string(),
+        ));
+    }
+
+    // Pre-scan for CHECK ACCESS privilege ON resource FOR USER "name"
+    if upper.starts_with("CHECK ACCESS ") {
+        let rest = trimmed["CHECK ACCESS ".len()..].trim().trim_end_matches(';');
+        return parse_check_access(rest);
     }
 
     let dialect = GenericDialect {};
@@ -201,11 +292,11 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
         // CREATE SCHEMA
         Statement::CreateSchema { .. } => Ok(StatementKind::CreateSchema(Box::new(stmt))),
 
-        // GRANT → Policy
-        Statement::Grant { .. } => Ok(StatementKind::Policy(Box::new(stmt))),
+        // GRANT → dedicated variant for access control
+        Statement::Grant { .. } => Ok(StatementKind::Grant(Box::new(stmt))),
 
-        // REVOKE → Policy
-        Statement::Revoke { .. } => Ok(StatementKind::Policy(Box::new(stmt))),
+        // REVOKE → dedicated variant for access control
+        Statement::Revoke { .. } => Ok(StatementKind::Revoke(Box::new(stmt))),
 
         // EXPLAIN → Utility
         Statement::Explain { .. } => Ok(StatementKind::Utility(Box::new(stmt))),
@@ -310,6 +401,58 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
     }
 }
 
+/// Parse a dotted resource reference like `catalog.namespace.table` into
+/// (catalog, namespace, table). Supports 1-part, 2-part, and 3-part names.
+fn parse_resource_reference(s: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let parts: Vec<&str> = s.split('.').map(|p| p.trim()).collect();
+    match parts.len() {
+        1 => (Some(parts[0].to_string()), None, None),
+        2 => (Some(parts[0].to_string()), Some(parts[1].to_string()), None),
+        3 => (
+            Some(parts[0].to_string()),
+            Some(parts[1].to_string()),
+            Some(parts[2].to_string()),
+        ),
+        _ => (Some(s.to_string()), None, None),
+    }
+}
+
+/// Parse `CHECK ACCESS privilege ON resource FOR USER "name"`.
+fn parse_check_access(rest: &str) -> sqe_core::Result<StatementKind> {
+    let upper = rest.to_uppercase();
+    // Find " ON " to split privilege from the rest
+    let on_pos = upper
+        .find(" ON ")
+        .ok_or_else(|| sqe_core::SqeError::Execution(
+            "CHECK ACCESS requires: CHECK ACCESS <privilege> ON <resource> FOR USER \"<name>\"".to_string(),
+        ))?;
+    let privilege = rest[..on_pos].trim().to_string();
+    let after_on = rest[on_pos + 4..].trim();
+
+    // Find " FOR USER " to split resource from user
+    let after_on_upper = after_on.to_uppercase();
+    let for_user_pos = after_on_upper
+        .find(" FOR USER ")
+        .ok_or_else(|| sqe_core::SqeError::Execution(
+            "CHECK ACCESS requires: CHECK ACCESS <privilege> ON <resource> FOR USER \"<name>\"".to_string(),
+        ))?;
+    let resource = after_on[..for_user_pos].trim();
+    let user = after_on[for_user_pos + " FOR USER ".len()..]
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string();
+
+    let (catalog, namespace, table) = parse_resource_reference(resource);
+    Ok(StatementKind::CheckAccess(CheckAccessParams {
+        privilege,
+        catalog,
+        namespace,
+        table,
+        user,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,15 +554,135 @@ mod tests {
     }
 
     #[test]
-    fn test_grant_is_policy() {
+    fn test_grant_is_grant() {
         let result = parse_and_classify("GRANT SELECT ON foo TO bar");
-        assert!(matches!(result, Ok(StatementKind::Policy(_))));
+        assert!(matches!(result, Ok(StatementKind::Grant(_))));
     }
 
     #[test]
-    fn test_revoke_is_policy() {
+    fn test_revoke_is_revoke() {
         let result = parse_and_classify("REVOKE SELECT ON foo FROM bar");
-        assert!(matches!(result, Ok(StatementKind::Policy(_))));
+        assert!(matches!(result, Ok(StatementKind::Revoke(_))));
+    }
+
+    #[test]
+    fn test_show_grants_on_resource() {
+        let result = parse_and_classify("SHOW GRANTS ON my_catalog.my_ns.my_table");
+        assert!(
+            matches!(result, Ok(StatementKind::ShowGrants(ShowGrantsTarget::OnResource { .. }))),
+            "Expected ShowGrants OnResource, got: {result:?}"
+        );
+    }
+
+    #[test]
+    #[test]
+    fn test_show_grants_to_group() {
+        let result = parse_and_classify("SHOW GRANTS TO GROUP \"SG-Risk-Analysts\"");
+        assert!(result.is_ok());
+        match result.unwrap() {
+            StatementKind::ShowGrants(ShowGrantsTarget::ToGrantee { grantee_type, grantee_name }) => {
+                assert_eq!(grantee_type, "GROUP");
+                assert_eq!(grantee_name, "SG-Risk-Analysts");
+            }
+            other => panic!("Expected ShowGrants(ToGrantee), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_show_grants_to_role() {
+        let result = parse_and_classify("SHOW GRANTS TO ROLE \"admin\"");
+        assert!(
+            matches!(result, Ok(StatementKind::ShowGrants(ShowGrantsTarget::ToGrantee { .. }))),
+            "Expected ShowGrants ToGrantee, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_show_effective_grants() {
+        let result = parse_and_classify("SHOW EFFECTIVE GRANTS FOR USER \"alice\"");
+        assert!(
+            matches!(result, Ok(StatementKind::ShowEffectiveGrants(_))),
+            "Expected ShowEffectiveGrants, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_show_effective_grants_extracts_user() {
+        let result = parse_and_classify("SHOW EFFECTIVE GRANTS FOR USER \"alice\"").unwrap();
+        if let StatementKind::ShowEffectiveGrants(user) = result {
+            assert_eq!(user, "alice");
+        } else {
+            panic!("Expected ShowEffectiveGrants");
+        }
+    }
+
+    #[test]
+    fn test_check_access() {
+        let result = parse_and_classify("CHECK ACCESS SELECT ON my_catalog.my_ns.orders FOR USER \"alice\"");
+        assert!(
+            matches!(result, Ok(StatementKind::CheckAccess(_))),
+            "Expected CheckAccess, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_check_access_extracts_params() {
+        let result = parse_and_classify("CHECK ACCESS SELECT ON cat.ns.tbl FOR USER \"bob\"").unwrap();
+        if let StatementKind::CheckAccess(params) = result {
+            assert_eq!(params.privilege, "SELECT");
+            assert_eq!(params.catalog.as_deref(), Some("cat"));
+            assert_eq!(params.namespace.as_deref(), Some("ns"));
+            assert_eq!(params.table.as_deref(), Some("tbl"));
+            assert_eq!(params.user, "bob");
+        } else {
+            panic!("Expected CheckAccess");
+        }
+    }
+
+    #[test]
+    fn test_grant_name() {
+        let stmt = Parser::parse_sql(&GenericDialect {}, "GRANT SELECT ON foo TO bar")
+            .unwrap()
+            .remove(0);
+        let kind = StatementKind::Grant(Box::new(stmt));
+        assert_eq!(kind.name(), "grant");
+    }
+
+    #[test]
+    fn test_revoke_name() {
+        let stmt = Parser::parse_sql(&GenericDialect {}, "REVOKE SELECT ON foo FROM bar")
+            .unwrap()
+            .remove(0);
+        let kind = StatementKind::Revoke(Box::new(stmt));
+        assert_eq!(kind.name(), "revoke");
+    }
+
+    #[test]
+    fn test_show_grants_name() {
+        let kind = StatementKind::ShowGrants(ShowGrantsTarget::OnResource {
+            catalog: None,
+            namespace: None,
+            table: None,
+        });
+        assert_eq!(kind.name(), "showgrants");
+    }
+
+    #[test]
+    fn test_show_effective_grants_name() {
+        let kind = StatementKind::ShowEffectiveGrants("alice".to_string());
+        assert_eq!(kind.name(), "showeffectivegrants");
+    }
+
+    #[test]
+    fn test_check_access_name() {
+        let kind = StatementKind::CheckAccess(CheckAccessParams {
+            privilege: "SELECT".to_string(),
+            catalog: None,
+            namespace: None,
+            table: None,
+            user: "alice".to_string(),
+        });
+        assert_eq!(kind.name(), "checkaccess");
     }
 
     #[test]

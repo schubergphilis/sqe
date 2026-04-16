@@ -723,7 +723,7 @@ That's future work. It's also future work that's made easier by the foundation w
 The hard part of distributed execution isn't the execution itself. It's the plumbing: serialisation, health monitoring, credential management, plan manipulation. We built that plumbing in twelve days, because Ballista showed us which pipes to lay.
 
 ::: {.ailog}
-**AI Logbook:** The human decided to fork Ballista's ideas rather than use it as-is or build from scratch. The AI implemented the `SqePhysicalCodec`, the `WeightedScheduler`, and the heartbeat protocol in three passes. The plan surgery function — `replace_scan_in_plan`, replacing a scan leaf in a tree while preserving all ancestor nodes — took the AI four attempts before the recursive traversal was correct. The first version replaced the entire plan; the fix was commit `3a123ea`.
+**AI Logbook:** The human decided to fork Ballista's ideas rather than use it as-is or build from scratch. The AI implemented the `SqePhysicalCodec`, the `WeightedScheduler`, and the heartbeat protocol in three passes. The plan surgery function (`replace_scan_in_plan`, replacing a scan leaf in a tree while preserving all ancestor nodes) took the AI four attempts before the recursive traversal was correct. The first version replaced the entire plan; the fix was commit `3a123ea`.
 :::
 
 Next chapter, we'll walk through the coordinator and worker in detail -- how a query enters the coordinator, gets split into fragments, dispatched to workers, executed with the user's credentials, and reassembled into a result stream that the client receives as if the query ran locally.
