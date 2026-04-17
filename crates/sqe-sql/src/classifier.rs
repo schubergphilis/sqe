@@ -167,11 +167,11 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
             .trim()
             .trim_end_matches(';')
             .to_string();
-        let target = parse_resource_reference(&rest);
+        let (catalog, namespace, table) = parse_resource_reference(&rest)?;
         return Ok(StatementKind::ShowGrants(ShowGrantsTarget::OnResource {
-            catalog: target.0,
-            namespace: target.1,
-            table: target.2,
+            catalog,
+            namespace,
+            table,
         }));
     }
     if upper.starts_with("SHOW GRANTS TO ") {
@@ -403,17 +403,22 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
 
 /// Parse a dotted resource reference like `catalog.namespace.table` into
 /// (catalog, namespace, table). Supports 1-part, 2-part, and 3-part names.
-fn parse_resource_reference(s: &str) -> (Option<String>, Option<String>, Option<String>) {
+/// Returns an error for 4+ part names (e.g. `a.b.c.d`).
+fn parse_resource_reference(
+    s: &str,
+) -> sqe_core::Result<(Option<String>, Option<String>, Option<String>)> {
     let parts: Vec<&str> = s.split('.').map(|p| p.trim()).collect();
     match parts.len() {
-        1 => (Some(parts[0].to_string()), None, None),
-        2 => (Some(parts[0].to_string()), Some(parts[1].to_string()), None),
-        3 => (
+        1 => Ok((Some(parts[0].to_string()), None, None)),
+        2 => Ok((Some(parts[0].to_string()), Some(parts[1].to_string()), None)),
+        3 => Ok((
             Some(parts[0].to_string()),
             Some(parts[1].to_string()),
             Some(parts[2].to_string()),
-        ),
-        _ => (Some(s.to_string()), None, None),
+        )),
+        n => Err(sqe_core::SqeError::Execution(format!(
+            "Resource reference has {n} parts (max 3): {s}"
+        ))),
     }
 }
 
@@ -443,7 +448,7 @@ fn parse_check_access(rest: &str) -> sqe_core::Result<StatementKind> {
         .trim_matches('\'')
         .to_string();
 
-    let (catalog, namespace, table) = parse_resource_reference(resource);
+    let (catalog, namespace, table) = parse_resource_reference(resource)?;
     Ok(StatementKind::CheckAccess(CheckAccessParams {
         privilege,
         catalog,
@@ -575,7 +580,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn test_show_grants_to_group() {
         let result = parse_and_classify("SHOW GRANTS TO GROUP \"SG-Risk-Analysts\"");
         assert!(result.is_ok());
@@ -683,6 +687,29 @@ mod tests {
             user: "alice".to_string(),
         });
         assert_eq!(kind.name(), "checkaccess");
+    }
+
+    #[test]
+    fn test_show_grants_on_four_part_name_errors() {
+        let result = parse_and_classify("SHOW GRANTS ON a.b.c.d");
+        assert!(result.is_err(), "4-part resource name should be rejected");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("4 parts"),
+            "Error should mention part count, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_check_access_four_part_name_errors() {
+        let result =
+            parse_and_classify("CHECK ACCESS SELECT ON a.b.c.d FOR USER \"alice\"");
+        assert!(result.is_err(), "4-part resource name should be rejected");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("4 parts"),
+            "Error should mention part count, got: {err}"
+        );
     }
 
     #[test]
