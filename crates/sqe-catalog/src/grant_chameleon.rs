@@ -28,10 +28,13 @@ pub struct ChameleonGrantBackend {
 }
 
 impl ChameleonGrantBackend {
-    pub fn new(client: AccessControlClient) -> Self {
-        Self {
-            client: Arc::new(client),
-        }
+    /// Wrap a shared `AccessControlClient`.
+    ///
+    /// The caller keeps ownership via `Arc` so the same client can be shared
+    /// with other subsystems (coordinator session, info_schema providers) that
+    /// already hold an `Arc<AccessControlClient>`.
+    pub fn new(client: Arc<AccessControlClient>) -> Self {
+        Self { client }
     }
 }
 
@@ -43,29 +46,100 @@ fn chameleon_grantee_type(grantee: &Grantee) -> &'static str {
     }
 }
 
-/// Build a `GrantRequest` from a `GrantStatement`.
-fn to_grant_request(stmt: &GrantStatement) -> GrantRequest {
+/// Build a `GrantRequest` from the common fields shared by `GrantStatement`
+/// and `RevokeStatement`. Keeping this in one place prevents the two call
+/// sites from silently diverging (e.g. swapping catalog and namespace).
+fn build_grant_request(
+    privilege: &str,
+    catalog: &Option<String>,
+    namespace: &Option<String>,
+    table: &Option<String>,
+    grantee: &Grantee,
+) -> GrantRequest {
     GrantRequest {
-        privilege: stmt.privilege.clone(),
-        catalog: stmt.catalog.clone(),
-        namespace: stmt.namespace.clone(),
-        table: stmt.table.clone(),
-        grantee_type: chameleon_grantee_type(&stmt.grantee).to_string(),
-        grantee_name: stmt.grantee.name().to_string(),
+        privilege: privilege.to_string(),
+        catalog: catalog.clone(),
+        namespace: namespace.clone(),
+        table: table.clone(),
+        grantee_type: chameleon_grantee_type(grantee).to_string(),
+        grantee_name: grantee.name().to_string(),
         effect: None,
     }
 }
 
+/// Build a `GrantRequest` from a `GrantStatement`.
+fn to_grant_request(stmt: &GrantStatement) -> GrantRequest {
+    build_grant_request(
+        &stmt.privilege,
+        &stmt.catalog,
+        &stmt.namespace,
+        &stmt.table,
+        &stmt.grantee,
+    )
+}
+
+/// Build a `GrantRequest` from a `RevokeStatement`.
+///
+/// The Chameleon API accepts the same payload shape for both grant and revoke,
+/// so they share the builder above.
+fn to_revoke_request(stmt: &RevokeStatement) -> GrantRequest {
+    build_grant_request(
+        &stmt.privilege,
+        &stmt.catalog,
+        &stmt.namespace,
+        &stmt.table,
+        &stmt.grantee,
+    )
+}
+
+/// Translate a `GrantFilter` into `ShowGrantsParams` for the Chameleon API.
+fn filter_to_params(filter: &GrantFilter) -> ShowGrantsParams {
+    match filter {
+        GrantFilter::OnResource {
+            catalog,
+            namespace,
+            table,
+        } => ShowGrantsParams {
+            catalog: catalog.clone(),
+            namespace: namespace.clone(),
+            table: table.clone(),
+            grantee_type: None,
+            grantee_name: None,
+        },
+        GrantFilter::ToGrantee(grantee) => ShowGrantsParams {
+            catalog: None,
+            namespace: None,
+            table: None,
+            grantee_type: Some(chameleon_grantee_type(grantee).to_string()),
+            grantee_name: Some(grantee.name().to_string()),
+        },
+    }
+}
+
+/// Translate an `AccessCheck` into a `CheckAccessRequest`.
+fn check_to_request(check: &AccessCheck) -> CheckAccessRequest {
+    CheckAccessRequest {
+        user: check.user.clone(),
+        privilege: check.privilege.clone(),
+        catalog: check.catalog.clone(),
+        namespace: check.namespace.clone(),
+        table: check.table.clone(),
+    }
+}
+
 /// Convert a `CatalogGrantEntry` (from access_control) to our trait's `GrantEntry`.
-fn from_catalog_entry(e: &CatalogGrantEntry) -> GrantEntry {
+///
+/// Takes the entry by value so callers iterating a response `Vec` can move
+/// fields out instead of cloning every string.
+fn from_catalog_entry(e: CatalogGrantEntry) -> GrantEntry {
     GrantEntry {
-        privilege: e.privilege.clone(),
-        resource: e.resource.clone(),
-        grantee_type: e.grantee_type.clone(),
-        grantee_name: e.grantee_name.clone(),
-        effect: e.effect.clone(),
-        granted_by: e.granted_by.clone(),
-        granted_at: e.granted_at.clone(),
+        privilege: e.privilege,
+        resource: e.resource,
+        grantee_type: e.grantee_type,
+        grantee_name: e.grantee_name,
+        effect: e.effect,
+        granted_by: e.granted_by,
+        granted_at: e.granted_at,
     }
 }
 
@@ -77,15 +151,7 @@ impl GrantBackend for ChameleonGrantBackend {
     }
 
     async fn revoke(&self, token: &str, stmt: &RevokeStatement) -> sqe_core::Result<()> {
-        let req = GrantRequest {
-            privilege: stmt.privilege.clone(),
-            catalog: stmt.catalog.clone(),
-            namespace: stmt.namespace.clone(),
-            table: stmt.table.clone(),
-            grantee_type: chameleon_grantee_type(&stmt.grantee).to_string(),
-            grantee_name: stmt.grantee.name().to_string(),
-            effect: None,
-        };
+        let req = to_revoke_request(stmt);
         self.client.revoke(token, &req).await
     }
 
@@ -94,28 +160,9 @@ impl GrantBackend for ChameleonGrantBackend {
         token: &str,
         filter: &GrantFilter,
     ) -> sqe_core::Result<Vec<GrantEntry>> {
-        let params = match filter {
-            GrantFilter::OnResource {
-                catalog,
-                namespace,
-                table,
-            } => ShowGrantsParams {
-                catalog: catalog.clone(),
-                namespace: namespace.clone(),
-                table: table.clone(),
-                grantee_type: None,
-                grantee_name: None,
-            },
-            GrantFilter::ToGrantee(grantee) => ShowGrantsParams {
-                catalog: None,
-                namespace: None,
-                table: None,
-                grantee_type: Some(chameleon_grantee_type(grantee).to_string()),
-                grantee_name: Some(grantee.name().to_string()),
-            },
-        };
+        let params = filter_to_params(filter);
         let entries = self.client.show_grants(token, &params).await?;
-        Ok(entries.iter().map(from_catalog_entry).collect())
+        Ok(entries.into_iter().map(from_catalog_entry).collect())
     }
 
     async fn show_effective(
@@ -124,7 +171,7 @@ impl GrantBackend for ChameleonGrantBackend {
         user: &str,
     ) -> sqe_core::Result<Vec<GrantEntry>> {
         let entries = self.client.show_effective(token, user).await?;
-        Ok(entries.iter().map(from_catalog_entry).collect())
+        Ok(entries.into_iter().map(from_catalog_entry).collect())
     }
 
     async fn check_access(
@@ -132,13 +179,7 @@ impl GrantBackend for ChameleonGrantBackend {
         token: &str,
         check: &AccessCheck,
     ) -> sqe_core::Result<AccessCheckResult> {
-        let req = CheckAccessRequest {
-            user: check.user.clone(),
-            privilege: check.privilege.clone(),
-            catalog: check.catalog.clone(),
-            namespace: check.namespace.clone(),
-            table: check.table.clone(),
-        };
+        let req = check_to_request(check);
         let resp = self.client.check_access(token, &req).await?;
         Ok(AccessCheckResult {
             allowed: resp.allowed,
@@ -155,6 +196,8 @@ impl GrantBackend for ChameleonGrantBackend {
 mod tests {
     use super::*;
 
+    // ── chameleon_grantee_type ───────────────────────────────────────
+
     #[test]
     fn chameleon_maps_user_to_user() {
         assert_eq!(chameleon_grantee_type(&Grantee::User("alice".into())), "USER");
@@ -169,6 +212,8 @@ mod tests {
     fn chameleon_maps_group_to_group() {
         assert_eq!(chameleon_grantee_type(&Grantee::Group("SG-Risk".into())), "GROUP");
     }
+
+    // ── to_grant_request / to_revoke_request ─────────────────────────
 
     #[test]
     fn to_grant_request_translates_fields() {
@@ -190,6 +235,82 @@ mod tests {
     }
 
     #[test]
+    fn to_revoke_request_translates_fields() {
+        let stmt = RevokeStatement {
+            privilege: "INSERT".into(),
+            catalog: Some("cat".into()),
+            namespace: Some("ns".into()),
+            table: Some("tbl".into()),
+            grantee: Grantee::User("alice".into()),
+        };
+        let req = to_revoke_request(&stmt);
+        assert_eq!(req.privilege, "INSERT");
+        assert_eq!(req.catalog.as_deref(), Some("cat"));
+        assert_eq!(req.namespace.as_deref(), Some("ns"));
+        assert_eq!(req.table.as_deref(), Some("tbl"));
+        assert_eq!(req.grantee_type, "USER");
+        assert_eq!(req.grantee_name, "alice");
+        assert!(req.effect.is_none());
+    }
+
+    // ── filter_to_params ─────────────────────────────────────────────
+
+    #[test]
+    fn filter_on_resource_populates_resource_fields_only() {
+        let filter = GrantFilter::OnResource {
+            catalog: Some("cat".into()),
+            namespace: Some("ns".into()),
+            table: Some("tbl".into()),
+        };
+        let params = filter_to_params(&filter);
+        assert_eq!(params.catalog.as_deref(), Some("cat"));
+        assert_eq!(params.namespace.as_deref(), Some("ns"));
+        assert_eq!(params.table.as_deref(), Some("tbl"));
+        assert!(params.grantee_type.is_none());
+        assert!(params.grantee_name.is_none());
+    }
+
+    #[test]
+    fn filter_to_grantee_role_populates_grantee_fields_only() {
+        let filter = GrantFilter::ToGrantee(Grantee::Role("analysts".into()));
+        let params = filter_to_params(&filter);
+        assert!(params.catalog.is_none());
+        assert!(params.namespace.is_none());
+        assert!(params.table.is_none());
+        assert_eq!(params.grantee_type.as_deref(), Some("GROUP"));
+        assert_eq!(params.grantee_name.as_deref(), Some("analysts"));
+    }
+
+    #[test]
+    fn filter_to_grantee_user_maps_grantee_type_to_user() {
+        let filter = GrantFilter::ToGrantee(Grantee::User("alice".into()));
+        let params = filter_to_params(&filter);
+        assert_eq!(params.grantee_type.as_deref(), Some("USER"));
+        assert_eq!(params.grantee_name.as_deref(), Some("alice"));
+    }
+
+    // ── check_to_request ─────────────────────────────────────────────
+
+    #[test]
+    fn check_to_request_translates_fields() {
+        let check = AccessCheck {
+            user: "alice".into(),
+            privilege: "SELECT".into(),
+            catalog: Some("cat".into()),
+            namespace: Some("ns".into()),
+            table: Some("tbl".into()),
+        };
+        let req = check_to_request(&check);
+        assert_eq!(req.user, "alice");
+        assert_eq!(req.privilege, "SELECT");
+        assert_eq!(req.catalog.as_deref(), Some("cat"));
+        assert_eq!(req.namespace.as_deref(), Some("ns"));
+        assert_eq!(req.table.as_deref(), Some("tbl"));
+    }
+
+    // ── from_catalog_entry ───────────────────────────────────────────
+
+    #[test]
     fn from_catalog_entry_copies_all_fields() {
         let catalog_entry = CatalogGrantEntry {
             privilege: "SELECT".into(),
@@ -200,7 +321,7 @@ mod tests {
             granted_by: Some("admin".into()),
             granted_at: Some("2026-04-17T10:00:00Z".into()),
         };
-        let entry = from_catalog_entry(&catalog_entry);
+        let entry = from_catalog_entry(catalog_entry);
         assert_eq!(entry.privilege, "SELECT");
         assert_eq!(entry.resource, "cat.ns.tbl");
         assert_eq!(entry.grantee_type, "GROUP");
