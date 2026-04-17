@@ -1,5 +1,6 @@
 pub mod access_control;
 pub mod circuit_breaker;
+pub mod grant_chameleon;
 pub mod rest_catalog;
 pub mod catalog_provider;
 pub mod manifest_cache;

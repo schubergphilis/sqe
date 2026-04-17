@@ -11,11 +11,14 @@ use datafusion::prelude::SessionContext;
 use tracing::{debug, info, warn, Span};
 
 use sqlparser::ast::{Statement, TableFactor};
-use sqe_catalog::{AccessControlClient, IcebergScanExec, SessionCatalog};
+use sqe_catalog::{IcebergScanExec, SessionCatalog};
 use sqe_core::{QueryConfig, Session, SortMode, SqeConfig, SqeError};
 
 use crate::adaptive_sort;
 use sqe_policy::{PolicyEnforcer, PolicyStore};
+use sqe_policy::grants::{
+    AccessCheck, GrantBackend, GrantFilter, GrantStatement, Grantee, RevokeStatement,
+};
 use sqe_sql::{parse_and_classify, StatementKind};
 
 use crate::catalog_ops::CatalogOps;
@@ -78,9 +81,9 @@ pub struct QueryHandler {
     /// Shared global table metadata cache. Persists across sessions and queries so
     /// that repeated `load_table()` calls skip the Polaris REST round-trip.
     table_cache: Option<sqe_catalog::TableMetadataCache>,
-    /// HTTP client for the platform access control API (GRANT/REVOKE/SHOW GRANTS).
-    /// Initialized when `[access_control]` backend is configured (not "none").
-    access_control_client: Option<Arc<AccessControlClient>>,
+    /// Pluggable backend for GRANT/REVOKE/SHOW GRANTS operations.
+    /// Initialized by the caller based on `[access_control]` config.
+    grant_backend: Option<Arc<dyn GrantBackend>>,
 }
 
 impl QueryHandler {
@@ -95,6 +98,7 @@ impl QueryHandler {
         audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
         query_tracker: Arc<QueryTracker>,
         query_cache: Option<Arc<ResultCache>>,
+        grant_backend: Option<Arc<dyn GrantBackend>>,
     ) -> sqe_core::Result<Self> {
         let catalog_ops = CatalogOps::new(config.clone());
         let mut write_handler = WriteHandler::new(config.clone());
@@ -113,22 +117,6 @@ impl QueryHandler {
         let runtime = crate::runtime::build_coordinator_runtime(&config.coordinator)
             .map_err(|e| sqe_core::SqeError::Config(format!("Failed to build runtime: {e}")))?;
 
-        // Initialize access control client when a backend is configured.
-        let access_control_client = if config.access_control.backend != "none"
-            && !config.access_control.url.is_empty()
-        {
-            tracing::info!(
-                backend = %config.access_control.backend,
-                url = %config.access_control.url,
-                "Access control backend configured"
-            );
-            Some(Arc::new(
-                AccessControlClient::new(&config.access_control.url)?,
-            ))
-        } else {
-            None
-        };
-
         Ok(Self {
             policy_enforcer,
             policy_store,
@@ -146,7 +134,7 @@ impl QueryHandler {
             runtime,
             manifest_cache: None,
             table_cache: None,
-            access_control_client,
+            grant_backend,
         })
     }
 
@@ -1562,9 +1550,9 @@ impl QueryHandler {
 
     // ── Access control handlers ──────────────────────────────────────────
 
-    /// Return the access control client or a `NotImplemented` error.
-    fn require_access_control(&self) -> sqe_core::Result<&AccessControlClient> {
-        self.access_control_client
+    /// Return the grant backend or a `NotImplemented` error.
+    fn require_grant_backend(&self) -> sqe_core::Result<&dyn GrantBackend> {
+        self.grant_backend
             .as_deref()
             .ok_or_else(|| {
                 SqeError::NotImplemented(
@@ -1574,13 +1562,8 @@ impl QueryHandler {
             })
     }
 
-    /// Extract privilege, resource parts, grantee type, and grantee name from a
-    /// sqlparser `Statement::Grant` or `Statement::Revoke`.
-    #[allow(clippy::type_complexity)]
-    fn extract_grant_fields(
-        stmt: &Statement,
-    ) -> sqe_core::Result<(String, Option<String>, Option<String>, Option<String>, String, String)>
-    {
+    /// Extract a `GrantStatement` from a sqlparser `Statement::Grant` or `Statement::Revoke`.
+    fn extract_grant_statement(stmt: &Statement) -> sqe_core::Result<GrantStatement> {
         let (privileges, objects, grantees) = match stmt {
             Statement::Grant {
                 privileges,
@@ -1601,11 +1584,8 @@ impl QueryHandler {
             }
         };
 
-        // Extract privilege string
         let privilege = format!("{privileges}");
 
-        // Extract resource parts (catalog, namespace, table) from the grant object.
-        // Objects follow the pattern: [catalog.][namespace.]table
         let (catalog, namespace, table) = match objects {
             sqlparser::ast::GrantObjects::Tables(tables) if !tables.is_empty() => {
                 let name = &tables[0];
@@ -1644,145 +1624,133 @@ impl QueryHandler {
             _ => (None, None, None),
         };
 
-        // Extract grantee type and name
-        let grantee = grantees.first().ok_or_else(|| {
+        let raw_grantee = grantees.first().ok_or_else(|| {
             SqeError::Execution("GRANT/REVOKE requires at least one grantee".to_string())
         })?;
-        // Map sqlparser's GranteesType to the backend's grantee_type.
-        //
-        // Chameleon backend: GROUP / USER
-        //   SQL `TO GROUP "SG-Risk"` -> grantee_type: "GROUP"
-        //   SQL `TO USER "alice"`    -> grantee_type: "USER"
-        //   SQL `TO ROLE "admins"`   -> grantee_type: "GROUP" (ROLE = GROUP in Chameleon)
-        //
-        // Polaris backend: PRINCIPAL_ROLE / CATALOG_ROLE
-        //   SQL `TO ROLE "admins"`   -> grantee_type: "PRINCIPAL_ROLE"
-        //   (Polaris has no USER-level grants, only role-based)
-        //
-        // The backend type is checked at the handler level, not here.
-        // Default mapping is Chameleon-style (GROUP/USER).
-        let grantee_type = match &grantee.grantee_type {
-            sqlparser::ast::GranteesType::User => "USER".to_string(),
-            sqlparser::ast::GranteesType::Role => "GROUP".to_string(),
-            sqlparser::ast::GranteesType::Group => "GROUP".to_string(),
-            sqlparser::ast::GranteesType::DatabaseRole => "GROUP".to_string(),
-            _ => "USER".to_string(), // Bare identifier defaults to USER
-        };
-        let grantee_name = grantee
-            .name
-            .as_ref()
-            .map(|n| n.to_string())
-            .unwrap_or_default();
 
-        Ok((privilege, catalog, namespace, table, grantee_type, grantee_name))
+        // Extract the raw grantee name without surrounding quotes.
+        // GranteeName::ObjectName.to_string() would include quotes for quoted identifiers
+        // such as `TO ROLE "analysts"`. We want the bare value instead.
+        // In sqlparser 0.54, ObjectName is Vec<Ident>; each Ident.value is the raw string.
+        let grantee_name = match raw_grantee.name.as_ref() {
+            Some(sqlparser::ast::GranteeName::ObjectName(obj)) => obj
+                .0
+                .iter()
+                .map(|id| id.value.clone())
+                .collect::<Vec<_>>()
+                .join("."),
+            Some(other) => other.to_string(),
+            None => String::new(),
+        };
+
+        let grantee = match &raw_grantee.grantee_type {
+            sqlparser::ast::GranteesType::User => Grantee::User(grantee_name),
+            sqlparser::ast::GranteesType::None => Grantee::User(grantee_name),
+            sqlparser::ast::GranteesType::Role => Grantee::Role(grantee_name),
+            sqlparser::ast::GranteesType::Group => Grantee::Group(grantee_name),
+            sqlparser::ast::GranteesType::DatabaseRole => Grantee::Role(grantee_name),
+            other => {
+                return Err(SqeError::NotImplemented(format!(
+                    "Unsupported grantee type: {other:?}. Use USER, ROLE, or GROUP"
+                )));
+            }
+        };
+
+        Ok(GrantStatement {
+            privilege,
+            catalog,
+            namespace,
+            table,
+            grantee,
+        })
     }
 
-    /// Handle GRANT by forwarding to the platform access control API.
+    /// Handle GRANT by delegating to the configured grant backend.
     async fn handle_grant(
         &self,
         session: &Session,
         stmt: &Statement,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let client = self.require_access_control()?;
-        let (privilege, catalog, namespace, table, grantee_type, grantee_name) =
-            Self::extract_grant_fields(stmt)?;
-
-        let req = sqe_catalog::access_control::GrantRequest {
-            privilege,
-            catalog,
-            namespace,
-            table,
-            grantee_type,
-            grantee_name,
-            effect: None, // default = ALLOW
-        };
-
-        client.grant(&session.access_token, &req).await?;
+        let backend = self.require_grant_backend()?;
+        let grant_stmt = Self::extract_grant_statement(stmt)?;
+        backend.grant(&session.access_token, &grant_stmt).await?;
         Ok(vec![])
     }
 
-    /// Handle REVOKE by forwarding to the platform access control API.
+    /// Handle REVOKE by delegating to the configured grant backend.
     async fn handle_revoke(
         &self,
         session: &Session,
         stmt: &Statement,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let client = self.require_access_control()?;
-        let (privilege, catalog, namespace, table, grantee_type, grantee_name) =
-            Self::extract_grant_fields(stmt)?;
-
-        let req = sqe_catalog::access_control::GrantRequest {
-            privilege,
-            catalog,
-            namespace,
-            table,
-            grantee_type,
-            grantee_name,
-            effect: None,
+        let backend = self.require_grant_backend()?;
+        let grant_stmt = Self::extract_grant_statement(stmt)?;
+        let revoke_stmt = RevokeStatement {
+            privilege: grant_stmt.privilege,
+            catalog: grant_stmt.catalog,
+            namespace: grant_stmt.namespace,
+            table: grant_stmt.table,
+            grantee: grant_stmt.grantee,
         };
-
-        client.revoke(&session.access_token, &req).await?;
+        backend.revoke(&session.access_token, &revoke_stmt).await?;
         Ok(vec![])
     }
 
-    /// Handle SHOW GRANTS by querying the platform access control API.
+    /// Handle SHOW GRANTS by delegating to the configured grant backend.
     async fn handle_show_grants(
         &self,
         session: &Session,
         target: &sqe_sql::ShowGrantsTarget,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let client = self.require_access_control()?;
+        let backend = self.require_grant_backend()?;
 
-        let params = match target {
+        let filter = match target {
             sqe_sql::ShowGrantsTarget::OnResource {
                 catalog,
                 namespace,
                 table,
-            } => sqe_catalog::access_control::ShowGrantsParams {
+            } => GrantFilter::OnResource {
                 catalog: catalog.clone(),
                 namespace: namespace.clone(),
                 table: table.clone(),
-                grantee_type: None,
-                grantee_name: None,
             },
             sqe_sql::ShowGrantsTarget::ToGrantee {
                 grantee_type,
                 grantee_name,
-            } => sqe_catalog::access_control::ShowGrantsParams {
-                catalog: None,
-                namespace: None,
-                table: None,
-                grantee_type: Some(grantee_type.clone()),
-                grantee_name: Some(grantee_name.clone()),
-            },
+            } => {
+                let grantee = match grantee_type.to_uppercase().as_str() {
+                    "ROLE" => Grantee::Role(grantee_name.clone()),
+                    "GROUP" => Grantee::Group(grantee_name.clone()),
+                    _ => Grantee::User(grantee_name.clone()),
+                };
+                GrantFilter::ToGrantee(grantee)
+            }
         };
 
-        let entries = client.show_grants(&session.access_token, &params).await?;
+        let entries = backend.show_grants(&session.access_token, &filter).await?;
         Self::grants_to_record_batch(&entries)
     }
 
-    /// Handle SHOW EFFECTIVE GRANTS by querying the platform access control API.
+    /// Handle SHOW EFFECTIVE GRANTS by delegating to the configured grant backend.
     async fn handle_show_effective_grants(
         &self,
         session: &Session,
         user: &str,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let client = self.require_access_control()?;
-        let entries = client
-            .show_effective(&session.access_token, user)
-            .await?;
+        let backend = self.require_grant_backend()?;
+        let entries = backend.show_effective(&session.access_token, user).await?;
         Self::grants_to_record_batch(&entries)
     }
 
-    /// Handle CHECK ACCESS by querying the platform access control API.
+    /// Handle CHECK ACCESS by delegating to the configured grant backend.
     async fn handle_check_access(
         &self,
         session: &Session,
         params: &sqe_sql::CheckAccessParams,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let client = self.require_access_control()?;
+        let backend = self.require_grant_backend()?;
 
-        let req = sqe_catalog::access_control::CheckAccessRequest {
+        let check = AccessCheck {
             user: params.user.clone(),
             privilege: params.privilege.clone(),
             catalog: params.catalog.clone(),
@@ -1790,7 +1758,7 @@ impl QueryHandler {
             table: params.table.clone(),
         };
 
-        let resp = client.check_access(&session.access_token, &req).await?;
+        let resp = backend.check_access(&session.access_token, &check).await?;
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("allowed", DataType::Boolean, false),
@@ -1813,7 +1781,7 @@ impl QueryHandler {
 
     /// Convert a list of `GrantEntry` values into a `RecordBatch` for the client.
     fn grants_to_record_batch(
-        entries: &[sqe_catalog::access_control::GrantEntry],
+        entries: &[sqe_policy::grants::GrantEntry],
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("privilege", DataType::Utf8, false),
@@ -2628,101 +2596,76 @@ mod tests {
         assert_eq!(result["value-required"], false);
     }
 
-    // ── extract_grant_fields tests ──────────────────────────────────
+    // ── extract_grant_statement tests ──────────────────────────────────
 
     #[test]
-    fn extract_grant_fields_basic_table() {
+    fn extract_grant_statement_basic_table() {
+        use sqe_policy::grants::Grantee;
         use sqlparser::dialect::GenericDialect;
         use sqlparser::parser::Parser;
 
         let sql = "GRANT SELECT ON my_catalog.my_schema.my_table TO alice";
         let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
-        let (privilege, catalog, namespace, table, _grantee_type, grantee_name) =
-            QueryHandler::extract_grant_fields(&stmts[0]).unwrap();
+        let stmt = QueryHandler::extract_grant_statement(&stmts[0]).unwrap();
 
-        assert_eq!(privilege, "SELECT");
-        assert_eq!(catalog.as_deref(), Some("my_catalog"));
-        assert_eq!(namespace.as_deref(), Some("my_schema"));
-        assert_eq!(table.as_deref(), Some("my_table"));
-        assert_eq!(grantee_name, "alice");
+        assert_eq!(stmt.privilege, "SELECT");
+        assert_eq!(stmt.catalog.as_deref(), Some("my_catalog"));
+        assert_eq!(stmt.namespace.as_deref(), Some("my_schema"));
+        assert_eq!(stmt.table.as_deref(), Some("my_table"));
+        assert!(matches!(stmt.grantee, Grantee::User(ref n) if n == "alice"));
     }
 
     #[test]
-    fn extract_grant_fields_two_part_name() {
+    fn extract_grant_statement_role_grantee() {
+        use sqe_policy::grants::Grantee;
         use sqlparser::dialect::GenericDialect;
         use sqlparser::parser::Parser;
 
-        let sql = "GRANT INSERT ON my_schema.my_table TO bob";
+        let sql = r#"GRANT SELECT ON my_schema.my_table TO ROLE "analysts""#;
         let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
-        let (privilege, catalog, namespace, table, _, grantee_name) =
-            QueryHandler::extract_grant_fields(&stmts[0]).unwrap();
+        let stmt = QueryHandler::extract_grant_statement(&stmts[0]).unwrap();
 
-        assert_eq!(privilege, "INSERT");
-        assert!(catalog.is_none());
-        assert_eq!(namespace.as_deref(), Some("my_schema"));
-        assert_eq!(table.as_deref(), Some("my_table"));
-        assert_eq!(grantee_name, "bob");
+        assert_eq!(stmt.privilege, "SELECT");
+        assert!(matches!(stmt.grantee, Grantee::Role(ref n) if n == "analysts"));
     }
 
     #[test]
-    fn extract_grant_fields_single_table_name() {
+    fn extract_grant_statement_group_grantee() {
+        use sqe_policy::grants::Grantee;
         use sqlparser::dialect::GenericDialect;
         use sqlparser::parser::Parser;
 
-        let sql = "GRANT DELETE ON my_table TO charlie";
+        let sql = r#"GRANT INSERT ON my_table TO GROUP "SG-Risk""#;
         let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
-        let (privilege, catalog, namespace, table, _, grantee_name) =
-            QueryHandler::extract_grant_fields(&stmts[0]).unwrap();
+        let stmt = QueryHandler::extract_grant_statement(&stmts[0]).unwrap();
 
-        assert_eq!(privilege, "DELETE");
-        assert!(catalog.is_none());
-        assert!(namespace.is_none());
-        assert_eq!(table.as_deref(), Some("my_table"));
-        assert_eq!(grantee_name, "charlie");
+        assert_eq!(stmt.privilege, "INSERT");
+        assert!(matches!(stmt.grantee, Grantee::Group(ref n) if n == "SG-Risk"));
     }
 
     #[test]
-    fn extract_grant_fields_revoke() {
+    fn extract_grant_statement_bare_identifier_defaults_to_user() {
+        // sqlparser 0.54 parses `TO alice` as GranteesType::None (bare identifier,
+        // no explicit ROLE/USER prefix). We default bare identifiers to User.
+        use sqe_policy::grants::Grantee;
         use sqlparser::dialect::GenericDialect;
         use sqlparser::parser::Parser;
 
-        let sql = "REVOKE SELECT ON prod.analytics.events FROM alice";
+        let sql = "GRANT SELECT ON t TO alice";
         let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
-        let (privilege, catalog, namespace, table, _, grantee_name) =
-            QueryHandler::extract_grant_fields(&stmts[0]).unwrap();
+        let stmt = QueryHandler::extract_grant_statement(&stmts[0]).unwrap();
 
-        assert_eq!(privilege, "SELECT");
-        assert_eq!(catalog.as_deref(), Some("prod"));
-        assert_eq!(namespace.as_deref(), Some("analytics"));
-        assert_eq!(table.as_deref(), Some("events"));
-        assert_eq!(grantee_name, "alice");
+        assert!(matches!(stmt.grantee, Grantee::User(ref n) if n == "alice"));
     }
 
     #[test]
-    fn extract_grant_fields_all_tables_in_schema() {
-        use sqlparser::dialect::GenericDialect;
-        use sqlparser::parser::Parser;
-
-        let sql = "GRANT SELECT ON ALL TABLES IN SCHEMA my_schema TO analyst";
-        let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
-        let (privilege, catalog, namespace, table, _, grantee_name) =
-            QueryHandler::extract_grant_fields(&stmts[0]).unwrap();
-
-        assert_eq!(privilege, "SELECT");
-        assert!(catalog.is_none());
-        assert_eq!(namespace.as_deref(), Some("my_schema"));
-        assert!(table.is_none(), "ALL TABLES IN SCHEMA should not set table");
-        assert_eq!(grantee_name, "analyst");
-    }
-
-    #[test]
-    fn extract_grant_fields_rejects_non_grant_statement() {
+    fn extract_grant_statement_rejects_non_grant() {
         use sqlparser::dialect::GenericDialect;
         use sqlparser::parser::Parser;
 
         let sql = "SELECT 1";
         let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
-        let result = QueryHandler::extract_grant_fields(&stmts[0]);
+        let result = QueryHandler::extract_grant_statement(&stmts[0]);
 
         assert!(result.is_err(), "Should reject non-GRANT/REVOKE statements");
         let err_msg = format!("{}", result.unwrap_err());
@@ -2733,18 +2676,23 @@ mod tests {
     }
 
     #[test]
-    fn extract_grant_fields_grantee_type_for_bare_identifier() {
-        // sqlparser 0.54 parses `TO alice` as GranteesType::None (bare identifier,
-        // no explicit ROLE/USER prefix). Our code formats this via Debug as "NONE".
+    fn extract_grant_statement_handles_revoke_three_part_name() {
+        // Belt-and-suspenders: the GRANT and REVOKE arms share downstream code,
+        // but this test guards against future divergence and also exercises
+        // the 3-part identifier path (catalog.namespace.table) in one shot.
+        use sqe_policy::grants::Grantee;
         use sqlparser::dialect::GenericDialect;
         use sqlparser::parser::Parser;
 
-        let sql = "GRANT SELECT ON t TO alice";
+        let sql = "REVOKE SELECT ON prod.analytics.events FROM alice";
         let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
-        let (_, _, _, _, grantee_type, _) =
-            QueryHandler::extract_grant_fields(&stmts[0]).unwrap();
+        let stmt = QueryHandler::extract_grant_statement(&stmts[0]).unwrap();
 
-        assert_eq!(grantee_type, "NONE");
+        assert_eq!(stmt.privilege, "SELECT");
+        assert_eq!(stmt.catalog.as_deref(), Some("prod"));
+        assert_eq!(stmt.namespace.as_deref(), Some("analytics"));
+        assert_eq!(stmt.table.as_deref(), Some("events"));
+        assert!(matches!(stmt.grantee, Grantee::User(ref n) if n == "alice"));
     }
 
     /// DENY is not a standard SQL keyword recognized by sqlparser.

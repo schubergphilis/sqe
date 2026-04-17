@@ -70,6 +70,7 @@ async fn test_simple_select() {
     );
     let handler = sqe_coordinator::QueryHandler::new(
         policy, None, config, None, None, None, None, query_tracker, None,
+        None, // grant_backend
     ).expect("Failed to create QueryHandler");
 
     let batches = handler
@@ -396,6 +397,7 @@ async fn test_distributed_select() {
     );
     let handler = sqe_coordinator::QueryHandler::new(
         policy, None, config, Some(registry), None, None, None, query_tracker, None,
+        None, // grant_backend
     ).expect("Failed to create QueryHandler");
 
     // First create a test table
@@ -1706,6 +1708,7 @@ async fn test_different_user_catalog_visibility() {
             None, None, None, None,
             Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history)),
             None,
+            None, // grant_backend
         ).expect("Failed to create QueryHandler");
 
     // adminuser has catalog_admin + table_reader + data_writer roles
@@ -1813,6 +1816,7 @@ async fn test_trino_http_query() {
         None,
         query_tracker,
         None,
+        None, // grant_backend
     ).expect("Failed to create QueryHandler"));
 
     // Bind to port 0 to get an OS-assigned free port

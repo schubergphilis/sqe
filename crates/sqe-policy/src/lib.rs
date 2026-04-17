@@ -1,3 +1,4 @@
+pub mod grants;
 pub mod plan_rewriter;
 pub mod policy_store;
 pub mod opa;
