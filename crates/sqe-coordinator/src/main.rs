@@ -199,6 +199,7 @@ async fn main() -> anyhow::Result<()> {
         Some(audit.clone()),
         query_tracker,
         query_cache,
+        None, // TODO(task-6): wire grant_backend
     )?.with_manifest_cache(manifest_cache).with_table_cache(table_cache));
 
     // Spawn background memory metrics reporter (updates gauges every 1s for Grafana)
