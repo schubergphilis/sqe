@@ -4,7 +4,6 @@
 //! - `ChameleonGrantBackend` — wraps the existing Chameleon platform API client
 //! - `PolarisGrantBackend` — calls the Polaris Management REST API
 
-pub mod chameleon;
 pub mod polaris;
 
 use async_trait::async_trait;
