@@ -751,6 +751,14 @@ pub struct AccessControlConfig {
     /// Request timeout in seconds.
     #[serde(default = "default_access_control_timeout")]
     pub timeout_secs: u64,
+    /// Optional: Polaris service account client_id for management API.
+    /// When absent, the user's passthrough OIDC token is used.
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// Optional: Polaris service account client_secret for management API.
+    /// When absent, the user's passthrough OIDC token is used.
+    #[serde(default)]
+    pub client_secret: Option<String>,
 }
 
 impl Default for AccessControlConfig {
@@ -759,6 +767,8 @@ impl Default for AccessControlConfig {
             backend: "none".to_string(),
             url: String::new(),
             timeout_secs: 30,
+            client_id: None,
+            client_secret: None,
         }
     }
 }
