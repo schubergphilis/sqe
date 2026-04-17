@@ -4,9 +4,11 @@ use std::time::Instant;
 
 use sqe_core::SqeConfig;
 
+use sqe_catalog::grant_chameleon::ChameleonGrantBackend;
 use sqe_coordinator::flight_sql::SqeFlightSqlService;
 use sqe_coordinator::QueryHandler;
 use sqe_coordinator::SessionManager;
+use sqe_policy::grants::{polaris::PolarisGrantBackend, GrantBackend};
 
 // Trino adapter types
 use sqe_trino_compat::server::{NodeContext, TrinoAuthenticator, TrinoQueryExecutor};
@@ -184,6 +186,40 @@ async fn main() -> anyhow::Result<()> {
         "Initialized global table metadata cache (shared across all sessions)"
     );
 
+    // Select the grant backend based on access_control.backend config.
+    // "chameleon" (default for existing deployments), "polaris" (3-step
+    // Management API), or "none" (access control disabled).
+    let grant_backend: Option<Arc<dyn GrantBackend>> = match config
+        .access_control
+        .backend
+        .as_str()
+    {
+        "chameleon" if !config.access_control.url.is_empty() => {
+            tracing::info!(
+                backend = "chameleon",
+                url = %config.access_control.url,
+                "Access control backend configured"
+            );
+            let client = Arc::new(sqe_catalog::AccessControlClient::new(
+                &config.access_control.url,
+            )?);
+            Some(Arc::new(ChameleonGrantBackend::new(client)))
+        }
+        "polaris" if !config.access_control.url.is_empty() => {
+            tracing::info!(
+                backend = "polaris",
+                url = %config.access_control.url,
+                "Access control backend configured"
+            );
+            Some(Arc::new(PolarisGrantBackend::new(
+                &config.access_control.url,
+                config.access_control.client_id.clone(),
+                config.access_control.client_secret.clone(),
+            )?))
+        }
+        _ => None,
+    };
+
     // Initialize query handler
     let query_handler = Arc::new(QueryHandler::new(
         policy_enforcer,
@@ -199,7 +235,7 @@ async fn main() -> anyhow::Result<()> {
         Some(audit.clone()),
         query_tracker,
         query_cache,
-        None, // TODO(task-6): wire grant_backend
+        grant_backend,
     )?.with_manifest_cache(manifest_cache).with_table_cache(table_cache));
 
     // Spawn background memory metrics reporter (updates gauges every 1s for Grafana)
