@@ -5,15 +5,44 @@
 //! 2. Grant privilege to catalog role (`PUT /catalogs/{c}/catalog-roles/{r}/grants`)
 //! 3. Assign catalog role to principal role (`PUT /principal-roles/{pr}/catalog-roles/{c}`)
 
+use std::time::{Duration, Instant};
+
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use super::{
     AccessCheck, AccessCheckResult, GrantBackend, GrantEntry, GrantFilter, GrantStatement,
     Grantee, RevokeStatement,
 };
+
+/// Safety margin subtracted from the token's `expires_in` so we refresh
+/// before the IdP considers the token expired.
+const TOKEN_EXPIRY_SAFETY_MARGIN: Duration = Duration::from_secs(30);
+
+/// Reject identifier values that contain characters which would change the
+/// shape of a URL when interpolated with `format!`. Catalog, role, and user
+/// names come from user input (GRANT/REVOKE SQL) and flow straight into URL
+/// path segments, so validation is a defense-in-depth step against path
+/// traversal and request smuggling. Matches the "reject invalid inputs"
+/// precedent in commit c3c5431.
+fn validate_url_identifier(value: &str, what: &str) -> sqe_core::Result<()> {
+    if value.is_empty() {
+        return Err(sqe_core::SqeError::Execution(format!(
+            "{what} must not be empty"
+        )));
+    }
+    if let Some(bad) = value.chars().find(|c| {
+        matches!(c, '/' | '?' | '#' | '%' | '\\') || c.is_whitespace() || c.is_control()
+    }) {
+        return Err(sqe_core::SqeError::Execution(format!(
+            "{what} '{value}' contains invalid character {bad:?}"
+        )));
+    }
+    Ok(())
+}
 
 // ── Privilege mapping (SQL -> Polaris) ────────────────────────────────────────
 //
@@ -54,11 +83,22 @@ pub struct PolarisGrantBackend {
 }
 
 /// OAuth2 client_credentials token source for Polaris management API.
+///
+/// Uses a single-entry cache guarded by a `tokio::sync::Mutex`, which gives
+/// two properties in one primitive: per-entry TTL driven by the IdP's
+/// `expires_in`, and single-flight refresh under concurrent misses.
 struct ServiceTokenSource {
     token_url: String,
     client_id: String,
     client_secret: String,
-    cache: moka::future::Cache<String, String>,
+    cached: Mutex<Option<CachedToken>>,
+}
+
+/// A cached service token with the instant at which it should be considered
+/// expired (`expires_in` minus `TOKEN_EXPIRY_SAFETY_MARGIN`).
+struct CachedToken {
+    token: String,
+    expires_at: Instant,
 }
 
 /// OAuth2 token response from Polaris.
@@ -66,7 +106,6 @@ struct ServiceTokenSource {
 struct TokenResponse {
     access_token: String,
     #[serde(default = "default_expires_in")]
-    #[allow(dead_code)]
     expires_in: u64,
 }
 
@@ -89,7 +128,7 @@ impl PolarisGrantBackend {
         client_secret: Option<String>,
     ) -> sqe_core::Result<Self> {
         let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| {
                 sqe_core::SqeError::Config(format!("Failed to build HTTP client: {e}"))
@@ -107,10 +146,7 @@ impl PolarisGrantBackend {
                     token_url,
                     client_id: id,
                     client_secret: secret,
-                    cache: moka::future::Cache::builder()
-                        .max_capacity(1)
-                        .time_to_live(std::time::Duration::from_secs(3570))
-                        .build(),
+                    cached: Mutex::new(None),
                 })
             }
             _ => None,
@@ -125,55 +161,65 @@ impl PolarisGrantBackend {
 
     /// Resolve the token to use for a Management API call.
     ///
-    /// If service credentials are configured, fetch (or return cached)
-    /// service token. Otherwise return the user's passthrough token.
+    /// If service credentials are configured, return a cached service token
+    /// when it is still fresh, otherwise fetch a new one. The cache lock is
+    /// held across the fetch so concurrent callers collapse to one request.
+    /// If no service credentials are configured, return the user's passthrough
+    /// token verbatim.
     async fn resolve_token(&self, user_token: &str) -> sqe_core::Result<String> {
-        match &self.service_token {
-            None => Ok(user_token.to_string()),
-            Some(source) => {
-                let key = "polaris_service_token".to_string();
-                if let Some(cached) = source.cache.get(&key).await {
-                    return Ok(cached);
-                }
-                debug!(token_url = %source.token_url, "Fetching Polaris service token");
-                let resp = self
-                    .client
-                    .post(&source.token_url)
-                    .form(&[
-                        ("grant_type", "client_credentials"),
-                        ("client_id", &source.client_id),
-                        ("client_secret", &source.client_secret),
-                        ("scope", "PRINCIPAL_ROLE:ALL"),
-                    ])
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        sqe_core::SqeError::Auth(format!(
-                            "Polaris token fetch failed: {e}"
-                        ))
-                    })?;
+        let Some(source) = &self.service_token else {
+            return Ok(user_token.to_string());
+        };
 
-                if !resp.status().is_success() {
-                    let status = resp.status();
-                    let text = resp.text().await.unwrap_or_default();
-                    return Err(sqe_core::SqeError::Auth(format!(
-                        "Polaris token fetch failed (HTTP {status}): {text}"
-                    )));
-                }
+        let mut slot = source.cached.lock().await;
 
-                let token_resp: TokenResponse = resp.json().await.map_err(|e| {
-                    sqe_core::SqeError::Auth(format!(
-                        "Polaris token response parse failed: {e}"
-                    ))
-                })?;
-
-                source
-                    .cache
-                    .insert(key, token_resp.access_token.clone())
-                    .await;
-                Ok(token_resp.access_token)
+        if let Some(cached) = slot.as_ref() {
+            if Instant::now() < cached.expires_at {
+                return Ok(cached.token.clone());
             }
         }
+
+        debug!(token_url = %source.token_url, "Fetching Polaris service token");
+        let resp = self
+            .client
+            .post(&source.token_url)
+            .form(&[
+                ("grant_type", "client_credentials"),
+                ("client_id", &source.client_id),
+                ("client_secret", &source.client_secret),
+                ("scope", "PRINCIPAL_ROLE:ALL"),
+            ])
+            .send()
+            .await
+            .map_err(|e| {
+                sqe_core::SqeError::Auth(format!("Polaris token fetch failed: {e}"))
+            })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(sqe_core::SqeError::Auth(format!(
+                "Polaris token fetch failed (HTTP {status}): {text}"
+            )));
+        }
+
+        let token_resp: TokenResponse = resp.json().await.map_err(|e| {
+            sqe_core::SqeError::Auth(format!("Polaris token response parse failed: {e}"))
+        })?;
+
+        // Honor the IdP's advertised lifetime with a safety margin, so the
+        // token is refreshed before the server rejects it.
+        let ttl = Duration::from_secs(token_resp.expires_in)
+            .saturating_sub(TOKEN_EXPIRY_SAFETY_MARGIN);
+        let expires_at = Instant::now() + ttl;
+        let token = token_resp.access_token;
+
+        *slot = Some(CachedToken {
+            token: token.clone(),
+            expires_at,
+        });
+
+        Ok(token)
     }
 }
 
@@ -245,6 +291,7 @@ impl GrantBackend for PolarisGrantBackend {
                 "Polaris GRANT requires a catalog name (use catalog.namespace.table)".into(),
             )
         })?;
+        validate_url_identifier(catalog, "catalog")?;
 
         let principal_role = match &stmt.grantee {
             Grantee::Role(name) | Grantee::Group(name) => name.clone(),
@@ -254,6 +301,7 @@ impl GrantBackend for PolarisGrantBackend {
                 ));
             }
         };
+        validate_url_identifier(&principal_role, "principal role")?;
 
         let cr_name = catalog_role_name(&principal_role);
         let (polaris_priv, resource_type) = map_sql_to_polaris_privilege(&stmt.privilege);
@@ -370,6 +418,7 @@ impl GrantBackend for PolarisGrantBackend {
                 "Polaris REVOKE requires a catalog name (use catalog.namespace.table)".into(),
             )
         })?;
+        validate_url_identifier(catalog, "catalog")?;
 
         let principal_role = match &stmt.grantee {
             Grantee::Role(name) | Grantee::Group(name) => name.clone(),
@@ -379,6 +428,7 @@ impl GrantBackend for PolarisGrantBackend {
                 ));
             }
         };
+        validate_url_identifier(&principal_role, "principal role")?;
 
         let cr_name = catalog_role_name(&principal_role);
         let (polaris_priv, resource_type) = map_sql_to_polaris_privilege(&stmt.privilege);
@@ -446,6 +496,7 @@ impl GrantBackend for PolarisGrantBackend {
                         "Polaris SHOW GRANTS ON requires a catalog name".into(),
                     )
                 })?;
+                validate_url_identifier(catalog, "catalog")?;
 
                 // List all catalog roles, then get grants for each
                 let url = format!(
@@ -569,6 +620,7 @@ impl GrantBackend for PolarisGrantBackend {
         token: &str,
         user: &str,
     ) -> sqe_core::Result<Vec<GrantEntry>> {
+        validate_url_identifier(user, "user")?;
         let token = self.resolve_token(token).await?;
 
         // Step 1: Get principal's principal-roles
@@ -718,29 +770,33 @@ impl GrantBackend for PolarisGrantBackend {
         token: &str,
         check: &AccessCheck,
     ) -> sqe_core::Result<AccessCheckResult> {
-        // Walk the effective grants chain and check for a matching privilege
+        // A check_access decision is a trust boundary. Require the caller to
+        // name the resource explicitly rather than fall back to "any grant
+        // with this privilege name", which would be fail-open.
+        let catalog = check.catalog.as_deref().ok_or_else(|| {
+            sqe_core::SqeError::Execution(
+                "Polaris check_access requires a catalog; use catalog.namespace.table".into(),
+            )
+        })?;
+        validate_url_identifier(catalog, "catalog")?;
+
+        // Walk the effective grants chain and check for a matching privilege.
         let effective = self.show_effective(token, &check.user).await?;
 
         let (polaris_priv, _) = map_sql_to_polaris_privilege(&check.privilege);
+        let ns_vec = check.namespace.as_ref().map(|s| vec![s.clone()]);
+        let target_resource =
+            format_polaris_resource(catalog, ns_vec.as_deref(), check.table.as_deref());
 
         for entry in &effective {
-            if entry.privilege == polaris_priv {
-                // Check resource match
-                let ns_vec = check.namespace.as_ref().map(|s| vec![s.clone()]);
-                let target_resource = format_polaris_resource(
-                    check.catalog.as_deref().unwrap_or(""),
-                    ns_vec.as_deref(),
-                    check.table.as_deref(),
-                );
-                if entry.resource == target_resource || check.catalog.is_none() {
-                    return Ok(AccessCheckResult {
-                        allowed: true,
-                        reason: Some(format!(
-                            "Granted via principal role '{}'",
-                            entry.grantee_name
-                        )),
-                    });
-                }
+            if entry.privilege == polaris_priv && entry.resource == target_resource {
+                return Ok(AccessCheckResult {
+                    allowed: true,
+                    reason: Some(format!(
+                        "Granted via principal role '{}'",
+                        entry.grantee_name
+                    )),
+                });
             }
         }
 
@@ -748,9 +804,7 @@ impl GrantBackend for PolarisGrantBackend {
             allowed: false,
             reason: Some(format!(
                 "No matching grant for {} {} on {}",
-                check.user,
-                check.privilege,
-                check.catalog.as_deref().unwrap_or("(no catalog)")
+                check.user, check.privilege, catalog
             )),
         })
     }
@@ -959,5 +1013,83 @@ mod tests {
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["catalogRole"]["name"], "sqe_analysts");
+    }
+
+    // ── validate_url_identifier ──────────────────────────────────────
+
+    #[test]
+    fn validate_identifier_accepts_alphanumeric_and_punctuation() {
+        assert!(validate_url_identifier("analysts", "role").is_ok());
+        assert!(validate_url_identifier("SG-Risk", "role").is_ok());
+        assert!(validate_url_identifier("jacob.verhoeks", "user").is_ok());
+        assert!(validate_url_identifier("data_eng", "role").is_ok());
+    }
+
+    #[test]
+    fn validate_identifier_rejects_empty_string() {
+        let err = validate_url_identifier("", "catalog").unwrap_err();
+        assert!(matches!(err, sqe_core::SqeError::Execution(_)));
+    }
+
+    #[test]
+    fn validate_identifier_rejects_path_separators_and_control() {
+        for bad in &["foo/bar", "foo\\bar", "foo?q", "foo#frag", "foo%20", "foo bar", "foo\nbar"] {
+            assert!(
+                validate_url_identifier(bad, "catalog").is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    // ── check_access fail-closed (C1 regression guard) ───────────────
+
+    #[tokio::test]
+    async fn check_access_requires_catalog() {
+        let backend = PolarisGrantBackend::new(
+            "http://polaris:8181/api/management/v1",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let check = AccessCheck {
+            user: "alice".into(),
+            privilege: "SELECT".into(),
+            catalog: None,
+            namespace: Some("ns".into()),
+            table: Some("orders".into()),
+        };
+
+        let err = backend.check_access("token", &check).await.unwrap_err();
+        match err {
+            sqe_core::SqeError::Execution(msg) => {
+                assert!(
+                    msg.contains("requires a catalog"),
+                    "unexpected error text: {msg}"
+                );
+            }
+            other => panic!("expected SqeError::Execution, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn check_access_rejects_invalid_catalog_identifier() {
+        let backend = PolarisGrantBackend::new(
+            "http://polaris:8181/api/management/v1",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let check = AccessCheck {
+            user: "alice".into(),
+            privilege: "SELECT".into(),
+            catalog: Some("cat/../other".into()),
+            namespace: None,
+            table: None,
+        };
+
+        let err = backend.check_access("token", &check).await.unwrap_err();
+        assert!(matches!(err, sqe_core::SqeError::Execution(_)));
     }
 }
