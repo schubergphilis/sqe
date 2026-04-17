@@ -2675,6 +2675,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn extract_grant_statement_handles_revoke_three_part_name() {
+        // Belt-and-suspenders: the GRANT and REVOKE arms share downstream code,
+        // but this test guards against future divergence and also exercises
+        // the 3-part identifier path (catalog.namespace.table) in one shot.
+        use sqe_policy::grants::Grantee;
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let sql = "REVOKE SELECT ON prod.analytics.events FROM alice";
+        let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+        let stmt = QueryHandler::extract_grant_statement(&stmts[0]).unwrap();
+
+        assert_eq!(stmt.privilege, "SELECT");
+        assert_eq!(stmt.catalog.as_deref(), Some("prod"));
+        assert_eq!(stmt.namespace.as_deref(), Some("analytics"));
+        assert_eq!(stmt.table.as_deref(), Some("events"));
+        assert!(matches!(stmt.grantee, Grantee::User(ref n) if n == "alice"));
+    }
+
     /// DENY is not a standard SQL keyword recognized by sqlparser.
     /// It cannot be parsed as a Statement::Grant or Statement::Revoke.
     /// SQE would need custom pre-scan logic to handle DENY syntax.
