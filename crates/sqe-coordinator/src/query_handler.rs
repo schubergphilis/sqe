@@ -1666,7 +1666,14 @@ impl QueryHandler {
             sqlparser::ast::GranteesType::Role => "GROUP".to_string(),
             sqlparser::ast::GranteesType::Group => "GROUP".to_string(),
             sqlparser::ast::GranteesType::DatabaseRole => "GROUP".to_string(),
-            _ => "USER".to_string(), // Bare identifier defaults to USER
+            // Bare identifier (no USER/ROLE/GROUP prefix) defaults to USER.
+            // Example: `GRANT SELECT ON t TO alice` -> grantee_type = "USER"
+            sqlparser::ast::GranteesType::None => "USER".to_string(),
+            other => {
+                return Err(SqeError::NotImplemented(format!(
+                    "Unsupported grantee type: {other:?}. Use USER, ROLE, or GROUP"
+                )));
+            }
         };
         let grantee_name = grantee
             .name
@@ -2735,7 +2742,7 @@ mod tests {
     #[test]
     fn extract_grant_fields_grantee_type_for_bare_identifier() {
         // sqlparser 0.54 parses `TO alice` as GranteesType::None (bare identifier,
-        // no explicit ROLE/USER prefix). Our code formats this via Debug as "NONE".
+        // no explicit ROLE/USER prefix). We default bare identifiers to "USER".
         use sqlparser::dialect::GenericDialect;
         use sqlparser::parser::Parser;
 
@@ -2744,7 +2751,7 @@ mod tests {
         let (_, _, _, _, grantee_type, _) =
             QueryHandler::extract_grant_fields(&stmts[0]).unwrap();
 
-        assert_eq!(grantee_type, "NONE");
+        assert_eq!(grantee_type, "USER");
     }
 
     /// DENY is not a standard SQL keyword recognized by sqlparser.
