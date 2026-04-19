@@ -84,8 +84,13 @@ impl ObjectCache {
     }
 
     /// Retrieves an Arc [`Manifest`] from the cache
-    /// or retrieves one from FileIO and parses it if not present
-    pub(crate) async fn get_manifest(&self, manifest_file: &ManifestFile) -> Result<Arc<Manifest>> {
+    /// or retrieves one from FileIO and parses it if not present.
+    ///
+    /// Exposed (changed from `pub(crate)`) so embedders that need manifest
+    /// column statistics for query-time pruning can reuse the cache warmed
+    /// by `TableScan::plan_files()` instead of re-fetching from object
+    /// storage. Matches the existing public surface of `get_manifest_list`.
+    pub async fn get_manifest(&self, manifest_file: &ManifestFile) -> Result<Arc<Manifest>> {
         if self.cache_disabled {
             return manifest_file
                 .load_manifest(&self.file_io)
