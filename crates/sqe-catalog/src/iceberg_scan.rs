@@ -54,6 +54,15 @@ pub const DEFAULT_SMALL_FILE_THRESHOLD_BYTES: u64 = 3 * 1024 * 1024;
 /// iceberg-rust's `ObjectCache` and ignore this knob.
 pub const DEFAULT_MANIFEST_CONCURRENCY: usize = 64;
 
+/// Default concurrency for the direct-read small-file fast path.
+///
+/// The fast path reads each eligible file entirely in one S3 GET. Without
+/// parallelism the loop is strictly serial, so total latency is roughly
+/// `files × round_trip`. Fanning out with `buffer_unordered` overlaps the
+/// GETs; 8 matches `storage.max_concurrent_files` and keeps the peak
+/// in-flight bytes bounded (`concurrency × small_file_threshold`).
+pub const DEFAULT_DIRECT_READ_CONCURRENCY: usize = 8;
+
 #[derive(Debug)]
 pub struct IcebergScanExec {
     table: Table,
@@ -98,6 +107,12 @@ pub struct IcebergScanExec {
     /// bounds, null counts) which `FileScanTask` does not expose. Defaults to
     /// [`DEFAULT_MANIFEST_CONCURRENCY`].
     manifest_concurrency: usize,
+    /// Concurrency for the direct-read small-file fast path.
+    ///
+    /// When the fast path is active, each eligible file becomes a single S3
+    /// GET. This field sets how many of those GETs are in flight at once via
+    /// `buffer_unordered`. Defaults to [`DEFAULT_DIRECT_READ_CONCURRENCY`].
+    direct_read_concurrency: usize,
 }
 
 impl IcebergScanExec {
@@ -168,7 +183,7 @@ impl IcebergScanExec {
             }
         };
         let properties = Arc::new(PlanProperties::new(eq_props, Partitioning::UnknownPartitioning(1), EmissionType::Incremental, Boundedness::Bounded));
-        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![], manifest_concurrency: DEFAULT_MANIFEST_CONCURRENCY }
+        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![], manifest_concurrency: DEFAULT_MANIFEST_CONCURRENCY, direct_read_concurrency: DEFAULT_DIRECT_READ_CONCURRENCY }
     }
 
     /// Set the snapshot ID for time travel queries.
@@ -196,6 +211,14 @@ impl IcebergScanExec {
     /// zero-width `buffer_unordered` which would stall.
     pub fn with_manifest_concurrency(mut self, concurrency: usize) -> Self {
         self.manifest_concurrency = concurrency.max(1);
+        self
+    }
+
+    /// Set the concurrency for the direct-read small-file fast path.
+    ///
+    /// A value of `0` is treated as `1` (sequential fallback).
+    pub fn with_direct_read_concurrency(mut self, concurrency: usize) -> Self {
+        self.direct_read_concurrency = concurrency.max(1);
         self
     }
 
@@ -246,6 +269,7 @@ impl IcebergScanExec {
             small_file_threshold_bytes: self.small_file_threshold_bytes,
             pushed_down_filters: filters,
             manifest_concurrency: self.manifest_concurrency,
+            direct_read_concurrency: self.direct_read_concurrency,
         }
     }
 
@@ -575,6 +599,7 @@ impl ExecutionPlan for IcebergScanExec {
         let snapshot_id = self.snapshot_id;
         let small_file_threshold = self.small_file_threshold_bytes;
         let manifest_concurrency = self.manifest_concurrency;
+        let direct_read_concurrency = self.direct_read_concurrency;
         let pushed_down_filters = self.pushed_down_filters.clone();
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         let _files_pruned_minmax = MetricBuilder::new(&self.metrics).counter("files_pruned_minmax", partition);
@@ -654,7 +679,6 @@ impl ExecutionPlan for IcebergScanExec {
                 );
 
                 let file_io = table.file_io().clone();
-                let mut all_batches: Vec<RecordBatch> = Vec::new();
 
                 // Snapshot dynamic filters NON-BLOCKING.
                 // Never call wait_complete() — it deadlocks when this scan is
@@ -726,94 +750,125 @@ impl ExecutionPlan for IcebergScanExec {
                     }
                 }
 
-                for (path, size) in &file_entries {
-                    debug!(path = %path, size = size, "Direct-read: reading file");
+                // Parallel small-file fast path.
+                //
+                // Each file is a single S3 GET plus an in-memory Parquet decode.
+                // We fan these out with `buffer_unordered(direct_read_concurrency)`
+                // so per-file latency is amortised across concurrent requests
+                // instead of accumulating serially. Order within the resulting
+                // batch stream is not preserved, which DataFusion tolerates: the
+                // scan is already marked `UnknownPartitioning`.
+                //
+                // Per-task captures are all cheap: `FileIO` and `SchemaRef` are
+                // `Arc`, `projection` is an `Option<Vec<String>>` sized O(query
+                // columns), and `resolved_filters` is wrapped in an outer `Arc`
+                // so clones are refcount bumps.
+                let concurrency = direct_read_concurrency.max(1);
+                let resolved_filters = Arc::new(resolved_filters);
+                let per_file_results: Vec<Vec<RecordBatch>> = futures::stream::iter(
+                    file_entries.into_iter().map(|(path, size)| {
+                        let file_io = file_io.clone();
+                        let projection = projection.clone();
+                        let schema = schema.clone();
+                        let resolved_filters = Arc::clone(&resolved_filters);
+                        async move {
+                            debug!(path = %path, size = size, "Direct-read: reading file");
 
-                    let input = file_io
-                        .new_input(path)
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                    let bytes = input
-                        .read()
-                        .await
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                            let input = file_io
+                                .new_input(&path)
+                                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                            let bytes = input
+                                .read()
+                                .await
+                                .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                    // Parse Parquet from the in-memory bytes.
-                    // `bytes::Bytes` implements `ChunkReader` so this works directly.
-                    let reader_opts = ArrowReaderOptions::new().with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required);
-                    let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(bytes, reader_opts)
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                            // Parse Parquet from the in-memory bytes.
+                            // `bytes::Bytes` implements `ChunkReader` so this works directly.
+                            let reader_opts = ArrowReaderOptions::new().with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required);
+                            let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(bytes, reader_opts)
+                                .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                    // Apply column projection by mapping column names to Parquet indices.
-                    // For COUNT(*) queries, projection is Some([]) (empty list) -- we read
-                    // just the first column to get the row count, then discard the data.
-                    let builder = if let Some(ref cols) = projection {
-                        let parquet_schema = builder.parquet_schema().clone();
-                        let arrow_schema = builder.schema().clone();
-                        let indices: Vec<usize> = cols
-                            .iter()
-                            .filter_map(|col| {
-                                arrow_schema.fields().iter().position(|f| f.name() == col)
-                            })
-                            .collect();
-                        if indices.is_empty() {
-                            // COUNT(*) or similar: no columns needed, just row count.
-                            // Read the smallest column (first one) to get the row count.
-                            let mask = ProjectionMask::roots(&parquet_schema, vec![0]);
-                            builder.with_projection(mask)
-                        } else {
-                            let mask = ProjectionMask::roots(&parquet_schema, indices);
-                            builder.with_projection(mask)
+                            // Apply column projection by mapping column names to Parquet indices.
+                            // For COUNT(*) queries, projection is Some([]) (empty list) -- we read
+                            // just the first column to get the row count, then discard the data.
+                            let builder = if let Some(ref cols) = projection {
+                                let parquet_schema = builder.parquet_schema().clone();
+                                let arrow_schema = builder.schema().clone();
+                                let indices: Vec<usize> = cols
+                                    .iter()
+                                    .filter_map(|col| {
+                                        arrow_schema.fields().iter().position(|f| f.name() == col)
+                                    })
+                                    .collect();
+                                if indices.is_empty() {
+                                    // COUNT(*) or similar: no columns needed, just row count.
+                                    // Read the smallest column (first one) to get the row count.
+                                    let mask = ProjectionMask::roots(&parquet_schema, vec![0]);
+                                    builder.with_projection(mask)
+                                } else {
+                                    let mask = ProjectionMask::roots(&parquet_schema, indices);
+                                    builder.with_projection(mask)
+                                }
+                            } else {
+                                builder
+                            };
+
+                            // Apply resolved dynamic filters as Parquet row filters.
+                            //
+                            // Each resolved filter becomes an ArrowPredicate that the Parquet
+                            // reader evaluates per row group / page. Rows that fail the
+                            // predicate are skipped before full decoding, reducing I/O and CPU.
+                            //
+                            // We use ProjectionMask::all() so the predicate receives all
+                            // columns. This is simpler than computing the minimal column set
+                            // for the filter expression. For an MVP this is acceptable; a
+                            // future optimisation can intersect filter columns with the
+                            // Parquet schema to build a tighter mask.
+                            let builder = if !resolved_filters.is_empty() {
+                                let mut predicates: Vec<Box<dyn ArrowPredicate>> = Vec::new();
+                                for filter_expr in resolved_filters.iter() {
+                                    let mask = ProjectionMask::all();
+                                    predicates.push(Box::new(PhysicalExprPredicate {
+                                        expr: Arc::clone(filter_expr),
+                                        projection: mask,
+                                    }));
+                                }
+                                builder.with_row_filter(RowFilter::new(predicates))
+                            } else {
+                                builder
+                            };
+
+                            let reader = builder
+                                .with_batch_size(8192)
+                                .build()
+                                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+                            let is_count_star = projection.as_ref().is_some_and(|cols| cols.is_empty());
+                            let mut batches: Vec<RecordBatch> = Vec::new();
+                            for batch_result in reader {
+                                let batch = batch_result.map_err(|e| DataFusionError::External(Box::new(e)))?;
+                                if is_count_star {
+                                    // For COUNT(*): return empty-column batch with correct row count.
+                                    // DataFusion only needs the row count, not the data.
+                                    batches.push(RecordBatch::try_new_with_options(
+                                        schema.clone(),
+                                        vec![],
+                                        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+                                    ).map_err(|e| DataFusionError::External(Box::new(e)))?);
+                                } else {
+                                    batches.push(batch);
+                                }
+                            }
+                            Ok::<Vec<RecordBatch>, DataFusionError>(batches)
                         }
-                    } else {
-                        builder
-                    };
+                    }),
+                )
+                .buffer_unordered(concurrency)
+                .try_collect()
+                .await?;
 
-                    // Apply resolved dynamic filters as Parquet row filters.
-                    //
-                    // Each resolved filter becomes an ArrowPredicate that the Parquet
-                    // reader evaluates per row group / page. Rows that fail the
-                    // predicate are skipped before full decoding, reducing I/O and CPU.
-                    //
-                    // We use ProjectionMask::all() so the predicate receives all
-                    // columns. This is simpler than computing the minimal column set
-                    // for the filter expression. For an MVP this is acceptable; a
-                    // future optimisation can intersect filter columns with the
-                    // Parquet schema to build a tighter mask.
-                    let builder = if !resolved_filters.is_empty() {
-                        let mut predicates: Vec<Box<dyn ArrowPredicate>> = Vec::new();
-                        for filter_expr in &resolved_filters {
-                            let mask = ProjectionMask::all();
-                            predicates.push(Box::new(PhysicalExprPredicate {
-                                expr: Arc::clone(filter_expr),
-                                projection: mask,
-                            }));
-                        }
-                        builder.with_row_filter(RowFilter::new(predicates))
-                    } else {
-                        builder
-                    };
-
-                    let reader = builder
-                        .with_batch_size(8192)
-                        .build()
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-                    let is_count_star = projection.as_ref().is_some_and(|cols| cols.is_empty());
-                    for batch_result in reader {
-                        let batch = batch_result.map_err(|e| DataFusionError::External(Box::new(e)))?;
-                        if is_count_star {
-                            // For COUNT(*): return empty-column batch with correct row count.
-                            // DataFusion only needs the row count, not the data.
-                            all_batches.push(RecordBatch::try_new_with_options(
-                                schema.clone(),
-                                vec![],
-                                &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
-                            ).map_err(|e| DataFusionError::External(Box::new(e)))?);
-                        } else {
-                            all_batches.push(batch);
-                        }
-                    }
-                }
+                let all_batches: Vec<RecordBatch> =
+                    per_file_results.into_iter().flatten().collect();
 
                 debug!(batch_count = all_batches.len(), "Direct-read: scan complete");
                 let s: BatchStream = futures::stream::iter(
