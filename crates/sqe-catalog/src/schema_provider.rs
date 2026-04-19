@@ -30,6 +30,8 @@ pub struct SqeSchemaProvider {
     prom_metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
     /// Small-file threshold in bytes for the direct-read fast path.
     small_file_threshold_bytes: u64,
+    /// Concurrency for direct manifest walks during pruning.
+    manifest_concurrency: usize,
 }
 
 impl SqeSchemaProvider {
@@ -47,12 +49,20 @@ impl SqeSchemaProvider {
             warehouse,
             prom_metrics: None,
             small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
+            manifest_concurrency: crate::iceberg_scan::DEFAULT_MANIFEST_CONCURRENCY,
         }
     }
 
     /// Set the small-file threshold (bytes) for the direct-read fast path.
     pub fn with_small_file_threshold(mut self, threshold_bytes: u64) -> Self {
         self.small_file_threshold_bytes = threshold_bytes;
+        self
+    }
+
+    /// Set the per-scan concurrency used when walking manifests for
+    /// column-statistics pruning.
+    pub fn with_manifest_concurrency(mut self, concurrency: usize) -> Self {
+        self.manifest_concurrency = concurrency.max(1);
         self
     }
 
@@ -193,7 +203,9 @@ impl SchemaProvider for SqeSchemaProvider {
                             Some(ref m) => provider.with_metrics(Arc::clone(m)),
                             None => provider,
                         };
-                        let provider = provider.with_small_file_threshold(self.small_file_threshold_bytes);
+                        let provider = provider
+                            .with_small_file_threshold(self.small_file_threshold_bytes)
+                            .with_manifest_concurrency(self.manifest_concurrency);
                         return Ok(Some(Arc::new(provider)));
                     }
                     Err(e) => {

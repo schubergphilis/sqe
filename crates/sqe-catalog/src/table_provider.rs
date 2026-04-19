@@ -39,6 +39,8 @@ pub struct SqeTableProvider {
     trust_sort_order: bool,
     /// Small-file threshold in bytes for the direct-read fast path.
     small_file_threshold_bytes: u64,
+    /// Concurrency for direct manifest walks during pruning.
+    manifest_concurrency: usize,
 }
 
 impl SqeTableProvider {
@@ -63,6 +65,7 @@ impl SqeTableProvider {
             trust_sort_order: false,
             snapshot_id: None,
             small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
+            manifest_concurrency: crate::iceberg_scan::DEFAULT_MANIFEST_CONCURRENCY,
         })
     }
 
@@ -78,6 +81,13 @@ impl SqeTableProvider {
     /// from memory, bypassing iceberg-rust's `scan.to_arrow()` pipeline.
     pub fn with_small_file_threshold(mut self, threshold_bytes: u64) -> Self {
         self.small_file_threshold_bytes = threshold_bytes;
+        self
+    }
+
+    /// Set the per-scan concurrency used when walking manifests for
+    /// column-statistics pruning.
+    pub fn with_manifest_concurrency(mut self, concurrency: usize) -> Self {
+        self.manifest_concurrency = concurrency.max(1);
         self
     }
 
@@ -183,7 +193,9 @@ impl TableProvider for SqeTableProvider {
         if self.trust_sort_order {
             exec = exec.with_trust_sort_order(true);
         }
-        exec = exec.with_small_file_threshold(self.small_file_threshold_bytes);
+        exec = exec
+            .with_small_file_threshold(self.small_file_threshold_bytes)
+            .with_manifest_concurrency(self.manifest_concurrency);
         Ok(Arc::new(exec))
     }
 }

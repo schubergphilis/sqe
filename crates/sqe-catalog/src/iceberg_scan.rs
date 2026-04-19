@@ -45,6 +45,15 @@ use crate::pruning_stats::IcebergManifestStatistics;
 /// from memory, bypassing iceberg-rust's `scan.to_arrow()` pipeline.
 pub const DEFAULT_SMALL_FILE_THRESHOLD_BYTES: u64 = 3 * 1024 * 1024;
 
+/// Default concurrency for loading Iceberg manifests during query-time
+/// column-statistics pruning.
+///
+/// Each manifest is a separate S3 GET. On wide snapshots the sequential
+/// walk dominates cold-cache plan latency; loading manifests in parallel
+/// collapses that to roughly one round trip. Warm reads are served from
+/// iceberg-rust's `ObjectCache` and ignore this knob.
+pub const DEFAULT_MANIFEST_CONCURRENCY: usize = 64;
+
 #[derive(Debug)]
 pub struct IcebergScanExec {
     table: Table,
@@ -81,6 +90,14 @@ pub struct IcebergScanExec {
     /// These are `PhysicalExpr`s (not logical `Expr`s) because they come from the
     /// physical optimizer, after logical-to-physical conversion has already occurred.
     pushed_down_filters: Vec<Arc<dyn PhysicalExpr>>,
+    /// Concurrency for direct manifest walks (column-stats pruning path).
+    ///
+    /// The primary scan planner goes through `Table::scan().plan_files()` which
+    /// has its own internal concurrency limit. This field only applies to the
+    /// pruning walks that need `DataFile` column statistics (lower/upper
+    /// bounds, null counts) which `FileScanTask` does not expose. Defaults to
+    /// [`DEFAULT_MANIFEST_CONCURRENCY`].
+    manifest_concurrency: usize,
 }
 
 impl IcebergScanExec {
@@ -151,7 +168,7 @@ impl IcebergScanExec {
             }
         };
         let properties = Arc::new(PlanProperties::new(eq_props, Partitioning::UnknownPartitioning(1), EmissionType::Incremental, Boundedness::Bounded));
-        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![] }
+        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![], manifest_concurrency: DEFAULT_MANIFEST_CONCURRENCY }
     }
 
     /// Set the snapshot ID for time travel queries.
@@ -170,6 +187,15 @@ impl IcebergScanExec {
     /// Pass `0` to disable the fast path for all files.
     pub fn with_small_file_threshold(mut self, threshold_bytes: u64) -> Self {
         self.small_file_threshold_bytes = threshold_bytes;
+        self
+    }
+
+    /// Set the concurrency for direct manifest walks during pruning.
+    ///
+    /// A value of `0` is treated as `1` (sequential fallback) to avoid a
+    /// zero-width `buffer_unordered` which would stall.
+    pub fn with_manifest_concurrency(mut self, concurrency: usize) -> Self {
+        self.manifest_concurrency = concurrency.max(1);
         self
     }
 
@@ -219,6 +245,7 @@ impl IcebergScanExec {
             trust_sort_order: self.trust_sort_order,
             small_file_threshold_bytes: self.small_file_threshold_bytes,
             pushed_down_filters: filters,
+            manifest_concurrency: self.manifest_concurrency,
         }
     }
 
@@ -283,28 +310,42 @@ impl IcebergScanExec {
     /// Load all live data files (with full column statistics) for the current snapshot.
     ///
     /// Returns `DataFile` objects including `lower_bounds` / `upper_bounds` /
-    /// `null_value_counts` needed by `PruningPredicate`. Because `FileScanTask` from
-    /// `Table::scan().plan_files()` does not expose those maps, the pruning path still
-    /// has to iterate manifests directly. Iceberg-rust's internal `ObjectCache` is
-    /// not reachable from here (`ObjectCache::get_manifest` is `pub(crate)`), so
-    /// callers are expected to parallelise this walk where throughput matters.
+    /// `null_value_counts` needed by `PruningPredicate`. `FileScanTask` from
+    /// `Table::scan().plan_files()` does not expose those maps, so the pruning
+    /// path walks manifests directly.
+    ///
+    /// Routes both the manifest-list and per-manifest reads through
+    /// `Table::object_cache()`, so warm queries (any prior `plan_files()` call
+    /// on the same snapshot) are served from memory without additional S3
+    /// GETs. Cold reads are parallelised with `buffer_unordered` at
+    /// `self.manifest_concurrency`.
     pub async fn collect_data_files(&self) -> Result<Vec<DataFile>, iceberg::Error> {
-        let metadata = self.table.metadata();
+        let metadata_ref = self.table.metadata_ref();
         let snapshot = if let Some(sid) = self.snapshot_id {
-            match metadata.snapshot_by_id(sid) { Some(s) => s, None => return Ok(vec![]) }
+            match metadata_ref.snapshot_by_id(sid) { Some(s) => s, None => return Ok(vec![]) }
         } else {
-            match metadata.current_snapshot() { Some(s) => s, None => return Ok(vec![]) }
+            match metadata_ref.current_snapshot() { Some(s) => s, None => return Ok(vec![]) }
         };
-        let manifest_list = snapshot.load_manifest_list(self.table.file_io(), metadata).await?;
-        let mut data_files = Vec::new();
-        for mf in manifest_list.entries() {
-            let manifest = mf.load_manifest(self.table.file_io()).await?;
-            for entry in manifest.entries() {
-                if entry.status() != ManifestStatus::Deleted && entry.data_file().content_type() == DataContentType::Data {
-                    data_files.push(entry.data_file().clone());
-                }
-            }
-        }
+        let cache = self.table.object_cache();
+        let manifest_list = cache.get_manifest_list(snapshot, &metadata_ref).await?;
+        let concurrency = self.manifest_concurrency.max(1);
+        let manifests: Vec<Arc<iceberg::spec::Manifest>> = futures::stream::iter(manifest_list.entries().iter().cloned())
+            .map(|mf| { let cache = cache.clone(); async move { cache.get_manifest(&mf).await } })
+            .buffer_unordered(concurrency)
+            .try_collect()
+            .await?;
+        let data_files = manifests
+            .into_iter()
+            .flat_map(|manifest| {
+                manifest
+                    .entries()
+                    .iter()
+                    .filter(|e| e.status() != ManifestStatus::Deleted
+                        && e.data_file().content_type() == DataContentType::Data)
+                    .map(|e| e.data_file().clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         Ok(data_files)
     }
 
@@ -533,6 +574,7 @@ impl ExecutionPlan for IcebergScanExec {
         let predicates = self.predicates.clone();
         let snapshot_id = self.snapshot_id;
         let small_file_threshold = self.small_file_threshold_bytes;
+        let manifest_concurrency = self.manifest_concurrency;
         let pushed_down_filters = self.pushed_down_filters.clone();
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         let _files_pruned_minmax = MetricBuilder::new(&self.metrics).counter("files_pruned_minmax", partition);
@@ -651,7 +693,7 @@ impl ExecutionPlan for IcebergScanExec {
                 if !resolved_filters.is_empty() && file_entries.len() > 1 {
                     let file_paths: std::collections::HashSet<String> =
                         file_entries.iter().map(|(p, _)| p.clone()).collect();
-                    match collect_data_files_for_pruning(&table, snapshot_id, &file_paths).await {
+                    match collect_data_files_for_pruning(&table, snapshot_id, &file_paths, manifest_concurrency).await {
                         Ok(data_files) if !data_files.is_empty() => {
                             let iceberg_schema = table.metadata().current_schema();
                             let (kept, pruned_count) =
@@ -927,46 +969,63 @@ async fn collect_data_files_via_plan(
 ///
 /// Only files matching the given `file_paths` set are returned, so callers can
 /// restrict to the files they actually intend to read.
+///
+/// Routes reads through `Table::object_cache()` so warm queries (same
+/// snapshot after a prior `plan_files()` call) avoid redundant S3 GETs.
+/// Cold reads are parallelised with `buffer_unordered` at `concurrency`.
 async fn collect_data_files_for_pruning(
     table: &Table,
     snapshot_id: Option<i64>,
     file_paths: &std::collections::HashSet<String>,
+    concurrency: usize,
 ) -> DFResult<Vec<DataFile>> {
-    let metadata = table.metadata();
+    let metadata_ref = table.metadata_ref();
     let snapshot = if let Some(sid) = snapshot_id {
-        match metadata.snapshot_by_id(sid) {
+        match metadata_ref.snapshot_by_id(sid) {
             Some(s) => s,
             None => return Ok(Vec::new()),
         }
     } else {
-        match metadata.current_snapshot() {
+        match metadata_ref.current_snapshot() {
             Some(s) => s,
             None => return Ok(Vec::new()),
         }
     };
 
-    let manifest_list = snapshot
-        .load_manifest_list(table.file_io(), metadata)
+    let cache = table.object_cache();
+    let manifest_list = cache
+        .get_manifest_list(snapshot, &metadata_ref)
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-    let mut data_files: Vec<DataFile> = Vec::new();
+    let concurrency = concurrency.max(1);
+    let manifests: Vec<Arc<iceberg::spec::Manifest>> = futures::stream::iter(
+        manifest_list.entries().iter().cloned(),
+    )
+    .map(|mf| {
+        let cache = cache.clone();
+        async move { cache.get_manifest(&mf).await }
+    })
+    .buffer_unordered(concurrency)
+    .try_collect()
+    .await
+    .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-    for mf in manifest_list.entries() {
-        let manifest = mf
-            .load_manifest(table.file_io())
-            .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-        for entry in manifest.entries() {
-            if entry.status() != ManifestStatus::Deleted
-                && entry.data_file().content_type() == DataContentType::Data
-                && file_paths.contains(entry.data_file().file_path())
-            {
-                data_files.push(entry.data_file().clone());
-            }
-        }
-    }
+    let data_files = manifests
+        .into_iter()
+        .flat_map(|manifest| {
+            manifest
+                .entries()
+                .iter()
+                .filter(|entry| {
+                    entry.status() != ManifestStatus::Deleted
+                        && entry.data_file().content_type() == DataContentType::Data
+                        && file_paths.contains(entry.data_file().file_path())
+                })
+                .map(|entry| entry.data_file().clone())
+                .collect::<Vec<_>>()
+        })
+        .collect();
 
     Ok(data_files)
 }
@@ -1057,33 +1116,12 @@ impl PhysicalExprPredicate {
         let mut new_columns: Vec<arrow::array::ArrayRef> = Vec::with_capacity(batch.num_columns());
         let mut new_fields: Vec<arrow::datatypes::FieldRef> = Vec::with_capacity(batch.num_columns());
 
-        // Collect the types the expression references for each column
-        let expected_types: std::collections::HashMap<usize, arrow::datatypes::DataType> =
-            std::collections::HashMap::new();
-
-        // Extract column references from the expression tree
-        fn collect_column_types(
-            expr: &Arc<dyn PhysicalExpr>,
-            expected: &mut std::collections::HashMap<usize, arrow::datatypes::DataType>,
-        ) {
-            if let Some(col) = expr.as_any().downcast_ref::<datafusion::physical_plan::expressions::Column>() {
-                // The expression expects this column to have a specific type
-                if let Ok(dt) = expr.data_type(&arrow::datatypes::Schema::empty()) {
-                    // data_type on a Column returns the column's own type, not useful
-                    // We need the PARENT expression's expected type instead
-                    let _ = dt; // Column type from expression, will use parent context
-                }
-                let _ = col; // We'll use a different approach
-            }
-            for child in expr.children() {
-                collect_column_types(child, expected);
-            }
-        }
-
-        // Simpler approach: try to evaluate. If it fails with type mismatch,
-        // identify the mismatched columns from the error and cast them.
-        // But even simpler: just widen all integer columns to Int64 and all
-        // string columns to Utf8, which covers the common Iceberg type gaps.
+        // Widen narrow integer columns to Int64 and narrow string columns to
+        // Utf8. Covers the common Iceberg vs DataFusion type gaps (Iceberg
+        // integers materialise as Int32, predicates compare against Int64).
+        // Earlier iterations tried to walk the expression tree to collect the
+        // expected type per column; the heuristic below proved sufficient and
+        // kept that machinery from paying for itself.
         for (i, field) in expr_schema.fields().iter().enumerate() {
             let col = batch.column(i);
             let actual_type = col.data_type();
@@ -1120,10 +1158,6 @@ impl PhysicalExprPredicate {
                 new_fields.push(field.clone());
             }
         }
-
-        // Suppress unused warnings for the helper function
-        let _ = collect_column_types;
-        let _ = expected_types;
 
         if needs_cast {
             let new_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(new_fields));
