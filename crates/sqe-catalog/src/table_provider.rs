@@ -13,7 +13,6 @@ use iceberg::table::Table;
 use tracing::debug;
 
 use crate::expr_to_predicate;
-use crate::manifest_cache::ManifestCache;
 
 /// DataFusion `TableProvider` that wraps an Iceberg `Table`.
 ///
@@ -38,8 +37,6 @@ pub struct SqeTableProvider {
     snapshot_id: Option<i64>,
     /// Trust Iceberg sort order for all columns (not just partition keys).
     trust_sort_order: bool,
-    /// Optional shared manifest file cache passed down to IcebergScanExec.
-    manifest_cache: Option<ManifestCache>,
     /// Small-file threshold in bytes for the direct-read fast path.
     small_file_threshold_bytes: u64,
 }
@@ -65,18 +62,8 @@ impl SqeTableProvider {
             prom_metrics: None,
             trust_sort_order: false,
             snapshot_id: None,
-            manifest_cache: None,
             small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
         })
-    }
-
-    /// Attach a shared manifest cache to accelerate warm queries.
-    ///
-    /// When set, `IcebergScanExec` will serve manifest entries from the cache
-    /// on repeated scans, avoiding S3 fetches for immutable manifest files.
-    pub fn with_manifest_cache(mut self, cache: ManifestCache) -> Self {
-        self.manifest_cache = Some(cache);
-        self
     }
 
     /// Attach Prometheus metrics for file pruning and S3 I/O.
@@ -195,9 +182,6 @@ impl TableProvider for SqeTableProvider {
         }
         if self.trust_sort_order {
             exec = exec.with_trust_sort_order(true);
-        }
-        if let Some(ref mc) = self.manifest_cache {
-            exec = exec.with_manifest_cache(mc.clone());
         }
         exec = exec.with_small_file_threshold(self.small_file_threshold_bytes);
         Ok(Arc::new(exec))

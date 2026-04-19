@@ -37,7 +37,6 @@ use parquet::arrow::arrow_reader::{
 use parquet::arrow::ProjectionMask;
 use tracing::{debug, info_span, warn};
 
-use crate::manifest_cache::{ManifestCache, ManifestEntryData};
 use crate::pruning_stats::IcebergManifestStatistics;
 
 /// Default small-file threshold: 3 MB.
@@ -62,10 +61,6 @@ pub struct IcebergScanExec {
     /// by a sort-on-write engine). Default false: only partition columns are trusted.
     /// WARNING: if data is not actually sorted, queries may return incorrect results.
     trust_sort_order: bool,
-    /// Optional shared manifest file cache. When set, parsed manifest entries are
-    /// served from the cache on warm queries, avoiding S3 round-trips per manifest.
-    /// Immutability of Iceberg manifest files makes this safe without a TTL.
-    manifest_cache: Option<ManifestCache>,
     /// Maximum file size in bytes for the direct-read fast path.
     ///
     /// When all data files in the scan are smaller than this threshold, SQE reads
@@ -156,17 +151,7 @@ impl IcebergScanExec {
             }
         };
         let properties = Arc::new(PlanProperties::new(eq_props, Partitioning::UnknownPartitioning(1), EmissionType::Incremental, Boundedness::Bounded));
-        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, manifest_cache: None, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![] }
-    }
-
-    /// Attach a shared manifest file cache for warm-query acceleration.
-    ///
-    /// When set, `collect_data_files()` checks the cache before fetching each
-    /// manifest from S3. Safe without a TTL because Iceberg manifest files are
-    /// immutable by specification.
-    pub fn with_manifest_cache(mut self, cache: ManifestCache) -> Self {
-        self.manifest_cache = Some(cache);
-        self
+        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![] }
     }
 
     /// Set the snapshot ID for time travel queries.
@@ -232,7 +217,6 @@ impl IcebergScanExec {
             metrics: ExecutionPlanMetricsSet::new(),
             snapshot_id: self.snapshot_id,
             trust_sort_order: self.trust_sort_order,
-            manifest_cache: self.manifest_cache.clone(),
             small_file_threshold_bytes: self.small_file_threshold_bytes,
             pushed_down_filters: filters,
         }
@@ -296,6 +280,14 @@ impl IcebergScanExec {
         Ok((result, pruned_count))
     }
 
+    /// Load all live data files (with full column statistics) for the current snapshot.
+    ///
+    /// Returns `DataFile` objects including `lower_bounds` / `upper_bounds` /
+    /// `null_value_counts` needed by `PruningPredicate`. Because `FileScanTask` from
+    /// `Table::scan().plan_files()` does not expose those maps, the pruning path still
+    /// has to iterate manifests directly. Iceberg-rust's internal `ObjectCache` is
+    /// not reachable from here (`ObjectCache::get_manifest` is `pub(crate)`), so
+    /// callers are expected to parallelise this walk where throughput matters.
     pub async fn collect_data_files(&self) -> Result<Vec<DataFile>, iceberg::Error> {
         let metadata = self.table.metadata();
         let snapshot = if let Some(sid) = self.snapshot_id {
@@ -306,58 +298,7 @@ impl IcebergScanExec {
         let manifest_list = snapshot.load_manifest_list(self.table.file_io(), metadata).await?;
         let mut data_files = Vec::new();
         for mf in manifest_list.entries() {
-            // Populate the cache on first load; subsequent callers that only need
-            // file paths + sizes (not full column stats) can use data_file_info()
-            // which is backed by iceberg's plan_files() API.
-            //
-            // Note: collect_data_files() is used by the min/max pruning path which
-            // needs full DataFile objects with column statistics. Therefore we always
-            // load the manifest from S3 here. The cache provides a fast-path skip
-            // only for manifests known to be empty (contains no live data files).
-            if let Some(ref mc) = self.manifest_cache {
-                if let Some(cached_entries) = mc.get(&mf.manifest_path) {
-                    if cached_entries.is_empty() {
-                        // Skip S3 fetch for known-empty manifests.
-                        debug!(manifest = %mf.manifest_path, "Manifest cache: skip empty manifest");
-                        continue;
-                    }
-                    // Non-empty: fall through to load full DataFile for pruning stats.
-                }
-            }
-
             let manifest = mf.load_manifest(self.table.file_io()).await?;
-
-            // Populate the cache so data_file_info() and empty-manifest skipping
-            // can benefit on warm queries.
-            if let Some(ref mc) = self.manifest_cache {
-                if mc.get(&mf.manifest_path).is_none() {
-                    let cache_entries: Vec<ManifestEntryData> = manifest
-                        .entries()
-                        .iter()
-                        .filter(|e| {
-                            e.status() != ManifestStatus::Deleted
-                                && e.data_file().content_type() == DataContentType::Data
-                        })
-                        .map(|e| {
-                            let df = e.data_file();
-                            ManifestEntryData {
-                                file_path: df.file_path().to_string(),
-                                file_size: df.file_size_in_bytes(),
-                                record_count: df.record_count(),
-                                content_type: df.content_type(),
-                                status: e.status(),
-                            }
-                        })
-                        .collect();
-                    debug!(
-                        manifest = %mf.manifest_path,
-                        entries = cache_entries.len(),
-                        "Manifest cache: populated"
-                    );
-                    mc.insert(mf.manifest_path.clone(), cache_entries);
-                }
-            }
-
             for entry in manifest.entries() {
                 if entry.status() != ManifestStatus::Deleted && entry.data_file().content_type() == DataContentType::Data {
                     data_files.push(entry.data_file().clone());
@@ -591,7 +532,6 @@ impl ExecutionPlan for IcebergScanExec {
         let projection = self.projection.clone();
         let predicates = self.predicates.clone();
         let snapshot_id = self.snapshot_id;
-        let manifest_cache = self.manifest_cache.clone();
         let small_file_threshold = self.small_file_threshold_bytes;
         let pushed_down_filters = self.pushed_down_filters.clone();
         let baseline = BaselineMetrics::new(&self.metrics, partition);
@@ -619,12 +559,19 @@ impl ExecutionPlan for IcebergScanExec {
         let schema_for_stream = schema.clone();
         let stream = futures::stream::once(async move {
             let schema = schema_for_stream;
-            // ── Collect data file list from our cache-backed path ────────────
+            // ── Collect data file list via iceberg-rust's scan planner ────────
             //
-            // `collect_data_files_cached` reads the snapshot's manifest list (1 S3 GET
-            // on first call) and then serves each manifest's entries from the
-            // ManifestCache, avoiding redundant S3 fetches on warm queries.
-            let mut file_entries = collect_data_files_cached(&table, snapshot_id, manifest_cache.as_ref()).await?;
+            // `Table::scan().plan_files()` reads the manifest list and manifests
+            // through iceberg-rust's internal `ObjectCache`, which is kept warm
+            // across queries because `TableMetadataCache` caches `Table` instances
+            // globally. On a warm table this is served from memory; on cold, it
+            // is one manifest-list GET plus one GET per manifest.
+            let mut file_entries = collect_data_files_via_plan(
+                &table,
+                snapshot_id,
+                projection.as_deref(),
+                predicates.as_ref(),
+            ).await?;
 
             if file_entries.is_empty() {
                 let empty = RecordBatch::new_empty(schema.clone());
@@ -927,105 +874,54 @@ impl ExecutionPlan for IcebergScanExec {
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
-/// Collect the set of live data files for the given snapshot using
-/// the ManifestCache where possible.
+/// Collect `(file_path, file_size_bytes)` pairs for the given snapshot via
+/// iceberg-rust's scan planner.
 ///
-/// Returns `(file_path, file_size_bytes)` pairs.  The function loads the
-/// snapshot's manifest *list* from S3 (one unavoidable GET on the first query
-/// for a given snapshot) and then serves each individual manifest's entries
-/// from the cache, avoiding per-manifest S3 fetches on warm queries.
-async fn collect_data_files_cached(
+/// Going through `Table::scan().plan_files()` routes every manifest and
+/// manifest-list read through iceberg-rust's internal `ObjectCache`. Because
+/// `TableMetadataCache` caches `Table` instances globally, the per-`Table`
+/// object cache persists across queries and serves warm reads from memory.
+///
+/// Partition / predicate pruning from `predicates` is also applied here by
+/// the planner, so files that cannot match the query are filtered before
+/// they reach the scan node.
+async fn collect_data_files_via_plan(
     table: &Table,
     snapshot_id: Option<i64>,
-    manifest_cache: Option<&ManifestCache>,
+    projection: Option<&[String]>,
+    predicates: Option<&Predicate>,
 ) -> DFResult<Vec<(String, u64)>> {
-    let metadata = table.metadata();
-    let snapshot = if let Some(sid) = snapshot_id {
-        match metadata.snapshot_by_id(sid) {
-            Some(s) => s,
-            None => return Ok(Vec::new()),
-        }
-    } else {
-        match metadata.current_snapshot() {
-            Some(s) => s,
-            None => return Ok(Vec::new()),
-        }
-    };
+    let mut sb = table.scan();
+    if let Some(sid) = snapshot_id {
+        sb = sb.snapshot_id(sid);
+    }
+    if let Some(cols) = projection {
+        sb = sb.select(cols.iter().map(|s| s.as_str()));
+    }
+    if let Some(pred) = predicates {
+        sb = sb.with_filter(pred.clone());
+    }
+    let scan = sb
+        .build()
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-    let manifest_list = snapshot
-        .load_manifest_list(table.file_io(), metadata)
+    let tasks: Vec<iceberg::scan::FileScanTask> = scan
+        .plan_files()
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .try_collect()
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-    let mut file_entries: Vec<(String, u64)> = Vec::new();
-
-    for mf in manifest_list.entries() {
-        // Fast path: serve from cache when available.
-        if let Some(mc) = manifest_cache {
-            if let Some(cached) = mc.get(&mf.manifest_path) {
-                for entry in cached.iter() {
-                    if entry.status != ManifestStatus::Deleted
-                        && entry.content_type == DataContentType::Data
-                    {
-                        file_entries.push((entry.file_path.clone(), entry.file_size));
-                    }
-                }
-                continue; // Cache hit — skip S3 read for this manifest.
-            }
-        }
-
-        // Cache miss (or no cache): load manifest from S3.
-        let manifest = mf
-            .load_manifest(table.file_io())
-            .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-        // Populate the cache so subsequent calls are served from memory.
-        if let Some(mc) = manifest_cache {
-            if mc.get(&mf.manifest_path).is_none() {
-                let cache_entries: Vec<ManifestEntryData> = manifest
-                    .entries()
-                    .iter()
-                    .filter(|e| {
-                        e.status() != ManifestStatus::Deleted
-                            && e.data_file().content_type() == DataContentType::Data
-                    })
-                    .map(|e| {
-                        let df = e.data_file();
-                        ManifestEntryData {
-                            file_path: df.file_path().to_string(),
-                            file_size: df.file_size_in_bytes(),
-                            record_count: df.record_count(),
-                            content_type: df.content_type(),
-                            status: e.status(),
-                        }
-                    })
-                    .collect();
-                debug!(
-                    manifest = %mf.manifest_path,
-                    entries = cache_entries.len(),
-                    "collect_data_files_cached: populated manifest cache"
-                );
-                mc.insert(mf.manifest_path.clone(), cache_entries);
-            }
-        }
-
-        for entry in manifest.entries() {
-            if entry.status() != ManifestStatus::Deleted
-                && entry.data_file().content_type() == DataContentType::Data
-            {
-                let df = entry.data_file();
-                file_entries.push((df.file_path().to_string(), df.file_size_in_bytes()));
-            }
-        }
-    }
-
-    Ok(file_entries)
+    Ok(tasks
+        .into_iter()
+        .map(|t| (t.data_file_path, t.file_size_in_bytes))
+        .collect())
 }
 
 /// Collect full `DataFile` objects (with column statistics) for the given snapshot.
 ///
-/// Unlike `collect_data_files_cached` which returns lightweight `(path, size)` pairs,
+/// Unlike `collect_data_files_via_plan` which returns lightweight `(path, size)` pairs,
 /// this function loads the full manifest entries with lower/upper bounds needed for
 /// `PruningPredicate` evaluation. Used by dynamic-filter file-level pruning.
 ///
