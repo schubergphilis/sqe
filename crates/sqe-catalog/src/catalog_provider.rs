@@ -34,6 +34,9 @@ pub struct SqeCatalogProvider {
     /// Small-file threshold in bytes for the direct-read fast path.
     /// Propagated to schema and table providers.
     small_file_threshold_bytes: u64,
+    /// Concurrency for direct manifest walks during pruning.
+    /// Propagated to schema and table providers.
+    manifest_concurrency: usize,
 }
 
 impl std::fmt::Debug for SqeCatalogProvider {
@@ -91,6 +94,7 @@ impl SqeCatalogProvider {
             session_user,
             prom_metrics: None,
             small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
+            manifest_concurrency: crate::iceberg_scan::DEFAULT_MANIFEST_CONCURRENCY,
         })
     }
 
@@ -104,6 +108,13 @@ impl SqeCatalogProvider {
     /// Propagated to all schema and table providers.
     pub fn with_small_file_threshold(mut self, threshold_bytes: u64) -> Self {
         self.small_file_threshold_bytes = threshold_bytes;
+        self
+    }
+
+    /// Set the per-scan concurrency used when walking manifests for
+    /// column-statistics pruning. Propagated to schema and table providers.
+    pub fn with_manifest_concurrency(mut self, concurrency: usize) -> Self {
+        self.manifest_concurrency = concurrency.max(1);
         self
     }
 
@@ -124,6 +135,7 @@ impl SqeCatalogProvider {
             session_user: None,
             prom_metrics: None,
             small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
+            manifest_concurrency: crate::iceberg_scan::DEFAULT_MANIFEST_CONCURRENCY,
         }
     }
 }
@@ -166,6 +178,7 @@ impl CatalogProvider for SqeCatalogProvider {
             provider = provider.with_metrics(Arc::clone(m));
         }
         provider = provider.with_small_file_threshold(self.small_file_threshold_bytes);
+        provider = provider.with_manifest_concurrency(self.manifest_concurrency);
 
         Some(Arc::new(provider))
 

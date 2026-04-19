@@ -179,6 +179,8 @@ pub async fn create_session_context(
             let small_file_threshold_bytes = config.catalog.small_file_threshold_mb
                 .saturating_mul(1024 * 1024);
             catalog_provider = catalog_provider.with_small_file_threshold(small_file_threshold_bytes);
+            catalog_provider = catalog_provider
+                .with_manifest_concurrency(config.catalog.manifest_concurrency);
 
             ctx.register_catalog(&catalog_name, Arc::new(catalog_provider));
 

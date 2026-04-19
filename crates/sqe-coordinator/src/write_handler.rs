@@ -4,6 +4,7 @@ use arrow::compute::filter_record_batch;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::prelude::SessionContext as DFSessionContext;
+use futures::{StreamExt, TryStreamExt};
 use iceberg::arrow::arrow_type_to_type;
 use iceberg::spec::{
     DataContentType, DataFile, FormatVersion, ManifestStatus, NestedField, Schema as IcebergSchema,
@@ -1514,39 +1515,54 @@ impl WriteHandler {
     ///
     /// Reads the current snapshot's manifest list, loads each manifest, and
     /// collects all data file entries that are Added or Existing (not Deleted).
+    ///
+    /// Routes reads through `Table::object_cache()` so warm CoW operations
+    /// avoid redundant S3 GETs. Cold reads are parallelised with
+    /// `buffer_unordered` at `config.catalog.manifest_concurrency`.
     async fn collect_data_files(
         &self,
         table: &IcebergTable,
     ) -> sqe_core::Result<Vec<DataFile>> {
-        let metadata = table.metadata();
-        let snapshot = match metadata.current_snapshot() {
+        let metadata_ref = table.metadata_ref();
+        let snapshot = match metadata_ref.current_snapshot() {
             Some(s) => s,
             None => return Ok(vec![]), // no snapshot = empty table
         };
 
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), metadata)
+        let cache = table.object_cache();
+        let manifest_list = cache
+            .get_manifest_list(snapshot, &metadata_ref)
             .await
             .map_err(|e| SqeError::Execution(format!("Failed to load manifest list: {e}")))?;
 
-        let mut data_files = Vec::new();
-        for manifest_file in manifest_list.entries() {
-            let manifest = manifest_file
-                .load_manifest(table.file_io())
-                .await
-                .map_err(|e| {
-                    SqeError::Execution(format!("Failed to load manifest: {e}"))
-                })?;
+        let concurrency = self.config.catalog.manifest_concurrency.max(1);
+        let manifests: Vec<Arc<iceberg::spec::Manifest>> = futures::stream::iter(
+            manifest_list.entries().iter().cloned(),
+        )
+        .map(|mf| {
+            let cache = cache.clone();
+            async move { cache.get_manifest(&mf).await }
+        })
+        .buffer_unordered(concurrency)
+        .try_collect()
+        .await
+        .map_err(|e| SqeError::Execution(format!("Failed to load manifest: {e}")))?;
 
-            for entry in manifest.entries() {
-                // Only include live data files (Added or Existing), skip Deleted
-                if entry.status() != ManifestStatus::Deleted
-                    && entry.data_file().content_type() == DataContentType::Data
-                {
-                    data_files.push(entry.data_file().clone());
-                }
-            }
-        }
+        let data_files = manifests
+            .into_iter()
+            .flat_map(|manifest| {
+                manifest
+                    .entries()
+                    .iter()
+                    .filter(|entry| {
+                        // Only include live data files (Added or Existing), skip Deleted
+                        entry.status() != ManifestStatus::Deleted
+                            && entry.data_file().content_type() == DataContentType::Data
+                    })
+                    .map(|entry| entry.data_file().clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
 
         Ok(data_files)
     }
