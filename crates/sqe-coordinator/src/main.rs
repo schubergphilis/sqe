@@ -170,12 +170,10 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Build the global shared manifest file cache (immutable Iceberg manifests — no TTL).
-    let manifest_cache = sqe_catalog::ManifestCache::new(config.catalog.manifest_cache_mb);
-    tracing::info!(
-        manifest_cache_mb = config.catalog.manifest_cache_mb,
-        "Initialized global Iceberg manifest cache"
-    );
+    // Manifest-list and manifest caching is delegated to iceberg-rust's
+    // per-`Table` `ObjectCache`. Because `TableMetadataCache` (built below)
+    // caches `Table` instances globally, the per-table object cache persists
+    // across queries and sessions.
 
     // Build the global table metadata cache (shared across all sessions and queries).
     // Table metadata is user-independent — schema, partitions, and snapshots are the
@@ -236,7 +234,7 @@ async fn main() -> anyhow::Result<()> {
         query_tracker,
         query_cache,
         grant_backend,
-    )?.with_manifest_cache(manifest_cache).with_table_cache(table_cache));
+    )?.with_table_cache(table_cache));
 
     // Spawn background memory metrics reporter (updates gauges every 1s for Grafana)
     sqe_coordinator::memory::spawn_metrics_reporter(

@@ -75,9 +75,6 @@ pub struct QueryHandler {
     /// Shared DataFusion runtime with FairSpillPool memory management.
     /// Built once at startup and reused across all queries.
     runtime: Arc<RuntimeEnv>,
-    /// Optional shared manifest file cache. Passed to every session context so
-    /// that warm queries avoid re-fetching immutable Iceberg manifest files from S3.
-    manifest_cache: Option<sqe_catalog::ManifestCache>,
     /// Shared global table metadata cache. Persists across sessions and queries so
     /// that repeated `load_table()` calls skip the Polaris REST round-trip.
     table_cache: Option<sqe_catalog::TableMetadataCache>,
@@ -132,20 +129,9 @@ impl QueryHandler {
             query_cache,
             query_semaphore,
             runtime,
-            manifest_cache: None,
             table_cache: None,
             grant_backend,
         })
-    }
-
-    /// Attach a shared manifest file cache used to accelerate repeated scans.
-    ///
-    /// The cache is propagated to every session context and down to each
-    /// `IcebergScanExec`. Call once at coordinator startup with a globally
-    /// shared `ManifestCache` instance.
-    pub fn with_manifest_cache(mut self, cache: sqe_catalog::ManifestCache) -> Self {
-        self.manifest_cache = Some(cache);
-        self
     }
 
     /// Attach a global table metadata cache shared across all sessions and queries.
@@ -1174,7 +1160,6 @@ impl QueryHandler {
             &self.query_tracker,
             Some(&self.runtime),
             self.metrics.as_ref(),
-            self.manifest_cache.as_ref(),
             self.table_cache.as_ref(),
         )
         .await
