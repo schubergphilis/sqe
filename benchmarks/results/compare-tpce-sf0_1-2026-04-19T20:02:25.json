@@ -1,0 +1,153 @@
+{
+  "benchmark": "tpce",
+  "scale": 0.1,
+  "timestamp": "2026-04-19T20:02:25.797522+00:00",
+  "sqe_endpoint": "http://localhost:60051",
+  "trino_endpoint": "http://localhost:38080",
+  "queries": [
+    {
+      "query_name": "broker_volume",
+      "sqe_time_ms": 23,
+      "trino_time_ms": 281,
+      "speedup": 12.217391304347826,
+      "sqe_rows": 0,
+      "trino_rows": 0,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "customer_position",
+      "sqe_time_ms": 78,
+      "trino_time_ms": 911,
+      "speedup": 11.679487179487179,
+      "sqe_rows": 194500,
+      "trino_rows": 194500,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "data_maintenance",
+      "sqe_time_ms": 6,
+      "trino_time_ms": 5,
+      "speedup": 0.8333333333333334,
+      "sqe_rows": 0,
+      "trino_rows": 0,
+      "rows_match": false,
+      "sqe_error": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'test_warehouse.default.news_item' not found\"",
+      "trino_error": "Trino query error: line 12:5: Schema must be specified when session schema is not set",
+      "status": "BothFailed"
+    },
+    {
+      "query_name": "market_feed",
+      "sqe_time_ms": 23,
+      "trino_time_ms": 159,
+      "speedup": 6.913043478260869,
+      "sqe_rows": 10,
+      "trino_rows": 10,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "market_watch",
+      "sqe_time_ms": 16,
+      "trino_time_ms": 5,
+      "speedup": 0.3125,
+      "sqe_rows": 0,
+      "trino_rows": 0,
+      "rows_match": false,
+      "sqe_error": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'test_warehouse.default.watch_item' not found\"",
+      "trino_error": "Trino query error: line 17:5: Schema must be specified when session schema is not set",
+      "status": "BothFailed"
+    },
+    {
+      "query_name": "security_detail",
+      "sqe_time_ms": 100,
+      "trino_time_ms": 391,
+      "speedup": 3.91,
+      "sqe_rows": 0,
+      "trino_rows": 10,
+      "rows_match": false,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "RowDiff"
+    },
+    {
+      "query_name": "trade_lookup",
+      "sqe_time_ms": 49,
+      "trino_time_ms": 310,
+      "speedup": 6.326530612244898,
+      "sqe_rows": 523,
+      "trino_rows": 523,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "trade_order",
+      "sqe_time_ms": 102,
+      "trino_time_ms": 231,
+      "speedup": 2.264705882352941,
+      "sqe_rows": 0,
+      "trino_rows": 3,
+      "rows_match": false,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "RowDiff"
+    },
+    {
+      "query_name": "trade_result",
+      "sqe_time_ms": 115787,
+      "trino_time_ms": 10388,
+      "speedup": 0.08971646212441811,
+      "sqe_rows": 178750000,
+      "trino_rows": 0,
+      "rows_match": false,
+      "sqe_error": null,
+      "trino_error": "Trino query error: Query exceeded per-node memory limit of 4.69GB [Allocated: 4.69GB, Delta: 634.07kB, Top Consumers: {OrderByOperator=4.68GB, LazyOutputBuffer=4.33MB, ExchangeOperator=1.50MB}]",
+      "status": "TrinoFailed"
+    },
+    {
+      "query_name": "trade_status",
+      "sqe_time_ms": 179,
+      "trino_time_ms": 668,
+      "speedup": 3.7318435754189943,
+      "sqe_rows": 2960,
+      "trino_rows": 2960,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "trade_update",
+      "sqe_time_ms": 68,
+      "trino_time_ms": 263,
+      "speedup": 3.8676470588235294,
+      "sqe_rows": 523,
+      "trino_rows": 523,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    }
+  ],
+  "summary": {
+    "total": 11,
+    "matched": 6,
+    "row_diff": 2,
+    "sqe_failed": 0,
+    "trino_failed": 1,
+    "both_failed": 2,
+    "avg_speedup": 6.363831136367028,
+    "median_speedup": 6.326530612244898,
+    "sqe_total_ms": 116431,
+    "trino_total_ms": 13612
+  }
+}
