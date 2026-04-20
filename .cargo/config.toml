@@ -16,20 +16,12 @@ target-dir = "target"
 # roughly halved, and typically costs < 15 % of wall-clock vs. unrestricted.
 # Override per-invocation with `cargo build -j N` or `CARGO_BUILD_JOBS=N`.
 jobs = 4
-# sccache: shared compilation cache. Skips rustc work whenever the exact
-# same crate + rustflags combination has been built before (clean rebuilds,
-# branch switches, fresh checkouts). Does not cache incremental units, so
-# the dev-release profile with incremental=true mostly misses. Release
-# and dev clean-builds see large hit rates. Works around the Defender
-# real-time-scan penalty by reading cached artifacts instead of re-writing
-# thousands of object files.
-# Override per-invocation with `RUSTC_WRAPPER= cargo build` to bypass.
-rustc-wrapper = "/opt/homebrew/bin/sccache"
-
-# sccache tuning. Cap cache at 20 GB. Default is 10 GB which the DataFusion
-# graph alone fills inside a few clean builds.
-[env]
-SCCACHE_CACHE_SIZE = "20G"
+# sccache was tried here and made things worse on Defender-scanned Macs:
+# every cache miss writes artifacts to BOTH target/ and
+# ~/Library/Caches/Mozilla.sccache, doubling the file surface Defender
+# scans. With IT-managed exclusions unavailable, the wrapper adds pure
+# overhead. Keep sccache installed for occasional `RUSTC_WRAPPER=sccache
+# cargo build` experiments, but leave it off by default.
 
 # ── Local development (macOS) ─────────────────────────────────────────────
 # mold does NOT support macOS native linking (Mach-O format).
