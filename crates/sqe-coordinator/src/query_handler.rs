@@ -6,7 +6,8 @@ use arrow_array::{ArrayRef, BooleanArray, Int64Array, builder::StringBuilder};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::{collect, ExecutionPlan};
+use datafusion::physical_plan::{execute_stream, ExecutionPlan};
+use futures::TryStreamExt;
 use datafusion::prelude::SessionContext;
 use tracing::{debug, info, warn, Span};
 
@@ -777,11 +778,63 @@ impl QueryHandler {
         // Try to distribute scan work across workers
         let final_plan = self.try_distribute(physical_plan, session, query_id).await;
 
-        // Execute the (possibly distributed) plan
+        // Execute the (possibly distributed) plan.
+        //
+        // We drive the stream manually instead of using DataFusion's `collect()`
+        // so the row-count limit can fire BEFORE the entire result set is
+        // materialised. `collect()` buffers every batch into memory first and
+        // only returns when the plan is exhausted. For an unbounded or
+        // mis-shaped query (e.g. a 20M-row fact-to-dimension cross product) the
+        // buffered `Vec<RecordBatch>` could grow to many GB and trigger an
+        // OS-level OOM kill. Streaming and counting as we go lets the
+        // coordinator reject oversized queries with a clean error and keeps the
+        // process alive for other concurrent requests.
+        //
+        // Two caps apply:
+        //   1. The user-configured `query.max_result_rows` (0 means no explicit
+        //      cap, but see #2).
+        //   2. A hard memory-derived ceiling: `memory_limit / 256` rows, assuming
+        //      a conservative 256-byte average row size. This fires even when
+        //      the config disables #1. The coordinator must never be one query
+        //      away from the OS SIGKILLing the process for crossing the memory
+        //      line, so we always enforce something lower than total memory.
         let output_schema = final_plan.schema();
-        let mut batches = collect(final_plan.clone(), ctx.task_ctx())
-            .await
+        let configured_max = self.config.query.max_result_rows;
+        let memory_ceiling: usize = {
+            let bytes = crate::memory::limit_bytes(&self.runtime.memory_pool);
+            if bytes == 0 { 0 } else { bytes / 256 }
+        };
+        let effective_max: usize = match (configured_max, memory_ceiling) {
+            (0, 0) => 0, // neither cap configured. Falls back to OS behaviour.
+            (0, m) => m,
+            (c, 0) => c,
+            (c, m) => c.min(m),
+        };
+        let mut stream = execute_stream(final_plan.clone(), ctx.task_ctx())
             .map_err(|e| SqeError::Execution(format!("Query execution failed: {e}")))?;
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        let mut rows_so_far: usize = 0;
+        while let Some(batch) = stream
+            .try_next()
+            .await
+            .map_err(|e| SqeError::Execution(format!("Query execution failed: {e}")))?
+        {
+            rows_so_far = rows_so_far.saturating_add(batch.num_rows());
+            if effective_max > 0 && rows_so_far > effective_max {
+                let reason = if configured_max > 0 && rows_so_far > configured_max {
+                    format!("configured max_result_rows={configured_max}")
+                } else {
+                    format!(
+                        "memory-derived ceiling={effective_max} (memory_limit / 256 bytes-per-row)"
+                    )
+                };
+                return Err(SqeError::Execution(format!(
+                    "Query result exceeds maximum allowed rows ({rows_so_far} > {effective_max}). \
+                     Reason: {reason}. Use LIMIT to reduce output or raise the limit in config."
+                )));
+            }
+            batches.push(batch);
+        }
 
         // Aggregate spill metrics from the executed plan tree
         if let Some(ref metrics) = self.metrics {
@@ -821,13 +874,10 @@ impl QueryHandler {
             batches.push(RecordBatch::new_empty(output_schema));
         }
 
+        // `rows_so_far` was tracked during streaming above, but we recompute
+        // here because the empty-batch fallback above may have appended a
+        // zero-row schema batch.
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        if self.config.query.max_result_rows > 0 && total_rows > self.config.query.max_result_rows {
-            return Err(SqeError::Execution(format!(
-                "Query result exceeds maximum allowed rows ({} > {}). Use LIMIT to reduce output.",
-                total_rows, self.config.query.max_result_rows
-            )));
-        }
 
         info!(
             batch_count = batches.len(),
