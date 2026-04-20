@@ -2073,6 +2073,46 @@ fn collect_and_replace_in_subqueries(
     }
 }
 
+/// Fold a non-empty slice of expressions into a balanced binary tree using `op`.
+///
+/// A left-leaning fold (`((((a op b) op c) op d))`) grows linearly in depth
+/// with the input length. `Display::fmt` on `sqlparser::ast::Expr::BinaryOp`
+/// recurses into `left` and `right`, so a chain of N left-leaning nodes
+/// produces a call stack of N frames. For the TPC-E CoW `UPDATE` path that
+/// rewrites `(col1, col2) IN (SELECT ...)` with thousands of matching rows,
+/// the tokio-rt-worker thread (default 2MB stack on macOS) overflowed after
+/// ~8K rows.
+///
+/// A balanced fold (`((a op b) op (c op d))`) has depth `ceil(log2(N))`, so
+/// even millions of rows stay within a few dozen frames. Semantics are
+/// preserved because `AND` and `OR` are associative.
+fn fold_balanced_binary(
+    mut nodes: Vec<sqlparser::ast::Expr>,
+    op: sqlparser::ast::BinaryOperator,
+) -> Option<sqlparser::ast::Expr> {
+    use sqlparser::ast::Expr;
+
+    if nodes.is_empty() {
+        return None;
+    }
+    while nodes.len() > 1 {
+        let mut next: Vec<Expr> = Vec::with_capacity(nodes.len().div_ceil(2));
+        let mut iter = nodes.into_iter();
+        while let Some(left) = iter.next() {
+            match iter.next() {
+                Some(right) => next.push(Expr::BinaryOp {
+                    left: Box::new(left),
+                    op: op.clone(),
+                    right: Box::new(right),
+                }),
+                None => next.push(left),
+            }
+        }
+        nodes = next;
+    }
+    nodes.into_iter().next()
+}
+
 /// Walk `expr` and substitute every sentinel `InList` with a single `Placeholder("?N")`
 /// list element with the real expression (using the collected values) or a `Boolean`
 /// constant when the value list is empty.
@@ -2084,6 +2124,11 @@ fn collect_and_replace_in_subqueries(
 /// and the result is an OR chain of AND conditions:
 ///   `(col1=v1 AND col2=v2) OR (col1=v3 AND col2=v4) OR ...`
 /// This avoids DataFusion's lack of support for tuple-IN in DML context.
+///
+/// The chain is built as a balanced binary tree (see [`fold_balanced_binary`])
+/// so rewrites of large IN-subqueries (thousands to millions of rows) do not
+/// overflow the tokio worker stack when Display or the downstream parser
+/// walks the expression.
 ///
 /// `idx` tracks which entry in `subqueries`/`value_lists` we are currently visiting.
 /// Must be called with the same `expr` that `collect_and_replace_in_subqueries` modified.
@@ -2123,41 +2168,35 @@ fn substitute_in_subquery_placeholders(
                                 // (col1, col2) IN (SELECT c1, c2 ...) becomes
                                 // (col1=v1 AND col2=v2) OR (col1=v3 AND col2=v4) OR ...
                                 // NOT IN becomes the negation of that OR chain.
+                                //
+                                // Both the per-row AND-chain and the cross-row
+                                // OR-chain are built with `fold_balanced_binary`
+                                // to keep the tree depth O(log N) instead of
+                                // O(N). A linear left-fold blew the tokio-rt-worker
+                                // stack on TPC-E SF1 trade_result_update_holding
+                                // (thousands of pending trades).
                                 let col_refs = col_refs.clone();
-                                let mut or_chain: Option<Expr> = None;
+                                let mut and_exprs: Vec<Expr> = Vec::with_capacity(rows.len());
                                 for row in rows {
-                                    // Build AND chain for this row: col1=v1 AND col2=v2 ...
-                                    let mut and_chain: Option<Expr> = None;
-                                    for (col_ref, val) in col_refs.iter().zip(row.iter()) {
-                                        let eq = Expr::BinaryOp {
+                                    let eqs: Vec<Expr> = col_refs
+                                        .iter()
+                                        .zip(row.iter())
+                                        .map(|(col_ref, val)| Expr::BinaryOp {
                                             left: Box::new(col_ref.clone()),
                                             op: BinaryOperator::Eq,
                                             right: Box::new(val.clone()),
-                                        };
-                                        and_chain = Some(match and_chain {
-                                            Some(prev) => Expr::BinaryOp {
-                                                left: Box::new(prev),
-                                                op: BinaryOperator::And,
-                                                right: Box::new(eq),
-                                            },
-                                            None => eq,
-                                        });
-                                    }
-                                    if let Some(and_expr) = and_chain {
-                                        or_chain = Some(match or_chain {
-                                            Some(prev) => Expr::BinaryOp {
-                                                left: Box::new(prev),
-                                                op: BinaryOperator::Or,
-                                                right: Box::new(Expr::Nested(Box::new(and_expr))),
-                                            },
-                                            None => and_expr,
-                                        });
+                                        })
+                                        .collect();
+                                    if let Some(and_expr) =
+                                        fold_balanced_binary(eqs, BinaryOperator::And)
+                                    {
+                                        and_exprs.push(Expr::Nested(Box::new(and_expr)));
                                     }
                                 }
-                                let or_expr = or_chain
+                                let or_expr = fold_balanced_binary(and_exprs, BinaryOperator::Or)
                                     .unwrap_or(Expr::Value(SqlValue::Boolean(false)));
                                 *expr = if neg {
-                                    // NOT IN → wrap in NOT
+                                    // NOT IN -> wrap in NOT
                                     Expr::UnaryOp {
                                         op: sqlparser::ast::UnaryOperator::Not,
                                         expr: Box::new(Expr::Nested(Box::new(or_expr))),
@@ -3117,5 +3156,74 @@ SET c = ( \
         let assignments = parse_update(sql);
         let (_, joins) = decorrelate_scalar_subqueries(&assignments, "t");
         assert!(joins.is_empty(), "non-eq correlation should be left alone");
+    }
+
+    // -------------------------------------------------------------------------
+    // fold_balanced_binary tests
+    // -------------------------------------------------------------------------
+
+    /// Depth of the BinaryOp tree formed by `fold_balanced_binary`. For a
+    /// balanced fold we expect `ceil(log2(N))` for N >= 1.
+    fn tree_depth(expr: &sqlparser::ast::Expr) -> usize {
+        use sqlparser::ast::Expr;
+        match expr {
+            Expr::BinaryOp { left, right, .. } => {
+                1 + tree_depth(left).max(tree_depth(right))
+            }
+            _ => 0,
+        }
+    }
+
+    fn num_literal(n: i64) -> sqlparser::ast::Expr {
+        use sqlparser::ast::{Expr, Value as SqlValue};
+        Expr::Value(SqlValue::Number(n.to_string(), false))
+    }
+
+    #[test]
+    fn fold_balanced_binary_empty_returns_none() {
+        let out = fold_balanced_binary(Vec::new(), sqlparser::ast::BinaryOperator::And);
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn fold_balanced_binary_single_returns_same_expr() {
+        let out = fold_balanced_binary(
+            vec![num_literal(42)],
+            sqlparser::ast::BinaryOperator::Or,
+        );
+        assert_eq!(format!("{}", out.unwrap()), "42");
+    }
+
+    #[test]
+    fn fold_balanced_binary_is_balanced_for_large_n() {
+        // 10_000 nodes: a left-fold would be 10_000 deep. A balanced fold
+        // must be at most ceil(log2(10_000)) = 14. Cap at 20 as generous
+        // headroom for round-up pairing.
+        let nodes: Vec<_> = (0..10_000).map(num_literal).collect();
+        let out =
+            fold_balanced_binary(nodes, sqlparser::ast::BinaryOperator::Or).unwrap();
+        let depth = tree_depth(&out);
+        assert!(
+            depth <= 20,
+            "balanced fold over 10k nodes produced depth {depth}; expected <= 20"
+        );
+        assert!(depth >= 14, "balanced fold over 10k nodes produced depth {depth}; expected >= 14");
+    }
+
+    #[test]
+    fn fold_balanced_binary_preserves_elements() {
+        // A fold over N equality nodes should preserve all N leaves even
+        // though their internal arrangement is balanced. Display the tree
+        // and count occurrences of each literal.
+        let nodes: Vec<_> = (0..64).map(num_literal).collect();
+        let out =
+            fold_balanced_binary(nodes, sqlparser::ast::BinaryOperator::And).unwrap();
+        let rendered = format!("{out}");
+        for n in 0..64 {
+            assert!(
+                rendered.contains(&format!("{n}")),
+                "balanced fold dropped literal {n}: {rendered}"
+            );
+        }
     }
 }

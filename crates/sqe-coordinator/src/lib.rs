@@ -16,6 +16,7 @@ pub mod query_cache;
 pub mod query_tracker;
 pub mod rate_limiter;
 pub mod scheduler;
+pub mod streaming;
 pub mod session_manager;
 pub mod worker_registry;
 pub mod trino_functions;
