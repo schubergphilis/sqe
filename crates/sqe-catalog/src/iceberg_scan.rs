@@ -791,7 +791,16 @@ impl ExecutionPlan for IcebergScanExec {
                             // Apply column projection by mapping column names to Parquet indices.
                             // For COUNT(*) queries, projection is Some([]) (empty list) -- we read
                             // just the first column to get the row count, then discard the data.
-                            let builder = if let Some(ref cols) = projection {
+                            //
+                            // The computed ProjectionMask is also reused for the row filter below
+                            // so the predicate sees a batch shaped like `projected_schema`. That is
+                            // required for correctness: `DynamicFilterPhysicalExpr` emitted by the
+                            // hash join encodes `Column(index=N)` where N is the position in the
+                            // scan's projected output schema (not the full Parquet schema). If we
+                            // hand the predicate a full-schema batch, `Column(0)` reads the wrong
+                            // column and the filter silently drops every row whose projected
+                            // column 0 happens not to coincide with full column 0.
+                            let (builder, filter_mask) = if let Some(ref cols) = projection {
                                 let parquet_schema = builder.parquet_schema().clone();
                                 let arrow_schema = builder.schema().clone();
                                 let indices: Vec<usize> = cols
@@ -804,13 +813,16 @@ impl ExecutionPlan for IcebergScanExec {
                                     // COUNT(*) or similar: no columns needed, just row count.
                                     // Read the smallest column (first one) to get the row count.
                                     let mask = ProjectionMask::roots(&parquet_schema, vec![0]);
-                                    builder.with_projection(mask)
+                                    (builder.with_projection(mask.clone()), mask)
                                 } else {
                                     let mask = ProjectionMask::roots(&parquet_schema, indices);
-                                    builder.with_projection(mask)
+                                    (builder.with_projection(mask.clone()), mask)
                                 }
                             } else {
-                                builder
+                                // No projection: predicate sees the full Parquet schema, which
+                                // matches the scan's projected_schema (they're the same when no
+                                // projection is applied).
+                                (builder, ProjectionMask::all())
                             };
 
                             // Apply resolved dynamic filters as Parquet row filters.
@@ -819,18 +831,16 @@ impl ExecutionPlan for IcebergScanExec {
                             // reader evaluates per row group / page. Rows that fail the
                             // predicate are skipped before full decoding, reducing I/O and CPU.
                             //
-                            // We use ProjectionMask::all() so the predicate receives all
-                            // columns. This is simpler than computing the minimal column set
-                            // for the filter expression. For an MVP this is acceptable; a
-                            // future optimisation can intersect filter columns with the
-                            // Parquet schema to build a tighter mask.
+                            // `filter_mask` (computed above) matches the output projection, so
+                            // the predicate evaluates against a batch whose column layout
+                            // matches `projected_schema`. That is the schema the filter's
+                            // column indices were resolved against.
                             let builder = if !resolved_filters.is_empty() {
                                 let mut predicates: Vec<Box<dyn ArrowPredicate>> = Vec::new();
                                 for filter_expr in resolved_filters.iter() {
-                                    let mask = ProjectionMask::all();
                                     predicates.push(Box::new(PhysicalExprPredicate {
                                         expr: Arc::clone(filter_expr),
-                                        projection: mask,
+                                        projection: filter_mask.clone(),
                                     }));
                                 }
                                 builder.with_row_filter(RowFilter::new(predicates))
