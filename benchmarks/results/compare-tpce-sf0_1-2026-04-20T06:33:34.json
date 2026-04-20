@@ -1,0 +1,153 @@
+{
+  "benchmark": "tpce",
+  "scale": 0.1,
+  "timestamp": "2026-04-20T06:33:34.761349+00:00",
+  "sqe_endpoint": "http://localhost:60051",
+  "trino_endpoint": "http://localhost:38080",
+  "queries": [
+    {
+      "query_name": "broker_volume",
+      "sqe_time_ms": 20,
+      "trino_time_ms": 2698,
+      "speedup": 134.9,
+      "sqe_rows": 25,
+      "trino_rows": 25,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "customer_position",
+      "sqe_time_ms": 25,
+      "trino_time_ms": 737,
+      "speedup": 29.48,
+      "sqe_rows": 9092,
+      "trino_rows": 9092,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "data_maintenance",
+      "sqe_time_ms": 9,
+      "trino_time_ms": 27,
+      "speedup": 3.0,
+      "sqe_rows": 0,
+      "trino_rows": 0,
+      "rows_match": false,
+      "sqe_error": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'test_warehouse.default.news_item' not found\"",
+      "trino_error": "Trino query error: line 12:5: Schema must be specified when session schema is not set",
+      "status": "BothFailed"
+    },
+    {
+      "query_name": "market_feed",
+      "sqe_time_ms": 30,
+      "trino_time_ms": 384,
+      "speedup": 12.8,
+      "sqe_rows": 10,
+      "trino_rows": 10,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "market_watch",
+      "sqe_time_ms": 7,
+      "trino_time_ms": 8,
+      "speedup": 1.1428571428571428,
+      "sqe_rows": 0,
+      "trino_rows": 0,
+      "rows_match": false,
+      "sqe_error": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'test_warehouse.default.watch_item' not found\"",
+      "trino_error": "Trino query error: line 17:5: Schema must be specified when session schema is not set",
+      "status": "BothFailed"
+    },
+    {
+      "query_name": "security_detail",
+      "sqe_time_ms": 33,
+      "trino_time_ms": 588,
+      "speedup": 17.818181818181817,
+      "sqe_rows": 0,
+      "trino_rows": 10,
+      "rows_match": false,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "RowDiff"
+    },
+    {
+      "query_name": "trade_lookup",
+      "sqe_time_ms": 4,
+      "trino_time_ms": 402,
+      "speedup": 100.5,
+      "sqe_rows": 0,
+      "trino_rows": 468,
+      "rows_match": false,
+      "sqe_error": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'test_warehouse.tpce_sf0_1.settlement' not found\"",
+      "trino_error": null,
+      "status": "SqeFailed"
+    },
+    {
+      "query_name": "trade_order",
+      "sqe_time_ms": 33,
+      "trino_time_ms": 705,
+      "speedup": 21.363636363636363,
+      "sqe_rows": 0,
+      "trino_rows": 300,
+      "rows_match": false,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "RowDiff"
+    },
+    {
+      "query_name": "trade_result",
+      "sqe_time_ms": 46,
+      "trino_time_ms": 652,
+      "speedup": 14.173913043478262,
+      "sqe_rows": 19418,
+      "trino_rows": 19418,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "trade_status",
+      "sqe_time_ms": 35,
+      "trino_time_ms": 425,
+      "speedup": 12.142857142857142,
+      "sqe_rows": 3081,
+      "trino_rows": 3081,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "trade_update",
+      "sqe_time_ms": 4,
+      "trino_time_ms": 322,
+      "speedup": 80.5,
+      "sqe_rows": 0,
+      "trino_rows": 468,
+      "rows_match": false,
+      "sqe_error": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'test_warehouse.tpce_sf0_1.settlement' not found\"",
+      "trino_error": null,
+      "status": "SqeFailed"
+    }
+  ],
+  "summary": {
+    "total": 11,
+    "matched": 5,
+    "row_diff": 2,
+    "sqe_failed": 2,
+    "trino_failed": 0,
+    "both_failed": 2,
+    "avg_speedup": 34.66836976687908,
+    "median_speedup": 17.818181818181817,
+    "sqe_total_ms": 246,
+    "trino_total_ms": 6948
+  }
+}

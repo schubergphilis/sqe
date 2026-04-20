@@ -1623,6 +1623,7 @@ impl WriteHandler {
 
         // Register the batch as a temporary table so DataFusion can evaluate the predicate
         let table_name = format!("__delete_{}", table_ident.name());
+        let orig_name = table_ident.name();
         let mem_table = datafusion::datasource::MemTable::try_new(
             batch.schema(),
             vec![vec![batch.clone()]],
@@ -1632,8 +1633,12 @@ impl WriteHandler {
             .map_err(|e| SqeError::Execution(format!("Failed to register temp table: {e}")))?;
 
         // Execute: SELECT <where_clause> AS __match FROM __delete_<table>
-        let eval_sql =
-            format!("SELECT CAST(({where_sql}) AS BOOLEAN) AS __match FROM datafusion.public.{table_name}");
+        // Alias the scratch table to the original target name (see apply_update
+        // for rationale) so correlated subqueries inside the WHERE clause can
+        // reference `tablename.col`.
+        let eval_sql = format!(
+            "SELECT CAST(({where_sql}) AS BOOLEAN) AS __match FROM datafusion.public.{table_name} AS \"{orig_name}\""
+        );
         let df = ctx.sql(&eval_sql).await.map_err(|e| {
             SqeError::Execution(format!("Failed to evaluate WHERE clause: {e}"))
         })?;
@@ -1680,6 +1685,7 @@ impl WriteHandler {
         use arrow_array::BooleanArray;
 
         let table_name = format!("__mor_delete_{}", table_ident.name());
+        let orig_name = table_ident.name();
         let mem_table = datafusion::datasource::MemTable::try_new(
             batch.schema(),
             vec![vec![batch.clone()]],
@@ -1688,8 +1694,10 @@ impl WriteHandler {
         ctx.register_table(format!("datafusion.public.{table_name}"), Arc::new(mem_table))
             .map_err(|e| SqeError::Execution(format!("Failed to register temp table: {e}")))?;
 
+        // Alias the scratch table to the original target name so correlated
+        // subqueries inside WHERE can reference `tablename.col`.
         let eval_sql = format!(
-            "SELECT CAST(({where_sql}) AS BOOLEAN) AS __match FROM datafusion.public.{table_name}"
+            "SELECT CAST(({where_sql}) AS BOOLEAN) AS __match FROM datafusion.public.{table_name} AS \"{orig_name}\""
         );
         let df = ctx.sql(&eval_sql).await.map_err(|e| {
             SqeError::Execution(format!("Failed to evaluate WHERE clause: {e}"))
@@ -1731,6 +1739,7 @@ impl WriteHandler {
         table_ident: &TableIdent,
     ) -> sqe_core::Result<RecordBatch> {
         let table_name = format!("__update_{}", table_ident.name());
+        let orig_name = table_ident.name();
         let mem_table = datafusion::datasource::MemTable::try_new(
             batch.schema(),
             vec![vec![batch.clone()]],
@@ -1770,7 +1779,15 @@ impl WriteHandler {
             })
             .collect();
 
-        let select_sql = format!("SELECT {} FROM datafusion.public.{table_name}", columns.join(", "));
+        // Alias the scratch table back to the UPDATE target's original name so
+        // correlated subqueries inside the SET expression can reference it.
+        // e.g. `SET x = (SELECT ... WHERE ... = holding_summary.hs_ca_id)` needs
+        // `holding_summary` to be in scope; without the alias DataFusion only
+        // sees `__update_holding_summary` and fails to resolve the correlation.
+        let select_sql = format!(
+            "SELECT {cols} FROM datafusion.public.{table_name} AS \"{orig_name}\"",
+            cols = columns.join(", "),
+        );
         let df = ctx.sql(&select_sql).await.map_err(|e| {
             SqeError::Execution(format!("Failed to evaluate UPDATE: {e}"))
         })?;
@@ -1795,6 +1812,7 @@ impl WriteHandler {
         table_ident: &TableIdent,
     ) -> sqe_core::Result<usize> {
         let table_name = format!("__count_{}", table_ident.name());
+        let orig_name = table_ident.name();
         let mem_table = datafusion::datasource::MemTable::try_new(
             batch.schema(),
             vec![vec![batch.clone()]],
@@ -1803,7 +1821,12 @@ impl WriteHandler {
         ctx.register_table(format!("datafusion.public.{table_name}"), Arc::new(mem_table))
             .map_err(|e| SqeError::Execution(format!("Register error: {e}")))?;
 
-        let sql = format!("SELECT COUNT(*) AS cnt FROM datafusion.public.{table_name} WHERE {where_sql}");
+        // Alias the scratch table to the original target name (see apply_update
+        // for rationale) — allows `tablename.col` references in WHERE subqueries
+        // to resolve correctly.
+        let sql = format!(
+            "SELECT COUNT(*) AS cnt FROM datafusion.public.{table_name} AS \"{orig_name}\" WHERE {where_sql}"
+        );
         let df = ctx.sql(&sql).await.map_err(|e| {
             SqeError::Execution(format!("Count query failed: {e}"))
         })?;
