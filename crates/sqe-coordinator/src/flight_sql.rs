@@ -25,15 +25,17 @@ use arrow_flight::{
     Action, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest,
     HandshakeResponse, Ticket,
 };
+use arrow_flight::error::FlightError;
 use arrow_ipc::writer::IpcWriteOptions;
 use base64::Engine;
-use futures::{Stream, TryStreamExt, stream};
+use futures::{Stream, StreamExt, TryStreamExt, stream};
 use prost::Message;
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
 
 use sqe_core::SqeConfig;
+use sqe_sql::{StatementKind, parse_and_classify};
 
 use crate::query_handler::QueryHandler;
 use crate::query_tracker::QueryTracker;
@@ -253,6 +255,56 @@ impl SqeFlightSqlService {
     ) -> Result<Response<FlightStream>, Status> {
         let options = self.flight_ipc_options()?;
         encode_batches_to_stream(batches, options)
+    }
+
+    /// Route a SQL statement into a Flight SQL response.
+    ///
+    /// SELECT queries flow through [`QueryHandler::execute_stream`], which
+    /// hands back a DataFusion [`SendableRecordBatchStream`]. Batches pass
+    /// directly into the Flight encoder -- the coordinator never holds more
+    /// than a few in-flight batches in memory, so 20M+ row results no longer
+    /// OOM the process. Memory-heavy operators spill to disk via the
+    /// configured `FairSpillPool` + `spill_dir`.
+    ///
+    /// Every other statement kind (DML, DDL, SHOW, GRANT, etc.) still goes
+    /// through the buffered [`QueryHandler::execute`] path and is converted
+    /// into a Flight response with [`Self::batches_to_stream`]. Those
+    /// statements produce small result sets (row counts, catalog metadata)
+    /// where buffering is free and the existing handlers rely on owning the
+    /// full `Vec<RecordBatch>`.
+    async fn run_sql_into_flight_response(
+        &self,
+        session: &sqe_core::Session,
+        sql: &str,
+    ) -> Result<Response<FlightStream>, Status> {
+        let kind = parse_and_classify(sql).map_err(|e| sqe_error_to_status(&e, None))?;
+
+        if matches!(kind, StatementKind::Query(_)) {
+            let (schema, stream) = self
+                .query_handler
+                .execute_stream(session, sql)
+                .await
+                .map_err(|e| sqe_error_to_status(&e, None))?;
+
+            let options = self.flight_ipc_options()?;
+            let batch_stream = stream.map(|res| {
+                res.map_err(|e| FlightError::ExternalError(Box::new(e)))
+            });
+            let flight_stream = FlightDataEncoderBuilder::new()
+                .with_schema(schema)
+                .with_options(options)
+                .build(batch_stream)
+                .map_err(Status::from);
+
+            return Ok(Response::new(Box::pin(flight_stream)));
+        }
+
+        let batches = self
+            .query_handler
+            .execute(session, sql)
+            .await
+            .map_err(|e| sqe_error_to_status(&e, None))?;
+        self.batches_to_stream(batches)
     }
 
     // -----------------------------------------------------------------
@@ -535,13 +587,7 @@ impl FlightSqlService for SqeFlightSqlService {
         let sql_str = std::str::from_utf8(sql)
             .map_err(|e| Status::internal(format!("Invalid statement handle: {e}")))?;
 
-        let batches = self
-            .query_handler
-            .execute(&session, sql_str)
-            .await
-            .map_err(|e| sqe_error_to_status(&e, None))?;
-
-        self.batches_to_stream(batches)
+        self.run_sql_into_flight_response(&session, sql_str).await
     }
 
     /// Handle fallback do_get for tickets that don't match known Flight SQL types.
@@ -562,13 +608,7 @@ impl FlightSqlService for SqeFlightSqlService {
                 "do_get_fallback executing query"
             );
 
-            let batches = self
-                .query_handler
-                .execute(&session, &fetch.handle)
-                .await
-                .map_err(|e| sqe_error_to_status(&e, None))?;
-
-            return self.batches_to_stream(batches);
+            return self.run_sql_into_flight_response(&session, &fetch.handle).await;
         }
 
         Err(Status::unimplemented(format!(
@@ -955,13 +995,7 @@ impl FlightSqlService for SqeFlightSqlService {
             "Executing prepared statement"
         );
 
-        let batches = self
-            .query_handler
-            .execute(&session, &fetch.handle)
-            .await
-            .map_err(|e| sqe_error_to_status(&e, None))?;
-
-        self.batches_to_stream(batches)
+        self.run_sql_into_flight_response(&session, &fetch.handle).await
     }
 
     async fn do_get_table_types(

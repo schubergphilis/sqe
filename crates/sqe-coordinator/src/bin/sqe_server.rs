@@ -262,8 +262,32 @@ impl TrinoQueryExecutor for QueryHandlerAdapter {
 }
 
 // ── Main ───────────────────────────────────────────────────────
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+//
+// We build the tokio runtime manually instead of using `#[tokio::main]` so we
+// can set a larger thread stack. The default 2 MiB worker stack is enough for
+// most query plans but overflows on deep AST trees — notably, DataFusion
+// re-parses WHERE clauses produced by our CoW DML rewrites, and the SQL
+// grammar parses `a OR b OR c OR ...` as a left-leaning chain of depth N.
+// For N in the thousands (e.g. TPC-E `trade_result_update_holding`, which
+// materialises `(ca, sym) IN (SELECT ...)` into an O(N) OR chain over every
+// pending trade), DataFusion's own AST walkers exhaust the 2 MiB stack and
+// SIGABRT the coordinator. The coordinator must never crash — we spill,
+// stream, and absorb large plans instead. An 8 MiB worker stack gives us ~4x
+// the headroom at zero runtime cost.
+fn main() -> anyhow::Result<()> {
+    const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(WORKER_STACK_BYTES)
+        .thread_name("sqe-coordinator")
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build tokio runtime: {e}"))?;
+
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let config_path = cli
