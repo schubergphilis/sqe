@@ -1748,18 +1748,18 @@ impl WriteHandler {
         ctx.register_table(format!("datafusion.public.{table_name}"), Arc::new(mem_table))
             .map_err(|e| SqeError::Execution(format!("Failed to register temp table: {e}")))?;
 
-        // Build assignment map: column_name -> expression_sql
+        // Best-effort decorrelation of any `ScalarSubquery` nodes in the SET
+        // expressions. DataFusion's physical planner cannot compile scalar
+        // subqueries that survive inside a CASE WHEN ... THEN (subquery) ELSE
+        // col END projection, so we rewrite recognised correlated-equality
+        // shapes into LEFT JOINs at the outer FROM. Shapes we don't recognise
+        // are left alone and will surface DataFusion's original error — no
+        // change in behaviour for them.
+        let (decorrelated, extra_joins) =
+            decorrelate_scalar_subqueries(assignments, orig_name);
         let mut assignment_map = std::collections::HashMap::new();
-        for a in assignments {
-            let col_name = match &a.target {
-                sqlparser::ast::AssignmentTarget::ColumnName(name) => format!("{name}"),
-                sqlparser::ast::AssignmentTarget::Tuple(names) => {
-                    // Tuple assignment (a, b) = ... — take first for simplicity
-                    names.first().map(|n| format!("{n}")).unwrap_or_default()
-                }
-            };
-            let expr_sql = format!("{}", a.value);
-            assignment_map.insert(col_name, expr_sql);
+        for d in &decorrelated {
+            assignment_map.insert(d.col_name.clone(), d.expr_sql.clone());
         }
 
         // Build SELECT with CASE expressions for assigned columns
@@ -1784,9 +1784,19 @@ impl WriteHandler {
         // e.g. `SET x = (SELECT ... WHERE ... = holding_summary.hs_ca_id)` needs
         // `holding_summary` to be in scope; without the alias DataFusion only
         // sees `__update_holding_summary` and fails to resolve the correlation.
+        //
+        // `extra_joins` carries any LEFT JOIN clauses produced by the
+        // decorrelator above so the outer SELECT can reference the joined
+        // `__corrN.__val` columns substituted into the SET expressions.
+        let joins_sql = if extra_joins.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", extra_joins.join(" "))
+        };
         let select_sql = format!(
-            "SELECT {cols} FROM datafusion.public.{table_name} AS \"{orig_name}\"",
+            "SELECT {cols} FROM datafusion.public.{table_name} AS \"{orig_name}\"{joins}",
             cols = columns.join(", "),
+            joins = joins_sql,
         );
         let df = ctx.sql(&select_sql).await.map_err(|e| {
             SqeError::Execution(format!("Failed to evaluate UPDATE: {e}"))
@@ -2185,6 +2195,297 @@ fn substitute_in_subquery_placeholders(
             substitute_in_subquery_placeholders(high, subqueries, value_lists, idx);
         }
         _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Correlated ScalarSubquery decorrelator (UPDATE SET)
+// ---------------------------------------------------------------------------
+//
+// DataFusion's physical planner does not compile `Expr::ScalarSubquery` that
+// survives into DML. The `ScalarSubqueryToJoin` optimizer rule rewrites most
+// projection-scoped scalar subqueries, but it does not reach subqueries buried
+// inside a `CASE WHEN cond THEN expr ELSE col END` — which is the exact shape
+// `apply_update` generates from an `UPDATE ... SET col = <expr>` statement.
+//
+// We decorrelate here at the sqlparser-AST level for a narrow shape:
+//
+//     SET col = <expr_with>(SELECT <scalar>
+//                           FROM <tables>
+//                           WHERE <target>.k1 = <sub_alias>.k1'
+//                             AND <target>.k2 = <sub_alias>.k2'
+//                             AND <local_preds>
+//                           [LIMIT 1])
+//
+// Rewritten to:
+//
+//     SET col = <expr_with> "__corrN"."__val"
+//     (+ LEFT JOIN (
+//          SELECT <sub_alias>.k1' AS __k0, <sub_alias>.k2' AS __k1,
+//                 MAX(<scalar>)    AS __val
+//          FROM <tables>
+//          WHERE <local_preds>
+//          GROUP BY <sub_alias>.k1', <sub_alias>.k2'
+//        ) AS "__corrN"
+//        ON __corrN.__k0 = <target>.k1 AND __corrN.__k1 = <target>.k2)
+//
+// The `MAX` aggregate is an approximation of `LIMIT 1`: any one value per
+// correlation group. For UPDATE statements that expect a specific row
+// (ORDER BY + LIMIT 1), MAX may pick a different row, so behaviour differs
+// from e.g. PostgreSQL's UPDATE FROM JOIN semantics. Use only when the
+// subquery is a simple correlated lookup.
+//
+// Any shape not matching the above (non-equality correlation, non-scalar
+// projection, nested subqueries, no correlation at all) leaves the
+// assignment unchanged — current behaviour then surfaces DataFusion's clear
+// "ScalarSubquery not implemented" error.
+
+/// Returned by [`decorrelate_scalar_subqueries`] for each SET assignment.
+pub(crate) struct DecorrelatedAssignment {
+    /// Target column name.
+    pub col_name: String,
+    /// Assignment RHS expression (with correlated scalar subqueries replaced
+    /// by `"__corrN"."__val"` column references if decorrelation succeeded).
+    pub expr_sql: String,
+}
+
+/// Walks the `assignments`, attempts to decorrelate every correlated
+/// ScalarSubquery it finds, and returns the rewritten assignments plus the
+/// LEFT JOIN clauses to append to the outer SELECT's FROM.
+pub(crate) fn decorrelate_scalar_subqueries(
+    assignments: &[sqlparser::ast::Assignment],
+    target_name: &str,
+) -> (Vec<DecorrelatedAssignment>, Vec<String>) {
+    use sqlparser::ast::AssignmentTarget;
+
+    let mut out_assignments: Vec<DecorrelatedAssignment> = Vec::with_capacity(assignments.len());
+    let mut joins: Vec<String> = Vec::new();
+    let mut next_idx = 0usize;
+
+    for a in assignments {
+        let col_name = match &a.target {
+            AssignmentTarget::ColumnName(name) => format!("{name}"),
+            AssignmentTarget::Tuple(names) => names.first().map(|n| format!("{n}")).unwrap_or_default(),
+        };
+        let mut expr = a.value.clone();
+        rewrite_subqueries_in_expr(&mut expr, target_name, &mut next_idx, &mut joins);
+        out_assignments.push(DecorrelatedAssignment {
+            col_name,
+            expr_sql: format!("{expr}"),
+        });
+    }
+
+    (out_assignments, joins)
+}
+
+/// Recursively walk an Expr looking for `Expr::Subquery(Box<Query>)` nodes and
+/// try to decorrelate each. On success, the node is replaced with a compound
+/// identifier pointing at the joined lookup column; on failure, the node is
+/// left untouched so the caller's current error path still fires.
+fn rewrite_subqueries_in_expr(
+    expr: &mut sqlparser::ast::Expr,
+    target_name: &str,
+    next_idx: &mut usize,
+    joins: &mut Vec<String>,
+) {
+    use sqlparser::ast::Expr;
+
+    match expr {
+        Expr::Subquery(q) => {
+            if let Some((join_sql, alias)) = try_decorrelate_query(q, target_name, *next_idx) {
+                joins.push(join_sql);
+                *expr = Expr::CompoundIdentifier(vec![
+                    sqlparser::ast::Ident::with_quote('"', alias),
+                    sqlparser::ast::Ident::with_quote('"', "__val".to_string()),
+                ]);
+                *next_idx += 1;
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            rewrite_subqueries_in_expr(left, target_name, next_idx, joins);
+            rewrite_subqueries_in_expr(right, target_name, next_idx, joins);
+        }
+        Expr::UnaryOp { expr: inner, .. } => {
+            rewrite_subqueries_in_expr(inner, target_name, next_idx, joins);
+        }
+        Expr::Nested(inner) => {
+            rewrite_subqueries_in_expr(inner, target_name, next_idx, joins);
+        }
+        Expr::Case { operand, conditions, results, else_result } => {
+            if let Some(op) = operand {
+                rewrite_subqueries_in_expr(op, target_name, next_idx, joins);
+            }
+            for c in conditions {
+                rewrite_subqueries_in_expr(c, target_name, next_idx, joins);
+            }
+            for r in results {
+                rewrite_subqueries_in_expr(r, target_name, next_idx, joins);
+            }
+            if let Some(e) = else_result {
+                rewrite_subqueries_in_expr(e, target_name, next_idx, joins);
+            }
+        }
+        Expr::Function(_) => {
+            // Most function arguments are expressions; the full sqlparser
+            // walker is complex. For now we skip — correlated subqueries
+            // buried inside function calls remain un-decorrelated and surface
+            // DataFusion's original error, which is an acceptable fallback.
+        }
+        _ => {}
+    }
+}
+
+/// Attempt to decorrelate a single scalar subquery against `target_name`.
+/// Returns `(join_sql, alias)` when the shape matches, or `None` to skip.
+fn try_decorrelate_query(
+    q: &sqlparser::ast::Query,
+    target_name: &str,
+    idx: usize,
+) -> Option<(String, String)> {
+    use sqlparser::ast::{Expr, SelectItem, SetExpr};
+
+    // Only plain SELECT (no UNION, no VALUES).
+    let select = match q.body.as_ref() {
+        SetExpr::Select(s) => s.as_ref(),
+        _ => return None,
+    };
+
+    // Require a single unnamed scalar projection.
+    if select.projection.len() != 1 {
+        return None;
+    }
+    let scalar_expr_sql = match &select.projection[0] {
+        SelectItem::UnnamedExpr(e) => format!("{e}"),
+        SelectItem::ExprWithAlias { expr, .. } => format!("{expr}"),
+        _ => return None,
+    };
+
+    // Need a WHERE clause — correlation has to live somewhere.
+    let where_expr = select.selection.as_ref()?;
+
+    // Partition the WHERE conjuncts into correlation predicates (equality
+    // between a target-table column and a subquery-side column) and local
+    // predicates (everything else).
+    let mut conjuncts: Vec<&Expr> = Vec::new();
+    collect_and_conjuncts(where_expr, &mut conjuncts);
+
+    let mut correlation: Vec<(String, String)> = Vec::new();
+    let mut local_preds: Vec<String> = Vec::new();
+    for c in conjuncts {
+        if let Some((t_col, s_col)) = extract_correlation_eq(c, target_name) {
+            correlation.push((t_col, s_col));
+        } else {
+            local_preds.push(format!("{c}"));
+        }
+    }
+    if correlation.is_empty() {
+        return None;
+    }
+
+    // Rebuild FROM clause verbatim (sqlparser's Display handles joins).
+    let from_sql = select
+        .from
+        .iter()
+        .map(|t| format!("{t}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if from_sql.is_empty() {
+        return None;
+    }
+
+    let alias = format!("__corr{idx}");
+    let select_cols: Vec<String> = correlation
+        .iter()
+        .enumerate()
+        .map(|(i, (_, s))| format!("({s}) AS __k{i}"))
+        .collect();
+    let group_by: Vec<String> = correlation.iter().map(|(_, s)| s.clone()).collect();
+
+    let where_sql = if local_preds.is_empty() {
+        "TRUE".to_string()
+    } else {
+        local_preds.join(" AND ")
+    };
+
+    let decorr_sql = format!(
+        "SELECT {cols}, MAX({scalar}) AS __val FROM {from} WHERE {where_} GROUP BY {group_by}",
+        cols = select_cols.join(", "),
+        scalar = scalar_expr_sql,
+        from = from_sql,
+        where_ = where_sql,
+        group_by = group_by.join(", "),
+    );
+
+    let on_clauses: Vec<String> = correlation
+        .iter()
+        .enumerate()
+        .map(|(i, (t_col, _))| {
+            format!("\"{alias}\".__k{i} = \"{target_name}\".{t_col}")
+        })
+        .collect();
+
+    let join_sql = format!(
+        "LEFT JOIN ({sub}) AS \"{alias}\" ON {on}",
+        sub = decorr_sql,
+        on = on_clauses.join(" AND "),
+    );
+
+    Some((join_sql, alias))
+}
+
+/// Flatten `a AND b AND c ...` into `[a, b, c]`.
+fn collect_and_conjuncts<'a>(
+    expr: &'a sqlparser::ast::Expr,
+    out: &mut Vec<&'a sqlparser::ast::Expr>,
+) {
+    use sqlparser::ast::{BinaryOperator, Expr};
+    match expr {
+        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+            collect_and_conjuncts(left, out);
+            collect_and_conjuncts(right, out);
+        }
+        Expr::Nested(inner) => collect_and_conjuncts(inner, out),
+        other => out.push(other),
+    }
+}
+
+/// If `pred` is `<target>.col = <alias>.col'` (or the reversed form), return
+/// `Some((<target>.col, <alias>.col'))`. The `<target>.col` is returned as
+/// just the column name (outer target alias is the UPDATE target itself and
+/// applied by the caller when building the ON clause).
+fn extract_correlation_eq(
+    pred: &sqlparser::ast::Expr,
+    target_name: &str,
+) -> Option<(String, String)> {
+    use sqlparser::ast::{BinaryOperator, Expr};
+
+    let (left, right) = match pred {
+        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => (left.as_ref(), right.as_ref()),
+        Expr::Nested(inner) => return extract_correlation_eq(inner, target_name),
+        _ => return None,
+    };
+
+    let left_ref = compound_ident_parts(left);
+    let right_ref = compound_ident_parts(right);
+    match (left_ref, right_ref) {
+        (Some((lq, lc)), Some((rq, rc))) if lq == target_name && rq != target_name => {
+            Some((lc, format!("{rq}.{rc}")))
+        }
+        (Some((lq, lc)), Some((rq, rc))) if rq == target_name && lq != target_name => {
+            Some((rc, format!("{lq}.{lc}")))
+        }
+        _ => None,
+    }
+}
+
+/// If `expr` is a two-part compound identifier `a.b`, return `(a, b)`.
+fn compound_ident_parts(expr: &sqlparser::ast::Expr) -> Option<(String, String)> {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            Some((parts[0].value.clone(), parts[1].value.clone()))
+        }
+        _ => None,
     }
 }
 
@@ -2715,5 +3016,106 @@ mod tests {
         // An empty string yields a single empty segment → invalid.
         let result = parse_ingest_table_name("");
         assert!(result.is_err());
+    }
+
+    // ---------------------------------------------------------------------
+    // Correlated ScalarSubquery decorrelator tests
+    // ---------------------------------------------------------------------
+
+    fn parse_update(sql: &str) -> Vec<sqlparser::ast::Assignment> {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+        let stmts = Parser::parse_sql(&GenericDialect {}, sql).expect("parse UPDATE");
+        match stmts.into_iter().next().expect("one statement") {
+            sqlparser::ast::Statement::Update { assignments, .. } => assignments,
+            _ => panic!("expected UPDATE"),
+        }
+    }
+
+    #[test]
+    fn decorrelator_rewrites_simple_correlated_subquery() {
+        let sql = "\
+UPDATE holding_summary \
+SET hs_qty = hs_qty + ( \
+    SELECT t.t_qty FROM trade t \
+    WHERE t.t_ca_id = holding_summary.hs_ca_id \
+      AND t.t_st_id = 'PNDG' \
+    LIMIT 1 \
+)";
+        let assignments = parse_update(sql);
+        let (rewritten, joins) = decorrelate_scalar_subqueries(&assignments, "holding_summary");
+        assert_eq!(rewritten.len(), 1);
+        assert_eq!(rewritten[0].col_name, "hs_qty");
+        // The scalar subquery must have been replaced with a column reference
+        // into the joined lookup.
+        assert!(
+            rewritten[0].expr_sql.contains("\"__corr0\".\"__val\""),
+            "unexpected rewritten expr: {}",
+            rewritten[0].expr_sql
+        );
+        assert_eq!(joins.len(), 1);
+        assert!(joins[0].contains("LEFT JOIN"));
+        assert!(joins[0].contains("GROUP BY t.t_ca_id"));
+        assert!(joins[0].contains("MAX(t.t_qty)"));
+        assert!(joins[0].contains("t.t_st_id = 'PNDG'"));
+        assert!(joins[0].contains("\"__corr0\".__k0 = \"holding_summary\".hs_ca_id"));
+    }
+
+    #[test]
+    fn decorrelator_handles_two_correlation_keys() {
+        let sql = "\
+UPDATE holding_summary \
+SET hs_qty = ( \
+    SELECT t.t_qty FROM trade t \
+    WHERE t.t_ca_id = holding_summary.hs_ca_id \
+      AND t.t_s_symb = holding_summary.hs_s_symb \
+)";
+        let assignments = parse_update(sql);
+        let (_, joins) = decorrelate_scalar_subqueries(&assignments, "holding_summary");
+        assert_eq!(joins.len(), 1);
+        assert!(joins[0].contains("GROUP BY t.t_ca_id, t.t_s_symb"));
+        assert!(joins[0].contains("__k0 = \"holding_summary\".hs_ca_id"));
+        assert!(joins[0].contains("__k1 = \"holding_summary\".hs_s_symb"));
+    }
+
+    #[test]
+    fn decorrelator_skips_when_no_correlation() {
+        // Subquery with no reference to the UPDATE target — leave as-is.
+        let sql = "\
+UPDATE customer \
+SET c_balance = ( \
+    SELECT MAX(trade_price) FROM trade WHERE t_st_id = 'PNDG' \
+)";
+        let assignments = parse_update(sql);
+        let (rewritten, joins) = decorrelate_scalar_subqueries(&assignments, "customer");
+        assert!(joins.is_empty(), "should not emit joins: {:?}", joins);
+        // Expression should still contain the subquery unchanged.
+        assert!(
+            rewritten[0].expr_sql.contains("SELECT"),
+            "subquery should remain: {}",
+            rewritten[0].expr_sql
+        );
+    }
+
+    #[test]
+    fn decorrelator_skips_when_no_subquery() {
+        let sql = "UPDATE district SET d_ytd = d_ytd + 2500.00 WHERE d_id = 1";
+        let assignments = parse_update(sql);
+        let (rewritten, joins) = decorrelate_scalar_subqueries(&assignments, "district");
+        assert!(joins.is_empty());
+        assert_eq!(rewritten[0].expr_sql, "d_ytd + 2500.00");
+    }
+
+    #[test]
+    fn decorrelator_skips_non_equality_correlation() {
+        // Correlation via `>` — we only decorrelate equality shapes.
+        let sql = "\
+UPDATE t \
+SET c = ( \
+    SELECT x FROM s WHERE s.k > t.k \
+)";
+        let assignments = parse_update(sql);
+        let (_, joins) = decorrelate_scalar_subqueries(&assignments, "t");
+        assert!(joins.is_empty(), "non-eq correlation should be left alone");
     }
 }
