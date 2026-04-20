@@ -16,8 +16,14 @@ client_id = "root"
 client_secret = "s3cr3t"
 
 [query]
-# Benchmarks load large dimension tables (e.g. customer_demographics: 1.9M rows)
-max_result_rows = 0
+# Cap result rows streamed back to the client. The bench occasionally
+# hits pathological queries (e.g. TPC-E trade_result at SF1 returns 20M+
+# rows from a fact-to-dimension cross product because the generator's
+# low-cardinality FK pools force a near-cross product). Collecting that
+# into memory OOMs the coordinator. 10M is plenty for every TPC-H /
+# TPC-DS / SSB / TPC-C query at SF1, catches real generator bugs loudly,
+# and leaves the engine alive for subsequent queries.
+max_result_rows = 10_000_000
 # SF1 loads need enough memory for large CTAS + HashJoins
 max_query_memory = "6GB"
 # SF1 CTAS loads can take >5min for large fact tables
