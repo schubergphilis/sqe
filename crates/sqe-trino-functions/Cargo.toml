@@ -1,0 +1,32 @@
+[package]
+name = "sqe-trino-functions"
+version = "0.15.0"
+edition = "2021"
+
+# Trino-compatible scalar UDFs for DataFusion.
+#
+# Split out of `sqe-coordinator` so an edit to the coordinator's query or
+# write handlers does not force ~4.2k LOC of UDF code (plus its deps:
+# unicode-normalization, rust-stemmers, chrono-tz, regex) to recompile.
+# See openspec change `split-trino-functions` for the rationale.
+
+[dependencies]
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+chrono = { workspace = true }
+datafusion = { workspace = true }
+serde_json = { workspace = true }
+url = { workspace = true }
+base64 = "0.22"
+
+# These four deps move here with the code — nothing else in the workspace
+# uses them, so pulling them out of sqe-coordinator's dep graph is the main
+# incremental-build win of this split.
+regex = { workspace = true }
+unicode-normalization = { workspace = true }
+rust-stemmers = { workspace = true }
+chrono-tz = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+datafusion-functions-json = { workspace = true }
