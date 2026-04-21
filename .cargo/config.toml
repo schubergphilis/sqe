@@ -9,6 +9,19 @@ pipelining = true
 # Pin target directory to prevent parallel agents from creating duplicate
 # build artifacts (which can balloon to 100GB+).
 target-dir = "target"
+# Cap parallel compile jobs. On Apple Silicon (5P+6E), running all 11 cores
+# plus DataFusion/arrow/iceberg-rust link units in parallel pushes memory
+# over the swap threshold on 16 GB machines and makes the system unusable
+# during the build. Four jobs uses only performance cores, keeps peak RSS
+# roughly halved, and typically costs < 15 % of wall-clock vs. unrestricted.
+# Override per-invocation with `cargo build -j N` or `CARGO_BUILD_JOBS=N`.
+jobs = 4
+# sccache was tried here and made things worse on Defender-scanned Macs:
+# every cache miss writes artifacts to BOTH target/ and
+# ~/Library/Caches/Mozilla.sccache, doubling the file surface Defender
+# scans. With IT-managed exclusions unavailable, the wrapper adds pure
+# overhead. Keep sccache installed for occasional `RUSTC_WRAPPER=sccache
+# cargo build` experiments, but leave it off by default.
 
 # ── Local development (macOS) ─────────────────────────────────────────────
 # mold does NOT support macOS native linking (Mach-O format).

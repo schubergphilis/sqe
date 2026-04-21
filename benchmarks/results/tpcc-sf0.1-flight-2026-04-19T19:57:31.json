@@ -1,0 +1,124 @@
+{
+  "benchmark": "tpcc",
+  "scale_factor": 0.1,
+  "protocol": "flight",
+  "timestamp": "2026-04-19T19:57:31",
+  "summary": {
+    "total": 17,
+    "pass": 12,
+    "fail": 0,
+    "diff": 0,
+    "skip": 0,
+    "error": 5,
+    "total_duration_ms": 884
+  },
+  "queries": [
+    {
+      "id": "customer_balance",
+      "status": "pass",
+      "duration_ms": 180,
+      "rows": 0
+    },
+    {
+      "id": "delivery",
+      "status": "pass",
+      "duration_ms": 60,
+      "rows": 0
+    },
+    {
+      "id": "delivery_delete",
+      "status": "pass",
+      "duration_ms": 52,
+      "rows": 1
+    },
+    {
+      "id": "delivery_update_customer",
+      "status": "error",
+      "duration_ms": 2,
+      "rows": 0,
+      "message": "do_get failed: Tonic error: code: 'Internal error', message: \"Catalog operation failed\""
+    },
+    {
+      "id": "delivery_update_orderline",
+      "status": "pass",
+      "duration_ms": 161,
+      "rows": 1
+    },
+    {
+      "id": "delivery_update_orders",
+      "status": "pass",
+      "duration_ms": 43,
+      "rows": 1
+    },
+    {
+      "id": "district_orders",
+      "status": "pass",
+      "duration_ms": 49,
+      "rows": 1
+    },
+    {
+      "id": "new_order",
+      "status": "pass",
+      "duration_ms": 89,
+      "rows": 0
+    },
+    {
+      "id": "new_order_update_district",
+      "status": "pass",
+      "duration_ms": 50,
+      "rows": 1
+    },
+    {
+      "id": "new_order_update_stock",
+      "status": "pass",
+      "duration_ms": 112,
+      "rows": 1
+    },
+    {
+      "id": "order_status",
+      "status": "error",
+      "duration_ms": 4,
+      "rows": 0,
+      "message": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'test_warehouse.default.customer' not found\""
+    },
+    {
+      "id": "payment",
+      "status": "pass",
+      "duration_ms": 30,
+      "rows": 0
+    },
+    {
+      "id": "payment_update_customer",
+      "status": "error",
+      "duration_ms": 2,
+      "rows": 0,
+      "message": "do_get failed: Tonic error: code: 'Internal error', message: \"Catalog operation failed\""
+    },
+    {
+      "id": "payment_update_district",
+      "status": "error",
+      "duration_ms": 2,
+      "rows": 0,
+      "message": "do_get failed: Tonic error: code: 'Internal error', message: \"Catalog operation failed\""
+    },
+    {
+      "id": "payment_update_warehouse",
+      "status": "error",
+      "duration_ms": 1,
+      "rows": 0,
+      "message": "do_get failed: Tonic error: code: 'Internal error', message: \"Catalog operation failed\""
+    },
+    {
+      "id": "stock_level",
+      "status": "pass",
+      "duration_ms": 24,
+      "rows": 1
+    },
+    {
+      "id": "warehouse_summary",
+      "status": "pass",
+      "duration_ms": 23,
+      "rows": 0
+    }
+  ]
+}

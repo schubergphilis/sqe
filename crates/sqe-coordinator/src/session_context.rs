@@ -7,7 +7,7 @@ use moka::future::Cache;
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
-use sqe_catalog::{ManifestCache, SessionCatalog, SqeCatalogProvider, TableMetadataCache};
+use sqe_catalog::{SessionCatalog, SqeCatalogProvider, TableMetadataCache};
 use sqe_core::{Session, SqeConfig, SqeError};
 use sqe_policy::PolicyStore;
 
@@ -48,7 +48,7 @@ static SESSION_CONTEXT_CACHE: LazyLock<Cache<String, (SessionContext, Arc<Sessio
 /// On a cache hit the `SessionContext` and `SessionCatalog` are cloned in O(1)
 /// and returned immediately, skipping all registration work.
 #[allow(clippy::too_many_arguments)]
-#[tracing::instrument(skip(config, session, policy_store, query_tracker, runtime, prom_metrics, manifest_cache, table_cache), fields(username = %session.user.username))]
+#[tracing::instrument(skip(config, session, policy_store, query_tracker, runtime, prom_metrics, table_cache), fields(username = %session.user.username))]
 pub async fn create_session_context(
     config: &SqeConfig,
     session: &Session,
@@ -56,7 +56,6 @@ pub async fn create_session_context(
     query_tracker: &Arc<QueryTracker>,
     runtime: Option<&Arc<RuntimeEnv>>,
     prom_metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
-    manifest_cache: Option<&ManifestCache>,
     table_cache: Option<&TableMetadataCache>,
 ) -> sqe_core::Result<(SessionContext, Arc<SessionCatalog>)> {
     // --- Cache key: username + token fingerprint ---
@@ -175,14 +174,13 @@ pub async fn create_session_context(
             if let Some(m) = prom_metrics {
                 catalog_provider = catalog_provider.with_metrics(Arc::clone(m));
             }
-            if let Some(mc) = manifest_cache {
-                catalog_provider = catalog_provider.with_manifest_cache(mc.clone());
-            }
             // Apply the small-file direct-read threshold from catalog config.
             // Convert MB to bytes; 0 MB disables the fast path.
             let small_file_threshold_bytes = config.catalog.small_file_threshold_mb
                 .saturating_mul(1024 * 1024);
             catalog_provider = catalog_provider.with_small_file_threshold(small_file_threshold_bytes);
+            catalog_provider = catalog_provider
+                .with_manifest_concurrency(config.catalog.manifest_concurrency);
 
             ctx.register_catalog(&catalog_name, Arc::new(catalog_provider));
 

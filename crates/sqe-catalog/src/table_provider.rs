@@ -13,7 +13,6 @@ use iceberg::table::Table;
 use tracing::debug;
 
 use crate::expr_to_predicate;
-use crate::manifest_cache::ManifestCache;
 
 /// DataFusion `TableProvider` that wraps an Iceberg `Table`.
 ///
@@ -38,10 +37,10 @@ pub struct SqeTableProvider {
     snapshot_id: Option<i64>,
     /// Trust Iceberg sort order for all columns (not just partition keys).
     trust_sort_order: bool,
-    /// Optional shared manifest file cache passed down to IcebergScanExec.
-    manifest_cache: Option<ManifestCache>,
     /// Small-file threshold in bytes for the direct-read fast path.
     small_file_threshold_bytes: u64,
+    /// Concurrency for direct manifest walks during pruning.
+    manifest_concurrency: usize,
 }
 
 impl SqeTableProvider {
@@ -65,18 +64,9 @@ impl SqeTableProvider {
             prom_metrics: None,
             trust_sort_order: false,
             snapshot_id: None,
-            manifest_cache: None,
             small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
+            manifest_concurrency: crate::iceberg_scan::DEFAULT_MANIFEST_CONCURRENCY,
         })
-    }
-
-    /// Attach a shared manifest cache to accelerate warm queries.
-    ///
-    /// When set, `IcebergScanExec` will serve manifest entries from the cache
-    /// on repeated scans, avoiding S3 fetches for immutable manifest files.
-    pub fn with_manifest_cache(mut self, cache: ManifestCache) -> Self {
-        self.manifest_cache = Some(cache);
-        self
     }
 
     /// Attach Prometheus metrics for file pruning and S3 I/O.
@@ -91,6 +81,13 @@ impl SqeTableProvider {
     /// from memory, bypassing iceberg-rust's `scan.to_arrow()` pipeline.
     pub fn with_small_file_threshold(mut self, threshold_bytes: u64) -> Self {
         self.small_file_threshold_bytes = threshold_bytes;
+        self
+    }
+
+    /// Set the per-scan concurrency used when walking manifests for
+    /// column-statistics pruning.
+    pub fn with_manifest_concurrency(mut self, concurrency: usize) -> Self {
+        self.manifest_concurrency = concurrency.max(1);
         self
     }
 
@@ -196,10 +193,9 @@ impl TableProvider for SqeTableProvider {
         if self.trust_sort_order {
             exec = exec.with_trust_sort_order(true);
         }
-        if let Some(ref mc) = self.manifest_cache {
-            exec = exec.with_manifest_cache(mc.clone());
-        }
-        exec = exec.with_small_file_threshold(self.small_file_threshold_bytes);
+        exec = exec
+            .with_small_file_threshold(self.small_file_threshold_bytes)
+            .with_manifest_concurrency(self.manifest_concurrency);
         Ok(Arc::new(exec))
     }
 }

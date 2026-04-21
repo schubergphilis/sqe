@@ -136,3 +136,17 @@ split-debuginfo = "unpacked"
 codegen-units = 4        # More parallelism during codegen (default=1)
 lto = "thin"             # Thin LTO: ~80% of full LTO benefit, much faster link
 strip = true             # Strip debug symbols from binary (~50% smaller)
+
+# ── Dev-release profile: optimized runtime, cheap compile ──────
+# Use this for benchmark iteration (`cargo build --profile dev-release`).
+# Drops thin-LTO (big RAM spike at link time) and cranks codegen-units
+# (more parallelism, faster per-crate compile). Same opt-level as release
+# so query perf is representative; binary is a bit larger and lacks the
+# last few % of LTO-driven inlining.
+[profile.dev-release]
+inherits = "release"
+lto = false              # Skip LTO — the link-time RAM peak is what
+                         # pushes the machine into swap thrashing.
+codegen-units = 16       # More parallel codegen per crate; faster wall time.
+incremental = true       # Reuse artifacts across iterations — huge for loop work.
+strip = false            # Keep symbols; benchmarks want readable traces.

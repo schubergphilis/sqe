@@ -82,8 +82,25 @@ impl TrinoQueryExecutor for QueryHandlerAdapter {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+// We build the tokio runtime manually instead of using `#[tokio::main]` so we
+// can set a larger thread stack. See the matching note in `bin/sqe_server.rs`.
+// The 2 MiB default is too small for DataFusion's AST walkers on deep WHERE
+// trees produced by CoW DML rewrites; 8 MiB gives ~4x headroom at no runtime
+// cost. Keep this binary and `sqe_server` in sync.
+fn main() -> anyhow::Result<()> {
+    const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(WORKER_STACK_BYTES)
+        .thread_name("sqe-coordinator")
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build tokio runtime: {e}"))?;
+
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let started_at = Instant::now();
     let ready = Arc::new(AtomicBool::new(false));
 
@@ -170,12 +187,10 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Build the global shared manifest file cache (immutable Iceberg manifests — no TTL).
-    let manifest_cache = sqe_catalog::ManifestCache::new(config.catalog.manifest_cache_mb);
-    tracing::info!(
-        manifest_cache_mb = config.catalog.manifest_cache_mb,
-        "Initialized global Iceberg manifest cache"
-    );
+    // Manifest-list and manifest caching is delegated to iceberg-rust's
+    // per-`Table` `ObjectCache`. Because `TableMetadataCache` (built below)
+    // caches `Table` instances globally, the per-table object cache persists
+    // across queries and sessions.
 
     // Build the global table metadata cache (shared across all sessions and queries).
     // Table metadata is user-independent — schema, partitions, and snapshots are the
@@ -236,7 +251,7 @@ async fn main() -> anyhow::Result<()> {
         query_tracker,
         query_cache,
         grant_backend,
-    )?.with_manifest_cache(manifest_cache).with_table_cache(table_cache));
+    )?.with_table_cache(table_cache));
 
     // Spawn background memory metrics reporter (updates gauges every 1s for Grafana)
     sqe_coordinator::memory::spawn_metrics_reporter(

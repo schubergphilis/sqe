@@ -258,6 +258,44 @@ fn normalize_query_id(id: &str) -> String {
     n.to_string()
 }
 
+/// Strip SQL line comments (`-- ...` to end-of-line, preserving the newline).
+///
+/// The prefixer's "inside a quoted string" heuristic counts apostrophes to
+/// detect string literals, but apostrophes inside comments (e.g.
+/// `-- credit the customer's balance`) trip it up. Comments have no runtime
+/// effect, so we remove them before scanning. Block comments (`/* ... */`)
+/// are rare in the bench queries and left untouched.
+fn strip_line_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                out.push(c);
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                out.push(c);
+            }
+            '-' if !in_single && !in_double && chars.peek() == Some(&'-') => {
+                // Consume the second '-' and the rest of the line.
+                chars.next();
+                for nc in chars.by_ref() {
+                    if nc == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Replace unqualified table names in the query SQL with
 /// `<namespace>.<table>` qualified names.
 ///
@@ -281,7 +319,9 @@ pub(crate) fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> Stri
     // Longest first to prevent "part" matching inside "partsupp"
     tables.sort_by_key(|t| std::cmp::Reverse(t.len()));
 
-    let mut result = sql.to_string();
+    // Strip line comments up front so apostrophes in prose like "customer's"
+    // don't unbalance the string-literal quote check below.
+    let mut result = strip_line_comments(sql);
 
     for table in &tables {
         let qualified = format!("{namespace}.{table}");
@@ -366,8 +406,18 @@ pub(crate) fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> Stri
                 // Check it's not inside a quoted string (heuristic:
                 // count unescaped quotes before this position — odd means inside quotes).
                 // Check both single quotes (SQL string literals) and double quotes (identifiers).
-                let single_quotes_before = remaining[..pos].matches('\'').count();
-                let double_quotes_before = remaining[..pos].matches('"').count();
+                //
+                // Must count across `output + remaining[..pos]`, not just
+                // `remaining[..pos]`. When an earlier occurrence of the same
+                // bare table name was consumed (e.g. the `news_item` inside a
+                // string literal `'news_item'`), its opening quote now lives in
+                // `output` while the closing quote stays in `remaining`. Scoping
+                // the count to `remaining[..pos]` alone yields an odd number and
+                // wrongly flags the real FROM-context match as inside a string.
+                let single_quotes_before =
+                    output.matches('\'').count() + remaining[..pos].matches('\'').count();
+                let double_quotes_before =
+                    output.matches('"').count() + remaining[..pos].matches('"').count();
                 let inside_string = !single_quotes_before.is_multiple_of(2);
                 let inside_identifier = !double_quotes_before.is_multiple_of(2);
                 if !inside_string && !inside_identifier {
@@ -495,6 +545,71 @@ mod tests {
         assert!(result.contains("tpcds_sf1.catalog_returns"), "catalog_returns: {result}");
         assert!(result.contains("tpcds_sf1.call_center"), "call_center: {result}");
         assert!(result.contains("tpcds_sf1.customer"), "customer: {result}");
+    }
+
+    #[test]
+    fn prefix_tables_survives_apostrophe_in_comment() {
+        // Regression: a possessive apostrophe inside a line comment (e.g.
+        // `customer's balance`) used to leave a phantom open quote in the
+        // quote-balance heuristic and disabled qualification for the rest
+        // of the query.
+        let sql = "\
+-- Debit the customer's balance\n\
+UPDATE customer SET c_balance = c_balance - 1 WHERE c_id = 1;";
+        let result = prefix_tables(sql, "tpcc_sf1", "tpcc");
+        assert!(
+            result.contains("UPDATE tpcc_sf1.customer"),
+            "expected UPDATE target qualified:\n{result}"
+        );
+    }
+
+    #[test]
+    fn prefix_tables_survives_string_literal_shadowing_table_name() {
+        // Regression: a SELECT that uses a string literal equal to a table
+        // name (`'news_item'` in TPC-E data_maintenance) used to leave a
+        // phantom open quote after the prefixer advanced past the `news_item`
+        // inside the literal, blocking the real FROM-clause qualification.
+        let sql = "\
+SELECT 'news_item' AS target FROM news_item WHERE 1=1;";
+        let result = prefix_tables(sql, "tpce_sf1", "tpce");
+        assert!(
+            result.contains("FROM tpce_sf1.news_item"),
+            "expected FROM qualified:\n{result}"
+        );
+        assert!(
+            result.contains("'news_item'"),
+            "string literal must not be rewritten:\n{result}"
+        );
+    }
+
+    #[test]
+    fn prefix_tables_qualifies_multiline_from_with_aliases() {
+        // Regression: order_status-style query — multi-line FROM with
+        // bare-name joins plus a correlated subquery in WHERE.
+        let sql = "\
+-- Look up a customer's most recent order\n\
+SELECT c.c_id FROM\n\
+    customer c\n\
+    JOIN orders o ON o.o_c_id = c.c_id\n\
+    JOIN order_line ol ON ol.ol_o_id = o.o_id\n\
+WHERE o.o_id = (\n\
+    SELECT MAX(o2.o_id) FROM orders o2 WHERE o2.o_c_id = c.c_id\n\
+);";
+        let result = prefix_tables(sql, "tpcc_sf1", "tpcc");
+        assert!(
+            result.contains("tpcc_sf1.customer"),
+            "customer must be qualified:\n{result}"
+        );
+        assert!(
+            result.contains("tpcc_sf1.order_line"),
+            "order_line must be qualified:\n{result}"
+        );
+        // `orders` appears twice (outer FROM and inner subquery); both qualified.
+        assert_eq!(
+            result.matches("tpcc_sf1.orders").count(),
+            2,
+            "both `orders` occurrences must be qualified:\n{result}"
+        );
     }
 
     #[test]

@@ -37,7 +37,6 @@ use parquet::arrow::arrow_reader::{
 use parquet::arrow::ProjectionMask;
 use tracing::{debug, info_span, warn};
 
-use crate::manifest_cache::{ManifestCache, ManifestEntryData};
 use crate::pruning_stats::IcebergManifestStatistics;
 
 /// Default small-file threshold: 3 MB.
@@ -45,6 +44,24 @@ use crate::pruning_stats::IcebergManifestStatistics;
 /// Files below this size are read entirely in a single S3 GET and parsed
 /// from memory, bypassing iceberg-rust's `scan.to_arrow()` pipeline.
 pub const DEFAULT_SMALL_FILE_THRESHOLD_BYTES: u64 = 3 * 1024 * 1024;
+
+/// Default concurrency for loading Iceberg manifests during query-time
+/// column-statistics pruning.
+///
+/// Each manifest is a separate S3 GET. On wide snapshots the sequential
+/// walk dominates cold-cache plan latency; loading manifests in parallel
+/// collapses that to roughly one round trip. Warm reads are served from
+/// iceberg-rust's `ObjectCache` and ignore this knob.
+pub const DEFAULT_MANIFEST_CONCURRENCY: usize = 64;
+
+/// Default concurrency for the direct-read small-file fast path.
+///
+/// The fast path reads each eligible file entirely in one S3 GET. Without
+/// parallelism the loop is strictly serial, so total latency is roughly
+/// `files × round_trip`. Fanning out with `buffer_unordered` overlaps the
+/// GETs; 8 matches `storage.max_concurrent_files` and keeps the peak
+/// in-flight bytes bounded (`concurrency × small_file_threshold`).
+pub const DEFAULT_DIRECT_READ_CONCURRENCY: usize = 8;
 
 #[derive(Debug)]
 pub struct IcebergScanExec {
@@ -62,10 +79,6 @@ pub struct IcebergScanExec {
     /// by a sort-on-write engine). Default false: only partition columns are trusted.
     /// WARNING: if data is not actually sorted, queries may return incorrect results.
     trust_sort_order: bool,
-    /// Optional shared manifest file cache. When set, parsed manifest entries are
-    /// served from the cache on warm queries, avoiding S3 round-trips per manifest.
-    /// Immutability of Iceberg manifest files makes this safe without a TTL.
-    manifest_cache: Option<ManifestCache>,
     /// Maximum file size in bytes for the direct-read fast path.
     ///
     /// When all data files in the scan are smaller than this threshold, SQE reads
@@ -86,6 +99,20 @@ pub struct IcebergScanExec {
     /// These are `PhysicalExpr`s (not logical `Expr`s) because they come from the
     /// physical optimizer, after logical-to-physical conversion has already occurred.
     pushed_down_filters: Vec<Arc<dyn PhysicalExpr>>,
+    /// Concurrency for direct manifest walks (column-stats pruning path).
+    ///
+    /// The primary scan planner goes through `Table::scan().plan_files()` which
+    /// has its own internal concurrency limit. This field only applies to the
+    /// pruning walks that need `DataFile` column statistics (lower/upper
+    /// bounds, null counts) which `FileScanTask` does not expose. Defaults to
+    /// [`DEFAULT_MANIFEST_CONCURRENCY`].
+    manifest_concurrency: usize,
+    /// Concurrency for the direct-read small-file fast path.
+    ///
+    /// When the fast path is active, each eligible file becomes a single S3
+    /// GET. This field sets how many of those GETs are in flight at once via
+    /// `buffer_unordered`. Defaults to [`DEFAULT_DIRECT_READ_CONCURRENCY`].
+    direct_read_concurrency: usize,
 }
 
 impl IcebergScanExec {
@@ -156,17 +183,7 @@ impl IcebergScanExec {
             }
         };
         let properties = Arc::new(PlanProperties::new(eq_props, Partitioning::UnknownPartitioning(1), EmissionType::Incremental, Boundedness::Bounded));
-        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, manifest_cache: None, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![] }
-    }
-
-    /// Attach a shared manifest file cache for warm-query acceleration.
-    ///
-    /// When set, `collect_data_files()` checks the cache before fetching each
-    /// manifest from S3. Safe without a TTL because Iceberg manifest files are
-    /// immutable by specification.
-    pub fn with_manifest_cache(mut self, cache: ManifestCache) -> Self {
-        self.manifest_cache = Some(cache);
-        self
+        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![], manifest_concurrency: DEFAULT_MANIFEST_CONCURRENCY, direct_read_concurrency: DEFAULT_DIRECT_READ_CONCURRENCY }
     }
 
     /// Set the snapshot ID for time travel queries.
@@ -185,6 +202,23 @@ impl IcebergScanExec {
     /// Pass `0` to disable the fast path for all files.
     pub fn with_small_file_threshold(mut self, threshold_bytes: u64) -> Self {
         self.small_file_threshold_bytes = threshold_bytes;
+        self
+    }
+
+    /// Set the concurrency for direct manifest walks during pruning.
+    ///
+    /// A value of `0` is treated as `1` (sequential fallback) to avoid a
+    /// zero-width `buffer_unordered` which would stall.
+    pub fn with_manifest_concurrency(mut self, concurrency: usize) -> Self {
+        self.manifest_concurrency = concurrency.max(1);
+        self
+    }
+
+    /// Set the concurrency for the direct-read small-file fast path.
+    ///
+    /// A value of `0` is treated as `1` (sequential fallback).
+    pub fn with_direct_read_concurrency(mut self, concurrency: usize) -> Self {
+        self.direct_read_concurrency = concurrency.max(1);
         self
     }
 
@@ -232,9 +266,10 @@ impl IcebergScanExec {
             metrics: ExecutionPlanMetricsSet::new(),
             snapshot_id: self.snapshot_id,
             trust_sort_order: self.trust_sort_order,
-            manifest_cache: self.manifest_cache.clone(),
             small_file_threshold_bytes: self.small_file_threshold_bytes,
             pushed_down_filters: filters,
+            manifest_concurrency: self.manifest_concurrency,
+            direct_read_concurrency: self.direct_read_concurrency,
         }
     }
 
@@ -296,74 +331,45 @@ impl IcebergScanExec {
         Ok((result, pruned_count))
     }
 
+    /// Load all live data files (with full column statistics) for the current snapshot.
+    ///
+    /// Returns `DataFile` objects including `lower_bounds` / `upper_bounds` /
+    /// `null_value_counts` needed by `PruningPredicate`. `FileScanTask` from
+    /// `Table::scan().plan_files()` does not expose those maps, so the pruning
+    /// path walks manifests directly.
+    ///
+    /// Routes both the manifest-list and per-manifest reads through
+    /// `Table::object_cache()`, so warm queries (any prior `plan_files()` call
+    /// on the same snapshot) are served from memory without additional S3
+    /// GETs. Cold reads are parallelised with `buffer_unordered` at
+    /// `self.manifest_concurrency`.
     pub async fn collect_data_files(&self) -> Result<Vec<DataFile>, iceberg::Error> {
-        let metadata = self.table.metadata();
+        let metadata_ref = self.table.metadata_ref();
         let snapshot = if let Some(sid) = self.snapshot_id {
-            match metadata.snapshot_by_id(sid) { Some(s) => s, None => return Ok(vec![]) }
+            match metadata_ref.snapshot_by_id(sid) { Some(s) => s, None => return Ok(vec![]) }
         } else {
-            match metadata.current_snapshot() { Some(s) => s, None => return Ok(vec![]) }
+            match metadata_ref.current_snapshot() { Some(s) => s, None => return Ok(vec![]) }
         };
-        let manifest_list = snapshot.load_manifest_list(self.table.file_io(), metadata).await?;
-        let mut data_files = Vec::new();
-        for mf in manifest_list.entries() {
-            // Populate the cache on first load; subsequent callers that only need
-            // file paths + sizes (not full column stats) can use data_file_info()
-            // which is backed by iceberg's plan_files() API.
-            //
-            // Note: collect_data_files() is used by the min/max pruning path which
-            // needs full DataFile objects with column statistics. Therefore we always
-            // load the manifest from S3 here. The cache provides a fast-path skip
-            // only for manifests known to be empty (contains no live data files).
-            if let Some(ref mc) = self.manifest_cache {
-                if let Some(cached_entries) = mc.get(&mf.manifest_path) {
-                    if cached_entries.is_empty() {
-                        // Skip S3 fetch for known-empty manifests.
-                        debug!(manifest = %mf.manifest_path, "Manifest cache: skip empty manifest");
-                        continue;
-                    }
-                    // Non-empty: fall through to load full DataFile for pruning stats.
-                }
-            }
-
-            let manifest = mf.load_manifest(self.table.file_io()).await?;
-
-            // Populate the cache so data_file_info() and empty-manifest skipping
-            // can benefit on warm queries.
-            if let Some(ref mc) = self.manifest_cache {
-                if mc.get(&mf.manifest_path).is_none() {
-                    let cache_entries: Vec<ManifestEntryData> = manifest
-                        .entries()
-                        .iter()
-                        .filter(|e| {
-                            e.status() != ManifestStatus::Deleted
-                                && e.data_file().content_type() == DataContentType::Data
-                        })
-                        .map(|e| {
-                            let df = e.data_file();
-                            ManifestEntryData {
-                                file_path: df.file_path().to_string(),
-                                file_size: df.file_size_in_bytes(),
-                                record_count: df.record_count(),
-                                content_type: df.content_type(),
-                                status: e.status(),
-                            }
-                        })
-                        .collect();
-                    debug!(
-                        manifest = %mf.manifest_path,
-                        entries = cache_entries.len(),
-                        "Manifest cache: populated"
-                    );
-                    mc.insert(mf.manifest_path.clone(), cache_entries);
-                }
-            }
-
-            for entry in manifest.entries() {
-                if entry.status() != ManifestStatus::Deleted && entry.data_file().content_type() == DataContentType::Data {
-                    data_files.push(entry.data_file().clone());
-                }
-            }
-        }
+        let cache = self.table.object_cache();
+        let manifest_list = cache.get_manifest_list(snapshot, &metadata_ref).await?;
+        let concurrency = self.manifest_concurrency.max(1);
+        let manifests: Vec<Arc<iceberg::spec::Manifest>> = futures::stream::iter(manifest_list.entries().iter().cloned())
+            .map(|mf| { let cache = cache.clone(); async move { cache.get_manifest(&mf).await } })
+            .buffer_unordered(concurrency)
+            .try_collect()
+            .await?;
+        let data_files = manifests
+            .into_iter()
+            .flat_map(|manifest| {
+                manifest
+                    .entries()
+                    .iter()
+                    .filter(|e| e.status() != ManifestStatus::Deleted
+                        && e.data_file().content_type() == DataContentType::Data)
+                    .map(|e| e.data_file().clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         Ok(data_files)
     }
 
@@ -591,8 +597,9 @@ impl ExecutionPlan for IcebergScanExec {
         let projection = self.projection.clone();
         let predicates = self.predicates.clone();
         let snapshot_id = self.snapshot_id;
-        let manifest_cache = self.manifest_cache.clone();
         let small_file_threshold = self.small_file_threshold_bytes;
+        let manifest_concurrency = self.manifest_concurrency;
+        let direct_read_concurrency = self.direct_read_concurrency;
         let pushed_down_filters = self.pushed_down_filters.clone();
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         let _files_pruned_minmax = MetricBuilder::new(&self.metrics).counter("files_pruned_minmax", partition);
@@ -619,12 +626,19 @@ impl ExecutionPlan for IcebergScanExec {
         let schema_for_stream = schema.clone();
         let stream = futures::stream::once(async move {
             let schema = schema_for_stream;
-            // ── Collect data file list from our cache-backed path ────────────
+            // ── Collect data file list via iceberg-rust's scan planner ────────
             //
-            // `collect_data_files_cached` reads the snapshot's manifest list (1 S3 GET
-            // on first call) and then serves each manifest's entries from the
-            // ManifestCache, avoiding redundant S3 fetches on warm queries.
-            let mut file_entries = collect_data_files_cached(&table, snapshot_id, manifest_cache.as_ref()).await?;
+            // `Table::scan().plan_files()` reads the manifest list and manifests
+            // through iceberg-rust's internal `ObjectCache`, which is kept warm
+            // across queries because `TableMetadataCache` caches `Table` instances
+            // globally. On a warm table this is served from memory; on cold, it
+            // is one manifest-list GET plus one GET per manifest.
+            let mut file_entries = collect_data_files_via_plan(
+                &table,
+                snapshot_id,
+                projection.as_deref(),
+                predicates.as_ref(),
+            ).await?;
 
             if file_entries.is_empty() {
                 let empty = RecordBatch::new_empty(schema.clone());
@@ -665,7 +679,6 @@ impl ExecutionPlan for IcebergScanExec {
                 );
 
                 let file_io = table.file_io().clone();
-                let mut all_batches: Vec<RecordBatch> = Vec::new();
 
                 // Snapshot dynamic filters NON-BLOCKING.
                 // Never call wait_complete() — it deadlocks when this scan is
@@ -704,7 +717,7 @@ impl ExecutionPlan for IcebergScanExec {
                 if !resolved_filters.is_empty() && file_entries.len() > 1 {
                     let file_paths: std::collections::HashSet<String> =
                         file_entries.iter().map(|(p, _)| p.clone()).collect();
-                    match collect_data_files_for_pruning(&table, snapshot_id, &file_paths).await {
+                    match collect_data_files_for_pruning(&table, snapshot_id, &file_paths, manifest_concurrency).await {
                         Ok(data_files) if !data_files.is_empty() => {
                             let iceberg_schema = table.metadata().current_schema();
                             let (kept, pruned_count) =
@@ -737,94 +750,135 @@ impl ExecutionPlan for IcebergScanExec {
                     }
                 }
 
-                for (path, size) in &file_entries {
-                    debug!(path = %path, size = size, "Direct-read: reading file");
+                // Parallel small-file fast path.
+                //
+                // Each file is a single S3 GET plus an in-memory Parquet decode.
+                // We fan these out with `buffer_unordered(direct_read_concurrency)`
+                // so per-file latency is amortised across concurrent requests
+                // instead of accumulating serially. Order within the resulting
+                // batch stream is not preserved, which DataFusion tolerates: the
+                // scan is already marked `UnknownPartitioning`.
+                //
+                // Per-task captures are all cheap: `FileIO` and `SchemaRef` are
+                // `Arc`, `projection` is an `Option<Vec<String>>` sized O(query
+                // columns), and `resolved_filters` is wrapped in an outer `Arc`
+                // so clones are refcount bumps.
+                let concurrency = direct_read_concurrency.max(1);
+                let resolved_filters = Arc::new(resolved_filters);
+                let per_file_results: Vec<Vec<RecordBatch>> = futures::stream::iter(
+                    file_entries.into_iter().map(|(path, size)| {
+                        let file_io = file_io.clone();
+                        let projection = projection.clone();
+                        let schema = schema.clone();
+                        let resolved_filters = Arc::clone(&resolved_filters);
+                        async move {
+                            debug!(path = %path, size = size, "Direct-read: reading file");
 
-                    let input = file_io
-                        .new_input(path)
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                    let bytes = input
-                        .read()
-                        .await
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                            let input = file_io
+                                .new_input(&path)
+                                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                            let bytes = input
+                                .read()
+                                .await
+                                .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                    // Parse Parquet from the in-memory bytes.
-                    // `bytes::Bytes` implements `ChunkReader` so this works directly.
-                    let reader_opts = ArrowReaderOptions::new().with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required);
-                    let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(bytes, reader_opts)
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                            // Parse Parquet from the in-memory bytes.
+                            // `bytes::Bytes` implements `ChunkReader` so this works directly.
+                            let reader_opts = ArrowReaderOptions::new().with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required);
+                            let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(bytes, reader_opts)
+                                .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                    // Apply column projection by mapping column names to Parquet indices.
-                    // For COUNT(*) queries, projection is Some([]) (empty list) -- we read
-                    // just the first column to get the row count, then discard the data.
-                    let builder = if let Some(ref cols) = projection {
-                        let parquet_schema = builder.parquet_schema().clone();
-                        let arrow_schema = builder.schema().clone();
-                        let indices: Vec<usize> = cols
-                            .iter()
-                            .filter_map(|col| {
-                                arrow_schema.fields().iter().position(|f| f.name() == col)
-                            })
-                            .collect();
-                        if indices.is_empty() {
-                            // COUNT(*) or similar: no columns needed, just row count.
-                            // Read the smallest column (first one) to get the row count.
-                            let mask = ProjectionMask::roots(&parquet_schema, vec![0]);
-                            builder.with_projection(mask)
-                        } else {
-                            let mask = ProjectionMask::roots(&parquet_schema, indices);
-                            builder.with_projection(mask)
+                            // Apply column projection by mapping column names to Parquet indices.
+                            // For COUNT(*) queries, projection is Some([]) (empty list) -- we read
+                            // just the first column to get the row count, then discard the data.
+                            //
+                            // The computed ProjectionMask is also reused for the row filter below
+                            // so the predicate sees a batch shaped like `projected_schema`. That is
+                            // required for correctness: `DynamicFilterPhysicalExpr` emitted by the
+                            // hash join encodes `Column(index=N)` where N is the position in the
+                            // scan's projected output schema (not the full Parquet schema). If we
+                            // hand the predicate a full-schema batch, `Column(0)` reads the wrong
+                            // column and the filter silently drops every row whose projected
+                            // column 0 happens not to coincide with full column 0.
+                            let (builder, filter_mask) = if let Some(ref cols) = projection {
+                                let parquet_schema = builder.parquet_schema().clone();
+                                let arrow_schema = builder.schema().clone();
+                                let indices: Vec<usize> = cols
+                                    .iter()
+                                    .filter_map(|col| {
+                                        arrow_schema.fields().iter().position(|f| f.name() == col)
+                                    })
+                                    .collect();
+                                if indices.is_empty() {
+                                    // COUNT(*) or similar: no columns needed, just row count.
+                                    // Read the smallest column (first one) to get the row count.
+                                    let mask = ProjectionMask::roots(&parquet_schema, vec![0]);
+                                    (builder.with_projection(mask.clone()), mask)
+                                } else {
+                                    let mask = ProjectionMask::roots(&parquet_schema, indices);
+                                    (builder.with_projection(mask.clone()), mask)
+                                }
+                            } else {
+                                // No projection: predicate sees the full Parquet schema, which
+                                // matches the scan's projected_schema (they're the same when no
+                                // projection is applied).
+                                (builder, ProjectionMask::all())
+                            };
+
+                            // Apply resolved dynamic filters as Parquet row filters.
+                            //
+                            // Each resolved filter becomes an ArrowPredicate that the Parquet
+                            // reader evaluates per row group / page. Rows that fail the
+                            // predicate are skipped before full decoding, reducing I/O and CPU.
+                            //
+                            // `filter_mask` (computed above) matches the output projection, so
+                            // the predicate evaluates against a batch whose column layout
+                            // matches `projected_schema`. That is the schema the filter's
+                            // column indices were resolved against.
+                            let builder = if !resolved_filters.is_empty() {
+                                let mut predicates: Vec<Box<dyn ArrowPredicate>> = Vec::new();
+                                for filter_expr in resolved_filters.iter() {
+                                    predicates.push(Box::new(PhysicalExprPredicate {
+                                        expr: Arc::clone(filter_expr),
+                                        projection: filter_mask.clone(),
+                                    }));
+                                }
+                                builder.with_row_filter(RowFilter::new(predicates))
+                            } else {
+                                builder
+                            };
+
+                            let reader = builder
+                                .with_batch_size(8192)
+                                .build()
+                                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+                            let is_count_star = projection.as_ref().is_some_and(|cols| cols.is_empty());
+                            let mut batches: Vec<RecordBatch> = Vec::new();
+                            for batch_result in reader {
+                                let batch = batch_result.map_err(|e| DataFusionError::External(Box::new(e)))?;
+                                if is_count_star {
+                                    // For COUNT(*): return empty-column batch with correct row count.
+                                    // DataFusion only needs the row count, not the data.
+                                    batches.push(RecordBatch::try_new_with_options(
+                                        schema.clone(),
+                                        vec![],
+                                        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+                                    ).map_err(|e| DataFusionError::External(Box::new(e)))?);
+                                } else {
+                                    batches.push(batch);
+                                }
+                            }
+                            Ok::<Vec<RecordBatch>, DataFusionError>(batches)
                         }
-                    } else {
-                        builder
-                    };
+                    }),
+                )
+                .buffer_unordered(concurrency)
+                .try_collect()
+                .await?;
 
-                    // Apply resolved dynamic filters as Parquet row filters.
-                    //
-                    // Each resolved filter becomes an ArrowPredicate that the Parquet
-                    // reader evaluates per row group / page. Rows that fail the
-                    // predicate are skipped before full decoding, reducing I/O and CPU.
-                    //
-                    // We use ProjectionMask::all() so the predicate receives all
-                    // columns. This is simpler than computing the minimal column set
-                    // for the filter expression. For an MVP this is acceptable; a
-                    // future optimisation can intersect filter columns with the
-                    // Parquet schema to build a tighter mask.
-                    let builder = if !resolved_filters.is_empty() {
-                        let mut predicates: Vec<Box<dyn ArrowPredicate>> = Vec::new();
-                        for filter_expr in &resolved_filters {
-                            let mask = ProjectionMask::all();
-                            predicates.push(Box::new(PhysicalExprPredicate {
-                                expr: Arc::clone(filter_expr),
-                                projection: mask,
-                            }));
-                        }
-                        builder.with_row_filter(RowFilter::new(predicates))
-                    } else {
-                        builder
-                    };
-
-                    let reader = builder
-                        .with_batch_size(8192)
-                        .build()
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-                    let is_count_star = projection.as_ref().is_some_and(|cols| cols.is_empty());
-                    for batch_result in reader {
-                        let batch = batch_result.map_err(|e| DataFusionError::External(Box::new(e)))?;
-                        if is_count_star {
-                            // For COUNT(*): return empty-column batch with correct row count.
-                            // DataFusion only needs the row count, not the data.
-                            all_batches.push(RecordBatch::try_new_with_options(
-                                schema.clone(),
-                                vec![],
-                                &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
-                            ).map_err(|e| DataFusionError::External(Box::new(e)))?);
-                        } else {
-                            all_batches.push(batch);
-                        }
-                    }
-                }
+                let all_batches: Vec<RecordBatch> =
+                    per_file_results.into_iter().flatten().collect();
 
                 debug!(batch_count = all_batches.len(), "Direct-read: scan complete");
                 let s: BatchStream = futures::stream::iter(
@@ -927,150 +981,116 @@ impl ExecutionPlan for IcebergScanExec {
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
-/// Collect the set of live data files for the given snapshot using
-/// the ManifestCache where possible.
+/// Collect `(file_path, file_size_bytes)` pairs for the given snapshot via
+/// iceberg-rust's scan planner.
 ///
-/// Returns `(file_path, file_size_bytes)` pairs.  The function loads the
-/// snapshot's manifest *list* from S3 (one unavoidable GET on the first query
-/// for a given snapshot) and then serves each individual manifest's entries
-/// from the cache, avoiding per-manifest S3 fetches on warm queries.
-async fn collect_data_files_cached(
+/// Going through `Table::scan().plan_files()` routes every manifest and
+/// manifest-list read through iceberg-rust's internal `ObjectCache`. Because
+/// `TableMetadataCache` caches `Table` instances globally, the per-`Table`
+/// object cache persists across queries and serves warm reads from memory.
+///
+/// Partition / predicate pruning from `predicates` is also applied here by
+/// the planner, so files that cannot match the query are filtered before
+/// they reach the scan node.
+async fn collect_data_files_via_plan(
     table: &Table,
     snapshot_id: Option<i64>,
-    manifest_cache: Option<&ManifestCache>,
+    projection: Option<&[String]>,
+    predicates: Option<&Predicate>,
 ) -> DFResult<Vec<(String, u64)>> {
-    let metadata = table.metadata();
-    let snapshot = if let Some(sid) = snapshot_id {
-        match metadata.snapshot_by_id(sid) {
-            Some(s) => s,
-            None => return Ok(Vec::new()),
-        }
-    } else {
-        match metadata.current_snapshot() {
-            Some(s) => s,
-            None => return Ok(Vec::new()),
-        }
-    };
+    let mut sb = table.scan();
+    if let Some(sid) = snapshot_id {
+        sb = sb.snapshot_id(sid);
+    }
+    if let Some(cols) = projection {
+        sb = sb.select(cols.iter().map(|s| s.as_str()));
+    }
+    if let Some(pred) = predicates {
+        sb = sb.with_filter(pred.clone());
+    }
+    let scan = sb
+        .build()
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-    let manifest_list = snapshot
-        .load_manifest_list(table.file_io(), metadata)
+    let tasks: Vec<iceberg::scan::FileScanTask> = scan
+        .plan_files()
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .try_collect()
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-    let mut file_entries: Vec<(String, u64)> = Vec::new();
-
-    for mf in manifest_list.entries() {
-        // Fast path: serve from cache when available.
-        if let Some(mc) = manifest_cache {
-            if let Some(cached) = mc.get(&mf.manifest_path) {
-                for entry in cached.iter() {
-                    if entry.status != ManifestStatus::Deleted
-                        && entry.content_type == DataContentType::Data
-                    {
-                        file_entries.push((entry.file_path.clone(), entry.file_size));
-                    }
-                }
-                continue; // Cache hit — skip S3 read for this manifest.
-            }
-        }
-
-        // Cache miss (or no cache): load manifest from S3.
-        let manifest = mf
-            .load_manifest(table.file_io())
-            .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-        // Populate the cache so subsequent calls are served from memory.
-        if let Some(mc) = manifest_cache {
-            if mc.get(&mf.manifest_path).is_none() {
-                let cache_entries: Vec<ManifestEntryData> = manifest
-                    .entries()
-                    .iter()
-                    .filter(|e| {
-                        e.status() != ManifestStatus::Deleted
-                            && e.data_file().content_type() == DataContentType::Data
-                    })
-                    .map(|e| {
-                        let df = e.data_file();
-                        ManifestEntryData {
-                            file_path: df.file_path().to_string(),
-                            file_size: df.file_size_in_bytes(),
-                            record_count: df.record_count(),
-                            content_type: df.content_type(),
-                            status: e.status(),
-                        }
-                    })
-                    .collect();
-                debug!(
-                    manifest = %mf.manifest_path,
-                    entries = cache_entries.len(),
-                    "collect_data_files_cached: populated manifest cache"
-                );
-                mc.insert(mf.manifest_path.clone(), cache_entries);
-            }
-        }
-
-        for entry in manifest.entries() {
-            if entry.status() != ManifestStatus::Deleted
-                && entry.data_file().content_type() == DataContentType::Data
-            {
-                let df = entry.data_file();
-                file_entries.push((df.file_path().to_string(), df.file_size_in_bytes()));
-            }
-        }
-    }
-
-    Ok(file_entries)
+    Ok(tasks
+        .into_iter()
+        .map(|t| (t.data_file_path, t.file_size_in_bytes))
+        .collect())
 }
 
 /// Collect full `DataFile` objects (with column statistics) for the given snapshot.
 ///
-/// Unlike `collect_data_files_cached` which returns lightweight `(path, size)` pairs,
+/// Unlike `collect_data_files_via_plan` which returns lightweight `(path, size)` pairs,
 /// this function loads the full manifest entries with lower/upper bounds needed for
 /// `PruningPredicate` evaluation. Used by dynamic-filter file-level pruning.
 ///
 /// Only files matching the given `file_paths` set are returned, so callers can
 /// restrict to the files they actually intend to read.
+///
+/// Routes reads through `Table::object_cache()` so warm queries (same
+/// snapshot after a prior `plan_files()` call) avoid redundant S3 GETs.
+/// Cold reads are parallelised with `buffer_unordered` at `concurrency`.
 async fn collect_data_files_for_pruning(
     table: &Table,
     snapshot_id: Option<i64>,
     file_paths: &std::collections::HashSet<String>,
+    concurrency: usize,
 ) -> DFResult<Vec<DataFile>> {
-    let metadata = table.metadata();
+    let metadata_ref = table.metadata_ref();
     let snapshot = if let Some(sid) = snapshot_id {
-        match metadata.snapshot_by_id(sid) {
+        match metadata_ref.snapshot_by_id(sid) {
             Some(s) => s,
             None => return Ok(Vec::new()),
         }
     } else {
-        match metadata.current_snapshot() {
+        match metadata_ref.current_snapshot() {
             Some(s) => s,
             None => return Ok(Vec::new()),
         }
     };
 
-    let manifest_list = snapshot
-        .load_manifest_list(table.file_io(), metadata)
+    let cache = table.object_cache();
+    let manifest_list = cache
+        .get_manifest_list(snapshot, &metadata_ref)
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-    let mut data_files: Vec<DataFile> = Vec::new();
+    let concurrency = concurrency.max(1);
+    let manifests: Vec<Arc<iceberg::spec::Manifest>> = futures::stream::iter(
+        manifest_list.entries().iter().cloned(),
+    )
+    .map(|mf| {
+        let cache = cache.clone();
+        async move { cache.get_manifest(&mf).await }
+    })
+    .buffer_unordered(concurrency)
+    .try_collect()
+    .await
+    .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-    for mf in manifest_list.entries() {
-        let manifest = mf
-            .load_manifest(table.file_io())
-            .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-        for entry in manifest.entries() {
-            if entry.status() != ManifestStatus::Deleted
-                && entry.data_file().content_type() == DataContentType::Data
-                && file_paths.contains(entry.data_file().file_path())
-            {
-                data_files.push(entry.data_file().clone());
-            }
-        }
-    }
+    let data_files = manifests
+        .into_iter()
+        .flat_map(|manifest| {
+            manifest
+                .entries()
+                .iter()
+                .filter(|entry| {
+                    entry.status() != ManifestStatus::Deleted
+                        && entry.data_file().content_type() == DataContentType::Data
+                        && file_paths.contains(entry.data_file().file_path())
+                })
+                .map(|entry| entry.data_file().clone())
+                .collect::<Vec<_>>()
+        })
+        .collect();
 
     Ok(data_files)
 }
@@ -1161,33 +1181,12 @@ impl PhysicalExprPredicate {
         let mut new_columns: Vec<arrow::array::ArrayRef> = Vec::with_capacity(batch.num_columns());
         let mut new_fields: Vec<arrow::datatypes::FieldRef> = Vec::with_capacity(batch.num_columns());
 
-        // Collect the types the expression references for each column
-        let expected_types: std::collections::HashMap<usize, arrow::datatypes::DataType> =
-            std::collections::HashMap::new();
-
-        // Extract column references from the expression tree
-        fn collect_column_types(
-            expr: &Arc<dyn PhysicalExpr>,
-            expected: &mut std::collections::HashMap<usize, arrow::datatypes::DataType>,
-        ) {
-            if let Some(col) = expr.as_any().downcast_ref::<datafusion::physical_plan::expressions::Column>() {
-                // The expression expects this column to have a specific type
-                if let Ok(dt) = expr.data_type(&arrow::datatypes::Schema::empty()) {
-                    // data_type on a Column returns the column's own type, not useful
-                    // We need the PARENT expression's expected type instead
-                    let _ = dt; // Column type from expression, will use parent context
-                }
-                let _ = col; // We'll use a different approach
-            }
-            for child in expr.children() {
-                collect_column_types(child, expected);
-            }
-        }
-
-        // Simpler approach: try to evaluate. If it fails with type mismatch,
-        // identify the mismatched columns from the error and cast them.
-        // But even simpler: just widen all integer columns to Int64 and all
-        // string columns to Utf8, which covers the common Iceberg type gaps.
+        // Widen narrow integer columns to Int64 and narrow string columns to
+        // Utf8. Covers the common Iceberg vs DataFusion type gaps (Iceberg
+        // integers materialise as Int32, predicates compare against Int64).
+        // Earlier iterations tried to walk the expression tree to collect the
+        // expected type per column; the heuristic below proved sufficient and
+        // kept that machinery from paying for itself.
         for (i, field) in expr_schema.fields().iter().enumerate() {
             let col = batch.column(i);
             let actual_type = col.data_type();
@@ -1224,10 +1223,6 @@ impl PhysicalExprPredicate {
                 new_fields.push(field.clone());
             }
         }
-
-        // Suppress unused warnings for the helper function
-        let _ = collect_column_types;
-        let _ = expected_types;
 
         if needs_cast {
             let new_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(new_fields));

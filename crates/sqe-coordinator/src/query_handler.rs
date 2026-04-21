@@ -5,8 +5,10 @@ use arrow_array::RecordBatch;
 use arrow_array::{ArrayRef, BooleanArray, Int64Array, builder::StringBuilder};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::{collect, ExecutionPlan};
+use datafusion::physical_plan::{execute_stream, ExecutionPlan};
+use futures::TryStreamExt;
 use datafusion::prelude::SessionContext;
 use tracing::{debug, info, warn, Span};
 
@@ -28,12 +30,15 @@ use crate::query_tracker::{FragmentState, QueryTracker};
 use crate::write_handler::WriteHandler;
 
 /// Per-query resource metrics extracted from the executed physical plan tree.
+///
+/// `pub(crate)` so the streaming finalizer can construct and inspect
+/// these alongside the existing `execute()` path.
 #[derive(Debug, Clone, Default)]
-struct PlanMetrics {
-    bytes_scanned: u64,
-    rows_scanned: u64,
-    spill_bytes: u64,
-    peak_memory_bytes: u64,
+pub(crate) struct PlanMetrics {
+    pub(crate) bytes_scanned: u64,
+    pub(crate) rows_scanned: u64,
+    pub(crate) spill_bytes: u64,
+    pub(crate) peak_memory_bytes: u64,
 }
 
 /// Determine the effective query timeout for a session.
@@ -75,9 +80,6 @@ pub struct QueryHandler {
     /// Shared DataFusion runtime with FairSpillPool memory management.
     /// Built once at startup and reused across all queries.
     runtime: Arc<RuntimeEnv>,
-    /// Optional shared manifest file cache. Passed to every session context so
-    /// that warm queries avoid re-fetching immutable Iceberg manifest files from S3.
-    manifest_cache: Option<sqe_catalog::ManifestCache>,
     /// Shared global table metadata cache. Persists across sessions and queries so
     /// that repeated `load_table()` calls skip the Polaris REST round-trip.
     table_cache: Option<sqe_catalog::TableMetadataCache>,
@@ -132,20 +134,9 @@ impl QueryHandler {
             query_cache,
             query_semaphore,
             runtime,
-            manifest_cache: None,
             table_cache: None,
             grant_backend,
         })
-    }
-
-    /// Attach a shared manifest file cache used to accelerate repeated scans.
-    ///
-    /// The cache is propagated to every session context and down to each
-    /// `IcebergScanExec`. Call once at coordinator startup with a globally
-    /// shared `ManifestCache` instance.
-    pub fn with_manifest_cache(mut self, cache: sqe_catalog::ManifestCache) -> Self {
-        self.manifest_cache = Some(cache);
-        self
     }
 
     /// Attach a global table metadata cache shared across all sessions and queries.
@@ -679,6 +670,243 @@ impl QueryHandler {
         result
     }
 
+    /// Plan and open a streaming SELECT without buffering the result.
+    ///
+    /// Returns `(schema, stream)`. Batches are yielded from DataFusion to
+    /// the caller one at a time; the coordinator never accumulates the
+    /// full result set. Memory-bound intermediate state (hash joins,
+    /// sorts, group-bys) is handled by DataFusion's spill-aware operators
+    /// against the shared [`FairSpillPool`], so arbitrarily large result
+    /// sets can flow through without the coordinator being killed by the
+    /// OS for exceeding its memory limit.
+    ///
+    /// The returned stream is wrapped in a [`crate::streaming::TrackedRecordBatchStream`]
+    /// that records query tracker / metrics / audit state when the stream
+    /// ends (clean EOF, error, or client drop). A held concurrency permit
+    /// keeps the query counted against `max_concurrent_queries` for the
+    /// full streaming lifetime.
+    ///
+    /// Only [`StatementKind::Query`] is supported. Any other statement
+    /// returns [`SqeError::NotImplemented`]; the caller should fall back
+    /// to [`Self::execute`] in that case. DML that materializes a result
+    /// set (INSERT, MERGE, DELETE, UPDATE) still goes through the
+    /// buffered path because the write handlers consume a `Vec<RecordBatch>`.
+    #[tracing::instrument(
+        skip(self, session, sql),
+        fields(
+            db.system.name = "sqe",
+            username = %session.user.username,
+            sql_length = sql.len(),
+        ),
+        name = "execute_stream",
+    )]
+    pub async fn execute_stream(
+        &self,
+        session: &Session,
+        sql: &str,
+    ) -> sqe_core::Result<(SchemaRef, SendableRecordBatchStream)> {
+        // --- Admission control -------------------------------------------------
+        let pressure = crate::memory::check_pressure(&self.runtime.memory_pool);
+        if let Some(ref metrics) = self.metrics {
+            metrics.coordinator_memory_pressure.set(pressure.as_gauge());
+            metrics
+                .coordinator_memory_used_bytes
+                .set(crate::memory::used_bytes(&self.runtime.memory_pool) as f64);
+            metrics
+                .coordinator_memory_limit_bytes
+                .set(crate::memory::limit_bytes(&self.runtime.memory_pool) as f64);
+        }
+        if !pressure.admits_new_query() {
+            warn!(
+                pressure = %pressure,
+                username = %session.user.username,
+                "Rejecting streaming query due to memory pressure"
+            );
+            let sort_cols = extract_order_by_columns(sql);
+            return Err(SqeError::Execution(
+                adaptive_sort::format_pressure_rejection(&sort_cols, pressure),
+            ));
+        }
+
+        // Acquire owned concurrency permit so it can be moved into the
+        // stream wrapper and released when the client finishes draining.
+        let permit = if let Some(ref sem) = self.query_semaphore {
+            match Arc::clone(sem).try_acquire_owned() {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    return Err(SqeError::Execution(format!(
+                        "Too many concurrent queries ({} active). Please retry later.",
+                        self.config.query.max_concurrent_queries
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
+        // --- Classify ---------------------------------------------------------
+        let kind = parse_and_classify(sql)?;
+        let kind_name = kind.name().to_string();
+        if !matches!(kind, StatementKind::Query(_)) {
+            return Err(SqeError::NotImplemented(
+                "execute_stream only supports SELECT queries; \
+                 use execute() for DML and metadata statements"
+                    .into(),
+            ));
+        }
+
+        // --- Start tracker ----------------------------------------------------
+        let start = std::time::Instant::now();
+        let query_id = uuid::Uuid::now_v7();
+        info!(
+            query_id = %query_id,
+            username = %session.user.username,
+            sql_length = sql.len(),
+            "Starting streaming query"
+        );
+        self.query_tracker.start(
+            query_id,
+            &session.user.username,
+            session.source.as_deref(),
+            sql,
+            &session.id,
+            None,
+            session.user.roles.clone(),
+        );
+
+        // --- Plan + open DataFusion stream -----------------------------------
+        match self.open_stream(session, sql, &query_id, start).await {
+            Ok((schema, inner_stream, final_plan)) => {
+                let finalizer = crate::streaming::StreamFinalizer {
+                    tracker: Arc::clone(&self.query_tracker),
+                    metrics: self.metrics.clone(),
+                    audit: self.audit.clone(),
+                    query_id,
+                    username: session.user.username.clone(),
+                    session_id: session.id.clone(),
+                    sql: sql.to_string(),
+                    kind_name,
+                    plan: final_plan,
+                    runtime: Arc::clone(&self.runtime),
+                    start,
+                    slow_query_threshold_secs: self.config.query.slow_query_threshold_secs,
+                    sql_length: sql.len(),
+                };
+
+                let tracked = crate::streaming::TrackedRecordBatchStream::new(
+                    inner_stream,
+                    finalizer,
+                    permit,
+                );
+                let boxed: SendableRecordBatchStream = Box::pin(tracked);
+                Ok((schema, boxed))
+            }
+            Err(e) => {
+                // Planning failure: mark failed and return. The permit
+                // (held in this function's scope) drops here and the
+                // semaphore slot is released.
+                self.query_tracker.failed(&query_id, &e);
+                if let Some(ref metrics) = self.metrics {
+                    metrics
+                        .query_count
+                        .with_label_values(&["error", &kind_name])
+                        .inc();
+                    metrics
+                        .query_duration
+                        .with_label_values(&[&kind_name])
+                        .observe(start.elapsed().as_secs_f64());
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Build the physical plan and open a DataFusion record-batch stream.
+    ///
+    /// This is the streaming counterpart to [`Self::execute_query`]: it
+    /// reproduces the same planning, policy-enforcement, physical-plan
+    /// building, star-schema reorder, adaptive-sort, and `try_distribute`
+    /// steps, but returns the opened [`SendableRecordBatchStream`] plus
+    /// the final plan instead of draining into a `Vec<RecordBatch>`.
+    async fn open_stream(
+        &self,
+        session: &Session,
+        sql: &str,
+        query_id: &uuid::Uuid,
+        start: std::time::Instant,
+    ) -> sqe_core::Result<(
+        SchemaRef,
+        SendableRecordBatchStream,
+        Arc<dyn ExecutionPlan>,
+    )> {
+        let (ctx, session_catalog) = self.create_session_context(session).await?;
+
+        let sql = self.handle_time_travel(sql, &ctx, &session_catalog).await?;
+        let sql = sql.as_str();
+
+        let df = ctx
+            .sql(sql)
+            .await
+            .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
+        let plan = df.logical_plan().clone();
+        let enforced_plan = self.policy_enforcer.evaluate(&session.user, plan).await?;
+        debug!("Policy-enforced plan (streaming): {:?}", enforced_plan);
+
+        let enforced_df = ctx
+            .execute_logical_plan(enforced_plan)
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to create execution plan: {e}")))?;
+        let physical_plan = enforced_df
+            .create_physical_plan()
+            .await
+            .map_err(|e| SqeError::Execution(format!("Physical plan creation failed: {e}")))?;
+
+        // Star-schema join reorder
+        let physical_plan = if self.config.query.star_schema_reorder {
+            let rule = sqe_planner::StarSchemaReorderRule::new(
+                self.config.query.star_schema_min_ratio,
+            );
+            match rule.optimize(
+                physical_plan.clone(),
+                &datafusion::config::ConfigOptions::new(),
+            ) {
+                Ok(optimized) => optimized,
+                Err(e) => {
+                    debug!(error = %e, "Star-schema join reorder failed, using original plan");
+                    physical_plan
+                }
+            }
+        } else {
+            physical_plan
+        };
+
+        // Adaptive sort stripping
+        let sort_mode = SortMode::parse(&self.config.query.sort_mode);
+        let pressure = crate::memory::check_pressure(&self.runtime.memory_pool);
+        let (physical_plan, sort_decisions) = adaptive_sort::apply_adaptive_sort(
+            physical_plan,
+            sort_mode,
+            pressure,
+            self.metrics.as_ref(),
+        );
+        if let Some(warning) = adaptive_sort::format_sort_warning(&sort_decisions, sort_mode) {
+            debug!(warning = %warning, "Adaptive sort stripping applied (streaming)");
+        }
+
+        // Distribute scan across workers if possible
+        let final_plan = self.try_distribute(physical_plan, session, query_id).await;
+
+        // Planning complete — promote tracker to Running
+        self.query_tracker
+            .running(query_id, start.elapsed().as_millis() as u64);
+
+        let schema = final_plan.schema();
+        let stream = execute_stream(Arc::clone(&final_plan), ctx.task_ctx())
+            .map_err(|e| SqeError::Execution(format!("Query execution failed: {e}")))?;
+
+        Ok((schema, stream, final_plan))
+    }
+
     /// Return the schema for a SQL statement without executing it.
     ///
     /// Only pure SELECT/WITH queries are planned via DataFusion. For all
@@ -791,11 +1019,63 @@ impl QueryHandler {
         // Try to distribute scan work across workers
         let final_plan = self.try_distribute(physical_plan, session, query_id).await;
 
-        // Execute the (possibly distributed) plan
+        // Execute the (possibly distributed) plan.
+        //
+        // We drive the stream manually instead of using DataFusion's `collect()`
+        // so the row-count limit can fire BEFORE the entire result set is
+        // materialised. `collect()` buffers every batch into memory first and
+        // only returns when the plan is exhausted. For an unbounded or
+        // mis-shaped query (e.g. a 20M-row fact-to-dimension cross product) the
+        // buffered `Vec<RecordBatch>` could grow to many GB and trigger an
+        // OS-level OOM kill. Streaming and counting as we go lets the
+        // coordinator reject oversized queries with a clean error and keeps the
+        // process alive for other concurrent requests.
+        //
+        // Two caps apply:
+        //   1. The user-configured `query.max_result_rows` (0 means no explicit
+        //      cap, but see #2).
+        //   2. A hard memory-derived ceiling: `memory_limit / 256` rows, assuming
+        //      a conservative 256-byte average row size. This fires even when
+        //      the config disables #1. The coordinator must never be one query
+        //      away from the OS SIGKILLing the process for crossing the memory
+        //      line, so we always enforce something lower than total memory.
         let output_schema = final_plan.schema();
-        let mut batches = collect(final_plan.clone(), ctx.task_ctx())
-            .await
+        let configured_max = self.config.query.max_result_rows;
+        let memory_ceiling: usize = {
+            let bytes = crate::memory::limit_bytes(&self.runtime.memory_pool);
+            if bytes == 0 { 0 } else { bytes / 256 }
+        };
+        let effective_max: usize = match (configured_max, memory_ceiling) {
+            (0, 0) => 0, // neither cap configured. Falls back to OS behaviour.
+            (0, m) => m,
+            (c, 0) => c,
+            (c, m) => c.min(m),
+        };
+        let mut stream = execute_stream(final_plan.clone(), ctx.task_ctx())
             .map_err(|e| SqeError::Execution(format!("Query execution failed: {e}")))?;
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        let mut rows_so_far: usize = 0;
+        while let Some(batch) = stream
+            .try_next()
+            .await
+            .map_err(|e| SqeError::Execution(format!("Query execution failed: {e}")))?
+        {
+            rows_so_far = rows_so_far.saturating_add(batch.num_rows());
+            if effective_max > 0 && rows_so_far > effective_max {
+                let reason = if configured_max > 0 && rows_so_far > configured_max {
+                    format!("configured max_result_rows={configured_max}")
+                } else {
+                    format!(
+                        "memory-derived ceiling={effective_max} (memory_limit / 256 bytes-per-row)"
+                    )
+                };
+                return Err(SqeError::Execution(format!(
+                    "Query result exceeds maximum allowed rows ({rows_so_far} > {effective_max}). \
+                     Reason: {reason}. Use LIMIT to reduce output or raise the limit in config."
+                )));
+            }
+            batches.push(batch);
+        }
 
         // Aggregate spill metrics from the executed plan tree
         if let Some(ref metrics) = self.metrics {
@@ -835,13 +1115,10 @@ impl QueryHandler {
             batches.push(RecordBatch::new_empty(output_schema));
         }
 
+        // `rows_so_far` was tracked during streaming above, but we recompute
+        // here because the empty-batch fallback above may have appended a
+        // zero-row schema batch.
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        if self.config.query.max_result_rows > 0 && total_rows > self.config.query.max_result_rows {
-            return Err(SqeError::Execution(format!(
-                "Query result exceeds maximum allowed rows ({} > {}). Use LIMIT to reduce output.",
-                total_rows, self.config.query.max_result_rows
-            )));
-        }
 
         info!(
             batch_count = batches.len(),
@@ -1174,7 +1451,6 @@ impl QueryHandler {
             &self.query_tracker,
             Some(&self.runtime),
             self.metrics.as_ref(),
-            self.manifest_cache.as_ref(),
             self.table_cache.as_ref(),
         )
         .await
@@ -2152,7 +2428,7 @@ fn extract_order_by_columns(sql: &str) -> Vec<String> {
 /// `ParquetExec`, `CsvExec`) to approximate bytes/rows scanned, and sums
 /// `spilled_bytes` across all nodes. `peak_memory_bytes` is left at 0 here
 /// and filled by the caller from the runtime memory pool snapshot.
-fn extract_plan_metrics(plan: &Arc<dyn ExecutionPlan>) -> PlanMetrics {
+pub(crate) fn extract_plan_metrics(plan: &Arc<dyn ExecutionPlan>) -> PlanMetrics {
     use datafusion::physical_plan::metrics::MetricValue;
 
     let mut bytes_scanned: u64 = 0;
@@ -2205,7 +2481,7 @@ fn extract_plan_metrics(plan: &Arc<dyn ExecutionPlan>) -> PlanMetrics {
 /// NestedLoopJoinExec) contribute to join spill metrics. DataFusion's
 /// `MetricsSet` provides `spill_count()` and `spilled_bytes()` on each
 /// operator after execution.
-fn aggregate_spill_metrics(plan: &Arc<dyn ExecutionPlan>) -> (usize, usize, usize, usize) {
+pub(crate) fn aggregate_spill_metrics(plan: &Arc<dyn ExecutionPlan>) -> (usize, usize, usize, usize) {
     let mut sort_spill_count: usize = 0;
     let mut sort_spill_bytes: usize = 0;
     let mut join_spill_count: usize = 0;

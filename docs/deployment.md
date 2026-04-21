@@ -164,7 +164,6 @@ Each entry requires a `type` field. Supported types:
 | `polaris_url` | (required) | Polaris REST Catalog URL |
 | `warehouse` | `""` | Default warehouse name |
 | `metadata_cache_ttl_secs` | `30` | Table metadata cache TTL |
-| `manifest_cache_mb` | `512` | Manifest file cache size in MB. `0` to disable |
 | `default_table_format_version` | `2` | Iceberg table format version for new tables |
 | `trust_sort_order` | `false` | Trust Iceberg sort order for all columns (not just partition keys) |
 | `small_file_threshold_mb` | `3` | Max file size for direct-read fast path. `0` to disable |
@@ -284,7 +283,6 @@ jwks_url = "https://keycloak.example.com/realms/iceberg/protocol/openid-connect/
 polaris_url = "http://polaris:8181/api/catalog"
 warehouse = "production"
 metadata_cache_ttl_secs = 30
-manifest_cache_mb = 1024
 
 [storage]
 s3_endpoint = "https://s3.eu-west-1.amazonaws.com"

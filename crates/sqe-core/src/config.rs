@@ -608,11 +608,6 @@ pub struct CatalogConfig {
     pub warehouse: String,
     #[serde(default = "default_cache_ttl")]
     pub metadata_cache_ttl_secs: u64,
-    /// Memory budget for the global Iceberg manifest file cache in megabytes.
-    /// Manifest files are immutable by Iceberg spec so no TTL is needed.
-    /// Set to 0 to disable. Default: 512 MB.
-    #[serde(default = "default_manifest_cache_mb")]
-    pub manifest_cache_mb: u64,
     /// Default Iceberg table format version for new tables (2 or 3).
     #[serde(default = "default_table_format_version")]
     pub default_table_format_version: u8,
@@ -641,6 +636,17 @@ pub struct CatalogConfig {
     /// compression ratio vs. speed for S3.
     #[serde(default = "default_parquet_compression")]
     pub parquet_compression: String,
+    /// Concurrency for loading Iceberg manifests during query-time column
+    /// statistics pruning and CoW write paths.
+    ///
+    /// Each manifest is a separate S3 GET. On wide snapshots the sequential
+    /// walk dominates cold-cache plan latency; loading manifests in parallel
+    /// collapses that to roughly one round trip. Warm-cache reads are served
+    /// from the iceberg-rust `ObjectCache` and ignore this knob.
+    ///
+    /// Default: 64.
+    #[serde(default = "default_manifest_concurrency")]
+    pub manifest_concurrency: usize,
 }
 
 #[derive(Deserialize, Clone)]
@@ -905,9 +911,9 @@ fn default_refresh_buffer() -> u64 { 60 }
 fn default_true() -> bool { true }
 fn default_cache_ttl() -> u64 { 30 }
 fn default_table_format_version() -> u8 { 2 }
-fn default_manifest_cache_mb() -> u64 { 512 }
 fn default_small_file_threshold_mb() -> u64 { 3 }
 fn default_parquet_compression() -> String { "zstd".to_string() }
+fn default_manifest_concurrency() -> usize { 64 }
 fn default_passthrough() -> String { "passthrough".to_string() }
 fn default_prometheus_port() -> u16 { 9090 }
 fn default_per_user_rpm() -> u32 { 60 }
@@ -1047,8 +1053,8 @@ impl SqeConfig {
         env_override_str("SQE_CATALOG__POLARIS_URL", &mut self.catalog.polaris_url);
         env_override_str("SQE_CATALOG__WAREHOUSE", &mut self.catalog.warehouse);
         env_override_u64("SQE_CATALOG__METADATA_CACHE_TTL_SECS", &mut self.catalog.metadata_cache_ttl_secs);
-        env_override_u64("SQE_CATALOG__MANIFEST_CACHE_MB", &mut self.catalog.manifest_cache_mb);
         env_override_u8("SQE_CATALOG__DEFAULT_TABLE_FORMAT_VERSION", &mut self.catalog.default_table_format_version);
+        env_override_usize("SQE_CATALOG__MANIFEST_CONCURRENCY", &mut self.catalog.manifest_concurrency);
 
         // Storage
         env_override_str("SQE_STORAGE__S3_ENDPOINT", &mut self.storage.s3_endpoint);
@@ -1262,11 +1268,11 @@ mod tests {
                 polaris_url: "https://polaris.example.com".to_string(),
                 warehouse: "wh".to_string(),
                 metadata_cache_ttl_secs: 30,
-                manifest_cache_mb: 512,
                 default_table_format_version: 2,
                 trust_sort_order: false,
                 small_file_threshold_mb: 3,
                 parquet_compression: "zstd".to_string(),
+                manifest_concurrency: 64,
             },
             storage: StorageConfig::default(),
             policy: PolicyConfig::default(),

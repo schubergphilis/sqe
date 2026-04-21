@@ -1,6 +1,6 @@
 # SQE — Next Steps
 
-> Status as of 2026-04-16. **SQE wins 5 of 7 benchmark suites at SF1 vs Trino 465.** DataFusion 53. Star-schema join reorder. Broadcast threshold 64MB. Dynamic filter type coercion. GRANT/REVOKE SQL via platform API. Open-source release prep complete. 214/222 queries pass (SF1). 99/99 TPC-DS. 1,334+ unit tests, 60/60 integration tests. 43/43 security audit findings resolved. Known limitation: q72 (15.5s vs Trino 1.4s, upstream DF#3843). **Next: OSS release + pluggable catalogs.** <-- NEXT
+> Status as of 2026-04-20. **SQE wins 5 of 7 benchmark suites at SF1 vs Trino 465.** DataFusion 53. Star-schema join reorder. Broadcast threshold 64MB. Dynamic filter type coercion. GRANT/REVOKE SQL via platform API. Open-source release prep complete. **222/222 queries pass at SF1** (TPC-H 22, TPC-DS 99, SSB 13, TPC-C 17, TPC-E 18, TPC-BB 10, ClickBench 43). Full suite runs in 154.8s. Streaming Flight SQL results path (no more result-set buffering — coordinator stays alive on 21M-row selects). 8 MiB tokio worker stack (no more SIGABRT on deep CoW WHERE rewrites). 1,334+ unit tests, 60/60 integration tests. 43/43 security audit findings resolved. Known limitation: q72 (15.5s vs Trino 1.4s, upstream DF#3843). **Next: OSS release + pluggable catalogs.** <-- NEXT
 
 > **Monitoring:** OPA SPI refactor in Polaris (PR #3999, still draft) will affect Phase 5 OPA integration when it lands — do not implement OPA against Polaris until this stabilises. Remote S3 signing (Iceberg 1.12, not yet released) will affect the pluggable-catalogs design.
 
@@ -203,10 +203,11 @@ Step 9b: 5-layer caching    ✅ DONE (RestCatalog cache, table metadata cache, m
 Step 9c: DECIMAL + correctness ✅ DONE (parse_float_as_decimal=true, COUNT(*) crash fix, cache invalidation after DDL/DML, Int64 date returns)
 Step 9d: safe defaults       ✅ DONE (sort_mode=partition_only, FairSpillPool fallback, spill_to_disk=true, trust_sort_order=false)
 Step 9e: Trino comparison    ✅ DONE (SQE 2.5-8.8x faster than Trino 465 across all 7 suites, 221/222 match)
+Step 9f: scale hardening     ✅ DONE (streaming result path, tuple-IN balanced fold, 8 MiB worker stack, pre-flight port check — SF1 222/222 pass; TPC-E trade_result streams 21M rows in 8.7s without OOM)
 Step 5: pluggable catalogs  (AWS Glue, Nessie, Hive Metastore, storage-only, Delta Lake) ← NEXT
 Step 6: semantic layer      (new crates; fully additive; no existing code broken)
 ```
 
 Step 5 (pluggable catalogs) is next. Step 6 is independent and fully additive.
 
-> **Upstream watch list:** iceberg-rust MoR (Epic #2186, Q3 2026) could replace CoW DELETE/MERGE with more efficient position-delete approach in the future; Polaris OPA SPI refactor (PR #3999) must stabilise before Phase 5 OPA integration; remote S3 signing (Iceberg 1.12) will require revisiting pluggable-catalogs credential vending design; DataFusion `IN (subquery)` not supported in physical plan for MemTable-referenced columns — blocks 5 TPC-E DML benchmark queries (market_feed_update, trade_result_update_holding, trade_result_update_status, trade_update_executor, trade_update_settlement). Workaround: rewrite as `EXISTS` or `JOIN`. Track upstream DataFusion for fix. DataFusion ROLLUP returns 0 rows with empty GROUP BY input (apache/datafusion#21570) — causes 6 TPC-DS DIFF results.
+> **Upstream watch list:** iceberg-rust MoR (Epic #2186, Q3 2026) could replace CoW DELETE/MERGE with more efficient position-delete approach in the future; Polaris OPA SPI refactor (PR #3999) must stabilise before Phase 5 OPA integration; remote S3 signing (Iceberg 1.12) will require revisiting pluggable-catalogs credential vending design. DataFusion `IN (subquery)` still not supported in physical plan for MemTable-referenced columns — SQE rewrites those in `substitute_in_subquery_placeholders` before planning (previously blocked 5 TPC-E DML queries, all passing since 2026-04-20). Track upstream DataFusion for native support. DataFusion ROLLUP returns 0 rows with empty GROUP BY input (apache/datafusion#21570) — causes 6 TPC-DS DIFF results.
