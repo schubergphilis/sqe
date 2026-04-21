@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arrow::compute::filter_record_batch;
@@ -30,9 +31,11 @@ use crate::writer::{
 fn affected_rows_batch(count: usize) -> Vec<RecordBatch> {
     use arrow_array::Int64Array;
     use arrow_schema::{DataType, Field};
-    let schema = Arc::new(ArrowSchema::new(vec![
-        Field::new("rows_affected", DataType::Int64, false),
-    ]));
+    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "rows_affected",
+        DataType::Int64,
+        false,
+    )]));
     match RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![count as i64]))]) {
         Ok(batch) => vec![batch],
         Err(_) => vec![],
@@ -54,7 +57,11 @@ pub struct WriteHandler {
 
 impl WriteHandler {
     pub fn new(config: SqeConfig) -> Self {
-        Self { config, metrics: None, table_cache: None }
+        Self {
+            config,
+            metrics: None,
+            table_cache: None,
+        }
     }
 
     pub fn with_metrics(mut self, metrics: Arc<sqe_metrics::MetricsRegistry>) -> Self {
@@ -155,7 +162,14 @@ impl WriteHandler {
         // Write data files (skip if no data)
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         if total_rows > 0 {
-            let data_files = write_data_files_with_metrics(&table, batches, "ctas", self.metrics.as_ref(), self.compression()).await?;
+            let data_files = write_data_files_with_metrics(
+                &table,
+                batches,
+                "ctas",
+                self.metrics.as_ref(),
+                self.compression(),
+            )
+            .await?;
 
             if !data_files.is_empty() {
                 // Commit data files via fast-append transaction
@@ -276,9 +290,9 @@ impl WriteHandler {
         if !data_files.is_empty() {
             let tx = Transaction::new(&table);
             let action = tx.fast_append().add_data_files(data_files);
-            let tx = action.apply(tx).map_err(|e| {
-                SqeError::Execution(format!("Failed to apply fast append: {e}"))
-            })?;
+            let tx = action
+                .apply(tx)
+                .map_err(|e| SqeError::Execution(format!("Failed to apply fast append: {e}")))?;
             tx.commit(catalog.as_ref()).await.map_err(|e| {
                 SqeError::Execution(format!("Failed to commit CTAS transaction: {e}"))
             })?;
@@ -368,9 +382,9 @@ impl WriteHandler {
         if !data_files.is_empty() {
             let tx = Transaction::new(&table);
             let action = tx.fast_append().add_data_files(data_files);
-            let tx = action.apply(tx).map_err(|e| {
-                SqeError::Execution(format!("Failed to apply fast append: {e}"))
-            })?;
+            let tx = action
+                .apply(tx)
+                .map_err(|e| SqeError::Execution(format!("Failed to apply fast append: {e}")))?;
             tx.commit(catalog.as_ref()).await.map_err(|e| {
                 SqeError::Execution(format!("Failed to commit INSERT transaction: {e}"))
             })?;
@@ -415,7 +429,11 @@ impl WriteHandler {
                     .options
                     .iter()
                     .any(|opt| matches!(opt.option, sqlparser::ast::ColumnOption::NotNull));
-                Ok(arrow_schema::Field::new(col.name.value.clone(), arrow_type, nullable))
+                Ok(arrow_schema::Field::new(
+                    col.name.value.clone(),
+                    arrow_type,
+                    nullable,
+                ))
             })
             .collect::<sqe_core::Result<Vec<_>>>()?;
 
@@ -523,16 +541,23 @@ impl WriteHandler {
             .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
 
         // Write data files
-        let data_files = write_data_files_with_metrics(&table, batches, "insert", self.metrics.as_ref(), self.compression()).await?;
+        let data_files = write_data_files_with_metrics(
+            &table,
+            batches,
+            "insert",
+            self.metrics.as_ref(),
+            self.compression(),
+        )
+        .await?;
 
         if !data_files.is_empty() {
             // Commit via fast-append
             let tx = Transaction::new(&table);
             let action = tx.fast_append().add_data_files(data_files);
 
-            let tx = action.apply(tx).map_err(|e| {
-                SqeError::Execution(format!("Failed to apply fast append: {e}"))
-            })?;
+            let tx = action
+                .apply(tx)
+                .map_err(|e| SqeError::Execution(format!("Failed to apply fast append: {e}")))?;
 
             tx.commit(catalog.as_ref()).await.map_err(|e| {
                 SqeError::Execution(format!("Failed to commit INSERT transaction: {e}"))
@@ -590,14 +615,21 @@ impl WriteHandler {
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
 
-        let data_files = write_data_files_with_metrics(&table, batches, "ingest", self.metrics.as_ref(), self.compression()).await?;
+        let data_files = write_data_files_with_metrics(
+            &table,
+            batches,
+            "ingest",
+            self.metrics.as_ref(),
+            self.compression(),
+        )
+        .await?;
 
         if !data_files.is_empty() {
             let tx = Transaction::new(&table);
             let action = tx.fast_append().add_data_files(data_files);
-            let tx = action.apply(tx).map_err(|e| {
-                SqeError::Execution(format!("Failed to apply fast append: {e}"))
-            })?;
+            let tx = action
+                .apply(tx)
+                .map_err(|e| SqeError::Execution(format!("Failed to apply fast append: {e}")))?;
             tx.commit(catalog.as_ref()).await.map_err(|e| {
                 SqeError::Execution(format!("Failed to commit ingest transaction: {e}"))
             })?;
@@ -669,18 +701,21 @@ impl WriteHandler {
             let tx = action.apply(tx).map_err(|e| {
                 SqeError::Execution(format!("Failed to apply truncate transaction: {e}"))
             })?;
-            tx.commit(catalog.as_catalog().as_ref()).await.map_err(|e| {
-                SqeError::Execution(format!("Failed to commit truncate: {e}"))
-            })?;
+            tx.commit(catalog.as_catalog().as_ref())
+                .await
+                .map_err(|e| SqeError::Execution(format!("Failed to commit truncate: {e}")))?;
             info!(table = %table_ident, "DELETE: table truncated successfully");
             return Ok(vec![]);
         }
 
         // WHERE clause present: CoW rewrite
         let raw_where = format!("{}", where_clause.as_ref().unwrap());
-        // Rewrite IN (subquery) → IN (literal_list) before per-file evaluation.
-        // DataFusion's physical planner rejects InSubquery in DML context.
-        let where_sql = self.rewrite_in_subquery_where(&raw_where, ctx).await?;
+        // Lift any `IN (subquery)` expressions out of the WHERE into materialised
+        // scratch MemTables joined via LEFT JOIN. The cleanup guard must outlive
+        // every per-batch evaluator call below; `_in_subq_guard`'s Drop runs at
+        // the end of this handler and deregisters the scratch tables.
+        let (where_sql, joins_sql, _in_subq_guard) =
+            self.lift_in_subqueries(&raw_where, ctx).await?;
         info!(
             table = %table_ident,
             file_count = old_data_files.len(),
@@ -702,9 +737,9 @@ impl WriteHandler {
             // Evaluate WHERE predicate against each batch, keep rows that do NOT match
             let mut surviving_batches = Vec::new();
             for batch in &batches {
-                let filtered =
-                    self.filter_batch_negate(ctx, batch, &where_sql, &table_ident)
-                        .await?;
+                let filtered = self
+                    .filter_batch_negate(ctx, batch, &where_sql, &joins_sql, &table_ident)
+                    .await?;
                 total_deleted += batch.num_rows() - filtered.num_rows();
                 if filtered.num_rows() > 0 {
                     surviving_batches.push(filtered);
@@ -713,7 +748,14 @@ impl WriteHandler {
 
             // Write surviving rows as new data files (skip if all rows deleted)
             if !surviving_batches.is_empty() {
-                let new_files = write_data_files_with_metrics(&table, surviving_batches, "delete", self.metrics.as_ref(), self.compression()).await?;
+                let new_files = write_data_files_with_metrics(
+                    &table,
+                    surviving_batches,
+                    "delete",
+                    self.metrics.as_ref(),
+                    self.compression(),
+                )
+                .await?;
                 new_data_files.extend(new_files);
             }
         }
@@ -732,12 +774,12 @@ impl WriteHandler {
             .rewrite_files()
             .add_data_files(new_data_files)
             .delete_files(old_data_files);
-        let tx = action.apply(tx).map_err(|e| {
-            SqeError::Execution(format!("Failed to apply DELETE rewrite: {e}"))
-        })?;
-        tx.commit(catalog.as_catalog().as_ref()).await.map_err(|e| {
-            SqeError::Execution(format!("Failed to commit DELETE: {e}"))
-        })?;
+        let tx = action
+            .apply(tx)
+            .map_err(|e| SqeError::Execution(format!("Failed to apply DELETE rewrite: {e}")))?;
+        tx.commit(catalog.as_catalog().as_ref())
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to commit DELETE: {e}")))?;
 
         info!(table = %table_ident, deleted_rows = total_deleted, "DELETE committed successfully");
         Ok(affected_rows_batch(total_deleted))
@@ -813,17 +855,18 @@ impl WriteHandler {
             let tx = action.apply(tx).map_err(|e| {
                 SqeError::Execution(format!("Failed to apply truncate transaction: {e}"))
             })?;
-            tx.commit(catalog.as_catalog().as_ref()).await.map_err(|e| {
-                SqeError::Execution(format!("Failed to commit truncate: {e}"))
-            })?;
+            tx.commit(catalog.as_catalog().as_ref())
+                .await
+                .map_err(|e| SqeError::Execution(format!("Failed to commit truncate: {e}")))?;
             info!(table = %table_ident, "MoR DELETE: table truncated successfully");
             return Ok(vec![]);
         }
 
         let raw_where = format!("{}", where_clause.as_ref().unwrap());
-        // Rewrite IN (subquery) → IN (literal_list) before per-file evaluation.
-        // DataFusion's physical planner rejects InSubquery in DML context.
-        let where_sql = self.rewrite_in_subquery_where(&raw_where, ctx).await?;
+        // Lift any `IN (subquery)` expressions; see `handle_delete` for details.
+        // The guard must outlive the per-batch loop below.
+        let (where_sql, joins_sql, _in_subq_guard) =
+            self.lift_in_subqueries(&raw_where, ctx).await?;
         info!(
             table = %table_ident,
             file_count = old_data_files.len(),
@@ -846,7 +889,7 @@ impl WriteHandler {
             let mut row_offset: i64 = 0;
             for batch in &batches {
                 let match_mask = self
-                    .filter_batch_match(ctx, batch, &where_sql, &table_ident)
+                    .filter_batch_match(ctx, batch, &where_sql, &joins_sql, &table_ident)
                     .await?;
 
                 for row_idx in 0..batch.num_rows() {
@@ -871,7 +914,8 @@ impl WriteHandler {
         );
 
         // Write position delete files (sorted by (file_path, pos) inside the helper).
-        let delete_files = write_position_delete_files(&table, position_deletes, self.compression()).await?;
+        let delete_files =
+            write_position_delete_files(&table, position_deletes, self.compression()).await?;
 
         // Commit: append position delete files. FastAppendAction auto-routes DataFiles
         // with content_type=PositionDeletes into the delete manifest entry.
@@ -880,9 +924,9 @@ impl WriteHandler {
         let tx = action.apply(tx).map_err(|e| {
             SqeError::Execution(format!("Failed to apply MoR DELETE fast-append: {e}"))
         })?;
-        tx.commit(catalog.as_catalog().as_ref()).await.map_err(|e| {
-            SqeError::Execution(format!("Failed to commit MoR DELETE: {e}"))
-        })?;
+        tx.commit(catalog.as_catalog().as_ref())
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to commit MoR DELETE: {e}")))?;
 
         info!(table = %table_ident, deleted_rows = deleted_count, "MoR DELETE committed successfully");
         Ok(affected_rows_batch(deleted_count))
@@ -947,9 +991,10 @@ impl WriteHandler {
             .as_ref()
             .map(|w| format!("{w}"))
             .unwrap_or_else(|| "TRUE".to_string());
-        // Rewrite IN (subquery) → IN (literal_list) before per-file evaluation.
-        // DataFusion's physical planner rejects InSubquery in DML context.
-        let where_sql = self.rewrite_in_subquery_where(&raw_where, ctx).await?;
+        // Lift any `IN (subquery)` expressions; see `handle_delete` for details.
+        // The guard must outlive the per-batch loop below.
+        let (where_sql, joins_sql, _in_subq_guard) =
+            self.lift_in_subqueries(&raw_where, ctx).await?;
 
         info!(
             table = %table_ident,
@@ -974,7 +1019,14 @@ impl WriteHandler {
 
             for batch in &batches {
                 let rewritten = self
-                    .apply_update(ctx, batch, assignments, &where_sql, &table_ident)
+                    .apply_update(
+                        ctx,
+                        batch,
+                        assignments,
+                        &where_sql,
+                        &joins_sql,
+                        &table_ident,
+                    )
                     .await?;
                 rewritten_batches.push(rewritten);
             }
@@ -982,12 +1034,19 @@ impl WriteHandler {
             // Count updated rows by comparing before/after
             for batch in &batches {
                 let count = self
-                    .count_matching_rows(ctx, batch, &where_sql, &table_ident)
+                    .count_matching_rows(ctx, batch, &where_sql, &joins_sql, &table_ident)
                     .await?;
                 total_updated += count;
             }
 
-            let new_files = write_data_files_with_metrics(&table, rewritten_batches, "update", self.metrics.as_ref(), self.compression()).await?;
+            let new_files = write_data_files_with_metrics(
+                &table,
+                rewritten_batches,
+                "update",
+                self.metrics.as_ref(),
+                self.compression(),
+            )
+            .await?;
             new_data_files.extend(new_files);
         }
 
@@ -1004,12 +1063,12 @@ impl WriteHandler {
             .rewrite_files()
             .add_data_files(new_data_files)
             .delete_files(old_data_files);
-        let tx = action.apply(tx).map_err(|e| {
-            SqeError::Execution(format!("Failed to apply UPDATE rewrite: {e}"))
-        })?;
-        tx.commit(catalog.as_catalog().as_ref()).await.map_err(|e| {
-            SqeError::Execution(format!("Failed to commit UPDATE: {e}"))
-        })?;
+        let tx = action
+            .apply(tx)
+            .map_err(|e| SqeError::Execution(format!("Failed to apply UPDATE rewrite: {e}")))?;
+        tx.commit(catalog.as_catalog().as_ref())
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to commit UPDATE: {e}")))?;
 
         info!(table = %table_ident, updated_rows = total_updated, "UPDATE committed successfully");
         Ok(affected_rows_batch(total_updated))
@@ -1104,11 +1163,9 @@ impl WriteHandler {
         } else {
             // Empty table — get the schema from the Iceberg table metadata
             let iceberg_schema = table.metadata().current_schema();
-            let arrow_schema = iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
-                .map_err(|e| {
-                    SqeError::Execution(format!(
-                        "Failed to convert Iceberg schema to Arrow: {e}"
-                    ))
+            let arrow_schema =
+                iceberg::arrow::schema_to_arrow_schema(iceberg_schema).map_err(|e| {
+                    SqeError::Execution(format!("Failed to convert Iceberg schema to Arrow: {e}"))
                 })?;
             Arc::new(arrow_schema)
         };
@@ -1120,12 +1177,8 @@ impl WriteHandler {
             .collect();
 
         // Use the target alias (or a default) for the merge MemTable names
-        let t_alias = target_alias
-            .clone()
-            .unwrap_or_else(|| "t".to_string());
-        let s_alias = source_alias
-            .clone()
-            .unwrap_or_else(|| "s".to_string());
+        let t_alias = target_alias.clone().unwrap_or_else(|| "t".to_string());
+        let s_alias = source_alias.clone().unwrap_or_else(|| "s".to_string());
         let target_table_ref = "__merge_target".to_string();
         let source_table_ref = "__merge_source".to_string();
         let qualified_target_ref = format!("datafusion.public.{target_table_ref}");
@@ -1134,22 +1187,13 @@ impl WriteHandler {
         // Register target data as a MemTable in the full session context
         // (which has all catalog tables registered for cross-table subqueries)
         let target_mem = if target_batches.is_empty() {
-            datafusion::datasource::MemTable::try_new(
-                target_schema.clone(),
-                vec![],
-            )
+            datafusion::datasource::MemTable::try_new(target_schema.clone(), vec![])
         } else {
-            datafusion::datasource::MemTable::try_new(
-                target_schema.clone(),
-                vec![target_batches],
-            )
+            datafusion::datasource::MemTable::try_new(target_schema.clone(), vec![target_batches])
         }
         .map_err(|e| SqeError::Execution(format!("Failed to create target MemTable: {e}")))?;
-        ctx
-            .register_table(&qualified_target_ref, Arc::new(target_mem))
-            .map_err(|e| {
-                SqeError::Execution(format!("Failed to register target MemTable: {e}"))
-            })?;
+        ctx.register_table(&qualified_target_ref, Arc::new(target_mem))
+            .map_err(|e| SqeError::Execution(format!("Failed to register target MemTable: {e}")))?;
 
         // Use the pre-executed source batches (caller handles source query execution)
         if source_batches.is_empty() {
@@ -1160,16 +1204,13 @@ impl WriteHandler {
         let source_schema = source_batches[0].schema();
 
         // Register source data as a MemTable
-        let source_mem = datafusion::datasource::MemTable::try_new(
-            source_schema.clone(),
-            vec![source_batches],
-        )
-        .map_err(|e| SqeError::Execution(format!("Failed to create source MemTable: {e}")))?;
-        ctx
-            .register_table(&qualified_source_ref, Arc::new(source_mem))
-            .map_err(|e| {
-                SqeError::Execution(format!("Failed to register source MemTable: {e}"))
-            })?;
+        let source_mem =
+            datafusion::datasource::MemTable::try_new(source_schema.clone(), vec![source_batches])
+                .map_err(|e| {
+                    SqeError::Execution(format!("Failed to create source MemTable: {e}"))
+                })?;
+        ctx.register_table(&qualified_source_ref, Arc::new(source_mem))
+            .map_err(|e| SqeError::Execution(format!("Failed to register source MemTable: {e}")))?;
 
         // Rewrite the ON condition to use our MemTable names instead of aliases
         let on_rewritten = on_sql
@@ -1325,12 +1366,14 @@ impl WriteHandler {
             "MERGE: executing merge query"
         );
 
-        let df = ctx.sql(&select_sql).await.map_err(|e| {
-            SqeError::Execution(format!("Failed to plan MERGE query: {e}"))
-        })?;
-        let mut result_batches: Vec<RecordBatch> = df.collect().await.map_err(|e| {
-            SqeError::Execution(format!("Failed to execute MERGE query: {e}"))
-        })?;
+        let df = ctx
+            .sql(&select_sql)
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to plan MERGE query: {e}")))?;
+        let mut result_batches: Vec<RecordBatch> = df
+            .collect()
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to execute MERGE query: {e}")))?;
 
         // Deregister temp tables to avoid polluting the shared session context
         let _ = ctx.deregister_table(&qualified_target_ref);
@@ -1355,8 +1398,7 @@ impl WriteHandler {
                         *flag = false;
                     }
                 }
-                let keep_arr =
-                    arrow::array::BooleanArray::from(keep);
+                let keep_arr = arrow::array::BooleanArray::from(keep);
                 let filtered = filter_record_batch(batch, &keep_arr).map_err(|e| {
                     SqeError::Execution(format!("Failed to filter MERGE DELETE results: {e}"))
                 })?;
@@ -1370,7 +1412,14 @@ impl WriteHandler {
         // Write new data files from the merged results
         let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
         let new_data_files = if total_rows > 0 {
-            write_data_files_with_metrics(&table, result_batches, "merge", self.metrics.as_ref(), self.compression()).await?
+            write_data_files_with_metrics(
+                &table,
+                result_batches,
+                "merge",
+                self.metrics.as_ref(),
+                self.compression(),
+            )
+            .await?
         } else {
             vec![]
         };
@@ -1397,12 +1446,12 @@ impl WriteHandler {
         if !old_data_files.is_empty() {
             action = action.delete_files(old_data_files);
         }
-        let tx = action.apply(tx).map_err(|e| {
-            SqeError::Execution(format!("Failed to apply MERGE rewrite: {e}"))
-        })?;
-        tx.commit(catalog.as_catalog().as_ref()).await.map_err(|e| {
-            SqeError::Execution(format!("Failed to commit MERGE: {e}"))
-        })?;
+        let tx = action
+            .apply(tx)
+            .map_err(|e| SqeError::Execution(format!("Failed to apply MERGE rewrite: {e}")))?;
+        tx.commit(catalog.as_catalog().as_ref())
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to commit MERGE: {e}")))?;
 
         info!(table = %table_ident, total_rows, "MERGE committed successfully");
         Ok(affected_rows_batch(total_rows))
@@ -1428,12 +1477,13 @@ impl WriteHandler {
                     let parts: Vec<String> = name.0.iter().map(|i| i.value.clone()).collect();
                     parts.last().cloned().unwrap_or_default()
                 }
-                sqlparser::ast::AssignmentTarget::Tuple(names) => {
-                    names.first().map(|n| {
+                sqlparser::ast::AssignmentTarget::Tuple(names) => names
+                    .first()
+                    .map(|n| {
                         let parts: Vec<String> = n.0.iter().map(|i| i.value.clone()).collect();
                         parts.last().cloned().unwrap_or_default()
-                    }).unwrap_or_default()
-                }
+                    })
+                    .unwrap_or_default(),
             };
             if col_name == col {
                 let expr_sql = format!("{}", a.value);
@@ -1519,10 +1569,7 @@ impl WriteHandler {
     /// Routes reads through `Table::object_cache()` so warm CoW operations
     /// avoid redundant S3 GETs. Cold reads are parallelised with
     /// `buffer_unordered` at `config.catalog.manifest_concurrency`.
-    async fn collect_data_files(
-        &self,
-        table: &IcebergTable,
-    ) -> sqe_core::Result<Vec<DataFile>> {
+    async fn collect_data_files(&self, table: &IcebergTable) -> sqe_core::Result<Vec<DataFile>> {
         let metadata_ref = table.metadata_ref();
         let snapshot = match metadata_ref.current_snapshot() {
             Some(s) => s,
@@ -1536,17 +1583,16 @@ impl WriteHandler {
             .map_err(|e| SqeError::Execution(format!("Failed to load manifest list: {e}")))?;
 
         let concurrency = self.config.catalog.manifest_concurrency.max(1);
-        let manifests: Vec<Arc<iceberg::spec::Manifest>> = futures::stream::iter(
-            manifest_list.entries().iter().cloned(),
-        )
-        .map(|mf| {
-            let cache = cache.clone();
-            async move { cache.get_manifest(&mf).await }
-        })
-        .buffer_unordered(concurrency)
-        .try_collect()
-        .await
-        .map_err(|e| SqeError::Execution(format!("Failed to load manifest: {e}")))?;
+        let manifests: Vec<Arc<iceberg::spec::Manifest>> =
+            futures::stream::iter(manifest_list.entries().iter().cloned())
+                .map(|mf| {
+                    let cache = cache.clone();
+                    async move { cache.get_manifest(&mf).await }
+                })
+                .buffer_unordered(concurrency)
+                .try_collect()
+                .await
+                .map_err(|e| SqeError::Execution(format!("Failed to load manifest: {e}")))?;
 
         let data_files = manifests
             .into_iter()
@@ -1599,23 +1645,30 @@ impl WriteHandler {
             ))
         })?;
 
-        let batches: Vec<RecordBatch> = reader
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                SqeError::Execution(format!("Failed to read Parquet file '{file_path}': {e}"))
-            })?;
+        let batches: Vec<RecordBatch> =
+            reader
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| {
+                    SqeError::Execution(format!("Failed to read Parquet file '{file_path}': {e}"))
+                })?;
 
         Ok(batches)
     }
 
     /// Evaluate a WHERE clause against a RecordBatch and return rows that do NOT match.
     /// Used for DELETE: we keep the rows that don't match the WHERE predicate.
+    ///
+    /// `joins_sql` is a concatenation of `LEFT JOIN ...` clauses produced by
+    /// [`Self::lift_in_subqueries`] and is spliced into the outer SELECT's
+    /// FROM clause immediately after the aliased target. Pass an empty string
+    /// when no lifted joins are needed.
     async fn filter_batch_negate(
         &self,
         ctx: &DFSessionContext,
         batch: &RecordBatch,
         where_sql: &str,
+        joins_sql: &str,
         table_ident: &TableIdent,
     ) -> sqe_core::Result<RecordBatch> {
         use arrow::compute::not;
@@ -1624,27 +1677,31 @@ impl WriteHandler {
         // Register the batch as a temporary table so DataFusion can evaluate the predicate
         let table_name = format!("__delete_{}", table_ident.name());
         let orig_name = table_ident.name();
-        let mem_table = datafusion::datasource::MemTable::try_new(
-            batch.schema(),
-            vec![vec![batch.clone()]],
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])
+                .map_err(|e| SqeError::Execution(format!("Failed to create MemTable: {e}")))?;
+        ctx.register_table(
+            format!("datafusion.public.{table_name}"),
+            Arc::new(mem_table),
         )
-        .map_err(|e| SqeError::Execution(format!("Failed to create MemTable: {e}")))?;
-        ctx.register_table(format!("datafusion.public.{table_name}"), Arc::new(mem_table))
-            .map_err(|e| SqeError::Execution(format!("Failed to register temp table: {e}")))?;
+        .map_err(|e| SqeError::Execution(format!("Failed to register temp table: {e}")))?;
 
         // Execute: SELECT <where_clause> AS __match FROM __delete_<table>
         // Alias the scratch table to the original target name (see apply_update
         // for rationale) so correlated subqueries inside the WHERE clause can
         // reference `tablename.col`.
         let eval_sql = format!(
-            "SELECT CAST(({where_sql}) AS BOOLEAN) AS __match FROM datafusion.public.{table_name} AS \"{orig_name}\""
+            "SELECT CAST(({where_sql}) AS BOOLEAN) AS __match \
+             FROM datafusion.public.{table_name} AS \"{orig_name}\"{joins_sql}"
         );
-        let df = ctx.sql(&eval_sql).await.map_err(|e| {
-            SqeError::Execution(format!("Failed to evaluate WHERE clause: {e}"))
-        })?;
-        let result_batches: Vec<RecordBatch> = df.collect().await.map_err(|e| {
-            SqeError::Execution(format!("Failed to collect WHERE evaluation: {e}"))
-        })?;
+        let df = ctx
+            .sql(&eval_sql)
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to evaluate WHERE clause: {e}")))?;
+        let result_batches: Vec<RecordBatch> = df
+            .collect()
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to collect WHERE evaluation: {e}")))?;
 
         // Deregister temp table
         let _ = ctx.deregister_table(format!("datafusion.public.{table_name}"));
@@ -1675,36 +1732,44 @@ impl WriteHandler {
     ///
     /// Unlike `filter_batch_negate`, this returns the raw match mask rather than the
     /// filtered batch, so the caller can record which row positions matched.
+    ///
+    /// `joins_sql` carries the `LEFT JOIN ...` clauses produced by
+    /// [`Self::lift_in_subqueries`]; see `filter_batch_negate` for details.
     async fn filter_batch_match(
         &self,
         ctx: &DFSessionContext,
         batch: &RecordBatch,
         where_sql: &str,
+        joins_sql: &str,
         table_ident: &TableIdent,
     ) -> sqe_core::Result<arrow_array::BooleanArray> {
         use arrow_array::BooleanArray;
 
         let table_name = format!("__mor_delete_{}", table_ident.name());
         let orig_name = table_ident.name();
-        let mem_table = datafusion::datasource::MemTable::try_new(
-            batch.schema(),
-            vec![vec![batch.clone()]],
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])
+                .map_err(|e| SqeError::Execution(format!("Failed to create MemTable: {e}")))?;
+        ctx.register_table(
+            format!("datafusion.public.{table_name}"),
+            Arc::new(mem_table),
         )
-        .map_err(|e| SqeError::Execution(format!("Failed to create MemTable: {e}")))?;
-        ctx.register_table(format!("datafusion.public.{table_name}"), Arc::new(mem_table))
-            .map_err(|e| SqeError::Execution(format!("Failed to register temp table: {e}")))?;
+        .map_err(|e| SqeError::Execution(format!("Failed to register temp table: {e}")))?;
 
         // Alias the scratch table to the original target name so correlated
         // subqueries inside WHERE can reference `tablename.col`.
         let eval_sql = format!(
-            "SELECT CAST(({where_sql}) AS BOOLEAN) AS __match FROM datafusion.public.{table_name} AS \"{orig_name}\""
+            "SELECT CAST(({where_sql}) AS BOOLEAN) AS __match \
+             FROM datafusion.public.{table_name} AS \"{orig_name}\"{joins_sql}"
         );
-        let df = ctx.sql(&eval_sql).await.map_err(|e| {
-            SqeError::Execution(format!("Failed to evaluate WHERE clause: {e}"))
-        })?;
-        let result_batches: Vec<RecordBatch> = df.collect().await.map_err(|e| {
-            SqeError::Execution(format!("Failed to collect WHERE evaluation: {e}"))
-        })?;
+        let df = ctx
+            .sql(&eval_sql)
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to evaluate WHERE clause: {e}")))?;
+        let result_batches: Vec<RecordBatch> = df
+            .collect()
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to collect WHERE evaluation: {e}")))?;
 
         let _ = ctx.deregister_table(format!("datafusion.public.{table_name}"));
 
@@ -1730,23 +1795,30 @@ impl WriteHandler {
     ///
     /// For each column, generates CASE WHEN <where> THEN <new_value> ELSE <old_value> END.
     /// Unchanged columns pass through directly.
+    ///
+    /// `in_subquery_joins` carries the `LEFT JOIN ...` clauses produced by
+    /// [`Self::lift_in_subqueries`] and is appended to the outer SELECT's FROM
+    /// clause after any decorrelator-generated joins. Pass an empty string when
+    /// no lifted joins are needed.
     async fn apply_update(
         &self,
         ctx: &DFSessionContext,
         batch: &RecordBatch,
         assignments: &[sqlparser::ast::Assignment],
         where_sql: &str,
+        in_subquery_joins: &str,
         table_ident: &TableIdent,
     ) -> sqe_core::Result<RecordBatch> {
         let table_name = format!("__update_{}", table_ident.name());
         let orig_name = table_ident.name();
-        let mem_table = datafusion::datasource::MemTable::try_new(
-            batch.schema(),
-            vec![vec![batch.clone()]],
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])
+                .map_err(|e| SqeError::Execution(format!("Failed to create MemTable: {e}")))?;
+        ctx.register_table(
+            format!("datafusion.public.{table_name}"),
+            Arc::new(mem_table),
         )
-        .map_err(|e| SqeError::Execution(format!("Failed to create MemTable: {e}")))?;
-        ctx.register_table(format!("datafusion.public.{table_name}"), Arc::new(mem_table))
-            .map_err(|e| SqeError::Execution(format!("Failed to register temp table: {e}")))?;
+        .map_err(|e| SqeError::Execution(format!("Failed to register temp table: {e}")))?;
 
         // Best-effort decorrelation of any `ScalarSubquery` nodes in the SET
         // expressions. DataFusion's physical planner cannot compile scalar
@@ -1755,8 +1827,7 @@ impl WriteHandler {
         // shapes into LEFT JOINs at the outer FROM. Shapes we don't recognise
         // are left alone and will surface DataFusion's original error — no
         // change in behaviour for them.
-        let (decorrelated, extra_joins) =
-            decorrelate_scalar_subqueries(assignments, orig_name);
+        let (decorrelated, extra_joins) = decorrelate_scalar_subqueries(assignments, orig_name);
         let mut assignment_map = std::collections::HashMap::new();
         for d in &decorrelated {
             assignment_map.insert(d.col_name.clone(), d.expr_sql.clone());
@@ -1770,9 +1841,7 @@ impl WriteHandler {
             .map(|f| {
                 let col = f.name().clone();
                 if let Some(expr) = assignment_map.get(&col) {
-                    format!(
-                        "CASE WHEN ({where_sql}) THEN ({expr}) ELSE \"{col}\" END AS \"{col}\""
-                    )
+                    format!("CASE WHEN ({where_sql}) THEN ({expr}) ELSE \"{col}\" END AS \"{col}\"")
                 } else {
                     format!("\"{col}\"")
                 }
@@ -1785,64 +1854,81 @@ impl WriteHandler {
         // `holding_summary` to be in scope; without the alias DataFusion only
         // sees `__update_holding_summary` and fails to resolve the correlation.
         //
-        // `extra_joins` carries any LEFT JOIN clauses produced by the
-        // decorrelator above so the outer SELECT can reference the joined
-        // `__corrN.__val` columns substituted into the SET expressions.
+        // Two join sources get appended to the outer FROM clause:
+        //   1. `extra_joins` from the decorrelator above — these provide the
+        //      `__corrN.__val` columns substituted into the SET expressions.
+        //   2. `in_subquery_joins` from `lift_in_subqueries` — these provide the
+        //      `__sqN.__matched` flags referenced from the rewritten WHERE.
+        // Decorrelator joins come first so any columns they introduce are in
+        // scope for the IN-subquery join ON clauses (not currently exercised,
+        // but preserves a consistent ordering).
         let joins_sql = if extra_joins.is_empty() {
-            String::new()
+            in_subquery_joins.to_string()
         } else {
-            format!(" {}", extra_joins.join(" "))
+            format!(" {}{}", extra_joins.join(" "), in_subquery_joins)
         };
         let select_sql = format!(
             "SELECT {cols} FROM datafusion.public.{table_name} AS \"{orig_name}\"{joins}",
             cols = columns.join(", "),
             joins = joins_sql,
         );
-        let df = ctx.sql(&select_sql).await.map_err(|e| {
-            SqeError::Execution(format!("Failed to evaluate UPDATE: {e}"))
-        })?;
-        let result_batches: Vec<RecordBatch> = df.collect().await.map_err(|e| {
-            SqeError::Execution(format!("Failed to collect UPDATE results: {e}"))
-        })?;
+        let df = ctx
+            .sql(&select_sql)
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to evaluate UPDATE: {e}")))?;
+        let result_batches: Vec<RecordBatch> = df
+            .collect()
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to collect UPDATE results: {e}")))?;
 
         let _ = ctx.deregister_table(format!("datafusion.public.{table_name}"));
 
         // Return the first (and only) result batch
-        result_batches.into_iter().next().ok_or_else(|| {
-            SqeError::Execution("UPDATE produced no output batches".to_string())
-        })
+        result_batches
+            .into_iter()
+            .next()
+            .ok_or_else(|| SqeError::Execution("UPDATE produced no output batches".to_string()))
     }
 
     /// Count rows matching a WHERE clause in a batch.
+    ///
+    /// `joins_sql` carries the `LEFT JOIN ...` clauses produced by
+    /// [`Self::lift_in_subqueries`]; see `filter_batch_negate` for details.
     async fn count_matching_rows(
         &self,
         ctx: &DFSessionContext,
         batch: &RecordBatch,
         where_sql: &str,
+        joins_sql: &str,
         table_ident: &TableIdent,
     ) -> sqe_core::Result<usize> {
         let table_name = format!("__count_{}", table_ident.name());
         let orig_name = table_ident.name();
-        let mem_table = datafusion::datasource::MemTable::try_new(
-            batch.schema(),
-            vec![vec![batch.clone()]],
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])
+                .map_err(|e| SqeError::Execution(format!("MemTable error: {e}")))?;
+        ctx.register_table(
+            format!("datafusion.public.{table_name}"),
+            Arc::new(mem_table),
         )
-        .map_err(|e| SqeError::Execution(format!("MemTable error: {e}")))?;
-        ctx.register_table(format!("datafusion.public.{table_name}"), Arc::new(mem_table))
-            .map_err(|e| SqeError::Execution(format!("Register error: {e}")))?;
+        .map_err(|e| SqeError::Execution(format!("Register error: {e}")))?;
 
         // Alias the scratch table to the original target name (see apply_update
         // for rationale) — allows `tablename.col` references in WHERE subqueries
         // to resolve correctly.
         let sql = format!(
-            "SELECT COUNT(*) AS cnt FROM datafusion.public.{table_name} AS \"{orig_name}\" WHERE {where_sql}"
+            "SELECT COUNT(*) AS cnt \
+             FROM datafusion.public.{table_name} AS \"{orig_name}\"{joins_sql} \
+             WHERE {where_sql}"
         );
-        let df = ctx.sql(&sql).await.map_err(|e| {
-            SqeError::Execution(format!("Count query failed: {e}"))
-        })?;
-        let batches: Vec<RecordBatch> = df.collect().await.map_err(|e| {
-            SqeError::Execution(format!("Count collect failed: {e}"))
-        })?;
+        let df = ctx
+            .sql(&sql)
+            .await
+            .map_err(|e| SqeError::Execution(format!("Count query failed: {e}")))?;
+        let batches: Vec<RecordBatch> = df
+            .collect()
+            .await
+            .map_err(|e| SqeError::Execution(format!("Count collect failed: {e}")))?;
 
         let _ = ctx.deregister_table(format!("datafusion.public.{table_name}"));
 
@@ -1858,136 +1944,283 @@ impl WriteHandler {
         Ok(count)
     }
 
-    /// Rewrite `IN (SELECT ...)` to `IN (val1, val2, ...)` in a WHERE-clause string.
+    /// Lift every `IN (subquery)` in `where_sql` into a LEFT JOIN over a
+    /// pre-materialised DISTINCT keyset.
     ///
-    /// DataFusion's physical planner rejects `InSubquery` in UPDATE/DELETE context
-    /// with "Physical plan does not support logical expression InSubquery(...)".
-    /// SELECT works fine; only DML fails.
+    /// Replaces the old literal-inlining rewriter. The old rewriter materialised
+    /// each subquery into an `IN (v1, v2, ...)` or OR-of-ANDs list, producing
+    /// O(N) plan text for N matching rows. TPC-E SF10 at 34,496 tuples crashed
+    /// the coordinator with a stack overflow (see the regression test at
+    /// `tests/in_subquery_or_stack_overflow.rs` for the failure mode).
     ///
-    /// Workaround: before executing DML, detect any `IN (subquery)` in the WHERE
-    /// clause, execute each subquery as a standalone SELECT (using the same session
-    /// context / Iceberg snapshot), collect the result values, and rewrite the
-    /// WHERE clause to use `IN (literal_list)`.  The rewritten SQL is semantically
-    /// identical and DataFusion handles it without issues.
+    /// The new approach:
     ///
-    /// Returns the original string unchanged when no subqueries are present, so
-    /// the fast path has zero overhead.
-    async fn rewrite_in_subquery_where(
+    /// 1. Execute each subquery once, projecting its columns as `__col0..__colK`
+    ///    plus a constant `TRUE AS __matched` column, with NULL rows dropped and
+    ///    DISTINCT applied.
+    /// 2. Register the result as a scratch `MemTable` named `__sqe_in_subq_<id>`
+    ///    where `<id>` is a process-global monotonic counter.
+    /// 3. Emit a `LEFT JOIN` clause against the scratch table on the LHS columns.
+    /// 4. Replace the original `IN (subquery)` node with
+    ///    `COALESCE("__sq<alias_id>"."__matched", FALSE)`, wrapped in `NOT` for
+    ///    `NOT IN`.
+    ///
+    /// Returns:
+    /// - The rewritten WHERE string (O(1) in subquery cardinality).
+    /// - A concatenated JOIN clause string to append to the outer SELECT's FROM.
+    /// - An RAII guard that deregisters every scratch table on drop.
+    ///
+    /// Fast path: if `where_sql` contains no `SELECT` token, returns
+    /// `(where_sql.to_string(), "", empty_guard)` with zero overhead. Matches
+    /// the fast-path behaviour of the old rewriter.
+    ///
+    /// NULL semantics: rows where any matcher column is NULL are dropped from
+    /// the scratch keyset, and outer rows with NULL in matcher columns do not
+    /// match. This preserves the behaviour of the old rewriter (which skipped
+    /// NULL subquery rows at the Rust level) and is a deliberate deviation from
+    /// strict SQL `IN`/`NOT IN` semantics in the presence of NULLs.
+    async fn lift_in_subqueries(
         &self,
         where_sql: &str,
         ctx: &DFSessionContext,
-    ) -> sqe_core::Result<String> {
-        use sqlparser::ast::{Expr, Value as SqlValue};
-        use sqlparser::dialect::GenericDialect;
-        use sqlparser::parser::Parser;
+    ) -> sqe_core::Result<(String, String, InSubqueryCleanup)> {
+        lift_in_subqueries(where_sql, ctx).await
+    }
+}
 
-        // Quick bail-out: most WHERE clauses don't contain subqueries.
-        if !where_sql.to_uppercase().contains("SELECT") {
-            return Ok(where_sql.to_string());
-        }
+// ---------------------------------------------------------------------------
+// Free-function form of the IN-subquery lifter.
+//
+// `WriteHandler::lift_in_subqueries` is a thin shim that delegates here. The
+// method has no `self` dependencies; keeping the implementation free-standing
+// lets integration tests drive it directly without constructing a full
+// `SqeConfig` + `WriteHandler`.
+// ---------------------------------------------------------------------------
 
-        // Parse the WHERE expression by wrapping it in a dummy SELECT.
-        let dummy_sql = format!("SELECT * FROM __dummy WHERE {where_sql}");
-        let mut stmts = Parser::parse_sql(&GenericDialect {}, &dummy_sql)
-            .map_err(|e| SqeError::Execution(format!("IN-subquery rewrite parse error: {e}")))?;
+/// See [`WriteHandler::lift_in_subqueries`] for semantics. Exposed for the
+/// integration test in `tests/in_subquery_view_rewrite.rs`.
+#[doc(hidden)]
+pub async fn lift_in_subqueries(
+    where_sql: &str,
+    ctx: &DFSessionContext,
+) -> sqe_core::Result<(String, String, InSubqueryCleanup)> {
+    use datafusion::datasource::MemTable;
+    use sqlparser::ast::SetExpr;
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
 
-        let where_expr = match stmts.first_mut() {
-            Some(sqlparser::ast::Statement::Query(q)) => {
-                match q.body.as_mut() {
-                    sqlparser::ast::SetExpr::Select(sel) => sel.selection.take(),
-                    _ => return Ok(where_sql.to_string()),
-                }
-            }
-            _ => return Ok(where_sql.to_string()),
-        };
-
-        let mut expr = match where_expr {
-            Some(e) => e,
-            None => return Ok(where_sql.to_string()),
-        };
-
-        // Collect all InSubquery occurrences and replace them with sentinel
-        // placeholder expressions. We store the extracted subquery SQL strings
-        // and the `negated` flag so we can execute them asynchronously.
-        let mut subqueries: Vec<(String, bool)> = Vec::new();
-        collect_and_replace_in_subqueries(&mut expr, &mut subqueries);
-
-        if subqueries.is_empty() {
-            return Ok(where_sql.to_string());
-        }
-
-        // Execute each collected subquery and gather the literal value lists.
-        //
-        // `value_lists` is Vec<rows> where each row is Vec<column_values>.
-        // For single-column IN subqueries each row has exactly one element.
-        // For multi-column (tuple) IN subqueries each row has N elements,
-        // one per column of the subquery result, enabling the OR-of-ANDs rewrite.
-        let mut value_lists: Vec<Vec<Vec<Expr>>> = Vec::with_capacity(subqueries.len());
-        for (subquery_sql, _negated) in &subqueries {
-            let df = ctx.sql(subquery_sql).await.map_err(|e| {
-                SqeError::Execution(format!(
-                    "IN-subquery execution failed for `{subquery_sql}`: {e}"
-                ))
-            })?;
-            let batches = df.collect().await.map_err(|e| {
-                SqeError::Execution(format!(
-                    "IN-subquery collect failed for `{subquery_sql}`: {e}"
-                ))
-            })?;
-
-            let mut rows: Vec<Vec<Expr>> = Vec::new();
-            for batch in &batches {
-                let num_cols = batch.num_columns();
-                'row: for row in 0..batch.num_rows() {
-                    let mut col_literals: Vec<Expr> = Vec::with_capacity(num_cols);
-                    for col_idx in 0..num_cols {
-                        let col = batch.column(col_idx);
-                        // Skip entire row if any column is NULL.
-                        if col.is_null(row) {
-                            continue 'row;
-                        }
-                        let val_str = arrow::util::display::array_value_to_string(col, row)
-                            .unwrap_or_default();
-                        let literal = match col.data_type() {
-                            arrow::datatypes::DataType::Int8
-                            | arrow::datatypes::DataType::Int16
-                            | arrow::datatypes::DataType::Int32
-                            | arrow::datatypes::DataType::Int64
-                            | arrow::datatypes::DataType::UInt8
-                            | arrow::datatypes::DataType::UInt16
-                            | arrow::datatypes::DataType::UInt32
-                            | arrow::datatypes::DataType::UInt64 => {
-                                Expr::Value(SqlValue::Number(val_str, false))
-                            }
-                            arrow::datatypes::DataType::Float32
-                            | arrow::datatypes::DataType::Float64 => {
-                                Expr::Value(SqlValue::Number(val_str, false))
-                            }
-                            _ => Expr::Value(SqlValue::SingleQuotedString(val_str)),
-                        };
-                        col_literals.push(literal);
-                    }
-                    rows.push(col_literals);
-                }
-            }
-            value_lists.push(rows);
-        }
-
-        // Second pass: substitute the sentinel placeholders with InList / Boolean
-        // (single-column) or OR-of-ANDs (multi-column / tuple IN).
-        let mut idx = 0usize;
-        substitute_in_subquery_placeholders(&mut expr, &subqueries, &value_lists, &mut idx);
-
-        let rewritten = format!("{expr}");
-        tracing::info!(
-            original = %where_sql,
-            rewritten = %&rewritten[..rewritten.len().min(300)],
-            subquery_count = subqueries.len(),
-            "Rewrote IN (subquery) to literal predicate(s) for DML WHERE clause"
-        );
-        Ok(rewritten)
+    // Fast path: most WHERE clauses don't contain subqueries.
+    if !where_sql.to_uppercase().contains("SELECT") {
+        return Ok((
+            where_sql.to_string(),
+            String::new(),
+            InSubqueryCleanup::empty(ctx),
+        ));
     }
 
+    // Parse the WHERE expression by wrapping it in a dummy SELECT.
+    let dummy_sql = format!("SELECT * FROM __dummy WHERE {where_sql}");
+    let mut stmts = Parser::parse_sql(&GenericDialect {}, &dummy_sql)
+        .map_err(|e| SqeError::Execution(format!("IN-subquery lift parse error: {e}")))?;
+
+    let where_expr_opt = match stmts.first_mut() {
+        Some(Statement::Query(q)) => match q.body.as_mut() {
+            SetExpr::Select(sel) => sel.selection.take(),
+            _ => {
+                return Ok((
+                    where_sql.to_string(),
+                    String::new(),
+                    InSubqueryCleanup::empty(ctx),
+                ));
+            }
+        },
+        _ => {
+            return Ok((
+                where_sql.to_string(),
+                String::new(),
+                InSubqueryCleanup::empty(ctx),
+            ));
+        }
+    };
+
+    let mut expr = match where_expr_opt {
+        Some(e) => e,
+        None => {
+            return Ok((
+                where_sql.to_string(),
+                String::new(),
+                InSubqueryCleanup::empty(ctx),
+            ));
+        }
+    };
+
+    // Walk the AST and replace every `InSubquery` node with a sentinel
+    // identifier. The sentinel is a plain `Expr::Identifier` containing a
+    // unique token; text-substitution at the end swaps each token for the
+    // real COALESCE expression. Using a sentinel keeps the rewritten AST
+    // depth O(1) in subquery cardinality and avoids the sqlparser-Display
+    // trick that caused the old rewriter's stack overflow.
+    let mut found: Vec<LiftedSubquery> = Vec::new();
+    collect_and_sentinel_in_subqueries(&mut expr, &mut found);
+
+    if found.is_empty() {
+        return Ok((
+            where_sql.to_string(),
+            String::new(),
+            InSubqueryCleanup::empty(ctx),
+        ));
+    }
+
+    let mut joins: Vec<String> = Vec::with_capacity(found.len());
+    let mut scratch_names: Vec<String> = Vec::with_capacity(found.len());
+    let mut replacements: Vec<(String, String)> = Vec::with_capacity(found.len());
+
+    for (alias_idx, lifted) in found.into_iter().enumerate() {
+        let LiftedSubquery {
+            lhs_cols,
+            subquery_text,
+            negated,
+            sentinel,
+        } = lifted;
+        let num_cols = lhs_cols.len();
+
+        // Preflight: get the subquery's output column names so we can alias
+        // them positionally as __col0..__colN. Column names in the
+        // subquery's projection may be arbitrary (e.g. `t.t_ca_id`); we do
+        // not depend on them beyond this preflight.
+        let preflight_sql = format!("SELECT * FROM ({subquery_text}) AS __sq");
+        let pre_df = ctx.sql(&preflight_sql).await.map_err(|e| {
+            SqeError::Execution(format!(
+                "IN-subquery preflight failed for `{preflight_sql}`: {e}"
+            ))
+        })?;
+        let subq_cols: Vec<String> = pre_df
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect();
+        drop(pre_df);
+
+        if subq_cols.len() != num_cols {
+            return Err(SqeError::Execution(format!(
+                "IN-subquery arity mismatch: LHS has {num_cols} column(s), \
+                     subquery returns {} column(s)",
+                subq_cols.len()
+            )));
+        }
+
+        // Build the scratch-materialiser SQL. Using `__sq."<name>"` avoids
+        // ambiguity when the subquery contains joins whose output column
+        // names collide; wrapping in `FROM ({subquery}) AS __sq` flattens
+        // the projection to a single relation.
+        let projections: Vec<String> = subq_cols
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                format!(
+                    "\"__sq\".\"{esc_name}\" AS \"__col{i}\"",
+                    esc_name = name.replace('"', "\"\""),
+                )
+            })
+            .collect();
+        let null_filters: Vec<String> = subq_cols
+            .iter()
+            .map(|name| {
+                format!(
+                    "\"__sq\".\"{esc_name}\" IS NOT NULL",
+                    esc_name = name.replace('"', "\"\""),
+                )
+            })
+            .collect();
+        let materialiser_sql = format!(
+            "SELECT DISTINCT {projs}, TRUE AS \"__matched\" \
+                 FROM ({sub}) AS __sq \
+                 WHERE {filters}",
+            projs = projections.join(", "),
+            sub = subquery_text,
+            filters = null_filters.join(" AND "),
+        );
+
+        // Execute the materialiser and wrap its output into a MemTable.
+        // The DataFrame's schema is taken before `collect()` consumes it so
+        // we can build the MemTable even when the subquery returns zero
+        // rows (in which case the scratch table has the right shape but no
+        // data; every LEFT JOIN lookup misses and `COALESCE(..., FALSE)`
+        // evaluates to FALSE — i.e. `IN (empty)` is FALSE and `NOT IN
+        // (empty)` is TRUE, matching the old rewriter's behaviour).
+        let mat_df = ctx.sql(&materialiser_sql).await.map_err(|e| {
+            SqeError::Execution(format!("IN-subquery materialiser plan failed: {e}"))
+        })?;
+        let schema: Arc<ArrowSchema> = Arc::new(mat_df.schema().as_arrow().clone());
+        let batches = mat_df.collect().await.map_err(|e| {
+            SqeError::Execution(format!("IN-subquery materialiser execution failed: {e}"))
+        })?;
+
+        let mem = MemTable::try_new(schema, vec![batches]).map_err(|e| {
+            SqeError::Execution(format!(
+                "Failed to build MemTable for IN-subquery keyset: {e}"
+            ))
+        })?;
+
+        let counter_id = IN_SUBQUERY_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let scratch_name = format!("__sqe_in_subq_{counter_id}");
+        ctx.register_table(scratch_name.as_str(), Arc::new(mem))
+            .map_err(|e| {
+                SqeError::Execution(format!(
+                    "Failed to register IN-subquery scratch MemTable: {e}"
+                ))
+            })?;
+        scratch_names.push(scratch_name.clone());
+
+        // Build the LEFT JOIN clause and the replacement expression text.
+        // The per-statement alias `__sqN` is bounded by `found.len()` and
+        // keeps the JOIN's ON clause readable in debug logs.
+        let alias = format!("__sq{alias_idx}");
+        let on_clauses: Vec<String> = (0..num_cols)
+            .map(|i| format!("\"{alias}\".\"__col{i}\" = {lhs}", lhs = lhs_cols[i],))
+            .collect();
+        let join_clause = format!(
+            " LEFT JOIN \"{scratch_name}\" AS \"{alias}\" ON {on}",
+            on = on_clauses.join(" AND "),
+        );
+        joins.push(join_clause);
+
+        let coalesce_sql = format!("COALESCE(\"{alias}\".\"__matched\", FALSE)");
+        let replacement = if negated {
+            format!("(NOT {coalesce_sql})")
+        } else {
+            coalesce_sql
+        };
+        replacements.push((sentinel, replacement));
+    }
+
+    // Stringify the modified WHERE AST. Depth is O(1) in subquery
+    // cardinality because every `InSubquery` node is now a single
+    // `Expr::Identifier` sentinel.
+    let mut rewritten = format!("{expr}");
+    for (sentinel, replacement) in &replacements {
+        rewritten = rewritten.replace(sentinel, replacement);
+    }
+
+    tracing::info!(
+        original = %&where_sql[..where_sql.len().min(200)],
+        rewritten = %&rewritten[..rewritten.len().min(200)],
+        subquery_count = replacements.len(),
+        "Lifted IN (subquery) into LEFT JOIN(s) for DML WHERE clause"
+    );
+
+    Ok((
+        rewritten,
+        joins.join(""),
+        InSubqueryCleanup {
+            ctx: ctx.clone(),
+            scratch_tables: scratch_names,
+        },
+    ))
+}
+
+impl WriteHandler {
     fn format_version(&self) -> FormatVersion {
         match self.config.catalog.default_table_format_version {
             3 => FormatVersion::V3,
@@ -1998,10 +2231,7 @@ impl WriteHandler {
 
     /// Create a `SessionCatalogBridge` (which implements `iceberg::Catalog`)
     /// for the given session.
-    async fn create_catalog_bridge(
-        &self,
-        session: &Session,
-    ) -> sqe_core::Result<Arc<dyn Catalog>> {
+    async fn create_catalog_bridge(&self, session: &Session) -> sqe_core::Result<Arc<dyn Catalog>> {
         let session_catalog = Arc::new(
             SessionCatalog::new(
                 &self.config.catalog.polaris_url,
@@ -2009,7 +2239,8 @@ impl WriteHandler {
                 &session.access_token,
                 &self.config.storage,
                 self.table_cache.clone(),
-                None, None,
+                None,
+                None,
             )
             .await?,
         );
@@ -2024,214 +2255,145 @@ impl WriteHandler {
 }
 
 // ---------------------------------------------------------------------------
-// IN-subquery rewrite helpers (free functions, sync, no async_recursion needed)
+// IN-subquery view-lift: RAII cleanup + AST sentinelisation
 // ---------------------------------------------------------------------------
 
-/// Walk `expr` recursively, replacing every `InSubquery { expr, subquery, negated }` node
-/// with a sentinel `Expr::Value(Value::Placeholder("?N"))`.
+/// Process-global monotonic counter for naming scratch MemTables registered
+/// by [`WriteHandler::lift_in_subqueries`]. A plain atomic is sufficient:
+/// DML statements across sessions never share scratch tables, and the counter
+/// only has to guarantee distinctness, not ordering.
+static IN_SUBQUERY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// RAII handle that deregisters a set of scratch MemTables on drop.
 ///
-/// The extracted `(subquery_sql, negated)` tuples are pushed into `out` in the
-/// order they are encountered (depth-first, left-to-right), which must match
-/// the order used by `substitute_in_subquery_placeholders`.
-fn collect_and_replace_in_subqueries(
+/// Returned by [`WriteHandler::lift_in_subqueries`] and bound by the DML
+/// handler so it outlives the per-batch SELECT loop. On drop, every
+/// registered scratch table is deregistered from the session context.
+///
+/// Deregister errors are logged at `warn!` and swallowed: matches the
+/// existing scratch-table cleanup behaviour inside `filter_batch_negate`,
+/// `filter_batch_match`, `apply_update`, and `count_matching_rows` (see the
+/// `let _ = ctx.deregister_table(...)` calls in this file).
+#[doc(hidden)]
+pub struct InSubqueryCleanup {
+    ctx: DFSessionContext,
+    scratch_tables: Vec<String>,
+}
+
+impl InSubqueryCleanup {
+    /// Build a cleanup guard that holds no scratch tables. Used on fast-path
+    /// returns from `lift_in_subqueries` where no subqueries were found.
+    fn empty(ctx: &DFSessionContext) -> Self {
+        Self {
+            ctx: ctx.clone(),
+            scratch_tables: Vec::new(),
+        }
+    }
+}
+
+impl Drop for InSubqueryCleanup {
+    fn drop(&mut self) {
+        for name in &self.scratch_tables {
+            if let Err(e) = self.ctx.deregister_table(name.as_str()) {
+                tracing::warn!(
+                    table = %name,
+                    error = %e,
+                    "in-subquery scratch deregister failed"
+                );
+            }
+        }
+    }
+}
+
+/// One `IN (subquery)` occurrence that the lifter needs to materialise.
+struct LiftedSubquery {
+    /// LHS columns as SQL text. For `col IN (...)` this has length 1; for
+    /// `(c1, c2) IN (...)` it has length 2. The strings are used verbatim in
+    /// the JOIN ON clause, so qualified references like `target.col` are
+    /// preserved.
+    lhs_cols: Vec<String>,
+    /// Text of the parenthesised subquery (without outer `IN (` wrapper).
+    subquery_text: String,
+    /// Whether the original expression was `NOT IN`.
+    negated: bool,
+    /// Unique sentinel token substituted into the WHERE string. The lifter
+    /// replaces the `Expr::InSubquery` AST node with `Expr::Identifier(sentinel)`
+    /// before stringifying; after stringification the sentinel is swapped for
+    /// the real `COALESCE(...)` expression text.
+    sentinel: String,
+}
+
+/// Walk `expr` recursively. For every `InSubquery { expr, subquery, negated }`
+/// found, collect its LHS column list, subquery text, and a unique sentinel
+/// token, then replace the node with `Expr::Identifier(sentinel)` (no wrap:
+/// the `negated` flag is encoded in the replacement text that gets
+/// substituted later, not in the AST).
+///
+/// The sentinel token uses a `__SQE_IN_SUBQ_SENTINEL_<idx>__` form that does
+/// not appear in user SQL and is stable across `Display` impls.
+fn collect_and_sentinel_in_subqueries(
     expr: &mut sqlparser::ast::Expr,
-    out: &mut Vec<(String, bool)>,
+    out: &mut Vec<LiftedSubquery>,
 ) {
-    use sqlparser::ast::{Expr, Value as SqlValue};
+    use sqlparser::ast::{Expr, Ident};
 
     match expr {
-        Expr::InSubquery { expr: inner, subquery, negated } => {
-            let subquery_sql = format!("SELECT * FROM ({subquery}) AS __sq");
+        Expr::InSubquery {
+            expr: inner,
+            subquery,
+            negated,
+        } => {
             let neg = *negated;
-            out.push((subquery_sql, neg));
-            let idx = out.len() - 1;
-            // Replace this node with a sentinel placeholder.
-            // We keep `inner` to use later; stash its current value.
-            let inner_box = std::mem::replace(inner, Box::new(Expr::Value(SqlValue::Null)));
-            *expr = Expr::Nested(Box::new(Expr::InList {
-                expr: inner_box,
-                list: vec![Expr::Value(SqlValue::Placeholder(format!("?{idx}")))],
+            let subquery_text = format!("{subquery}");
+            let lhs_cols: Vec<String> = match inner.as_ref() {
+                Expr::Tuple(items) => items.iter().map(|e| format!("{e}")).collect(),
+                other => vec![format!("{other}")],
+            };
+            let idx = out.len();
+            let sentinel = format!("__SQE_IN_SUBQ_SENTINEL_{idx}__");
+            out.push(LiftedSubquery {
+                lhs_cols,
+                subquery_text,
                 negated: neg,
-            }));
+                sentinel: sentinel.clone(),
+            });
+            *expr = Expr::Identifier(Ident::new(sentinel));
         }
         Expr::BinaryOp { left, right, .. } => {
-            collect_and_replace_in_subqueries(left, out);
-            collect_and_replace_in_subqueries(right, out);
+            collect_and_sentinel_in_subqueries(left, out);
+            collect_and_sentinel_in_subqueries(right, out);
         }
         Expr::UnaryOp { expr: inner, .. } => {
-            collect_and_replace_in_subqueries(inner, out);
+            collect_and_sentinel_in_subqueries(inner, out);
         }
         Expr::Nested(inner) => {
-            collect_and_replace_in_subqueries(inner, out);
+            collect_and_sentinel_in_subqueries(inner, out);
         }
-        Expr::Between { expr: e, low, high, .. } => {
-            collect_and_replace_in_subqueries(e, out);
-            collect_and_replace_in_subqueries(low, out);
-            collect_and_replace_in_subqueries(high, out);
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            collect_and_sentinel_in_subqueries(e, out);
+            collect_and_sentinel_in_subqueries(low, out);
+            collect_and_sentinel_in_subqueries(high, out);
         }
-        _ => {}
-    }
-}
-
-/// Fold a non-empty slice of expressions into a balanced binary tree using `op`.
-///
-/// A left-leaning fold (`((((a op b) op c) op d))`) grows linearly in depth
-/// with the input length. `Display::fmt` on `sqlparser::ast::Expr::BinaryOp`
-/// recurses into `left` and `right`, so a chain of N left-leaning nodes
-/// produces a call stack of N frames. For the TPC-E CoW `UPDATE` path that
-/// rewrites `(col1, col2) IN (SELECT ...)` with thousands of matching rows,
-/// the tokio-rt-worker thread (default 2MB stack on macOS) overflowed after
-/// ~8K rows.
-///
-/// A balanced fold (`((a op b) op (c op d))`) has depth `ceil(log2(N))`, so
-/// even millions of rows stay within a few dozen frames. Semantics are
-/// preserved because `AND` and `OR` are associative.
-fn fold_balanced_binary(
-    mut nodes: Vec<sqlparser::ast::Expr>,
-    op: sqlparser::ast::BinaryOperator,
-) -> Option<sqlparser::ast::Expr> {
-    use sqlparser::ast::Expr;
-
-    if nodes.is_empty() {
-        return None;
-    }
-    while nodes.len() > 1 {
-        let mut next: Vec<Expr> = Vec::with_capacity(nodes.len().div_ceil(2));
-        let mut iter = nodes.into_iter();
-        while let Some(left) = iter.next() {
-            match iter.next() {
-                Some(right) => next.push(Expr::BinaryOp {
-                    left: Box::new(left),
-                    op: op.clone(),
-                    right: Box::new(right),
-                }),
-                None => next.push(left),
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                collect_and_sentinel_in_subqueries(op, out);
             }
-        }
-        nodes = next;
-    }
-    nodes.into_iter().next()
-}
-
-/// Walk `expr` and substitute every sentinel `InList` with a single `Placeholder("?N")`
-/// list element with the real expression (using the collected values) or a `Boolean`
-/// constant when the value list is empty.
-///
-/// For single-column IN subqueries the sentinel's `col_expr` is a plain column reference
-/// and the result is `col IN (v1, v2, ...)` (or `NOT IN`).
-///
-/// For multi-column (tuple) IN subqueries the sentinel's `col_expr` is `Expr::Tuple`
-/// and the result is an OR chain of AND conditions:
-///   `(col1=v1 AND col2=v2) OR (col1=v3 AND col2=v4) OR ...`
-/// This avoids DataFusion's lack of support for tuple-IN in DML context.
-///
-/// The chain is built as a balanced binary tree (see [`fold_balanced_binary`])
-/// so rewrites of large IN-subqueries (thousands to millions of rows) do not
-/// overflow the tokio worker stack when Display or the downstream parser
-/// walks the expression.
-///
-/// `idx` tracks which entry in `subqueries`/`value_lists` we are currently visiting.
-/// Must be called with the same `expr` that `collect_and_replace_in_subqueries` modified.
-#[allow(clippy::only_used_in_recursion)]
-fn substitute_in_subquery_placeholders(
-    expr: &mut sqlparser::ast::Expr,
-    subqueries: &[(String, bool)],
-    value_lists: &[Vec<Vec<sqlparser::ast::Expr>>],
-    idx: &mut usize,
-) {
-    use sqlparser::ast::{BinaryOperator, Expr, Value as SqlValue};
-
-    match expr {
-        // Sentinel pattern: Nested(InList { list: [Placeholder("?N")], .. })
-        Expr::Nested(inner) => {
-            if let Expr::InList { list, negated, expr: col_expr } = inner.as_mut() {
-                if list.len() == 1 {
-                    if let Expr::Value(SqlValue::Placeholder(p)) = &list[0] {
-                        if p.starts_with('?') {
-                            let current_idx = *idx;
-                            *idx += 1;
-                            let rows = &value_lists[current_idx];
-                            let neg = *negated;
-                            let col =
-                                std::mem::replace(col_expr, Box::new(Expr::Value(SqlValue::Null)));
-
-                            if rows.is_empty() {
-                                // IN () → FALSE; NOT IN () → TRUE
-                                *expr = Expr::Value(SqlValue::Boolean(!neg));
-                                return;
-                            }
-
-                            // Determine whether this is a tuple IN by checking if the
-                            // sentinel's col_expr (now in `col`) is an Expr::Tuple.
-                            if let Expr::Tuple(col_refs) = col.as_ref() {
-                                // Multi-column (tuple) IN rewrite:
-                                // (col1, col2) IN (SELECT c1, c2 ...) becomes
-                                // (col1=v1 AND col2=v2) OR (col1=v3 AND col2=v4) OR ...
-                                // NOT IN becomes the negation of that OR chain.
-                                //
-                                // Both the per-row AND-chain and the cross-row
-                                // OR-chain are built with `fold_balanced_binary`
-                                // to keep the tree depth O(log N) instead of
-                                // O(N). A linear left-fold blew the tokio-rt-worker
-                                // stack on TPC-E SF1 trade_result_update_holding
-                                // (thousands of pending trades).
-                                let col_refs = col_refs.clone();
-                                let mut and_exprs: Vec<Expr> = Vec::with_capacity(rows.len());
-                                for row in rows {
-                                    let eqs: Vec<Expr> = col_refs
-                                        .iter()
-                                        .zip(row.iter())
-                                        .map(|(col_ref, val)| Expr::BinaryOp {
-                                            left: Box::new(col_ref.clone()),
-                                            op: BinaryOperator::Eq,
-                                            right: Box::new(val.clone()),
-                                        })
-                                        .collect();
-                                    if let Some(and_expr) =
-                                        fold_balanced_binary(eqs, BinaryOperator::And)
-                                    {
-                                        and_exprs.push(Expr::Nested(Box::new(and_expr)));
-                                    }
-                                }
-                                let or_expr = fold_balanced_binary(and_exprs, BinaryOperator::Or)
-                                    .unwrap_or(Expr::Value(SqlValue::Boolean(false)));
-                                *expr = if neg {
-                                    // NOT IN -> wrap in NOT
-                                    Expr::UnaryOp {
-                                        op: sqlparser::ast::UnaryOperator::Not,
-                                        expr: Box::new(Expr::Nested(Box::new(or_expr))),
-                                    }
-                                } else {
-                                    Expr::Nested(Box::new(or_expr))
-                                };
-                            } else {
-                                // Single-column IN: flatten rows to a value list and use InList.
-                                let flat: Vec<Expr> =
-                                    rows.iter().filter_map(|r| r.first().cloned()).collect();
-                                *expr = Expr::InList {
-                                    expr: col,
-                                    list: flat,
-                                    negated: neg,
-                                };
-                            }
-                            return;
-                        }
-                    }
-                }
+            for c in conditions {
+                collect_and_sentinel_in_subqueries(c, out);
             }
-            substitute_in_subquery_placeholders(inner, subqueries, value_lists, idx);
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            substitute_in_subquery_placeholders(left, subqueries, value_lists, idx);
-            substitute_in_subquery_placeholders(right, subqueries, value_lists, idx);
-        }
-        Expr::UnaryOp { expr: inner, .. } => {
-            substitute_in_subquery_placeholders(inner, subqueries, value_lists, idx);
-        }
-        Expr::Between { expr: e, low, high, .. } => {
-            substitute_in_subquery_placeholders(e, subqueries, value_lists, idx);
-            substitute_in_subquery_placeholders(low, subqueries, value_lists, idx);
-            substitute_in_subquery_placeholders(high, subqueries, value_lists, idx);
+            for r in results {
+                collect_and_sentinel_in_subqueries(r, out);
+            }
+            if let Some(e) = else_result {
+                collect_and_sentinel_in_subqueries(e, out);
+            }
         }
         _ => {}
     }
@@ -2304,7 +2466,9 @@ pub(crate) fn decorrelate_scalar_subqueries(
     for a in assignments {
         let col_name = match &a.target {
             AssignmentTarget::ColumnName(name) => format!("{name}"),
-            AssignmentTarget::Tuple(names) => names.first().map(|n| format!("{n}")).unwrap_or_default(),
+            AssignmentTarget::Tuple(names) => {
+                names.first().map(|n| format!("{n}")).unwrap_or_default()
+            }
         };
         let mut expr = a.value.clone();
         rewrite_subqueries_in_expr(&mut expr, target_name, &mut next_idx, &mut joins);
@@ -2350,7 +2514,12 @@ fn rewrite_subqueries_in_expr(
         Expr::Nested(inner) => {
             rewrite_subqueries_in_expr(inner, target_name, next_idx, joins);
         }
-        Expr::Case { operand, conditions, results, else_result } => {
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
             if let Some(op) = operand {
                 rewrite_subqueries_in_expr(op, target_name, next_idx, joins);
             }
@@ -2458,9 +2627,7 @@ fn try_decorrelate_query(
     let on_clauses: Vec<String> = correlation
         .iter()
         .enumerate()
-        .map(|(i, (t_col, _))| {
-            format!("\"{alias}\".__k{i} = \"{target_name}\".{t_col}")
-        })
+        .map(|(i, (t_col, _))| format!("\"{alias}\".__k{i} = \"{target_name}\".{t_col}"))
         .collect();
 
     let join_sql = format!(
@@ -2479,7 +2646,11 @@ fn collect_and_conjuncts<'a>(
 ) {
     use sqlparser::ast::{BinaryOperator, Expr};
     match expr {
-        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
             collect_and_conjuncts(left, out);
             collect_and_conjuncts(right, out);
         }
@@ -2499,7 +2670,11 @@ fn extract_correlation_eq(
     use sqlparser::ast::{BinaryOperator, Expr};
 
     let (left, right) = match pred {
-        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => (left.as_ref(), right.as_ref()),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => (left.as_ref(), right.as_ref()),
         Expr::Nested(inner) => return extract_correlation_eq(inner, target_name),
         _ => return None,
     };
@@ -2536,7 +2711,9 @@ fn compound_ident_parts(expr: &sqlparser::ast::Expr) -> Option<(String, String)>
 /// individually using `arrow_type_to_type` and assign sequential field IDs
 /// starting from 1.
 /// Convert a sqlparser SQL data type to an Arrow DataType.
-pub(crate) fn sql_type_to_arrow(sql_type: &sqlparser::ast::DataType) -> sqe_core::Result<arrow_schema::DataType> {
+pub(crate) fn sql_type_to_arrow(
+    sql_type: &sqlparser::ast::DataType,
+) -> sqe_core::Result<arrow_schema::DataType> {
     use arrow_schema::DataType;
     use sqlparser::ast::DataType as SqlType;
 
@@ -2557,9 +2734,18 @@ pub(crate) fn sql_type_to_arrow(sql_type: &sqlparser::ast::DataType) -> sqe_core
         SqlType::Timestamp(precision, _tz_info) => {
             let p = precision.unwrap_or(6);
             match p {
-                0..=3 => Ok(DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None)),
-                4..=6 => Ok(DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)),
-                _ => Ok(DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None)),
+                0..=3 => Ok(DataType::Timestamp(
+                    arrow_schema::TimeUnit::Millisecond,
+                    None,
+                )),
+                4..=6 => Ok(DataType::Timestamp(
+                    arrow_schema::TimeUnit::Microsecond,
+                    None,
+                )),
+                _ => Ok(DataType::Timestamp(
+                    arrow_schema::TimeUnit::Nanosecond,
+                    None,
+                )),
             }
         }
         SqlType::Decimal(info) | SqlType::Numeric(info) => {
@@ -2670,8 +2856,14 @@ mod tests {
         let iceberg_schema = arrow_schema_to_iceberg(&arrow_schema).unwrap();
         let fields: Vec<_> = iceberg_schema.as_struct().fields().to_vec();
 
-        assert!(fields[0].required, "non-nullable Arrow field should map to required Iceberg field");
-        assert!(!fields[1].required, "nullable Arrow field should map to optional Iceberg field");
+        assert!(
+            fields[0].required,
+            "non-nullable Arrow field should map to required Iceberg field"
+        );
+        assert!(
+            !fields[1].required,
+            "nullable Arrow field should map to optional Iceberg field"
+        );
     }
 
     #[test]
@@ -2762,9 +2954,11 @@ mod tests {
 
     #[test]
     fn test_arrow_schema_to_iceberg_decimal_type() {
-        let arrow_schema = ArrowSchema::new(vec![
-            Field::new("amount", DataType::Decimal128(18, 4), false),
-        ]);
+        let arrow_schema = ArrowSchema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(18, 4),
+            false,
+        )]);
 
         let iceberg_schema = arrow_schema_to_iceberg(&arrow_schema).unwrap();
         let fields: Vec<_> = iceberg_schema.as_struct().fields().to_vec();
@@ -2776,9 +2970,7 @@ mod tests {
 
     #[test]
     fn test_arrow_schema_to_iceberg_binary_type() {
-        let arrow_schema = ArrowSchema::new(vec![
-            Field::new("payload", DataType::Binary, true),
-        ]);
+        let arrow_schema = ArrowSchema::new(vec![Field::new("payload", DataType::Binary, true)]);
 
         let iceberg_schema = arrow_schema_to_iceberg(&arrow_schema).unwrap();
         assert_eq!(iceberg_schema.as_struct().fields().len(), 1);
@@ -2810,10 +3002,7 @@ mod tests {
             sql_type_to_arrow(&SqlType::SmallInt(None)).unwrap(),
             DataType::Int16
         );
-        assert_eq!(
-            sql_type_to_arrow(&SqlType::Int16).unwrap(),
-            DataType::Int16
-        );
+        assert_eq!(sql_type_to_arrow(&SqlType::Int16).unwrap(), DataType::Int16);
         assert_eq!(
             sql_type_to_arrow(&SqlType::Int(None)).unwrap(),
             DataType::Int32
@@ -2822,18 +3011,12 @@ mod tests {
             sql_type_to_arrow(&SqlType::Integer(None)).unwrap(),
             DataType::Int32
         );
-        assert_eq!(
-            sql_type_to_arrow(&SqlType::Int32).unwrap(),
-            DataType::Int32
-        );
+        assert_eq!(sql_type_to_arrow(&SqlType::Int32).unwrap(), DataType::Int32);
         assert_eq!(
             sql_type_to_arrow(&SqlType::BigInt(None)).unwrap(),
             DataType::Int64
         );
-        assert_eq!(
-            sql_type_to_arrow(&SqlType::Int64).unwrap(),
-            DataType::Int64
-        );
+        assert_eq!(sql_type_to_arrow(&SqlType::Int64).unwrap(), DataType::Int64);
     }
 
     #[test]
@@ -2862,10 +3045,7 @@ mod tests {
             sql_type_to_arrow(&SqlType::Varchar(None)).unwrap(),
             DataType::Utf8
         );
-        assert_eq!(
-            sql_type_to_arrow(&SqlType::Text).unwrap(),
-            DataType::Utf8
-        );
+        assert_eq!(sql_type_to_arrow(&SqlType::Text).unwrap(), DataType::Utf8);
         assert_eq!(
             sql_type_to_arrow(&SqlType::Char(None)).unwrap(),
             DataType::Utf8
@@ -2902,10 +3082,7 @@ mod tests {
 
     #[test]
     fn test_sql_type_to_arrow_date() {
-        assert_eq!(
-            sql_type_to_arrow(&SqlType::Date).unwrap(),
-            DataType::Date32
-        );
+        assert_eq!(sql_type_to_arrow(&SqlType::Date).unwrap(), DataType::Date32);
     }
 
     #[test]
@@ -2946,32 +3123,28 @@ mod tests {
     #[test]
     fn test_sql_type_to_arrow_timestamp_high_precision() {
         // Precision 7+ → Nanosecond
-        let result =
-            sql_type_to_arrow(&SqlType::Timestamp(Some(9), TimezoneInfo::None)).unwrap();
+        let result = sql_type_to_arrow(&SqlType::Timestamp(Some(9), TimezoneInfo::None)).unwrap();
         assert_eq!(result, DataType::Timestamp(TimeUnit::Nanosecond, None));
     }
 
     #[test]
     fn test_sql_type_to_arrow_decimal_full() {
-        let result = sql_type_to_arrow(&SqlType::Decimal(
-            ExactNumberInfo::PrecisionAndScale(18, 4),
-        ))
-        .unwrap();
+        let result =
+            sql_type_to_arrow(&SqlType::Decimal(ExactNumberInfo::PrecisionAndScale(18, 4)))
+                .unwrap();
         assert_eq!(result, DataType::Decimal128(18, 4));
     }
 
     #[test]
     fn test_sql_type_to_arrow_decimal_precision_only() {
-        let result =
-            sql_type_to_arrow(&SqlType::Decimal(ExactNumberInfo::Precision(10))).unwrap();
+        let result = sql_type_to_arrow(&SqlType::Decimal(ExactNumberInfo::Precision(10))).unwrap();
         // Scale defaults to 0
         assert_eq!(result, DataType::Decimal128(10, 0));
     }
 
     #[test]
     fn test_sql_type_to_arrow_decimal_no_info() {
-        let result =
-            sql_type_to_arrow(&SqlType::Decimal(ExactNumberInfo::None)).unwrap();
+        let result = sql_type_to_arrow(&SqlType::Decimal(ExactNumberInfo::None)).unwrap();
         // Defaults to Decimal128(38, 10)
         assert_eq!(result, DataType::Decimal128(38, 10));
     }
@@ -2979,14 +3152,12 @@ mod tests {
     #[test]
     fn test_sql_type_to_arrow_numeric_alias() {
         // NUMERIC is the same as DECIMAL in the implementation.
-        let decimal_result = sql_type_to_arrow(&SqlType::Decimal(
-            ExactNumberInfo::PrecisionAndScale(12, 2),
-        ))
-        .unwrap();
-        let numeric_result = sql_type_to_arrow(&SqlType::Numeric(
-            ExactNumberInfo::PrecisionAndScale(12, 2),
-        ))
-        .unwrap();
+        let decimal_result =
+            sql_type_to_arrow(&SqlType::Decimal(ExactNumberInfo::PrecisionAndScale(12, 2)))
+                .unwrap();
+        let numeric_result =
+            sql_type_to_arrow(&SqlType::Numeric(ExactNumberInfo::PrecisionAndScale(12, 2)))
+                .unwrap();
         assert_eq!(decimal_result, numeric_result);
     }
 
@@ -3156,74 +3327,5 @@ SET c = ( \
         let assignments = parse_update(sql);
         let (_, joins) = decorrelate_scalar_subqueries(&assignments, "t");
         assert!(joins.is_empty(), "non-eq correlation should be left alone");
-    }
-
-    // -------------------------------------------------------------------------
-    // fold_balanced_binary tests
-    // -------------------------------------------------------------------------
-
-    /// Depth of the BinaryOp tree formed by `fold_balanced_binary`. For a
-    /// balanced fold we expect `ceil(log2(N))` for N >= 1.
-    fn tree_depth(expr: &sqlparser::ast::Expr) -> usize {
-        use sqlparser::ast::Expr;
-        match expr {
-            Expr::BinaryOp { left, right, .. } => {
-                1 + tree_depth(left).max(tree_depth(right))
-            }
-            _ => 0,
-        }
-    }
-
-    fn num_literal(n: i64) -> sqlparser::ast::Expr {
-        use sqlparser::ast::{Expr, Value as SqlValue};
-        Expr::Value(SqlValue::Number(n.to_string(), false))
-    }
-
-    #[test]
-    fn fold_balanced_binary_empty_returns_none() {
-        let out = fold_balanced_binary(Vec::new(), sqlparser::ast::BinaryOperator::And);
-        assert!(out.is_none());
-    }
-
-    #[test]
-    fn fold_balanced_binary_single_returns_same_expr() {
-        let out = fold_balanced_binary(
-            vec![num_literal(42)],
-            sqlparser::ast::BinaryOperator::Or,
-        );
-        assert_eq!(format!("{}", out.unwrap()), "42");
-    }
-
-    #[test]
-    fn fold_balanced_binary_is_balanced_for_large_n() {
-        // 10_000 nodes: a left-fold would be 10_000 deep. A balanced fold
-        // must be at most ceil(log2(10_000)) = 14. Cap at 20 as generous
-        // headroom for round-up pairing.
-        let nodes: Vec<_> = (0..10_000).map(num_literal).collect();
-        let out =
-            fold_balanced_binary(nodes, sqlparser::ast::BinaryOperator::Or).unwrap();
-        let depth = tree_depth(&out);
-        assert!(
-            depth <= 20,
-            "balanced fold over 10k nodes produced depth {depth}; expected <= 20"
-        );
-        assert!(depth >= 14, "balanced fold over 10k nodes produced depth {depth}; expected >= 14");
-    }
-
-    #[test]
-    fn fold_balanced_binary_preserves_elements() {
-        // A fold over N equality nodes should preserve all N leaves even
-        // though their internal arrangement is balanced. Display the tree
-        // and count occurrences of each literal.
-        let nodes: Vec<_> = (0..64).map(num_literal).collect();
-        let out =
-            fold_balanced_binary(nodes, sqlparser::ast::BinaryOperator::And).unwrap();
-        let rendered = format!("{out}");
-        for n in 0..64 {
-            assert!(
-                rendered.contains(&format!("{n}")),
-                "balanced fold dropped literal {n}: {rendered}"
-            );
-        }
     }
 }

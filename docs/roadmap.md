@@ -5,6 +5,7 @@
 - [x] Single-node query engine (DataFusion + iceberg-rust + OIDC + Flight SQL)
 - [x] Distributed execution (coordinator-worker, shuffle, spill-to-disk)
 - [x] Full DML: CTAS, INSERT INTO, DELETE, UPDATE, MERGE INTO (Copy-on-Write)
+- [x] CoW DML scales to TPC-E SF10+ (`IN (subquery)` lifted to a scratch-MemTable + LEFT JOIN; plan size O(1) in subquery cardinality, no stack overflow at 34K+ tuples)
 - [x] Streaming writes (constant-memory CTAS/INSERT, no OOM on SF1+)
 - [x] Trino HTTP compatibility (pagination, headers, dual auth, system.jdbc.*)
 - [x] Trino SQL compatibility ~95% (70+ UDFs, USE, SHOW CREATE TABLE, TRUNCATE, etc.)
