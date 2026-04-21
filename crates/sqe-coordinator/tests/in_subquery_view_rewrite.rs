@@ -489,3 +489,223 @@ fn stack_overflow_regression_gate_file_exists() {
         "stack-overflow regression gate is missing at {path:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 5.11 Regression: scratch table must be registered under datafusion.public
+// ---------------------------------------------------------------------------
+//
+// The original `lift_in_subqueries` implementation registered its scratch
+// MemTable with a bare name (`__sqe_in_subq_{id}`) and referenced the same
+// bare name in the generated LEFT JOIN. In unit tests this worked because
+// `SessionContext::new()` defaults to catalog=`datafusion`, schema=`public`,
+// so bare names resolved to the built-in MemorySchemaProvider (which accepts
+// `register_table`). In production the session's default catalog is the
+// Iceberg catalog whose `SchemaProvider` inherits DataFusion's default
+// `register_table` impl, which returns:
+//
+//     Execution error: schema provider does not support registering tables
+//
+// TPC-E SF10 runs on 2026-04-21 surfaced this as five failed DML queries
+// (see `benchmarks/results/tpce-sf10-flight-2026-04-21T11:44:40.json`).
+//
+// This test reproduces the hostile default-catalog condition by building a
+// minimal read-only catalog that inherits the default `register_table` error
+// and installing it as the session default. Without the fix,
+// `lift_in_subqueries` fails at registration. With the fix, registration
+// succeeds because it uses the fully-qualified `datafusion.public` path —
+// which is always present in any `SessionContext` regardless of the default.
+
+mod read_only_iceberg_like {
+    //! Minimal catalog + schema provider that rejects `register_table`,
+    //! modelling the production Iceberg catalog's refusal to accept
+    //! scratch-table registrations.
+
+    use std::any::Any;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use datafusion::catalog::{CatalogProvider, SchemaProvider};
+    use datafusion::datasource::TableProvider;
+    use datafusion::error::Result;
+
+    #[derive(Debug)]
+    pub struct ReadOnlySchema {
+        pub tables: HashMap<String, Arc<dyn TableProvider>>,
+    }
+
+    #[async_trait]
+    impl SchemaProvider for ReadOnlySchema {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn table_names(&self) -> Vec<String> {
+            self.tables.keys().cloned().collect()
+        }
+        async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
+            Ok(self.tables.get(name).cloned())
+        }
+        fn table_exist(&self, name: &str) -> bool {
+            self.tables.contains_key(name)
+        }
+        // `register_table` / `deregister_table` intentionally NOT overridden.
+        // The defaults return "schema provider does not support registering
+        // tables" / "... deregistering tables", matching the production
+        // Iceberg catalog behaviour this test is guarding against.
+    }
+
+    #[derive(Debug)]
+    pub struct ReadOnlyCatalog {
+        pub schemas: HashMap<String, Arc<dyn SchemaProvider>>,
+    }
+
+    impl CatalogProvider for ReadOnlyCatalog {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn schema_names(&self) -> Vec<String> {
+            self.schemas.keys().cloned().collect()
+        }
+        fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+            self.schemas.get(name).cloned()
+        }
+        // `register_schema` inherits default not-impl error, which is fine.
+    }
+}
+
+/// Regression test for the TPC-E SF10 failure on 2026-04-21: scratch MemTable
+/// registration must go through the built-in `datafusion.public` catalog,
+/// not the session's default catalog, because the default catalog in
+/// production is an Iceberg bridge that does not support `register_table`.
+#[tokio::test(flavor = "multi_thread")]
+async fn scratch_registers_when_session_default_catalog_rejects_registration() {
+    use std::collections::HashMap;
+
+    use datafusion::catalog::{CatalogProvider, SchemaProvider};
+    use datafusion::datasource::TableProvider;
+    use datafusion::execution::context::SessionConfig;
+
+    use read_only_iceberg_like::{ReadOnlyCatalog, ReadOnlySchema};
+
+    // Build the outer relation `t(c1)` and a keyset `keyset(k)`.
+    let outer_schema_arrow = Arc::new(Schema::new(vec![Field::new("c1", DataType::Int64, true)]));
+    let outer_batch = RecordBatch::try_new(
+        outer_schema_arrow.clone(),
+        vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4, 5]))],
+    )
+    .expect("build outer batch");
+    let outer_mem: Arc<dyn TableProvider> = Arc::new(
+        MemTable::try_new(outer_schema_arrow.clone(), vec![vec![outer_batch]])
+            .expect("build outer memtable"),
+    );
+
+    let keyset_schema_arrow = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+    let keyset_batch = RecordBatch::try_new(
+        keyset_schema_arrow.clone(),
+        vec![Arc::new(Int64Array::from(vec![2_i64, 4]))],
+    )
+    .expect("build keyset batch");
+    let keyset_mem: Arc<dyn TableProvider> = Arc::new(
+        MemTable::try_new(keyset_schema_arrow.clone(), vec![vec![keyset_batch]])
+            .expect("build keyset memtable"),
+    );
+
+    // Assemble the read-only catalog that will refuse `register_table` calls
+    // against its default schema — the same refusal we see in production.
+    let mut iceberg_tables: HashMap<String, Arc<dyn TableProvider>> = HashMap::new();
+    iceberg_tables.insert("t".into(), outer_mem);
+    iceberg_tables.insert("keyset".into(), keyset_mem);
+    let iceberg_schema: Arc<dyn SchemaProvider> = Arc::new(ReadOnlySchema {
+        tables: iceberg_tables,
+    });
+    let mut iceberg_schemas: HashMap<String, Arc<dyn SchemaProvider>> = HashMap::new();
+    iceberg_schemas.insert("default".into(), iceberg_schema);
+    let iceberg_catalog: Arc<dyn CatalogProvider> = Arc::new(ReadOnlyCatalog {
+        schemas: iceberg_schemas,
+    });
+
+    let config = SessionConfig::new().with_default_catalog_and_schema("iceberg", "default");
+    let ctx = SessionContext::new_with_config(config);
+    ctx.register_catalog("iceberg", iceberg_catalog);
+
+    // Mirror the production coordinator's session setup: alongside the
+    // Iceberg catalog (used for real tables), a `datafusion.public`
+    // MemoryCatalog is registered so DML helpers can register scratch
+    // MemTables through it. See `sqe-coordinator/src/session_context.rs`
+    // around the `register_catalog("datafusion", df_catalog)` call.
+    use datafusion::catalog::{MemoryCatalogProvider, MemorySchemaProvider};
+    let df_cat = Arc::new(MemoryCatalogProvider::new());
+    df_cat
+        .register_schema("public", Arc::new(MemorySchemaProvider::new()))
+        .expect("MemoryCatalogProvider accepts schema registration");
+    ctx.register_catalog("datafusion", df_cat);
+
+    // Sanity: the fixture is genuinely hostile. A bare `register_table` call
+    // in this session must fail with the same error text we see in
+    // production. If this assertion ever stops holding, the test would
+    // silently stop guarding against the original bug.
+    let dummy_schema_arrow = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+    let dummy_batch = RecordBatch::try_new(
+        dummy_schema_arrow.clone(),
+        vec![Arc::new(Int64Array::from(vec![0_i64]))],
+    )
+    .expect("build dummy batch");
+    let dummy_mem: Arc<dyn TableProvider> = Arc::new(
+        MemTable::try_new(dummy_schema_arrow, vec![vec![dummy_batch]]).expect("build dummy mem"),
+    );
+    let bare_err = ctx
+        .register_table("sanity_bare", dummy_mem)
+        .expect_err("fixture is not hostile: bare register_table unexpectedly succeeded");
+    assert!(
+        bare_err
+            .to_string()
+            .contains("does not support registering tables"),
+        "sanity check got unexpected error text: {bare_err}"
+    );
+
+    // Act: the rewriter must succeed. Without the fix this returns
+    // `SqeError::Execution("Failed to register IN-subquery scratch MemTable: \
+    // Execution error: schema provider does not support registering tables")`.
+    let (where_sql, joins_sql, _guard) = lift_in_subqueries("c1 IN (SELECT k FROM keyset)", &ctx)
+        .await
+        .expect("lift_in_subqueries must not fail in hostile-default-catalog session");
+
+    // Invariants on the rewrite output.
+    assert!(
+        where_sql.contains("__matched"),
+        "rewritten WHERE missing __matched: {where_sql}"
+    );
+    assert!(
+        joins_sql.contains("LEFT JOIN"),
+        "joins_sql missing LEFT JOIN: {joins_sql}"
+    );
+    assert!(
+        joins_sql.contains("datafusion.public"),
+        "joins_sql must reference the scratch table through the \
+         fully-qualified `datafusion.public` path (a bare name would \
+         resolve to the session's default catalog and fail at plan time): \
+         {joins_sql}"
+    );
+
+    // End-to-end: execute the outer SELECT the DML handler would build and
+    // check the rows. `t` resolves via the session default (iceberg.default),
+    // the LEFT JOIN reaches across to datafusion.public for the scratch.
+    let sql = format!("SELECT c1 FROM t{joins_sql} WHERE {where_sql}");
+    let df = ctx.sql(&sql).await.expect("plan outer SELECT");
+    let batches = df.collect().await.expect("collect outer SELECT");
+    let mut rows: Vec<i64> = Vec::new();
+    for b in batches {
+        let col = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("c1 is Int64");
+        for i in 0..b.num_rows() {
+            if col.is_valid(i) {
+                rows.push(col.value(i));
+            }
+        }
+    }
+    rows.sort_unstable();
+    assert_eq!(rows, vec![2_i64, 4]);
+}
