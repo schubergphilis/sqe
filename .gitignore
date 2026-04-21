@@ -17,3 +17,4 @@ benchmarks/results/
 # Logs
 *.log
 *.jsonl
+log*.txt
