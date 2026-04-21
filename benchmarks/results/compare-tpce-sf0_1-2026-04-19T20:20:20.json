@@ -1,0 +1,153 @@
+{
+  "benchmark": "tpce",
+  "scale": 0.1,
+  "timestamp": "2026-04-19T20:20:20.799946+00:00",
+  "sqe_endpoint": "http://localhost:60051",
+  "trino_endpoint": "http://localhost:38080",
+  "queries": [
+    {
+      "query_name": "broker_volume",
+      "sqe_time_ms": 18,
+      "trino_time_ms": 2587,
+      "speedup": 143.72222222222223,
+      "sqe_rows": 25,
+      "trino_rows": 25,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "customer_position",
+      "sqe_time_ms": 29,
+      "trino_time_ms": 668,
+      "speedup": 23.03448275862069,
+      "sqe_rows": 9092,
+      "trino_rows": 9092,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "data_maintenance",
+      "sqe_time_ms": 13,
+      "trino_time_ms": 35,
+      "speedup": 2.6923076923076925,
+      "sqe_rows": 0,
+      "trino_rows": 0,
+      "rows_match": false,
+      "sqe_error": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'test_warehouse.default.news_item' not found\"",
+      "trino_error": "Trino query error: line 12:5: Schema must be specified when session schema is not set",
+      "status": "BothFailed"
+    },
+    {
+      "query_name": "market_feed",
+      "sqe_time_ms": 28,
+      "trino_time_ms": 391,
+      "speedup": 13.964285714285714,
+      "sqe_rows": 10,
+      "trino_rows": 10,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "market_watch",
+      "sqe_time_ms": 11,
+      "trino_time_ms": 12,
+      "speedup": 1.0909090909090908,
+      "sqe_rows": 0,
+      "trino_rows": 0,
+      "rows_match": false,
+      "sqe_error": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'test_warehouse.default.watch_item' not found\"",
+      "trino_error": "Trino query error: line 17:5: Schema must be specified when session schema is not set",
+      "status": "BothFailed"
+    },
+    {
+      "query_name": "security_detail",
+      "sqe_time_ms": 33,
+      "trino_time_ms": 538,
+      "speedup": 16.303030303030305,
+      "sqe_rows": 0,
+      "trino_rows": 10,
+      "rows_match": false,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "RowDiff"
+    },
+    {
+      "query_name": "trade_lookup",
+      "sqe_time_ms": 4,
+      "trino_time_ms": 419,
+      "speedup": 104.75,
+      "sqe_rows": 0,
+      "trino_rows": 468,
+      "rows_match": false,
+      "sqe_error": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'test_warehouse.tpce_sf0_1.settlement' not found\"",
+      "trino_error": null,
+      "status": "SqeFailed"
+    },
+    {
+      "query_name": "trade_order",
+      "sqe_time_ms": 44,
+      "trino_time_ms": 573,
+      "speedup": 13.022727272727273,
+      "sqe_rows": 0,
+      "trino_rows": 300,
+      "rows_match": false,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "RowDiff"
+    },
+    {
+      "query_name": "trade_result",
+      "sqe_time_ms": 36,
+      "trino_time_ms": 537,
+      "speedup": 14.916666666666666,
+      "sqe_rows": 19418,
+      "trino_rows": 19418,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "trade_status",
+      "sqe_time_ms": 42,
+      "trino_time_ms": 380,
+      "speedup": 9.047619047619047,
+      "sqe_rows": 3081,
+      "trino_rows": 3081,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "trade_update",
+      "sqe_time_ms": 4,
+      "trino_time_ms": 240,
+      "speedup": 60.0,
+      "sqe_rows": 0,
+      "trino_rows": 468,
+      "rows_match": false,
+      "sqe_error": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'test_warehouse.tpce_sf0_1.settlement' not found\"",
+      "trino_error": null,
+      "status": "SqeFailed"
+    }
+  ],
+  "summary": {
+    "total": 11,
+    "matched": 5,
+    "row_diff": 2,
+    "sqe_failed": 2,
+    "trino_failed": 0,
+    "both_failed": 2,
+    "avg_speedup": 33.43014771216742,
+    "median_speedup": 14.916666666666666,
+    "sqe_total_ms": 262,
+    "trino_total_ms": 6380
+  }
+}

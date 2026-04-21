@@ -314,8 +314,8 @@ where
     let mut prefetch_queue: VecDeque<PrefetchHandle> = VecDeque::new();
 
     // Seed the prefetch queue with up to `depth` upcoming files.
-    for j in 1..=depth.min(file_infos.len().saturating_sub(1)) {
-        let (next_path, next_size) = &file_infos[j];
+    let seed_count = depth.min(file_infos.len().saturating_sub(1));
+    for (next_path, next_size) in file_infos.iter().skip(1).take(seed_count) {
         prefetch_queue.push_back(prefetch_footer(
             Arc::clone(&store),
             next_path.clone(),

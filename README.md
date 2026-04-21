@@ -82,7 +82,7 @@ For Docker, Kubernetes, TLS, and auth provider setup, see [docs/deployment.md](d
 | TPC-BB (10) | 45.4s | 197.2s | **2.3x** | 10/10 |
 | ClickBench (43) | 1.6s | 3.7s | **2.6x** | 43/43 |
 
-**SQE wins 5 of 7 suites at SF1.** 214/222 queries pass. Known limitation: [TPC-DS q72](docs/blog/2026-04-16-our-nemesis-q72.md) (upstream DataFusion CBO gap).
+**SQE wins 5 of 7 suites at SF1.** 222/222 queries pass across the full suite (TPC-H 22 + TPC-DS 99 + SSB 13 + TPC-C 17 + TPC-E 18 + TPC-BB 10 + ClickBench 43), 154.8s end-to-end. Known limitation: [TPC-DS q72](docs/blog/2026-04-16-our-nemesis-q72.md) (upstream DataFusion CBO gap).
 
 Run your own benchmarks:
 

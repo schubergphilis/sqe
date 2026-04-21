@@ -8,7 +8,6 @@ use sqe_core::config::StorageConfig;
 use sqe_core::SessionUser;
 use sqe_policy::PolicyStore;
 
-use crate::manifest_cache::ManifestCache;
 use crate::rest_catalog::SessionCatalog;
 use crate::schema_provider::SqeSchemaProvider;
 
@@ -32,11 +31,12 @@ pub struct SqeCatalogProvider {
     session_user: Option<SessionUser>,
     /// Optional Prometheus metrics propagated to schema/table providers.
     prom_metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
-    /// Optional shared manifest cache propagated to schema and table providers.
-    manifest_cache: Option<ManifestCache>,
     /// Small-file threshold in bytes for the direct-read fast path.
     /// Propagated to schema and table providers.
     small_file_threshold_bytes: u64,
+    /// Concurrency for direct manifest walks during pruning.
+    /// Propagated to schema and table providers.
+    manifest_concurrency: usize,
 }
 
 impl std::fmt::Debug for SqeCatalogProvider {
@@ -93,8 +93,8 @@ impl SqeCatalogProvider {
             policy_store,
             session_user,
             prom_metrics: None,
-            manifest_cache: None,
             small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
+            manifest_concurrency: crate::iceberg_scan::DEFAULT_MANIFEST_CONCURRENCY,
         })
     }
 
@@ -104,16 +104,17 @@ impl SqeCatalogProvider {
         self
     }
 
-    /// Attach a shared manifest cache to be propagated to schema/table providers.
-    pub fn with_manifest_cache(mut self, cache: ManifestCache) -> Self {
-        self.manifest_cache = Some(cache);
-        self
-    }
-
     /// Set the small-file threshold (bytes) for the direct-read fast path.
     /// Propagated to all schema and table providers.
     pub fn with_small_file_threshold(mut self, threshold_bytes: u64) -> Self {
         self.small_file_threshold_bytes = threshold_bytes;
+        self
+    }
+
+    /// Set the per-scan concurrency used when walking manifests for
+    /// column-statistics pruning. Propagated to schema and table providers.
+    pub fn with_manifest_concurrency(mut self, concurrency: usize) -> Self {
+        self.manifest_concurrency = concurrency.max(1);
         self
     }
 
@@ -133,8 +134,8 @@ impl SqeCatalogProvider {
             policy_store: None,
             session_user: None,
             prom_metrics: None,
-            manifest_cache: None,
             small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
+            manifest_concurrency: crate::iceberg_scan::DEFAULT_MANIFEST_CONCURRENCY,
         }
     }
 }
@@ -176,10 +177,8 @@ impl CatalogProvider for SqeCatalogProvider {
         if let Some(ref m) = self.prom_metrics {
             provider = provider.with_metrics(Arc::clone(m));
         }
-        if let Some(ref mc) = self.manifest_cache {
-            provider = provider.with_manifest_cache(mc.clone());
-        }
         provider = provider.with_small_file_threshold(self.small_file_threshold_bytes);
+        provider = provider.with_manifest_concurrency(self.manifest_concurrency);
 
         Some(Arc::new(provider))
 

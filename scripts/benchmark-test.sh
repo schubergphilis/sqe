@@ -97,6 +97,18 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 SQE_LOG_FILE="/tmp/sqe-bench-coord-$$.log"
 SQE_CONFIG="$ROOT_DIR/tests/sqe-test.toml"
 
+# Fail fast if any coordinator port is already bound. A stale coordinator
+# from a previous run silently steals the health probe below and the bench
+# then runs against the wrong binary -- something we burned hours debugging
+# when a pre-streaming coordinator was still holding :18080.
+for port in 60051 18080 19090; do
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo " FAILED: port $port is already bound. Kill the stale process and retry:"
+        echo "   lsof -nP -iTCP:$port -sTCP:LISTEN"
+        exit 1
+    fi
+done
+
 RUST_LOG="${RUST_LOG:-sqe=info,warn}" \
     "$SQE_BIN" "$SQE_CONFIG" \
     > "$SQE_LOG_FILE" 2>&1 &
@@ -202,11 +214,17 @@ cleanup() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     kill "$SQE_PID" 2>/dev/null || true
     wait "$SQE_PID" 2>/dev/null || true
-    rm -f "$SQE_LOG_FILE"
+    # Preserve the coordinator log so a post-mortem is possible after a
+    # crash or OOM kill. Old /tmp files are evicted by the OS in due course,
+    # and disk cost is negligible versus the debugging value on large-scale
+    # benchmark runs.
+    if [ -f "$SQE_LOG_FILE" ]; then
+        echo "Coordinator log preserved at: $SQE_LOG_FILE"
+    fi
     if [ -n "$TRINO_CONTAINER" ]; then
         docker stop trino-bench 2>/dev/null || true
     fi
-    # Don't tear down docker — leave it for subsequent runs
+    # Don't tear down docker -- leave it for subsequent runs
     echo "Done."
 }
 trap cleanup EXIT
