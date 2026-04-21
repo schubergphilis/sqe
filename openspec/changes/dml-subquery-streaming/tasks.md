@@ -50,15 +50,12 @@
 
 ## 6. Benchmark validation
 
-> Tasks 6.1-6.5 require a live Polaris + S3 stack and the full benchmarking harness. They are deferred to a manual validation pass run before the change is archived. The change can be reviewed and merged on the strength of:
-> - the unit test suite (`cargo test -p sqe-coordinator --lib` 289/289 passing),
-> - the Phase 5 regression tests (`tests/in_subquery_view_rewrite.rs` 10/10 passing in debug + 1 release-only stress test),
-> - the existing stack-overflow gate (`tests/in_subquery_or_stack_overflow.rs::prod_stack_32k`).
+> Tasks 6.1-6.5 require a live Polaris + S3 stack and the full benchmarking harness. Partial validation landed on 2026-04-21: the first SF10 run (`tpce-sf10-flight-2026-04-21T11:44:40.json`) exposed a catalog-prefix bug in `lift_in_subqueries` (5 DML errors); MR !69 fixed it and the rerun (`tpce-sf10-flight-2026-04-21T12:20:36.json`) cleared every query. The remaining rows stay deferred to their own manual runs:
 
 - [ ] 6.1 `scripts/integration-test.sh tpch` passes 22/22 (no regression on non-DML paths) — DEFERRED, manual run
-- [ ] 6.2 Full TPC-E SF10 run: `BENCH_SCALE=10 ./scripts/benchmark-test.sh tpce` completes; `trade_result_update_holding` returns the expected row count — DEFERRED, manual run
-- [ ] 6.3 Stretch: TPC-E SF100 `trade_result_update_holding` completes (previously impossible) — DEFERRED, manual run
-- [ ] 6.4 Commit benchmark JSON report to `benchmarks/results/` for historical tracking — DEFERRED, manual run
+- [x] 6.2 Full TPC-E SF10 run: `BENCH_SCALE=10 ./scripts/benchmark-test.sh tpce` completes; `trade_result_update_holding` returns the expected row count — **2026-04-21: 18/18 pass, 0 error, total 24.4 s**; `trade_result_update_holding` runs in 10.94 s (rewritten query) returning 1 row (see `benchmarks/results/tpce-sf10-flight-2026-04-21T12:20:36.json`)
+- [ ] 6.3 Stretch: TPC-E SF100 `trade_result_update_holding` completes (previously impossible) — IN PROGRESS, user running `BENCH_SCALE=100` at time of archive
+- [x] 6.4 Commit benchmark JSON report to `benchmarks/results/` for historical tracking — `tpce-sf10-flight-2026-04-21T12:20:36.json` committed in MR !69
 - [ ] 6.5 TPC-H SF1 single-node + distributed runs pass (from `tpch-sf1-flight-2026-04-02T14:16:27.json` and `tpch-sf1-flight-2026-04-06T20:57:10.json` baselines) — DEFERRED, manual run
 
 ## 7. Cleanup
