@@ -22,6 +22,7 @@ sqe-catalog = { path = "../sqe-catalog" }
 sqe-sql = { path = "../sqe-sql" }
 sqe-policy = { path = "../sqe-policy" }
 sqe-planner = { path = "../sqe-planner" }
+sqe-trino-functions = { path = "../sqe-trino-functions" }
 datafusion = { workspace = true }
 datafusion-proto = { workspace = true }
 arrow = { workspace = true }
@@ -48,7 +49,6 @@ anyhow = { workspace = true }
 base64 = "0.22"
 datafusion-functions-json = { workspace = true }
 datafusion-expr = { workspace = true }
-url = { workspace = true }
 sqlparser = { workspace = true }
 iceberg = { workspace = true }
 parquet = { workspace = true }
@@ -63,10 +63,6 @@ subtle = "2"
 sqe-worker = { path = "../sqe-worker" }
 opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }
-unicode-normalization = { workspace = true }
-rust-stemmers = { workspace = true }
-chrono-tz = { workspace = true }
-regex = { workspace = true }
 
 [dev-dependencies]
 toml = { workspace = true }

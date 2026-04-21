@@ -11,9 +11,9 @@ use datafusion::prelude::*;
 
 async fn ctx() -> SessionContext {
     let mut ctx = SessionContext::new();
-    sqe_coordinator::trino_functions::register_trino_functions(&ctx);
+    sqe_trino_functions::register_trino_functions(&ctx);
     datafusion_functions_json::register_all(&mut ctx).expect("register JSON functions");
-    sqe_coordinator::trino_functions_ext::register_extended_trino_functions(&ctx);
+    sqe_trino_functions::register_extended_trino_functions(&ctx);
     ctx
 }
 
