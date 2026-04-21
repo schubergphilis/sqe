@@ -2163,25 +2163,41 @@ pub async fn lift_in_subqueries(
             ))
         })?;
 
+        // Register the scratch MemTable under the built-in `datafusion.public`
+        // catalog/schema rather than the session's default. In production the
+        // DML handler hands us a `SessionContext` whose default catalog is the
+        // Iceberg catalog, whose `SchemaProvider` rejects `register_table` with
+        // "schema provider does not support registering tables". The other
+        // scratch-table call sites in this file (`filter_batch_negate`,
+        // `filter_batch_match`, `apply_update`, `count_matching_rows`) already
+        // use this qualified path for the same reason — see commit 725a47c
+        // "fix: register DML temp tables in datafusion catalog, not Iceberg
+        // catalog". Keep register, JOIN reference, and deregister in lockstep
+        // so the Drop impl on `InSubqueryCleanup` releases the same table it
+        // registered.
         let counter_id = IN_SUBQUERY_COUNTER.fetch_add(1, Ordering::Relaxed);
         let scratch_name = format!("__sqe_in_subq_{counter_id}");
-        ctx.register_table(scratch_name.as_str(), Arc::new(mem))
+        let qualified_scratch = format!("datafusion.public.{scratch_name}");
+        ctx.register_table(qualified_scratch.as_str(), Arc::new(mem))
             .map_err(|e| {
                 SqeError::Execution(format!(
                     "Failed to register IN-subquery scratch MemTable: {e}"
                 ))
             })?;
-        scratch_names.push(scratch_name.clone());
+        scratch_names.push(qualified_scratch.clone());
 
         // Build the LEFT JOIN clause and the replacement expression text.
         // The per-statement alias `__sqN` is bounded by `found.len()` and
-        // keeps the JOIN's ON clause readable in debug logs.
+        // keeps the JOIN's ON clause readable in debug logs. The scratch
+        // table is referenced through its fully-qualified catalog path to
+        // match the registration above; a bare name would resolve against
+        // the session's default catalog (Iceberg) and fail at plan time.
         let alias = format!("__sq{alias_idx}");
         let on_clauses: Vec<String> = (0..num_cols)
             .map(|i| format!("\"{alias}\".\"__col{i}\" = {lhs}", lhs = lhs_cols[i],))
             .collect();
         let join_clause = format!(
-            " LEFT JOIN \"{scratch_name}\" AS \"{alias}\" ON {on}",
+            " LEFT JOIN datafusion.public.\"{scratch_name}\" AS \"{alias}\" ON {on}",
             on = on_clauses.join(" AND "),
         );
         joins.push(join_clause);
@@ -2270,6 +2286,11 @@ static IN_SUBQUERY_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// handler so it outlives the per-batch SELECT loop. On drop, every
 /// registered scratch table is deregistered from the session context.
 ///
+/// `scratch_tables` stores the fully-qualified `datafusion.public.<name>`
+/// path used at registration, so `deregister_table` resolves to the same
+/// slot regardless of what the session's default catalog is (in production
+/// that default is the Iceberg catalog).
+///
 /// Deregister errors are logged at `warn!` and swallowed: matches the
 /// existing scratch-table cleanup behaviour inside `filter_batch_negate`,
 /// `filter_batch_match`, `apply_update`, and `count_matching_rows` (see the
@@ -2277,6 +2298,9 @@ static IN_SUBQUERY_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[doc(hidden)]
 pub struct InSubqueryCleanup {
     ctx: DFSessionContext,
+    /// Fully-qualified `datafusion.public.<scratch_name>` paths that Drop
+    /// will deregister. Storing the qualified form (not the bare name)
+    /// mirrors the registration path in `lift_in_subqueries`.
     scratch_tables: Vec<String>,
 }
 
