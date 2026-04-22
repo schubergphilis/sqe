@@ -9,13 +9,15 @@ pipelining = true
 # Pin target directory to prevent parallel agents from creating duplicate
 # build artifacts (which can balloon to 100GB+).
 target-dir = "target"
-# Cap parallel compile jobs. On Apple Silicon (5P+6E), running all 11 cores
-# plus DataFusion/arrow/iceberg-rust link units in parallel pushes memory
-# over the swap threshold on 16 GB machines and makes the system unusable
-# during the build. Four jobs uses only performance cores, keeps peak RSS
-# roughly halved, and typically costs < 15 % of wall-clock vs. unrestricted.
+# Cap parallel compile jobs. On a 16 GB Apple Silicon (5P+6E), running all
+# 11 cores plus DataFusion/arrow/iceberg-rust link units in parallel pushes
+# memory over the swap threshold and makes the system unusable during the
+# build. On a 32 GB+ machine memory is not the constraint, so we stay on the
+# performance cores plus two efficiency cores: wall-clock is roughly halved
+# versus `jobs = 4` on a full cold build, and peak RSS stays under 20 GB.
+# On a 16 GB machine, drop this back to 4 (or set `CARGO_BUILD_JOBS=4`).
 # Override per-invocation with `cargo build -j N` or `CARGO_BUILD_JOBS=N`.
-jobs = 4
+jobs = 8
 # sccache was tried here and made things worse on Defender-scanned Macs:
 # every cache miss writes artifacts to BOTH target/ and
 # ~/Library/Caches/Mozilla.sccache, doubling the file surface Defender
@@ -25,9 +27,15 @@ jobs = 4
 
 # ── Local development (macOS) ─────────────────────────────────────────────
 # mold does NOT support macOS native linking (Mach-O format).
-# For faster macOS linking: brew install llvm, then use ld64.lld:
-# [target.aarch64-apple-darwin]
-# rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/opt/llvm/bin/ld64.lld"]
+# `ld64.lld` is LLVM's Mach-O linker. It links large Rust debug binaries
+# roughly 2-3x faster than Apple's default ld64. Prerequisite:
+#   brew install lld
+# This installs `/opt/homebrew/bin/ld64.lld` (much smaller than the full
+# `brew install llvm` formula). If the binary is missing on a teammate's
+# machine the link step will fail with a clear "linker not found" error;
+# comment this block out locally if you cannot install lld.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/bin/ld64.lld"]
 
 # ── Linux / Docker builds ─────────────────────────────────────────────────
 # The Dockerfile already sets RUSTFLAGS for mold; this section acts as
