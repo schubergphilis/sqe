@@ -6,6 +6,8 @@
 - [x] Distributed execution (coordinator-worker, shuffle, spill-to-disk)
 - [x] Full DML: CTAS, INSERT INTO, DELETE, UPDATE, MERGE INTO (Copy-on-Write)
 - [x] CoW DML scales to TPC-E SF10+ (`IN (subquery)` lifted to a scratch-MemTable + LEFT JOIN; plan size O(1) in subquery cardinality, no stack overflow at 34K+ tuples)
+- [x] Trino UDFs split into `sqe-trino-functions` crate (4,175 LOC moved; coordinator incremental builds skip UDF recompile)
+- [x] macOS dev build config: `jobs = 8`, `ld64.lld` linker (2-3x faster link on M-series)
 - [x] Streaming writes (constant-memory CTAS/INSERT, no OOM on SF1+)
 - [x] Trino HTTP compatibility (pagination, headers, dual auth, system.jdbc.*)
 - [x] Trino SQL compatibility ~95% (70+ UDFs, USE, SHOW CREATE TABLE, TRUNCATE, etc.)
@@ -34,6 +36,7 @@
 - [ ] OPA/Cedar policy engine (row filters, column masks)
 - [ ] Pluggable catalog backends (AWS Glue, Nessie, Hive Metastore)
 - [ ] Helm chart for Kubernetes deployment
+- [ ] CoW DML scales to TPC-E SF100 (`cow-dml-parallel-streaming` change: parallelise per-file rewrite + stream writes + drop double-WHERE; targets `trade_result_update_holding` under 120 s at SF100)
 
 ## Planned
 
