@@ -12,6 +12,9 @@ set -euo pipefail
 #   ./scripts/benchmark-test.sh tpch ssb           # run TPC-H and SSB
 #   BENCH_SCALE=0.01 ./scripts/benchmark-test.sh   # use SF0.01 (faster)
 #   BENCH_PROTOCOL=trino ./scripts/benchmark-test.sh  # use Trino HTTP
+#   PROFILE=debug ./scripts/benchmark-test.sh      # debug build + target/debug/ binaries
+#                                                  # (default: release; skips --release
+#                                                  # for faster incremental rebuilds)
 #   ./scripts/benchmark-test.sh --compare-trino tpch  # compare SQE vs Trino output
 #   ./scripts/benchmark-test.sh --compare-trino       # compare all benchmarks
 
@@ -42,6 +45,21 @@ S3_REGION="${S3_REGION:-us-east-1}"
 SQE_USERNAME="${SQE_USERNAME:-root}"
 SQE_PASSWORD="${SQE_PASSWORD:-}"
 
+# Build profile: `release` (default) uses `cargo build --release` and
+# runs binaries out of `target/release/`. `debug` skips `--release` for
+# faster incremental rebuilds and runs out of `target/debug/`. The debug
+# profile is slower at query time but dramatically faster to compile, so
+# it is the right default when iterating on the coordinator between
+# benchmark runs. Scale factors beyond SF1 should still use release.
+PROFILE="${PROFILE:-release}"
+case "$PROFILE" in
+    release|debug) ;;
+    *)
+        echo "ERROR: PROFILE must be 'release' or 'debug', got: '$PROFILE'" >&2
+        exit 1
+        ;;
+esac
+
 # Parse options
 ALL_BENCHMARKS=(tpch ssb tpcds tpcc tpce tpcbb clickbench)
 BENCHMARKS=()
@@ -66,11 +84,15 @@ cd "$ROOT_DIR"
 
 # ── Build sqe-bench ───────────────────────────────────────────
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  Building sqe-bench..."
+echo "  Building sqe-bench (profile: $PROFILE)..."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-cargo build -p sqe-bench -p sqe-coordinator --release 2>&1
-BENCH_BIN="$ROOT_DIR/target/release/sqe-bench"
-SQE_BIN="$ROOT_DIR/target/release/sqe-coordinator"
+if [ "$PROFILE" = "release" ]; then
+    cargo build -p sqe-bench -p sqe-coordinator --release 2>&1
+else
+    cargo build -p sqe-bench -p sqe-coordinator 2>&1
+fi
+BENCH_BIN="$ROOT_DIR/target/$PROFILE/sqe-bench"
+SQE_BIN="$ROOT_DIR/target/$PROFILE/sqe-coordinator"
 
 if [ ! -x "$BENCH_BIN" ]; then
     echo "ERROR: sqe-bench binary not found at $BENCH_BIN"
