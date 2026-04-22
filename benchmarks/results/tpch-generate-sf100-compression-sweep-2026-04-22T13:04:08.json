@@ -1,0 +1,49 @@
+{
+  "benchmark": "tpch",
+  "phase": "generate",
+  "measurement": "compression_sweep",
+  "scale_factor": 100,
+  "timestamp": "2026-04-22T13:04:08",
+  "machine": "llm01",
+  "config": {
+    "threads": 32,
+    "row_group_size": null,
+    "output_fs": "tmpfs"
+  },
+  "runs": [
+    {
+      "compression": "none",
+      "lineitem_duration_ms": 19400,
+      "lineitem_size_gib": 41,
+      "total_size_gib": 56,
+      "lineitem_bytes_per_row": 73
+    },
+    {
+      "compression": "snappy",
+      "lineitem_duration_ms": 20700,
+      "total_duration_ms": 27300,
+      "notes": "size not recorded; completed before /dev/shm exhaustion forced cleanup"
+    },
+    {
+      "compression": "zstd3",
+      "lineitem_duration_ms": 26900,
+      "lineitem_size_gib": 28,
+      "total_size_gib": 37,
+      "lineitem_bytes_per_row": 50,
+      "baseline": true
+    },
+    {
+      "compression": "zstd9",
+      "lineitem_duration_ms": 42100,
+      "lineitem_size_gib": 27,
+      "total_size_gib": 36,
+      "lineitem_bytes_per_row": 48
+    }
+  ],
+  "analysis": [
+    "zstd3 is the right default: pays 25% more time than raw for 34% better compression.",
+    "zstd9 is a poor trade: 57% more time for only 4% smaller files. Classic ZSTD diminishing returns above level 3.",
+    "snappy saves 23% time over zstd3 but typically produces ~30% larger files.",
+    "none is a legitimate option when storage is cheap and regeneration is frequent: 28% time saving at 46% size inflation over zstd3."
+  ]
+}
