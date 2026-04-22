@@ -182,7 +182,18 @@ pub async fn run_benchmark_test(
             eprintln!("[bench] SQL:\n{sql}\n---");
         }
 
-        let timeout_secs = query.timeout_secs.max(120);
+        // Per-query timeout resolution (highest priority first):
+        //   1. `BENCH_QUERY_TIMEOUT_SECS` env var: overrides EVERYTHING,
+        //      including the `-- timeout: Ns` header in the .sql file.
+        //      Use this for SF100+ runs where the committed headers
+        //      (typically 60-120s, sized for SF1) are too tight.
+        //   2. `-- timeout: Ns` header in the .sql file, with a floor of
+        //      120s to prevent a typo from setting it to 0.
+        //   3. Default 300s (from `parse_query_file`).
+        let timeout_secs = std::env::var("BENCH_QUERY_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_else(|| query.timeout_secs.max(120));
         let start = std::time::Instant::now();
 
         // Use tokio::select! so the timeout fires even if the gRPC stream
