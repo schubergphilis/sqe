@@ -1,4 +1,4 @@
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: Generate data for a benchmark
 
@@ -36,7 +36,6 @@ The system SHALL generate benchmark data (TPC-H, TPC-DS, SSB, TPC-C, TPC-E, TPC-
 - **THEN** the output Parquet files are byte-identical to the pre-change implementation for the same `(benchmark, scale, compression)` tuple
 - **AND** their SHA-256 hashes match a committed golden value
 
-## ADDED Requirements
 
 ### Requirement: Configurable generator parallelism
 
