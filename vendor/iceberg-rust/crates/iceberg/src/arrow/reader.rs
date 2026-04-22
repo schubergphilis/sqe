@@ -23,7 +23,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow_arith::boolean::{and, and_kleene, is_not_null, is_null, not, or, or_kleene};
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Float32Type, Float64Type};
 use arrow_array::{Array, ArrayRef, BooleanArray, Datum as ArrowDatum, RecordBatch, Scalar};
+use arrow_buffer::BooleanBuffer;
 use arrow_cast::cast::cast;
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{
@@ -1445,6 +1448,35 @@ fn project_column(
     }
 }
 
+fn compute_is_nan(array: &ArrayRef) -> std::result::Result<BooleanArray, ArrowError> {
+    // Compute NaN over the contiguous values slice, then fold the null bitmap
+    // in with a single bitwise AND so that null slots become false.
+    let (is_nan, nulls) = match array.data_type() {
+        DataType::Float32 => {
+            let arr = array.as_primitive::<Float32Type>();
+            (
+                BooleanBuffer::from_iter(arr.values().iter().map(|v| v.is_nan())),
+                arr.nulls(),
+            )
+        }
+        DataType::Float64 => {
+            let arr = array.as_primitive::<Float64Type>();
+            (
+                BooleanBuffer::from_iter(arr.values().iter().map(|v| v.is_nan())),
+                arr.nulls(),
+            )
+        }
+        _ => unreachable!("is_nan is only valid for float types"),
+    };
+
+    let values = match nulls {
+        Some(nulls) => &is_nan & nulls.inner(),
+        None => is_nan,
+    };
+
+    Ok(BooleanArray::new(values, None))
+}
+
 type PredicateResult =
     dyn FnMut(RecordBatch) -> std::result::Result<BooleanArray, ArrowError> + Send + 'static;
 
@@ -1527,8 +1559,11 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         reference: &BoundReference,
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
-        if self.bound_reference(reference)?.is_some() {
-            self.build_always_true()
+        if let Some(idx) = self.bound_reference(reference)? {
+            Ok(Box::new(move |batch| {
+                let column = project_column(&batch, idx)?;
+                compute_is_nan(&column)
+            }))
         } else {
             // A missing column, treating it as null.
             self.build_always_false()
@@ -1540,8 +1575,12 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         reference: &BoundReference,
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
-        if self.bound_reference(reference)?.is_some() {
-            self.build_always_false()
+        if let Some(idx) = self.bound_reference(reference)? {
+            Ok(Box::new(move |batch| {
+                let column = project_column(&batch, idx)?;
+                let is_nan = compute_is_nan(&column)?;
+                not(&is_nan)
+            }))
         } else {
             // A missing column, treating it as null.
             self.build_always_true()
