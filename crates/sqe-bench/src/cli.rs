@@ -46,6 +46,22 @@ pub enum Command {
         /// S3 region
         #[arg(long, env = "AWS_DEFAULT_REGION", default_value = "us-east-1")]
         s3_region: String,
+
+        /// Worker threads for parallel per-partition generation. Default
+        /// is `std::thread::available_parallelism()`, clamped to [1, 256].
+        /// Overrides the `BENCH_GEN_THREADS` env var when set.
+        #[arg(long)]
+        threads: Option<usize>,
+
+        /// Parquet compression codec: `zstd1`, `zstd3` (default), `zstd9`,
+        /// `snappy`, or `none`. Overrides `BENCH_GEN_COMPRESSION`.
+        #[arg(long)]
+        compression: Option<String>,
+
+        /// Max rows per parquet row group. Overrides `BENCH_GEN_ROW_GROUP_SIZE`.
+        /// Default is the parquet writer's default.
+        #[arg(long)]
+        row_group_size: Option<usize>,
     },
 
     /// Load generated data into SQE via Iceberg REST catalog

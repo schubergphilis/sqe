@@ -2272,6 +2272,7 @@ impl BenchmarkGenerator for TpceGenerator {
         table: &str,
         scale: f64,
         output_dir: &str,
+        _config: &super::GenerateConfig,
     ) -> anyhow::Result<GenerateStats> {
         let start = std::time::Instant::now();
 

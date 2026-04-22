@@ -7,7 +7,10 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use super::{parquet_writer, BenchmarkGenerator, GenerateStats, TableDef};
+use super::{
+    parallel_generate_table, parquet_writer, BenchmarkGenerator, GenerateConfig, GenerateStats,
+    TableDef,
+};
 
 pub struct TpchGenerator;
 
@@ -345,16 +348,35 @@ fn generate_nation() -> (SchemaRef, Vec<RecordBatch>) {
 
 const BATCH_SIZE: usize = 10_000;
 
+#[cfg(test)]
 fn generate_supplier(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let schema = supplier_schema();
-    let total = super::scaled(scale, 10_000.0);
-    let total = total.max(1);
-    let mut rng = StdRng::seed_from_u64(seed_for_table("supplier"));
-    let mut batches = Vec::new();
+    let total = super::scaled(scale, 10_000.0).max(1);
+    let batches: Vec<RecordBatch> =
+        generate_supplier_range(0..total, scale, seed_for_table("supplier")).collect();
+    (supplier_schema(), batches)
+}
 
-    let mut offset = 0usize;
-    while offset < total {
-        let n = BATCH_SIZE.min(total - offset);
+/// Range-based streaming iterator for the supplier table.
+///
+/// Each batch is built lazily in `next()`. Partition callers pass a
+/// disjoint row range and a deterministic seed; the iterator yields
+/// batches covering exactly that range. Keys are derived from the row
+/// offset so parallel partitions never collide.
+fn generate_supplier_range(
+    range: std::ops::Range<usize>,
+    _scale: f64,
+    seed: u64,
+) -> impl Iterator<Item = RecordBatch> + Send {
+    let schema = supplier_schema();
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut offset = range.start;
+    let end = range.end;
+
+    std::iter::from_fn(move || {
+        if offset >= end {
+            return None;
+        }
+        let n = BATCH_SIZE.min(end - offset);
         let mut s_suppkey = Vec::with_capacity(n);
         let mut s_name = Vec::with_capacity(n);
         let mut s_address = Vec::with_capacity(n);
@@ -380,37 +402,47 @@ fn generate_supplier(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let phone_refs: Vec<&str> = s_phone.iter().map(|s| s.as_str()).collect();
         let comment_refs: Vec<&str> = s_comment.iter().map(|s| s.as_str()).collect();
 
-        batches.push(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from(s_suppkey)),
-                    Arc::new(StringArray::from(name_refs)),
-                    Arc::new(StringArray::from(addr_refs)),
-                    Arc::new(Int32Array::from(s_nationkey)),
-                    Arc::new(StringArray::from(phone_refs)),
-                    Arc::new(Float64Array::from(s_acctbal)),
-                    Arc::new(StringArray::from(comment_refs)),
-                ],
-            )
-            .expect("supplier batch"),
-        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(s_suppkey)),
+                Arc::new(StringArray::from(name_refs)),
+                Arc::new(StringArray::from(addr_refs)),
+                Arc::new(Int32Array::from(s_nationkey)),
+                Arc::new(StringArray::from(phone_refs)),
+                Arc::new(Float64Array::from(s_acctbal)),
+                Arc::new(StringArray::from(comment_refs)),
+            ],
+        )
+        .expect("supplier batch");
         offset += n;
-    }
-
-    (schema, batches)
+        Some(batch)
+    })
 }
 
+#[cfg(test)]
 fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let schema = customer_schema();
-    let total = super::scaled(scale, 150_000.0);
-    let total = total.max(1);
-    let mut rng = StdRng::seed_from_u64(seed_for_table("customer"));
-    let mut batches = Vec::new();
+    let total = super::scaled(scale, 150_000.0).max(1);
+    let batches: Vec<RecordBatch> =
+        generate_customer_range(0..total, scale, seed_for_table("customer")).collect();
+    (customer_schema(), batches)
+}
 
-    let mut offset = 0usize;
-    while offset < total {
-        let n = BATCH_SIZE.min(total - offset);
+fn generate_customer_range(
+    range: std::ops::Range<usize>,
+    _scale: f64,
+    seed: u64,
+) -> impl Iterator<Item = RecordBatch> + Send {
+    let schema = customer_schema();
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut offset = range.start;
+    let end = range.end;
+
+    std::iter::from_fn(move || {
+        if offset >= end {
+            return None;
+        }
+        let n = BATCH_SIZE.min(end - offset);
         let mut c_custkey = Vec::with_capacity(n);
         let mut c_name = Vec::with_capacity(n);
         let mut c_address = Vec::with_capacity(n);
@@ -439,38 +471,48 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let seg_refs: Vec<&str> = c_mktsegment.iter().map(|s| s.as_str()).collect();
         let comment_refs: Vec<&str> = c_comment.iter().map(|s| s.as_str()).collect();
 
-        batches.push(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from(c_custkey)),
-                    Arc::new(StringArray::from(name_refs)),
-                    Arc::new(StringArray::from(addr_refs)),
-                    Arc::new(Int32Array::from(c_nationkey)),
-                    Arc::new(StringArray::from(phone_refs)),
-                    Arc::new(Float64Array::from(c_acctbal)),
-                    Arc::new(StringArray::from(seg_refs)),
-                    Arc::new(StringArray::from(comment_refs)),
-                ],
-            )
-            .expect("customer batch"),
-        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(c_custkey)),
+                Arc::new(StringArray::from(name_refs)),
+                Arc::new(StringArray::from(addr_refs)),
+                Arc::new(Int32Array::from(c_nationkey)),
+                Arc::new(StringArray::from(phone_refs)),
+                Arc::new(Float64Array::from(c_acctbal)),
+                Arc::new(StringArray::from(seg_refs)),
+                Arc::new(StringArray::from(comment_refs)),
+            ],
+        )
+        .expect("customer batch");
         offset += n;
-    }
-
-    (schema, batches)
+        Some(batch)
+    })
 }
 
+#[cfg(test)]
 fn generate_part(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let schema = part_schema();
-    let total = super::scaled(scale, 200_000.0);
-    let total = total.max(1);
-    let mut rng = StdRng::seed_from_u64(seed_for_table("part"));
-    let mut batches = Vec::new();
+    let total = super::scaled(scale, 200_000.0).max(1);
+    let batches: Vec<RecordBatch> =
+        generate_part_range(0..total, scale, seed_for_table("part")).collect();
+    (part_schema(), batches)
+}
 
-    let mut offset = 0usize;
-    while offset < total {
-        let n = BATCH_SIZE.min(total - offset);
+fn generate_part_range(
+    range: std::ops::Range<usize>,
+    _scale: f64,
+    seed: u64,
+) -> impl Iterator<Item = RecordBatch> + Send {
+    let schema = part_schema();
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut offset = range.start;
+    let end = range.end;
+
+    std::iter::from_fn(move || {
+        if offset >= end {
+            return None;
+        }
+        let n = BATCH_SIZE.min(end - offset);
         let mut p_partkey = Vec::with_capacity(n);
         let mut p_name = Vec::with_capacity(n);
         let mut p_mfgr = Vec::with_capacity(n);
@@ -513,46 +555,58 @@ fn generate_part(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let container_refs: Vec<&str> = p_container.iter().map(|s| s.as_str()).collect();
         let comment_refs: Vec<&str> = p_comment.iter().map(|s| s.as_str()).collect();
 
-        batches.push(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from(p_partkey)),
-                    Arc::new(StringArray::from(name_refs)),
-                    Arc::new(StringArray::from(mfgr_refs)),
-                    Arc::new(StringArray::from(brand_refs)),
-                    Arc::new(StringArray::from(type_refs)),
-                    Arc::new(Int32Array::from(p_size)),
-                    Arc::new(StringArray::from(container_refs)),
-                    Arc::new(Float64Array::from(p_retailprice)),
-                    Arc::new(StringArray::from(comment_refs)),
-                ],
-            )
-            .expect("part batch"),
-        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(p_partkey)),
+                Arc::new(StringArray::from(name_refs)),
+                Arc::new(StringArray::from(mfgr_refs)),
+                Arc::new(StringArray::from(brand_refs)),
+                Arc::new(StringArray::from(type_refs)),
+                Arc::new(Int32Array::from(p_size)),
+                Arc::new(StringArray::from(container_refs)),
+                Arc::new(Float64Array::from(p_retailprice)),
+                Arc::new(StringArray::from(comment_refs)),
+            ],
+        )
+        .expect("part batch");
         offset += n;
-    }
-
-    (schema, batches)
+        Some(batch)
+    })
 }
 
+#[cfg(test)]
 fn generate_partsupp(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let schema = partsupp_schema();
-    let num_parts = (scale * 200_000.0) as i32;
-    let num_suppliers = (scale * 10_000.0) as i32;
     // 4 suppliers per part → SF * 800,000 rows
-    let total = super::scaled(scale, 800_000.0);
-    let total = total.max(1);
-    let mut rng = StdRng::seed_from_u64(seed_for_table("partsupp"));
-    let mut batches = Vec::new();
+    let total = super::scaled(scale, 800_000.0).max(1);
+    let batches: Vec<RecordBatch> =
+        generate_partsupp_range(0..total, scale, seed_for_table("partsupp")).collect();
+    (partsupp_schema(), batches)
+}
 
-    let mut offset = 0usize;
-    // Iterate: for each partkey, 4 suppkeys
-    let mut part_idx = 1i32;
-    let mut supp_offset_idx = 0usize;
+fn generate_partsupp_range(
+    range: std::ops::Range<usize>,
+    scale: f64,
+    seed: u64,
+) -> impl Iterator<Item = RecordBatch> + Send {
+    let schema = partsupp_schema();
+    let num_parts = ((scale * 200_000.0) as i32).max(1);
+    let num_suppliers = ((scale * 10_000.0) as i32).max(1);
+    let mut rng = StdRng::seed_from_u64(seed);
+    // Reconstruct (part_idx, supp_offset_idx) from the row range's starting
+    // offset. 4 rows per partkey cycle; the serial path started at
+    // (part_idx=1, supp_offset_idx=0) and incremented monotonically. Any
+    // row index r maps to (r / 4 + 1, r % 4), modulo wraparound at num_parts.
+    let mut offset = range.start;
+    let end = range.end;
+    let mut part_idx = ((range.start / 4) % (num_parts as usize)) as i32 + 1;
+    let mut supp_offset_idx = range.start % 4;
 
-    while offset < total {
-        let n = BATCH_SIZE.min(total - offset);
+    std::iter::from_fn(move || {
+        if offset >= end {
+            return None;
+        }
+        let n = BATCH_SIZE.min(end - offset);
         let mut ps_partkey = Vec::with_capacity(n);
         let mut ps_suppkey = Vec::with_capacity(n);
         let mut ps_availqty = Vec::with_capacity(n);
@@ -579,36 +633,46 @@ fn generate_partsupp(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
         let comment_refs: Vec<&str> = ps_comment.iter().map(|s| s.as_str()).collect();
 
-        batches.push(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from(ps_partkey)),
-                    Arc::new(Int32Array::from(ps_suppkey)),
-                    Arc::new(Int32Array::from(ps_availqty)),
-                    Arc::new(Float64Array::from(ps_supplycost)),
-                    Arc::new(StringArray::from(comment_refs)),
-                ],
-            )
-            .expect("partsupp batch"),
-        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ps_partkey)),
+                Arc::new(Int32Array::from(ps_suppkey)),
+                Arc::new(Int32Array::from(ps_availqty)),
+                Arc::new(Float64Array::from(ps_supplycost)),
+                Arc::new(StringArray::from(comment_refs)),
+            ],
+        )
+        .expect("partsupp batch");
         offset += n;
-    }
-
-    (schema, batches)
+        Some(batch)
+    })
 }
 
+#[cfg(test)]
 fn generate_orders(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let schema = orders_schema();
-    let total = super::scaled(scale, 1_500_000.0);
-    let total = total.max(1);
-    let num_customers = (scale * 150_000.0) as i32;
-    let mut rng = StdRng::seed_from_u64(seed_for_table("orders"));
-    let mut batches = Vec::new();
+    let total = super::scaled(scale, 1_500_000.0).max(1);
+    let batches: Vec<RecordBatch> =
+        generate_orders_range(0..total, scale, seed_for_table("orders")).collect();
+    (orders_schema(), batches)
+}
 
-    let mut offset = 0usize;
-    while offset < total {
-        let n = BATCH_SIZE.min(total - offset);
+fn generate_orders_range(
+    range: std::ops::Range<usize>,
+    scale: f64,
+    seed: u64,
+) -> impl Iterator<Item = RecordBatch> + Send {
+    let schema = orders_schema();
+    let num_customers = ((scale * 150_000.0) as i32).max(1);
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut offset = range.start;
+    let end = range.end;
+
+    std::iter::from_fn(move || {
+        if offset >= end {
+            return None;
+        }
+        let n = BATCH_SIZE.min(end - offset);
         let mut o_orderkey = Vec::with_capacity(n);
         let mut o_custkey = Vec::with_capacity(n);
         let mut o_orderstatus = Vec::with_capacity(n);
@@ -626,7 +690,7 @@ fn generate_orders(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             let clerk_num = rng.gen_range(1..=1000i32);
 
             o_orderkey.push(key);
-            o_custkey.push(rng.gen_range(1..=num_customers.max(1)));
+            o_custkey.push(rng.gen_range(1..=num_customers));
             o_orderstatus.push(status.to_string());
             o_totalprice.push((rng.gen_range(10_000..50_000_000_i64) as f64) / 100.0);
             o_orderdate.push(random_date(&mut rng));
@@ -641,42 +705,52 @@ fn generate_orders(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let clerk_refs: Vec<&str> = o_clerk.iter().map(|s| s.as_str()).collect();
         let comment_refs: Vec<&str> = o_comment.iter().map(|s| s.as_str()).collect();
 
-        batches.push(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int64Array::from(o_orderkey)),
-                    Arc::new(Int32Array::from(o_custkey)),
-                    Arc::new(StringArray::from(status_refs)),
-                    Arc::new(Float64Array::from(o_totalprice)),
-                    Arc::new(Date32Array::from(o_orderdate)),
-                    Arc::new(StringArray::from(priority_refs)),
-                    Arc::new(StringArray::from(clerk_refs)),
-                    Arc::new(Int32Array::from(o_shippriority)),
-                    Arc::new(StringArray::from(comment_refs)),
-                ],
-            )
-            .expect("orders batch"),
-        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(o_orderkey)),
+                Arc::new(Int32Array::from(o_custkey)),
+                Arc::new(StringArray::from(status_refs)),
+                Arc::new(Float64Array::from(o_totalprice)),
+                Arc::new(Date32Array::from(o_orderdate)),
+                Arc::new(StringArray::from(priority_refs)),
+                Arc::new(StringArray::from(clerk_refs)),
+                Arc::new(Int32Array::from(o_shippriority)),
+                Arc::new(StringArray::from(comment_refs)),
+            ],
+        )
+        .expect("orders batch");
         offset += n;
-    }
-
-    (schema, batches)
+        Some(batch)
+    })
 }
 
+#[cfg(test)]
 fn generate_lineitem(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let schema = lineitem_schema();
-    let total = super::scaled(scale, 6_000_000.0);
-    let total = total.max(1);
-    let num_orders = (scale * 1_500_000.0) as i64;
-    let num_parts = (scale * 200_000.0) as i32;
-    let num_suppliers = (scale * 10_000.0) as i32;
-    let mut rng = StdRng::seed_from_u64(seed_for_table("lineitem"));
-    let mut batches = Vec::new();
+    let total = super::scaled(scale, 6_000_000.0).max(1);
+    let batches: Vec<RecordBatch> =
+        generate_lineitem_range(0..total, scale, seed_for_table("lineitem")).collect();
+    (lineitem_schema(), batches)
+}
 
-    let mut offset = 0usize;
-    while offset < total {
-        let n = BATCH_SIZE.min(total - offset);
+fn generate_lineitem_range(
+    range: std::ops::Range<usize>,
+    scale: f64,
+    seed: u64,
+) -> impl Iterator<Item = RecordBatch> + Send {
+    let schema = lineitem_schema();
+    let num_orders = ((scale * 1_500_000.0) as i64).max(1);
+    let num_parts = ((scale * 200_000.0) as i32).max(1);
+    let num_suppliers = ((scale * 10_000.0) as i32).max(1);
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut offset = range.start;
+    let end = range.end;
+
+    std::iter::from_fn(move || {
+        if offset >= end {
+            return None;
+        }
+        let n = BATCH_SIZE.min(end - offset);
         let mut l_orderkey = Vec::with_capacity(n);
         let mut l_partkey = Vec::with_capacity(n);
         let mut l_suppkey = Vec::with_capacity(n);
@@ -695,9 +769,9 @@ fn generate_lineitem(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let mut l_comment = Vec::with_capacity(n);
 
         for i in 0..n {
-            let orderkey = rng.gen_range(1..=num_orders.max(1));
-            let partkey = rng.gen_range(1..=num_parts.max(1));
-            let suppkey = 1 + (partkey + rng.gen_range(0..4i32)) % num_suppliers.max(1);
+            let orderkey = rng.gen_range(1..=num_orders);
+            let partkey = rng.gen_range(1..=num_parts);
+            let suppkey = 1 + (partkey + rng.gen_range(0..4i32)) % num_suppliers;
             let linenumber = ((offset + i) % 7 + 1) as i32;
             let quantity = rng.gen_range(1..=50i32) as f64;
             let retailprice = 90001.0 + (partkey as f64 / 10.0) % 20001.0;
@@ -732,34 +806,31 @@ fn generate_lineitem(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let mode_refs: Vec<&str> = l_shipmode.iter().map(|s| s.as_str()).collect();
         let comment_refs: Vec<&str> = l_comment.iter().map(|s| s.as_str()).collect();
 
-        batches.push(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int64Array::from(l_orderkey)),
-                    Arc::new(Int32Array::from(l_partkey)),
-                    Arc::new(Int32Array::from(l_suppkey)),
-                    Arc::new(Int32Array::from(l_linenumber)),
-                    Arc::new(Float64Array::from(l_quantity)),
-                    Arc::new(Float64Array::from(l_extendedprice)),
-                    Arc::new(Float64Array::from(l_discount)),
-                    Arc::new(Float64Array::from(l_tax)),
-                    Arc::new(StringArray::from(rflag_refs)),
-                    Arc::new(StringArray::from(lstatus_refs)),
-                    Arc::new(Date32Array::from(l_shipdate)),
-                    Arc::new(Date32Array::from(l_commitdate)),
-                    Arc::new(Date32Array::from(l_receiptdate)),
-                    Arc::new(StringArray::from(instruct_refs)),
-                    Arc::new(StringArray::from(mode_refs)),
-                    Arc::new(StringArray::from(comment_refs)),
-                ],
-            )
-            .expect("lineitem batch"),
-        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(l_orderkey)),
+                Arc::new(Int32Array::from(l_partkey)),
+                Arc::new(Int32Array::from(l_suppkey)),
+                Arc::new(Int32Array::from(l_linenumber)),
+                Arc::new(Float64Array::from(l_quantity)),
+                Arc::new(Float64Array::from(l_extendedprice)),
+                Arc::new(Float64Array::from(l_discount)),
+                Arc::new(Float64Array::from(l_tax)),
+                Arc::new(StringArray::from(rflag_refs)),
+                Arc::new(StringArray::from(lstatus_refs)),
+                Arc::new(Date32Array::from(l_shipdate)),
+                Arc::new(Date32Array::from(l_commitdate)),
+                Arc::new(Date32Array::from(l_receiptdate)),
+                Arc::new(StringArray::from(instruct_refs)),
+                Arc::new(StringArray::from(mode_refs)),
+                Arc::new(StringArray::from(comment_refs)),
+            ],
+        )
+        .expect("lineitem batch");
         offset += n;
-    }
-
-    (schema, batches)
+        Some(batch)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -821,35 +892,119 @@ impl BenchmarkGenerator for TpchGenerator {
         table: &str,
         scale: f64,
         output_dir: &str,
+        config: &GenerateConfig,
     ) -> anyhow::Result<GenerateStats> {
-        let start = std::time::Instant::now();
+        let full_output = format!("{output_dir}/tpch/sf{scale}");
 
-        let (schema, batches) = match table {
-            "region" => generate_region(),
-            "nation" => generate_nation(),
-            "supplier" => generate_supplier(scale),
-            "customer" => generate_customer(scale),
-            "part" => generate_part(scale),
-            "partsupp" => generate_partsupp(scale),
-            "orders" => generate_orders(scale),
-            "lineitem" => generate_lineitem(scale),
+        // Tiny fixed-size tables (region, nation) bypass the parallel
+        // dispatcher entirely. One batch, one thread, one file.
+        match table {
+            "region" => {
+                let start = std::time::Instant::now();
+                let (schema, batches) = generate_region();
+                let (files, bytes) = parquet_writer::write_parquet_files(
+                    &batches, schema, &full_output, table,
+                )?;
+                let rows = batches.iter().map(|b| b.num_rows()).sum();
+                return Ok(GenerateStats {
+                    table: table.to_string(),
+                    rows,
+                    bytes: bytes as usize,
+                    files,
+                    duration: start.elapsed(),
+                });
+            }
+            "nation" => {
+                let start = std::time::Instant::now();
+                let (schema, batches) = generate_nation();
+                let (files, bytes) = parquet_writer::write_parquet_files(
+                    &batches, schema, &full_output, table,
+                )?;
+                let rows = batches.iter().map(|b| b.num_rows()).sum();
+                return Ok(GenerateStats {
+                    table: table.to_string(),
+                    rows,
+                    bytes: bytes as usize,
+                    files,
+                    duration: start.elapsed(),
+                });
+            }
+            _ => {}
+        }
+
+        // Scaling tables: each has a `generate_<table>_range` iterator
+        // factory. We dispatch the partitions through
+        // `parallel_generate_table`, which streams batches into per-worker
+        // parquet writers.
+        let (total_rows, schema): (usize, SchemaRef) = match table {
+            "supplier" => (
+                super::scaled(scale, 10_000.0).max(1),
+                supplier_schema(),
+            ),
+            "customer" => (
+                super::scaled(scale, 150_000.0).max(1),
+                customer_schema(),
+            ),
+            "part" => (super::scaled(scale, 200_000.0).max(1), part_schema()),
+            "partsupp" => (
+                super::scaled(scale, 800_000.0).max(1),
+                partsupp_schema(),
+            ),
+            "orders" => (
+                super::scaled(scale, 1_500_000.0).max(1),
+                orders_schema(),
+            ),
+            "lineitem" => (
+                super::scaled(scale, 6_000_000.0).max(1),
+                lineitem_schema(),
+            ),
             _ => anyhow::bail!("Unknown TPC-H table: {table}"),
         };
 
-        let full_output = format!("{output_dir}/tpch/sf{scale}");
-        let (files, bytes) =
-            parquet_writer::write_parquet_files(&batches, schema, &full_output, table)?;
-        let rows = batches.iter().map(|b| b.num_rows()).sum();
+        let base_seed = seed_for_table(table);
+        let gen_range: BoxedRangeFn = match table {
+            "supplier" => Box::new(move |range, seed| {
+                Box::new(generate_supplier_range(range, scale, seed))
+            }),
+            "customer" => Box::new(move |range, seed| {
+                Box::new(generate_customer_range(range, scale, seed))
+            }),
+            "part" => Box::new(move |range, seed| {
+                Box::new(generate_part_range(range, scale, seed))
+            }),
+            "partsupp" => Box::new(move |range, seed| {
+                Box::new(generate_partsupp_range(range, scale, seed))
+            }),
+            "orders" => Box::new(move |range, seed| {
+                Box::new(generate_orders_range(range, scale, seed))
+            }),
+            "lineitem" => Box::new(move |range, seed| {
+                Box::new(generate_lineitem_range(range, scale, seed))
+            }),
+            _ => unreachable!("filtered above"),
+        };
 
-        Ok(GenerateStats {
-            table: table.to_string(),
-            rows,
-            bytes: bytes as usize,
-            files,
-            duration: start.elapsed(),
-        })
+        parallel_generate_table(
+            table,
+            schema,
+            total_rows,
+            base_seed,
+            &full_output,
+            config,
+            gen_range,
+        )
     }
 }
+
+/// Boxed closure type for per-table range-based generator dispatch.
+///
+/// Each `generate_<table>_range` factory returns `impl Iterator`, so we
+/// type-erase through a `Box<dyn Iterator>` to store a uniform closure
+/// signature in the match below. Factored into a type alias to keep
+/// clippy's `type_complexity` lint happy.
+type BoxedRangeFn = Box<
+    dyn Fn(std::ops::Range<usize>, u64) -> Box<dyn Iterator<Item = RecordBatch> + Send> + Sync,
+>;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -973,21 +1128,21 @@ mod tests {
         // Use a stable path under /tmp; parquet_writer creates subdirs
         let output = "/tmp/sqe-bench-test-tpch-parquet";
 
-        let stats = gen.generate_table("region", 1.0, output).unwrap();
+        let stats = gen.generate_table("region", 1.0, output, &Default::default()).unwrap();
         assert_eq!(stats.rows, 5);
         assert_eq!(stats.files, 1);
 
-        let stats = gen.generate_table("nation", 1.0, output).unwrap();
+        let stats = gen.generate_table("nation", 1.0, output, &Default::default()).unwrap();
         assert_eq!(stats.rows, 25);
 
-        let stats = gen.generate_table("supplier", 0.01, output).unwrap();
+        let stats = gen.generate_table("supplier", 0.01, output, &Default::default()).unwrap();
         assert_eq!(stats.rows, 100);
     }
 
     #[test]
     fn test_unknown_table_errors() {
         let gen = TpchGenerator;
-        let result = gen.generate_table("nonexistent", 1.0, "/tmp");
+        let result = gen.generate_table("nonexistent", 1.0, "/tmp", &Default::default());
         assert!(result.is_err());
     }
 }

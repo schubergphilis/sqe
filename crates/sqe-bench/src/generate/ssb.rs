@@ -773,6 +773,7 @@ impl BenchmarkGenerator for SsbGenerator {
         table: &str,
         scale: f64,
         output_dir: &str,
+        _config: &super::GenerateConfig,
     ) -> anyhow::Result<GenerateStats> {
         let start = std::time::Instant::now();
 
@@ -955,7 +956,7 @@ mod tests {
         let gen = SsbGenerator;
         let output = "/tmp/sqe-bench-test-ssb-parquet";
 
-        let stats = gen.generate_table("dim_date", 1.0, output).unwrap();
+        let stats = gen.generate_table("dim_date", 1.0, output, &Default::default()).unwrap();
         assert_eq!(stats.rows, 2557);
         assert_eq!(stats.files, 1);
         assert!(stats.bytes > 0);
@@ -968,7 +969,7 @@ mod tests {
         let sf = 0.01_f64;
 
         for table in gen.tables() {
-            let stats = gen.generate_table(&table.name, sf, output).unwrap();
+            let stats = gen.generate_table(&table.name, sf, output, &Default::default()).unwrap();
             let expected = (table.row_count)(sf);
             assert_eq!(
                 stats.rows, expected,
@@ -1011,6 +1012,6 @@ mod tests {
     #[test]
     fn test_unknown_table_errors() {
         let gen = SsbGenerator;
-        assert!(gen.generate_table("no_such_table", 1.0, "/tmp").is_err());
+        assert!(gen.generate_table("no_such_table", 1.0, "/tmp", &Default::default()).is_err());
     }
 }

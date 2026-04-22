@@ -3,6 +3,10 @@ name = "sqe-bench"
 version = "0.15.0"
 edition = "2021"
 
+[lib]
+name = "sqe_bench"
+path = "src/lib.rs"
+
 [[bin]]
 name = "sqe-bench"
 path = "src/main.rs"

@@ -33,12 +33,24 @@ async fn main() -> anyhow::Result<()> {
             benchmark,
             scale,
             output,
+            threads,
+            compression,
+            row_group_size,
             ..
         } => {
+            let config = generate::GenerateConfig::resolve(
+                threads,
+                compression.as_deref(),
+                row_group_size,
+            )?;
             let gen = generate::get_generator(&benchmark)?;
+            println!(
+                "Generating {benchmark} (threads={}, compression={:?}, row_group_size={:?})",
+                config.threads, config.compression, config.row_group_size,
+            );
             for table_def in gen.tables() {
                 println!("Generating {}.{}...", benchmark, table_def.name);
-                let stats = gen.generate_table(&table_def.name, scale, &output)?;
+                let stats = gen.generate_table(&table_def.name, scale, &output, &config)?;
                 println!(
                     "  {} rows, {} files, {:.1}s",
                     stats.rows,
