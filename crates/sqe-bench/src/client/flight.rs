@@ -102,12 +102,22 @@ async fn build_channel(host: &str) -> anyhow::Result<Channel> {
     } else {
         format!("http://{host}")
     };
+    // Per-request timeout. Long CTAS loads (e.g. TPC-H SF100 lineitem =
+    // 28 GiB / 600M rows) can take well over the old 5-minute hard-coded
+    // value. Override via `BENCH_CLIENT_TIMEOUT_SECS` when running at
+    // large scale factors; the default of 1800 s (30 min) covers SF100
+    // on a modest box without artificially capping SF1000 runs either.
+    let timeout_secs: u64 = std::env::var("BENCH_CLIENT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1800);
+
     let channel = Channel::from_shared(url.clone())
         .map_err(|e| anyhow::anyhow!("Invalid endpoint URI '{url}': {e}"))?
         .keep_alive_while_idle(true)
         .http2_keep_alive_interval(Duration::from_secs(10))
         .keep_alive_timeout(Duration::from_secs(20))
-        .timeout(Duration::from_secs(300))
+        .timeout(Duration::from_secs(timeout_secs))
         .connect_timeout(Duration::from_secs(10))
         .connect()
         .await
