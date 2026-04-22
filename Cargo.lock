@@ -4804,7 +4804,6 @@ dependencies = [
  "base64",
  "bytes",
  "chrono",
- "chrono-tz",
  "clap",
  "dashmap",
  "datafusion",
@@ -4818,9 +4817,7 @@ dependencies = [
  "opentelemetry",
  "parquet",
  "prost",
- "regex",
  "reqwest",
- "rust-stemmers",
  "serde",
  "serde_json",
  "sha2",
@@ -4832,6 +4829,7 @@ dependencies = [
  "sqe-policy",
  "sqe-sql",
  "sqe-trino-compat",
+ "sqe-trino-functions",
  "sqe-worker",
  "sqlparser 0.54.0",
  "subtle",
@@ -4843,8 +4841,6 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
- "unicode-normalization",
- "url",
  "uuid",
 ]
 
@@ -4950,6 +4946,26 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "sqe-trino-functions"
+version = "0.15.0"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "base64",
+ "chrono",
+ "chrono-tz",
+ "datafusion",
+ "datafusion-functions-json",
+ "regex",
+ "rust-stemmers",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "unicode-normalization",
+ "url",
 ]
 
 [[package]]
