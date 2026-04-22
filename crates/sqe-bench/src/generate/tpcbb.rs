@@ -343,6 +343,7 @@ impl BenchmarkGenerator for TpcbbGenerator {
         table: &str,
         scale: f64,
         output_dir: &str,
+        _config: &super::GenerateConfig,
     ) -> anyhow::Result<GenerateStats> {
         let start = std::time::Instant::now();
 
@@ -466,13 +467,13 @@ mod tests {
         let output = "/tmp/sqe-bench-test-tpcbb-parquet";
 
         let stats = gen
-            .generate_table("web_clickstreams", 0.001, output)
+            .generate_table("web_clickstreams", 0.001, output, &Default::default())
             .unwrap();
         assert_eq!(stats.rows, 4_000);
         assert_eq!(stats.files, 1);
 
         let stats = gen
-            .generate_table("product_reviews", 0.001, output)
+            .generate_table("product_reviews", 0.001, output, &Default::default())
             .unwrap();
         assert_eq!(stats.rows, 100);
         assert_eq!(stats.files, 1);
@@ -481,7 +482,7 @@ mod tests {
     #[test]
     fn test_unknown_table_errors() {
         let gen = TpcbbGenerator;
-        let result = gen.generate_table("store_sales", 1.0, "/tmp");
+        let result = gen.generate_table("store_sales", 1.0, "/tmp", &Default::default());
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("tpcds"), "error should mention tpcds");
