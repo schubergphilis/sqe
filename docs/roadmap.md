@@ -30,6 +30,7 @@
 - [x] Benchmark suite: 7 suites, 222 queries, --compare-trino
 - [x] dbt adapter (dbt-sqe via ADBC Flight SQL)
 - [x] OSS release preparation (Apache 2.0, CONTRIBUTING.md, docs)
+- [x] Parallel + streaming TPC-H data generation (SF1000 in 6:23 on 32 cores, lineitem 4:43 / 29x speedup / 91% scaling efficiency / 2.2 GiB peak RSS for 6B rows in flight via `std::thread::scope`)
 
 ## In Progress
 
@@ -37,6 +38,7 @@
 - [ ] Pluggable catalog backends (AWS Glue, Nessie, Hive Metastore)
 - [ ] Helm chart for Kubernetes deployment
 - [ ] CoW DML scales to TPC-E SF100 (`cow-dml-parallel-streaming` change: parallelise per-file rewrite + stream writes + drop double-WHERE; targets `trade_result_update_holding` under 120 s at SF100)
+- [ ] Parallel + streaming generation for the other 6 benchmarks (SSB, TPC-DS, TPC-C, TPC-E, TPC-BB, ClickBench). Trait signature is already wired; each generator needs its per-table `_range` refactor.
 
 ## Planned
 
