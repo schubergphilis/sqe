@@ -1,4 +1,5 @@
 pub mod clickbench;
+pub mod config;
 pub mod parquet_writer;
 pub mod ssb;
 pub mod tpcc;
@@ -9,6 +10,8 @@ pub mod tpcds;
 
 use arrow_schema::SchemaRef;
 use std::time::Duration;
+
+pub use config::GenerateConfig;
 
 /// Scale a row count ensuring at least 1 row for small scale factors.
 pub(crate) fn scaled(scale: f64, base: f64) -> usize {
@@ -43,7 +46,122 @@ pub trait BenchmarkGenerator: Send + Sync {
         table: &str,
         scale: f64,
         output_dir: &str,
+        config: &GenerateConfig,
     ) -> anyhow::Result<GenerateStats>;
+}
+
+/// Dispatch per-partition row generation across `config.threads` OS threads.
+///
+/// `gen_range(range, seed)` must be a pure function that returns an iterator
+/// of RecordBatch for the given row range. Each partition gets a disjoint
+/// range from [`config::partition`] and a deterministic seed from
+/// [`config::seed_for_table_partition`].
+///
+/// Each worker owns its own parquet writer, writing into a unique file
+/// prefix of the form `{part_idx:04}` (e.g. `0003`). Files inside one
+/// partition rotate at the 128 MiB cap handled by
+/// [`parquet_writer::write_parquet_stream`].
+///
+/// The returned [`GenerateStats`] aggregates rows, bytes, and file counts
+/// across all partitions.
+///
+/// Determinism: at `config.threads == 1`, the single partition spans the
+/// whole row range with `seed = base_seed`, reproducing the pre-parallel
+/// row order and RNG state exactly.
+pub fn parallel_generate_table<G, I>(
+    table_name: &str,
+    schema: SchemaRef,
+    total_rows: usize,
+    base_seed: u64,
+    output_dir: &str,
+    config: &GenerateConfig,
+    gen_range: G,
+) -> anyhow::Result<GenerateStats>
+where
+    G: Fn(std::ops::Range<usize>, u64) -> I + Sync,
+    I: IntoIterator<Item = arrow_array::RecordBatch> + Send,
+    I::IntoIter: Send,
+{
+    use std::sync::Mutex;
+
+    let start = std::time::Instant::now();
+    let threads = config.threads.max(1);
+
+    // Single-threaded fast path: skip thread::scope overhead and preserve
+    // byte-identical output with the pre-parallel serial code (seed unchanged,
+    // whole range produced as one partition).
+    if threads == 1 {
+        let batches = gen_range(0..total_rows, base_seed);
+        let (files, bytes) = parquet_writer::write_parquet_stream(
+            batches,
+            schema,
+            output_dir,
+            table_name,
+            "",
+            config,
+        )?;
+        return Ok(GenerateStats {
+            table: table_name.to_string(),
+            rows: total_rows,
+            bytes: bytes as usize,
+            files,
+            duration: start.elapsed(),
+        });
+    }
+
+    let ranges = config::partition(total_rows, threads);
+    let errors: Mutex<Vec<anyhow::Error>> = Mutex::new(Vec::new());
+    let per_partition: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+
+    std::thread::scope(|s| {
+        for (part_idx, range) in ranges.into_iter().enumerate() {
+            let schema = schema.clone();
+            let output_dir = output_dir.to_string();
+            let table_name = table_name.to_string();
+            let config = *config;
+            let gen_range = &gen_range;
+            let errors = &errors;
+            let per_partition = &per_partition;
+
+            s.spawn(move || {
+                let prefix = format!("{part_idx:04}");
+                let seed = config::seed_for_table_partition(base_seed, part_idx);
+                let iter = gen_range(range, seed);
+                match parquet_writer::write_parquet_stream(
+                    iter,
+                    schema,
+                    &output_dir,
+                    &table_name,
+                    &prefix,
+                    &config,
+                ) {
+                    Ok((files, bytes)) => {
+                        per_partition.lock().unwrap().push((files, bytes));
+                    }
+                    Err(e) => {
+                        errors.lock().unwrap().push(e);
+                    }
+                }
+            });
+        }
+    });
+
+    let errors = errors.into_inner().unwrap();
+    if let Some(e) = errors.into_iter().next() {
+        return Err(e);
+    }
+
+    let per_partition = per_partition.into_inner().unwrap();
+    let total_files: usize = per_partition.iter().map(|(f, _)| *f).sum();
+    let total_bytes: u64 = per_partition.iter().map(|(_, b)| *b).sum();
+
+    Ok(GenerateStats {
+        table: table_name.to_string(),
+        rows: total_rows,
+        bytes: total_bytes as usize,
+        files: total_files,
+        duration: start.elapsed(),
+    })
 }
 
 pub fn get_generator(name: &str) -> anyhow::Result<Box<dyn BenchmarkGenerator>> {

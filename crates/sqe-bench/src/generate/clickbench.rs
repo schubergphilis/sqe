@@ -661,6 +661,7 @@ impl BenchmarkGenerator for ClickBenchGenerator {
         table: &str,
         scale: f64,
         output_dir: &str,
+        _config: &super::GenerateConfig,
     ) -> anyhow::Result<GenerateStats> {
         if table != "hits" {
             anyhow::bail!("Unknown ClickBench table: {table}. Only 'hits' is defined.");
