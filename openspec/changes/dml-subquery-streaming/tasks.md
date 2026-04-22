@@ -53,9 +53,9 @@
 > Tasks 6.1-6.5 require a live Polaris + S3 stack and the full benchmarking harness. Partial validation landed on 2026-04-21: the first SF10 run (`tpce-sf10-flight-2026-04-21T11:44:40.json`) exposed a catalog-prefix bug in `lift_in_subqueries` (5 DML errors); MR !69 fixed it and the rerun (`tpce-sf10-flight-2026-04-21T12:20:36.json`) cleared every query. The remaining rows stay deferred to their own manual runs:
 
 - [ ] 6.1 `scripts/integration-test.sh tpch` passes 22/22 (no regression on non-DML paths) — DEFERRED, manual run
-- [x] 6.2 Full TPC-E SF10 run: `BENCH_SCALE=10 ./scripts/benchmark-test.sh tpce` completes; `trade_result_update_holding` returns the expected row count — **2026-04-21: 18/18 pass, 0 error, total 24.4 s**; `trade_result_update_holding` runs in 10.94 s (rewritten query) returning 1 row (see `benchmarks/results/tpce-sf10-flight-2026-04-21T12:20:36.json`)
-- [ ] 6.3 Stretch: TPC-E SF100 `trade_result_update_holding` completes (previously impossible) — IN PROGRESS, user running `BENCH_SCALE=100` at time of archive
-- [x] 6.4 Commit benchmark JSON report to `benchmarks/results/` for historical tracking — `tpce-sf10-flight-2026-04-21T12:20:36.json` committed in MR !69
+- [x] 6.2 Full TPC-E SF10 run: `BENCH_SCALE=10 ./scripts/benchmark-test.sh tpce` completes; `trade_result_update_holding` returns the expected row count — 18/18 pass, `trade_result_update_holding` 10,936 ms, 1 row. Result: `tpce-sf10-flight-2026-04-21T12:20:36.json`.
+- [ ] 6.3 Stretch: TPC-E SF100 `trade_result_update_holding` completes (previously impossible) — 17/18 pass at SF100 (total 319.8s). `trade_result_update_holding` times out at the 120s harness cap (SF10 was 10.94s, so 10x data would be ~109s linearly. Observed behaviour is super-linear: see `trade_result_update_settlement` 0.48s -> 11.7s, a 24x blow-up for 10x data). The CoW per-file rewrite cost, not the IN-subquery materialiser alone, is the bottleneck. Blocked on follow-up #3 (ApplyToJoinRule / LeftSemi) for the IN-subquery path and on a broader CoW rewrite audit for the other updates. Result: `tpce-sf100-flight-2026-04-21T19:09:34.json`.
+- [x] 6.4 Commit benchmark JSON report to `benchmarks/results/` for historical tracking — SF10 and SF100 JSONs committed.
 - [ ] 6.5 TPC-H SF1 single-node + distributed runs pass (from `tpch-sf1-flight-2026-04-02T14:16:27.json` and `tpch-sf1-flight-2026-04-06T20:57:10.json` baselines) — DEFERRED, manual run
 
 ## 7. Cleanup
