@@ -49,15 +49,44 @@ for i in $(seq 1 15); do
 done
 
 # ── 1. Create S3 bucket ───────────────────────────────────────
+# Create-or-verify: try head-bucket first, only attempt create if it's
+# missing, and fail loud with the real error message if both fail. The
+# old implementation masked stderr and always printed "done", which hid
+# silent-creation failures until Polaris tried to write to the bucket
+# and got back a NoSuchBucket 404 hours later.
 echo -n "Creating S3 bucket 'warehouse'... "
 if command -v aws &> /dev/null; then
-    AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" \
-        aws --endpoint-url "$S3_URL" --region us-east-1 s3 mb s3://warehouse 2>/dev/null || true
+    if AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" \
+       aws --endpoint-url "$S3_URL" --region us-east-1 \
+       s3api head-bucket --bucket warehouse 2>/dev/null; then
+        echo "already exists"
+    else
+        MB_OUT=$(AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" \
+            aws --endpoint-url "$S3_URL" --region us-east-1 \
+            s3 mb s3://warehouse 2>&1) || {
+            echo "FAILED"
+            echo "  aws s3 mb stderr: $MB_OUT" >&2
+            echo "  Check RustFS is up and credentials match docker-compose.test.yml." >&2
+            exit 1
+        }
+        echo "created"
+    fi
 else
-    curl -s -o /dev/null -X PUT "$S3_URL/warehouse" \
-        -u "${S3_ACCESS_KEY}:${S3_SECRET_KEY}" 2>/dev/null || true
+    # curl fallback: HTTP PUT returns 200 on create, 409 on already-exists
+    # (with RustFS), or 403/4xx on auth/config error. Capture status.
+    CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT "$S3_URL/warehouse" \
+        -u "${S3_ACCESS_KEY}:${S3_SECRET_KEY}" 2>/dev/null || echo "000")
+    case "$CODE" in
+        200|204) echo "created" ;;
+        409)     echo "already exists" ;;
+        *)
+            echo "FAILED (HTTP $CODE)"
+            echo "  PUT $S3_URL/warehouse returned $CODE" >&2
+            echo "  Install 'aws' CLI for a clearer error, or check RustFS auth." >&2
+            exit 1
+            ;;
+    esac
 fi
-echo "done"
 
 # ── 2. Get Polaris OAuth2 token ────────────────────────────────
 echo -n "Getting Polaris token... "
