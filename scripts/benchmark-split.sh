@@ -100,13 +100,32 @@ echo "Starting test stack..."
 docker compose -f "$COMPOSE_FILE" up -d >/dev/null
 "$SCRIPT_DIR/bootstrap-test.sh"
 
-# Kill any stale coord
-pkill -f "$SQE_BIN" 2>/dev/null
-sleep 2
+# Kill any stale coord.
+#
+# Previous implementation used `pkill -f "$SQE_BIN"` where $SQE_BIN is
+# the absolute path. That misses coords started with a relative path
+# (e.g. `./target/release/sqe-coordinator` from an earlier shell). We
+# saw this bite: the script spawned a "new" coord that tried to bind
+# already-held ports (:18080, :19090) and partially failed, then
+# queries landed inconsistently on the old vs new coord.
+#
+# Match by the binary name only, which catches both relative and
+# absolute invocations. Escalate to SIGKILL if the first SIGTERM
+# doesn't take effect within 3 s.
+pkill -f 'sqe-coordinator($| )' 2>/dev/null || true
+for _ in 1 2 3; do
+    pgrep -f 'sqe-coordinator($| )' >/dev/null 2>&1 || break
+    sleep 1
+done
+if pgrep -f 'sqe-coordinator($| )' >/dev/null 2>&1; then
+    echo "WARN: sqe-coordinator did not exit on SIGTERM, sending SIGKILL" >&2
+    pkill -9 -f 'sqe-coordinator($| )' 2>/dev/null || true
+    sleep 2
+fi
 
 for port in 60051 18080 19090; do
     if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
-        echo "ERROR: port $port already bound. Kill the stale process and retry:" >&2
+        echo "ERROR: port $port already bound after coord cleanup. Check who owns it:" >&2
         echo "  lsof -nP -iTCP:$port -sTCP:LISTEN" >&2
         exit 1
     fi
