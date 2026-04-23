@@ -380,7 +380,11 @@ impl DisplayAs for IcebergTableScan {
             self.predicates
                 .clone()
                 .map_or(String::from(""), |p| format!("{p}"))
-        )
+        )?;
+        if let Some(limit) = self.limit {
+            write!(f, " limit:[{limit}]")?;
+        }
+        Ok(())
     }
 }
 
