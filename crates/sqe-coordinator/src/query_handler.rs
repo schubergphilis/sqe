@@ -116,6 +116,19 @@ impl QueryHandler {
         if let Some(ref a) = audit {
             maintenance_handler = maintenance_handler.with_audit(Arc::clone(a));
         }
+        // Wire the query tracker in as a history callback so
+        // `suggest_bloom_filter_columns` can walk recent SQL texts.
+        {
+            let tracker = Arc::clone(&query_tracker);
+            let f: crate::maintenance::QueryHistoryFn = Arc::new(move || {
+                tracker
+                    .records()
+                    .into_iter()
+                    .map(|rec| rec.sql.clone())
+                    .collect()
+            });
+            maintenance_handler = maintenance_handler.with_query_history(f);
+        }
         let explain_handler = crate::explain::ExplainHandler::new(Arc::clone(&policy_enforcer));
         let query_semaphore = if config.query.max_concurrent_queries > 0 {
             Some(Arc::new(tokio::sync::Semaphore::new(config.query.max_concurrent_queries)))
@@ -468,7 +481,12 @@ impl QueryHandler {
 
                 StatementKind::Delete(stmt) => {
                     let (ctx, session_catalog) = self.create_session_context(session).await?;
-                    self.write_handler.handle_delete(session, stmt, session_catalog, &ctx).await
+                    // Dispatch on `write.delete.mode` table property. Default CoW
+                    // matches prior behaviour; `merge-on-read` routes to position
+                    // or equality deletes depending on declared primary key.
+                    self.write_handler
+                        .handle_delete_dispatch(session, stmt, session_catalog, &ctx)
+                        .await
                 }
 
                 StatementKind::Update(stmt) => {

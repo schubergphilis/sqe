@@ -125,6 +125,11 @@ regex = "1"
 futures = "0.3"
 tokio-util = "0.7"
 
+# Puffin NDV sketches — pure-Rust Apache DataSketches theta implementation.
+# Used by `crates/sqe-catalog/src/puffin_stats.rs` to write theta sketches
+# into Puffin sidecar files for the Iceberg statistics file list.
+datasketches = "0.2"
+
 # ── Dev profile: fast incremental builds ───────────────────────
 [profile.dev]
 # Line-tables only — enough for backtraces/panics, much less to generate.
