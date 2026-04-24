@@ -45,3 +45,9 @@ rustflags = ["-C", "linker=clang", "-C", "link-arg=-fuse-ld=mold"]
 
 # ── Release profile additions ─────────────────────────────────────────────
 # codegen-units, lto, strip are set in the workspace Cargo.toml [profile.release].
+
+# ── xtask alias ───────────────────────────────────────────────────────────
+# `cargo xtask <subcommand>` is the convention for repo-local dev tooling.
+# See `xtask/` crate for available subcommands (e.g., `cargo xtask matrix-report`).
+[alias]
+xtask = "run --package xtask --"
