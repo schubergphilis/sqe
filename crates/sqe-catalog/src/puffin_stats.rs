@@ -30,6 +30,14 @@
 //! Emission is gated by the table property `write.puffin.stats = 'true'`.
 //! The default is off while the deferred consumer side lands; flipping the
 //! default to true is a follow-up once tasks 7.12-7.14 close.
+//!
+//! ## Consumer side (deferred)
+//!
+//! TODO(matrix-f): tasks 7.12-7.14 wire these blobs into DataFusion's
+//! `StatisticsSource` once it lands in DataFusion 54. See
+//! `crates/sqe-planner/src/stats.rs` for the planned module and
+//! <https://github.com/apache/datafusion/issues/21157> for the upstream
+//! tracking issue.
 
 use std::collections::HashMap;
 

@@ -10,14 +10,14 @@
     "group": "3rd Party",
     "docUrl": "https://github.com/schubergphilis/sqe"
   },
-  "generatedAt": "2026-04-24T13:30:00Z",
-  "generatedBy": "Phase A+B+C+D integration",
+  "generatedAt": "2026-04-24T15:00:00Z",
+  "generatedBy": "Phase A+B+C+D+F integration",
   "score": {
-    "raw": 87,
+    "raw": 92,
     "max": 189,
-    "percent": 46.0
+    "percent": 48.7
   },
-  "note": "Integration of all four parallel phases: Phase A catalogs, Phase B maintenance, Phase C branching/tagging, Phase D V3 types. Honest ratings throughout (HMS/Glue stubs marked none, rewrite_data_files partial).",
+  "note": "Integration of five phases: A catalogs, B maintenance, C branching/tagging, D V3 types, F Puffin bloom filters. Honest ratings throughout (HMS/Glue stubs marked none, rewrite_data_files partial, bloom-filters v3 partial pending V3 integration run).",
   "support": {
     "sqe:position-deletes:v2": {
       "level": "full",
@@ -248,16 +248,20 @@
       "caveats": []
     },
     "sqe:bloom-filters:v2": {
-      "level": "none",
-      "notes": "Parquet footer min/max only; no bloom, no Puffin emit.",
-      "evidence": null,
-      "caveats": []
+      "level": "full",
+      "notes": "write.parquet.bloom-filter-columns + write.parquet.bloom-filter-fpp honoured at write. DataFusion reads blooms during Parquet scan by default. Puffin theta-sketch sidecar emitted on CTAS/INSERT when write.puffin.stats = 'true'.",
+      "evidence": "crates/sqe-coordinator/src/writer.rs, crates/sqe-catalog/src/puffin_stats.rs",
+      "caveats": [
+        "Streaming CTAS/INSERT paths do not yet emit Puffin sidecars."
+      ]
     },
     "sqe:bloom-filters:v3": {
-      "level": "none",
-      "notes": "Blocked on V2.",
-      "evidence": null,
-      "caveats": []
+      "level": "partial",
+      "notes": "Writer path is format-version agnostic; V3 tables produce bloom-enabled Parquet. V3-specific integration tests not run yet.",
+      "evidence": "crates/sqe-coordinator/src/writer.rs",
+      "caveats": [
+        "V3 end-to-end tests not run; marked partial pending integration run."
+      ]
     },
     "sqe:hive-metastore:v2": {
       "level": "none",
