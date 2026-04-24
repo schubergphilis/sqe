@@ -14,7 +14,7 @@ use sqe_core::{Session, SqeConfig, SqeError};
 use sqe_sql::{BranchRetention, RefDdl};
 use tracing::instrument;
 
-use crate::write_handler::sql_type_to_arrow;
+use crate::write_handler::{default_to_iceberg_literal as alter_default_to_iceberg_literal, sql_type_to_arrow};
 
 /// Handles catalog DDL operations (DROP TABLE, ALTER TABLE RENAME, views).
 ///
@@ -458,11 +458,44 @@ impl CatalogOps {
                         )))?;
 
                     max_field_id += 1;
-                    let new_field = if not_null {
-                        NestedField::required(max_field_id, &column_def.name.value, iceberg_type)
+                    let mut new_field = if not_null {
+                        NestedField::required(
+                            max_field_id,
+                            &column_def.name.value,
+                            iceberg_type.clone(),
+                        )
                     } else {
-                        NestedField::optional(max_field_id, &column_def.name.value, iceberg_type)
+                        NestedField::optional(
+                            max_field_id,
+                            &column_def.name.value,
+                            iceberg_type.clone(),
+                        )
                     };
+
+                    // Extract a DEFAULT literal, if any, and set both defaults.
+                    // `initial_default` fills existing rows retroactively;
+                    // `write_default` applies to new inserts.
+                    let default_expr =
+                        column_def.options.iter().find_map(|o| match &o.option {
+                            sqlparser::ast::ColumnOption::Default(e) => Some(e),
+                            _ => None,
+                        });
+                    if let Some(expr) = default_expr {
+                        let sql_literal = sqe_sql::extract_default_literal(expr).map_err(|e| {
+                            SqeError::Execution(format!(
+                                "Invalid DEFAULT for column '{}': {e}",
+                                column_def.name.value
+                            ))
+                        })?;
+                        if let Some(lit) =
+                            alter_default_to_iceberg_literal(&sql_literal, &iceberg_type)
+                        {
+                            new_field = new_field
+                                .with_initial_default(lit.clone())
+                                .with_write_default(lit);
+                        }
+                    }
+
                     fields.push(StdArc::new(new_field));
                 }
 

@@ -402,6 +402,8 @@ impl WriteHandler {
     /// Handle CREATE TABLE [IF NOT EXISTS] ns.table (column definitions)
     ///
     /// Creates an empty Iceberg table from explicit column definitions.
+    /// Honours V3 features (nanosecond timestamps, column defaults) by
+    /// auto-bumping the format version.
     #[instrument(skip(self, session, stmt), fields(username = %session.user.username))]
     pub async fn handle_create_table(
         &self,
@@ -419,7 +421,13 @@ impl WriteHandler {
 
         let (namespace, name) = parse_table_ref(&ct.name)?;
 
-        // Convert SQL column definitions to Arrow schema
+        if ct.columns.is_empty() {
+            return Err(SqeError::Execution(
+                "CREATE TABLE requires at least one column definition".into(),
+            ));
+        }
+
+        // Convert SQL column definitions to Arrow schema.
         let arrow_fields: Vec<arrow_schema::Field> = ct
             .columns
             .iter()
@@ -437,20 +445,24 @@ impl WriteHandler {
             })
             .collect::<sqe_core::Result<Vec<_>>>()?;
 
-        if arrow_fields.is_empty() {
-            return Err(SqeError::Execution(
-                "CREATE TABLE requires at least one column definition".into(),
-            ));
-        }
-
         let arrow_schema = ArrowSchema::new(arrow_fields);
-        let iceberg_schema = arrow_schema_to_iceberg(&arrow_schema)?;
+        let iceberg_schema = arrow_schema_to_iceberg_with_defaults(&arrow_schema, &ct.columns)?;
+
+        // Decide the format version. V3 features auto-upgrade the table;
+        // otherwise fall back to the configured default (normally V2).
+        let needs_v3 = requires_v3_features(&ct.columns, &iceberg_schema);
+        let format_version = if needs_v3 {
+            FormatVersion::V3
+        } else {
+            self.format_version()
+        };
 
         info!(
             username = %session.user.username,
             namespace = %namespace,
             table = %name,
             columns = arrow_schema.fields().len(),
+            format_version = ?format_version,
             "Creating empty table"
         );
 
@@ -467,7 +479,7 @@ impl WriteHandler {
         let table_creation = TableCreation::builder()
             .name(name.clone())
             .schema(iceberg_schema)
-            .format_version(self.format_version())
+            .format_version(format_version)
             .build();
 
         catalog
@@ -2739,7 +2751,22 @@ pub(crate) fn sql_type_to_arrow(
     sql_type: &sqlparser::ast::DataType,
 ) -> sqe_core::Result<arrow_schema::DataType> {
     use arrow_schema::DataType;
+    use sqe_sql::{detect_ns_timestamp, NsTimestamp};
     use sqlparser::ast::DataType as SqlType;
+
+    // V3 nanosecond timestamps arrive as `DataType::Custom` from sqlparser.
+    // Route them through the sqe-sql helper so the mapping stays in one place.
+    if let Some(kind) = detect_ns_timestamp(sql_type) {
+        return Ok(match kind {
+            NsTimestamp::WithoutTz => {
+                DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None)
+            }
+            NsTimestamp::WithTz => DataType::Timestamp(
+                arrow_schema::TimeUnit::Nanosecond,
+                Some("UTC".into()),
+            ),
+        });
+    }
 
     match sql_type {
         SqlType::Boolean => Ok(DataType::Boolean),
@@ -2755,20 +2782,25 @@ pub(crate) fn sql_type_to_arrow(
         SqlType::Char(_) | SqlType::Character(_) => Ok(DataType::Utf8),
         SqlType::Binary(_) | SqlType::Varbinary(_) | SqlType::Bytea => Ok(DataType::Binary),
         SqlType::Date => Ok(DataType::Date32),
-        SqlType::Timestamp(precision, _tz_info) => {
+        SqlType::Timestamp(precision, tz_info) => {
             let p = precision.unwrap_or(6);
+            let tz = if sqe_sql::is_tz_variant(tz_info) {
+                Some("UTC".into())
+            } else {
+                None
+            };
             match p {
                 0..=3 => Ok(DataType::Timestamp(
                     arrow_schema::TimeUnit::Millisecond,
-                    None,
+                    tz,
                 )),
                 4..=6 => Ok(DataType::Timestamp(
                     arrow_schema::TimeUnit::Microsecond,
-                    None,
+                    tz,
                 )),
                 _ => Ok(DataType::Timestamp(
                     arrow_schema::TimeUnit::Nanosecond,
-                    None,
+                    tz,
                 )),
             }
         }
@@ -2812,6 +2844,146 @@ fn arrow_schema_to_iceberg(arrow_schema: &ArrowSchema) -> sqe_core::Result<Icebe
         .with_fields(fields)
         .build()
         .map_err(|e| SqeError::Execution(format!("Failed to build Iceberg schema: {e}")))
+}
+
+/// Build an Iceberg schema from an Arrow schema, applying column DEFAULTs.
+///
+/// For each column def with a `DEFAULT` option, extracts the literal and
+/// sets both `initial_default` and `write_default` on the `NestedField`.
+/// `initial_default` fills existing rows in case of retroactive `ADD COLUMN`;
+/// `write_default` applies to new rows when no value is provided.
+pub(crate) fn arrow_schema_to_iceberg_with_defaults(
+    arrow_schema: &ArrowSchema,
+    column_defs: &[sqlparser::ast::ColumnDef],
+) -> sqe_core::Result<IcebergSchema> {
+    use sqe_sql::{extract_default_literal, DefaultLiteral};
+
+    if arrow_schema.fields().len() != column_defs.len() {
+        return Err(SqeError::Execution(format!(
+            "Schema field count ({}) does not match column definition count ({})",
+            arrow_schema.fields().len(),
+            column_defs.len()
+        )));
+    }
+
+    let mut fields = Vec::with_capacity(arrow_schema.fields().len());
+
+    for (idx, (arrow_field, col_def)) in arrow_schema
+        .fields()
+        .iter()
+        .zip(column_defs.iter())
+        .enumerate()
+    {
+        let field_id = (idx + 1) as i32;
+        let iceberg_type = arrow_type_to_type(arrow_field.data_type()).map_err(|e| {
+            SqeError::Execution(format!(
+                "Cannot convert Arrow type {:?} for field '{}' to Iceberg type: {e}",
+                arrow_field.data_type(),
+                arrow_field.name()
+            ))
+        })?;
+
+        let mut field = if arrow_field.is_nullable() {
+            NestedField::optional(field_id, arrow_field.name(), iceberg_type.clone())
+        } else {
+            NestedField::required(field_id, arrow_field.name(), iceberg_type.clone())
+        };
+
+        // Pull the DEFAULT from the column def (if any) and lift it into
+        // an iceberg Literal compatible with the target type.
+        let default_expr = col_def.options.iter().find_map(|o| match &o.option {
+            sqlparser::ast::ColumnOption::Default(expr) => Some(expr),
+            _ => None,
+        });
+
+        if let Some(expr) = default_expr {
+            let sql_literal = extract_default_literal(expr).map_err(|e| {
+                SqeError::Execution(format!(
+                    "Invalid DEFAULT for column '{}': {e}",
+                    col_def.name.value
+                ))
+            })?;
+
+            if let Some(iceberg_literal) = default_to_iceberg_literal(&sql_literal, &iceberg_type)
+            {
+                field = field
+                    .with_initial_default(iceberg_literal.clone())
+                    .with_write_default(iceberg_literal);
+            } else if !matches!(sql_literal, DefaultLiteral::Null) {
+                return Err(SqeError::Execution(format!(
+                    "DEFAULT literal for column '{}' is not compatible with type {:?}",
+                    col_def.name.value, iceberg_type
+                )));
+            }
+            // DefaultLiteral::Null is a no-op: NULL is already the absent default.
+        }
+
+        fields.push(Arc::new(field));
+    }
+
+    IcebergSchema::builder()
+        .with_fields(fields)
+        .build()
+        .map_err(|e| SqeError::Execution(format!("Failed to build Iceberg schema: {e}")))
+}
+
+/// Convert a SQL-surface default literal into an Iceberg `Literal`.
+///
+/// Returns `None` if the combination of SQL literal and target Iceberg
+/// type is not representable. The caller decides whether that is a
+/// hard error or a silent NULL.
+pub(crate) fn default_to_iceberg_literal(
+    sql_literal: &sqe_sql::DefaultLiteral,
+    target: &iceberg::spec::Type,
+) -> Option<iceberg::spec::Literal> {
+    use iceberg::spec::{Literal, PrimitiveLiteral, PrimitiveType, Type};
+    use sqe_sql::DefaultLiteral;
+
+    let prim = match target {
+        Type::Primitive(p) => p,
+        // Struct/list/map defaults are not in scope.
+        _ => return None,
+    };
+
+    match (sql_literal, prim) {
+        (DefaultLiteral::Null, _) => None,
+        (DefaultLiteral::Int(i), PrimitiveType::Int) => Some(Literal::int(*i as i32)),
+        (DefaultLiteral::Int(i), PrimitiveType::Long) => Some(Literal::long(*i)),
+        (DefaultLiteral::Int(i), PrimitiveType::Float) => Some(Literal::float(*i as f32)),
+        (DefaultLiteral::Int(i), PrimitiveType::Double) => Some(Literal::double(*i as f64)),
+        (DefaultLiteral::Float(f), PrimitiveType::Float) => Some(Literal::float(*f as f32)),
+        (DefaultLiteral::Float(f), PrimitiveType::Double) => Some(Literal::double(*f)),
+        (DefaultLiteral::Bool(b), PrimitiveType::Boolean) => Some(Literal::bool(*b)),
+        (DefaultLiteral::String(s), PrimitiveType::String) => Some(Literal::string(s)),
+        // Fall back: wrap string-like literals as strings.
+        (DefaultLiteral::String(s), _) => {
+            Some(Literal::Primitive(PrimitiveLiteral::String(s.clone())))
+        }
+        _ => None,
+    }
+}
+
+/// Decide whether a CREATE TABLE definition requires Iceberg format-version 3.
+///
+/// Triggers V3 when any column uses a V3-only SQL type (nanosec timestamps)
+/// or when any column carries a write-default through the Iceberg schema.
+pub(crate) fn requires_v3_features(
+    column_defs: &[sqlparser::ast::ColumnDef],
+    iceberg_schema: &IcebergSchema,
+) -> bool {
+    use sqe_sql::is_v3_only_type;
+
+    // Nanosecond timestamps and other V3-only SQL types trigger V3.
+    if column_defs.iter().any(|c| is_v3_only_type(&c.data_type)) {
+        return true;
+    }
+
+    // A write_default or initial_default means V3 too.
+    iceberg_schema
+        .as_struct()
+        .fields()
+        .iter()
+        .any(|f| f.write_default.is_some() || f.initial_default.is_some())
 }
 
 #[cfg(test)]
@@ -3149,6 +3321,260 @@ mod tests {
         // Precision 7+ → Nanosecond
         let result = sql_type_to_arrow(&SqlType::Timestamp(Some(9), TimezoneInfo::None)).unwrap();
         assert_eq!(result, DataType::Timestamp(TimeUnit::Nanosecond, None));
+    }
+
+    #[test]
+    fn test_sql_type_to_arrow_timestamp_ns_custom_type() {
+        // TIMESTAMP_NS(9) lands in sqlparser as DataType::Custom.
+        use sqlparser::ast::ObjectName;
+
+        let custom = SqlType::Custom(
+            ObjectName(vec![sqlparser::ast::Ident::new("TIMESTAMP_NS")]),
+            vec!["9".to_string()],
+        );
+        let result = sql_type_to_arrow(&custom).unwrap();
+        assert_eq!(result, DataType::Timestamp(TimeUnit::Nanosecond, None));
+
+        // Lowercase should map to the same type (identifiers are case-insensitive).
+        let custom_lower = SqlType::Custom(
+            ObjectName(vec![sqlparser::ast::Ident::new("timestamp_ns")]),
+            vec!["9".to_string()],
+        );
+        let result_lower = sql_type_to_arrow(&custom_lower).unwrap();
+        assert_eq!(result_lower, DataType::Timestamp(TimeUnit::Nanosecond, None));
+    }
+
+    #[test]
+    fn test_sql_type_to_arrow_timestamptz_ns_custom_type() {
+        use sqlparser::ast::ObjectName;
+
+        let custom = SqlType::Custom(
+            ObjectName(vec![sqlparser::ast::Ident::new("TIMESTAMPTZ_NS")]),
+            vec!["9".to_string()],
+        );
+        let result = sql_type_to_arrow(&custom).unwrap();
+        assert_eq!(
+            result,
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
+        );
+    }
+
+    #[test]
+    fn test_sql_type_to_arrow_ns_via_parser() {
+        // Parse CREATE TABLE and feed the resulting column type through the
+        // conversion. Locks behaviour across the full parser -> mapper path.
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let sql = "CREATE TABLE events (ts TIMESTAMP_NS(9), utcts TIMESTAMPTZ_NS(9))";
+        let stmt = Parser::parse_sql(&GenericDialect {}, sql).unwrap().remove(0);
+        let sqlparser::ast::Statement::CreateTable(ct) = stmt else {
+            panic!("expected CreateTable");
+        };
+        assert_eq!(
+            sql_type_to_arrow(&ct.columns[0].data_type).unwrap(),
+            DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
+        assert_eq!(
+            sql_type_to_arrow(&ct.columns[1].data_type).unwrap(),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
+        );
+    }
+
+    #[test]
+    fn test_arrow_to_iceberg_preserves_nanosec() {
+        // Nanosecond Arrow timestamps must map to Iceberg TimestampNs / TimestamptzNs.
+        use arrow_schema::Field;
+        use iceberg::spec::{PrimitiveType, Type};
+
+        let arrow_schema = ArrowSchema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+            Field::new(
+                "utcts",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                true,
+            ),
+        ]);
+        let iceberg = arrow_schema_to_iceberg(&arrow_schema).unwrap();
+        let fields: Vec<_> = iceberg.as_struct().fields().to_vec();
+        assert!(matches!(
+            *fields[0].field_type,
+            Type::Primitive(PrimitiveType::TimestampNs)
+        ));
+        assert!(matches!(
+            *fields[1].field_type,
+            Type::Primitive(PrimitiveType::TimestamptzNs)
+        ));
+    }
+
+    // ------------------------------------------------------------------
+    // DEFAULT literal handling and format-version gating
+    // ------------------------------------------------------------------
+
+    fn parse_create_table(sql: &str) -> sqlparser::ast::CreateTable {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let stmt = Parser::parse_sql(&GenericDialect {}, sql)
+            .expect("sql parses")
+            .into_iter()
+            .next()
+            .expect("one statement");
+        match stmt {
+            sqlparser::ast::Statement::CreateTable(ct) => ct,
+            other => panic!("expected CreateTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_default_string_sets_write_default() {
+        use iceberg::spec::{Literal, PrimitiveLiteral};
+
+        let ct = parse_create_table(
+            "CREATE TABLE orders (id BIGINT, status STRING DEFAULT 'pending')",
+        );
+        let arrow_fields: Vec<_> = ct
+            .columns
+            .iter()
+            .map(|c| {
+                let ty = sql_type_to_arrow(&c.data_type).unwrap();
+                Field::new(c.name.value.clone(), ty, true)
+            })
+            .collect();
+        let arrow_schema = ArrowSchema::new(arrow_fields);
+        let iceberg = arrow_schema_to_iceberg_with_defaults(&arrow_schema, &ct.columns).unwrap();
+        let fields: Vec<_> = iceberg.as_struct().fields().to_vec();
+
+        let status = fields.iter().find(|f| f.name == "status").unwrap();
+        assert!(
+            matches!(
+                status.write_default.as_ref(),
+                Some(Literal::Primitive(PrimitiveLiteral::String(s))) if s == "pending"
+            ),
+            "write_default should be 'pending', got {:?}",
+            status.write_default
+        );
+        assert!(
+            matches!(
+                status.initial_default.as_ref(),
+                Some(Literal::Primitive(PrimitiveLiteral::String(s))) if s == "pending"
+            ),
+            "initial_default should be 'pending', got {:?}",
+            status.initial_default
+        );
+    }
+
+    #[test]
+    fn test_default_integer_on_bigint() {
+        use iceberg::spec::{Literal, PrimitiveLiteral};
+
+        let ct = parse_create_table("CREATE TABLE t (n BIGINT DEFAULT 42)");
+        let arrow_fields: Vec<_> = ct
+            .columns
+            .iter()
+            .map(|c| {
+                let ty = sql_type_to_arrow(&c.data_type).unwrap();
+                Field::new(c.name.value.clone(), ty, true)
+            })
+            .collect();
+        let arrow_schema = ArrowSchema::new(arrow_fields);
+        let iceberg = arrow_schema_to_iceberg_with_defaults(&arrow_schema, &ct.columns).unwrap();
+        let fields: Vec<_> = iceberg.as_struct().fields().to_vec();
+
+        assert!(matches!(
+            fields[0].write_default.as_ref(),
+            Some(Literal::Primitive(PrimitiveLiteral::Long(42)))
+        ));
+    }
+
+    #[test]
+    fn test_default_function_rejected_with_clear_error() {
+        let ct = parse_create_table(
+            "CREATE TABLE t (ts TIMESTAMP DEFAULT current_timestamp())",
+        );
+        let arrow_fields: Vec<_> = ct
+            .columns
+            .iter()
+            .map(|c| {
+                let ty = sql_type_to_arrow(&c.data_type).unwrap();
+                Field::new(c.name.value.clone(), ty, true)
+            })
+            .collect();
+        let arrow_schema = ArrowSchema::new(arrow_fields);
+        let err =
+            arrow_schema_to_iceberg_with_defaults(&arrow_schema, &ct.columns).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("current_timestamp"),
+            "error should name rejected function: {msg}"
+        );
+        assert!(
+            msg.contains("Accepted forms"),
+            "error should list accepted forms: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_requires_v3_on_nanosec_timestamp() {
+        let ct = parse_create_table("CREATE TABLE t (ts TIMESTAMP_NS(9))");
+        let arrow_fields: Vec<_> = ct
+            .columns
+            .iter()
+            .map(|c| {
+                let ty = sql_type_to_arrow(&c.data_type).unwrap();
+                Field::new(c.name.value.clone(), ty, true)
+            })
+            .collect();
+        let iceberg = arrow_schema_to_iceberg_with_defaults(
+            &ArrowSchema::new(arrow_fields),
+            &ct.columns,
+        )
+        .unwrap();
+        assert!(requires_v3_features(&ct.columns, &iceberg));
+    }
+
+    #[test]
+    fn test_requires_v3_on_write_default() {
+        let ct = parse_create_table(
+            "CREATE TABLE t (id BIGINT, status STRING DEFAULT 'pending')",
+        );
+        let arrow_fields: Vec<_> = ct
+            .columns
+            .iter()
+            .map(|c| {
+                let ty = sql_type_to_arrow(&c.data_type).unwrap();
+                Field::new(c.name.value.clone(), ty, true)
+            })
+            .collect();
+        let iceberg = arrow_schema_to_iceberg_with_defaults(
+            &ArrowSchema::new(arrow_fields),
+            &ct.columns,
+        )
+        .unwrap();
+        assert!(requires_v3_features(&ct.columns, &iceberg));
+    }
+
+    #[test]
+    fn test_does_not_require_v3_when_v2_only() {
+        let ct = parse_create_table("CREATE TABLE t (id BIGINT, name STRING)");
+        let arrow_fields: Vec<_> = ct
+            .columns
+            .iter()
+            .map(|c| {
+                let ty = sql_type_to_arrow(&c.data_type).unwrap();
+                Field::new(c.name.value.clone(), ty, true)
+            })
+            .collect();
+        let iceberg = arrow_schema_to_iceberg_with_defaults(
+            &ArrowSchema::new(arrow_fields),
+            &ct.columns,
+        )
+        .unwrap();
+        assert!(!requires_v3_features(&ct.columns, &iceberg));
     }
 
     #[test]
