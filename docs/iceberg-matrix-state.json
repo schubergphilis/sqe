@@ -10,14 +10,14 @@
     "group": "3rd Party",
     "docUrl": "https://github.com/schubergphilis/sqe"
   },
-  "generatedAt": "2026-04-24T13:00:00Z",
-  "generatedBy": "Phase A+B+C integration (catalogs + maintenance + branching/tagging)",
+  "generatedAt": "2026-04-24T13:30:00Z",
+  "generatedBy": "Phase A+B+C+D integration",
   "score": {
-    "raw": 73,
+    "raw": 87,
     "max": 189,
-    "percent": 38.6
+    "percent": 46.0
   },
-  "note": "Integration branch: Phase A (catalogs) + Phase B (maintenance, 3 of 4 real) + Phase C (branching/tagging full).",
+  "note": "Integration of all four parallel phases: Phase A catalogs, Phase B maintenance, Phase C branching/tagging, Phase D V3 types. Honest ratings throughout (HMS/Glue stubs marked none, rewrite_data_files partial).",
   "support": {
     "sqe:position-deletes:v2": {
       "level": "full",
@@ -78,9 +78,9 @@
       "caveats": []
     },
     "sqe:schema-evolution:v3": {
-      "level": "unknown",
-      "notes": "V3 type coverage untested.",
-      "evidence": null,
+      "level": "partial",
+      "notes": "ADD COLUMN with DEFAULT uses initial_default; existing V2 evolution ops apply to V3 tables.",
+      "evidence": "crates/sqe-coordinator/src/catalog_ops.rs",
       "caveats": []
     },
     "sqe:type-promotion:v2": {
@@ -90,18 +90,16 @@
       "caveats": []
     },
     "sqe:type-promotion:v3": {
-      "level": "unknown",
-      "notes": "V3 type coverage untested.",
-      "evidence": null,
+      "level": "partial",
+      "notes": "Existing V2 widening rules apply to V3 tables; nanosec-to-microsecond narrowing not attempted.",
+      "evidence": "crates/sqe-sql/src/ddl.rs",
       "caveats": []
     },
     "sqe:column-default-values:v3": {
-      "level": "unknown",
-      "notes": "iceberg-rust has initial_default/write_default; SQE DDL does not expose.",
-      "evidence": "vendor/iceberg-rust/crates/iceberg/src/spec/datatypes.rs",
-      "caveats": [
-        "No DDL surface."
-      ]
+      "level": "full",
+      "notes": "CREATE TABLE ... DEFAULT <literal> applies write_default; ALTER TABLE ADD COLUMN ... DEFAULT applies initial_default. Function-call defaults rejected with clear error.",
+      "evidence": "crates/sqe-sql/src/v3_types.rs",
+      "caveats": []
     },
     "sqe:table-creation:v2": {
       "level": "full",
@@ -110,9 +108,9 @@
       "caveats": []
     },
     "sqe:table-creation:v3": {
-      "level": "none",
-      "notes": "Format-version 3 not emitted.",
-      "evidence": null,
+      "level": "partial",
+      "notes": "CREATE TABLE emits format-version: 3 when any V3-only feature is used; V2-only schemas remain format-version: 2 for compat.",
+      "evidence": "crates/sqe-coordinator/src/write_handler.rs",
       "caveats": []
     },
     "sqe:time-travel:v2": {
@@ -122,9 +120,9 @@
       "caveats": []
     },
     "sqe:time-travel:v3": {
-      "level": "none",
-      "notes": "V3 not tested.",
-      "evidence": null,
+      "level": "partial",
+      "notes": "FOR SYSTEM_TIME AS OF works against V3 tables using the same snapshot walk.",
+      "evidence": "crates/sqe-sql/src/time_travel.rs",
       "caveats": []
     },
     "sqe:table-maintenance:v2": {
@@ -192,10 +190,12 @@
       "caveats": []
     },
     "sqe:read-support:v3": {
-      "level": "none",
-      "notes": "V3-specific features untested.",
-      "evidence": null,
-      "caveats": []
+      "level": "partial",
+      "notes": "V3 tables produced by SQE are readable via existing iceberg-rust scan path (nanosec types supported, defaults materialised on read).",
+      "evidence": "crates/sqe-coordinator/src/write_handler.rs",
+      "caveats": [
+        "Variant/geometry not supported."
+      ]
     },
     "sqe:write-insert:v2": {
       "level": "full",
@@ -204,10 +204,12 @@
       "caveats": []
     },
     "sqe:write-insert:v3": {
-      "level": "none",
-      "notes": "No V3-enabled tables produced.",
-      "evidence": null,
-      "caveats": []
+      "level": "partial",
+      "notes": "INSERT into V3 tables works when columns use nanosec timestamps or typed defaults; V3-only types (Variant, geometry) still unsupported.",
+      "evidence": "crates/sqe-coordinator/src/write_handler.rs",
+      "caveats": [
+        "Variant/geometry writes not supported."
+      ]
     },
     "sqe:write-merge-update-delete:v2": {
       "level": "full",
@@ -404,9 +406,9 @@
       "caveats": []
     },
     "sqe:nanosecond-timestamps:v3": {
-      "level": "unknown",
-      "notes": "iceberg-rust has TimestampNs; SQE DDL does not expose.",
-      "evidence": "vendor/iceberg-rust/crates/iceberg/src/spec/datatypes.rs",
+      "level": "full",
+      "notes": "TIMESTAMP_NS(N) and TIMESTAMPTZ_NS(N) DDL route to PrimitiveType::TimestampNs/TimestamptzNs; Arrow bridge and INSERT/SELECT wiring covered by v3_types_integration.",
+      "evidence": "crates/sqe-sql/src/v3_types.rs",
       "caveats": []
     },
     "sqe:cdc-support:v3": {
