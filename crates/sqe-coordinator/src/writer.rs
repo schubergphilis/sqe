@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::compute::cast;
@@ -20,9 +21,25 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
+use parquet::schema::types::ColumnPath;
 use sqe_core::SqeError;
 use tracing::{info, instrument};
 use uuid::Uuid;
+
+/// Iceberg table property that lists columns to get Parquet bloom filters.
+///
+/// Value is a comma-separated list of column names (case-sensitive, matched
+/// against the top-level schema field names). Absence of the property means
+/// no bloom filters are written.
+pub const PROP_BLOOM_FILTER_COLUMNS: &str = "write.parquet.bloom-filter-columns";
+
+/// Iceberg table property for the bloom filter false-positive probability.
+///
+/// Defaults to [`DEFAULT_BLOOM_FILTER_FPP`] (1%) when absent or unparseable.
+pub const PROP_BLOOM_FILTER_FPP: &str = "write.parquet.bloom-filter-fpp";
+
+/// Default bloom filter FPP when the table property is absent.
+pub const DEFAULT_BLOOM_FILTER_FPP: f64 = 0.01;
 
 /// Parse a compression config string into a Parquet `Compression` value.
 ///
@@ -46,10 +63,103 @@ pub fn parse_parquet_compression(s: &str) -> Compression {
 }
 
 /// Build `WriterProperties` with the given compression codec.
+///
+/// Used by the position-delete writer and other paths that do not carry an
+/// Iceberg table context. Data-file writes go through
+/// [`writer_props_for_table`] so that per-table bloom filter settings apply.
 fn writer_props(compression: Compression) -> WriterProperties {
     WriterProperties::builder()
         .set_compression(compression)
         .build()
+}
+
+/// Build `WriterProperties` honouring the table's bloom filter properties.
+///
+/// Reads `write.parquet.bloom-filter-columns` (comma-separated column list)
+/// and optional `write.parquet.bloom-filter-fpp` (float) and enables
+/// per-column bloom filters on the returned [`WriterProperties`]. Columns
+/// not present in the Iceberg schema are warned about and skipped.
+///
+/// Absence of the bloom filter columns property leaves the writer with no
+/// bloom filters (matching Iceberg spec default).
+pub fn writer_props_for_table(
+    table: &Table,
+    compression: Compression,
+) -> WriterProperties {
+    build_writer_props(
+        table.metadata().properties(),
+        table.metadata().current_schema(),
+        compression,
+    )
+}
+
+/// Pure helper used by both [`writer_props_for_table`] and the unit tests.
+///
+/// Decouples property parsing from the iceberg-rust [`Table`] so tests can
+/// exercise every branch without standing up a catalog.
+fn build_writer_props(
+    properties: &HashMap<String, String>,
+    schema: &IcebergSchema,
+    compression: Compression,
+) -> WriterProperties {
+    let mut builder = WriterProperties::builder().set_compression(compression);
+
+    let columns = parse_bloom_filter_columns(properties);
+    if columns.is_empty() {
+        return builder.build();
+    }
+
+    let fpp = parse_bloom_filter_fpp(properties);
+    let schema_fields = schema.as_struct().fields();
+    let valid_names: Vec<&str> = schema_fields.iter().map(|f| f.name.as_str()).collect();
+
+    for col in &columns {
+        if valid_names.iter().any(|name| *name == col.as_str()) {
+            let path = ColumnPath::new(vec![col.clone()]);
+            builder = builder
+                .set_column_bloom_filter_enabled(path.clone(), true)
+                .set_column_bloom_filter_fpp(path, fpp);
+        } else {
+            tracing::warn!(
+                column = %col,
+                "write.parquet.bloom-filter-columns references unknown column; skipping"
+            );
+        }
+    }
+
+    builder.build()
+}
+
+/// Parse `write.parquet.bloom-filter-columns` into a deduplicated list.
+///
+/// Values are comma-separated, trimmed, and compared case-sensitively against
+/// the schema. Duplicate names are folded silently so user typos in the
+/// property do not blow up the writer.
+fn parse_bloom_filter_columns(properties: &HashMap<String, String>) -> Vec<String> {
+    let Some(raw) = properties.get(PROP_BLOOM_FILTER_COLUMNS) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let name = trimmed.to_string();
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// Parse `write.parquet.bloom-filter-fpp` or fall back to the default.
+fn parse_bloom_filter_fpp(properties: &HashMap<String, String>) -> f64 {
+    properties
+        .get(PROP_BLOOM_FILTER_FPP)
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|f| *f > 0.0 && *f < 1.0)
+        .unwrap_or(DEFAULT_BLOOM_FILTER_FPP)
 }
 
 /// Write RecordBatches as Parquet data files for an Iceberg table.
@@ -98,7 +208,7 @@ pub async fn write_data_files(
     );
 
     let parquet_writer_builder = ParquetWriterBuilder::new(
-        writer_props(compression),
+        writer_props_for_table(table, compression),
         table.metadata().current_schema().clone(),
     );
 
@@ -198,7 +308,7 @@ pub async fn write_data_files_streaming(
     );
 
     let parquet_writer_builder = ParquetWriterBuilder::new(
-        writer_props(compression),
+        writer_props_for_table(table, compression),
         table.metadata().current_schema().clone(),
     );
 
@@ -520,4 +630,131 @@ fn apply_stamped_schema(
         .collect();
     RecordBatch::try_new(stamped_schema.clone(), new_columns?)
         .map_err(|e| SqeError::Execution(format!("Failed to apply stamped schema: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
+
+    /// Build a minimal Iceberg schema with two fields: `id: long`, `name: string`.
+    fn schema_id_name() -> IcebergSchema {
+        IcebergSchema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .expect("schema")
+    }
+
+    #[test]
+    fn bloom_filter_columns_absent_means_no_bloom() {
+        let props = HashMap::new();
+        let schema = schema_id_name();
+        let w = build_writer_props(&props, &schema, Compression::UNCOMPRESSED);
+        assert!(
+            w.bloom_filter_properties(&ColumnPath::new(vec!["id".to_string()]))
+                .is_none(),
+            "no bloom filter should be enabled when property is absent"
+        );
+    }
+
+    #[test]
+    fn bloom_filter_columns_single_column_enables_bloom() {
+        let mut props = HashMap::new();
+        props.insert(PROP_BLOOM_FILTER_COLUMNS.to_string(), "id".to_string());
+        let schema = schema_id_name();
+        let w = build_writer_props(&props, &schema, Compression::UNCOMPRESSED);
+
+        let bf = w
+            .bloom_filter_properties(&ColumnPath::new(vec!["id".to_string()]))
+            .expect("id should have bloom filter");
+        assert!((bf.fpp - DEFAULT_BLOOM_FILTER_FPP).abs() < f64::EPSILON);
+
+        // `name` should NOT have bloom
+        assert!(
+            w.bloom_filter_properties(&ColumnPath::new(vec!["name".to_string()]))
+                .is_none(),
+            "name column should not have bloom filter"
+        );
+    }
+
+    #[test]
+    fn bloom_filter_columns_multiple_columns() {
+        let mut props = HashMap::new();
+        props.insert(
+            PROP_BLOOM_FILTER_COLUMNS.to_string(),
+            "id, name".to_string(),
+        );
+        let schema = schema_id_name();
+        let w = build_writer_props(&props, &schema, Compression::UNCOMPRESSED);
+
+        assert!(
+            w.bloom_filter_properties(&ColumnPath::new(vec!["id".to_string()]))
+                .is_some()
+        );
+        assert!(
+            w.bloom_filter_properties(&ColumnPath::new(vec!["name".to_string()]))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn bloom_filter_fpp_honours_property() {
+        let mut props = HashMap::new();
+        props.insert(PROP_BLOOM_FILTER_COLUMNS.to_string(), "id".to_string());
+        props.insert(PROP_BLOOM_FILTER_FPP.to_string(), "0.05".to_string());
+        let schema = schema_id_name();
+        let w = build_writer_props(&props, &schema, Compression::UNCOMPRESSED);
+
+        let bf = w
+            .bloom_filter_properties(&ColumnPath::new(vec!["id".to_string()]))
+            .expect("id should have bloom filter");
+        assert!((bf.fpp - 0.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn bloom_filter_fpp_invalid_falls_back_to_default() {
+        let mut props = HashMap::new();
+        props.insert(PROP_BLOOM_FILTER_COLUMNS.to_string(), "id".to_string());
+        props.insert(PROP_BLOOM_FILTER_FPP.to_string(), "garbage".to_string());
+        let schema = schema_id_name();
+        let w = build_writer_props(&props, &schema, Compression::UNCOMPRESSED);
+        let bf = w
+            .bloom_filter_properties(&ColumnPath::new(vec!["id".to_string()]))
+            .expect("id should have bloom filter");
+        assert!((bf.fpp - DEFAULT_BLOOM_FILTER_FPP).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn bloom_filter_unknown_column_is_skipped() {
+        let mut props = HashMap::new();
+        props.insert(
+            PROP_BLOOM_FILTER_COLUMNS.to_string(),
+            "id,does_not_exist".to_string(),
+        );
+        let schema = schema_id_name();
+        let w = build_writer_props(&props, &schema, Compression::UNCOMPRESSED);
+        // `id` should still work; bogus column is silently dropped.
+        assert!(
+            w.bloom_filter_properties(&ColumnPath::new(vec!["id".to_string()]))
+                .is_some()
+        );
+        assert!(
+            w.bloom_filter_properties(&ColumnPath::new(vec!["does_not_exist".to_string()]))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_bloom_filter_columns_trims_and_dedups() {
+        let mut props = HashMap::new();
+        props.insert(
+            PROP_BLOOM_FILTER_COLUMNS.to_string(),
+            " id , name ,id,, ".to_string(),
+        );
+        let cols = parse_bloom_filter_columns(&props);
+        assert_eq!(cols, vec!["id".to_string(), "name".to_string()]);
+    }
 }
