@@ -1,5 +1,6 @@
 pub mod adaptive_sort;
 pub mod catalog_ops;
+pub mod maintenance;
 pub mod tls;
 pub mod codec;
 pub mod credential_refresh;
