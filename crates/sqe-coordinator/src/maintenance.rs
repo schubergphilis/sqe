@@ -27,6 +27,13 @@ use sqe_core::{Session, SqeConfig, SqeError};
 use sqe_sql::{ProcedureCall, TableRef};
 use tracing::{info, warn};
 
+/// Callback that returns a snapshot of recent SQL query texts.
+///
+/// Used by `suggest_bloom_filter_columns` to read the query log without
+/// pulling `QueryTracker` into the procedure AST. Returning owned `String`s
+/// keeps the closure simple and avoids lifetime gymnastics.
+pub type QueryHistoryFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
 /// Dispatcher for `CALL system.*` maintenance procedures.
 ///
 /// The handler is lightweight. It holds config for catalog construction and
@@ -36,6 +43,7 @@ pub struct MaintenanceHandler {
     config: SqeConfig,
     audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
     table_cache: Option<TableMetadataCache>,
+    query_history: Option<QueryHistoryFn>,
 }
 
 impl MaintenanceHandler {
@@ -44,6 +52,7 @@ impl MaintenanceHandler {
             config,
             audit: None,
             table_cache: None,
+            query_history: None,
         }
     }
 
@@ -54,6 +63,15 @@ impl MaintenanceHandler {
 
     pub fn with_table_cache(mut self, cache: TableMetadataCache) -> Self {
         self.table_cache = Some(cache);
+        self
+    }
+
+    /// Attach a callback that returns the current query log.
+    ///
+    /// Required for `suggest_bloom_filter_columns`; without it the procedure
+    /// returns an empty suggestion set (still a well-formed response).
+    pub fn with_query_history(mut self, f: QueryHistoryFn) -> Self {
+        self.query_history = Some(f);
         self
     }
 
@@ -104,7 +122,36 @@ impl MaintenanceHandler {
             ProcedureCall::RewriteManifests { table: _ } => {
                 self.rewrite_manifests(session, &table_ref).await
             }
+            ProcedureCall::SuggestBloomFilterColumns {
+                table: _,
+                history_limit,
+            } => self.suggest_bloom_filter_columns(&table_ref, *history_limit),
         }
+    }
+
+    /// Read-only probe: walk the in-memory query log and surface the top
+    /// equality-filtered columns for the target table.
+    ///
+    /// Unlike the mutating maintenance procedures, this one does not require
+    /// write privilege; the privilege check in [`authorize_or_deny`] gates
+    /// by `table_ref` semantics but the target is merely used to filter the
+    /// history. We still route through the same dispatcher for a consistent
+    /// audit trail, but the early-return for a missing history callback is
+    /// graceful.
+    fn suggest_bloom_filter_columns(
+        &self,
+        table_ref: &TableRef,
+        history_limit: Option<usize>,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let queries = match &self.query_history {
+            Some(f) => f(),
+            None => Vec::new(),
+        };
+        crate::suggest_bloom::suggest_bloom_filter_columns(
+            table_ref,
+            &queries,
+            history_limit,
+        )
     }
 
     /// Privilege check. Maintenance procedures mutate table state; we insist
@@ -121,6 +168,11 @@ impl MaintenanceHandler {
         call: &ProcedureCall,
         table_ref: &TableRef,
     ) -> sqe_core::Result<()> {
+        // Read-only procedures bypass the write-privilege gate.
+        if matches!(call, ProcedureCall::SuggestBloomFilterColumns { .. }) {
+            return Ok(());
+        }
+
         if session_has_write_privilege(session) {
             return Ok(());
         }
