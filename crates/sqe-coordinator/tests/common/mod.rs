@@ -106,6 +106,7 @@ pub fn fmt_val(col: &dyn arrow_array::Array, row: usize) -> String {
 }
 
 /// Pretty-print RecordBatches for test diagnostics using Arrow's built-in formatter.
+#[allow(dead_code)] // used by integration_test.rs; dead in binaries that don't call it
 pub fn print_results(label: &str, sql: &str, batches: &[arrow_array::RecordBatch]) {
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     println!("\n-- {label} ({total_rows} rows)");

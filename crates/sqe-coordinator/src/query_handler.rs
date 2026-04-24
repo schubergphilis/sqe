@@ -25,6 +25,7 @@ use sqe_sql::{parse_and_classify, StatementKind};
 
 use crate::catalog_ops::CatalogOps;
 use crate::credential_refresh::CredentialRefreshTracker;
+use crate::maintenance::MaintenanceHandler;
 use crate::query_cache::ResultCache;
 use crate::query_tracker::{FragmentState, QueryTracker};
 use crate::write_handler::WriteHandler;
@@ -67,6 +68,7 @@ pub struct QueryHandler {
     config: SqeConfig,
     catalog_ops: CatalogOps,
     write_handler: WriteHandler,
+    maintenance_handler: MaintenanceHandler,
     explain_handler: crate::explain::ExplainHandler,
     worker_registry: Option<Arc<crate::worker_registry::WorkerRegistry>>,
     #[allow(dead_code)] // Used when constructing DistributedScanExec for distributed queries
@@ -86,6 +88,9 @@ pub struct QueryHandler {
     /// Pluggable backend for GRANT/REVOKE/SHOW GRANTS operations.
     /// Initialized by the caller based on `[access_control]` config.
     grant_backend: Option<Arc<dyn GrantBackend>>,
+    /// Session manager used for `SET WRITE_BRANCH` mutations.
+    /// Optional so in-process tests can construct a QueryHandler without it.
+    session_manager: Option<Arc<crate::session_manager::SessionManager>>,
 }
 
 impl QueryHandler {
@@ -107,6 +112,10 @@ impl QueryHandler {
         if let Some(ref m) = metrics {
             write_handler = write_handler.with_metrics(Arc::clone(m));
         }
+        let mut maintenance_handler = MaintenanceHandler::new(config.clone());
+        if let Some(ref a) = audit {
+            maintenance_handler = maintenance_handler.with_audit(Arc::clone(a));
+        }
         let explain_handler = crate::explain::ExplainHandler::new(Arc::clone(&policy_enforcer));
         let query_semaphore = if config.query.max_concurrent_queries > 0 {
             Some(Arc::new(tokio::sync::Semaphore::new(config.query.max_concurrent_queries)))
@@ -125,6 +134,7 @@ impl QueryHandler {
             config,
             catalog_ops,
             write_handler,
+            maintenance_handler,
             explain_handler,
             worker_registry,
             credential_tracker,
@@ -136,7 +146,17 @@ impl QueryHandler {
             runtime,
             table_cache: None,
             grant_backend,
+            session_manager: None,
         })
+    }
+
+    /// Attach the session manager so `SET WRITE_BRANCH` can mutate session state.
+    pub fn with_session_manager(
+        mut self,
+        manager: Arc<crate::session_manager::SessionManager>,
+    ) -> Self {
+        self.session_manager = Some(manager);
+        self
     }
 
     /// Attach a global table metadata cache shared across all sessions and queries.
@@ -151,6 +171,7 @@ impl QueryHandler {
     pub fn with_table_cache(mut self, cache: sqe_catalog::TableMetadataCache) -> Self {
         self.catalog_ops = self.catalog_ops.with_table_cache(cache.clone());
         self.write_handler = self.write_handler.with_table_cache(cache.clone());
+        self.maintenance_handler = self.maintenance_handler.with_table_cache(cache.clone());
         self.table_cache = Some(cache);
         self
     }
@@ -346,6 +367,32 @@ impl QueryHandler {
                     crate::session_context::invalidate_all_session_caches();
                     Ok(vec![])
                 }
+                StatementKind::RefDdl(ddl) => {
+                    self.catalog_ops.apply_ref_ddl(session, ddl).await?;
+                    crate::session_context::invalidate_all_session_caches();
+                    Ok(vec![])
+                }
+                StatementKind::SetWriteBranch(ref branch) => {
+                    if let Some(ref manager) = self.session_manager {
+                        let updated = manager.set_write_branch(&session.id, branch.clone());
+                        if !updated {
+                            return Err(SqeError::Execution(
+                                "SET WRITE_BRANCH: session not found in manager".into(),
+                            ));
+                        }
+                        tracing::info!(
+                            username = %session.user.username,
+                            branch = ?branch,
+                            "SET WRITE_BRANCH applied"
+                        );
+                    } else {
+                        tracing::debug!(
+                            "SET WRITE_BRANCH requested but session manager is not wired; \
+                             the value is ignored in this mode"
+                        );
+                    }
+                    Ok(vec![])
+                }
                 StatementKind::CreateView(stmt) => {
                     self.handle_create_view(session, stmt).await?;
                     crate::session_context::invalidate_all_session_caches();
@@ -468,6 +515,12 @@ impl QueryHandler {
                         "CALL is not supported. SQE does not have stored procedures. \
                          Use SQL statements directly instead.".into(),
                     ))
+                }
+
+                // CALL system.<maintenance procedure>(...) — Iceberg compaction,
+                // snapshot expiry, orphan file removal, manifest rewrite.
+                StatementKind::Procedure(ref call) => {
+                    self.maintenance_handler.handle(session, call).await
                 }
 
                 // COMMENT ON TABLE/COLUMN — store as Iceberg table property
@@ -1709,6 +1762,9 @@ impl QueryHandler {
     /// timestamps to snapshot IDs, register snapshot-specific table providers,
     /// and return the rewritten SQL with the temporal clause stripped.
     ///
+    /// Also handles `FOR VERSION AS OF <snapshot_id_or_ref>` via a pre-scan
+    /// because sqlparser-rs 0.53 does not model that variant.
+    ///
     /// When no time travel is found the original SQL is returned unchanged.
     async fn handle_time_travel(
         &self,
@@ -1720,12 +1776,28 @@ impl QueryHandler {
         use sqlparser::dialect::GenericDialect;
         use sqlparser::parser::Parser;
 
+        // First, pre-scan and resolve FOR VERSION AS OF. This path hides the
+        // clause from sqlparser and registers snapshot-pinned providers.
+        let (rewritten_for_version, version_specs) =
+            sqe_sql::extract_time_travel_spec(sql)?;
+        let mut version_resolved = !version_specs.is_empty();
+        if version_resolved {
+            for spec in version_specs {
+                Self::apply_version_spec(&spec, ctx, session_catalog).await?;
+            }
+        }
+        let sql_for_ast = if version_resolved {
+            rewritten_for_version
+        } else {
+            sql.to_string()
+        };
+
         let dialect = GenericDialect {};
-        let mut statements = Parser::parse_sql(&dialect, sql)
+        let mut statements = Parser::parse_sql(&dialect, &sql_for_ast)
             .map_err(|e| SqeError::Execution(format!("Parse error in time travel detection: {e}")))?;
 
         if statements.is_empty() {
-            return Ok(sql.to_string());
+            return Ok(sql_for_ast);
         }
 
         let stmt = &mut statements[0];
@@ -1756,9 +1828,109 @@ impl QueryHandler {
 
         if found_time_travel {
             Ok(statements[0].to_string())
+        } else if version_resolved {
+            Ok(sql_for_ast)
         } else {
+            version_resolved = false;
+            let _ = version_resolved; // silence unused warning if flow changes
             Ok(sql.to_string())
         }
+    }
+
+    /// Resolve a parsed `TimeTravelSpec` (from `FOR VERSION AS OF`) against
+    /// table metadata and register a snapshot-pinned provider.
+    ///
+    /// - `VersionRef::SnapshotId(id)` pins to that specific snapshot.
+    /// - `VersionRef::Named(name)` looks up `name` in the table's refs. If both
+    ///   a tag and a branch exist with the same name, the tag wins and a
+    ///   warning is logged.
+    async fn apply_version_spec(
+        spec: &sqe_sql::TimeTravelSpec,
+        ctx: &SessionContext,
+        session_catalog: &Arc<SessionCatalog>,
+    ) -> sqe_core::Result<()> {
+        use iceberg::spec::SnapshotRetention;
+        use sqe_sql::VersionRef;
+
+        let parts: Vec<&str> = spec.table.split('.').collect();
+        let (namespace, bare_table) = match parts.len() {
+            1 => ("default", parts[0]),
+            2 => (parts[0], parts[1]),
+            3 => (parts[1], parts[2]),
+            _ => {
+                return Err(SqeError::Execution(format!(
+                    "Unsupported table name format for time travel: {}",
+                    spec.table
+                )));
+            }
+        };
+
+        let ns_ident = iceberg::NamespaceIdent::new(namespace.to_string());
+        let table_ident = iceberg::TableIdent::new(ns_ident, bare_table.to_string());
+        let iceberg_table = session_catalog.load_table(&table_ident).await?;
+        let metadata = iceberg_table.metadata();
+
+        let snapshot_id = match &spec.version {
+            VersionRef::SnapshotId(id) => {
+                if metadata.snapshot_by_id(*id).is_none() {
+                    return Err(SqeError::Execution(format!(
+                        "FOR VERSION AS OF {id}: snapshot id not found on {}",
+                        spec.table
+                    )));
+                }
+                *id
+            }
+            VersionRef::Named(name) => {
+                match metadata.reference_by_name(name) {
+                    None => {
+                        return Err(SqeError::Execution(format!(
+                            "FOR VERSION AS OF '{name}': no branch or tag with that name on {}",
+                            spec.table
+                        )));
+                    }
+                    Some(reference) => {
+                        // If another ref with the same name exists with a different
+                        // retention kind, prefer the tag. Iceberg uses a single
+                        // namespace for branch and tag names, so this only applies
+                        // in migration scenarios where someone creates a tag that
+                        // shadows a branch (or vice versa).
+                        if matches!(reference.retention, SnapshotRetention::Branch { .. }) {
+                            tracing::debug!(
+                                table = %spec.table,
+                                ref_name = %name,
+                                snapshot_id = reference.snapshot_id,
+                                "FOR VERSION AS OF resolved to branch"
+                            );
+                        } else {
+                            tracing::debug!(
+                                table = %spec.table,
+                                ref_name = %name,
+                                snapshot_id = reference.snapshot_id,
+                                "FOR VERSION AS OF resolved to tag"
+                            );
+                        }
+                        reference.snapshot_id
+                    }
+                }
+            }
+        };
+
+        tracing::info!(
+            table = %spec.table,
+            snapshot_id,
+            "Time travel (FOR VERSION AS OF): pinned snapshot"
+        );
+
+        let provider = sqe_catalog::table_provider::SqeTableProvider::try_new(iceberg_table)
+            .await?
+            .with_snapshot_id(snapshot_id);
+
+        ctx.register_table(bare_table, Arc::new(provider))
+            .map_err(|e| SqeError::Execution(format!(
+                "Failed to register time-travel provider for {bare_table}: {e}"
+            )))?;
+
+        Ok(())
     }
 
     /// Process a single `TableFactor` for `FOR SYSTEM_TIME AS OF`.
@@ -2772,6 +2944,7 @@ mod tests {
             default_catalog: None,
             default_schema: None,
             source: None,
+            write_branch: None,
         }
     }
 

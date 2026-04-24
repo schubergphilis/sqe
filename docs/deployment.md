@@ -653,6 +653,141 @@ scopes = ["openid", "profile"]
 
 ---
 
+## 5b. Catalog Backends
+
+SQE ships with the Iceberg REST catalog as the default backend. Phase A of the
+iceberg-matrix-parity change adds feature-gated backends for Glue, HMS, JDBC
+(SQLite/PostgreSQL), and a Hadoop storage-only catalog. Pick the backends you
+need at build time via Cargo features:
+
+```bash
+# Default build: REST only (Polaris, Nessie, Snowflake Horizon).
+cargo build --release
+
+# Full build: every backend available at runtime.
+cargo build --release --features sql,hadoop,hms,glue
+```
+
+Each feature maps to a `catalog.type` value in `sqe.toml`.
+
+### REST: Polaris, Snowflake Horizon, Nessie
+
+The REST backend speaks the Iceberg REST Catalog protocol. It works against
+Apache Polaris (the default target), Snowflake Horizon (Polaris-based), and
+Project Nessie via Nessie's REST adapter. Bearer tokens pass through from the
+authenticated user session.
+
+```toml
+# Polaris (the built-in reference target).
+[catalog]
+type = "rest"
+polaris_url = "http://polaris:8181/api/catalog"
+warehouse = "polaris"
+
+# Nessie via the REST adapter on the same host.
+[catalog]
+type = "rest"
+polaris_url = "http://nessie:19120/iceberg"
+warehouse = "main"
+```
+
+Nessie exposes branches as reference names. SQE's REST client sends the bearer
+token verbatim; Nessie validates it against its configured OIDC provider.
+Read-only operations (SELECT, SHOW TABLES, DESCRIBE) work out of the box.
+Write operations depend on Nessie's Iceberg REST parity for CTAS and INSERT,
+which tracks apache/polaris-rest behaviour.
+
+### JDBC: SQLite (local dev) and PostgreSQL
+
+The JDBC backend stores metadata in a relational database. SQLite is handy for
+local development and tests; PostgreSQL is the production target.
+
+```toml
+# SQLite file (created on first use).
+[catalog]
+type = "jdbc"
+url = "sqlite:///tmp/sqe-catalog.db"
+catalog_name = "sqe"
+
+# PostgreSQL.
+[catalog]
+type = "jdbc"
+url = "postgresql://catalog.example.com/iceberg"
+catalog_name = "sqe"
+```
+
+The SQLite path is fully implemented today. PostgreSQL support arrives when
+SQE adopts the upstream `iceberg-catalog-sql` crate from apache/iceberg-rust.
+
+### Hadoop: storage-only warehouse
+
+Hadoop catalogs have no catalog service. SQE lists tables by walking the
+warehouse path and reading the highest `metadata/v<N>.metadata.json` per
+directory. S3-compatible stores and local filesystems both work; object-store
+credentials come from the `[storage]` section.
+
+```toml
+[catalog]
+type = "hadoop"
+warehouse = "s3://lake/warehouse"
+```
+
+Write operations through the Hadoop layout are race-prone on object stores
+without atomic rename. Production workloads should use REST, HMS, or JDBC.
+
+### HMS (Hive Metastore)
+
+The HMS backend speaks Thrift to a running metastore on port 9083.
+
+```toml
+[catalog]
+type = "hms"
+uri = "thrift://hms.example.com:9083"
+warehouse = "s3://lake/warehouse"
+```
+
+HMS enforces table-level locking on write. SQE acquires the lock before the
+commit RPC and releases it after success or failure. The current build carries
+a marker implementation; the real Thrift wiring adopts
+`iceberg-catalog-hms` from apache/iceberg-rust in a follow-up change.
+
+### Glue (AWS)
+
+```toml
+[catalog]
+type = "glue"
+region = "eu-west-1"
+warehouse = "s3://lake/warehouse"
+```
+
+The AWS SDK picks credentials from the standard chain (env vars, profile,
+instance role). The current build carries a marker implementation; real
+wiring via `iceberg-catalog-glue` is tracked in the matrix-parity change.
+
+### Unity Catalog (OIDC machine-to-machine)
+
+Unity Catalog REST supports OAuth2 client-credentials (M2M) in addition to
+personal access tokens. SQE has an `OidcM2mProvider` in the auth chain.
+
+```toml
+[catalog]
+type = "rest"
+polaris_url = "https://<workspace>.cloud.databricks.com/api/2.1/unity-catalog"
+warehouse = "main"
+
+[[auth.providers]]
+type = "oidc_m2m"
+token_endpoint = "https://<workspace>.cloud.databricks.com/oidc/v1/token"
+client_id = "<sp_application_id>"
+client_secret = "<sp_secret>"
+scope = "all-apis"
+```
+
+The provider caches the access token and refreshes it 60 seconds before it
+would expire, so catalog requests never see a stale token.
+
+---
+
 ## 6. Monitoring
 
 ### Prometheus metrics
