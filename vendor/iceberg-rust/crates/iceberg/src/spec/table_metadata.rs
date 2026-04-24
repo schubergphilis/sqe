@@ -328,6 +328,24 @@ impl TableMetadata {
         })
     }
 
+    /// Lookup the [`SnapshotReference`] (branch or tag metadata) by name.
+    ///
+    /// Unlike [`Self::snapshot_for_ref`], this returns the reference envelope,
+    /// which includes the retention policy and whether it's a branch or tag.
+    #[inline]
+    pub fn reference_by_name(&self, ref_name: &str) -> Option<&SnapshotReference> {
+        self.refs.get(ref_name)
+    }
+
+    /// Iterate all named references (branches and tags) in the table.
+    ///
+    /// Each entry is `(name, &SnapshotReference)`. The returned iterator
+    /// reflects the current metadata snapshot and is not ordered.
+    #[inline]
+    pub fn refs_iter(&self) -> impl Iterator<Item = (&str, &SnapshotReference)> {
+        self.refs.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
     /// Return all sort orders.
     #[inline]
     pub fn sort_orders_iter(&self) -> impl ExactSizeIterator<Item = &SortOrderRef> {
