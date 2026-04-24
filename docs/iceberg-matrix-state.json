@@ -13,11 +13,11 @@
   "generatedAt": "2026-04-24T15:20:00Z",
   "generatedBy": "Phase E row-delta",
   "score": {
-    "raw": 91,
+    "raw": 95,
     "max": 189,
-    "percent": 48.1
+    "percent": 50.3
   },
-  "note": "Phase E lands equality-delete writer and RowDeltaAction commit path. equality-deletes:v2 none->partial (+2), equality-deletes:v3 none->partial (+2). merge-on-read stays partial until Phase H brings UPDATE/MERGE. Prior phases unchanged.",
+  "note": "Integration of Phase E (equality-delete writer + RowDeltaAction), F (bloom filters + Puffin NDV, coordinator path), G (CDC parser + planner primitives). All three rated honestly; UPDATE/MERGE MoR, worker-side bloom, and CDC SQL dispatch land as follow-ups.",
   "support": {
     "sqe:position-deletes:v2": {
       "level": "full",
@@ -253,16 +253,23 @@
       "caveats": []
     },
     "sqe:bloom-filters:v2": {
-      "level": "none",
-      "notes": "Parquet footer min/max only; no bloom, no Puffin emit.",
-      "evidence": null,
-      "caveats": []
+      "level": "partial",
+      "notes": "write.parquet.bloom-filter-columns + write.parquet.bloom-filter-fpp honoured in the coordinator's CTAS/INSERT batch path. DataFusion reads blooms automatically. Puffin theta-sketch sidecar emitted via puffin_stats. CALL system.suggest_bloom_filter_columns analyses query history.",
+      "evidence": "crates/sqe-coordinator/src/writer.rs, crates/sqe-catalog/src/puffin_stats.rs, crates/sqe-coordinator/src/suggest_bloom.rs",
+      "caveats": [
+        "Worker / streaming write path (sqe-worker) not wired; distributed writes miss blooms.",
+        "Read-probe end-to-end verification deferred; needs docker-compose.test.yml run.",
+        "DataFusion StatisticsSource consumer for Puffin NDV is blocked on DF 54 (apache/datafusion#21157)."
+      ]
     },
     "sqe:bloom-filters:v3": {
-      "level": "none",
-      "notes": "Blocked on V2.",
-      "evidence": null,
-      "caveats": []
+      "level": "partial",
+      "notes": "Writer path is format-version agnostic; V3 tables produce bloom-enabled Parquet. V3-specific integration tests not run.",
+      "evidence": "crates/sqe-coordinator/src/writer.rs",
+      "caveats": [
+        "V3 integration coverage pending.",
+        "Same worker-path gap as v2."
+      ]
     },
     "sqe:hive-metastore:v2": {
       "level": "none",
