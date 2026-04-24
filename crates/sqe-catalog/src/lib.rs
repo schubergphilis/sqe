@@ -14,6 +14,7 @@ pub mod iceberg_scan;
 pub mod incremental_scan;
 pub mod info_schema;
 pub mod late_materialize;
+pub mod parquet_writer_config;
 pub mod pruning_stats;
 pub mod puffin_stats;
 pub mod read_parquet;
