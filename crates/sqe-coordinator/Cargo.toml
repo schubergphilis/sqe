@@ -75,6 +75,8 @@ sqe-metrics = { path = "../sqe-metrics" }
 sqe-trino-compat = { path = "../sqe-trino-compat" }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
+iceberg = { workspace = true }
+sqlparser = { workspace = true }
 parquet = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
