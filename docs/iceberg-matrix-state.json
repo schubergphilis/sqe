@@ -10,14 +10,14 @@
     "group": "3rd Party",
     "docUrl": "https://github.com/schubergphilis/sqe"
   },
-  "generatedAt": "2026-04-24T13:30:00Z",
-  "generatedBy": "Phase A+B+C+D integration",
+  "generatedAt": "2026-04-24T15:20:00Z",
+  "generatedBy": "Phase E row-delta",
   "score": {
-    "raw": 87,
+    "raw": 96,
     "max": 189,
-    "percent": 46.0
+    "percent": 50.8
   },
-  "note": "Integration of all four parallel phases: Phase A catalogs, Phase B maintenance, Phase C branching/tagging, Phase D V3 types. Honest ratings throughout (HMS/Glue stubs marked none, rewrite_data_files partial).",
+  "note": "Integration of Phase E + F + G. Honest ratings: equality-deletes partial (write tested, Spark read not verified), merge-on-read:v2 partial (only DELETE, UPDATE/MERGE still CoW, Phase H), bloom-filters partial (coordinator-only write), cdc-support unknown (library primitives only, no SQL dispatch).",
   "support": {
     "sqe:position-deletes:v2": {
       "level": "full",
@@ -34,28 +34,33 @@
       ]
     },
     "sqe:equality-deletes:v2": {
-      "level": "none",
-      "notes": "Writer exists in vendored iceberg-rust; no SQE commit path.",
-      "evidence": null,
-      "caveats": []
+      "level": "partial",
+      "notes": "DELETE with write.delete.mode=merge-on-read writes equality-delete files via EqualityDeleteFileWriter and commits through RowDeltaAction. Unit tests assert file structure (3 data + 2 pos-delete + 1 eq-delete + Operation::Overwrite). Cross-engine read verification (Spark 4.1) ships as #[ignore] integration test pending docker-compose.spark.yml.",
+      "evidence": "crates/sqe-coordinator/src/write_handler.rs#handle_delete_equality",
+      "caveats": [
+        "No cross-engine read test executed (Spark interop is #[ignore]).",
+        "RowDeltaOperation::delete_entries simplified to Ok(vec![]) against the RisingWave fork's SnapshotProducer; behaviour matches the fork's own CoW path but not independently verified against Java Iceberg."
+      ]
     },
     "sqe:equality-deletes:v3": {
-      "level": "none",
-      "notes": "Blocked on V2 support.",
-      "evidence": null,
-      "caveats": []
+      "level": "partial",
+      "notes": "Same writer path as V2; V3 roundtrip not yet exercised in integration tests.",
+      "evidence": "crates/sqe-coordinator/src/write_handler.rs#handle_delete_equality",
+      "caveats": [
+        "V3 end-to-end test pending."
+      ]
     },
     "sqe:merge-on-read:v2": {
       "level": "partial",
-      "notes": "DELETE emits position deletes; UPDATE and MERGE still CoW.",
-      "evidence": "crates/sqe-planner/src/dml.rs",
+      "notes": "DELETE dispatches to equality-delete (PK tables) or position-delete (no PK) via write.delete.mode. UPDATE and MERGE still take the CoW path; MoR dispatch for those lands in Phase H.",
+      "evidence": "crates/sqe-coordinator/src/write_handler.rs#handle_delete_dispatch",
       "caveats": [
-        "UPDATE/MERGE not on MoR path."
+        "Only DELETE has a MoR path; UPDATE and MERGE still CoW."
       ]
     },
     "sqe:merge-on-read:v3": {
       "level": "none",
-      "notes": "Blocked on V2.",
+      "notes": "Blocked on Phase H (UPDATE/MERGE MoR).",
       "evidence": null,
       "caveats": []
     },
@@ -248,16 +253,23 @@
       "caveats": []
     },
     "sqe:bloom-filters:v2": {
-      "level": "none",
-      "notes": "Parquet footer min/max only; no bloom, no Puffin emit.",
-      "evidence": null,
-      "caveats": []
+      "level": "partial",
+      "notes": "write.parquet.bloom-filter-columns + write.parquet.bloom-filter-fpp honoured in the coordinator's CTAS/INSERT batch path. DataFusion reads blooms automatically. Puffin theta-sketch sidecar emitted via puffin_stats. CALL system.suggest_bloom_filter_columns analyses query history.",
+      "evidence": "crates/sqe-coordinator/src/writer.rs, crates/sqe-catalog/src/puffin_stats.rs, crates/sqe-coordinator/src/suggest_bloom.rs",
+      "caveats": [
+        "Worker / streaming write path (sqe-worker) not wired; distributed writes miss blooms.",
+        "Read-probe end-to-end verification deferred; needs docker-compose.test.yml run.",
+        "DataFusion StatisticsSource consumer for Puffin NDV is blocked on DF 54 (apache/datafusion#21157)."
+      ]
     },
     "sqe:bloom-filters:v3": {
-      "level": "none",
-      "notes": "Blocked on V2.",
-      "evidence": null,
-      "caveats": []
+      "level": "partial",
+      "notes": "Writer path is format-version agnostic; V3 tables produce bloom-enabled Parquet. V3-specific integration tests not run.",
+      "evidence": "crates/sqe-coordinator/src/writer.rs",
+      "caveats": [
+        "V3 integration coverage pending.",
+        "Same worker-path gap as v2."
+      ]
     },
     "sqe:hive-metastore:v2": {
       "level": "none",
@@ -412,10 +424,13 @@
       "caveats": []
     },
     "sqe:cdc-support:v3": {
-      "level": "none",
-      "notes": "Planned in Phase G.",
-      "evidence": null,
-      "caveats": []
+      "level": "unknown",
+      "notes": "Library primitives shipped: FOR INCREMENTAL BETWEEN SNAPSHOT parser (sqe-sql/src/time_travel.rs) and range-scan planner with delete reconciliation + meta columns (sqe-catalog/src/incremental_scan.rs). End-to-end SQL execution wiring deferred.",
+      "evidence": "crates/sqe-catalog/src/incremental_scan.rs, crates/sqe-sql/src/time_travel.rs",
+      "caveats": [
+        "Parser and planner unit-tested in isolation; no end-to-end SQL test exists yet.",
+        "query_handler.rs has not been wired; SELECT ... FOR INCREMENTAL ... is not dispatched."
+      ]
     },
     "sqe:lineage:v3": {
       "level": "none",

@@ -94,9 +94,10 @@ matrix-score:
   script:
     - cargo xtask matrix-report --min-percent $MATRIX_MIN_PERCENT
   variables:
-    # Baseline updated per phase tag. Current: Phase A+B+C+D integrated at 46%.
-    # Phase E target: 50%. Phase F: 53%. Phase G: 55%. Phase H: 83%.
-    MATRIX_MIN_PERCENT: "45"
+    # Baseline updated per phase tag. Current: Phase A-G integrated at 50.8%.
+    # Phase H target: 55%. Deferred follow-ups (HMS/Glue real, CDC query_handler,
+    # rewrite_data_files Parquet re-encoding) move this to ~60%.
+    MATRIX_MIN_PERCENT: "50"
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes:

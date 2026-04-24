@@ -16,6 +16,9 @@ use iceberg::{Catalog, TableCreation, TableIdent};
 use sqlparser::ast::Statement;
 use tracing::info;
 
+use sqe_catalog::puffin_stats::{
+    puffin_stats_enabled, write_puffin_sidecar,
+};
 use sqe_catalog::{SessionCatalog, TableMetadataCache};
 use sqe_core::{Session, SqeConfig, SqeError};
 use tracing::instrument;
@@ -23,7 +26,7 @@ use tracing::instrument;
 use crate::catalog_ops::parse_table_ref;
 use crate::writer::{
     parse_parquet_compression, write_data_files_streaming_with_metrics,
-    write_data_files_with_metrics, write_position_delete_files,
+    write_data_files_with_metrics, write_equality_delete_files, write_position_delete_files,
 };
 
 /// Build a single-row RecordBatch reporting affected row count.
@@ -78,6 +81,91 @@ impl WriteHandler {
     /// Return the Parquet compression codec from config.
     fn compression(&self) -> parquet::basic::Compression {
         parse_parquet_compression(&self.config.catalog.parquet_compression)
+    }
+
+    /// Emit a Puffin NDV sidecar for the most recent snapshot, if opted in.
+    ///
+    /// Runs after a successful append-style commit. The caller reloads the
+    /// table to get the new snapshot; we then build theta sketches from the
+    /// just-written batches and register the sidecar via
+    /// [`UpdateStatisticsAction`]. A failure here is logged and swallowed:
+    /// the data commit has already succeeded, so losing statistics is not
+    /// worth rolling back for.
+    async fn maybe_emit_puffin_sidecar(
+        &self,
+        catalog: &Arc<dyn Catalog>,
+        table_ident: &TableIdent,
+        batches_for_stats: &[RecordBatch],
+    ) {
+        // Reload the table post-commit so we see the new snapshot id and
+        // sequence number.
+        let table = match catalog.load_table(table_ident).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, "puffin: could not reload table for sidecar");
+                return;
+            }
+        };
+        if !puffin_stats_enabled(table.metadata().properties()) {
+            return;
+        }
+        let Some(snapshot_id) = table.metadata().current_snapshot_id() else {
+            // No snapshot yet — nothing to attach the sidecar to.
+            return;
+        };
+        let sequence_number = table.metadata().last_sequence_number();
+
+        let metadata_location = match table.metadata_location() {
+            Some(p) => p,
+            None => {
+                tracing::warn!("puffin: no metadata_location on loaded table");
+                return;
+            }
+        };
+        let base_dir = metadata_location
+            .rsplit_once('/')
+            .map(|(head, _tail)| head)
+            .unwrap_or(metadata_location)
+            .to_string();
+
+        let stats_file = match write_puffin_sidecar(
+            table.file_io(),
+            &base_dir,
+            table.metadata().current_schema(),
+            batches_for_stats,
+            snapshot_id,
+            sequence_number,
+        )
+        .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(error = %e, "puffin: sidecar write failed");
+                return;
+            }
+        };
+
+        // Reload fresh for the stats transaction so our view of the metadata
+        // is current (avoid committing against stale base metadata).
+        let table = match catalog.load_table(table_ident).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, "puffin: reload for stats tx failed");
+                return;
+            }
+        };
+        let tx = Transaction::new(&table);
+        let action = tx.update_statistics().set_statistics(stats_file);
+        let tx = match action.apply(tx) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, "puffin: apply update_statistics failed");
+                return;
+            }
+        };
+        if let Err(e) = tx.commit(catalog.as_ref()).await {
+            tracing::warn!(error = %e, "puffin: commit update_statistics failed");
+        }
     }
 
     /// Handle CREATE TABLE [OR REPLACE] ns.table AS SELECT ...
@@ -162,6 +250,12 @@ impl WriteHandler {
         // Write data files (skip if no data)
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         if total_rows > 0 {
+            // Clone batches cheaply for the Puffin sidecar when the table has
+            // opted in. RecordBatch clones are Arc bumps, not data copies.
+            let stats_snapshot: Option<Vec<RecordBatch>> =
+                puffin_stats_enabled(table.metadata().properties())
+                    .then(|| batches.clone());
+
             let data_files = write_data_files_with_metrics(
                 &table,
                 batches,
@@ -183,6 +277,11 @@ impl WriteHandler {
                 tx.commit(catalog.as_ref()).await.map_err(|e| {
                     SqeError::Execution(format!("Failed to commit CTAS transaction: {e}"))
                 })?;
+
+                if let Some(stats_batches) = stats_snapshot {
+                    self.maybe_emit_puffin_sidecar(&catalog, &table_ident, &stats_batches)
+                        .await;
+                }
             }
 
             info!(
@@ -552,6 +651,10 @@ impl WriteHandler {
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
 
+        // Clone batches for a Puffin sidecar only when the table opted in.
+        let stats_snapshot: Option<Vec<RecordBatch>> =
+            puffin_stats_enabled(table.metadata().properties()).then(|| batches.clone());
+
         // Write data files
         let data_files = write_data_files_with_metrics(
             &table,
@@ -574,6 +677,11 @@ impl WriteHandler {
             tx.commit(catalog.as_ref()).await.map_err(|e| {
                 SqeError::Execution(format!("Failed to commit INSERT transaction: {e}"))
             })?;
+
+            if let Some(stats_batches) = stats_snapshot {
+                self.maybe_emit_puffin_sidecar(&catalog, &table_ident, &stats_batches)
+                    .await;
+            }
 
             info!(
                 table = %table_ident,
@@ -942,6 +1050,255 @@ impl WriteHandler {
 
         info!(table = %table_ident, deleted_rows = deleted_count, "MoR DELETE committed successfully");
         Ok(affected_rows_batch(deleted_count))
+    }
+
+    /// Handle DELETE FROM using Merge-on-Read with equality deletes.
+    ///
+    /// Phase E, tasks 6.7 and 6.8. Commits an equality-delete file that names
+    /// the table's declared identifier fields (primary key). Downstream readers
+    /// exclude any row where those fields match one of the emitted values.
+    ///
+    /// Advantages over position deletes:
+    ///
+    /// - Snapshot-stable: rows added later that match the equality keys are
+    ///   also excluded without writing new deletes.
+    /// - Compact: one delete file per batch of keys, regardless of how many
+    ///   data files those keys span.
+    ///
+    /// The file is committed via `RowDeltaAction` so the operation classifies
+    /// as `Overwrite` with `added-delete-files=1` in the snapshot summary,
+    /// matching Java Iceberg and Spark semantics.
+    #[instrument(skip(self, session, stmt, catalog, ctx), fields(username = %session.user.username))]
+    pub async fn handle_delete_equality(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+        catalog: Arc<SessionCatalog>,
+        ctx: &DFSessionContext,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let delete = match stmt {
+            Statement::Delete(d) => d,
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected DELETE statement, got: {other}"
+                )));
+            }
+        };
+
+        let tables = match &delete.from {
+            sqlparser::ast::FromTable::WithFromKeyword(tables) => tables,
+            sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
+        };
+        let table_factor_name = match &tables[0].relation {
+            sqlparser::ast::TableFactor::Table { name, .. } => name,
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected table name in DELETE, got: {other}"
+                )));
+            }
+        };
+
+        let (namespace, name) = parse_table_ref(table_factor_name)?;
+        let table_ident = TableIdent::new(namespace, name);
+        let table = catalog.load_table(&table_ident).await?;
+
+        // Equality deletes require declared identifier-field-ids (primary key).
+        let identifier_field_ids: Vec<i32> = table
+            .metadata()
+            .current_schema()
+            .identifier_field_ids()
+            .collect();
+        if identifier_field_ids.is_empty() {
+            return Err(SqeError::Execution(format!(
+                "table {table_ident} has no identifier-field-ids; equality-delete path requires a primary key"
+            )));
+        }
+
+        let old_data_files = self.collect_data_files(&table).await?;
+        if old_data_files.is_empty() {
+            info!(table = %table_ident, "equality DELETE: table has no data files");
+            return Ok(vec![]);
+        }
+
+        let where_clause = &delete.selection;
+        // DELETE without WHERE clause: falling back to CoW truncate as
+        // emitting an empty equality-delete file serves no purpose.
+        if where_clause.is_none() {
+            info!(
+                table = %table_ident,
+                file_count = old_data_files.len(),
+                "equality DELETE: no WHERE clause, falling back to CoW truncate"
+            );
+            let tx = Transaction::new(&table);
+            let action = tx.rewrite_files().delete_files(old_data_files);
+            let tx = action.apply(tx).map_err(|e| {
+                SqeError::Execution(format!("Failed to apply truncate transaction: {e}"))
+            })?;
+            tx.commit(catalog.as_catalog().as_ref())
+                .await
+                .map_err(|e| SqeError::Execution(format!("Failed to commit truncate: {e}")))?;
+            return Ok(vec![]);
+        }
+
+        let raw_where = format!("{}", where_clause.as_ref().unwrap());
+        let (where_sql, joins_sql, _in_subq_guard) =
+            self.lift_in_subqueries(&raw_where, ctx).await?;
+        info!(
+            table = %table_ident,
+            file_count = old_data_files.len(),
+            where_clause = %where_sql,
+            equality_ids = ?identifier_field_ids,
+            "equality DELETE: scanning for matching rows"
+        );
+
+        // Scan every data file and collect rows where WHERE matches. Equality
+        // deletes need only the identifier columns, so we keep the full batch
+        // for now and let the writer project downstream.
+        let mut key_batches: Vec<RecordBatch> = Vec::new();
+        let mut total_matched: usize = 0;
+
+        for data_file in &old_data_files {
+            let file_path = data_file.file_path().to_string();
+            let batches = self.read_parquet_via_table(&table, &file_path).await?;
+            if batches.is_empty() {
+                continue;
+            }
+            for batch in batches {
+                let match_mask = self
+                    .filter_batch_match(ctx, &batch, &where_sql, &joins_sql, &table_ident)
+                    .await?;
+                let filtered = filter_record_batch(&batch, &match_mask).map_err(|e| {
+                    SqeError::Execution(format!("failed to filter match rows: {e}"))
+                })?;
+                if filtered.num_rows() == 0 {
+                    continue;
+                }
+                total_matched += filtered.num_rows();
+                key_batches.push(filtered);
+            }
+        }
+
+        if total_matched == 0 {
+            info!(table = %table_ident, "equality DELETE: no matching rows, nothing to commit");
+            return Ok(vec![]);
+        }
+
+        let delete_files = write_equality_delete_files(
+            &table,
+            key_batches,
+            identifier_field_ids,
+            self.compression(),
+        )
+        .await?;
+
+        // Commit via RowDeltaAction: this emits Operation::Overwrite with
+        // added-delete-files > 0 and no removed/added data files. The
+        // SnapshotProducer's added-delete-files summary key mirrors Spark.
+        let tx = Transaction::new(&table);
+        let snapshot_id = table.metadata().current_snapshot_id();
+        let mut action = tx.row_delta().add_delete_files(delete_files);
+        if let Some(snap) = snapshot_id {
+            action = action.validate_from_snapshot(snap);
+        }
+        let tx = action.apply(tx).map_err(|e| {
+            SqeError::Execution(format!("Failed to apply RowDelta transaction: {e}"))
+        })?;
+        tx.commit(catalog.as_catalog().as_ref()).await.map_err(|e| {
+            let msg = e.to_string().to_lowercase();
+            if msg.contains("stale snapshot") || msg.contains("rowdelta conflict") {
+                SqeError::Catalog(format!("commit conflict: {e}"))
+            } else {
+                SqeError::Execution(format!("Failed to commit equality DELETE: {e}"))
+            }
+        })?;
+
+        info!(
+            table = %table_ident,
+            deleted_rows = total_matched,
+            "equality DELETE committed successfully"
+        );
+        Ok(affected_rows_batch(total_matched))
+    }
+
+    /// Dispatch a DELETE statement to CoW, MoR position deletes, or MoR
+    /// equality deletes based on the target table's `write.delete.mode`
+    /// property (Phase E, task 6.8).
+    ///
+    /// Semantics:
+    ///
+    /// - `copy-on-write` (default): rewrite data files. Backward compatible.
+    /// - `merge-on-read`: pick equality deletes when the table declares a
+    ///   primary key (identifier-field-ids), otherwise fall back to position
+    ///   deletes.
+    pub async fn handle_delete_dispatch(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+        catalog: Arc<SessionCatalog>,
+        ctx: &DFSessionContext,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // Peek at the target table to read its properties. Any parse or
+        // load error falls through to the default CoW path, which surfaces
+        // the error at that point.
+        let delete = match stmt {
+            Statement::Delete(d) => d,
+            _ => return self.handle_delete(session, stmt, catalog, ctx).await,
+        };
+        let tables = match &delete.from {
+            sqlparser::ast::FromTable::WithFromKeyword(t) => t,
+            sqlparser::ast::FromTable::WithoutKeyword(t) => t,
+        };
+        let table_factor_name = match tables.first().map(|t| &t.relation) {
+            Some(sqlparser::ast::TableFactor::Table { name, .. }) => name,
+            _ => return self.handle_delete(session, stmt, catalog, ctx).await,
+        };
+
+        let Ok((namespace, name)) = parse_table_ref(table_factor_name) else {
+            return self.handle_delete(session, stmt, catalog, ctx).await;
+        };
+        let table_ident = TableIdent::new(namespace, name);
+        let Ok(table) = catalog.load_table(&table_ident).await else {
+            return self.handle_delete(session, stmt, catalog, ctx).await;
+        };
+
+        let mode = table
+            .metadata()
+            .properties()
+            .get("write.delete.mode")
+            .map(|s| s.as_str())
+            .unwrap_or("copy-on-write");
+
+        match mode {
+            "merge-on-read" => {
+                // Prefer equality deletes when the table declares a PK.
+                let has_ids = table
+                    .metadata()
+                    .current_schema()
+                    .identifier_field_ids()
+                    .next()
+                    .is_some();
+                if has_ids {
+                    info!(
+                        table = %table_ident,
+                        "DELETE dispatch: MoR + equality deletes"
+                    );
+                    self.handle_delete_equality(session, stmt, catalog, ctx).await
+                } else {
+                    info!(
+                        table = %table_ident,
+                        "DELETE dispatch: MoR + position deletes (no PK declared)"
+                    );
+                    self.handle_delete_mor(session, stmt, catalog, ctx).await
+                }
+            }
+            "copy-on-write" => {
+                info!(table = %table_ident, "DELETE dispatch: CoW");
+                self.handle_delete(session, stmt, catalog, ctx).await
+            }
+            other => Err(SqeError::Execution(format!(
+                "unsupported write.delete.mode '{other}' on table {table_ident}; expected 'copy-on-write' or 'merge-on-read'"
+            ))),
+        }
     }
 
     /// Handle UPDATE ns.table SET col = expr [WHERE ...]

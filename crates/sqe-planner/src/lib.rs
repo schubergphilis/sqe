@@ -6,6 +6,7 @@ pub mod predicate_transfer;
 pub mod scan_task;
 pub mod shuffle_exec;
 pub mod splitter;
+pub mod stats;
 pub mod stage_planner;
 pub mod star_schema_reorder;
 
