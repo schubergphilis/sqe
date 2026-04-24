@@ -266,7 +266,13 @@ impl QueryHandler {
         };
 
         let start = std::time::Instant::now();
-        let kind = parse_and_classify(sql)?;
+        // Pre-strip `FOR INCREMENTAL BETWEEN SNAPSHOT` before classification.
+        // sqlparser does not model the clause, so the classifier's
+        // `Parser::parse_sql` would reject it. The downstream
+        // `handle_incremental` call re-extracts the specs from the original
+        // SQL and registers the providers against the same session context.
+        let (classify_sql, _incremental_specs) = sqe_sql::extract_incremental_spec(sql)?;
+        let kind = parse_and_classify(&classify_sql)?;
         let kind_name = kind.name().to_string();
         let span = Span::current();
         span.record("statement_type", kind_name.as_str());
@@ -824,7 +830,10 @@ impl QueryHandler {
         };
 
         // --- Classify ---------------------------------------------------------
-        let kind = parse_and_classify(sql)?;
+        // See execute() for why we pre-strip `FOR INCREMENTAL BETWEEN` before
+        // handing SQL to sqlparser-rs.
+        let (classify_sql, _incremental_specs) = sqe_sql::extract_incremental_spec(sql)?;
+        let kind = parse_and_classify(&classify_sql)?;
         let kind_name = kind.name().to_string();
         if !matches!(kind, StatementKind::Query(_)) {
             return Err(SqeError::NotImplemented(
@@ -920,7 +929,8 @@ impl QueryHandler {
     )> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
 
-        let sql = self.handle_time_travel(sql, &ctx, &session_catalog).await?;
+        let sql = self.handle_incremental(sql, &ctx, &session_catalog).await?;
+        let sql = self.handle_time_travel(&sql, &ctx, &session_catalog).await?;
         let sql = sql.as_str();
 
         let df = ctx
@@ -997,12 +1007,24 @@ impl QueryHandler {
         session: &Session,
         sql: &str,
     ) -> sqe_core::Result<SchemaRef> {
-        let kind = parse_and_classify(sql)?;
+        // Pre-strip FOR INCREMENTAL so sqlparser can tokenise the statement.
+        let (classify_sql, _incremental_specs) = sqe_sql::extract_incremental_spec(sql)?;
+        let kind = parse_and_classify(&classify_sql)?;
 
         if matches!(kind, StatementKind::Query(_)) {
-            let (ctx, _) = self.create_session_context(session).await?;
+            let (ctx, session_catalog) = self.create_session_context(session).await?;
+            // Register incremental providers so the planner can resolve the
+            // tables with their augmented schemas. The FOR INCREMENTAL clause
+            // must be stripped before handle_time_travel sees it because that
+            // step parses the SQL with sqlparser.
+            let sql_for_plan = self
+                .handle_incremental(sql, &ctx, &session_catalog)
+                .await?;
+            let sql_for_plan = self
+                .handle_time_travel(&sql_for_plan, &ctx, &session_catalog)
+                .await?;
             let df = ctx
-                .sql(sql)
+                .sql(&sql_for_plan)
                 .await
                 .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
             Ok(Arc::new(df.schema().as_arrow().clone()))
@@ -1029,9 +1051,16 @@ impl QueryHandler {
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
 
-        // Pre-process time travel: detect FOR SYSTEM_TIME AS OF, resolve snapshot IDs,
-        // register snapshot-specific table providers, and strip the temporal clause.
-        let sql = self.handle_time_travel(sql, &ctx, &session_catalog).await?;
+        // Pre-process incremental (CDC) first. The FOR INCREMENTAL BETWEEN
+        // clause is not modelled by sqlparser-rs, so the downstream
+        // handle_time_travel call (which parses SQL) would fail if we left it
+        // in place. handle_incremental strips the clause text and registers
+        // an IncrementalTableProvider per target table.
+        let sql = self.handle_incremental(sql, &ctx, &session_catalog).await?;
+        // Pre-process time travel: detect FOR SYSTEM_TIME AS OF, resolve
+        // snapshot IDs, register snapshot-specific table providers, and
+        // strip the temporal clause.
+        let sql = self.handle_time_travel(&sql, &ctx, &session_catalog).await?;
         let sql = sql.as_str();
 
         // Plan the query via DataFusion's SQL planner
@@ -2022,6 +2051,139 @@ impl QueryHandler {
         Ok(false)
     }
 
+    /// Pre-process SQL for CDC incremental scans. Detect
+    /// `FOR INCREMENTAL BETWEEN SNAPSHOT x AND SNAPSHOT y`, resolve the range
+    /// against table metadata, plan the file list with delete reconciliation,
+    /// and register a transient `IncrementalTableProvider` for each target
+    /// table. Returns the SQL with the clause stripped and each target table
+    /// reference rewritten to a qualified `datafusion.public.<alias>` name so
+    /// the planner resolves to the freshly registered provider.
+    ///
+    /// When no incremental clause is found, the original SQL is returned
+    /// unchanged.
+    async fn handle_incremental(
+        &self,
+        sql: &str,
+        ctx: &SessionContext,
+        session_catalog: &Arc<SessionCatalog>,
+    ) -> sqe_core::Result<String> {
+        let (mut rewritten, specs) = sqe_sql::extract_incremental_spec(sql)?;
+        if specs.is_empty() {
+            return Ok(sql.to_string());
+        }
+        for spec in &specs {
+            let alias = Self::apply_incremental_spec(spec, ctx, session_catalog).await?;
+            // Rewrite the table reference (e.g. `ns.events`) to the qualified
+            // MemoryCatalog path (`datafusion.public.<alias>`). The replacement
+            // is whole-token so `events.id` inside a SELECT list is preserved
+            // because it doesn't match the qualified form.
+            rewritten = replace_table_reference(&rewritten, &spec.table, &alias);
+        }
+        tracing::info!(
+            specs = specs.len(),
+            "Handled FOR INCREMENTAL BETWEEN SNAPSHOT clauses"
+        );
+        Ok(rewritten)
+    }
+
+    /// Resolve one `IncrementalSpec` against the catalog, register an
+    /// `IncrementalTableProvider` in the in-memory `datafusion.public` schema,
+    /// and return the fully qualified name the caller should substitute into
+    /// the SQL.
+    async fn apply_incremental_spec(
+        spec: &sqe_sql::IncrementalSpec,
+        ctx: &SessionContext,
+        session_catalog: &Arc<SessionCatalog>,
+    ) -> sqe_core::Result<String> {
+        use iceberg::arrow::schema_to_arrow_schema;
+        use std::collections::HashMap;
+
+        let parts: Vec<&str> = spec.table.split('.').collect();
+        let (namespace, bare_table) = match parts.len() {
+            1 => ("default", parts[0]),
+            2 => (parts[0], parts[1]),
+            3 => (parts[1], parts[2]),
+            _ => {
+                return Err(SqeError::Execution(format!(
+                    "Unsupported table name format for incremental scan: {}",
+                    spec.table
+                )));
+            }
+        };
+
+        let ns_ident = iceberg::NamespaceIdent::new(namespace.to_string());
+        let table_ident = iceberg::TableIdent::new(ns_ident, bare_table.to_string());
+        let iceberg_table = session_catalog.load_table(&table_ident).await?;
+
+        // Plan the range. `plan_incremental` also calls `resolve_range`
+        // internally, so range validation happens once.
+        let mut plan = sqe_catalog::incremental_scan::plan_incremental(
+            &iceberg_table,
+            spec.start,
+            spec.end,
+        )
+        .await?;
+
+        // Reconcile in-range deletes. Without a referenced-data-file map
+        // (position deletes currently do not expose one through
+        // `plan_incremental`), we default every delete file to "no reference"
+        // which keeps equality deletes intact. This is the same defensive
+        // default the helper uses in its unit tests.
+        let empty_refs: HashMap<String, Option<String>> = HashMap::new();
+        let kept_deletes =
+            sqe_catalog::incremental_scan::reconcile_in_range_deletes(
+                &plan.data_files,
+                std::mem::take(&mut plan.delete_files),
+                &empty_refs,
+            );
+        plan.delete_files = kept_deletes;
+
+        tracing::info!(
+            table = %spec.table,
+            start = spec.start,
+            end = spec.end,
+            snapshots = plan.snapshots_in_range.len(),
+            data_files = plan.data_files.len(),
+            delete_files = plan.delete_files.len(),
+            "Incremental scan: planned range"
+        );
+
+        let base_schema = schema_to_arrow_schema(iceberg_table.metadata().current_schema())
+            .map_err(|e| {
+                SqeError::Catalog(format!(
+                    "Failed to convert Iceberg schema to Arrow for {}: {e}",
+                    spec.table
+                ))
+            })?;
+
+        let file_io = iceberg_table.file_io().clone();
+        let provider =
+            sqe_catalog::incremental_provider::IncrementalTableProvider::new(
+                Arc::new(base_schema),
+                plan,
+                Some(file_io),
+            );
+
+        // Register under a unique alias in the `datafusion.public` schema,
+        // which is a MemoryCatalogProvider and supports dynamic registration.
+        // The alias embeds a short uuid to avoid collisions when the same
+        // table is referenced multiple times in one statement.
+        let alias = format!(
+            "__sqe_incr_{}_{}",
+            bare_table,
+            uuid::Uuid::now_v7().simple()
+        );
+        let qualified = format!("datafusion.public.{alias}");
+        ctx.register_table(qualified.as_str(), Arc::new(provider))
+            .map_err(|e| {
+                SqeError::Execution(format!(
+                    "Failed to register incremental provider for {bare_table}: {e}"
+                ))
+            })?;
+
+        Ok(qualified)
+    }
+
     // ── Access control handlers ──────────────────────────────────────────
 
     /// Return the grant backend or a `NotImplemented` error.
@@ -2510,6 +2672,47 @@ impl QueryHandler {
         Ok(())
     }
 
+}
+
+/// Replace whole-token occurrences of `needle` (case insensitive) in `sql` with `replacement`.
+///
+/// Used to rewrite a table reference like `ns.t` to `datafusion.public.alias` after the incremental pre-parser has run.
+///
+/// The match is strict: `needle` must be preceded and followed by a character that cannot appear in a SQL identifier (whitespace, punctuation, or start / end of string). This prevents spurious matches when `needle` appears as a substring of a longer identifier.
+fn replace_table_reference(sql: &str, needle: &str, replacement: &str) -> String {
+    if needle.is_empty() {
+        return sql.to_string();
+    }
+    let sql_upper = sql.to_uppercase();
+    let needle_upper = needle.to_uppercase();
+    let mut out = String::with_capacity(sql.len());
+    let mut cursor = 0usize;
+    while let Some(pos) = sql_upper[cursor..].find(needle_upper.as_str()) {
+        let abs = cursor + pos;
+        // Verify word boundary. The character preceding `abs` must not be an
+        // identifier character, and the character after `abs + needle.len()`
+        // must also not be an identifier character (letter, digit, `_`, `.`).
+        let pre_ok = abs == 0
+            || !is_ident_char(sql.as_bytes()[abs - 1]);
+        let end = abs + needle.len();
+        let post_ok = end == sql.len() || !is_ident_char(sql.as_bytes()[end]);
+        if pre_ok && post_ok {
+            out.push_str(&sql[cursor..abs]);
+            out.push_str(replacement);
+            cursor = end;
+        } else {
+            // Advance by one byte past the start of this match so we can keep
+            // searching for later occurrences.
+            out.push_str(&sql[cursor..=abs]);
+            cursor = abs + 1;
+        }
+    }
+    out.push_str(&sql[cursor..]);
+    out
+}
+
+fn is_ident_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'.'
 }
 
 /// Resolve a SQL timestamp expression to epoch milliseconds.
