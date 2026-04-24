@@ -21,10 +21,79 @@
 //! tested without a real warehouse.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
+use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::error::ArrowError;
 use iceberg::spec::{DataContentType, ManifestStatus, SnapshotRef, TableMetadata};
 use iceberg::table::Table;
 use sqe_core::{Result, SqeError};
+
+/// Meta column name for the change kind (`insert` or `delete`).
+pub const CHANGE_TYPE_COLUMN: &str = "_change_type";
+/// Meta column name for the per-snapshot ordinal.
+pub const CHANGE_ORDINAL_COLUMN: &str = "_change_ordinal";
+/// Meta column name for the source snapshot id.
+pub const COMMIT_SNAPSHOT_ID_COLUMN: &str = "_commit_snapshot_id";
+
+/// Append `_change_type`, `_change_ordinal`, `_commit_snapshot_id` columns
+/// to an Arrow schema.
+///
+/// The executor uses this to rebuild the output schema when meta columns
+/// are part of the projection.
+pub fn augment_schema_with_meta(base: &Schema) -> Arc<Schema> {
+    let mut fields: Vec<Field> = base.fields().iter().map(|f| f.as_ref().clone()).collect();
+    fields.push(Field::new(CHANGE_TYPE_COLUMN, DataType::Utf8, false));
+    fields.push(Field::new(CHANGE_ORDINAL_COLUMN, DataType::Int64, false));
+    fields.push(Field::new(COMMIT_SNAPSHOT_ID_COLUMN, DataType::Int64, false));
+    Arc::new(Schema::new_with_metadata(fields, base.metadata().clone()))
+}
+
+/// Return true if any of the three CDC meta column names are referenced.
+///
+/// Used by the coordinator to decide whether the query requires the
+/// incremental scan path. A regular query that references a meta column
+/// without `FOR INCREMENTAL BETWEEN` must fail with a clear error.
+pub fn references_meta_column(columns: &[&str]) -> bool {
+    columns.iter().any(|c| is_meta_column(c))
+}
+
+/// Return true if `name` is one of the three CDC meta columns.
+pub fn is_meta_column(name: &str) -> bool {
+    matches!(
+        name,
+        CHANGE_TYPE_COLUMN | CHANGE_ORDINAL_COLUMN | COMMIT_SNAPSHOT_ID_COLUMN
+    )
+}
+
+/// Attach CDC meta columns to a batch. Every row in `batch` gets the same
+/// three values taken from `file`.
+///
+/// The output schema is the input schema with three appended fields. The
+/// caller is expected to have removed any projection of the meta column
+/// names from the Parquet read path and to ask this function to add them
+/// back after decode.
+pub fn attach_meta_columns(
+    batch: RecordBatch,
+    file: &IncrementalFile,
+) -> std::result::Result<RecordBatch, ArrowError> {
+    let n = batch.num_rows();
+    let schema = augment_schema_with_meta(&batch.schema());
+
+    let change_type: ArrayRef =
+        Arc::new(StringArray::from(vec![file.kind.as_str(); n]));
+    let change_ordinal: ArrayRef = Arc::new(Int64Array::from(vec![file.ordinal; n]));
+    let commit_snapshot: ArrayRef =
+        Arc::new(Int64Array::from(vec![file.snapshot_id; n]));
+
+    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+    columns.push(change_type);
+    columns.push(change_ordinal);
+    columns.push(commit_snapshot);
+
+    RecordBatch::try_new(schema, columns)
+}
 
 /// Whether a file represents an inserted or deleted row population for the
 /// CDC meta column `_change_type`.
@@ -503,5 +572,80 @@ mod tests {
         ]);
         let snaps = resolve_range(&md, 0, 102).unwrap();
         assert_eq!(snaps, vec![100, 101, 102]);
+    }
+
+    // ── Meta column synthesis (task 8.10-8.12) ──────────────────────────
+
+    #[test]
+    fn meta_column_helpers_recognise_names() {
+        assert!(is_meta_column("_change_type"));
+        assert!(is_meta_column("_change_ordinal"));
+        assert!(is_meta_column("_commit_snapshot_id"));
+        assert!(!is_meta_column("id"));
+        assert!(!is_meta_column("_other"));
+
+        assert!(references_meta_column(&["id", "_change_type"]));
+        assert!(!references_meta_column(&["id", "name"]));
+    }
+
+    #[test]
+    fn augment_schema_appends_three_meta_fields() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let base = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let augmented = augment_schema_with_meta(&base);
+        let names: Vec<&str> = augmented.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "id",
+                "_change_type",
+                "_change_ordinal",
+                "_commit_snapshot_id"
+            ]
+        );
+        assert_eq!(augmented.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(augmented.field(2).data_type(), &DataType::Int64);
+        assert_eq!(augmented.field(3).data_type(), &DataType::Int64);
+    }
+
+    #[test]
+    fn attach_meta_columns_populates_three_values() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let id = Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![id]).unwrap();
+        let file = IncrementalFile {
+            path: "f.parquet".into(),
+            size_bytes: 100,
+            snapshot_id: 42,
+            kind: ChangeKind::Delete,
+            ordinal: 7,
+        };
+        let augmented = attach_meta_columns(batch, &file).unwrap();
+        assert_eq!(augmented.num_rows(), 3);
+        assert_eq!(augmented.num_columns(), 4);
+
+        let change_type = augmented
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(change_type.value(0), "delete");
+        assert_eq!(change_type.value(2), "delete");
+
+        let ordinal = augmented
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ordinal.value(0), 7);
+
+        let commit = augmented
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(commit.value(1), 42);
     }
 }
