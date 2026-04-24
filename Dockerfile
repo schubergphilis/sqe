@@ -34,6 +34,9 @@ FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY vendor/ vendor/
+# xtask is listed as a workspace member in Cargo.toml; cargo metadata
+# (which cargo-chef invokes under the hood) fails if it's absent.
+COPY xtask/ xtask/
 RUN cargo chef prepare --recipe-path recipe.json
 
 # ── Stage 3: Build dependencies (cached unless recipe changes) ─
@@ -54,6 +57,9 @@ ARG TARGETARCH
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY vendor/ vendor/
+# xtask must be present for workspace resolution, even though we don't
+# build its binary here.
+COPY xtask/ xtask/
 RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
     --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},target=/usr/local/cargo/git \
     --mount=type=cache,id=sqe-sccache-${TARGETARCH},target=/sccache \
