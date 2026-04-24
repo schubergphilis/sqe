@@ -98,12 +98,8 @@ fn find_needle(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if haystack.len() < needle.len() {
         return None;
     }
-    for i in 0..=haystack.len() - needle.len() {
-        if &haystack[i..i + needle.len()] == needle {
-            return Some(i);
-        }
-    }
-    None
+    (0..=haystack.len() - needle.len())
+        .find(|&i| &haystack[i..i + needle.len()] == needle)
 }
 
 /// Walk back over a table reference. Supports:
