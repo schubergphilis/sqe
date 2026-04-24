@@ -61,6 +61,7 @@ pub use update_schema::UpdateSchemaAction;
 mod manifest_filter;
 
 pub use manifest_filter::*;
+mod branch;
 mod overwrite_files;
 mod remove_snapshots;
 mod rewrite_files;
@@ -72,6 +73,8 @@ mod update_properties;
 mod update_schema;
 mod update_statistics;
 mod upgrade_format_version;
+
+pub use branch::{CreateBranchAction, CreateTagAction, RemoveRefAction};
 
 use std::sync::Arc;
 use std::time::Duration;
