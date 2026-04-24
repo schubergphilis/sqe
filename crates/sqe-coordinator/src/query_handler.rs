@@ -25,6 +25,7 @@ use sqe_sql::{parse_and_classify, StatementKind};
 
 use crate::catalog_ops::CatalogOps;
 use crate::credential_refresh::CredentialRefreshTracker;
+use crate::maintenance::MaintenanceHandler;
 use crate::query_cache::ResultCache;
 use crate::query_tracker::{FragmentState, QueryTracker};
 use crate::write_handler::WriteHandler;
@@ -67,6 +68,7 @@ pub struct QueryHandler {
     config: SqeConfig,
     catalog_ops: CatalogOps,
     write_handler: WriteHandler,
+    maintenance_handler: MaintenanceHandler,
     explain_handler: crate::explain::ExplainHandler,
     worker_registry: Option<Arc<crate::worker_registry::WorkerRegistry>>,
     #[allow(dead_code)] // Used when constructing DistributedScanExec for distributed queries
@@ -107,6 +109,10 @@ impl QueryHandler {
         if let Some(ref m) = metrics {
             write_handler = write_handler.with_metrics(Arc::clone(m));
         }
+        let mut maintenance_handler = MaintenanceHandler::new(config.clone());
+        if let Some(ref a) = audit {
+            maintenance_handler = maintenance_handler.with_audit(Arc::clone(a));
+        }
         let explain_handler = crate::explain::ExplainHandler::new(Arc::clone(&policy_enforcer));
         let query_semaphore = if config.query.max_concurrent_queries > 0 {
             Some(Arc::new(tokio::sync::Semaphore::new(config.query.max_concurrent_queries)))
@@ -125,6 +131,7 @@ impl QueryHandler {
             config,
             catalog_ops,
             write_handler,
+            maintenance_handler,
             explain_handler,
             worker_registry,
             credential_tracker,
@@ -151,6 +158,7 @@ impl QueryHandler {
     pub fn with_table_cache(mut self, cache: sqe_catalog::TableMetadataCache) -> Self {
         self.catalog_ops = self.catalog_ops.with_table_cache(cache.clone());
         self.write_handler = self.write_handler.with_table_cache(cache.clone());
+        self.maintenance_handler = self.maintenance_handler.with_table_cache(cache.clone());
         self.table_cache = Some(cache);
         self
     }
@@ -468,6 +476,12 @@ impl QueryHandler {
                         "CALL is not supported. SQE does not have stored procedures. \
                          Use SQL statements directly instead.".into(),
                     ))
+                }
+
+                // CALL system.<maintenance procedure>(...) — Iceberg compaction,
+                // snapshot expiry, orphan file removal, manifest rewrite.
+                StatementKind::Procedure(ref call) => {
+                    self.maintenance_handler.handle(session, call).await
                 }
 
                 // COMMENT ON TABLE/COLUMN — store as Iceberg table property
