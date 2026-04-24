@@ -52,6 +52,8 @@ parquet = { workspace = true }
 bytes = { workspace = true }
 prometheus = { workspace = true }
 regex = { workspace = true }
+# Puffin NDV sketches (apache-datasketches-theta-v1 blob body).
+datasketches = { workspace = true }
 # Optional backend dependencies
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 
