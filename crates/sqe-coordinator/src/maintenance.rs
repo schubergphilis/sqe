@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use iceberg::spec::{DataContentType, ManifestStatus};
+use iceberg::spec::{DataContentType, DataFile, ManifestStatus};
 use iceberg::table::Table as IcebergTable;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
@@ -26,6 +26,8 @@ use sqe_catalog::{SessionCatalog, TableMetadataCache};
 use sqe_core::{Session, SqeConfig, SqeError};
 use sqe_sql::{ProcedureCall, TableRef};
 use tracing::{info, warn};
+
+use crate::writer::{parse_parquet_compression, write_data_files};
 
 /// Callback that returns a snapshot of recent SQL query texts.
 ///
@@ -221,13 +223,16 @@ impl MaintenanceHandler {
         table_ref: &TableRef,
         target_file_size_bytes: Option<u64>,
         min_input_files: Option<usize>,
-        _max_concurrent_file_group_rewrites: Option<usize>,
+        max_concurrent_file_group_rewrites: Option<usize>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         const DEFAULT_TARGET_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
         const DEFAULT_MIN_INPUT_FILES: usize = 5;
+        const DEFAULT_MAX_CONCURRENT_GROUPS: usize = 4;
 
         let target_bytes = target_file_size_bytes.unwrap_or(DEFAULT_TARGET_FILE_SIZE_BYTES);
         let min_input = min_input_files.unwrap_or(DEFAULT_MIN_INPUT_FILES);
+        let max_concurrent =
+            max_concurrent_file_group_rewrites.unwrap_or(DEFAULT_MAX_CONCURRENT_GROUPS);
 
         let catalog = self.create_catalog_bridge(session).await?;
         let ident = to_table_ident(table_ref);
@@ -235,7 +240,11 @@ impl MaintenanceHandler {
 
         let old_data_files = collect_live_data_files(&table).await?;
         let input_count = old_data_files.len();
-        let total_bytes: i64 = old_data_files.iter().map(|f| f.file_size_in_bytes() as i64).sum();
+        let total_bytes: i64 = old_data_files
+            .iter()
+            .map(|f| f.file_size_in_bytes() as i64)
+            .sum();
+        let total_input_rows: u64 = old_data_files.iter().map(|f| f.record_count()).sum();
 
         if input_count < min_input {
             info!(
@@ -255,61 +264,132 @@ impl MaintenanceHandler {
             )?]);
         }
 
-        // Read each input file, re-emit contents grouped by target size, then
-        // commit the rewrite transaction. We reuse the existing writer in
-        // `WriteHandler`, but that module depends on a SessionContext. To
-        // avoid crossing that boundary, we do the minimal version here: group
-        // existing files into batches whose cumulative size is under the
-        // target, and treat the group boundary as the file boundary.
-        //
-        // This collapses many small files into bounded groups without
-        // actually re-encoding Parquet; the resulting manifest still
-        // references the same underlying files. That is a safe first cut:
-        // the spec only requires that the number of referenced files drops,
-        // and re-encoding is left to a follow-up once we share Parquet
-        // writers across handlers.
-        //
-        // For now we rely on iceberg-rust's `RewriteFilesAction` merge step
-        // to consolidate the manifest. The action accepts identical add/
-        // delete sets as a no-op, which we use when a rewrite is not needed.
-        //
-        // NOTE: the re-encoding path lands behind follow-up task 3.x; tests
-        // pointed at this handler should assert the API surface and that a
-        // below-threshold table returns "skipped".
+        // Greedy bin-pack small files into groups under `target_bytes`. Files
+        // already at or above target are skipped (no win from re-emitting
+        // them). Sort descending by size so the larger small-files anchor
+        // each group and leftover capacity soaks up the smallest files.
+        let groups = pack_file_groups(&old_data_files, target_bytes);
+
+        // Only groups with >= min_input members are worth rewriting; smaller
+        // groups would trade one commit for no real reduction.
+        let eligible_groups: Vec<Vec<DataFile>> = groups
+            .into_iter()
+            .filter(|g| g.len() >= min_input)
+            .collect();
+
+        if eligible_groups.is_empty() {
+            info!(
+                table = %ident,
+                input_count,
+                "rewrite_data_files: no groups meet min_input_files after packing"
+            );
+            return Ok(vec![summary_batch(
+                call_name_rewrite(),
+                &ident,
+                input_count as i64,
+                0,
+                total_bytes,
+                0,
+                "skipped: no eligible groups".to_string(),
+            )?]);
+        }
+
         info!(
             table = %ident,
             input_count,
             target_bytes,
             min_input,
-            "rewrite_data_files: committing manifest consolidation"
+            max_concurrent,
+            group_count = eligible_groups.len(),
+            "rewrite_data_files: rewriting groups"
         );
 
-        // Manifest consolidation only: trigger RewriteManifestsAction as a
-        // side effect of an empty add+delete set is not supported by the
-        // vendored code. The minimum viable behaviour is to call the
-        // manifest-rewrite action which reorganises without changing
-        // references. Re-encoding of Parquet payloads remains a deferred
-        // follow-up. We still commit so the output row count reflects a
-        // successful action even when no files were actually merged.
+        // Re-encode each group into one or more new Parquet files. We bound
+        // concurrency so large tables do not exhaust file descriptors or S3
+        // connections.
+        let compression = parse_parquet_compression(&self.config.catalog.parquet_compression);
+
+        let mut new_files: Vec<DataFile> = Vec::new();
+        let mut old_files: Vec<DataFile> = Vec::new();
+        let mut rewritten_rows: u64 = 0;
+
+        use futures::stream::{self, StreamExt, TryStreamExt};
+
+        let table_arc = Arc::new(table.clone());
+        let results: Vec<(Vec<DataFile>, Vec<DataFile>, u64)> =
+            stream::iter(eligible_groups.into_iter())
+                .map(|group| {
+                    let table_for_group = table_arc.clone();
+                    async move {
+                        rewrite_group(&table_for_group, group, compression).await
+                    }
+                })
+                .buffer_unordered(max_concurrent.max(1))
+                .try_collect()
+                .await?;
+
+        for (group_new, group_old, group_rows) in results {
+            new_files.extend(group_new);
+            old_files.extend(group_old);
+            rewritten_rows += group_rows;
+        }
+
+        // Row-count invariant: the rows in the files we are deleting must
+        // equal the rows in the files we are adding. If not, we have a bug
+        // and must NOT commit.
+        let removed_rows: u64 = old_files.iter().map(|f| f.record_count()).sum();
+        let added_rows: u64 = new_files.iter().map(|f| f.record_count()).sum();
+        if added_rows != removed_rows {
+            return Err(SqeError::Execution(format!(
+                "rewrite_data_files row-count invariant violated: removed={removed_rows} \
+                 added={added_rows} (read_count={rewritten_rows}); aborting before commit"
+            )));
+        }
+
+        let output_count = new_files.len() as i64;
+        let output_bytes: i64 = new_files.iter().map(|f| f.file_size_in_bytes() as i64).sum();
+
+        info!(
+            table = %ident,
+            input_count = old_files.len(),
+            output_count,
+            removed_rows,
+            added_rows,
+            "rewrite_data_files: committing RewriteFilesAction"
+        );
+
+        // Commit via RewriteFilesAction: atomic swap of old -> new files.
+        // Concurrent writers who committed between our read and this commit
+        // cause a retryable CommitConflict error via the vendored fork's
+        // SnapshotProducer; classify_commit_error flags that as retryable.
         let tx = Transaction::new(&table);
-        let action = tx.rewrite_manifests();
+        let action = tx
+            .rewrite_files()
+            .add_data_files(new_files)
+            .delete_files(old_files.clone());
         let tx_applied = action
             .apply(tx)
-            .map_err(|e| SqeError::Execution(format!("rewrite_manifests apply failed: {e}")))?;
+            .map_err(|e| SqeError::Execution(format!("rewrite_files apply failed: {e}")))?;
 
         tx_applied
             .commit(catalog.as_ref())
             .await
             .map_err(|e| classify_commit_error(e, "rewrite_data_files"))?;
 
+        // Sanity check: total row count pre-rewrite should still equal
+        // post-rewrite. `total_input_rows` counts all live data files, but we
+        // only rewrote the ones that landed in eligible groups. Files left
+        // alone keep their rows; rewritten files swap in equal-row replacements.
+        let _ = total_input_rows; // tracked for observability
+
         Ok(vec![summary_batch(
             call_name_rewrite(),
             &ident,
             input_count as i64,
-            input_count as i64,
+            output_count,
             total_bytes,
-            total_bytes,
-            "committed".to_string(),
+            output_bytes,
+            format!("committed rewritten={}", old_files.len()),
         )?])
     }
 
@@ -553,6 +633,125 @@ async fn collect_live_data_files(
     Ok(data_files)
 }
 
+/// Greedy bin-pack a list of data files into groups whose total size stays
+/// under `target_bytes`. Files already at or above target are dropped: there
+/// is no benefit to rewriting a file that is already large.
+///
+/// The algorithm sorts files descending by size so larger small-files anchor
+/// each group and the remaining capacity is filled with the smallest files.
+/// Simple, deterministic, and good enough for the maintenance use case.
+pub(crate) fn pack_file_groups(files: &[DataFile], target_bytes: u64) -> Vec<Vec<DataFile>> {
+    // Filter files that are already at or above target: no point re-emitting.
+    let mut small: Vec<DataFile> = files
+        .iter()
+        .filter(|f| f.file_size_in_bytes() < target_bytes)
+        .cloned()
+        .collect();
+    // Descending by size.
+    small.sort_by(|a, b| b.file_size_in_bytes().cmp(&a.file_size_in_bytes()));
+
+    let mut groups: Vec<Vec<DataFile>> = Vec::new();
+    for f in small {
+        let size = f.file_size_in_bytes();
+        // Try to fit into an existing group.
+        let mut placed = false;
+        for g in groups.iter_mut() {
+            let current: u64 = g.iter().map(|x| x.file_size_in_bytes()).sum();
+            if current + size <= target_bytes {
+                g.push(f.clone());
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            groups.push(vec![f]);
+        }
+    }
+    groups
+}
+
+/// Read every Parquet file in `group`, combine the batches, and emit the
+/// combined contents as a fresh set of data files. Returns
+/// `(new_files, old_files, total_rows_read)` so the caller can build the
+/// commit payload and validate the row-count invariant.
+async fn rewrite_group(
+    table: &IcebergTable,
+    group: Vec<DataFile>,
+    compression: parquet::basic::Compression,
+) -> sqe_core::Result<(Vec<DataFile>, Vec<DataFile>, u64)> {
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    let mut rows_read: u64 = 0;
+
+    for df in &group {
+        let file_batches = read_parquet_file(table, df.file_path()).await?;
+        for b in file_batches {
+            rows_read += b.num_rows() as u64;
+            if b.num_rows() > 0 {
+                batches.push(b);
+            }
+        }
+    }
+
+    // Safety check: rows we read must equal the sum the manifest told us.
+    let expected: u64 = group.iter().map(|f| f.record_count()).sum();
+    if rows_read != expected {
+        return Err(SqeError::Execution(format!(
+            "rewrite_group: Parquet row count {rows_read} does not match manifest \
+             record_count {expected} for group of {} files",
+            group.len()
+        )));
+    }
+
+    if batches.is_empty() {
+        // Empty group: caller treats this as a no-op (nothing added, nothing removed).
+        return Ok((vec![], vec![], 0));
+    }
+
+    let new_files = write_data_files(table, batches, "rewrite", compression).await?;
+
+    Ok((new_files, group, rows_read))
+}
+
+/// Read a Parquet data file via the table's configured FileIO. Mirrors the
+/// helper in `WriteHandler::read_parquet_via_table` but lives here to avoid
+/// depending on that handler's session context.
+async fn read_parquet_file(
+    table: &IcebergTable,
+    file_path: &str,
+) -> sqe_core::Result<Vec<RecordBatch>> {
+    let file_io = table.file_io();
+    let input = file_io
+        .new_input(file_path)
+        .map_err(|e| SqeError::Execution(format!("Failed to open file '{file_path}': {e}")))?;
+
+    let input_file = input
+        .read()
+        .await
+        .map_err(|e| SqeError::Execution(format!("Failed to read file '{file_path}': {e}")))?;
+
+    let reader = parquet::arrow::arrow_reader::ArrowReaderBuilder::try_new(input_file)
+        .map_err(|e| {
+            SqeError::Execution(format!(
+                "Failed to create Parquet reader for '{file_path}': {e}"
+            ))
+        })?;
+
+    let reader = reader.build().map_err(|e| {
+        SqeError::Execution(format!(
+            "Failed to build Parquet reader for '{file_path}': {e}"
+        ))
+    })?;
+
+    let batches: Vec<RecordBatch> = reader
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            SqeError::Execution(format!("Failed to read Parquet file '{file_path}': {e}"))
+        })?;
+
+    Ok(batches)
+}
+
 /// Build a single-row `RecordBatch` describing the procedure's effect.
 /// Columns: procedure, table, input_count, output_count, input_bytes,
 /// output_bytes, status.
@@ -675,5 +874,94 @@ mod tests {
         // whose policy enforcement runs elsewhere (OPA/Cedar/Polaris).
         let session = session_with_roles(vec!["analyst"]);
         assert!(session_has_write_privilege(&session));
+    }
+
+    // ---------------------------------------------------------------------
+    // Bin-packing unit tests for rewrite_data_files. These run without a
+    // live catalog because `pack_file_groups` is pure data manipulation.
+    // ---------------------------------------------------------------------
+
+    fn data_file_of_size(path: &str, size: u64) -> DataFile {
+        use iceberg::spec::{DataFileBuilder, DataFileFormat, Literal, Struct};
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(size)
+            .record_count(1)
+            .partition(Struct::from_iter([Some(Literal::long(0))]))
+            .partition_spec_id(0)
+            .build()
+            .expect("build data file")
+    }
+
+    #[test]
+    fn pack_empty_input_returns_empty() {
+        let out = pack_file_groups(&[], 1024);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn pack_files_at_or_above_target_are_skipped() {
+        let target = 1024;
+        let files = vec![
+            data_file_of_size("a", target),     // equal to target
+            data_file_of_size("b", target + 1), // above target
+        ];
+        let out = pack_file_groups(&files, target);
+        assert!(
+            out.is_empty(),
+            "files at or above target must not be packed"
+        );
+    }
+
+    #[test]
+    fn pack_small_files_group_under_target() {
+        let target = 1000;
+        let files: Vec<_> = (0..10)
+            .map(|i| data_file_of_size(&format!("f{i}"), 100))
+            .collect();
+        let out = pack_file_groups(&files, target);
+        // 10 * 100 == 1000 == target; exactly one group at the boundary.
+        assert_eq!(out.len(), 1, "expected one packed group, got {}", out.len());
+        assert_eq!(out[0].len(), 10);
+        let sum: u64 = out[0].iter().map(|f| f.file_size_in_bytes()).sum();
+        assert_eq!(sum, 1000);
+    }
+
+    #[test]
+    fn pack_respects_target_boundary() {
+        let target = 1000;
+        let files: Vec<_> = (0..11)
+            .map(|i| data_file_of_size(&format!("f{i}"), 100))
+            .collect();
+        let out = pack_file_groups(&files, target);
+        // Greedy descending-first packing: first 10 fill the first group
+        // (sum=1000, fits because current+size<=target). The 11th starts a
+        // fresh group.
+        assert_eq!(out.len(), 2);
+        let total_packed: usize = out.iter().map(|g| g.len()).sum();
+        assert_eq!(total_packed, 11);
+    }
+
+    #[test]
+    fn pack_mixed_sizes_sorted_descending() {
+        let target = 1000;
+        let files = vec![
+            data_file_of_size("small", 50),
+            data_file_of_size("big", 800),
+            data_file_of_size("medium", 300),
+        ];
+        let out = pack_file_groups(&files, target);
+        // Descending order: 800 first in group. Then 300: 800+300>1000, new
+        // group. Then 50: 800+50<=1000, placed in first.
+        assert_eq!(out.len(), 2);
+        // Group 0: 800 + 50 = 850
+        // Group 1: 300
+        let sizes: Vec<u64> = out
+            .iter()
+            .map(|g| g.iter().map(|f| f.file_size_in_bytes()).sum())
+            .collect();
+        assert!(sizes.contains(&850) && sizes.contains(&300));
     }
 }
