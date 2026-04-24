@@ -17,6 +17,10 @@ pub struct Session {
     pub default_schema: Option<String>,
     /// Client source identifier (from X-Trino-Source).
     pub source: Option<String>,
+    /// Named Iceberg branch for writes in this session. When set via
+    /// `SET WRITE_BRANCH = '<name>'`, INSERT/UPDATE/DELETE/MERGE statements
+    /// route their snapshot ref updates to this branch instead of `main`.
+    pub write_branch: Option<String>,
 }
 
 impl std::fmt::Debug for Session {
@@ -56,7 +60,14 @@ impl Session {
             default_catalog: None,
             default_schema: None,
             source: None,
+            write_branch: None,
         }
+    }
+
+    /// Set the write branch for this session. Passing `None` clears the value
+    /// and sends subsequent writes to `main`.
+    pub fn set_write_branch(&mut self, branch: Option<String>) {
+        self.write_branch = branch;
     }
 
     /// Returns a new session with the given default catalog.

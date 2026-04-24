@@ -2,13 +2,16 @@ use std::collections::HashMap;
 use std::sync::Arc as StdArc;
 use std::sync::Arc;
 
-use iceberg::spec::{NestedField, Schema as IcebergSchema};
+use iceberg::spec::{
+    MAIN_BRANCH, NestedField, Schema as IcebergSchema, SnapshotReference, SnapshotRetention,
+};
 use iceberg::{Catalog, NamespaceIdent, TableIdent, TableRequirement, TableUpdate};
 use sqlparser::ast::{AlterColumnOperation, AlterTableOperation, Expr, ObjectName, ObjectType, SchemaName, SqlOption, Statement, Value};
 use tracing::info;
 
 use sqe_catalog::{SessionCatalog, TableMetadataCache};
 use sqe_core::{Session, SqeConfig, SqeError};
+use sqe_sql::{BranchRetention, RefDdl};
 use tracing::instrument;
 
 use crate::write_handler::sql_type_to_arrow;
@@ -662,6 +665,146 @@ impl CatalogOps {
         Ok(())
     }
 
+    /// Execute a parsed `RefDdl` (CREATE/DROP BRANCH/TAG) against the catalog.
+    ///
+    /// Builds the appropriate `TableUpdate::SetSnapshotRef` or `RemoveSnapshotRef`
+    /// and commits it via the Iceberg REST API. Rejects DROP BRANCH on main
+    /// and CREATE TAG on a duplicate name (unless `CREATE OR REPLACE`).
+    #[instrument(skip(self, session, ddl), fields(username = %session.user.username))]
+    pub async fn apply_ref_ddl(
+        &self,
+        session: &Session,
+        ddl: &RefDdl,
+    ) -> sqe_core::Result<()> {
+        let (table_ref, ref_name, is_drop) = match ddl {
+            RefDdl::CreateBranch { table, name, .. }
+            | RefDdl::CreateTag { table, name, .. } => (table.as_str(), name.as_str(), false),
+            RefDdl::DropBranch { table, name, .. }
+            | RefDdl::DropTag { table, name, .. } => (table.as_str(), name.as_str(), true),
+        };
+
+        // Reject drop of the reserved main branch early, before any round-trip.
+        if is_drop && ref_name == MAIN_BRANCH {
+            return Err(SqeError::Execution(
+                "cannot drop the main branch".to_string(),
+            ));
+        }
+
+        let object_name = parse_object_name(table_ref)?;
+        let (namespace, name) = parse_table_ref(&object_name)?;
+        let table_ident = TableIdent::new(namespace, name);
+
+        let session_catalog = Arc::new(
+            SessionCatalog::new(
+                &self.config.catalog.polaris_url,
+                &self.config.catalog.warehouse,
+                &session.access_token,
+                &self.config.storage,
+                self.table_cache.clone(),
+                None, None,
+            )
+            .await?,
+        );
+
+        let table = session_catalog.load_table(&table_ident).await?;
+        let metadata = table.metadata();
+        let existing = metadata.reference_by_name(ref_name);
+
+        let updates = match ddl {
+            RefDdl::CreateBranch {
+                snapshot_id,
+                retention,
+                ..
+            } => {
+                let snap_id = resolve_snapshot_id(&table, *snapshot_id)?;
+                let retention_spec = branch_retention(retention);
+                vec![TableUpdate::SetSnapshotRef {
+                    ref_name: ref_name.to_string(),
+                    reference: SnapshotReference {
+                        snapshot_id: snap_id,
+                        retention: retention_spec,
+                    },
+                }]
+            }
+            RefDdl::CreateTag {
+                snapshot_id,
+                create_or_replace,
+                max_ref_age_ms,
+                ..
+            } => {
+                if existing.is_some() && !create_or_replace {
+                    return Err(SqeError::Execution(format!(
+                        "tag '{ref_name}' already exists (use CREATE OR REPLACE TAG)"
+                    )));
+                }
+                let snap_id = resolve_snapshot_id(&table, *snapshot_id)?;
+                vec![TableUpdate::SetSnapshotRef {
+                    ref_name: ref_name.to_string(),
+                    reference: SnapshotReference {
+                        snapshot_id: snap_id,
+                        retention: SnapshotRetention::Tag {
+                            max_ref_age_ms: *max_ref_age_ms,
+                        },
+                    },
+                }]
+            }
+            RefDdl::DropBranch {
+                if_exists, ..
+            }
+            | RefDdl::DropTag {
+                if_exists, ..
+            } => {
+                if existing.is_none() {
+                    if *if_exists {
+                        info!(
+                            table = %table_ident,
+                            ref_name,
+                            "Ref not found; IF EXISTS specified, ignoring"
+                        );
+                        return Ok(());
+                    }
+                    return Err(SqeError::Execution(format!(
+                        "reference '{ref_name}' does not exist"
+                    )));
+                }
+                // If a DropBranch targets a tag (or vice versa), report a helpful error
+                // so users don't silently clobber a reference of the wrong kind.
+                if let Some(existing) = existing {
+                    match (ddl, &existing.retention) {
+                        (RefDdl::DropBranch { .. }, SnapshotRetention::Tag { .. }) => {
+                            return Err(SqeError::Execution(format!(
+                                "'{ref_name}' is a tag, not a branch; use DROP TAG"
+                            )));
+                        }
+                        (RefDdl::DropTag { .. }, SnapshotRetention::Branch { .. }) => {
+                            return Err(SqeError::Execution(format!(
+                                "'{ref_name}' is a branch, not a tag; use DROP BRANCH"
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
+                vec![TableUpdate::RemoveSnapshotRef {
+                    ref_name: ref_name.to_string(),
+                }]
+            }
+        };
+
+        info!(
+            username = %session.user.username,
+            table = %table_ident,
+            ref_name,
+            action = ddl_action_label(ddl),
+            "Applying branch/tag DDL"
+        );
+
+        session_catalog
+            .commit_schema_update(&table_ident, updates, vec![])
+            .await?;
+
+        Ok(())
+    }
+
     /// Create a `SessionCatalogBridge` (which implements `iceberg::Catalog`)
     /// for the given session.
     async fn create_catalog_bridge(
@@ -756,6 +899,63 @@ fn parse_namespace_from_object_name(name: &ObjectName) -> sqe_core::Result<Names
             "Invalid schema reference with {n} parts: {name}"
         ))),
     }
+}
+
+/// Short label for a RefDdl, used in logs.
+fn ddl_action_label(ddl: &RefDdl) -> &'static str {
+    match ddl {
+        RefDdl::CreateBranch { .. } => "create_branch",
+        RefDdl::CreateTag { .. } => "create_tag",
+        RefDdl::DropBranch { .. } => "drop_branch",
+        RefDdl::DropTag { .. } => "drop_tag",
+    }
+}
+
+/// Resolve a user-provided snapshot id, falling back to the current snapshot
+/// when `given` is None. Fails when the snapshot id does not exist in the
+/// table's history, or when the table has no snapshots at all.
+fn resolve_snapshot_id(
+    table: &iceberg::table::Table,
+    given: Option<i64>,
+) -> sqe_core::Result<i64> {
+    match given {
+        Some(id) => {
+            if table.metadata().snapshot_by_id(id).is_none() {
+                return Err(SqeError::Execution(format!(
+                    "snapshot id {id} not found in table history"
+                )));
+            }
+            Ok(id)
+        }
+        None => table.metadata().current_snapshot_id().ok_or_else(|| {
+            SqeError::Execution(
+                "cannot create a ref on a table with no snapshots; run INSERT first"
+                    .to_string(),
+            )
+        }),
+    }
+}
+
+fn branch_retention(spec: &BranchRetention) -> SnapshotRetention {
+    SnapshotRetention::Branch {
+        min_snapshots_to_keep: spec.min_snapshots_to_keep,
+        max_snapshot_age_ms: spec.max_snapshot_age_ms,
+        max_ref_age_ms: spec.max_ref_age_ms,
+    }
+}
+
+/// Parse a dotted string like `ns.t` into a sqlparser `ObjectName`.
+fn parse_object_name(s: &str) -> sqe_core::Result<ObjectName> {
+    let idents: Vec<sqlparser::ast::Ident> = s
+        .split('.')
+        .map(|p| sqlparser::ast::Ident::new(p.trim_matches('"')))
+        .collect();
+    if idents.is_empty() {
+        return Err(SqeError::Execution(format!(
+            "invalid table reference: '{s}'"
+        )));
+    }
+    Ok(ObjectName(idents))
 }
 
 /// Check if an iceberg error indicates a table was not found.

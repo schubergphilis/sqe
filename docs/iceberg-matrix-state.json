@@ -10,14 +10,14 @@
     "group": "3rd Party",
     "docUrl": "https://github.com/schubergphilis/sqe"
   },
-  "generatedAt": "2026-04-24T12:30:00Z",
-  "generatedBy": "Phase A+B integration (catalogs + maintenance)",
+  "generatedAt": "2026-04-24T13:00:00Z",
+  "generatedBy": "Phase A+B+C integration (catalogs + maintenance + branching/tagging)",
   "score": {
-    "raw": 67,
+    "raw": 73,
     "max": 189,
-    "percent": 35.4
+    "percent": 38.6
   },
-  "note": "Integration branch: Phase A (catalog scaffolding + OIDC M2M + SQL/Hadoop backends, HMS/Glue stubs) + Phase B (3 of 4 maintenance procedures real, rewrite_data_files manifest-only).",
+  "note": "Integration branch: Phase A (catalogs) + Phase B (maintenance, 3 of 4 real) + Phase C (branching/tagging full).",
   "support": {
     "sqe:position-deletes:v2": {
       "level": "full",
@@ -144,15 +144,15 @@
       ]
     },
     "sqe:branching-tagging:v2": {
-      "level": "none",
-      "notes": "Not implemented.",
-      "evidence": null,
+      "level": "full",
+      "notes": "Transaction::{create_branch, create_tag, drop_branch, drop_tag} in vendored iceberg-rust + ALTER TABLE ... CREATE BRANCH/TAG DDL + SET WRITE_BRANCH session var. Main branch drop rejected.",
+      "evidence": "vendor/iceberg-rust/crates/iceberg/src/transaction/branch.rs",
       "caveats": []
     },
     "sqe:branching-tagging:v3": {
-      "level": "none",
-      "notes": "Not implemented.",
-      "evidence": null,
+      "level": "full",
+      "notes": "Same transaction actions apply to V3 tables; ref semantics are format-version agnostic.",
+      "evidence": "vendor/iceberg-rust/crates/iceberg/src/transaction/branch.rs",
       "caveats": []
     },
     "sqe:hidden-partitioning:v2": {

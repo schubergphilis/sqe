@@ -174,6 +174,23 @@ impl SessionManager {
         Some(touched)
     }
 
+    /// Update the session's `write_branch` so subsequent writes route to the
+    /// named Iceberg branch. Passing `None` clears the override.
+    ///
+    /// The session is copied (because `Session` is behind an `Arc` and cannot
+    /// be mutated in place), mutated, and re-inserted atomically.
+    pub fn set_write_branch(&self, session_id: &str, branch: Option<String>) -> bool {
+        let Some(session) = self.sessions.get(session_id) else {
+            return false;
+        };
+        let mut updated = (*session.value().clone()).clone();
+        updated.set_write_branch(branch);
+        updated.touch();
+        self.sessions
+            .insert(session_id.to_string(), Arc::new(updated));
+        true
+    }
+
     /// Save current sessions to a JSON file for crash recovery.
     ///
     /// Only non-sensitive fields are serialized (id, username, expires_at).
