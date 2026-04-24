@@ -2,6 +2,8 @@ use sqlparser::ast::{AlterTableOperation, ObjectType, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
+use crate::ddl::{try_parse_ref_ddl, RefDdl};
+
 /// Target for SHOW GRANTS statements.
 #[derive(Debug)]
 pub enum ShowGrantsTarget {
@@ -79,6 +81,8 @@ pub enum StatementKind {
     Comment(Box<Statement>),
     /// SHOW STATS FOR table — return row/file/size stats from snapshot summary
     ShowStats(String),
+    /// ALTER TABLE ... CREATE/DROP BRANCH/TAG — branching and tagging DDL
+    RefDdl(Box<RefDdl>),
 }
 
 impl StatementKind {
@@ -119,6 +123,7 @@ impl StatementKind {
             StatementKind::AlterTableProps(_) => "altertableprops",
             StatementKind::Comment(_) => "comment",
             StatementKind::ShowStats(_) => "showstats",
+            StatementKind::RefDdl(_) => "refddl",
         }
     }
 }
@@ -200,6 +205,15 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
     if upper.starts_with("CHECK ACCESS ") {
         let rest = trimmed["CHECK ACCESS ".len()..].trim().trim_end_matches(';');
         return parse_check_access(rest);
+    }
+
+    // Pre-scan for ALTER TABLE ... CREATE/DROP BRANCH|TAG. These are not part of
+    // standard SQL and sqlparser-rs will either reject them or classify them as
+    // generic AlterTable statements, losing the branch/tag semantics.
+    if upper.starts_with("ALTER TABLE ") {
+        if let Some(ref_ddl) = try_parse_ref_ddl(trimmed)? {
+            return Ok(StatementKind::RefDdl(Box::new(ref_ddl)));
+        }
     }
 
     let dialect = GenericDialect {};
