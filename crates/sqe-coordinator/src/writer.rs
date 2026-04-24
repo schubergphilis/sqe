@@ -114,7 +114,7 @@ fn build_writer_props(
     let valid_names: Vec<&str> = schema_fields.iter().map(|f| f.name.as_str()).collect();
 
     for col in &columns {
-        if valid_names.iter().any(|name| *name == col.as_str()) {
+        if valid_names.contains(&col.as_str()) {
             let path = ColumnPath::new(vec![col.clone()]);
             builder = builder
                 .set_column_bloom_filter_enabled(path.clone(), true)

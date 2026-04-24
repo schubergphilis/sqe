@@ -62,6 +62,14 @@ pub enum ProcedureCall {
     },
     /// Consolidate small manifest files via vendored `RewriteManifestsAction`.
     RewriteManifests { table: TableRef },
+    /// Suggest columns for `write.parquet.bloom-filter-columns` based on
+    /// recent query history (Phase F task 7.10).
+    SuggestBloomFilterColumns {
+        table: TableRef,
+        /// Optional history window (default 1000). Caps the number of
+        /// finished-query records examined.
+        history_limit: Option<usize>,
+    },
 }
 
 impl ProcedureCall {
@@ -72,6 +80,7 @@ impl ProcedureCall {
             ProcedureCall::ExpireSnapshots { .. } => "expire_snapshots",
             ProcedureCall::RemoveOrphanFiles { .. } => "remove_orphan_files",
             ProcedureCall::RewriteManifests { .. } => "rewrite_manifests",
+            ProcedureCall::SuggestBloomFilterColumns { .. } => "suggest_bloom_filter_columns",
         }
     }
 
@@ -82,7 +91,8 @@ impl ProcedureCall {
             ProcedureCall::RewriteDataFiles { table, .. }
             | ProcedureCall::ExpireSnapshots { table, .. }
             | ProcedureCall::RemoveOrphanFiles { table, .. }
-            | ProcedureCall::RewriteManifests { table } => table,
+            | ProcedureCall::RewriteManifests { table }
+            | ProcedureCall::SuggestBloomFilterColumns { table, .. } => table,
         }
     }
 }
@@ -160,6 +170,7 @@ pub fn try_parse_call(stmt: &Statement) -> sqe_core::Result<Option<ProcedureCall
         "expire_snapshots" => parse_expire_snapshots(args).map(Some),
         "remove_orphan_files" => parse_remove_orphan_files(args).map(Some),
         "rewrite_manifests" => parse_rewrite_manifests(args).map(Some),
+        "suggest_bloom_filter_columns" => parse_suggest_bloom_filter_columns(args).map(Some),
         _ => Ok(None),
     }
 }
@@ -359,6 +370,20 @@ fn parse_rewrite_manifests(mut args: Vec<(String, Expr)>) -> sqe_core::Result<Pr
     Ok(ProcedureCall::RewriteManifests { table })
 }
 
+fn parse_suggest_bloom_filter_columns(
+    mut args: Vec<(String, Expr)>,
+) -> sqe_core::Result<ProcedureCall> {
+    let table = take_table(&mut args)?;
+    let history_limit = take_option(&mut args, "history_limit", |e| {
+        expect_usize(e, "history_limit")
+    })?;
+    expect_no_remaining(&args, "suggest_bloom_filter_columns")?;
+    Ok(ProcedureCall::SuggestBloomFilterColumns {
+        table,
+        history_limit,
+    })
+}
+
 // The `_` bindings below exist to silence "unused" lints if we later restrict
 // which sqlparser types we import. Keeping this hook avoids churn.
 #[allow(dead_code)]
@@ -544,5 +569,35 @@ mod tests {
         let call = try_parse_call(&stmt).unwrap().expect("match");
         assert_eq!(call.name(), "rewrite_data_files");
         assert_eq!(call.table().as_string(), "ns.t");
+    }
+
+    #[test]
+    fn parses_suggest_bloom_filter_columns_bare() {
+        let stmt = parse_first("CALL system.suggest_bloom_filter_columns(table => 'ns.t')");
+        let call = try_parse_call(&stmt).unwrap().expect("match");
+        match call {
+            ProcedureCall::SuggestBloomFilterColumns {
+                table,
+                history_limit,
+            } => {
+                assert_eq!(table.as_string(), "ns.t");
+                assert_eq!(history_limit, None);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_suggest_bloom_filter_columns_with_limit() {
+        let stmt = parse_first(
+            "CALL system.suggest_bloom_filter_columns(table => 'ns.t', history_limit => 500)",
+        );
+        let call = try_parse_call(&stmt).unwrap().expect("match");
+        match call {
+            ProcedureCall::SuggestBloomFilterColumns {
+                history_limit, ..
+            } => assert_eq!(history_limit, Some(500)),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }
