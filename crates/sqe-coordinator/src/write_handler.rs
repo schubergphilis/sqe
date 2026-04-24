@@ -2094,6 +2094,476 @@ impl WriteHandler {
         Ok(affected_rows_batch(total_rows))
     }
 
+    /// Dispatch MERGE to CoW or MoR based on `write.merge.mode`
+    /// (Phase H, task 9.7).
+    ///
+    /// - `copy-on-write` (default): rewrite all target files via
+    ///   `handle_merge` (pre-existing behaviour).
+    /// - `merge-on-read`: route to `handle_merge_equality` when the table
+    ///   declares a primary key. Without a PK we fall back to CoW because
+    ///   the MATCHED clauses need old-row keys for the equality delete.
+    pub async fn handle_merge_dispatch(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+        source_batches: Vec<RecordBatch>,
+        catalog: Arc<SessionCatalog>,
+        ctx: &DFSessionContext,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // Peek at the target table to read its properties.
+        let merge_table = match stmt {
+            Statement::Merge { table, .. } => table,
+            _ => {
+                return self
+                    .handle_merge(session, stmt, source_batches, catalog, ctx)
+                    .await;
+            }
+        };
+        let target_name = match merge_table {
+            sqlparser::ast::TableFactor::Table { name, .. } => name,
+            _ => {
+                return self
+                    .handle_merge(session, stmt, source_batches, catalog, ctx)
+                    .await;
+            }
+        };
+        let Ok((namespace, name)) = parse_table_ref(target_name) else {
+            return self
+                .handle_merge(session, stmt, source_batches, catalog, ctx)
+                .await;
+        };
+        let table_ident = TableIdent::new(namespace, name);
+        let Ok(table) = catalog.load_table(&table_ident).await else {
+            return self
+                .handle_merge(session, stmt, source_batches, catalog, ctx)
+                .await;
+        };
+
+        let mode = resolve_merge_mode(table.metadata().properties())?;
+        match mode {
+            WriteMode::MergeOnRead => {
+                let has_ids = table
+                    .metadata()
+                    .current_schema()
+                    .identifier_field_ids()
+                    .next()
+                    .is_some();
+                if has_ids {
+                    info!(
+                        table = %table_ident,
+                        "MERGE dispatch: MoR + equality deletes"
+                    );
+                    self.handle_merge_equality(session, stmt, source_batches, catalog, ctx)
+                        .await
+                } else {
+                    info!(
+                        table = %table_ident,
+                        "MERGE dispatch: MoR requested but no PK; falling back to CoW"
+                    );
+                    self.handle_merge(session, stmt, source_batches, catalog, ctx)
+                        .await
+                }
+            }
+            WriteMode::CopyOnWrite => {
+                info!(table = %table_ident, "MERGE dispatch: CoW");
+                self.handle_merge(session, stmt, source_batches, catalog, ctx)
+                    .await
+            }
+        }
+    }
+
+    /// Handle MERGE INTO in Merge-on-Read mode.
+    ///
+    /// The three MERGE clause branches map onto RowDelta inputs:
+    ///
+    /// - `WHEN MATCHED THEN UPDATE`: emit a data file row with the new
+    ///   values and an equality-delete row with the matched target's PK.
+    /// - `WHEN MATCHED THEN DELETE`: emit an equality-delete row only.
+    /// - `WHEN NOT MATCHED THEN INSERT`: emit a data file row only.
+    ///
+    /// All outputs commit in one `RowDeltaAction`. Target rows that have
+    /// no matching source row pass through untouched: no rewrite, no
+    /// delete.
+    #[instrument(
+        skip(self, session, stmt, source_batches, catalog, ctx),
+        fields(username = %session.user.username)
+    )]
+    pub async fn handle_merge_equality(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+        source_batches: Vec<RecordBatch>,
+        catalog: Arc<SessionCatalog>,
+        ctx: &DFSessionContext,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        use sqlparser::ast::{MergeAction, MergeClauseKind, MergeInsertKind, TableFactor};
+
+        let (table_factor, source_factor, on_expr, clauses) = match stmt {
+            Statement::Merge {
+                table,
+                source,
+                on,
+                clauses,
+                ..
+            } => (table, source, on, clauses),
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected MERGE statement, got: {other}"
+                )));
+            }
+        };
+
+        let (target_table_name, target_alias) = match table_factor {
+            TableFactor::Table { name, alias, .. } => {
+                let alias_str = alias.as_ref().map(|a| a.name.value.clone());
+                (name, alias_str)
+            }
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected table name in MERGE target, got: {other}"
+                )));
+            }
+        };
+        let (namespace, name) = parse_table_ref(target_table_name)?;
+        let table_ident = TableIdent::new(namespace, name);
+
+        let source_alias = match source_factor {
+            TableFactor::Table { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()),
+            TableFactor::Derived { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()),
+            _ => None,
+        };
+        let on_sql = format!("{on_expr}");
+
+        let table = catalog.load_table(&table_ident).await?;
+        let identifier_field_ids: Vec<i32> = table
+            .metadata()
+            .current_schema()
+            .identifier_field_ids()
+            .collect();
+        if identifier_field_ids.is_empty() {
+            return Err(SqeError::Execution(format!(
+                "MoR MERGE on {table_ident} requires identifier-field-ids (primary key)"
+            )));
+        }
+
+        // Collect target batches for the JOIN. Unlike CoW we do not need
+        // to rewrite them; the RowDelta only touches matched rows.
+        let old_data_files = self.collect_data_files(&table).await?;
+        let mut target_batches: Vec<RecordBatch> = Vec::new();
+        for data_file in &old_data_files {
+            let file_path = data_file.file_path();
+            let batches = self.read_parquet_via_table(&table, file_path).await?;
+            target_batches.extend(batches);
+        }
+
+        // Resolve schema from the existing data or the Iceberg metadata.
+        let target_schema = if let Some(first) = target_batches.first() {
+            first.schema()
+        } else {
+            let iceberg_schema = table.metadata().current_schema();
+            let arrow_schema =
+                iceberg::arrow::schema_to_arrow_schema(iceberg_schema).map_err(|e| {
+                    SqeError::Execution(format!("Failed to convert Iceberg schema to Arrow: {e}"))
+                })?;
+            Arc::new(arrow_schema)
+        };
+        let target_columns: Vec<String> = target_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+
+        let t_alias = target_alias.clone().unwrap_or_else(|| "t".to_string());
+        let s_alias = source_alias.clone().unwrap_or_else(|| "s".to_string());
+        let target_ref = "__merge_mor_target".to_string();
+        let source_ref = "__merge_mor_source".to_string();
+        let q_target = format!("datafusion.public.{target_ref}");
+        let q_source = format!("datafusion.public.{source_ref}");
+
+        let target_mem = if target_batches.is_empty() {
+            datafusion::datasource::MemTable::try_new(target_schema.clone(), vec![])
+        } else {
+            datafusion::datasource::MemTable::try_new(
+                target_schema.clone(),
+                vec![target_batches.clone()],
+            )
+        }
+        .map_err(|e| SqeError::Execution(format!("Failed to create target MemTable: {e}")))?;
+        ctx.register_table(&q_target, Arc::new(target_mem))
+            .map_err(|e| SqeError::Execution(format!("Failed to register target MemTable: {e}")))?;
+
+        if source_batches.is_empty() {
+            info!(table = %table_ident, "MoR MERGE: source returned no data, nothing to merge");
+            let _ = ctx.deregister_table(&q_target);
+            return Ok(vec![]);
+        }
+        let source_schema = source_batches[0].schema();
+        let source_mem =
+            datafusion::datasource::MemTable::try_new(source_schema.clone(), vec![source_batches])
+                .map_err(|e| {
+                    SqeError::Execution(format!("Failed to create source MemTable: {e}"))
+                })?;
+        ctx.register_table(&q_source, Arc::new(source_mem))
+            .map_err(|e| SqeError::Execution(format!("Failed to register source MemTable: {e}")))?;
+
+        let source_columns: Vec<String> = source_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+
+        let on_rewritten = on_sql
+            .replace(&format!("{t_alias}."), &format!("{target_ref}."))
+            .replace(&format!("{s_alias}."), &format!("{source_ref}."));
+
+        // Classify MERGE clauses.
+        let mut matched_update: Option<&[sqlparser::ast::Assignment]> = None;
+        let mut matched_delete = false;
+        let mut not_matched_insert: Option<(&[sqlparser::ast::Ident], &MergeInsertKind)> = None;
+        for clause in clauses {
+            match (&clause.clause_kind, &clause.action) {
+                (MergeClauseKind::Matched, MergeAction::Update { assignments }) => {
+                    matched_update = Some(assignments);
+                }
+                (MergeClauseKind::Matched, MergeAction::Delete) => {
+                    matched_delete = true;
+                }
+                (
+                    MergeClauseKind::NotMatched | MergeClauseKind::NotMatchedByTarget,
+                    MergeAction::Insert(insert_expr),
+                ) => {
+                    not_matched_insert = Some((&insert_expr.columns, &insert_expr.kind));
+                }
+                (MergeClauseKind::NotMatchedBySource, MergeAction::Delete) => {
+                    return Err(SqeError::NotImplemented(
+                        "WHEN NOT MATCHED BY SOURCE THEN DELETE is not yet supported".to_string(),
+                    ));
+                }
+                _ => {
+                    return Err(SqeError::NotImplemented(format!(
+                        "Unsupported MERGE clause combination: {:?} / {:?}",
+                        clause.clause_kind, clause.action
+                    )));
+                }
+            }
+        }
+
+        info!(
+            table = %table_ident,
+            on_condition = %on_sql,
+            matched_update = matched_update.is_some(),
+            matched_delete,
+            not_matched_insert = not_matched_insert.is_some(),
+            "MoR MERGE: planning row delta"
+        );
+
+        let mut new_data_batches: Vec<RecordBatch> = Vec::new();
+        let mut equality_delete_batches: Vec<RecordBatch> = Vec::new();
+        let mut updated_rows: usize = 0;
+        let mut deleted_rows: usize = 0;
+        let mut inserted_rows: usize = 0;
+
+        // MATCHED UPDATE: INNER JOIN of target + source, emit new row per
+        // match plus an equality-delete row for the old target PK.
+        if let Some(assignments) = matched_update {
+            let update_cols: Vec<String> = target_columns
+                .iter()
+                .map(|col| {
+                    let expr = self.resolve_update_expr(
+                        col,
+                        assignments,
+                        &target_ref,
+                        &source_ref,
+                        &t_alias,
+                        &s_alias,
+                    );
+                    format!("{expr} AS \"{col}\"")
+                })
+                .collect();
+            let new_sql = format!(
+                "SELECT {} FROM {q_target} INNER JOIN {q_source} ON {on_rewritten}",
+                update_cols.join(", ")
+            );
+            let df = ctx
+                .sql(&new_sql)
+                .await
+                .map_err(|e| SqeError::Execution(format!("MoR MERGE UPDATE plan failed: {e}")))?;
+            let batches = df.collect().await.map_err(|e| {
+                SqeError::Execution(format!("MoR MERGE UPDATE execution failed: {e}"))
+            })?;
+            for batch in batches {
+                updated_rows += batch.num_rows();
+                if batch.num_rows() > 0 {
+                    new_data_batches.push(batch);
+                }
+            }
+
+            // Old target rows for the equality delete. The writer projects
+            // identifier columns, so we select all target columns for the
+            // matched rows.
+            let old_cols: Vec<String> = target_columns
+                .iter()
+                .map(|col| format!("{target_ref}.\"{col}\" AS \"{col}\""))
+                .collect();
+            let old_sql = format!(
+                "SELECT {} FROM {q_target} INNER JOIN {q_source} ON {on_rewritten}",
+                old_cols.join(", ")
+            );
+            let df = ctx.sql(&old_sql).await.map_err(|e| {
+                SqeError::Execution(format!("MoR MERGE old-key plan failed: {e}"))
+            })?;
+            let batches = df.collect().await.map_err(|e| {
+                SqeError::Execution(format!("MoR MERGE old-key execution failed: {e}"))
+            })?;
+            for batch in batches {
+                if batch.num_rows() > 0 {
+                    equality_delete_batches.push(batch);
+                }
+            }
+        }
+
+        // MATCHED DELETE: emit equality-delete rows only, no new data file.
+        if matched_delete {
+            let old_cols: Vec<String> = target_columns
+                .iter()
+                .map(|col| format!("{target_ref}.\"{col}\" AS \"{col}\""))
+                .collect();
+            let del_sql = format!(
+                "SELECT {} FROM {q_target} INNER JOIN {q_source} ON {on_rewritten}",
+                old_cols.join(", ")
+            );
+            let df = ctx.sql(&del_sql).await.map_err(|e| {
+                SqeError::Execution(format!("MoR MERGE DELETE plan failed: {e}"))
+            })?;
+            let batches = df.collect().await.map_err(|e| {
+                SqeError::Execution(format!("MoR MERGE DELETE execution failed: {e}"))
+            })?;
+            for batch in batches {
+                deleted_rows += batch.num_rows();
+                if batch.num_rows() > 0 {
+                    equality_delete_batches.push(batch);
+                }
+            }
+        }
+
+        // NOT MATCHED INSERT: LEFT ANTI JOIN from source to target.
+        if let Some((insert_cols, insert_kind)) = not_matched_insert {
+            let insert_exprs: Vec<String> = target_columns
+                .iter()
+                .map(|col| {
+                    let expr = self.resolve_insert_expr(
+                        col,
+                        insert_cols,
+                        insert_kind,
+                        &source_ref,
+                        &source_columns,
+                        &s_alias,
+                        &t_alias,
+                        &target_ref,
+                    );
+                    format!("{expr} AS \"{col}\"")
+                })
+                .collect();
+            // A source row is "not matched" when the JOIN on the ON
+            // condition does not find a target row. LEFT ANTI JOIN gives
+            // that directly.
+            let insert_sql = format!(
+                "SELECT {} FROM {q_source} WHERE NOT EXISTS \
+                 (SELECT 1 FROM {q_target} WHERE {on_rewritten})",
+                insert_exprs.join(", ")
+            );
+            let df = ctx.sql(&insert_sql).await.map_err(|e| {
+                SqeError::Execution(format!("MoR MERGE INSERT plan failed: {e}"))
+            })?;
+            let batches = df.collect().await.map_err(|e| {
+                SqeError::Execution(format!("MoR MERGE INSERT execution failed: {e}"))
+            })?;
+            for batch in batches {
+                inserted_rows += batch.num_rows();
+                if batch.num_rows() > 0 {
+                    new_data_batches.push(batch);
+                }
+            }
+        }
+
+        let _ = ctx.deregister_table(&q_target);
+        let _ = ctx.deregister_table(&q_source);
+
+        let total_touched = updated_rows + deleted_rows + inserted_rows;
+        if total_touched == 0 {
+            info!(table = %table_ident, "MoR MERGE: no matched or not-matched rows");
+            return Ok(vec![]);
+        }
+
+        let new_data_files = if !new_data_batches.is_empty() {
+            write_data_files_with_metrics(
+                &table,
+                new_data_batches,
+                "merge-mor",
+                self.metrics.as_ref(),
+                self.compression(),
+            )
+            .await?
+        } else {
+            vec![]
+        };
+
+        let delete_files = if !equality_delete_batches.is_empty() {
+            write_equality_delete_files(
+                &table,
+                equality_delete_batches,
+                identifier_field_ids,
+                self.compression(),
+            )
+            .await?
+        } else {
+            vec![]
+        };
+
+        info!(
+            table = %table_ident,
+            updated_rows,
+            deleted_rows,
+            inserted_rows,
+            new_data_files = new_data_files.len(),
+            equality_delete_files = delete_files.len(),
+            "MoR MERGE: committing row delta"
+        );
+
+        let tx = Transaction::new(&table);
+        let snapshot_id = table.metadata().current_snapshot_id();
+        let mut action = tx.row_delta();
+        if !new_data_files.is_empty() {
+            action = action.add_data_files(new_data_files);
+        }
+        if !delete_files.is_empty() {
+            action = action.add_delete_files(delete_files);
+        }
+        if let Some(snap) = snapshot_id {
+            action = action.validate_from_snapshot(snap);
+        }
+        let tx = action.apply(tx).map_err(|e| {
+            SqeError::Execution(format!("Failed to apply MoR MERGE row delta: {e}"))
+        })?;
+        tx.commit(catalog.as_catalog().as_ref()).await.map_err(|e| {
+            let msg = e.to_string().to_lowercase();
+            if msg.contains("stale snapshot") || msg.contains("rowdelta conflict") {
+                SqeError::Catalog(format!("commit conflict: {e}"))
+            } else {
+                SqeError::Execution(format!("Failed to commit MoR MERGE: {e}"))
+            }
+        })?;
+
+        info!(
+            table = %table_ident,
+            updated_rows,
+            deleted_rows,
+            inserted_rows,
+            "MoR MERGE committed successfully"
+        );
+        Ok(affected_rows_batch(total_touched))
+    }
+
     /// Resolve an UPDATE SET expression for a single column in the MERGE context.
     ///
     /// Rewrites alias references (e.g., `t.col` or `s.col`) to point to the

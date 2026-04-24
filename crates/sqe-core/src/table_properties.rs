@@ -29,8 +29,9 @@ pub const WRITE_MERGE_MODE: &str = "write.merge.mode";
 ///   `RewriteFiles` action. Existing behaviour.
 /// - `MergeOnRead`: emit equality-delete or position-delete files plus new
 ///   data files, commit via `RowDeltaAction`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WriteMode {
+    #[default]
     CopyOnWrite,
     MergeOnRead,
 }
@@ -54,12 +55,6 @@ impl WriteMode {
                 "unsupported write mode '{other}'; expected 'copy-on-write' or 'merge-on-read'"
             ))),
         }
-    }
-}
-
-impl Default for WriteMode {
-    fn default() -> Self {
-        WriteMode::CopyOnWrite
     }
 }
 
