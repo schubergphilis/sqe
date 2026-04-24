@@ -3,6 +3,24 @@ name = "sqe-catalog"
 version = "0.15.0"
 edition = "2021"
 
+[features]
+default = ["rest"]
+# REST catalog (always on today; the flag is here so the matrix-parity phase A
+# can expose `--no-default-features` builds that skip other backends).
+rest = []
+# JDBC-style SQL catalog. Uses `rusqlite` bundled mode for SQLite tests;
+# PostgreSQL support arrives when we adopt the upstream `iceberg-catalog-sql`
+# crate (pinned to apache/iceberg-rust 0.8.0 once the RisingWave fork rebases).
+sql = ["dep:rusqlite"]
+# Hadoop storage-only backend. No extra dependency — the backend scans a
+# warehouse path via `object_store`, which is already linked.
+hadoop = []
+# Hive Metastore over Thrift. Requires upstream `iceberg-catalog-hms` once the
+# vendored fork rebases onto a release that exports it.
+hms = []
+# AWS Glue Data Catalog. Requires upstream `iceberg-catalog-glue` + aws-config.
+glue = []
+
 [dependencies]
 sqe-core = { path = "../sqe-core" }
 sqe-policy = { path = "../sqe-policy" }
@@ -33,3 +51,11 @@ iceberg-datafusion = { workspace = true }
 parquet = { workspace = true }
 bytes = { workspace = true }
 prometheus = { workspace = true }
+regex = { workspace = true }
+# Optional backend dependencies
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+sqe-auth = { path = "../sqe-auth" }
