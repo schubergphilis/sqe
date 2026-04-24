@@ -10,14 +10,14 @@
     "group": "3rd Party",
     "docUrl": "https://github.com/schubergphilis/sqe"
   },
-  "generatedAt": "2026-04-24T15:20:00Z",
-  "generatedBy": "Phase E row-delta",
+  "generatedAt": "2026-04-24T16:30:00Z",
+  "generatedBy": "Phase H MoR UPDATE/MERGE",
   "score": {
-    "raw": 96,
+    "raw": 99,
     "max": 189,
-    "percent": 50.8
+    "percent": 52.4
   },
-  "note": "Integration of Phase E + F + G. Honest ratings: equality-deletes partial (write tested, Spark read not verified), merge-on-read:v2 partial (only DELETE, UPDATE/MERGE still CoW, Phase H), bloom-filters partial (coordinator-only write), cdc-support unknown (library primitives only, no SQL dispatch).",
+  "note": "Phase H integrated. merge-on-read:v2 full (DELETE, UPDATE, MERGE all route through RowDeltaAction when write.*.mode = merge-on-read and the table has a PK). merge-on-read:v3 partial (same writer path; V3 round trip untested). equality-deletes still partial (Spark read #[ignore] pending docker-compose.spark.yml). bloom-filters partial (coordinator-only write). cdc-support unknown (library primitives only).",
   "support": {
     "sqe:position-deletes:v2": {
       "level": "full",
@@ -51,18 +51,21 @@
       ]
     },
     "sqe:merge-on-read:v2": {
-      "level": "partial",
-      "notes": "DELETE dispatches to equality-delete (PK tables) or position-delete (no PK) via write.delete.mode. UPDATE and MERGE still take the CoW path; MoR dispatch for those lands in Phase H.",
-      "evidence": "crates/sqe-coordinator/src/write_handler.rs#handle_delete_dispatch",
+      "level": "full",
+      "notes": "All three DML kinds (DELETE, UPDATE, MERGE) route through RowDeltaAction when write.*.mode = merge-on-read. UPDATE emits one data file per batch of matched rows plus an equality delete for old PKs. MERGE composes MATCHED UPDATE (data file + equality delete), MATCHED DELETE (equality delete only), and NOT MATCHED INSERT (data file only) into one RowDelta commit. Without a declared PK the dispatcher falls back to CoW for UPDATE and MERGE; DELETE falls back to position deletes.",
+      "evidence": "crates/sqe-coordinator/src/write_handler.rs#handle_update_equality, handle_merge_equality",
       "caveats": [
-        "Only DELETE has a MoR path; UPDATE and MERGE still CoW."
+        "Cross-engine read test (Spark 4.1, Trino 465) ships as #[ignore] pending docker-compose.spark.yml / docker-compose.trino.yml.",
+        "MoR benchmark harness at scripts/benchmark-mor-vs-cow.sh is scripted; live timings require the test stack."
       ]
     },
     "sqe:merge-on-read:v3": {
-      "level": "none",
-      "notes": "Blocked on Phase H (UPDATE/MERGE MoR).",
-      "evidence": null,
-      "caveats": []
+      "level": "partial",
+      "notes": "Same writer path and commit mechanism as V2. V3 round trip not yet exercised in integration tests.",
+      "evidence": "crates/sqe-coordinator/src/write_handler.rs#handle_update_equality, handle_merge_equality",
+      "caveats": [
+        "V3 end-to-end test pending."
+      ]
     },
     "sqe:copy-on-write:v2": {
       "level": "full",
