@@ -4920,6 +4920,7 @@ dependencies = [
 name = "sqe-sql"
 version = "0.15.0"
 dependencies = [
+ "chrono",
  "sqe-core",
  "sqlparser 0.54.0",
  "tracing",
