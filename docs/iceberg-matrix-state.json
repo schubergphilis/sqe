@@ -13,9 +13,9 @@
   "generatedAt": "2026-04-24T15:00:00Z",
   "generatedBy": "Phase A+B+C+D+G integration",
   "score": {
-    "raw": 89,
+    "raw": 88,
     "max": 189,
-    "percent": 47.1
+    "percent": 46.6
   },
   "note": "Integration of Phase A catalogs, Phase B maintenance, Phase C branching/tagging, Phase D V3 types, and Phase G CDC range scan. Honest ratings throughout (HMS/Glue stubs marked none, rewrite_data_files partial, CDC partial for parser+planner pending full coordinator wiring).",
   "support": {
@@ -412,12 +412,12 @@
       "caveats": []
     },
     "sqe:cdc-support:v3": {
-      "level": "partial",
-      "notes": "FOR INCREMENTAL BETWEEN SNAPSHOT x AND SNAPSHOT y parses; range-scan planner walks parent chain and collects added files; meta columns (_change_type, _change_ordinal, _commit_snapshot_id) materialise. Full coordinator wiring lands in a follow-up commit.",
+      "level": "unknown",
+      "notes": "Library primitives shipped: FOR INCREMENTAL BETWEEN SNAPSHOT parser (sqe-sql/src/time_travel.rs) and range-scan planner with delete reconciliation and _change_type/_change_ordinal/_commit_snapshot_id meta columns (sqe-catalog/src/incremental_scan.rs). End-to-end SQL execution wiring (query_handler dispatch + IncrementalScanExec physical node) deferred to a follow-up. Users cannot execute the query today.",
       "evidence": "crates/sqe-catalog/src/incremental_scan.rs, crates/sqe-sql/src/time_travel.rs",
       "caveats": [
-        "Changelog view (full row-level deltas) deferred; Phase G covers range scan only.",
-        "Coordinator query handler wiring pending."
+        "Parser and planner unit-tested in isolation; no end-to-end SQL test exists yet.",
+        "query_handler.rs has not been wired; SELECT ... FOR INCREMENTAL ... is not dispatched."
       ]
     },
     "sqe:lineage:v3": {
