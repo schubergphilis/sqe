@@ -13,11 +13,11 @@
   "generatedAt": "2026-04-24T15:20:00Z",
   "generatedBy": "Phase E row-delta",
   "score": {
-    "raw": 95,
+    "raw": 96,
     "max": 189,
-    "percent": 50.3
+    "percent": 50.8
   },
-  "note": "Integration of Phase E (equality-delete writer + RowDeltaAction), F (bloom filters + Puffin NDV, coordinator path), G (CDC parser + planner primitives). All three rated honestly; UPDATE/MERGE MoR, worker-side bloom, and CDC SQL dispatch land as follow-ups.",
+  "note": "Integration of Phase E + F + G. Honest ratings: equality-deletes partial (write tested, Spark read not verified), merge-on-read:v2 partial (only DELETE, UPDATE/MERGE still CoW, Phase H), bloom-filters partial (coordinator-only write), cdc-support unknown (library primitives only, no SQL dispatch).",
   "support": {
     "sqe:position-deletes:v2": {
       "level": "full",
@@ -424,10 +424,13 @@
       "caveats": []
     },
     "sqe:cdc-support:v3": {
-      "level": "none",
-      "notes": "Planned in Phase G.",
-      "evidence": null,
-      "caveats": []
+      "level": "unknown",
+      "notes": "Library primitives shipped: FOR INCREMENTAL BETWEEN SNAPSHOT parser (sqe-sql/src/time_travel.rs) and range-scan planner with delete reconciliation + meta columns (sqe-catalog/src/incremental_scan.rs). End-to-end SQL execution wiring deferred.",
+      "evidence": "crates/sqe-catalog/src/incremental_scan.rs, crates/sqe-sql/src/time_travel.rs",
+      "caveats": [
+        "Parser and planner unit-tested in isolation; no end-to-end SQL test exists yet.",
+        "query_handler.rs has not been wired; SELECT ... FOR INCREMENTAL ... is not dispatched."
+      ]
     },
     "sqe:lineage:v3": {
       "level": "none",

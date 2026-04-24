@@ -1,12 +1,12 @@
-//! Pre-parser for `FOR VERSION AS OF` time-travel clauses.
+//! Pre-parser for `FOR VERSION AS OF` and `FOR INCREMENTAL BETWEEN` clauses.
 //!
 //! sqlparser-rs 0.53 only models `FOR SYSTEM_TIME AS OF <expr>`. Trino/Iceberg
-//! also accept `FOR VERSION AS OF <snapshot_id_or_ref>`, where the argument is
-//! either a numeric snapshot id or a quoted branch/tag name.
+//! also accept `FOR VERSION AS OF <snapshot_id_or_ref>` and the Iceberg CDC
+//! extension `FOR INCREMENTAL BETWEEN SNAPSHOT <x> AND SNAPSHOT <y>`.
 //!
-//! We pre-scan the SQL text for `FOR VERSION AS OF`, extract the table name
-//! and version value, then strip the clause so sqlparser can parse the query.
-//! The coordinator resolves the version against table metadata:
+//! We pre-scan the SQL text, extract table name and clause arguments, then
+//! strip the clause so sqlparser can parse the query. The coordinator
+//! resolves snapshot ids against table metadata:
 //!
 //! 1. If the value is an integer literal, treat it as a snapshot id.
 //! 2. If the value is a string literal, look it up in the table's named refs.
@@ -31,6 +31,24 @@ pub struct TimeTravelSpec {
     pub table: String,
     /// The extracted version reference.
     pub version: VersionRef,
+}
+
+/// The parsed incremental-range specification for one table reference.
+///
+/// Returned by [`extract_incremental_spec`] when the user supplies
+/// `FOR INCREMENTAL BETWEEN SNAPSHOT <start> AND SNAPSHOT <end>`.
+///
+/// The coordinator resolves `start` and `end` against table metadata, then
+/// builds a scan over only the data files added in the open-closed interval
+/// `(start, end]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncrementalSpec {
+    /// Table name as it appears in SQL (may be qualified, e.g. `ns.t`).
+    pub table: String,
+    /// Starting snapshot id, exclusive.
+    pub start: i64,
+    /// Ending snapshot id, inclusive.
+    pub end: i64,
 }
 
 /// Extract all `FOR VERSION AS OF` clauses from the SQL text.
@@ -191,6 +209,118 @@ fn parse_version_token(input: &str) -> Result<(VersionRef, usize)> {
     }
 }
 
+/// Extract all `FOR INCREMENTAL BETWEEN SNAPSHOT x AND SNAPSHOT y` clauses.
+///
+/// Returns the rewritten SQL with those clauses stripped plus a vector of
+/// resolved specs. Each spec carries the table name and the pair of snapshot
+/// ids. The caller is responsible for validating both ids exist on the
+/// target table.
+///
+/// The clause must be exactly `FOR INCREMENTAL BETWEEN SNAPSHOT <id1> AND
+/// SNAPSHOT <id2>` (case insensitive). Descending ranges (start greater than
+/// end) or non-integer arguments are rejected here with a clear error.
+pub fn extract_incremental_spec(sql: &str) -> Result<(String, Vec<IncrementalSpec>)> {
+    let upper = sql.to_uppercase();
+    let needle = " FOR INCREMENTAL BETWEEN SNAPSHOT ";
+    if !upper.contains(needle.trim()) {
+        return Ok((sql.to_string(), vec![]));
+    }
+
+    let mut out = String::with_capacity(sql.len());
+    let mut specs = Vec::new();
+    let bytes = sql.as_bytes();
+    let upper_bytes = upper.as_bytes();
+    let mut cursor = 0;
+
+    while cursor < bytes.len() {
+        let window_start = cursor;
+        let remaining = &upper_bytes[cursor..];
+        let needle_upper = needle.as_bytes();
+        let hit = find_needle(remaining, needle_upper);
+        match hit {
+            None => {
+                out.push_str(&sql[window_start..]);
+                break;
+            }
+            Some(offset) => {
+                let clause_start = cursor + offset;
+                let table_end = sql[..clause_start].trim_end().len();
+                let table_start = find_table_start(&sql[..table_end]);
+                let table = sql[table_start..table_end].trim().to_string();
+
+                out.push_str(&sql[window_start..clause_start]);
+
+                let after_kw = clause_start + needle.len();
+                let (start_id, consumed_start) = parse_integer_token(&sql[after_kw..])?;
+                let after_start = after_kw + consumed_start;
+
+                // Expect `AND SNAPSHOT` (with leading + trailing whitespace).
+                let rest = &sql[after_start..];
+                let rest_upper = rest.to_uppercase();
+                let and_marker = "AND SNAPSHOT";
+                let rest_trimmed = rest_upper.trim_start();
+                let leading_ws = rest_upper.len() - rest_trimmed.len();
+                if leading_ws == 0 || !rest_trimmed.starts_with(and_marker) {
+                    return Err(SqeError::Execution(
+                        "FOR INCREMENTAL BETWEEN SNAPSHOT: expected 'AND SNAPSHOT <id>'"
+                            .to_string(),
+                    ));
+                }
+                let after_and_kw = after_start + leading_ws + and_marker.len();
+                let (end_id, consumed_end) = parse_integer_token(&sql[after_and_kw..])?;
+                cursor = after_and_kw + consumed_end;
+
+                if start_id > end_id {
+                    return Err(SqeError::Execution(format!(
+                        "FOR INCREMENTAL BETWEEN SNAPSHOT {start_id} AND SNAPSHOT {end_id}: start must be older than end"
+                    )));
+                }
+
+                specs.push(IncrementalSpec {
+                    table,
+                    start: start_id,
+                    end: end_id,
+                });
+            }
+        }
+    }
+
+    Ok((out, specs))
+}
+
+/// Parse an integer literal, returning (value, bytes_consumed).
+///
+/// Accepts an optional leading `-`. Iceberg's `UNASSIGNED_SNAPSHOT_ID` is -1,
+/// so negatives are tolerated at the parser layer.
+fn parse_integer_token(input: &str) -> Result<(i64, usize)> {
+    let trimmed = input.trim_start();
+    let leading_ws = input.len() - trimmed.len();
+
+    if trimmed.is_empty() {
+        return Err(SqeError::Execution(
+            "FOR INCREMENTAL BETWEEN SNAPSHOT: expected snapshot id".to_string(),
+        ));
+    }
+
+    let first = trimmed.as_bytes()[0];
+    if !first.is_ascii_digit() && first != b'-' {
+        return Err(SqeError::Execution(format!(
+            "FOR INCREMENTAL BETWEEN SNAPSHOT: expected integer, got '{}'",
+            trimmed.split_whitespace().next().unwrap_or("")
+        )));
+    }
+    let end = trimmed
+        .find(|c: char| !c.is_ascii_digit() && c != '-')
+        .unwrap_or(trimmed.len());
+    let num_str = &trimmed[..end];
+    let id: i64 = num_str.parse().map_err(|_| {
+        SqeError::Execution(format!(
+            "FOR INCREMENTAL BETWEEN SNAPSHOT: '{num_str}' is not a valid snapshot id"
+        ))
+    })?;
+    Ok((id, leading_ws + end))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +400,72 @@ mod tests {
         let input = "SELECT * FROM t FOR VERSION AS OF -1";
         let (_sql, specs) = extract_time_travel_spec(input).unwrap();
         assert_eq!(specs[0].version, VersionRef::SnapshotId(-1));
+    }
+
+    // ── Incremental scan clause (Phase G) ────────────────────────────────
+
+    #[test]
+    fn no_incremental_passes_through() {
+        let (sql, specs) = extract_incremental_spec("SELECT * FROM t").unwrap();
+        assert_eq!(sql, "SELECT * FROM t");
+        assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn extract_incremental_between_snapshots() {
+        let input = "SELECT * FROM ns.t FOR INCREMENTAL BETWEEN SNAPSHOT 100 AND SNAPSHOT 105";
+        let (sql, specs) = extract_incremental_spec(input).unwrap();
+        assert_eq!(sql, "SELECT * FROM ns.t");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            specs[0],
+            IncrementalSpec {
+                table: "ns.t".to_string(),
+                start: 100,
+                end: 105,
+            }
+        );
+    }
+
+    #[test]
+    fn extract_incremental_case_insensitive() {
+        let input = "select * from t for incremental between snapshot 1 and snapshot 2";
+        let (_sql, specs) = extract_incremental_spec(input).unwrap();
+        assert_eq!(specs[0].start, 1);
+        assert_eq!(specs[0].end, 2);
+    }
+
+    #[test]
+    fn incremental_rejects_descending_range() {
+        let input = "SELECT * FROM t FOR INCREMENTAL BETWEEN SNAPSHOT 102 AND SNAPSHOT 100";
+        let err = extract_incremental_spec(input).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("start must be older than end"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn incremental_requires_and_snapshot() {
+        let input = "SELECT * FROM t FOR INCREMENTAL BETWEEN SNAPSHOT 1 SNAPSHOT 2";
+        let err = extract_incremental_spec(input).unwrap_err();
+        assert!(err.to_string().contains("AND SNAPSHOT"));
+    }
+
+    #[test]
+    fn incremental_rejects_non_integer() {
+        let input = "SELECT * FROM t FOR INCREMENTAL BETWEEN SNAPSHOT 'abc' AND SNAPSHOT 2";
+        let err = extract_incremental_spec(input).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("expected integer"));
+    }
+
+    #[test]
+    fn incremental_allows_equal_snapshots() {
+        // Equal start/end is a valid empty range (open-closed interval).
+        let input = "SELECT * FROM t FOR INCREMENTAL BETWEEN SNAPSHOT 5 AND SNAPSHOT 5";
+        let (_sql, specs) = extract_incremental_spec(input).unwrap();
+        assert_eq!(specs[0].start, 5);
+        assert_eq!(specs[0].end, 5);
     }
 }
