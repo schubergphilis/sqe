@@ -83,6 +83,9 @@ pub enum StatementKind {
     ShowStats(String),
     /// ALTER TABLE ... CREATE/DROP BRANCH/TAG — branching and tagging DDL
     RefDdl(Box<RefDdl>),
+    /// SET WRITE_BRANCH = 'name' — route writes in this session to a named branch.
+    /// SET WRITE_BRANCH = DEFAULT (or unquoted) resets to main.
+    SetWriteBranch(Option<String>),
 }
 
 impl StatementKind {
@@ -124,6 +127,7 @@ impl StatementKind {
             StatementKind::Comment(_) => "comment",
             StatementKind::ShowStats(_) => "showstats",
             StatementKind::RefDdl(_) => "refddl",
+            StatementKind::SetWriteBranch(_) => "setwritebranch",
         }
     }
 }
@@ -214,6 +218,30 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
         if let Some(ref_ddl) = try_parse_ref_ddl(trimmed)? {
             return Ok(StatementKind::RefDdl(Box::new(ref_ddl)));
         }
+    }
+
+    // SET WRITE_BRANCH = '<name>' routes writes to a named Iceberg branch.
+    // We intercept it here so the coordinator can update session state
+    // without going through DataFusion's generic SET handling.
+    if upper.starts_with("SET WRITE_BRANCH") {
+        let rest = trimmed["SET WRITE_BRANCH".len()..]
+            .trim()
+            .trim_end_matches(';')
+            .trim();
+        // Accept: SET WRITE_BRANCH = 'name', SET WRITE_BRANCH 'name',
+        //         SET WRITE_BRANCH = DEFAULT, SET WRITE_BRANCH = NULL
+        let stripped = rest.strip_prefix('=').unwrap_or(rest).trim();
+        let upper_val = stripped.to_uppercase();
+        if upper_val == "DEFAULT" || upper_val == "NULL" || stripped.is_empty() {
+            return Ok(StatementKind::SetWriteBranch(None));
+        }
+        let name = stripped
+            .trim_start_matches('\'')
+            .trim_end_matches('\'')
+            .trim_start_matches('"')
+            .trim_end_matches('"')
+            .to_string();
+        return Ok(StatementKind::SetWriteBranch(Some(name)));
     }
 
     let dialect = GenericDialect {};
@@ -1164,5 +1192,88 @@ mod tests {
             matches!(result, Ok(StatementKind::ShowStats(_))),
             "Expected ShowStats, got: {result:?}"
         );
+    }
+
+    // ── Branch/Tag DDL tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_create_branch_classified_as_ref_ddl() {
+        let kind = parse_and_classify("ALTER TABLE t CREATE BRANCH feature_x").unwrap();
+        match kind {
+            StatementKind::RefDdl(b) => match *b {
+                RefDdl::CreateBranch { name, .. } => assert_eq!(name, "feature_x"),
+                other => panic!("expected CreateBranch, got {other:?}"),
+            },
+            other => panic!("expected RefDdl, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_create_tag_classified_as_ref_ddl() {
+        let kind = parse_and_classify("ALTER TABLE t CREATE TAG v1").unwrap();
+        assert!(matches!(kind, StatementKind::RefDdl(_)));
+    }
+
+    #[test]
+    fn test_drop_branch_classified_as_ref_ddl() {
+        let kind = parse_and_classify("ALTER TABLE t DROP BRANCH stale").unwrap();
+        assert!(matches!(kind, StatementKind::RefDdl(_)));
+    }
+
+    #[test]
+    fn test_drop_tag_if_exists_classified_as_ref_ddl() {
+        let kind = parse_and_classify("ALTER TABLE t DROP TAG v1 IF EXISTS").unwrap();
+        assert!(matches!(kind, StatementKind::RefDdl(_)));
+    }
+
+    #[test]
+    fn test_alter_table_add_column_still_alter_schema() {
+        // Regression: branch pre-scan must not steal regular ALTER TABLE.
+        let kind = parse_and_classify("ALTER TABLE t ADD COLUMN x INT").unwrap();
+        assert!(matches!(kind, StatementKind::AlterSchema(_)));
+    }
+
+    #[test]
+    fn test_ref_ddl_name() {
+        let kind = parse_and_classify("ALTER TABLE t CREATE BRANCH b").unwrap();
+        assert_eq!(kind.name(), "refddl");
+    }
+
+    // ── SET WRITE_BRANCH tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_set_write_branch_quoted() {
+        let kind = parse_and_classify("SET WRITE_BRANCH = 'feature_x'").unwrap();
+        match kind {
+            StatementKind::SetWriteBranch(Some(name)) => assert_eq!(name, "feature_x"),
+            other => panic!("expected SetWriteBranch, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_set_write_branch_without_equals() {
+        let kind = parse_and_classify("SET WRITE_BRANCH 'trunk'").unwrap();
+        match kind {
+            StatementKind::SetWriteBranch(Some(name)) => assert_eq!(name, "trunk"),
+            other => panic!("expected SetWriteBranch, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_set_write_branch_default_clears() {
+        let kind = parse_and_classify("SET WRITE_BRANCH = DEFAULT").unwrap();
+        assert!(matches!(kind, StatementKind::SetWriteBranch(None)));
+    }
+
+    #[test]
+    fn test_set_write_branch_null_clears() {
+        let kind = parse_and_classify("SET WRITE_BRANCH = NULL").unwrap();
+        assert!(matches!(kind, StatementKind::SetWriteBranch(None)));
+    }
+
+    #[test]
+    fn test_set_write_branch_name() {
+        let kind = parse_and_classify("SET WRITE_BRANCH = 'x'").unwrap();
+        assert_eq!(kind.name(), "setwritebranch");
     }
 }
