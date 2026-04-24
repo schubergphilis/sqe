@@ -4,6 +4,7 @@
 .DS_Store
 tests/.test-env
 .worktrees/
+.claude/worktrees/
 benchmarks/results/
 
 # Secrets & certs
