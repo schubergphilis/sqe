@@ -2,6 +2,8 @@ use sqlparser::ast::{AlterTableOperation, ObjectType, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
+use crate::procedures::{try_parse_call, ProcedureCall};
+
 /// Target for SHOW GRANTS statements.
 #[derive(Debug)]
 pub enum ShowGrantsTarget {
@@ -73,6 +75,9 @@ pub enum StatementKind {
     Truncate(String),
     /// CALL procedure — not supported, returns informative error
     Call(Box<Statement>),
+    /// CALL system.<maintenance procedure>(...) matched against the
+    /// Iceberg maintenance procedure registry.
+    Procedure(Box<ProcedureCall>),
     /// ALTER TABLE ... SET TBLPROPERTIES (...) — update Iceberg table properties
     AlterTableProps(Box<Statement>),
     /// COMMENT ON TABLE/COLUMN — store comment as Iceberg table property
@@ -116,6 +121,7 @@ impl StatementKind {
             StatementKind::ShowCreateTable(_) => "showcreatetable",
             StatementKind::Truncate(_) => "truncate",
             StatementKind::Call(_) => "call",
+            StatementKind::Procedure(_) => "procedure",
             StatementKind::AlterTableProps(_) => "altertableprops",
             StatementKind::Comment(_) => "comment",
             StatementKind::ShowStats(_) => "showstats",
@@ -389,8 +395,13 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
             Ok(StatementKind::Truncate(name))
         }
 
-        // CALL procedure — not supported, returns informative error
-        Statement::Call(_) => Ok(StatementKind::Call(Box::new(stmt))),
+        // CALL procedure — dispatch to Iceberg maintenance procedures when the
+        // name is `system.<known>`. Unknown calls fall through to the generic
+        // `Call(_)` variant so the existing "not supported" error triggers.
+        Statement::Call(_) => match try_parse_call(&stmt)? {
+            Some(proc) => Ok(StatementKind::Procedure(Box::new(proc))),
+            None => Ok(StatementKind::Call(Box::new(stmt))),
+        },
 
         // COMMENT ON TABLE/COLUMN — store as Iceberg table property
         Statement::Comment { .. } => Ok(StatementKind::Comment(Box::new(stmt))),
@@ -1031,6 +1042,33 @@ mod tests {
             .remove(0);
         let kind = StatementKind::Call(Box::new(stmt));
         assert_eq!(kind.name(), "call");
+    }
+
+    #[test]
+    fn test_call_system_rewrite_data_files_is_procedure() {
+        let result = parse_and_classify("CALL system.rewrite_data_files(table => 'ns.t')");
+        assert!(
+            matches!(result, Ok(StatementKind::Procedure(_))),
+            "Expected Procedure, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_call_system_unknown_is_plain_call() {
+        let result = parse_and_classify("CALL system.unknown_proc(table => 'ns.t')");
+        assert!(
+            matches!(result, Ok(StatementKind::Call(_))),
+            "Expected Call (unknown system.*), got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_procedure_name() {
+        use crate::procedures::{ProcedureCall, TableRef};
+        let kind = StatementKind::Procedure(Box::new(ProcedureCall::RewriteManifests {
+            table: TableRef::parse("ns.t").unwrap(),
+        }));
+        assert_eq!(kind.name(), "procedure");
     }
 
     #[test]

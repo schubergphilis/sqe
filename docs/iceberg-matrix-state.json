@@ -10,14 +10,14 @@
     "group": "3rd Party",
     "docUrl": "https://github.com/schubergphilis/sqe"
   },
-  "generatedAt": "2026-04-24T12:00:00Z",
-  "generatedBy": "Phase A catalog adoption (sql/hadoop backends + OIDC M2M)",
+  "generatedAt": "2026-04-24T12:30:00Z",
+  "generatedBy": "Phase A+B integration (catalogs + maintenance)",
   "score": {
-    "raw": 63,
+    "raw": 67,
     "max": 189,
-    "percent": 33.3
+    "percent": 35.4
   },
-  "note": "Phase A partial: JDBC/SQLite, Hadoop storage-only, and OIDC M2M auth landed with tests. HMS and Glue stubs carry typed configs; full Thrift/AWS-SDK wiring tracks the rebase onto apache/iceberg-rust. Nessie documented in docs/deployment.md (Section 5b).",
+  "note": "Integration branch: Phase A (catalog scaffolding + OIDC M2M + SQL/Hadoop backends, HMS/Glue stubs) + Phase B (3 of 4 maintenance procedures real, rewrite_data_files manifest-only).",
   "support": {
     "sqe:position-deletes:v2": {
       "level": "full",
@@ -128,18 +128,20 @@
       "caveats": []
     },
     "sqe:table-maintenance:v2": {
-      "level": "none",
-      "notes": "Vendored actions exist; no SQL surface.",
-      "evidence": null,
+      "level": "partial",
+      "notes": "CALL system.expire_snapshots / remove_orphan_files / rewrite_manifests wrap vendored actions. rewrite_data_files currently consolidates manifests only (no Parquet re-encoding); full compaction lands as a Phase B follow-up.",
+      "evidence": "crates/sqe-coordinator/src/maintenance.rs",
       "caveats": [
-        "No CALL system.* procedures."
+        "rewrite_data_files does not re-encode Parquet payloads."
       ]
     },
     "sqe:table-maintenance:v3": {
-      "level": "none",
-      "notes": "Blocked on V2.",
-      "evidence": null,
-      "caveats": []
+      "level": "partial",
+      "notes": "Same procedures apply to format-version 3 tables; same rewrite_data_files caveat.",
+      "evidence": "crates/sqe-coordinator/src/maintenance.rs",
+      "caveats": [
+        "rewrite_data_files does not re-encode Parquet payloads."
+      ]
     },
     "sqe:branching-tagging:v2": {
       "level": "none",
