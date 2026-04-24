@@ -583,8 +583,11 @@ impl QueryHandler {
                     let (ctx, session_catalog) = self.create_session_context(session).await?;
                     let source_batches =
                         self.execute_query(session, &source_sql, &query_id, &plan_metrics).await?;
+                    // Dispatch on `write.merge.mode` table property. Default CoW
+                    // matches prior behaviour; `merge-on-read` routes to the
+                    // equality-delete path when the target has a declared PK.
                     self.write_handler
-                        .handle_merge(session, stmt, source_batches, session_catalog, &ctx)
+                        .handle_merge_dispatch(session, stmt, source_batches, session_catalog, &ctx)
                         .await
                 }
             }
