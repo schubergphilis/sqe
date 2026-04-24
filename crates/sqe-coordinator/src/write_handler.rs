@@ -20,7 +20,9 @@ use sqe_catalog::puffin_stats::{
     puffin_stats_enabled, write_puffin_sidecar,
 };
 use sqe_catalog::{SessionCatalog, TableMetadataCache};
-use sqe_core::table_properties::{WriteMode, resolve_delete_mode};
+use sqe_core::table_properties::{
+    WriteMode, resolve_delete_mode, resolve_merge_mode, resolve_update_mode,
+};
 use sqe_core::{Session, SqeConfig, SqeError};
 use tracing::instrument;
 
@@ -1433,6 +1435,279 @@ impl WriteHandler {
             .map_err(|e| SqeError::Execution(format!("Failed to commit UPDATE: {e}")))?;
 
         info!(table = %table_ident, updated_rows = total_updated, "UPDATE committed successfully");
+        Ok(affected_rows_batch(total_updated))
+    }
+
+    /// Dispatch an UPDATE statement to CoW or MoR based on
+    /// `write.update.mode` (Phase H, task 9.4).
+    ///
+    /// - `copy-on-write` (default): rewrite affected data files in place.
+    /// - `merge-on-read`: fall through to MoR only when the table declares
+    ///   identifier-field-ids (primary key). Without a PK we cannot emit an
+    ///   equality delete for the old row, so we fall back to CoW with a log
+    ///   entry rather than fail.
+    pub async fn handle_update_dispatch(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+        catalog: Arc<SessionCatalog>,
+        ctx: &DFSessionContext,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // Peek at the target table to read its properties.
+        let update_table = match stmt {
+            Statement::Update { table, .. } => table,
+            _ => return self.handle_update(session, stmt, catalog, ctx).await,
+        };
+        let table_factor_name = match &update_table.relation {
+            sqlparser::ast::TableFactor::Table { name, .. } => name,
+            _ => return self.handle_update(session, stmt, catalog, ctx).await,
+        };
+        let Ok((namespace, name)) = parse_table_ref(table_factor_name) else {
+            return self.handle_update(session, stmt, catalog, ctx).await;
+        };
+        let table_ident = TableIdent::new(namespace, name);
+        let Ok(table) = catalog.load_table(&table_ident).await else {
+            return self.handle_update(session, stmt, catalog, ctx).await;
+        };
+
+        let mode = resolve_update_mode(table.metadata().properties())?;
+
+        match mode {
+            WriteMode::MergeOnRead => {
+                let has_ids = table
+                    .metadata()
+                    .current_schema()
+                    .identifier_field_ids()
+                    .next()
+                    .is_some();
+                if has_ids {
+                    info!(
+                        table = %table_ident,
+                        "UPDATE dispatch: MoR + equality deletes"
+                    );
+                    self.handle_update_equality(session, stmt, catalog, ctx).await
+                } else {
+                    info!(
+                        table = %table_ident,
+                        "UPDATE dispatch: MoR requested but no PK; falling back to CoW"
+                    );
+                    self.handle_update(session, stmt, catalog, ctx).await
+                }
+            }
+            WriteMode::CopyOnWrite => {
+                info!(table = %table_ident, "UPDATE dispatch: CoW");
+                self.handle_update(session, stmt, catalog, ctx).await
+            }
+        }
+    }
+
+    /// Handle UPDATE in Merge-on-Read mode.
+    ///
+    /// For each matched row we emit two records:
+    ///
+    /// 1. A row in a new data file carrying the UPDATE'd values.
+    /// 2. A row in an equality-delete file carrying the old primary-key
+    ///    values so the pre-update row is hidden at scan time.
+    ///
+    /// Both are committed atomically via `RowDeltaAction`. Unmatched rows
+    /// in existing data files are left alone: no file rewrite. The SF100
+    /// `trade_result_update_holding` pattern benefits here because the
+    /// working set is the small set of matched rows, not every file in
+    /// the partition.
+    #[instrument(skip(self, session, stmt, catalog, ctx), fields(username = %session.user.username))]
+    pub async fn handle_update_equality(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+        catalog: Arc<SessionCatalog>,
+        ctx: &DFSessionContext,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let (table_factor, assignments, selection) = match stmt {
+            Statement::Update {
+                table,
+                assignments,
+                selection,
+                ..
+            } => (table, assignments, selection),
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected UPDATE statement, got: {other}"
+                )));
+            }
+        };
+
+        let table_name = match &table_factor.relation {
+            sqlparser::ast::TableFactor::Table { name, .. } => name,
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected table name in UPDATE, got: {other}"
+                )));
+            }
+        };
+
+        let (namespace, name) = parse_table_ref(table_name)?;
+        let table_ident = TableIdent::new(namespace, name);
+        let table = catalog.load_table(&table_ident).await?;
+
+        // MoR UPDATE requires declared identifier-field-ids (primary key)
+        // so we can emit an equality delete for the old row. Without a PK
+        // the dispatcher falls back to CoW; reaching this function without
+        // a PK is a caller bug.
+        let identifier_field_ids: Vec<i32> = table
+            .metadata()
+            .current_schema()
+            .identifier_field_ids()
+            .collect();
+        if identifier_field_ids.is_empty() {
+            return Err(SqeError::Execution(format!(
+                "MoR UPDATE on {table_ident} requires identifier-field-ids (primary key)"
+            )));
+        }
+
+        let old_data_files = self.collect_data_files(&table).await?;
+        if old_data_files.is_empty() {
+            info!(table = %table_ident, "MoR UPDATE: table has no data files");
+            return Ok(vec![]);
+        }
+
+        let raw_where = selection
+            .as_ref()
+            .map(|w| format!("{w}"))
+            .unwrap_or_else(|| "TRUE".to_string());
+        let (where_sql, joins_sql, _in_subq_guard) =
+            self.lift_in_subqueries(&raw_where, ctx).await?;
+
+        info!(
+            table = %table_ident,
+            file_count = old_data_files.len(),
+            assignments = assignments.len(),
+            where_clause = %where_sql,
+            equality_ids = ?identifier_field_ids,
+            "MoR UPDATE: scanning for matching rows"
+        );
+
+        // For each data file, find the matched rows twice:
+        //   - once with the UPDATE applied, projected into a new data file
+        //   - once as the raw matched rows, projected into an equality
+        //     delete file keyed on identifier-field-ids
+        //
+        // The CoW `apply_update` helper returns a per-batch full rewrite
+        // (matched rows get new values, others pass through). For MoR we
+        // only want the matched rows, so we filter after apply_update.
+        let mut new_row_batches: Vec<RecordBatch> = Vec::new();
+        let mut key_batches: Vec<RecordBatch> = Vec::new();
+        let mut total_updated: usize = 0;
+
+        for data_file in &old_data_files {
+            let file_path = data_file.file_path().to_string();
+            let batches = self.read_parquet_via_table(&table, &file_path).await?;
+            if batches.is_empty() {
+                continue;
+            }
+            for batch in batches {
+                let match_mask = self
+                    .filter_batch_match(ctx, &batch, &where_sql, &joins_sql, &table_ident)
+                    .await?;
+                // Skip files with zero matches: no new data rows, no
+                // equality deletes. Leaving them alone is the point of MoR.
+                let matched_count = match_mask.true_count();
+                if matched_count == 0 {
+                    continue;
+                }
+                total_updated += matched_count;
+
+                // Old PKs for the equality delete. Filter the original
+                // batch by the match mask; the equality-delete writer
+                // projects identifier columns from the Iceberg schema.
+                let old_keys = filter_record_batch(&batch, &match_mask).map_err(|e| {
+                    SqeError::Execution(format!("failed to filter match rows: {e}"))
+                })?;
+                if old_keys.num_rows() > 0 {
+                    key_batches.push(old_keys);
+                }
+
+                // New values for the data file. `apply_update` produces a
+                // full-batch rewrite with CASE WHEN where THEN new ELSE
+                // old END, then we filter to only the matched rows so we
+                // do not re-write the unchanged ones.
+                let full_rewrite = self
+                    .apply_update(
+                        ctx,
+                        &batch,
+                        assignments,
+                        &where_sql,
+                        &joins_sql,
+                        &table_ident,
+                    )
+                    .await?;
+                let new_rows =
+                    filter_record_batch(&full_rewrite, &match_mask).map_err(|e| {
+                        SqeError::Execution(format!("failed to filter updated rows: {e}"))
+                    })?;
+                if new_rows.num_rows() > 0 {
+                    new_row_batches.push(new_rows);
+                }
+            }
+        }
+
+        if total_updated == 0 {
+            info!(table = %table_ident, "MoR UPDATE: no matching rows, nothing to commit");
+            return Ok(vec![]);
+        }
+
+        // Write the data file with the new values and the equality delete
+        // file with the old keys. Both go into one RowDelta commit.
+        let new_data_files = write_data_files_with_metrics(
+            &table,
+            new_row_batches,
+            "update-mor",
+            self.metrics.as_ref(),
+            self.compression(),
+        )
+        .await?;
+
+        let delete_files = write_equality_delete_files(
+            &table,
+            key_batches,
+            identifier_field_ids,
+            self.compression(),
+        )
+        .await?;
+
+        info!(
+            table = %table_ident,
+            updated_rows = total_updated,
+            new_data_files = new_data_files.len(),
+            equality_delete_files = delete_files.len(),
+            "MoR UPDATE: committing row delta"
+        );
+
+        let tx = Transaction::new(&table);
+        let snapshot_id = table.metadata().current_snapshot_id();
+        let mut action = tx
+            .row_delta()
+            .add_data_files(new_data_files)
+            .add_delete_files(delete_files);
+        if let Some(snap) = snapshot_id {
+            action = action.validate_from_snapshot(snap);
+        }
+        let tx = action.apply(tx).map_err(|e| {
+            SqeError::Execution(format!("Failed to apply MoR UPDATE row delta: {e}"))
+        })?;
+        tx.commit(catalog.as_catalog().as_ref()).await.map_err(|e| {
+            let msg = e.to_string().to_lowercase();
+            if msg.contains("stale snapshot") || msg.contains("rowdelta conflict") {
+                SqeError::Catalog(format!("commit conflict: {e}"))
+            } else {
+                SqeError::Execution(format!("Failed to commit MoR UPDATE: {e}"))
+            }
+        })?;
+
+        info!(
+            table = %table_ident,
+            updated_rows = total_updated,
+            "MoR UPDATE committed successfully"
+        );
         Ok(affected_rows_batch(total_updated))
     }
 
