@@ -11,6 +11,7 @@ pub mod expr_to_predicate;
 pub mod footer_cache;
 pub mod iceberg_metadata_tvf;
 pub mod iceberg_scan;
+pub mod incremental_scan;
 pub mod info_schema;
 pub mod late_materialize;
 pub mod pruning_stats;
