@@ -1,4 +1,5 @@
 pub mod access_control;
+pub mod backends;
 pub mod circuit_breaker;
 pub mod grant_chameleon;
 pub mod rest_catalog;

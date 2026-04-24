@@ -7,3 +7,4 @@ edition = "2021"
 sqe-core = { path = "../sqe-core" }
 sqlparser = { workspace = true }
 tracing = { workspace = true }
+chrono = { workspace = true }

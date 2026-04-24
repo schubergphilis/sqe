@@ -2,6 +2,9 @@ use sqlparser::ast::{AlterTableOperation, ObjectType, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
+use crate::ddl::{try_parse_ref_ddl, RefDdl};
+use crate::procedures::{try_parse_call, ProcedureCall};
+
 /// Target for SHOW GRANTS statements.
 #[derive(Debug)]
 pub enum ShowGrantsTarget {
@@ -73,12 +76,20 @@ pub enum StatementKind {
     Truncate(String),
     /// CALL procedure — not supported, returns informative error
     Call(Box<Statement>),
+    /// CALL system.<maintenance procedure>(...) matched against the
+    /// Iceberg maintenance procedure registry.
+    Procedure(Box<ProcedureCall>),
     /// ALTER TABLE ... SET TBLPROPERTIES (...) — update Iceberg table properties
     AlterTableProps(Box<Statement>),
     /// COMMENT ON TABLE/COLUMN — store comment as Iceberg table property
     Comment(Box<Statement>),
     /// SHOW STATS FOR table — return row/file/size stats from snapshot summary
     ShowStats(String),
+    /// ALTER TABLE ... CREATE/DROP BRANCH/TAG — branching and tagging DDL
+    RefDdl(Box<RefDdl>),
+    /// SET WRITE_BRANCH = 'name' — route writes in this session to a named branch.
+    /// SET WRITE_BRANCH = DEFAULT (or unquoted) resets to main.
+    SetWriteBranch(Option<String>),
 }
 
 impl StatementKind {
@@ -116,9 +127,12 @@ impl StatementKind {
             StatementKind::ShowCreateTable(_) => "showcreatetable",
             StatementKind::Truncate(_) => "truncate",
             StatementKind::Call(_) => "call",
+            StatementKind::Procedure(_) => "procedure",
             StatementKind::AlterTableProps(_) => "altertableprops",
             StatementKind::Comment(_) => "comment",
             StatementKind::ShowStats(_) => "showstats",
+            StatementKind::RefDdl(_) => "refddl",
+            StatementKind::SetWriteBranch(_) => "setwritebranch",
         }
     }
 }
@@ -200,6 +214,39 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
     if upper.starts_with("CHECK ACCESS ") {
         let rest = trimmed["CHECK ACCESS ".len()..].trim().trim_end_matches(';');
         return parse_check_access(rest);
+    }
+
+    // Pre-scan for ALTER TABLE ... CREATE/DROP BRANCH|TAG. These are not part of
+    // standard SQL and sqlparser-rs will either reject them or classify them as
+    // generic AlterTable statements, losing the branch/tag semantics.
+    if upper.starts_with("ALTER TABLE ") {
+        if let Some(ref_ddl) = try_parse_ref_ddl(trimmed)? {
+            return Ok(StatementKind::RefDdl(Box::new(ref_ddl)));
+        }
+    }
+
+    // SET WRITE_BRANCH = '<name>' routes writes to a named Iceberg branch.
+    // We intercept it here so the coordinator can update session state
+    // without going through DataFusion's generic SET handling.
+    if upper.starts_with("SET WRITE_BRANCH") {
+        let rest = trimmed["SET WRITE_BRANCH".len()..]
+            .trim()
+            .trim_end_matches(';')
+            .trim();
+        // Accept: SET WRITE_BRANCH = 'name', SET WRITE_BRANCH 'name',
+        //         SET WRITE_BRANCH = DEFAULT, SET WRITE_BRANCH = NULL
+        let stripped = rest.strip_prefix('=').unwrap_or(rest).trim();
+        let upper_val = stripped.to_uppercase();
+        if upper_val == "DEFAULT" || upper_val == "NULL" || stripped.is_empty() {
+            return Ok(StatementKind::SetWriteBranch(None));
+        }
+        let name = stripped
+            .trim_start_matches('\'')
+            .trim_end_matches('\'')
+            .trim_start_matches('"')
+            .trim_end_matches('"')
+            .to_string();
+        return Ok(StatementKind::SetWriteBranch(Some(name)));
     }
 
     let dialect = GenericDialect {};
@@ -389,8 +436,13 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
             Ok(StatementKind::Truncate(name))
         }
 
-        // CALL procedure — not supported, returns informative error
-        Statement::Call(_) => Ok(StatementKind::Call(Box::new(stmt))),
+        // CALL procedure — dispatch to Iceberg maintenance procedures when the
+        // name is `system.<known>`. Unknown calls fall through to the generic
+        // `Call(_)` variant so the existing "not supported" error triggers.
+        Statement::Call(_) => match try_parse_call(&stmt)? {
+            Some(proc) => Ok(StatementKind::Procedure(Box::new(proc))),
+            None => Ok(StatementKind::Call(Box::new(stmt))),
+        },
 
         // COMMENT ON TABLE/COLUMN — store as Iceberg table property
         Statement::Comment { .. } => Ok(StatementKind::Comment(Box::new(stmt))),
@@ -1034,6 +1086,33 @@ mod tests {
     }
 
     #[test]
+    fn test_call_system_rewrite_data_files_is_procedure() {
+        let result = parse_and_classify("CALL system.rewrite_data_files(table => 'ns.t')");
+        assert!(
+            matches!(result, Ok(StatementKind::Procedure(_))),
+            "Expected Procedure, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_call_system_unknown_is_plain_call() {
+        let result = parse_and_classify("CALL system.unknown_proc(table => 'ns.t')");
+        assert!(
+            matches!(result, Ok(StatementKind::Call(_))),
+            "Expected Call (unknown system.*), got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_procedure_name() {
+        use crate::procedures::{ProcedureCall, TableRef};
+        let kind = StatementKind::Procedure(Box::new(ProcedureCall::RewriteManifests {
+            table: TableRef::parse("ns.t").unwrap(),
+        }));
+        assert_eq!(kind.name(), "procedure");
+    }
+
+    #[test]
     fn test_create_or_replace_view_is_create_view() {
         let result = parse_and_classify("CREATE OR REPLACE VIEW v AS SELECT 1");
         assert!(
@@ -1150,5 +1229,88 @@ mod tests {
             matches!(result, Ok(StatementKind::ShowStats(_))),
             "Expected ShowStats, got: {result:?}"
         );
+    }
+
+    // ── Branch/Tag DDL tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_create_branch_classified_as_ref_ddl() {
+        let kind = parse_and_classify("ALTER TABLE t CREATE BRANCH feature_x").unwrap();
+        match kind {
+            StatementKind::RefDdl(b) => match *b {
+                RefDdl::CreateBranch { name, .. } => assert_eq!(name, "feature_x"),
+                other => panic!("expected CreateBranch, got {other:?}"),
+            },
+            other => panic!("expected RefDdl, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_create_tag_classified_as_ref_ddl() {
+        let kind = parse_and_classify("ALTER TABLE t CREATE TAG v1").unwrap();
+        assert!(matches!(kind, StatementKind::RefDdl(_)));
+    }
+
+    #[test]
+    fn test_drop_branch_classified_as_ref_ddl() {
+        let kind = parse_and_classify("ALTER TABLE t DROP BRANCH stale").unwrap();
+        assert!(matches!(kind, StatementKind::RefDdl(_)));
+    }
+
+    #[test]
+    fn test_drop_tag_if_exists_classified_as_ref_ddl() {
+        let kind = parse_and_classify("ALTER TABLE t DROP TAG v1 IF EXISTS").unwrap();
+        assert!(matches!(kind, StatementKind::RefDdl(_)));
+    }
+
+    #[test]
+    fn test_alter_table_add_column_still_alter_schema() {
+        // Regression: branch pre-scan must not steal regular ALTER TABLE.
+        let kind = parse_and_classify("ALTER TABLE t ADD COLUMN x INT").unwrap();
+        assert!(matches!(kind, StatementKind::AlterSchema(_)));
+    }
+
+    #[test]
+    fn test_ref_ddl_name() {
+        let kind = parse_and_classify("ALTER TABLE t CREATE BRANCH b").unwrap();
+        assert_eq!(kind.name(), "refddl");
+    }
+
+    // ── SET WRITE_BRANCH tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_set_write_branch_quoted() {
+        let kind = parse_and_classify("SET WRITE_BRANCH = 'feature_x'").unwrap();
+        match kind {
+            StatementKind::SetWriteBranch(Some(name)) => assert_eq!(name, "feature_x"),
+            other => panic!("expected SetWriteBranch, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_set_write_branch_without_equals() {
+        let kind = parse_and_classify("SET WRITE_BRANCH 'trunk'").unwrap();
+        match kind {
+            StatementKind::SetWriteBranch(Some(name)) => assert_eq!(name, "trunk"),
+            other => panic!("expected SetWriteBranch, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_set_write_branch_default_clears() {
+        let kind = parse_and_classify("SET WRITE_BRANCH = DEFAULT").unwrap();
+        assert!(matches!(kind, StatementKind::SetWriteBranch(None)));
+    }
+
+    #[test]
+    fn test_set_write_branch_null_clears() {
+        let kind = parse_and_classify("SET WRITE_BRANCH = NULL").unwrap();
+        assert!(matches!(kind, StatementKind::SetWriteBranch(None)));
+    }
+
+    #[test]
+    fn test_set_write_branch_name() {
+        let kind = parse_and_classify("SET WRITE_BRANCH = 'x'").unwrap();
+        assert_eq!(kind.name(), "setwritebranch");
     }
 }
