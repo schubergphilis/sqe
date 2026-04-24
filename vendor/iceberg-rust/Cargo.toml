@@ -21,6 +21,7 @@ members = [
   "crates/iceberg",
   "crates/catalog/rest",
   "crates/integrations/datafusion",
+  "crates/test_utils",
 ]
 resolver = "2"
 

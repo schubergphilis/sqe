@@ -651,6 +651,17 @@ partition_struct: {:?}, partition_type: {:?}",
             );
         }
 
+        // RowDelta/MoR: position and equality delete files must be counted in
+        // the snapshot summary so downstream tooling (Spark, matrix checks,
+        // dbt) can see added-delete-files, total-position-deletes, etc.
+        for delete_file in &self.added_delete_files {
+            summary_collector.add_file(
+                delete_file,
+                table_metadata.current_schema().clone(),
+                table_metadata.default_partition_spec().clone(),
+            );
+        }
+
         let previous_snapshot = table_metadata
             .snapshot_by_id(self.snapshot_id)
             .and_then(|snapshot| snapshot.parent_snapshot_id())
