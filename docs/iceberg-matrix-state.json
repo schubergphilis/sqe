@@ -10,14 +10,14 @@
     "group": "3rd Party",
     "docUrl": "https://github.com/schubergphilis/sqe"
   },
-  "generatedAt": "2026-04-24T13:30:00Z",
-  "generatedBy": "Phase A+B+C+D integration",
+  "generatedAt": "2026-04-24T15:00:00Z",
+  "generatedBy": "Phase A+B+C+D+G integration",
   "score": {
-    "raw": 87,
+    "raw": 89,
     "max": 189,
-    "percent": 46.0
+    "percent": 47.1
   },
-  "note": "Integration of all four parallel phases: Phase A catalogs, Phase B maintenance, Phase C branching/tagging, Phase D V3 types. Honest ratings throughout (HMS/Glue stubs marked none, rewrite_data_files partial).",
+  "note": "Integration of Phase A catalogs, Phase B maintenance, Phase C branching/tagging, Phase D V3 types, and Phase G CDC range scan. Honest ratings throughout (HMS/Glue stubs marked none, rewrite_data_files partial, CDC partial for parser+planner pending full coordinator wiring).",
   "support": {
     "sqe:position-deletes:v2": {
       "level": "full",
@@ -412,10 +412,13 @@
       "caveats": []
     },
     "sqe:cdc-support:v3": {
-      "level": "none",
-      "notes": "Planned in Phase G.",
-      "evidence": null,
-      "caveats": []
+      "level": "partial",
+      "notes": "FOR INCREMENTAL BETWEEN SNAPSHOT x AND SNAPSHOT y parses; range-scan planner walks parent chain and collects added files; meta columns (_change_type, _change_ordinal, _commit_snapshot_id) materialise. Full coordinator wiring lands in a follow-up commit.",
+      "evidence": "crates/sqe-catalog/src/incremental_scan.rs, crates/sqe-sql/src/time_travel.rs",
+      "caveats": [
+        "Changelog view (full row-level deltas) deferred; Phase G covers range scan only.",
+        "Coordinator query handler wiring pending."
+      ]
     },
     "sqe:lineage:v3": {
       "level": "none",
