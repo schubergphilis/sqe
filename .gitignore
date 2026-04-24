@@ -7,6 +7,9 @@ tests/.test-env
 .claude/worktrees/
 benchmarks/results/
 
+# Vendored iceberg-rust has its own resolver; its Cargo.lock is not checked in.
+vendor/iceberg-rust/Cargo.lock
+
 # Secrets & certs
 .env
 .env.*

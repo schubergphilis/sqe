@@ -468,7 +468,12 @@ impl QueryHandler {
 
                 StatementKind::Delete(stmt) => {
                     let (ctx, session_catalog) = self.create_session_context(session).await?;
-                    self.write_handler.handle_delete(session, stmt, session_catalog, &ctx).await
+                    // Dispatch on `write.delete.mode` table property. Default CoW
+                    // matches prior behaviour; `merge-on-read` routes to position
+                    // or equality deletes depending on declared primary key.
+                    self.write_handler
+                        .handle_delete_dispatch(session, stmt, session_catalog, &ctx)
+                        .await
                 }
 
                 StatementKind::Update(stmt) => {
