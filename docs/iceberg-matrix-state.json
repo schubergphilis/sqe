@@ -13,11 +13,11 @@
   "generatedAt": "2026-04-24T15:00:00Z",
   "generatedBy": "Phase A+B+C+D+F integration",
   "score": {
-    "raw": 92,
+    "raw": 91,
     "max": 189,
-    "percent": 48.7
+    "percent": 48.1
   },
-  "note": "Integration of five phases: A catalogs, B maintenance, C branching/tagging, D V3 types, F Puffin bloom filters. Honest ratings throughout (HMS/Glue stubs marked none, rewrite_data_files partial, bloom-filters v3 partial pending V3 integration run).",
+  "note": "Phase F ships bloom filter write + Puffin NDV sketch emission in the coordinator batch path. Read probe and worker-side streaming write deferred. bloom-filters:v2 none->partial (+2), bloom-filters:v3 none->partial (+2).",
   "support": {
     "sqe:position-deletes:v2": {
       "level": "full",
@@ -248,11 +248,13 @@
       "caveats": []
     },
     "sqe:bloom-filters:v2": {
-      "level": "full",
-      "notes": "write.parquet.bloom-filter-columns + write.parquet.bloom-filter-fpp honoured at write. DataFusion reads blooms during Parquet scan by default. Puffin theta-sketch sidecar emitted on CTAS/INSERT when write.puffin.stats = 'true'.",
-      "evidence": "crates/sqe-coordinator/src/writer.rs, crates/sqe-catalog/src/puffin_stats.rs",
+      "level": "partial",
+      "notes": "write.parquet.bloom-filter-columns + write.parquet.bloom-filter-fpp honoured in the coordinator's CTAS/INSERT batch path. DataFusion reads blooms automatically from Parquet files. Puffin theta-sketch sidecar emitted via puffin_stats module. CALL system.suggest_bloom_filter_columns analyses query history.",
+      "evidence": "crates/sqe-coordinator/src/writer.rs, crates/sqe-catalog/src/puffin_stats.rs, crates/sqe-coordinator/src/suggest_bloom.rs",
       "caveats": [
-        "Streaming CTAS/INSERT paths do not yet emit Puffin sidecars."
+        "Worker / streaming write path (sqe-worker) not wired; distributed writes miss blooms.",
+        "Read-probe end-to-end verification (files_pruned_bloom via EXPLAIN ANALYZE) deferred -- needs docker-compose.test.yml.",
+        "DataFusion StatisticsSource consumer for Puffin NDV is blocked on DF 54 (apache/datafusion#21157)."
       ]
     },
     "sqe:bloom-filters:v3": {
