@@ -236,22 +236,26 @@ async fn async_main() -> anyhow::Result<()> {
     };
 
     // Initialize query handler
-    let query_handler = Arc::new(QueryHandler::new(
-        policy_enforcer,
-        None, // policy_store — wired when policy engine is enabled
-        config.clone(),
-        if config.coordinator.worker_urls.is_empty() {
-            None
-        } else {
-            Some(worker_registry.clone())
-        },
-        None, // credential tracker — wired via sqe_server binary
-        Some(metrics.clone()),
-        Some(audit.clone()),
-        query_tracker,
-        query_cache,
-        grant_backend,
-    )?.with_table_cache(table_cache));
+    let query_handler = Arc::new(
+        QueryHandler::new(
+            policy_enforcer,
+            None, // policy_store — wired when policy engine is enabled
+            config.clone(),
+            if config.coordinator.worker_urls.is_empty() {
+                None
+            } else {
+                Some(worker_registry.clone())
+            },
+            None, // credential tracker — wired via sqe_server binary
+            Some(metrics.clone()),
+            Some(audit.clone()),
+            query_tracker,
+            query_cache,
+            grant_backend,
+        )?
+        .with_table_cache(table_cache)
+        .with_session_manager(session_manager.clone()),
+    );
 
     // Spawn background memory metrics reporter (updates gauges every 1s for Grafana)
     sqe_coordinator::memory::spawn_metrics_reporter(

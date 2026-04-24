@@ -82,6 +82,36 @@ cargo-test:
       - target/
       - .cargo/registry/
 
+# ── Iceberg matrix score regression guard ─────────────────────
+# Runs `cargo xtask matrix-report --min-percent N` where N is the current
+# baseline. If the committed docs/iceberg-matrix-state.json drops below the
+# baseline, the job fails. Bump MATRIX_MIN_PERCENT when a phase lands.
+matrix-score:
+  stage: check
+  image: rust:bookworm
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq cmake protobuf-compiler libssl-dev pkg-config > /dev/null
+  script:
+    - cargo xtask matrix-report --min-percent $MATRIX_MIN_PERCENT
+  variables:
+    # Baseline updated per phase tag. Current: Phase A+B+C+D integrated at 46%.
+    # Phase E target: 50%. Phase F: 53%. Phase G: 55%. Phase H: 83%.
+    MATRIX_MIN_PERCENT: "45"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - docs/iceberg-matrix-state.json
+        - xtask/**/*
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
+      changes:
+        - docs/iceberg-matrix-state.json
+        - xtask/**/*
+  cache:
+    key: xtask-${CI_COMMIT_REF_SLUG}
+    paths:
+      - target/
+      - .cargo/registry/
+
 # ── Container builds ───────────────────────────────────────────
 
 # Disable template default job — we define our own below

@@ -14,6 +14,7 @@ members = [
     "crates/sqe-metrics",
     "crates/sqe-cli",
     "crates/sqe-bench",
+    "xtask",
 ]
 # Exclude vendored iceberg-rust — it has its own workspace.
 # SQE references the crates via path deps, not workspace members.
