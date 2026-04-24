@@ -20,6 +20,7 @@ use sqe_catalog::puffin_stats::{
     puffin_stats_enabled, write_puffin_sidecar,
 };
 use sqe_catalog::{SessionCatalog, TableMetadataCache};
+use sqe_core::table_properties::{WriteMode, resolve_delete_mode};
 use sqe_core::{Session, SqeConfig, SqeError};
 use tracing::instrument;
 
@@ -1261,15 +1262,10 @@ impl WriteHandler {
             return self.handle_delete(session, stmt, catalog, ctx).await;
         };
 
-        let mode = table
-            .metadata()
-            .properties()
-            .get("write.delete.mode")
-            .map(|s| s.as_str())
-            .unwrap_or("copy-on-write");
+        let mode = resolve_delete_mode(table.metadata().properties())?;
 
         match mode {
-            "merge-on-read" => {
+            WriteMode::MergeOnRead => {
                 // Prefer equality deletes when the table declares a PK.
                 let has_ids = table
                     .metadata()
@@ -1291,13 +1287,10 @@ impl WriteHandler {
                     self.handle_delete_mor(session, stmt, catalog, ctx).await
                 }
             }
-            "copy-on-write" => {
+            WriteMode::CopyOnWrite => {
                 info!(table = %table_ident, "DELETE dispatch: CoW");
                 self.handle_delete(session, stmt, catalog, ctx).await
             }
-            other => Err(SqeError::Execution(format!(
-                "unsupported write.delete.mode '{other}' on table {table_ident}; expected 'copy-on-write' or 'merge-on-read'"
-            ))),
         }
     }
 
