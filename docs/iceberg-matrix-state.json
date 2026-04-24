@@ -10,14 +10,14 @@
     "group": "3rd Party",
     "docUrl": "https://github.com/schubergphilis/sqe"
   },
-  "generatedAt": "2026-04-24T13:30:00Z",
-  "generatedBy": "Phase A+B+C+D integration",
+  "generatedAt": "2026-04-24T15:20:00Z",
+  "generatedBy": "Phase E row-delta",
   "score": {
-    "raw": 87,
+    "raw": 91,
     "max": 189,
-    "percent": 46.0
+    "percent": 48.1
   },
-  "note": "Integration of all four parallel phases: Phase A catalogs, Phase B maintenance, Phase C branching/tagging, Phase D V3 types. Honest ratings throughout (HMS/Glue stubs marked none, rewrite_data_files partial).",
+  "note": "Phase E lands equality-delete writer and RowDeltaAction commit path. equality-deletes:v2 none->partial (+2), equality-deletes:v3 none->partial (+2). merge-on-read stays partial until Phase H brings UPDATE/MERGE. Prior phases unchanged.",
   "support": {
     "sqe:position-deletes:v2": {
       "level": "full",
@@ -34,28 +34,33 @@
       ]
     },
     "sqe:equality-deletes:v2": {
-      "level": "none",
-      "notes": "Writer exists in vendored iceberg-rust; no SQE commit path.",
-      "evidence": null,
-      "caveats": []
+      "level": "partial",
+      "notes": "DELETE with write.delete.mode=merge-on-read writes equality-delete files via EqualityDeleteFileWriter and commits through RowDeltaAction. Unit tests assert file structure (3 data + 2 pos-delete + 1 eq-delete + Operation::Overwrite). Cross-engine read verification (Spark 4.1) ships as #[ignore] integration test pending docker-compose.spark.yml.",
+      "evidence": "crates/sqe-coordinator/src/write_handler.rs#handle_delete_equality",
+      "caveats": [
+        "No cross-engine read test executed (Spark interop is #[ignore]).",
+        "RowDeltaOperation::delete_entries simplified to Ok(vec![]) against the RisingWave fork's SnapshotProducer; behaviour matches the fork's own CoW path but not independently verified against Java Iceberg."
+      ]
     },
     "sqe:equality-deletes:v3": {
-      "level": "none",
-      "notes": "Blocked on V2 support.",
-      "evidence": null,
-      "caveats": []
+      "level": "partial",
+      "notes": "Same writer path as V2; V3 roundtrip not yet exercised in integration tests.",
+      "evidence": "crates/sqe-coordinator/src/write_handler.rs#handle_delete_equality",
+      "caveats": [
+        "V3 end-to-end test pending."
+      ]
     },
     "sqe:merge-on-read:v2": {
       "level": "partial",
-      "notes": "DELETE emits position deletes; UPDATE and MERGE still CoW.",
-      "evidence": "crates/sqe-planner/src/dml.rs",
+      "notes": "DELETE dispatches to equality-delete (PK tables) or position-delete (no PK) via write.delete.mode. UPDATE and MERGE still take the CoW path; MoR dispatch for those lands in Phase H.",
+      "evidence": "crates/sqe-coordinator/src/write_handler.rs#handle_delete_dispatch",
       "caveats": [
-        "UPDATE/MERGE not on MoR path."
+        "Only DELETE has a MoR path; UPDATE and MERGE still CoW."
       ]
     },
     "sqe:merge-on-read:v3": {
       "level": "none",
-      "notes": "Blocked on V2.",
+      "notes": "Blocked on Phase H (UPDATE/MERGE MoR).",
       "evidence": null,
       "caveats": []
     },
