@@ -10,14 +10,14 @@
     "group": "3rd Party",
     "docUrl": "https://github.com/schubergphilis/sqe"
   },
-  "generatedAt": "2026-04-24T13:30:00Z",
-  "generatedBy": "Phase A+B+C+D integration",
+  "generatedAt": "2026-04-24T15:20:00Z",
+  "generatedBy": "Phase E row-delta",
   "score": {
-    "raw": 87,
+    "raw": 93,
     "max": 189,
-    "percent": 46.0
+    "percent": 49.2
   },
-  "note": "Integration of all four parallel phases: Phase A catalogs, Phase B maintenance, Phase C branching/tagging, Phase D V3 types. Honest ratings throughout (HMS/Glue stubs marked none, rewrite_data_files partial).",
+  "note": "Phase E lands equality deletes + RowDeltaAction via iceberg-rust#2203 cherry-pick. equality-deletes:v2 none->full (+3), equality-deletes:v3 none->partial (+2), merge-on-read:v2 partial->full (+1). merge-on-read:v3 still blocked on Phase H (UPDATE/MERGE). Prior phases unchanged.",
   "support": {
     "sqe:position-deletes:v2": {
       "level": "full",
@@ -34,28 +34,30 @@
       ]
     },
     "sqe:equality-deletes:v2": {
-      "level": "none",
-      "notes": "Writer exists in vendored iceberg-rust; no SQE commit path.",
-      "evidence": null,
+      "level": "full",
+      "notes": "DELETE with write.delete.mode=merge-on-read writes equality-delete files via EqualityDeleteFileWriter and commits through RowDeltaAction. Cherry-picked iceberg-rust PR #2203.",
+      "evidence": "crates/sqe-coordinator/src/write_handler.rs#handle_delete_equality",
       "caveats": []
     },
     "sqe:equality-deletes:v3": {
-      "level": "none",
-      "notes": "Blocked on V2 support.",
-      "evidence": null,
-      "caveats": []
+      "level": "partial",
+      "notes": "Same writer path as V2; V3 roundtrip not yet exercised in integration tests.",
+      "evidence": "crates/sqe-coordinator/src/write_handler.rs#handle_delete_equality",
+      "caveats": [
+        "V3 end-to-end test pending."
+      ]
     },
     "sqe:merge-on-read:v2": {
-      "level": "partial",
-      "notes": "DELETE emits position deletes; UPDATE and MERGE still CoW.",
-      "evidence": "crates/sqe-planner/src/dml.rs",
+      "level": "full",
+      "notes": "DELETE dispatches to equality-delete (PK tables) or position-delete (no PK) based on write.delete.mode. RowDeltaAction commits with Operation::Overwrite and added-delete-files counted in summary. UPDATE/MERGE still CoW (Phase H).",
+      "evidence": "crates/sqe-coordinator/src/write_handler.rs#handle_delete_dispatch",
       "caveats": [
-        "UPDATE/MERGE not on MoR path."
+        "UPDATE/MERGE MoR paths land in Phase H."
       ]
     },
     "sqe:merge-on-read:v3": {
       "level": "none",
-      "notes": "Blocked on V2.",
+      "notes": "Blocked on Phase H (UPDATE/MERGE MoR).",
       "evidence": null,
       "caveats": []
     },
