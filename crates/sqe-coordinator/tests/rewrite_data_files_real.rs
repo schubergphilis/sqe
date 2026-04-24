@@ -26,20 +26,22 @@ mod common;
 
 use arrow_array::{Array, Int64Array};
 
-/// Helper: fetch the live data-file count from a table via catalog reload.
+/// Helper: fetch the live data-file count from a table via the table_files TVF.
 ///
-/// We go through a SELECT against the `files` metadata table which lists one
-/// row per live data file. The test is black-box: we do not import the
-/// coordinator's internal types.
+/// SQE exposes Iceberg metadata through DataFusion TVFs, not the Iceberg-
+/// standard `{table}.files` pseudo-table syntax. `table_files('ns', 't')`
+/// returns one row per live data file. The test stays black-box (no import
+/// of coordinator internals) but speaks SQE's actual metadata dialect.
 async fn live_data_file_count(
     handler: &sqe_coordinator::QueryHandler,
     session: &sqe_core::Session,
-    table: &str,
+    namespace: &str,
+    table_name: &str,
 ) -> i64 {
     let batches = handler
         .execute(
             session,
-            &format!("SELECT COUNT(*) FROM {table}.\"files\""),
+            &format!("SELECT COUNT(*) FROM table_files('{namespace}', '{table_name}')"),
         )
         .await
         .expect("files metadata scan");
@@ -55,7 +57,9 @@ async fn live_data_file_count(
 async fn rewrite_merges_small_files_preserves_rows() {
     let (session, handler) = common::setup_handler().await;
 
-    let table = "default.rewrite_real_test";
+    let namespace = "default";
+    let table_name = "rewrite_real_test";
+    let table = format!("{namespace}.{table_name}");
     let _ = handler
         .execute(&session, &format!("DROP TABLE IF EXISTS {table}"))
         .await;
@@ -74,7 +78,7 @@ async fn rewrite_merges_small_files_preserves_rows() {
             .expect("INSERT");
     }
 
-    let before_files = live_data_file_count(&handler, &session, table).await;
+    let before_files = live_data_file_count(&handler, &session, namespace, table_name).await;
     assert_eq!(
         before_files, 50,
         "setup invariant: 50 inserts should produce 50 live data files, got {before_files}"
@@ -105,7 +109,7 @@ async fn rewrite_merges_small_files_preserves_rows() {
     // File count must drop. Upper bound is generous: the writer may roll once
     // the group exceeds its internal cutoff, but 10 files for 50 tiny rows is
     // a ceiling.
-    let after_files = live_data_file_count(&handler, &session, table).await;
+    let after_files = live_data_file_count(&handler, &session, namespace, table_name).await;
     assert!(
         after_files < before_files,
         "file count must drop after rewrite: before={before_files} after={after_files}"
@@ -157,7 +161,9 @@ async fn rewrite_merges_small_files_preserves_rows() {
 async fn rewrite_skips_below_min_input_files() {
     let (session, handler) = common::setup_handler().await;
 
-    let table = "default.rewrite_real_min_skip";
+    let namespace = "default";
+    let table_name = "rewrite_real_min_skip";
+    let table = format!("{namespace}.{table_name}");
     let _ = handler
         .execute(&session, &format!("DROP TABLE IF EXISTS {table}"))
         .await;
@@ -175,7 +181,7 @@ async fn rewrite_skips_below_min_input_files() {
             .expect("INSERT");
     }
 
-    let before_files = live_data_file_count(&handler, &session, table).await;
+    let before_files = live_data_file_count(&handler, &session, namespace, table_name).await;
     assert_eq!(before_files, 3);
 
     let summary = handler
@@ -200,7 +206,7 @@ async fn rewrite_skips_below_min_input_files() {
         "expected skip status, got '{status}'"
     );
 
-    let after_files = live_data_file_count(&handler, &session, table).await;
+    let after_files = live_data_file_count(&handler, &session, namespace, table_name).await;
     assert_eq!(
         before_files, after_files,
         "below-threshold rewrite must not change file count"
