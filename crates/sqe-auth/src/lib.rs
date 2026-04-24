@@ -1,6 +1,7 @@
 pub mod oidc_password;
 pub mod oidc_provider;
 pub mod oidc_discovery;
+pub mod oidc_m2m;
 pub mod oauth;
 pub mod anonymous;
 pub mod api_key;
@@ -28,6 +29,7 @@ pub use provider::{AuthProvider, AuthError, FlightCredentials, Identity};
 pub use chain::AuthChain;
 pub use oidc_discovery::{OidcDiscovery, OidcDiscoveryConfig, DiscoveredEndpoints};
 pub use oidc_provider::{OidcPasswordProvider, OidcPasswordProviderConfig};
+pub use oidc_m2m::{OidcM2mConfig, OidcM2mProvider};
 pub use anonymous::{AnonymousProvider, AnonymousProviderConfig};
 pub use api_key::{ApiKeyProvider, ApiKeyProviderConfig, ApiKeyEntry};
 pub use aws_iam::{AwsIamProvider, AwsIamProviderConfig, KeyMapping as AwsKeyMapping};

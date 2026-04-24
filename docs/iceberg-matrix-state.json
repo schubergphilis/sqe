@@ -10,83 +10,414 @@
     "group": "3rd Party",
     "docUrl": "https://github.com/schubergphilis/sqe"
   },
-  "generatedAt": "2026-04-24T00:00:00Z",
-  "generatedBy": "seed (pre-automation)",
+  "generatedAt": "2026-04-24T12:00:00Z",
+  "generatedBy": "Phase A catalog adoption (sql/hadoop backends + OIDC M2M)",
   "score": {
-    "raw": 58,
+    "raw": 63,
     "max": 189,
-    "percent": 30.7
+    "percent": 33.3
   },
-  "note": "Seed baseline captured from docs/superpowers/plans/2026-04-24-iceberg-matrix-parity.md and openspec/changes/iceberg-matrix-parity/. Regenerate with `cargo xtask matrix-report` once the automation lands in Phase 1 task 1.2.",
+  "note": "Phase A partial: JDBC/SQLite, Hadoop storage-only, and OIDC M2M auth landed with tests. HMS and Glue stubs carry typed configs; full Thrift/AWS-SDK wiring tracks the rebase onto apache/iceberg-rust. Nessie documented in docs/deployment.md (Section 5b).",
   "support": {
-    "sqe:position-deletes:v2":          { "level": "full",    "notes": "PositionDeleteFileWriter + FastAppendAction (Step 8d).", "evidence": "crates/sqe-worker/src/exec/delete.rs", "caveats": [] },
-    "sqe:position-deletes:v3":          { "level": "unknown", "notes": "V3 path not tested end-to-end.", "evidence": null, "caveats": ["No V3 integration test yet."] },
-    "sqe:equality-deletes:v2":          { "level": "none",    "notes": "Writer exists in vendored iceberg-rust; no SQE commit path.", "evidence": null, "caveats": [] },
-    "sqe:equality-deletes:v3":          { "level": "none",    "notes": "Blocked on V2 support.", "evidence": null, "caveats": [] },
-    "sqe:merge-on-read:v2":             { "level": "partial", "notes": "DELETE emits position deletes; UPDATE and MERGE still CoW.", "evidence": "crates/sqe-planner/src/dml.rs", "caveats": ["UPDATE/MERGE not on MoR path."] },
-    "sqe:merge-on-read:v3":             { "level": "none",    "notes": "Blocked on V2.", "evidence": null, "caveats": [] },
-    "sqe:copy-on-write:v2":             { "level": "full",    "notes": "DELETE/UPDATE/MERGE via RisingWave iceberg-rust fork rewrite_files().", "evidence": "vendor/iceberg-rust/crates/iceberg/src/transaction/rewrite_files.rs", "caveats": [] },
-    "sqe:copy-on-write:v3":             { "level": "none",    "notes": "V3 feature roundtrip untested.", "evidence": null, "caveats": [] },
-
-    "sqe:schema-evolution:v2":          { "level": "full",    "notes": "ADD/DROP/RENAME COLUMN, SET/DROP NOT NULL (Step 7.3).", "evidence": "crates/sqe-sql/src/ddl.rs", "caveats": [] },
-    "sqe:schema-evolution:v3":          { "level": "unknown", "notes": "V3 type coverage untested.", "evidence": null, "caveats": [] },
-    "sqe:type-promotion:v2":            { "level": "full",    "notes": "int->long, float->double, decimal widening.", "evidence": "crates/sqe-sql/src/ddl.rs", "caveats": [] },
-    "sqe:type-promotion:v3":            { "level": "unknown", "notes": "V3 type coverage untested.", "evidence": null, "caveats": [] },
-    "sqe:column-default-values:v3":     { "level": "unknown", "notes": "iceberg-rust has initial_default/write_default; SQE DDL does not expose.", "evidence": "vendor/iceberg-rust/crates/iceberg/src/spec/datatypes.rs", "caveats": ["No DDL surface."] },
-    "sqe:table-creation:v2":            { "level": "full",    "notes": "CREATE TABLE, CTAS streaming.", "evidence": "crates/sqe-coordinator/src/handlers/ddl.rs", "caveats": [] },
-    "sqe:table-creation:v3":            { "level": "none",    "notes": "Format-version 3 not emitted.", "evidence": null, "caveats": [] },
-    "sqe:time-travel:v2":               { "level": "full",    "notes": "FOR SYSTEM_TIME AS OF + 6 metadata TVFs (Step 8c).", "evidence": "crates/sqe-sql/src/time_travel.rs", "caveats": [] },
-    "sqe:time-travel:v3":               { "level": "none",    "notes": "V3 not tested.", "evidence": null, "caveats": [] },
-    "sqe:table-maintenance:v2":         { "level": "none",    "notes": "Vendored actions exist; no SQL surface.", "evidence": null, "caveats": ["No CALL system.* procedures."] },
-    "sqe:table-maintenance:v3":         { "level": "none",    "notes": "Blocked on V2.", "evidence": null, "caveats": [] },
-    "sqe:branching-tagging:v2":         { "level": "none",    "notes": "Not implemented.", "evidence": null, "caveats": [] },
-    "sqe:branching-tagging:v3":         { "level": "none",    "notes": "Not implemented.", "evidence": null, "caveats": [] },
-
-    "sqe:hidden-partitioning:v2":       { "level": "full",    "notes": "year/month/day/hour/bucket/truncate.", "evidence": "crates/sqe-catalog/src/partition_spec.rs", "caveats": [] },
-    "sqe:hidden-partitioning:v3":       { "level": "none",    "notes": "V3 type coverage missing.", "evidence": null, "caveats": [] },
-    "sqe:partition-evolution:v2":       { "level": "full",    "notes": "Partition spec evolution supported.", "evidence": "crates/sqe-catalog/src/partition_spec.rs", "caveats": [] },
-    "sqe:partition-evolution:v3":       { "level": "none",    "notes": "V3 type coverage missing.", "evidence": null, "caveats": [] },
-    "sqe:multi-arg-transforms:v3":      { "level": "none",    "notes": "Spec not stable upstream.", "evidence": null, "caveats": [] },
-
-    "sqe:read-support:v2":              { "level": "full",    "notes": "DataFusion 53 scan + predicate pushdown + projection.", "evidence": "crates/sqe-catalog/src/scan.rs", "caveats": [] },
-    "sqe:read-support:v3":              { "level": "none",    "notes": "V3-specific features untested.", "evidence": null, "caveats": [] },
-    "sqe:write-insert:v2":              { "level": "full",    "notes": "Streaming INSERT and CTAS.", "evidence": "crates/sqe-worker/src/exec/insert.rs", "caveats": [] },
-    "sqe:write-insert:v3":              { "level": "none",    "notes": "No V3-enabled tables produced.", "evidence": null, "caveats": [] },
-    "sqe:write-merge-update-delete:v2": { "level": "full",    "notes": "All three DML ops via CoW rewrite_files().", "evidence": "crates/sqe-planner/src/dml.rs", "caveats": [] },
-    "sqe:write-merge-update-delete:v3": { "level": "none",    "notes": "V3 untested.", "evidence": null, "caveats": [] },
-    "sqe:catalog-integration:v2":       { "level": "full",    "notes": "Iceberg REST (Polaris primary).", "evidence": "crates/sqe-catalog/src/rest.rs", "caveats": [] },
-    "sqe:catalog-integration:v3":       { "level": "none",    "notes": "V3 tables not exercised.", "evidence": null, "caveats": [] },
-    "sqe:statistics:v2":                { "level": "full",    "notes": "Column metrics used for pruning and CBO.", "evidence": "crates/sqe-planner/src/stats.rs", "caveats": [] },
-    "sqe:statistics:v3":                { "level": "none",    "notes": "V3 untested.", "evidence": null, "caveats": [] },
-    "sqe:bloom-filters:v2":             { "level": "none",    "notes": "Parquet footer min/max only; no bloom, no Puffin emit.", "evidence": null, "caveats": [] },
-    "sqe:bloom-filters:v3":             { "level": "none",    "notes": "Blocked on V2.", "evidence": null, "caveats": [] },
-
-    "sqe:hive-metastore:v2":            { "level": "none",    "notes": "Planned in Phase A.", "evidence": null, "caveats": [] },
-    "sqe:hive-metastore:v3":            { "level": "none",    "notes": "Blocked on V2.", "evidence": null, "caveats": [] },
-    "sqe:aws-glue-catalog:v2":          { "level": "none",    "notes": "Planned in Phase A.", "evidence": null, "caveats": [] },
-    "sqe:aws-glue-catalog:v3":          { "level": "none",    "notes": "Blocked on V2.", "evidence": null, "caveats": [] },
-    "sqe:rest-catalog:v2":              { "level": "full",    "notes": "Primary catalog type.", "evidence": "crates/sqe-catalog/src/rest.rs", "caveats": [] },
-    "sqe:rest-catalog:v3":              { "level": "none",    "notes": "V3-enabled REST catalogs untested.", "evidence": null, "caveats": [] },
-    "sqe:nessie:v2":                    { "level": "partial", "notes": "Works via iceberg-catalog-rest against Nessie's REST adapter; undocumented.", "evidence": null, "caveats": ["No integration test yet."] },
-    "sqe:nessie:v3":                    { "level": "none",    "notes": "Blocked on V3 catalog exercise.", "evidence": null, "caveats": [] },
-    "sqe:polaris:v2":                   { "level": "full",    "notes": "Primary target catalog.", "evidence": "crates/sqe-catalog/src/rest.rs", "caveats": [] },
-    "sqe:polaris:v3":                   { "level": "none",    "notes": "V3 untested.", "evidence": null, "caveats": [] },
-    "sqe:unity-catalog:v2":             { "level": "partial", "notes": "Compatible via REST; no M2M auth provider yet.", "evidence": null, "caveats": ["PAT-only; no OIDC M2M."] },
-    "sqe:unity-catalog:v3":             { "level": "none",    "notes": "Blocked.", "evidence": null, "caveats": [] },
-    "sqe:snowflake-horizon-catalog:v2": { "level": "partial", "notes": "Horizon is Polaris-based; REST wiring compatible; no live test.", "evidence": null, "caveats": ["No live integration test."] },
-    "sqe:snowflake-horizon-catalog:v3": { "level": "none",    "notes": "Blocked.", "evidence": null, "caveats": [] },
-    "sqe:hadoop-catalog:v2":            { "level": "none",    "notes": "Planned in Phase A (storage-only backend).", "evidence": null, "caveats": [] },
-    "sqe:hadoop-catalog:v3":            { "level": "none",    "notes": "Blocked.", "evidence": null, "caveats": [] },
-    "sqe:jdbc-catalog:v2":              { "level": "none",    "notes": "Planned in Phase A (iceberg-catalog-sql adoption).", "evidence": null, "caveats": [] },
-    "sqe:jdbc-catalog:v3":              { "level": "none",    "notes": "Blocked.", "evidence": null, "caveats": [] },
-
-    "sqe:variant-type:v3":              { "level": "none",    "notes": "Deferred to next cycle. iceberg-rust #2188 not merged.", "evidence": null, "caveats": [] },
-    "sqe:shredded-variant:v3":          { "level": "none",    "notes": "Deferred. Blocked on arrow-rs #9790.", "evidence": null, "caveats": [] },
-    "sqe:geometry-type:v3":             { "level": "none",    "notes": "Deferred. Blocked on DataFusion UDT (#12644).", "evidence": null, "caveats": [] },
-    "sqe:vector-type:v3":               { "level": "none",    "notes": "Deferred. Iceberg V3 vector spec not finalised.", "evidence": null, "caveats": [] },
-    "sqe:nanosecond-timestamps:v3":     { "level": "unknown", "notes": "iceberg-rust has TimestampNs; SQE DDL does not expose.", "evidence": "vendor/iceberg-rust/crates/iceberg/src/spec/datatypes.rs", "caveats": [] },
-
-    "sqe:cdc-support:v3":               { "level": "none",    "notes": "Planned in Phase G.", "evidence": null, "caveats": [] },
-    "sqe:lineage:v3":                   { "level": "none",    "notes": "Deferred to next cycle.", "evidence": null, "caveats": [] }
+    "sqe:position-deletes:v2": {
+      "level": "full",
+      "notes": "PositionDeleteFileWriter + FastAppendAction (Step 8d).",
+      "evidence": "crates/sqe-worker/src/exec/delete.rs",
+      "caveats": []
+    },
+    "sqe:position-deletes:v3": {
+      "level": "unknown",
+      "notes": "V3 path not tested end-to-end.",
+      "evidence": null,
+      "caveats": [
+        "No V3 integration test yet."
+      ]
+    },
+    "sqe:equality-deletes:v2": {
+      "level": "none",
+      "notes": "Writer exists in vendored iceberg-rust; no SQE commit path.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:equality-deletes:v3": {
+      "level": "none",
+      "notes": "Blocked on V2 support.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:merge-on-read:v2": {
+      "level": "partial",
+      "notes": "DELETE emits position deletes; UPDATE and MERGE still CoW.",
+      "evidence": "crates/sqe-planner/src/dml.rs",
+      "caveats": [
+        "UPDATE/MERGE not on MoR path."
+      ]
+    },
+    "sqe:merge-on-read:v3": {
+      "level": "none",
+      "notes": "Blocked on V2.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:copy-on-write:v2": {
+      "level": "full",
+      "notes": "DELETE/UPDATE/MERGE via RisingWave iceberg-rust fork rewrite_files().",
+      "evidence": "vendor/iceberg-rust/crates/iceberg/src/transaction/rewrite_files.rs",
+      "caveats": []
+    },
+    "sqe:copy-on-write:v3": {
+      "level": "none",
+      "notes": "V3 feature roundtrip untested.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:schema-evolution:v2": {
+      "level": "full",
+      "notes": "ADD/DROP/RENAME COLUMN, SET/DROP NOT NULL (Step 7.3).",
+      "evidence": "crates/sqe-sql/src/ddl.rs",
+      "caveats": []
+    },
+    "sqe:schema-evolution:v3": {
+      "level": "unknown",
+      "notes": "V3 type coverage untested.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:type-promotion:v2": {
+      "level": "full",
+      "notes": "int->long, float->double, decimal widening.",
+      "evidence": "crates/sqe-sql/src/ddl.rs",
+      "caveats": []
+    },
+    "sqe:type-promotion:v3": {
+      "level": "unknown",
+      "notes": "V3 type coverage untested.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:column-default-values:v3": {
+      "level": "unknown",
+      "notes": "iceberg-rust has initial_default/write_default; SQE DDL does not expose.",
+      "evidence": "vendor/iceberg-rust/crates/iceberg/src/spec/datatypes.rs",
+      "caveats": [
+        "No DDL surface."
+      ]
+    },
+    "sqe:table-creation:v2": {
+      "level": "full",
+      "notes": "CREATE TABLE, CTAS streaming.",
+      "evidence": "crates/sqe-coordinator/src/handlers/ddl.rs",
+      "caveats": []
+    },
+    "sqe:table-creation:v3": {
+      "level": "none",
+      "notes": "Format-version 3 not emitted.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:time-travel:v2": {
+      "level": "full",
+      "notes": "FOR SYSTEM_TIME AS OF + 6 metadata TVFs (Step 8c).",
+      "evidence": "crates/sqe-sql/src/time_travel.rs",
+      "caveats": []
+    },
+    "sqe:time-travel:v3": {
+      "level": "none",
+      "notes": "V3 not tested.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:table-maintenance:v2": {
+      "level": "none",
+      "notes": "Vendored actions exist; no SQL surface.",
+      "evidence": null,
+      "caveats": [
+        "No CALL system.* procedures."
+      ]
+    },
+    "sqe:table-maintenance:v3": {
+      "level": "none",
+      "notes": "Blocked on V2.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:branching-tagging:v2": {
+      "level": "none",
+      "notes": "Not implemented.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:branching-tagging:v3": {
+      "level": "none",
+      "notes": "Not implemented.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:hidden-partitioning:v2": {
+      "level": "full",
+      "notes": "year/month/day/hour/bucket/truncate.",
+      "evidence": "crates/sqe-catalog/src/partition_spec.rs",
+      "caveats": []
+    },
+    "sqe:hidden-partitioning:v3": {
+      "level": "none",
+      "notes": "V3 type coverage missing.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:partition-evolution:v2": {
+      "level": "full",
+      "notes": "Partition spec evolution supported.",
+      "evidence": "crates/sqe-catalog/src/partition_spec.rs",
+      "caveats": []
+    },
+    "sqe:partition-evolution:v3": {
+      "level": "none",
+      "notes": "V3 type coverage missing.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:multi-arg-transforms:v3": {
+      "level": "none",
+      "notes": "Spec not stable upstream.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:read-support:v2": {
+      "level": "full",
+      "notes": "DataFusion 53 scan + predicate pushdown + projection.",
+      "evidence": "crates/sqe-catalog/src/scan.rs",
+      "caveats": []
+    },
+    "sqe:read-support:v3": {
+      "level": "none",
+      "notes": "V3-specific features untested.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:write-insert:v2": {
+      "level": "full",
+      "notes": "Streaming INSERT and CTAS.",
+      "evidence": "crates/sqe-worker/src/exec/insert.rs",
+      "caveats": []
+    },
+    "sqe:write-insert:v3": {
+      "level": "none",
+      "notes": "No V3-enabled tables produced.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:write-merge-update-delete:v2": {
+      "level": "full",
+      "notes": "All three DML ops via CoW rewrite_files().",
+      "evidence": "crates/sqe-planner/src/dml.rs",
+      "caveats": []
+    },
+    "sqe:write-merge-update-delete:v3": {
+      "level": "none",
+      "notes": "V3 untested.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:catalog-integration:v2": {
+      "level": "full",
+      "notes": "Iceberg REST (Polaris primary).",
+      "evidence": "crates/sqe-catalog/src/rest.rs",
+      "caveats": []
+    },
+    "sqe:catalog-integration:v3": {
+      "level": "none",
+      "notes": "V3 tables not exercised.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:statistics:v2": {
+      "level": "full",
+      "notes": "Column metrics used for pruning and CBO.",
+      "evidence": "crates/sqe-planner/src/stats.rs",
+      "caveats": []
+    },
+    "sqe:statistics:v3": {
+      "level": "none",
+      "notes": "V3 untested.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:bloom-filters:v2": {
+      "level": "none",
+      "notes": "Parquet footer min/max only; no bloom, no Puffin emit.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:bloom-filters:v3": {
+      "level": "none",
+      "notes": "Blocked on V2.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:hive-metastore:v2": {
+      "level": "none",
+      "notes": "Config scaffolding only at backends/hms.rs; all calls return SqeError::Catalog. Functional wiring arrives with upstream iceberg-catalog-hms adoption.",
+      "evidence": "crates/sqe-catalog/src/backends/hms.rs",
+      "caveats": [
+        "Marker only; no functional HMS access yet."
+      ]
+    },
+    "sqe:hive-metastore:v3": {
+      "level": "none",
+      "notes": "Blocked on V2.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:aws-glue-catalog:v2": {
+      "level": "none",
+      "notes": "Config scaffolding only at backends/glue.rs; all calls return SqeError::Catalog. Functional wiring arrives with upstream iceberg-catalog-glue adoption.",
+      "evidence": "crates/sqe-catalog/src/backends/glue.rs",
+      "caveats": [
+        "Marker only; no functional GLUE access yet."
+      ]
+    },
+    "sqe:aws-glue-catalog:v3": {
+      "level": "none",
+      "notes": "Blocked on V2.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:rest-catalog:v2": {
+      "level": "full",
+      "notes": "Primary catalog type.",
+      "evidence": "crates/sqe-catalog/src/rest.rs",
+      "caveats": []
+    },
+    "sqe:rest-catalog:v3": {
+      "level": "none",
+      "notes": "V3-enabled REST catalogs untested.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:nessie:v2": {
+      "level": "full",
+      "notes": "Works via iceberg-catalog-rest against Nessie's REST adapter; documented in docs/deployment.md Section 5b.",
+      "evidence": "docs/deployment.md",
+      "caveats": [
+        "Write parity depends on Nessie's REST adapter completeness."
+      ]
+    },
+    "sqe:nessie:v3": {
+      "level": "none",
+      "notes": "Blocked on V3 catalog exercise.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:polaris:v2": {
+      "level": "full",
+      "notes": "Primary target catalog.",
+      "evidence": "crates/sqe-catalog/src/rest.rs",
+      "caveats": []
+    },
+    "sqe:polaris:v3": {
+      "level": "none",
+      "notes": "V3 untested.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:unity-catalog:v2": {
+      "level": "partial",
+      "notes": "Compatible via REST; OIDC M2M auth provider landed in Phase A.",
+      "evidence": "crates/sqe-auth/src/oidc_m2m.rs",
+      "caveats": [
+        "No live integration test against Unity Catalog yet."
+      ]
+    },
+    "sqe:unity-catalog:v3": {
+      "level": "none",
+      "notes": "Blocked.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:snowflake-horizon-catalog:v2": {
+      "level": "partial",
+      "notes": "Horizon is Polaris-based; REST wiring compatible; no live test.",
+      "evidence": null,
+      "caveats": [
+        "No live integration test."
+      ]
+    },
+    "sqe:snowflake-horizon-catalog:v3": {
+      "level": "none",
+      "notes": "Blocked.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:hadoop-catalog:v2": {
+      "level": "partial",
+      "notes": "Storage-only scanner walks warehouse paths for metadata/v*.metadata.json (feature `hadoop`). Read path only; writes defer to REST/HMS.",
+      "evidence": "crates/sqe-catalog/src/backends/hadoop.rs",
+      "caveats": [
+        "Write path is race-prone on object stores without atomic rename; intentionally read-oriented."
+      ]
+    },
+    "sqe:hadoop-catalog:v3": {
+      "level": "none",
+      "notes": "Blocked.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:jdbc-catalog:v2": {
+      "level": "partial",
+      "notes": "SQLite roundtrip implemented and tested (feature `sql`); PostgreSQL arrives via upstream iceberg-catalog-sql (task 2.11).",
+      "evidence": "crates/sqe-catalog/src/backends/sql.rs",
+      "caveats": [
+        "PostgreSQL path pinned to apache/iceberg-rust adoption in task 2.11."
+      ]
+    },
+    "sqe:jdbc-catalog:v3": {
+      "level": "none",
+      "notes": "Blocked.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:variant-type:v3": {
+      "level": "none",
+      "notes": "Deferred to next cycle. iceberg-rust #2188 not merged.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:shredded-variant:v3": {
+      "level": "none",
+      "notes": "Deferred. Blocked on arrow-rs #9790.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:geometry-type:v3": {
+      "level": "none",
+      "notes": "Deferred. Blocked on DataFusion UDT (#12644).",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:vector-type:v3": {
+      "level": "none",
+      "notes": "Deferred. Iceberg V3 vector spec not finalised.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:nanosecond-timestamps:v3": {
+      "level": "unknown",
+      "notes": "iceberg-rust has TimestampNs; SQE DDL does not expose.",
+      "evidence": "vendor/iceberg-rust/crates/iceberg/src/spec/datatypes.rs",
+      "caveats": []
+    },
+    "sqe:cdc-support:v3": {
+      "level": "none",
+      "notes": "Planned in Phase G.",
+      "evidence": null,
+      "caveats": []
+    },
+    "sqe:lineage:v3": {
+      "level": "none",
+      "notes": "Deferred to next cycle.",
+      "evidence": null,
+      "caveats": []
+    }
   }
 }
