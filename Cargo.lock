@@ -1807,6 +1807,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "datasketches"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c286de4e81ea2590afc24d754e0f83810c566f50a1388fa75ebd57928c0d9745"
+
+[[package]]
 name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4792,6 +4798,7 @@ dependencies = [
  "dashmap",
  "datafusion",
  "datafusion-expr",
+ "datasketches",
  "futures",
  "iceberg",
  "iceberg-catalog-rest",
