@@ -13,11 +13,11 @@
   "generatedAt": "2026-04-24T15:20:00Z",
   "generatedBy": "Phase E row-delta",
   "score": {
-    "raw": 93,
+    "raw": 91,
     "max": 189,
-    "percent": 49.2
+    "percent": 48.1
   },
-  "note": "Phase E lands equality deletes + RowDeltaAction via iceberg-rust#2203 cherry-pick. equality-deletes:v2 none->full (+3), equality-deletes:v3 none->partial (+2), merge-on-read:v2 partial->full (+1). merge-on-read:v3 still blocked on Phase H (UPDATE/MERGE). Prior phases unchanged.",
+  "note": "Phase E lands equality-delete writer and RowDeltaAction commit path. equality-deletes:v2 none->partial (+2), equality-deletes:v3 none->partial (+2). merge-on-read stays partial until Phase H brings UPDATE/MERGE. Prior phases unchanged.",
   "support": {
     "sqe:position-deletes:v2": {
       "level": "full",
@@ -34,10 +34,13 @@
       ]
     },
     "sqe:equality-deletes:v2": {
-      "level": "full",
-      "notes": "DELETE with write.delete.mode=merge-on-read writes equality-delete files via EqualityDeleteFileWriter and commits through RowDeltaAction. Cherry-picked iceberg-rust PR #2203.",
+      "level": "partial",
+      "notes": "DELETE with write.delete.mode=merge-on-read writes equality-delete files via EqualityDeleteFileWriter and commits through RowDeltaAction. Unit tests assert file structure (3 data + 2 pos-delete + 1 eq-delete + Operation::Overwrite). Cross-engine read verification (Spark 4.1) ships as #[ignore] integration test pending docker-compose.spark.yml.",
       "evidence": "crates/sqe-coordinator/src/write_handler.rs#handle_delete_equality",
-      "caveats": []
+      "caveats": [
+        "No cross-engine read test executed (Spark interop is #[ignore]).",
+        "RowDeltaOperation::delete_entries simplified to Ok(vec![]) against the RisingWave fork's SnapshotProducer; behaviour matches the fork's own CoW path but not independently verified against Java Iceberg."
+      ]
     },
     "sqe:equality-deletes:v3": {
       "level": "partial",
@@ -48,11 +51,11 @@
       ]
     },
     "sqe:merge-on-read:v2": {
-      "level": "full",
-      "notes": "DELETE dispatches to equality-delete (PK tables) or position-delete (no PK) based on write.delete.mode. RowDeltaAction commits with Operation::Overwrite and added-delete-files counted in summary. UPDATE/MERGE still CoW (Phase H).",
+      "level": "partial",
+      "notes": "DELETE dispatches to equality-delete (PK tables) or position-delete (no PK) via write.delete.mode. UPDATE and MERGE still take the CoW path; MoR dispatch for those lands in Phase H.",
       "evidence": "crates/sqe-coordinator/src/write_handler.rs#handle_delete_dispatch",
       "caveats": [
-        "UPDATE/MERGE MoR paths land in Phase H."
+        "Only DELETE has a MoR path; UPDATE and MERGE still CoW."
       ]
     },
     "sqe:merge-on-read:v3": {
