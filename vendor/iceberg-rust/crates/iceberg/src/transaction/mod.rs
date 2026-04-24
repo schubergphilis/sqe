@@ -66,6 +66,7 @@ mod overwrite_files;
 mod remove_snapshots;
 mod rewrite_files;
 mod rewrite_manifests;
+mod row_delta;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -75,6 +76,7 @@ mod update_statistics;
 mod upgrade_format_version;
 
 pub use branch::{CreateBranchAction, CreateTagAction, RemoveRefAction};
+pub use row_delta::RowDeltaAction;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -217,6 +219,13 @@ impl Transaction {
     /// It can consolidate small manifests or re-cluster entries.
     pub fn rewrite_manifests(&self) -> RewriteManifestsAction {
         RewriteManifestsAction::new()
+    }
+
+    /// Creates a row-delta action. Commits added data files, added delete files
+    /// (position or equality), and removed data files in a single atomic snapshot.
+    /// Used by MoR DELETE/UPDATE/MERGE paths.
+    pub fn row_delta(&self) -> RowDeltaAction {
+        RowDeltaAction::new()
     }
 
     /// Commit transaction.
