@@ -151,8 +151,13 @@ trap cleanup EXIT INT TERM
 
 run_generate() {
     local bench=$1 log=$2
-    # tpcbb reuses tpcds data; skip its generate step
-    [ "$bench" = "tpcbb" ] && { echo "  [gen] skip (tpcbb reuses tpcds)"; return 0; }
+    # tpcbb reuses tpcds's large fact tables (store_sales, web_sales, etc.)
+    # but ALSO produces its own two tables (web_clickstreams, product_reviews).
+    # So we still call `generate tpcbb`; the generator knows it only emits
+    # those two tables. Previous implementation skipped tpcbb's generate
+    # entirely, which caused the 5 TPC-BB queries that join
+    # web_clickstreams/product_reviews to fail with "Query execution failed"
+    # (tables not found) at load time.
     echo "  [gen] $bench (SF$BENCH_SCALE, threads=$BENCH_GEN_THREADS)"
     BENCH_GEN_THREADS=$BENCH_GEN_THREADS \
       "$BENCH_BIN" generate "$bench" \
