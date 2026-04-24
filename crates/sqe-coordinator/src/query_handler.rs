@@ -491,7 +491,12 @@ impl QueryHandler {
 
                 StatementKind::Update(stmt) => {
                     let (ctx, session_catalog) = self.create_session_context(session).await?;
-                    self.write_handler.handle_update(session, stmt, session_catalog, &ctx).await
+                    // Dispatch on `write.update.mode` table property. Default CoW
+                    // matches prior behaviour; `merge-on-read` routes to the
+                    // equality-delete path when the table has a declared PK.
+                    self.write_handler
+                        .handle_update_dispatch(session, stmt, session_catalog, &ctx)
+                        .await
                 }
 
                 // Transaction stubs — no-ops for JDBC tools that use setAutoCommit(false)
