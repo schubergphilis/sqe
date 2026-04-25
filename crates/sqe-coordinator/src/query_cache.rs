@@ -150,6 +150,26 @@ impl ResultCache {
         }
     }
 
+    /// Drop every cached query. Used after maintenance procedures (CALL
+    /// system.rewrite_data_files, expire_snapshots, etc.) where the per-
+    /// table invalidation does not catch results that referenced the table
+    /// only through a TVF (table_files, table_snapshots), because the
+    /// TableScan in the plan carries the TVF function name rather than
+    /// the underlying Iceberg table identifier.
+    pub fn invalidate_all(&self) {
+        let count = self.cache.entry_count();
+        self.cache.invalidate_all();
+        self.table_index.clear();
+        if count > 0 {
+            info!(evicted = count, "ResultCache invalidated entirely after maintenance procedure");
+        }
+        if let Some(ref m) = self.metrics {
+            m.cache_invalidations.inc_by(count as f64);
+            m.cache_entries.set(0.0);
+            m.cache_size_bytes.set(0.0);
+        }
+    }
+
     pub fn entry_count(&self) -> u64 {
         self.cache.entry_count()
     }

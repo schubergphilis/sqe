@@ -350,7 +350,9 @@ pub async fn create_session_context(
 ///
 /// Must be called after DDL/DML operations (CTAS, DROP TABLE, INSERT, etc.)
 /// that modify the catalog so subsequent queries see the new schema state.
-#[allow(dead_code)]
+/// Also called after CALL system.<maintenance procedure>(...) so the
+/// cached DataFusion TVF MemTables (table_files, table_snapshots, etc.)
+/// rebuild from the post-rewrite Polaris snapshot.
 pub async fn invalidate_session_cache(username: &str) {
     let prefix = format!("{username}:");
     let keys_to_remove: Vec<String> = SESSION_CONTEXT_CACHE
@@ -361,7 +363,16 @@ pub async fn invalidate_session_cache(username: &str) {
     for key in &keys_to_remove {
         SESSION_CONTEXT_CACHE.remove(key.as_str()).await;
     }
-    debug!(username = %username, count = keys_to_remove.len(), "SessionContext cache invalidated for user after schema change");
+    // Moka's remove is queued as a pending task; flush so the cache sees
+    // the removal on the very next try_get_with in the same tokio tick.
+    // Without this, a CALL system.<proc> followed by SELECT in the same
+    // session within one test tick still hits the stale cached entry.
+    SESSION_CONTEXT_CACHE.run_pending_tasks().await;
+    debug!(
+        username = %username,
+        count = keys_to_remove.len(),
+        "SessionContext cache invalidated for user after schema change"
+    );
 }
 
 /// Invalidate all cached SessionContexts.

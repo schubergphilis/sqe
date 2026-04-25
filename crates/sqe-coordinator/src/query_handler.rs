@@ -546,10 +546,42 @@ impl QueryHandler {
                     ))
                 }
 
-                // CALL system.<maintenance procedure>(...) — Iceberg compaction,
-                // snapshot expiry, orphan file removal, manifest rewrite.
+                // CALL system.<maintenance procedure>(...) - Iceberg
+                // compaction, snapshot expiry, orphan file removal, manifest
+                // rewrite. These procedures write new snapshots; the cached
+                // SessionContext in SESSION_CONTEXT_CACHE holds DataFusion
+                // TVF MemTables built from the pre-call snapshot, so any
+                // follow-up SELECT ... FROM table_files(...) / table_snapshots(...)
+                // in the same session would serve stale rows. Invalidate after
+                // the call completes so the next query rebuilds the context
+                // against the fresh Polaris metadata.
                 StatementKind::Procedure(ref call) => {
-                    self.maintenance_handler.handle(session, call).await
+                    let _ = call; // table_ref kept for future per-table invalidation
+                    let result = self.maintenance_handler.handle(session, call).await;
+
+                    // Maintenance procedures rewrite the table's snapshot
+                    // history. Two caches must drop their entries before the
+                    // next read or the user sees stale results:
+                    //
+                    // 1. SESSION_CONTEXT_CACHE keeps a per-user DataFusion
+                    //    SessionContext. Its registered table_files /
+                    //    table_snapshots TVFs return MemTables built from the
+                    //    pre-rewrite metadata. moka's remove + flush of
+                    //    pending tasks drops the entry immediately.
+                    // 2. ResultCache (query_cache) keys by SQL text. The
+                    //    per-table invalidation does NOT cover queries that
+                    //    referenced the table through a TVF: the TableScan
+                    //    carries the function name (`table_files`) rather
+                    //    than the Iceberg identifier. Nuke the whole result
+                    //    cache after a procedure: maintenance procedures are
+                    //    rare and the cache rebuilds cheaply on next read.
+                    crate::session_context::invalidate_session_cache(
+                        &session.user.username,
+                    ).await;
+                    if let Some(ref qcache) = self.query_cache {
+                        qcache.invalidate_all();
+                    }
+                    result
                 }
 
                 // COMMENT ON TABLE/COLUMN — store as Iceberg table property
