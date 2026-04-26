@@ -166,10 +166,11 @@ Full configuration reference: [docs/deployment.md](docs/deployment.md).
 | [Security Hardening: 43 Findings](docs/blog/2026-04-13-security-hardening-43-findings.md) | Production audit |
 | [DataFusion 53 and the Iceberg Fork](docs/blog/2026-04-14-datafusion-53-and-the-iceberg-fork.md) | DF 53 upgrade, vendoring |
 | [Our Nemesis: TPC-DS Q72](docs/blog/2026-04-16-our-nemesis-q72.md) | The one query we can't beat |
+| [The Iceberg Matrix and the Quiet Bug Hiding in V3](docs/blog/2026-04-26-the-matrix-and-the-quiet-bug.md) | Integration tests find what unit tests miss |
 
 ## Book
 
-SQE's design and development journey is documented in the ebook **"Sovereign by Design: Building a Production Query Engine on DataFusion"** (19 chapters). Source in [docs/ebook/](docs/ebook/). Build with `cd docs/ebook && make`.
+SQE's design and development journey is documented in the ebook **"Sovereign by Design: Building a Production Query Engine on DataFusion"** (20 chapters). Source in [docs/ebook/](docs/ebook/). Build with `cd docs/ebook && make`.
 
 ## Contributing
 
