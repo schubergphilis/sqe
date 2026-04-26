@@ -16,10 +16,18 @@
 # under the License.
 
 [workspace]
-# SQE vendored subset — only the 3 crates SQE depends on
+# SQE vendored subset of apache/iceberg-rust.
+# The HMS catalog source is vendored from upstream apache/iceberg-rust
+# v0.9.0 (Phase K) so SQE can ship Hive Metastore support without
+# migrating the whole engine off the RisingWave fork (which has DF 53
+# and our cherry-picked RowDelta + branch/tag actions that upstream
+# 0.9.0 lacks).
 members = [
   "crates/iceberg",
+  "crates/catalog/glue",
+  "crates/catalog/hms",
   "crates/catalog/rest",
+  "crates/catalog/sql",
   "crates/integrations/datafusion",
   "crates/test_utils",
 ]

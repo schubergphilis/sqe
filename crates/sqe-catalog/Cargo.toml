@@ -8,18 +8,23 @@ default = ["rest"]
 # REST catalog (always on today; the flag is here so the matrix-parity phase A
 # can expose `--no-default-features` builds that skip other backends).
 rest = []
-# JDBC-style SQL catalog. Uses `rusqlite` bundled mode for SQLite tests;
-# PostgreSQL support arrives when we adopt the upstream `iceberg-catalog-sql`
-# crate (pinned to apache/iceberg-rust 0.8.0 once the RisingWave fork rebases).
-sql = ["dep:rusqlite"]
+# JDBC-style SQL catalog. SQLite via rusqlite (existing helper) plus the
+# upstream iceberg-catalog-sql crate which uses sqlx::any for runtime
+# dispatch to SQLite/PostgreSQL/MySQL.
+sql = ["dep:rusqlite", "dep:iceberg-catalog-sql", "dep:sqlx"]
+# Add-on for `sql`: enable PostgreSQL via sqlx. Kept separate so the base
+# `sql` feature does not pull tls-rustls + tokio-runtime + postgres driver
+# into builds that only want SQLite.
+sql-postgres = ["sql", "sqlx/postgres", "sqlx/runtime-tokio", "sqlx/tls-rustls"]
 # Hadoop storage-only backend. No extra dependency — the backend scans a
 # warehouse path via `object_store`, which is already linked.
 hadoop = []
-# Hive Metastore over Thrift. Requires upstream `iceberg-catalog-hms` once the
-# vendored fork rebases onto a release that exports it.
-hms = []
-# AWS Glue Data Catalog. Requires upstream `iceberg-catalog-glue` + aws-config.
-glue = []
+# Hive Metastore over Thrift. Vendored from apache/iceberg-rust v0.9.0;
+# pulls in volo-thrift + pilota only when this feature is enabled.
+hms = ["dep:iceberg-catalog-hms"]
+# AWS Glue Data Catalog. Vendored from apache/iceberg-rust v0.9.0;
+# pulls in aws-sdk-glue + aws-config only when this feature is enabled.
+glue = ["dep:iceberg-catalog-glue"]
 
 [dependencies]
 sqe-core = { path = "../sqe-core" }
@@ -54,8 +59,13 @@ prometheus = { workspace = true }
 regex = { workspace = true }
 # Puffin NDV sketches (apache-datasketches-theta-v1 blob body).
 datasketches = { workspace = true }
-# Optional backend dependencies
+# Optional backend dependencies — gated by the corresponding cargo feature
+# above. None of these are pulled into a default `cargo build`.
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+iceberg-catalog-hms = { workspace = true, optional = true }
+iceberg-catalog-glue = { workspace = true, optional = true }
+iceberg-catalog-sql = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
