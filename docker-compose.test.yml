@@ -47,5 +47,28 @@ services:
     ports:
       - "19000:9000"
 
+  # PostgreSQL backing store for the iceberg-catalog-sql JDBC catalog.
+  # Used by the Phase L pg_jdbc_catalog test that exercises the vendored
+  # `iceberg-catalog-sql` crate against a real Postgres instance. Port
+  # 15432 is offset from the production default (5432) to avoid
+  # collisions on dev boxes.
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: iceberg
+      POSTGRES_PASSWORD: iceberg
+      POSTGRES_DB: iceberg_catalog
+    ports:
+      - "15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iceberg -d iceberg_catalog"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
 volumes:
   rustfs-data:
+  postgres-data:
