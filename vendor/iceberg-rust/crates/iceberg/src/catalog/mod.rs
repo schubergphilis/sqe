@@ -114,6 +114,20 @@ pub trait Catalog: Debug + Sync + Send {
 pub trait CatalogBuilder: Default + Debug + Send + Sync {
     /// The catalog type that this builder creates.
     type C: Catalog;
+    /// Optional storage factory that the catalog will use when constructing
+    /// `FileIO` for table data. Default impl drops the factory; catalogs
+    /// that need it (HMS, Glue) override.
+    ///
+    /// SQE-vendored from upstream apache/iceberg-rust v0.9.0's
+    /// `CatalogBuilder::with_storage_factory`. Added to the fork's trait so
+    /// the upstream HMS / Glue catalog crates compile unmodified.
+    #[allow(unused_variables)]
+    fn with_storage_factory(
+        self,
+        storage_factory: std::sync::Arc<dyn crate::io::StorageFactory>,
+    ) -> Self {
+        self
+    }
     /// Create a new catalog instance.
     fn load(
         self,

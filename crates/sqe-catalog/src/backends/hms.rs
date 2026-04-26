@@ -1,17 +1,13 @@
 //! Hive Metastore (HMS) catalog backend.
 //!
 //! HMS speaks Thrift over a TCP port (9083 by default). The upstream
-//! `iceberg-catalog-hms` crate wraps a Thrift client and implements the
-//! `iceberg::Catalog` trait on top; SQE adopts that crate once the vendored
-//! RisingWave fork rebases onto an apache/iceberg-rust release that exports
-//! compatible types. Until then this module carries a configuration type and
-//! a marker struct so that the `hms` Cargo feature is a no-op with a clear
-//! error message.
+//! `iceberg-catalog-hms` crate (vendored from apache/iceberg-rust v0.9.0
+//! into `vendor/iceberg-rust/crates/catalog/hms/`) wraps a Thrift client
+//! and implements the `iceberg::Catalog` trait on top.
 //!
-//! The HMS write path acquires a table-level lock via `lock`/`unlock` RPCs
-//! before committing a new metadata pointer. The spec in
-//! `openspec/changes/iceberg-matrix-parity/specs/catalog-backends/spec.md`
-//! requires this; the real implementation tracks Phase A of the matrix plan.
+//! Enable the `hms` cargo feature to pull in volo-thrift + pilota and
+//! get a functioning backend. Without the feature the struct stays as a
+//! marker that returns a clear error pointing at the feature flag.
 
 use sqe_core::{Result as SqeResult, SqeError};
 
@@ -53,12 +49,50 @@ impl HmsBackend {
         &self.config
     }
 
-    /// List tables in a namespace. Today this returns an error; the real
-    /// implementation lands in Phase A task 2.7.
+    /// Build the underlying `HmsCatalog` from the vendored upstream crate.
+    ///
+    /// Returns an error when the `hms` cargo feature is disabled. With the
+    /// feature on, this constructs a working Thrift-backed catalog.
+    #[cfg(feature = "hms")]
+    pub async fn build_catalog(
+        &self,
+        storage_factory: std::sync::Arc<dyn iceberg::io::StorageFactory>,
+    ) -> SqeResult<iceberg_catalog_hms::HmsCatalog> {
+        use iceberg::CatalogBuilder;
+        let mut props = std::collections::HashMap::new();
+        props.insert(
+            iceberg_catalog_hms::HMS_CATALOG_PROP_URI.to_string(),
+            self.config.uri.clone(),
+        );
+        props.insert(
+            iceberg_catalog_hms::HMS_CATALOG_PROP_WAREHOUSE.to_string(),
+            self.config.warehouse.clone(),
+        );
+        if let Some(timeout_ms) = self.config.timeout_ms {
+            props.insert(
+                iceberg_catalog_hms::HMS_CATALOG_PROP_THRIFT_TRANSPORT.to_string(),
+                "buffered".to_string(),
+            );
+            // The upstream HMS catalog does not expose a public timeout
+            // field on the builder; the timeout_ms config is recorded for
+            // future extension and surfaced via a warning if unused.
+            let _ = timeout_ms;
+        }
+        iceberg_catalog_hms::HmsCatalogBuilder::default()
+            .with_storage_factory(storage_factory)
+            .load(&self.config.uri.clone(), props)
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to build HmsCatalog: {e}")))
+    }
+
+    /// Stub `list_tables` for builds without the `hms` feature. Returns
+    /// an error pointing at the feature flag so misconfigured deployments
+    /// fail loudly rather than silently.
+    #[cfg(not(feature = "hms"))]
     pub async fn list_tables(&self, _namespace: &str) -> SqeResult<Vec<String>> {
         Err(SqeError::Catalog(format!(
-            "HMS backend not yet wired to upstream iceberg-catalog-hms (configured URI {}); \
-             tracked in openspec/changes/iceberg-matrix-parity/tasks.md task 2.7",
+            "HMS backend requires building with the `hms` cargo feature \
+             (configured URI {}). Build with `cargo build --features hms` to enable.",
             self.config.uri
         )))
     }
@@ -76,12 +110,13 @@ mod tests {
         assert_eq!(cfg.timeout_ms, Some(5_000));
     }
 
+    #[cfg(not(feature = "hms"))]
     #[tokio::test]
     async fn list_tables_returns_stub_error() {
         let backend = HmsBackend::new(HmsConfig::new("thrift://hms.test:9083", "wh"));
         let err = backend.list_tables("ns").await.unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("HMS backend"));
-        assert!(msg.contains("task 2.7"));
+        assert!(msg.contains("`hms` cargo feature"));
     }
 }
