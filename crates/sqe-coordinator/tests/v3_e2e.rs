@@ -227,7 +227,7 @@ async fn insert_then_select_round_trips_v3_table() {
 
     let files = live_data_file_count(&handler, &session, ns, name).await;
     assert!(
-        files >= 1 && files <= 2,
+        (1..=2).contains(&files),
         "expected 1 or 2 data files after INSERT, got {files}"
     );
 
@@ -863,6 +863,64 @@ async fn cdc_incremental_scan_on_v3_table() {
     assert_eq!(
         delta_count, 3,
         "CDC range from beginning to latest must surface all three INSERTed rows"
+    );
+
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"))
+        .await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Cell: sqe:type-promotion:v3
+//
+// V2 widening rules (int -> long, float -> double, decimal widening)
+// apply equally to V3 tables. ALTER TABLE ... ALTER COLUMN ... TYPE
+// commits a schema change that surfaces through information_schema.
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn type_promotion_int_to_bigint_on_v3_table() {
+    let (session, handler) = common::setup_handler().await;
+    let ns = "default";
+    let name = "v3_type_promo";
+    let fq = format!("{ns}.{name}");
+
+    reset_table(
+        &handler,
+        &session,
+        &fq,
+        &format!("CREATE TABLE {fq} (id INT, ts TIMESTAMP_NS(9))"),
+    )
+    .await;
+
+    handler
+        .execute(
+            &session,
+            &format!("ALTER TABLE {fq} ALTER COLUMN id SET DATA TYPE BIGINT"),
+        )
+        .await
+        .expect("ALTER COLUMN type promotion");
+
+    let cols = handler
+        .execute(
+            &session,
+            &format!(
+                "SELECT data_type FROM information_schema.columns \
+                 WHERE table_schema = '{ns}' AND table_name = '{name}' \
+                 AND column_name = 'id'"
+            ),
+        )
+        .await
+        .expect("information_schema lookup after promotion");
+    let dtype = cols[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .expect("StringArray")
+        .value(0);
+    assert!(
+        dtype.contains("Int64") || dtype.contains("BIGINT") || dtype.contains("bigint"),
+        "Type promotion did not surface BIGINT in information_schema: got {dtype}"
     );
 
     let _ = handler
