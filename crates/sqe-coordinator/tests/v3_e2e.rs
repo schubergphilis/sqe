@@ -497,6 +497,90 @@ async fn equality_delete_update_on_v3_table() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Cell: sqe:write-merge-update-delete:v3 (MERGE direct test)
+//
+// MERGE INTO on a V3 table with MATCHED UPDATE + NOT MATCHED INSERT:
+// the table starts with one row, MERGE updates that row's value and
+// inserts a new row. Validates the MERGE dispatcher works on V3
+// metadata, complementing the existing UPDATE and DELETE coverage.
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn merge_into_on_v3_table() {
+    let (session, handler) = common::setup_handler().await;
+    let ns = "default";
+    let name = "v3_merge_into";
+    let fq = format!("{ns}.{name}");
+
+    reset_table(
+        &handler,
+        &session,
+        &fq,
+        &format!(
+            "CREATE TABLE {fq} (id BIGINT, ts TIMESTAMP_NS(9), v BIGINT)"
+        ),
+    )
+    .await;
+
+    handler
+        .execute(
+            &session,
+            &format!(
+                "INSERT INTO {fq} VALUES (1, TIMESTAMP '2026-04-26 10:00:00', 10)"
+            ),
+        )
+        .await
+        .expect("seed INSERT");
+
+    handler
+        .execute(
+            &session,
+            &format!(
+                "MERGE INTO {fq} t \
+                 USING (SELECT 1 AS id, TIMESTAMP '2026-04-26 10:00:01' AS ts, 99 AS v \
+                        UNION ALL \
+                        SELECT 2 AS id, TIMESTAMP '2026-04-26 10:00:02' AS ts, 22 AS v) src \
+                 ON t.id = src.id \
+                 WHEN MATCHED THEN UPDATE SET v = src.v \
+                 WHEN NOT MATCHED THEN INSERT (id, ts, v) VALUES (src.id, src.ts, src.v)"
+            ),
+        )
+        .await
+        .expect("MERGE INTO");
+
+    let count = row_count(&handler, &session, &fq).await;
+    assert_eq!(count, 2, "MERGE INTO should produce 2 rows on V3 table");
+
+    let updated = handler
+        .execute(&session, &format!("SELECT v FROM {fq} WHERE id = 1"))
+        .await
+        .expect("select updated");
+    let v = updated[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Int64Array")
+        .value(0);
+    assert_eq!(v, 99, "MATCHED UPDATE branch must surface the new value");
+
+    let inserted = handler
+        .execute(&session, &format!("SELECT v FROM {fq} WHERE id = 2"))
+        .await
+        .expect("select inserted");
+    let v = inserted[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Int64Array")
+        .value(0);
+    assert_eq!(v, 22, "NOT MATCHED INSERT branch must surface the new row");
+
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"))
+        .await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Cell: sqe:time-travel:v3
 //
 // A V3 table records each commit in the snapshot log so future
