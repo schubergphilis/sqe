@@ -231,10 +231,12 @@ impl WriteHandler {
         let catalog = self.create_catalog_bridge(session).await?;
 
         // Create the table in the catalog
+        let create_format_version = self.format_version();
         let table_creation = TableCreation::builder()
             .name(name.clone())
             .schema(iceberg_schema)
-            .format_version(self.format_version())
+            .format_version(create_format_version)
+            .properties(format_version_properties(create_format_version))
             .build();
 
         let _created_table = catalog
@@ -357,10 +359,12 @@ impl WriteHandler {
 
         let catalog = self.create_catalog_bridge(session).await?;
 
+        let create_format_version = self.format_version();
         let table_creation = TableCreation::builder()
             .name(name.clone())
             .schema(iceberg_schema)
-            .format_version(self.format_version())
+            .format_version(create_format_version)
+            .properties(format_version_properties(create_format_version))
             .build();
 
         let _created_table = catalog
@@ -578,10 +582,18 @@ impl WriteHandler {
             }
         }
 
+        // Merge in user-specified TBLPROPERTIES / WITH options so Polaris
+        // stores them alongside the format-version directive. Without this
+        // step CREATE TABLE silently drops every property the user typed.
+        let mut props = format_version_properties(format_version);
+        merge_user_table_properties(&mut props, &ct.table_properties);
+        merge_user_table_properties(&mut props, &ct.with_options);
+
         let table_creation = TableCreation::builder()
             .name(name.clone())
             .schema(iceberg_schema)
             .format_version(format_version)
+            .properties(props)
             .build();
 
         catalog
@@ -4079,6 +4091,64 @@ pub(crate) fn requires_v3_features(
         .fields()
         .iter()
         .any(|f| f.write_default.is_some() || f.initial_default.is_some())
+}
+
+/// Build the table-properties map that signals the desired Iceberg format
+/// version to a REST catalog (Polaris, Tabular, etc).
+///
+/// The Iceberg REST `CreateTableRequest` has no dedicated `format-version`
+/// field; the spec uses the reserved `format-version` table property to
+/// communicate the version at create time. iceberg-rust currently does not
+/// auto-translate `TableCreation.format_version` into this property, so we
+/// set it explicitly.
+pub(crate) fn format_version_properties(
+    format_version: FormatVersion,
+) -> std::collections::HashMap<String, String> {
+    let mut props = std::collections::HashMap::new();
+    let value = match format_version {
+        FormatVersion::V1 => "1",
+        FormatVersion::V2 => "2",
+        FormatVersion::V3 => "3",
+    };
+    props.insert("format-version".to_string(), value.to_string());
+    props
+}
+
+/// Fold a `Vec<SqlOption>` (from sqlparser-rs `TBLPROPERTIES (...)` or
+/// `WITH (...)` clauses) into a property HashMap.
+///
+/// Only `KeyValue` options are materialised. Existing entries in `props`
+/// (typically `format-version` set by the SQE auto-upgrade path) are
+/// preserved when the user did not explicitly set them; an explicit
+/// user-supplied value wins so callers can pin a different format version.
+pub(crate) fn merge_user_table_properties(
+    props: &mut std::collections::HashMap<String, String>,
+    options: &[sqlparser::ast::SqlOption],
+) {
+    use sqlparser::ast::SqlOption;
+    for opt in options {
+        if let SqlOption::KeyValue { key, value } = opt {
+            let k = key.value.clone();
+            let v = sql_expr_to_property_string(value);
+            props.insert(k, v);
+        }
+    }
+}
+
+/// Turn a sqlparser `Expr` value used in TBLPROPERTIES / WITH into the
+/// raw string Iceberg expects. We trim surrounding string-literal quotes
+/// so `'merge-on-read'` becomes `merge-on-read` rather than `'merge-on-read'`.
+fn sql_expr_to_property_string(expr: &sqlparser::ast::Expr) -> String {
+    use sqlparser::ast::{Expr, Value};
+    match expr {
+        Expr::Value(v) => match v {
+            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => s.clone(),
+            Value::Number(n, _) => n.clone(),
+            Value::Boolean(b) => b.to_string(),
+            other => other.to_string(),
+        },
+        other => other.to_string(),
+    }
 }
 
 #[cfg(test)]
