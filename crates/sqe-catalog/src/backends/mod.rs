@@ -50,6 +50,11 @@ pub enum BackendKind {
 
 impl BackendKind {
     /// Parse a catalog-type string from config into a backend identifier.
+    ///
+    /// Kept as an inherent method (not `std::str::FromStr`) because the return
+    /// type is `Option<Self>`, not `Result<Self, Err>`, and the input is the
+    /// full set of supported config strings rather than a strict round-trip.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "rest" => Some(Self::Rest),

@@ -4245,6 +4245,29 @@ pub(crate) fn build_partition_spec(
     Ok(Some(spec))
 }
 
+/// Parse a raw partition transform SQL fragment such as `year(ts)`,
+/// `bucket(16, user_id)`, or a bare column name `region`, returning
+/// `(source_column, target_name, Transform)`.
+///
+/// Used by the partition-evolution handler (ALTER TABLE ADD/DROP/REPLACE
+/// PARTITION FIELD) so it can share the exact same transform vocabulary as
+/// CREATE TABLE's `PARTITIONED BY` clause.
+pub(crate) fn parse_partition_transform_sql(
+    transform_sql: &str,
+) -> sqe_core::Result<(String, String, iceberg::spec::Transform)> {
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    let dialect = GenericDialect {};
+    let mut parser = Parser::new(&dialect)
+        .try_with_sql(transform_sql)
+        .map_err(|e| SqeError::Execution(format!("Failed to lex partition transform '{transform_sql}': {e}")))?;
+    let expr = parser
+        .parse_expr()
+        .map_err(|e| SqeError::Execution(format!("Failed to parse partition transform '{transform_sql}': {e}")))?;
+    parse_partition_transform(&expr)
+}
+
 /// Parse a single partition expression into `(source_column, target_name, Transform)`.
 fn parse_partition_transform(
     expr: &sqlparser::ast::Expr,
