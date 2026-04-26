@@ -1932,13 +1932,19 @@ impl QueryHandler {
         use sqlparser::parser::Parser;
 
         // First, pre-scan and resolve FOR VERSION AS OF. This path hides the
-        // clause from sqlparser and registers snapshot-pinned providers.
-        let (rewritten_for_version, version_specs) =
+        // clause from sqlparser and registers snapshot-pinned providers
+        // under aliases in the writable `datafusion.public` schema. The
+        // SQL is rewritten so the original table reference (which lives
+        // in the read-only Iceberg schema provider) is replaced with the
+        // alias.
+        let (mut rewritten_for_version, version_specs) =
             sqe_sql::extract_time_travel_spec(sql)?;
         let mut version_resolved = !version_specs.is_empty();
         if version_resolved {
-            for spec in version_specs {
-                Self::apply_version_spec(&spec, ctx, session_catalog).await?;
+            for spec in &version_specs {
+                let alias = Self::apply_version_spec(spec, ctx, session_catalog).await?;
+                rewritten_for_version =
+                    replace_table_reference(&rewritten_for_version, &spec.table, &alias);
             }
         }
         let sql_for_ast = if version_resolved {
@@ -2003,7 +2009,7 @@ impl QueryHandler {
         spec: &sqe_sql::TimeTravelSpec,
         ctx: &SessionContext,
         session_catalog: &Arc<SessionCatalog>,
-    ) -> sqe_core::Result<()> {
+    ) -> sqe_core::Result<String> {
         use iceberg::spec::SnapshotRetention;
         use sqe_sql::VersionRef;
 
@@ -2080,12 +2086,22 @@ impl QueryHandler {
             .await?
             .with_snapshot_id(snapshot_id);
 
-        ctx.register_table(bare_table, Arc::new(provider))
+        // Register under a unique alias in `datafusion.public` (a
+        // MemoryCatalog schema that supports dynamic registration).
+        // The Iceberg schema provider that owns the original table name
+        // is read-only.
+        let alias = format!(
+            "__sqe_ver_{}_{}",
+            bare_table,
+            uuid::Uuid::now_v7().simple()
+        );
+        let qualified = format!("datafusion.public.{alias}");
+        ctx.register_table(qualified.as_str(), Arc::new(provider))
             .map_err(|e| SqeError::Execution(format!(
                 "Failed to register time-travel provider for {bare_table}: {e}"
             )))?;
 
-        Ok(())
+        Ok(qualified)
     }
 
     /// Process a single `TableFactor` for `FOR SYSTEM_TIME AS OF`.
