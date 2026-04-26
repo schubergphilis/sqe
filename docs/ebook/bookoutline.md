@@ -141,15 +141,16 @@ Splitting the engine across coordinator and workers. Ballista heritage, custom s
 
 ---
 
-## Part V: Production (Chapters 15-17) — ~60 pages
+## Part V: Production (Chapters 15-17) — ~75 pages
 
 Shipping it. Running it. Keeping it running.
 
 | Ch | Title | Pages | Topics |
 |----|-------|-------|--------|
-| 15 | **Deploying Sovereignty** | 22 | Docker multi-stage build (2.3GB → 47MB). Helm chart: coordinator Deployment + worker StatefulSet. Rolling upgrades with zero query interruption. Resource requests that make sense. The Kubernetes topology for a sovereign engine. |
+| 15 | **Deploying Sovereignty** | 22 | Docker multi-stage build (2.3GB to 47MB). Helm chart: coordinator Deployment + worker StatefulSet. Rolling upgrades with zero query interruption. Resource requests that make sense. The Kubernetes topology for a sovereign engine. |
 | 16 | **Benchmarks Don't Lie (But They Mislead)** | 22 | TPC-H, TPC-DS, SSB, TPC-C, TPC-E, TPC-BB on Iceberg. SQE vs Trino on same hardware via `--compare-trino` flag (identical queries, same Polaris catalog, diff results). Where SQE wins (scan, auth overhead, cold start, memory). The sort order correctness trap: why trusting Iceberg sort metadata can silently corrupt results. The benchmark that mattered: 50 dbt models, nightly batch, wall-clock time. |
-| 17 | **What We'd Do Differently** | 22 | The AI-assisted build: honest assessment — what the AI did well (implementation, debugging, test generation), what it didn't (architecture, security trade-offs). The human reviewed every big turn. Decisions we'd change. What Rust taught us (including: compile times at scale are real). The open-source goal. Where this goes next. Build-vs-buy honest accounting. |
+| 16b | **The Matrix and the Quiet Bug** | 15 | The Iceberg matrix scoreboard. What "partial" actually meant. The format-version bug hiding in the iceberg-rust REST request. TBLPROPERTIES being silently dropped. FOR VERSION AS OF registering against a read-only schema. Three commits, sixteen cells flipped, one rule earned: integration tests are the only tests that matter for catalog interactions. |
+| 17 | **What We'd Do Differently** | 22 | The AI-assisted build: honest assessment, what the AI did well (implementation, debugging, test generation), what it didn't (architecture, security trade-offs). The human reviewed every big turn. Decisions we'd change. What Rust taught us (including: compile times at scale are real). The open-source goal. Where this goes next. Build-vs-buy honest accounting. |
 
 **Art of Agents crossover:** Chapter 17 maps to *Use of Spies* (Ch 13: Feedback Loops) — the retrospective that closes the build cycle.
 
