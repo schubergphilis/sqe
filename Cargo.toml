@@ -48,6 +48,14 @@ object_store = { version = "0.13", features = ["aws"] }
 iceberg = { path = "vendor/iceberg-rust/crates/iceberg" }
 iceberg-catalog-rest = { path = "vendor/iceberg-rust/crates/catalog/rest" }
 iceberg-datafusion = { path = "vendor/iceberg-rust/crates/integrations/datafusion" }
+# Optional catalog backends, vendored from upstream apache/iceberg-rust
+# v0.9.0 alongside the RisingWave fork. Gated by cargo features in
+# sqe-catalog so a default REST-only build does not pull in AWS SDK,
+# Thrift, or sqlx weight.
+iceberg-catalog-hms = { path = "vendor/iceberg-rust/crates/catalog/hms" }
+iceberg-catalog-glue = { path = "vendor/iceberg-rust/crates/catalog/glue" }
+iceberg-catalog-sql = { path = "vendor/iceberg-rust/crates/catalog/sql" }
+sqlx = { version = "0.8.1", default-features = false }
 
 # SQL parser — DataFusion 53 ships sqlparser 0.54
 sqlparser = "0.54"
