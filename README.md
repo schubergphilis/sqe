@@ -75,7 +75,7 @@ For Docker, Kubernetes, TLS, and auth provider setup, see [docs/deployment.md](d
 
 | Suite | SQE | Trino | Speedup | Pass |
 |---|---|---|---|---|
-| TPC-H (22) | 14.9s | 17.4s | **1.8x** | 22/22 |
+| TPC-H (22) | 21.9s | 30.4s | **2.1x** | 22/22 |
 | SSB (13) | 6.2s | 4.8s | 0.8x | 13/13 |
 | TPC-DS (99) | 50.6s | 31.6s | 1.0x | 99/99 |
 | TPC-C (8 read) | 0.5s | 1.6s | **3.4x** | 7/8 |
