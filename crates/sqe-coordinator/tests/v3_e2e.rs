@@ -689,6 +689,94 @@ async fn rewrite_data_files_on_v3_table() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Cell: sqe:time-travel:v3 (FOR VERSION AS OF)
+//
+// Pin a specific snapshot via `FOR VERSION AS OF <snapshot_id>` and
+// confirm the SELECT returns the row count from that historical
+// snapshot rather than the latest one. The pre-classifier strips the
+// FOR VERSION AS OF clause before sqlparser sees it; the engine then
+// registers a snapshot-pinned provider under a writable alias and
+// rewrites the SQL to reference it.
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn for_version_as_of_on_v3_table() {
+    let (session, handler) = common::setup_handler().await;
+    let ns = "default";
+    let name = "v3_for_version";
+    let fq = format!("{ns}.{name}");
+
+    reset_table(
+        &handler,
+        &session,
+        &fq,
+        &format!("CREATE TABLE {fq} (id BIGINT, ts TIMESTAMP_NS(9))"),
+    )
+    .await;
+
+    handler
+        .execute(
+            &session,
+            &format!("INSERT INTO {fq} VALUES (1, TIMESTAMP '2026-04-26 10:00:00')"),
+        )
+        .await
+        .expect("INSERT 1");
+
+    // Capture the snapshot id BEFORE INSERT 2/3.
+    let pin_batches = handler
+        .execute(
+            &session,
+            &format!(
+                "SELECT snapshot_id FROM table_snapshots('{ns}', '{name}') \
+                 WHERE is_current_snapshot = TRUE"
+            ),
+        )
+        .await
+        .expect("snapshot_id pin");
+    let pin_snap = pin_batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Int64Array")
+        .value(0);
+
+    handler
+        .execute(
+            &session,
+            &format!("INSERT INTO {fq} VALUES (2, TIMESTAMP '2026-04-26 10:01:00')"),
+        )
+        .await
+        .expect("INSERT 2");
+
+    let now_count = row_count(&handler, &session, &fq).await;
+    assert_eq!(now_count, 2, "live table sees both INSERTs");
+
+    let pinned_batches = handler
+        .execute(
+            &session,
+            &format!(
+                "SELECT COUNT(*) FROM {fq} FOR VERSION AS OF {pin_snap}"
+            ),
+        )
+        .await
+        .expect("FOR VERSION AS OF query");
+    let pinned_count = pinned_batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Int64Array")
+        .value(0);
+    assert_eq!(
+        pinned_count, 1,
+        "FOR VERSION AS OF must show only the row visible at the pinned snapshot"
+    );
+
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"))
+        .await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Cell: sqe:cdc-support:v3
 //
 // FOR INCREMENTAL BETWEEN SNAPSHOT against a V3 table returns the rows

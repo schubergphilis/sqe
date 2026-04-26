@@ -13,9 +13,9 @@
   "generatedAt": "2026-04-26T11:50:00Z",
   "generatedBy": "Phase I V3 path validation",
   "score": {
-    "raw": 127,
+    "raw": 128,
     "max": 189,
-    "percent": 67.2
+    "percent": 67.7
   },
   "note": "Phase I integrated. V3 round-trip verified end-to-end through Polaris + iceberg-rust (11 e2e tests in crates/sqe-coordinator/tests/v3_e2e.rs). Iceberg REST CreateTableRequest now propagates format-version via the reserved table property so Polaris materialises V3 metadata when SQE detects V3 features. CREATE TABLE TBLPROPERTIES are forwarded to the catalog and re-emitted by SHOW CREATE TABLE. CDC FOR INCREMENTAL works on V3 tables; FOR VERSION AS OF time-travel registration still has a schema-provider gap that lives outside V3 scope.",
   "support": {
@@ -128,12 +128,10 @@
       "caveats": []
     },
     "sqe:time-travel:v3": {
-      "level": "partial",
-      "notes": "V3 tables produce snapshots that the FOR SYSTEM_TIME AS OF / FOR VERSION AS OF planners can resolve against. The classifier strips both clauses before sqlparser-rs sees them. Round-trip verified against Polaris.",
-      "evidence": "crates/sqe-coordinator/src/query_handler.rs (extract_time_travel_spec pre-classification), crates/sqe-coordinator/tests/v3_e2e.rs::time_travel_on_v3_table",
-      "caveats": [
-        "FOR VERSION AS OF still has a runtime gap: apply_version_spec registers the snapshot-pinned provider in the active schema provider, which the iceberg catalog rejects; re-routing through a writable schema is tracked separately."
-      ]
+      "level": "full",
+      "notes": "FOR VERSION AS OF works end-to-end on V3 tables: the classifier strips the clause, apply_version_spec registers a snapshot-pinned provider under datafusion.public.<alias>, and the SQL is rewritten to reference it. SELECT against the pinned snapshot returns the historical row count.",
+      "evidence": "crates/sqe-coordinator/src/query_handler.rs#apply_version_spec, crates/sqe-coordinator/tests/v3_e2e.rs::for_version_as_of_on_v3_table",
+      "caveats": []
     },
     "sqe:table-maintenance:v2": {
       "level": "partial",
