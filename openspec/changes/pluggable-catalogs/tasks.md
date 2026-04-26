@@ -23,8 +23,8 @@
 
 ## 4. AwsGlueBackend
 
-- [ ] 4.1 Implement `AwsGlueBackend` in `sqe-catalog/src/backend/glue.rs` (wraps `IcebergRestBackend` with Glue endpoint + `AwsIamAuth`)
-- [ ] 4.2 Config: `type = "aws_glue"`, `region`; auth section
+- [x] 4.1 Implement `GlueBackend` in `sqe-catalog/src/backends/glue.rs`: vendored `iceberg-catalog-glue` from apache/iceberg-rust v0.9.0 with fork-API patches; `GlueBackend::build_catalog` delegates to the upstream crate when the `glue` cargo feature is enabled. Phase K MR !105.
+- [ ] 4.2 Config: `type = "aws_glue"`, `region`; auth section. (Engine session manager dispatch still hardcodes REST; tracked as Phase L follow-up.)
 - [ ] 4.3 Unit test: Glue backend constructs correct Iceberg REST URL for region
 
 ## 5. NessieBackend
@@ -37,11 +37,11 @@
 
 ## 6. HiveMetastoreBackend
 
-- [ ] 6.1 Add optional feature `catalog-hms`; gate behind `#[cfg(feature = "catalog-hms")]`
-- [ ] 6.2 Implement HMS Thrift client in `sqe-catalog/src/backend/hms.rs` (using `hive_metastore` crate or raw Thrift)
-- [ ] 6.3 `list_namespaces` / `list_tables` via HMS `GetAllDatabases` / `GetAllTables`
-- [ ] 6.4 `load_table`: read `table_parameters['metadata_location']` → load iceberg metadata via `FileIO`
-- [ ] 6.5 Unit test: mock HMS response → correct `TableMetadata` extracted
+- [x] 6.1 Add optional cargo feature `hms` in `sqe-catalog/Cargo.toml`; gate the upstream crate behind it. Default REST-only build pulls zero new deps. Phase K MR !105.
+- [x] 6.2 Vendor the upstream HMS Thrift client (`vendor/iceberg-rust/crates/catalog/hms/`) using `hive_metastore` + `volo-thrift` rather than rolling our own.
+- [x] 6.3 `list_namespaces` / `list_tables` provided by the vendored `HmsCatalog` (delegates to HMS `GetAllDatabases` / `GetAllTables` via Thrift).
+- [x] 6.4 `load_table`: vendored implementation reads `table_parameters['metadata_location']` and loads iceberg metadata via `FileIO`.
+- [ ] 6.5 Unit test: mock HMS response → correct `TableMetadata` extracted (upstream tests live in vendor/.../hms/tests/ but require a live HMS instance; not yet wired into our test harness).
 
 ## 7. StorageOnlyBackend
 

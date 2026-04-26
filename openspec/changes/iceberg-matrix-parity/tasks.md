@@ -8,17 +8,17 @@
 
 ## 2. Phase A: Catalog adoption sweep
 
-- [x] 2.1 Pin iceberg-rust workspace crates (glue, hms, sql, s3tables) to a matching commit in `Cargo.toml` (deferred: vendored RisingWave fork at 0.8.0 still incompatible with upstream 0.8.0 catalog crates; feature flags added with stubs)
+- [x] 2.1 Vendor iceberg-rust catalog crates (glue, hms, sql) from upstream apache/iceberg-rust v0.9.0 into `vendor/iceberg-rust/crates/catalog/{glue,hms,sql}/` alongside the existing RisingWave fork. Three small fork-API patches applied (CatalogBuilder gained a default `with_storage_factory`; FileIOBuilder calls switched to scheme-string API). Phase K MR !105.
 - [x] 2.2 Write failing integration test `glue_backend_lists_databases` (ignored by default)
-- [x] 2.3 Implement `crates/sqe-catalog/src/backends/glue.rs` wrapping `iceberg-catalog-glue` (marker impl; AWS SDK wiring deferred to fork rebase)
+- [x] 2.3 Implement `crates/sqe-catalog/src/backends/glue.rs` wrapping `iceberg-catalog-glue` — `GlueBackend::build_catalog` now delegates to the vendored upstream crate when `--features glue` is enabled.
 - [x] 2.4 Wire Glue into catalog registry behind `glue` Cargo feature
-- [ ] 2.5 Verify Glue test passes against live AWS (manual; blocked on 2.3 real impl)
+- [ ] 2.5 Verify Glue test passes against live AWS (manual; needs LocalStack or real AWS Glue endpoint)
 - [x] 2.6 Write failing integration test `hms_backend_lists_tables`
-- [x] 2.7 Implement `crates/sqe-catalog/src/backends/hms.rs` wrapping `iceberg-catalog-hms` (marker impl; Thrift client deferred to fork rebase)
+- [x] 2.7 Implement `crates/sqe-catalog/src/backends/hms.rs` wrapping `iceberg-catalog-hms` — `HmsBackend::build_catalog` now delegates to the vendored upstream crate when `--features hms` is enabled.
 - [x] 2.8 Wire HMS into catalog registry behind `hms` Cargo feature
-- [ ] 2.9 Verify HMS test passes against docker-compose HMS stack (blocked on 2.7 real impl)
+- [ ] 2.9 Verify HMS test passes against docker-compose HMS stack (needs `docker-compose.hms.yml` and a live HMS server)
 - [x] 2.10 Write failing integration test `jdbc_backend_sqlite_roundtrip`
-- [x] 2.11 Implement `crates/sqe-catalog/src/backends/sql.rs` (SQLite via rusqlite; PostgreSQL pending upstream adoption)
+- [x] 2.11 Implement `crates/sqe-catalog/src/backends/sql.rs` (SQLite via rusqlite). PostgreSQL/MySQL now available through the vendored `iceberg-catalog-sql` crate (sqlx::any) behind the `sql-postgres` feature.
 - [x] 2.12 Wire JDBC into catalog registry behind `sql` Cargo feature
 - [x] 2.13 Verify JDBC test passes against SQLite (PostgreSQL ignored test placeholder)
 - [x] 2.14 Write failing integration test `hadoop_backend_auto_discovery`
