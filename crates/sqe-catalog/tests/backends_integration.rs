@@ -115,6 +115,87 @@ mod sql {
     }
 }
 
+// -- iceberg-catalog-sql + Postgres (vendored upstream) ---------------------
+
+#[cfg(feature = "sql-postgres")]
+mod sql_postgres {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use iceberg::io::OpenDalStorageFactory;
+    use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
+    use iceberg_catalog_sql::{
+        SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlCatalogBuilder,
+    };
+
+    /// Smoke test: connect to a live Postgres instance, build the vendored
+    /// `iceberg-catalog-sql` catalog, create + list + drop a namespace.
+    ///
+    /// Stack: `docker compose -f docker-compose.test.yml up -d postgres`
+    /// then `cargo test -p sqe-catalog --features sql-postgres -- --ignored
+    /// jdbc_postgres_namespace_roundtrip`.
+    ///
+    /// Default `SQE_TEST_PG_URL` matches the docker-compose service:
+    /// `postgres://iceberg:iceberg@localhost:15432/iceberg_catalog`.
+    #[tokio::test]
+    #[ignore = "requires live Postgres; run with --ignored against docker-compose postgres"]
+    async fn jdbc_postgres_namespace_roundtrip() {
+        let url = std::env::var("SQE_TEST_PG_URL").unwrap_or_else(|_| {
+            "postgres://iceberg:iceberg@localhost:15432/iceberg_catalog".to_string()
+        });
+        // Warehouse path: any reachable file:// dir works for the namespace
+        // smoke test because we never call create_table here.
+        let warehouse = std::env::var("SQE_TEST_PG_WAREHOUSE")
+            .unwrap_or_else(|_| "/tmp/sqe-pg-jdbc-test-warehouse".to_string());
+
+        let mut props = HashMap::new();
+        props.insert(SQL_CATALOG_PROP_URI.to_string(), url.clone());
+        props.insert(SQL_CATALOG_PROP_WAREHOUSE.to_string(), warehouse);
+
+        let catalog = SqlCatalogBuilder::default()
+            .with_storage_factory(Arc::new(OpenDalStorageFactory::Fs))
+            .load("postgres-jdbc-test", props)
+            .await
+            .expect("SqlCatalog should build against live Postgres");
+
+        let ns = NamespaceIdent::new(format!(
+            "sqe_test_ns_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+
+        // Best-effort cleanup of any leftover namespace from a previous run.
+        let _ = catalog.drop_namespace(&ns).await;
+
+        catalog
+            .create_namespace(&ns, HashMap::new())
+            .await
+            .expect("create_namespace should succeed against Postgres");
+
+        let listed = catalog
+            .list_namespaces(None)
+            .await
+            .expect("list_namespaces should succeed");
+        assert!(
+            listed.iter().any(|n| n == &ns),
+            "newly created namespace {ns:?} must appear in list_namespaces"
+        );
+
+        catalog
+            .drop_namespace(&ns)
+            .await
+            .expect("drop_namespace should succeed");
+
+        let after = catalog
+            .list_namespaces(None)
+            .await
+            .expect("list_namespaces after drop");
+        assert!(
+            !after.iter().any(|n| n == &ns),
+            "namespace {ns:?} must be gone after drop"
+        );
+    }
+}
+
 // -- Hadoop (storage-only) --------------------------------------------------
 
 #[cfg(feature = "hadoop")]
