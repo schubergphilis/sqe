@@ -362,9 +362,25 @@ impl MaintenanceHandler {
         // Concurrent writers who committed between our read and this commit
         // cause a retryable CommitConflict error via the vendored fork's
         // SnapshotProducer; classify_commit_error flags that as retryable.
+        //
+        // set_enable_delete_filter_manager(true) is required for the commit to
+        // actually mark the replaced data files as deleted in the output
+        // manifest. Without it, the SnapshotProducer's existing_manifest()
+        // branch at snapshot.rs skips the filter pass entirely, adds the new
+        // data file, and leaves the old files alive: live count becomes N+1
+        // instead of 1. Default is false in iceberg-rust's RewriteFilesAction
+        // because other callers (e.g. fast appends) do not need to rewrite
+        // existing manifests. We do.
         let tx = Transaction::new(&table);
+        // check_file_existence forces a manifest scan that validates every
+        // removed path exists in the current snapshot; any mismatch turns
+        // into a hard error instead of a silent no-op. Combined with
+        // enable_delete_filter_manager, the SnapshotProducer rewrites the
+        // existing data manifests and marks the replaced files as deleted.
         let action = tx
             .rewrite_files()
+            .set_enable_delete_filter_manager(true)
+            .set_check_file_existence(true)
             .add_data_files(new_files)
             .delete_files(old_files.clone());
         let tx_applied = action
@@ -375,6 +391,46 @@ impl MaintenanceHandler {
             .commit(catalog.as_ref())
             .await
             .map_err(|e| classify_commit_error(e, "rewrite_data_files"))?;
+
+        // After the commit, invalidate the shared TableMetadataCache entry so
+        // subsequent load_table calls (including the table_files TVF used by
+        // readers) do not serve stale metadata with the pre-rewrite manifest
+        // list. The SessionCatalogAdapter's update_table impl already calls
+        // invalidate via its own SessionCatalog, but iceberg-rust's Transaction
+        // commit path goes through a different catalog reference passed to
+        // `.commit(catalog)` above: that Arc<dyn Catalog> may not share the
+        // same invalidation hook if the Transaction retries or if the adapter
+        // was constructed inline. Invalidating here closes the window. When
+        // no cache is configured (e.g. in tests without a coordinator-shared
+        // cache) the invalidation is a no-op.
+        let cache_key = format!("{}.{}", ident.namespace(), ident.name());
+        if let Some(tc) = &self.table_cache {
+            tc.invalidate(&cache_key).await;
+        }
+
+        // Sanity check: post-commit reload should show the new file count.
+        // If this disagrees with the committed action stats, we have a
+        // catalog-state-propagation bug that must not be papered over.
+        let reloaded = catalog.load_table(&ident).await.map_err(|e| {
+            SqeError::Catalog(format!(
+                "rewrite_data_files: post-commit reload failed: {e}"
+            ))
+        })?;
+        let live_after = collect_live_data_files(&reloaded).await?.len();
+        info!(
+            table = %ident,
+            live_after,
+            expected_after = output_count,
+            "rewrite_data_files: post-commit verification"
+        );
+        if live_after as i64 != output_count + (input_count as i64 - old_files.len() as i64) {
+            warn!(
+                table = %ident,
+                live_after,
+                expected_after = output_count + (input_count as i64 - old_files.len() as i64),
+                "rewrite_data_files: live file count after commit does not match expectation"
+            );
+        }
 
         // Sanity check: total row count pre-rewrite should still equal
         // post-rewrite. `total_input_rows` counts all live data files, but we
