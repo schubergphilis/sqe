@@ -149,24 +149,77 @@ pub async fn write_data_files(
 
     let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
 
-    let mut writer = data_file_writer_builder
-        .build(None)
-        .await
-        .map_err(|e| SqeError::Execution(format!("Failed to build data file writer: {e}")))?;
+    let metadata = table.metadata();
+    let partition_spec = metadata.default_partition_spec().clone();
+    let data_files = if partition_spec.is_unpartitioned() {
+        // Fast path: unpartitioned tables use the data-file writer directly.
+        let mut writer = data_file_writer_builder
+            .build(None)
+            .await
+            .map_err(|e| {
+                SqeError::Execution(format!("Failed to build data file writer: {e}"))
+            })?;
 
-    for batch in &batches {
-        if batch.num_rows() > 0 {
-            writer
-                .write(batch.clone())
-                .await
-                .map_err(|e| SqeError::Execution(format!("Write error: {e}")))?;
+        for batch in &batches {
+            if batch.num_rows() > 0 {
+                writer
+                    .write(batch.clone())
+                    .await
+                    .map_err(|e| SqeError::Execution(format!("Write error: {e}")))?;
+            }
         }
-    }
 
-    let data_files = writer
-        .close()
-        .await
-        .map_err(|e| SqeError::Execution(format!("Close writer error: {e}")))?;
+        writer
+            .close()
+            .await
+            .map_err(|e| SqeError::Execution(format!("Close writer error: {e}")))?
+    } else {
+        // Partitioned path: TaskWriter routes per-row to per-partition
+        // writers, emitting one DataFile per partition with the right
+        // partition struct attached. We pass a partition splitter that
+        // COMPUTES partition values from source columns at runtime
+        // (`try_new_with_computed_values`), so callers do not need to
+        // pre-stamp a `_partition` column on the incoming RecordBatch.
+        // Fanout writer enabled so unsorted INSERTs work without a
+        // pre-clustering step.
+        use iceberg::arrow::RecordBatchPartitionSplitter;
+        use iceberg::writer::task_writer::TaskWriter;
+        let schema = metadata.current_schema().clone();
+        let splitter = RecordBatchPartitionSplitter::try_new_with_computed_values(
+            schema.clone(),
+            partition_spec.clone(),
+        )
+        .map_err(|e| {
+            SqeError::Execution(format!(
+                "Failed to build partition splitter: {e}"
+            ))
+        })?;
+        let mut writer = TaskWriter::new_with_partition_splitter(
+            data_file_writer_builder,
+            true,
+            schema,
+            partition_spec,
+            Some(splitter),
+        );
+        for batch in &batches {
+            if batch.num_rows() > 0 {
+                writer
+                    .write(batch.clone())
+                    .await
+                    .map_err(|e| {
+                        SqeError::Execution(format!(
+                            "Partitioned write error: {e}"
+                        ))
+                    })?;
+            }
+        }
+        writer
+            .close()
+            .await
+            .map_err(|e| {
+                SqeError::Execution(format!("Close partitioned writer error: {e}"))
+            })?
+    };
 
     info!(
         file_count = data_files.len(),
@@ -249,42 +302,100 @@ pub async fn write_data_files_streaming(
 
     let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
 
-    let mut writer = data_file_writer_builder
-        .build(None)
-        .await
-        .map_err(|e| SqeError::Execution(format!("Failed to build data file writer: {e}")))?;
-
     // Build the stamped schema once from the Iceberg schema so it can be reused
     // for every batch without re-deriving it on each iteration.
-    let iceberg_schema = table.metadata().current_schema();
+    let metadata = table.metadata();
+    let iceberg_schema = metadata.current_schema();
     let stamped_schema = build_stamped_schema(iceberg_schema)?;
+    let partition_spec = metadata.default_partition_spec().clone();
 
     let mut total_rows = 0usize;
 
-    while let Some(batch_result) = stream.next().await {
-        let batch = batch_result
-            .map_err(|e| SqeError::Execution(format!("Stream error: {e}")))?;
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        let stamped = apply_stamped_schema(batch, &stamped_schema)?;
-        total_rows += stamped.num_rows();
-        writer
-            .write(stamped)
+    let data_files = if partition_spec.is_unpartitioned() {
+        // Fast path: unpartitioned tables stream straight into a
+        // DataFileWriter.
+        let mut writer = data_file_writer_builder
+            .build(None)
             .await
-            .map_err(|e| SqeError::Execution(format!("Write error: {e}")))?;
-    }
+            .map_err(|e| {
+                SqeError::Execution(format!(
+                    "Failed to build data file writer: {e}"
+                ))
+            })?;
 
-    if total_rows == 0 {
-        // No rows streamed — close the writer cleanly and return empty.
-        let _ = writer.close().await;
-        return Ok((vec![], 0));
-    }
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result
+                .map_err(|e| SqeError::Execution(format!("Stream error: {e}")))?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let stamped = apply_stamped_schema(batch, &stamped_schema)?;
+            total_rows += stamped.num_rows();
+            writer
+                .write(stamped)
+                .await
+                .map_err(|e| SqeError::Execution(format!("Write error: {e}")))?;
+        }
 
-    let data_files = writer
-        .close()
-        .await
-        .map_err(|e| SqeError::Execution(format!("Close writer error: {e}")))?;
+        if total_rows == 0 {
+            let _ = writer.close().await;
+            return Ok((vec![], 0));
+        }
+
+        writer
+            .close()
+            .await
+            .map_err(|e| SqeError::Execution(format!("Close writer error: {e}")))?
+    } else {
+        // Partitioned streaming: TaskWriter routes per-row to the right
+        // partition writer; the splitter computes partition values from
+        // source columns at runtime so the input stream does not need a
+        // pre-stamped `_partition` column. Fanout enabled so unsorted
+        // streams work.
+        use iceberg::arrow::RecordBatchPartitionSplitter;
+        use iceberg::writer::task_writer::TaskWriter;
+        let splitter = RecordBatchPartitionSplitter::try_new_with_computed_values(
+            iceberg_schema.clone(),
+            partition_spec.clone(),
+        )
+        .map_err(|e| {
+            SqeError::Execution(format!(
+                "Failed to build partition splitter: {e}"
+            ))
+        })?;
+        let mut writer = TaskWriter::new_with_partition_splitter(
+            data_file_writer_builder,
+            true,
+            iceberg_schema.clone(),
+            partition_spec,
+            Some(splitter),
+        );
+
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result
+                .map_err(|e| SqeError::Execution(format!("Stream error: {e}")))?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let stamped = apply_stamped_schema(batch, &stamped_schema)?;
+            total_rows += stamped.num_rows();
+            writer.write(stamped).await.map_err(|e| {
+                SqeError::Execution(format!("Partitioned write error: {e}"))
+            })?;
+        }
+
+        if total_rows == 0 {
+            let _ = writer.close().await;
+            return Ok((vec![], 0));
+        }
+
+        writer
+            .close()
+            .await
+            .map_err(|e| SqeError::Execution(format!(
+                "Close partitioned writer error: {e}"
+            )))?
+    };
 
     info!(
         file_count = data_files.len(),
