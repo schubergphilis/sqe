@@ -10,14 +10,14 @@
     "group": "3rd Party",
     "docUrl": "https://github.com/schubergphilis/sqe"
   },
-  "generatedAt": "2026-04-26T18:30:00Z",
-  "generatedBy": "Phase L Postgres JDBC live test",
+  "generatedAt": "2026-04-26T20:00:00Z",
+  "generatedBy": "Phase M PARTITIONED BY hidden-partitioning",
   "score": {
-    "raw": 149,
+    "raw": 151,
     "max": 189,
-    "percent": 78.8
+    "percent": 79.9
   },
-  "note": "Phase L integrated on top of Phase K. Score stays 149/189 (78.8%) but jdbc-catalog:v2's evidence column upgrades from 'crate compiles against fork' to 'live Postgres roundtrip'. Added postgres:16-alpine to docker-compose.test.yml; the jdbc_postgres_namespace_roundtrip test connects to localhost:15432, creates a namespace, lists it, drops it. Engine session manager dispatch refactor (gap #2 from Phase K) deferred to Phase M because it touches 60+ SessionCatalog usages across sqe-catalog + sqe-coordinator; that scope earns its own MR.",
+  "note": "Phase M integrated on top of Phase L. Score 149/189 (78.8%) -> 151/189 (79.9%). PARTITIONED BY (...) now works in CREATE TABLE for the six standard Iceberg transforms: identity, year, month, day, hour, bucket(N, col), truncate(L, col), void. Pre-parser normalizes Hive/Spark/Trino-style PARTITIONED BY into sqlparser's native PARTITION BY form. The handler translates the parsed Expr tree into an UnboundPartitionSpec with explicit field IDs starting at 1000 (Polaris rejects null field IDs). The writer (both batch and streaming paths) routes partitioned writes through TaskWriter + RecordBatchPartitionSplitter so partition values are computed per row and the right partition struct lands on each DataFile. Verified end-to-end against Polaris with 8 e2e tests: identity, day, bucket, truncate, multi-column composite, V3 nanosec timestamps, and two negative cases. hidden-partitioning v2 and v3 both flip from partial to full.",
   "support": {
     "sqe:position-deletes:v2": {
       "level": "full",
@@ -164,20 +164,16 @@
       "caveats": []
     },
     "sqe:hidden-partitioning:v2": {
-      "level": "partial",
-      "notes": "Read path honours all V2 transforms (year/month/day/hour/bucket/truncate/identity); partition columns surface through the scanner and partition pruning is applied. Write path lacks a SQL `PARTITIONED BY (...)` clause: tables are created via Spark/Trino and read by SQE.",
-      "evidence": "crates/sqe-catalog/src/iceberg_scan.rs#partition_column_names",
-      "caveats": [
-        "CREATE TABLE in SQE has no partition-spec syntax yet; iceberg-rust UnboundPartitionSpec is plumbed but unwired in the SQL handler."
-      ]
+      "level": "full",
+      "notes": "CREATE TABLE ... PARTITIONED BY (...) accepts all six standard Iceberg transforms: identity (bare column), year/month/day/hour, bucket(N, col), truncate(L, col), and void(col). The clause is normalized from `PARTITIONED BY` to sqlparser's native `PARTITION BY` form by a pre-parser, then translated into an Iceberg UnboundPartitionSpec with explicit field IDs starting at 1000 (Polaris rejects null IDs). The writer uses TaskWriter + RecordBatchPartitionSplitter to compute partition values per row and route them to per-partition data files. Verified end-to-end against Polaris: identity, day, bucket, truncate, and 3-field composite specs all round-trip; INSERT + COUNT(*) + WHERE on the partition column return correct results.",
+      "evidence": "crates/sqe-coordinator/src/write_handler.rs#build_partition_spec, crates/sqe-coordinator/src/writer.rs (TaskWriter path), crates/sqe-coordinator/tests/partition_e2e.rs",
+      "caveats": []
     },
     "sqe:hidden-partitioning:v3": {
-      "level": "partial",
-      "notes": "Same iceberg-rust scan path as V2 reads V3-format partition specs; transforms over V3 types (TIMESTAMP_NS) decode through the same Transform machinery. Write path shares the V2 gap: CREATE TABLE has no PARTITIONED BY syntax in SQE yet.",
-      "evidence": "crates/sqe-catalog/src/iceberg_scan.rs#partition_column_names",
-      "caveats": [
-        "Same write-path gap as V2: no SQL syntax for partition spec at create time."
-      ]
+      "level": "full",
+      "notes": "Same SQL syntax as V2 (PARTITIONED BY) and the same writer path. Verified on a V3 table with a TIMESTAMP_NS column partitioned by day(ts): INSERT routes per-row through the partition splitter and COUNT(*) returns the expected count.",
+      "evidence": "crates/sqe-coordinator/tests/partition_e2e.rs::create_table_partitioned_by_day_on_v3_table",
+      "caveats": []
     },
     "sqe:partition-evolution:v2": {
       "level": "partial",

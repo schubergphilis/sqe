@@ -1,11 +1,13 @@
 pub mod classifier;
 pub mod ddl;
+pub mod partition;
 pub mod procedures;
 pub mod time_travel;
 pub mod v3_types;
 
 pub use classifier::{parse_and_classify, CheckAccessParams, ShowGrantsTarget, StatementKind};
 pub use ddl::{try_parse_ref_ddl, BranchRetention, RefDdl};
+pub use partition::normalize_partitioned_by;
 pub use procedures::{try_parse_call, ProcedureCall, TableRef};
 pub use time_travel::{
     extract_incremental_spec, extract_time_travel_spec, IncrementalSpec, TimeTravelSpec, VersionRef,

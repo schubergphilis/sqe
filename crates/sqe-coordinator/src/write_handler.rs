@@ -589,11 +589,21 @@ impl WriteHandler {
         merge_user_table_properties(&mut props, &ct.table_properties);
         merge_user_table_properties(&mut props, &ct.with_options);
 
+        // Translate any PARTITIONED BY (...) clause into an Iceberg
+        // UnboundPartitionSpec. Identity transforms cover bare column
+        // refs; year/month/day/hour/bucket/truncate/void cover the
+        // standard hidden-partitioning transforms.
+        let partition_spec = build_partition_spec(
+            ct.partition_by.as_deref(),
+            &iceberg_schema,
+        )?;
+
         let table_creation = TableCreation::builder()
             .name(name.clone())
             .schema(iceberg_schema)
             .format_version(format_version)
             .properties(props)
+            .partition_spec_opt(partition_spec)
             .build();
 
         catalog
@@ -4151,11 +4161,313 @@ fn sql_expr_to_property_string(expr: &sqlparser::ast::Expr) -> String {
     }
 }
 
+/// Translate a sqlparser `PARTITIONED BY (...)` clause into an Iceberg
+/// [`UnboundPartitionSpec`]. Supports the six standard transforms:
+///
+/// | SQL              | Transform              |
+/// |------------------|------------------------|
+/// | `col`            | `Identity`             |
+/// | `year(col)`      | `Year`                 |
+/// | `month(col)`     | `Month`                |
+/// | `day(col)`       | `Day`                  |
+/// | `hour(col)`      | `Hour`                 |
+/// | `bucket(N, col)` | `Bucket(N)`            |
+/// | `truncate(L, col)` | `Truncate(L)`        |
+///
+/// The partition field name is auto-derived following the Iceberg
+/// convention: `<col>` for identity, `<col>_<transform>` for time
+/// transforms, `<col>_bucket_<N>` for bucket, `<col>_trunc_<L>` for
+/// truncate. Source column ids come from the table's iceberg schema.
+///
+/// Returns `Ok(None)` when no `PARTITIONED BY` clause is present so
+/// callers can pass the result to `TableCreation::builder().partition_spec_opt()`
+/// directly.
+pub(crate) fn build_partition_spec(
+    partition_by: Option<&sqlparser::ast::Expr>,
+    iceberg_schema: &IcebergSchema,
+) -> sqe_core::Result<Option<iceberg::spec::UnboundPartitionSpec>> {
+    use iceberg::spec::{UnboundPartitionField, UnboundPartitionSpec};
+    use sqlparser::ast::Expr;
+
+    let Some(expr) = partition_by else {
+        return Ok(None);
+    };
+
+    // The PARTITIONED BY clause may be a single expression or a tuple
+    // of expressions. sqlparser models multi-column partitioning as
+    // `Expr::Tuple(Vec<Expr>)`; single-column as the bare expression.
+    let exprs: Vec<&Expr> = match expr {
+        Expr::Tuple(items) => items.iter().collect(),
+        Expr::Nested(inner) => match inner.as_ref() {
+            Expr::Tuple(items) => items.iter().collect(),
+            other => vec![other],
+        },
+        other => vec![other],
+    };
+
+    // Iceberg V2 expects partition field ids to be unique across all
+    // partition specs. By spec, fresh specs start their field ids at
+    // 1000 and increment by 1 per field. iceberg-rust's UnboundPartitionSpec
+    // serializes `field-id: null` when None, which Polaris's REST
+    // endpoint rejects. Assigning the standard 1000+ ids up front keeps
+    // the wire format compatible.
+    let mut fields = Vec::with_capacity(exprs.len());
+    let mut next_field_id: i32 = 1000;
+    for partition_expr in exprs {
+        let (source_name, target_name, transform) =
+            parse_partition_transform(partition_expr)?;
+        let source_id = iceberg_schema
+            .as_struct()
+            .fields()
+            .iter()
+            .find(|f| f.name == source_name)
+            .map(|f| f.id)
+            .ok_or_else(|| {
+                SqeError::Execution(format!(
+                    "PARTITIONED BY references unknown column '{source_name}'"
+                ))
+            })?;
+        fields.push(UnboundPartitionField {
+            source_id,
+            field_id: Some(next_field_id),
+            name: target_name,
+            transform,
+        });
+        next_field_id += 1;
+    }
+
+    let spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_fields(fields)
+        .map_err(|e| SqeError::Execution(format!("Invalid PARTITIONED BY clause: {e}")))?
+        .build();
+
+    Ok(Some(spec))
+}
+
+/// Parse a single partition expression into `(source_column, target_name, Transform)`.
+fn parse_partition_transform(
+    expr: &sqlparser::ast::Expr,
+) -> sqe_core::Result<(String, String, iceberg::spec::Transform)> {
+    use iceberg::spec::Transform;
+    use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Value};
+
+    match expr {
+        // Bare column name = identity transform.
+        Expr::Identifier(ident) => Ok((
+            ident.value.clone(),
+            ident.value.clone(),
+            Transform::Identity,
+        )),
+        // Compound identifier (e.g. `t.col`) — take the last segment.
+        Expr::CompoundIdentifier(parts) => {
+            let name = parts
+                .last()
+                .map(|p| p.value.clone())
+                .ok_or_else(|| {
+                    SqeError::Execution(
+                        "PARTITIONED BY: empty compound identifier".to_string(),
+                    )
+                })?;
+            Ok((name.clone(), name, Transform::Identity))
+        }
+        // Function call: year(col), bucket(N, col), truncate(L, col), etc.
+        Expr::Function(func) => {
+            let fn_name = func
+                .name
+                .0
+                .last()
+                .map(|id| id.value.to_ascii_lowercase())
+                .ok_or_else(|| {
+                    SqeError::Execution(
+                        "PARTITIONED BY: function call without a name".to_string(),
+                    )
+                })?;
+            let args = match &func.args {
+                FunctionArguments::List(list) => &list.args,
+                _ => {
+                    return Err(SqeError::Execution(format!(
+                        "PARTITIONED BY: unsupported argument form for {fn_name}()"
+                    )));
+                }
+            };
+
+            // Extract the bare-expr arguments out of FunctionArg.
+            let bare_args: Vec<&Expr> = args
+                .iter()
+                .filter_map(|a| match a {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                    _ => None,
+                })
+                .collect();
+
+            // Helper closures.
+            let column_name = |arg: &Expr| -> sqe_core::Result<String> {
+                match arg {
+                    Expr::Identifier(id) => Ok(id.value.clone()),
+                    Expr::CompoundIdentifier(parts) => parts
+                        .last()
+                        .map(|p| p.value.clone())
+                        .ok_or_else(|| {
+                            SqeError::Execution(format!(
+                                "PARTITIONED BY {fn_name}(): empty compound identifier"
+                            ))
+                        }),
+                    other => Err(SqeError::Execution(format!(
+                        "PARTITIONED BY {fn_name}(): expected column name, got {other}"
+                    ))),
+                }
+            };
+            let int_arg = |arg: &Expr| -> sqe_core::Result<u32> {
+                match arg {
+                    Expr::Value(v) => match v {
+                        Value::Number(n, _) => n.parse::<u32>().map_err(|e| {
+                            SqeError::Execution(format!(
+                                "PARTITIONED BY {fn_name}(): integer parameter '{n}': {e}"
+                            ))
+                        }),
+                        other => Err(SqeError::Execution(format!(
+                            "PARTITIONED BY {fn_name}(): expected integer, got {other}"
+                        ))),
+                    },
+                    other => Err(SqeError::Execution(format!(
+                        "PARTITIONED BY {fn_name}(): expected integer literal, got {other}"
+                    ))),
+                }
+            };
+
+            match fn_name.as_str() {
+                "year" | "years" => {
+                    if bare_args.len() != 1 {
+                        return Err(SqeError::Execution(
+                            "PARTITIONED BY year(): expected exactly one column".into(),
+                        ));
+                    }
+                    let col = column_name(bare_args[0])?;
+                    Ok((col.clone(), format!("{col}_year"), Transform::Year))
+                }
+                "month" | "months" => {
+                    if bare_args.len() != 1 {
+                        return Err(SqeError::Execution(
+                            "PARTITIONED BY month(): expected exactly one column".into(),
+                        ));
+                    }
+                    let col = column_name(bare_args[0])?;
+                    Ok((col.clone(), format!("{col}_month"), Transform::Month))
+                }
+                "day" | "days" => {
+                    if bare_args.len() != 1 {
+                        return Err(SqeError::Execution(
+                            "PARTITIONED BY day(): expected exactly one column".into(),
+                        ));
+                    }
+                    let col = column_name(bare_args[0])?;
+                    Ok((col.clone(), format!("{col}_day"), Transform::Day))
+                }
+                "hour" | "hours" => {
+                    if bare_args.len() != 1 {
+                        return Err(SqeError::Execution(
+                            "PARTITIONED BY hour(): expected exactly one column".into(),
+                        ));
+                    }
+                    let col = column_name(bare_args[0])?;
+                    Ok((col.clone(), format!("{col}_hour"), Transform::Hour))
+                }
+                "bucket" => {
+                    if bare_args.len() != 2 {
+                        return Err(SqeError::Execution(
+                            "PARTITIONED BY bucket(N, col): expected exactly two arguments".into(),
+                        ));
+                    }
+                    let n = int_arg(bare_args[0])?;
+                    let col = column_name(bare_args[1])?;
+                    Ok((
+                        col.clone(),
+                        format!("{col}_bucket_{n}"),
+                        Transform::Bucket(n),
+                    ))
+                }
+                "truncate" => {
+                    if bare_args.len() != 2 {
+                        return Err(SqeError::Execution(
+                            "PARTITIONED BY truncate(L, col): expected exactly two arguments".into(),
+                        ));
+                    }
+                    let l = int_arg(bare_args[0])?;
+                    let col = column_name(bare_args[1])?;
+                    Ok((
+                        col.clone(),
+                        format!("{col}_trunc_{l}"),
+                        Transform::Truncate(l),
+                    ))
+                }
+                "void" => {
+                    if bare_args.len() != 1 {
+                        return Err(SqeError::Execution(
+                            "PARTITIONED BY void(col): expected exactly one column".into(),
+                        ));
+                    }
+                    let col = column_name(bare_args[0])?;
+                    Ok((col.clone(), format!("{col}_null"), Transform::Void))
+                }
+                other => Err(SqeError::Execution(format!(
+                    "PARTITIONED BY: unsupported transform '{other}'. \
+                     Supported: identity (bare column), year, month, day, hour, \
+                     bucket(N, col), truncate(L, col), void."
+                ))),
+            }
+        }
+        other => Err(SqeError::Execution(format!(
+            "PARTITIONED BY: unsupported expression form: {other}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, TimeUnit};
     use sqlparser::ast::{DataType as SqlType, ExactNumberInfo, TimezoneInfo};
+
+    // -------------------------------------------------------------------------
+    // build_partition_spec JSON shape (for catalog interop debugging)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn build_partition_spec_emits_polaris_compatible_json() {
+        use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
+        use std::sync::Arc;
+
+        let schema = IcebergSchema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "region",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+            ])
+            .build()
+            .unwrap();
+
+        let dialect = sqlparser::dialect::GenericDialect {};
+        let mut parser = sqlparser::parser::Parser::new(&dialect)
+            .try_with_sql("region")
+            .unwrap();
+        let expr = parser.parse_expr().unwrap();
+        let spec = build_partition_spec(Some(&expr), &schema).unwrap().unwrap();
+        let json = serde_json::to_string_pretty(&spec).unwrap();
+        eprintln!("PARTITION SPEC JSON:\n{json}");
+        // The spec must serialize with kebab-case keys that Polaris recognises.
+        assert!(json.contains("\"source-id\": 2"), "json: {json}");
+        assert!(json.contains("\"transform\": \"identity\""), "json: {json}");
+        assert!(json.contains("\"name\": \"region\""), "json: {json}");
+    }
 
     // -------------------------------------------------------------------------
     // arrow_schema_to_iceberg tests
