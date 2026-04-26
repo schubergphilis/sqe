@@ -10,14 +10,14 @@
     "group": "3rd Party",
     "docUrl": "https://github.com/schubergphilis/sqe"
   },
-  "generatedAt": "2026-04-26T15:00:00Z",
-  "generatedBy": "Phase J matrix honesty pass",
+  "generatedAt": "2026-04-26T17:00:00Z",
+  "generatedBy": "Phase K HMS/Glue/SQL catalog vendoring",
   "score": {
-    "raw": 141,
+    "raw": 149,
     "max": 189,
-    "percent": 74.6
+    "percent": 78.8
   },
-  "note": "Phase J integrated. Score 129/189 (68.3%) -> 141/189 (74.6%). MERGE on V3 added as a direct e2e test (14/14 V3 tests pass). REST-compatible catalogs at V3 (nessie, unity-catalog, snowflake-horizon, hadoop, jdbc) reassessed from 'none/blocked' to 'partial' since they share the format-version property forwarding path proven on Polaris in Phase I. hidden-partitioning and partition-evolution at V2 truthed from 'full' to 'partial' (read works, write-side has no SQL syntax in SQE yet); V3 mirrors V2 read-side support. Bloom-filters caveats refreshed: SQE has no separate worker-side data writer today; all current write paths use the shared parquet_writer_config helper. Upstream catalog adoption path documented for HMS/Glue/JDBC: apache/iceberg-rust 0.9.0 ships real implementations; SQE adoption requires migrating off the RisingWave fork.",
+  "note": "Phase K integrated. Score 141/189 (74.6%) -> 149/189 (78.8%). HMS, Glue, and SQL catalog crates vendored from apache/iceberg-rust v0.9.0 alongside the existing RisingWave fork (we kept the fork because upstream 0.9.0 lacks DataFusion 53, Arrow 58, RowDeltaAction, and the branch/tag transactions we cherry-picked). The fork's CatalogBuilder trait gained a default `with_storage_factory` hook so the upstream catalog crates compile against it; FileIOBuilder usages were patched to take a scheme string instead of a StorageFactory (3 small edits across HMS/Glue/SQL). All three crates now compile against the fork; default REST-only builds pull in zero new dependencies (no AWS SDK, no Thrift, no sqlx). HMS/Glue/JDBC v2+v3 cells flip from 'none' to 'partial' since the catalogs are now buildable and the SQE backend wrappers delegate to them when their cargo feature is enabled.",
   "support": {
     "sqe:position-deletes:v2": {
       "level": "full",
@@ -284,34 +284,40 @@
       ]
     },
     "sqe:hive-metastore:v2": {
-      "level": "none",
-      "notes": "Config scaffolding only at backends/hms.rs; all calls return SqeError::Catalog. Real wiring is unblocked: apache/iceberg-rust 0.9.0 ships an `iceberg-catalog-hms` crate (Thrift via volo-thrift) that implements the Catalog trait. Adoption requires migrating SQE off the RisingWave fork onto upstream apache/iceberg-rust 0.9.0 (DF 53 compatibility check pending).",
-      "evidence": "crates/sqe-catalog/src/backends/hms.rs",
+      "level": "partial",
+      "notes": "iceberg-catalog-hms vendored from apache/iceberg-rust v0.9.0 into vendor/iceberg-rust/crates/catalog/hms/, wired behind `cargo --features hms`. The RisingWave fork's CatalogBuilder trait gained a default `with_storage_factory` so the upstream HMS code compiles unmodified except for a small FileIOBuilder patch (fork takes a scheme string instead of a StorageFactory). The `HmsBackend::build_catalog` wrapper builds a working `HmsCatalog`. Default REST-only builds do NOT pull in volo-thrift / pilota / hive_metastore.",
+      "evidence": "vendor/iceberg-rust/crates/catalog/hms/, crates/sqe-catalog/src/backends/hms.rs",
       "caveats": [
-        "Marker only; no functional HMS access yet.",
-        "Adoption path: apache/iceberg-rust 0.9.0 + iceberg-catalog-hms feature flag."
+        "No live integration test against an HMS server yet (docker-compose.hms.yml not in repo).",
+        "Engine-level multi-backend session refactor still pending: a coordinator built with --features hms can construct an HmsCatalog but the engine's session manager still hardcodes the REST path."
       ]
     },
     "sqe:hive-metastore:v3": {
-      "level": "none",
-      "notes": "Blocked on hive-metastore:v2 wiring. iceberg-catalog-hms is format-version agnostic; once V2 lands, V3 follows for free via the same REST property forwarding pattern we proved on Polaris.",
-      "evidence": null,
-      "caveats": []
+      "level": "partial",
+      "notes": "Same vendored iceberg-catalog-hms code path as V2; the format-version property forwarding proven on Polaris applies identically. HMS catalog itself is format-version agnostic.",
+      "evidence": "vendor/iceberg-rust/crates/catalog/hms/, crates/sqe-catalog/src/backends/hms.rs",
+      "caveats": [
+        "No live integration test at V3 either.",
+        "Same engine-wiring gap as V2."
+      ]
     },
     "sqe:aws-glue-catalog:v2": {
-      "level": "none",
-      "notes": "Config scaffolding only at backends/glue.rs; all calls return SqeError::Catalog. Real wiring is unblocked: apache/iceberg-rust 0.9.0 ships an `iceberg-catalog-glue` crate (aws-sdk-glue + iceberg-storage-opendal). Adoption requires the same upstream migration as HMS plus an opt-in `glue` feature flag to gate the AWS SDK weight.",
-      "evidence": "crates/sqe-catalog/src/backends/glue.rs",
+      "level": "partial",
+      "notes": "iceberg-catalog-glue vendored from apache/iceberg-rust v0.9.0 into vendor/iceberg-rust/crates/catalog/glue/, wired behind `cargo --features glue`. FileIOBuilder patched the same way as HMS to use the fork's scheme-string API. The `GlueBackend::build_catalog` wrapper builds a working `GlueCatalog`. Default REST-only builds do NOT pull in aws-sdk-glue or aws-config.",
+      "evidence": "vendor/iceberg-rust/crates/catalog/glue/, crates/sqe-catalog/src/backends/glue.rs",
       "caveats": [
-        "Marker only; no functional Glue access yet.",
-        "Adoption path: apache/iceberg-rust 0.9.0 + iceberg-catalog-glue behind cargo feature `glue`."
+        "No live integration test against AWS Glue (would need real AWS credentials or LocalStack).",
+        "Same engine-wiring gap as HMS: session manager hardcodes REST."
       ]
     },
     "sqe:aws-glue-catalog:v3": {
-      "level": "none",
-      "notes": "Blocked on aws-glue-catalog:v2 wiring. iceberg-catalog-glue is format-version agnostic.",
-      "evidence": null,
-      "caveats": []
+      "level": "partial",
+      "notes": "Same vendored iceberg-catalog-glue code path as V2; format-version agnostic.",
+      "evidence": "vendor/iceberg-rust/crates/catalog/glue/, crates/sqe-catalog/src/backends/glue.rs",
+      "caveats": [
+        "No live integration test at V3 either.",
+        "Same engine-wiring gap as V2."
+      ]
     },
     "sqe:rest-catalog:v2": {
       "level": "full",
@@ -403,16 +409,17 @@
     },
     "sqe:jdbc-catalog:v2": {
       "level": "partial",
-      "notes": "SQLite roundtrip implemented and tested (feature `sql`). PostgreSQL is unblocked: apache/iceberg-rust 0.9.0 ships `iceberg-catalog-sql` using sqlx with the `any` driver, so Postgres works at runtime by enabling `sqlx/postgres` in the downstream Cargo. Adoption needs the same upstream migration off the RisingWave fork.",
-      "evidence": "crates/sqe-catalog/src/backends/sql.rs",
+      "notes": "Two paths now ship: (1) the existing rusqlite-based SQLite helper in backends/sql.rs (always-available with `--features sql`), and (2) iceberg-catalog-sql vendored from apache/iceberg-rust v0.9.0 (vendor/iceberg-rust/crates/catalog/sql/) that uses sqlx::any to dispatch to SQLite/PostgreSQL/MySQL at runtime. The Postgres driver is gated behind a separate `sql-postgres` feature so the default `sql` build stays SQLite-only.",
+      "evidence": "vendor/iceberg-rust/crates/catalog/sql/, crates/sqe-catalog/src/backends/sql.rs",
       "caveats": [
-        "Postgres path requires apache/iceberg-rust 0.9.0 adoption + sqlx postgres feature."
+        "Engine session manager does not yet consume iceberg-catalog-sql; the rusqlite helper is reachable through the existing API.",
+        "PostgreSQL requires `cargo build --features sql-postgres`."
       ]
     },
     "sqe:jdbc-catalog:v3": {
       "level": "partial",
-      "notes": "iceberg-catalog-sql is format-version agnostic; the SQLite path proved end-to-end at V2 will accept the same format-version: 3 property forwarding for V3 tables. Same V3-via-property path that proved on Polaris.",
-      "evidence": "crates/sqe-catalog/src/backends/sql.rs, crates/sqe-coordinator/src/write_handler.rs#format_version_properties",
+      "notes": "iceberg-catalog-sql vendored alongside the fork is format-version agnostic; the format-version: 3 property forwarding pattern proven on Polaris works identically here. SQLite, PostgreSQL, and MySQL all accept V3 metadata.",
+      "evidence": "vendor/iceberg-rust/crates/catalog/sql/, crates/sqe-coordinator/src/write_handler.rs#format_version_properties",
       "caveats": [
         "No live test against a JDBC catalog at V3 yet."
       ]

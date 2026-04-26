@@ -1,14 +1,13 @@
 //! AWS Glue Data Catalog backend.
 //!
 //! Glue is a hosted Iceberg-compatible catalog. The upstream
-//! `iceberg-catalog-glue` crate drives it via the AWS SDK; SQE adopts it
-//! once the vendored fork rebases onto a release that exports compatible
-//! types. Today this module is a marker with a typed config struct so the
-//! catalog registry can accept `catalog.type = "glue"` in `sqe.toml` and
-//! return a clear error.
+//! `iceberg-catalog-glue` crate (vendored from apache/iceberg-rust v0.9.0
+//! into `vendor/iceberg-rust/crates/catalog/glue/`) drives Glue via the
+//! AWS SDK and implements the `iceberg::Catalog` trait.
 //!
-//! Real implementation lands in Phase A task 2.3. Until then, the `glue`
-//! Cargo feature pulls in this module but no AWS SDK; builds stay small.
+//! Enable the `glue` cargo feature to pull in aws-sdk-glue + aws-config
+//! and get a functioning backend. Without the feature the struct stays
+//! a marker that fails loudly with a pointer at the feature flag.
 
 use sqe_core::{Result as SqeResult, SqeError};
 
@@ -48,11 +47,44 @@ impl GlueBackend {
         &self.config
     }
 
-    /// List databases (Glue calls namespaces `Database`). Stub.
+    /// Build the underlying `GlueCatalog` from the vendored upstream crate.
+    ///
+    /// Returns an error when the `glue` cargo feature is disabled. With the
+    /// feature on, this constructs a working AWS SDK-backed catalog.
+    #[cfg(feature = "glue")]
+    pub async fn build_catalog(
+        &self,
+        storage_factory: std::sync::Arc<dyn iceberg::io::StorageFactory>,
+    ) -> SqeResult<iceberg_catalog_glue::GlueCatalog> {
+        use iceberg::CatalogBuilder;
+        let mut props = std::collections::HashMap::new();
+        props.insert(
+            iceberg_catalog_glue::GLUE_CATALOG_PROP_WAREHOUSE.to_string(),
+            self.config.warehouse.clone(),
+        );
+        props.insert(
+            iceberg_catalog_glue::AWS_REGION_NAME.to_string(),
+            self.config.region.clone(),
+        );
+        if let Some(endpoint) = self.config.endpoint.as_ref() {
+            props.insert(
+                iceberg_catalog_glue::GLUE_CATALOG_PROP_URI.to_string(),
+                endpoint.clone(),
+            );
+        }
+        iceberg_catalog_glue::GlueCatalogBuilder::default()
+            .with_storage_factory(storage_factory)
+            .load("glue", props)
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to build GlueCatalog: {e}")))
+    }
+
+    /// Stub `list_databases` for builds without the `glue` feature.
+    #[cfg(not(feature = "glue"))]
     pub async fn list_databases(&self) -> SqeResult<Vec<String>> {
         Err(SqeError::Catalog(format!(
-            "Glue backend not yet wired to upstream iceberg-catalog-glue (region {}); \
-             tracked in openspec/changes/iceberg-matrix-parity/tasks.md task 2.3",
+            "Glue backend requires building with the `glue` cargo feature \
+             (region {}). Build with `cargo build --features glue` to enable.",
             self.config.region
         )))
     }
@@ -69,12 +101,13 @@ mod tests {
         assert!(cfg.endpoint.is_none());
     }
 
+    #[cfg(not(feature = "glue"))]
     #[tokio::test]
     async fn list_databases_returns_stub_error() {
         let backend = GlueBackend::new(GlueConfig::new("eu-west-1", "s3://lake/wh"));
         let err = backend.list_databases().await.unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("Glue backend"));
-        assert!(msg.contains("task 2.3"));
+        assert!(msg.contains("`glue` cargo feature"));
     }
 }
