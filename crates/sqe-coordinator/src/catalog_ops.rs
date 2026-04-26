@@ -11,10 +11,13 @@ use tracing::info;
 
 use sqe_catalog::{SessionCatalog, TableMetadataCache};
 use sqe_core::{Session, SqeConfig, SqeError};
-use sqe_sql::{BranchRetention, RefDdl};
+use sqe_sql::{BranchRetention, PartitionEvolution, RefDdl};
 use tracing::instrument;
 
-use crate::write_handler::{default_to_iceberg_literal as alter_default_to_iceberg_literal, sql_type_to_arrow};
+use crate::write_handler::{
+    default_to_iceberg_literal as alter_default_to_iceberg_literal, parse_partition_transform_sql,
+    sql_type_to_arrow,
+};
 
 /// Handles catalog DDL operations (DROP TABLE, ALTER TABLE RENAME, views).
 ///
@@ -830,6 +833,190 @@ impl CatalogOps {
             action = ddl_action_label(ddl),
             "Applying branch/tag DDL"
         );
+
+        session_catalog
+            .commit_schema_update(&table_ident, updates, vec![])
+            .await?;
+
+        Ok(())
+    }
+
+    /// Execute a parsed `PartitionEvolution` (ALTER TABLE ... ADD/DROP/REPLACE
+    /// PARTITION FIELD) against the catalog.
+    ///
+    /// Builds a fresh `UnboundPartitionSpec` derived from the table's current
+    /// default spec, applies the requested change, and commits via
+    /// `TableUpdate::AddSpec` + `TableUpdate::SetDefaultSpec { spec_id: -1 }`.
+    /// `-1` instructs the catalog to set the just-added spec as the default,
+    /// matching the convention used by upstream iceberg-rust.
+    ///
+    /// Field IDs for newly added partition fields start at
+    /// `metadata.last_partition_id() + 1`, preserving global field-ID
+    /// uniqueness as required by the Iceberg V2 spec.
+    #[instrument(skip(self, session, evolution), fields(username = %session.user.username))]
+    pub async fn apply_partition_evolution(
+        &self,
+        session: &Session,
+        evolution: &PartitionEvolution,
+    ) -> sqe_core::Result<()> {
+        use iceberg::spec::{UnboundPartitionField, UnboundPartitionSpec};
+
+        let table_ref = match evolution {
+            PartitionEvolution::AddField { table, .. }
+            | PartitionEvolution::DropField { table, .. }
+            | PartitionEvolution::ReplaceField { table, .. } => table.as_str(),
+        };
+
+        let object_name = parse_object_name(table_ref)?;
+        let (namespace, name) = parse_table_ref(&object_name)?;
+        let table_ident = TableIdent::new(namespace, name);
+
+        let session_catalog = Arc::new(
+            SessionCatalog::new(
+                &self.config.catalog.polaris_url,
+                &self.config.catalog.warehouse,
+                &session.access_token,
+                &self.config.storage,
+                self.table_cache.clone(),
+                None,
+                None,
+            )
+            .await?,
+        );
+
+        let table = session_catalog.load_table(&table_ident).await?;
+        let metadata = table.metadata();
+        let current_spec = metadata.default_partition_spec();
+        let current_spec_id = metadata.default_partition_spec_id();
+        let mut next_field_id = metadata.last_partition_id() + 1;
+        // First-ever partition field on a previously unpartitioned table:
+        // start at the standard 1000 to match `build_partition_spec`.
+        if next_field_id <= 0 {
+            next_field_id = 1000;
+        }
+        let schema = metadata.current_schema();
+
+        // Carry over the existing fields as the starting point for every
+        // operation, then mutate the list in place. Each existing field is
+        // converted from `PartitionField` (bound) to `UnboundPartitionField`
+        // (the form `UnboundPartitionSpec` accepts).
+        let mut fields: Vec<UnboundPartitionField> = current_spec
+            .fields()
+            .iter()
+            .cloned()
+            .map(|f| f.into_unbound())
+            .collect();
+
+        // Resolve a transform-SQL fragment to `(source_id, target_name, transform)`,
+        // verifying the source column exists in the current schema.
+        let resolve_transform =
+            |transform_sql: &str| -> sqe_core::Result<UnboundPartitionField> {
+                let (source_name, target_name, transform) =
+                    parse_partition_transform_sql(transform_sql)?;
+                let source_id = schema
+                    .as_struct()
+                    .fields()
+                    .iter()
+                    .find(|f| f.name == source_name)
+                    .map(|f| f.id)
+                    .ok_or_else(|| {
+                        SqeError::Execution(format!(
+                            "ALTER TABLE PARTITION FIELD: column '{source_name}' not found in table schema"
+                        ))
+                    })?;
+                Ok(UnboundPartitionField {
+                    source_id,
+                    field_id: None, // assigned below
+                    name: target_name,
+                    transform,
+                })
+            };
+
+        // Locate an existing field by transform-SQL fragment, matching on the
+        // canonical Iceberg field name produced by `parse_partition_transform_sql`.
+        let find_field_pos = |fields: &[UnboundPartitionField],
+                              transform_sql: &str|
+         -> sqe_core::Result<usize> {
+            let (_src, target_name, _transform) = parse_partition_transform_sql(transform_sql)?;
+            fields
+                .iter()
+                .position(|f| f.name == target_name)
+                .ok_or_else(|| {
+                    SqeError::Execution(format!(
+                        "ALTER TABLE PARTITION FIELD: no existing partition field matches '{transform_sql}'"
+                    ))
+                })
+        };
+
+        let action_label = match evolution {
+            PartitionEvolution::AddField { transform_sql, .. } => {
+                let mut new_field = resolve_transform(transform_sql)?;
+                if fields.iter().any(|f| f.name == new_field.name) {
+                    return Err(SqeError::Execution(format!(
+                        "ALTER TABLE ADD PARTITION FIELD: a partition field named '{}' already exists",
+                        new_field.name
+                    )));
+                }
+                new_field.field_id = Some(next_field_id);
+                fields.push(new_field);
+                "add_partition_field"
+            }
+            PartitionEvolution::DropField { transform_sql, .. } => {
+                let pos = find_field_pos(&fields, transform_sql)?;
+                fields.remove(pos);
+                "drop_partition_field"
+            }
+            PartitionEvolution::ReplaceField {
+                old_transform_sql,
+                new_transform_sql,
+                ..
+            } => {
+                let pos = find_field_pos(&fields, old_transform_sql)?;
+                let mut new_field = resolve_transform(new_transform_sql)?;
+                // Reject a no-op REPLACE so the user gets a clear error rather
+                // than a silently identical spec.
+                if fields[pos].name == new_field.name {
+                    return Err(SqeError::Execution(format!(
+                        "ALTER TABLE REPLACE PARTITION FIELD: old and new fields are identical ('{}')",
+                        new_field.name
+                    )));
+                }
+                fields.remove(pos);
+                if fields.iter().any(|f| f.name == new_field.name) {
+                    return Err(SqeError::Execution(format!(
+                        "ALTER TABLE REPLACE PARTITION FIELD: target field '{}' already exists",
+                        new_field.name
+                    )));
+                }
+                new_field.field_id = Some(next_field_id);
+                fields.push(new_field);
+                "replace_partition_field"
+            }
+        };
+
+        let new_spec_id = current_spec_id + 1;
+        let new_spec: UnboundPartitionSpec = UnboundPartitionSpec::builder()
+            .with_spec_id(new_spec_id)
+            .add_partition_fields(fields)
+            .map_err(|e| {
+                SqeError::Execution(format!("Invalid partition spec after evolution: {e}"))
+            })?
+            .build();
+
+        info!(
+            username = %session.user.username,
+            table = %table_ident,
+            action = action_label,
+            new_spec_id,
+            "Applying partition evolution"
+        );
+
+        // SetDefaultSpec { spec_id: -1 } instructs the catalog to use the
+        // just-added spec, matching the upstream iceberg-rust convention.
+        let updates = vec![
+            TableUpdate::AddSpec { spec: new_spec },
+            TableUpdate::SetDefaultSpec { spec_id: -1 },
+        ];
 
         session_catalog
             .commit_schema_update(&table_ident, updates, vec![])

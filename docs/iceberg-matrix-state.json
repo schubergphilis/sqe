@@ -10,14 +10,14 @@
     "group": "3rd Party",
     "docUrl": "https://github.com/schubergphilis/sqe"
   },
-  "generatedAt": "2026-04-26T20:00:00Z",
-  "generatedBy": "Phase M PARTITIONED BY hidden-partitioning",
+  "generatedAt": "2026-04-26T21:30:00Z",
+  "generatedBy": "Phase N partition-evolution (ALTER TABLE PARTITION FIELD)",
   "score": {
-    "raw": 151,
+    "raw": 153,
     "max": 189,
-    "percent": 79.9
+    "percent": 81.0
   },
-  "note": "Phase M integrated on top of Phase L. Score 149/189 (78.8%) -> 151/189 (79.9%). PARTITIONED BY (...) now works in CREATE TABLE for the six standard Iceberg transforms: identity, year, month, day, hour, bucket(N, col), truncate(L, col), void. Pre-parser normalizes Hive/Spark/Trino-style PARTITIONED BY into sqlparser's native PARTITION BY form. The handler translates the parsed Expr tree into an UnboundPartitionSpec with explicit field IDs starting at 1000 (Polaris rejects null field IDs). The writer (both batch and streaming paths) routes partitioned writes through TaskWriter + RecordBatchPartitionSplitter so partition values are computed per row and the right partition struct lands on each DataFile. Verified end-to-end against Polaris with 8 e2e tests: identity, day, bucket, truncate, multi-column composite, V3 nanosec timestamps, and two negative cases. hidden-partitioning v2 and v3 both flip from partial to full.",
+  "note": "Phase N integrated on top of Phase M. Score 151/189 (79.9%) -> 153/189 (81.0%). ALTER TABLE ADD/DROP/REPLACE PARTITION FIELD now evolves the Iceberg partition spec end-to-end. A pre-parser in sqe-sql intercepts the non-standard syntax (sqlparser-rs only models Hive-style PARTITION (col=val)) and produces a PartitionEvolution AST node carrying the raw transform SQL. The coordinator's apply_partition_evolution handler loads the table, derives a fresh UnboundPartitionSpec from the current default spec by adding/removing/replacing fields (field ids start at metadata.last_partition_id() + 1 to keep Iceberg V2's per-table uniqueness), and commits TableUpdate::AddSpec + TableUpdate::SetDefaultSpec { spec_id: -1 } via SessionCatalog::commit_schema_update. The writer was patched so the unpartitioned fast path stamps the table's current default spec_id (after a DROP that empties the spec, the table is unpartitioned but spec_id != 0; the catalog rejected the commit with 'Data file partition spec id does not match table default partition spec id' until the writer started passing a synthetic empty PartitionKey). Verified end-to-end against Polaris with 7 e2e tests: ADD identity, ADD day(ts), DROP, REPLACE identity -> bucket(8, col), V3 partition evolution, and two negative cases (DROP unknown field, ADD on unknown column). partition-evolution v2 and v3 both flip from partial to full.",
   "support": {
     "sqe:position-deletes:v2": {
       "level": "full",
@@ -176,20 +176,16 @@
       "caveats": []
     },
     "sqe:partition-evolution:v2": {
-      "level": "partial",
-      "notes": "Read path tolerates partition spec evolution: iceberg-rust returns the per-data-file spec id and the scanner uses it to pick the right transforms when reading. Write-side spec evolution (ALTER TABLE ADD/DROP/REPLACE PARTITION FIELD) is not wired into SQE's DDL handler yet.",
-      "evidence": "crates/sqe-catalog/src/iceberg_metadata_tvf.rs (manifests TVF surfaces partition_spec_id per file)",
-      "caveats": [
-        "ALTER TABLE for partition spec evolution not implemented in SQE."
-      ]
+      "level": "full",
+      "notes": "ALTER TABLE ADD/DROP/REPLACE PARTITION FIELD evolves the partition spec end-to-end. Pre-parser in sqe-sql/partition_evolution.rs lifts the non-standard syntax into a PartitionEvolution AST. The coordinator's apply_partition_evolution handler builds a new UnboundPartitionSpec from the current default spec, assigns continuing field ids from metadata.last_partition_id() + 1, and commits TableUpdate::AddSpec + SetDefaultSpec { spec_id: -1 } via the REST table-commit endpoint. Read path was already correct (per-file partition_spec_id from iceberg-rust). Writer was patched so the unpartitioned fast path stamps the current default spec_id when spec_id != 0.",
+      "evidence": "crates/sqe-coordinator/tests/partition_evolution_e2e.rs (7/7 pass against Polaris)",
+      "caveats": []
     },
     "sqe:partition-evolution:v3": {
-      "level": "partial",
-      "notes": "V3 metadata stores per-file partition_spec_id the same way V2 does; the scan path picks up evolved specs identically. Write-side spec evolution shares the V2 gap.",
-      "evidence": "crates/sqe-catalog/src/iceberg_metadata_tvf.rs",
-      "caveats": [
-        "Same write-path gap as V2."
-      ]
+      "level": "full",
+      "notes": "V3 metadata stores per-file partition_spec_id the same way V2 does; the same coordinator handler and writer path exercise V3 nanosec timestamp partitioning unchanged.",
+      "evidence": "crates/sqe-coordinator/tests/partition_evolution_e2e.rs::add_partition_field_on_v3_table",
+      "caveats": []
     },
     "sqe:multi-arg-transforms:v3": {
       "level": "none",
