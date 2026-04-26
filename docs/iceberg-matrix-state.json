@@ -13,9 +13,9 @@
   "generatedAt": "2026-04-26T11:50:00Z",
   "generatedBy": "Phase I V3 path validation",
   "score": {
-    "raw": 128,
+    "raw": 129,
     "max": 189,
-    "percent": 67.7
+    "percent": 68.3
   },
   "note": "Phase I integrated. V3 round-trip verified end-to-end through Polaris + iceberg-rust (11 e2e tests in crates/sqe-coordinator/tests/v3_e2e.rs). Iceberg REST CreateTableRequest now propagates format-version via the reserved table property so Polaris materialises V3 metadata when SQE detects V3 features. CREATE TABLE TBLPROPERTIES are forwarded to the catalog and re-emitted by SHOW CREATE TABLE. CDC FOR INCREMENTAL works on V3 tables; FOR VERSION AS OF time-travel registration still has a schema-provider gap that lives outside V3 scope.",
   "support": {
@@ -98,10 +98,12 @@
       "caveats": []
     },
     "sqe:type-promotion:v3": {
-      "level": "partial",
-      "notes": "Existing V2 widening rules apply to V3 tables; nanosec-to-microsecond narrowing not attempted.",
-      "evidence": "crates/sqe-sql/src/ddl.rs",
-      "caveats": []
+      "level": "full",
+      "notes": "ALTER TABLE ... ALTER COLUMN ... SET DATA TYPE widens columns on V3 tables (verified int -> bigint). The new type surfaces through information_schema.columns and the schema change commits through Polaris.",
+      "evidence": "crates/sqe-coordinator/tests/v3_e2e.rs::type_promotion_int_to_bigint_on_v3_table",
+      "caveats": [
+        "Nanosecond-to-microsecond narrowing not attempted (Iceberg spec rejects narrowing)."
+      ]
     },
     "sqe:column-default-values:v3": {
       "level": "full",
