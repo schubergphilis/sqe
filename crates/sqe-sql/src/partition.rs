@@ -65,7 +65,7 @@ pub fn normalize_partitioned_by(sql: &str) -> String {
         if (c == b'P' || c == b'p') && i + 14 <= bytes.len() {
             let before_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
             if before_ok && case_insensitive_eq(&bytes[i..i + 13], b"PARTITIONED B")
-                && bytes[i + 13].to_ascii_uppercase() == b'Y'
+                && bytes[i + 13].eq_ignore_ascii_case(&b'Y')
                 && (i + 14 == bytes.len() || !is_ident_byte(bytes[i + 14]))
             {
                 // Replace `PARTITIONED BY` with `PARTITION BY`.
@@ -87,10 +87,7 @@ fn is_ident_byte(c: u8) -> bool {
 }
 
 fn case_insensitive_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .zip(b)
-            .all(|(x, y)| x.to_ascii_uppercase() == y.to_ascii_uppercase())
+    a.eq_ignore_ascii_case(b)
 }
 
 fn contains_partitioned_by_keyword(sql: &str) -> bool {

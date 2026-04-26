@@ -3,6 +3,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::ddl::{try_parse_ref_ddl, RefDdl};
+use crate::partition_evolution::{try_parse_partition_evolution, PartitionEvolution};
 use crate::procedures::{try_parse_call, ProcedureCall};
 
 /// Target for SHOW GRANTS statements.
@@ -90,6 +91,11 @@ pub enum StatementKind {
     /// SET WRITE_BRANCH = 'name' — route writes in this session to a named branch.
     /// SET WRITE_BRANCH = DEFAULT (or unquoted) resets to main.
     SetWriteBranch(Option<String>),
+    /// ALTER TABLE ... ADD/DROP/REPLACE PARTITION FIELD — partition spec evolution.
+    /// sqlparser-rs has no AST for transform-based partition fields, so this
+    /// variant carries the pre-parsed `PartitionEvolution` and routes through
+    /// a dedicated coordinator handler.
+    PartitionEvolution(Box<PartitionEvolution>),
 }
 
 impl StatementKind {
@@ -133,6 +139,7 @@ impl StatementKind {
             StatementKind::ShowStats(_) => "showstats",
             StatementKind::RefDdl(_) => "refddl",
             StatementKind::SetWriteBranch(_) => "setwritebranch",
+            StatementKind::PartitionEvolution(_) => "partitionevolution",
         }
     }
 }
@@ -222,6 +229,12 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
     if upper.starts_with("ALTER TABLE ") {
         if let Some(ref_ddl) = try_parse_ref_ddl(trimmed)? {
             return Ok(StatementKind::RefDdl(Box::new(ref_ddl)));
+        }
+        // Pre-scan for ALTER TABLE ... ADD/DROP/REPLACE PARTITION FIELD. The
+        // transform expression form is non-standard and sqlparser-rs models
+        // only Hive-style PARTITION (col=val), so we intercept here.
+        if let Some(pe) = try_parse_partition_evolution(trimmed)? {
+            return Ok(StatementKind::PartitionEvolution(Box::new(pe)));
         }
     }
 
@@ -1312,5 +1325,60 @@ mod tests {
     fn test_set_write_branch_name() {
         let kind = parse_and_classify("SET WRITE_BRANCH = 'x'").unwrap();
         assert_eq!(kind.name(), "setwritebranch");
+    }
+
+    // ── PARTITION FIELD evolution tests ───────────────────────────────────
+
+    #[test]
+    fn classify_add_partition_field() {
+        let kind =
+            parse_and_classify("ALTER TABLE ns.t ADD PARTITION FIELD year(ts)").unwrap();
+        match kind {
+            StatementKind::PartitionEvolution(b) => match *b {
+                PartitionEvolution::AddField { table, transform_sql } => {
+                    assert_eq!(table, "ns.t");
+                    assert_eq!(transform_sql, "year(ts)");
+                }
+                other => panic!("expected AddField, got {other:?}"),
+            },
+            other => panic!("expected PartitionEvolution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_drop_partition_field() {
+        let kind =
+            parse_and_classify("ALTER TABLE ns.t DROP PARTITION FIELD region").unwrap();
+        assert!(matches!(
+            kind,
+            StatementKind::PartitionEvolution(b)
+                if matches!(*b, PartitionEvolution::DropField { .. })
+        ));
+    }
+
+    #[test]
+    fn classify_replace_partition_field() {
+        let kind = parse_and_classify(
+            "ALTER TABLE ns.t REPLACE PARTITION FIELD region WITH bucket(8, region)",
+        )
+        .unwrap();
+        assert!(matches!(
+            kind,
+            StatementKind::PartitionEvolution(b)
+                if matches!(*b, PartitionEvolution::ReplaceField { .. })
+        ));
+    }
+
+    #[test]
+    fn classify_partition_evolution_name() {
+        let kind = parse_and_classify("ALTER TABLE t ADD PARTITION FIELD region").unwrap();
+        assert_eq!(kind.name(), "partitionevolution");
+    }
+
+    #[test]
+    fn alter_add_column_still_alter_schema_after_partition_pre_scan() {
+        // Regression: the partition pre-scan must not steal regular ALTER TABLE.
+        let kind = parse_and_classify("ALTER TABLE t ADD COLUMN x INT").unwrap();
+        assert!(matches!(kind, StatementKind::AlterSchema(_)));
     }
 }
