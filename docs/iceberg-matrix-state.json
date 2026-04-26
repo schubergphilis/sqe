@@ -10,14 +10,14 @@
     "group": "3rd Party",
     "docUrl": "https://github.com/schubergphilis/sqe"
   },
-  "generatedAt": "2026-04-26T17:00:00Z",
-  "generatedBy": "Phase K HMS/Glue/SQL catalog vendoring",
+  "generatedAt": "2026-04-26T18:30:00Z",
+  "generatedBy": "Phase L Postgres JDBC live test",
   "score": {
     "raw": 149,
     "max": 189,
     "percent": 78.8
   },
-  "note": "Phase K integrated. Score 141/189 (74.6%) -> 149/189 (78.8%). HMS, Glue, and SQL catalog crates vendored from apache/iceberg-rust v0.9.0 alongside the existing RisingWave fork (we kept the fork because upstream 0.9.0 lacks DataFusion 53, Arrow 58, RowDeltaAction, and the branch/tag transactions we cherry-picked). The fork's CatalogBuilder trait gained a default `with_storage_factory` hook so the upstream catalog crates compile against it; FileIOBuilder usages were patched to take a scheme string instead of a StorageFactory (3 small edits across HMS/Glue/SQL). All three crates now compile against the fork; default REST-only builds pull in zero new dependencies (no AWS SDK, no Thrift, no sqlx). HMS/Glue/JDBC v2+v3 cells flip from 'none' to 'partial' since the catalogs are now buildable and the SQE backend wrappers delegate to them when their cargo feature is enabled.",
+  "note": "Phase L integrated on top of Phase K. Score stays 149/189 (78.8%) but jdbc-catalog:v2's evidence column upgrades from 'crate compiles against fork' to 'live Postgres roundtrip'. Added postgres:16-alpine to docker-compose.test.yml; the jdbc_postgres_namespace_roundtrip test connects to localhost:15432, creates a namespace, lists it, drops it. Engine session manager dispatch refactor (gap #2 from Phase K) deferred to Phase M because it touches 60+ SessionCatalog usages across sqe-catalog + sqe-coordinator; that scope earns its own MR.",
   "support": {
     "sqe:position-deletes:v2": {
       "level": "full",
@@ -409,11 +409,11 @@
     },
     "sqe:jdbc-catalog:v2": {
       "level": "partial",
-      "notes": "Two paths now ship: (1) the existing rusqlite-based SQLite helper in backends/sql.rs (always-available with `--features sql`), and (2) iceberg-catalog-sql vendored from apache/iceberg-rust v0.9.0 (vendor/iceberg-rust/crates/catalog/sql/) that uses sqlx::any to dispatch to SQLite/PostgreSQL/MySQL at runtime. The Postgres driver is gated behind a separate `sql-postgres` feature so the default `sql` build stays SQLite-only.",
-      "evidence": "vendor/iceberg-rust/crates/catalog/sql/, crates/sqe-catalog/src/backends/sql.rs",
+      "notes": "Two paths ship: (1) the rusqlite-based SQLite helper in backends/sql.rs (always-available with `--features sql`), and (2) iceberg-catalog-sql vendored from apache/iceberg-rust v0.9.0 (vendor/iceberg-rust/crates/catalog/sql/) using sqlx::any to dispatch to SQLite/PostgreSQL/MySQL. Postgres path verified end-to-end with `jdbc_postgres_namespace_roundtrip` in crates/sqe-catalog/tests/backends_integration.rs against the docker-compose.test.yml postgres service: create_namespace + list_namespaces + drop_namespace all succeed against a live Postgres instance.",
+      "evidence": "vendor/iceberg-rust/crates/catalog/sql/, crates/sqe-catalog/tests/backends_integration.rs::sql_postgres::jdbc_postgres_namespace_roundtrip",
       "caveats": [
-        "Engine session manager does not yet consume iceberg-catalog-sql; the rusqlite helper is reachable through the existing API.",
-        "PostgreSQL requires `cargo build --features sql-postgres`."
+        "Engine session manager does not yet consume iceberg-catalog-sql; the rusqlite helper is the only path the coordinator routes to today.",
+        "Live test exercises namespace ops; create_table needs a writable warehouse FileIO and was not included in the Phase L slice."
       ]
     },
     "sqe:jdbc-catalog:v3": {
