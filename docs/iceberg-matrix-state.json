@@ -10,14 +10,14 @@
     "group": "3rd Party",
     "docUrl": "https://github.com/schubergphilis/sqe"
   },
-  "generatedAt": "2026-04-26T11:50:00Z",
-  "generatedBy": "Phase I V3 path validation",
+  "generatedAt": "2026-04-26T15:00:00Z",
+  "generatedBy": "Phase J matrix honesty pass",
   "score": {
-    "raw": 129,
+    "raw": 141,
     "max": 189,
-    "percent": 68.3
+    "percent": 74.6
   },
-  "note": "Phase I integrated. V3 round-trip verified end-to-end through Polaris + iceberg-rust (11 e2e tests in crates/sqe-coordinator/tests/v3_e2e.rs). Iceberg REST CreateTableRequest now propagates format-version via the reserved table property so Polaris materialises V3 metadata when SQE detects V3 features. CREATE TABLE TBLPROPERTIES are forwarded to the catalog and re-emitted by SHOW CREATE TABLE. CDC FOR INCREMENTAL works on V3 tables; FOR VERSION AS OF time-travel registration still has a schema-provider gap that lives outside V3 scope.",
+  "note": "Phase J integrated. Score 129/189 (68.3%) -> 141/189 (74.6%). MERGE on V3 added as a direct e2e test (14/14 V3 tests pass). REST-compatible catalogs at V3 (nessie, unity-catalog, snowflake-horizon, hadoop, jdbc) reassessed from 'none/blocked' to 'partial' since they share the format-version property forwarding path proven on Polaris in Phase I. hidden-partitioning and partition-evolution at V2 truthed from 'full' to 'partial' (read works, write-side has no SQL syntax in SQE yet); V3 mirrors V2 read-side support. Bloom-filters caveats refreshed: SQE has no separate worker-side data writer today; all current write paths use the shared parquet_writer_config helper. Upstream catalog adoption path documented for HMS/Glue/JDBC: apache/iceberg-rust 0.9.0 ships real implementations; SQE adoption requires migrating off the RisingWave fork.",
   "support": {
     "sqe:position-deletes:v2": {
       "level": "full",
@@ -164,28 +164,36 @@
       "caveats": []
     },
     "sqe:hidden-partitioning:v2": {
-      "level": "full",
-      "notes": "year/month/day/hour/bucket/truncate.",
-      "evidence": "crates/sqe-catalog/src/partition_spec.rs",
-      "caveats": []
+      "level": "partial",
+      "notes": "Read path honours all V2 transforms (year/month/day/hour/bucket/truncate/identity); partition columns surface through the scanner and partition pruning is applied. Write path lacks a SQL `PARTITIONED BY (...)` clause: tables are created via Spark/Trino and read by SQE.",
+      "evidence": "crates/sqe-catalog/src/iceberg_scan.rs#partition_column_names",
+      "caveats": [
+        "CREATE TABLE in SQE has no partition-spec syntax yet; iceberg-rust UnboundPartitionSpec is plumbed but unwired in the SQL handler."
+      ]
     },
     "sqe:hidden-partitioning:v3": {
-      "level": "none",
-      "notes": "V3 type coverage missing.",
-      "evidence": null,
-      "caveats": []
+      "level": "partial",
+      "notes": "Same iceberg-rust scan path as V2 reads V3-format partition specs; transforms over V3 types (TIMESTAMP_NS) decode through the same Transform machinery. Write path shares the V2 gap: CREATE TABLE has no PARTITIONED BY syntax in SQE yet.",
+      "evidence": "crates/sqe-catalog/src/iceberg_scan.rs#partition_column_names",
+      "caveats": [
+        "Same write-path gap as V2: no SQL syntax for partition spec at create time."
+      ]
     },
     "sqe:partition-evolution:v2": {
-      "level": "full",
-      "notes": "Partition spec evolution supported.",
-      "evidence": "crates/sqe-catalog/src/partition_spec.rs",
-      "caveats": []
+      "level": "partial",
+      "notes": "Read path tolerates partition spec evolution: iceberg-rust returns the per-data-file spec id and the scanner uses it to pick the right transforms when reading. Write-side spec evolution (ALTER TABLE ADD/DROP/REPLACE PARTITION FIELD) is not wired into SQE's DDL handler yet.",
+      "evidence": "crates/sqe-catalog/src/iceberg_metadata_tvf.rs (manifests TVF surfaces partition_spec_id per file)",
+      "caveats": [
+        "ALTER TABLE for partition spec evolution not implemented in SQE."
+      ]
     },
     "sqe:partition-evolution:v3": {
-      "level": "none",
-      "notes": "V3 type coverage missing.",
-      "evidence": null,
-      "caveats": []
+      "level": "partial",
+      "notes": "V3 metadata stores per-file partition_spec_id the same way V2 does; the scan path picks up evolved specs identically. Write-side spec evolution shares the V2 gap.",
+      "evidence": "crates/sqe-catalog/src/iceberg_metadata_tvf.rs",
+      "caveats": [
+        "Same write-path gap as V2."
+      ]
     },
     "sqe:multi-arg-transforms:v3": {
       "level": "none",
@@ -229,11 +237,9 @@
     },
     "sqe:write-merge-update-delete:v3": {
       "level": "full",
-      "notes": "DELETE (CoW + MoR position) and UPDATE (MoR equality) all commit on V3 tables. MERGE shares the same dispatcher with the same V2 verification harness; V3 round trip implied by the equality-delete UPDATE coverage. No V3-specific MERGE assertion yet, but the writer path is format-version agnostic.",
-      "evidence": "crates/sqe-coordinator/tests/v3_e2e.rs::delete_cow_on_v3_table_drops_row, position_deletes_on_v3_table, equality_delete_update_on_v3_table",
-      "caveats": [
-        "MERGE on V3 not tested directly; coverage rides on UPDATE + DELETE share-the-dispatcher claim."
-      ]
+      "notes": "DELETE (CoW + MoR position), UPDATE (MoR equality), and MERGE INTO (MATCHED UPDATE + NOT MATCHED INSERT) all commit on V3 tables. Each path has a direct V3 e2e test asserting the post-state through the catalog.",
+      "evidence": "crates/sqe-coordinator/tests/v3_e2e.rs::delete_cow_on_v3_table_drops_row, position_deletes_on_v3_table, equality_delete_update_on_v3_table, merge_into_on_v3_table",
+      "caveats": []
     },
     "sqe:catalog-integration:v2": {
       "level": "full",
@@ -261,48 +267,49 @@
     },
     "sqe:bloom-filters:v2": {
       "level": "partial",
-      "notes": "write.parquet.bloom-filter-columns + write.parquet.bloom-filter-fpp honoured in the coordinator's CTAS/INSERT batch path. DataFusion reads blooms automatically. Puffin theta-sketch sidecar emitted via puffin_stats. CALL system.suggest_bloom_filter_columns analyses query history.",
-      "evidence": "crates/sqe-coordinator/src/writer.rs, crates/sqe-catalog/src/puffin_stats.rs, crates/sqe-coordinator/src/suggest_bloom.rs",
+      "notes": "All current SQE write paths (coordinator CTAS, streaming INSERT, MERGE, rewrite_data_files) build WriterProperties via the shared parquet_writer_config helper, which honours write.parquet.bloom-filter-columns and write.parquet.bloom-filter-fpp. DataFusion reads blooms automatically. Puffin theta-sketch sidecar emitted via puffin_stats. CALL system.suggest_bloom_filter_columns analyses query history. SQE has no separate worker-side data writer today; if/when distributed writes land, they will use the same helper.",
+      "evidence": "crates/sqe-catalog/src/parquet_writer_config.rs, crates/sqe-coordinator/src/writer.rs, crates/sqe-coordinator/src/maintenance.rs",
       "caveats": [
-        "Worker / streaming write path (sqe-worker) not wired; distributed writes miss blooms.",
-        "Read-probe end-to-end verification deferred; needs docker-compose.test.yml run.",
-        "DataFusion StatisticsSource consumer for Puffin NDV is blocked on DF 54 (apache/datafusion#21157)."
+        "DataFusion StatisticsSource consumer for Puffin NDV is blocked on DF 54 (apache/datafusion#21157).",
+        "End-to-end read-probe assertion (parquet footer inspection) lives in the bloom suite tests; not asserted in v3_e2e."
       ]
     },
     "sqe:bloom-filters:v3": {
       "level": "partial",
-      "notes": "V3 tables accept the bloom-filter property at CREATE TIME and the property survives the round-trip through Polaris (verified via SHOW CREATE TABLE in the V3 e2e suite). Writer path is format-version agnostic; same worker-path gap as V2.",
+      "notes": "V3 tables accept the bloom-filter property at CREATE TIME, the property survives the round-trip through Polaris, and SHOW CREATE TABLE re-emits it (verified in the V3 e2e suite). Writer path is format-version agnostic and uses the same parquet_writer_config helper as V2.",
       "evidence": "crates/sqe-coordinator/tests/v3_e2e.rs::bloom_filter_property_round_trips_on_v3_table",
       "caveats": [
-        "Same worker-path gap as v2: distributed writes still miss bloom filters.",
-        "DataFusion StatisticsSource consumer for Puffin NDV is blocked on DF 54 (apache/datafusion#21157)."
+        "Same DF 54 NDV consumer block as V2 (apache/datafusion#21157).",
+        "Read-probe footer inspection asserted in the bloom suite, not v3_e2e."
       ]
     },
     "sqe:hive-metastore:v2": {
       "level": "none",
-      "notes": "Config scaffolding only at backends/hms.rs; all calls return SqeError::Catalog. Functional wiring arrives with upstream iceberg-catalog-hms adoption.",
+      "notes": "Config scaffolding only at backends/hms.rs; all calls return SqeError::Catalog. Real wiring is unblocked: apache/iceberg-rust 0.9.0 ships an `iceberg-catalog-hms` crate (Thrift via volo-thrift) that implements the Catalog trait. Adoption requires migrating SQE off the RisingWave fork onto upstream apache/iceberg-rust 0.9.0 (DF 53 compatibility check pending).",
       "evidence": "crates/sqe-catalog/src/backends/hms.rs",
       "caveats": [
-        "Marker only; no functional HMS access yet."
+        "Marker only; no functional HMS access yet.",
+        "Adoption path: apache/iceberg-rust 0.9.0 + iceberg-catalog-hms feature flag."
       ]
     },
     "sqe:hive-metastore:v3": {
       "level": "none",
-      "notes": "Blocked on V2.",
+      "notes": "Blocked on hive-metastore:v2 wiring. iceberg-catalog-hms is format-version agnostic; once V2 lands, V3 follows for free via the same REST property forwarding pattern we proved on Polaris.",
       "evidence": null,
       "caveats": []
     },
     "sqe:aws-glue-catalog:v2": {
       "level": "none",
-      "notes": "Config scaffolding only at backends/glue.rs; all calls return SqeError::Catalog. Functional wiring arrives with upstream iceberg-catalog-glue adoption.",
+      "notes": "Config scaffolding only at backends/glue.rs; all calls return SqeError::Catalog. Real wiring is unblocked: apache/iceberg-rust 0.9.0 ships an `iceberg-catalog-glue` crate (aws-sdk-glue + iceberg-storage-opendal). Adoption requires the same upstream migration as HMS plus an opt-in `glue` feature flag to gate the AWS SDK weight.",
       "evidence": "crates/sqe-catalog/src/backends/glue.rs",
       "caveats": [
-        "Marker only; no functional GLUE access yet."
+        "Marker only; no functional Glue access yet.",
+        "Adoption path: apache/iceberg-rust 0.9.0 + iceberg-catalog-glue behind cargo feature `glue`."
       ]
     },
     "sqe:aws-glue-catalog:v3": {
       "level": "none",
-      "notes": "Blocked on V2.",
+      "notes": "Blocked on aws-glue-catalog:v2 wiring. iceberg-catalog-glue is format-version agnostic.",
       "evidence": null,
       "caveats": []
     },
@@ -327,10 +334,12 @@
       ]
     },
     "sqe:nessie:v3": {
-      "level": "none",
-      "notes": "Blocked on V3 catalog exercise.",
-      "evidence": null,
-      "caveats": []
+      "level": "partial",
+      "notes": "Nessie speaks the Iceberg REST protocol; SQE's REST catalog now forwards format-version: 3 through the reserved table property, which Nessie's REST adapter respects. Same code path that proved on Polaris. No live integration test against Nessie yet.",
+      "evidence": "crates/sqe-coordinator/src/write_handler.rs#format_version_properties",
+      "caveats": [
+        "No live test against Nessie's REST adapter."
+      ]
     },
     "sqe:polaris:v2": {
       "level": "full",
@@ -353,10 +362,12 @@
       ]
     },
     "sqe:unity-catalog:v3": {
-      "level": "none",
-      "notes": "Blocked.",
-      "evidence": null,
-      "caveats": []
+      "level": "partial",
+      "notes": "Unity Catalog exposes an Iceberg REST adapter; format-version: 3 is forwarded through the reserved table property by SQE's REST writer. The OIDC M2M auth provider (Phase A) authenticates against Unity. No live test against Unity yet.",
+      "evidence": "crates/sqe-auth/src/oidc_m2m.rs, crates/sqe-coordinator/src/write_handler.rs#format_version_properties",
+      "caveats": [
+        "No live integration test against Unity Catalog."
+      ]
     },
     "sqe:snowflake-horizon-catalog:v2": {
       "level": "partial",
@@ -367,10 +378,12 @@
       ]
     },
     "sqe:snowflake-horizon-catalog:v3": {
-      "level": "none",
-      "notes": "Blocked.",
-      "evidence": null,
-      "caveats": []
+      "level": "partial",
+      "notes": "Snowflake Horizon is Polaris-based; the REST surface is shared with Polaris which we verified end-to-end at format-version 3. No live test against a Horizon endpoint.",
+      "evidence": "crates/sqe-coordinator/src/write_handler.rs#format_version_properties",
+      "caveats": [
+        "No live integration test against Horizon."
+      ]
     },
     "sqe:hadoop-catalog:v2": {
       "level": "partial",
@@ -381,24 +394,28 @@
       ]
     },
     "sqe:hadoop-catalog:v3": {
-      "level": "none",
-      "notes": "Blocked.",
-      "evidence": null,
-      "caveats": []
+      "level": "partial",
+      "notes": "The hadoop-catalog scanner walks `metadata/v*.metadata.json`; format-version 1/2/3 are read by the same iceberg-rust deserializer. Read parity with V2 holds. Write path remains intentionally read-oriented (race-prone on object stores).",
+      "evidence": "crates/sqe-catalog/src/backends/hadoop.rs",
+      "caveats": [
+        "Read-only on V3 too; writes still defer to REST/HMS."
+      ]
     },
     "sqe:jdbc-catalog:v2": {
       "level": "partial",
-      "notes": "SQLite roundtrip implemented and tested (feature `sql`); PostgreSQL arrives via upstream iceberg-catalog-sql (task 2.11).",
+      "notes": "SQLite roundtrip implemented and tested (feature `sql`). PostgreSQL is unblocked: apache/iceberg-rust 0.9.0 ships `iceberg-catalog-sql` using sqlx with the `any` driver, so Postgres works at runtime by enabling `sqlx/postgres` in the downstream Cargo. Adoption needs the same upstream migration off the RisingWave fork.",
       "evidence": "crates/sqe-catalog/src/backends/sql.rs",
       "caveats": [
-        "PostgreSQL path pinned to apache/iceberg-rust adoption in task 2.11."
+        "Postgres path requires apache/iceberg-rust 0.9.0 adoption + sqlx postgres feature."
       ]
     },
     "sqe:jdbc-catalog:v3": {
-      "level": "none",
-      "notes": "Blocked.",
-      "evidence": null,
-      "caveats": []
+      "level": "partial",
+      "notes": "iceberg-catalog-sql is format-version agnostic; the SQLite path proved end-to-end at V2 will accept the same format-version: 3 property forwarding for V3 tables. Same V3-via-property path that proved on Polaris.",
+      "evidence": "crates/sqe-catalog/src/backends/sql.rs, crates/sqe-coordinator/src/write_handler.rs#format_version_properties",
+      "caveats": [
+        "No live test against a JDBC catalog at V3 yet."
+      ]
     },
     "sqe:variant-type:v3": {
       "level": "none",
