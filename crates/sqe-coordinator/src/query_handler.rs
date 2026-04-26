@@ -278,6 +278,12 @@ impl QueryHandler {
         // and would otherwise reject the query.
         let (classify_sql, _version_specs) =
             sqe_sql::extract_time_travel_spec(&classify_sql)?;
+        // Rewrite Hive/Spark/Trino-style `PARTITIONED BY (...)` into
+        // sqlparser-friendly `PARTITION BY (...)`. sqlparser's native
+        // PARTITIONED BY expects column definitions; we want Iceberg
+        // transforms (year/month/day/hour/bucket/truncate/identity)
+        // which fit the BigQuery-style `PARTITION BY <expr>` shape.
+        let classify_sql = sqe_sql::normalize_partitioned_by(&classify_sql);
         let kind = parse_and_classify(&classify_sql)?;
         let kind_name = kind.name().to_string();
         let span = Span::current();
@@ -878,6 +884,12 @@ impl QueryHandler {
         // and would otherwise reject the query.
         let (classify_sql, _version_specs) =
             sqe_sql::extract_time_travel_spec(&classify_sql)?;
+        // Rewrite Hive/Spark/Trino-style `PARTITIONED BY (...)` into
+        // sqlparser-friendly `PARTITION BY (...)`. sqlparser's native
+        // PARTITIONED BY expects column definitions; we want Iceberg
+        // transforms (year/month/day/hour/bucket/truncate/identity)
+        // which fit the BigQuery-style `PARTITION BY <expr>` shape.
+        let classify_sql = sqe_sql::normalize_partitioned_by(&classify_sql);
         let kind = parse_and_classify(&classify_sql)?;
         let kind_name = kind.name().to_string();
         if !matches!(kind, StatementKind::Query(_)) {
@@ -1060,6 +1072,12 @@ impl QueryHandler {
         // and would otherwise reject the query.
         let (classify_sql, _version_specs) =
             sqe_sql::extract_time_travel_spec(&classify_sql)?;
+        // Rewrite Hive/Spark/Trino-style `PARTITIONED BY (...)` into
+        // sqlparser-friendly `PARTITION BY (...)`. sqlparser's native
+        // PARTITIONED BY expects column definitions; we want Iceberg
+        // transforms (year/month/day/hour/bucket/truncate/identity)
+        // which fit the BigQuery-style `PARTITION BY <expr>` shape.
+        let classify_sql = sqe_sql::normalize_partitioned_by(&classify_sql);
         let kind = parse_and_classify(&classify_sql)?;
 
         if matches!(kind, StatementKind::Query(_)) {
