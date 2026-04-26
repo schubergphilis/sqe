@@ -704,7 +704,7 @@ pub(crate) fn pack_file_groups(files: &[DataFile], target_bytes: u64) -> Vec<Vec
         .cloned()
         .collect();
     // Descending by size.
-    small.sort_by(|a, b| b.file_size_in_bytes().cmp(&a.file_size_in_bytes()));
+    small.sort_by_key(|b| std::cmp::Reverse(b.file_size_in_bytes()));
 
     let mut groups: Vec<Vec<DataFile>> = Vec::new();
     for f in small {

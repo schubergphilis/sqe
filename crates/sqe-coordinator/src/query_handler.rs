@@ -403,6 +403,13 @@ impl QueryHandler {
                     crate::session_context::invalidate_all_session_caches();
                     Ok(vec![])
                 }
+                StatementKind::PartitionEvolution(evolution) => {
+                    self.catalog_ops
+                        .apply_partition_evolution(session, evolution)
+                        .await?;
+                    crate::session_context::invalidate_all_session_caches();
+                    Ok(vec![])
+                }
                 StatementKind::SetWriteBranch(ref branch) => {
                     if let Some(ref manager) = self.session_manager {
                         let updated = manager.set_write_branch(&session.id, branch.clone());

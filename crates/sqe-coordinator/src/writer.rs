@@ -6,7 +6,7 @@ use arrow_schema::Schema as ArrowSchema;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::StreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
-use iceberg::spec::{DataFile, Schema as IcebergSchema};
+use iceberg::spec::{DataFile, PartitionKey, Schema as IcebergSchema, Struct};
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::base_writer::equality_delete_writer::{
@@ -27,6 +27,27 @@ use sqe_catalog::parquet_writer_config::{self, writer_props_for_table as shared_
 use sqe_core::SqeError;
 use tracing::{info, instrument};
 use uuid::Uuid;
+
+/// When a table is logically unpartitioned (no fields, or all-Void) but its
+/// default partition spec is not the original `spec_id == 0`, the data files
+/// must still be stamped with the current default spec id so the catalog
+/// commit succeeds. Returns `None` for the canonical `spec_id == 0` case so
+/// the writer keeps its previous fast-path behaviour. For evolved unpartitioned
+/// specs, returns a synthetic `PartitionKey` with empty struct data and the
+/// current spec attached.
+fn unpartitioned_spec_key(
+    table: &Table,
+    partition_spec: &iceberg::spec::PartitionSpecRef,
+) -> Option<PartitionKey> {
+    if partition_spec.spec_id() == 0 {
+        return None;
+    }
+    Some(PartitionKey::new(
+        (**partition_spec).clone(),
+        table.metadata().current_schema().clone(),
+        Struct::empty(),
+    ))
+}
 
 /// Iceberg table property that lists columns to get Parquet bloom filters.
 ///
@@ -153,8 +174,16 @@ pub async fn write_data_files(
     let partition_spec = metadata.default_partition_spec().clone();
     let data_files = if partition_spec.is_unpartitioned() {
         // Fast path: unpartitioned tables use the data-file writer directly.
+        // Even on the unpartitioned path the data file must record the
+        // table's current default spec id. Tables that have evolved
+        // their partition spec (ALTER TABLE DROP/REPLACE PARTITION FIELD)
+        // can be unpartitioned with `spec_id != 0`, and the catalog
+        // rejects the commit with "Data file partition spec id does not
+        // match table default partition spec id" when the file is
+        // stamped with the iceberg-rust default of 0.
+        let partition_key = unpartitioned_spec_key(table, &partition_spec);
         let mut writer = data_file_writer_builder
-            .build(None)
+            .build(partition_key)
             .await
             .map_err(|e| {
                 SqeError::Execution(format!("Failed to build data file writer: {e}"))
@@ -313,9 +342,11 @@ pub async fn write_data_files_streaming(
 
     let data_files = if partition_spec.is_unpartitioned() {
         // Fast path: unpartitioned tables stream straight into a
-        // DataFileWriter.
+        // DataFileWriter. See `write_data_files` for why we still need
+        // a synthetic empty PartitionKey when `spec_id != 0`.
+        let partition_key = unpartitioned_spec_key(table, &partition_spec);
         let mut writer = data_file_writer_builder
-            .build(None)
+            .build(partition_key)
             .await
             .map_err(|e| {
                 SqeError::Execution(format!(
