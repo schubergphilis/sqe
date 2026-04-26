@@ -272,6 +272,12 @@ impl QueryHandler {
         // `handle_incremental` call re-extracts the specs from the original
         // SQL and registers the providers against the same session context.
         let (classify_sql, _incremental_specs) = sqe_sql::extract_incremental_spec(sql)?;
+        // Also strip `FOR VERSION AS OF`. sqlparser-rs models
+        // `FOR SYSTEM_TIME AS OF` natively but not VERSION; the time-travel
+        // pre-parser handles VERSION later, but the classifier runs first
+        // and would otherwise reject the query.
+        let (classify_sql, _version_specs) =
+            sqe_sql::extract_time_travel_spec(&classify_sql)?;
         let kind = parse_and_classify(&classify_sql)?;
         let kind_name = kind.name().to_string();
         let span = Span::current();
@@ -521,8 +527,9 @@ impl QueryHandler {
 
                 // SHOW CREATE TABLE — reconstruct DDL from information_schema
                 StatementKind::ShowCreateTable(ref stmt) => {
-                    let (ctx, _session_catalog) = self.create_session_context(session).await?;
-                    self.handle_show_create_table(session, stmt, &ctx).await
+                    let (ctx, session_catalog) = self.create_session_context(session).await?;
+                    self.handle_show_create_table(session, stmt, &ctx, &session_catalog)
+                        .await
                 }
 
                 // TRUNCATE TABLE — rewrite as DELETE FROM (no WHERE clause)
@@ -865,6 +872,12 @@ impl QueryHandler {
         // See execute() for why we pre-strip `FOR INCREMENTAL BETWEEN` before
         // handing SQL to sqlparser-rs.
         let (classify_sql, _incremental_specs) = sqe_sql::extract_incremental_spec(sql)?;
+        // Also strip `FOR VERSION AS OF`. sqlparser-rs models
+        // `FOR SYSTEM_TIME AS OF` natively but not VERSION; the time-travel
+        // pre-parser handles VERSION later, but the classifier runs first
+        // and would otherwise reject the query.
+        let (classify_sql, _version_specs) =
+            sqe_sql::extract_time_travel_spec(&classify_sql)?;
         let kind = parse_and_classify(&classify_sql)?;
         let kind_name = kind.name().to_string();
         if !matches!(kind, StatementKind::Query(_)) {
@@ -1041,6 +1054,12 @@ impl QueryHandler {
     ) -> sqe_core::Result<SchemaRef> {
         // Pre-strip FOR INCREMENTAL so sqlparser can tokenise the statement.
         let (classify_sql, _incremental_specs) = sqe_sql::extract_incremental_spec(sql)?;
+        // Also strip `FOR VERSION AS OF`. sqlparser-rs models
+        // `FOR SYSTEM_TIME AS OF` natively but not VERSION; the time-travel
+        // pre-parser handles VERSION later, but the classifier runs first
+        // and would otherwise reject the query.
+        let (classify_sql, _version_specs) =
+            sqe_sql::extract_time_travel_spec(&classify_sql)?;
         let kind = parse_and_classify(&classify_sql)?;
 
         if matches!(kind, StatementKind::Query(_)) {
@@ -1602,6 +1621,7 @@ impl QueryHandler {
         _session: &Session,
         stmt: &Statement,
         ctx: &SessionContext,
+        session_catalog: &Arc<SessionCatalog>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         use arrow_array::StringArray as ArrowStringArray;
 
@@ -1667,6 +1687,54 @@ impl QueryHandler {
             }
         }
         ddl.push_str("\n)");
+
+        // Append TBLPROPERTIES (k = 'v', ...) for any user-set properties.
+        // The Iceberg metadata exposes the property map; we filter out the
+        // reserved keys that Iceberg manages internally so the round-trip
+        // matches what the user actually set in CREATE TABLE.
+        let parts: Vec<&str> = table_name.split('.').collect();
+        let (ns, bare) = match parts.len() {
+            1 => ("default", parts[0]),
+            2 => (parts[0], parts[1]),
+            3 => (parts[1], parts[2]),
+            _ => ("default", parts[parts.len() - 1]),
+        };
+        let ns_ident = iceberg::NamespaceIdent::new(ns.to_string());
+        let table_ident = iceberg::TableIdent::new(ns_ident, bare.to_string());
+        if let Ok(table) = session_catalog.load_table(&table_ident).await {
+            let props = table.metadata().properties();
+            // Iceberg-internal property keys we never want to surface.
+            const SUPPRESSED_PREFIXES: &[&str] = &[
+                "current-",
+                "snapshot-count",
+                "last-",
+                "uuid",
+                "format-version",
+                "default-",
+                "owner",
+            ];
+            let mut user_props: Vec<(&String, &String)> = props
+                .iter()
+                .filter(|(k, _)| {
+                    !SUPPRESSED_PREFIXES
+                        .iter()
+                        .any(|pre| k.starts_with(pre))
+                })
+                .collect();
+            user_props.sort_by(|a, b| a.0.cmp(b.0));
+            if !user_props.is_empty() {
+                ddl.push_str("\nTBLPROPERTIES (\n");
+                let last = user_props.len() - 1;
+                for (i, (k, v)) in user_props.iter().enumerate() {
+                    ddl.push_str(&format!("   '{k}' = '{v}'"));
+                    if i != last {
+                        ddl.push(',');
+                    }
+                    ddl.push('\n');
+                }
+                ddl.push(')');
+            }
+        }
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "Create Table",
