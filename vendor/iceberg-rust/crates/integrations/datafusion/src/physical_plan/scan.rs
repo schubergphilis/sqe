@@ -20,16 +20,25 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::vec;
 
-use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::array::{BooleanArray, RecordBatch};
+use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use datafusion::common::config::ConfigOptions;
+use datafusion::common::DataFusionError;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::filter_pushdown::{
+    ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
+    PushedDown,
+};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
+use datafusion::physical_plan::{
+    ColumnarValue, DisplayAs, ExecutionPlan, Partitioning, PlanProperties,
+};
 use datafusion::prelude::Expr;
-use futures::{Stream, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use iceberg::expr::Predicate;
 use iceberg::table::Table;
 
@@ -49,10 +58,22 @@ pub struct IcebergTableScan {
     plan_properties: Arc<PlanProperties>,
     /// Projection column names, None means all columns
     projection: Option<Vec<String>>,
-    /// Filters to apply to the table scan
+    /// Static filters converted to an Iceberg [`Predicate`] at planning time
+    /// and pushed into manifest pruning + Parquet row-group eval.
     predicates: Option<Predicate>,
     /// Optional limit on the number of rows to return
     limit: Option<usize>,
+    /// Runtime filters absorbed via [`ExecutionPlan::handle_child_pushdown_result`].
+    ///
+    /// These typically come from a `HashJoinExec` build side
+    /// ([`datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr`])
+    /// and start as `lit(true)`. The hash-join build phase replaces the
+    /// inner expression with a real predicate (e.g. an `IN`-list of build
+    /// keys) once the build side completes. We evaluate these per-batch
+    /// during `execute()` so any filtering effect kicks in as soon as the
+    /// build side finishes, even for scans that have already started
+    /// streaming.
+    runtime_filters: Vec<Arc<dyn PhysicalExpr>>,
 }
 
 impl IcebergTableScan {
@@ -80,6 +101,24 @@ impl IcebergTableScan {
             projection,
             predicates,
             limit,
+            runtime_filters: Vec::new(),
+        }
+    }
+
+    /// Return a copy of this scan with `extra_filters` appended to the
+    /// runtime filter list. Used by [`ExecutionPlan::handle_child_pushdown_result`]
+    /// when a parent (typically `HashJoinExec`) hands us a dynamic filter.
+    fn with_runtime_filters(&self, extra_filters: Vec<Arc<dyn PhysicalExpr>>) -> Self {
+        let mut combined = self.runtime_filters.clone();
+        combined.extend(extra_filters);
+        Self {
+            table: self.table.clone(),
+            snapshot_id: self.snapshot_id,
+            plan_properties: self.plan_properties.clone(),
+            projection: self.projection.clone(),
+            predicates: self.predicates.clone(),
+            limit: self.limit,
+            runtime_filters: combined,
         }
     }
 
@@ -154,11 +193,27 @@ impl ExecutionPlan for IcebergTableScan {
         );
         let stream = futures::stream::once(fut).try_flatten();
 
+        // Apply runtime filters (e.g. join build-side dynamic filters)
+        // per batch. The filters start as `lit(true)` while the build
+        // side is still loading and become selective once it completes,
+        // so we evaluate fresh on every batch.
+        let runtime_filters = self.runtime_filters.clone();
+        let filtered_stream: Pin<
+            Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>,
+        > = if runtime_filters.is_empty() {
+            Box::pin(stream)
+        } else {
+            Box::pin(stream.map(move |batch_res| match batch_res {
+                Ok(batch) => apply_runtime_filters(batch, &runtime_filters),
+                Err(e) => Err(e),
+            }))
+        };
+
         // Apply limit if specified
         let limited_stream: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
             if let Some(limit) = self.limit {
                 let mut remaining = limit;
-                Box::pin(stream.try_filter_map(move |batch| {
+                Box::pin(filtered_stream.try_filter_map(move |batch| {
                     futures::future::ready(if remaining == 0 {
                         Ok(None)
                     } else if batch.num_rows() <= remaining {
@@ -171,7 +226,7 @@ impl ExecutionPlan for IcebergTableScan {
                     })
                 }))
             } else {
-                Box::pin(stream)
+                filtered_stream
             };
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -179,6 +234,95 @@ impl ExecutionPlan for IcebergTableScan {
             limited_stream,
         )))
     }
+
+    /// Accept runtime filters from a parent node (e.g. dynamic filters
+    /// from a `HashJoinExec` build side). Leaf scans return an empty
+    /// [`FilterDescription`] because they have no children to push to;
+    /// the absorption happens in [`Self::handle_child_pushdown_result`].
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        _parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> DFResult<FilterDescription> {
+        Ok(FilterDescription::new())
+    }
+
+    /// Bind the runtime filters that the framework has decided to push
+    /// down to this scan. Returns a clone of the scan with the filters
+    /// stored, so `execute()` can apply them per batch. We mark the
+    /// parent filters as "supported" (yes) so the framework knows it
+    /// can drop the wrapping `FilterExec` and avoid double-evaluating.
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> DFResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        let absorbed: Vec<Arc<dyn PhysicalExpr>> = child_pushdown_result
+            .parent_filters
+            .iter()
+            .map(|f| Arc::clone(&f.filter))
+            .collect();
+
+        if absorbed.is_empty() {
+            return Ok(FilterPushdownPropagation::if_all(child_pushdown_result));
+        }
+
+        // Mark each absorbed parent filter as supported so the framework
+        // knows it can drop the wrapping `FilterExec` and avoid double
+        // evaluation.
+        let supported: Vec<PushedDown> =
+            vec![PushedDown::Yes; child_pushdown_result.parent_filters.len()];
+        let new_node = self.with_runtime_filters(absorbed);
+        Ok(FilterPushdownPropagation::with_parent_pushdown_result(supported)
+            .with_updated_node(Arc::new(new_node) as Arc<dyn ExecutionPlan>))
+    }
+}
+
+/// Helper: tiny wrapper around DataFusion's `PhysicalExpr::evaluate` +
+/// `arrow::compute::filter_record_batch` to apply a list of conjunctive
+/// runtime filters to a batch and return the surviving rows.
+///
+/// Each filter is evaluated in turn; as soon as a batch goes empty we
+/// return an empty batch with the same schema rather than continuing to
+/// evaluate the rest.
+fn apply_runtime_filters(
+    mut batch: RecordBatch,
+    filters: &[Arc<dyn PhysicalExpr>],
+) -> DFResult<RecordBatch> {
+    for filter in filters {
+        if batch.num_rows() == 0 {
+            break;
+        }
+        let mask_value = filter.evaluate(&batch)?;
+        let mask: BooleanArray = match mask_value {
+            ColumnarValue::Array(arr) => arr
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "runtime filter must produce a BooleanArray".into(),
+                    )
+                })?
+                .clone(),
+            ColumnarValue::Scalar(scalar) => {
+                // Scalar true (the initial DynamicFilterPhysicalExpr value)
+                // means "keep all rows". Scalar false / null means "drop
+                // everything in this batch".
+                let keep_all = matches!(
+                    scalar,
+                    datafusion::common::ScalarValue::Boolean(Some(true))
+                );
+                if keep_all {
+                    continue;
+                }
+                BooleanArray::from(vec![false; batch.num_rows()])
+            }
+        };
+        batch = filter_record_batch(&batch, &mask).map_err(DataFusionError::from)?;
+    }
+    Ok(batch)
 }
 
 impl DisplayAs for IcebergTableScan {
