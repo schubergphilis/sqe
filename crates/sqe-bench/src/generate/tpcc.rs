@@ -1,11 +1,31 @@
 use std::sync::Arc;
 
-use arrow_array::{Date32Array, Float64Array, Int32Array, RecordBatch, StringArray};
+use arrow_array::{Date32Array, Decimal128Array, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use super::{parquet_writer, BenchmarkGenerator, GenerateStats, TableDef};
+
+/// Convert an f64 vector to a TPC-C DECIMAL(precision, scale) array.
+///
+/// TPC-C uses several different decimal shapes — DECIMAL(4,4) for tax
+/// rates and discounts, DECIMAL(12,2) for warehouse/customer balances,
+/// DECIMAL(6,2) for transaction amounts, DECIMAL(5,2) for item prices.
+/// Storing these as Float64 introduces non-associative SUM behaviour
+/// across partial aggregations and breaks any equality compare on a
+/// computed total (the same class of bug fixed for TPC-H q15).
+///
+/// Multiplies by 10^scale and rounds to i128 to land on the integer
+/// representation arrow-rs uses internally.
+fn decimal_array(values: Vec<f64>, precision: u8, scale: i8) -> Decimal128Array {
+    let factor = 10_f64.powi(scale as i32);
+    let scaled: Vec<i128> =
+        values.into_iter().map(|v| (v * factor).round() as i128).collect();
+    Decimal128Array::from_iter_values(scaled)
+        .with_precision_and_scale(precision, scale)
+        .expect("valid TPC-C precision/scale")
+}
 
 pub struct TpccGenerator;
 
@@ -22,8 +42,8 @@ fn warehouse_schema() -> SchemaRef {
         Field::new("w_city", DataType::Utf8, false),
         Field::new("w_state", DataType::Utf8, false),
         Field::new("w_zip", DataType::Utf8, false),
-        Field::new("w_tax", DataType::Float64, false),
-        Field::new("w_ytd", DataType::Float64, false),
+        Field::new("w_tax", DataType::Decimal128(4, 4), false),
+        Field::new("w_ytd", DataType::Decimal128(12, 2), false),
     ]))
 }
 
@@ -37,8 +57,8 @@ fn district_schema() -> SchemaRef {
         Field::new("d_city", DataType::Utf8, false),
         Field::new("d_state", DataType::Utf8, false),
         Field::new("d_zip", DataType::Utf8, false),
-        Field::new("d_tax", DataType::Float64, false),
-        Field::new("d_ytd", DataType::Float64, false),
+        Field::new("d_tax", DataType::Decimal128(4, 4), false),
+        Field::new("d_ytd", DataType::Decimal128(12, 2), false),
         Field::new("d_next_o_id", DataType::Int32, false),
     ]))
 }
@@ -59,10 +79,10 @@ fn customer_schema() -> SchemaRef {
         Field::new("c_phone", DataType::Utf8, false),
         Field::new("c_since", DataType::Date32, false),
         Field::new("c_credit", DataType::Utf8, false),
-        Field::new("c_credit_lim", DataType::Float64, false),
-        Field::new("c_discount", DataType::Float64, false),
-        Field::new("c_balance", DataType::Float64, false),
-        Field::new("c_ytd_payment", DataType::Float64, false),
+        Field::new("c_credit_lim", DataType::Decimal128(12, 2), false),
+        Field::new("c_discount", DataType::Decimal128(4, 4), false),
+        Field::new("c_balance", DataType::Decimal128(12, 2), false),
+        Field::new("c_ytd_payment", DataType::Decimal128(12, 2), false),
         Field::new("c_payment_cnt", DataType::Int32, false),
         Field::new("c_delivery_cnt", DataType::Int32, false),
         Field::new("c_data", DataType::Utf8, false),
@@ -77,7 +97,7 @@ fn history_schema() -> SchemaRef {
         Field::new("h_d_id", DataType::Int32, false),
         Field::new("h_w_id", DataType::Int32, false),
         Field::new("h_date", DataType::Date32, false),
-        Field::new("h_amount", DataType::Float64, false),
+        Field::new("h_amount", DataType::Decimal128(6, 2), false),
         Field::new("h_data", DataType::Utf8, false),
     ]))
 }
@@ -113,7 +133,7 @@ fn order_line_schema() -> SchemaRef {
         Field::new("ol_supply_w_id", DataType::Int32, false),
         Field::new("ol_delivery_d", DataType::Date32, true),
         Field::new("ol_quantity", DataType::Int32, false),
-        Field::new("ol_amount", DataType::Float64, false),
+        Field::new("ol_amount", DataType::Decimal128(6, 2), false),
         Field::new("ol_dist_info", DataType::Utf8, false),
     ]))
 }
@@ -123,7 +143,7 @@ fn item_schema() -> SchemaRef {
         Field::new("i_id", DataType::Int32, false),
         Field::new("i_im_id", DataType::Int32, false),
         Field::new("i_name", DataType::Utf8, false),
-        Field::new("i_price", DataType::Float64, false),
+        Field::new("i_price", DataType::Decimal128(5, 2), false),
         Field::new("i_data", DataType::Utf8, false),
     ]))
 }
@@ -299,8 +319,8 @@ fn generate_warehouse(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
                     Arc::new(StringArray::from(city_refs)),
                     Arc::new(StringArray::from(state_refs)),
                     Arc::new(StringArray::from(zip_refs)),
-                    Arc::new(Float64Array::from(w_tax)),
-                    Arc::new(Float64Array::from(w_ytd)),
+                    Arc::new(decimal_array(w_tax, 4, 4)),
+                    Arc::new(decimal_array(w_ytd, 12, 2)),
                 ],
             )
             .expect("warehouse batch"),
@@ -372,8 +392,8 @@ fn generate_district(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
                     Arc::new(StringArray::from(city_refs)),
                     Arc::new(StringArray::from(state_refs)),
                     Arc::new(StringArray::from(zip_refs)),
-                    Arc::new(Float64Array::from(d_tax)),
-                    Arc::new(Float64Array::from(d_ytd)),
+                    Arc::new(decimal_array(d_tax, 4, 4)),
+                    Arc::new(decimal_array(d_ytd, 12, 2)),
                     Arc::new(Int32Array::from(d_next_o_id)),
                 ],
             )
@@ -488,10 +508,10 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
                     Arc::new(StringArray::from(phone_refs)),
                     Arc::new(Date32Array::from(c_since)),
                     Arc::new(StringArray::from(credit_refs)),
-                    Arc::new(Float64Array::from(c_credit_lim)),
-                    Arc::new(Float64Array::from(c_discount)),
-                    Arc::new(Float64Array::from(c_balance)),
-                    Arc::new(Float64Array::from(c_ytd_payment)),
+                    Arc::new(decimal_array(c_credit_lim, 12, 2)),
+                    Arc::new(decimal_array(c_discount, 4, 4)),
+                    Arc::new(decimal_array(c_balance, 12, 2)),
+                    Arc::new(decimal_array(c_ytd_payment, 12, 2)),
                     Arc::new(Int32Array::from(c_payment_cnt)),
                     Arc::new(Int32Array::from(c_delivery_cnt)),
                     Arc::new(StringArray::from(data_refs)),
@@ -554,7 +574,7 @@ fn generate_history(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
                     Arc::new(Int32Array::from(h_d_id)),
                     Arc::new(Int32Array::from(h_w_id)),
                     Arc::new(Date32Array::from(h_date)),
-                    Arc::new(Float64Array::from(h_amount)),
+                    Arc::new(decimal_array(h_amount, 6, 2)),
                     Arc::new(StringArray::from(data_refs)),
                 ],
             )
@@ -750,7 +770,7 @@ fn generate_order_line(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
                     Arc::new(Int32Array::from(ol_supply_w_id)),
                     Arc::new(Date32Array::from(ol_delivery_d)),
                     Arc::new(Int32Array::from(ol_quantity)),
-                    Arc::new(Float64Array::from(ol_amount)),
+                    Arc::new(decimal_array(ol_amount, 6, 2)),
                     Arc::new(StringArray::from(dist_refs)),
                 ],
             )
@@ -805,7 +825,7 @@ fn generate_item() -> (SchemaRef, Vec<RecordBatch>) {
                     Arc::new(Int32Array::from(i_id)),
                     Arc::new(Int32Array::from(i_im_id)),
                     Arc::new(StringArray::from(name_refs)),
-                    Arc::new(Float64Array::from(i_price)),
+                    Arc::new(decimal_array(i_price, 5, 2)),
                     Arc::new(StringArray::from(data_refs)),
                 ],
             )
