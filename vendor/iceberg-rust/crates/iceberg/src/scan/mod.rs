@@ -34,7 +34,7 @@ use futures::{SinkExt, StreamExt, TryStreamExt};
 use crate::arrow::ArrowReaderBuilder;
 use crate::delete_file_index::DeleteFileIndex;
 use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
-use crate::expr::{Bind, BoundPredicate, Predicate};
+use crate::expr::{Bind, BoundPredicate, DynamicPredicate, Predicate};
 use crate::io::FileIO;
 use crate::metadata_columns::{get_metadata_field_id, is_metadata_column_name};
 use crate::runtime::spawn;
@@ -59,6 +59,12 @@ pub struct TableScanBuilder<'a> {
     batch_size: Option<usize>,
     case_sensitive: bool,
     filter: Option<Predicate>,
+    /// Optional [`DynamicPredicate`] that is sampled per file scan task
+    /// and ANDed into the static `filter`. Used by query engines (e.g.
+    /// iceberg-datafusion) to route hash-join build-side bloom filters
+    /// into the scan after the build side has completed. See
+    /// <https://github.com/apache/iceberg-rust/issues/2376>.
+    dynamic_predicate: Option<Arc<dyn DynamicPredicate>>,
     concurrency_limit_data_files: usize,
     concurrency_limit_manifest_entries: usize,
     concurrency_limit_manifest_files: usize,
@@ -79,6 +85,7 @@ impl<'a> TableScanBuilder<'a> {
             batch_size: None,
             case_sensitive: true,
             filter: None,
+            dynamic_predicate: None,
             concurrency_limit_data_files: num_cpus,
             concurrency_limit_manifest_entries: num_cpus,
             concurrency_limit_manifest_files: num_cpus,
@@ -105,6 +112,23 @@ impl<'a> TableScanBuilder<'a> {
         // calls rewrite_not to remove Not nodes, which must be absent
         // when applying the manifest evaluator
         self.filter = Some(predicate.rewrite_not());
+        self
+    }
+
+    /// Specifies a [`DynamicPredicate`] to consult once per file scan task.
+    ///
+    /// The result is ANDed into any static `filter` set on this builder.
+    /// Mirrors Trino's `DynamicFilter` model: each task samples
+    /// `current()` at open time, freezes the resulting predicate, and
+    /// uses it for row-group / page-index / row-filter pruning. Tasks
+    /// that open before the dynamic source becomes useful (e.g. before
+    /// a hash join build side completes) simply see `None` and fall
+    /// back to the static predicate.
+    pub fn with_dynamic_predicate(
+        mut self,
+        dynamic_predicate: Arc<dyn DynamicPredicate>,
+    ) -> Self {
+        self.dynamic_predicate = Some(dynamic_predicate);
         self
     }
 
@@ -247,6 +271,7 @@ impl<'a> TableScanBuilder<'a> {
                         concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
                         row_group_filtering_enabled: self.row_group_filtering_enabled,
                         row_selection_enabled: self.row_selection_enabled,
+                        dynamic_predicate: self.dynamic_predicate.clone(),
                     });
                 };
                 current_snapshot_id.clone()
@@ -341,6 +366,7 @@ impl<'a> TableScanBuilder<'a> {
             concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
+            dynamic_predicate: self.dynamic_predicate,
         })
     }
 }
@@ -369,6 +395,11 @@ pub struct TableScan {
 
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+
+    /// Optional caller-supplied [`DynamicPredicate`] (see
+    /// [`TableScanBuilder::with_dynamic_predicate`]). Sampled by the
+    /// reader once per file scan task and ANDed into the static filter.
+    dynamic_predicate: Option<Arc<dyn DynamicPredicate>>,
 }
 
 impl TableScan {
@@ -479,6 +510,11 @@ impl TableScan {
 
         if let Some(batch_size) = self.batch_size {
             arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);
+        }
+
+        if let Some(dynamic_predicate) = self.dynamic_predicate.clone() {
+            arrow_reader_builder =
+                arrow_reader_builder.with_dynamic_predicate(dynamic_predicate);
         }
 
         arrow_reader_builder.build().read(self.plan_files().await?)

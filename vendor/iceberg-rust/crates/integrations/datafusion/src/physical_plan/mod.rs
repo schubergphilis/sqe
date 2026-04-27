@@ -18,6 +18,7 @@
 pub(crate) mod commit;
 pub mod expr_to_predicate;
 pub(crate) mod metadata_scan;
+pub(crate) mod physical_to_predicate;
 pub(crate) mod project;
 pub(crate) mod repartition;
 pub(crate) mod scan;

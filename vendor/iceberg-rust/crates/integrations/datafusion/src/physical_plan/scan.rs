@@ -39,11 +39,43 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::Expr;
 use futures::{Stream, StreamExt, TryStreamExt};
-use iceberg::expr::Predicate;
+use iceberg::expr::{DynamicPredicate, Predicate};
 use iceberg::table::Table;
 
 use super::expr_to_predicate::convert_filters_to_predicate;
+use super::physical_to_predicate::convert_physical_filters_to_predicate;
 use crate::to_datafusion_error;
+
+/// Bridge that exposes a set of DataFusion runtime [`PhysicalExpr`]s
+/// (typically `DynamicFilterPhysicalExpr` from a [`HashJoinExec`] build
+/// side) to iceberg-rust's per-task scan pruning via the
+/// [`DynamicPredicate`] trait.
+///
+/// On each call to `current()`, the bridge attempts to translate the
+/// most-recent state of the runtime filters into an iceberg
+/// [`Predicate`]. When the filters are still at their initial
+/// "always-true" placeholder (the build side has not yet completed), or
+/// when their physical shape isn't representable in iceberg's expression
+/// vocabulary, `current()` returns `None` and the reader falls back to
+/// the static predicate alone. This means per-task sampling is purely
+/// additive — it never regresses correctness or performance compared to
+/// having no dynamic predicate at all.
+#[derive(Debug)]
+struct RuntimeFiltersDynamicPredicate {
+    filters: Vec<Arc<dyn PhysicalExpr>>,
+}
+
+impl RuntimeFiltersDynamicPredicate {
+    fn new(filters: Vec<Arc<dyn PhysicalExpr>>) -> Arc<Self> {
+        Arc::new(Self { filters })
+    }
+}
+
+impl DynamicPredicate for RuntimeFiltersDynamicPredicate {
+    fn current(&self) -> Option<Predicate> {
+        convert_physical_filters_to_predicate(&self.filters)
+    }
+}
 
 /// Manages the scanning process of an Iceberg [`Table`], encapsulating the
 /// necessary details and computed properties required for execution planning.
@@ -185,11 +217,27 @@ impl ExecutionPlan for IcebergTableScan {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
+        // Bridge any runtime filters (e.g. dynamic filters from a
+        // HashJoinExec build side) into the iceberg-rust scan via the
+        // DynamicPredicate API. The bridge samples the latest filter
+        // state once per FileScanTask and ANDs it into the static
+        // predicate so row-group min/max + page-index pruning kick in
+        // mid-stream once the build side completes.
+        let dynamic_predicate: Option<Arc<dyn DynamicPredicate>> =
+            if self.runtime_filters.is_empty() {
+                None
+            } else {
+                Some(RuntimeFiltersDynamicPredicate::new(
+                    self.runtime_filters.clone(),
+                ))
+            };
+
         let fut = get_batch_stream(
             self.table.clone(),
             self.snapshot_id,
             self.projection.clone(),
             self.predicates.clone(),
+            dynamic_predicate,
         );
         let stream = futures::stream::once(fut).try_flatten();
 
@@ -354,6 +402,7 @@ async fn get_batch_stream(
     snapshot_id: Option<i64>,
     column_names: Option<Vec<String>>,
     predicates: Option<Predicate>,
+    dynamic_predicate: Option<Arc<dyn DynamicPredicate>>,
 ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
     let scan_builder = match snapshot_id {
         Some(snapshot_id) => table.scan().snapshot_id(snapshot_id),
@@ -366,6 +415,9 @@ async fn get_batch_stream(
     };
     if let Some(pred) = predicates {
         scan_builder = scan_builder.with_filter(pred);
+    }
+    if let Some(dp) = dynamic_predicate {
+        scan_builder = scan_builder.with_dynamic_predicate(dp);
     }
     let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
 
