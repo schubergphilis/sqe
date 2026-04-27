@@ -1,9 +1,29 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    Date32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    Date32Array, Decimal128Array, Int32Array, Int64Array, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+
+/// Convert an f64 vector to a TPC-H DECIMAL(15, 2) array.
+///
+/// TPC-H mandates DECIMAL(15, 2) for every monetary and quantity column
+/// (l_quantity, l_extendedprice, l_discount, l_tax, s_acctbal, c_acctbal,
+/// p_retailprice, ps_supplycost, o_totalprice). Storing these as Float64
+/// breaks q15's `total_revenue = MAX(total_revenue)` equality compare:
+/// Float64 SUM is not associative, so partial aggregations across
+/// partitions diverge by one or two ULPs from the global MAX, and the
+/// equality predicate misses by epsilon.
+///
+/// We multiply the f64 by 100 and round to i128 to land on the spec's
+/// scale-2 representation. Range fits comfortably: TPC-H prices stay
+/// well under 1e13, scale-100 → ~1e15, while DECIMAL(15) covers 1e15.
+fn decimal_15_2_array(values: Vec<f64>) -> Decimal128Array {
+    let scaled: Vec<i128> = values.into_iter().map(|v| (v * 100.0).round() as i128).collect();
+    Decimal128Array::from_iter_values(scaled)
+        .with_precision_and_scale(15, 2)
+        .expect("Decimal128(15, 2) is valid for TPC-H money/quantity columns")
+}
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -42,7 +62,7 @@ fn supplier_schema() -> SchemaRef {
         Field::new("s_address", DataType::Utf8, true),
         Field::new("s_nationkey", DataType::Int32, false),
         Field::new("s_phone", DataType::Utf8, true),
-        Field::new("s_acctbal", DataType::Float64, false),
+        Field::new("s_acctbal", DataType::Decimal128(15, 2), false),
         Field::new("s_comment", DataType::Utf8, true),
     ]))
 }
@@ -54,7 +74,7 @@ fn customer_schema() -> SchemaRef {
         Field::new("c_address", DataType::Utf8, true),
         Field::new("c_nationkey", DataType::Int32, false),
         Field::new("c_phone", DataType::Utf8, true),
-        Field::new("c_acctbal", DataType::Float64, false),
+        Field::new("c_acctbal", DataType::Decimal128(15, 2), false),
         Field::new("c_mktsegment", DataType::Utf8, true),
         Field::new("c_comment", DataType::Utf8, true),
     ]))
@@ -69,7 +89,7 @@ fn part_schema() -> SchemaRef {
         Field::new("p_type", DataType::Utf8, true),
         Field::new("p_size", DataType::Int32, false),
         Field::new("p_container", DataType::Utf8, true),
-        Field::new("p_retailprice", DataType::Float64, false),
+        Field::new("p_retailprice", DataType::Decimal128(15, 2), false),
         Field::new("p_comment", DataType::Utf8, true),
     ]))
 }
@@ -79,7 +99,7 @@ fn partsupp_schema() -> SchemaRef {
         Field::new("ps_partkey", DataType::Int32, false),
         Field::new("ps_suppkey", DataType::Int32, false),
         Field::new("ps_availqty", DataType::Int32, false),
-        Field::new("ps_supplycost", DataType::Float64, false),
+        Field::new("ps_supplycost", DataType::Decimal128(15, 2), false),
         Field::new("ps_comment", DataType::Utf8, true),
     ]))
 }
@@ -89,7 +109,7 @@ fn orders_schema() -> SchemaRef {
         Field::new("o_orderkey", DataType::Int64, false),
         Field::new("o_custkey", DataType::Int32, false),
         Field::new("o_orderstatus", DataType::Utf8, false),
-        Field::new("o_totalprice", DataType::Float64, false),
+        Field::new("o_totalprice", DataType::Decimal128(15, 2), false),
         Field::new("o_orderdate", DataType::Date32, false),
         Field::new("o_orderpriority", DataType::Utf8, true),
         Field::new("o_clerk", DataType::Utf8, true),
@@ -104,10 +124,10 @@ fn lineitem_schema() -> SchemaRef {
         Field::new("l_partkey", DataType::Int32, false),
         Field::new("l_suppkey", DataType::Int32, false),
         Field::new("l_linenumber", DataType::Int32, false),
-        Field::new("l_quantity", DataType::Float64, false),
-        Field::new("l_extendedprice", DataType::Float64, false),
-        Field::new("l_discount", DataType::Float64, false),
-        Field::new("l_tax", DataType::Float64, false),
+        Field::new("l_quantity", DataType::Decimal128(15, 2), false),
+        Field::new("l_extendedprice", DataType::Decimal128(15, 2), false),
+        Field::new("l_discount", DataType::Decimal128(15, 2), false),
+        Field::new("l_tax", DataType::Decimal128(15, 2), false),
         Field::new("l_returnflag", DataType::Utf8, true),
         Field::new("l_linestatus", DataType::Utf8, true),
         Field::new("l_shipdate", DataType::Date32, false),
@@ -410,7 +430,7 @@ fn generate_supplier_range(
                 Arc::new(StringArray::from(addr_refs)),
                 Arc::new(Int32Array::from(s_nationkey)),
                 Arc::new(StringArray::from(phone_refs)),
-                Arc::new(Float64Array::from(s_acctbal)),
+                Arc::new(decimal_15_2_array(s_acctbal)),
                 Arc::new(StringArray::from(comment_refs)),
             ],
         )
@@ -479,7 +499,7 @@ fn generate_customer_range(
                 Arc::new(StringArray::from(addr_refs)),
                 Arc::new(Int32Array::from(c_nationkey)),
                 Arc::new(StringArray::from(phone_refs)),
-                Arc::new(Float64Array::from(c_acctbal)),
+                Arc::new(decimal_15_2_array(c_acctbal)),
                 Arc::new(StringArray::from(seg_refs)),
                 Arc::new(StringArray::from(comment_refs)),
             ],
@@ -565,7 +585,7 @@ fn generate_part_range(
                 Arc::new(StringArray::from(type_refs)),
                 Arc::new(Int32Array::from(p_size)),
                 Arc::new(StringArray::from(container_refs)),
-                Arc::new(Float64Array::from(p_retailprice)),
+                Arc::new(decimal_15_2_array(p_retailprice)),
                 Arc::new(StringArray::from(comment_refs)),
             ],
         )
@@ -639,7 +659,7 @@ fn generate_partsupp_range(
                 Arc::new(Int32Array::from(ps_partkey)),
                 Arc::new(Int32Array::from(ps_suppkey)),
                 Arc::new(Int32Array::from(ps_availqty)),
-                Arc::new(Float64Array::from(ps_supplycost)),
+                Arc::new(decimal_15_2_array(ps_supplycost)),
                 Arc::new(StringArray::from(comment_refs)),
             ],
         )
@@ -711,7 +731,7 @@ fn generate_orders_range(
                 Arc::new(Int64Array::from(o_orderkey)),
                 Arc::new(Int32Array::from(o_custkey)),
                 Arc::new(StringArray::from(status_refs)),
-                Arc::new(Float64Array::from(o_totalprice)),
+                Arc::new(decimal_15_2_array(o_totalprice)),
                 Arc::new(Date32Array::from(o_orderdate)),
                 Arc::new(StringArray::from(priority_refs)),
                 Arc::new(StringArray::from(clerk_refs)),
@@ -813,10 +833,10 @@ fn generate_lineitem_range(
                 Arc::new(Int32Array::from(l_partkey)),
                 Arc::new(Int32Array::from(l_suppkey)),
                 Arc::new(Int32Array::from(l_linenumber)),
-                Arc::new(Float64Array::from(l_quantity)),
-                Arc::new(Float64Array::from(l_extendedprice)),
-                Arc::new(Float64Array::from(l_discount)),
-                Arc::new(Float64Array::from(l_tax)),
+                Arc::new(decimal_15_2_array(l_quantity)),
+                Arc::new(decimal_15_2_array(l_extendedprice)),
+                Arc::new(decimal_15_2_array(l_discount)),
+                Arc::new(decimal_15_2_array(l_tax)),
                 Arc::new(StringArray::from(rflag_refs)),
                 Arc::new(StringArray::from(lstatus_refs)),
                 Arc::new(Date32Array::from(l_shipdate)),
