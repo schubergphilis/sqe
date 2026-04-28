@@ -137,8 +137,16 @@ q04 +11%, q08 +18%, q09 +11%, q11 +16%). All five share a shape:
 runtime filter, and the leaf scan absorbs all of them. Per-task
 sampling cost compounds.
 
-We tried two follow-up fixes on a fresh attempt. Both made things
-worse and got reverted.
+We tried four follow-up fixes across three fresh attempts. All four
+made things worse and got reverted. Each failed for a different
+reason; cataloguing them here so the next person doesn't repeat the
+same mistakes.
+
+The fourth failure (cap=200 below) is the most informative. It
+revealed that **SF10 has a ~5-7% run-to-run noise floor**, which is
+larger than every effect size we were trying to optimize. Without
+multi-run statistics or a more sensitive measurement, we cannot
+distinguish "the fix helped" from "this run got lucky."
 
 ### Failed attempt 1: IN-list size cap
 
@@ -171,9 +179,96 @@ Net SF10 result with both fixes: **150,693 ms**. *slower* than
 Path B (148,511 ms) and Path B-2 (143,590 ms). q14 went +35%, q16
 +91%, q01 +24%.
 
+### Failed attempt 3: OnceLock first-success cache
+
+The fix: replace the `Mutex<Vec<...>>` cache with a `std::sync::OnceLock<Predicate>`
+that fills on the first call returning a non-`None` predicate and is
+read lock-free thereafter. The intent: avoid both the Mutex contention
+from attempt 2 and the conversion cost on every per-task call. The
+trade-off was acknowledged up front: lock in the FIRST snapshot we
+observe.
+
+Why it backfired (a new failure mode, distinct from attempts 1-2):
+multi-filter scans (q04, q06, q08, q09) have several DynamicFilterPhysicalExpr
+runtime filters that seal at *different times* as the upstream hash
+joins finish their builds. The first task that observes ANY filter
+sealed converts to a Predicate that AND-combines whatever sealed so
+far. The OnceLock then locks that **partial** predicate in for the
+rest of the scan, so later tasks miss the additional pruning that
+would have come from filters sealing later. q04 got +34%, q06 +74%,
+q16 +42% relative to Path B-2 alone.
+
+Net SF10 result: **150,811 ms** (worse than Path B-2's 143,590 ms by
+~5%, and even slightly worse than Path B alone's 148,511 ms).
+
+The takeaway for any future cache-based attempt: caching only works
+if all dynamic filters in the bundle have sealed by the time you
+populate the cache. A single `OnceLock` keyed on "first non-None" is
+therefore unsafe for multi-filter scans. A correct cache needs either
+(a) per-filter `OnceLock` slots indexed by stable filter identity, or
+(b) a sentinel that says "all filters in this bundle are sealed" before
+the cache fills. Both depend on iceberg-rust / DataFusion exposing a
+"is this filter sealed?" predicate, which is the upstream API ask in
+issue 2376.
+
+### Failed attempt 4: Trino-aligned IN-list cap at 200
+
+The fix: cap `convert_in_list` at 200 values, matching iceberg-rust's
+own `IN_PREDICATE_LIMIT` constant (defined identically in
+`row_group_metrics_evaluator.rs`, `manifest_evaluator.rs`, and
+`inclusive_metrics_evaluator.rs`). Above 200 values the iceberg-rust
+evaluator unconditionally returns `ROW_GROUP_MIGHT_MATCH`, so any
+larger `Predicate::Set` we hand it has the conversion + binding cost
+amortized across zero pruning benefit. The intent: align with
+upstream's threshold to never do work the reader will discard.
+
+This was a different failure mode from attempt 1 (which used 4096):
+attempt 1 sat in the dead zone (200-4096 values: full converter cost,
+zero pruning), whereas attempt 4 was placed exactly at the upstream
+boundary so we should never waste work.
+
+Why it backfired (the smoking-gun moment): SF10 result was
+**151,635 ms** versus Path B-2's 143,590 ms, a 5.6% regression. But
+look at what regressed:
+
+| q | join? | Path B-2 | cap=200 | delta |
+|---|---|---:|---:|---:|
+| q06 | none | 4,660 | 6,612 | +42% |
+| q03 | none | 8,153 | 10,514 | +29% |
+| q20 | yes | 5,173 | 6,579 | +27% |
+| q05 | yes | 6,700 | 8,101 | +21% |
+
+q06 has zero joins, so no runtime filters reach its scan, so the
+cap setting is **literally a no-op for that query**. It still moved
++42%. The variance band of SF10 itself is wider than the effect
+we're trying to measure.
+
+Cross-checking SF10 totals across functionally-equivalent runs:
+
+| date  | code state                | total |
+|-------|---------------------------|------:|
+| 4/27  | Path B alone              | 148,511 |
+| 4/27  | Path B-2 (final)          | 143,590 |
+| 4/27  | Path B-2 + OnceLock       | 150,811 |
+| 4/28  | Path B-2 + cap=200        | 151,635 |
+
+The spread is ±5-7% with no single run-to-run difference attributable
+to a code change. SF10's noise sources include cold object-cache state
+on every regenerate, Trino's per-run JIT warm-up, OS page-cache
+variance across the 60M-row lineitem, and Polaris's age-since-restart
+affecting catalog response latency.
+
+The takeaway: at SF10, a single bench run can't reliably measure
+effects below 7%. The Path B-2 baseline already has 22/22 match and
+−12.4% vs the 4/21 baseline; that's signal we know is real because it
+sits well above the noise band. Anything inside ±5% needs either a
+multi-run confidence interval (5+ runs, 2 hours), a focused single-
+query EXPLAIN ANALYZE, or a smaller deterministic benchmark.
+
 ### Resolution
 
-Both attempts reverted; branch is back at `c564a89` (clean Path B-2).
+All four attempts reverted; branch is back at `c564a89` (clean
+Path B-2).
 Postmortem comment posted to
 [apache/iceberg-rust#2376](https://github.com/apache/iceberg-rust/issues/2376#issuecomment-4330042368)
 with API recommendations for upstream:
