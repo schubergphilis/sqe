@@ -51,7 +51,7 @@ use iceberg::spec::Datum;
 /// the slice is currently translatable — for example because every
 /// `DynamicFilterPhysicalExpr` is still at its initial `lit(true)`
 /// placeholder.
-pub(crate) fn convert_physical_filters_to_predicate(
+pub fn convert_physical_filters_to_predicate(
     filters: &[Arc<dyn PhysicalExpr>],
 ) -> Option<Predicate> {
     filters
