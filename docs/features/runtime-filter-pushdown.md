@@ -137,7 +137,7 @@ q04 +11%, q08 +18%, q09 +11%, q11 +16%). All five share a shape:
 runtime filter, and the leaf scan absorbs all of them. Per-task
 sampling cost compounds.
 
-We tried four follow-up fixes across three fresh attempts. All four
+We tried five follow-up fixes across four fresh attempts. All five
 made things worse and got reverted. Each failed for a different
 reason; cataloguing them here so the next person doesn't repeat the
 same mistakes.
@@ -265,10 +265,57 @@ sits well above the noise band. Anything inside ±5% needs either a
 multi-run confidence interval (5+ runs, 2 hours), a focused single-
 query EXPLAIN ANALYZE, or a smaller deterministic benchmark.
 
+### Failed attempt 5: bound-predicate cache (post-microbench)
+
+The fix: add a `current_bound(schema, case_sensitive) -> Option<BoundPredicate>`
+method to the `DynamicPredicate` trait, plumb the reader through it,
+and override in `RuntimeFiltersDynamicPredicate` with a per-filter
+sealed-state cache backed by a `Mutex<Option<CachedBound>>`. The
+microbenchmark (commit `5eeb00c`) showed `Predicate::bind` is the
+dominant per-task cost (~61 ms at N=580K, 3x the conversion cost),
+so caching the *bound* result rather than the unbound one targets the
+right layer.
+
+The design supposedly avoided the partial-seal trap from attempt 3 by
+treating each filter independently: walk every filter, contribute the
+ones whose `DynamicFilterPhysicalExpr` inner is no longer `lit(true)`,
+mark `fully_sealed` only when every filter passed the check this round,
+and short-circuit subsequent calls to a lock-free clone of the cached
+combined `BoundPredicate`.
+
+Why it backfired (despite being microbench-correct): SF10 result was
+**162,589 ms vs Path B-2's 143,590 ms (+13.2%)**. q11 -28% and q12 -15%
+showed the cache works when filters seal early, but q05 +73%, q20 +40%,
+q01/q03 +33%, q22 +30% all regressed because:
+
+1. **Multi-join queries seal filters at staggered times.** Until the
+   last filter seals, every task hits the slow path: walk every filter,
+   convert each sealed one, AND them, bind once. That work is the same
+   as Path B-2 plus a Mutex round-trip.
+
+2. **The Mutex contends across the scan's concurrent tasks.** Every
+   slow-path call grabs the Mutex twice (read for fast path, write
+   to update). With ~12 concurrent FileScanTask processors per scan,
+   the lock serializes them. This is the same failure mode as
+   attempt 2; the lock-free fast path only kicks in after `fully_sealed`,
+   which can be late in queries with deep join chains.
+
+3. **The microbench measured single-threaded steady-state cost; the
+   real workload pays Mutex acquisition cost on every call.** The
+   bench predicted ~80 ms saved per task; the lock contention burnt
+   most of that and added some.
+
+This was the most disappointing failure because the microbench data
+strongly suggested it should work. The lesson: targeting the right
+layer (bind) is necessary but not sufficient. Without an upstream
+signal that lets us know when filters are sealed (so the cache can
+populate exactly once at the right moment), every Mutex-based design
+hits this contention floor.
+
 ### Resolution
 
-All four attempts reverted; branch is back at `c564a89` (clean
-Path B-2).
+All five attempts reverted; branch is back at `5eeb00c` (clean
+Path B-2 plus the criterion microbench).
 Postmortem comment posted to
 [apache/iceberg-rust#2376](https://github.com/apache/iceberg-rust/issues/2376#issuecomment-4330042368)
 with API recommendations for upstream:
