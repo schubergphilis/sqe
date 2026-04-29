@@ -17,22 +17,11 @@
 
 #[cfg(feature = "glue")]
 mod glue {
-    use sqe_catalog::backends::glue::{GlueBackend, GlueConfig};
-
-    /// Requires live AWS credentials and a pre-provisioned Glue database.
-    /// Skipped by default because it touches real AWS.
-    #[tokio::test]
-    #[ignore = "requires live AWS credentials; run with --ignored"]
-    async fn glue_backend_lists_databases() {
-        let region = std::env::var("SQE_TEST_GLUE_REGION").unwrap_or_else(|_| "eu-west-1".into());
-        let warehouse = std::env::var("SQE_TEST_GLUE_WAREHOUSE")
-            .expect("SQE_TEST_GLUE_WAREHOUSE must be set for this test");
-        let backend = GlueBackend::new(GlueConfig::new(region, warehouse));
-        let result = backend.list_databases().await;
-        // When the real implementation lands (task 2.3) this should succeed.
-        // Today the stub returns an error pointing at the task list.
-        assert!(result.is_err(), "expected stub error until task 2.3 lands");
-    }
+    use sqe_catalog::backends::glue::GlueConfig;
+    // Live AWS Glue test is wired in Phase O day 4-5 (real round-trip
+    // via `GlueBackend::build_catalog` against an AWS account specified
+    // in tests/.env). The pure-config test below exercises the wrapper
+    // type without touching AWS.
 
     #[test]
     fn glue_config_constructs() {
@@ -45,18 +34,86 @@ mod glue {
 
 #[cfg(feature = "hms")]
 mod hms {
+    use std::sync::Arc;
+
+    use iceberg::io::OpenDalStorageFactory;
+    use iceberg::{Catalog, NamespaceIdent};
     use sqe_catalog::backends::hms::{HmsBackend, HmsConfig};
 
+    /// Live HMS round-trip: create_namespace -> namespace_exists -> drop_namespace.
+    ///
+    /// Brings a real Thrift round-trip against a Hive metastore container,
+    /// proving the vendored `iceberg-catalog-hms` crate (Phase K) works
+    /// end-to-end on this fork. Marked `#[ignore]` because it needs the
+    /// `docker-compose.hms.yml` stack running:
+    ///
+    /// ```bash
+    /// docker compose -f docker-compose.test.yml \
+    ///                -f docker-compose.hms.yml up -d
+    /// cargo test -p sqe-catalog --features hms backends_integration -- \
+    ///     --ignored hms::
+    /// ```
+    ///
+    /// The test uses a unique namespace name per run (`sqe_hms_ci_<uuid>`)
+    /// so concurrent runs don't collide, and cleans up on success.
+    /// Failure leaves the namespace behind for inspection.
     #[tokio::test]
     #[ignore = "requires docker-compose HMS stack; run with --ignored"]
-    async fn hms_backend_lists_tables() {
+    async fn hms_namespace_round_trip() {
+        // Upstream HmsCatalog calls `to_socket_addrs()` directly on the
+        // configured address, so it wants `host:port` (no scheme prefix).
+        // Force IPv4 because Docker port forwarding on macOS doesn't
+        // always answer on the IPv6 loopback that `localhost` resolves
+        // to first.
         let uri = std::env::var("SQE_TEST_HMS_URI")
-            .unwrap_or_else(|_| "thrift://localhost:9083".into());
+            .unwrap_or_else(|_| "127.0.0.1:19083".into());
         let warehouse = std::env::var("SQE_TEST_HMS_WAREHOUSE")
-            .unwrap_or_else(|_| "s3://lake/warehouse".into());
+            .unwrap_or_else(|_| "s3a://warehouse/hms/".into());
+
+        // Storage factory: HMS stores warehouse paths but our test
+        // doesn't actually open Parquet files. The `Fs` factory
+        // satisfies `with_storage_factory` without pulling in S3
+        // credentials. (Same pattern the existing iceberg-catalog-sql
+        // test below uses on line ~209.)
+        let storage_factory: Arc<dyn iceberg::io::StorageFactory> =
+            Arc::new(OpenDalStorageFactory::Fs);
+
         let backend = HmsBackend::new(HmsConfig::new(uri, warehouse));
-        let result = backend.list_tables("default").await;
-        assert!(result.is_err(), "expected stub error until task 2.7 lands");
+        let catalog = backend
+            .build_catalog(storage_factory)
+            .await
+            .expect("HmsCatalog builds against the docker stack");
+
+        // Unique-per-run namespace so parallel tests / re-runs don't collide.
+        let ns_name = format!("sqe_hms_ci_{}", uuid::Uuid::new_v4().simple());
+        let ns = NamespaceIdent::new(ns_name.clone());
+
+        // create_namespace -> list_namespaces -> drop_namespace round-trip.
+        // We list (rather than `namespace_exists`) so any name-mangling
+        // upstream is visible in the assertion failure rather than
+        // hidden behind a bare false.
+        catalog
+            .create_namespace(&ns, std::collections::HashMap::new())
+            .await
+            .unwrap_or_else(|e| panic!("create_namespace({ns_name}) failed: {e}"));
+
+        let listed = catalog
+            .list_namespaces(None)
+            .await
+            .expect("list_namespaces");
+        let listed_names: Vec<String> = listed
+            .iter()
+            .map(|n| n.as_ref().join("."))
+            .collect();
+        assert!(
+            listed_names.iter().any(|n| n == &ns_name),
+            "namespace {ns_name} should appear in list after create. Got: {listed_names:?}"
+        );
+
+        catalog
+            .drop_namespace(&ns)
+            .await
+            .unwrap_or_else(|e| panic!("drop_namespace({ns_name}) failed: {e}"));
     }
 }
 
