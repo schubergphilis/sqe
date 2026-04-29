@@ -28,6 +28,12 @@ keywords = ["iceberg", "rest", "catalog"]
 license = { workspace = true }
 repository = { workspace = true }
 
+[features]
+# SigV4 auth for AWS Iceberg REST endpoints (S3 Tables, Glue Iceberg
+# REST, Lake Formation). Off by default so a pure-OSS REST stack
+# (Polaris, Nessie, Lakekeeper) doesn't pull in the AWS SDK.
+aws-sigv4 = ["dep:aws-sigv4", "dep:aws-credential-types", "dep:aws-config", "dep:bytes"]
+
 [dependencies]
 async-trait = { workspace = true }
 base64 = "0.22"
@@ -44,6 +50,12 @@ tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 typed-builder = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
+# Optional AWS SigV4 signer for the AWS Iceberg REST endpoints. Pinned
+# to the same major as `aws-config 1.8.7` already in the workspace.
+aws-sigv4 = { version = "1", optional = true }
+aws-credential-types = { version = "1", optional = true }
+aws-config = { version = "1.8.7", optional = true }
+bytes = { workspace = true, optional = true }
 
 [dev-dependencies]
 iceberg_test_utils = { path = "../../test_utils", features = ["tests"] }

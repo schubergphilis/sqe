@@ -3400,7 +3400,11 @@ name = "iceberg-catalog-rest"
 version = "0.8.0"
 dependencies = [
  "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sigv4",
  "base64",
+ "bytes",
  "chrono",
  "gcp_auth",
  "http 1.4.0",

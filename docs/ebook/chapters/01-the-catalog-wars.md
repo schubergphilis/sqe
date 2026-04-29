@@ -367,6 +367,37 @@ The crate depends on `iceberg` and `iceberg-catalog-rest` from iceberg-rust, `da
 None of these modules knows or cares that the catalog is Polaris. They speak the Iceberg REST protocol. If we swapped Polaris for a compliant Nessie instance, or a future version of Unity's REST endpoint, or a catalog that doesn't exist yet, the code wouldn't change. The config file would change. That's it.
 
 
+## The Test: Five Catalogs in One Branch
+
+The previous section ends with a strong claim. If we swapped Polaris for Nessie, or for Glue, or for an HMS instance, the engine code would not change. We built it that way on purpose. But "designed to" and "actually does" are different statements. So we tested it.
+
+The test fits in one branch on a Friday afternoon. Five catalogs, five live integration tests, each one creating and dropping a namespace through the iceberg-rust `Catalog` trait. Same code path the engine uses against Polaris in production.
+
+Hive Metastore comes first. We start an `apache/hive:standalone-metastore-4.1.0` container with bundled Derby and a local-filesystem warehouse. The vendored `iceberg-catalog-hms` crate speaks Thrift over port 9083. The test passes after one failure. Mac OS resolves `localhost` to IPv6 first; Docker's port forwarding answers IPv4 only. Switch to `127.0.0.1` and the round-trip works on the first try.
+
+Project Nessie next. We pull `ghcr.io/projectnessie/nessie:0.107.5` because the 0.76 line shipped a partial Iceberg REST adapter that 404'd on `/iceberg/v1/config`; 0.107 is the first tag where the surface is fully usable. Once the container is up, the test connects through the same `iceberg-catalog-rest` client SQE has been using against Polaris. Zero code changes. The namespace round-trip passes.
+
+JDBC Postgres is already wired from earlier work. The test was sitting in the harness waiting for someone to run it. We run it. It passes.
+
+AWS Glue is next, and this is where it gets interesting. We have a real AWS account in eu-central-1. We create a dedicated S3 bucket as the warehouse, drop the AWS profile name into a gitignored `.env` (the template at `.env.example` is committed), and run the test. It creates a Glue database, lists it, drops it. Real AWS, real credentials, real round-trip. No code changes to the engine.
+
+Then the surprise. AWS S3 Tables is supposed to be the hardest of the five. It needs SigV4 signing on every request, which is a different auth model than the OAuth bearer flow SQE was built around. We expect a separate backend, a separate code path, maybe a week of work.
+
+Then we read the AWS docs more carefully. S3 Tables exposes itself through the same Iceberg REST protocol that Polaris speaks, just with SigV4 instead of OAuth. The endpoint is `https://glue.<region>.amazonaws.com/iceberg`. The wire format is identical. The only difference is the signature on the request.
+
+So we add a feature flag to the vendored `iceberg-catalog-rest` crate. `aws-sigv4`, default-on for SQE, default-off upstream so a Polaris-only build stays AWS-SDK-free. The patch is a single new module that reads credentials from the standard AWS provider chain and signs each outgoing `reqwest::Request` inside the existing `HttpClient::authenticate` method. The OAuth path short-circuits when the SigV4 signer is configured.
+
+Three properties trigger the new path: `rest.sigv4-enabled=true`, `rest.signing-name=glue`, `rest.signing-region=<region>`. AWS advertises these in the server's `/v1/config` response anyway. We just have to set them on the user config so the very first call (the config fetch itself) is signed.
+
+The test passes. We list namespaces in a real S3 Tables bucket. The catalog comes back with a single namespace, `table_demo_analytics`. We list tables. One table, `table_user_events`. All through SQE's existing `iceberg::Catalog` interface. Zero engine changes.
+
+Five catalogs verified live. The same engine binary, configured five different ways. Each catalog's idiosyncrasies live entirely inside its respective backend crate or, for the REST family, inside a vendored auth shim. The coordinator does not know whether it's talking to Polaris or Nessie or AWS. The query path is the same.
+
+The matrix score moves from 153/189 to 158/189. Five cells flip from `partial` to `full`. The capability gain is bigger than the score reflects. The score counts cells, not catalogs. The capability is "this engine talks to every catalog the lakehouse market actually uses." That capability did not exist a week earlier.
+
+The architectural bet from 2024 paid off. We chose Polaris because it speaks the Iceberg REST protocol and stays out of the way. Two years later, every other catalog we wanted to support either spoke the same protocol natively (Nessie) or could be reached through it with a small auth shim (Glue, S3 Tables). The catalog choice is reversible. We tested it. It is.
+
+
 ## The Lesson
 
 I spent most of 2024 testing catalogs. Glue, Unity, Snowflake's Iceberg support, cross-cloud bridges, Gravitino, Nessie. I wrote about each one. I built prototypes with each one. I hit limitations with each one.

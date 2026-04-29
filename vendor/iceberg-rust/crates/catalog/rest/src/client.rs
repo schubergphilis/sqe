@@ -48,6 +48,12 @@ pub(crate) struct HttpClient {
     disable_header_redaction: bool,
     /// GCP service account JSON for authentication.
     gcp_credential: Option<String>,
+    /// AWS SigV4 signer. `Some` when `rest.sigv4-enabled=true` was
+    /// resolved from either the user config or the server's
+    /// `/v1/config` defaults; in that case the OAuth/Bearer path is
+    /// bypassed and outgoing requests are signed with SigV4 instead.
+    #[cfg(feature = "aws-sigv4")]
+    sigv4_signer: Option<crate::sigv4::SigV4Signer>,
 }
 
 impl Debug for HttpClient {
@@ -71,6 +77,8 @@ impl HttpClient {
             extra_oauth_params: cfg.extra_oauth_params(),
             disable_header_redaction: cfg.disable_header_redaction(),
             gcp_credential: cfg.gcp_credential(),
+            #[cfg(feature = "aws-sigv4")]
+            sigv4_signer: build_sigv4_signer(cfg),
         })
     }
 
@@ -101,6 +109,13 @@ impl HttpClient {
             },
             disable_header_redaction: cfg.disable_header_redaction(),
             gcp_credential: cfg.gcp_credential().or(self.gcp_credential),
+            // The user config doesn't carry SigV4 props on the first
+            // pass; the AWS endpoint advertises them in its
+            // `/v1/config` response, which lands here through
+            // `merge_with_config`. Rebuild the signer once we have
+            // the merged props.
+            #[cfg(feature = "aws-sigv4")]
+            sigv4_signer: build_sigv4_signer(cfg).or(self.sigv4_signer),
         })
     }
 
@@ -241,6 +256,16 @@ impl HttpClient {
     ///
     /// # TODO: Support automatic token refreshing.
     async fn authenticate(&self, req: &mut Request) -> Result<()> {
+        // AWS SigV4 path: short-circuits the OAuth/Bearer flow entirely
+        // because AWS's REST endpoints reject Bearer headers and need
+        // the request to be signed with the resolved AWS credentials.
+        // Triggered by `rest.sigv4-enabled=true` in either user or
+        // server-supplied config.
+        #[cfg(feature = "aws-sigv4")]
+        if let Some(signer) = self.sigv4_signer.as_ref() {
+            return signer.sign(req).await;
+        }
+
         // Clone the token from lock without holding the lock for entire function.
         let token = self.token.lock().await.clone();
 
@@ -365,6 +390,23 @@ fn format_headers_redacted(headers: &HeaderMap, disable_redaction: bool) -> Stri
         })
         .collect();
     format!("{redacted:?}")
+}
+
+/// Build a SigV4 signer from the merged catalog config when the
+/// server (or the user) advertises `rest.sigv4-enabled=true`.
+///
+/// Returns `None` when SigV4 is off or when the required signing-name
+/// or signing-region props are missing. The signer caches the AWS
+/// credentials provider chain on first sign call, so building it is
+/// cheap.
+#[cfg(feature = "aws-sigv4")]
+fn build_sigv4_signer(cfg: &RestCatalogConfig) -> Option<crate::sigv4::SigV4Signer> {
+    if !cfg.sigv4_enabled() {
+        return None;
+    }
+    let region = cfg.signing_region()?;
+    let name = cfg.signing_name()?;
+    Some(crate::sigv4::SigV4Signer::new(region, name))
 }
 
 /// Deserializes a unexpected catalog response into an error.
