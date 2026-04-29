@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
-use sqe_core::config::StorageConfig;
+use sqe_core::config::{SqeConfig, StorageConfig};
 use sqe_core::SqeError;
 use sqe_metrics::propagation::trace_context_http_headers;
 
@@ -202,6 +202,41 @@ impl SessionCatalog {
     /// `table_cache` is the shared global `TableMetadataCache` created once at coordinator
     /// startup. When `Some`, all sessions share the same cache so cache misses are amortised
     /// across users. When `None` a private cache is built locally (used in tests).
+    /// Build a `SessionCatalog` from the coordinator's `SqeConfig` plus
+    /// the user's bearer token. Optional shared table cache is forwarded
+    /// to `Self::new`.
+    ///
+    /// This is the helper every `*_handler.rs` should use; it keeps the
+    /// 8-arg `new()` constructor available for the rare callers (tests)
+    /// that need to wire a custom HTTP client or circuit breaker. The
+    /// 13 coordinator call sites that all pass the same `(config,
+    /// session.access_token, table_cache, None, None)` tuple should go
+    /// through this single entry point so changes to the catalog
+    /// construction path don't have to touch each handler.
+    ///
+    /// Phase O+ will grow this helper into a backend-dispatch factory:
+    /// when `config.catalog.backend` selects HMS / Glue / JDBC the
+    /// helper will return a `SessionCatalog`-shaped wrapper around the
+    /// matching `iceberg::Catalog` implementation. For now (Phase O+
+    /// step 1) it always returns the REST `SessionCatalog`, identical
+    /// to what the call sites built manually.
+    pub async fn for_session(
+        config: &SqeConfig,
+        table_cache: Option<TableMetadataCache>,
+        bearer_token: &str,
+    ) -> sqe_core::Result<Self> {
+        Self::new(
+            &config.catalog.polaris_url,
+            &config.catalog.warehouse,
+            bearer_token,
+            &config.storage,
+            table_cache,
+            None,
+            None,
+        )
+        .await
+    }
+
     pub async fn new(
         polaris_url: &str,
         warehouse: &str,

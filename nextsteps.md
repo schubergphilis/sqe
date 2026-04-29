@@ -215,4 +215,31 @@ Step 6: semantic layer      (new crates; fully additive; no existing code broken
 
 Step 9g (cow-dml-parallel-streaming) is the immediate SF100 unblock. Step 5 (pluggable catalogs) follows. Step 6 is independent and fully additive.
 
-> **Upstream watch list:** iceberg-rust MoR (Epic #2186, Q3 2026) could replace CoW DELETE/MERGE with a more efficient position-delete approach; this matters for the longer-term follow-up to `cow-dml-parallel-streaming` (default UPDATE mode -> MoR when the change fraction is small). Polaris OPA SPI refactor (PR #3999) must stabilise before Phase 5 OPA integration. Remote S3 signing (Iceberg 1.12) will require revisiting pluggable-catalogs credential vending design. DataFusion `IN (subquery)` still not supported in physical plan for MemTable-referenced columns: SQE lifts those to a scratch-MemTable + LEFT JOIN in `lift_in_subqueries` before planning (previously blocked 5 TPC-E DML queries; the old literal-inlining rewriter crashed at 34K tuples in SF10). The LEFT JOIN + COALESCE pattern prevents DataFusion's `EliminateOuterJoin` from producing a LeftSemi join; a follow-up to `cow-dml-parallel-streaming` will route `IN` directly through `DecorrelatePredicateSubquery` to emit native LeftSemi. Track upstream DataFusion for native `IN (subquery)` on MemTables. DataFusion ROLLUP returns 0 rows with empty GROUP BY input (apache/datafusion#21570): causes 6 TPC-DS DIFF results. DataFusion MERGE INTO (apache/datafusion#20746) is in progress; would enable a single-pass plan over the DELETE+UPDATE+INSERT combo that Spark already supports.
+> **Upstream watch list (refreshed 2026-04-29):**
+>
+> _Resolved since the last refresh:_
+>
+> - **★ risingwavelabs/iceberg-rust caught up to DataFusion 53.** Commit `fb290e4c9` on the fork's main branch (2026-04-15) merges PR #148, which lands DF 53 + Arrow 58. SQE has been carrying a downstream rebase since Phase F; we can now align with the upstream fork on its next vendor refresh.
+>
+> _Blocking matrix v3 cells, still open:_
+>
+> - **apache/iceberg-rust#2188 (Variant)** — open, in active review, merge conflicts. Likely lands within weeks. Unblocks `variant-type:v3`.
+> - **apache/arrow-rs#9790 (BorrowedShreddingState refactor)** — opened 2026-04-22, no traction yet. Parent shredded variant work has effectively landed in arrow-rs; this is cleanup. Worth re-checking what arrow-rs version SQE pins. `shredded-variant:v3` may already be partly reachable.
+> - **apache/datafusion#12644 (User-defined types)** — open since 2024-09-27. Long-running design discussion (geoarrow extension types). No merge in sight; `geometry-type:v3` will not unblock soon via DataFusion proper. Practical path is to ride on arrow-rs extension-type metadata above DataFusion.
+> - **Apache Iceberg V3 Java spec activity** — heavy traffic on variant (#15385 predicate pushdown, #16133 row-group skip, #14297 shredded write) and lineage (#15776 ORC `_row_id`); geometry stalled (#12347 since 2025-09). V3 is still landing pieces; the `multi-arg-transforms:v3`, `vector-type:v3`, `lineage:v3` cells track that progress.
+>
+> _SQE-filed, no upstream traction yet:_
+>
+> - **apache/iceberg-rust#2376 (DynamicPredicate API)** — SQE filed this; latest comment 2026-04-28 sharpens the cache-layer API ask (`is_sealed()` / `generation()`). MR !112 already shipped Path B-2 downstream so SQE is unblocked; the issue tracks getting the cache helper accepted upstream.
+>
+> _Affecting older watchlist items:_
+>
+> - **apache/datafusion#21570 (ROLLUP empty GROUP BY)** — open, an assignee took it on 2026-04-12 and committed to a PR. Should land in 1-2 release cycles. Still causes 6 TPC-DS DIFF results.
+> - **apache/datafusion#20746 (MERGE INTO)** — open umbrella issue, no in-flight PR. Don't expect MERGE in DataFusion soon; SQE keeps its CoW MERGE path.
+> - **DataFusion `IN (subquery)` on MemTable-referenced columns** — no specific upstream issue; closest open work (#14554, #15046) is stale. SQE's `lift_in_subqueries` workaround stays.
+>
+> _Pre-existing items (no change):_
+>
+> - **iceberg-rust MoR (Epic #2186, Q3 2026)** — could replace CoW DELETE/MERGE with a more efficient position-delete approach; matters for the longer-term follow-up to `cow-dml-parallel-streaming`.
+> - **Polaris OPA SPI refactor (PR #3999)** — must stabilise before Phase 5 OPA integration.
+> - **Remote S3 signing (Iceberg 1.12)** — will require revisiting credential vending in pluggable-catalogs once it ships.
