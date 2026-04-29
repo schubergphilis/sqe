@@ -3378,14 +3378,10 @@ impl WriteHandler {
     /// for the given session.
     async fn create_catalog_bridge(&self, session: &Session) -> sqe_core::Result<Arc<dyn Catalog>> {
         let session_catalog = Arc::new(
-            SessionCatalog::new(
-                &self.config.catalog.polaris_url,
-                &self.config.catalog.warehouse,
-                &session.access_token,
-                &self.config.storage,
+            SessionCatalog::for_session(
+                &self.config,
                 self.table_cache.clone(),
-                None,
-                None,
+                &session.access_token,
             )
             .await?,
         );

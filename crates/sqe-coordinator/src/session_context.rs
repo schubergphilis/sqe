@@ -144,13 +144,10 @@ pub async fn create_session_context(
             // Pass the shared global table metadata cache so Polaris REST round-trips are
             // skipped for tables that have already been loaded within the TTL window.
             let session_catalog = Arc::new(
-                SessionCatalog::new(
-                    &config.catalog.polaris_url,
-                    &config.catalog.warehouse,
-                    &session.access_token,
-                    &config.storage,
+                SessionCatalog::for_session(
+                    config,
                     table_cache.cloned(),
-                    None, None,
+                    &session.access_token,
                 )
                 .await
                 .map_err(Arc::new)?,
