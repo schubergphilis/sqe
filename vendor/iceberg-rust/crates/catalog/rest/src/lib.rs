@@ -53,6 +53,8 @@
 
 mod catalog;
 mod client;
+#[cfg(feature = "aws-sigv4")]
+mod sigv4;
 mod types;
 
 pub use catalog::*;

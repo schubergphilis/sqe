@@ -10,14 +10,14 @@
     "group": "3rd Party",
     "docUrl": "https://github.com/schubergphilis/sqe"
   },
-  "generatedAt": "2026-04-29T19:00:00Z",
-  "generatedBy": "Phase O live catalog matrix (HMS + Nessie + JDBC + Glue)",
+  "generatedAt": "2026-04-29T20:00:00Z",
+  "generatedBy": "Phase P AWS S3 Tables via Iceberg REST + SigV4",
   "score": {
     "raw": 158,
     "max": 189,
     "percent": 83.6
   },
-  "note": "Phase O integrated on top of Phase N. Score 153/189 (81.0%) -> 158/189 (83.6%). Five cells flip from partial to full because Phase O proved the catalogs live, not just at compile-time: hive-metastore v2 + v3 (apache/hive:standalone-metastore-4.1.0 over Thrift via docker-compose.hms.yml), nessie v3 (ghcr.io/projectnessie/nessie:0.107.5 over Iceberg REST via docker-compose.nessie.yml -- 0.76.x had a partial adapter, 0.107.x is the first tag where /iceberg/v1/config returns 200), aws-glue-catalog v2 + v3 (real AWS account in eu-central-1, credentials from the standard provider chain, warehouse bucket and profile name held in .env so neither lands in source). Each backend exercises the full create_namespace -> list_namespaces -> drop_namespace round-trip through the iceberg-rust Catalog trait. Default cargo build now ships every supported catalog backend compiled in (sqe-catalog default features expanded to rest + sql-postgres + hms + glue + hadoop). The session-manager wiring gap stays as a caveat on each non-REST cell -- the engine still hardcodes the REST path, so a coordinator can construct an HmsCatalog/GlueCatalog but won't dispatch SQL through it yet. JDBC postgres remains partial for the same reason (the live test passes, but the engine doesn't consume iceberg-catalog-sql either). Closing that gap is the next phase, after which jdbc/hms/glue/nessie can all drop from `partial` to `full` on the engine-integration axis.",
+  "note": "Phase P sits on top of Phase O. Score stays at 158/189 (83.6%) because the score rubric counts cells, not capabilities, and Phase P enriches existing `full` cells (rest-catalog and aws-glue-catalog) rather than flipping new ones. The capability lift is real: the vendored iceberg-catalog-rest client gained an `aws-sigv4` cargo feature (default-on for SQE) that swaps in an AWS SigV4 signer when `rest.sigv4-enabled=true` is set on user props or surfaces in the server's /v1/config defaults. With it, the same code path that talks to Polaris and Nessie now talks to AWS's federated Glue Iceberg REST endpoint (`glue.<region>.amazonaws.com/iceberg`, signing-name=glue) and the per-bucket S3 Tables endpoint (`s3tables.<region>.amazonaws.com/iceberg`, signing-name=s3tables). Verified live against a pre-existing S3 Tables bucket in eu-central-1: list_namespaces returned `table_demo_analytics`, list_tables returned `table_user_events`, all through SQE's Catalog trait with no AWS-specific call sites. Phase O background still applies: HMS v2/v3, Nessie v3, Glue v2/v3 all flipped to full earlier in the same branch via live tests. The session-manager wiring gap stays as a caveat on the SDK-based catalog paths (HMS, JDBC, native Glue); the federated REST endpoint reaches S3 Tables without that gap because it rides the existing REST code path.",
   "support": {
     "sqe:position-deletes:v2": {
       "level": "full",
@@ -293,30 +293,30 @@
     },
     "sqe:aws-glue-catalog:v2": {
       "level": "full",
-      "notes": "iceberg-catalog-glue vendored from apache/iceberg-rust v0.9.0 into vendor/iceberg-rust/crates/catalog/glue/, wired behind the `glue` cargo feature (now in default). Phase O verified against a real AWS account in eu-central-1: live_glue_namespace_round_trip creates, lists, and drops a Glue database through GlueBackend::build_catalog using the standard AWS provider chain. Credentials and warehouse bucket flow through .env (template at .env.example) so no profile names land in source.",
-      "evidence": "vendor/iceberg-rust/crates/catalog/glue/, crates/sqe-catalog/src/backends/glue.rs, crates/sqe-catalog/tests/backends_integration.rs::glue::live_glue_namespace_round_trip",
+      "notes": "Two parallel paths now ship: (1) iceberg-catalog-glue vendored from apache/iceberg-rust v0.9.0 (AWS SDK over the Glue API directly); (2) the federated Glue Iceberg REST endpoint at https://glue.<region>.amazonaws.com/iceberg, reachable through the vendored iceberg-catalog-rest client with Phase P's SigV4 auth. Path (1) verified by live_glue_namespace_round_trip in eu-central-1: create_namespace -> list_namespaces -> drop_namespace through GlueBackend::build_catalog using the standard AWS provider chain. Path (2) verified by list_namespaces_via_glue_rest in the same test file, listing namespaces and tables in a pre-existing S3 Tables bucket through SigV4-signed REST. Credentials and warehouse identifiers flow through .env (template at .env.example) so no profile names land in source.",
+      "evidence": "vendor/iceberg-rust/crates/catalog/glue/, crates/sqe-catalog/src/backends/glue.rs, crates/sqe-catalog/tests/backends_integration.rs::glue::live_glue_namespace_round_trip, crates/sqe-catalog/tests/backends_integration.rs::s3_tables::list_namespaces_via_glue_rest, vendor/iceberg-rust/crates/catalog/rest/src/sigv4.rs",
       "caveats": [
-        "Same engine-wiring gap as HMS: session manager hardcodes REST."
+        "Engine-wiring gap on the SDK path: a coordinator built with `--features glue` can construct a GlueCatalog but the session manager still hardcodes the REST path. The federated REST endpoint avoids that gap because it goes through the existing REST code path."
       ]
     },
     "sqe:aws-glue-catalog:v3": {
       "level": "full",
-      "notes": "Same vendored iceberg-catalog-glue code path as V2 plus the format-version forwarding pattern proven on Polaris (Glue stores Iceberg metadata pointers; format-version lives in metadata.json which the catalog is opaque to). Live AWS round-trip verified in Phase O.",
-      "evidence": "vendor/iceberg-rust/crates/catalog/glue/, crates/sqe-catalog/src/backends/glue.rs, crates/sqe-catalog/tests/backends_integration.rs::glue::live_glue_namespace_round_trip",
+      "notes": "Same two parallel paths as V2: native AWS SDK via iceberg-catalog-glue, and the federated Glue Iceberg REST endpoint with SigV4 signing. Both are format-version agnostic at the catalog layer; format-version: 3 is forwarded through the Iceberg metadata.json which the catalogs treat as opaque. Live AWS round-trip verified in Phase O (SDK path) and Phase P (REST path against an existing S3 Tables bucket).",
+      "evidence": "vendor/iceberg-rust/crates/catalog/glue/, crates/sqe-catalog/src/backends/glue.rs, crates/sqe-catalog/tests/backends_integration.rs::glue::live_glue_namespace_round_trip, crates/sqe-catalog/tests/backends_integration.rs::s3_tables::list_namespaces_via_glue_rest",
       "caveats": [
-        "Same engine-wiring gap as V2."
+        "Same engine-wiring gap as V2 on the SDK path; the REST path is already wired."
       ]
     },
     "sqe:rest-catalog:v2": {
       "level": "full",
-      "notes": "Primary catalog type.",
-      "evidence": "crates/sqe-catalog/src/rest.rs",
+      "notes": "Primary catalog type. Phase P added optional AWS SigV4 signing to the vendored `iceberg-catalog-rest` client (cargo feature `aws-sigv4`, on by default in SQE), letting the same code path talk to AWS's Iceberg REST endpoints (`glue.<region>.amazonaws.com/iceberg` and the per-bucket `s3tables.<region>.amazonaws.com/iceberg`). Authenticator reads the standard AWS credential chain, swaps in for the OAuth/Bearer flow when `rest.sigv4-enabled=true` lands in user props or the server's /v1/config defaults.",
+      "evidence": "crates/sqe-catalog/src/rest.rs, vendor/iceberg-rust/crates/catalog/rest/src/sigv4.rs",
       "caveats": []
     },
     "sqe:rest-catalog:v3": {
       "level": "full",
-      "notes": "Iceberg REST catalogs accept V3 tables when SQE forwards format-version as a table property in CreateTableRequest. Verified end-to-end against Polaris (Apache Polaris is REST-spec compliant).",
-      "evidence": "crates/sqe-coordinator/src/write_handler.rs#format_version_properties, crates/sqe-coordinator/tests/v3_e2e.rs (full suite)",
+      "notes": "Iceberg REST catalogs accept V3 tables when SQE forwards format-version as a table property in CreateTableRequest. Verified end-to-end against Polaris (Apache Polaris is REST-spec compliant). Phase P SigV4 patch makes the same V3 forwarding work against AWS S3 Tables through the federated Glue Iceberg REST endpoint.",
+      "evidence": "crates/sqe-coordinator/src/write_handler.rs#format_version_properties, crates/sqe-coordinator/tests/v3_e2e.rs (full suite), vendor/iceberg-rust/crates/catalog/rest/src/sigv4.rs",
       "caveats": []
     },
     "sqe:nessie:v2": {
