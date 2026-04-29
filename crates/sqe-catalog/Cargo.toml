@@ -4,9 +4,21 @@ version = "0.15.0"
 edition = "2021"
 
 [features]
-default = ["rest"]
-# REST catalog (always on today; the flag is here so the matrix-parity phase A
-# can expose `--no-default-features` builds that skip other backends).
+# Default ships every supported catalog backend compiled in. Picking a
+# backend is a runtime config concern, not a build-time one. Operators
+# who need a slim image (or want to drop the AWS SDK weight) build with
+# `--no-default-features --features rest` (or any subset).
+#
+# Approximate binary cost on top of a `rest`-only build: nessie adds 0
+# (REST adapter, no new deps); hadoop adds ~0 (uses existing FileIO);
+# sql-postgres ~5-10 MB; hms ~10-15 MB; glue ~50-80 MB (the AWS SDK is
+# the heavyweight). Default release binary lands around 180-200 MB,
+# which is fine for our Kubernetes deployments and matches Java stacks
+# of similar scope.
+default = ["rest", "sql-postgres", "hms", "glue", "hadoop"]
+# REST catalog (the protocol Polaris and Nessie both speak). Always on
+# in default; the flag exists so `--no-default-features --features rest`
+# is a valid slim build.
 rest = []
 # JDBC-style SQL catalog. SQLite via rusqlite (existing helper) plus the
 # upstream iceberg-catalog-sql crate which uses sqlx::any for runtime

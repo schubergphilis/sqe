@@ -17,23 +17,85 @@
 
 #[cfg(feature = "glue")]
 mod glue {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use iceberg::io::OpenDalStorageFactory;
+    use iceberg::{Catalog, NamespaceIdent};
     use sqe_catalog::backends::glue::{GlueBackend, GlueConfig};
 
-    /// Requires live AWS credentials and a pre-provisioned Glue database.
-    /// Skipped by default because it touches real AWS.
+    /// Live AWS Glue round-trip: create_namespace -> list_namespaces ->
+    /// drop_namespace, against the user's account in eu-central-1 (or
+    /// whichever region they configured).
+    ///
+    /// Reads credentials from the standard AWS provider chain. Use
+    /// `.env` (template at `.env.example`) to avoid putting profile
+    /// names in shell history:
+    ///
+    /// ```bash
+    /// cp .env.example .env  # then edit AWS_PROFILE/AWS_REGION/warehouse
+    /// set -a; source .env; set +a
+    /// cargo test -p sqe-catalog --features glue backends_integration -- \
+    ///     --ignored glue::live_glue_namespace_round_trip
+    /// ```
+    ///
+    /// The test panics with a clear message if `SQE_TEST_GLUE_WAREHOUSE`
+    /// is not set; that's the signal that the operator opted out of the
+    /// live AWS path. Glue databases are regional and need a real S3
+    /// bucket to exist for the LocationUri.
     #[tokio::test]
-    #[ignore = "requires live AWS credentials; run with --ignored"]
-    async fn glue_backend_lists_databases() {
-        let region = std::env::var("SQE_TEST_GLUE_REGION").unwrap_or_else(|_| "eu-west-1".into());
+    #[ignore = "requires AWS credentials + a pre-created S3 bucket; run with --ignored"]
+    async fn live_glue_namespace_round_trip() {
         let warehouse = std::env::var("SQE_TEST_GLUE_WAREHOUSE")
-            .expect("SQE_TEST_GLUE_WAREHOUSE must be set for this test");
+            .expect(
+                "SQE_TEST_GLUE_WAREHOUSE must be set to a pre-created \
+                 s3:// path, e.g. s3://sqe-glue-it-eu-central-1/wh/. \
+                 Copy .env.example to .env and source it.",
+            );
+        let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "eu-central-1".into());
+
+        // Glue stores warehouse paths but the namespace round-trip
+        // doesn't write Parquet, so the Fs storage factory is enough
+        // to satisfy `with_storage_factory`. Same pattern as HMS.
+        let storage_factory: Arc<dyn iceberg::io::StorageFactory> =
+            Arc::new(OpenDalStorageFactory::Fs);
+
         let backend = GlueBackend::new(GlueConfig::new(region, warehouse));
-        let result = backend.list_databases().await;
-        // When the real implementation lands (task 2.3) this should succeed.
-        // Today the stub returns an error pointing at the task list.
-        assert!(result.is_err(), "expected stub error until task 2.3 lands");
+        let catalog = backend
+            .build_catalog(storage_factory)
+            .await
+            .expect("GlueCatalog builds with the configured AWS profile");
+
+        // Glue database names are restricted to lowercase ASCII +
+        // underscore + digits, max 255 chars. UUID hex chunk fits.
+        let ns_name = format!("sqe_glue_ci_{}", uuid::Uuid::new_v4().simple());
+        let ns = NamespaceIdent::new(ns_name.clone());
+
+        catalog
+            .create_namespace(&ns, HashMap::new())
+            .await
+            .unwrap_or_else(|e| panic!("create_namespace({ns_name}) failed: {e}"));
+
+        let listed = catalog
+            .list_namespaces(None)
+            .await
+            .expect("list_namespaces");
+        let listed_names: Vec<String> =
+            listed.iter().map(|n| n.as_ref().join(".")).collect();
+        assert!(
+            listed_names.iter().any(|n| n == &ns_name),
+            "namespace {ns_name} should appear in list after create. Got first 20: {:?}",
+            listed_names.iter().take(20).collect::<Vec<_>>()
+        );
+
+        catalog
+            .drop_namespace(&ns)
+            .await
+            .unwrap_or_else(|e| panic!("drop_namespace({ns_name}) failed: {e}"));
     }
 
+    /// Pure-config smoke test: exercises the wrapper struct without
+    /// touching AWS. Useful in CI where the live test is gated.
     #[test]
     fn glue_config_constructs() {
         let cfg = GlueConfig::new("eu-west-1", "s3://lake/wh");
@@ -45,18 +107,86 @@ mod glue {
 
 #[cfg(feature = "hms")]
 mod hms {
+    use std::sync::Arc;
+
+    use iceberg::io::OpenDalStorageFactory;
+    use iceberg::{Catalog, NamespaceIdent};
     use sqe_catalog::backends::hms::{HmsBackend, HmsConfig};
 
+    /// Live HMS round-trip: create_namespace -> namespace_exists -> drop_namespace.
+    ///
+    /// Brings a real Thrift round-trip against a Hive metastore container,
+    /// proving the vendored `iceberg-catalog-hms` crate (Phase K) works
+    /// end-to-end on this fork. Marked `#[ignore]` because it needs the
+    /// `docker-compose.hms.yml` stack running:
+    ///
+    /// ```bash
+    /// docker compose -f docker-compose.test.yml \
+    ///                -f docker-compose.hms.yml up -d
+    /// cargo test -p sqe-catalog --features hms backends_integration -- \
+    ///     --ignored hms::
+    /// ```
+    ///
+    /// The test uses a unique namespace name per run (`sqe_hms_ci_<uuid>`)
+    /// so concurrent runs don't collide, and cleans up on success.
+    /// Failure leaves the namespace behind for inspection.
     #[tokio::test]
     #[ignore = "requires docker-compose HMS stack; run with --ignored"]
-    async fn hms_backend_lists_tables() {
+    async fn hms_namespace_round_trip() {
+        // Upstream HmsCatalog calls `to_socket_addrs()` directly on the
+        // configured address, so it wants `host:port` (no scheme prefix).
+        // Force IPv4 because Docker port forwarding on macOS doesn't
+        // always answer on the IPv6 loopback that `localhost` resolves
+        // to first.
         let uri = std::env::var("SQE_TEST_HMS_URI")
-            .unwrap_or_else(|_| "thrift://localhost:9083".into());
+            .unwrap_or_else(|_| "127.0.0.1:19083".into());
         let warehouse = std::env::var("SQE_TEST_HMS_WAREHOUSE")
-            .unwrap_or_else(|_| "s3://lake/warehouse".into());
+            .unwrap_or_else(|_| "s3a://warehouse/hms/".into());
+
+        // Storage factory: HMS stores warehouse paths but our test
+        // doesn't actually open Parquet files. The `Fs` factory
+        // satisfies `with_storage_factory` without pulling in S3
+        // credentials. (Same pattern the existing iceberg-catalog-sql
+        // test below uses on line ~209.)
+        let storage_factory: Arc<dyn iceberg::io::StorageFactory> =
+            Arc::new(OpenDalStorageFactory::Fs);
+
         let backend = HmsBackend::new(HmsConfig::new(uri, warehouse));
-        let result = backend.list_tables("default").await;
-        assert!(result.is_err(), "expected stub error until task 2.7 lands");
+        let catalog = backend
+            .build_catalog(storage_factory)
+            .await
+            .expect("HmsCatalog builds against the docker stack");
+
+        // Unique-per-run namespace so parallel tests / re-runs don't collide.
+        let ns_name = format!("sqe_hms_ci_{}", uuid::Uuid::new_v4().simple());
+        let ns = NamespaceIdent::new(ns_name.clone());
+
+        // create_namespace -> list_namespaces -> drop_namespace round-trip.
+        // We list (rather than `namespace_exists`) so any name-mangling
+        // upstream is visible in the assertion failure rather than
+        // hidden behind a bare false.
+        catalog
+            .create_namespace(&ns, std::collections::HashMap::new())
+            .await
+            .unwrap_or_else(|e| panic!("create_namespace({ns_name}) failed: {e}"));
+
+        let listed = catalog
+            .list_namespaces(None)
+            .await
+            .expect("list_namespaces");
+        let listed_names: Vec<String> = listed
+            .iter()
+            .map(|n| n.as_ref().join("."))
+            .collect();
+        assert!(
+            listed_names.iter().any(|n| n == &ns_name),
+            "namespace {ns_name} should appear in list after create. Got: {listed_names:?}"
+        );
+
+        catalog
+            .drop_namespace(&ns)
+            .await
+            .unwrap_or_else(|e| panic!("drop_namespace({ns_name}) failed: {e}"));
     }
 }
 
@@ -237,6 +367,214 @@ mod hadoop {
     async fn hadoop_backend_minio_integration() {
         // Future: wire to a running MinIO instance and discover real tables.
         unimplemented!("MinIO integration arrives with task 2.16");
+    }
+}
+
+// -- Nessie (Iceberg REST) --------------------------------------------------
+
+#[cfg(feature = "rest")]
+mod nessie {
+    use std::collections::HashMap;
+
+    // CatalogBuilder is the trait that adds `.load(name, props)` onto
+    // `RestCatalogBuilder::default()`. Without it the call resolves to
+    // nothing on the bare struct.
+    use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
+    use iceberg_catalog_rest::RestCatalogBuilder;
+
+    /// Live Nessie round-trip via the Iceberg REST adapter.
+    ///
+    /// Nessie speaks Iceberg REST, so this exercises the same client SQE
+    /// uses against Polaris. Proving it works against Nessie's adapter
+    /// flips the matrix cell from "REST library compiles" to "verified
+    /// against the actual server."
+    ///
+    /// Stack:
+    /// ```bash
+    /// docker compose -f docker-compose.test.yml \
+    ///                -f docker-compose.nessie.yml up -d
+    /// cargo test -p sqe-catalog backends_integration -- \
+    ///     --ignored nessie::
+    /// ```
+    ///
+    /// The `prefix` Nessie returns from `/iceberg/v1/config` is
+    /// `main|warehouse` (URL-encoded as `main%7Cwarehouse`). The
+    /// upstream `RestCatalog` client reads it from the config response
+    /// and prepends it to subsequent paths automatically; we don't have
+    /// to thread it through.
+    #[tokio::test]
+    #[ignore = "requires docker-compose Nessie stack; run with --ignored"]
+    async fn nessie_namespace_round_trip() {
+        // `/iceberg/` is the Iceberg REST mount point Nessie reports
+        // back via the config response. Trailing slash matters: the
+        // client appends `v1/config?warehouse=...` directly.
+        let uri = std::env::var("SQE_TEST_NESSIE_URI")
+            .unwrap_or_else(|_| "http://127.0.0.1:19121/iceberg/".into());
+        let warehouse = std::env::var("SQE_TEST_NESSIE_WAREHOUSE")
+            .unwrap_or_else(|_| "warehouse".into());
+
+        let mut props = HashMap::new();
+        props.insert("uri".to_string(), uri);
+        props.insert("warehouse".to_string(), warehouse);
+
+        let catalog = RestCatalogBuilder::default()
+            .load("sqe-nessie-test".to_string(), props)
+            .await
+            .expect("RestCatalog builds against Nessie");
+
+        // Unique-per-run namespace so parallel runs don't collide.
+        let ns_name = format!("sqe_nessie_ci_{}", uuid::Uuid::new_v4().simple());
+        let ns = NamespaceIdent::new(ns_name.clone());
+
+        catalog
+            .create_namespace(&ns, HashMap::new())
+            .await
+            .unwrap_or_else(|e| panic!("create_namespace({ns_name}) failed: {e}"));
+
+        let listed = catalog
+            .list_namespaces(None)
+            .await
+            .expect("list_namespaces");
+        let listed_names: Vec<String> =
+            listed.iter().map(|n| n.as_ref().join(".")).collect();
+        assert!(
+            listed_names.iter().any(|n| n == &ns_name),
+            "namespace {ns_name} should appear in list after create. Got: {listed_names:?}"
+        );
+
+        catalog
+            .drop_namespace(&ns)
+            .await
+            .unwrap_or_else(|e| panic!("drop_namespace({ns_name}) failed: {e}"));
+    }
+}
+
+// -- AWS S3 Tables (Iceberg REST + SigV4) -----------------------------------
+
+#[cfg(feature = "rest")]
+mod s3_tables {
+    use std::collections::HashMap;
+
+    use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
+    use iceberg_catalog_rest::RestCatalogBuilder;
+
+    /// Live AWS S3 Tables read-only smoke test through the federated
+    /// Glue Iceberg REST endpoint.
+    ///
+    /// AWS publishes two Iceberg REST surfaces in front of S3 Tables:
+    ///
+    ///   - `https://glue.<region>.amazonaws.com/iceberg` (federated)
+    ///   - `https://s3tables.<region>.amazonaws.com/iceberg` (per-bucket)
+    ///
+    /// Both speak the standard Iceberg REST protocol but require AWS
+    /// SigV4 on every request. Phase P added a `aws-sigv4` feature to
+    /// the vendored `iceberg-catalog-rest` crate that swaps the
+    /// OAuth/Bearer authenticator for a SigV4 signer when the user
+    /// (or the server's `/v1/config` defaults) advertises
+    /// `rest.sigv4-enabled=true`.
+    ///
+    /// This test exercises the smallest end-to-end shape: list the
+    /// namespaces visible to the configured AWS principal in the
+    /// pre-existing test bucket, then list tables in the first
+    /// namespace. No DDL or DML — namespace creation through this
+    /// federated endpoint requires Lake Formation grants we don't
+    /// own here.
+    ///
+    /// Run:
+    /// ```bash
+    /// set -a; source .env; set +a   # AWS_PROFILE, AWS_REGION
+    /// cargo test -p sqe-catalog backends_integration -- \
+    ///     --ignored s3_tables::list_namespaces_via_glue_rest
+    /// ```
+    ///
+    /// Fails fast with a clear message if `SQE_TEST_S3TABLES_WAREHOUSE`
+    /// isn't set; that's the signal that the operator opted out of the
+    /// AWS path. The warehouse format is the value AWS returns from
+    /// the `/v1/config` `prefix` override:
+    /// `<account-id>:s3tablescatalog/<bucket-name>`.
+    #[tokio::test]
+    #[ignore = "requires AWS credentials + a pre-existing S3 Tables bucket; run with --ignored"]
+    async fn list_namespaces_via_glue_rest() {
+        let warehouse = std::env::var("SQE_TEST_S3TABLES_WAREHOUSE").expect(
+            "SQE_TEST_S3TABLES_WAREHOUSE must be set, e.g. \
+             311141556126:s3tablescatalog/iceberg-demo-table-iceberg-data",
+        );
+        let region =
+            std::env::var("AWS_REGION").unwrap_or_else(|_| "eu-central-1".into());
+        // Default to the federated Glue endpoint; per-bucket
+        // `s3tables.<region>.amazonaws.com/iceberg` is also valid but
+        // requires `rest.signing-name=s3tables`.
+        let uri = std::env::var("SQE_TEST_S3TABLES_URI").unwrap_or_else(|_| {
+            format!("https://glue.{region}.amazonaws.com/iceberg")
+        });
+        let signing_name =
+            std::env::var("SQE_TEST_S3TABLES_SIGNING_NAME").unwrap_or_else(|_| "glue".into());
+
+        let mut props = HashMap::new();
+        props.insert("uri".to_string(), uri);
+        props.insert("warehouse".to_string(), warehouse);
+        // Opt the client into SigV4 mode. AWS also advertises these
+        // in the server's `/v1/config` defaults, but we have to set
+        // them on the user config so that the very first request
+        // (the config fetch itself) is signed.
+        props.insert("rest.sigv4-enabled".to_string(), "true".to_string());
+        props.insert("rest.signing-name".to_string(), signing_name);
+        props.insert("rest.signing-region".to_string(), region.clone());
+
+        let catalog = RestCatalogBuilder::default()
+            .load("sqe-s3tables-test".to_string(), props)
+            .await
+            .expect("RestCatalog builds with SigV4 against AWS Glue Iceberg REST");
+
+        // Listing must succeed. The expected response shape is a
+        // single-element vec with at least one namespace; AWS returns
+        // an empty list when no namespaces exist, which we treat as a
+        // skip rather than a failure (a fresh bucket is a valid
+        // state).
+        let listed = catalog
+            .list_namespaces(None)
+            .await
+            .expect("list_namespaces should succeed under SigV4");
+
+        if listed.is_empty() {
+            eprintln!(
+                "S3 Tables warehouse has no namespaces; the SigV4 round-trip \
+                 reached the server but there's nothing to enumerate. \
+                 Configure a namespace via `aws s3tables` or skip this run."
+            );
+            return;
+        }
+
+        // Drill into the first namespace and list tables. We only
+        // assert the call doesn't error; a freshly created namespace
+        // legitimately has zero tables.
+        let first = listed.first().expect("checked non-empty above").clone();
+        let tables = catalog
+            .list_tables(&first)
+            .await
+            .unwrap_or_else(|e| panic!("list_tables({first:?}) failed: {e}"));
+
+        let ns_str = first.as_ref().join(".");
+        let table_names: Vec<String> = tables
+            .iter()
+            .map(|t| format!("{}.{}", t.namespace.as_ref().join("."), t.name))
+            .collect();
+        eprintln!(
+            "S3 Tables round-trip ok: namespace={ns_str} tables={table_names:?}"
+        );
+
+        // Sanity check: at least the namespace listing came back
+        // without an Authorization-Bearer 403, which is the failure
+        // mode if the SigV4 path didn't actually engage.
+        assert!(
+            !ns_str.is_empty(),
+            "namespace string parsed from listing should be non-empty"
+        );
+        // We deliberately don't assert a specific namespace name
+        // because the bucket contents change over time. The presence
+        // of any successfully-enumerated namespace plus a clean
+        // `list_tables` call is enough to prove the SigV4 wiring.
+        let _ = NamespaceIdent::new(ns_str);
     }
 }
 
