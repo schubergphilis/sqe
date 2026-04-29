@@ -46,7 +46,7 @@ object_store = { version = "0.13", features = ["aws"] }
 # DeletionVectorWriter, OverwriteFilesAction, parallel manifest loading.
 # Vendored in vendor/iceberg-rust/ — see vendor/iceberg-rust/README.md
 iceberg = { path = "vendor/iceberg-rust/crates/iceberg" }
-iceberg-catalog-rest = { path = "vendor/iceberg-rust/crates/catalog/rest" }
+iceberg-catalog-rest = { path = "vendor/iceberg-rust/crates/catalog/rest", features = ["aws-sigv4"] }
 iceberg-datafusion = { path = "vendor/iceberg-rust/crates/integrations/datafusion" }
 # Optional catalog backends, vendored from upstream apache/iceberg-rust
 # v0.9.0 alongside the RisingWave fork. Gated by cargo features in

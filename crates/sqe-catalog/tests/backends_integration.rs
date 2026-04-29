@@ -449,6 +449,135 @@ mod nessie {
     }
 }
 
+// -- AWS S3 Tables (Iceberg REST + SigV4) -----------------------------------
+
+#[cfg(feature = "rest")]
+mod s3_tables {
+    use std::collections::HashMap;
+
+    use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
+    use iceberg_catalog_rest::RestCatalogBuilder;
+
+    /// Live AWS S3 Tables read-only smoke test through the federated
+    /// Glue Iceberg REST endpoint.
+    ///
+    /// AWS publishes two Iceberg REST surfaces in front of S3 Tables:
+    ///
+    ///   - `https://glue.<region>.amazonaws.com/iceberg` (federated)
+    ///   - `https://s3tables.<region>.amazonaws.com/iceberg` (per-bucket)
+    ///
+    /// Both speak the standard Iceberg REST protocol but require AWS
+    /// SigV4 on every request. Phase P added a `aws-sigv4` feature to
+    /// the vendored `iceberg-catalog-rest` crate that swaps the
+    /// OAuth/Bearer authenticator for a SigV4 signer when the user
+    /// (or the server's `/v1/config` defaults) advertises
+    /// `rest.sigv4-enabled=true`.
+    ///
+    /// This test exercises the smallest end-to-end shape: list the
+    /// namespaces visible to the configured AWS principal in the
+    /// pre-existing test bucket, then list tables in the first
+    /// namespace. No DDL or DML — namespace creation through this
+    /// federated endpoint requires Lake Formation grants we don't
+    /// own here.
+    ///
+    /// Run:
+    /// ```bash
+    /// set -a; source .env; set +a   # AWS_PROFILE, AWS_REGION
+    /// cargo test -p sqe-catalog backends_integration -- \
+    ///     --ignored s3_tables::list_namespaces_via_glue_rest
+    /// ```
+    ///
+    /// Fails fast with a clear message if `SQE_TEST_S3TABLES_WAREHOUSE`
+    /// isn't set; that's the signal that the operator opted out of the
+    /// AWS path. The warehouse format is the value AWS returns from
+    /// the `/v1/config` `prefix` override:
+    /// `<account-id>:s3tablescatalog/<bucket-name>`.
+    #[tokio::test]
+    #[ignore = "requires AWS credentials + a pre-existing S3 Tables bucket; run with --ignored"]
+    async fn list_namespaces_via_glue_rest() {
+        let warehouse = std::env::var("SQE_TEST_S3TABLES_WAREHOUSE").expect(
+            "SQE_TEST_S3TABLES_WAREHOUSE must be set, e.g. \
+             311141556126:s3tablescatalog/iceberg-demo-table-iceberg-data",
+        );
+        let region =
+            std::env::var("AWS_REGION").unwrap_or_else(|_| "eu-central-1".into());
+        // Default to the federated Glue endpoint; per-bucket
+        // `s3tables.<region>.amazonaws.com/iceberg` is also valid but
+        // requires `rest.signing-name=s3tables`.
+        let uri = std::env::var("SQE_TEST_S3TABLES_URI").unwrap_or_else(|_| {
+            format!("https://glue.{region}.amazonaws.com/iceberg")
+        });
+        let signing_name =
+            std::env::var("SQE_TEST_S3TABLES_SIGNING_NAME").unwrap_or_else(|_| "glue".into());
+
+        let mut props = HashMap::new();
+        props.insert("uri".to_string(), uri);
+        props.insert("warehouse".to_string(), warehouse);
+        // Opt the client into SigV4 mode. AWS also advertises these
+        // in the server's `/v1/config` defaults, but we have to set
+        // them on the user config so that the very first request
+        // (the config fetch itself) is signed.
+        props.insert("rest.sigv4-enabled".to_string(), "true".to_string());
+        props.insert("rest.signing-name".to_string(), signing_name);
+        props.insert("rest.signing-region".to_string(), region.clone());
+
+        let catalog = RestCatalogBuilder::default()
+            .load("sqe-s3tables-test".to_string(), props)
+            .await
+            .expect("RestCatalog builds with SigV4 against AWS Glue Iceberg REST");
+
+        // Listing must succeed. The expected response shape is a
+        // single-element vec with at least one namespace; AWS returns
+        // an empty list when no namespaces exist, which we treat as a
+        // skip rather than a failure (a fresh bucket is a valid
+        // state).
+        let listed = catalog
+            .list_namespaces(None)
+            .await
+            .expect("list_namespaces should succeed under SigV4");
+
+        if listed.is_empty() {
+            eprintln!(
+                "S3 Tables warehouse has no namespaces; the SigV4 round-trip \
+                 reached the server but there's nothing to enumerate. \
+                 Configure a namespace via `aws s3tables` or skip this run."
+            );
+            return;
+        }
+
+        // Drill into the first namespace and list tables. We only
+        // assert the call doesn't error; a freshly created namespace
+        // legitimately has zero tables.
+        let first = listed.first().expect("checked non-empty above").clone();
+        let tables = catalog
+            .list_tables(&first)
+            .await
+            .unwrap_or_else(|e| panic!("list_tables({first:?}) failed: {e}"));
+
+        let ns_str = first.as_ref().join(".");
+        let table_names: Vec<String> = tables
+            .iter()
+            .map(|t| format!("{}.{}", t.namespace.as_ref().join("."), t.name))
+            .collect();
+        eprintln!(
+            "S3 Tables round-trip ok: namespace={ns_str} tables={table_names:?}"
+        );
+
+        // Sanity check: at least the namespace listing came back
+        // without an Authorization-Bearer 403, which is the failure
+        // mode if the SigV4 path didn't actually engage.
+        assert!(
+            !ns_str.is_empty(),
+            "namespace string parsed from listing should be non-empty"
+        );
+        // We deliberately don't assert a specific namespace name
+        // because the bucket contents change over time. The presence
+        // of any successfully-enumerated namespace plus a clean
+        // `list_tables` call is enough to prove the SigV4 wiring.
+        let _ = NamespaceIdent::new(ns_str);
+    }
+}
+
 // -- Unity Catalog (OIDC M2M) -----------------------------------------------
 
 #[cfg(feature = "rest")]

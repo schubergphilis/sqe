@@ -336,6 +336,38 @@ impl RestCatalogConfig {
         Some(value.clone())
     }
 
+    /// Whether the configured server expects AWS SigV4-signed requests.
+    ///
+    /// AWS's Iceberg REST endpoints (the federated `glue` catalog and
+    /// the per-bucket `s3tables` one) advertise this through the
+    /// `rest.sigv4-enabled` property in their `/v1/config` response;
+    /// callers can also set it on the user config explicitly. When
+    /// true, the [`HttpClient`] swaps the OAuth/Bearer authenticator
+    /// for the SigV4 signer (see `client::authenticate`).
+    #[cfg(feature = "aws-sigv4")]
+    pub(crate) fn sigv4_enabled(&self) -> bool {
+        self.props
+            .get("rest.sigv4-enabled")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    /// AWS service name used in the SigV4 signature scope. AWS sets
+    /// this to `glue` for the federated endpoint and `s3tables` for
+    /// the per-bucket variant.
+    #[cfg(feature = "aws-sigv4")]
+    pub(crate) fn signing_name(&self) -> Option<String> {
+        self.props.get("rest.signing-name").cloned()
+    }
+
+    /// AWS region used in the SigV4 signature scope. The endpoint
+    /// includes the region in its hostname (`glue.eu-central-1...`),
+    /// but the signer needs it as a separate string.
+    #[cfg(feature = "aws-sigv4")]
+    pub(crate) fn signing_region(&self) -> Option<String> {
+        self.props.get("rest.signing-region").cloned()
+    }
+
     /// Merge the `RestCatalogConfig` with the a [`CatalogConfig`] (fetched from the REST server).
     pub(crate) fn merge_with_config(mut self, mut config: CatalogConfig) -> Self {
         if let Some(uri) = config.overrides.remove("uri") {
