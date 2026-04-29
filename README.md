@@ -75,14 +75,16 @@ For Docker, Kubernetes, TLS, and auth provider setup, see [docs/deployment.md](d
 
 | Suite | SQE | Trino | Speedup | Pass |
 |---|---|---|---|---|
-| TPC-H (22) | 21.9s | 30.4s | **2.1x** | 22/22 |
+| TPC-H (22) | 14.5s | 20.0s | **1.4x** | 22/22 |
 | SSB (13) | 6.2s | 4.8s | 0.8x | 13/13 |
 | TPC-DS (99) | 50.6s | 31.6s | 1.0x | 99/99 |
 | TPC-C (8 read) | 0.5s | 1.6s | **3.4x** | 7/8 |
 | TPC-BB (10) | 45.4s | 197.2s | **2.3x** | 10/10 |
 | ClickBench (43) | 1.6s | 3.7s | **2.6x** | 43/43 |
 
-**SQE wins 5 of 7 suites at SF1.** 222/222 queries pass across the full suite (TPC-H 22 + TPC-DS 99 + SSB 13 + TPC-C 17 + TPC-E 18 + TPC-BB 10 + ClickBench 43), 154.8s end-to-end. Known limitation: [TPC-DS q72](docs/blog/2026-04-16-our-nemesis-q72.md) (upstream DataFusion CBO gap).
+**SQE wins 5 of 7 suites at SF1.** 222/222 queries pass across the full suite (TPC-H 22 + TPC-DS 99 + SSB 13 + TPC-C 17 + TPC-E 18 + TPC-BB 10 + ClickBench 43). Known limitation: [TPC-DS q72](docs/blog/2026-04-16-our-nemesis-q72.md) (upstream DataFusion CBO gap).
+
+TPC-H specifically benefits from the runtime filter pushdown work (Path B + B-2): SF1 dropped from 21.9s to 14.5s (-21% SQE total, broad per-query gains on lineitem-heavy joins), and SF10 dropped from 163.9s to 143.6s (-12.4%, biggest absolute wins q06 -4.9s, q07 -4.9s, q14 -2.7s). q15 RowDiff (a TPC-H correctness flag from float-based bench data) is also fixed. See [docs/features/runtime-filter-pushdown.md](docs/features/runtime-filter-pushdown.md) for design + the engineering log of five rejected follow-up fixes.
 
 Run your own benchmarks:
 

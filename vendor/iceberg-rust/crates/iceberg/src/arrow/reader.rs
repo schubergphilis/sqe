@@ -52,7 +52,7 @@ use crate::error::Result;
 use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
 use crate::expr::visitors::page_index_evaluator::PageIndexEvaluator;
 use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator;
-use crate::expr::{BoundPredicate, BoundReference};
+use crate::expr::{Bind, BoundPredicate, BoundReference, DynamicPredicate};
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{RESERVED_FIELD_ID_FILE, is_metadata_field};
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
@@ -70,6 +70,7 @@ pub struct ArrowReaderBuilder {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     metadata_size_hint: Option<usize>,
+    dynamic_predicate: Option<Arc<dyn DynamicPredicate>>,
 }
 
 impl ArrowReaderBuilder {
@@ -84,7 +85,19 @@ impl ArrowReaderBuilder {
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
             metadata_size_hint: None,
+            dynamic_predicate: None,
         }
+    }
+
+    /// Attach a [`DynamicPredicate`] that the reader will sample once
+    /// per file scan task and AND into the static predicate. See
+    /// [`crate::scan::TableScanBuilder::with_dynamic_predicate`].
+    pub fn with_dynamic_predicate(
+        mut self,
+        dynamic_predicate: Arc<dyn DynamicPredicate>,
+    ) -> Self {
+        self.dynamic_predicate = Some(dynamic_predicate);
+        self
     }
 
     /// Sets the max number of in flight data files that are being fetched
@@ -134,6 +147,7 @@ impl ArrowReaderBuilder {
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
             metadata_size_hint: self.metadata_size_hint,
+            dynamic_predicate: self.dynamic_predicate,
         }
     }
 }
@@ -151,6 +165,9 @@ pub struct ArrowReader {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     metadata_size_hint: Option<usize>,
+    /// Optional caller-supplied [`DynamicPredicate`] consulted once per
+    /// file scan task. See [`ArrowReaderBuilder::with_dynamic_predicate`].
+    dynamic_predicate: Option<Arc<dyn DynamicPredicate>>,
 }
 
 impl ArrowReader {
@@ -163,6 +180,7 @@ impl ArrowReader {
         let row_group_filtering_enabled = self.row_group_filtering_enabled;
         let row_selection_enabled = self.row_selection_enabled;
         let metadata_size_hint = self.metadata_size_hint;
+        let dynamic_predicate = self.dynamic_predicate.clone();
 
         // Fast-path for single concurrency to avoid overhead of try_flatten_unordered
         let stream: ArrowRecordBatchStream = if concurrency_limit_data_files == 1 {
@@ -170,6 +188,7 @@ impl ArrowReader {
                 tasks
                     .and_then(move |task| {
                         let file_io = file_io.clone();
+                        let dynamic_predicate = dynamic_predicate.clone();
 
                         Self::process_file_scan_task(
                             task,
@@ -179,6 +198,7 @@ impl ArrowReader {
                             row_group_filtering_enabled,
                             row_selection_enabled,
                             metadata_size_hint,
+                            dynamic_predicate,
                         )
                     })
                     .map_err(|err| {
@@ -192,6 +212,7 @@ impl ArrowReader {
                 tasks
                     .map_ok(move |task| {
                         let file_io = file_io.clone();
+                        let dynamic_predicate = dynamic_predicate.clone();
 
                         Self::process_file_scan_task(
                             task,
@@ -201,6 +222,7 @@ impl ArrowReader {
                             row_group_filtering_enabled,
                             row_selection_enabled,
                             metadata_size_hint,
+                            dynamic_predicate,
                         )
                     })
                     .map_err(|err| {
@@ -224,6 +246,7 @@ impl ArrowReader {
         row_group_filtering_enabled: bool,
         row_selection_enabled: bool,
         metadata_size_hint: Option<usize>,
+        dynamic_predicate: Option<Arc<dyn DynamicPredicate>>,
     ) -> Result<ArrowRecordBatchStream> {
         let should_load_page_index =
             (row_selection_enabled && task.predicate.is_some()) || !task.deletes.is_empty();
@@ -353,18 +376,32 @@ impl ArrowReader {
         let delete_filter = delete_filter_rx.await.unwrap()?;
         let delete_predicate = delete_filter.build_equality_delete_predicate(&task).await?;
 
+        // Sample the optional caller-supplied dynamic predicate (e.g. a
+        // hash join build-side bloom routed through
+        // `TableScanBuilder::with_dynamic_predicate`). The sample is
+        // taken once per task, mirroring Trino's `DynamicFilter` model;
+        // a `None` return means the dynamic source is not yet useful
+        // and we fall back to the static predicate alone. Binding fails
+        // gracefully into `None` so a translation hiccup never breaks
+        // the read.
+        let dynamic_bound_predicate: Option<BoundPredicate> = dynamic_predicate
+            .as_ref()
+            .and_then(|dp| dp.current())
+            .and_then(|unbound| unbound.bind(task.schema.clone(), true).ok());
+
         // In addition to the optional predicate supplied in the `FileScanTask`,
-        // we also have an optional predicate resulting from equality delete files.
-        // If both are present, we logical-AND them together to form a single filter
-        // predicate that we can pass to the `RecordBatchStreamBuilder`.
-        let final_predicate = match (&task.predicate, delete_predicate) {
-            (None, None) => None,
-            (Some(predicate), None) => Some(predicate.clone()),
-            (None, Some(ref predicate)) => Some(predicate.clone()),
-            (Some(filter_predicate), Some(delete_predicate)) => {
-                Some(filter_predicate.clone().and(delete_predicate))
-            }
-        };
+        // we also have an optional predicate resulting from equality delete files,
+        // and an optional dynamic predicate from the caller. AND them all together
+        // to form a single filter predicate that the reader's existing min/max,
+        // page-index, and row-filter pruning paths can use.
+        let final_predicate = [
+            task.predicate.clone(),
+            delete_predicate,
+            dynamic_bound_predicate,
+        ]
+        .into_iter()
+        .flatten()
+        .reduce(BoundPredicate::and);
 
         // There are three possible sources for potential lists of selected RowGroup indices,
         // and two for `RowSelection`s.

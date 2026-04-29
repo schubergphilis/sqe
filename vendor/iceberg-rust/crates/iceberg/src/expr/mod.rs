@@ -21,10 +21,12 @@ mod term;
 use serde::{Deserialize, Serialize};
 pub use term::*;
 pub(crate) mod accessor;
+mod dynamic;
 mod predicate;
 pub(crate) mod visitors;
 use std::fmt::{Display, Formatter};
 
+pub use dynamic::DynamicPredicate;
 pub use predicate::*;
 
 use crate::spec::SchemaRef;
