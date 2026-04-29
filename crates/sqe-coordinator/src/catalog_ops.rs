@@ -292,13 +292,10 @@ impl CatalogOps {
             "Creating view"
         );
 
-        let session_catalog = SessionCatalog::new(
-            &self.config.catalog.polaris_url,
-            &self.config.catalog.warehouse,
-            &session.access_token,
-            &self.config.storage,
+        let session_catalog = SessionCatalog::for_session(
+            &self.config,
             self.table_cache.clone(),
-            None, None,
+            &session.access_token,
         )
         .await?;
 
@@ -359,13 +356,10 @@ impl CatalogOps {
             "Dropping view"
         );
 
-        let session_catalog = SessionCatalog::new(
-            &self.config.catalog.polaris_url,
-            &self.config.catalog.warehouse,
-            &session.access_token,
-            &self.config.storage,
+        let session_catalog = SessionCatalog::for_session(
+            &self.config,
             self.table_cache.clone(),
-            None, None,
+            &session.access_token,
         )
         .await?;
 
@@ -416,13 +410,10 @@ impl CatalogOps {
         // Use SessionCatalog directly so we can call commit_schema_update, which
         // bypasses the crate-private TableCommit::build() method.
         let session_catalog = Arc::new(
-            SessionCatalog::new(
-                &self.config.catalog.polaris_url,
-                &self.config.catalog.warehouse,
-                &session.access_token,
-                &self.config.storage,
+            SessionCatalog::for_session(
+                &self.config,
                 self.table_cache.clone(),
-                None, None,
+                &session.access_token,
             )
             .await?,
         );
@@ -675,13 +666,10 @@ impl CatalogOps {
         );
 
         let session_catalog = Arc::new(
-            SessionCatalog::new(
-                &self.config.catalog.polaris_url,
-                &self.config.catalog.warehouse,
-                &session.access_token,
-                &self.config.storage,
+            SessionCatalog::for_session(
+                &self.config,
                 self.table_cache.clone(),
-                None, None,
+                &session.access_token,
             )
             .await?,
         );
@@ -731,13 +719,10 @@ impl CatalogOps {
         let table_ident = TableIdent::new(namespace, name);
 
         let session_catalog = Arc::new(
-            SessionCatalog::new(
-                &self.config.catalog.polaris_url,
-                &self.config.catalog.warehouse,
-                &session.access_token,
-                &self.config.storage,
+            SessionCatalog::for_session(
+                &self.config,
                 self.table_cache.clone(),
-                None, None,
+                &session.access_token,
             )
             .await?,
         );
@@ -872,14 +857,10 @@ impl CatalogOps {
         let table_ident = TableIdent::new(namespace, name);
 
         let session_catalog = Arc::new(
-            SessionCatalog::new(
-                &self.config.catalog.polaris_url,
-                &self.config.catalog.warehouse,
-                &session.access_token,
-                &self.config.storage,
+            SessionCatalog::for_session(
+                &self.config,
                 self.table_cache.clone(),
-                None,
-                None,
+                &session.access_token,
             )
             .await?,
         );
@@ -1032,13 +1013,10 @@ impl CatalogOps {
         session: &Session,
     ) -> sqe_core::Result<Arc<dyn Catalog>> {
         let session_catalog = Arc::new(
-            SessionCatalog::new(
-                &self.config.catalog.polaris_url,
-                &self.config.catalog.warehouse,
-                &session.access_token,
-                &self.config.storage,
+            SessionCatalog::for_session(
+                &self.config,
                 self.table_cache.clone(),
-                None, None,
+                &session.access_token,
             )
             .await?,
         );
