@@ -578,12 +578,20 @@ mod s3_tables {
     }
 }
 
-// -- Unity Catalog (OIDC M2M) -----------------------------------------------
+// -- Unity Catalog (OIDC M2M auth provider) --------------------------------
 
 #[cfg(feature = "rest")]
 mod unity_catalog {
+    use std::collections::HashMap;
+
+    use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
+    use iceberg_catalog_rest::RestCatalogBuilder;
     use sqe_auth::{OidcM2mConfig, OidcM2mProvider};
 
+    /// OIDC M2M auth provider smoke test. Verifies the auth path SQE
+    /// uses against a Databricks-hosted Unity Catalog with bearer auth
+    /// turned on. Independent of the read-only Iceberg REST smoke
+    /// below.
     #[tokio::test]
     #[ignore = "requires Unity Catalog M2M credentials; run with --ignored"]
     async fn unity_catalog_m2m_auth_obtains_token() {
@@ -599,5 +607,77 @@ mod unity_catalog {
 
         let token = provider.get_token().await.unwrap();
         assert!(!token.is_empty(), "Unity Catalog returned an empty token");
+    }
+
+    /// Live Unity Catalog OSS round-trip via the Iceberg REST adapter.
+    ///
+    /// Read-only smoke: Unity OSS only implements list/load endpoints
+    /// (GET namespaces, GET tables, HEAD table). Create / drop /
+    /// commit are not implemented yet (unitycatalog/unitycatalog#3),
+    /// so this test asserts what we *can* observe: the bundled
+    /// `unity.default.marksheet_uniform` table that ships with the
+    /// image.
+    ///
+    /// Stack:
+    /// ```bash
+    /// docker compose -f docker-compose.test.yml \
+    ///                -f docker-compose.unity.yml up -d
+    /// cargo test -p sqe-catalog backends_integration -- \
+    ///     --ignored unity_catalog::list_via_unity_rest
+    /// ```
+    ///
+    /// Auth is disabled by default in the unity OSS image, so the
+    /// REST client connects without a bearer token. The bearer-auth
+    /// path against a Databricks-hosted Unity is exercised separately
+    /// by `unity_catalog_m2m_auth_obtains_token`.
+    #[tokio::test]
+    #[ignore = "requires docker-compose Unity stack; run with --ignored"]
+    async fn list_via_unity_rest() {
+        // Unity exposes its Iceberg REST surface under
+        // /api/2.1/unity-catalog/iceberg/. The trailing slash is
+        // optional; the REST client appends `v1/config?warehouse=...`
+        // either way.
+        let uri = std::env::var("SQE_TEST_UNITY_URI").unwrap_or_else(|_| {
+            "http://127.0.0.1:18080/api/2.1/unity-catalog/iceberg".into()
+        });
+        // `warehouse` is the catalog name in Unity's model, not an
+        // S3 URI. The seeded image ships with a catalog called
+        // `unity` containing a `default` schema.
+        let warehouse =
+            std::env::var("SQE_TEST_UNITY_WAREHOUSE").unwrap_or_else(|_| "unity".into());
+
+        let mut props = HashMap::new();
+        props.insert("uri".to_string(), uri);
+        props.insert("warehouse".to_string(), warehouse);
+
+        let catalog = RestCatalogBuilder::default()
+            .load("sqe-unity-test".to_string(), props)
+            .await
+            .expect("RestCatalog builds against Unity Catalog OSS");
+
+        // The seeded image always carries a `default` namespace.
+        let listed = catalog
+            .list_namespaces(None)
+            .await
+            .expect("list_namespaces should succeed against Unity OSS");
+        let listed_names: Vec<String> =
+            listed.iter().map(|n| n.as_ref().join(".")).collect();
+        assert!(
+            listed_names.iter().any(|n| n == "default"),
+            "expected `default` namespace in Unity OSS seed; got {listed_names:?}"
+        );
+
+        // The seeded namespace ships with `marksheet_uniform`. That
+        // gives us a stable read-only target without a setup script.
+        let default_ns = NamespaceIdent::new("default".to_string());
+        let tables = catalog
+            .list_tables(&default_ns)
+            .await
+            .expect("list_tables(default) should succeed against Unity OSS");
+        let table_names: Vec<String> = tables.iter().map(|t| t.name.clone()).collect();
+        assert!(
+            table_names.iter().any(|n| n == "marksheet_uniform"),
+            "expected seeded `marksheet_uniform` table in Unity OSS; got {table_names:?}"
+        );
     }
 }
