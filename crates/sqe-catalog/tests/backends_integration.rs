@@ -17,12 +17,85 @@
 
 #[cfg(feature = "glue")]
 mod glue {
-    use sqe_catalog::backends::glue::GlueConfig;
-    // Live AWS Glue test is wired in Phase O day 4-5 (real round-trip
-    // via `GlueBackend::build_catalog` against an AWS account specified
-    // in tests/.env). The pure-config test below exercises the wrapper
-    // type without touching AWS.
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
+    use iceberg::io::OpenDalStorageFactory;
+    use iceberg::{Catalog, NamespaceIdent};
+    use sqe_catalog::backends::glue::{GlueBackend, GlueConfig};
+
+    /// Live AWS Glue round-trip: create_namespace -> list_namespaces ->
+    /// drop_namespace, against the user's account in eu-central-1 (or
+    /// whichever region they configured).
+    ///
+    /// Reads credentials from the standard AWS provider chain. Use
+    /// `.env` (template at `.env.example`) to avoid putting profile
+    /// names in shell history:
+    ///
+    /// ```bash
+    /// cp .env.example .env  # then edit AWS_PROFILE/AWS_REGION/warehouse
+    /// set -a; source .env; set +a
+    /// cargo test -p sqe-catalog --features glue backends_integration -- \
+    ///     --ignored glue::live_glue_namespace_round_trip
+    /// ```
+    ///
+    /// The test panics with a clear message if `SQE_TEST_GLUE_WAREHOUSE`
+    /// is not set; that's the signal that the operator opted out of the
+    /// live AWS path. Glue databases are regional and need a real S3
+    /// bucket to exist for the LocationUri.
+    #[tokio::test]
+    #[ignore = "requires AWS credentials + a pre-created S3 bucket; run with --ignored"]
+    async fn live_glue_namespace_round_trip() {
+        let warehouse = std::env::var("SQE_TEST_GLUE_WAREHOUSE")
+            .expect(
+                "SQE_TEST_GLUE_WAREHOUSE must be set to a pre-created \
+                 s3:// path, e.g. s3://sqe-glue-it-eu-central-1/wh/. \
+                 Copy .env.example to .env and source it.",
+            );
+        let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "eu-central-1".into());
+
+        // Glue stores warehouse paths but the namespace round-trip
+        // doesn't write Parquet, so the Fs storage factory is enough
+        // to satisfy `with_storage_factory`. Same pattern as HMS.
+        let storage_factory: Arc<dyn iceberg::io::StorageFactory> =
+            Arc::new(OpenDalStorageFactory::Fs);
+
+        let backend = GlueBackend::new(GlueConfig::new(region, warehouse));
+        let catalog = backend
+            .build_catalog(storage_factory)
+            .await
+            .expect("GlueCatalog builds with the configured AWS profile");
+
+        // Glue database names are restricted to lowercase ASCII +
+        // underscore + digits, max 255 chars. UUID hex chunk fits.
+        let ns_name = format!("sqe_glue_ci_{}", uuid::Uuid::new_v4().simple());
+        let ns = NamespaceIdent::new(ns_name.clone());
+
+        catalog
+            .create_namespace(&ns, HashMap::new())
+            .await
+            .unwrap_or_else(|e| panic!("create_namespace({ns_name}) failed: {e}"));
+
+        let listed = catalog
+            .list_namespaces(None)
+            .await
+            .expect("list_namespaces");
+        let listed_names: Vec<String> =
+            listed.iter().map(|n| n.as_ref().join(".")).collect();
+        assert!(
+            listed_names.iter().any(|n| n == &ns_name),
+            "namespace {ns_name} should appear in list after create. Got first 20: {:?}",
+            listed_names.iter().take(20).collect::<Vec<_>>()
+        );
+
+        catalog
+            .drop_namespace(&ns)
+            .await
+            .unwrap_or_else(|e| panic!("drop_namespace({ns_name}) failed: {e}"));
+    }
+
+    /// Pure-config smoke test: exercises the wrapper struct without
+    /// touching AWS. Useful in CI where the live test is gated.
     #[test]
     fn glue_config_constructs() {
         let cfg = GlueConfig::new("eu-west-1", "s3://lake/wh");
