@@ -39,6 +39,7 @@ For detailed Mermaid diagrams (query pipeline, crate dependencies, caching layer
 - **SQL**: Full ANSI SQL via DataFusion 53 -- window functions, CTEs, subqueries, joins, aggregates, GROUPING SETS, ROLLUP
 - **DDL/DML**: CREATE TABLE AS SELECT, INSERT INTO, DELETE, UPDATE, MERGE INTO (CoW), CREATE/DROP VIEW, ALTER TABLE
 - **Iceberg**: Time travel, metadata TVFs (snapshots, manifests, files, partitions), partition evolution, schema evolution
+- **Catalogs**: Apache Polaris, Project Nessie, AWS Glue, AWS S3 Tables, Hive Metastore, JDBC (Postgres/MySQL/SQLite), Hadoop storage-only. All five non-REST catalogs live-tested in Phase O+P; AWS endpoints reachable through SigV4-signed Iceberg REST.
 - **Protocols**: Arrow Flight SQL (primary) + Trino HTTP (compatibility)
 - **Auth**: Pluggable chain -- OIDC, bearer token, API key, mTLS, anonymous, AWS IAM, device code, token exchange
 - **Distributed**: Coordinator-worker architecture with shuffle, spill-to-disk, adaptive sort
@@ -139,9 +140,9 @@ Full configuration reference: [docs/deployment.md](docs/deployment.md).
 | Language | Rust |
 | Query Engine | Apache DataFusion 53 |
 | Table Format | Apache Iceberg v2/v3 |
-| Catalog | Apache Polaris (Iceberg REST) |
+| Catalog | Apache Polaris (default) + Project Nessie, AWS Glue, AWS S3 Tables (via Iceberg REST + SigV4), Hive Metastore, JDBC (Postgres/MySQL/SQLite), Hadoop storage-only |
 | Wire Protocol | Arrow Flight SQL + Trino HTTP |
-| Storage | S3-compatible (AWS, Ceph, MinIO, R2) |
+| Storage | S3-compatible (AWS, Ceph, R2, rustfs) + local filesystem |
 | Observability | OpenTelemetry + Prometheus |
 | License | Apache 2.0 |
 
@@ -169,6 +170,8 @@ Full configuration reference: [docs/deployment.md](docs/deployment.md).
 | [DataFusion 53 and the Iceberg Fork](docs/blog/2026-04-14-datafusion-53-and-the-iceberg-fork.md) | DF 53 upgrade, vendoring |
 | [Our Nemesis: TPC-DS Q72](docs/blog/2026-04-16-our-nemesis-q72.md) | The one query we can't beat |
 | [The Iceberg Matrix and the Quiet Bug Hiding in V3](docs/blog/2026-04-26-the-matrix-and-the-quiet-bug.md) | Integration tests find what unit tests miss |
+| [Why a Public Iceberg Matrix Beats Vendor Spec Sheets](docs/blog/2026-04-29-the-iceberg-matrix-as-a-scoreboard.md) | A scoreboard for the lakehouse ecosystem |
+| [SQE Talks to Five Catalogs Now: HMS, Nessie, Glue, JDBC, S3 Tables](docs/blog/2026-04-29-five-catalogs-live.md) | The live verification phase + AWS SigV4 |
 
 ## Book
 
