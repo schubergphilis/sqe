@@ -40,6 +40,11 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 expect-test = { workspace = true }
 parquet = { workspace = true }
 tempfile = { workspace = true }
+
+[[bench]]
+name = "runtime_filter_pushdown"
+harness = false
