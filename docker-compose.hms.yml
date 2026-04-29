@@ -1,0 +1,65 @@
+# docker-compose.hms.yml — Hive Metastore stack for live HMS catalog tests.
+#
+# Layered on top of docker-compose.test.yml. The HMS server is the only
+# new component; we reuse the existing rustfs (S3) and postgres (HMS
+# backing store) containers. Postgres gets an extra database created
+# at startup via an init script.
+#
+# Usage:
+#   docker compose -f docker-compose.test.yml -f docker-compose.hms.yml up -d
+#   cargo test -p sqe-coordinator --test hms_e2e -- --ignored
+#
+# Why apache/hive:4.0.0-standalone-metastore-server:
+#   The metastore-server-only image runs the Thrift service on port 9083
+#   without HiveServer2 / HDFS. Lighter than the full hive distribution.
+#   Image: docker.io/apache/hive:4.0.0-standalone-metastore-server (~600 MB).
+
+services:
+  hive-metastore:
+    image: apache/hive:4.0.0-standalone-metastore-server
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # HMS reads its own DB connection settings from these JVM properties.
+      # We point it at the existing test-stack postgres on the `hms_metastore`
+      # database (created by the init script below).
+      DB_DRIVER: postgres
+      SERVICE_NAME: metastore
+      SERVICE_OPTS: >-
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/hms_metastore
+        -Djavax.jdo.option.ConnectionUserName=iceberg
+        -Djavax.jdo.option.ConnectionPassword=iceberg
+        -Dmetastore.warehouse.dir=s3a://warehouse/hms/
+        -Dfs.s3a.endpoint=http://rustfs:9000
+        -Dfs.s3a.access.key=s3admin
+        -Dfs.s3a.secret.key=s3admin
+        -Dfs.s3a.path.style.access=true
+        -Dfs.s3a.connection.ssl.enabled=false
+    ports:
+      - "19083:9083"
+    healthcheck:
+      # No HTTP endpoint; the server just listens on the Thrift port.
+      # Probe via TCP using nc bundled in the image.
+      test: ["CMD-SHELL", "nc -z localhost 9083 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  # Init container that creates the HMS database in the existing postgres.
+  # Idempotent: re-creates only if the database is missing. Runs once and
+  # exits cleanly so it doesn't keep the stack from settling.
+  hms-postgres-init:
+    image: postgres:16-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: iceberg
+    entrypoint: |
+      sh -c "psql -h postgres -U iceberg -d iceberg_catalog -c \"
+        SELECT 'CREATE DATABASE hms_metastore'
+        WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'hms_metastore')
+      \\gexec\" || true"
