@@ -297,6 +297,85 @@ mod hadoop {
     }
 }
 
+// -- Nessie (Iceberg REST) --------------------------------------------------
+
+#[cfg(feature = "rest")]
+mod nessie {
+    use std::collections::HashMap;
+
+    // CatalogBuilder is the trait that adds `.load(name, props)` onto
+    // `RestCatalogBuilder::default()`. Without it the call resolves to
+    // nothing on the bare struct.
+    use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
+    use iceberg_catalog_rest::RestCatalogBuilder;
+
+    /// Live Nessie round-trip via the Iceberg REST adapter.
+    ///
+    /// Nessie speaks Iceberg REST, so this exercises the same client SQE
+    /// uses against Polaris. Proving it works against Nessie's adapter
+    /// flips the matrix cell from "REST library compiles" to "verified
+    /// against the actual server."
+    ///
+    /// Stack:
+    /// ```bash
+    /// docker compose -f docker-compose.test.yml \
+    ///                -f docker-compose.nessie.yml up -d
+    /// cargo test -p sqe-catalog backends_integration -- \
+    ///     --ignored nessie::
+    /// ```
+    ///
+    /// The `prefix` Nessie returns from `/iceberg/v1/config` is
+    /// `main|warehouse` (URL-encoded as `main%7Cwarehouse`). The
+    /// upstream `RestCatalog` client reads it from the config response
+    /// and prepends it to subsequent paths automatically; we don't have
+    /// to thread it through.
+    #[tokio::test]
+    #[ignore = "requires docker-compose Nessie stack; run with --ignored"]
+    async fn nessie_namespace_round_trip() {
+        // `/iceberg/` is the Iceberg REST mount point Nessie reports
+        // back via the config response. Trailing slash matters: the
+        // client appends `v1/config?warehouse=...` directly.
+        let uri = std::env::var("SQE_TEST_NESSIE_URI")
+            .unwrap_or_else(|_| "http://127.0.0.1:19121/iceberg/".into());
+        let warehouse = std::env::var("SQE_TEST_NESSIE_WAREHOUSE")
+            .unwrap_or_else(|_| "warehouse".into());
+
+        let mut props = HashMap::new();
+        props.insert("uri".to_string(), uri);
+        props.insert("warehouse".to_string(), warehouse);
+
+        let catalog = RestCatalogBuilder::default()
+            .load("sqe-nessie-test".to_string(), props)
+            .await
+            .expect("RestCatalog builds against Nessie");
+
+        // Unique-per-run namespace so parallel runs don't collide.
+        let ns_name = format!("sqe_nessie_ci_{}", uuid::Uuid::new_v4().simple());
+        let ns = NamespaceIdent::new(ns_name.clone());
+
+        catalog
+            .create_namespace(&ns, HashMap::new())
+            .await
+            .unwrap_or_else(|e| panic!("create_namespace({ns_name}) failed: {e}"));
+
+        let listed = catalog
+            .list_namespaces(None)
+            .await
+            .expect("list_namespaces");
+        let listed_names: Vec<String> =
+            listed.iter().map(|n| n.as_ref().join(".")).collect();
+        assert!(
+            listed_names.iter().any(|n| n == &ns_name),
+            "namespace {ns_name} should appear in list after create. Got: {listed_names:?}"
+        );
+
+        catalog
+            .drop_namespace(&ns)
+            .await
+            .unwrap_or_else(|e| panic!("drop_namespace({ns_name}) failed: {e}"));
+    }
+}
+
 // -- Unity Catalog (OIDC M2M) -----------------------------------------------
 
 #[cfg(feature = "rest")]
