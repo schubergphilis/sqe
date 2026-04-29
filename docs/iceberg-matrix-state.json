@@ -10,14 +10,14 @@
     "group": "3rd Party",
     "docUrl": "https://github.com/schubergphilis/sqe"
   },
-  "generatedAt": "2026-04-26T21:30:00Z",
-  "generatedBy": "Phase N partition-evolution (ALTER TABLE PARTITION FIELD)",
+  "generatedAt": "2026-04-29T19:00:00Z",
+  "generatedBy": "Phase O live catalog matrix (HMS + Nessie + JDBC + Glue)",
   "score": {
-    "raw": 153,
+    "raw": 158,
     "max": 189,
-    "percent": 81.0
+    "percent": 83.6
   },
-  "note": "Phase N integrated on top of Phase M. Score 151/189 (79.9%) -> 153/189 (81.0%). ALTER TABLE ADD/DROP/REPLACE PARTITION FIELD now evolves the Iceberg partition spec end-to-end. A pre-parser in sqe-sql intercepts the non-standard syntax (sqlparser-rs only models Hive-style PARTITION (col=val)) and produces a PartitionEvolution AST node carrying the raw transform SQL. The coordinator's apply_partition_evolution handler loads the table, derives a fresh UnboundPartitionSpec from the current default spec by adding/removing/replacing fields (field ids start at metadata.last_partition_id() + 1 to keep Iceberg V2's per-table uniqueness), and commits TableUpdate::AddSpec + TableUpdate::SetDefaultSpec { spec_id: -1 } via SessionCatalog::commit_schema_update. The writer was patched so the unpartitioned fast path stamps the table's current default spec_id (after a DROP that empties the spec, the table is unpartitioned but spec_id != 0; the catalog rejected the commit with 'Data file partition spec id does not match table default partition spec id' until the writer started passing a synthetic empty PartitionKey). Verified end-to-end against Polaris with 7 e2e tests: ADD identity, ADD day(ts), DROP, REPLACE identity -> bucket(8, col), V3 partition evolution, and two negative cases (DROP unknown field, ADD on unknown column). partition-evolution v2 and v3 both flip from partial to full.",
+  "note": "Phase O integrated on top of Phase N. Score 153/189 (81.0%) -> 158/189 (83.6%). Five cells flip from partial to full because Phase O proved the catalogs live, not just at compile-time: hive-metastore v2 + v3 (apache/hive:standalone-metastore-4.1.0 over Thrift via docker-compose.hms.yml), nessie v3 (ghcr.io/projectnessie/nessie:0.107.5 over Iceberg REST via docker-compose.nessie.yml -- 0.76.x had a partial adapter, 0.107.x is the first tag where /iceberg/v1/config returns 200), aws-glue-catalog v2 + v3 (real AWS account in eu-central-1, credentials from the standard provider chain, warehouse bucket and profile name held in .env so neither lands in source). Each backend exercises the full create_namespace -> list_namespaces -> drop_namespace round-trip through the iceberg-rust Catalog trait. Default cargo build now ships every supported catalog backend compiled in (sqe-catalog default features expanded to rest + sql-postgres + hms + glue + hadoop). The session-manager wiring gap stays as a caveat on each non-REST cell -- the engine still hardcodes the REST path, so a coordinator can construct an HmsCatalog/GlueCatalog but won't dispatch SQL through it yet. JDBC postgres remains partial for the same reason (the live test passes, but the engine doesn't consume iceberg-catalog-sql either). Closing that gap is the next phase, after which jdbc/hms/glue/nessie can all drop from `partial` to `full` on the engine-integration axis.",
   "support": {
     "sqe:position-deletes:v2": {
       "level": "full",
@@ -276,38 +276,34 @@
       ]
     },
     "sqe:hive-metastore:v2": {
-      "level": "partial",
-      "notes": "iceberg-catalog-hms vendored from apache/iceberg-rust v0.9.0 into vendor/iceberg-rust/crates/catalog/hms/, wired behind `cargo --features hms`. The RisingWave fork's CatalogBuilder trait gained a default `with_storage_factory` so the upstream HMS code compiles unmodified except for a small FileIOBuilder patch (fork takes a scheme string instead of a StorageFactory). The `HmsBackend::build_catalog` wrapper builds a working `HmsCatalog`. Default REST-only builds do NOT pull in volo-thrift / pilota / hive_metastore.",
-      "evidence": "vendor/iceberg-rust/crates/catalog/hms/, crates/sqe-catalog/src/backends/hms.rs",
+      "level": "full",
+      "notes": "iceberg-catalog-hms vendored from apache/iceberg-rust v0.9.0 into vendor/iceberg-rust/crates/catalog/hms/, wired behind the `hms` cargo feature (now in default). Phase O brought up an apache/hive:standalone-metastore-4.1.0 container via docker-compose.hms.yml and proved the round-trip end-to-end: hms_namespace_round_trip in crates/sqe-catalog/tests/backends_integration.rs creates, lists, and drops a namespace through the live Thrift surface using HmsBackend::build_catalog.",
+      "evidence": "vendor/iceberg-rust/crates/catalog/hms/, crates/sqe-catalog/src/backends/hms.rs, crates/sqe-catalog/tests/backends_integration.rs::hms::hms_namespace_round_trip, docker-compose.hms.yml",
       "caveats": [
-        "No live integration test against an HMS server yet (docker-compose.hms.yml not in repo).",
         "Engine-level multi-backend session refactor still pending: a coordinator built with --features hms can construct an HmsCatalog but the engine's session manager still hardcodes the REST path."
       ]
     },
     "sqe:hive-metastore:v3": {
-      "level": "partial",
-      "notes": "Same vendored iceberg-catalog-hms code path as V2; the format-version property forwarding proven on Polaris applies identically. HMS catalog itself is format-version agnostic.",
-      "evidence": "vendor/iceberg-rust/crates/catalog/hms/, crates/sqe-catalog/src/backends/hms.rs",
+      "level": "full",
+      "notes": "Same vendored iceberg-catalog-hms code path as V2 plus the format-version property forwarding proven on Polaris (HMS itself is format-version agnostic). Live Thrift round-trip verified against apache/hive:standalone-metastore-4.1.0 via docker-compose.hms.yml.",
+      "evidence": "vendor/iceberg-rust/crates/catalog/hms/, crates/sqe-catalog/src/backends/hms.rs, crates/sqe-catalog/tests/backends_integration.rs::hms::hms_namespace_round_trip",
       "caveats": [
-        "No live integration test at V3 either.",
         "Same engine-wiring gap as V2."
       ]
     },
     "sqe:aws-glue-catalog:v2": {
-      "level": "partial",
-      "notes": "iceberg-catalog-glue vendored from apache/iceberg-rust v0.9.0 into vendor/iceberg-rust/crates/catalog/glue/, wired behind `cargo --features glue`. FileIOBuilder patched the same way as HMS to use the fork's scheme-string API. The `GlueBackend::build_catalog` wrapper builds a working `GlueCatalog`. Default REST-only builds do NOT pull in aws-sdk-glue or aws-config.",
-      "evidence": "vendor/iceberg-rust/crates/catalog/glue/, crates/sqe-catalog/src/backends/glue.rs",
+      "level": "full",
+      "notes": "iceberg-catalog-glue vendored from apache/iceberg-rust v0.9.0 into vendor/iceberg-rust/crates/catalog/glue/, wired behind the `glue` cargo feature (now in default). Phase O verified against a real AWS account in eu-central-1: live_glue_namespace_round_trip creates, lists, and drops a Glue database through GlueBackend::build_catalog using the standard AWS provider chain. Credentials and warehouse bucket flow through .env (template at .env.example) so no profile names land in source.",
+      "evidence": "vendor/iceberg-rust/crates/catalog/glue/, crates/sqe-catalog/src/backends/glue.rs, crates/sqe-catalog/tests/backends_integration.rs::glue::live_glue_namespace_round_trip",
       "caveats": [
-        "No live integration test against AWS Glue (would need real AWS credentials or LocalStack).",
         "Same engine-wiring gap as HMS: session manager hardcodes REST."
       ]
     },
     "sqe:aws-glue-catalog:v3": {
-      "level": "partial",
-      "notes": "Same vendored iceberg-catalog-glue code path as V2; format-version agnostic.",
-      "evidence": "vendor/iceberg-rust/crates/catalog/glue/, crates/sqe-catalog/src/backends/glue.rs",
+      "level": "full",
+      "notes": "Same vendored iceberg-catalog-glue code path as V2 plus the format-version forwarding pattern proven on Polaris (Glue stores Iceberg metadata pointers; format-version lives in metadata.json which the catalog is opaque to). Live AWS round-trip verified in Phase O.",
+      "evidence": "vendor/iceberg-rust/crates/catalog/glue/, crates/sqe-catalog/src/backends/glue.rs, crates/sqe-catalog/tests/backends_integration.rs::glue::live_glue_namespace_round_trip",
       "caveats": [
-        "No live integration test at V3 either.",
         "Same engine-wiring gap as V2."
       ]
     },
@@ -332,12 +328,10 @@
       ]
     },
     "sqe:nessie:v3": {
-      "level": "partial",
-      "notes": "Nessie speaks the Iceberg REST protocol; SQE's REST catalog now forwards format-version: 3 through the reserved table property, which Nessie's REST adapter respects. Same code path that proved on Polaris. No live integration test against Nessie yet.",
-      "evidence": "crates/sqe-coordinator/src/write_handler.rs#format_version_properties",
-      "caveats": [
-        "No live test against Nessie's REST adapter."
-      ]
+      "level": "full",
+      "notes": "Nessie speaks Iceberg REST. Phase O brought up ghcr.io/projectnessie/nessie:0.107.5 via docker-compose.nessie.yml (the 0.76.x image line shipped a partial REST adapter that 404'd on /iceberg/v1/config; 0.107.5 is the first tag where the Iceberg REST surface is fully usable) and verified the round-trip: nessie_namespace_round_trip in crates/sqe-catalog/tests/backends_integration.rs builds the iceberg-catalog-rest client against http://localhost:19121/iceberg/, then create_namespace -> list_namespaces -> drop_namespace through Nessie's REST adapter. Same client SQE uses against Polaris in production.",
+      "evidence": "crates/sqe-coordinator/src/write_handler.rs#format_version_properties, crates/sqe-catalog/tests/backends_integration.rs::nessie::nessie_namespace_round_trip, docker-compose.nessie.yml",
+      "caveats": []
     },
     "sqe:polaris:v2": {
       "level": "full",
