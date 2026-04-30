@@ -83,3 +83,7 @@ sqlx = { workspace = true, optional = true }
 tempfile = "3"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 sqe-auth = { path = "../sqe-auth" }
+# Used in the Phase O+ integration test to deserialise an inline
+# `[catalog.backend]` block into `SqeConfig` rather than constructing
+# all 14 SqeConfig fields by hand.
+toml = "0.8"
