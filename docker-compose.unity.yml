@@ -1,0 +1,43 @@
+# docker-compose.unity.yml — Unity Catalog OSS stack for live REST tests.
+#
+# Unity Catalog (the open-source server from unitycatalog/unitycatalog)
+# exposes an Iceberg REST adapter at /api/2.1/unity-catalog/iceberg/.
+# The adapter is read-only at this version: list_namespaces /
+# list_tables / load_table work, but create / drop / commit do not
+# (tracking https://github.com/unitycatalog/unitycatalog/issues/3).
+# Our integration test in backends_integration.rs::unity_catalog::
+# is therefore a read-only smoke against the bundled `unity.default.
+# marksheet_uniform` table that ships with the image.
+#
+# Usage:
+#   docker compose -f docker-compose.test.yml \
+#                  -f docker-compose.unity.yml up -d
+#   cargo test -p sqe-catalog backends_integration -- \
+#       --ignored unity_catalog::list_via_unity_rest
+#
+# Auth is disabled by default in this image. The OIDC M2M auth provider
+# in sqe-auth (verified separately by `unity_catalog_m2m_auth_obtains_
+# token`) is the wire we'd use against a Databricks-hosted Unity
+# instance with bearer auth turned on.
+
+services:
+  unity:
+    # Pin a specific main-* tag rather than `main` or `latest`. The
+    # project does not publish semver-tagged images on Docker Hub, so
+    # this is the most reproducible option until they do.
+    image: unitycatalog/unitycatalog:main-2f2e32d
+    ports:
+      # Offset from the local-dev default (8080) so the container
+      # doesn't fight with anyone running Unity locally.
+      - "18080:8080"
+    healthcheck:
+      # The /v1/config endpoint always answers when the server is up,
+      # and Unity requires the warehouse query parameter so we feed
+      # the bundled catalog name (`unity`).
+      test:
+        - "CMD-SHELL"
+        - "curl -fsS 'http://localhost:8080/api/2.1/unity-catalog/iceberg/v1/config?warehouse=unity' || exit 1"
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
