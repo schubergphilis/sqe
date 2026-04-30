@@ -84,7 +84,7 @@ def main() -> None:
         "the de-facto reference engineers consult when picking an Iceberg engine. Data lives at "
         "[Neuw84/iceberg-matrix](https://github.com/Neuw84/iceberg-matrix).")
     add("")
-    add(f"**Score: {score['raw']}/{score['max']} ({score['percent']}%)**  |  **Target: 156/189 (83%)**")
+    add(f"**Score: {score['raw']}/{score['max']} ({score['percent']}%)**  |  **Stretch: 170/189 (90%)**")
     add("")
     add(f"Last generated: {d.get('generatedAt', 'n/a')}  |  Source: `{d.get('generatedBy', 'manual')}`")
     add("")
@@ -108,21 +108,37 @@ def main() -> None:
     add("")
     add("## Peer rankings")
     add("")
+    # Peer scores from icebergmatrix.org. The SQE row inserts into
+    # the right slot by score so the ranking stays correct as we
+    # climb. Update PEERS when icebergmatrix.org publishes new data.
+    peers = [
+        ("AWS EMR (Spark 7.12)", 180),
+        ("OSS Spark 4.1", 175),
+        ("OSS Flink 2.2", 153),
+        ("Snowflake", 134),
+        ("PyIceberg 0.11", 130),
+        ("Databricks DBR 17.3", 103),
+        ("DuckDB 1.5", 85),
+        ("Daft", 77),
+        ("Athena v3", 59),
+        ("ClickHouse 26.1", 46),
+    ]
+    sqe_row = (
+        f"| **SQE (current)** | **{score['raw']}/{score['max']}** | **{score['percent']}** |"
+    )
     add("| Engine | Score | % |")
     add("|---|---:|---:|")
-    add("| AWS EMR (Spark 7.12) | 180/189 | 95 |")
-    add("| OSS Spark 4.1 | 175/189 | 93 |")
-    add("| OSS Flink 2.2 | 153/189 | 81 |")
-    add("| Snowflake | 134/189 | 71 |")
-    add("| PyIceberg 0.11 | 130/189 | 69 |")
-    add("| Databricks DBR 17.3 | 103/189 | 54 |")
-    add(f"| **SQE (current)** | **{score['raw']}/{score['max']}** | **{score['percent']}** |")
-    add("| DuckDB 1.5 | 85/189 | 45 |")
-    add("| Daft | 77/189 | 41 |")
-    add("| Athena v3 | 59/189 | 31 |")
-    add("| ClickHouse 26.1 | 46/189 | 24 |")
+    inserted = False
+    for name, raw in peers:
+        if not inserted and score['raw'] >= raw:
+            add(sqe_row)
+            inserted = True
+        pct = round(raw * 100 / 189)
+        add(f"| {name} | {raw}/189 | {pct} |")
+    if not inserted:
+        add(sqe_row)
     add("")
-    add("Peer scores from icebergmatrix.org as of 2026-04-24.")
+    add("Peer scores from icebergmatrix.org as of 2026-04-29.")
     add("")
     add("---")
     add("")
@@ -178,9 +194,14 @@ def main() -> None:
         "SQE has all three operations in both CoW and MoR modes.")
     add("- **Arrow Flight SQL primary + Trino HTTP compat.** Matches the protocol surface of "
         "Spark and Flink without a JVM.")
-    add("- **Benchmarks vs Trino 465.** 5 of 7 suites faster at SF1. Latest SF0.1 run: 2.3x "
-        "faster across TPC-H, TPC-DS, SSB, ClickBench (177/177 SQE pass, 170/177 byte-match "
-        "Trino). See `benchmarks/results/*2026-04-24*.json`.")
+    add("- **Five catalogs verified live.** Polaris (production), Hive Metastore (Thrift), "
+        "Project Nessie (REST), AWS Glue (SDK + federated REST), AWS S3 Tables (REST + "
+        "SigV4). Unity Catalog OSS verified read-only via the same iceberg-catalog-rest "
+        "client. The vendored `iceberg-catalog-rest` gained an `aws-sigv4` cargo feature in "
+        "Phase P so AWS endpoints share the OSS code path.")
+    add("- **Benchmarks vs Trino 465.** 5 of 7 suites faster at SF1 (TPC-H 1.4x, TPC-C 3.4x, "
+        "TPC-BB 2.3x, ClickBench 2.6x). See the `benchmarks/results/` directory for raw "
+        "JSON; numbers in README.md.")
     add("- **Security audit.** 43 of 43 findings resolved before OSS release.")
     add("")
     add("---")
