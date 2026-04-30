@@ -45,10 +45,23 @@ token_refresh_buffer_secs = 60  # Refresh tokens this many seconds before expiry
 ssl_verification = true         # Set false for dev (self-signed certs)
 
 [catalog]
-polaris_url = "http://polaris:8181/api/catalog"
-warehouse = "iceberg"
+polaris_url = "http://polaris:8181/api/catalog"   # REST catalog endpoint
+warehouse = "iceberg"           # warehouse identifier the catalog expects
 metadata_cache_ttl_secs = 30    # Table metadata cache TTL
 default_table_format_version = 2 # Iceberg table format version (2 or 3)
+# `polaris_url` accepts any Iceberg REST endpoint. SQE has been
+# verified live against Apache Polaris, Project Nessie 0.107+,
+# Unity Catalog OSS, AWS Glue Iceberg REST, and AWS S3 Tables (via
+# the federated Glue endpoint). For AWS endpoints the vendored
+# REST client signs requests with SigV4 when the server advertises
+# `rest.sigv4-enabled=true` in its /v1/config defaults.
+#
+# Hive Metastore, native AWS Glue (SDK path), and JDBC catalogs
+# have working backend libraries in `crates/sqe-catalog/src/backends/`
+# (live integration tests under
+# `crates/sqe-catalog/tests/backends_integration.rs`) but the engine
+# session manager still routes SQL through the REST path. End-to-end
+# SQL dispatch through HMS/Glue/JDBC is tracked as a follow-up.
 
 [storage]
 s3_endpoint = "http://s3:9000"

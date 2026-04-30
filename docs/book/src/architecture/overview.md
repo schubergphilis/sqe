@@ -29,9 +29,9 @@ graph TB
     end
 
     subgraph "External Services"
-        KC["Keycloak OIDC"]
-        POL["Apache Polaris<br/>(Iceberg REST Catalog)"]
-        S3["S3 / MinIO"]
+        KC["OIDC provider<br/>(Keycloak / Auth0 / Entra)"]
+        CAT["Catalog backend<br/>(Polaris / Nessie / Glue REST /<br/>S3 Tables / Unity / HMS / JDBC)"]
+        S3["S3-compatible storage<br/>(AWS / Ceph / R2 / rustfs)"]
     end
 
     JDBC --> FLS
@@ -46,11 +46,13 @@ graph TB
     SCHED --> W2
     SCHED --> WN
 
-    QH --> POL
+    QH --> CAT
     W1 --> S3
     W2 --> S3
     WN --> S3
 ```
+
+The catalog backend is selectable at runtime. Polaris is the primary target and the only one verified end-to-end for production write paths today. Nessie, AWS Glue, AWS S3 Tables, Unity Catalog OSS, Hive Metastore, JDBC (Postgres), and Hadoop storage-only are all reachable through the same `iceberg::Catalog` trait, with live integration tests in `crates/sqe-catalog/tests/backends_integration.rs`. AWS endpoints share the OSS Iceberg REST code path through the `aws-sigv4` cargo feature on the vendored `iceberg-catalog-rest` crate. See [features/iceberg.md](../features/iceberg.md) for the catalog-by-catalog state.
 
 ## Request Flow
 
