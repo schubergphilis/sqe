@@ -324,6 +324,114 @@ mod sql_postgres {
             "namespace {ns:?} must be gone after drop"
         );
     }
+
+    /// Phase O+ step 2: prove the engine session manager can route
+    /// through a JDBC backend end-to-end. Builds an `SqeConfig` with
+    /// `catalog.backend = Jdbc { url, warehouse }`, calls
+    /// `SessionCatalog::for_session`, and asserts that:
+    ///
+    ///   1. The trait-only methods (`list_namespaces`, namespace
+    ///      round-trip) succeed against live Postgres.
+    ///   2. REST-only methods (`create_view`) error with a clear
+    ///      "requires the REST catalog backend" message rather than
+    ///      silently making an HTTP call to an empty URL.
+    ///
+    /// Closes the engine-wiring caveat on `sqe:jdbc-catalog:v2`. The
+    /// existing `jdbc_postgres_namespace_roundtrip` proves the
+    /// library layer; this proves the SQE engine dispatcher.
+    #[tokio::test]
+    #[ignore = "requires live Postgres; run with --ignored against docker-compose postgres"]
+    async fn for_session_dispatches_through_jdbc_backend() {
+        use std::sync::Arc;
+
+        use iceberg::Catalog;
+        use sqe_catalog::SessionCatalog;
+        use sqe_core::config::CatalogBackend;
+
+        let url = std::env::var("SQE_TEST_PG_URL").unwrap_or_else(|_| {
+            "postgres://iceberg:iceberg@localhost:15432/iceberg_catalog".to_string()
+        });
+        let warehouse = std::env::var("SQE_TEST_PG_WAREHOUSE")
+            .unwrap_or_else(|_| "/tmp/sqe-pg-jdbc-engine-test-warehouse".to_string());
+
+        // Parse a minimal `SqeConfig` from inline TOML and override
+        // the catalog block with the JDBC backend selector. Going
+        // through the parser exercises the same path operators take
+        // when starting `sqe-server`, and dodges the "all 14 fields
+        // by hand" tedium.
+        let toml = format!(
+            r#"
+[coordinator]
+flight_sql_port = 50051
+
+[auth]
+client_id = "sqe-client"
+
+[catalog]
+polaris_url = ""
+warehouse = "{warehouse}"
+
+[catalog.backend]
+type = "jdbc"
+url = "{url}"
+warehouse = "{warehouse}"
+"#,
+            url = url,
+            warehouse = warehouse,
+        );
+        let mut config: sqe_core::config::SqeConfig =
+            toml::from_str(&toml).expect("config TOML parses");
+        // The `catalog.backend = { type = "jdbc", ... }` shape lands
+        // as `CatalogBackend::Jdbc` after deserialisation; sanity
+        // check before we use it.
+        assert!(matches!(config.catalog.backend, CatalogBackend::Jdbc { .. }));
+        // Tighten timeouts to keep the test fast.
+        config.catalog.metadata_cache_ttl_secs = 30;
+
+        let session_catalog =
+            SessionCatalog::for_session(&config, None, "irrelevant-bearer-for-jdbc")
+                .await
+                .expect("SessionCatalog::for_session should build through JDBC backend");
+
+        let session_catalog = Arc::new(session_catalog);
+        let bridge: Arc<dyn Catalog> = session_catalog.as_catalog();
+
+        // Round-trip a unique namespace to prove writes go through.
+        let ns = NamespaceIdent::new(format!(
+            "sqe_engine_jdbc_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = bridge.drop_namespace(&ns).await;
+        bridge
+            .create_namespace(&ns, HashMap::new())
+            .await
+            .expect("create_namespace through JDBC backend");
+        let after_create = bridge
+            .list_namespaces(None)
+            .await
+            .expect("list_namespaces after create");
+        assert!(
+            after_create.iter().any(|n| n == &ns),
+            "newly created namespace {ns:?} should appear in JDBC list"
+        );
+        bridge
+            .drop_namespace(&ns)
+            .await
+            .expect("drop_namespace through JDBC backend");
+
+        // REST-only path: create_view should fail fast with a clear
+        // "requires REST" error rather than an opaque HTTP failure
+        // against an empty polaris_url.
+        let view_err = session_catalog
+            .create_view(&ns, "should_not_create", "SELECT 1", &serde_json::json!({}))
+            .await
+            .expect_err("create_view should error on JDBC backend");
+        let msg = format!("{view_err}");
+        assert!(
+            msg.contains("REST catalog backend") || msg.contains("create_view"),
+            "expected REST-backend error mentioning create_view; got: {msg}"
+        );
+    }
 }
 
 // -- Hadoop (storage-only) --------------------------------------------------
