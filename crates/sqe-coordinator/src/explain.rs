@@ -67,38 +67,72 @@ impl ExplainHandler {
         Ok(vec![batch])
     }
 
-    /// EXPLAIN ANALYZE <query> — executes the query and returns per-operator metrics.
+    /// EXPLAIN ANALYZE <query> — executes the query and returns per-operator
+    /// metrics, prefixed with phase-level timings (parse + logical plan,
+    /// policy evaluation, physical plan, execution, total).
+    ///
     /// Output schema: (step INT32, operation TEXT, output_rows INT64, elapsed_ms FLOAT64,
     ///                 output_bytes INT64, output_batches INT64,
     ///                 spill_count INT64, spilled_bytes INT64, spilled_rows INT64)
+    ///
+    /// Phase rows have negative `step` values so they sort before the
+    /// physical-plan operator rows (which start at step 0). Operation
+    /// names are prefixed with `[phase] ` to make them easy to filter.
     pub async fn analyze(
         &self,
         session: &Session,
         inner_sql: &str,
         ctx: &SessionContext,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let total_start = std::time::Instant::now();
+
+        let parse_start = std::time::Instant::now();
         let df = ctx
             .sql(inner_sql)
             .await
             .map_err(|e| SqeError::Execution(format!("EXPLAIN ANALYZE planning failed: {e}")))?;
         let logical = df.logical_plan().clone();
+        let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
+
+        let policy_start = std::time::Instant::now();
         let enforced = self
             .policy_enforcer
             .evaluate(&session.user, logical)
             .await?;
+        let policy_ms = policy_start.elapsed().as_secs_f64() * 1000.0;
 
+        let physical_plan_start = std::time::Instant::now();
         let physical = ctx
             .state()
             .create_physical_plan(&enforced)
             .await
             .map_err(|e| SqeError::Execution(format!("Physical planning failed: {e}")))?;
+        let physical_plan_ms = physical_plan_start.elapsed().as_secs_f64() * 1000.0;
 
         // Execute — populates metrics on each node in-place
+        let execute_start = std::time::Instant::now();
         collect(physical.clone(), ctx.task_ctx())
             .await
             .map_err(|e| SqeError::Execution(format!("EXPLAIN ANALYZE execution failed: {e}")))?;
+        let execute_ms = execute_start.elapsed().as_secs_f64() * 1000.0;
 
-        let mut rows: Vec<AnalyzeRow> = Vec::new();
+        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+        // The "framework" overhead is everything outside per-operator
+        // execution: parse + logical plan + policy + physical plan +
+        // result materialization. This is the value that dominates SSB
+        // SF1 timings where each query has tiny actual work but a fixed
+        // setup cost.
+        let framework_ms = total_ms - execute_ms;
+
+        // Phase rows go first in the output. Negative step keeps them
+        // visually distinct from the per-operator step numbers (0..N).
+        let mut rows: Vec<AnalyzeRow> = vec![
+            phase_row(-5, "[phase] parse + logical plan", parse_ms),
+            phase_row(-4, "[phase] policy evaluate", policy_ms),
+            phase_row(-3, "[phase] physical plan", physical_plan_ms),
+            phase_row(-2, "[phase] execute (per-op detail below)", execute_ms),
+            phase_row(-1, "[phase] framework overhead (parse + plan + policy + result)", framework_ms),
+        ];
         walk_analyze(&physical, &mut rows);
 
         let schema = Arc::new(Schema::new(vec![
@@ -182,28 +216,48 @@ impl ExplainHandler {
         inner_sql: &str,
         ctx: &SessionContext,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let total_start = std::time::Instant::now();
+
+        let parse_start = std::time::Instant::now();
         let df = ctx
             .sql(inner_sql)
             .await
             .map_err(|e| SqeError::Execution(format!("EXPLAIN FULL planning failed: {e}")))?;
         let logical = df.logical_plan().clone();
+        let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
+
+        let policy_start = std::time::Instant::now();
         let enforced = self
             .policy_enforcer
             .evaluate(&session.user, logical)
             .await?;
+        let policy_ms = policy_start.elapsed().as_secs_f64() * 1000.0;
 
+        let physical_plan_start = std::time::Instant::now();
         let physical = ctx
             .state()
             .create_physical_plan(&enforced)
             .await
             .map_err(|e| SqeError::Execution(format!("Physical planning failed: {e}")))?;
+        let physical_plan_ms = physical_plan_start.elapsed().as_secs_f64() * 1000.0;
 
         // Execute — populates per-node metrics in-place
+        let execute_start = std::time::Instant::now();
         collect(physical.clone(), ctx.task_ctx())
             .await
             .map_err(|e| SqeError::Execution(format!("EXPLAIN FULL execution failed: {e}")))?;
+        let execute_ms = execute_start.elapsed().as_secs_f64() * 1000.0;
 
-        let mut rows: Vec<FullRow> = Vec::new();
+        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+        let framework_ms = total_ms - execute_ms;
+
+        let mut rows: Vec<FullRow> = vec![
+            full_phase_row(-5, "[phase] parse + logical plan", parse_ms),
+            full_phase_row(-4, "[phase] policy evaluate", policy_ms),
+            full_phase_row(-3, "[phase] physical plan", physical_plan_ms),
+            full_phase_row(-2, "[phase] execute (per-op detail below)", execute_ms),
+            full_phase_row(-1, "[phase] framework overhead (parse + plan + policy + result)", framework_ms),
+        ];
         walk_full(&physical, &mut rows);
 
         let schema = Arc::new(Schema::new(vec![
@@ -271,6 +325,23 @@ impl ExplainHandler {
 // Private row types and free-function tree walkers
 // ---------------------------------------------------------------------------
 
+/// Build an `AnalyzeRow` for a phase-level timing entry. Phase rows
+/// only carry `elapsed_ms`; the other metric columns are `None` so
+/// downstream filtering can ignore them or render them as blanks.
+fn phase_row(step: i32, operation: &str, elapsed_ms: f64) -> AnalyzeRow {
+    AnalyzeRow {
+        step,
+        operation: operation.to_string(),
+        output_rows: None,
+        elapsed_ms: Some(elapsed_ms),
+        output_bytes: None,
+        output_batches: None,
+        spill_count: None,
+        spilled_bytes: None,
+        spilled_rows: None,
+    }
+}
+
 struct AnalyzeRow {
     step: i32,
     operation: String,
@@ -281,6 +352,24 @@ struct AnalyzeRow {
     spill_count: Option<i64>,
     spilled_bytes: Option<i64>,
     spilled_rows: Option<i64>,
+}
+
+fn full_phase_row(step: i32, operation: &str, elapsed_ms: f64) -> FullRow {
+    FullRow {
+        step,
+        operation: operation.to_string(),
+        estimated_rows: None,
+        estimated_bytes: None,
+        files_scanned: None,
+        files_total: None,
+        output_rows: None,
+        elapsed_ms: Some(elapsed_ms),
+        output_bytes: None,
+        output_batches: None,
+        spill_count: None,
+        spilled_bytes: None,
+        spilled_rows: None,
+    }
 }
 
 struct FullRow {
