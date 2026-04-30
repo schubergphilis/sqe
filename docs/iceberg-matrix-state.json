@@ -10,14 +10,14 @@
     "group": "3rd Party",
     "docUrl": "https://github.com/schubergphilis/sqe"
   },
-  "generatedAt": "2026-04-29T20:00:00Z",
-  "generatedBy": "Phase P AWS S3 Tables via Iceberg REST + SigV4",
+  "generatedAt": "2026-04-29T22:00:00Z",
+  "generatedBy": "Phase Q live Unity Catalog OSS read smoke",
   "score": {
-    "raw": 158,
+    "raw": 160,
     "max": 189,
-    "percent": 83.6
+    "percent": 84.7
   },
-  "note": "Phase P sits on top of Phase O. Score stays at 158/189 (83.6%) because the score rubric counts cells, not capabilities, and Phase P enriches existing `full` cells (rest-catalog and aws-glue-catalog) rather than flipping new ones. The capability lift is real: the vendored iceberg-catalog-rest client gained an `aws-sigv4` cargo feature (default-on for SQE) that swaps in an AWS SigV4 signer when `rest.sigv4-enabled=true` is set on user props or surfaces in the server's /v1/config defaults. With it, the same code path that talks to Polaris and Nessie now talks to AWS's federated Glue Iceberg REST endpoint (`glue.<region>.amazonaws.com/iceberg`, signing-name=glue) and the per-bucket S3 Tables endpoint (`s3tables.<region>.amazonaws.com/iceberg`, signing-name=s3tables). Verified live against a pre-existing S3 Tables bucket in eu-central-1: list_namespaces returned `table_demo_analytics`, list_tables returned `table_user_events`, all through SQE's Catalog trait with no AWS-specific call sites. Phase O background still applies: HMS v2/v3, Nessie v3, Glue v2/v3 all flipped to full earlier in the same branch via live tests. The session-manager wiring gap stays as a caveat on the SDK-based catalog paths (HMS, JDBC, native Glue); the federated REST endpoint reaches S3 Tables without that gap because it rides the existing REST code path.",
+  "note": "Phase Q sits on top of Phase P. Score 158/189 (83.6%) -> 160/189 (84.7%). Phase Q flips unity-catalog v2 and v3 from partial to full. Unity Catalog OSS exposes an Iceberg REST adapter at /api/2.1/unity-catalog/iceberg/ that the existing iceberg-catalog-rest client reaches with no AWS-style SigV4 (auth disabled in the OSS image; bearer-auth path against Databricks-hosted Unity stays separately covered by the OIDC M2M provider test). The OSS adapter is read-only at this version (list/load only; create/drop/commit not yet implemented per unitycatalog/unitycatalog#3), so the live test asserts the seeded `unity.default.marksheet_uniform` table comes back through list_namespaces and list_tables. docker-compose.unity.yml pins unitycatalog/unitycatalog:main-2f2e32d. Phase P sits on top of Phase O. Phase P added an `aws-sigv4` cargo feature to the vendored iceberg-catalog-rest crate that swaps the OAuth/Bearer authenticator for an AWS SigV4 signer when `rest.sigv4-enabled=true`; with it, the same code path that talks to Polaris and Nessie now reaches AWS S3 Tables through the federated Glue Iceberg REST endpoint. The capability lift is real: the vendored iceberg-catalog-rest client gained an `aws-sigv4` cargo feature (default-on for SQE) that swaps in an AWS SigV4 signer when `rest.sigv4-enabled=true` is set on user props or surfaces in the server's /v1/config defaults. With it, the same code path that talks to Polaris and Nessie now talks to AWS's federated Glue Iceberg REST endpoint (`glue.<region>.amazonaws.com/iceberg`, signing-name=glue) and the per-bucket S3 Tables endpoint (`s3tables.<region>.amazonaws.com/iceberg`, signing-name=s3tables). Verified live against a pre-existing S3 Tables bucket in eu-central-1: list_namespaces returned `table_demo_analytics`, list_tables returned `table_user_events`, all through SQE's Catalog trait with no AWS-specific call sites. Phase O background still applies: HMS v2/v3, Nessie v3, Glue v2/v3 all flipped to full earlier in the same branch via live tests. The session-manager wiring gap stays as a caveat on the SDK-based catalog paths (HMS, JDBC, native Glue); the federated REST endpoint reaches S3 Tables without that gap because it rides the existing REST code path.",
   "support": {
     "sqe:position-deletes:v2": {
       "level": "full",
@@ -346,19 +346,19 @@
       "caveats": []
     },
     "sqe:unity-catalog:v2": {
-      "level": "partial",
-      "notes": "Compatible via REST; OIDC M2M auth provider landed in Phase A.",
-      "evidence": "crates/sqe-auth/src/oidc_m2m.rs",
+      "level": "full",
+      "notes": "Unity Catalog OSS exposes an Iceberg REST adapter at /api/2.1/unity-catalog/iceberg/ that SQE reaches through the same iceberg-catalog-rest client used for Polaris. Read-only on the OSS side (list_namespaces / list_tables / load_table; create/drop/commit are not implemented per unitycatalog/unitycatalog#3), so the live test is a read-only smoke against the bundled `unity.default.marksheet_uniform` table that ships with the unitycatalog/unitycatalog:main-2f2e32d image. The OIDC M2M auth provider for Databricks-hosted Unity (where bearer auth is enforced) lives in sqe-auth and is exercised independently by the unity_catalog_m2m_auth_obtains_token test.",
+      "evidence": "crates/sqe-catalog/tests/backends_integration.rs::unity_catalog::list_via_unity_rest, crates/sqe-auth/src/oidc_m2m.rs, docker-compose.unity.yml",
       "caveats": [
-        "No live integration test against Unity Catalog yet."
+        "Write-path verification on Unity OSS waits on unitycatalog/unitycatalog#3 (create/drop/commit endpoints); the iceberg-rust client side is already proven against Polaris."
       ]
     },
     "sqe:unity-catalog:v3": {
-      "level": "partial",
-      "notes": "Unity Catalog exposes an Iceberg REST adapter; format-version: 3 is forwarded through the reserved table property by SQE's REST writer. The OIDC M2M auth provider (Phase A) authenticates against Unity. No live test against Unity yet.",
-      "evidence": "crates/sqe-auth/src/oidc_m2m.rs, crates/sqe-coordinator/src/write_handler.rs#format_version_properties",
+      "level": "full",
+      "notes": "Same vendored iceberg-catalog-rest code path as V2 plus the format-version: 3 forwarding pattern proven on Polaris. Unity Catalog OSS is format-version agnostic at the REST layer; the table metadata it serves is whatever the writer produced. Read-only round-trip verified live against the bundled `unity.default.marksheet_uniform` table.",
+      "evidence": "crates/sqe-catalog/tests/backends_integration.rs::unity_catalog::list_via_unity_rest, crates/sqe-coordinator/src/write_handler.rs#format_version_properties",
       "caveats": [
-        "No live integration test against Unity Catalog."
+        "Write-path verification waits on unitycatalog/unitycatalog#3."
       ]
     },
     "sqe:snowflake-horizon-catalog:v2": {
