@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/schubergphilis/sqe/security/advisories/new
+    about: Report security issues privately, not as a public issue. See SECURITY.md.
+  - name: Question or discussion
+    url: https://github.com/schubergphilis/sqe/discussions
+    about: Open-ended questions about SQE go in Discussions, not Issues.

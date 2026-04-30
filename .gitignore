@@ -24,3 +24,6 @@ vendor/iceberg-rust/Cargo.lock
 *.log
 *.jsonl
 log*.txt
+
+# External submission scratch dirs (e.g. icebergmatrix.org submission JSON)
+docs/neuw84-submission/
