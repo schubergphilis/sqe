@@ -2,9 +2,9 @@
 
 Current state of SQE against the [icebergmatrix.org](https://icebergmatrix.org) rubric, the de-facto reference engineers consult when picking an Iceberg engine. Data lives at [Neuw84/iceberg-matrix](https://github.com/Neuw84/iceberg-matrix).
 
-**Score: 162/189 (85.7%)**  |  **Stretch: 170/189 (90%)**
+**Score: 163/189 (86.2%)**  |  **Stretch: 170/189 (90%)**
 
-Last generated: 2026-04-29T23:00:00Z  |  Source: `Phase R bloom-filter footer inspection`
+Last generated: 2026-04-30T10:00:00Z  |  Source: `Phase O+ step 2 backend dispatch in SessionCatalog`
 
 Regenerate: `python3 scripts/render-iceberg-matrix.py`. Source of truth: `docs/iceberg-matrix-state.json`.
 
@@ -29,7 +29,7 @@ Each feature is scored against V2 and V3 of the Iceberg spec (63 cells total). A
 |---|---:|---:|
 | AWS EMR (Spark 7.12) | 180/189 | 95 |
 | OSS Spark 4.1 | 175/189 | 93 |
-| **SQE (current)** | **162/189** | **85.7** |
+| **SQE (current)** | **163/189** | **86.2** |
 | OSS Flink 2.2 | 153/189 | 81 |
 | Snowflake | 134/189 | 71 |
 | PyIceberg 0.11 | 130/189 | 69 |
@@ -97,7 +97,7 @@ Peer scores from icebergmatrix.org as of 2026-04-29.
 | Unity Catalog | F | F | Unity Catalog OSS exposes an Iceberg REST adapter at /api/2.1/unity-catalog/iceberg/ that SQE reaches through the same iceberg-catalog-rest  | Same vendored iceberg-catalog-rest code path as V2 plus the format-version: 3 forwarding pattern proven on Polaris. Unity Catalog OSS is for |
 | Snowflake Horizon | P | P | Horizon is Polaris-based; REST wiring compatible; no live test. | Snowflake Horizon is Polaris-based; the REST surface is shared with Polaris which we verified end-to-end at format-version 3. No live test a |
 | Hadoop Catalog | P | P | Storage-only scanner walks warehouse paths for metadata/v*.metadata.json (feature `hadoop`). Read path only; writes defer to REST/HMS. | The hadoop-catalog scanner walks `metadata/v*.metadata.json`; format-version 1/2/3 are read by the same iceberg-rust deserializer. Read pari |
-| JDBC Catalog | P | P | Two paths ship: (1) the rusqlite-based SQLite helper in backends/sql.rs (always-available with `--features sql`), and (2) iceberg-catalog-sq | iceberg-catalog-sql vendored alongside the fork is format-version agnostic; the format-version: 3 property forwarding pattern proven on Pola |
+| JDBC Catalog | F | P | Two paths ship: (1) the rusqlite-based SQLite helper in backends/sql.rs (always-available with `--features sql`), and (2) iceberg-catalog-sq | iceberg-catalog-sql vendored alongside the fork is format-version agnostic; the format-version: 3 property forwarding pattern proven on Pola |
 
 ### V3 data types
 
@@ -130,9 +130,7 @@ Cells marked `partial` or `unknown` have specific gaps documented in `docs/icebe
 - **snowflake-horizon-catalog (v3)**: No live integration test against Horizon.
 - **hadoop-catalog (v2)**: Write path is race-prone on object stores without atomic rename; intentionally read-oriented.
 - **hadoop-catalog (v3)**: Read-only on V3 too; writes still defer to REST/HMS.
-- **jdbc-catalog (v2)**: Engine session manager does not yet consume iceberg-catalog-sql; the rusqlite helper is the only path the coordinator routes to today.
-- **jdbc-catalog (v2)**: Live test exercises namespace ops; create_table needs a writable warehouse FileIO and was not included in the Phase L slice.
-- **jdbc-catalog (v3)**: No live test against a JDBC catalog at V3 yet.
+- **jdbc-catalog (v3)**: No live test against a JDBC catalog at V3 yet (engine wiring is now in place; remaining gap is a V3 round-trip against the JDBC backend).
 
 ---
 
