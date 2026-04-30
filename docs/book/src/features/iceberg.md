@@ -1,6 +1,16 @@
 # Iceberg Integration
 
-SQE is built on [iceberg-rust](https://github.com/apache/iceberg-rust) and [Apache Polaris](https://polaris.apache.org/) (Iceberg REST Catalog). It's not a connector — Iceberg is the only table format SQE supports.
+SQE is built on the [iceberg-rust](https://github.com/apache/iceberg-rust) library (vendored fork) and speaks the [Iceberg REST Catalog](https://iceberg.apache.org/spec/#rest-catalog) protocol natively. Iceberg is the only table format SQE supports.
+
+## Iceberg version
+
+- **iceberg-rust**: SQE-rebased fork of [risingwavelabs/iceberg-rust](https://github.com/risingwavelabs/iceberg-rust) `dev_rebase_main_20260303` at commit `645f02a4b533`, vendored at `vendor/iceberg-rust/`. Provides `RewriteFilesAction` / `OverwriteFilesAction` (Copy-on-Write DELETE/UPDATE), `PositionDeleteFileWriter` (Merge-on-Read position deletes), and `DeletionVectorWriter` (Iceberg V3) on top of upstream v0.9.0.
+- **DataFusion**: 53.0
+- **Arrow**: 58
+- **Parquet**: 58
+- **Iceberg table format**: V2 and V3. V3 features verified end-to-end (TIMESTAMP_NS, column defaults, equality-delete UPDATE on identifier-fields, partition evolution).
+
+The matrix score against [icebergmatrix.org](https://icebergmatrix.org) is 162/189 (85.7%). See [iceberg-matrix.md](../../../iceberg-matrix.md) for the per-cell breakdown.
 
 ## Architecture
 
@@ -12,94 +22,131 @@ graph TB
         WR["Writer<br/>(Parquet output)"]
     end
 
-    SC -->|REST API + bearer token| POL["Apache Polaris<br/>(Iceberg REST Catalog)"]
-    POL -->|table metadata| SC
-    POL -->|S3 credentials<br/>(credential vending)| SC
+    SC -->|REST API + bearer / SigV4| CAT["Catalog backend<br/>(Polaris / Nessie / Glue REST /<br/>S3 Tables / Unity / HMS / JDBC / Hadoop)"]
+    CAT -->|table metadata| SC
+    CAT -->|S3 credentials<br/>(credential vending)| SC
 
-    TP -->|read Parquet| S3["S3 / MinIO"]
-    WR -->|write Parquet| S3
+    TP -->|read Parquet| OS["S3-compatible storage<br/>(AWS / Ceph / R2 / rustfs)"]
+    WR -->|write Parquet| OS
 
-    SC -->|commit| POL
+    SC -->|commit| CAT
 ```
 
-## Catalog: Apache Polaris
+## Supported catalogs
 
-SQE talks to Polaris via the [Iceberg REST Catalog API](https://iceberg.apache.org/spec/#rest-catalog). Key interactions:
+SQE keeps the catalog choice as a runtime configuration concern. Every catalog below ships compiled in by default; pick one in `[catalog]`.
 
-| Operation | REST Endpoint | SQE Use |
+| Catalog | Protocol | Auth | Status |
+|---|---|---|---|
+| Apache Polaris | Iceberg REST | OIDC bearer + credential vending | primary |
+| Project Nessie 0.107+ | Iceberg REST | bearer / anonymous | live verified |
+| AWS Glue (Iceberg REST) | Iceberg REST + AWS SigV4 | AWS provider chain | live verified |
+| AWS S3 Tables | Iceberg REST + AWS SigV4 (`s3tables` signing) | AWS provider chain | live verified |
+| Unity Catalog OSS | Iceberg REST | bearer (Databricks) / anonymous (OSS) | live verified, read-only on OSS |
+| Hive Metastore | Thrift | none / Kerberos | live verified |
+| JDBC (Postgres / MySQL / SQLite) | iceberg-catalog-sql | DB credentials | live verified (Postgres) |
+| Hadoop / storage-only | object_store path scan | none | live verified, read-only |
+
+Live integration tests for HMS, Nessie, JDBC Postgres, AWS Glue, AWS S3 Tables, and Unity OSS live in `crates/sqe-catalog/tests/backends_integration.rs`. Each is `#[ignore]` and runs against a docker-compose overlay or a real cloud account configured via `.env`.
+
+The AWS endpoints share the OSS Iceberg REST code path. Phase P added an `aws-sigv4` cargo feature to the vendored `iceberg-catalog-rest` crate that swaps the OAuth/Bearer authenticator for an AWS SigV4 signer when `rest.sigv4-enabled=true` lands in the catalog properties (or in the server's `/v1/config` defaults). The signer reads credentials from the standard AWS provider chain.
+
+## Catalog REST surface
+
+For Polaris, Nessie, Unity OSS, AWS Glue, and AWS S3 Tables, SQE talks to the catalog via the Iceberg REST API. Key interactions:
+
+| Operation | REST endpoint | SQE use |
 |---|---|---|
-| List namespaces | `GET /v1/namespaces` | `SHOW SCHEMAS` |
-| List tables | `GET /v1/namespaces/{ns}/tables` | `SHOW TABLES` |
-| Load table | `POST /v1/namespaces/{ns}/tables/{t}` | Query planning |
-| Create table | `POST /v1/namespaces/{ns}/tables` | `CREATE TABLE` |
-| Drop table | `DELETE /v1/namespaces/{ns}/tables/{t}` | `DROP TABLE` |
-| Create namespace | `POST /v1/namespaces` | `CREATE SCHEMA` |
-| Drop namespace | `DELETE /v1/namespaces/{ns}` | `DROP SCHEMA` |
-| Commit table | `POST /v1/namespaces/{ns}/tables/{t}` | After write |
+| List namespaces | `GET /v1/{prefix}/namespaces` | `SHOW SCHEMAS` |
+| List tables | `GET /v1/{prefix}/namespaces/{ns}/tables` | `SHOW TABLES` |
+| Load table | `GET /v1/{prefix}/namespaces/{ns}/tables/{t}` | Query planning |
+| Create table | `POST /v1/{prefix}/namespaces/{ns}/tables` | `CREATE TABLE` |
+| Drop table | `DELETE /v1/{prefix}/namespaces/{ns}/tables/{t}` | `DROP TABLE` |
+| Create namespace | `POST /v1/{prefix}/namespaces` | `CREATE SCHEMA` |
+| Drop namespace | `DELETE /v1/{prefix}/namespaces/{ns}` | `DROP SCHEMA` |
+| Commit table | `POST /v1/{prefix}/namespaces/{ns}/tables/{t}` | After write |
+| Server config | `GET /v1/config?warehouse=...` | Discovery / signing hints |
 
-Every request includes the **user's bearer token** — Polaris enforces catalog-level access control.
+Every request includes the user's bearer token (Polaris, Unity, Nessie, anything OIDC) or is signed with AWS SigV4 (Glue, S3 Tables). The catalog enforces access control.
 
-## Credential Vending
+## Credential vending
 
-When SQE loads a table, Polaris returns the table metadata *and* scoped S3 credentials for accessing that table's data files:
+When SQE loads a table, the catalog returns the table metadata and scoped storage credentials for accessing the data files:
 
 ```mermaid
 sequenceDiagram
     participant SQE
-    participant Polaris
-    participant S3
+    participant Catalog
+    participant Storage as S3 / Object store
 
-    SQE->>Polaris: Load table (user token)
-    Polaris-->>SQE: Table metadata<br/>+ S3 credentials (STS)<br/>scoped to this table's prefix
+    SQE->>Catalog: Load table (user token / SigV4)
+    Catalog-->>SQE: Table metadata<br/>+ scoped storage credentials<br/>(STS / table-scoped key)
     Note over SQE: Credentials are per-user,<br/>per-table, time-limited
-    SQE->>S3: Read Parquet (scoped credentials)
-    S3-->>SQE: Data (only allowed prefix)
+    SQE->>Storage: Read Parquet (scoped credentials)
+    Storage-->>SQE: Data (allowed prefix only)
 ```
 
 This means:
-- No service account with broad S3 access
-- Each user's S3 access is scoped to exactly the tables they're querying
-- Credentials are short-lived (STS tokens)
 
-## Read Path
+- No service account with broad storage access.
+- Each user's storage access is scoped to exactly the tables they are querying.
+- Credentials are short-lived (STS or equivalent).
+
+## Read path
 
 ```mermaid
 graph LR
-    PLAN["LogicalPlan<br/>TableScan"] --> META["Load table metadata<br/>from Polaris"]
+    PLAN["LogicalPlan<br/>TableScan"] --> META["Load table metadata<br/>from catalog"]
     META --> PRUNE["Partition pruning<br/>(manifest filtering)"]
     PRUNE --> FILES["Data file list"]
-    FILES --> READ["Read Parquet<br/>(columnar, predicate pushdown)"]
+    FILES --> READ["Read Parquet<br/>(columnar, predicate pushdown,<br/>row-group skipping, RowFilter)"]
     READ --> BATCH["Arrow RecordBatches"]
 ```
 
-SQE leverages:
-- **Partition pruning** — Iceberg metadata is used to skip entire partitions that don't match query predicates
-- **Column projection** — only requested columns are read from Parquet
-- **Predicate pushdown** — filters pushed down to Parquet row group level
-- **Metadata caching** — table metadata cached with configurable TTL (default 30s) via `moka`
+Read-side optimizations:
 
-## Write Path
+- **Partition pruning**: Iceberg manifest stats skip whole partitions that cannot match the query predicate.
+- **Column projection**: only requested columns leave Parquet.
+- **Predicate pushdown**: filters land at the row group level, the page-index level, and the Parquet `RowFilter`.
+- **Runtime filter pushdown**: Phase P shipped a `DynamicPredicate` API that absorbs DataFusion 53 hash-join build-side runtime filters into the same pruning surface. SF10 TPC-H lineitem-heavy queries saw `q06 -51%`, `q07 -31%`, `q14 -33%`. Engineering log at [`docs/features/runtime-filter-pushdown.md`](../../../features/runtime-filter-pushdown.md).
+- **Bloom filter consultation**: `write.parquet.bloom-filter-columns` lands bloom offsets in the file footer; DataFusion consults them automatically for literal equality predicates at scan time.
+- **5-layer caching**: REST catalog cache, table metadata cache, manifest cache, SessionContext cache, OAuth token cache. Warm queries hit sub-millisecond planning.
+
+## Write path
 
 ```mermaid
 graph LR
-    SQL["CTAS / INSERT"] --> EXEC["Execute SELECT"]
+    SQL["CTAS / INSERT / DELETE / UPDATE / MERGE"] --> EXEC["Execute SELECT"]
     EXEC --> BATCH["RecordBatches"]
-    BATCH --> PARQUET["Write Parquet<br/>to S3"]
-    PARQUET --> COMMIT["Commit to Iceberg<br/>(append snapshot)"]
+    BATCH --> WRITE["Write Parquet<br/>(WriterProperties from table props)"]
+    WRITE --> COMMIT["Commit to Iceberg<br/>(append / row-delta / rewrite)"]
 ```
 
-Currently supported:
-- **CTAS** (`CREATE TABLE AS SELECT`) — creates table schema from query, writes Parquet data files, commits initial snapshot
-- **INSERT INTO** — appends data files to existing table, commits new snapshot
+Supported DML, both V2 and V3 verified:
 
-Coming soon (blocked on iceberg-rust):
-- **MERGE INTO** — row-level upsert with position deletes
-- **DELETE FROM** — row-level delete with position deletes
-- **UPDATE** — row-level update (rewrite affected rows)
+- **CREATE TABLE AS SELECT**: Apache Iceberg V2 and V3, including TIMESTAMP_NS columns and DEFAULT literals.
+- **INSERT INTO**: streaming, with proper schema validation against the catalog.
+- **DELETE FROM**: Copy-on-Write via `RewriteFilesAction`, or Merge-on-Read via `PositionDeleteFileWriter` when `write.delete.mode=merge-on-read`.
+- **UPDATE**: CoW or MoR (equality deletes when the table declares an identifier-field-id).
+- **MERGE INTO**: full WHEN MATCHED / WHEN NOT MATCHED semantics, dispatching to CoW or MoR based on the table's `write.update.mode`.
+- **ALTER TABLE**: `ADD/DROP/RENAME COLUMN`, `SET/DROP NOT NULL`, type promotion, `ADD/DROP/REPLACE PARTITION FIELD` (partition evolution), `CREATE/DROP BRANCH/TAG`, `SET WRITE BRANCH`.
 
-## Iceberg Version
+The writer respects `write.parquet.bloom-filter-columns` and `write.parquet.bloom-filter-fpp` for any column the schema knows about. The footer-inspection test in `crates/sqe-catalog/src/parquet_writer_config.rs` proves bloom offsets land in the resulting Parquet file.
 
-SQE uses **iceberg-rust 0.8.0** with **Iceberg table format v2** (v3 support planned). This pairs with:
-- DataFusion 51.x
-- Arrow 57.x
-- Parquet 57.x
+## V3 features verified
+
+- **TIMESTAMP_NS / TIMESTAMPTZ_NS**: V3 nanosecond timestamps round-trip end-to-end.
+- **Column defaults**: `CREATE TABLE ... DEFAULT <literal>` applies `write_default`; `ALTER TABLE ADD COLUMN ... DEFAULT` applies `initial_default`.
+- **Position deletes (V3)**: MoR DELETE on a V3 table writes position-delete files.
+- **Equality deletes (V3)**: UPDATE with a declared identifier-field-id commits a single RowDelta with new data file plus equality-delete row.
+- **Partition evolution (V3)**: `ALTER TABLE ADD/DROP/REPLACE PARTITION FIELD` evolves the spec on V3 tables, including with day(ts) on TIMESTAMP_NS columns.
+- **Time travel (V3)**: `FOR SYSTEM_TIME AS OF` and `FOR VERSION AS OF` work against V3 tables through the same snapshot walk as V2.
+- **Schema evolution (V3)**: `ADD COLUMN`, `DROP COLUMN`, `RENAME COLUMN`, `SET DATA TYPE` all work on V3.
+
+V3 features still blocked upstream:
+
+- **Variant**: pending iceberg-rust [#2188](https://github.com/apache/iceberg-rust/pull/2188).
+- **Geometry**: pending DataFusion UDT [#12644](https://github.com/apache/datafusion/issues/12644).
+- **Vector / Embedding**: V3 spec not finalised.
+
+The deferred list is tracked in [docs/iceberg-matrix-state.json](../../../iceberg-matrix-state.json) under `caveats` for each cell.
