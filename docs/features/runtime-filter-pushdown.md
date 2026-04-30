@@ -362,3 +362,60 @@ The relevant baselines for this work:
 | Decimal Datums not yet handled in the physical converter | small. extend `scalar_to_datum` once `iceberg::spec::Datum::decimal` accepts a raw i128 + (precision, scale) | low for TPC-H, blocks decimal-keyed hash joins |
 | q15 CTE re-scan independent of Path B-2 | requires DataFusion CTE materialization (DF 53 has none); SQE-level rewrite alternative is fragile | low |
 | Trino bench reliability at SF10 | container OOM / timeout on q18+ in some runs; not a SQE bug | low |
+
+## Negative result: bloom-on-write does not compose with Path B-2
+
+A side branch (`feat/bench-bloom-on-join-keys`, commit `f022619`)
+explored writing Parquet bloom filters on TPC-H/SSB join-key columns
+at data-generation time. The hypothesis was that blooms would prune
+row groups when the runtime filter could not, and the two would
+compose multiplicatively.
+
+The actual numbers, measured before and after Path B-2 landed:
+
+- **SF1**: bloom-on-write was already a regression on its own (+24%
+  slower) because at SF1 the per-row-group bloom evaluation overhead
+  exceeded the prune benefit. DataFusion only consults blooms for
+  *literal* equality predicates, not for the build side of a hash
+  join, and TPC-H has no literal predicates on join keys.
+- **SF10 with Path B alone** (pre-B-2): bloom-on-write recovered the
+  SF1 cost and produced -7.5% wins on q06 / q07 / q14 because larger
+  row groups tipped the cost-benefit toward bloom pruning.
+- **SF10 with Path B-2**: bloom-on-write *regressed* by +25.9s when
+  layered on top. Path B-2's runtime filter already prunes the row
+  groups the bloom would address; the bloom adds eval overhead with
+  no incremental benefit.
+
+The takeaway is that bloom-on-write and runtime filter pushdown
+target the same row-group pruning surface for join keys. Path B-2's
+runtime filter is more selective: it carries actual min/max bounds or
+in-list literals from the build side, and arrives at the reader
+through the same `DynamicPredicate` machinery the static predicate
+uses. Adding a parallel bloom probe burns CPU on row groups Path B-2
+has already pruned.
+
+The branch is deliberately unmerged. The matrix `bloom-filters:v2/v3`
+cells are still `full` because the per-table bloom write path is
+correct end-to-end (verified by the
+`writer_props_emit_bloom_filter_in_parquet_footer` test in
+`crates/sqe-catalog/src/parquet_writer_config.rs`): users who ask for
+blooms via `write.parquet.bloom-filter-columns` get them. The
+negative result here is specifically about *forcing* blooms on join
+keys at bench-data-generation time, which is a benchmark-stack
+choice rather than a property of the engine's bloom support.
+
+When blooms still help (and the per-table path covers):
+
+- Literal predicates on bloomed columns at scan time
+  (`WHERE bloomed_col = 5`)
+- Point-lookup workloads with skewed value distributions where
+  column min/max stats provide a wide range
+- IN-list filters with a small constant set on a bloomed column
+
+When blooms do not help (the bench-bloom-on-write path):
+
+- Hash join build-side filtering on join keys (Path B-2 covers it)
+- Range scans on dense integer columns (min/max stats already do
+  this for free)
+- Anything where the runtime filter or static predicate has already
+  pruned the row group
