@@ -155,13 +155,39 @@ fn convert_in_list(in_list: &InListExpr) -> Option<Predicate> {
         // for v1 — extend later when needed.
         return None;
     }
+    // An empty IN-list means the predicate is provably false: no value
+    // matches an empty set. This is the shape DataFusion's hash-join
+    // dynamic filter takes when the build side completes with zero
+    // rows (e.g. SSB q3.4 with `c_city = 'UNITED KI1'` matching no
+    // customers). Emit `Predicate::AlwaysFalse` so iceberg's row-group
+    // metrics evaluator prunes every data file. Without this, the
+    // empty IN-list would be silently dropped and the probe-side scan
+    // would read its entire fact table only to produce zero rows
+    // through the hash join. See `physical_to_predicate.rs` history
+    // for the SSB SF1 trace that surfaced this gap.
+    //
+    // The IN-list literal-extraction loop must run BEFORE the
+    // emptiness check so a list containing only unsupported types
+    // (e.g. decimal) falls through to `None` rather than being
+    // confused with a genuinely empty list.
     let col_name = extract_column(in_list.expr())?;
+    if in_list.list().is_empty() {
+        // Empty IN-list with no items: provably false. Reference
+        // unused but kept for clarity that the predicate is on a
+        // specific column.
+        let _ = col_name;
+        return Some(Predicate::AlwaysFalse);
+    }
     let mut datums = Vec::with_capacity(in_list.list().len());
     for item in in_list.list() {
         let lit = extract_literal(item)?;
         datums.push(scalar_to_datum(&lit)?);
     }
     if datums.is_empty() {
+        // Defensive: every item failed to convert (shouldn't happen
+        // when `in_list.list()` was non-empty, but treat as
+        // unconvertible rather than provably false). The reader will
+        // fall back to the static predicate.
         return None;
     }
     Some(Reference::new(col_name).is_in(datums))
