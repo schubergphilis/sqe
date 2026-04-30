@@ -236,4 +236,75 @@ mod tests {
         let cols = parse_bloom_filter_columns(&props);
         assert_eq!(cols, vec!["id".to_string(), "name".to_string()]);
     }
+
+    /// End-to-end footer inspection: build `WriterProperties` from
+    /// table props, write a tiny parquet file with them, then re-read
+    /// the file's metadata and assert that the bloomed column carries a
+    /// bloom filter offset. Closes the gap in the matrix evidence for
+    /// `sqe:bloom-filters:v2/v3`: the previous tests proved property
+    /// parsing and the v3 e2e test proved property round-trip through
+    /// the catalog, but neither inspected the resulting file's parquet
+    /// footer. This test does, without needing the docker-compose
+    /// stack or any S3 plumbing.
+    #[test]
+    fn writer_props_emit_bloom_filter_in_parquet_footer() {
+        use std::sync::Arc;
+
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use bytes::Bytes;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        // Build the same WriterProperties production uses, with bloom
+        // filters on `id` only. `name` should NOT get a bloom.
+        let mut props = HashMap::new();
+        props.insert(PROP_BLOOM_FILTER_COLUMNS.to_string(), "id".to_string());
+        let schema = schema_id_name();
+        let writer_props = build_writer_props(&props, &schema, Compression::UNCOMPRESSED);
+
+        // Build a 4-row record batch matching the iceberg schema. The
+        // bloom filter is sized to the per-page row count; a single
+        // batch is enough to populate it.
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4])),
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
+            ],
+        )
+        .expect("record batch");
+
+        // Write to an in-memory buffer so the test stays self-contained.
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer = ArrowWriter::try_new(&mut buf, arrow_schema, Some(writer_props))
+                .expect("ArrowWriter");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close writer");
+        }
+
+        // Re-read the file and assert bloom filter offsets.
+        let reader = SerializedFileReader::new(Bytes::from(buf)).expect("reader");
+        let metadata = reader.metadata();
+        assert_eq!(metadata.num_row_groups(), 1, "expected single row group");
+        let rg = metadata.row_group(0);
+
+        // Column ordering matches the arrow schema: 0 = id, 1 = name.
+        let id_col = rg.column(0);
+        let name_col = rg.column(1);
+
+        assert!(
+            id_col.bloom_filter_offset().is_some(),
+            "id column should carry a bloom filter offset; metadata: {id_col:?}"
+        );
+        assert!(
+            name_col.bloom_filter_offset().is_none(),
+            "name column should NOT carry a bloom filter offset; metadata: {name_col:?}"
+        );
+    }
 }
