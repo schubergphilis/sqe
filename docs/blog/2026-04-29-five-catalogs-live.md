@@ -84,9 +84,9 @@ This is where the test stack stops being self-contained. Glue is a managed servi
 Jacob has one. We created an S3 bucket in eu-central-1 to use as the warehouse, dropped the AWS profile name and bucket URI into a gitignored `.env` file, and updated the test to read from environment.
 
 ```bash
-AWS_PROFILE=jacobbuilder
+AWS_PROFILE=your-aws-profile
 AWS_REGION=eu-central-1
-SQE_TEST_GLUE_WAREHOUSE=s3://sqe-glue-it-eu-central-1/wh/
+SQE_TEST_GLUE_WAREHOUSE=s3://your-glue-it-bucket/wh/
 ```
 
 The `.env.example` file is the committed template. The actual `.env` is in `.gitignore`. Adding `!.env.example` as an exception means `cp .env.example .env` works without a second thought.
