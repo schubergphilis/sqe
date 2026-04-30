@@ -601,11 +601,64 @@ fn default_challenge_timeout() -> u64 {
     900
 }
 
+/// Selectable catalog backend. Defaults to `Rest` so existing TOML
+/// configurations keep working unchanged.
+///
+/// The non-REST variants point at the per-backend constructors in
+/// `crates/sqe-catalog/src/backends/`; selecting one routes the
+/// engine session manager through that backend's iceberg::Catalog
+/// implementation instead of through the REST client. REST-specific
+/// SessionCatalog methods (view DDL, commit_schema_update through
+/// raw REST) error out under non-REST backends.
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase", tag = "type")]
+pub enum CatalogBackend {
+    /// Iceberg REST (Polaris, Nessie, Unity OSS, AWS Glue REST,
+    /// AWS S3 Tables). Configured via `polaris_url` + `warehouse` on
+    /// CatalogConfig. AWS endpoints engage SigV4 automatically when
+    /// the server's /v1/config response advertises
+    /// `rest.sigv4-enabled=true`.
+    #[default]
+    Rest,
+    /// Hive Metastore over Thrift. Requires the `hms` cargo feature
+    /// on sqe-catalog. `uri` is `host:port` of the metastore.
+    Hms {
+        uri: String,
+        #[serde(default)]
+        warehouse: String,
+    },
+    /// AWS Glue Data Catalog over the AWS SDK. Requires the `glue`
+    /// cargo feature. `region` mandatory; `endpoint` optional for
+    /// LocalStack.
+    Glue {
+        region: String,
+        #[serde(default)]
+        warehouse: String,
+        #[serde(default)]
+        endpoint: Option<String>,
+    },
+    /// JDBC catalog (Postgres, MySQL, SQLite) via iceberg-catalog-sql.
+    /// Requires the `sql-postgres` cargo feature. `url` is the JDBC
+    /// connection string; `warehouse` is the on-disk path used for
+    /// new tables when the DB doesn't carry one.
+    Jdbc {
+        url: String,
+        #[serde(default)]
+        warehouse: String,
+    },
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct CatalogConfig {
     pub polaris_url: String,
     #[serde(default)]
     pub warehouse: String,
+    /// Backend selector. When omitted from TOML, deserialises to
+    /// `CatalogBackend::Rest` so the existing `polaris_url` field
+    /// keeps driving the engine. Non-REST variants source their own
+    /// connection details from the enum.
+    #[serde(default)]
+    pub backend: CatalogBackend,
     #[serde(default = "default_cache_ttl")]
     pub metadata_cache_ttl_secs: u64,
     /// Default Iceberg table format version for new tables (2 or 3).
@@ -1267,6 +1320,7 @@ mod tests {
             catalog: CatalogConfig {
                 polaris_url: "https://polaris.example.com".to_string(),
                 warehouse: "wh".to_string(),
+                backend: CatalogBackend::default(),
                 metadata_cache_ttl_secs: 30,
                 default_table_format_version: 2,
                 trust_sort_order: false,

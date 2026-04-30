@@ -141,6 +141,74 @@ impl TableMetadataCache {
     }
 }
 
+/// Backend handle inside `SessionCatalog`.
+///
+/// REST keeps its `Arc<RwLock<RestCatalog>>` because the per-session
+/// `REST_CATALOG_CACHE` (keyed by URL + token fingerprint) hands out
+/// the same Arc to every session that authenticates with the same
+/// token, and the existing code accesses it through `read().await`.
+/// Non-REST backends construct their iceberg::Catalog implementation
+/// once during `for_session` and store it directly as a trait
+/// object; there is no equivalent shared cache today (HMS / Glue /
+/// JDBC catalog construction is cheap and idempotent).
+pub(crate) enum CatalogHandle {
+    Rest(Arc<RwLock<RestCatalog>>),
+    Other(Arc<dyn iceberg::Catalog>),
+}
+
+impl std::fmt::Debug for CatalogHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rest(_) => f.debug_tuple("Rest").field(&"<RestCatalog>").finish(),
+            Self::Other(c) => f.debug_tuple("Other").field(c).finish(),
+        }
+    }
+}
+
+impl CatalogHandle {
+    /// REST-only handle for methods that need direct access to
+    /// `RestCatalog` (cache invalidation, ETag-based revalidation
+    /// fast paths). `None` for non-REST backends; callers fall back
+    /// to the trait-only path.
+    #[allow(dead_code)] // wired up incrementally; keep accessor for future REST-only fast paths
+    pub(crate) fn rest(&self) -> Option<&Arc<RwLock<RestCatalog>>> {
+        match self {
+            Self::Rest(r) => Some(r),
+            Self::Other(_) => None,
+        }
+    }
+}
+
+/// Match on a `CatalogHandle` and run the same iceberg::Catalog
+/// trait method against either variant. Macro because each method
+/// signature is different and async closures aren't stable.
+///
+/// Usage:
+/// ```ignore
+/// dispatch_catalog!(self.inner, list_namespaces(parent))
+/// ```
+/// Expands to a match that acquires the REST read lock when needed
+/// and returns the awaited iceberg::Catalog method result. Used by
+/// every `SessionCatalog` and `SessionCatalogBridge` method that
+/// only needs the standard trait surface.
+macro_rules! dispatch_catalog {
+    ($handle:expr, $method:ident($($args:expr),* $(,)?)) => {
+        match &$handle {
+            $crate::rest_catalog::CatalogHandle::Rest(rest) => {
+                let catalog = rest.read().await;
+                catalog.$method($($args),*).await
+            }
+            $crate::rest_catalog::CatalogHandle::Other(catalog) => {
+                catalog.$method($($args),*).await
+            }
+        }
+    };
+}
+// Re-export the macro for use within this module. `pub(crate) use`
+// is the documented idiom even though the import looks self-referential.
+#[allow(unused_imports)]
+pub(crate) use dispatch_catalog;
+
 /// Per-session Iceberg REST catalog wrapper.
 ///
 /// Each authenticated user session gets its own `SessionCatalog` instance
@@ -154,7 +222,14 @@ impl TableMetadataCache {
 /// * **Fault isolation**: when Polaris is unavailable the circuit opens and
 ///   subsequent requests fail fast without wasting threads / connections.
 pub struct SessionCatalog {
-    inner: Arc<RwLock<RestCatalog>>,
+    /// Backend handle. The REST variant keeps the existing cached
+    /// `Arc<RwLock<RestCatalog>>` so the per-session catalog cache
+    /// keeps working unchanged. Non-REST variants hold the iceberg
+    /// trait object directly. REST-specific methods on
+    /// `SessionCatalog` (view DDL, raw `commit_schema_update`, ETag
+    /// revalidation in `load_table`) match on this and error out
+    /// when the backend isn't REST.
+    inner: CatalogHandle,
     polaris_url: String,
     warehouse: String,
     bearer_token: String,
@@ -214,27 +289,154 @@ impl SessionCatalog {
     /// through this single entry point so changes to the catalog
     /// construction path don't have to touch each handler.
     ///
-    /// Phase O+ will grow this helper into a backend-dispatch factory:
-    /// when `config.catalog.backend` selects HMS / Glue / JDBC the
-    /// helper will return a `SessionCatalog`-shaped wrapper around the
-    /// matching `iceberg::Catalog` implementation. For now (Phase O+
-    /// step 1) it always returns the REST `SessionCatalog`, identical
-    /// to what the call sites built manually.
+    /// Phase O+ step 2: dispatches on `config.catalog.backend`. The
+    /// REST variant (default) goes through `Self::new` and gives back
+    /// the legacy `CatalogHandle::Rest` shape so view DDL and
+    /// `commit_schema_update` keep working. HMS / Glue / JDBC build
+    /// the matching iceberg::Catalog through the per-backend
+    /// constructor in `crates/sqe-catalog/src/backends/` and store
+    /// it as `CatalogHandle::Other`. REST-only methods on
+    /// SessionCatalog return an error under non-REST handles.
     pub async fn for_session(
         config: &SqeConfig,
         table_cache: Option<TableMetadataCache>,
         bearer_token: &str,
     ) -> sqe_core::Result<Self> {
-        Self::new(
-            &config.catalog.polaris_url,
-            &config.catalog.warehouse,
-            bearer_token,
-            &config.storage,
+        match &config.catalog.backend {
+            sqe_core::config::CatalogBackend::Rest => {
+                Self::new(
+                    &config.catalog.polaris_url,
+                    &config.catalog.warehouse,
+                    bearer_token,
+                    &config.storage,
+                    table_cache,
+                    None,
+                    None,
+                )
+                .await
+            }
+            other => Self::for_session_other_backend(
+                config,
+                bearer_token,
+                table_cache.unwrap_or_else(|| TableMetadataCache::new(0)),
+                other,
+            )
+            .await,
+        }
+    }
+
+    /// Build a `SessionCatalog` over a non-REST backend. Pulled out
+    /// of `for_session` so the REST fast path stays a single
+    /// straight-line constructor and the per-backend feature gates
+    /// stay localised.
+    async fn for_session_other_backend(
+        config: &SqeConfig,
+        bearer_token: &str,
+        table_cache: TableMetadataCache,
+        backend: &sqe_core::config::CatalogBackend,
+    ) -> sqe_core::Result<Self> {
+        use sqe_core::config::CatalogBackend;
+        let inner: Arc<dyn iceberg::Catalog> = match backend {
+            CatalogBackend::Rest => unreachable!("Rest handled in for_session"),
+            #[cfg(feature = "hms")]
+            CatalogBackend::Hms { uri, warehouse } => {
+                let storage_factory: Arc<dyn iceberg::io::StorageFactory> =
+                    Arc::new(iceberg::io::OpenDalStorageFactory::Fs);
+                let backend = crate::backends::hms::HmsBackend::new(
+                    crate::backends::hms::HmsConfig::new(uri.clone(), warehouse.clone()),
+                );
+                let catalog = backend
+                    .build_catalog(storage_factory)
+                    .await
+                    .map_err(|e| SqeError::Catalog(format!("HMS catalog build failed: {e}")))?;
+                Arc::new(catalog)
+            }
+            #[cfg(not(feature = "hms"))]
+            CatalogBackend::Hms { .. } => {
+                return Err(SqeError::Catalog(
+                    "HMS backend requires the `hms` cargo feature on sqe-catalog".into(),
+                ));
+            }
+            #[cfg(feature = "glue")]
+            CatalogBackend::Glue {
+                region,
+                warehouse,
+                endpoint,
+            } => {
+                let storage_factory: Arc<dyn iceberg::io::StorageFactory> =
+                    Arc::new(iceberg::io::OpenDalStorageFactory::Fs);
+                let mut glue_cfg = crate::backends::glue::GlueConfig::new(
+                    region.clone(),
+                    warehouse.clone(),
+                );
+                glue_cfg.endpoint = endpoint.clone();
+                let backend = crate::backends::glue::GlueBackend::new(glue_cfg);
+                let catalog = backend
+                    .build_catalog(storage_factory)
+                    .await
+                    .map_err(|e| SqeError::Catalog(format!("Glue catalog build failed: {e}")))?;
+                Arc::new(catalog)
+            }
+            #[cfg(not(feature = "glue"))]
+            CatalogBackend::Glue { .. } => {
+                return Err(SqeError::Catalog(
+                    "Glue backend requires the `glue` cargo feature on sqe-catalog".into(),
+                ));
+            }
+            #[cfg(feature = "sql-postgres")]
+            CatalogBackend::Jdbc { url, warehouse } => {
+                use iceberg::CatalogBuilder;
+                use iceberg_catalog_sql::{
+                    SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlCatalogBuilder,
+                };
+                let storage_factory: Arc<dyn iceberg::io::StorageFactory> =
+                    Arc::new(iceberg::io::OpenDalStorageFactory::Fs);
+                let mut props = HashMap::new();
+                props.insert(SQL_CATALOG_PROP_URI.to_string(), url.clone());
+                props.insert(SQL_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.clone());
+                let catalog = SqlCatalogBuilder::default()
+                    .with_storage_factory(storage_factory)
+                    .load("sqe-jdbc-session", props)
+                    .await
+                    .map_err(|e| SqeError::Catalog(format!("JDBC catalog build failed: {e}")))?;
+                Arc::new(catalog)
+            }
+            #[cfg(not(feature = "sql-postgres"))]
+            CatalogBackend::Jdbc { .. } => {
+                return Err(SqeError::Catalog(
+                    "JDBC backend requires the `sql-postgres` cargo feature on sqe-catalog"
+                        .into(),
+                ));
+            }
+        };
+
+        let token_fingerprint = {
+            use sha2::{Digest, Sha256};
+            let hash = Sha256::digest(bearer_token.as_bytes());
+            format!("{:x}", hash)[..16].to_string()
+        };
+
+        info!(
+            backend = ?backend,
+            token_fingerprint = %token_fingerprint,
+            "Creating SessionCatalog over non-REST backend"
+        );
+
+        Ok(Self {
+            inner: CatalogHandle::Other(inner),
+            polaris_url: String::new(),
+            warehouse: config.catalog.warehouse.clone(),
+            bearer_token: bearer_token.to_string(),
+            token_fingerprint,
+            storage_config: config.storage.clone(),
+            http_client: reqwest::Client::new(),
+            circuit_breaker: Arc::new(CircuitBreaker::new(
+                "non-rest-catalog",
+                5,
+                std::time::Duration::from_secs(30),
+            )),
             table_cache,
-            None,
-            None,
-        )
-        .await
+        })
     }
 
     pub async fn new(
@@ -344,7 +546,7 @@ impl SessionCatalog {
         let table_cache = table_cache.unwrap_or_else(|| TableMetadataCache::new(0));
 
         Ok(Self {
-            inner,
+            inner: CatalogHandle::Rest(inner),
             polaris_url: polaris_url.to_string(),
             warehouse: warehouse.to_string(),
             bearer_token: bearer_token.to_string(),
@@ -383,10 +585,7 @@ impl SessionCatalog {
         self.circuit_breaker
             .check()
             .map_err(sqe_core::SqeError::Catalog)?;
-        let catalog = self.inner.read().await;
-        let result = catalog
-            .list_namespaces(None)
-            .await
+        let result = dispatch_catalog!(self.inner, list_namespaces(None))
             .map_err(|e| sqe_core::SqeError::Catalog(format!("Failed to list namespaces: {e}")));
         match &result {
             Ok(_) => self.circuit_breaker.record_success(),
@@ -407,10 +606,7 @@ impl SessionCatalog {
             namespace = ?namespace,
             "Getting namespace"
         );
-        let catalog = self.inner.read().await;
-        catalog
-            .get_namespace(namespace)
-            .await
+        dispatch_catalog!(self.inner, get_namespace(namespace))
             .map_err(|e| sqe_core::SqeError::Catalog(format!("Failed to get namespace: {e}")))
     }
 
@@ -428,10 +624,7 @@ impl SessionCatalog {
         self.circuit_breaker
             .check()
             .map_err(sqe_core::SqeError::Catalog)?;
-        let catalog = self.inner.read().await;
-        let result = catalog
-            .list_tables(namespace)
-            .await
+        let result = dispatch_catalog!(self.inner, list_tables(namespace))
             .map_err(|e| sqe_core::SqeError::Catalog(format!("Failed to list tables: {e}")));
         match &result {
             Ok(_) => self.circuit_breaker.record_success(),
@@ -547,14 +740,13 @@ impl SessionCatalog {
             );
         }
 
-        // Full load via iceberg-rust's RestCatalog.
+        // Full load via the configured catalog backend (REST or
+        // any iceberg::Catalog). Non-REST backends skip the ETag
+        // capture below since they do not expose REST headers.
         self.circuit_breaker
             .check()
             .map_err(sqe_core::SqeError::Catalog)?;
-        let catalog = self.inner.read().await;
-        let result = catalog
-            .load_table(table_ident)
-            .await
+        let result = dispatch_catalog!(self.inner, load_table(table_ident))
             .map_err(|e| sqe_core::SqeError::Catalog(format!("Failed to load table: {e}")));
         match &result {
             Ok(table) => {
@@ -638,19 +830,36 @@ impl SessionCatalog {
 
     /// Check if a table exists.
     pub async fn table_exists(&self, table_ident: &TableIdent) -> sqe_core::Result<bool> {
-        let catalog = self.inner.read().await;
-        catalog
-            .table_exists(table_ident)
-            .await
-            .map_err(|e| {
-                sqe_core::SqeError::Catalog(format!("Failed to check table existence: {e}"))
-            })
+        dispatch_catalog!(self.inner, table_exists(table_ident)).map_err(|e| {
+            sqe_core::SqeError::Catalog(format!("Failed to check table existence: {e}"))
+        })
     }
 
     /// Build the Polaris REST URL prefix for this warehouse.
     fn rest_prefix(&self) -> String {
         let base = self.polaris_url.trim_end_matches('/');
         format!("{base}/v1/{}", self.warehouse)
+    }
+
+    /// Guard for methods that talk to the REST catalog directly
+    /// (view DDL, raw `commit_schema_update`). These bypass the
+    /// iceberg::Catalog trait, so they only function under
+    /// `CatalogHandle::Rest`. Returns an error pointing at the
+    /// backend mismatch rather than letting a downstream HTTP call
+    /// fail with an opaque "connection refused" against an empty
+    /// polaris_url.
+    fn require_rest_backend(&self, op: &str) -> sqe_core::Result<()> {
+        if matches!(self.inner, CatalogHandle::Rest(_)) {
+            Ok(())
+        } else {
+            Err(SqeError::Catalog(format!(
+                "{op} requires the REST catalog backend; the configured \
+                 backend ({:?}) does not expose this operation through the \
+                 iceberg::Catalog trait. Switch [catalog].backend to `rest` \
+                 or use a tool that talks directly to the configured backend.",
+                self.inner
+            )))
+        }
     }
 
     /// Create a view via the Polaris REST API.
@@ -665,6 +874,7 @@ impl SessionCatalog {
         sql: &str,
         schema: &serde_json::Value,
     ) -> sqe_core::Result<()> {
+        self.require_rest_backend("create_view")?;
         let ns_str = namespace
             .as_ref()
             .iter()
@@ -737,6 +947,7 @@ impl SessionCatalog {
         &self,
         namespace: &NamespaceIdent,
     ) -> sqe_core::Result<Vec<String>> {
+        self.require_rest_backend("list_views")?;
         let ns_str = namespace
             .as_ref()
             .iter()
@@ -798,6 +1009,7 @@ impl SessionCatalog {
         namespace: &NamespaceIdent,
         name: &str,
     ) -> sqe_core::Result<Option<String>> {
+        self.require_rest_backend("load_view_sql")?;
         let ns_str = namespace
             .as_ref()
             .iter()
@@ -862,6 +1074,7 @@ impl SessionCatalog {
         namespace: &NamespaceIdent,
         name: &str,
     ) -> sqe_core::Result<()> {
+        self.require_rest_backend("drop_view")?;
         let ns_str = namespace
             .as_ref()
             .iter()
@@ -925,6 +1138,7 @@ impl SessionCatalog {
         updates: Vec<TableUpdate>,
         requirements: Vec<TableRequirement>,
     ) -> sqe_core::Result<()> {
+        self.require_rest_backend("commit_schema_update")?;
         let ns_str = table_ident
             .namespace()
             .as_ref()
@@ -1011,8 +1225,7 @@ impl Catalog for SessionCatalogBridge {
         &self,
         parent: Option<&NamespaceIdent>,
     ) -> iceberg::Result<Vec<NamespaceIdent>> {
-        let catalog = self.session.inner.read().await;
-        catalog.list_namespaces(parent).await
+        dispatch_catalog!(self.session.inner, list_namespaces(parent))
     }
 
     async fn create_namespace(
@@ -1020,21 +1233,18 @@ impl Catalog for SessionCatalogBridge {
         namespace: &NamespaceIdent,
         properties: HashMap<String, String>,
     ) -> iceberg::Result<iceberg::Namespace> {
-        let catalog = self.session.inner.read().await;
-        catalog.create_namespace(namespace, properties).await
+        dispatch_catalog!(self.session.inner, create_namespace(namespace, properties))
     }
 
     async fn get_namespace(
         &self,
         namespace: &NamespaceIdent,
     ) -> iceberg::Result<iceberg::Namespace> {
-        let catalog = self.session.inner.read().await;
-        catalog.get_namespace(namespace).await
+        dispatch_catalog!(self.session.inner, get_namespace(namespace))
     }
 
     async fn namespace_exists(&self, namespace: &NamespaceIdent) -> iceberg::Result<bool> {
-        let catalog = self.session.inner.read().await;
-        catalog.namespace_exists(namespace).await
+        dispatch_catalog!(self.session.inner, namespace_exists(namespace))
     }
 
     async fn update_namespace(
@@ -1042,21 +1252,18 @@ impl Catalog for SessionCatalogBridge {
         namespace: &NamespaceIdent,
         properties: HashMap<String, String>,
     ) -> iceberg::Result<()> {
-        let catalog = self.session.inner.read().await;
-        catalog.update_namespace(namespace, properties).await
+        dispatch_catalog!(self.session.inner, update_namespace(namespace, properties))
     }
 
     async fn drop_namespace(&self, namespace: &NamespaceIdent) -> iceberg::Result<()> {
-        let catalog = self.session.inner.read().await;
-        catalog.drop_namespace(namespace).await
+        dispatch_catalog!(self.session.inner, drop_namespace(namespace))
     }
 
     async fn list_tables(
         &self,
         namespace: &NamespaceIdent,
     ) -> iceberg::Result<Vec<TableIdent>> {
-        let catalog = self.session.inner.read().await;
-        catalog.list_tables(namespace).await
+        dispatch_catalog!(self.session.inner, list_tables(namespace))
     }
 
     async fn create_table(
@@ -1065,8 +1272,7 @@ impl Catalog for SessionCatalogBridge {
         creation: iceberg::TableCreation,
     ) -> iceberg::Result<Table> {
         let table_name = creation.name.clone();
-        let catalog = self.session.inner.read().await;
-        let result = catalog.create_table(namespace, creation).await?;
+        let result = dispatch_catalog!(self.session.inner, create_table(namespace, creation))?;
         // Invalidate any stale cache entry for this table name.
         let ident = TableIdent::new(namespace.clone(), table_name);
         self.session.table_cache.invalidate(&format!("{}.{}", ident.namespace(), ident.name())).await;
@@ -1082,17 +1288,17 @@ impl Catalog for SessionCatalogBridge {
     }
 
     async fn drop_table(&self, table: &TableIdent) -> iceberg::Result<()> {
-        let catalog = self.session.inner.read().await;
-        let result = catalog.drop_table(table).await;
-        // Invalidate on success or failure — stale data is worse than a miss.
-        drop(catalog);
-        self.session.table_cache.invalidate(&format!("{}.{}", table.namespace(), table.name())).await;
+        let result = dispatch_catalog!(self.session.inner, drop_table(table));
+        // Invalidate on success or failure: stale data is worse than a miss.
+        self.session
+            .table_cache
+            .invalidate(&format!("{}.{}", table.namespace(), table.name()))
+            .await;
         result
     }
 
     async fn table_exists(&self, table: &TableIdent) -> iceberg::Result<bool> {
-        let catalog = self.session.inner.read().await;
-        catalog.table_exists(table).await
+        dispatch_catalog!(self.session.inner, table_exists(table))
     }
 
     async fn rename_table(
@@ -1100,8 +1306,7 @@ impl Catalog for SessionCatalogBridge {
         src: &TableIdent,
         dest: &TableIdent,
     ) -> iceberg::Result<()> {
-        let catalog = self.session.inner.read().await;
-        catalog.rename_table(src, dest).await
+        dispatch_catalog!(self.session.inner, rename_table(src, dest))
     }
 
     async fn register_table(
@@ -1109,17 +1314,17 @@ impl Catalog for SessionCatalogBridge {
         table: &TableIdent,
         metadata_location: String,
     ) -> iceberg::Result<Table> {
-        let catalog = self.session.inner.read().await;
-        catalog.register_table(table, metadata_location).await
+        dispatch_catalog!(self.session.inner, register_table(table, metadata_location))
     }
 
     async fn update_table(&self, commit: iceberg::TableCommit) -> iceberg::Result<Table> {
         let ident = commit.identifier().clone();
-        let catalog = self.session.inner.read().await;
-        let result = catalog.update_table(commit).await;
-        drop(catalog);
+        let result = dispatch_catalog!(self.session.inner, update_table(commit));
         // Invalidate cache so any subsequent load_table sees updated metadata.
-        self.session.table_cache.invalidate(&format!("{}.{}", ident.namespace(), ident.name())).await;
+        self.session
+            .table_cache
+            .invalidate(&format!("{}.{}", ident.namespace(), ident.name()))
+            .await;
         result
     }
 }
