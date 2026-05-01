@@ -3442,6 +3442,7 @@ dependencies = [
  "iceberg",
  "parquet",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
