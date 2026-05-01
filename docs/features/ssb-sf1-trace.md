@@ -70,46 +70,117 @@ The expectation was that runtime filter pushdown (Path B-2,
 [runtime-filter-pushdown.md](runtime-filter-pushdown.md)) would prune
 lineorder via dim build-side filtering. The trace shows it does not.
 
-## Why Path B-2 does not engage
+## Why Path B-2 did not engage
 
 Added temporary `eprintln!` traces to `convert_physical` and
 `convert_in_list` in
 `vendor/iceberg-rust/crates/integrations/datafusion/src/physical_plan/physical_to_predicate.rs`
-and ran the full SSB suite. **Zero invocations.** The dynamic predicate
-code path is never reached on any SSB SF1 query.
+and ran the full SSB suite. **Zero invocations.** The dynamic
+predicate code path was never reached on any SSB SF1 query. The
+ground truth: DataFusion was not pushing runtime filters down to
+SQE's `IcebergScanExec` at all. Why is covered in the
+[root cause](#root-cause-missing-gather_filters_for_pushdown-override)
+subsection below.
 
-Tracking the cause: `IcebergScanExec.runtime_filters` ends up empty
-after DataFusion's filter-pushdown phase. That field is populated by
-`handle_child_pushdown_result`, which is called by the optimizer when
-it decides to push runtime filters down to a leaf scan. For SSB SF1,
-DataFusion is not pushing those filters.
+### Debugging Path B-2 going forward
 
-What we know:
+SQE's `IcebergScanExec` (the production scan node, in
+`crates/sqe-catalog/src/iceberg_scan.rs`) emits a `tracing::debug!`
+line in `handle_child_pushdown_result` so future investigators can
+see whether DataFusion is offering filters to the scan and how many
+of them are dynamic:
 
-- `datafusion.optimizer.enable_dynamic_filter_pushdown` is set to
-  `true` in `session_context.rs:101`.
-- TPC-H SF10 sees per-query gains of `q06 -51%`, `q07 -31%`,
-  `q14 -33%` from Path B-2, so the wiring works.
-- SSB SF1 sees no gains, even on queries with non-trivial dim build
-  sides (q3.2 has a 2192-row supplier filter result; q4.1 has 5959-row
-  customer filter; both should generate a meaningful runtime filter).
+```bash
+RUST_LOG="info,sqe_catalog=debug" \
+  BENCH_SCALE=1 ./scripts/benchmark-test.sh ssb
+```
 
-Hypotheses, not yet narrowed:
+The relevant log fields:
 
-1. SSB's plan structure puts an intermediate physical node (e.g.
-   `RepartitionExec`) between the `HashJoinExec` and the
-   `IcebergScanExec` that blocks pushdown. The runtime filters for
-   SSB joins would need to traverse a `RepartitionExec` boundary;
-   TPC-H plans may be flatter.
-2. The `HashJoinExec` for SSB is not generating a `DynamicFilterPhysicalExpr`
-   at all because of cardinality estimates (DataFusion may decide the
-   filter is not selective enough to be worth pushing).
-3. SSB tables are small enough that DataFusion's optimizer skips the
-   dynamic filter generation entirely (cost-model decision).
+```
+target=sqe_catalog::iceberg_scan
+  IcebergScanExec::handle_child_pushdown_result
+    table=...  parent_filter_count=N  dynamic_filter_count=N
+```
 
-Disambiguating these requires either reading DataFusion 53's
-`DynamicFilterPushdown` rule or adding tracing inside DataFusion. Not
-attempted in this investigation.
+The vendored `IcebergTableScan` in `iceberg-rust` emits equivalent
+logs under `target=iceberg_datafusion::physical_plan::scan`, but SQE
+queries hit the SQE node, not the vendored one. Use the
+`iceberg_datafusion=debug` filter only when investigating direct uses
+of the vendored crate.
+
+If `parent_filter_count = 0` on every call, DataFusion never offered
+a runtime filter to this scan: an intermediate node in the plan
+blocked pushdown, or the cost-model rule decided this join was not
+worth a dynamic filter, or, as it turned out for SSB SF1, the scan
+itself failed to declare itself a filter-absorbing leaf via
+`gather_filters_for_pushdown`.
+
+If `parent_filter_count > 0` but `dynamic_filter_count = 0`, the
+parent forwarded only static filters (already handled at plan time)
+and there is no runtime filter to honor.
+
+If `dynamic_filter_count > 0` but the bench shows no scan reduction,
+the runtime filter is reaching the scan but pruning is not happening.
+Two reasons that might be: the dynamic filter is still at its
+`lit(true)` placeholder when the scan executes (normal for the first
+batches), or the iceberg row-group/file pruning is not honoring it.
+Check `physical_to_predicate.rs::convert_physical` and the
+`file_entries.len() > 1` gate in
+`iceberg_scan.rs::execute_partition_inner` next.
+
+### Root cause: missing `gather_filters_for_pushdown` override
+
+The hypotheses above were all wrong. The dynamic filter never reached
+the scan because SQE's `IcebergScanExec` (in
+`crates/sqe-catalog/src/iceberg_scan.rs`) was missing the
+`gather_filters_for_pushdown` override.
+
+The default `ExecutionPlan::gather_filters_for_pushdown` returns
+`FilterDescription::all_unsupported(...)`. That tells DataFusion's
+filter-pushdown rule "this node does not support any of these
+filters." The optimizer then abandons the dynamic filter, and
+`handle_child_pushdown_result` is never called. Path B-2 silently
+no-ops.
+
+Adding the override (returning `FilterDescription::new()`, the
+leaf-scan convention used by the vendored `IcebergTableScan` in
+iceberg-rust) tells DataFusion the scan absorbs filters. With debug
+logging on, lineorder now shows:
+
+```
+target=sqe_catalog::iceberg_scan
+  IcebergScanExec::handle_child_pushdown_result
+    table=lineorder  parent_filter_count=1  dynamic_filter_count=1
+```
+
+The dynamic filter from the dim build side now reaches the scan.
+
+The vendored `IcebergTableScan` already had the correct override;
+SQE's reimplementation simply did not. None of the three earlier
+hypotheses (intermediate `RepartitionExec`, missing
+`DynamicFilterPhysicalExpr`, cost-model rejection) was right.
+
+### Why SSB SF1 still does not see a wall-clock improvement
+
+The fix engages Path B-2 correctly but does not move the SSB SF1
+floor. Two reasons:
+
+1. SSB SF1 lineorder fits in one Parquet file. SQE's file-level
+   pruning is gated by `file_entries.len() > 1` in
+   `iceberg_scan.rs`: it only attempts to skip files when there is
+   more than one to choose between. Single-file tables fall through
+   to a full scan.
+
+2. SQE's `IcebergScanExec` does no row-group level pruning with the
+   dynamic filter. Even if the file-level gate were lifted, it would
+   either keep or skip the entire 6 M-row file. To get sub-file
+   pruning, the runtime filter would need to be evaluated against
+   per-row-group min/max from the Parquet footer.
+
+Expected to pay off at SF10+ where lineorder spans multiple files
+and a selective dim build side can skip whole files. Track row-group
+level dynamic-filter pruning as a follow-up.
 
 ## What the empty-IN-list fix changes
 
@@ -164,12 +235,23 @@ before the join discovers it has no work.
    Estimated savings: ~160 ms / query when the optimizer flips the order
    correctly.
 
-3. **Investigate why Path B-2 does not engage on SSB.** Larger payoff
-   if found (lineorder scan reduction on q2.2, q3.2, q3.3, q3.4, q4.1
-   = potentially ~500 ms across SSB SF1) but unknown root cause.
-   Requires DataFusion-level tracing.
+3. **Row-group level dynamic-filter pruning in `IcebergScanExec`.**
+   Path B-2 now engages (the `gather_filters_for_pushdown` fix lands
+   the runtime filter on the scan) but SF1 still scans 6 M rows
+   because lineorder is one file and SQE only prunes at file level.
+   Wire the resolved dynamic filter through `PruningPredicate` over
+   per-row-group min/max from the Parquet footer, the way DataFusion
+   does for static filters in `ParquetExec`. Lifts the
+   `file_entries.len() > 1` gate as well so single-file tables can
+   still benefit. Estimated savings: matches the SF10+ Path B-2
+   numbers when the dim build is selective.
 
-4. **Plan cache.** Production hygiene; adds ~0.5 ms / query benefit on
+4. **Investigate Path B-2 at SF10.** Path B-2 is now wired up but the
+   SSB SF1 cardinality is too small to demonstrate it. Re-run SSB at
+   SF10 to confirm the fix actually reduces lineorder scans on
+   queries with selective dim builds.
+
+5. **Plan cache.** Production hygiene; adds ~0.5 ms / query benefit on
    repeated SQL. Not the SF1 fix.
 
 The trace work itself (MR !121, !122) is the foundation: every future

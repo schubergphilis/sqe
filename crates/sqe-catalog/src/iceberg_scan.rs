@@ -17,7 +17,8 @@ use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion::physical_optimizer::pruning::PruningPredicate;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::filter_pushdown::{
-    ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
+    ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
+    PushedDown,
 };
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
@@ -543,12 +544,66 @@ impl ExecutionPlan for IcebergScanExec {
         })
     }
 
+    /// Declare ourselves a leaf to DataFusion's filter pushdown rule.
+    ///
+    /// The default `ExecutionPlan::gather_filters_for_pushdown` returns
+    /// `FilterDescription::all_unsupported(...)`, which tells the
+    /// optimizer "I do not support any of these filters." When SQE's
+    /// `IcebergScanExec` inherits that default, the optimizer abandons
+    /// the dynamic filter it tried to push down from a parent
+    /// `HashJoinExec`, and `handle_child_pushdown_result` is never
+    /// called. Path B-2 (runtime filter pushdown into the Iceberg
+    /// scan) silently no-ops as a result. This was the root cause of
+    /// SSB SF1 lineorder being scanned in full even when the dim
+    /// build side filter was 0 rows: the dynamic filter never reached
+    /// this scan to prune anything.
+    ///
+    /// Returning `FilterDescription::new()` (an empty descriptor,
+    /// matching the leaf-scan convention used by the vendored
+    /// `IcebergTableScan` in iceberg-rust) tells the optimizer "no
+    /// children to forward to; absorb the filters here." After that,
+    /// `handle_child_pushdown_result` runs and stores the dynamic
+    /// filters on `pushed_down_filters` for evaluation at scan time.
+    ///
+    /// See `docs/features/ssb-sf1-trace.md` for the investigation
+    /// trail and `docs/features/runtime-filter-pushdown.md` for the
+    /// broader Path B-2 design.
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        _parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> DFResult<FilterDescription> {
+        Ok(FilterDescription::new())
+    }
+
     fn handle_child_pushdown_result(
         &self,
         _phase: FilterPushdownPhase,
         child_pushdown_result: ChildPushdownResult,
         _config: &ConfigOptions,
     ) -> DFResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        // Trace at debug so the iceberg-datafusion bridge can be
+        // diagnosed via `RUST_LOG=sqe_catalog=debug` without affecting
+        // production logs. Counts both the total parent filters and
+        // the subset that are `DynamicFilterPhysicalExpr` (the only
+        // shape we accept for runtime filtering).
+        let dyn_count = child_pushdown_result
+            .parent_filters
+            .iter()
+            .filter(|pf| {
+                pf.filter
+                    .as_any()
+                    .downcast_ref::<DynamicFilterPhysicalExpr>()
+                    .is_some()
+            })
+            .count();
+        tracing::debug!(
+            table = %self.table.identifier(),
+            parent_filter_count = child_pushdown_result.parent_filters.len(),
+            dynamic_filter_count = dyn_count,
+            "IcebergScanExec::handle_child_pushdown_result"
+        );
         // As a leaf node, we selectively accept pushed-down filters:
         // - Dynamic filters (from hash join build side): ACCEPT — we store them
         //   and will evaluate them at scan time for file/row-group pruning.
