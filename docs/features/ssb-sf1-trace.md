@@ -78,6 +78,43 @@ Added temporary `eprintln!` traces to `convert_physical` and
 and ran the full SSB suite. **Zero invocations.** The dynamic predicate
 code path is never reached on any SSB SF1 query.
 
+### Debugging Path B-2 going forward
+
+`IcebergTableScan::gather_filters_for_pushdown` and
+`handle_child_pushdown_result` both emit `tracing::debug!` lines now,
+so the next investigator can see whether DataFusion offers filters to
+the scan and whether the scan absorbs them:
+
+```bash
+RUST_LOG="info,iceberg_datafusion=debug" \
+  BENCH_SCALE=1 ./scripts/benchmark-test.sh ssb
+```
+
+The relevant log fields:
+
+```
+target=iceberg_datafusion::physical_plan::scan
+  IcebergTableScan::gather_filters_for_pushdown
+    phase=Post  parent_filter_count=N
+
+  IcebergTableScan::handle_child_pushdown_result
+    phase=Post  absorbed_filter_count=N
+```
+
+If `parent_filter_count = 0` on every call, DataFusion never offered a
+runtime filter to this scan: an intermediate node in the plan blocked
+pushdown, or the cost-model rule decided this join was not worth a
+dynamic filter.
+
+If `parent_filter_count > 0` but `absorbed_filter_count = 0`, the
+scan rejected the filter (should not happen; scan accepts every
+filter today).
+
+If `absorbed_filter_count > 0` but the bench shows no scan reduction,
+the runtime filter is reaching the scan but the iceberg row-group
+pruning is not reducing the file list. Check
+`physical_to_predicate.rs::convert_physical` next.
+
 Tracking the cause: `IcebergScanExec.runtime_filters` ends up empty
 after DataFusion's filter-pushdown phase. That field is populated by
 `handle_child_pushdown_result`, which is called by the optimizer when
