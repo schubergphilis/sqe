@@ -289,10 +289,20 @@ impl ExecutionPlan for IcebergTableScan {
     /// the absorption happens in [`Self::handle_child_pushdown_result`].
     fn gather_filters_for_pushdown(
         &self,
-        _phase: FilterPushdownPhase,
-        _parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
         _config: &ConfigOptions,
     ) -> DFResult<FilterDescription> {
+        // Trace at `debug!` (not `info!`) so production logs stay clean
+        // by default. Set `RUST_LOG=iceberg_datafusion=debug` to see
+        // whether DataFusion is offering filters to this scan; useful
+        // for diagnosing why Path B-2 (runtime filter pushdown) is or
+        // is not engaging on a given query.
+        tracing::debug!(
+            phase = ?phase,
+            parent_filter_count = parent_filters.len(),
+            "IcebergTableScan::gather_filters_for_pushdown"
+        );
         Ok(FilterDescription::new())
     }
 
@@ -303,7 +313,7 @@ impl ExecutionPlan for IcebergTableScan {
     /// can drop the wrapping `FilterExec` and avoid double-evaluating.
     fn handle_child_pushdown_result(
         &self,
-        _phase: FilterPushdownPhase,
+        phase: FilterPushdownPhase,
         child_pushdown_result: ChildPushdownResult,
         _config: &ConfigOptions,
     ) -> DFResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
@@ -312,6 +322,19 @@ impl ExecutionPlan for IcebergTableScan {
             .iter()
             .map(|f| Arc::clone(&f.filter))
             .collect();
+
+        // Trace whether this scan absorbed runtime filters. When the
+        // count is non-zero the absorbed filters reach
+        // `RuntimeFiltersDynamicPredicate` in `execute()` and feed
+        // the iceberg-rust row-group pruning. When the count is zero
+        // and a join above had a dynamic filter, the framework chose
+        // not to push it down (intermediate node blocked, partition
+        // mode mismatch, etc.).
+        tracing::debug!(
+            phase = ?phase,
+            absorbed_filter_count = absorbed.len(),
+            "IcebergTableScan::handle_child_pushdown_result"
+        );
 
         if absorbed.is_empty() {
             return Ok(FilterPushdownPropagation::if_all(child_pushdown_result));
