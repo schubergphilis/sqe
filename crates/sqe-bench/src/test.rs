@@ -232,6 +232,19 @@ pub async fn run_benchmark_test(
                 let duration = start.elapsed();
                 let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
+                // BENCH_DEBUG=1 prints the batch contents for ad-hoc
+                // tracing (e.g. running EXPLAIN ANALYZE through the
+                // bench harness to capture the new phase rows).
+                if std::env::var("BENCH_DEBUG").is_ok() && rows < 200 {
+                    eprintln!("[bench] {} result ({} rows):", query.id, rows);
+                    for batch in &batches {
+                        match arrow::util::pretty::pretty_format_batches(&[batch.clone()]) {
+                            Ok(s) => eprintln!("{}", s),
+                            Err(e) => eprintln!("[bench] pretty-format error: {e}"),
+                        }
+                    }
+                }
+
                 let status = match load_expected(benchmark, scale, &query.id) {
                     Ok(Some(expected)) => match compare_results(&batches, &expected, 1e-4) {
                         Ok(CompareStatus::Pass) => TestStatus::Pass,
