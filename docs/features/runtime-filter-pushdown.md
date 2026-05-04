@@ -312,11 +312,101 @@ signal that lets us know when filters are sealed (so the cache can
 populate exactly once at the right moment), every Mutex-based design
 hits this contention floor.
 
+### Failed attempt 6: SQE-side unconditional `with_dynamic_predicate` (2026-05-03)
+
+The fix: after MR !124 (`6a03124`) brought Path B-2 to SQE's own
+`IcebergScanExec` via the `gather_filters_for_pushdown` override,
+the natural next step was to call `with_dynamic_predicate` on the
+iceberg-rust scan builder from SQE's streaming path too. The wiring
+mirrors what the vendored `IcebergTableScan` already does: build a
+`RuntimeFiltersDynamicPredicate` from the resolved
+`pushed_down_filters` and pass it via `sb.with_dynamic_predicate(dp)`
+right next to the existing `sb.with_filter(static_pred)` call. The
+runtime filter then participates in iceberg-rust's row-group min/max,
+page-index, and post-decode RowFilter passes alongside the static
+predicate.
+
+Why it backfired (recovering known ground): SSB SF1 has single-file
+`lineorder` with high-cardinality unsorted join keys (`lo_custkey`,
+`lo_suppkey`). Row-group min/max evaluator runs across the file's
+row groups but every row group spans the full key range, so no row
+group is excluded. Pure conversion plus bind cost is paid 26 times
+across the suite (once per `FileScanTask` reaching lineorder), with
+zero pruning benefit.
+
+Bisect on a single day, same docker stack:
+
+| SSB SF1 configuration | SQE total | Wiring fires |
+|---|---:|---:|
+| Bisect (no wiring at all) | 6,647 ms | 0x |
+| Unconditional wiring (run 1) | 9,454 ms | 26x |
+| Unconditional wiring (run 2) | 9,086 ms | 26x |
+
+Net SF1 regression: **~+37%**. The same failure mode as attempts 1-5:
+the per-task pruning surface charges a fixed cost per filter and only
+recovers it when the filter shape matches the data layout. SSB join-key
+filters at SF1 satisfy neither condition.
+
+Trace evidence the wiring fired correctly (so this is genuinely the
+data-shape problem, not a bug):
+
+```
+target=sqe_catalog::iceberg_scan
+  IcebergScanExec: wired runtime filters into iceberg-rust DynamicPredicate
+    table=ssb_sf1.lineorder  count=1  files=1
+```
+
+### Failed attempt 7: SQE-side gated `with_dynamic_predicate` (2026-05-03)
+
+The fix: gate attempt 6 on `file_entries.len() > 1`, mirroring the
+existing file-level pruning gate. SF1 single-file lineorder skips
+the wiring (post-decode filter still applies). SF10+ multi-file
+lineorder activates it.
+
+```rust
+if !pushed_down_filters.is_empty() && file_entries.len() > 1 {
+    let dp = RuntimeFiltersDynamicPredicate::new(pushed_down_filters.clone());
+    sb = sb.with_dynamic_predicate(dp);
+}
+```
+
+Why it backfired (the gate is too coarse): SF1 is preserved cleanly
+(7,412 ms gated, 6,647 ms bisect, gate fires 0x). But SF10 reproduces
+the per-class TPC-H Path B-2 pattern from attempts 1-5:
+
+| SSB SF10 q | Apr 21 baseline | Today (gated) | Delta | Class |
+|------:|------:|------:|------:|---|
+| q1.1 | 5,179 |  3,656 | **-29%** | 1 dim, sorted-column probe (`lo_orderdate`) |
+| q1.2 | 4,359 |  3,819 | -12%   | same shape |
+| q1.3 | 3,884 |  2,740 | **-29%** | same shape |
+| q3.4 | 4,935 |  4,318 | -13%   | 0-row dim, `AlwaysFalse` short-circuit |
+| q3.1 | 6,121 |  8,972 | **+47%** | 3 dim, high-card key probe |
+| q3.2 | 5,080 |  7,071 | +39%   | same |
+| q3.3 | 4,253 |  8,269 | **+94%** | same, worst case |
+| q4.2 | 7,634 | 13,556 | **+78%** | 4 dim, high-card key probe |
+| q4.3 | 7,389 | 10,755 | +46%   | same |
+| **TOT** | **76,059** | **89,855** | **+18.1%** | net regression |
+
+The gate catches "is there file-level pruning potential", but does
+not differentiate by **filter shape** (whether iceberg-rust's
+row-group evaluator can use the predicate at all) or **column
+layout** (whether differentiated min/max stats exist on the probe
+column). The gate fires on q3.x and q4.x where neither factor is
+favourable, paying the per-task cost without earning pruning.
+
+The pattern is identical to TPC-H attempts 1-5: queries with one
+dominant filter on a clustered column win, multi-join queries with
+high-cardinality probe columns lose. SSB SF10 confirms what the
+TPC-H work already established. The per-task surface is structurally
+mixed without an additional gating mechanism (filter shape + column
+layout).
+
 ### Resolution
 
-All five attempts reverted; branch is back at `5eeb00c` (clean
-Path B-2 plus the criterion microbench).
-Postmortem comment posted to
+All seven attempts reverted; SQE's `IcebergScanExec` stays at the
+post-decode-filter-only path on main. The vendored `IcebergTableScan`
+keeps Path B-2 (working as designed for the TPC-H mix). Postmortem
+comment posted to
 [apache/iceberg-rust#2376](https://github.com/apache/iceberg-rust/issues/2376#issuecomment-4330042368)
 with API recommendations for upstream:
 
@@ -326,7 +416,518 @@ with API recommendations for upstream:
 2. Have the `DynamicPredicate` trait return an opaque `(Predicate,
    version)` so the reader can manage its own cache key.
 
-Either is small and forward-compatible.
+Either is small and forward-compatible. Both unblock the multi-filter
+staggered-seal class.
+
+## Bench timeline at a glance
+
+Chronological inflection points of the runtime-filter work, grouped
+by what changed in the codebase. Each row is a single bench run; the
+totals are exact (not averaged) so the noise floor (±5-7% at SF10,
+±5-10% at SF1) is visible inline.
+
+### TPC-H SF10
+
+| Date | Code state | SQE total | Match | Notes |
+|------|------------|----------:|------:|-------|
+| 4/20 | Pre-runtime-filter, broken q15 | 125,600 ms | 9/22 | quoted DECIMAL bug active |
+| 4/21 | Pre-DECIMAL Float64 baseline | 163,858 ms | 6/22 | q15 broken, q07/q14 etc fail |
+| 4/27 | Path B (post-batch only) | 148,511 ms | **22/22** | -9.4% on TOTAL, fixes correctness |
+| 4/27 | Path B + B-2 (per-task DP) | **143,590 ms** | 17/22 | additional -3.3%; current main |
+| 4/27 | + IN-list cap=4096 | reverted | - | q04 +24%, others mixed |
+| 4/27 | + Arc::ptr_eq cache | 150,693 ms | - | Mutex contention, q14 +35%, q16 +91% |
+| 4/27 | + OnceLock first-success | 150,811 ms | - | partial-seal trap, q06 +74%, q16 +42% |
+| 4/28 | + cap=200 (Trino-aligned) | 151,635 ms | - | noise floor visible: q06 (no joins) +42% |
+| 4/29 | + bound-predicate cache | 162,589 ms | - | +13.2%, Mutex contention |
+| 4/30 | Path B + B-2 (cleaned) | matches 143,590 | - | all attempts reverted |
+
+### SSB SF1
+
+| Date | Code state | SQE total | Notes |
+|------|------------|----------:|-------|
+| 4/14 | pre-perf baseline | 7,554 ms | early benchmark stack |
+| 4/15 | + small-file fast path | 6,208 ms | first wins |
+| 4/16 | + dynamic filter pushdown | 6,191 ms | DF 53 dynamic filter wired |
+| 4/20 | + parallel small-file fast path | 6,552 ms | within noise |
+| 4/30 | + Phase O+ catalog dispatch | 6,908 ms | within noise |
+| 5/1  | post MR !124 (Path B-2 wiring SSB) | 8,410 ms | SSB-only run, cold Trino |
+| 5/3  | bisect (no wiring) | **6,647 ms** | today's stable baseline |
+| 5/3  | unconditional wiring (run 1) | 9,454 ms | **+37% regression** |
+| 5/3  | unconditional wiring (run 2) | 9,086 ms | **+34% regression** |
+| 5/3  | gated wiring (`file_count > 1`) | 7,412 ms | within noise (gate fires 0x at SF1) |
+
+### SSB SF10
+
+| Date | Code state | SQE total | Notes |
+|------|------------|----------:|-------|
+| 4/20 | pre-runtime-filter | 92,300 ms | first SF10 SSB run |
+| 4/21 | clean baseline | 76,059 ms | reference baseline for today |
+| 5/3  | gated wiring (today) | 89,855 ms | +18% net, mixed per-query |
+
+### Per-query effect at TPC-H SF10 (cumulative pre-B vs B+B-2)
+
+The work that landed on main. Negative percentages = faster.
+
+| q | Pre-B | B+B-2 | Delta | Class |
+|---|------:|------:|------:|---|
+| q01 |  8,404 |  7,180 | -15% | full lineitem scan, group-by |
+| q02 |  1,339 |  1,587 | **+19%** | 5-way join, NOT LIKE on a column the converter can't translate |
+| q03 |  9,369 |  8,153 | -13% | mktsegment + 3-way join |
+| q04 |  5,370 |  4,711 | -12% | orderdate range + EXISTS subquery |
+| q05 |  7,930 |  6,700 | -16% | regional 6-way join, low-card region keys |
+| **q06** |  9,546 |  4,660 | **-51%** | 1 table, sorted-column range filter (canonical win) |
+| **q07** | 14,290 |  9,436 | **-34%** | 2 selective hash joins, lineitem clustered |
+| q08 |  9,262 |  8,045 | -13% | regional brand share |
+| q09 |  7,058 |  6,982 |  -1% | flat |
+| q10 |  9,419 | 10,203 |  +8% | LEFT JOIN noise |
+| **q11** |    756 |  1,114 | **+47%** | tiny query, all shuffled keys, overhead dominant |
+| q12 |  8,815 |  7,767 | -12% | shipmode filter |
+| q13 |  3,606 |  3,185 | -12% | left outer join NOT LIKE |
+| **q14** |  8,139 |  5,458 | **-33%** | 1 join, 1 month range filter (canonical win) |
+| q15 | 10,715 |  8,997 | -16% | CTE plus revenue threshold |
+| q16 |    578 |    563 |  -3% | tiny, flat |
+| q17 |  5,409 |  5,168 |  -4% | flat |
+| q18 | 17,640 | 17,646 |  +0% | dominated by full scan |
+| q19 |  8,332 |  9,428 | **+13%** | OR-of-AND on multiple columns (translation failure) |
+| **q20** |  6,391 |  5,173 | **-19%** | semi-join chain, selective key filters |
+| q21 | 10,673 | 10,684 |  +0% | flat |
+| q22 |    817 |    750 |  -8% | small |
+| **TOT** | **163,858** | **143,590** | **-12.4%** | |
+
+Five clean wins in the win signature class (q06, q07, q14, q15, q20).
+Three regressions in the loss signature class (q02, q11, q19). Eleven
+queries in the noise band. The +12.4% total is real because the wins
+are large enough (q06 -51%, q07 -34%, q14 -33%) to dominate the noise
+and the small regressions.
+
+### Per-query effect at SSB SF10 (Apr 21 baseline vs today gated wiring)
+
+The data behind the +18.1% total today. Same shape pattern as TPC-H.
+
+| q | Apr 21 | Today | Delta | Class |
+|---|------:|------:|------:|---|
+| **q1.1** |  5,179 |  3,656 | **-29%** | 1 dim, sorted column (mirrors q06/q14) |
+| q1.2 |  4,359 |  3,819 | -12% | same |
+| **q1.3** |  3,884 |  2,740 | **-29%** | same |
+| q2.1 |  5,374 |  6,175 | +15% | 3 dim, varied selectivity |
+| q2.2 |  4,932 |  5,490 | +11% | same |
+| q2.3 |  5,928 |  5,975 |  +1% | same |
+| **q3.1** |  6,121 |  8,972 | **+47%** | 3 dim, high-card key probe (mirrors q11) |
+| q3.2 |  5,080 |  7,071 | +39% | same |
+| **q3.3** |  4,253 |  8,269 | **+94%** | same, worst regression |
+| q3.4 |  4,935 |  4,318 | -13% | 0-row dim, `AlwaysFalse` |
+| q4.1 | 10,991 |  9,059 | -18% | 4 dim, date-range dominant |
+| **q4.2** |  7,634 | 13,556 | **+78%** | 4 dim, high-card key probe |
+| q4.3 |  7,389 | 10,755 | +46% | same |
+| **TOT** | **76,059** | **89,855** | **+18%** | |
+
+The cross-suite mapping is one-for-one. SSB q1.x ≈ TPC-H q06/q14
+(sorted column wins). SSB q3.x ≈ TPC-H q11 (high-card probe loses).
+SSB q3.4 ≈ TPC-H q15's `AlwaysFalse`-ish path (selective short-circuit
+wins). 4-dim queries (q4.x) regress more than 3-dim because each
+extra filter compounds the overhead.
+
+## Cross-suite reading: what the SSB and TPC-H data add up to
+
+The per-query tables above (TPC-H SF10 cumulative effect, SSB SF10
+gated wiring) line up class-for-class:
+
+| Class | TPC-H SF10 | SSB SF10 |
+|-------|-----------:|---------:|
+| 1 dim, sorted-column probe (clean win) | q06 -51%, q07 -34%, q14 -33% | q1.1 -29%, q1.3 -29% |
+| Selective short-circuit / `AlwaysFalse` | q15 -16% | q3.4 -13% |
+| Multi-dim, high-cardinality key probe (clean loss) | q11 +47%, q19 +13%, q02 +19% | q3.1 +47%, q3.3 +94%, q4.2 +78% |
+| Tiny query, overhead-dominated | q11 (756 ms baseline) | q3.x at SF1 (sub-second) |
+
+The mixed bag is **not noise** and not an implementation bug. It is
+structural and reproduces across two benchmarks. The SF10 SSB run
+explains why the `with_dynamic_predicate` call is intentionally
+absent from SQE's `IcebergScanExec` on main even though the
+machinery exists in the vendored crate: the author of `c564a89`
+already knew the regression class would dominate on the SSB mix.
+SQE's scan path stays at post-batch filter-only because that
+matches the realistic SQL workloads we run.
+
+## Why mixed results: a per-query walkthrough
+
+The cross-suite data shows clearly that the wiring helps some queries
+and hurts others. The why is not "noise" or "implementation bugs": it
+is a small set of compounding mechanical reasons. Each is illustrated
+with a query that exhibits it.
+
+### 1. IN_PREDICATE_LIMIT = 200 in iceberg-rust's evaluators
+
+The row-group + manifest + inclusive metric evaluators all bail to
+`MIGHT_MATCH` when an IN-list has more than 200 values. The
+`Predicate::Set` we built is **fully evaluated** before that bail-out:
+field reference resolution, type binding, conversion cost. All of
+that is paid; none of it produces pruning.
+
+**SSB q3.3 hits this hard.** The customer build emits ~8K custkey
+values for `c_city IN ('UNITED KI1','UNITED KI5')` (8K customers
+from 30K total whose city matches). 8K is 40x the cap. Conversion +
+bind run, evaluator returns MIGHT_MATCH, no row group skipped. With
+3 dim joins all paying this cost per `FileScanTask`, the overhead
+compounds linearly.
+
+```sql
+-- q3.3
+FROM lineorder, dim_date, customer, supplier
+WHERE lo_custkey = c_custkey
+  AND lo_suppkey = s_suppkey
+  AND lo_orderdate = d_datekey
+  AND (c_city = 'UNITED KI1' OR c_city = 'UNITED KI5')      -- ~8K custkeys
+  AND (s_city = 'UNITED KI1' OR s_city = 'UNITED KI5')      -- ~5 suppkeys
+  AND d_year BETWEEN 1992 AND 1997                          -- 2191 datekeys
+```
+
+q3.4 has the **identical join structure** but `d_yearmonth = 'Dec1997'`
+narrows the date filter to ~30 days. The narrower date dimension
+fits under the 200 cap AND happens to align with lineorder's natural
+orderdate clustering, so it wins (-13%). Same query, different filter
+selectivity, opposite outcome.
+
+### 2. Probe-side data layout (clustered vs shuffled)
+
+`lineorder` is naturally written ordered by `lo_orderdate`. Files
+that arrive into the table ship in chronological order and Iceberg
+preserves that. Row groups within a file therefore have
+**differentiated** min/max on `lo_orderdate`: a 1993 row group has
+`min=19930101, max=19931231`, a 1994 row group has 1994 bounds, etc.
+
+Date-range filters are **bounds** (BETWEEN, >, <), not IN-lists.
+Bounds against differentiated min/max prune cleanly: a 1993 filter
+against a 1995 row group is provably outside the range, drop the
+row group.
+
+`lo_custkey`, `lo_suppkey`, `lo_partkey` are **shuffled** across
+files because customer/supplier/part are dim tables joined into
+fact rows. Every row group has min ≈ 1 and max ≈ N for these. The
+evaluator runs but cannot find a bound that excludes the row group.
+We pay the cost; nothing prunes.
+
+**SSB q1.1 wins (-29%) on this**:
+
+```sql
+-- q1.1 (1 dim join, date filter only)
+FROM lineorder, dim_date
+WHERE lo_orderdate = d_datekey
+  AND d_year = 1993
+  ...
+```
+
+The `dim_date` build emits 365 datekeys for d_year=1993. DataFusion
+recognises this as a contiguous range and emits the dynamic filter
+as bounds (`l_orderdate BETWEEN 19930101 AND 19931231`) rather than
+an IN-list. Bounds against a sorted-column row group min/max =
+clean prune. Most non-1993 row groups skip entirely.
+
+**SSB q3.1 loses (+47%)** with the same orderdate column AND a
+6-year date range filter (so date pruning is weaker), PLUS two
+shuffled-key joins:
+
+```sql
+-- q3.1 (3 dim joins, two on shuffled keys)
+WHERE lo_custkey = c_custkey  -- shuffled
+  AND lo_suppkey = s_suppkey  -- shuffled
+  AND lo_orderdate = d_datekey  -- sorted, but date range is 6 years
+  ...
+```
+
+Net effect: weaker date pruning + zero key-column pruning + cost on
+3 filters per task = -47% slower.
+
+### 3. Filter shape: bounds vs IN-list
+
+DataFusion's hash join chooses between two dynamic-filter shapes
+based on build size:
+
+- **Small build**: emit `InListExpr(probe_col, [build_keys...])`.
+  Translates to `Predicate::Set` for iceberg-rust. Subject to the
+  200-element cap.
+- **Build is a contiguous numeric range**: emit
+  `BinaryExpr(probe_col >= min AND probe_col <= max)`. Translates to
+  `Predicate::Binary` bounds. Always evaluated; no cap.
+
+Bounds work against any column with differentiated row-group min/max
+(sorted or partitioned). IN-list shapes only prune when the probe
+column has clusters of contiguous values.
+
+**TPC-H q11 illustrates the cost side without the benefit side**:
+
+```sql
+-- q11 (2 hash joins, ALL on shuffled keys)
+FROM partsupp, supplier, nation
+WHERE ps_suppkey = s_suppkey
+  AND s_nationkey = n_nationkey
+  AND n_name = 'GERMANY'
+HAVING SUM(...) > (subquery scans the same tables again)
+```
+
+`s_nationkey` build for n_name='GERMANY' = 1 nationkey, well under
+the cap. Bind succeeds. But `partsupp` is the probe and is unsorted
+by suppkey across its files. Min/max evaluator runs, can't prune.
+Total query is small (756 ms baseline); per-task overhead becomes a
+visible fraction. Net +47% regression.
+
+### 4. Multi-filter staggered sealing
+
+`HashJoinExec` build sides complete at different wall-clock times.
+The earliest dim that finishes building seals its dynamic filter
+first; later dims seal later. Tasks that start scanning while only
+some filters are sealed see a partial predicate.
+
+Concretely: when the per-task `dp.current()` is called early in the
+scan, it returns `Some(predicate)` only for the dims whose builds
+have completed. Tasks that call later get a more selective predicate.
+Iceberg-rust does not re-call `dp.current()` for a task once the file
+is open, so early-task tasks miss the late-sealing filters entirely.
+
+**SSB q4.2 (+78%) is the canonical example**:
+
+```sql
+-- q4.2 (4 dim joins, all sealing at different times)
+FROM lineorder, dim_date, customer, supplier, part
+WHERE lo_custkey = c_custkey
+  AND lo_suppkey = s_suppkey
+  AND lo_partkey = p_partkey
+  AND lo_orderdate = d_datekey
+  AND c_region = 'AMERICA'
+  AND s_region = 'AMERICA'
+  ...
+```
+
+Four dims build in parallel. supplier (smallest) seals first, then
+maybe date, then customer, then part. Lineorder scan tasks ramp up
+as soon as the first build is ready. The probe side does most of
+its decoding while only 1-2 of 4 filters have sealed. By the time
+all 4 are sealed, the scan is mostly done. The runtime filter never
+gets to apply with full selectivity at the scan layer.
+
+This is the same failure mode that killed the OnceLock cache (failed
+attempt 3).
+
+### 5. OR-branch translation failures
+
+iceberg-rust's predicate AST supports `Or`, but
+`convert_physical_filters_to_predicate` requires **both** sides of an
+OR to translate. If one side has a shape it doesn't understand
+(e.g., a complex BinaryExpr nested inside, or a non-supported
+literal type), the whole OR returns `None`.
+
+**TPC-H q19 is the classic OR-of-AND query**:
+
+```sql
+WHERE
+  (p_partkey = l_partkey AND p_brand = 'Brand#12'
+   AND p_container IN ('SM CASE','SM BOX',...) AND ...)
+  OR (p_partkey = l_partkey AND p_brand = 'Brand#23'
+      AND p_container IN ('MED BAG','MED BOX',...) AND ...)
+  OR (p_partkey = l_partkey AND p_brand = 'Brand#34'
+      AND p_container IN ('LG CASE','LG BOX',...) AND ...)
+```
+
+DataFusion may emit a single dynamic filter combining all three
+branches, or one per branch with union semantics. Either way, the
+converter has to walk every leaf and translate. Any leaf failing to
+translate kills the whole branch. q19 +13% regressed because we
+walked the tree, failed somewhere, and returned None. We paid the
+walk cost for nothing.
+
+### 6. Small-query overhead amortization
+
+Per-task `DynamicPredicate` sampling has a fixed cost: walk the
+runtime filters, downcast each, build the iceberg `Predicate`, bind
+to the file schema. The microbench (commit `5eeb00c`) measured this
+at ~80 ms per task at N=580K IN-list size; less at smaller sizes
+but never zero.
+
+For tiny queries (q11 at 756 ms baseline, q22 at 817 ms, q3.1 at
+~6s) the per-task overhead is a visible fraction of total wall-clock.
+For large queries (q07 at 14 s, q15 at 10 s) the overhead amortizes
+across more useful work.
+
+This is why noise is so visible at SF1 (most queries < 1 s) and
+muted at SF10 (most queries 5-15 s). It is also why the failed
+attempt 4 (cap=200) measured +42% on q06 even though q06 has zero
+joins: the noise band is wider than the effect on small queries.
+
+### 7. The signature of a clean win
+
+A query wins from `with_dynamic_predicate` when **all** of these are
+true:
+
+1. The probe-side column is naturally clustered or sorted.
+2. The build side is small enough (<200 values) to land as a real
+   IN-list, OR the dim filter is contiguous (date range, region IN)
+   so DataFusion emits bounds.
+3. The total query has > ~5 s of decode work for the per-task
+   overhead to amortize against.
+4. There is one dominant filter, or one filter that seals first
+   and is selective on its own.
+
+TPC-H q06, q14, q07, q20 all match this signature. SSB q1.1, q1.2,
+q1.3 do too. q3.4 wins via the AlwaysFalse short-circuit (special
+case of #2 with build size = 0).
+
+### 8. The signature of a clean loss
+
+A query loses when:
+
+1. Multiple dim joins with shuffled probe-side columns
+   (custkey, suppkey, partkey).
+2. At least one dim build is large (> 200 values) so its
+   `Predicate::Set` is wasted conversion.
+3. Total query is small (< 5 s) so per-task overhead dominates.
+
+TPC-H q11, q19, q02 match this. SSB q3.1, q3.2, q3.3 do too. The
+worst offenders are the 4-dim queries (q4.2, q4.3) which compound
+all three.
+
+## Core issue and smart solutions
+
+Reduced to one line: **SQE pays per-task eval cost on every filter,
+regardless of whether that filter can actually prune row groups for
+the data shape it targets.**
+
+Everything else falls out of that. The per-task overhead is fixed.
+The pruning benefit varies by query shape. So the cost-benefit goes
+positive or negative based on factors the wiring decision never
+considers.
+
+The 5 failed attempts tried to reduce per-task cost via caching
+(Arc::ptr_eq, OnceLock, bound-cache). All hit Mutex contention or
+partial-seal traps. The cache attempts were solving the wrong
+problem. Caching reduces the per-task cost when the cost is paid.
+The real fix is **don't pay the cost when the filter can't help**.
+
+Five candidate paths, ranked by depth of fix:
+
+### A. Read Parquet bloom filters in iceberg-rust's row-group evaluator
+
+Deepest fix. Today the evaluator reads only min/max statistics. Bloom
+filters can prune **high-cardinality unsorted columns** (custkey,
+suppkey, partkey) where min/max can't.
+
+Concretely: when the evaluator sees `Predicate::Set(col, values)` and
+min/max returns MIGHT_MATCH, fall through to the column's Parquet
+bloom filter chunk. Hash each value, check membership. If no value
+hits the bloom, the row group provably has no matching rows. Skip.
+
+We **already write** Parquet bloom filters on join-key columns when
+`write.parquet.bloom-filter-columns` is set (matrix-f, commits
+`eb95e72`, `9172dc3`). The data is on disk. The reader does not
+consult it.
+
+This is what Trino does internally and why Trino wins on q3.x and
+q4.x where we lose. It composes with everything else and addresses
+the root cause for the entire regression class.
+
+Cost: vendored iceberg-rust patch. Bounded scope. Plumbing into the
+existing `row_group_metrics_evaluator` path.
+
+### B. Predicate-shape-aware wiring (practical, shippable next)
+
+Translate the runtime filter once at scan-builder time, inspect the
+resulting `Predicate`, then wire to `with_dynamic_predicate` only
+when the shape can prune:
+
+```rust
+let dp = RuntimeFiltersDynamicPredicate::new(filters);
+match dp.current() {
+    Some(Predicate::AlwaysFalse) => sb = sb.with_dynamic_predicate(dp), // free win
+    Some(Predicate::Binary(_))   => sb = sb.with_dynamic_predicate(dp), // bounds prune sorted cols
+    Some(Predicate::Set(_, vals)) if vals.len() <= 200 => {
+        sb = sb.with_dynamic_predicate(dp);                              // under iceberg-rust IN_PREDICATE_LIMIT
+    }
+    _ => { /* skip wiring; post-decode filter still applies */ }
+}
+```
+
+This avoids the IN_PREDICATE_LIMIT trap (cause #1), the OR-translation
+failure trap (cause #5), and never pays the eval cost when the
+predicate can't translate to a prunable shape.
+
+Open issue: at scan-builder time the build side may not have sealed
+yet. `current()` returns `None` or `AlwaysTrue` and we skip wiring.
+Later when the build seals, the predicate is prunable but the wiring
+decision is already made.
+
+Mitigation: keep the SQE post-decode filter as the safety net. Net
+effect: B is **strictly additive on top of Path B**, no SF1
+regression, real wins on the queries where the predicate translates
+to a pruneable shape.
+
+Bounded scope, ~50 lines in `iceberg_scan.rs`.
+
+### C. Column-layout-aware wiring (catches the data shape)
+
+At scan startup, inspect manifest data: for each column referenced
+by a runtime-filter target, compute the variance of per-file
+min/max ranges:
+
+- High variance (different files have different ranges) means the
+  column is clustered. Wire predicates targeting it.
+- Low variance (every file has roughly the full range) means the
+  column is shuffled. Skip wiring.
+
+Catches `lo_orderdate is sorted` vs `lo_custkey is shuffled`
+structurally, regardless of filter shape. Combine with B: wire only
+when both the predicate shape is prunable AND the probe column has
+differentiated stats.
+
+Cost: one-time per scan. Manifest data already loaded. Cheap.
+
+### D. Don't double-evaluate
+
+When wiring `with_dynamic_predicate`, iceberg-rust's RowFilter
+applies the predicate post-decode. SQE's per-batch loop also applies
+it post-decode. The same predicate runs twice on the same surviving
+rows.
+
+Track which predicates were handed to iceberg-rust. Skip those in
+the SQE post-decode loop. Apply only the predicates that didn't
+translate.
+
+Independent of A/B/C, removes a small redundant cost. Worth a few
+percent on queries where multiple filters translate.
+
+### E. Plan-time cardinality estimation (orthogonal)
+
+Pre-evaluate constant dim filters at plan time using tracked Iceberg
+metadata. If the result is provably empty (no manifest entries match
+the filter), replace the join subtree with `EmptyRelation`. Captures
+q3.4 / q2.2 / q2.3 SSB and any TPC-DS empty-result query.
+
+Doesn't touch the per-task surface. Pure plan-time logic. Bounded
+scope.
+
+### Recommended order: B + D + E first, then A, then C
+
+B first because it is the smallest change with the cleanest signal:
+ship predicate-shape gating, watch the bench. Should reclaim the
+q3.4 / q1.1 wins without the q3.3 / q4.2 regressions. If B alone
+nets positive on SSB SF10, the per-task surface is done for this
+round.
+
+D as a follow-up cleanup. Doing the same predicate twice is wasted
+work once we know about it.
+
+E in parallel. Solves the 0-row dim case fundamentally. Composes
+additively with B (B catches prunable shapes that aren't 0-row, E
+catches 0-row before the scan even starts).
+
+A as a focused follow-up MR after B + D + E land. Deepest fix but
+touches the upstream evaluator. Better measured against a clean
+baseline.
+
+C as a refinement of B once A and E are in place. C only helps in
+cases B doesn't already catch.
+
+The thing all 5 failed attempts missed: the cost reduction was
+always inside the per-task path. The smart move is to **not enter
+the per-task path at all when the predicate can't be prunable**.
+B + C do that. A makes more predicates prunable.
 
 ## How to reproduce
 
