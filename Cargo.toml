@@ -23,11 +23,11 @@ exclude = ["vendor/iceberg-rust"]
 [workspace.dependencies]
 # Query engine — DataFusion 53 with hash join dynamic filters, LIMIT-aware pruning,
 # 40x faster planning, nested field pushdown, and 42 function improvements.
-datafusion = "53"
-datafusion-common = "53"
-datafusion-expr = "53"
-datafusion-sql = "53"
-datafusion-proto = "53"
+datafusion = "53.1"
+datafusion-common = "53.1"
+datafusion-expr = "53.1"
+datafusion-sql = "53.1"
+datafusion-proto = "53.1"
 
 # Arrow 58 / Parquet 58 — aligned with DataFusion 53
 arrow = { version = "58", features = ["prettyprint", "ipc_compression"] }
