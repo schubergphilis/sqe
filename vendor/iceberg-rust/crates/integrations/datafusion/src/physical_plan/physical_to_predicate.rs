@@ -43,8 +43,45 @@ use datafusion::physical_expr::expressions::{
 };
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::scalar::ScalarValue;
-use iceberg::expr::{Predicate, Reference};
+use iceberg::expr::{DynamicPredicate, Predicate, Reference};
 use iceberg::spec::Datum;
+
+/// Bridge that exposes a set of DataFusion runtime [`PhysicalExpr`]s
+/// (typically `DynamicFilterPhysicalExpr` from a `HashJoinExec` build
+/// side) to iceberg-rust's per-task scan pruning via the
+/// [`DynamicPredicate`] trait.
+///
+/// On each call to [`DynamicPredicate::current`], the bridge attempts
+/// to translate the most-recent state of the runtime filters into an
+/// iceberg [`Predicate`]. When the filters are still at their initial
+/// "always-true" placeholder (the build side has not yet completed),
+/// or when their physical shape is not representable in iceberg's
+/// expression vocabulary, `current()` returns `None` and the reader
+/// falls back to the static predicate alone. Per-task sampling is
+/// purely additive: it never regresses correctness or performance
+/// compared to having no dynamic predicate at all.
+///
+/// Reused across both the vendored `IcebergTableScan` and SQE's own
+/// `IcebergScanExec` so the runtime-filter wiring stays in one place.
+#[derive(Debug)]
+pub struct RuntimeFiltersDynamicPredicate {
+    filters: Vec<Arc<dyn PhysicalExpr>>,
+}
+
+impl RuntimeFiltersDynamicPredicate {
+    /// Wrap a set of runtime filters in an [`Arc`]'d
+    /// [`DynamicPredicate`] suitable for
+    /// `TableScanBuilder::with_dynamic_predicate`.
+    pub fn new(filters: Vec<Arc<dyn PhysicalExpr>>) -> Arc<Self> {
+        Arc::new(Self { filters })
+    }
+}
+
+impl DynamicPredicate for RuntimeFiltersDynamicPredicate {
+    fn current(&self) -> Option<Predicate> {
+        convert_physical_filters_to_predicate(&self.filters)
+    }
+}
 
 /// Convert a slice of runtime [`PhysicalExpr`]s into a single iceberg
 /// [`Predicate`] (ANDed together). Returns `None` if no expression in
