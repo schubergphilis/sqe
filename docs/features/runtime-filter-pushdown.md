@@ -312,11 +312,101 @@ signal that lets us know when filters are sealed (so the cache can
 populate exactly once at the right moment), every Mutex-based design
 hits this contention floor.
 
+### Failed attempt 6: SQE-side unconditional `with_dynamic_predicate` (2026-05-03)
+
+The fix: after MR !124 (`6a03124`) brought Path B-2 to SQE's own
+`IcebergScanExec` via the `gather_filters_for_pushdown` override,
+the natural next step was to call `with_dynamic_predicate` on the
+iceberg-rust scan builder from SQE's streaming path too. The wiring
+mirrors what the vendored `IcebergTableScan` already does: build a
+`RuntimeFiltersDynamicPredicate` from the resolved
+`pushed_down_filters` and pass it via `sb.with_dynamic_predicate(dp)`
+right next to the existing `sb.with_filter(static_pred)` call. The
+runtime filter then participates in iceberg-rust's row-group min/max,
+page-index, and post-decode RowFilter passes alongside the static
+predicate.
+
+Why it backfired (recovering known ground): SSB SF1 has single-file
+`lineorder` with high-cardinality unsorted join keys (`lo_custkey`,
+`lo_suppkey`). Row-group min/max evaluator runs across the file's
+row groups but every row group spans the full key range, so no row
+group is excluded. Pure conversion plus bind cost is paid 26 times
+across the suite (once per `FileScanTask` reaching lineorder), with
+zero pruning benefit.
+
+Bisect on a single day, same docker stack:
+
+| SSB SF1 configuration | SQE total | Wiring fires |
+|---|---:|---:|
+| Bisect (no wiring at all) | 6,647 ms | 0x |
+| Unconditional wiring (run 1) | 9,454 ms | 26x |
+| Unconditional wiring (run 2) | 9,086 ms | 26x |
+
+Net SF1 regression: **~+37%**. The same failure mode as attempts 1-5:
+the per-task pruning surface charges a fixed cost per filter and only
+recovers it when the filter shape matches the data layout. SSB join-key
+filters at SF1 satisfy neither condition.
+
+Trace evidence the wiring fired correctly (so this is genuinely the
+data-shape problem, not a bug):
+
+```
+target=sqe_catalog::iceberg_scan
+  IcebergScanExec: wired runtime filters into iceberg-rust DynamicPredicate
+    table=ssb_sf1.lineorder  count=1  files=1
+```
+
+### Failed attempt 7: SQE-side gated `with_dynamic_predicate` (2026-05-03)
+
+The fix: gate attempt 6 on `file_entries.len() > 1`, mirroring the
+existing file-level pruning gate. SF1 single-file lineorder skips
+the wiring (post-decode filter still applies). SF10+ multi-file
+lineorder activates it.
+
+```rust
+if !pushed_down_filters.is_empty() && file_entries.len() > 1 {
+    let dp = RuntimeFiltersDynamicPredicate::new(pushed_down_filters.clone());
+    sb = sb.with_dynamic_predicate(dp);
+}
+```
+
+Why it backfired (the gate is too coarse): SF1 is preserved cleanly
+(7,412 ms gated, 6,647 ms bisect, gate fires 0x). But SF10 reproduces
+the per-class TPC-H Path B-2 pattern from attempts 1-5:
+
+| SSB SF10 q | Apr 21 baseline | Today (gated) | Delta | Class |
+|------:|------:|------:|------:|---|
+| q1.1 | 5,179 |  3,656 | **-29%** | 1 dim, sorted-column probe (`lo_orderdate`) |
+| q1.2 | 4,359 |  3,819 | -12%   | same shape |
+| q1.3 | 3,884 |  2,740 | **-29%** | same shape |
+| q3.4 | 4,935 |  4,318 | -13%   | 0-row dim, `AlwaysFalse` short-circuit |
+| q3.1 | 6,121 |  8,972 | **+47%** | 3 dim, high-card key probe |
+| q3.2 | 5,080 |  7,071 | +39%   | same |
+| q3.3 | 4,253 |  8,269 | **+94%** | same, worst case |
+| q4.2 | 7,634 | 13,556 | **+78%** | 4 dim, high-card key probe |
+| q4.3 | 7,389 | 10,755 | +46%   | same |
+| **TOT** | **76,059** | **89,855** | **+18.1%** | net regression |
+
+The gate catches "is there file-level pruning potential", but does
+not differentiate by **filter shape** (whether iceberg-rust's
+row-group evaluator can use the predicate at all) or **column
+layout** (whether differentiated min/max stats exist on the probe
+column). The gate fires on q3.x and q4.x where neither factor is
+favourable, paying the per-task cost without earning pruning.
+
+The pattern is identical to TPC-H attempts 1-5: queries with one
+dominant filter on a clustered column win, multi-join queries with
+high-cardinality probe columns lose. SSB SF10 confirms what the
+TPC-H work already established. The per-task surface is structurally
+mixed without an additional gating mechanism (filter shape + column
+layout).
+
 ### Resolution
 
-All five attempts reverted; branch is back at `5eeb00c` (clean
-Path B-2 plus the criterion microbench).
-Postmortem comment posted to
+All seven attempts reverted; SQE's `IcebergScanExec` stays at the
+post-decode-filter-only path on main. The vendored `IcebergTableScan`
+keeps Path B-2 (working as designed for the TPC-H mix). Postmortem
+comment posted to
 [apache/iceberg-rust#2376](https://github.com/apache/iceberg-rust/issues/2376#issuecomment-4330042368)
 with API recommendations for upstream:
 
@@ -326,59 +416,136 @@ with API recommendations for upstream:
 2. Have the `DynamicPredicate` trait return an opaque `(Predicate,
    version)` so the reader can manage its own cache key.
 
-Either is small and forward-compatible.
+Either is small and forward-compatible. Both unblock the multi-filter
+staggered-seal class.
 
-## Cross-suite confirmation: SSB SF1 + SF10 (2026-05-03)
+## Bench timeline at a glance
 
-After MR !124 wired SQE's own `IcebergScanExec` into Path B-2 via the
-`gather_filters_for_pushdown` override, a follow-up branch tried to
-extend the wiring further: also call `with_dynamic_predicate` on the
-iceberg-rust scan builder so the runtime filter participates in
-row-group min/max + page-index + RowFilter pruning, the same way the
-vendored `IcebergTableScan` already does.
+Chronological inflection points of the runtime-filter work, grouped
+by what changed in the codebase. Each row is a single bench run; the
+totals are exact (not averaged) so the noise floor (±5-7% at SF10,
+±5-10% at SF1) is visible inline.
 
-The branch was bisected against the same docker stack on a single day
-to control for environmental drift:
+### TPC-H SF10
 
-| SSB SF1 configuration | SQE total | Wiring fires |
-|---|---:|---:|
-| Bisect (no wiring at all) | 6,647 ms | 0x |
-| Unconditional wiring (run 1) | 9,454 ms | 26x |
-| Unconditional wiring (run 2) | 9,086 ms | 26x |
-| Gated wiring (`file_count > 1`) | 7,412 ms | 0x |
+| Date | Code state | SQE total | Match | Notes |
+|------|------------|----------:|------:|-------|
+| 4/20 | Pre-runtime-filter, broken q15 | 125,600 ms | 9/22 | quoted DECIMAL bug active |
+| 4/21 | Pre-DECIMAL Float64 baseline | 163,858 ms | 6/22 | q15 broken, q07/q14 etc fail |
+| 4/27 | Path B (post-batch only) | 148,511 ms | **22/22** | -9.4% on TOTAL, fixes correctness |
+| 4/27 | Path B + B-2 (per-task DP) | **143,590 ms** | 17/22 | additional -3.3%; current main |
+| 4/27 | + IN-list cap=4096 | reverted | - | q04 +24%, others mixed |
+| 4/27 | + Arc::ptr_eq cache | 150,693 ms | - | Mutex contention, q14 +35%, q16 +91% |
+| 4/27 | + OnceLock first-success | 150,811 ms | - | partial-seal trap, q06 +74%, q16 +42% |
+| 4/28 | + cap=200 (Trino-aligned) | 151,635 ms | - | noise floor visible: q06 (no joins) +42% |
+| 4/29 | + bound-predicate cache | 162,589 ms | - | +13.2%, Mutex contention |
+| 4/30 | Path B + B-2 (cleaned) | matches 143,590 | - | all attempts reverted |
 
-The unconditional wiring **regressed SF1 by ~35%**. The gate (skip
-when single file) restored baseline behavior at SF1 and let the
-wiring engage at SF10 where lineorder spans 4 files. SF10 result vs
-the April 21 baseline:
+### SSB SF1
 
-| Query | Apr 21 | Today (gated) | Delta | Class |
-|------:|------:|------:|------:|---|
-| q1.1 | 5179 |  3656 | **-29%** | 1 dim, sorted column probe |
-| q1.2 | 4359 |  3819 | -12%   | 1 dim, sorted column probe |
-| q1.3 | 3884 |  2740 | **-29%** | 1 dim, sorted column probe |
-| q2.1 | 5374 |  6175 | +15%   | 3 dim, varied selectivity |
-| q2.2 | 4932 |  5490 | +11%   | 3 dim, varied selectivity |
-| q2.3 | 5928 |  5975 | +1%    | 3 dim, varied selectivity |
-| q3.1 | 6121 |  8972 | **+47%** | 3 dim, high-card key probe |
-| q3.2 | 5080 |  7071 | +39%   | 3 dim, high-card key probe |
-| q3.3 | 4253 |  8269 | **+94%** | 3 dim, high-card key probe |
-| q3.4 | 4935 |  4318 | -13%   | 3 dim, 0-row dim becomes AlwaysFalse |
-| q4.1 | 10991 | 9059 | -18%   | 4 dim, date-range dominant |
-| q4.2 | 7634 | 13556 | **+78%** | 4 dim, high-card key probe |
-| q4.3 | 7389 | 10755 | +46%   | 4 dim, high-card key probe |
-| **TOT** | **76,059** | **89,855** | **+18.1%** | net regression |
+| Date | Code state | SQE total | Notes |
+|------|------------|----------:|-------|
+| 4/14 | pre-perf baseline | 7,554 ms | early benchmark stack |
+| 4/15 | + small-file fast path | 6,208 ms | first wins |
+| 4/16 | + dynamic filter pushdown | 6,191 ms | DF 53 dynamic filter wired |
+| 4/20 | + parallel small-file fast path | 6,552 ms | within noise |
+| 4/30 | + Phase O+ catalog dispatch | 6,908 ms | within noise |
+| 5/1  | post MR !124 (Path B-2 wiring SSB) | 8,410 ms | SSB-only run, cold Trino |
+| 5/3  | bisect (no wiring) | **6,647 ms** | today's stable baseline |
+| 5/3  | unconditional wiring (run 1) | 9,454 ms | **+37% regression** |
+| 5/3  | unconditional wiring (run 2) | 9,086 ms | **+34% regression** |
+| 5/3  | gated wiring (`file_count > 1`) | 7,412 ms | within noise (gate fires 0x at SF1) |
 
-The classes match the TPC-H Path B / B-2 outcomes one-for-one:
-sorted-column probes win, multi-dim high-cardinality probes lose,
-empty dim builds short-circuit. The mixed bag is **not noise**; it
-is structural and reproduces across two benchmarks.
+### SSB SF10
 
-The SF10 result also explains why the `with_dynamic_predicate` call
-is intentionally absent from SQE's `IcebergScanExec` even though the
-machinery exists in the vendored crate. The author of `c564a89`
-already knew the regression class would dominate on the SSB-shaped
-mix; SQE's scan path stays at post-batch filter-only because that
+| Date | Code state | SQE total | Notes |
+|------|------------|----------:|-------|
+| 4/20 | pre-runtime-filter | 92,300 ms | first SF10 SSB run |
+| 4/21 | clean baseline | 76,059 ms | reference baseline for today |
+| 5/3  | gated wiring (today) | 89,855 ms | +18% net, mixed per-query |
+
+### Per-query effect at TPC-H SF10 (cumulative pre-B vs B+B-2)
+
+The work that landed on main. Negative percentages = faster.
+
+| q | Pre-B | B+B-2 | Delta | Class |
+|---|------:|------:|------:|---|
+| q01 |  8,404 |  7,180 | -15% | full lineitem scan, group-by |
+| q02 |  1,339 |  1,587 | **+19%** | 5-way join, NOT LIKE on a column the converter can't translate |
+| q03 |  9,369 |  8,153 | -13% | mktsegment + 3-way join |
+| q04 |  5,370 |  4,711 | -12% | orderdate range + EXISTS subquery |
+| q05 |  7,930 |  6,700 | -16% | regional 6-way join, low-card region keys |
+| **q06** |  9,546 |  4,660 | **-51%** | 1 table, sorted-column range filter (canonical win) |
+| **q07** | 14,290 |  9,436 | **-34%** | 2 selective hash joins, lineitem clustered |
+| q08 |  9,262 |  8,045 | -13% | regional brand share |
+| q09 |  7,058 |  6,982 |  -1% | flat |
+| q10 |  9,419 | 10,203 |  +8% | LEFT JOIN noise |
+| **q11** |    756 |  1,114 | **+47%** | tiny query, all shuffled keys, overhead dominant |
+| q12 |  8,815 |  7,767 | -12% | shipmode filter |
+| q13 |  3,606 |  3,185 | -12% | left outer join NOT LIKE |
+| **q14** |  8,139 |  5,458 | **-33%** | 1 join, 1 month range filter (canonical win) |
+| q15 | 10,715 |  8,997 | -16% | CTE plus revenue threshold |
+| q16 |    578 |    563 |  -3% | tiny, flat |
+| q17 |  5,409 |  5,168 |  -4% | flat |
+| q18 | 17,640 | 17,646 |  +0% | dominated by full scan |
+| q19 |  8,332 |  9,428 | **+13%** | OR-of-AND on multiple columns (translation failure) |
+| **q20** |  6,391 |  5,173 | **-19%** | semi-join chain, selective key filters |
+| q21 | 10,673 | 10,684 |  +0% | flat |
+| q22 |    817 |    750 |  -8% | small |
+| **TOT** | **163,858** | **143,590** | **-12.4%** | |
+
+Five clean wins in the win signature class (q06, q07, q14, q15, q20).
+Three regressions in the loss signature class (q02, q11, q19). Eleven
+queries in the noise band. The +12.4% total is real because the wins
+are large enough (q06 -51%, q07 -34%, q14 -33%) to dominate the noise
+and the small regressions.
+
+### Per-query effect at SSB SF10 (Apr 21 baseline vs today gated wiring)
+
+The data behind the +18.1% total today. Same shape pattern as TPC-H.
+
+| q | Apr 21 | Today | Delta | Class |
+|---|------:|------:|------:|---|
+| **q1.1** |  5,179 |  3,656 | **-29%** | 1 dim, sorted column (mirrors q06/q14) |
+| q1.2 |  4,359 |  3,819 | -12% | same |
+| **q1.3** |  3,884 |  2,740 | **-29%** | same |
+| q2.1 |  5,374 |  6,175 | +15% | 3 dim, varied selectivity |
+| q2.2 |  4,932 |  5,490 | +11% | same |
+| q2.3 |  5,928 |  5,975 |  +1% | same |
+| **q3.1** |  6,121 |  8,972 | **+47%** | 3 dim, high-card key probe (mirrors q11) |
+| q3.2 |  5,080 |  7,071 | +39% | same |
+| **q3.3** |  4,253 |  8,269 | **+94%** | same, worst regression |
+| q3.4 |  4,935 |  4,318 | -13% | 0-row dim, `AlwaysFalse` |
+| q4.1 | 10,991 |  9,059 | -18% | 4 dim, date-range dominant |
+| **q4.2** |  7,634 | 13,556 | **+78%** | 4 dim, high-card key probe |
+| q4.3 |  7,389 | 10,755 | +46% | same |
+| **TOT** | **76,059** | **89,855** | **+18%** | |
+
+The cross-suite mapping is one-for-one. SSB q1.x ≈ TPC-H q06/q14
+(sorted column wins). SSB q3.x ≈ TPC-H q11 (high-card probe loses).
+SSB q3.4 ≈ TPC-H q15's `AlwaysFalse`-ish path (selective short-circuit
+wins). 4-dim queries (q4.x) regress more than 3-dim because each
+extra filter compounds the overhead.
+
+## Cross-suite reading: what the SSB and TPC-H data add up to
+
+The per-query tables above (TPC-H SF10 cumulative effect, SSB SF10
+gated wiring) line up class-for-class:
+
+| Class | TPC-H SF10 | SSB SF10 |
+|-------|-----------:|---------:|
+| 1 dim, sorted-column probe (clean win) | q06 -51%, q07 -34%, q14 -33% | q1.1 -29%, q1.3 -29% |
+| Selective short-circuit / `AlwaysFalse` | q15 -16% | q3.4 -13% |
+| Multi-dim, high-cardinality key probe (clean loss) | q11 +47%, q19 +13%, q02 +19% | q3.1 +47%, q3.3 +94%, q4.2 +78% |
+| Tiny query, overhead-dominated | q11 (756 ms baseline) | q3.x at SF1 (sub-second) |
+
+The mixed bag is **not noise** and not an implementation bug. It is
+structural and reproduces across two benchmarks. The SF10 SSB run
+explains why the `with_dynamic_predicate` call is intentionally
+absent from SQE's `IcebergScanExec` on main even though the
+machinery exists in the vendored crate: the author of `c564a89`
+already knew the regression class would dominate on the SSB mix.
+SQE's scan path stays at post-batch filter-only because that
 matches the realistic SQL workloads we run.
 
 ## Why mixed results: a per-query walkthrough
