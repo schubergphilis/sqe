@@ -2,9 +2,9 @@
 
 Current state of SQE against the [icebergmatrix.org](https://icebergmatrix.org) rubric, the de-facto reference engineers consult when picking an Iceberg engine. Data lives at [Neuw84/iceberg-matrix](https://github.com/Neuw84/iceberg-matrix).
 
-**Score: 165/189 (87.3%)**  |  **Stretch: 170/189 (90%)**
+**Score: 166/189 (87.8%)**  |  **Stretch: 170/189 (90%)**
 
-Last generated: 2026-05-05T11:00:00Z  |  Source: `feat/equality-deletes-v2-audit: caveat audit, Spark cross-engine read = Apache Iceberg reference verification`
+Last generated: 2026-05-05T10:00:00Z  |  Source: `feat/maintenance-strong-form-test: prove rewrite_data_files real Parquet re-encoding via 10-file compaction live test`
 
 Regenerate: `python3 scripts/render-iceberg-matrix.py`. Source of truth: `docs/iceberg-matrix-state.json`.
 
@@ -31,7 +31,7 @@ Each feature is scored against V2 and V3 of the Iceberg spec (63 cells total). A
 |---|---:|---:|
 | AWS EMR (Spark 7.12) | 180/189 | 95 |
 | OSS Spark 4.1 | 175/189 | 93 |
-| **SQE (current)** | **165/189** | **87.3** |
+| **SQE (current)** | **166/189** | **87.8** |
 | OSS Flink 2.2 | 153/189 | 81 |
 | Snowflake | 134/189 | 71 |
 | PyIceberg 0.11 | 130/189 | 69 |
@@ -65,7 +65,7 @@ Peer scores from icebergmatrix.org as of 2026-04-29.
 | Column Default Values | n/a | F | V3-only feature | CREATE TABLE ... DEFAULT <literal> applies write_default; ALTER TABLE ADD COLUMN ... DEFAULT applies initial_default. Function-call defaults |
 | Table Creation | F | F | CREATE TABLE, CTAS streaming. | CREATE TABLE auto-upgrades to format-version 3 when columns require V3 features (TIMESTAMP_NS, DEFAULT). Polaris materialises V3 metadata be |
 | Time Travel / Snapshots | F | F | FOR SYSTEM_TIME AS OF + 6 metadata TVFs (Step 8c). | FOR VERSION AS OF works end-to-end on V3 tables: the classifier strips the clause, apply_version_spec registers a snapshot-pinned provider u |
-| Table Maintenance | P | P | All four CALL system.* procedures ship with both parser unit tests and live e2e tests that go through docker-compose.test.yml (Polaris + Rus | CALL system.rewrite_data_files merges files on V3 tables; row count preserved, file count drops, snapshot log moves forward. Same maintenanc |
+| Table Maintenance | F | F | All four CALL system.* procedures ship with both parser unit tests and live e2e tests that go through docker-compose.test.yml (Polaris + Rus | CALL system.rewrite_data_files merges files on V3 tables with real Parquet re-encoding; row count preserved, file count drops, snapshot log  |
 | Branching & Tagging | F | F | Transaction::{create_branch, create_tag, drop_branch, drop_tag} in vendored iceberg-rust + ALTER TABLE ... CREATE BRANCH/TAG DDL + SET WRITE | Same transaction actions apply to V3 tables; ref semantics are format-version agnostic. |
 
 ### Partitioning
@@ -124,8 +124,7 @@ Peer scores from icebergmatrix.org as of 2026-04-29.
 
 Cells marked `partial` or `unknown` have specific gaps documented in `docs/iceberg-matrix-state.json` under `caveats`. Key ones:
 
-- **table-maintenance (v2)**: rewrite_data_files does not re-encode Parquet payloads (manifest-only compaction).
-- **table-maintenance (v3)**: rewrite_data_files does not re-encode Parquet payloads (row groups stay as-is).
+- **equality-deletes (v2)**: RowDeltaOperation::delete_entries simplified to Ok(vec![]) against the RisingWave fork's SnapshotProducer; behaviour matches the fork's own CoW path but not independently verified against Java Iceberg.
 - **snowflake-horizon-catalog (v2)**: No live integration test.
 - **snowflake-horizon-catalog (v3)**: No live integration test against Horizon.
 - **hadoop-catalog (v2)**: Write path is race-prone on object stores without atomic rename; intentionally read-oriented.
