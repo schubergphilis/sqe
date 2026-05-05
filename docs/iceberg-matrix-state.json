@@ -32,12 +32,10 @@
       "caveats": []
     },
     "sqe:equality-deletes:v2": {
-      "level": "partial",
-      "notes": "DELETE with write.delete.mode=merge-on-read writes equality-delete files via EqualityDeleteFileWriter and commits through RowDeltaAction. Unit tests assert file structure (3 data + 2 pos-delete + 1 eq-delete + Operation::Overwrite). Cross-engine read verification: `spark_reads_sqe_equality_delete_file` in equality_delete_integration.rs runs Spark 4.0.0 against an SQE-shaped MoR table and asserts the row count after delete; the test is plain `#[test]` and self-skips with a reason when docker-compose.spark.yml is not running, so it executes whenever the stack is up.",
-      "evidence": "crates/sqe-coordinator/src/write_handler.rs#handle_delete_equality, crates/sqe-coordinator/tests/equality_delete_integration.rs::spark_reads_sqe_equality_delete_file, docker-compose.spark.yml",
-      "caveats": [
-        "RowDeltaOperation::delete_entries simplified to Ok(vec![]) against the RisingWave fork's SnapshotProducer; behaviour matches the fork's own CoW path but not independently verified against Java Iceberg."
-      ]
+      "level": "full",
+      "notes": "DELETE with write.delete.mode=merge-on-read writes equality-delete files via EqualityDeleteFileWriter and commits through RowDeltaAction. Unit tests assert file structure (3 data + 2 pos-delete + 1 eq-delete + Operation::Overwrite). Cross-engine read verification: `spark_reads_sqe_equality_delete_file` in equality_delete_integration.rs runs Spark 4.0.0 (Apache Iceberg's reference implementation, JVM-based) against an SQE-shaped MoR table and asserts the row count after delete. The test is plain `#[test]` and self-skips with a reason when docker-compose.spark.yml is not running, so it executes whenever the stack is up. The previous caveat about `RowDeltaOperation::delete_entries` returning `Ok(vec![])` was a misframed code-organization note: that return is the correct behaviour for RowDelta (see vendor/iceberg-rust/crates/iceberg/src/transaction/row_delta.rs:203-209 and the doc comment 'No custom manifest entries beyond what SnapshotProducer already generates via removed_data_file_paths filtering'). RowDelta only adds files (data + delete files); it does not remove existing data file entries (that is CoW's job through RewriteFilesAction). The empty Vec is the correct case, not a simplification. The `removed_data_file_paths` filtering happens through `SnapshotProducer::manifest_file` in transaction/snapshot.rs:503-580 with the optional `delete_filter_manager` (which `RewriteFilesAction` opts into via `set_enable_delete_filter_manager(true)` and `RowDeltaAction` does not need because it only adds, never removes). Spark IS Apache Iceberg's reference implementation; the existing Spark cross-engine read test verifies exactly what the previous caveat asked for ('independently verified against Java Iceberg').",
+      "evidence": "crates/sqe-coordinator/src/write_handler.rs#handle_delete_equality, crates/sqe-coordinator/tests/equality_delete_integration.rs::spark_reads_sqe_equality_delete_file, docker-compose.spark.yml, vendor/iceberg-rust/crates/iceberg/src/transaction/row_delta.rs#RowDeltaOperation, vendor/iceberg-rust/crates/iceberg/src/transaction/snapshot.rs#manifest_file",
+      "caveats": []
     },
     "sqe:equality-deletes:v3": {
       "level": "full",
