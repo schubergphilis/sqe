@@ -646,6 +646,18 @@ pub enum CatalogBackend {
         #[serde(default)]
         warehouse: String,
     },
+    /// AWS S3 Tables (managed Iceberg). Requires the `s3tables`
+    /// cargo feature on sqe-catalog. `table_bucket_arn` is the
+    /// fully-qualified ARN of the S3 Tables bucket
+    /// (`arn:aws:s3tables:REGION:ACCOUNT:bucket/NAME`).
+    /// `endpoint_url` is optional and only needed when targeting a
+    /// non-default S3 Tables endpoint (LocalStack, custom region
+    /// override).
+    S3tables {
+        table_bucket_arn: String,
+        #[serde(default)]
+        endpoint_url: Option<String>,
+    },
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -55,6 +55,18 @@ iceberg-datafusion = { path = "vendor/iceberg-rust/crates/integrations/datafusio
 iceberg-catalog-hms = { path = "vendor/iceberg-rust/crates/catalog/hms" }
 iceberg-catalog-glue = { path = "vendor/iceberg-rust/crates/catalog/glue" }
 iceberg-catalog-sql = { path = "vendor/iceberg-rust/crates/catalog/sql" }
+# AWS S3 Tables (managed Iceberg). Vendored from risingwavelabs fork
+# main; gated by sqe-catalog `s3tables` feature.
+iceberg-catalog-s3tables = { path = "vendor/iceberg-rust/crates/catalog/s3tables" }
+# Catalog factory dispatch. Loads any of the registered backends
+# (rest / glue / s3tables / hms / sql) by string name with a uniform
+# props HashMap. Replaces SQE's per-backend match dispatch.
+# `default-features = false` so each backend feature in sqe-catalog
+# (rest / glue / hms / sql / s3tables) controls which builders the
+# loader registry actually includes; without this the upstream
+# default pulls every backend's transitive AWS SDK / Thrift / sqlx
+# weight unconditionally.
+iceberg-catalog-loader = { path = "vendor/iceberg-rust/crates/catalog/loader", default-features = false }
 sqlx = { version = "0.8.1", default-features = false }
 
 # SQL parser — DataFusion 53 ships sqlparser 0.54
