@@ -1,6 +1,6 @@
 # Trino SQL Compatibility Matrix
 
-> Living document. Last updated: 2026-05-04 (DataFusion 53.1.0; SQL surface lift).
+> Living document. Last updated: 2026-05-05 (DataFusion 53.1.0; Trino math + codepoint aliases).
 > Rating: ✅ equivalent | ⚠️ partial/different semantics | ❌ missing | 🔧 SQE-specific
 
 SQE aims to be a drop-in replacement for Trino in Iceberg-only environments.
@@ -47,8 +47,8 @@ noting semantic differences and gaps.
 
 | Category | Total | ✅ | ⚠️ | ❌ | Coverage |
 |---|---|---|---|---|---|
-| Scalar: String | 27 | 24 | 3 | 0 | 100% |
-| Scalar: Math | 29 | 25 | 4 | 0 | 100% |
+| Scalar: String | 27 | 25 | 2 | 0 | 100% |
+| Scalar: Math | 29 | 29 | 0 | 0 | 100% |
 | Scalar: Date/Time | 38 | 37 | 1 | 0 | 100% |
 | Scalar: JSON | 12 | 11 | 1 | 0 | 100% |
 | Scalar: URL | 8 | 8 | 0 | 0 | 100% |
@@ -95,7 +95,7 @@ Each section lists Trino functions with their SQE status:
 | Trino Function | SQE Equivalent | Status | Notes |
 |---|---|---|---|
 | `chr(n)` | `chr(n)` | ✅ | Native DataFusion |
-| `codepoint(s)` | `ascii(s)` | ⚠️ | `ascii()` returns first byte, not Unicode codepoint |
+| `codepoint(s)` | `codepoint(s)` | ✅ | Trino compat UDF; full Unicode code point via proper UTF-8 decode. Errors on multi-character input per Trino spec |
 | `concat(s1, s2, ...)` | `concat(s1, s2, ...)` | ✅ | Native DataFusion |
 | `concat_ws(sep, s1, s2, ...)` | `concat_ws(sep, s1, s2, ...)` | ✅ | Native DataFusion |
 | `format(fmt, ...)` | `format(fmt, ...)` | ✅ | Trino compat UDF (%s, %d, %f, zero-pad, precision) |
@@ -134,7 +134,7 @@ Each section lists Trino functions with their SQE status:
 | `cos(x)` / `sin(x)` / `tan(x)` | `cos(x)` / `sin(x)` / `tan(x)` | ✅ | |
 | `cosh(x)` / `sinh(x)` / `tanh(x)` | Same | ✅ | Native DataFusion (already built-in) |
 | `degrees(x)` | `degrees(x)` | ✅ | |
-| `e()` | `exp(1)` | ⚠️ | No standalone `e()`, use `exp(1)` |
+| `e()` | `e()` | ✅ | Trino compat Nullary UDF returning `std::f64::consts::E` |
 | `exp(x)` | `exp(x)` | ✅ | |
 | `floor(x)` | `floor(x)` | ✅ | |
 | `from_base(s, radix)` | `from_base(s, radix)` | ✅ | Trino compat UDF |
@@ -143,17 +143,17 @@ Each section lists Trino functions with their SQE status:
 | `log(b, x)` | `log(b, x)` | ✅ | |
 | `log2(x)` | `log2(x)` | ✅ | |
 | `log10(x)` | `log10(x)` | ✅ | |
-| `mod(n, m)` | `n % m` | ⚠️ | Operator syntax, no `mod()` function |
+| `mod(n, m)` | `mod(n, m)` | ✅ | Trino compat UDF; coerces numeric args to Float64. Errors on `mod(_, 0)` per IEEE 754 |
 | `nan()` | `nan()` | ✅ | Trino compat UDF |
 | `pi()` | `pi()` | ✅ | |
 | `pow(x, p)` / `power(x, p)` | `power(x, p)` | ✅ | |
 | `radians(x)` | `radians(x)` | ✅ | |
 | `rand()` / `random()` | `random()` | ✅ | |
 | `round(x)` / `round(x, d)` | `round(x, d)` | ✅ | |
-| `sign(x)` | `signum(x)` | ⚠️ | Different name |
+| `sign(x)` | `sign(x)` | ✅ | Trino compat UDF; matches Trino spec including `sign(0) = 0` (Rust's `f64::signum(0.0)` returns 1.0, so the UDF overrides the zero case) |
 | `sqrt(x)` | `sqrt(x)` | ✅ | |
 | `to_base(n, radix)` | `to_base(n, radix)` | ✅ | Trino compat UDF |
-| `truncate(x)` | `trunc(x)` | ⚠️ | Different name |
+| `truncate(x[, n])` | `truncate(x[, n])` | ✅ | Trino compat UDF; truncates toward zero with optional decimal-precision argument |
 | `width_bucket(x, bound1, bound2, n)` | Same | ✅ | Native DataFusion (built-in in DF 52) |
 
 ## Scalar Functions: Date/Time
@@ -446,6 +446,20 @@ The ~4% remaining gap consists of features that require engine-level changes, sk
 | `JSON` logical type / `CAST(json AS T)` | ✅ shipped | `SqlType::JSON → Utf8` in `sql_type_to_arrow` (write_handler.rs:3927). DataFusion's built-in coercion handles `CAST(json AS BIGINT|VARCHAR|DOUBLE)` |
 | `TIME` / `TIME(p)` / `EXTRACT(HOUR\|MINUTE\|SECOND ...)` | ✅ shipped | `SqlType::Time` arm collapses 0..=6 precision to `Time64(Microsecond)`. `localtime()` actually returns Time64 now (was incorrectly returning Timestamp). `extract_component` handles Time64Microsecond + Time64Nanosecond arrays/scalars; `year()/month()/day()` raise plan errors on TIME columns per Trino spec |
 | Merge-on-Read (MoR) writes | ✅ already wired | `handle_delete_dispatch` has shipped since Phase O+; the doc was stale. Set `TBLPROPERTIES ('write.delete.mode'='merge-on-read')` to opt in. CoW remains the default for backward compat |
+
+### Items shipped 2026-05-05 (Trino aliases)
+
+Five more amber rows flipped to ✅ via small alias UDFs in `sqe-trino-functions/src/trino_functions.rs`:
+
+| Function | Status | What changed |
+|---|---|---|
+| `e()` | ✅ shipped | Nullary UDF returning `std::f64::consts::E`. Trino's `e()` is a function, not a constant; previously users had to write `exp(1)` |
+| `mod(n, m)` | ✅ shipped | Scalar UDF coercing both args to `Float64`; errors on `mod(_, 0)`. Trino has `mod()` as a function; DataFusion only exposes the `%` operator |
+| `truncate(x[, n])` | ✅ shipped | Scalar UDF that truncates toward zero with optional decimal-precision argument. Same shape as Trino's `truncate(x)` and `truncate(x, n)` |
+| `sign(x)` | ✅ shipped | Scalar UDF over `Float64`. Matches Trino spec including `sign(0) = 0` (Rust's `f64::signum(0.0)` returns 1.0; the UDF overrides the zero case) |
+| `codepoint(s)` | ✅ shipped | Scalar UDF returning the full Unicode code point of a single-character string. Errors on multi-character input per Trino spec. ASCII characters round-trip to the same value as `ascii()` for backward compat; Unicode characters now return the proper code point (`'é'` → 233) instead of the first UTF-8 byte (`195`) |
+
+Net coverage delta: **Scalar: Math 25/29 (4 amber) → 29/29 (0 amber)**. **Scalar: String 24/27 (3 amber) → 25/27 (2 amber)**.
 
 ## Operational Comparison
 
