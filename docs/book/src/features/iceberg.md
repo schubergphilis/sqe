@@ -34,22 +34,30 @@ graph TB
 
 ## Supported catalogs
 
-SQE keeps the catalog choice as a runtime configuration concern. Every catalog below ships compiled in by default; pick one in `[catalog]`.
+SQE keeps the catalog choice as a runtime configuration concern. Every catalog below ships compiled in by default; pick one in `[catalog.backend]`. See [Catalog backends](../getting-started/catalogs.md) for the full per-backend recipe with TOML examples and verification queries.
 
-| Catalog | Protocol | Auth | Status |
-|---|---|---|---|
-| Apache Polaris | Iceberg REST | OIDC bearer + credential vending | primary |
-| Project Nessie 0.107+ | Iceberg REST | bearer / anonymous | live verified |
-| AWS Glue (Iceberg REST) | Iceberg REST + AWS SigV4 | AWS provider chain | live verified |
-| AWS S3 Tables | Iceberg REST + AWS SigV4 (`s3tables` signing) | AWS provider chain | live verified |
-| Unity Catalog OSS | Iceberg REST | bearer (Databricks) / anonymous (OSS) | live verified, read-only on OSS |
-| Hive Metastore | Thrift | none / Kerberos | live verified |
-| JDBC (Postgres / MySQL / SQLite) | iceberg-catalog-sql | DB credentials | live verified (Postgres) |
-| Hadoop / storage-only | object_store path scan | none | live verified, read-only |
+| Catalog | `type` | Transport | Auth | Status |
+|---|---|---|---|---|
+| Apache Polaris | `rest` | Iceberg REST | OIDC bearer + credential vending | primary |
+| Project Nessie 0.107+ | `rest` | Iceberg REST | bearer / anonymous | live verified |
+| AWS Glue (Iceberg REST) | `rest` | Iceberg REST + AWS SigV4 | AWS provider chain | live verified |
+| AWS S3 Tables (REST) | `rest` | Iceberg REST + AWS SigV4 (`s3tables` signing) | AWS provider chain | live verified |
+| Unity Catalog OSS | `rest` | Iceberg REST | bearer (Databricks) / anonymous (OSS) | live verified, read-only on OSS |
+| AWS Glue (native SDK) | `glue` | aws-sdk-glue | AWS provider chain | live verified eu-central-1 |
+| AWS S3 Tables (native SDK) | `s3tables` | aws-sdk-s3tables | AWS provider chain | live verified eu-west-1 |
+| Hive Metastore | `hms` | Thrift | none / Kerberos | live verified |
+| JDBC (Postgres / MySQL / SQLite) | `jdbc` | iceberg-catalog-sql | DB credentials | live verified (Postgres) |
+| Hadoop / storage-only | `hadoop` | object_store path scan | none | live verified, read-only |
 
-Live integration tests for HMS, Nessie, JDBC Postgres, AWS Glue, AWS S3 Tables, and Unity OSS live in `crates/sqe-catalog/tests/backends_integration.rs`. Each is `#[ignore]` and runs against a docker-compose overlay or a real cloud account configured via `.env`.
+There are two ways into AWS-managed Iceberg. The **REST path** (`type = "rest"` with the Glue REST or S3 Tables REST endpoint as `polaris_url`) speaks the Iceberg REST protocol that AWS exposes on top of these services. The **native SDK path** (`type = "glue"` or `type = "s3tables"`) goes directly through `aws-sdk-glue` or `aws-sdk-s3tables` without REST. Both work; the SDK path is currently more maintained upstream and avoids the SigV4 signing patches.
 
-The AWS endpoints share the OSS Iceberg REST code path. Phase P added an `aws-sigv4` cargo feature to the vendored `iceberg-catalog-rest` crate that swaps the OAuth/Bearer authenticator for an AWS SigV4 signer when `rest.sigv4-enabled=true` lands in the catalog properties (or in the server's `/v1/config` defaults). The signer reads credentials from the standard AWS provider chain.
+The five non-Hadoop backends share one dispatch path through the upstream `iceberg-catalog-loader` crate. SQE's `for_session_other_backend` translates the typed `CatalogBackend` enum into a uniform `(catalog_type, name, props)` tuple and hands it to `iceberg_catalog_loader::load(type)`. The loader picks the right `CatalogBuilder` (REST / Glue / S3 Tables / HMS / SQL) and returns an `Arc<dyn iceberg::Catalog>`. Hadoop is the lone outlier because it is filesystem-only; its dispatch stays in `crates/sqe-catalog/src/backends/hadoop.rs`.
+
+Two SQE-only patches sit on top of the vendored loader. The first feature-gates each backend so a slim build does not transitively pull every backend's AWS SDK / Thrift / sqlx weight. The second adds `Send + Sync` to `BoxedCatalogBuilder` so the boxed builder can cross await points in async contexts. Both are documented in `vendor/iceberg-rust/README.md` and forward-compatible with upstream.
+
+Live integration tests for HMS, Nessie, JDBC Postgres, AWS Glue, AWS S3 Tables, and Unity OSS live in `crates/sqe-catalog/tests/backends_integration.rs`. Each is `#[ignore]` and runs against a docker-compose overlay or a real cloud account configured via `.env`. Glue and S3 Tables are also live-verified (2026-05-05) against AWS account `311141556126` in eu-central-1 and eu-west-1.
+
+The AWS REST endpoints share the OSS Iceberg REST code path. Phase P added an `aws-sigv4` cargo feature to the vendored `iceberg-catalog-rest` crate that swaps the OAuth/Bearer authenticator for an AWS SigV4 signer when `rest.sigv4-enabled=true` lands in the catalog properties (or in the server's `/v1/config` defaults). The signer reads credentials from the standard AWS provider chain.
 
 ## Catalog REST surface
 

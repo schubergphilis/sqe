@@ -112,9 +112,29 @@ curl http://localhost:9091/healthz   # → ok
 curl http://localhost:9091/readyz    # → 200 when ready
 ```
 
+## Pointing at a different catalog
+
+The walkthrough above runs SQE against the local Polaris stack
+over Iceberg REST. SQE supports five other catalog backends out
+of the box: AWS Glue (native SDK), AWS S3 Tables (managed
+Iceberg), Hive Metastore (Thrift), JDBC (Postgres / MySQL /
+SQLite), and Hadoop (filesystem-only). Each uses the same
+binary, just with a different `[catalog.backend]` block.
+
+See [Catalog backends](./catalogs.md) for the full per-backend
+recipe with TOML examples, AWS credential setup, verification
+queries, and a troubleshooting checklist. Glue and S3 Tables are
+verified live against AWS deployments.
+
+For the operator-friendly version of the same content (BI tool
+connection, slim builds, cargo features), see
+[`QUICKSTART.md`](https://github.com/schuberg/sqe/blob/main/QUICKSTART.md)
+in the repo root.
+
 ## Next Steps
 
-- [Configuration Reference](../deployment/configuration.md) — all settings and env vars
-- [Docker](../deployment/docker.md) — run in containers
-- [Kubernetes & Helm](../deployment/kubernetes.md) — production deployment
-- [Using the CLI](./cli.md) — full CLI reference
+- [Catalog backends](./catalogs.md): per-backend TOML, credentials, verification queries
+- [Configuration Reference](../deployment/configuration.md): all settings and env vars
+- [Docker](../deployment/docker.md): run in containers
+- [Kubernetes & Helm](../deployment/kubernetes.md): production deployment
+- [Using the CLI](./cli.md): full CLI reference

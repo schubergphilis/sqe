@@ -41,6 +41,7 @@
 # Getting Started
 
 - [Quickstart](./getting-started/quickstart.md)
+- [Catalog backends](./getting-started/catalogs.md)
 - [Building from Source](./getting-started/building.md)
 - [Using the CLI](./getting-started/cli.md)
 

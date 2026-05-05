@@ -49,19 +49,49 @@ polaris_url = "http://polaris:8181/api/catalog"   # REST catalog endpoint
 warehouse = "iceberg"           # warehouse identifier the catalog expects
 metadata_cache_ttl_secs = 30    # Table metadata cache TTL
 default_table_format_version = 2 # Iceberg table format version (2 or 3)
+
 # `polaris_url` accepts any Iceberg REST endpoint. SQE has been
 # verified live against Apache Polaris, Project Nessie 0.107+,
-# Unity Catalog OSS, AWS Glue Iceberg REST, and AWS S3 Tables (via
-# the federated Glue endpoint). For AWS endpoints the vendored
-# REST client signs requests with SigV4 when the server advertises
-# `rest.sigv4-enabled=true` in its /v1/config defaults.
-#
-# Hive Metastore, native AWS Glue (SDK path), and JDBC catalogs
-# have working backend libraries in `crates/sqe-catalog/src/backends/`
-# (live integration tests under
-# `crates/sqe-catalog/tests/backends_integration.rs`) but the engine
-# session manager still routes SQL through the REST path. End-to-end
-# SQL dispatch through HMS/Glue/JDBC is tracked as a follow-up.
+# Unity Catalog OSS, AWS Glue Iceberg REST, and AWS S3 Tables REST.
+# For AWS REST endpoints the vendored REST client signs requests
+# with SigV4 when the server advertises `rest.sigv4-enabled=true`
+# in its /v1/config defaults.
+
+# When `[catalog.backend]` is omitted, SQE defaults to `type = "rest"`
+# and uses `polaris_url` + `warehouse` above. To target a non-REST
+# catalog (HMS, AWS Glue native, AWS S3 Tables native, JDBC, Hadoop),
+# set the backend block explicitly. See `docs/book/src/getting-started/
+# catalogs.md` for the full per-backend reference.
+
+# [catalog.backend]
+# type = "hms"
+# uri  = "metastore.example.com:9083"
+# warehouse = "s3a://my-bucket/warehouse"
+
+# [catalog.backend]
+# type   = "glue"
+# region = "eu-central-1"
+# warehouse = "s3://my-bucket/warehouse"
+# # endpoint = "http://localhost:4566"   # optional, e.g. LocalStack
+
+# [catalog.backend]
+# type             = "s3tables"
+# table_bucket_arn = "arn:aws:s3tables:eu-west-1:123456789012:bucket/my-bucket"
+# # endpoint_url   = "http://localhost:4566"
+
+# [catalog.backend]
+# type      = "jdbc"
+# url       = "postgresql://user:pass@host:5432/iceberg"
+# warehouse = "s3://my-bucket/warehouse"
+
+# [catalog.backend]
+# type      = "hadoop"
+# warehouse = "s3://my-bucket/warehouse"
+
+# Non-REST backends dispatch through the upstream
+# `iceberg-catalog-loader` crate. End-to-end SQL through HMS, Glue,
+# S3 Tables, and JDBC works on main today. Hadoop has its own
+# dispatch in `crates/sqe-catalog/src/backends/hadoop.rs`.
 
 [storage]
 s3_endpoint = "http://s3:9000"
