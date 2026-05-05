@@ -72,7 +72,7 @@ Each chapter in this book connects to this journey. The callout boxes reference 
 
 ## Structure
 
-The book follows the arc of building SQE from zero to production across **five parts** and **18 chapters**, mirroring the actual journey. Each chapter pairs narrative (the *why*) with implementation (the *how*) and connects to spec-driven engineering principles from *The Art of Agents*.
+The book follows the arc of building SQE from zero to production across **five parts** and **19 chapters**, mirroring the actual journey. Each chapter pairs narrative (the *why*) with implementation (the *how*) and connects to spec-driven engineering principles from *The Art of Agents*.
 
 **Estimated total: 360-400 pages**
 
@@ -142,7 +142,7 @@ Splitting the engine across coordinator and workers. Ballista heritage, custom s
 
 ---
 
-## Part V: Production (Chapters 15-17) — ~75 pages
+## Part V: Production (Chapters 15-17) — ~87 pages
 
 Shipping it. Running it. Keeping it running.
 
@@ -150,7 +150,8 @@ Shipping it. Running it. Keeping it running.
 |----|-------|-------|--------|
 | 15 | **Deploying Sovereignty** | 22 | Docker multi-stage build (2.3GB to 47MB). Helm chart: coordinator Deployment + worker StatefulSet. Rolling upgrades with zero query interruption. Resource requests that make sense. The Kubernetes topology for a sovereign engine. |
 | 16 | **Benchmarks Don't Lie (But They Mislead)** | 22 | TPC-H, TPC-DS, SSB, TPC-C, TPC-E, TPC-BB on Iceberg. SQE vs Trino on same hardware via `--compare-trino` flag (identical queries, same Polaris catalog, diff results). Where SQE wins (scan, auth overhead, cold start, memory). The sort order correctness trap: why trusting Iceberg sort metadata can silently corrupt results. The benchmark that mattered: 50 dbt models, nightly batch, wall-clock time. |
-| 16b | **The Matrix and the Quiet Bug** | 15 | The Iceberg matrix scoreboard. What "partial" actually meant. The format-version bug hiding in the iceberg-rust REST request. TBLPROPERTIES being silently dropped. FOR VERSION AS OF registering against a read-only schema. Three commits, sixteen cells flipped, one rule earned: integration tests are the only tests that matter for catalog interactions. |
+| 16b | **The Matrix and the Quiet Bug** | 15 | The Iceberg matrix scoreboard. What "partial" actually meant. The format-version bug hiding in the iceberg-rust REST request. TBLPROPERTIES being silently dropped. FOR VERSION AS OF registering against a read-only schema. Three commits, sixteen cells flipped, one rule earned: integration tests are the only tests that matter for catalog interactions. Score 99/189 to 129/189. |
+| 16c | **Following Through** | 12 | The next six months of the punch list 16b left behind. Bloom filters via a footer-inspection unit test. PARTITIONED BY plus partition evolution. Live tests against HMS, Glue, Nessie, JDBC Postgres, and S3 Tables. Unity Catalog OSS. The loader refactor that deleted six hundred lines of wrappers. The doc that lied about MoR being missing when MoR had shipped months earlier. JSON and TIME as one-line type-system fixes. Score 129/189 to 164/189. Three more rules earned: stale docs are silent debt; loader patterns beat per-backend wrappers; partial cells should point at a pull request, not a phase. |
 | 17 | **What We'd Do Differently** | 22 | The AI-assisted build: honest assessment, what the AI did well (implementation, debugging, test generation), what it didn't (architecture, security trade-offs). The human reviewed every big turn. Decisions we'd change. What Rust taught us (including: compile times at scale are real). The open-source goal. Where this goes next. Build-vs-buy honest accounting. |
 
 **Art of Agents crossover:** Chapter 17 maps to *Use of Spies* (Ch 13: Feedback Loops) — the retrospective that closes the build cycle.
