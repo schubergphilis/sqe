@@ -106,6 +106,7 @@ Building the engine. Getting a SQL query to return results from an Iceberg table
 | 4 | **You Are the Query** | 20 | OIDC password grant flow. Why no service account. Bearer token passthrough to Polaris and S3. The `SqeSessionContext` — one per user, one per query. Session lifecycle. Why this model is impossible to retrofit into Trino. |
 | 5 | **Speaking Arrow** | 18 | Arrow Flight SQL protocol. Why not REST, why not JDBC directly. The `FlightSqlService` trait. Handshake → GetFlightInfo → DoGet pipeline. Connection from DBeaver, Python, Rust. The wire protocol as user experience. |
 | 6 | **The Catalog Is the API** | 24 | information_schema as a virtual provider. system.runtime.* tables. Namespace resolution. How dbt discovers your warehouse. The dbt-sqe adapter: Python + ADBC Flight SQL. Making `dbt run` work on the first try. |
+| 6b | **Speaking to Many Catalogs** | 12 | The mirror of chapter 6: server-side catalog selection. Six backends (REST, HMS, Glue, S3 Tables, JDBC, Hadoop) through the upstream `iceberg-catalog-loader` factory. Refactoring out the per-backend wrappers. Two upstream patches (cargo features, Send + Sync). Live validation against AWS Glue and S3 Tables. |
 
 **Art of Agents crossover:** Chapter 3 maps to *Energy* (Ch 5: Tool Design) — DataFusion is the tool. Chapter 4 maps to *Protocol* — auth shapes everything.
 

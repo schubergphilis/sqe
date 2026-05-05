@@ -49,12 +49,16 @@ For detailed Mermaid diagrams (query pipeline, crate dependencies, caching layer
 
 ## Getting Started
 
+For a five-minute walkthrough that covers all six catalog backends
+(REST / HMS / Glue / S3 Tables / JDBC / Hadoop) with sample TOML
+configs and verification queries, see [`QUICKSTART.md`](QUICKSTART.md).
+
 ### Prerequisites
 
 - **Rust 1.88+** ([rustup.rs](https://rustup.rs/))
-- **Docker** and Docker Compose
+- **Docker** and Docker Compose (only for the bundled local stack)
 
-### Quick start
+### Quick start (local Polaris stack)
 
 ```bash
 # Start the test stack (Polaris + S3 + SQE)
@@ -69,6 +73,10 @@ cargo run --bin sqe-cli -- --host localhost --port 50051 --username root --proto
 sqe> SHOW CATALOGS;
 sqe> SELECT * FROM test_warehouse.default.my_table LIMIT 10;
 ```
+
+For other backends (Glue, S3 Tables, HMS, JDBC, Hadoop) the same
+binary works against external infrastructure: see
+[`QUICKSTART.md`](QUICKSTART.md) and [`docs/catalogs.md`](docs/catalogs.md).
 
 For Docker, Kubernetes, TLS, and auth provider setup, see [docs/deployment.md](docs/deployment.md).
 
