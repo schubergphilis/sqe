@@ -52,8 +52,12 @@ pub fn register_extended_trino_functions(ctx: &datafusion::prelude::SessionConte
     // Hard UDFs
     ctx.register_udf(ScalarUDF::from(FormatDatetime));
     ctx.register_udf(ScalarUDF::from(ParseDatetime));
+    // word_stem(s) and word_stem(s, lang) live under the same name with a
+    // OneOf signature; word_stem_lang is registered as an alias for
+    // backward compatibility with callers that adopted the old separate
+    // name. Both `word_stem` and `word_stem_lang` resolve to the same
+    // implementation.
     ctx.register_udf(ScalarUDF::from(WordStem));
-    ctx.register_udf(ScalarUDF::from(WordStemLang));
 
     // Aggregate-like scalar aliases
     ctx.register_udf(ScalarUDF::from(Arbitrary));
@@ -876,7 +880,13 @@ impl ScalarUDFImpl for RegexpExtract {
     }
 }
 
-/// regexp_extract_all(s, pattern) → all matches as a JSON array string
+/// regexp_extract_all(s, pattern) → ARRAY(VARCHAR) of all matches.
+///
+/// Trino returns ARRAY(VARCHAR). Earlier SQE versions returned a JSON-array
+/// string for compatibility with callers that did not have ARRAY support;
+/// now that DataFusion's ARRAY plumbing is solid, this returns the proper
+/// `List<Utf8>` so downstream operators (UNNEST, cardinality, element_at)
+/// work without parsing the result.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct RegexpExtractAll;
 
@@ -893,18 +903,26 @@ impl ScalarUDFImpl for RegexpExtractAll {
         &SIG
     }
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Utf8)
+        Ok(DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Utf8,
+            true,
+        ))))
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        str_transform_2(&args.args, |s, pattern| {
-            let re = regex::Regex::new(pattern).ok()?;
-            let matches: Vec<&str> = re.find_iter(s).map(|m| m.as_str()).collect();
-            Some(serde_json::to_string(&matches).unwrap_or_default())
+        let strings = column_strings(&args.args, 0, "regexp_extract_all", args.number_rows)?;
+        let pattern_arr =
+            column_strings(&args.args, 1, "regexp_extract_all", args.number_rows)?;
+        build_regex_list_array("regexp_extract_all", &strings, &pattern_arr, |s, re| {
+            re.find_iter(s).map(|m| m.as_str().to_string()).collect()
         })
     }
 }
 
-/// regexp_split(s, pattern) → parts as a JSON array string
+/// regexp_split(s, pattern) → ARRAY(VARCHAR) of parts split by the pattern.
+///
+/// Same return-type story as regexp_extract_all: real `List<Utf8>` instead
+/// of a JSON-array string.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct RegexpSplit;
 
@@ -921,15 +939,102 @@ impl ScalarUDFImpl for RegexpSplit {
         &SIG
     }
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Utf8)
+        Ok(DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Utf8,
+            true,
+        ))))
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        str_transform_2(&args.args, |s, pattern| {
-            let re = regex::Regex::new(pattern).ok()?;
-            let parts: Vec<&str> = re.split(s).collect();
-            Some(serde_json::to_string(&parts).unwrap_or_default())
+        let strings = column_strings(&args.args, 0, "regexp_split", args.number_rows)?;
+        let pattern_arr = column_strings(&args.args, 1, "regexp_split", args.number_rows)?;
+        build_regex_list_array("regexp_split", &strings, &pattern_arr, |s, re| {
+            re.split(s).map(|p| p.to_string()).collect()
         })
     }
+}
+
+/// Coerce a string-typed column or scalar argument into an owned StringArray
+/// of length `n_rows` so the regex evaluators can iterate row-by-row without
+/// caring whether the input is a scalar broadcast or a real array column.
+fn column_strings(
+    args: &[ColumnarValue],
+    idx: usize,
+    fn_name: &str,
+    n_rows: usize,
+) -> DFResult<StringArray> {
+    let arg = args.get(idx).ok_or_else(|| {
+        DataFusionError::Plan(format!("{fn_name}: missing argument at index {idx}"))
+    })?;
+    match arg {
+        ColumnarValue::Scalar(ScalarValue::Utf8(opt) | ScalarValue::LargeUtf8(opt)) => {
+            let v = opt.clone();
+            Ok(StringArray::from_iter(std::iter::repeat_n(
+                v.as_deref(),
+                n_rows.max(1),
+            )))
+        }
+        ColumnarValue::Array(arr) => {
+            if let Some(s) = arr.as_any().downcast_ref::<StringArray>() {
+                Ok(s.clone())
+            } else if let Some(s) = arr.as_any().downcast_ref::<arrow::array::LargeStringArray>() {
+                let conv = arrow::compute::cast(s, &DataType::Utf8).map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "{fn_name}: cannot convert LargeUtf8 to Utf8: {e}"
+                    ))
+                })?;
+                Ok(conv
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "{fn_name}: cast to StringArray failed silently"
+                        ))
+                    })?
+                    .clone())
+            } else {
+                Err(DataFusionError::Plan(format!(
+                    "{fn_name}: argument {idx} must be Utf8 / VARCHAR, got {:?}",
+                    arr.data_type()
+                )))
+            }
+        }
+        other => Err(DataFusionError::Plan(format!(
+            "{fn_name}: argument {idx} must be a string scalar or array, got {other:?}"
+        ))),
+    }
+}
+
+/// Build a `ListArray` of Utf8 by applying `f(input_string, compiled_regex)`
+/// row-by-row. Used by both regexp_extract_all and regexp_split. Invalid
+/// patterns surface as a Plan error rather than a silent NULL row, mirroring
+/// Trino's behaviour.
+fn build_regex_list_array(
+    fn_name: &str,
+    strings: &StringArray,
+    patterns: &StringArray,
+    f: impl Fn(&str, &regex::Regex) -> Vec<String>,
+) -> DFResult<ColumnarValue> {
+    use arrow::array::{ListBuilder, StringBuilder};
+    let n = strings.len();
+    let mut builder = ListBuilder::new(StringBuilder::new());
+    for i in 0..n {
+        if strings.is_null(i) || patterns.is_null(i) {
+            builder.append_null();
+            continue;
+        }
+        let s = strings.value(i);
+        let p = patterns.value(i);
+        let re = regex::Regex::new(p).map_err(|e| {
+            DataFusionError::Plan(format!("{fn_name}: invalid regex pattern '{p}': {e}"))
+        })?;
+        let parts = f(s, &re);
+        for part in parts {
+            builder.values().append_value(part);
+        }
+        builder.append(true);
+    }
+    Ok(ColumnarValue::Array(Arc::new(builder.finish()) as ArrayRef))
 }
 
 /// normalize(s, form) → Unicode-normalized string (NFC/NFD/NFKC/NFKD)
@@ -1173,7 +1278,15 @@ fn joda_to_chrono(joda: &str) -> String {
         .replace("a", "%p")     // AM/PM
 }
 
-/// word_stem(s) → stemmed word (English by default)
+/// word_stem(s) or word_stem(s, lang) → stemmed word in the specified language.
+///
+/// Trino's `word_stem` accepts both arities under the same name. DataFusion's
+/// signature system supports the `OneOf` variant for that. The 1-arg form
+/// defaults to English; the 2-arg form picks the algorithm by ISO code or
+/// English name.
+///
+/// `word_stem_lang` is also kept as an alias for backward compatibility with
+/// existing SQE callers that adopted the 2-arg name.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct WordStem;
 
@@ -1185,68 +1298,60 @@ impl ScalarUDFImpl for WordStem {
         "word_stem"
     }
     fn signature(&self) -> &Signature {
-        static SIG: LazyLock<Signature> =
-            LazyLock::new(|| Signature::any(1, Volatility::Immutable));
+        // Either 1 arg (string) or 2 args (string, lang).
+        static SIG: LazyLock<Signature> = LazyLock::new(|| Signature::one_of(
+            vec![
+                TypeSignature::Any(1),
+                TypeSignature::Any(2),
+            ],
+            Volatility::Immutable,
+        ));
         &SIG
+    }
+    fn aliases(&self) -> &[String] {
+        // Some SQE deployments and tests still call `word_stem_lang(s, lang)`
+        // explicitly. Keep that name working as a registered alias.
+        static ALIASES: LazyLock<Vec<String>> =
+            LazyLock::new(|| vec!["word_stem_lang".to_string()]);
+        &ALIASES
     }
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Utf8)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         use rust_stemmers::{Algorithm, Stemmer};
-        let stemmer = Stemmer::create(Algorithm::English);
-        str_transform(&args.args[0], |s| Some(stemmer.stem(s).into_owned()))
-    }
-}
-
-/// word_stem_lang(s, lang) → stemmed word in specified language
-///
-/// NOTE: Trino's `word_stem(s, lang)` overload is registered here as `word_stem_lang`
-/// because DataFusion doesn't support multiple UDF arities for the same name. Users
-/// should call `word_stem_lang(word, 'en')` from SQE when needing language selection.
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct WordStemLang;
-
-impl ScalarUDFImpl for WordStemLang {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn name(&self) -> &str {
-        "word_stem_lang"
-    }
-    fn signature(&self) -> &Signature {
-        static SIG: LazyLock<Signature> =
-            LazyLock::new(|| Signature::any(2, Volatility::Immutable));
-        &SIG
-    }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Utf8)
-    }
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        use rust_stemmers::{Algorithm, Stemmer};
-        str_transform_2(&args.args, |s, lang| {
-            let algo = match lang.to_lowercase().as_str() {
-                "en" | "english" => Algorithm::English,
-                "fr" | "french" => Algorithm::French,
-                "de" | "german" => Algorithm::German,
-                "es" | "spanish" => Algorithm::Spanish,
-                "it" | "italian" => Algorithm::Italian,
-                "pt" | "portuguese" => Algorithm::Portuguese,
-                "nl" | "dutch" => Algorithm::Dutch,
-                "sv" | "swedish" => Algorithm::Swedish,
-                "no" | "norwegian" => Algorithm::Norwegian,
-                "da" | "danish" => Algorithm::Danish,
-                "fi" | "finnish" => Algorithm::Finnish,
-                "ro" | "romanian" => Algorithm::Romanian,
-                "hu" | "hungarian" => Algorithm::Hungarian,
-                "tr" | "turkish" => Algorithm::Turkish,
-                "ru" | "russian" => Algorithm::Russian,
-                "ar" | "arabic" => Algorithm::Arabic,
-                _ => Algorithm::English,
-            };
-            let stemmer = Stemmer::create(algo);
-            Some(stemmer.stem(s).into_owned())
-        })
+        match args.args.len() {
+            1 => {
+                let stemmer = Stemmer::create(Algorithm::English);
+                str_transform(&args.args[0], |s| Some(stemmer.stem(s).into_owned()))
+            }
+            2 => str_transform_2(&args.args, |s, lang| {
+                let algo = match lang.to_lowercase().as_str() {
+                    "en" | "english" => Algorithm::English,
+                    "fr" | "french" => Algorithm::French,
+                    "de" | "german" => Algorithm::German,
+                    "es" | "spanish" => Algorithm::Spanish,
+                    "it" | "italian" => Algorithm::Italian,
+                    "pt" | "portuguese" => Algorithm::Portuguese,
+                    "nl" | "dutch" => Algorithm::Dutch,
+                    "sv" | "swedish" => Algorithm::Swedish,
+                    "no" | "norwegian" => Algorithm::Norwegian,
+                    "da" | "danish" => Algorithm::Danish,
+                    "fi" | "finnish" => Algorithm::Finnish,
+                    "ro" | "romanian" => Algorithm::Romanian,
+                    "hu" | "hungarian" => Algorithm::Hungarian,
+                    "tr" | "turkish" => Algorithm::Turkish,
+                    "ru" | "russian" => Algorithm::Russian,
+                    "ar" | "arabic" => Algorithm::Arabic,
+                    _ => Algorithm::English,
+                };
+                let stemmer = Stemmer::create(algo);
+                Some(stemmer.stem(s).into_owned())
+            }),
+            n => Err(DataFusionError::Plan(format!(
+                "word_stem: expected 1 or 2 arguments, got {n}"
+            ))),
+        }
     }
 }
 
