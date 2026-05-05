@@ -2,9 +2,9 @@
 
 Current state of SQE against the [icebergmatrix.org](https://icebergmatrix.org) rubric, the de-facto reference engineers consult when picking an Iceberg engine. Data lives at [Neuw84/iceberg-matrix](https://github.com/Neuw84/iceberg-matrix).
 
-**Score: 166/189 (87.8%)**  |  **Stretch: 170/189 (90%)**
+**Score: 167/189 (88.4%)**  |  **Stretch: 170/189 (90%)**
 
-Last generated: 2026-05-05T10:00:00Z  |  Source: `feat/maintenance-strong-form-test: prove rewrite_data_files real Parquet re-encoding via 10-file compaction live test`
+Last generated: 2026-05-05T15:00:00Z  |  Source: `fix/score-recount-after-merges: post !129 + !130 score is 167, not 166`
 
 Regenerate: `python3 scripts/render-iceberg-matrix.py`. Source of truth: `docs/iceberg-matrix-state.json`.
 
@@ -31,7 +31,7 @@ Each feature is scored against V2 and V3 of the Iceberg spec (63 cells total). A
 |---|---:|---:|
 | AWS EMR (Spark 7.12) | 180/189 | 95 |
 | OSS Spark 4.1 | 175/189 | 93 |
-| **SQE (current)** | **166/189** | **87.8** |
+| **SQE (current)** | **167/189** | **88.4** |
 | OSS Flink 2.2 | 153/189 | 81 |
 | Snowflake | 134/189 | 71 |
 | PyIceberg 0.11 | 130/189 | 69 |
@@ -124,7 +124,6 @@ Peer scores from icebergmatrix.org as of 2026-04-29.
 
 Cells marked `partial` or `unknown` have specific gaps documented in `docs/iceberg-matrix-state.json` under `caveats`. Key ones:
 
-- **equality-deletes (v2)**: RowDeltaOperation::delete_entries simplified to Ok(vec![]) against the RisingWave fork's SnapshotProducer; behaviour matches the fork's own CoW path but not independently verified against Java Iceberg.
 - **snowflake-horizon-catalog (v2)**: No live integration test.
 - **snowflake-horizon-catalog (v3)**: No live integration test against Horizon.
 - **hadoop-catalog (v2)**: Write path is race-prone on object stores without atomic rename; intentionally read-oriented.

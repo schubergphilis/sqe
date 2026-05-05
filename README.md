@@ -6,7 +6,7 @@ A Rust-based distributed SQL query engine for [Apache Iceberg](https://iceberg.a
 
 Every query runs as the authenticated user. No service account.
 
-**Iceberg coverage: 166/189 (87.8%)** on the public [icebergmatrix.org](https://icebergmatrix.org) scoreboard, fifth overall and the only top-five entry that is not a Spark distribution. See [`docs/iceberg-matrix.md`](docs/iceberg-matrix.md) for the per-cell breakdown and [`docs/iceberg-matrix-compare.md`](docs/iceberg-matrix-compare.md) for the V2/V3 side-by-side against every other engine on the public scoreboard.
+**Iceberg coverage: 167/189 (88.4%)** on the public [icebergmatrix.org](https://icebergmatrix.org) scoreboard, fifth overall and the only top-five entry that is not a Spark distribution. See [`docs/iceberg-matrix.md`](docs/iceberg-matrix.md) for the per-cell breakdown and [`docs/iceberg-matrix-compare.md`](docs/iceberg-matrix-compare.md) for the V2/V3 side-by-side against every other engine on the public scoreboard.
 
 ## Architecture
 
