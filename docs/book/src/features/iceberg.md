@@ -10,7 +10,7 @@ SQE is built on the [iceberg-rust](https://github.com/apache/iceberg-rust) libra
 - **Parquet**: 58
 - **Iceberg table format**: V2 and V3. V3 features verified end-to-end (TIMESTAMP_NS, column defaults, equality-delete UPDATE on identifier-fields, partition evolution).
 
-The matrix score against [icebergmatrix.org](https://icebergmatrix.org) is 162/189 (85.7%). See [iceberg-matrix.md](../../../iceberg-matrix.md) for the per-cell breakdown.
+The matrix score against [icebergmatrix.org](https://icebergmatrix.org) is 164/189 (86.8%), placing SQE fifth on the public scoreboard behind only Spark distributions (EMR, AWS Glue, OSS Spark, Dataproc). See [iceberg-matrix.md](../../../iceberg-matrix.md) for the per-cell breakdown and [iceberg-matrix-compare.md](../../../iceberg-matrix-compare.md) for the side-by-side V2/V3 comparison against every other engine on the public scoreboard.
 
 ## Architecture
 
