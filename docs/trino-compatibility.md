@@ -1,11 +1,19 @@
 # Trino SQL Compatibility Matrix
 
-> Living document. Last updated: 2026-04-08.
+> Living document. Last updated: 2026-05-04 (DataFusion 53.1.0).
 > Rating: ✅ equivalent | ⚠️ partial/different semantics | ❌ missing | 🔧 SQE-specific
 
 SQE aims to be a drop-in replacement for Trino in Iceberg-only environments.
 This document maps every Trino SQL function and feature to its SQE equivalent,
 noting semantic differences and gaps.
+
+> **DataFusion 53.1.0 update (2026-05-04).** The bump from 53.0.0 to 53.1.0 brought
+> three filter-pushdown bug fixes (#20996 InList Dictionary, #21142 fetch fields on
+> push_down_filter, #21492 FilterExec projection). None of them unblock the ❌ items
+> below. The remaining gaps are structural (Trino sketch types, Arrow type system
+> limits, Iceberg spec gaps) or strategic (Parquet-only). See the
+> [Engine Limitations & Roadmap](#engine-limitations--roadmap) section for the
+> per-feature path forward, including concrete TIME and JSON action plans.
 
 ## Summary
 
@@ -28,12 +36,15 @@ noting semantic differences and gaps.
 ### Overall Coverage
 
 **~95% Trino SQL compatibility** for Iceberg-only workloads. The remaining gaps are:
-- **Trino-specific sketch types** (HyperLogLog, TDigest, SetDigest) — not used in typical Iceberg analytics
-- **Map-producing aggregates** (histogram, map_agg, multimap_agg) — need custom UDAF with MapBuilder
-- **CREATE MATERIALIZED VIEW** — not in Iceberg spec; use CTAS + scheduled refresh
-- **Lambda in window functions** — DataFusion engine limitation
-- **ORC format** — strategic choice: Parquet only
-- **MoR writes** — feasible (all writers + transaction APIs exist), but SQE currently uses CoW. MoR would improve efficiency for small deletes on large tables
+- **Trino-specific sketch types** (HyperLogLog, TDigest, SetDigest). Not used in typical Iceberg analytics.
+- **Map-producing aggregates** (histogram, map_agg, multimap_agg). Need custom UDAF with MapBuilder.
+- **CREATE MATERIALIZED VIEW**. Not in Iceberg spec; use CTAS + scheduled refresh.
+- **Lambda in window functions**. DataFusion engine limitation.
+- **ORC format**. Strategic choice: Parquet only.
+- **MoR writes**. Feasible (all writers + transaction APIs exist), but SQE currently uses CoW. MoR would improve efficiency for small deletes on large tables.
+- **`TIME` / `TIME(p)` SQL surface**. Arrow `Time64` and `localtime()` exist; CREATE-TABLE / literal / EXTRACT wiring is the lift. ~150 LOC, planned.
+- **`JSON` logical type**. All JSON *functions* work via `datafusion-functions-json` + Trino aliases; only `CAST(json AS T)` needs a `Utf8` alias + cast router (~50 LOC stopgap) until Arrow `Variant` lands.
+- **`TIME WITH TIME ZONE`**. No Arrow equivalent and not commonly used. Use `TIMESTAMP WITH TIME ZONE` instead.
 
 ## How to Read This Document
 
@@ -337,8 +348,8 @@ Each section lists Trino functions with their SQE status:
 | `CHAR(n)` | `Utf8` | ⚠️ | No fixed-length semantics |
 | `VARBINARY` | `Binary` | ✅ | |
 | `DATE` | `Date32` | ✅ | |
-| `TIME` | — | ❌ | No time-only type in Arrow |
-| `TIME WITH TIME ZONE` | — | ❌ | |
+| `TIME` | `Time64(Microsecond)` underneath | ❌ | Arrow type and `localtime()` UDF both exist; CREATE-TABLE/literal/EXTRACT wiring missing. See [Engine Limitations & Roadmap](#engine-limitations--roadmap) |
+| `TIME WITH TIME ZONE` | — | ❌ | No Arrow equivalent. Use `TIMESTAMP WITH TIME ZONE` |
 | `TIMESTAMP` | `Timestamp(Microsecond, None)` | ✅ | |
 | `TIMESTAMP WITH TIME ZONE` | `Timestamp(Microsecond, Some(tz))` | ✅ | |
 | `INTERVAL YEAR TO MONTH` | `Interval(YearMonth)` | ✅ | |
@@ -346,7 +357,7 @@ Each section lists Trino functions with their SQE status:
 | `ARRAY(T)` | `List(T)` | ✅ | |
 | `MAP(K, V)` | `Map(K, V)` | ✅ | |
 | `ROW(fields...)` | `Struct(fields...)` | ✅ | |
-| `JSON` | — | ❌ | No JSON type; use VARCHAR |
+| `JSON` | `Utf8` (under) | ❌ | All JSON *functions* work; no logical type yet. Stage-1 alias = ~50 LOC, Stage-2 = wait for `datafusion-variant`. See [Engine Limitations & Roadmap](#engine-limitations--roadmap) |
 | `UUID` | `Utf8` | ⚠️ | Stored as string, no UUID type |
 | `IPADDRESS` | `VARCHAR` | ⚠️ | Stored as VARCHAR, no IP-specific functions (subnet containment, etc.) |
 | `HyperLogLog` | — | ❌ | Trino-specific sketch type |
@@ -385,7 +396,9 @@ The ~5% remaining gap consists of features that require engine-level changes, sk
 
 | Feature | Blocker | Path Forward |
 |---|---|---|
-| `CAST(json AS type)` | No native JSON type in Arrow/DataFusion — JSON is stored as VARCHAR; `CAST(v AS JSON)` is covered by `to_json(v)` UDF | Wait for `datafusion-variant` (Iceberg v3 VARIANT type) or register custom CAST rules |
+| `TIME` / `TIME(p)` (without timezone) | SQL surface only. Arrow already has `Time64(Microsecond)`; iceberg-rust already maps Iceberg's `time` primitive to it (`vendor/iceberg-rust/crates/iceberg/src/arrow/schema.rs:452`); SQE already exposes `localtime()` and `current_time()` returning `Time64` (`crates/sqe-trino-functions/src/trino_functions.rs:1249`). The remaining gap is wiring: `CREATE TABLE t(t TIME)` does not parse the type into `Time64`, `TIME 'HH:MM:SS'` literals are not bound, and `EXTRACT(HOUR FROM t)` / `t1 < t2` do not coerce on Time64 columns | Three-step lift, all small: (1) extend SQE's CREATE TABLE type mapper to send `TIME` → `Time64(Microsecond)` and `TIME(p)` → `Time32`/`Time64` per precision, (2) register a `TIME` literal handler that builds a `ScalarValue::Time64Microsecond`, (3) register the four EXTRACT bridges (`hour`, `minute`, `second`, `millisecond`) on Time64. Estimated ~150 LOC across `sqe-coordinator/src/write_handler.rs` (DDL path) and `sqe-trino-functions/src/trino_functions.rs` (literal + EXTRACT). The Iceberg roundtrip already works at the catalog layer; this is purely the SQL-side surface |
+| `TIME WITH TIME ZONE` | Arrow has no `TimeWithTimezone` type at all (unlike `Timestamp(unit, Some(tz))`). Trino itself discourages it: nearly every production Trino table uses `TIMESTAMP WITH TIME ZONE` instead | Not planned. Recommend `TIMESTAMP WITH TIME ZONE` as the substitute (already ✅). If a future workload genuinely needs it, the workaround is a `Struct{time: Time64, tz: Utf8}` column with a custom comparison UDF. Not clean enough to ship as a built-in |
+| `JSON` type / `CAST(json AS type)` | All JSON *functions* already work: `json_extract`, `json_extract_scalar`, `json_array_length`, `json_parse`, `json_format`, `json_object`, plus `to_json(v)` for value→JSON. The blocker is that Arrow has no `JSON` logical type, so `CAST('{"a":1}' AS JSON)` and `CAST(json_col AS BIGINT)` have nowhere to land | Two-stage path. **Stage 1 (now, ~50 LOC):** alias `JSON` to `Utf8` in the CREATE TABLE type mapper + register `CAST(json AS T)` as a router that calls the existing `json_get_str` / `json_get_int` / `json_get_float` / `json_get_bool` UDFs based on the target type. This makes `CAST(json AS BIGINT)` work without lying about the storage. **Stage 2 (when upstream lands):** swap to Arrow's `Variant` type once `datafusion-variant` ships (the Iceberg V3 VARIANT type proposal at apache/arrow-rs#7142 covers both JSON and Iceberg V3 VARIANT in one shot). Stage 1 is a stopgap; Stage 2 is the real answer |
 | `histogram(x)` / `map_agg(k,v)` / `multimap_agg(k,v)` | Map-producing aggregates require custom UDAF with Arrow `MapBuilder` output; cannot be expressed as scalar UDFs | Implement as UDAF using `MapBuilder` (~200–300 lines each) |
 | `approx_most_frequent(n, x, cap)` | Count-Min Sketch algorithm requires stateful UDAF with sketch accumulator | Custom UDAF with sketch state (~400 lines) |
 | `merge(digest)` / HyperLogLog / TDigest / SetDigest | Trino-specific sketch types with binary merge semantics; no Arrow equivalent | Not planned — these types are not used in Iceberg analytics |
