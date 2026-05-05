@@ -2,9 +2,11 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-A Rust-based distributed SQL query engine for [Apache Iceberg](https://iceberg.apache.org/) tables. Built on [DataFusion](https://datafusion.apache.org/) and [iceberg-rust](https://github.com/apache/iceberg-rust), with pluggable OIDC authentication and bearer token passthrough to [Apache Polaris](https://polaris.apache.org/) REST Catalog.
+A Rust-based distributed SQL query engine for [Apache Iceberg](https://iceberg.apache.org/) tables. Built on [DataFusion](https://datafusion.apache.org/) 53.1 and [iceberg-rust](https://github.com/apache/iceberg-rust), with pluggable OIDC authentication and bearer token passthrough to [Apache Polaris](https://polaris.apache.org/) REST Catalog.
 
 Every query runs as the authenticated user. No service account.
+
+**Iceberg coverage: 164/189 (86.8%)** on the public [icebergmatrix.org](https://icebergmatrix.org) scoreboard, fifth overall and the only top-five entry that is not a Spark distribution. See [`docs/iceberg-matrix.md`](docs/iceberg-matrix.md) for the per-cell breakdown and [`docs/iceberg-matrix-compare.md`](docs/iceberg-matrix-compare.md) for the V2/V3 side-by-side against every other engine on the public scoreboard.
 
 ## Architecture
 
@@ -36,10 +38,10 @@ For detailed Mermaid diagrams (query pipeline, crate dependencies, caching layer
 
 ## Features
 
-- **SQL**: Full ANSI SQL via DataFusion 53 -- window functions, CTEs, subqueries, joins, aggregates, GROUPING SETS, ROLLUP
-- **DDL/DML**: CREATE TABLE AS SELECT, INSERT INTO, DELETE, UPDATE, MERGE INTO (CoW), CREATE/DROP VIEW, ALTER TABLE
-- **Iceberg**: Time travel, metadata TVFs (snapshots, manifests, files, partitions), partition evolution, schema evolution
-- **Catalogs**: Apache Polaris, Project Nessie, AWS Glue, AWS S3 Tables, Hive Metastore, JDBC (Postgres/MySQL/SQLite), Hadoop storage-only. All five non-REST catalogs live-tested in Phase O+P; AWS endpoints reachable through SigV4-signed Iceberg REST.
+- **SQL**: Full ANSI SQL via DataFusion 53.1: window functions, CTEs, subqueries, joins, aggregates, GROUPING SETS, ROLLUP. JSON columns, TIME columns, all standard scalar / aggregate / window functions.
+- **DDL/DML**: CREATE TABLE AS SELECT, INSERT INTO, DELETE, UPDATE, MERGE INTO. Default Copy-on-Write; opt into Merge-on-Read with `TBLPROPERTIES ('write.delete.mode' = 'merge-on-read')` for position-delete or equality-delete writers (commits via `FastAppendAction` / `RowDeltaAction`).
+- **Iceberg**: V2 and V3 end-to-end. Time travel, metadata TVFs (snapshots, manifests, files, partitions, history, refs), partition evolution, schema evolution, hidden partitioning, type promotion, column defaults, nanosecond timestamps, branching and tagging.
+- **Catalogs**: Apache Polaris (default), Project Nessie, Unity Catalog OSS, AWS Glue (native SDK), AWS S3 Tables (native SDK), Hive Metastore, JDBC (Postgres/MySQL/SQLite), Hadoop storage-only. All routed through the upstream `iceberg-catalog-loader` factory. Live-tested against real services in `crates/sqe-catalog/tests/backends_integration.rs`. AWS endpoints also reachable through SigV4-signed Iceberg REST.
 - **Protocols**: Arrow Flight SQL (primary) + Trino HTTP (compatibility)
 - **Auth**: Pluggable chain -- OIDC, bearer token, API key, mTLS, anonymous, AWS IAM, device code, token exchange
 - **Distributed**: Coordinator-worker architecture with shuffle, spill-to-disk, adaptive sort
@@ -146,9 +148,9 @@ Full configuration reference: [docs/deployment.md](docs/deployment.md).
 | Component | Technology |
 |-----------|-----------|
 | Language | Rust |
-| Query Engine | Apache DataFusion 53 |
-| Table Format | Apache Iceberg v2/v3 |
-| Catalog | Apache Polaris (default) + Project Nessie, AWS Glue, AWS S3 Tables (via Iceberg REST + SigV4), Hive Metastore, JDBC (Postgres/MySQL/SQLite), Hadoop storage-only |
+| Query Engine | Apache DataFusion 53.1 |
+| Table Format | Apache Iceberg v2 / v3 |
+| Catalog | Apache Polaris (default), Project Nessie, Unity Catalog OSS, AWS Glue (native), AWS S3 Tables (native), Hive Metastore, JDBC (Postgres/MySQL/SQLite), Hadoop storage-only. Loader-based dispatch via the upstream `iceberg-catalog-loader` factory |
 | Wire Protocol | Arrow Flight SQL + Trino HTTP |
 | Storage | S3-compatible (AWS, Ceph, R2, rustfs) + local filesystem |
 | Observability | OpenTelemetry + Prometheus |
@@ -160,9 +162,12 @@ Full configuration reference: [docs/deployment.md](docs/deployment.md).
 |-----|------|
 | [Architecture](docs/architecture.md) | Mermaid diagrams: query pipeline, crate deps, caching, distributed |
 | [Deployment](docs/deployment.md) | Docker Compose, Kubernetes, TLS, auth providers, monitoring |
+| [Iceberg Matrix](docs/iceberg-matrix.md) | Per-cell SQE coverage on the public scoreboard (164/189, 86.8%) |
+| [Iceberg Matrix Comparison](docs/iceberg-matrix-compare.md) | V2/V3 side-by-side against 20 other engines |
+| [Trino Compatibility](docs/trino-compatibility.md) | SQL feature matrix vs Trino (~96% coverage) |
+| [Catalog Backends](docs/catalogs.md) | Per-backend TOML, credentials, verification queries |
 | [Roadmap](docs/roadmap.md) | Full feature checklist (completed, in progress, planned) |
 | [Security Audit](docs/issues.md) | 43 findings, all resolved |
-| [Trino Compatibility](docs/trino-compatibility.md) | SQL feature matrix vs Trino |
 | [Performance Roadmap](docs/specs/performance-roadmap.md) | Optimization history, remaining gaps |
 
 ## Blog
@@ -183,7 +188,7 @@ Full configuration reference: [docs/deployment.md](docs/deployment.md).
 
 ## Book
 
-SQE's design and development journey is documented in the ebook **"Sovereign by Design: Building a Production Query Engine on DataFusion"** (20 chapters). Source in [docs/ebook/](docs/ebook/). Build with `cd docs/ebook && make`.
+SQE's design and development journey is documented in the ebook **"Sovereign by Design: Building a Production Query Engine on DataFusion"** (19 chapters across five parts, ~370 pages). Source in [docs/ebook/](docs/ebook/). Build with `cd docs/ebook && make`. Two of the chapters track the Iceberg matrix journey end to end: chapter 16b ("The Matrix and the Quiet Bug") covers the first honest pass from 99/189 to 129/189; chapter 16c ("Following Through") picks up the punch list and walks the next six months to 164/189.
 
 ## Contributing
 
