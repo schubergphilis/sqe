@@ -4,7 +4,7 @@ Current state of SQE against the [icebergmatrix.org](https://icebergmatrix.org) 
 
 **Score: 163/189 (86.2%)**  |  **Stretch: 170/189 (90%)**
 
-Last generated: 2026-04-30T10:00:00Z  |  Source: `Phase O+ step 2 backend dispatch in SessionCatalog`
+Last generated: 2026-05-04T12:00:00Z  |  Source: `feat/iceberg-loader-s3tables: generic iceberg-catalog-loader dispatch + S3 Tables backend + live AWS verification`
 
 Regenerate: `python3 scripts/render-iceberg-matrix.py`. Source of truth: `docs/iceberg-matrix-state.json`.
 
@@ -97,7 +97,7 @@ Peer scores from icebergmatrix.org as of 2026-04-29.
 | Unity Catalog | F | F | Unity Catalog OSS exposes an Iceberg REST adapter at /api/2.1/unity-catalog/iceberg/ that SQE reaches through the same iceberg-catalog-rest  | Same vendored iceberg-catalog-rest code path as V2 plus the format-version: 3 forwarding pattern proven on Polaris. Unity Catalog OSS is for |
 | Snowflake Horizon | P | P | Horizon is Polaris-based; REST wiring compatible; no live test. | Snowflake Horizon is Polaris-based; the REST surface is shared with Polaris which we verified end-to-end at format-version 3. No live test a |
 | Hadoop Catalog | P | P | Storage-only scanner walks warehouse paths for metadata/v*.metadata.json (feature `hadoop`). Read path only; writes defer to REST/HMS. | The hadoop-catalog scanner walks `metadata/v*.metadata.json`; format-version 1/2/3 are read by the same iceberg-rust deserializer. Read pari |
-| JDBC Catalog | F | P | Two paths ship: (1) the rusqlite-based SQLite helper in backends/sql.rs (always-available with `--features sql`), and (2) iceberg-catalog-sq | iceberg-catalog-sql vendored alongside the fork is format-version agnostic; the format-version: 3 property forwarding pattern proven on Pola |
+| JDBC Catalog | F | P | iceberg-catalog-sql vendored from apache/iceberg-rust v0.9.0 (vendor/iceberg-rust/crates/catalog/sql/) uses sqlx::any to dispatch to SQLite/ | iceberg-catalog-sql vendored alongside the fork is format-version agnostic; the format-version: 3 property forwarding pattern proven on Pola |
 
 ### V3 data types
 
