@@ -2,9 +2,9 @@
 
 Current state of SQE against the [icebergmatrix.org](https://icebergmatrix.org) rubric, the de-facto reference engineers consult when picking an Iceberg engine. Data lives at [Neuw84/iceberg-matrix](https://github.com/Neuw84/iceberg-matrix).
 
-**Score: 164/189 (86.8%)**  |  **Stretch: 170/189 (90%)**
+**Score: 165/189 (87.3%)**  |  **Stretch: 170/189 (90%)**
 
-Last generated: 2026-05-04T18:00:00Z  |  Source: `feat/iceberg-loader-s3tables: SQL surface lift (JSON, TIME) + JDBC v3 live test + repaired backend tests`
+Last generated: 2026-05-05T11:00:00Z  |  Source: `feat/equality-deletes-v2-audit: caveat audit, Spark cross-engine read = Apache Iceberg reference verification`
 
 Regenerate: `python3 scripts/render-iceberg-matrix.py`. Source of truth: `docs/iceberg-matrix-state.json`.
 
@@ -31,7 +31,7 @@ Each feature is scored against V2 and V3 of the Iceberg spec (63 cells total). A
 |---|---:|---:|
 | AWS EMR (Spark 7.12) | 180/189 | 95 |
 | OSS Spark 4.1 | 175/189 | 93 |
-| **SQE (current)** | **164/189** | **86.8** |
+| **SQE (current)** | **165/189** | **87.3** |
 | OSS Flink 2.2 | 153/189 | 81 |
 | Snowflake | 134/189 | 71 |
 | PyIceberg 0.11 | 130/189 | 69 |
@@ -52,7 +52,7 @@ Peer scores from icebergmatrix.org as of 2026-04-29.
 | Feature | V2 | V3 | V2 notes | V3 notes |
 |---|:---:|:---:|---|---|
 | Position Deletes | F | F | PositionDeleteFileWriter + FastAppendAction (Step 8d). | MoR DELETE on V3 tables writes position-delete files alongside the existing data files; live data file count stays unchanged after DELETE (n |
-| Equality Deletes | P | F | DELETE with write.delete.mode=merge-on-read writes equality-delete files via EqualityDeleteFileWriter and commits through RowDeltaAction. Un | Equality-delete UPDATE on a V3 table with a declared identifier-field-id commits a single RowDelta with the new data file and the equality-d |
+| Equality Deletes | F | F | DELETE with write.delete.mode=merge-on-read writes equality-delete files via EqualityDeleteFileWriter and commits through RowDeltaAction. Un | Equality-delete UPDATE on a V3 table with a declared identifier-field-id commits a single RowDelta with the new data file and the equality-d |
 | Merge-on-Read | F | F | All three DML kinds (DELETE, UPDATE, MERGE) route through RowDeltaAction when write.*.mode = merge-on-read. UPDATE emits one data file per b | MoR DELETE writes position-delete files; MoR UPDATE writes data + equality-delete in one RowDelta when the V3 table declares an identifier-f |
 | Copy-on-Write | F | F | DELETE/UPDATE/MERGE via RisingWave iceberg-rust fork rewrite_files(). | DELETE on a V3 table without a declared MoR property runs CoW: rewrites the matched files via RewriteFilesAction, drops the row from subsequ |
 
@@ -124,7 +124,6 @@ Peer scores from icebergmatrix.org as of 2026-04-29.
 
 Cells marked `partial` or `unknown` have specific gaps documented in `docs/iceberg-matrix-state.json` under `caveats`. Key ones:
 
-- **equality-deletes (v2)**: RowDeltaOperation::delete_entries simplified to Ok(vec![]) against the RisingWave fork's SnapshotProducer; behaviour matches the fork's own CoW path but not independently verified against Java Iceberg.
 - **table-maintenance (v2)**: rewrite_data_files does not re-encode Parquet payloads (manifest-only compaction).
 - **table-maintenance (v3)**: rewrite_data_files does not re-encode Parquet payloads (row groups stay as-is).
 - **snowflake-horizon-catalog (v2)**: No live integration test.
