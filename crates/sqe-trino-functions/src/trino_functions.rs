@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, StringArray,
-    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array,
+    StringArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampNanosecondArray,
 };
 use arrow::compute::kernels::zip::zip;
@@ -89,6 +89,15 @@ pub fn register_trino_functions(ctx: &datafusion::prelude::SessionContext) {
     ctx.register_udf(ScalarUDF::from(JsonExtractScalar));
     ctx.register_udf(ScalarUDF::from(JsonArrayLength));
     ctx.register_udf(ScalarUDF::from(JsonParse));
+
+    // Trino math + string aliases — short standalone names that Trino has and
+    // DataFusion does not expose under that exact spelling. Each one is a
+    // small wrapper UDF over an existing primitive.
+    ctx.register_udf(ScalarUDF::from(TrinoE));
+    ctx.register_udf(ScalarUDF::from(TrinoMod));
+    ctx.register_udf(ScalarUDF::from(TrinoTruncate));
+    ctx.register_udf(ScalarUDF::from(TrinoSign));
+    ctx.register_udf(ScalarUDF::from(TrinoCodepoint));
 }
 
 /// Extract a chrono component from a Date32, Timestamp, or Time64 array.
@@ -1363,6 +1372,338 @@ impl ScalarUDFImpl for LocalTime {
     }
 }
 
+// ─── e() → Euler's number (Trino has it as a Nullary fn) ──────────────────
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct TrinoE;
+
+impl ScalarUDFImpl for TrinoE {
+    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> &str { "e" }
+
+    fn signature(&self) -> &Signature {
+        static SIG: std::sync::LazyLock<Signature> = std::sync::LazyLock::new(|| {
+            Signature::new(TypeSignature::Nullary, Volatility::Immutable)
+        });
+        &SIG
+    }
+
+    fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Float64)
+    }
+
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        use datafusion::common::ScalarValue;
+        Ok(ColumnarValue::Scalar(ScalarValue::Float64(Some(
+            std::f64::consts::E,
+        ))))
+    }
+}
+
+// ─── mod(n, m) → n % m (Trino has it; DataFusion only has the % operator) ─
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct TrinoMod;
+
+impl ScalarUDFImpl for TrinoMod {
+    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> &str { "mod" }
+
+    fn signature(&self) -> &Signature {
+        // Two args, any numeric type. Coerces to a common Float64 to keep
+        // the return shape consistent across BIGINT and DOUBLE callers.
+        static SIG: std::sync::LazyLock<Signature> = std::sync::LazyLock::new(|| {
+            Signature::any(2, Volatility::Immutable)
+        });
+        &SIG
+    }
+
+    fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Float64)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        use datafusion::common::ScalarValue;
+        let [n, m] = take_function_args::<2>("mod", &args.args)?;
+        let n_f = to_f64_columnar(n)?;
+        let m_f = to_f64_columnar(m)?;
+        match (n_f, m_f) {
+            (ColumnarValue::Scalar(ScalarValue::Float64(Some(a))),
+             ColumnarValue::Scalar(ScalarValue::Float64(Some(b)))) => {
+                if b == 0.0 {
+                    return Err(DataFusionError::Execution(
+                        "mod(n, 0): division by zero".into(),
+                    ));
+                }
+                Ok(ColumnarValue::Scalar(ScalarValue::Float64(Some(a % b))))
+            }
+            // For arrays we re-promote to Float64Array and elementwise mod.
+            (a, b) => {
+                let a_arr = a.into_array(args.number_rows)?;
+                let b_arr = b.into_array(args.number_rows)?;
+                let a_f = a_arr.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                    DataFusionError::Internal("mod: lhs not Float64Array after coercion".into())
+                })?;
+                let b_f = b_arr.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                    DataFusionError::Internal("mod: rhs not Float64Array after coercion".into())
+                })?;
+                let result: Float64Array = a_f
+                    .iter()
+                    .zip(b_f.iter())
+                    .map(|(a, b)| match (a, b) {
+                        (Some(av), Some(bv)) if bv != 0.0 => Some(av % bv),
+                        _ => None,
+                    })
+                    .collect();
+                Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
+            }
+        }
+    }
+}
+
+/// Coerce any numeric ColumnarValue to Float64. Used by mod / truncate / sign
+/// so users can pass BIGINT, INT, DOUBLE, or DECIMAL without surprise.
+fn to_f64_columnar(v: ColumnarValue) -> DFResult<ColumnarValue> {
+    use datafusion::common::ScalarValue;
+    match v {
+        ColumnarValue::Scalar(ScalarValue::Float64(_)) => Ok(v),
+        ColumnarValue::Scalar(ScalarValue::Float32(Some(x))) => {
+            Ok(ColumnarValue::Scalar(ScalarValue::Float64(Some(x as f64))))
+        }
+        ColumnarValue::Scalar(ScalarValue::Int64(Some(x))) => {
+            Ok(ColumnarValue::Scalar(ScalarValue::Float64(Some(x as f64))))
+        }
+        ColumnarValue::Scalar(ScalarValue::Int32(Some(x))) => {
+            Ok(ColumnarValue::Scalar(ScalarValue::Float64(Some(x as f64))))
+        }
+        ColumnarValue::Scalar(ScalarValue::UInt64(Some(x))) => {
+            Ok(ColumnarValue::Scalar(ScalarValue::Float64(Some(x as f64))))
+        }
+        ColumnarValue::Scalar(ScalarValue::Float32(None) | ScalarValue::Int64(None) | ScalarValue::Int32(None) | ScalarValue::UInt64(None)) => {
+            Ok(ColumnarValue::Scalar(ScalarValue::Float64(None)))
+        }
+        ColumnarValue::Array(arr) => {
+            let casted = arrow::compute::cast(&arr, &DataType::Float64).map_err(|e| {
+                DataFusionError::Execution(format!("cannot coerce array to Float64: {e}"))
+            })?;
+            Ok(ColumnarValue::Array(casted))
+        }
+        other => Err(DataFusionError::Execution(format!(
+            "expected numeric scalar, got {other:?}"
+        ))),
+    }
+}
+
+/// Helper used by signature-checked UDFs. Mirrors DataFusion's
+/// `take_function_args` macro pattern for arity checks.
+fn take_function_args<const N: usize>(
+    fn_name: &str,
+    args: &[ColumnarValue],
+) -> DFResult<[ColumnarValue; N]> {
+    if args.len() != N {
+        return Err(DataFusionError::Plan(format!(
+            "{fn_name}: expected {N} arguments, got {}",
+            args.len()
+        )));
+    }
+    let mut out: Vec<ColumnarValue> = Vec::with_capacity(N);
+    out.extend(args.iter().cloned());
+    out.try_into()
+        .map_err(|_| DataFusionError::Internal(format!("{fn_name}: arity assertion failed")))
+}
+
+// ─── truncate(x [, n]) → DataFusion `trunc(x [, n])` alias ────────────────
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct TrinoTruncate;
+
+impl ScalarUDFImpl for TrinoTruncate {
+    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> &str { "truncate" }
+
+    fn signature(&self) -> &Signature {
+        // 1 or 2 args. Same shape as Trino's truncate(x) and truncate(x, n).
+        static SIG: std::sync::LazyLock<Signature> = std::sync::LazyLock::new(|| {
+            Signature::variadic_any(Volatility::Immutable)
+        });
+        &SIG
+    }
+
+    fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Float64)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        use datafusion::common::ScalarValue;
+        if args.args.is_empty() || args.args.len() > 2 {
+            return Err(DataFusionError::Plan(format!(
+                "truncate: expected 1 or 2 arguments, got {}",
+                args.args.len()
+            )));
+        }
+        let x = to_f64_columnar(args.args[0].clone())?;
+        let n_decimals: i32 = if args.args.len() == 2 {
+            match &args.args[1] {
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(v))) => *v as i32,
+                ColumnarValue::Scalar(ScalarValue::Int32(Some(v))) => *v,
+                ColumnarValue::Scalar(ScalarValue::Int64(None) | ScalarValue::Int32(None)) => 0,
+                _ => {
+                    return Err(DataFusionError::Plan(
+                        "truncate: second argument (decimals) must be an integer".into(),
+                    ))
+                }
+            }
+        } else {
+            0
+        };
+        let scale = 10f64.powi(n_decimals);
+        let trunc_one = |v: f64| (v * scale).trunc() / scale;
+        match x {
+            ColumnarValue::Scalar(ScalarValue::Float64(Some(v))) => Ok(ColumnarValue::Scalar(
+                ScalarValue::Float64(Some(trunc_one(v))),
+            )),
+            ColumnarValue::Scalar(ScalarValue::Float64(None)) => {
+                Ok(ColumnarValue::Scalar(ScalarValue::Float64(None)))
+            }
+            ColumnarValue::Array(arr) => {
+                let f = arr.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                    DataFusionError::Internal("truncate: not Float64Array after coercion".into())
+                })?;
+                let result: Float64Array = f.iter().map(|v| v.map(trunc_one)).collect();
+                Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
+            }
+            other => Err(DataFusionError::Internal(format!(
+                "truncate: unexpected scalar shape after coercion: {other:?}"
+            ))),
+        }
+    }
+}
+
+// ─── sign(x) → DataFusion `signum(x)` alias ────────────────────────────────
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct TrinoSign;
+
+impl ScalarUDFImpl for TrinoSign {
+    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> &str { "sign" }
+
+    fn signature(&self) -> &Signature {
+        static SIG: std::sync::LazyLock<Signature> = std::sync::LazyLock::new(|| {
+            Signature::any(1, Volatility::Immutable)
+        });
+        &SIG
+    }
+
+    fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Float64)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        use datafusion::common::ScalarValue;
+        let [x] = take_function_args::<1>("sign", &args.args)?;
+        let x = to_f64_columnar(x)?;
+        // Trino: sign(0) = 0. Rust's f64::signum(0.0) = 1.0 (positive zero
+        // is signed positive). Override the zero case explicitly.
+        let trino_signum = |v: f64| -> f64 {
+            if v == 0.0 {
+                0.0
+            } else if v.is_nan() {
+                f64::NAN
+            } else {
+                v.signum()
+            }
+        };
+        match x {
+            ColumnarValue::Scalar(ScalarValue::Float64(Some(v))) => Ok(ColumnarValue::Scalar(
+                ScalarValue::Float64(Some(trino_signum(v))),
+            )),
+            ColumnarValue::Scalar(ScalarValue::Float64(None)) => {
+                Ok(ColumnarValue::Scalar(ScalarValue::Float64(None)))
+            }
+            ColumnarValue::Array(arr) => {
+                let f = arr.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                    DataFusionError::Internal("sign: not Float64Array after coercion".into())
+                })?;
+                let result: Float64Array = f.iter().map(|v| v.map(trino_signum)).collect();
+                Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
+            }
+            other => Err(DataFusionError::Internal(format!(
+                "sign: unexpected scalar shape: {other:?}"
+            ))),
+        }
+    }
+}
+
+// ─── codepoint(s) → Unicode code point of a single-char string ─────────────
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct TrinoCodepoint;
+
+impl ScalarUDFImpl for TrinoCodepoint {
+    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> &str { "codepoint" }
+
+    fn signature(&self) -> &Signature {
+        static SIG: std::sync::LazyLock<Signature> = std::sync::LazyLock::new(|| {
+            Signature::any(1, Volatility::Immutable)
+        });
+        &SIG
+    }
+
+    fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
+        // Trino returns INTEGER. We return Int32 to match.
+        Ok(DataType::Int32)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        use datafusion::common::ScalarValue;
+        let [arg] = take_function_args::<1>("codepoint", &args.args)?;
+        let one = |s: &str| -> DFResult<i32> {
+            let mut chars = s.chars();
+            let c = chars.next().ok_or_else(|| {
+                DataFusionError::Execution(
+                    "codepoint: empty string has no code point".into(),
+                )
+            })?;
+            if chars.next().is_some() {
+                return Err(DataFusionError::Execution(format!(
+                    "codepoint: input must contain exactly one Unicode character, got {} chars",
+                    s.chars().count()
+                )));
+            }
+            Ok(c as i32)
+        };
+        match arg {
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))
+            | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s))) => {
+                Ok(ColumnarValue::Scalar(ScalarValue::Int32(Some(one(&s)?))))
+            }
+            ColumnarValue::Scalar(
+                ScalarValue::Utf8(None) | ScalarValue::LargeUtf8(None),
+            ) => Ok(ColumnarValue::Scalar(ScalarValue::Int32(None))),
+            ColumnarValue::Array(arr) => {
+                let s = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                    DataFusionError::Plan(
+                        "codepoint: input must be Utf8 / VARCHAR".into(),
+                    )
+                })?;
+                let mut out = Int32Array::builder(s.len());
+                for v in s.iter() {
+                    match v {
+                        None => out.append_null(),
+                        Some(text) => out.append_value(one(text)?),
+                    }
+                }
+                Ok(ColumnarValue::Array(Arc::new(out.finish()) as ArrayRef))
+            }
+            other => Err(DataFusionError::Plan(format!(
+                "codepoint: input must be a string scalar or array, got {other:?}"
+            ))),
+        }
+    }
+}
+
 // ─── localtimestamp → alias for CURRENT_TIMESTAMP ──────────────────────────
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -2347,6 +2688,109 @@ mod tests {
             Ok(plan) => plan.collect().await.is_err(),
         };
         assert!(failed, "year(time) should fail with a clear plan error");
+    }
+
+    // ── Trino math + string aliases ───────────────────────────────────────────
+
+    /// Run SQL returning a Float64 result.
+    async fn run_query_f64(sql: &str) -> f64 {
+        let ctx = SessionContext::new();
+        register_trino_functions(&ctx);
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let col = batches[0].column(0);
+        col.as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap_or_else(|| panic!("expected Float64Array, got {:?}", col.data_type()))
+            .value(0)
+    }
+
+    #[tokio::test]
+    async fn e_returns_eulers_constant() {
+        let v = run_query_f64("SELECT e()").await;
+        assert!(
+            (v - std::f64::consts::E).abs() < 1e-15,
+            "expected Euler's constant, got {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mod_int_returns_remainder() {
+        // Both operands integer; we coerce to Float64 internally so the
+        // result lands as Float64. 10 % 3 = 1.
+        let v = run_query_f64("SELECT mod(10, 3)").await;
+        assert_eq!(v, 1.0);
+    }
+
+    #[tokio::test]
+    async fn mod_float_returns_remainder() {
+        let v = run_query_f64("SELECT mod(10.5, 3.0)").await;
+        assert!((v - 1.5).abs() < 1e-12, "expected 1.5, got {v}");
+    }
+
+    #[tokio::test]
+    async fn mod_zero_divisor_errors() {
+        let ctx = SessionContext::new();
+        register_trino_functions(&ctx);
+        let res = ctx.sql("SELECT mod(10, 0)").await;
+        let failed = match res {
+            Err(_) => true,
+            Ok(plan) => plan.collect().await.is_err(),
+        };
+        assert!(failed, "mod(_, 0) should error");
+    }
+
+    #[tokio::test]
+    async fn truncate_drops_fractional_part() {
+        let v = run_query_f64("SELECT truncate(3.7)").await;
+        assert_eq!(v, 3.0);
+        let v = run_query_f64("SELECT truncate(-3.7)").await;
+        assert_eq!(v, -3.0);
+    }
+
+    #[tokio::test]
+    async fn truncate_with_precision() {
+        // Trino: truncate(2.71828, 2) = 2.71. Avoiding 3.14 because clippy
+        // flags it as an approximation of std::f64::consts::PI.
+        let v = run_query_f64("SELECT truncate(2.71828, 2)").await;
+        assert!((v - 2.71).abs() < 1e-12, "expected 2.71, got {v}");
+        let v = run_query_f64("SELECT truncate(-2.71828, 2)").await;
+        assert!((v + 2.71).abs() < 1e-12, "expected -2.71, got {v}");
+    }
+
+    #[tokio::test]
+    async fn sign_returns_signum() {
+        assert_eq!(run_query_f64("SELECT sign(42.0)").await, 1.0);
+        assert_eq!(run_query_f64("SELECT sign(-42.0)").await, -1.0);
+        assert_eq!(run_query_f64("SELECT sign(0.0)").await, 0.0);
+    }
+
+    #[tokio::test]
+    async fn codepoint_ascii_matches_byte() {
+        // ASCII char: codepoint == byte. 'A' = 65.
+        let v = run_query_i64("SELECT codepoint('A')").await;
+        assert_eq!(v, 65);
+    }
+
+    #[tokio::test]
+    async fn codepoint_unicode_returns_full_codepoint() {
+        // Trino's codepoint() must return the full Unicode code point,
+        // not the first UTF-8 byte. 'é' is U+00E9 = 233. ascii() on the
+        // same input returns 195 (the first UTF-8 byte 0xC3); codepoint
+        // is what callers actually want.
+        let v = run_query_i64("SELECT codepoint('é')").await;
+        assert_eq!(v, 233);
+    }
+
+    #[tokio::test]
+    async fn codepoint_multi_char_errors() {
+        let ctx = SessionContext::new();
+        register_trino_functions(&ctx);
+        let res = ctx.sql("SELECT codepoint('ab')").await;
+        let failed = match res {
+            Err(_) => true,
+            Ok(plan) => plan.collect().await.is_err(),
+        };
+        assert!(failed, "codepoint of multi-char string should error");
     }
 
     #[tokio::test]
