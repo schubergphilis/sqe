@@ -8,6 +8,8 @@ Last generated: 2026-05-04T18:00:00Z  |  Source: `feat/iceberg-loader-s3tables: 
 
 Regenerate: `python3 scripts/render-iceberg-matrix.py`. Source of truth: `docs/iceberg-matrix-state.json`.
 
+> **Side-by-side with every other engine:** see [`docs/iceberg-matrix-compare.md`](./iceberg-matrix-compare.md) for the V2/V3 comparison across SQE, Spark, Flink, PyIceberg, DuckDB, ClickHouse, Doris, Daft, Snowflake, Databricks, EMR, Glue, Athena, Redshift, BigQuery, Dataproc, Fabric, Synapse, Managed Flink, Firehose, and Kafka Connect.
+
 ---
 
 ## Legend
