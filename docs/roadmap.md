@@ -2,7 +2,7 @@
 
 ## Iceberg matrix coverage
 
-**Score: 164/189 (86.8%)** on the public [icebergmatrix.org](https://icebergmatrix.org) scoreboard, fifth overall behind only Spark distributions (EMR, AWS Glue, OSS Spark, Dataproc). See [`docs/iceberg-matrix.md`](iceberg-matrix.md) for the per-cell breakdown and [`docs/iceberg-matrix-compare.md`](iceberg-matrix-compare.md) for the V2/V3 comparison against every other engine on the public scoreboard.
+**Score: 166/189 (87.8%)** on the public [icebergmatrix.org](https://icebergmatrix.org) scoreboard, fifth overall behind only Spark distributions (EMR, AWS Glue, OSS Spark, Dataproc). See [`docs/iceberg-matrix.md`](iceberg-matrix.md) for the per-cell breakdown and [`docs/iceberg-matrix-compare.md`](iceberg-matrix-compare.md) for the V2/V3 comparison against every other engine on the public scoreboard.
 
 ## Completed
 
