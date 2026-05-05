@@ -6,7 +6,7 @@ A Rust-based distributed SQL query engine for [Apache Iceberg](https://iceberg.a
 
 Every query runs as the authenticated user. No service account.
 
-**Iceberg coverage: 164/189 (86.8%)** on the public [icebergmatrix.org](https://icebergmatrix.org) scoreboard, fifth overall and the only top-five entry that is not a Spark distribution. See [`docs/iceberg-matrix.md`](docs/iceberg-matrix.md) for the per-cell breakdown and [`docs/iceberg-matrix-compare.md`](docs/iceberg-matrix-compare.md) for the V2/V3 side-by-side against every other engine on the public scoreboard.
+**Iceberg coverage: 166/189 (87.8%)** on the public [icebergmatrix.org](https://icebergmatrix.org) scoreboard, fifth overall and the only top-five entry that is not a Spark distribution. See [`docs/iceberg-matrix.md`](docs/iceberg-matrix.md) for the per-cell breakdown and [`docs/iceberg-matrix-compare.md`](docs/iceberg-matrix-compare.md) for the V2/V3 side-by-side against every other engine on the public scoreboard.
 
 ## Architecture
 
@@ -162,7 +162,7 @@ Full configuration reference: [docs/deployment.md](docs/deployment.md).
 |-----|------|
 | [Architecture](docs/architecture.md) | Mermaid diagrams: query pipeline, crate deps, caching, distributed |
 | [Deployment](docs/deployment.md) | Docker Compose, Kubernetes, TLS, auth providers, monitoring |
-| [Iceberg Matrix](docs/iceberg-matrix.md) | Per-cell SQE coverage on the public scoreboard (164/189, 86.8%) |
+| [Iceberg Matrix](docs/iceberg-matrix.md) | Per-cell SQE coverage on the public scoreboard (166/189, 87.8%) |
 | [Iceberg Matrix Comparison](docs/iceberg-matrix-compare.md) | V2/V3 side-by-side against 20 other engines |
 | [Trino Compatibility](docs/trino-compatibility.md) | SQL feature matrix vs Trino (~96% coverage) |
 | [Catalog Backends](docs/catalogs.md) | Per-backend TOML, credentials, verification queries |

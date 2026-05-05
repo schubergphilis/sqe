@@ -281,9 +281,11 @@ def main():
     out.append('')
     out.append(render_scoreboard(platforms))
     out.append('')
-    out.append('SQE sits at **164/189 (86.8%)**, fifth on the public scoreboard behind '
-               'EMR Spark, AWS Glue Spark, OSS Spark, and Dataproc. SQE is the only '
-               'entry in the top five that is not a Spark distribution.')
+    sqe_score = score_of(platforms['sqe'])
+    sqe_pct = 100.0 * sqe_score / 189
+    out.append(f'SQE sits at **{sqe_score}/189 ({sqe_pct:.1f}%)**, fifth on the public '
+               'scoreboard behind EMR Spark, AWS Glue Spark, OSS Spark, and Dataproc. '
+               'SQE is the only entry in the top five that is not a Spark distribution.')
     out.append('')
     out.append('---')
     out.append('')
