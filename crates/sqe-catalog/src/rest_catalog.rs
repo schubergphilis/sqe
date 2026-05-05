@@ -336,20 +336,27 @@ impl SessionCatalog {
         backend: &sqe_core::config::CatalogBackend,
     ) -> sqe_core::Result<Self> {
         use sqe_core::config::CatalogBackend;
-        let inner: Arc<dyn iceberg::Catalog> = match backend {
+
+        // Each non-REST backend translates its typed config into the
+        // upstream loader's `(catalog_type, props_map)` shape. The
+        // loader picks the right `CatalogBuilder`, applies the
+        // shared `OpenDalStorageFactory::Fs` we want for SQE, and
+        // returns an `Arc<dyn iceberg::Catalog>`. All of this used
+        // to live in per-backend wrappers under
+        // `crates/sqe-catalog/src/backends/`; the wrappers are gone
+        // because the loader's uniform shape made them redundant.
+        // See `vendor/iceberg-rust/README.md` and
+        // `docs/catalogs.md` for the supported prop keys per backend.
+        let (catalog_type, name, props): (&str, &str, HashMap<String, String>) = match backend {
             CatalogBackend::Rest => unreachable!("Rest handled in for_session"),
+
             #[cfg(feature = "hms")]
             CatalogBackend::Hms { uri, warehouse } => {
-                let storage_factory: Arc<dyn iceberg::io::StorageFactory> =
-                    Arc::new(iceberg::io::OpenDalStorageFactory::Fs);
-                let backend = crate::backends::hms::HmsBackend::new(
-                    crate::backends::hms::HmsConfig::new(uri.clone(), warehouse.clone()),
-                );
-                let catalog = backend
-                    .build_catalog(storage_factory)
-                    .await
-                    .map_err(|e| SqeError::Catalog(format!("HMS catalog build failed: {e}")))?;
-                Arc::new(catalog)
+                use iceberg_catalog_hms::{HMS_CATALOG_PROP_URI, HMS_CATALOG_PROP_WAREHOUSE};
+                let mut p = HashMap::new();
+                p.insert(HMS_CATALOG_PROP_URI.to_string(), uri.clone());
+                p.insert(HMS_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.clone());
+                ("hms", "sqe-hms-session", p)
             }
             #[cfg(not(feature = "hms"))]
             CatalogBackend::Hms { .. } => {
@@ -357,25 +364,21 @@ impl SessionCatalog {
                     "HMS backend requires the `hms` cargo feature on sqe-catalog".into(),
                 ));
             }
+
             #[cfg(feature = "glue")]
-            CatalogBackend::Glue {
-                region,
-                warehouse,
-                endpoint,
-            } => {
-                let storage_factory: Arc<dyn iceberg::io::StorageFactory> =
-                    Arc::new(iceberg::io::OpenDalStorageFactory::Fs);
-                let mut glue_cfg = crate::backends::glue::GlueConfig::new(
-                    region.clone(),
-                    warehouse.clone(),
-                );
-                glue_cfg.endpoint = endpoint.clone();
-                let backend = crate::backends::glue::GlueBackend::new(glue_cfg);
-                let catalog = backend
-                    .build_catalog(storage_factory)
-                    .await
-                    .map_err(|e| SqeError::Catalog(format!("Glue catalog build failed: {e}")))?;
-                Arc::new(catalog)
+            CatalogBackend::Glue { region, warehouse, endpoint } => {
+                use iceberg_catalog_glue::GLUE_CATALOG_PROP_WAREHOUSE;
+                let mut p = HashMap::new();
+                p.insert(GLUE_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.clone());
+                // The Glue builder reads `region` and `endpoint` via
+                // the AWS SDK shared config layer; pass them through
+                // as standard AWS keys so LocalStack and custom
+                // endpoints work.
+                p.insert("aws.region".to_string(), region.clone());
+                if let Some(ep) = endpoint {
+                    p.insert("aws.endpoint_url".to_string(), ep.clone());
+                }
+                ("glue", "sqe-glue-session", p)
             }
             #[cfg(not(feature = "glue"))]
             CatalogBackend::Glue { .. } => {
@@ -383,32 +386,54 @@ impl SessionCatalog {
                     "Glue backend requires the `glue` cargo feature on sqe-catalog".into(),
                 ));
             }
+
             #[cfg(feature = "sql-postgres")]
             CatalogBackend::Jdbc { url, warehouse } => {
-                use iceberg::CatalogBuilder;
-                use iceberg_catalog_sql::{
-                    SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlCatalogBuilder,
-                };
-                let storage_factory: Arc<dyn iceberg::io::StorageFactory> =
-                    Arc::new(iceberg::io::OpenDalStorageFactory::Fs);
-                let mut props = HashMap::new();
-                props.insert(SQL_CATALOG_PROP_URI.to_string(), url.clone());
-                props.insert(SQL_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.clone());
-                let catalog = SqlCatalogBuilder::default()
-                    .with_storage_factory(storage_factory)
-                    .load("sqe-jdbc-session", props)
-                    .await
-                    .map_err(|e| SqeError::Catalog(format!("JDBC catalog build failed: {e}")))?;
-                Arc::new(catalog)
+                use iceberg_catalog_sql::{SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE};
+                let mut p = HashMap::new();
+                p.insert(SQL_CATALOG_PROP_URI.to_string(), url.clone());
+                p.insert(SQL_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.clone());
+                ("sql", "sqe-jdbc-session", p)
             }
             #[cfg(not(feature = "sql-postgres"))]
             CatalogBackend::Jdbc { .. } => {
                 return Err(SqeError::Catalog(
-                    "JDBC backend requires the `sql-postgres` cargo feature on sqe-catalog"
-                        .into(),
+                    "JDBC backend requires the `sql-postgres` cargo feature on sqe-catalog".into(),
+                ));
+            }
+
+            #[cfg(feature = "s3tables")]
+            CatalogBackend::S3tables { table_bucket_arn, endpoint_url } => {
+                use iceberg_catalog_s3tables::{
+                    S3TABLES_CATALOG_PROP_ENDPOINT_URL, S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN,
+                };
+                let mut p = HashMap::new();
+                p.insert(
+                    S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN.to_string(),
+                    table_bucket_arn.clone(),
+                );
+                if let Some(ep) = endpoint_url {
+                    p.insert(S3TABLES_CATALOG_PROP_ENDPOINT_URL.to_string(), ep.clone());
+                }
+                ("s3tables", "sqe-s3tables-session", p)
+            }
+            #[cfg(not(feature = "s3tables"))]
+            CatalogBackend::S3tables { .. } => {
+                return Err(SqeError::Catalog(
+                    "S3 Tables backend requires the `s3tables` cargo feature on sqe-catalog".into(),
                 ));
             }
         };
+
+        let inner: Arc<dyn iceberg::Catalog> = iceberg_catalog_loader::load(catalog_type)
+            .map_err(|e| SqeError::Catalog(format!(
+                "Catalog loader rejected type `{catalog_type}`: {e}"
+            )))?
+            .load(name.to_string(), props)
+            .await
+            .map_err(|e| SqeError::Catalog(format!(
+                "Catalog `{catalog_type}` build failed: {e}"
+            )))?;
 
         let token_fingerprint = {
             use sha2::{Digest, Sha256};

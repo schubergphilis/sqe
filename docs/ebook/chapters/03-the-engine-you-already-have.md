@@ -504,7 +504,7 @@ You don't subclass. You don't monkey-patch. You implement a trait and register i
 
 This is why the "80/20" framing is accurate. DataFusion gives you the SQL parser, the logical planner, the optimizer, the physical planner, the execution runtime, the Arrow memory model, and the pull-based streaming. That's 80% of a query engine. The remaining 20% -- the catalog integration, the storage layer, the auth model, the policy enforcement, the distribution strategy -- is your product. It's the part that makes your engine different from every other engine built on DataFusion.
 
-SQE's `Cargo.toml` tells the story:
+SQE's `Cargo.toml` tells the story (version numbers as of the work in this book; we have since moved to DF 53.1):
 
 ```toml
 datafusion = "52"
@@ -519,7 +519,7 @@ iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "1
 iceberg-catalog-rest = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "1978911ec4" }
 ```
 
-DataFusion 52, Arrow 57, Iceberg 0.9. Three version numbers that represent tens of thousands of hours of engineering by communities we will never have to hire. The SQL parsing, the columnar memory layout, the table format -- all solved problems. SQE's contribution is the glue: how these pieces fit together under a sovereign auth model.
+DataFusion 52, Arrow 57, Iceberg 0.9. Three version numbers that represent tens of thousands of hours of engineering by communities we will never have to hire. The SQL parsing, the columnar memory layout, the table format are all solved problems. SQE's contribution is the glue: how these pieces fit together under a sovereign auth model.
 
 ::: {.antipattern}
 **Antipattern: reimplementing what DataFusion already does.** The temptation is strong.
