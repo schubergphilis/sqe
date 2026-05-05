@@ -19,7 +19,7 @@ Cells like `./X` mean the feature is V3-only in the rubric (no V2 cell). Cells l
 | 2 | Glue (5.1) | 178/189 | 94.2% |
 | 3 | OSS Spark (4.1) | 175/189 | 92.6% |
 | 4 | Dataproc (2.3) | 174/189 | 92.1% |
-| 5 | SQE (0.15.0) **(this engine)** | 164/189 | 86.8% |
+| 5 | SQE (0.15.0) **(this engine)** | 165/189 | 87.3% |
 | 6 | Managed Flink (1.20) | 157/189 | 83.1% |
 | 7 | OSS Flink (2.2.0) | 153/189 | 81.0% |
 | 8 | Doris (4.1) | 144/189 | 76.2% |
@@ -37,7 +37,7 @@ Cells like `./X` mean the feature is V3-only in the rubric (no V2 cell). Cells l
 | 20 | BigQuery | 40/189 | 21.2% |
 | 21 | Data Firehose | 26/189 | 13.8% |
 
-SQE sits at **164/189 (86.8%)**, fifth on the public scoreboard behind EMR Spark, AWS Glue Spark, OSS Spark, and Dataproc. SQE is the only entry in the top five that is not a Spark distribution.
+SQE sits at **165/189 (87.3%)**, fifth on the public scoreboard behind EMR Spark, AWS Glue Spark, OSS Spark, and Dataproc. SQE is the only entry in the top five that is not a Spark distribution.
 
 ---
 
@@ -55,7 +55,7 @@ SQE first, then Spark, Flink, PyIceberg, DuckDB, ClickHouse, Doris, Daft, and Ka
 | Copy-on-Write | F/F | F/F | F/F | F/F | P/? | ./. | ./. | F/? | ./. |
 | Merge-on-Read | F/F | F/F | F/F | P/P | F/? | F/. | F/F | P/? | ./. |
 | Position Deletes | F/F | F/F | F/F | P/P | F/P | F/. | F/F | F/? | ./. |
-| Equality Deletes | P/F | F/F | F/F | P/. | F/. | P/. | F/. | ./? | ./. |
+| Equality Deletes | F/F | F/F | F/F | P/. | F/. | P/. | F/. | ./? | ./. |
 
 ### Schema & table evolution
 
@@ -127,7 +127,7 @@ SQE first, then Snowflake, Databricks, AWS, GCP, and Azure offerings. EMR / Glue
 | Copy-on-Write | F/F | F/F | F/F | F/F | F/F | P/. | F/. | F/F | P/. | F/. | F/F | ?/? | P/? |
 | Merge-on-Read | F/F | P/F | ./F | F/F | F/F | F/. | F/. | F/F | P/. | P/. | F/F | ?/? | P/? |
 | Position Deletes | F/F | P/F | ./. | F/F | F/F | F/. | F/. | F/F | ./. | P/. | F/F | ?/? | P/? |
-| Equality Deletes | P/F | ./. | ./. | F/F | F/F | F/. | F/. | F/F | F/. | P/. | F/F | ?/? | P/? |
+| Equality Deletes | F/F | ./. | ./. | F/F | F/F | F/. | F/. | F/F | F/. | P/. | F/F | ?/? | P/? |
 
 ### Schema & table evolution
 
