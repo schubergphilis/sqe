@@ -19,7 +19,7 @@ Cells like `./X` mean the feature is V3-only in the rubric (no V2 cell). Cells l
 | 2 | Glue (5.1) | 178/189 | 94.2% |
 | 3 | OSS Spark (4.1) | 175/189 | 92.6% |
 | 4 | Dataproc (2.3) | 174/189 | 92.1% |
-| 5 | SQE (0.15.0) **(this engine)** | 165/189 | 87.3% |
+| 5 | SQE (0.15.0) **(this engine)** | 166/189 | 87.8% |
 | 6 | Managed Flink (1.20) | 157/189 | 83.1% |
 | 7 | OSS Flink (2.2.0) | 153/189 | 81.0% |
 | 8 | Doris (4.1) | 144/189 | 76.2% |
@@ -37,7 +37,7 @@ Cells like `./X` mean the feature is V3-only in the rubric (no V2 cell). Cells l
 | 20 | BigQuery | 40/189 | 21.2% |
 | 21 | Data Firehose | 26/189 | 13.8% |
 
-SQE sits at **165/189 (87.3%)**, fifth on the public scoreboard behind EMR Spark, AWS Glue Spark, OSS Spark, and Dataproc. SQE is the only entry in the top five that is not a Spark distribution.
+SQE sits at **166/189 (87.8%)**, fifth on the public scoreboard behind EMR Spark, AWS Glue Spark, OSS Spark, and Dataproc. SQE is the only entry in the top five that is not a Spark distribution.
 
 ---
 
@@ -84,7 +84,7 @@ SQE first, then Spark, Flink, PyIceberg, DuckDB, ClickHouse, Doris, Daft, and Ka
 | --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | Statistics (Column Metrics) | F/F | F/F | F/F | F/F | F/P | P/. | F/F | F/? | P/P |
 | Bloom Filters & Puffin | F/F | F/F | ?/? | ./. | ./. | ./. | ?/? | ./? | ./. |
-| Table Maintenance | P/P | F/F | P/P | P/P | ./. | ./. | F/F | ./? | ./. |
+| Table Maintenance | F/F | F/F | P/P | P/P | ./. | ./. | F/F | ./? | ./. |
 
 ### Catalog backends
 
@@ -156,7 +156,7 @@ SQE first, then Snowflake, Databricks, AWS, GCP, and Azure offerings. EMR / Glue
 | --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | Statistics (Column Metrics) | F/F | F/F | ?/? | F/F | F/F | F/. | F/. | F/F | P/. | ?/. | F/F | ?/? | P/? |
 | Bloom Filters & Puffin | F/F | ./. | ./. | F/F | F/F | P/. | ./. | ?/? | ./. | ?/. | F/F | ?/? | P/? |
-| Table Maintenance | P/P | F/F | F/F | F/F | F/F | P/. | P/. | P/P | ./. | F/. | F/F | ?/? | P/? |
+| Table Maintenance | F/F | F/F | F/F | F/F | F/F | P/. | P/. | P/P | ./. | F/. | F/F | ?/? | P/? |
 
 ### Catalog backends
 
