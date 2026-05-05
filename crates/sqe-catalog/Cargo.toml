@@ -15,28 +15,39 @@ edition = "2021"
 # the heavyweight). Default release binary lands around 180-200 MB,
 # which is fine for our Kubernetes deployments and matches Java stacks
 # of similar scope.
-default = ["rest", "sql-postgres", "hms", "glue", "hadoop"]
+default = ["rest", "sql-postgres", "hms", "glue", "hadoop", "s3tables"]
 # REST catalog (the protocol Polaris and Nessie both speak). Always on
 # in default; the flag exists so `--no-default-features --features rest`
 # is a valid slim build.
-rest = []
+# SQE forwards each backend feature into the loader so the loader's
+# registry only contains backends the SQE binary actually links.
+# Without forwarding, the loader's default-features pull every
+# backend (and its AWS SDK / Thrift / sqlx weight) regardless of
+# what SQE asked for.
+rest = ["iceberg-catalog-loader/rest"]
 # JDBC-style SQL catalog. SQLite via rusqlite (existing helper) plus the
 # upstream iceberg-catalog-sql crate which uses sqlx::any for runtime
 # dispatch to SQLite/PostgreSQL/MySQL.
-sql = ["dep:rusqlite", "dep:iceberg-catalog-sql", "dep:sqlx"]
+sql = ["dep:rusqlite", "dep:iceberg-catalog-sql", "dep:sqlx", "iceberg-catalog-loader/sql"]
 # Add-on for `sql`: enable PostgreSQL via sqlx. Kept separate so the base
 # `sql` feature does not pull tls-rustls + tokio-runtime + postgres driver
 # into builds that only want SQLite.
 sql-postgres = ["sql", "sqlx/postgres", "sqlx/runtime-tokio", "sqlx/tls-rustls"]
 # Hadoop storage-only backend. No extra dependency — the backend scans a
-# warehouse path via `object_store`, which is already linked.
+# warehouse path via `object_store`, which is already linked. Hadoop has
+# no upstream loader counterpart; SQE's hadoop dispatch stays in
+# `crates/sqe-catalog/src/backends/hadoop.rs`.
 hadoop = []
 # Hive Metastore over Thrift. Vendored from apache/iceberg-rust v0.9.0;
 # pulls in volo-thrift + pilota only when this feature is enabled.
-hms = ["dep:iceberg-catalog-hms"]
+hms = ["dep:iceberg-catalog-hms", "iceberg-catalog-loader/hms"]
 # AWS Glue Data Catalog. Vendored from apache/iceberg-rust v0.9.0;
 # pulls in aws-sdk-glue + aws-config only when this feature is enabled.
-glue = ["dep:iceberg-catalog-glue"]
+glue = ["dep:iceberg-catalog-glue", "iceberg-catalog-loader/glue"]
+# AWS S3 Tables (managed Iceberg). Pulls in aws-sdk-s3tables. Shares
+# the aws-config + aws-sdk runtime already pulled by `glue`, so the
+# incremental binary cost is small (~5-10 MB).
+s3tables = ["dep:iceberg-catalog-s3tables", "iceberg-catalog-loader/s3tables"]
 
 [dependencies]
 sqe-core = { path = "../sqe-core" }
@@ -50,6 +61,14 @@ arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
 iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
+# Catalog factory dispatch. Replaces SQE's per-backend match
+# dispatch and gives every backend a uniform `load(name, props)`
+# entry point. The workspace-level dep declares
+# `default-features = false`; each SQE backend feature
+# (rest/glue/hms/sql/s3tables) below activates the matching
+# loader feature, so the loader's registry only includes builders
+# the SQE binary actually links.
+iceberg-catalog-loader = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
@@ -77,6 +96,7 @@ rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 iceberg-catalog-hms = { workspace = true, optional = true }
 iceberg-catalog-glue = { workspace = true, optional = true }
 iceberg-catalog-sql = { workspace = true, optional = true }
+iceberg-catalog-s3tables = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 
 [dev-dependencies]

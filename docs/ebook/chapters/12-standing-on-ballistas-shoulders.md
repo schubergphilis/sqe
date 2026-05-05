@@ -55,7 +55,7 @@ The key insight: Ballista's most valuable contribution isn't its scheduler or it
 
 Three things from Ballista's model survived into SQE essentially unchanged.
 
-**The serialisation model.** DataFusion's `datafusion-proto` crate provides protobuf serialisation for LogicalPlans and PhysicalPlans. This is the same serialisation layer that Ballista uses internally. We use it directly -- `datafusion-proto = "52"` in our `Cargo.toml`. The protobuf schema defines how every built-in DataFusion plan node (Filter, Projection, Aggregate, Sort, HashJoin, and dozens more) maps to a protobuf message and back. This is thousands of lines of code we didn't have to write.
+**The serialisation model.** DataFusion's `datafusion-proto` crate provides protobuf serialisation for LogicalPlans and PhysicalPlans. The same serialisation layer is what Ballista uses internally. We use it directly. `datafusion-proto = "53"` in our `Cargo.toml` (we have moved through 52 and 53.0 to 53.1 over the course of this book). The protobuf schema defines how every built-in DataFusion plan node (Filter, Projection, Aggregate, Sort, HashJoin, and dozens more) maps to a protobuf message and back. Thousands of lines of code we did not have to write.
 
 **The execution model.** Ballista's core insight is that a distributed query execution is just a set of independent scan tasks, each assigned to a worker, with results streamed back to the coordinator via Arrow Flight. The coordinator doesn't send the whole query to every worker. It sends each worker a *fragment* -- a subset of files to scan, with the credentials needed to read them. The worker executes the fragment, streams back RecordBatches, and the coordinator stitches the results together. SQE follows this pattern exactly.
 

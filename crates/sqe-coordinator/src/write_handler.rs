@@ -3925,6 +3925,42 @@ pub(crate) fn sql_type_to_arrow(
             };
             Ok(DataType::Decimal128(precision as u8, scale as i8))
         }
+        // JSON has no native Arrow logical type; alias it to Utf8.
+        // CAST(json_col AS BIGINT|DOUBLE|...) goes through DataFusion's
+        // built-in Utf8 -> target coercion. JSON-shaped extraction stays
+        // available via json_extract / json_get_str / json_get_int /
+        // json_get_float / json_get_bool registered at session start.
+        SqlType::JSON => Ok(DataType::Utf8),
+        // TIME (without timezone) maps to Arrow's Time64. Iceberg's
+        // `time` primitive is microseconds-since-midnight, which lines up
+        // with Time64(Microsecond). The same Time64 type already flows
+        // through the engine: localtime() / current_time() return it,
+        // and iceberg-rust's arrow bridge maps Iceberg time <-> Time64.
+        // TIME WITH TIME ZONE has no Arrow equivalent and is rejected.
+        SqlType::Time(precision, tz_info) => {
+            if sqe_sql::is_tz_variant(tz_info) {
+                return Err(SqeError::NotImplemented(
+                    "TIME WITH TIME ZONE has no Arrow equivalent. \
+                     Use TIMESTAMP WITH TIME ZONE instead."
+                        .to_string(),
+                ));
+            }
+            // Iceberg's `time` primitive is microseconds-since-midnight
+            // (no `time_ns` exists in the spec, V2 or V3). Iceberg-rust's
+            // arrow bridge therefore only round-trips `Time64(Microsecond)`.
+            // We accept any precision <= 6 and store at microsecond
+            // resolution. Higher precision is rejected with a clear message
+            // so the user picks `TIMESTAMP(9)` if they really need
+            // sub-microsecond resolution.
+            let p = precision.unwrap_or(6);
+            if p > 6 {
+                return Err(SqeError::NotImplemented(format!(
+                    "TIME({p}) precision exceeds Iceberg's microsecond `time` \
+                     primitive. Use TIMESTAMP(9) for sub-microsecond resolution."
+                )));
+            }
+            Ok(DataType::Time64(arrow_schema::TimeUnit::Microsecond))
+        }
         other => Err(SqeError::NotImplemented(format!(
             "SQL type not supported for CREATE TABLE: {other}"
         ))),
@@ -5108,15 +5144,57 @@ mod tests {
     }
 
     #[test]
-    fn test_sql_type_to_arrow_unsupported_returns_err() {
-        // JSON is not in the supported set — must return a NotImplemented error.
-        let result = sql_type_to_arrow(&SqlType::JSON);
+    fn test_sql_type_to_arrow_json_aliases_to_utf8() {
+        // JSON has no native Arrow logical type. The Stage-1 path is to
+        // alias it to Utf8 so CAST(json_col AS BIGINT|VARCHAR|DOUBLE)
+        // rides DataFusion's built-in Utf8 -> target coercion. JSON
+        // extraction stays available via the json_extract /
+        // json_get_str / json_get_int / json_get_float / json_get_bool
+        // UDFs registered at session start.
+        let result = sql_type_to_arrow(&SqlType::JSON).unwrap();
+        assert_eq!(result, DataType::Utf8);
+    }
+
+    #[test]
+    fn test_sql_type_to_arrow_time_default_precision() {
+        // Default TIME (no precision) is microsecond, matching Iceberg's
+        // `time` primitive and iceberg-rust's arrow bridge.
+        let result = sql_type_to_arrow(&SqlType::Time(None, TimezoneInfo::None)).unwrap();
+        assert_eq!(result, DataType::Time64(TimeUnit::Microsecond));
+    }
+
+    #[test]
+    fn test_sql_type_to_arrow_time_precision_branches() {
+        // Iceberg's `time` primitive is microsecond-only; precisions 0..=6
+        // collapse to Time64(Microsecond). Higher precisions are rejected
+        // with a clear NotImplemented since Iceberg has no `time_ns` type.
+        for p in 0u64..=6 {
+            let result =
+                sql_type_to_arrow(&SqlType::Time(Some(p), TimezoneInfo::None)).unwrap();
+            assert_eq!(
+                result,
+                DataType::Time64(TimeUnit::Microsecond),
+                "TIME({p}) should map to Time64(Microsecond) for Iceberg compatibility",
+            );
+        }
+        let err = sql_type_to_arrow(&SqlType::Time(Some(9), TimezoneInfo::None));
+        assert!(
+            matches!(err, Err(sqe_core::SqeError::NotImplemented(ref msg)) if msg.contains("TIME(9)")),
+            "TIME(9) should be rejected since Iceberg has no time_ns: got {err:?}",
+        );
+    }
+
+    #[test]
+    fn test_sql_type_to_arrow_time_with_timezone_rejected() {
+        // TIME WITH TIME ZONE has no Arrow equivalent. Reject with a
+        // clear NotImplemented so users see the TIMESTAMP WITH TIME
+        // ZONE workaround in the error message.
+        let result = sql_type_to_arrow(&SqlType::Time(None, TimezoneInfo::WithTimeZone));
         assert!(result.is_err());
         let err = result.unwrap_err();
-        // The error should be a NotImplemented variant.
         assert!(
-            matches!(err, sqe_core::SqeError::NotImplemented(_)),
-            "expected NotImplemented, got: {err:?}"
+            matches!(err, sqe_core::SqeError::NotImplemented(ref msg) if msg.contains("TIME WITH TIME ZONE")),
+            "expected TIME WITH TIME ZONE NotImplemented, got: {err:?}"
         );
     }
 

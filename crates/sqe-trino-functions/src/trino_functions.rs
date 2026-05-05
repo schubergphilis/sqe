@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, StringArray,
-    TimestampMicrosecondArray, TimestampNanosecondArray,
+    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    TimestampNanosecondArray,
 };
 use arrow::compute::kernels::zip::zip;
 use arrow::datatypes::DataType;
@@ -90,13 +91,19 @@ pub fn register_trino_functions(ctx: &datafusion::prelude::SessionContext) {
     ctx.register_udf(ScalarUDF::from(JsonParse));
 }
 
-/// Extract a chrono component from a Date32 or Timestamp array.
-/// Returns Int64 to match Trino's BIGINT return type for date extraction functions.
+/// Extract a chrono component from a Date32, Timestamp, or Time64 array.
+/// Returns Int64 to match Trino's BIGINT return type for extraction functions.
+///
+/// `f_time` returns `None` for extracts that don't apply to TIME columns
+/// (year, month, day_of_*, etc.). The dispatch surfaces a clear error so
+/// users see `year(time_col)` rejected rather than silently coerced to 0.
 fn extract_component(
     arg: &ColumnarValue,
+    fn_name: &str,
     f_date: fn(NaiveDate) -> f64,
     f_ts: fn(i64) -> f64,
     f_ts_ns: fn(i64) -> f64,
+    f_time: fn(i64) -> Option<f64>,
 ) -> DFResult<ColumnarValue> {
     match arg {
         ColumnarValue::Array(array) => {
@@ -109,9 +116,16 @@ fn extract_component(
                 ts_arr.iter().map(|opt| opt.map(|v| f_ts(v) as i64)).collect()
             } else if let Some(ts_arr) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
                 ts_arr.iter().map(|opt| opt.map(|v| f_ts_ns(v) as i64)).collect()
+            } else if let Some(time_arr) = array.as_any().downcast_ref::<Time64MicrosecondArray>() {
+                build_time_int64(time_arr.iter(), 1, fn_name, f_time)?
+            } else if let Some(time_arr) = array.as_any().downcast_ref::<Time64NanosecondArray>() {
+                // DataFusion produces Time64(Nanosecond) for `CAST('HH:MM:SS' AS TIME)`
+                // and friends. Convert nanoseconds-since-midnight to
+                // microseconds before delegating to the common time path.
+                build_time_int64(time_arr.iter(), 1_000, fn_name, f_time)?
             } else {
                 return Err(DataFusionError::Internal(format!(
-                    "Expected Date32 or Timestamp, got {:?}", array.data_type()
+                    "Expected Date32, Timestamp, or Time64, got {:?}", array.data_type()
                 )));
             };
             Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
@@ -125,13 +139,69 @@ fn extract_component(
                 }
                 ScalarValue::TimestampMicrosecond(Some(us), _) => f_ts(*us) as i64,
                 ScalarValue::TimestampNanosecond(Some(ns), _) => f_ts_ns(*ns) as i64,
+                ScalarValue::Time64Microsecond(Some(us)) => match f_time(*us) {
+                    Some(v) => v as i64,
+                    None => return Err(DataFusionError::Plan(format!(
+                        "{fn_name}() is not supported on TIME columns; use a TIMESTAMP or DATE source"
+                    ))),
+                },
+                ScalarValue::Time64Nanosecond(Some(ns)) => {
+                    // DataFusion produces Time64(Nanosecond) for `CAST('HH:MM:SS' AS TIME)`
+                    // and TIME literals. Convert ns -> us.
+                    let us = ns / 1_000;
+                    match f_time(us) {
+                        Some(v) => v as i64,
+                        None => return Err(DataFusionError::Plan(format!(
+                            "{fn_name}() is not supported on TIME columns; use a TIMESTAMP or DATE source"
+                        ))),
+                    }
+                }
                 _ => return Err(DataFusionError::Internal(format!(
-                    "Expected date or timestamp scalar, got {scalar:?}"
+                    "Expected date, timestamp, or time scalar, got {scalar:?}"
                 ))),
             };
             Ok(ColumnarValue::Scalar(ScalarValue::Int64(Some(val))))
         }
     }
+}
+
+/// Convert microseconds-since-midnight to a chrono `NaiveTime`. Returns
+/// `None` if the input is out of range (>= 86_400_000_000 us).
+fn time_us_to_naive(us: i64) -> Option<chrono::NaiveTime> {
+    if !(0..86_400_000_000).contains(&us) {
+        return None;
+    }
+    let secs = (us / 1_000_000) as u32;
+    let nanos = ((us % 1_000_000) * 1_000) as u32;
+    chrono::NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos)
+}
+
+/// Build an `Int64Array` from an iterator of optional time values, dividing
+/// each value by `denom` to convert to microseconds-since-midnight before
+/// applying `f_time`. The `fn_name` is used in the error message when
+/// `f_time` returns `None` (e.g. `year(time_col)`).
+fn build_time_int64<I>(
+    iter: I,
+    denom: i64,
+    fn_name: &str,
+    f_time: fn(i64) -> Option<f64>,
+) -> DFResult<Int64Array>
+where
+    I: Iterator<Item = Option<i64>>,
+{
+    let mut out = Vec::new();
+    for opt in iter {
+        match opt {
+            None => out.push(None),
+            Some(raw) => match f_time(raw / denom) {
+                Some(v) => out.push(Some(v as i64)),
+                None => return Err(DataFusionError::Plan(format!(
+                    "{fn_name}() is not supported on TIME columns; use a TIMESTAMP or DATE source"
+                ))),
+            },
+        }
+    }
+    Ok(out.into_iter().collect())
 }
 
 fn us_to_naive(us: i64) -> chrono::NaiveDateTime {
@@ -145,8 +215,12 @@ fn ns_to_naive(ns: i64) -> chrono::NaiveDateTime {
 }
 
 /// Macro to define a Trino date-extract function using direct chrono extraction.
+///
+/// The `$f_time` callback returns `Some(v)` for extracts that apply to TIME
+/// (hour, minute, second) and `None` otherwise so `year(time_col)` etc. fail
+/// loud rather than silently producing 0.
 macro_rules! trino_extract_fn {
-    ($struct_name:ident, $fn_name:expr, $f_date:expr, $f_us:expr, $f_ns:expr) => {
+    ($struct_name:ident, $fn_name:expr, $f_date:expr, $f_us:expr, $f_ns:expr, $f_time:expr) => {
         #[derive(Debug, PartialEq, Eq, Hash)]
         struct $struct_name;
 
@@ -167,7 +241,7 @@ macro_rules! trino_extract_fn {
             }
 
             fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-                extract_component(&args.args[0], $f_date, $f_us, $f_ns)
+                extract_component(&args.args[0], $fn_name, $f_date, $f_us, $f_ns, $f_time)
             }
         }
     };
@@ -176,52 +250,62 @@ macro_rules! trino_extract_fn {
 trino_extract_fn!(ExtractYear, "year",
     |d: NaiveDate| d.year() as f64,
     |us| us_to_naive(us).year() as f64,
-    |ns| ns_to_naive(ns).year() as f64
+    |ns| ns_to_naive(ns).year() as f64,
+    |_us: i64| None
 );
 trino_extract_fn!(ExtractMonth, "month",
     |d: NaiveDate| d.month() as f64,
     |us| us_to_naive(us).month() as f64,
-    |ns| ns_to_naive(ns).month() as f64
+    |ns| ns_to_naive(ns).month() as f64,
+    |_us: i64| None
 );
 trino_extract_fn!(ExtractDay, "day",
     |d: NaiveDate| d.day() as f64,
     |us| us_to_naive(us).day() as f64,
-    |ns| ns_to_naive(ns).day() as f64
+    |ns| ns_to_naive(ns).day() as f64,
+    |_us: i64| None
 );
 trino_extract_fn!(ExtractHour, "hour",
     |_d: NaiveDate| 0.0,
     |us| us_to_naive(us).hour() as f64,
-    |ns| ns_to_naive(ns).hour() as f64
+    |ns| ns_to_naive(ns).hour() as f64,
+    |us: i64| time_us_to_naive(us).map(|t| t.hour() as f64)
 );
 trino_extract_fn!(ExtractMinute, "minute",
     |_d: NaiveDate| 0.0,
     |us| us_to_naive(us).minute() as f64,
-    |ns| ns_to_naive(ns).minute() as f64
+    |ns| ns_to_naive(ns).minute() as f64,
+    |us: i64| time_us_to_naive(us).map(|t| t.minute() as f64)
 );
 trino_extract_fn!(ExtractSecond, "second",
     |_d: NaiveDate| 0.0,
     |us| us_to_naive(us).second() as f64,
-    |ns| ns_to_naive(ns).second() as f64
+    |ns| ns_to_naive(ns).second() as f64,
+    |us: i64| time_us_to_naive(us).map(|t| t.second() as f64)
 );
 trino_extract_fn!(DayOfWeek, "day_of_week",
     |d: NaiveDate| d.weekday().num_days_from_sunday() as f64,
     |us| us_to_naive(us).weekday().num_days_from_sunday() as f64,
-    |ns| ns_to_naive(ns).weekday().num_days_from_sunday() as f64
+    |ns| ns_to_naive(ns).weekday().num_days_from_sunday() as f64,
+    |_us: i64| None
 );
 trino_extract_fn!(DayOfYear, "day_of_year",
     |d: NaiveDate| d.ordinal() as f64,
     |us| us_to_naive(us).ordinal() as f64,
-    |ns| ns_to_naive(ns).ordinal() as f64
+    |ns| ns_to_naive(ns).ordinal() as f64,
+    |_us: i64| None
 );
 trino_extract_fn!(Quarter, "quarter",
     |d: NaiveDate| ((d.month() - 1) / 3 + 1) as f64,
     |us| { let m = us_to_naive(us).month(); ((m - 1) / 3 + 1) as f64 },
-    |ns| { let m = ns_to_naive(ns).month(); ((m - 1) / 3 + 1) as f64 }
+    |ns| { let m = ns_to_naive(ns).month(); ((m - 1) / 3 + 1) as f64 },
+    |_us: i64| None
 );
 trino_extract_fn!(Week, "week",
     |d: NaiveDate| d.iso_week().week() as f64,
     |us| us_to_naive(us).iso_week().week() as f64,
-    |ns| ns_to_naive(ns).iso_week().week() as f64
+    |ns| ns_to_naive(ns).iso_week().week() as f64,
+    |_us: i64| None
 );
 
 // ─── Helper: parse time-unit string ─────────────────────────────────────────
@@ -1263,20 +1347,19 @@ impl ScalarUDFImpl for LocalTime {
     }
 
     fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Timestamp(
-            arrow::datatypes::TimeUnit::Microsecond,
-            None,
-        ))
+        // Time-of-day, no timezone, microsecond precision. Matches Iceberg's
+        // `time` primitive and the type that EXTRACT(HOUR|MINUTE|SECOND ...)
+        // bridges accept.
+        Ok(DataType::Time64(arrow::datatypes::TimeUnit::Microsecond))
     }
 
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         use datafusion::common::ScalarValue;
-        let now = chrono::Local::now().naive_local();
-        let us = now.and_utc().timestamp_micros();
-        Ok(ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(
-            Some(us),
-            None,
-        )))
+        let now = chrono::Local::now().time();
+        // Microseconds since midnight.
+        let us = now.num_seconds_from_midnight() as i64 * 1_000_000
+            + (now.nanosecond() / 1_000) as i64;
+        Ok(ColumnarValue::Scalar(ScalarValue::Time64Microsecond(Some(us))))
     }
 }
 
@@ -2238,9 +2321,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn localtime_returns_current_year() {
-        let y = run_query("SELECT year(localtime())").await;
-        assert!(y >= 2025, "expected current year, got {y}");
+    async fn localtime_extracts_hour_minute_second() {
+        // localtime() returns Time64(Microsecond); the EXTRACT bridges
+        // accept it. Hour, minute, second land in 0..=23 / 0..=59 / 0..=59.
+        let h = run_query("SELECT hour(localtime())").await;
+        let m = run_query("SELECT minute(localtime())").await;
+        let s = run_query("SELECT second(localtime())").await;
+        assert!((0..=23).contains(&h), "hour out of range: {h}");
+        assert!((0..=59).contains(&m), "minute out of range: {m}");
+        assert!((0..=59).contains(&s), "second out of range: {s}");
+    }
+
+    #[tokio::test]
+    async fn year_on_time_column_errors() {
+        // Trino spec: year(time) is not supported. Our extract_component
+        // surfaces a Plan error rather than silently returning 0. Confirm
+        // we error on a Time64 input.
+        let ctx = SessionContext::new();
+        register_trino_functions(&ctx);
+        let res = ctx.sql("SELECT year(localtime())").await;
+        // The error can land at planning or execution depending on
+        // DataFusion's lazy logical planning. Either way, it must fail.
+        let failed = match res {
+            Err(_) => true,
+            Ok(plan) => plan.collect().await.is_err(),
+        };
+        assert!(failed, "year(time) should fail with a clear plan error");
+    }
+
+    #[tokio::test]
+    async fn hour_on_typed_time_literal() {
+        // A TIME-typed literal flows through Time64 -> hour() bridge.
+        // We use TYPED literal via cast since DataFusion's parser may
+        // not bind raw TIME 'HH:MM:SS' literals directly yet.
+        let ctx = SessionContext::new();
+        register_trino_functions(&ctx);
+        let batches = ctx
+            .sql("SELECT hour(CAST('14:30:45' AS TIME))")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let col = batches[0].column(0);
+        let val = col.as_any().downcast_ref::<Int64Array>().unwrap().value(0);
+        assert_eq!(val, 14, "hour from '14:30:45' should be 14");
     }
 
     // ── date_trunc (DataFusion built-in, verify Trino compat) ────────────────

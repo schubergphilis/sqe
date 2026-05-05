@@ -92,7 +92,7 @@ graph TB
     style COMMIT fill:#6f9
 ```
 
-CoW rewrites affected data files entirely. MoR support can be added later for write-heavy workloads when upstream iceberg-rust ships `RowDeltaAction`.
+CoW rewrites affected data files entirely. MoR has shipped: set `TBLPROPERTIES ('write.delete.mode' = 'merge-on-read')` to opt in. SQE writes a position-delete file (no PK) or an equality-delete file (with PK) and commits via `FastAppendAction` / `RowDeltaAction`. CoW remains the default for backward compatibility.
 
 ### Delivered
 
