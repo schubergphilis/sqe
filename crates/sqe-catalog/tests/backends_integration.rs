@@ -21,8 +21,10 @@ mod glue {
     use std::sync::Arc;
 
     use iceberg::io::OpenDalStorageFactory;
-    use iceberg::{Catalog, NamespaceIdent};
-    use sqe_catalog::backends::glue::{GlueBackend, GlueConfig};
+    use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
+    use iceberg_catalog_glue::{
+        AWS_REGION_NAME, GLUE_CATALOG_PROP_WAREHOUSE, GlueCatalogBuilder,
+    };
 
     /// Live AWS Glue round-trip: create_namespace -> list_namespaces ->
     /// drop_namespace, against the user's account in eu-central-1 (or
@@ -60,9 +62,15 @@ mod glue {
         let storage_factory: Arc<dyn iceberg::io::StorageFactory> =
             Arc::new(OpenDalStorageFactory::Fs);
 
-        let backend = GlueBackend::new(GlueConfig::new(region, warehouse));
-        let catalog = backend
-            .build_catalog(storage_factory)
+        // Build the upstream GlueCatalog directly through the loader
+        // builder pattern — same path the iceberg-catalog-loader uses
+        // when SQE's `[catalog.backend] type = "glue"` is selected.
+        let mut props = HashMap::new();
+        props.insert(GLUE_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.clone());
+        props.insert(AWS_REGION_NAME.to_string(), region.clone());
+        let catalog = GlueCatalogBuilder::default()
+            .with_storage_factory(storage_factory)
+            .load("sqe-glue-it", props)
             .await
             .expect("GlueCatalog builds with the configured AWS profile");
 
@@ -94,12 +102,23 @@ mod glue {
             .unwrap_or_else(|e| panic!("drop_namespace({ns_name}) failed: {e}"));
     }
 
-    /// Pure-config smoke test: exercises the wrapper struct without
-    /// touching AWS. Useful in CI where the live test is gated.
-    #[test]
-    fn glue_config_constructs() {
-        let cfg = GlueConfig::new("eu-west-1", "s3://lake/wh");
-        assert_eq!(cfg.region, "eu-west-1");
+    /// Pure-config smoke test: builds a GlueCatalogBuilder without
+    /// touching AWS. Verifies the warehouse + region props flow
+    /// through the loader path the same way the live test uses them.
+    #[tokio::test]
+    async fn glue_builder_rejects_empty_warehouse() {
+        let storage_factory: Arc<dyn iceberg::io::StorageFactory> =
+            Arc::new(OpenDalStorageFactory::Fs);
+        // Empty warehouse must fail fast at builder.load() rather than
+        // surfacing a confusing AWS error later.
+        let res = GlueCatalogBuilder::default()
+            .with_storage_factory(storage_factory)
+            .load("sqe-glue-it", HashMap::new())
+            .await;
+        assert!(
+            res.is_err(),
+            "empty warehouse should fail fast, got: {res:?}"
+        );
     }
 }
 
@@ -107,11 +126,14 @@ mod glue {
 
 #[cfg(feature = "hms")]
 mod hms {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use iceberg::io::OpenDalStorageFactory;
-    use iceberg::{Catalog, NamespaceIdent};
-    use sqe_catalog::backends::hms::{HmsBackend, HmsConfig};
+    use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
+    use iceberg_catalog_hms::{
+        HMS_CATALOG_PROP_URI, HMS_CATALOG_PROP_WAREHOUSE, HmsCatalogBuilder,
+    };
 
     /// Live HMS round-trip: create_namespace -> namespace_exists -> drop_namespace.
     ///
@@ -151,9 +173,15 @@ mod hms {
         let storage_factory: Arc<dyn iceberg::io::StorageFactory> =
             Arc::new(OpenDalStorageFactory::Fs);
 
-        let backend = HmsBackend::new(HmsConfig::new(uri, warehouse));
-        let catalog = backend
-            .build_catalog(storage_factory)
+        // Build the upstream HmsCatalog directly through the builder
+        // pattern — same path iceberg-catalog-loader uses when SQE's
+        // `[catalog.backend] type = "hms"` is selected.
+        let mut props = HashMap::new();
+        props.insert(HMS_CATALOG_PROP_URI.to_string(), uri.clone());
+        props.insert(HMS_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.clone());
+        let catalog = HmsCatalogBuilder::default()
+            .with_storage_factory(storage_factory)
+            .load("sqe-hms-it", props)
             .await
             .expect("HmsCatalog builds against the docker stack");
 
@@ -194,54 +222,61 @@ mod hms {
 
 #[cfg(feature = "sql")]
 mod sql {
-    use sqe_catalog::backends::sql::SqlBackend;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use iceberg::CatalogBuilder;
+    use iceberg::io::OpenDalStorageFactory;
+    use iceberg_catalog_sql::{
+        SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlCatalogBuilder,
+    };
     use tempfile::tempdir;
 
-    #[test]
-    fn jdbc_backend_sqlite_roundtrip() {
+    /// Builder smoke test: the vendored `iceberg-catalog-sql` crate
+    /// uses sqlx's `Any` driver, which only speaks the database
+    /// engines whose drivers are compiled in. The default-features
+    /// build of SQE pulls in PostgreSQL via the `sql-postgres` feature;
+    /// SQLite is not enabled by default. This test verifies the
+    /// builder rejects inputs without a registered driver, surfacing
+    /// the same fast-fail path the loader takes when SQE's
+    /// `[catalog.backend] type = "jdbc"` is selected with an
+    /// unsupported URL scheme.
+    ///
+    /// The full live SQL round-trip lives in `sql_postgres::*` and
+    /// runs against the docker-compose postgres stack.
+    #[tokio::test]
+    async fn jdbc_sqlite_builder_rejects_unsupported_driver() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("catalog.db");
-        let backend = SqlBackend::open_sqlite(path.to_str().unwrap(), "sqe").unwrap();
+        let db_path = dir.path().join("catalog.db");
+        let warehouse_path = dir.path().join("warehouse");
+        std::fs::create_dir_all(&warehouse_path).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let warehouse = format!("file://{}", warehouse_path.display());
 
-        // Start empty.
-        assert!(backend.list_namespaces().unwrap().is_empty());
+        let mut props = HashMap::new();
+        props.insert(SQL_CATALOG_PROP_URI.to_string(), url);
+        props.insert(SQL_CATALOG_PROP_WAREHOUSE.to_string(), warehouse);
 
-        // Insert two tables across two namespaces.
-        backend
-            .create_table("sales", "orders", "s3://lake/sales/orders/metadata/v1.metadata.json")
-            .unwrap();
-        backend
-            .create_table("sales", "customers", "s3://lake/sales/customers/metadata/v1.metadata.json")
-            .unwrap();
-        backend
-            .create_table("ops", "events", "s3://lake/ops/events/metadata/v1.metadata.json")
-            .unwrap();
+        let storage_factory: Arc<dyn iceberg::io::StorageFactory> =
+            Arc::new(OpenDalStorageFactory::Fs);
 
-        let namespaces = backend.list_namespaces().unwrap();
-        assert_eq!(namespaces, vec!["ops".to_string(), "sales".to_string()]);
-
-        let sales = backend.list_tables("sales").unwrap();
-        assert_eq!(sales, vec!["customers", "orders"]);
-
-        let ops = backend.list_tables("ops").unwrap();
-        assert_eq!(ops, vec!["events"]);
-
-        // Load and drop.
-        let entry = backend.load_table("sales", "orders").unwrap().unwrap();
-        assert_eq!(entry.name, "orders");
-
-        assert!(backend.drop_table("sales", "orders").unwrap());
-        assert_eq!(backend.list_tables("sales").unwrap(), vec!["customers"]);
-    }
-
-    #[test]
-    #[ignore = "requires PostgreSQL; run with --ignored and SQE_TEST_PG_URL set"]
-    fn jdbc_backend_postgres_roundtrip() {
-        // Postgres support arrives when the upstream `iceberg-catalog-sql` crate
-        // is adopted (task 2.11). Today we document the shape of the test.
-        let _url = std::env::var("SQE_TEST_PG_URL")
-            .expect("SQE_TEST_PG_URL must be set for this test");
-        unimplemented!("PostgreSQL path arrives via upstream iceberg-catalog-sql in task 2.11");
+        let res = SqlCatalogBuilder::default()
+            .with_storage_factory(storage_factory)
+            .load("sqe-sqlite-it", props)
+            .await;
+        // Without `sqlx/sqlite` enabled, sqlx::any reports
+        // "no driver found for URL scheme \"sqlite\"". The builder
+        // surfaces this as an iceberg::Error rather than panicking,
+        // which is what we want for the `type = jdbc` config path.
+        let err = res.expect_err(
+            "SqlCatalogBuilder should reject sqlite:// without sqlx/sqlite \
+             enabled (default SQE build only enables sqlx/postgres)",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sqlite") || msg.contains("driver"),
+            "expected driver-missing error, got: {msg}"
+        );
     }
 }
 
@@ -430,6 +465,113 @@ warehouse = "{warehouse}"
         assert!(
             msg.contains("REST catalog backend") || msg.contains("create_view"),
             "expected REST-backend error mentioning create_view; got: {msg}"
+        );
+    }
+
+    /// Live verification that the JDBC backend persists Iceberg
+    /// format-version 3 metadata round-trip. Closes the matrix caveat
+    /// on `sqe:jdbc-catalog:v3`: Phase O+ already proved the dispatcher
+    /// + V2 table round-trip; this test creates a V3 table, drops the
+    /// catalog handle, reloads, and asserts the metadata still reports
+    /// `format-version: 3`.
+    ///
+    /// The vendored `iceberg-catalog-sql` is format-version-agnostic;
+    /// SQLite, PostgreSQL, and MySQL all accept V3 metadata. We pick
+    /// PostgreSQL because the docker-compose stack already runs it for
+    /// the V2 round-trip, so this test rides the same infrastructure.
+    #[tokio::test]
+    #[ignore = "requires live Postgres; run with --ignored against docker-compose postgres"]
+    async fn jdbc_postgres_v3_table_format_version_roundtrip() {
+        use iceberg::TableCreation;
+        use iceberg::spec::{
+            NestedField, PrimitiveType, Schema as IcebergSchema, Type as IcebergType,
+        };
+
+        let url = std::env::var("SQE_TEST_PG_URL").unwrap_or_else(|_| {
+            "postgres://iceberg:iceberg@localhost:15432/iceberg_catalog".to_string()
+        });
+        let warehouse = std::env::var("SQE_TEST_PG_WAREHOUSE")
+            .unwrap_or_else(|_| "/tmp/sqe-pg-jdbc-v3-warehouse".to_string());
+
+        let mut props = HashMap::new();
+        props.insert(SQL_CATALOG_PROP_URI.to_string(), url.clone());
+        props.insert(SQL_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.clone());
+
+        let catalog = SqlCatalogBuilder::default()
+            .with_storage_factory(Arc::new(OpenDalStorageFactory::Fs))
+            .load("postgres-jdbc-v3-test", props)
+            .await
+            .expect("SqlCatalog should build against live Postgres");
+
+        // Unique namespace per run so retries don't conflict on the
+        // shared docker-compose volume.
+        let ns = NamespaceIdent::new(format!(
+            "sqe_v3_jdbc_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = catalog.drop_namespace(&ns).await;
+        catalog
+            .create_namespace(&ns, HashMap::new())
+            .await
+            .expect("create_namespace through JDBC backend");
+
+        // Schema with a single int column. We don't need a V3-only
+        // type here; the `format-version=3` table property is what
+        // iceberg-rust round-trips through the catalog.
+        let schema = IcebergSchema::builder()
+            .with_fields(vec![
+                NestedField::required(
+                    1,
+                    "id",
+                    IcebergType::Primitive(PrimitiveType::Long),
+                )
+                .into(),
+            ])
+            .build()
+            .expect("schema builder");
+
+        let mut table_props = HashMap::new();
+        table_props.insert("format-version".to_string(), "3".to_string());
+
+        let table_name = format!("v3_table_{}", uuid::Uuid::new_v4().simple());
+        let creation = TableCreation::builder()
+            .name(table_name.clone())
+            .schema(schema)
+            .properties(table_props)
+            .build();
+
+        // create_table writes the manifest under the warehouse root.
+        let created = catalog
+            .create_table(&ns, creation)
+            .await
+            .expect("create_table with format-version=3 through JDBC");
+        let v_at_create = created.metadata().format_version();
+
+        // Round-trip: drop the in-memory handle and reload via the
+        // catalog. If the catalog persisted V3 metadata correctly, the
+        // reloaded table reports the same format-version.
+        drop(created);
+        let table_ident = iceberg::TableIdent::new(ns.clone(), table_name.clone());
+        let reloaded = catalog
+            .load_table(&table_ident)
+            .await
+            .expect("load_table after JDBC create");
+        let v_at_reload = reloaded.metadata().format_version();
+
+        // Best-effort cleanup before assertions so a failure still
+        // leaves the database tidy for the next run.
+        let _ = catalog.drop_table(&table_ident).await;
+        let _ = catalog.drop_namespace(&ns).await;
+
+        assert_eq!(
+            v_at_create,
+            iceberg::spec::FormatVersion::V3,
+            "create_table should yield format-version=3"
+        );
+        assert_eq!(
+            v_at_reload,
+            iceberg::spec::FormatVersion::V3,
+            "JDBC reload must preserve format-version=3"
         );
     }
 }
