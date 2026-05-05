@@ -102,9 +102,13 @@ SELECT * FROM source_table WHERE condition;
 -- CTAS
 CREATE TABLE new_table AS SELECT * FROM existing_table;
 
--- DELETE (Copy-on-Write)
+-- DELETE (Copy-on-Write by default)
 DELETE FROM orders WHERE status = 'cancelled';
 DELETE FROM orders WHERE customer_id IN (SELECT id FROM blacklist);
+
+-- DELETE (Merge-on-Read; opt in via table property)
+ALTER TABLE orders SET TBLPROPERTIES ('write.delete.mode' = 'merge-on-read');
+DELETE FROM orders WHERE status = 'cancelled';  -- writes a position delete file
 
 -- UPDATE (Copy-on-Write)
 UPDATE orders SET status = 'shipped' WHERE tracking_id IS NOT NULL;
@@ -116,7 +120,32 @@ WHEN MATCHED THEN UPDATE SET value = source.value
 WHEN NOT MATCHED THEN INSERT (id, value) VALUES (source.id, source.value);
 ```
 
-All row-level write operations (DELETE, UPDATE, MERGE INTO) use Copy-on-Write via the RisingWave iceberg-rust fork's `rewrite_files()` transaction API. Affected data files are read, filtered/transformed, and rewritten as new files in a single atomic commit.
+All row-level write operations (DELETE, UPDATE, MERGE INTO) default to Copy-on-Write via the RisingWave iceberg-rust fork's `rewrite_files()` transaction API. Affected data files are read, filtered/transformed, and rewritten as new files in a single atomic commit.
+
+DELETE also supports Merge-on-Read when `write.delete.mode = 'merge-on-read'` is set on the table. SQE writes a position-delete file (or an equality-delete file when the table declares an identifier-field-id) and commits via `FastAppendAction` / `RowDeltaAction`. MoR avoids rewriting whole data files for small deletes against large tables.
+
+## Data Types
+
+SQE accepts the standard ANSI SQL type set plus a few Iceberg-specific extensions:
+
+```sql
+CREATE TABLE events (
+    id              BIGINT,
+    payload         JSON,                       -- Aliases to Utf8 underneath
+    occurred_at     TIMESTAMP(6),
+    occurred_time   TIME(6),                    -- Time-of-day, microseconds
+    occurred_at_tz  TIMESTAMP(6) WITH TIME ZONE,
+    occurred_ns     TIMESTAMP_NS,               -- V3-only: nanosecond precision
+    region_id       INTEGER,
+    amount          DECIMAL(18, 2)
+);
+```
+
+- `JSON` columns store as `Utf8`. `CAST(json_col AS BIGINT|VARCHAR|DOUBLE)` rides DataFusion's built-in coercion. JSON-shaped extraction works through `json_extract`, `json_extract_scalar`, `json_array_length`, `json_parse`, `json_get_str`, `json_get_int`, `json_get_float`, `json_get_bool`.
+- `TIME` / `TIME(p)` maps to Arrow `Time64(Microsecond)` since Iceberg's `time` primitive is microsecond-only across V2 and V3. Precisions 0..=6 collapse to microsecond. `TIME(p > 6)` rejects with a clear NotImplemented; use `TIMESTAMP(9)` for sub-microsecond resolution.
+- `TIME WITH TIME ZONE` rejects at CREATE TABLE: Arrow has no equivalent. Use `TIMESTAMP WITH TIME ZONE` instead.
+- `TIMESTAMP_NS` (and `TIMESTAMP_NS WITH TIME ZONE`) is a V3-only nanosecond timestamp. SQE auto-upgrades the table to format-version 3 when one of these types appears in a CREATE.
+- `localtime()` returns Time64. `EXTRACT(HOUR|MINUTE|SECOND FROM time_col)` works through the Trino-aliased `hour()` / `minute()` / `second()` UDFs. `year()` / `month()` / `day()` on a TIME column raise a clear plan error per Trino spec.
 
 ## Metadata Queries
 
