@@ -55,7 +55,7 @@ SQE first, then Spark, Flink, PyIceberg, DuckDB, ClickHouse, Doris, Daft, and Ka
 | Copy-on-Write | F/F | F/F | F/F | F/F | P/? | ./. | ./. | F/? | ./. |
 | Merge-on-Read | F/F | F/F | F/F | P/P | F/? | F/. | F/F | P/? | ./. |
 | Position Deletes | F/F | F/F | F/F | P/P | F/P | F/. | F/F | F/? | ./. |
-| Equality Deletes | P/F | F/F | F/F | P/. | F/. | P/. | F/. | ./? | ./. |
+| Equality Deletes | F/F | F/F | F/F | P/. | F/. | P/. | F/. | ./? | ./. |
 
 ### Schema & table evolution
 
@@ -127,7 +127,7 @@ SQE first, then Snowflake, Databricks, AWS, GCP, and Azure offerings. EMR / Glue
 | Copy-on-Write | F/F | F/F | F/F | F/F | F/F | P/. | F/. | F/F | P/. | F/. | F/F | ?/? | P/? |
 | Merge-on-Read | F/F | P/F | ./F | F/F | F/F | F/. | F/. | F/F | P/. | P/. | F/F | ?/? | P/? |
 | Position Deletes | F/F | P/F | ./. | F/F | F/F | F/. | F/. | F/F | ./. | P/. | F/F | ?/? | P/? |
-| Equality Deletes | P/F | ./. | ./. | F/F | F/F | F/. | F/. | F/F | F/. | P/. | F/F | ?/? | P/? |
+| Equality Deletes | F/F | ./. | ./. | F/F | F/F | F/. | F/. | F/F | F/. | P/. | F/F | ?/? | P/? |
 
 ### Schema & table evolution
 

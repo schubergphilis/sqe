@@ -52,7 +52,7 @@ Peer scores from icebergmatrix.org as of 2026-04-29.
 | Feature | V2 | V3 | V2 notes | V3 notes |
 |---|:---:|:---:|---|---|
 | Position Deletes | F | F | PositionDeleteFileWriter + FastAppendAction (Step 8d). | MoR DELETE on V3 tables writes position-delete files alongside the existing data files; live data file count stays unchanged after DELETE (n |
-| Equality Deletes | P | F | DELETE with write.delete.mode=merge-on-read writes equality-delete files via EqualityDeleteFileWriter and commits through RowDeltaAction. Un | Equality-delete UPDATE on a V3 table with a declared identifier-field-id commits a single RowDelta with the new data file and the equality-d |
+| Equality Deletes | F | F | DELETE with write.delete.mode=merge-on-read writes equality-delete files via EqualityDeleteFileWriter and commits through RowDeltaAction. Un | Equality-delete UPDATE on a V3 table with a declared identifier-field-id commits a single RowDelta with the new data file and the equality-d |
 | Merge-on-Read | F | F | All three DML kinds (DELETE, UPDATE, MERGE) route through RowDeltaAction when write.*.mode = merge-on-read. UPDATE emits one data file per b | MoR DELETE writes position-delete files; MoR UPDATE writes data + equality-delete in one RowDelta when the V3 table declares an identifier-f |
 | Copy-on-Write | F | F | DELETE/UPDATE/MERGE via RisingWave iceberg-rust fork rewrite_files(). | DELETE on a V3 table without a declared MoR property runs CoW: rewrites the matched files via RewriteFilesAction, drops the row from subsequ |
 
