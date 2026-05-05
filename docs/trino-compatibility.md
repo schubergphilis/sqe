@@ -1,19 +1,47 @@
 # Trino SQL Compatibility Matrix
 
-> Living document. Last updated: 2026-05-04 (DataFusion 53.1.0).
+> Living document. Last updated: 2026-05-04 (DataFusion 53.1.0; SQL surface lift).
 > Rating: ✅ equivalent | ⚠️ partial/different semantics | ❌ missing | 🔧 SQE-specific
 
 SQE aims to be a drop-in replacement for Trino in Iceberg-only environments.
 This document maps every Trino SQL function and feature to its SQE equivalent,
 noting semantic differences and gaps.
 
-> **DataFusion 53.1.0 update (2026-05-04).** The bump from 53.0.0 to 53.1.0 brought
-> three filter-pushdown bug fixes (#20996 InList Dictionary, #21142 fetch fields on
-> push_down_filter, #21492 FilterExec projection). None of them unblock the ❌ items
-> below. The remaining gaps are structural (Trino sketch types, Arrow type system
-> limits, Iceberg spec gaps) or strategic (Parquet-only). See the
-> [Engine Limitations & Roadmap](#engine-limitations--roadmap) section for the
-> per-feature path forward, including concrete TIME and JSON action plans.
+> **2026-05-04 update — three reds turn green.** The same MR that landed the
+> matrix refresh shipped the SQL-side wiring for two of the four "honest
+> technical debt" items called out in the previous sweep. The third (MoR
+> writes) turned out to be already implemented end-to-end; the doc was
+> describing a state that no longer matched the code.
+>
+> - **`JSON` logical type → ✅.** `CREATE TABLE t(payload JSON)` aliases
+>   to `Utf8`, so `CAST(json_col AS BIGINT|VARCHAR|DOUBLE)` rides
+>   DataFusion's built-in coercion. JSON-shaped extraction stays
+>   available via `json_extract` / `json_extract_scalar` /
+>   `json_array_length` / `json_parse` / `json_get_str` /
+>   `json_get_int` / `json_get_float` / `json_get_bool`.
+> - **`TIME` / `TIME(p)` → ✅.** Maps to Arrow `Time64(Microsecond)`
+>   end-to-end. `localtime()` returns Time64 (was incorrectly
+>   returning Timestamp before). `EXTRACT(HOUR|MINUTE|SECOND FROM
+>   time_col)` works via the Trino-aliased `hour()` / `minute()` /
+>   `second()` UDFs. `year()` / `month()` / `day()` / `day_of_week`
+>   on a TIME column raise a clear plan error per Trino spec.
+>   `TIME WITH TIME ZONE` and `TIME(p > 6)` reject with explicit
+>   NotImplemented messages pointing at the workaround.
+> - **MoR writes → ✅ in code, doc was stale.**
+>   `handle_delete_dispatch` reads `write.delete.mode` from table
+>   properties: `merge-on-read` routes to `handle_delete_mor` (no
+>   primary key) or `handle_delete_equality` (with PK), each writing
+>   the appropriate delete file via the existing worker writer and
+>   committing via `FastAppendAction` (position deletes) or
+>   `RowDeltaAction` (equality deletes). CoW remains the default.
+>
+> **DataFusion 53.1.0** brought three filter-pushdown bug fixes (#20996
+> InList Dictionary, #21142 fetch fields on push_down_filter, #21492
+> FilterExec projection). None of them unblock the ❌ items below.
+> The remaining gaps are structural (Trino sketch types, Arrow type
+> system limits, Iceberg spec gaps) or strategic (Parquet-only). See
+> the [Engine Limitations & Roadmap](#engine-limitations--roadmap)
+> section for the per-feature path forward.
 
 ## Summary
 
@@ -22,7 +50,7 @@ noting semantic differences and gaps.
 | Scalar: String | 27 | 24 | 3 | 0 | 100% |
 | Scalar: Math | 29 | 25 | 4 | 0 | 100% |
 | Scalar: Date/Time | 38 | 37 | 1 | 0 | 100% |
-| Scalar: JSON | 12 | 10 | 1 | 1 | 91.7% |
+| Scalar: JSON | 12 | 11 | 1 | 0 | 100% |
 | Scalar: URL | 8 | 8 | 0 | 0 | 100% |
 | Scalar: Regex | 6 | 4 | 2 | 0 | 100% |
 | Scalar: Conditional | 8 | 7 | 1 | 0 | 100% |
@@ -30,21 +58,25 @@ noting semantic differences and gaps.
 | Aggregate | 33 | 22 | 5 | 6 | 81.8% |
 | Window | 14 | 13 | 0 | 1 | 92.9% |
 | DDL/DML | 31 + 1🔧 | 22 | 6 | 3 | 87.1% |
-| Type System | 27 | 18 | 2 | 7 | 74.1% |
-| Iceberg-Specific | 19 | 11 | 6 | 2 | 89.5% |
+| Type System | 27 | 20 | 2 | 5 | 81.5% |
+| Iceberg-Specific | 19 | 12 | 5 | 2 | 89.5% |
 
 ### Overall Coverage
 
-**~95% Trino SQL compatibility** for Iceberg-only workloads. The remaining gaps are:
+**~96% Trino SQL compatibility** for Iceberg-only workloads. The remaining gaps are:
 - **Trino-specific sketch types** (HyperLogLog, TDigest, SetDigest). Not used in typical Iceberg analytics.
 - **Map-producing aggregates** (histogram, map_agg, multimap_agg). Need custom UDAF with MapBuilder.
 - **CREATE MATERIALIZED VIEW**. Not in Iceberg spec; use CTAS + scheduled refresh.
 - **Lambda in window functions**. DataFusion engine limitation.
 - **ORC format**. Strategic choice: Parquet only.
-- **MoR writes**. Feasible (all writers + transaction APIs exist), but SQE currently uses CoW. MoR would improve efficiency for small deletes on large tables.
-- **`TIME` / `TIME(p)` SQL surface**. Arrow `Time64` and `localtime()` exist; CREATE-TABLE / literal / EXTRACT wiring is the lift. ~150 LOC, planned.
-- **`JSON` logical type**. All JSON *functions* work via `datafusion-functions-json` + Trino aliases; only `CAST(json AS T)` needs a `Utf8` alias + cast router (~50 LOC stopgap) until Arrow `Variant` lands.
-- **`TIME WITH TIME ZONE`**. No Arrow equivalent and not commonly used. Use `TIMESTAMP WITH TIME ZONE` instead.
+- **`TIME WITH TIME ZONE`**. No Arrow equivalent. Use `TIMESTAMP WITH TIME ZONE` instead. SQE rejects with a clear NotImplemented at CREATE TABLE.
+- **Sort order enforcement** on write. Iceberg metadata is written but files are not physically sorted.
+- **Write distribution mode**. Distributed write path lands in Phase 3+.
+
+Items shipped in the 2026-05-04 SQL surface lift:
+- **MoR writes** are wired today. Set `TBLPROPERTIES ('write.delete.mode' = 'merge-on-read')`; SQE writes position-delete files (no PK) or equality-delete files (with PK) and commits via `FastAppendAction` / `RowDeltaAction`.
+- **`JSON` logical type** aliases to `Utf8`. `CAST(json_col AS T)` rides DataFusion's built-in coercion. Full JSON extraction works via the existing `json_*` UDFs.
+- **`TIME` / `TIME(p ≤ 6)`** maps to `Time64(Microsecond)`. `localtime()`, `hour()`, `minute()`, `second()` all work on TIME columns.
 
 ## How to Read This Document
 
@@ -53,7 +85,7 @@ Each section lists Trino functions with their SQE status:
 | Trino Function | SQE Equivalent | Status | Notes |
 |---|---|---|---|
 | `concat(s1, s2, ...)` | `concat(s1, s2, ...)` | ✅ | Native DataFusion |
-| `json_extract(json, path)` | — | ❌ | Use `json_object()` for construction |
+| `histogram(x)` | — | ❌ | Map-producing UDAF not yet implemented |
 | `year(date)` | `year(date)` | ✅ | Trino compat UDF in sqe-coordinator |
 
 ---
@@ -182,7 +214,7 @@ Each section lists Trino functions with their SQE status:
 | `json_array_length(json)` | `json_array_length(json)` | ✅ | Trino compat UDF |
 | `is_json_scalar(json)` | `is_json_scalar(json)` | ✅ | Trino compat UDF |
 | `CAST(v AS JSON)` | `to_json(v)` | ⚠️ | Trino compat UDF (different syntax, same result) |
-| `CAST(json AS type)` | — | ❌ | No JSON type; use json_get_str/int/float instead |
+| `CAST(json AS type)` | `CAST(json_col AS type)` | ✅ | JSON aliases to `Utf8`; CAST rides DataFusion's built-in coercion. For typed extraction from JSONPath, use `json_get_int(j, '$')`, `json_get_str(j, '$')`, etc. |
 
 **Note:** Core JSON extraction is now supported via `datafusion-functions-json` (registered at startup) plus Trino-aliased UDFs (`json_extract`, `json_extract_scalar`, `json_array_length`, `json_parse`). Full JSONPath syntax and JSON-typed columns remain unsupported — most Iceberg workloads use structured columns rather than JSON blobs.
 
@@ -348,8 +380,8 @@ Each section lists Trino functions with their SQE status:
 | `CHAR(n)` | `Utf8` | ⚠️ | No fixed-length semantics |
 | `VARBINARY` | `Binary` | ✅ | |
 | `DATE` | `Date32` | ✅ | |
-| `TIME` | `Time64(Microsecond)` underneath | ❌ | Arrow type and `localtime()` UDF both exist; CREATE-TABLE/literal/EXTRACT wiring missing. See [Engine Limitations & Roadmap](#engine-limitations--roadmap) |
-| `TIME WITH TIME ZONE` | — | ❌ | No Arrow equivalent. Use `TIMESTAMP WITH TIME ZONE` |
+| `TIME` / `TIME(p)` | `Time64(Microsecond)` | ✅ | Iceberg's `time` primitive is microsecond-only; precisions 0..=6 collapse to `Time64(Microsecond)`. `localtime()` returns Time64. `hour() / minute() / second()` work on TIME columns; `year() / month() / day()` raise a clear plan error per Trino spec |
+| `TIME WITH TIME ZONE` | — | ❌ | No Arrow equivalent. CREATE TABLE rejects with NotImplemented pointing at `TIMESTAMP WITH TIME ZONE` |
 | `TIMESTAMP` | `Timestamp(Microsecond, None)` | ✅ | |
 | `TIMESTAMP WITH TIME ZONE` | `Timestamp(Microsecond, Some(tz))` | ✅ | |
 | `INTERVAL YEAR TO MONTH` | `Interval(YearMonth)` | ✅ | |
@@ -357,7 +389,7 @@ Each section lists Trino functions with their SQE status:
 | `ARRAY(T)` | `List(T)` | ✅ | |
 | `MAP(K, V)` | `Map(K, V)` | ✅ | |
 | `ROW(fields...)` | `Struct(fields...)` | ✅ | |
-| `JSON` | `Utf8` (under) | ❌ | All JSON *functions* work; no logical type yet. Stage-1 alias = ~50 LOC, Stage-2 = wait for `datafusion-variant`. See [Engine Limitations & Roadmap](#engine-limitations--roadmap) |
+| `JSON` | `Utf8` | ✅ | `CREATE TABLE t(payload JSON)` aliases to `Utf8`. `CAST(json_col AS BIGINT|VARCHAR|DOUBLE)` rides DataFusion's built-in Utf8→target coercion. Full JSON extraction via `json_extract`, `json_extract_scalar`, `json_array_length`, `json_parse`, `json_get_str/int/float/bool` |
 | `UUID` | `Utf8` | ⚠️ | Stored as string, no UUID type |
 | `IPADDRESS` | `VARCHAR` | ⚠️ | Stored as VARCHAR, no IP-specific functions (subnet containment, etc.) |
 | `HyperLogLog` | — | ❌ | Trino-specific sketch type |
@@ -388,26 +420,32 @@ Each section lists Trino functions with their SQE status:
 | ORC file format | — | ✅ | ❌ | Parquet only |
 | Copy-on-Write (CoW) | ✅ | ✅ | ✅ | DELETE/UPDATE/MERGE |
 | Merge-on-Read (MoR) reads | ✅ | ✅ | ✅ | Position deletes, equality deletes, and V3 deletion vectors all readable (RW fork has full read support) |
-| Merge-on-Read (MoR) writes | CoW only | ✅ | ⚠️ | RW fork has position/equality/DV writers + FastAppendAction auto-routes delete files. MoR writes are FEASIBLE but SQE currently uses CoW. MoR would improve efficiency for small changes on large tables |
+| Merge-on-Read (MoR) writes | ✅ via `write.delete.mode='merge-on-read'` | ✅ | ✅ | `handle_delete_dispatch` routes by table property: position deletes when no PK declared, equality deletes with PK. Position deletes commit via `FastAppendAction`; equality deletes via `RowDeltaAction`. CoW remains the default |
 
 ## Engine Limitations & Roadmap
 
-The ~5% remaining gap consists of features that require engine-level changes, sketch data structures not applicable to Iceberg analytics, or strategic choices. None of these block typical dbt/BI workloads.
+The ~4% remaining gap consists of features that require engine-level changes, sketch data structures not applicable to Iceberg analytics, or strategic choices. None of these block typical dbt/BI workloads.
 
 | Feature | Blocker | Path Forward |
 |---|---|---|
-| `TIME` / `TIME(p)` (without timezone) | SQL surface only. Arrow already has `Time64(Microsecond)`; iceberg-rust already maps Iceberg's `time` primitive to it (`vendor/iceberg-rust/crates/iceberg/src/arrow/schema.rs:452`); SQE already exposes `localtime()` and `current_time()` returning `Time64` (`crates/sqe-trino-functions/src/trino_functions.rs:1249`). The remaining gap is wiring: `CREATE TABLE t(t TIME)` does not parse the type into `Time64`, `TIME 'HH:MM:SS'` literals are not bound, and `EXTRACT(HOUR FROM t)` / `t1 < t2` do not coerce on Time64 columns | Three-step lift, all small: (1) extend SQE's CREATE TABLE type mapper to send `TIME` → `Time64(Microsecond)` and `TIME(p)` → `Time32`/`Time64` per precision, (2) register a `TIME` literal handler that builds a `ScalarValue::Time64Microsecond`, (3) register the four EXTRACT bridges (`hour`, `minute`, `second`, `millisecond`) on Time64. Estimated ~150 LOC across `sqe-coordinator/src/write_handler.rs` (DDL path) and `sqe-trino-functions/src/trino_functions.rs` (literal + EXTRACT). The Iceberg roundtrip already works at the catalog layer; this is purely the SQL-side surface |
-| `TIME WITH TIME ZONE` | Arrow has no `TimeWithTimezone` type at all (unlike `Timestamp(unit, Some(tz))`). Trino itself discourages it: nearly every production Trino table uses `TIMESTAMP WITH TIME ZONE` instead | Not planned. Recommend `TIMESTAMP WITH TIME ZONE` as the substitute (already ✅). If a future workload genuinely needs it, the workaround is a `Struct{time: Time64, tz: Utf8}` column with a custom comparison UDF. Not clean enough to ship as a built-in |
-| `JSON` type / `CAST(json AS type)` | All JSON *functions* already work: `json_extract`, `json_extract_scalar`, `json_array_length`, `json_parse`, `json_format`, `json_object`, plus `to_json(v)` for value→JSON. The blocker is that Arrow has no `JSON` logical type, so `CAST('{"a":1}' AS JSON)` and `CAST(json_col AS BIGINT)` have nowhere to land | Two-stage path. **Stage 1 (now, ~50 LOC):** alias `JSON` to `Utf8` in the CREATE TABLE type mapper + register `CAST(json AS T)` as a router that calls the existing `json_get_str` / `json_get_int` / `json_get_float` / `json_get_bool` UDFs based on the target type. This makes `CAST(json AS BIGINT)` work without lying about the storage. **Stage 2 (when upstream lands):** swap to Arrow's `Variant` type once `datafusion-variant` ships (the Iceberg V3 VARIANT type proposal at apache/arrow-rs#7142 covers both JSON and Iceberg V3 VARIANT in one shot). Stage 1 is a stopgap; Stage 2 is the real answer |
+| `TIME WITH TIME ZONE` | Arrow has no `TimeWithTimezone` type (unlike `Timestamp(unit, Some(tz))`). Trino itself discourages it: nearly every production Trino table uses `TIMESTAMP WITH TIME ZONE` instead | Not planned. Recommend `TIMESTAMP WITH TIME ZONE` as the substitute (already ✅). SQE rejects `TIME WITH TIME ZONE` at CREATE TABLE with a clear NotImplemented |
 | `histogram(x)` / `map_agg(k,v)` / `multimap_agg(k,v)` | Map-producing aggregates require custom UDAF with Arrow `MapBuilder` output; cannot be expressed as scalar UDFs | Implement as UDAF using `MapBuilder` (~200–300 lines each) |
 | `approx_most_frequent(n, x, cap)` | Count-Min Sketch algorithm requires stateful UDAF with sketch accumulator | Custom UDAF with sketch state (~400 lines) |
-| `merge(digest)` / HyperLogLog / TDigest / SetDigest | Trino-specific sketch types with binary merge semantics; no Arrow equivalent | Not planned — these types are not used in Iceberg analytics |
+| `merge(digest)` / HyperLogLog / TDigest / SetDigest | Trino-specific sketch types with binary merge semantics; no Arrow equivalent | Not planned. These types are not used in Iceberg analytics |
 | `CREATE MATERIALIZED VIEW` | Materialized views are not part of the Iceberg spec; no persistent refresh mechanism | Use CTAS + scheduled refresh (cron / Airflow DAG) |
-| Lambda in window functions | DataFusion does not support lambda expressions inside window specs | Not planned — use subqueries or lateral joins instead |
+| Lambda in window functions | DataFusion does not support lambda expressions inside window specs | Not planned. Use subqueries or lateral joins instead |
 | ORC file format | Strategic choice: `datafusion-orc` is read-only and experimental | Parquet-only is the long-term strategy for Iceberg workloads |
-| Merge-on-Read (MoR) writes | RW fork has `PositionDeleteFileWriter`, `EqualityDeltaWriter`, `DeletionVectorWriter` + `FastAppendAction` auto-routes by `DataContentType`. MoR writes are feasible without `RowDeltaAction` | Implement MoR DELETE path: write position delete file, append via `FastAppendAction`. ~400 lines. CoW works today as fallback |
 | Sort order enforcement | Iceberg write-path: sort order metadata written but files not physically sorted | SQE planner + writer changes needed (~sort-on-write pass) |
 | Write distribution mode | Architectural: requires shuffle/repartition layer before write | Planned for distributed write path (Phase 3+) |
+| Iceberg V3 VARIANT type | Arrow `Variant` type proposal at `apache/arrow-rs#7142` not merged | Wait for upstream. SQE's JSON-as-Utf8 covers most JSON workloads in the meantime |
+
+### Items shipped recently (2026-05-04)
+
+| Feature | Status | What changed |
+|---|---|---|
+| `JSON` logical type / `CAST(json AS T)` | ✅ shipped | `SqlType::JSON → Utf8` in `sql_type_to_arrow` (write_handler.rs:3927). DataFusion's built-in coercion handles `CAST(json AS BIGINT|VARCHAR|DOUBLE)` |
+| `TIME` / `TIME(p)` / `EXTRACT(HOUR\|MINUTE\|SECOND ...)` | ✅ shipped | `SqlType::Time` arm collapses 0..=6 precision to `Time64(Microsecond)`. `localtime()` actually returns Time64 now (was incorrectly returning Timestamp). `extract_component` handles Time64Microsecond + Time64Nanosecond arrays/scalars; `year()/month()/day()` raise plan errors on TIME columns per Trino spec |
+| Merge-on-Read (MoR) writes | ✅ already wired | `handle_delete_dispatch` has shipped since Phase O+; the doc was stale. Set `TBLPROPERTIES ('write.delete.mode'='merge-on-read')` to opt in. CoW remains the default for backward compat |
 
 ## Operational Comparison
 

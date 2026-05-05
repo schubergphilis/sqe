@@ -2,9 +2,9 @@
 
 Current state of SQE against the [icebergmatrix.org](https://icebergmatrix.org) rubric, the de-facto reference engineers consult when picking an Iceberg engine. Data lives at [Neuw84/iceberg-matrix](https://github.com/Neuw84/iceberg-matrix).
 
-**Score: 163/189 (86.2%)**  |  **Stretch: 170/189 (90%)**
+**Score: 164/189 (86.8%)**  |  **Stretch: 170/189 (90%)**
 
-Last generated: 2026-05-04T12:00:00Z  |  Source: `feat/iceberg-loader-s3tables: generic iceberg-catalog-loader dispatch + S3 Tables backend + live AWS verification`
+Last generated: 2026-05-04T18:00:00Z  |  Source: `feat/iceberg-loader-s3tables: SQL surface lift (JSON, TIME) + JDBC v3 live test + repaired backend tests`
 
 Regenerate: `python3 scripts/render-iceberg-matrix.py`. Source of truth: `docs/iceberg-matrix-state.json`.
 
@@ -29,7 +29,7 @@ Each feature is scored against V2 and V3 of the Iceberg spec (63 cells total). A
 |---|---:|---:|
 | AWS EMR (Spark 7.12) | 180/189 | 95 |
 | OSS Spark 4.1 | 175/189 | 93 |
-| **SQE (current)** | **163/189** | **86.2** |
+| **SQE (current)** | **164/189** | **86.8** |
 | OSS Flink 2.2 | 153/189 | 81 |
 | Snowflake | 134/189 | 71 |
 | PyIceberg 0.11 | 130/189 | 69 |
@@ -63,7 +63,7 @@ Peer scores from icebergmatrix.org as of 2026-04-29.
 | Column Default Values | n/a | F | V3-only feature | CREATE TABLE ... DEFAULT <literal> applies write_default; ALTER TABLE ADD COLUMN ... DEFAULT applies initial_default. Function-call defaults |
 | Table Creation | F | F | CREATE TABLE, CTAS streaming. | CREATE TABLE auto-upgrades to format-version 3 when columns require V3 features (TIMESTAMP_NS, DEFAULT). Polaris materialises V3 metadata be |
 | Time Travel / Snapshots | F | F | FOR SYSTEM_TIME AS OF + 6 metadata TVFs (Step 8c). | FOR VERSION AS OF works end-to-end on V3 tables: the classifier strips the clause, apply_version_spec registers a snapshot-pinned provider u |
-| Table Maintenance | P | P | CALL system.expire_snapshots / remove_orphan_files / rewrite_manifests wrap vendored actions. rewrite_data_files currently consolidates mani | CALL system.rewrite_data_files merges files on V3 tables; row count preserved, file count drops, snapshot log moves forward. Same maintenanc |
+| Table Maintenance | P | P | All four CALL system.* procedures ship with both parser unit tests and live e2e tests that go through docker-compose.test.yml (Polaris + Rus | CALL system.rewrite_data_files merges files on V3 tables; row count preserved, file count drops, snapshot log moves forward. Same maintenanc |
 | Branching & Tagging | F | F | Transaction::{create_branch, create_tag, drop_branch, drop_tag} in vendored iceberg-rust + ALTER TABLE ... CREATE BRANCH/TAG DDL + SET WRITE | Same transaction actions apply to V3 tables; ref semantics are format-version agnostic. |
 
 ### Partitioning
@@ -97,7 +97,7 @@ Peer scores from icebergmatrix.org as of 2026-04-29.
 | Unity Catalog | F | F | Unity Catalog OSS exposes an Iceberg REST adapter at /api/2.1/unity-catalog/iceberg/ that SQE reaches through the same iceberg-catalog-rest  | Same vendored iceberg-catalog-rest code path as V2 plus the format-version: 3 forwarding pattern proven on Polaris. Unity Catalog OSS is for |
 | Snowflake Horizon | P | P | Horizon is Polaris-based; REST wiring compatible; no live test. | Snowflake Horizon is Polaris-based; the REST surface is shared with Polaris which we verified end-to-end at format-version 3. No live test a |
 | Hadoop Catalog | P | P | Storage-only scanner walks warehouse paths for metadata/v*.metadata.json (feature `hadoop`). Read path only; writes defer to REST/HMS. | The hadoop-catalog scanner walks `metadata/v*.metadata.json`; format-version 1/2/3 are read by the same iceberg-rust deserializer. Read pari |
-| JDBC Catalog | F | P | iceberg-catalog-sql vendored from apache/iceberg-rust v0.9.0 (vendor/iceberg-rust/crates/catalog/sql/) uses sqlx::any to dispatch to SQLite/ | iceberg-catalog-sql vendored alongside the fork is format-version agnostic; the format-version: 3 property forwarding pattern proven on Pola |
+| JDBC Catalog | F | F | iceberg-catalog-sql vendored from apache/iceberg-rust v0.9.0 (vendor/iceberg-rust/crates/catalog/sql/) uses sqlx::any to dispatch to SQLite/ | iceberg-catalog-sql vendored alongside the fork is format-version agnostic; the format-version: 3 property forwarding pattern proven on Pola |
 
 ### V3 data types
 
@@ -122,15 +122,13 @@ Peer scores from icebergmatrix.org as of 2026-04-29.
 
 Cells marked `partial` or `unknown` have specific gaps documented in `docs/iceberg-matrix-state.json` under `caveats`. Key ones:
 
-- **equality-deletes (v2)**: No cross-engine read test executed (Spark interop is #[ignore]).
 - **equality-deletes (v2)**: RowDeltaOperation::delete_entries simplified to Ok(vec![]) against the RisingWave fork's SnapshotProducer; behaviour matches the fork's own CoW path but not independently verified against Java Iceberg.
-- **table-maintenance (v2)**: rewrite_data_files does not re-encode Parquet payloads.
+- **table-maintenance (v2)**: rewrite_data_files does not re-encode Parquet payloads (manifest-only compaction).
 - **table-maintenance (v3)**: rewrite_data_files does not re-encode Parquet payloads (row groups stay as-is).
 - **snowflake-horizon-catalog (v2)**: No live integration test.
 - **snowflake-horizon-catalog (v3)**: No live integration test against Horizon.
 - **hadoop-catalog (v2)**: Write path is race-prone on object stores without atomic rename; intentionally read-oriented.
 - **hadoop-catalog (v3)**: Read-only on V3 too; writes still defer to REST/HMS.
-- **jdbc-catalog (v3)**: No live test against a JDBC catalog at V3 yet (engine wiring is now in place; remaining gap is a V3 round-trip against the JDBC backend).
 
 ---
 
