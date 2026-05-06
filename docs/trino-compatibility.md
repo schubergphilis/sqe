@@ -55,7 +55,7 @@ noting semantic differences and gaps.
 | Scalar: Regex | 6 | 6 | 0 | 0 | 100% |
 | Scalar: Conditional | 8 | 7 | 1 | 0 | 100% |
 | Scalar: Conversion | 10 | 9 | 0 | 1 | 90% |
-| Aggregate | 33 | 26 | 1 | 6 | 84.8% |
+| Aggregate | 33 | 27 | 0 | 6 | 87.9% |
 | Window | 14 | 13 | 0 | 1 | 92.9% |
 | DDL/DML | 31 + 1🔧 | 25 | 3 | 3 | 90.3% |
 | Type System | 27 | 20 | 2 | 5 | 81.5% |
@@ -280,7 +280,7 @@ Each section lists Trino functions with their SQE status:
 | `avg(x)` | Same | ✅ | |
 | `min(x)` / `max(x)` | Same | ✅ | |
 | `bool_and(x)` / `bool_or(x)` | `bool_and(x)` / `bool_or(x)` | ✅ | |
-| `every(x)` | `every(x)` | ✅ | Trino compat UDF (scalar alias for bool_and) |
+| `every(x)` | `every(x)` | ✅ | Real aggregate alias on `bool_and_udaf` (replaced an earlier scalar stub that returned the input unchanged and was wrong in any GROUP BY) |
 | `array_agg(x)` | `array_agg(x)` | ✅ | |
 | `array_agg(x ORDER BY y)` | Same | ✅ | DataFusion supports ordered agg |
 | `string_agg(x, sep)` | `string_agg(x, sep)` | ✅ | |
@@ -297,8 +297,9 @@ Each section lists Trino functions with their SQE status:
 | `regr_slope(y, x)` | `regr_slope(y, x)` | ✅ | |
 | `bitwise_and_agg(x)` | `bitwise_and_agg(x)` | ✅ | DataFusion's `bit_and` UDAF re-registered with `bitwise_and_agg` alias |
 | `bitwise_or_agg(x)` | `bitwise_or_agg(x)` | ✅ | DataFusion's `bit_or` UDAF re-registered with `bitwise_or_agg` alias |
+| `bitwise_xor_agg(x)` | `bitwise_xor_agg(x)` | ✅ | DataFusion's `bit_xor` UDAF re-registered with `bitwise_xor_agg` alias (DuckDB / Snowflake spelling) |
 | `arbitrary(x)` | `arbitrary(x)` | ✅ | Trino compat UDF (returns first non-null) |
-| `max_by(x, y)` / `min_by(x, y)` | `max_by(x, y)` / `min_by(x, y)` | ⚠️ | Scalar stub (aggregate behavior requires UDAF) |
+| `max_by(x, y)` / `min_by(x, y)` | `max_by(x, y)` / `min_by(x, y)` | ✅ | Real `AggregateUDFImpl` in `crates/sqe-trino-functions/src/aggregates.rs::ArgExtremum`. Type-flexible (x any type, y any orderable type). `arg_max(x, y)` / `arg_min(x, y)` registered as aliases (DuckDB / ClickHouse spelling) |
 | `histogram(x)` | — | ❌ | |
 | `multimap_agg(k, v)` | — | ❌ | |
 | `map_agg(k, v)` | — | ❌ | |
@@ -503,6 +504,7 @@ Net coverage delta this MR:
 
 The remaining DDL/DML ⚠️ rows after this MR are `PREPARE`/`EXECUTE` (DataFusion infrastructure, SQL integration incomplete), `CALL procedure(...)` for non-system procedures, and a couple of catalog-related edge cases. The remaining ❌ rows are `CREATE MATERIALIZED VIEW` (not in Iceberg spec), and two structural Trino-isms.
 
+<<<<<<< docs/trino-compatibility.md
 ### Items shipped 2026-05-08 (metadata `$`-syntax rewriter)
 
 Trino exposes Iceberg metadata tables under a `$<kind>` suffix on the
@@ -538,6 +540,32 @@ fallthrough, and combination with the `CAST(v AS JSON)` rewriter.
 Net coverage delta this MR:
 
 - **Iceberg-Specific** 19 cells: 6 ⚠️ → 6 ✅ (every `$` metadata table)
+=======
+### Items shipped 2026-05-08 (max_by / min_by real UDAFs + bitwise_xor_agg)
+
+The `max_by` / `min_by` scalar stubs that returned the first argument
+were the last "wrong answer in aggregate context" rows in the doc.
+Replaced with real `AggregateUDFImpl` in
+`crates/sqe-trino-functions/src/aggregates.rs::ArgExtremum`. Two
+registered names per direction (`max_by` + `arg_max`, `min_by` +
+`arg_min`).
+
+| Item | Kind | Status | What changed |
+|---|---|---|---|
+| `max_by(x, y)` / `min_by(x, y)` | new UDAF | ✅ | One `ArgExtremum` struct, two registered functions (one per direction). Generic `ArgExtremumAccumulator` over `ScalarValue` for x and y so both columns can be any DataType. Multi-phase aggregation works through `state()` / `merge_batch()`. NULL y is skipped per Trino spec. Empty group returns a typed NULL of x's type. 6 unit tests + 5 integration tests covering happy path, NULL handling, GROUP BY, multi-partial merge, integer + string types |
+| `arg_max(x, y)` / `arg_min(x, y)` | aliases | ✅ | Registered as aliases on the same UDAF. DuckDB and ClickHouse spelling for the same semantics |
+| `every(x)` | aggregate alias | ✅ | DataFusion's `bool_and_udaf` re-registered with `every` alias. Replaces a previous scalar stub that returned the input unchanged and was wrong in any GROUP BY |
+| `bitwise_xor_agg(x)` | aggregate alias | ✅ | DataFusion's `bit_xor_udaf` re-registered with `bitwise_xor_agg` alias. Rounds out the bitwise family started in MR !133 (`bitwise_and_agg`, `bitwise_or_agg`) |
+
+Net coverage delta this MR:
+
+- **Aggregate** 26/33 (1 amber) → **27/33 (zero amber)** — coverage 84.8% → 87.9%
+
+Aggregate now has zero amber rows; only ❌ remaining are the
+Map-producing UDAFs (`histogram`, `map_agg`, `multimap_agg`,
+`map_union`), `approx_most_frequent` (Count-Min Sketch), and
+`merge(digest)` (HyperLogLog/TDigest sketch types).
+>>>>>>> docs/trino-compatibility.md
 
 ## Operational Comparison
 

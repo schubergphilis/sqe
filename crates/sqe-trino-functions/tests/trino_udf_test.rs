@@ -842,6 +842,113 @@ async fn test_bitwise_or_agg_alias() {
 }
 
 #[tokio::test]
+async fn test_max_by_picks_correct_row() {
+    // max_by(x, y) returns x for the row where y is maximum.
+    let ctx = ctx().await;
+    let df = ctx
+        .sql(
+            "SELECT max_by(name, ts) FROM \
+             (VALUES ('a', 100), ('b', 300), ('c', 200)) t(name, ts)",
+        )
+        .await
+        .expect("max_by parse");
+    let batches = df.collect().await.expect("max_by execute");
+    let s = array_value_to_string(batches[0].column(0), 0).unwrap();
+    assert_eq!(s, "b", "max_by should return name at max ts");
+}
+
+#[tokio::test]
+async fn test_min_by_picks_correct_row() {
+    let ctx = ctx().await;
+    let df = ctx
+        .sql(
+            "SELECT min_by(name, ts) FROM \
+             (VALUES ('a', 100), ('b', 300), ('c', 200)) t(name, ts)",
+        )
+        .await
+        .expect("min_by parse");
+    let batches = df.collect().await.expect("min_by execute");
+    let s = array_value_to_string(batches[0].column(0), 0).unwrap();
+    assert_eq!(s, "a", "min_by should return name at min ts");
+}
+
+#[tokio::test]
+async fn test_arg_max_alias_resolves_to_max_by() {
+    // arg_max is a registered alias on max_by (DuckDB / ClickHouse spelling).
+    let ctx = ctx().await;
+    let df = ctx
+        .sql("SELECT arg_max(v, k) FROM (VALUES ('x', 1), ('y', 5), ('z', 3)) t(v, k)")
+        .await
+        .expect("arg_max parse");
+    let batches = df.collect().await.expect("arg_max execute");
+    let s = array_value_to_string(batches[0].column(0), 0).unwrap();
+    assert_eq!(s, "y");
+}
+
+#[tokio::test]
+async fn test_arg_min_alias_resolves_to_min_by() {
+    let ctx = ctx().await;
+    let df = ctx
+        .sql("SELECT arg_min(v, k) FROM (VALUES ('x', 1), ('y', 5), ('z', 3)) t(v, k)")
+        .await
+        .expect("arg_min parse");
+    let batches = df.collect().await.expect("arg_min execute");
+    let s = array_value_to_string(batches[0].column(0), 0).unwrap();
+    assert_eq!(s, "x");
+}
+
+#[tokio::test]
+async fn test_max_by_with_group_by() {
+    // dbt's typical use: max_by per partition. Here we group by region
+    // and pick the customer with the highest score per region.
+    let ctx = ctx().await;
+    let df = ctx
+        .sql(
+            "SELECT region, max_by(customer, score) AS top \
+             FROM (VALUES \
+                 ('EU', 'alice', 90), \
+                 ('EU', 'bob',   95), \
+                 ('US', 'carol', 80), \
+                 ('US', 'dave',  85)) \
+                 t(region, customer, score) \
+             GROUP BY region \
+             ORDER BY region",
+        )
+        .await
+        .expect("max_by group parse");
+    let batches = df.collect().await.expect("max_by group execute");
+    let region = array_value_to_string(batches[0].column(0), 0).unwrap();
+    let top_eu = array_value_to_string(batches[0].column(1), 0).unwrap();
+    let top_us = array_value_to_string(batches[0].column(1), 1).unwrap();
+    assert_eq!(region, "EU");
+    assert_eq!(top_eu, "bob", "EU top scorer");
+    assert_eq!(top_us, "dave", "US top scorer");
+}
+
+#[tokio::test]
+async fn test_every_alias_resolves_to_bool_and() {
+    // every(x) is the Trino spelling for bool_and(x); aggregates ALL
+    // booleans in the group.
+    let ctx = ctx().await;
+    let df = ctx
+        .sql("SELECT every(v) FROM (VALUES (true), (true), (true)) t(v)")
+        .await
+        .expect("every parse");
+    let batches = df.collect().await.expect("every execute");
+    let s = array_value_to_string(batches[0].column(0), 0).unwrap();
+    assert_eq!(s, "true", "every of all-true should be true");
+
+    // One false row should flip the answer.
+    let df2 = ctx
+        .sql("SELECT every(v) FROM (VALUES (true), (false), (true)) t(v)")
+        .await
+        .expect("every2 parse");
+    let batches2 = df2.collect().await.expect("every2 execute");
+    let s2 = array_value_to_string(batches2[0].column(0), 0).unwrap();
+    assert_eq!(s2, "false", "every with one false should be false");
+}
+
+#[tokio::test]
 async fn test_approx_percentile_alias() {
     let ctx = ctx().await;
     // approx_percentile(x, p) shares the impl with approx_percentile_cont.
