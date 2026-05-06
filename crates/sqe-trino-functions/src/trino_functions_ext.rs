@@ -21,8 +21,9 @@ use datafusion::scalar::ScalarValue;
 
 /// Register all extended Trino-compatible functions.
 pub fn register_extended_trino_functions(ctx: &datafusion::prelude::SessionContext) {
-    // Trivial aliases
-    ctx.register_udf(ScalarUDF::from(Every));
+    // Trivial aliases. `every` used to live here as a scalar stub;
+    // it now ships as a real aggregate alias on `bool_and` registered
+    // in `register_trino_aggregate_aliases` (trino_functions.rs).
     ctx.register_udf(ScalarUDF::from(Millisecond));
     ctx.register_udf(ScalarUDF::from(Infinity));
     ctx.register_udf(ScalarUDF::from(Nan));
@@ -59,10 +60,12 @@ pub fn register_extended_trino_functions(ctx: &datafusion::prelude::SessionConte
     // implementation.
     ctx.register_udf(ScalarUDF::from(WordStem));
 
-    // Aggregate-like scalar aliases
+    // Aggregate-like scalar aliases.
+    // `MaxBy` and `MinBy` used to live here as scalar stubs that
+    // returned the first argument. They now ship as real UDAFs in
+    // `aggregates::ArgExtremum` registered alongside the other
+    // Trino aggregate aliases in trino_functions.rs.
     ctx.register_udf(ScalarUDF::from(Arbitrary));
-    ctx.register_udf(ScalarUDF::from(MaxBy));
-    ctx.register_udf(ScalarUDF::from(MinBy));
     ctx.register_udf(ScalarUDF::from(Checksum));
     ctx.register_udf(ScalarUDF::from(TimezoneHour));
     ctx.register_udf(ScalarUDF::from(TimezoneMinute));
@@ -134,29 +137,11 @@ fn str_transform_2(
 // TRIVIAL ALIASES
 // ═══════════════════════════════════════════════════════════════════
 
-/// every(x) — scalar passthrough (aggregate form is bool_and(), already built-in)
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct Every;
-
-impl ScalarUDFImpl for Every {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn name(&self) -> &str {
-        "every"
-    }
-    fn signature(&self) -> &Signature {
-        static SIG: LazyLock<Signature> =
-            LazyLock::new(|| Signature::any(1, Volatility::Immutable));
-        &SIG
-    }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Boolean)
-    }
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        Ok(args.args[0].clone())
-    }
-}
+// `Every` used to live here as a scalar stub that returned the input
+// unchanged (aggregate `every(x)` collapses to the input under
+// single-row contexts but is wrong in any GROUP BY). It has been
+// replaced by the aggregate alias on `bool_and` registered in
+// trino_functions.rs::register_trino_aggregate_aliases.
 
 /// millisecond(ts) — extract millisecond component (0–999)
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -1394,60 +1379,13 @@ impl ScalarUDFImpl for Arbitrary {
     }
 }
 
-/// max_by(x, y) — Returns x for the row where y is maximum (scalar stub; returns first arg).
-///
-/// NOTE: Full aggregate semantics require an aggregate UDF with ORDER BY. This scalar stub
-/// handles single-row contexts and prevents parse errors in Trino-compat mode.
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct MaxBy;
-
-impl ScalarUDFImpl for MaxBy {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn name(&self) -> &str {
-        "max_by"
-    }
-    fn signature(&self) -> &Signature {
-        static SIG: LazyLock<Signature> =
-            LazyLock::new(|| Signature::new(TypeSignature::Any(2), Volatility::Immutable));
-        &SIG
-    }
-    fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(arg_types[0].clone())
-    }
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        // Scalar stub: return first arg (for single-row contexts)
-        Ok(args.args[0].clone())
-    }
-}
-
-/// min_by(x, y) — Returns x for the row where y is minimum (scalar stub; returns first arg).
-///
-/// NOTE: Full aggregate semantics require an aggregate UDF with ORDER BY. This scalar stub
-/// handles single-row contexts and prevents parse errors in Trino-compat mode.
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct MinBy;
-
-impl ScalarUDFImpl for MinBy {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn name(&self) -> &str {
-        "min_by"
-    }
-    fn signature(&self) -> &Signature {
-        static SIG: LazyLock<Signature> =
-            LazyLock::new(|| Signature::new(TypeSignature::Any(2), Volatility::Immutable));
-        &SIG
-    }
-    fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(arg_types[0].clone())
-    }
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        Ok(args.args[0].clone())
-    }
-}
+// `MaxBy` and `MinBy` used to live here as scalar stubs that returned
+// the first argument. They produced wrong results in any aggregation
+// context. Real UDAF implementations now ship in
+// `crates/sqe-trino-functions/src/aggregates.rs::ArgExtremum`,
+// registered alongside the other Trino aggregate aliases. `arg_max`
+// and `arg_min` are also registered as aliases on the same UDAF
+// (DuckDB / ClickHouse spelling).
 
 /// checksum(x) — Order-insensitive hash aggregate (XOR of hashes). Scalar impl for single values.
 #[derive(Debug, PartialEq, Eq, Hash)]
