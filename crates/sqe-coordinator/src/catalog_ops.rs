@@ -81,6 +81,18 @@ impl CatalogOps {
 
         match catalog.drop_table(&table_ident).await {
             Ok(()) => Ok(()),
+            // IF EXISTS only swallows "table missing inside an existing
+            // namespace". A missing namespace is a different failure that
+            // typically points at an upstream CREATE SCHEMA that didn't
+            // land — surfacing it here saves the operator from chasing a
+            // mysterious downstream CTAS error.
+            Err(e) if if_exists && is_namespace_not_found(&e) => {
+                Err(SqeError::Catalog(format!(
+                    "Failed to drop table {table_ident}: namespace is missing. \
+                     IF EXISTS does not cover missing namespaces. \
+                     Verify CREATE SCHEMA succeeded. Underlying error: {e}"
+                )))
+            }
             Err(e) if if_exists && is_table_not_found(&e) => {
                 info!(
                     table = %table_ident,
@@ -129,7 +141,13 @@ impl CatalogOps {
             .create_namespace(&namespace, HashMap::new())
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                info!(
+                    namespace = ?namespace,
+                    "Schema created"
+                );
+                Ok(())
+            }
             Err(e) if if_not_exists && is_namespace_already_exists(&e) => {
                 info!(
                     namespace = ?namespace,
@@ -1157,21 +1175,46 @@ fn parse_object_name(s: &str) -> sqe_core::Result<ObjectName> {
 }
 
 /// Check if an iceberg error indicates a table was not found.
+///
+/// Distinct from `is_namespace_not_found`. A "namespace does not exist"
+/// error means the schema is missing entirely, which is a different
+/// failure class from a missing table inside an existing schema.
+/// The two must not both swallow the same error or DROP TABLE IF EXISTS
+/// will mask schema-creation failures (see Polaris bench incident
+/// 2026-05-06: silent CREATE SCHEMA failure surfaced 37s later as a
+/// CATALOG_ERROR on the next CTAS).
 fn is_table_not_found(err: &iceberg::Error) -> bool {
     let msg = err.to_string().to_lowercase();
-    msg.contains("not found")
+
+    // Reject namespace errors first so the "does not exist" / "404"
+    // generic patterns below cannot match them.
+    if is_namespace_not_found_msg(&msg) {
+        return false;
+    }
+
+    msg.contains("table not found")
         || msg.contains("no such table")
+        || msg.contains("table does not exist")
+        || msg.contains("not found")
         || msg.contains("does not exist")
         || msg.contains("404")
 }
 
 /// Check if an iceberg error indicates a namespace was not found.
 fn is_namespace_not_found(err: &iceberg::Error) -> bool {
-    let msg = err.to_string().to_lowercase();
-    msg.contains("not found")
+    is_namespace_not_found_msg(&err.to_string().to_lowercase())
+}
+
+/// Internal helper. Matches the namespace-specific phrasings Polaris
+/// and other Iceberg REST catalogs return for a missing namespace.
+/// Caller must lower-case the message.
+fn is_namespace_not_found_msg(msg: &str) -> bool {
+    msg.contains("namespace not found")
         || msg.contains("no such namespace")
-        || msg.contains("does not exist")
-        || msg.contains("404")
+        || msg.contains("namespace does not exist")
+        || msg.contains("under a namespace that does not exist")
+        || msg.contains("schema not found")
+        || msg.contains("schema does not exist")
 }
 
 /// Check if an iceberg error indicates a namespace already exists.
@@ -1230,5 +1273,87 @@ mod tests {
             Ident::new("d"),
         ]);
         assert!(parse_table_ref(&name).is_err());
+    }
+
+    // ─── Error discriminator tests ────────────────────────────────
+    //
+    // The risk these tests guard against: a missing-namespace error
+    // getting mis-classified as table-not-found and silently swallowed
+    // by DROP TABLE IF EXISTS. That masked an upstream CREATE SCHEMA
+    // failure in the Polaris bench on 2026-05-06 (clickbench load).
+    //
+    // We construct iceberg::Error via the public Error::new API. The
+    // Polaris error path uses ErrorKind::Unexpected with a message
+    // string, not the typed NamespaceNotFound kind, so the match has
+    // to read the message.
+
+    use iceberg::{Error as IcebergError, ErrorKind};
+
+    fn unexpected(msg: &str) -> IcebergError {
+        IcebergError::new(ErrorKind::Unexpected, msg)
+    }
+
+    #[test]
+    fn namespace_not_found_recognises_polaris_create_table_phrasing() {
+        // Exact wording observed from Polaris in the 2026-05-06 incident.
+        let e = unexpected(
+            "Failed to create table: Unexpected => \
+             Tried to create a table under a namespace that does not exist",
+        );
+        assert!(is_namespace_not_found(&e));
+    }
+
+    #[test]
+    fn namespace_not_found_recognises_common_phrasings() {
+        for msg in [
+            "namespace does not exist",
+            "Namespace not found",
+            "no such namespace: foo",
+            "schema does not exist",
+            "schema not found",
+        ] {
+            let e = unexpected(msg);
+            assert!(is_namespace_not_found(&e), "should match: {msg}");
+        }
+    }
+
+    #[test]
+    fn table_not_found_does_not_swallow_namespace_errors() {
+        // Critical invariant: if we cannot tell table-missing from
+        // namespace-missing, DROP TABLE IF EXISTS will swallow a
+        // missing-schema condition and the operator will only see the
+        // failure on the next CTAS, far from the root cause.
+        for msg in [
+            "Tried to create a table under a namespace that does not exist",
+            "namespace does not exist",
+            "no such namespace: foo",
+        ] {
+            let e = unexpected(msg);
+            assert!(
+                !is_table_not_found(&e),
+                "is_table_not_found must reject namespace-missing message: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn table_not_found_recognises_real_table_errors() {
+        for msg in [
+            "table not found: foo.bar",
+            "No such table",
+            "Table does not exist",
+            "404 Not Found",
+        ] {
+            let e = unexpected(msg);
+            assert!(is_table_not_found(&e), "should match: {msg}");
+        }
+    }
+
+    #[test]
+    fn namespace_already_exists_recognises_common_phrasings() {
+        for msg in ["namespace already exists", "409 Conflict", "Conflict"] {
+            let e = unexpected(msg);
+            assert!(is_namespace_already_exists(&e), "should match: {msg}");
+        }
     }
 }
