@@ -704,3 +704,160 @@ async fn test_to_json_float() {
     let s = v.unwrap();
     assert!(s.contains("3.14"), "Expected '3.14' in to_json output, got: {s}");
 }
+
+// ─── Trino aliases batch (split, regex array returns, aggregates) ─────────
+
+#[tokio::test]
+async fn test_split_returns_array() {
+    // Trino's split(s, delim) returns ARRAY(VARCHAR). With the alias on
+    // string_to_array, the cell value renders as a bracketed list.
+    let v = eval_str("SELECT split('a,b,c', ',')").await;
+    let s = v.expect("split returned None");
+    assert!(
+        s.contains("a") && s.contains("b") && s.contains("c"),
+        "split output should contain all parts: {s}"
+    );
+    // Confirm it is an ARRAY render, not the JSON-string legacy shape.
+    assert!(
+        s.starts_with('[') || s.contains(", "),
+        "split should render as array, got: {s}"
+    );
+}
+
+#[tokio::test]
+async fn test_regexp_extract_all_returns_array_of_matches() {
+    // Returns List<Utf8>, not a JSON-array string. ARRAY rendering uses
+    // brackets. The function returns three matches for the digit pattern.
+    let v = eval_str(r#"SELECT regexp_extract_all('a1 b2 c3', '\d+')"#).await;
+    let s = v.expect("regexp_extract_all returned None");
+    for digit in ["1", "2", "3"] {
+        assert!(
+            s.contains(digit),
+            "regexp_extract_all output should contain '{digit}': {s}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_regexp_split_returns_array_of_parts() {
+    let v = eval_str(r#"SELECT regexp_split('one1two2three', '\d')"#).await;
+    let s = v.expect("regexp_split returned None");
+    for part in ["one", "two", "three"] {
+        assert!(
+            s.contains(part),
+            "regexp_split output should contain '{part}': {s}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_regexp_extract_all_invalid_pattern_errors() {
+    // Trino errors on invalid regex; confirm we surface the error rather
+    // than silently returning NULL.
+    let ctx = ctx().await;
+    let res = ctx.sql(r#"SELECT regexp_extract_all('x', '[unclosed')"#).await;
+    let failed = match res {
+        Err(_) => true,
+        Ok(plan) => plan.collect().await.is_err(),
+    };
+    assert!(failed, "regexp_extract_all with invalid pattern should error");
+}
+
+#[tokio::test]
+async fn test_word_stem_one_arg_defaults_to_english() {
+    // 1-arg form still works after the OneOf signature refactor.
+    let v = eval_str("SELECT word_stem('running')").await;
+    assert_eq!(v, Some("run".to_string()));
+}
+
+#[tokio::test]
+async fn test_word_stem_two_arg_picks_language() {
+    // 2-arg form works under the same name (no separate word_stem_lang
+    // call required, though that name is registered as an alias).
+    let v = eval_str("SELECT word_stem('liefen', 'de')").await;
+    assert!(v.is_some(), "word_stem(s, lang) returned None");
+}
+
+#[tokio::test]
+async fn test_word_stem_lang_alias_still_works() {
+    // word_stem_lang continues to resolve to the same UDF for backward
+    // compat with callers that adopted the old name.
+    let v = eval_str("SELECT word_stem_lang('liefen', 'de')").await;
+    assert!(v.is_some(), "word_stem_lang alias returned None");
+}
+
+// Aggregate aliases — same UDAF as the DataFusion built-in, exposed under
+// the Trino-spelled name via `with_aliases([...])`.
+
+#[tokio::test]
+async fn test_listagg_alias_resolves_to_string_agg() {
+    let ctx = ctx().await;
+    let df = ctx
+        .sql("SELECT listagg(v, ',') FROM (VALUES ('a'), ('b'), ('c')) t(v)")
+        .await
+        .expect("listagg parse");
+    let batches = df.collect().await.expect("listagg execute");
+    let s = array_value_to_string(batches[0].column(0), 0).unwrap();
+    // Order is implementation-defined for string_agg without ORDER BY,
+    // but we should see all three letters in the output.
+    for ch in ["a", "b", "c"] {
+        assert!(s.contains(ch), "listagg output should contain '{ch}': {s}");
+    }
+}
+
+#[tokio::test]
+async fn test_bitwise_and_agg_alias() {
+    let ctx = ctx().await;
+    let df = ctx
+        .sql("SELECT bitwise_and_agg(v) FROM (VALUES (12), (10), (6)) t(v)")
+        .await
+        .expect("bitwise_and_agg parse");
+    let batches = df.collect().await.expect("bitwise_and_agg execute");
+    // 12 & 10 & 6 = 0b1100 & 0b1010 & 0b0110 = 0b0000 = 0
+    let v = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Int64 result")
+        .value(0);
+    assert_eq!(v, 0);
+}
+
+#[tokio::test]
+async fn test_bitwise_or_agg_alias() {
+    let ctx = ctx().await;
+    let df = ctx
+        .sql("SELECT bitwise_or_agg(v) FROM (VALUES (1), (2), (4)) t(v)")
+        .await
+        .expect("bitwise_or_agg parse");
+    let batches = df.collect().await.expect("bitwise_or_agg execute");
+    let v = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Int64 result")
+        .value(0);
+    // 1 | 2 | 4 = 7
+    assert_eq!(v, 7);
+}
+
+#[tokio::test]
+async fn test_approx_percentile_alias() {
+    let ctx = ctx().await;
+    // approx_percentile(x, p) shares the impl with approx_percentile_cont.
+    // Median of 1..=9 is 5; assert the result is in a tight band around 5.
+    let df = ctx
+        .sql(
+            "SELECT approx_percentile(v, 0.5) FROM \
+             (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9)) t(v)",
+        )
+        .await
+        .expect("approx_percentile parse");
+    let batches = df.collect().await.expect("approx_percentile execute");
+    let s = array_value_to_string(batches[0].column(0), 0).unwrap();
+    let parsed: f64 = s.parse().expect("approx_percentile result must parse as f64");
+    assert!(
+        (4.0..=6.0).contains(&parsed),
+        "approx_percentile median should land near 5, got {parsed}"
+    );
+}
