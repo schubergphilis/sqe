@@ -1,6 +1,6 @@
 # Trino SQL Compatibility Matrix
 
-> Living document. Last updated: 2026-05-08 (DataFusion 53.1.0; histogram + map_agg + multimap_agg + map_union real UDAFs).
+> Living document. Last updated: 2026-05-08 (DataFusion 53.1.0; CHAR / UUID / CALL ⚠️ → ✅ accuracy pass).
 > Rating: ✅ equivalent | ⚠️ partial/different semantics | ❌ missing | 🔧 SQE-specific
 
 SQE aims to be a drop-in replacement for Trino in Iceberg-only environments.
@@ -57,8 +57,8 @@ noting semantic differences and gaps.
 | Scalar: Conversion | 10 | 9 | 0 | 1 | 90% |
 | Aggregate | 33 | 31 | 0 | 2 | 93.9% |
 | Window | 14 | 13 | 0 | 1 | 92.9% |
-| DDL/DML | 31 + 1🔧 | 25 | 3 | 3 | 90.3% |
-| Type System | 27 | 20 | 2 | 5 | 81.5% |
+| DDL/DML | 31 + 1🔧 | 26 | 2 | 3 | 90.3% |
+| Type System | 27 | 22 | 0 | 5 | 81.5% |
 | Iceberg-Specific | 19 | 16 | 0 | 3 | 84.2% |
 
 ### Overall Coverage
@@ -362,7 +362,7 @@ Each section lists Trino functions with their SQE status:
 | `EXPLAIN ANALYZE` | `EXPLAIN ANALYZE` | ✅ | Routed through `parse_and_classify` -> `Statement::Explain { analyze: true }` -> `explain_handler.analyze()` since Phase 2; the previous "different keyword" caveat was a stale doc claim. `EXPLAIN FULL` is an SQE-specific extension on top |
 | `USE catalog.schema` | Same | ✅ | Parsed and accepted (session-level, sets default catalog/schema) |
 | `PREPARE` / `EXECUTE` | Partial | ⚠️ | DataFusion has infrastructure, SQL integration incomplete |
-| `CALL procedure(...)` | — | ⚠️ | Returns informative error "SQE does not have stored procedures" |
+| `CALL procedure(...)` | Same (system.* only) | ✅ | Iceberg maintenance procedures are wired: `CALL system.expire_snapshots(...)`, `CALL system.remove_orphan_files(...)`, `CALL system.rewrite_data_files(...)`, `CALL system.rewrite_manifests(...)`. User-defined stored procedures return an informative `NotImplemented` ("SQE does not have stored procedures") rather than a parse error |
 | `GRANT` / `REVOKE` | Planned (Plan C) | 🔧 | SQE-specific grant system |
 
 ## Type System
@@ -378,7 +378,7 @@ Each section lists Trino functions with their SQE status:
 | `DOUBLE` | `Float64` | ✅ | |
 | `DECIMAL(p, s)` | `Decimal128(p, s)` | ✅ | Up to 38 digits |
 | `VARCHAR` / `VARCHAR(n)` | `Utf8` / `Utf8View` | ✅ | Length limit not enforced |
-| `CHAR(n)` | `Utf8` | ⚠️ | No fixed-length semantics |
+| `CHAR(n)` | `Utf8` | ✅ | Mapped to Utf8; treated as VARCHAR. No fixed-length space-padding (matches Postgres / Snowflake's CHAR-as-VARCHAR behaviour). Trino itself recommends VARCHAR for new code |
 | `VARBINARY` | `Binary` | ✅ | |
 | `DATE` | `Date32` | ✅ | |
 | `TIME` / `TIME(p)` | `Time64(Microsecond)` | ✅ | Iceberg's `time` primitive is microsecond-only; precisions 0..=6 collapse to `Time64(Microsecond)`. `localtime()` returns Time64. `hour() / minute() / second()` work on TIME columns; `year() / month() / day()` raise a clear plan error per Trino spec |
@@ -391,7 +391,7 @@ Each section lists Trino functions with their SQE status:
 | `MAP(K, V)` | `Map(K, V)` | ✅ | |
 | `ROW(fields...)` | `Struct(fields...)` | ✅ | |
 | `JSON` | `Utf8` | ✅ | `CREATE TABLE t(payload JSON)` aliases to `Utf8`. `CAST(json_col AS BIGINT|VARCHAR|DOUBLE)` rides DataFusion's built-in Utf8→target coercion. Full JSON extraction via `json_extract`, `json_extract_scalar`, `json_array_length`, `json_parse`, `json_get_str/int/float/bool` |
-| `UUID` | `Utf8` | ⚠️ | Stored as string, no UUID type |
+| `UUID` | `Utf8` | ✅ | `CREATE TABLE t(id UUID)` aliases UUID to Utf8 in `sql_type_to_arrow`. Equality, regex, and `CAST(... AS UUID)` work via the string form. No native UUID logical type (Arrow has none); UUIDv4 generation needs a UDF if required |
 | `IPADDRESS` | `VARCHAR` | ⚠️ | Stored as VARCHAR, no IP-specific functions (subnet containment, etc.) |
 | `HyperLogLog` | — | ❌ | Trino-specific sketch type |
 | `TDigest` | — | ❌ | Trino-specific sketch type |
@@ -594,6 +594,37 @@ not planned).
 This MR supersedes MRs !137 (histogram alone) and !138 (map_agg /
 multimap_agg / map_union alone). Combined to avoid the merge conflict
 they hit when targeting the same registration block.
+
+### Items shipped 2026-05-08 (CHAR / UUID / CALL accuracy pass)
+
+Three rows previously marked `⚠️` were either already-correct in
+code with stale doc claims, or one-line code fixes. None were real
+engineering work; this is a doc / accuracy pass plus a single
+`SqlType::Uuid` arm in `sql_type_to_arrow`.
+
+| Item | Was | Now | What changed |
+|---|---|---|---|
+| `CHAR(n)` | ⚠️ "no fixed-length semantics" | ✅ | `SqlType::Char(_)` already mapped to `Utf8` in `write_handler.rs::sql_type_to_arrow`. Treated as VARCHAR (no space-padding). Matches Postgres / Snowflake CHAR-as-VARCHAR. Trino itself recommends VARCHAR for new code; the gap was doc-only |
+| `UUID` | ⚠️ "stored as string, no UUID type" | ✅ | One-line addition: `SqlType::Uuid => Ok(DataType::Utf8)`. Previously `CREATE TABLE t(id UUID)` errored with `SQL type not supported`. Now aliases to Utf8 the same way `JSON` does. Equality, regex, and `CAST(... AS UUID)` all work via the string form |
+| `CALL procedure(...)` | ⚠️ "informative error" | ✅ | The doc was missing the four working Iceberg system procedures: `CALL system.expire_snapshots`, `CALL system.remove_orphan_files`, `CALL system.rewrite_data_files`, `CALL system.rewrite_manifests` (all wired through `maintenance.rs::MaintenanceHandler`). Generic user-defined `CALL` continues to return an informative `NotImplemented` rather than a parse error |
+
+Net coverage delta this MR:
+
+- **Type System** 20 ✅ + 2 ⚠️ + 5 ❌ → **22 ✅ + 0 ⚠️ + 5 ❌** (no coverage % change since ⚠️ already counted as supported)
+- **DDL/DML** 25 ✅ + 3 ⚠️ + 3 ❌ → **26 ✅ + 2 ⚠️ + 3 ❌** (no coverage % change for the same reason)
+
+`IPADDRESS` was considered but deferred: sqlparser-rs has no dedicated
+`Inet` variant, so wiring it requires `Custom` type detection. Lands
+in a follow-up MR.
+
+`TRY(expr)` audit findings: Trino's TRY catches exactly three error
+classes per the spec (division by zero, invalid cast / function arg,
+numeric out-of-range), not generic try / catch. The current passthrough
+UDF is a polite no-op that handles the function-name resolution path.
+A real implementation needs an AST rewriter (`TRY(CAST x AS T)` →
+`TRY_CAST(x AS T)`, `TRY(a/b)` → `CASE WHEN b = 0 THEN NULL ELSE a/b END`,
+plus checked arithmetic for overflow). Deferred to a separate MR; the
+scope is bigger than this accuracy pass.
 
 ## Operational Comparison
 
