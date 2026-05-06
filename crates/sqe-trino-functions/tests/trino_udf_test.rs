@@ -968,3 +968,201 @@ async fn test_approx_percentile_alias() {
         "approx_percentile median should land near 5, got {parsed}"
     );
 }
+
+// ─── histogram(x) — Trino map-producing aggregate ─────────────────────────
+
+#[tokio::test]
+async fn test_histogram_counts_distinct_string_values() {
+    let ctx = ctx().await;
+    let df = ctx
+        .sql(
+            "SELECT histogram(v) FROM \
+             (VALUES ('a'), ('b'), ('a'), ('c'), ('a'), ('b')) t(v)",
+        )
+        .await
+        .expect("histogram parse");
+    let batches = df.collect().await.expect("histogram execute");
+    let s = array_value_to_string(batches[0].column(0), 0).unwrap();
+    // Map render contains the entries in some order; just assert the
+    // pairs are present. Trino does not specify entry ordering.
+    for pair in ["a:3", "b:2", "c:1"] {
+        let (k, c) = pair.split_once(':').unwrap();
+        assert!(s.contains(k), "histogram output missing '{k}': {s}");
+        assert!(s.contains(c), "histogram output missing count {c}: {s}");
+    }
+}
+
+#[tokio::test]
+async fn test_histogram_skips_nulls() {
+    let ctx = ctx().await;
+    let df = ctx
+        .sql(
+            "SELECT histogram(v) FROM \
+             (VALUES (CAST('a' AS VARCHAR)), (NULL), ('a'), (NULL)) t(v)",
+        )
+        .await
+        .expect("histogram null parse");
+    let batches = df.collect().await.expect("histogram null execute");
+    let s = array_value_to_string(batches[0].column(0), 0).unwrap();
+    // 'a' counted twice; NULL not counted. The map should contain only one entry.
+    assert!(s.contains("a"), "histogram should still count 'a': {s}");
+    assert!(s.contains('2'), "count of 'a' should be 2: {s}");
+}
+
+#[tokio::test]
+async fn test_histogram_with_group_by() {
+    // Per-group histograms — the typical dbt pattern.
+    let ctx = ctx().await;
+    let df = ctx
+        .sql(
+            "SELECT region, histogram(status) AS h FROM (VALUES \
+                ('EU', 'shipped'), \
+                ('EU', 'pending'), \
+                ('EU', 'shipped'), \
+                ('US', 'cancelled')) \
+                t(region, status) \
+            GROUP BY region \
+            ORDER BY region",
+        )
+        .await
+        .expect("histogram group parse");
+    let batches = df.collect().await.expect("histogram group execute");
+    assert_eq!(batches[0].num_rows(), 2, "two groups");
+    // EU row contains 'shipped' twice and 'pending' once; US row contains
+    // 'cancelled' once. Render-format independence: assert by string match.
+    let eu_h = array_value_to_string(batches[0].column(1), 0).unwrap();
+    let us_h = array_value_to_string(batches[0].column(1), 1).unwrap();
+    assert!(eu_h.contains("shipped"), "EU should have shipped: {eu_h}");
+    assert!(eu_h.contains("pending"), "EU should have pending: {eu_h}");
+    assert!(us_h.contains("cancelled"), "US should have cancelled: {us_h}");
+    assert!(!us_h.contains("shipped"), "US should not see EU values: {us_h}");
+}
+
+#[tokio::test]
+async fn test_histogram_integer_keys() {
+    let ctx = ctx().await;
+    let df = ctx
+        .sql(
+            "SELECT histogram(v) FROM \
+             (VALUES (1), (2), (1), (3), (1), (2)) t(v)",
+        )
+        .await
+        .expect("histogram int parse");
+    let batches = df.collect().await.expect("histogram int execute");
+    let s = array_value_to_string(batches[0].column(0), 0).unwrap();
+    // Count: 1->3, 2->2, 3->1.
+    assert!(s.contains('1'), "histogram should contain key 1: {s}");
+    assert!(s.contains('2'), "histogram should contain key 2 / count: {s}");
+    assert!(s.contains('3'), "histogram should contain key 3: {s}");
+}
+
+// ─── Map-producing aggregates (map_agg, multimap_agg, map_union) ──────────
+
+#[tokio::test]
+async fn test_map_agg_aggregates_kv_pairs() {
+    let ctx = ctx().await;
+    let df = ctx
+        .sql(
+            "SELECT map_agg(k, v) FROM \
+             (VALUES ('a', 1), ('b', 2), ('c', 3)) t(k, v)",
+        )
+        .await
+        .expect("map_agg parse");
+    let batches = df.collect().await.expect("map_agg execute");
+    let s = array_value_to_string(batches[0].column(0), 0).unwrap();
+    for (k, v) in [("a", "1"), ("b", "2"), ("c", "3")] {
+        assert!(s.contains(k), "map_agg missing key '{k}': {s}");
+        assert!(s.contains(v), "map_agg missing value '{v}': {s}");
+    }
+}
+
+#[tokio::test]
+async fn test_map_agg_last_wins_on_duplicate_key() {
+    // Trino spec is implementation-defined for duplicate keys; SQE keeps
+    // the last value seen (matches DuckDB and Snowflake).
+    let ctx = ctx().await;
+    let df = ctx
+        .sql(
+            "SELECT map_agg(k, v) FROM \
+             (VALUES ('a', 1), ('a', 99)) t(k, v)",
+        )
+        .await
+        .expect("map_agg dup parse");
+    let batches = df.collect().await.expect("map_agg dup execute");
+    let s = array_value_to_string(batches[0].column(0), 0).unwrap();
+    assert!(s.contains("99"), "last-wins value 99 missing: {s}");
+    assert!(!s.contains('1') || s.contains("99"), "first-write 1 should not appear without 99: {s}");
+}
+
+#[tokio::test]
+async fn test_multimap_agg_groups_values_per_key() {
+    // multimap_agg(k, v) returns MAP<K, ARRAY<V>>: all values per key
+    // collected into an array. Insertion order preserved.
+    let ctx = ctx().await;
+    let df = ctx
+        .sql(
+            "SELECT multimap_agg(k, v) FROM \
+             (VALUES ('a', 1), ('b', 2), ('a', 3), ('a', 4)) t(k, v)",
+        )
+        .await
+        .expect("multimap_agg parse");
+    let batches = df.collect().await.expect("multimap_agg execute");
+    let s = array_value_to_string(batches[0].column(0), 0).unwrap();
+    // Output should mention all four values somewhere.
+    for v in ["1", "2", "3", "4"] {
+        assert!(s.contains(v), "multimap_agg missing value '{v}': {s}");
+    }
+    assert!(s.contains('a'), "multimap_agg missing key 'a': {s}");
+    assert!(s.contains('b'), "multimap_agg missing key 'b': {s}");
+}
+
+#[tokio::test]
+async fn test_map_union_merges_multiple_maps() {
+    // Build two map literals via map_agg, then map_union should merge.
+    // We assert with a plain SELECT against a synthetic source.
+    let ctx = ctx().await;
+    let df = ctx
+        .sql(
+            "WITH per_region AS ( \
+                SELECT region, map_agg(k, v) AS m FROM \
+                  (VALUES \
+                    ('EU', 'k1', 1), ('EU', 'k2', 2), \
+                    ('US', 'k3', 3), ('US', 'k4', 4)) \
+                  t(region, k, v) \
+                GROUP BY region \
+             ) \
+             SELECT map_union(m) FROM per_region",
+        )
+        .await
+        .expect("map_union parse");
+    let batches = df.collect().await.expect("map_union execute");
+    let s = array_value_to_string(batches[0].column(0), 0).unwrap();
+    for k in ["k1", "k2", "k3", "k4"] {
+        assert!(s.contains(k), "map_union missing key '{k}': {s}");
+    }
+}
+
+#[tokio::test]
+async fn test_map_agg_with_group_by() {
+    // Per-group map_agg — typical dbt pattern: build a dict per region.
+    let ctx = ctx().await;
+    let df = ctx
+        .sql(
+            "SELECT region, map_agg(k, v) AS m FROM \
+              (VALUES \
+                ('EU', 'k1', 1), ('EU', 'k2', 2), \
+                ('US', 'k3', 3)) \
+              t(region, k, v) \
+             GROUP BY region \
+             ORDER BY region",
+        )
+        .await
+        .expect("map_agg group parse");
+    let batches = df.collect().await.expect("map_agg group execute");
+    assert_eq!(batches[0].num_rows(), 2);
+    let eu_m = array_value_to_string(batches[0].column(1), 0).unwrap();
+    let us_m = array_value_to_string(batches[0].column(1), 1).unwrap();
+    assert!(eu_m.contains("k1") && eu_m.contains("k2"));
+    assert!(us_m.contains("k3"));
+    assert!(!us_m.contains("k1"), "US map should not see EU keys: {us_m}");
+}

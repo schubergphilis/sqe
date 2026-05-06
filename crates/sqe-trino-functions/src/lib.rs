@@ -17,6 +17,8 @@
 //! regex). See openspec change `split-trino-functions`.
 
 pub mod aggregates;
+pub mod histogram;
+pub mod map_aggregates;
 pub mod trino_functions;
 pub mod trino_functions_ext;
 
