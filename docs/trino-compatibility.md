@@ -1,6 +1,6 @@
 # Trino SQL Compatibility Matrix
 
-> Living document. Last updated: 2026-05-08 (DataFusion 53.1.0; max_by/min_by real UDAFs + bitwise_xor_agg alias).
+> Living document. Last updated: 2026-05-08 (DataFusion 53.1.0; metadata $-syntax rewriter, 6 ⚠️ → ✅).
 > Rating: ✅ equivalent | ⚠️ partial/different semantics | ❌ missing | 🔧 SQE-specific
 
 SQE aims to be a drop-in replacement for Trino in Iceberg-only environments.
@@ -59,7 +59,7 @@ noting semantic differences and gaps.
 | Window | 14 | 13 | 0 | 1 | 92.9% |
 | DDL/DML | 31 + 1🔧 | 25 | 3 | 3 | 90.3% |
 | Type System | 27 | 20 | 2 | 5 | 81.5% |
-| Iceberg-Specific | 19 | 12 | 5 | 2 | 89.5% |
+| Iceberg-Specific | 19 | 16 | 0 | 3 | 84.2% |
 
 ### Overall Coverage
 
@@ -409,12 +409,12 @@ Each section lists Trino functions with their SQE status:
 | Type widening | ✅ | ✅ | ✅ | INT→BIGINT, FLOAT→DOUBLE |
 | Time travel: `FOR VERSION AS OF` | `FOR SYSTEM_TIME AS OF` | ✅ | ✅ | Pre-processes AST, resolves snapshot_id via metadata |
 | Time travel: `FOR TIMESTAMP AS OF` | Same mechanism | ✅ | ✅ | Timestamp resolved to nearest snapshot |
-| `$snapshots` metadata table | `table_snapshots('ns', 'table')` | ✅ | ⚠️ | TVF instead of `$snapshots` syntax; queries Polaris REST catalog metadata |
-| `$manifests` metadata table | `table_manifests('ns', 'table')` | ✅ | ⚠️ | TVF instead of `$manifests` syntax; reads manifest list from Polaris |
-| `$history` metadata table | `table_history('ns', 'table')` | ✅ | ⚠️ | TVF syntax |
-| `$partitions` metadata table | `table_partitions('ns', 'table')` | ✅ | ⚠️ | TVF syntax |
-| `$files` metadata table | `table_files('ns', 'table')` | ✅ | ⚠️ | TVF syntax |
-| `$refs` metadata table | `table_refs('ns', 'table')` | ✅ | ⚠️ | TVF syntax |
+| `$snapshots` metadata table | `"ns.t$snapshots"` (Trino) or `table_snapshots('ns', 't')` (TVF) | ✅ | ✅ | sqe-sql AST rewriter translates `"ns.t$snapshots"` to `table_snapshots('ns', 't')` before DataFusion sees it. Both spellings work; dbt-trino macros that hard-code `$snapshots` resolve transparently |
+| `$manifests` metadata table | `"ns.t$manifests"` or `table_manifests('ns', 't')` | ✅ | ✅ | Same rewriter as `$snapshots` |
+| `$history` metadata table | `"ns.t$history"` or `table_history('ns', 't')` | ✅ | ✅ | Same rewriter |
+| `$partitions` metadata table | `"ns.t$partitions"` or `table_partitions('ns', 't')` | ✅ | ✅ | Same rewriter |
+| `$files` metadata table | `"ns.t$files"` or `table_files('ns', 't')` | ✅ | ✅ | Same rewriter |
+| `$refs` metadata table | `"ns.t$refs"` or `table_refs('ns', 't')` | ✅ | ✅ | Same rewriter |
 | Partition evolution | ✅ | ✅ | ✅ | Via ALTER TABLE |
 | Sort order | — | ✅ | ❌ | |
 | Write distribution mode | — | ✅ | ❌ | |
@@ -504,6 +504,43 @@ Net coverage delta this MR:
 
 The remaining DDL/DML ⚠️ rows after this MR are `PREPARE`/`EXECUTE` (DataFusion infrastructure, SQL integration incomplete), `CALL procedure(...)` for non-system procedures, and a couple of catalog-related edge cases. The remaining ❌ rows are `CREATE MATERIALIZED VIEW` (not in Iceberg spec), and two structural Trino-isms.
 
+<<<<<<< docs/trino-compatibility.md
+### Items shipped 2026-05-08 (metadata `$`-syntax rewriter)
+
+Trino exposes Iceberg metadata tables under a `$<kind>` suffix on the
+table name (`SELECT * FROM "ns.t$snapshots"`). SQE already had the
+data via TVFs (`table_snapshots('ns', 't')`), but `dbt-trino` macros
+that hard-code the `$snapshots` spelling failed at parse time. The
+new AST rewriter in `crates/sqe-sql/src/trino_compat.rs` translates
+the Trino spelling to the TVF call before DataFusion sees it.
+
+| Item | Was | Now |
+|---|---|---|
+| `$snapshots` metadata | ⚠️ "TVF instead of `$` syntax" | ✅ Both spellings resolve to the same TVF |
+| `$manifests` | ⚠️ same | ✅ same |
+| `$history` | ⚠️ same | ✅ same |
+| `$partitions` | ⚠️ same | ✅ same |
+| `$files` | ⚠️ same | ✅ same |
+| `$refs` | ⚠️ same | ✅ same |
+
+The rewriter handles both quoted-identifier shapes Trino emits
+(`"ns.t$snapshots"` collapsed into one ident, `"ns"."t$snapshots"`
+split across two), three-segment qualified names
+(`"cat"."schema"."t$snapshots"`), case-insensitive suffixes
+(`$SNAPSHOTS`), and aliases (`AS s`). Single-segment `"t$snapshots"`
+without a namespace is left alone so DataFusion produces a normal
+"table not found" error. Unknown `$` suffixes (`$wat`,
+`t$snapshots_archive`) pass through unchanged.
+
+10 new unit tests in `trino_compat::tests` cover all six suffixes,
+both quoting shapes, the three-segment namespace case, alias
+preservation, the unknown-suffix passthrough, the no-namespace
+fallthrough, and combination with the `CAST(v AS JSON)` rewriter.
+
+Net coverage delta this MR:
+
+- **Iceberg-Specific** 19 cells: 6 ⚠️ → 6 ✅ (every `$` metadata table)
+=======
 ### Items shipped 2026-05-08 (max_by / min_by real UDAFs + bitwise_xor_agg)
 
 The `max_by` / `min_by` scalar stubs that returned the first argument
@@ -528,6 +565,7 @@ Aggregate now has zero amber rows; only ❌ remaining are the
 Map-producing UDAFs (`histogram`, `map_agg`, `multimap_agg`,
 `map_union`), `approx_most_frequent` (Count-Min Sketch), and
 `merge(digest)` (HyperLogLog/TDigest sketch types).
+>>>>>>> docs/trino-compatibility.md
 
 ## Operational Comparison
 
