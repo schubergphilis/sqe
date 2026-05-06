@@ -968,3 +968,90 @@ async fn test_approx_percentile_alias() {
         "approx_percentile median should land near 5, got {parsed}"
     );
 }
+
+// ─── histogram(x) — Trino map-producing aggregate ─────────────────────────
+
+#[tokio::test]
+async fn test_histogram_counts_distinct_string_values() {
+    let ctx = ctx().await;
+    let df = ctx
+        .sql(
+            "SELECT histogram(v) FROM \
+             (VALUES ('a'), ('b'), ('a'), ('c'), ('a'), ('b')) t(v)",
+        )
+        .await
+        .expect("histogram parse");
+    let batches = df.collect().await.expect("histogram execute");
+    let s = array_value_to_string(batches[0].column(0), 0).unwrap();
+    // Map render contains the entries in some order; just assert the
+    // pairs are present. Trino does not specify entry ordering.
+    for pair in ["a:3", "b:2", "c:1"] {
+        let (k, c) = pair.split_once(':').unwrap();
+        assert!(s.contains(k), "histogram output missing '{k}': {s}");
+        assert!(s.contains(c), "histogram output missing count {c}: {s}");
+    }
+}
+
+#[tokio::test]
+async fn test_histogram_skips_nulls() {
+    let ctx = ctx().await;
+    let df = ctx
+        .sql(
+            "SELECT histogram(v) FROM \
+             (VALUES (CAST('a' AS VARCHAR)), (NULL), ('a'), (NULL)) t(v)",
+        )
+        .await
+        .expect("histogram null parse");
+    let batches = df.collect().await.expect("histogram null execute");
+    let s = array_value_to_string(batches[0].column(0), 0).unwrap();
+    // 'a' counted twice; NULL not counted. The map should contain only one entry.
+    assert!(s.contains("a"), "histogram should still count 'a': {s}");
+    assert!(s.contains('2'), "count of 'a' should be 2: {s}");
+}
+
+#[tokio::test]
+async fn test_histogram_with_group_by() {
+    // Per-group histograms — the typical dbt pattern.
+    let ctx = ctx().await;
+    let df = ctx
+        .sql(
+            "SELECT region, histogram(status) AS h FROM (VALUES \
+                ('EU', 'shipped'), \
+                ('EU', 'pending'), \
+                ('EU', 'shipped'), \
+                ('US', 'cancelled')) \
+                t(region, status) \
+            GROUP BY region \
+            ORDER BY region",
+        )
+        .await
+        .expect("histogram group parse");
+    let batches = df.collect().await.expect("histogram group execute");
+    assert_eq!(batches[0].num_rows(), 2, "two groups");
+    // EU row contains 'shipped' twice and 'pending' once; US row contains
+    // 'cancelled' once. Render-format independence: assert by string match.
+    let eu_h = array_value_to_string(batches[0].column(1), 0).unwrap();
+    let us_h = array_value_to_string(batches[0].column(1), 1).unwrap();
+    assert!(eu_h.contains("shipped"), "EU should have shipped: {eu_h}");
+    assert!(eu_h.contains("pending"), "EU should have pending: {eu_h}");
+    assert!(us_h.contains("cancelled"), "US should have cancelled: {us_h}");
+    assert!(!us_h.contains("shipped"), "US should not see EU values: {us_h}");
+}
+
+#[tokio::test]
+async fn test_histogram_integer_keys() {
+    let ctx = ctx().await;
+    let df = ctx
+        .sql(
+            "SELECT histogram(v) FROM \
+             (VALUES (1), (2), (1), (3), (1), (2)) t(v)",
+        )
+        .await
+        .expect("histogram int parse");
+    let batches = df.collect().await.expect("histogram int execute");
+    let s = array_value_to_string(batches[0].column(0), 0).unwrap();
+    // Count: 1->3, 2->2, 3->1.
+    assert!(s.contains('1'), "histogram should contain key 1: {s}");
+    assert!(s.contains('2'), "histogram should contain key 2 / count: {s}");
+    assert!(s.contains('3'), "histogram should contain key 3: {s}");
+}
