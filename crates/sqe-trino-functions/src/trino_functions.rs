@@ -125,7 +125,9 @@ pub fn register_trino_functions(ctx: &datafusion::prelude::SessionContext) {
 /// so the registry inserts the same UDAF under the Trino-spelled key.
 fn register_trino_aggregate_aliases(ctx: &datafusion::prelude::SessionContext) {
     use datafusion::functions_aggregate::approx_percentile_cont::approx_percentile_cont_udaf;
-    use datafusion::functions_aggregate::bit_and_or_xor::{bit_and_udaf, bit_or_udaf};
+    use datafusion::functions_aggregate::bit_and_or_xor::{
+        bit_and_udaf, bit_or_udaf, bit_xor_udaf,
+    };
     use datafusion::functions_aggregate::string_agg::string_agg_udaf;
 
     // listagg(x, sep) → string_agg(x, sep)
@@ -146,11 +148,33 @@ fn register_trino_aggregate_aliases(ctx: &datafusion::prelude::SessionContext) {
         .with_aliases(["bitwise_or_agg"]);
     ctx.register_udaf(bitwise_or);
 
+    // bitwise_xor_agg(x) → bit_xor(x). DataFusion exposes `bit_xor`
+    // natively; DuckDB and Snowflake use the explicit `bitwise_xor_agg`
+    // spelling. Same pattern as the and/or aliases above.
+    let bitwise_xor = (*bit_xor_udaf())
+        .clone()
+        .with_aliases(["bitwise_xor_agg"]);
+    ctx.register_udaf(bitwise_xor);
+
     // approx_percentile(x, p) → approx_percentile_cont(x, p)
     let approx_pc = (*approx_percentile_cont_udaf())
         .clone()
         .with_aliases(["approx_percentile"]);
     ctx.register_udaf(approx_pc);
+
+    // every(x) → bool_and(x). Trino spec calls this `every`; DuckDB
+    // and Postgres both have `every` as a synonym for `bool_and`.
+    use datafusion::functions_aggregate::bool_and_or::bool_and_udaf;
+    let every = (*bool_and_udaf()).clone().with_aliases(["every"]);
+    ctx.register_udaf(every);
+
+    // max_by(x, y) / min_by(x, y) — real UDAFs that pick x at the row
+    // where y is max/min. arg_max / arg_min are registered as aliases
+    // (DuckDB and ClickHouse spelling). Replaces the previous scalar
+    // stubs that returned the first argument and produced wrong
+    // results in any aggregation context.
+    ctx.register_udaf(crate::aggregates::ArgExtremum::max_by_udaf());
+    ctx.register_udaf(crate::aggregates::ArgExtremum::min_by_udaf());
 }
 
 /// Extract a chrono component from a Date32, Timestamp, or Time64 array.

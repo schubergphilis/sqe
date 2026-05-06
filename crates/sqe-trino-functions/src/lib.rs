@@ -16,6 +16,7 @@
 //! its transitive deps (unicode-normalization, rust-stemmers, chrono-tz,
 //! regex). See openspec change `split-trino-functions`.
 
+pub mod aggregates;
 pub mod trino_functions;
 pub mod trino_functions_ext;
 
