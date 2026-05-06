@@ -1,6 +1,6 @@
 # Trino SQL Compatibility Matrix
 
-> Living document. Last updated: 2026-05-05 (DataFusion 53.1.0; Trino math + codepoint aliases).
+> Living document. Last updated: 2026-05-06 (DataFusion 53.1.0; Trino aggregate + scalar aliases batch).
 > Rating: ✅ equivalent | ⚠️ partial/different semantics | ❌ missing | 🔧 SQE-specific
 
 SQE aims to be a drop-in replacement for Trino in Iceberg-only environments.
@@ -47,15 +47,15 @@ noting semantic differences and gaps.
 
 | Category | Total | ✅ | ⚠️ | ❌ | Coverage |
 |---|---|---|---|---|---|
-| Scalar: String | 27 | 25 | 2 | 0 | 100% |
+| Scalar: String | 27 | 27 | 0 | 0 | 100% |
 | Scalar: Math | 29 | 29 | 0 | 0 | 100% |
-| Scalar: Date/Time | 38 | 37 | 1 | 0 | 100% |
+| Scalar: Date/Time | 38 | 38 | 0 | 0 | 100% |
 | Scalar: JSON | 12 | 11 | 1 | 0 | 100% |
 | Scalar: URL | 8 | 8 | 0 | 0 | 100% |
-| Scalar: Regex | 6 | 4 | 2 | 0 | 100% |
+| Scalar: Regex | 6 | 6 | 0 | 0 | 100% |
 | Scalar: Conditional | 8 | 7 | 1 | 0 | 100% |
 | Scalar: Conversion | 10 | 9 | 0 | 1 | 90% |
-| Aggregate | 33 | 22 | 5 | 6 | 81.8% |
+| Aggregate | 33 | 26 | 1 | 6 | 84.8% |
 | Window | 14 | 13 | 0 | 1 | 92.9% |
 | DDL/DML | 31 + 1🔧 | 22 | 6 | 3 | 87.1% |
 | Type System | 27 | 20 | 2 | 5 | 81.5% |
@@ -112,7 +112,7 @@ Each section lists Trino functions with their SQE status:
 | `rpad(s, size, pad)` | `rpad(s, size, pad)` | ✅ | Native DataFusion |
 | `rtrim(s)` | `rtrim(s)` | ✅ | Native DataFusion |
 | `soundex(s)` | `soundex(s)` | ✅ | Trino compat UDF |
-| `split(s, delim)` | `string_to_array(s, delim)` | ⚠️ | Different name, same semantics |
+| `split(s, delim)` | `split(s, delim)` | ✅ | Trino-aliased on `string_to_array(s, delim)`; returns `ARRAY(VARCHAR)` |
 | `split_part(s, delim, idx)` | `split_part(s, delim, idx)` | ✅ | Native DataFusion |
 | `strpos(s, sub)` | `strpos(s, sub)` | ✅ | Trino compat UDF |
 | `substr(s, start, len)` | `substr(s, start, len)` | ✅ | Native DataFusion |
@@ -120,7 +120,7 @@ Each section lists Trino functions with their SQE status:
 | `trim(s)` | `trim(s)` | ✅ | Native DataFusion |
 | `upper(s)` | `upper(s)` | ✅ | Native DataFusion |
 | `word_stem(s)` | `word_stem(s)` | ✅ | Trino compat UDF (English default) |
-| `word_stem(s, lang)` | `word_stem_lang(s, lang)` | ⚠️ | Different name, 17 languages |
+| `word_stem(s, lang)` | `word_stem(s, lang)` | ✅ | Single UDF accepts both `word_stem(s)` (English default) and `word_stem(s, lang)`; `word_stem_lang(s, lang)` kept as a registered alias for backward compat. 17 languages |
 
 ## Scalar Functions: Math
 
@@ -173,7 +173,7 @@ Each section lists Trino functions with their SQE status:
 | `from_unixtime(n)` | `from_unixtime(n)` | ✅ | Trino compat UDF |
 | `to_unixtime(ts)` | `to_unixtime(ts)` | ✅ | Trino compat UDF |
 | `to_iso8601(ts)` | `to_iso8601(ts)` | ✅ | Trino compat UDF |
-| `date_add(unit, n, ts)` | `date_add(ts, unit, n)` | ⚠️ | Different argument order |
+| `date_add(unit, n, ts)` | `date_add(unit, n, ts)` | ✅ | Trino compat UDF in Trino's argument order. The previous "different argument order" caveat was a stale doc claim; the implementation in `crates/sqe-trino-functions/src/trino_functions.rs#DateAdd` has always taken `(unit, amount, date_or_ts)`, matching Trino's spec |
 | `date_diff(unit, ts1, ts2)` | `date_diff(unit, ts1, ts2)` | ✅ | Trino compat UDF |
 | `date_trunc(unit, ts)` | `date_trunc(unit, ts)` | ✅ | Native DataFusion |
 | `date_format(ts, fmt)` | `date_format(ts, fmt)` | ✅ | Trino compat UDF (MySQL format codes) |
@@ -237,10 +237,10 @@ Each section lists Trino functions with their SQE status:
 |---|---|---|---|
 | `regexp_count(s, pattern)` | `regexp_count(s, pattern)` | ✅ | Native DataFusion |
 | `regexp_extract(s, pattern)` | `regexp_extract(s, pattern)` | ✅ | Trino compat UDF |
-| `regexp_extract_all(s, pattern)` | `regexp_extract_all(s, pattern)` | ⚠️ | Returns JSON array string, not ARRAY type |
+| `regexp_extract_all(s, pattern)` | `regexp_extract_all(s, pattern)` | ✅ | Returns `ARRAY(VARCHAR)` (was previously a JSON-array string for legacy ARRAY-less callers; re-wired now that DataFusion's ARRAY plumbing is solid). Errors on invalid regex per Trino spec |
 | `regexp_like(s, pattern)` | `regexp_like(s, pattern)` | ✅ | Native DataFusion |
 | `regexp_replace(s, pattern, repl)` | `regexp_replace(s, pattern, repl)` | ✅ | |
-| `regexp_split(s, pattern)` | `regexp_split(s, pattern)` | ⚠️ | Returns JSON array string, not ARRAY type |
+| `regexp_split(s, pattern)` | `regexp_split(s, pattern)` | ✅ | Returns `ARRAY(VARCHAR)`; same re-wiring as `regexp_extract_all` |
 
 ## Scalar Functions: Conditional
 
@@ -284,9 +284,9 @@ Each section lists Trino functions with their SQE status:
 | `array_agg(x)` | `array_agg(x)` | ✅ | |
 | `array_agg(x ORDER BY y)` | Same | ✅ | DataFusion supports ordered agg |
 | `string_agg(x, sep)` | `string_agg(x, sep)` | ✅ | |
-| `listagg(x, sep)` | `string_agg(x, sep)` | ⚠️ | Use `string_agg()` alias |
+| `listagg(x, sep)` | `listagg(x, sep)` | ✅ | DataFusion's `string_agg` UDAF re-registered with `listagg` alias |
 | `approx_distinct(x)` | `approx_distinct(x)` | ✅ | |
-| `approx_percentile(x, p)` | `approx_percentile_cont(x, p)` | ⚠️ | Different name |
+| `approx_percentile(x, p)` | `approx_percentile(x, p)` | ✅ | DataFusion's `approx_percentile_cont` UDAF re-registered with `approx_percentile` alias |
 | `stddev(x)` / `stddev_samp(x)` | Same | ✅ | |
 | `stddev_pop(x)` | Same | ✅ | |
 | `variance(x)` / `var_samp(x)` | Same | ✅ | |
@@ -295,8 +295,8 @@ Each section lists Trino functions with their SQE status:
 | `covar_pop(y, x)` | `covar_pop(y, x)` | ✅ | |
 | `corr(y, x)` | `corr(y, x)` | ✅ | |
 | `regr_slope(y, x)` | `regr_slope(y, x)` | ✅ | |
-| `bitwise_and_agg(x)` | `bit_and(x)` | ⚠️ | Different name |
-| `bitwise_or_agg(x)` | `bit_or(x)` | ⚠️ | Different name |
+| `bitwise_and_agg(x)` | `bitwise_and_agg(x)` | ✅ | DataFusion's `bit_and` UDAF re-registered with `bitwise_and_agg` alias |
+| `bitwise_or_agg(x)` | `bitwise_or_agg(x)` | ✅ | DataFusion's `bit_or` UDAF re-registered with `bitwise_or_agg` alias |
 | `arbitrary(x)` | `arbitrary(x)` | ✅ | Trino compat UDF (returns first non-null) |
 | `max_by(x, y)` / `min_by(x, y)` | `max_by(x, y)` / `min_by(x, y)` | ⚠️ | Scalar stub (aggregate behavior requires UDAF) |
 | `histogram(x)` | — | ❌ | |
@@ -459,7 +459,30 @@ Five more amber rows flipped to ✅ via small alias UDFs in `sqe-trino-functions
 | `sign(x)` | ✅ shipped | Scalar UDF over `Float64`. Matches Trino spec including `sign(0) = 0` (Rust's `f64::signum(0.0)` returns 1.0; the UDF overrides the zero case) |
 | `codepoint(s)` | ✅ shipped | Scalar UDF returning the full Unicode code point of a single-character string. Errors on multi-character input per Trino spec. ASCII characters round-trip to the same value as `ascii()` for backward compat; Unicode characters now return the proper code point (`'é'` → 233) instead of the first UTF-8 byte (`195`) |
 
-Net coverage delta: **Scalar: Math 25/29 (4 amber) → 29/29 (0 amber)**. **Scalar: String 24/27 (3 amber) → 25/27 (2 amber)**.
+### Items shipped 2026-05-06 (more Trino aliases + array shape + caveat audit)
+
+Nine additional amber rows flipped to ✅:
+
+| Item | Kind | Status | What changed |
+|---|---|---|---|
+| `split(s, delim)` | scalar alias | ✅ | Registered as alias on DataFusion's `string_to_array_udf()`. Returns `ARRAY(VARCHAR)` |
+| `regexp_extract_all(s, p)` | return shape | ✅ | Re-wired from JSON-array string to real `List<Utf8>`. Errors on invalid regex per Trino spec |
+| `regexp_split(s, p)` | return shape | ✅ | Same re-wiring as `regexp_extract_all` |
+| `word_stem(s)` and `word_stem(s, lang)` | arity refactor | ✅ | Single UDF with `Signature::one_of([Any(1), Any(2)])`. `word_stem_lang(s, lang)` registered as a name-alias for backward compat |
+| `date_add(unit, n, ts)` | caveat audit | ✅ | The "different argument order" caveat was a stale doc claim. The implementation in `crates/sqe-trino-functions/src/trino_functions.rs#DateAdd` has always taken `(unit, amount, ts)`, matching Trino's spec |
+| `listagg(x, sep)` | aggregate alias | ✅ | DataFusion's `string_agg` UDAF re-registered with `listagg` alias |
+| `approx_percentile(x, p)` | aggregate alias | ✅ | DataFusion's `approx_percentile_cont` UDAF re-registered with `approx_percentile` alias |
+| `bitwise_and_agg(x)` | aggregate alias | ✅ | DataFusion's `bit_and` UDAF re-registered with `bitwise_and_agg` alias |
+| `bitwise_or_agg(x)` | aggregate alias | ✅ | DataFusion's `bit_or` UDAF re-registered with `bitwise_or_agg` alias |
+
+The aggregate aliases use `AggregateUDF::with_aliases([trino_name])`. The DataFusion registry inserts the UDAF under both its primary name and every alias (see `datafusion-execution-53.1.0/src/task.rs::register_udaf`), so SELECTs that use the Trino spelling resolve to the same accumulator. No new accumulators were written.
+
+Net coverage delta this MR:
+
+- **Scalar: String** 25/27 (2 amber) → **27/27 (0 amber)**
+- **Scalar: Date/Time** 37/38 (1 amber) → **38/38 (0 amber)**
+- **Scalar: Regex** 4/6 (2 amber) → **6/6 (0 amber)**
+- **Aggregate** 22/33 (5 amber, 6 red) → **26/33 (1 amber, 6 red)** — coverage 81.8% → 84.8%
 
 ## Operational Comparison
 

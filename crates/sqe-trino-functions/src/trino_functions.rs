@@ -98,6 +98,59 @@ pub fn register_trino_functions(ctx: &datafusion::prelude::SessionContext) {
     ctx.register_udf(ScalarUDF::from(TrinoTruncate));
     ctx.register_udf(ScalarUDF::from(TrinoSign));
     ctx.register_udf(ScalarUDF::from(TrinoCodepoint));
+
+    // Trino aggregate aliases — these are not new aggregates. Each is the
+    // existing DataFusion aggregate UDAF re-registered with the Trino name
+    // added to its `aliases` list. The SessionContext registry inserts the
+    // UDAF under both its primary name and every alias (see
+    // datafusion-execution-53.1.0/src/task.rs::register_udaf), so SELECTs
+    // that use the Trino spelling resolve to the same accumulator.
+    register_trino_aggregate_aliases(ctx);
+
+    // Trino split(s, delim) returns ARRAY(VARCHAR). DataFusion's
+    // `string_to_array(s, delim)` returns the same shape; register `split`
+    // as an alias on the same UDF so SELECT split(...) resolves to it.
+    use datafusion::functions_nested::string::string_to_array_udf;
+    let split = (*string_to_array_udf())
+        .clone()
+        .with_aliases(["split"]);
+    ctx.register_udf(split);
+}
+
+/// Register Trino-spelled aliases for existing DataFusion aggregate UDAFs.
+///
+/// The DataFusion aggregates (`string_agg`, `bit_and`, `bit_or`,
+/// `approx_percentile_cont`) are already registered by default in a
+/// `SessionContext`. We re-register a clone with `with_aliases([trino_name])`
+/// so the registry inserts the same UDAF under the Trino-spelled key.
+fn register_trino_aggregate_aliases(ctx: &datafusion::prelude::SessionContext) {
+    use datafusion::functions_aggregate::approx_percentile_cont::approx_percentile_cont_udaf;
+    use datafusion::functions_aggregate::bit_and_or_xor::{bit_and_udaf, bit_or_udaf};
+    use datafusion::functions_aggregate::string_agg::string_agg_udaf;
+
+    // listagg(x, sep) → string_agg(x, sep)
+    let listagg = (*string_agg_udaf())
+        .clone()
+        .with_aliases(["listagg"]);
+    ctx.register_udaf(listagg);
+
+    // bitwise_and_agg(x) → bit_and(x)
+    let bitwise_and = (*bit_and_udaf())
+        .clone()
+        .with_aliases(["bitwise_and_agg"]);
+    ctx.register_udaf(bitwise_and);
+
+    // bitwise_or_agg(x) → bit_or(x)
+    let bitwise_or = (*bit_or_udaf())
+        .clone()
+        .with_aliases(["bitwise_or_agg"]);
+    ctx.register_udaf(bitwise_or);
+
+    // approx_percentile(x, p) → approx_percentile_cont(x, p)
+    let approx_pc = (*approx_percentile_cont_udaf())
+        .clone()
+        .with_aliases(["approx_percentile"]);
+    ctx.register_udaf(approx_pc);
 }
 
 /// Extract a chrono component from a Date32, Timestamp, or Time64 array.
