@@ -504,7 +504,6 @@ Net coverage delta this MR:
 
 The remaining DDL/DML ⚠️ rows after this MR are `PREPARE`/`EXECUTE` (DataFusion infrastructure, SQL integration incomplete), `CALL procedure(...)` for non-system procedures, and a couple of catalog-related edge cases. The remaining ❌ rows are `CREATE MATERIALIZED VIEW` (not in Iceberg spec), and two structural Trino-isms.
 
-<<<<<<< docs/trino-compatibility.md
 ### Items shipped 2026-05-08 (metadata `$`-syntax rewriter)
 
 Trino exposes Iceberg metadata tables under a `$<kind>` suffix on the
@@ -540,7 +539,7 @@ fallthrough, and combination with the `CAST(v AS JSON)` rewriter.
 Net coverage delta this MR:
 
 - **Iceberg-Specific** 19 cells: 6 ⚠️ → 6 ✅ (every `$` metadata table)
-=======
+
 ### Items shipped 2026-05-08 (max_by / min_by real UDAFs + bitwise_xor_agg)
 
 The `max_by` / `min_by` scalar stubs that returned the first argument
@@ -565,7 +564,6 @@ Aggregate now has zero amber rows; only ❌ remaining are the
 Map-producing UDAFs (`histogram`, `map_agg`, `multimap_agg`,
 `map_union`), `approx_most_frequent` (Count-Min Sketch), and
 `merge(digest)` (HyperLogLog/TDigest sketch types).
->>>>>>> docs/trino-compatibility.md
 
 ## Operational Comparison
 
