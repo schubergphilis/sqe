@@ -1,6 +1,6 @@
 # Trino SQL Compatibility Matrix
 
-> Living document. Last updated: 2026-05-08 (DataFusion 53.1.0; metadata $-syntax rewriter, 6 ⚠️ → ✅).
+> Living document. Last updated: 2026-05-08 (DataFusion 53.1.0; map_agg / multimap_agg / map_union real UDAFs).
 > Rating: ✅ equivalent | ⚠️ partial/different semantics | ❌ missing | 🔧 SQE-specific
 
 SQE aims to be a drop-in replacement for Trino in Iceberg-only environments.
@@ -55,7 +55,7 @@ noting semantic differences and gaps.
 | Scalar: Regex | 6 | 6 | 0 | 0 | 100% |
 | Scalar: Conditional | 8 | 7 | 1 | 0 | 100% |
 | Scalar: Conversion | 10 | 9 | 0 | 1 | 90% |
-| Aggregate | 33 | 27 | 0 | 6 | 87.9% |
+| Aggregate | 33 | 30 | 0 | 3 | 90.9% |
 | Window | 14 | 13 | 0 | 1 | 92.9% |
 | DDL/DML | 31 + 1🔧 | 25 | 3 | 3 | 90.3% |
 | Type System | 27 | 20 | 2 | 5 | 81.5% |
@@ -65,7 +65,7 @@ noting semantic differences and gaps.
 
 **~96% Trino SQL compatibility** for Iceberg-only workloads. The remaining gaps are:
 - **Trino-specific sketch types** (HyperLogLog, TDigest, SetDigest). Not used in typical Iceberg analytics.
-- **Map-producing aggregates** (histogram, map_agg, multimap_agg). Need custom UDAF with MapBuilder.
+- **`approx_most_frequent(n, x, cap)`**: Trino's Count-Min Sketch UDAF, only ❌ remaining in the Aggregate category alongside `histogram` (in MR !137) and `merge(digest)` (HyperLogLog/TDigest sketch types — not planned). `map_agg`, `multimap_agg`, `map_union` all shipped.
 - **CREATE MATERIALIZED VIEW**. Not in Iceberg spec; use CTAS + scheduled refresh.
 - **Lambda in window functions**. DataFusion engine limitation.
 - **ORC format**. Strategic choice: Parquet only.
@@ -300,10 +300,10 @@ Each section lists Trino functions with their SQE status:
 | `bitwise_xor_agg(x)` | `bitwise_xor_agg(x)` | ✅ | DataFusion's `bit_xor` UDAF re-registered with `bitwise_xor_agg` alias (DuckDB / Snowflake spelling) |
 | `arbitrary(x)` | `arbitrary(x)` | ✅ | Trino compat UDF (returns first non-null) |
 | `max_by(x, y)` / `min_by(x, y)` | `max_by(x, y)` / `min_by(x, y)` | ✅ | Real `AggregateUDFImpl` in `crates/sqe-trino-functions/src/aggregates.rs::ArgExtremum`. Type-flexible (x any type, y any orderable type). `arg_max(x, y)` / `arg_min(x, y)` registered as aliases (DuckDB / ClickHouse spelling) |
-| `histogram(x)` | — | ❌ | |
-| `multimap_agg(k, v)` | — | ❌ | |
-| `map_agg(k, v)` | — | ❌ | |
-| `map_union(map)` | — | ❌ | |
+| `histogram(x)` | — | ❌ | Same Map-producing accumulator pattern as `map_agg`; ships in MR !137 (separate) |
+| `multimap_agg(k, v)` | `multimap_agg(k, v)` | ✅ | Real `AggregateUDFImpl` in `crates/sqe-trino-functions/src/map_aggregates.rs::MultimapAgg`. Returns `MAP<typeof(k), ARRAY<typeof(v)>>`. NULL keys skipped; insertion order preserved within each value list |
+| `map_agg(k, v)` | `map_agg(k, v)` | ✅ | Real `AggregateUDFImpl` in `crates/sqe-trino-functions/src/map_aggregates.rs::MapAgg`. Returns `MAP<typeof(k), typeof(v)>`. Last-wins on duplicate keys (matches DuckDB / Snowflake) |
+| `map_union(map)` | `map_union(m)` | ✅ | Real `AggregateUDFImpl` in `crates/sqe-trino-functions/src/map_aggregates.rs::MapUnion`. Takes a `MAP<K, V>` column and merges every input map into one. Last-wins on duplicate keys |
 | `checksum(x)` | `checksum(x)` | ✅ | Trino compat UDF (hash-based) |
 | `approx_most_frequent(n, x, cap)` | — | ❌ | |
 | `merge(digest)` | — | ❌ | HyperLogLog/TDigest |

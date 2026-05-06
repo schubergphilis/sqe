@@ -185,9 +185,9 @@ fn register_trino_aggregate_aliases(ctx: &datafusion::prelude::SessionContext) {
     // - multimap_agg(k, v): MAP<K, ARRAY<V>>; preserves insertion order.
     // - map_union(m): merges multiple maps; last-wins on duplicate keys.
     ctx.register_udaf(crate::histogram::Histogram::udaf());
-    // map_agg / multimap_agg / map_union land later in the same diff;
-    // the registrations are appended to this block below by the
-    // map-aggregates patch.
+    ctx.register_udaf(crate::map_aggregates::MapAgg::udaf());
+    ctx.register_udaf(crate::map_aggregates::MultimapAgg::udaf());
+    ctx.register_udaf(crate::map_aggregates::MapUnion::udaf());
 }
 
 /// Extract a chrono component from a Date32, Timestamp, or Time64 array.
