@@ -365,6 +365,18 @@ impl QueryHandler {
                         } else {
                             self.explain_handler.plan(session, &inner, &ctx).await
                         }
+                    } else if let sqlparser::ast::Statement::ShowColumns {
+                        show_options, ..
+                    } = stmt.as_ref()
+                    {
+                        // Trino: SHOW COLUMNS FROM ns.table -> rewrite as a
+                        // query against information_schema.columns. Same pattern
+                        // as handle_show_create_table; the Trino output has
+                        // four columns (Column, Type, Extra, Comment), but we
+                        // emit (column_name, data_type, is_nullable) for now.
+                        // dbt and most BI clients use this query for schema
+                        // inspection and only need the first two columns.
+                        self.handle_show_columns(session, show_options).await
                     } else {
                         Err(SqeError::NotImplemented(format!(
                             "Utility statement not supported: {stmt}"
@@ -1137,6 +1149,13 @@ impl QueryHandler {
         // snapshot IDs, register snapshot-specific table providers, and
         // strip the temporal clause.
         let sql = self.handle_time_travel(&sql, &ctx, &session_catalog).await?;
+        // Pre-process Trino-compat AST patterns DataFusion does not natively
+        // recognize. Today this only rewrites `CAST(v AS JSON)` to
+        // `to_json(v)`; the rewriter is a no-op when the input does not
+        // contain `as json` (case-insensitive). Errors during parse fall
+        // through as the original string so DataFusion produces its own
+        // error message.
+        let sql = sqe_sql::rewrite_trino_compat(&sql);
         let sql = sql.as_str();
 
         // Plan the query via DataFusion's SQL planner
@@ -1834,6 +1853,56 @@ impl QueryHandler {
             .map_err(|e| SqeError::Execution(format!("Failed to create result batch: {e}")))?;
 
         Ok(vec![batch])
+    }
+
+    /// Handle `SHOW COLUMNS FROM ns.table` (Trino syntax) by translating
+    /// into a query against `information_schema.columns`. Same pattern as
+    /// `handle_show_create_table`'s column lookup.
+    ///
+    /// Trino's full `SHOW COLUMNS` output has four columns (Column, Type,
+    /// Extra, Comment); SQE returns (column_name, data_type, is_nullable),
+    /// which is the subset dbt and BI clients use for schema inspection.
+    async fn handle_show_columns(
+        &self,
+        session: &Session,
+        show_options: &sqlparser::ast::ShowStatementOptions,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // sqlparser groups the table identifier under
+        // `show_in.parent_name`. Both `show_in` and `parent_name` are
+        // optional in the AST; missing either means the query did not
+        // name a table to inspect.
+        let table_name = show_options
+            .show_in
+            .as_ref()
+            .and_then(|si| si.parent_name.as_ref())
+            .map(|n| n.to_string())
+            .ok_or_else(|| {
+                SqeError::Execution(
+                    "SHOW COLUMNS requires `FROM <table>` (or `IN <table>`)".to_string(),
+                )
+            })?;
+
+        // Use only the bare table name for the WHERE filter; information_schema
+        // queries collapse to the leaf table name.
+        let bare_name = table_name.split('.').next_back().unwrap_or(&table_name);
+        let col_sql = format!(
+            "SELECT column_name, data_type, is_nullable \
+             FROM information_schema.columns \
+             WHERE table_name = '{bare_name}' \
+             ORDER BY ordinal_position"
+        );
+
+        let (ctx, _) = self.create_session_context(session).await?;
+        let df = ctx.sql(&col_sql).await.map_err(|e| {
+            SqeError::Execution(format!(
+                "SHOW COLUMNS failed to query information_schema: {e}"
+            ))
+        })?;
+        df.collect().await.map_err(|e| {
+            SqeError::Execution(format!(
+                "SHOW COLUMNS failed to collect column metadata: {e}"
+            ))
+        })
     }
 
     /// Handle SHOW TABLES by listing tables in a namespace from the Polaris catalog.

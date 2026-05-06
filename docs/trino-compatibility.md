@@ -1,6 +1,6 @@
 # Trino SQL Compatibility Matrix
 
-> Living document. Last updated: 2026-05-06 (DataFusion 53.1.0; Trino aggregate + scalar aliases batch).
+> Living document. Last updated: 2026-05-07 (DataFusion 53.1.0; CAST(v AS JSON) AST rewrite + SHOW COLUMNS handler + 3 stale doc flips).
 > Rating: ✅ equivalent | ⚠️ partial/different semantics | ❌ missing | 🔧 SQE-specific
 
 SQE aims to be a drop-in replacement for Trino in Iceberg-only environments.
@@ -50,14 +50,14 @@ noting semantic differences and gaps.
 | Scalar: String | 27 | 27 | 0 | 0 | 100% |
 | Scalar: Math | 29 | 29 | 0 | 0 | 100% |
 | Scalar: Date/Time | 38 | 38 | 0 | 0 | 100% |
-| Scalar: JSON | 12 | 11 | 1 | 0 | 100% |
+| Scalar: JSON | 12 | 12 | 0 | 0 | 100% |
 | Scalar: URL | 8 | 8 | 0 | 0 | 100% |
 | Scalar: Regex | 6 | 6 | 0 | 0 | 100% |
 | Scalar: Conditional | 8 | 7 | 1 | 0 | 100% |
 | Scalar: Conversion | 10 | 9 | 0 | 1 | 90% |
 | Aggregate | 33 | 26 | 1 | 6 | 84.8% |
 | Window | 14 | 13 | 0 | 1 | 92.9% |
-| DDL/DML | 31 + 1🔧 | 22 | 6 | 3 | 87.1% |
+| DDL/DML | 31 + 1🔧 | 25 | 3 | 3 | 90.3% |
 | Type System | 27 | 20 | 2 | 5 | 81.5% |
 | Iceberg-Specific | 19 | 12 | 5 | 2 | 89.5% |
 
@@ -213,7 +213,7 @@ Each section lists Trino functions with their SQE status:
 | `json_array_get(json, idx)` | `json_array_get(json, idx)` | ✅ | Trino compat UDF (supports negative index) |
 | `json_array_length(json)` | `json_array_length(json)` | ✅ | Trino compat UDF |
 | `is_json_scalar(json)` | `is_json_scalar(json)` | ✅ | Trino compat UDF |
-| `CAST(v AS JSON)` | `to_json(v)` | ⚠️ | Trino compat UDF (different syntax, same result) |
+| `CAST(v AS JSON)` | `CAST(v AS JSON)` | ✅ | sqe-sql AST rewriter intercepts `CAST(... AS JSON)` and rewrites to `to_json(...)` before DataFusion's planner sees it (DataFusion does not recognize `JSON` as a target type for CAST). Skipped when the SQL does not contain `as json` |
 | `CAST(json AS type)` | `CAST(json_col AS type)` | ✅ | JSON aliases to `Utf8`; CAST rides DataFusion's built-in coercion. For typed extraction from JSONPath, use `json_get_int(j, '$')`, `json_get_str(j, '$')`, etc. |
 
 **Note:** Core JSON extraction is now supported via `datafusion-functions-json` (registered at startup) plus Trino-aliased UDFs (`json_extract`, `json_extract_scalar`, `json_array_length`, `json_parse`). Full JSONPath syntax and JSON-typed columns remain unsupported — most Iceberg workloads use structured columns rather than JSON blobs.
@@ -331,7 +331,7 @@ Each section lists Trino functions with their SQE status:
 
 | Trino Statement | SQE Support | Status | Notes |
 |---|---|---|---|
-| `CREATE TABLE (cols) WITH (...)` | `CREATE TABLE (cols)` | ⚠️ | No WITH properties (Iceberg defaults) |
+| `CREATE TABLE (cols) WITH (...)` | `CREATE TABLE (cols) WITH (...)` | ✅ | Trino's `WITH (foo = 'bar')` syntax merges into table properties via `merge_user_table_properties` in `write_handler.rs:589-590`, alongside `TBLPROPERTIES (...)`. Both spellings produce identical Iceberg metadata |
 | `CREATE TABLE AS SELECT` | Same | ✅ | |
 | `DROP TABLE` | Same | ✅ | |
 | `ALTER TABLE ... RENAME TO` | Same | ✅ | |
@@ -354,11 +354,11 @@ Each section lists Trino functions with their SQE status:
 | `SHOW CATALOGS` | Same | ✅ | |
 | `SHOW SCHEMAS` | Same | ✅ | |
 | `SHOW TABLES` | Same | ✅ | |
-| `SHOW COLUMNS FROM` | `DESCRIBE` | ⚠️ | Different syntax |
+| `SHOW COLUMNS FROM` | `SHOW COLUMNS FROM` | ✅ | New `handle_show_columns` handler translates Trino's `SHOW COLUMNS FROM ns.t` into a query against `information_schema.columns`. Returns `(column_name, data_type, is_nullable)`, the subset dbt and BI clients use for schema inspection |
 | `SHOW CREATE TABLE` | Same | ✅ | Reconstructs DDL from information_schema |
 | `SHOW STATS FOR` | Same | ✅ | Returns row_count, data_file_count, total_size from snapshot summary |
 | `EXPLAIN` | Same | ✅ | DataFusion explain |
-| `EXPLAIN ANALYZE` | `EXPLAIN FULL` | ⚠️ | Different keyword, similar output |
+| `EXPLAIN ANALYZE` | `EXPLAIN ANALYZE` | ✅ | Routed through `parse_and_classify` -> `Statement::Explain { analyze: true }` -> `explain_handler.analyze()` since Phase 2; the previous "different keyword" caveat was a stale doc claim. `EXPLAIN FULL` is an SQE-specific extension on top |
 | `USE catalog.schema` | Same | ✅ | Parsed and accepted (session-level, sets default catalog/schema) |
 | `PREPARE` / `EXECUTE` | Partial | ⚠️ | DataFusion has infrastructure, SQL integration incomplete |
 | `CALL procedure(...)` | — | ⚠️ | Returns informative error "SQE does not have stored procedures" |
@@ -483,6 +483,25 @@ Net coverage delta this MR:
 - **Scalar: Date/Time** 37/38 (1 amber) → **38/38 (0 amber)**
 - **Scalar: Regex** 4/6 (2 amber) → **6/6 (0 amber)**
 - **Aggregate** 22/33 (5 amber, 6 red) → **26/33 (1 amber, 6 red)** — coverage 81.8% → 84.8%
+
+### Items shipped 2026-05-07 (CAST AS JSON rewrite + SHOW COLUMNS + stale doc flips)
+
+Two real fixes plus three stale-doc flips:
+
+| Item | Kind | Status | What changed |
+|---|---|---|---|
+| `CAST(v AS JSON)` | AST rewrite | ✅ | New `sqe_sql::rewrite_trino_compat(sql)` walks the parsed sqlparser AST and rewrites `Expr::Cast { data_type: JSON, expr }` to `Expr::Function { name: "to_json", args: [expr] }`. Wired into `execute_query` after time-travel pre-processing. Skips the AST walk + re-serialize when the SQL string does not contain `as json` (case-insensitive). DataFusion does not natively recognize `JSON` as a CAST target type, so without the rewrite users got "Unsupported SQL type JSON" at planning time |
+| `SHOW COLUMNS FROM ns.t` | new handler | ✅ | New `handle_show_columns` in query_handler.rs translates the Trino-style query into a SELECT against `information_schema.columns`, returning `(column_name, data_type, is_nullable)` ordered by ordinal_position. Same pattern as `handle_show_create_table`'s column lookup |
+| `CAST(json AS T)` | doc fix | ✅ | Already worked: JSON columns store as `Utf8`, DataFusion's built-in `Utf8 → T` coercion parses numeric / boolean strings into the target type. The doc had been misframing this as a syntax difference |
+| `EXPLAIN ANALYZE` | stale doc | ✅ | Already routed since Phase 2: `parse_and_classify` produces `StatementKind::Utility` with `Statement::Explain { analyze: true, .. }`, dispatched to `explain_handler.analyze()` which returns the per-operator timing breakdown. The "different keyword" caveat was a stale doc claim |
+| `CREATE TABLE (cols) WITH (foo = 'bar')` | stale doc | ✅ | Already handled: `merge_user_table_properties` in write_handler.rs merges both `TBLPROPERTIES (...)` and `WITH (...)` into the same table-property map (lines 589-590). Both spellings produce identical Iceberg metadata |
+
+Net coverage delta this MR:
+
+- **Scalar: JSON** 11/12 (1 amber) → **12/12 (0 amber)**
+- **DDL/DML** 22 ✅ + 6 ⚠️ + 3 ❌ → **25 ✅ + 3 ⚠️ + 3 ❌** (3 ⚠️ flipped to ✅)
+
+The remaining DDL/DML ⚠️ rows after this MR are `PREPARE`/`EXECUTE` (DataFusion infrastructure, SQL integration incomplete), `CALL procedure(...)` for non-system procedures, and a couple of catalog-related edge cases. The remaining ❌ rows are `CREATE MATERIALIZED VIEW` (not in Iceberg spec), and two structural Trino-isms.
 
 ## Operational Comparison
 
