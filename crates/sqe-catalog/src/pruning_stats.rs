@@ -7,9 +7,10 @@ use arrow::array::{
     ArrayRef, BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array,
     StringArray, TimestampMicrosecondArray, UInt64Array,
 };
-use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, Schema, SchemaRef, TimeUnit};
 use datafusion::common::pruning::PruningStatistics;
-use datafusion::common::{Column, ScalarValue};
+use datafusion::common::stats::Precision;
+use datafusion::common::{ColumnStatistics, Column, ScalarValue, Statistics};
 use iceberg::spec::{DataFile, Datum, PrimitiveLiteral};
 
 pub struct IcebergManifestStatistics {
@@ -73,6 +74,139 @@ fn build_bounds_array(data_files: &[DataFile], field_id: i32, data_type: &DataTy
         }
         _ => None,
     }
+}
+
+/// Aggregate per-column statistics from Iceberg manifest entries into the form
+/// DataFusion's cost-based optimizer expects.
+///
+/// For each field in `arrow_schema` we sum `null_value_counts`, take the min of
+/// `lower_bounds` and the max of `upper_bounds` across all `data_files`. The
+/// result is one `ColumnStatistics` entry per Arrow field, in the same order.
+///
+/// Fields where the manifest carries no bounds (or the field doesn't map to an
+/// Iceberg field id) yield `Precision::Absent` rather than failing — partial
+/// stats are better than no stats for join order selection.
+pub fn aggregate_column_statistics(
+    data_files: &[DataFile],
+    arrow_schema: &Schema,
+    iceberg_schema: &iceberg::spec::Schema,
+) -> Vec<ColumnStatistics> {
+    let id_lookup: Vec<(String, i32)> = iceberg_schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|f| (f.name.clone(), f.id))
+        .collect();
+
+    arrow_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let field_id = id_lookup
+                .iter()
+                .find(|(name, _)| name == field.name())
+                .map(|(_, id)| *id);
+            let Some(fid) = field_id else {
+                return ColumnStatistics::new_unknown();
+            };
+            let null_count = aggregate_null_count(data_files, fid);
+            let min_value = aggregate_bound(data_files, fid, field.data_type(), false);
+            let max_value = aggregate_bound(data_files, fid, field.data_type(), true);
+            ColumnStatistics {
+                null_count: null_count
+                    .map(Precision::Inexact)
+                    .unwrap_or(Precision::Absent),
+                max_value: max_value
+                    .map(Precision::Inexact)
+                    .unwrap_or(Precision::Absent),
+                min_value: min_value
+                    .map(Precision::Inexact)
+                    .unwrap_or(Precision::Absent),
+                sum_value: Precision::Absent,
+                distinct_count: Precision::Absent,
+                byte_size: Precision::Absent,
+            }
+        })
+        .collect()
+}
+
+/// Build a `Statistics` for an entire Iceberg snapshot from its data files.
+///
+/// Combines table-level row count and byte size with per-column min/max/null
+/// counts aggregated across all files. The `arrow_schema` should match the
+/// projection the scan node will return — typically `IcebergScanExec`'s
+/// `projected_schema`.
+pub fn aggregate_table_statistics(
+    data_files: &[DataFile],
+    arrow_schema: &Schema,
+    iceberg_schema: &iceberg::spec::Schema,
+) -> Statistics {
+    let num_rows: usize = data_files
+        .iter()
+        .map(|df| df.record_count() as usize)
+        .sum();
+    let total_byte_size: usize = data_files
+        .iter()
+        .map(|df| df.file_size_in_bytes() as usize)
+        .sum();
+    let column_statistics = aggregate_column_statistics(data_files, arrow_schema, iceberg_schema);
+    Statistics {
+        num_rows: Precision::Inexact(num_rows),
+        total_byte_size: Precision::Inexact(total_byte_size),
+        column_statistics,
+    }
+}
+
+fn aggregate_null_count(data_files: &[DataFile], field_id: i32) -> Option<usize> {
+    let mut total: u64 = 0;
+    let mut any = false;
+    for df in data_files {
+        if let Some(c) = df.null_value_counts().get(&field_id).copied() {
+            total = total.saturating_add(c);
+            any = true;
+        }
+    }
+    any.then_some(total as usize)
+}
+
+fn aggregate_bound(
+    data_files: &[DataFile],
+    field_id: i32,
+    data_type: &DataType,
+    use_max: bool,
+) -> Option<ScalarValue> {
+    let mut acc: Option<ScalarValue> = None;
+    for df in data_files {
+        let bounds = if use_max {
+            df.upper_bounds()
+        } else {
+            df.lower_bounds()
+        };
+        let Some(datum) = bounds.get(&field_id) else {
+            continue;
+        };
+        let Some(scalar) = datum_to_scalar(datum, data_type) else {
+            continue;
+        };
+        acc = Some(match acc {
+            None => scalar,
+            Some(prev) => match prev.partial_cmp(&scalar) {
+                // Skip if the two ScalarValues are not comparable. Mixed
+                // types here would imply schema corruption; keep what we
+                // already accepted rather than silently swapping.
+                None => prev,
+                Some(ord) => {
+                    let take_new = if use_max {
+                        ord == std::cmp::Ordering::Less
+                    } else {
+                        ord == std::cmp::Ordering::Greater
+                    };
+                    if take_new { scalar } else { prev }
+                }
+            },
+        });
+    }
+    acc
 }
 
 impl PruningStatistics for IcebergManifestStatistics {
@@ -190,5 +324,158 @@ mod tests {
         assert_eq!(stats.num_containers(), 0);
         assert!(stats.min_values(&Column::from_name("id")).is_none());
         assert!(stats.max_values(&Column::from_name("id")).is_none());
+    }
+
+    /// Two-file aggregation: min/max should span both files; null counts sum.
+    #[test]
+    fn test_aggregate_column_statistics_two_files() {
+        use iceberg::spec::{
+            DataContentType, DataFileBuilder, DataFileFormat, NestedField, PrimitiveType, Struct,
+            Type,
+        };
+        use std::collections::HashMap;
+
+        let iceberg_schema = iceberg::spec::Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "name",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let arrow_schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+
+        let file_a = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_format(DataFileFormat::Parquet)
+            .file_path("a.parquet".into())
+            .file_size_in_bytes(1024)
+            .record_count(100)
+            .partition_spec_id(0)
+            .partition(Struct::empty())
+            .lower_bounds(HashMap::from([
+                (1, Datum::int(10)),
+                (2, Datum::string("alpha")),
+            ]))
+            .upper_bounds(HashMap::from([
+                (1, Datum::int(50)),
+                (2, Datum::string("middle")),
+            ]))
+            .null_value_counts(HashMap::from([(1, 0u64), (2, 3u64)]))
+            .build()
+            .unwrap();
+        let file_b = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_format(DataFileFormat::Parquet)
+            .file_path("b.parquet".into())
+            .file_size_in_bytes(2048)
+            .record_count(200)
+            .partition_spec_id(0)
+            .partition(Struct::empty())
+            .lower_bounds(HashMap::from([
+                (1, Datum::int(40)),
+                (2, Datum::string("middle")),
+            ]))
+            .upper_bounds(HashMap::from([
+                (1, Datum::int(99)),
+                (2, Datum::string("zulu")),
+            ]))
+            .null_value_counts(HashMap::from([(1, 1u64), (2, 7u64)]))
+            .build()
+            .unwrap();
+
+        let stats =
+            aggregate_column_statistics(&[file_a, file_b], &arrow_schema, &iceberg_schema);
+        assert_eq!(stats.len(), 2);
+
+        // id: min=10, max=99, nulls=0+1=1
+        assert_eq!(stats[0].min_value, Precision::Inexact(ScalarValue::Int32(Some(10))));
+        assert_eq!(stats[0].max_value, Precision::Inexact(ScalarValue::Int32(Some(99))));
+        assert_eq!(stats[0].null_count, Precision::Inexact(1));
+        assert_eq!(stats[0].distinct_count, Precision::Absent);
+
+        // name: min="alpha", max="zulu", nulls=10
+        assert_eq!(
+            stats[1].min_value,
+            Precision::Inexact(ScalarValue::Utf8(Some("alpha".into())))
+        );
+        assert_eq!(
+            stats[1].max_value,
+            Precision::Inexact(ScalarValue::Utf8(Some("zulu".into())))
+        );
+        assert_eq!(stats[1].null_count, Precision::Inexact(10));
+    }
+
+    /// Field present in arrow_schema but not in iceberg_schema should yield
+    /// all-Absent statistics rather than panicking.
+    #[test]
+    fn test_aggregate_column_statistics_unknown_field() {
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        let iceberg_schema = iceberg::spec::Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let arrow_schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("not_in_iceberg", DataType::Utf8, true),
+        ]);
+        let stats = aggregate_column_statistics(&[], &arrow_schema, &iceberg_schema);
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[1].null_count, Precision::Absent);
+        assert_eq!(stats[1].min_value, Precision::Absent);
+        assert_eq!(stats[1].max_value, Precision::Absent);
+    }
+
+    /// Table-level aggregation should sum row counts and bytes across files.
+    #[test]
+    fn test_aggregate_table_statistics_totals() {
+        use iceberg::spec::{
+            DataContentType, DataFileBuilder, DataFileFormat, NestedField, PrimitiveType, Struct,
+            Type,
+        };
+
+        let iceberg_schema = iceberg::spec::Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let arrow_schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+
+        let make = |size: u64, rows: u64| {
+            DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_format(DataFileFormat::Parquet)
+                .file_path(format!("f-{rows}.parquet"))
+                .file_size_in_bytes(size)
+                .record_count(rows)
+                .partition_spec_id(0)
+                .partition(Struct::empty())
+                .build()
+                .unwrap()
+        };
+        let stats = aggregate_table_statistics(
+            &[make(1_000, 50), make(2_000, 75), make(500, 25)],
+            &arrow_schema,
+            &iceberg_schema,
+        );
+        assert_eq!(stats.num_rows, Precision::Inexact(150));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(3_500));
     }
 }
