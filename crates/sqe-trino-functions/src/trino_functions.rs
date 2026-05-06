@@ -175,6 +175,19 @@ fn register_trino_aggregate_aliases(ctx: &datafusion::prelude::SessionContext) {
     // results in any aggregation context.
     ctx.register_udaf(crate::aggregates::ArgExtremum::max_by_udaf());
     ctx.register_udaf(crate::aggregates::ArgExtremum::min_by_udaf());
+
+    // Map-producing aggregates (Trino-specific). All four use the same
+    // type-flexible MapArray construction path. State for multi-phase
+    // aggregation is List<Struct{key, value}> across the family.
+    //
+    // - histogram(x): MAP<typeof(x), BIGINT> with count per distinct value.
+    // - map_agg(k, v): MAP<K, V>; last-wins on duplicate keys.
+    // - multimap_agg(k, v): MAP<K, ARRAY<V>>; preserves insertion order.
+    // - map_union(m): merges multiple maps; last-wins on duplicate keys.
+    ctx.register_udaf(crate::histogram::Histogram::udaf());
+    ctx.register_udaf(crate::map_aggregates::MapAgg::udaf());
+    ctx.register_udaf(crate::map_aggregates::MultimapAgg::udaf());
+    ctx.register_udaf(crate::map_aggregates::MapUnion::udaf());
 }
 
 /// Extract a chrono component from a Date32, Timestamp, or Time64 array.
