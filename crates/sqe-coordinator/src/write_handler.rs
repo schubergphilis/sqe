@@ -3893,6 +3893,11 @@ pub(crate) fn sql_type_to_arrow(
             Ok(DataType::Utf8)
         }
         SqlType::Char(_) | SqlType::Character(_) => Ok(DataType::Utf8),
+        // UUID has no native Arrow logical type; alias it to Utf8 (the
+        // canonical string form). Equality, regex, and CAST(... AS UUID)
+        // all work transparently against the string representation.
+        // Matches the same pattern as JSON above.
+        SqlType::Uuid => Ok(DataType::Utf8),
         SqlType::Binary(_) | SqlType::Varbinary(_) | SqlType::Bytea => Ok(DataType::Binary),
         SqlType::Date => Ok(DataType::Date32),
         SqlType::Timestamp(precision, tz_info) => {
@@ -4790,6 +4795,7 @@ mod tests {
             sql_type_to_arrow(&SqlType::String(None)).unwrap(),
             DataType::Utf8
         );
+        assert_eq!(sql_type_to_arrow(&SqlType::Uuid).unwrap(), DataType::Utf8);
     }
 
     #[test]
