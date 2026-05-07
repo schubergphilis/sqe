@@ -5,6 +5,7 @@ mod embedded;
 mod flight;
 mod http;
 mod script;
+mod writable_iceberg_catalog;
 
 use clap::{Parser, ValueEnum};
 use client::SqlClient;
