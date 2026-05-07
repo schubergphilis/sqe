@@ -126,8 +126,18 @@ pub async fn create_session_context(
                     let pool = Arc::new(
                         datafusion::execution::memory_pool::FairSpillPool::new(max_memory),
                     );
+                    // V10 httpfs: lazy http(s) ObjectStoreRegistry mirrors the
+                    // primary coordinator runtime so the fallback path
+                    // (tests, one-shot helpers) also accepts URL-shaped
+                    // file paths in read_* TVFs.
+                    let registry = Arc::new(
+                        sqe_catalog::lazy_object_store::LazyHttpObjectStoreRegistry::new(
+                            datafusion::execution::object_store::DefaultObjectStoreRegistry::new(),
+                        ),
+                    );
                     let rt = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
                         .with_memory_pool(pool)
+                        .with_object_store_registry(registry)
                         .build_arc()
                         .map_err(|e| {
                             Arc::new(SqeError::Config(format!("Failed to create runtime env: {e}")))
