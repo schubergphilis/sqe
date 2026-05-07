@@ -31,11 +31,16 @@ pub enum DotCommand {
     /// one schema. The REPL turns this into an
     /// `information_schema.tables` query.
     Tables { schema: Option<String> },
-    /// `.schema <table>` — describe a table's columns. Maps to an
-    /// `information_schema.columns` query. Accepts unqualified
-    /// (`users`), 2-part (`public.users`), or 3-part
-    /// (`iceberg.staging.users`) names.
+    /// `.schema <table>` / `.describe <table>` — describe a table's
+    /// columns. Maps to an `information_schema.columns` query.
+    /// Accepts unqualified (`users`), 2-part (`public.users`), or
+    /// 3-part (`iceberg.staging.users`) names.
     Schema { table: String },
+    /// `.summarize <table>` — per-column count, distinct, null,
+    /// min, max. The REPL handles this via a two-step flow: read
+    /// columns from `information_schema.columns`, then build a
+    /// UNION ALL of per-column aggregates.
+    Summarize { table: String },
     /// `.databases` / `.catalogs` — list catalogs visible to the
     /// session. Maps to `information_schema.schemata`.
     Catalogs,
@@ -72,11 +77,20 @@ pub fn parse_dot_command(line: &str) -> Option<Result<DotCommand, String>> {
                 Some(arg.to_string())
             },
         }),
-        "schema" => {
+        "schema" | "describe" | "d" => {
             if arg.is_empty() {
-                Err(".schema needs a table name (try `.schema <table>`)".to_string())
+                Err(format!(".{cmd} needs a table name (try `.{cmd} <table>`)"))
             } else {
                 Ok(DotCommand::Schema {
+                    table: arg.to_string(),
+                })
+            }
+        }
+        "summarize" | "summary" => {
+            if arg.is_empty() {
+                Err(".summarize needs a table name (try `.summarize <table>`)".to_string())
+            } else {
+                Ok(DotCommand::Summarize {
                     table: arg.to_string(),
                 })
             }
@@ -123,6 +137,8 @@ pub fn help_text() -> &'static str {
      .exit, .quit         leave the REPL\n  \
      .tables [schema]     list tables (optionally filter by schema)\n  \
      .schema <table>      describe a table's columns\n  \
+     .describe <table>    alias for .schema\n  \
+     .summarize <table>   per-column count, distinct, null, min, max\n  \
      .catalogs            list catalogs visible to the session\n  \
      .read <path>         execute a SQL script file\n  \
      .timer on|off        toggle per-query elapsed-time output\n  \
@@ -184,6 +200,58 @@ pub fn build_catalogs_query() -> &'static str {
     "SELECT catalog_name, schema_name \
      FROM information_schema.schemata \
      ORDER BY catalog_name, schema_name"
+}
+
+/// Build the per-column statistics query for `.summarize <table>`.
+///
+/// `columns` is the list of `(column_name, data_type)` pairs the REPL
+/// fetched from `information_schema.columns` for the target table.
+/// The resulting SQL is a UNION ALL where each branch produces one
+/// row of column-level stats: row count, null count, distinct count,
+/// min, and max. Min/max are cast to text so columns of mixed types
+/// render in one table without an Arrow schema clash.
+///
+/// Returns `None` when the column list is empty (no such table /
+/// no columns).
+pub fn build_summarize_query(table: &str, columns: &[(String, String)]) -> Option<String> {
+    if columns.is_empty() {
+        return None;
+    }
+
+    let table_ref = quote_table_for_summarize(table);
+
+    let branches: Vec<String> = columns
+        .iter()
+        .map(|(name, data_type)| {
+            let escaped_name = name.replace('\'', "''");
+            let escaped_type = data_type.replace('\'', "''");
+            let quoted_col = format!("\"{}\"", name.replace('"', "\"\""));
+            format!(
+                "SELECT \
+                 '{escaped_name}' AS column_name, \
+                 '{escaped_type}' AS column_type, \
+                 COUNT(*) AS count, \
+                 COUNT(*) - COUNT({quoted_col}) AS null_count, \
+                 COUNT(DISTINCT {quoted_col}) AS distinct_count, \
+                 CAST(MIN({quoted_col}) AS VARCHAR) AS min, \
+                 CAST(MAX({quoted_col}) AS VARCHAR) AS max \
+                 FROM {table_ref}"
+            )
+        })
+        .collect();
+
+    Some(branches.join(" UNION ALL "))
+}
+
+/// Quote a 1-, 2-, or 3-part table name for use in a `FROM` clause.
+/// Each segment becomes a double-quoted identifier so reserved words
+/// and case-sensitive names work without surprise.
+fn quote_table_for_summarize(table: &str) -> String {
+    table
+        .split('.')
+        .map(|part| format!("\"{}\"", part.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 #[cfg(test)]
@@ -294,5 +362,115 @@ mod tests {
         // `'or'1'='1` should be quoted, not opened as SQL.
         let q = build_schema_query("admin'--.users");
         assert!(q.contains("table_schema = 'admin''--'"));
+    }
+
+    // -----------------------------------------------------------------------
+    // V9: .describe (alias for .schema), .summarize
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn describe_is_alias_for_schema() {
+        let cmd = parse_dot_command(".describe events").unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            DotCommand::Schema {
+                table: "events".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn d_short_alias_for_describe() {
+        let cmd = parse_dot_command(".d events").unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            DotCommand::Schema {
+                table: "events".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn describe_requires_arg() {
+        let result = parse_dot_command(".describe").unwrap();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("describe"));
+    }
+
+    #[test]
+    fn summarize_parses() {
+        let cmd = parse_dot_command(".summarize events").unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            DotCommand::Summarize {
+                table: "events".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn summarize_summary_alias() {
+        let cmd = parse_dot_command(".summary events").unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            DotCommand::Summarize {
+                table: "events".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn summarize_requires_arg() {
+        assert!(parse_dot_command(".summarize").unwrap().is_err());
+    }
+
+    #[test]
+    fn summarize_empty_columns_returns_none() {
+        assert_eq!(build_summarize_query("t", &[]), None);
+    }
+
+    #[test]
+    fn summarize_builds_union_all_per_column() {
+        let cols = vec![
+            ("id".to_string(), "Int64".to_string()),
+            ("name".to_string(), "Utf8".to_string()),
+        ];
+        let q = build_summarize_query("events", &cols).expect("non-empty");
+        // Two SELECT branches separated by UNION ALL.
+        assert_eq!(q.matches("UNION ALL").count(), 1);
+        assert_eq!(q.matches("SELECT").count(), 2);
+        // Each column appears as a literal name AND a quoted identifier
+        // for COUNT / MIN / MAX.
+        assert!(q.contains("'id' AS column_name"));
+        assert!(q.contains("'name' AS column_name"));
+        assert!(q.contains("\"id\""));
+        assert!(q.contains("\"name\""));
+        // Stats columns present.
+        assert!(q.contains("COUNT(*)"));
+        assert!(q.contains("COUNT(DISTINCT"));
+        assert!(q.contains("MIN("));
+        assert!(q.contains("MAX("));
+    }
+
+    #[test]
+    fn summarize_quotes_three_part_table() {
+        let cols = vec![("x".to_string(), "Int64".to_string())];
+        let q = build_summarize_query("iceberg.staging.events", &cols).unwrap();
+        assert!(q.contains("\"iceberg\".\"staging\".\"events\""));
+    }
+
+    #[test]
+    fn summarize_escapes_quotes_in_column_name() {
+        let cols = vec![("col\"with\"quotes".to_string(), "Utf8".to_string())];
+        let q = build_summarize_query("t", &cols).unwrap();
+        // Doubled quotes inside the SQL identifier.
+        assert!(q.contains("\"col\"\"with\"\"quotes\""));
+    }
+
+    #[test]
+    fn summarize_escapes_apostrophes_in_data_type() {
+        let cols = vec![("x".to_string(), "type'with'apos".to_string())];
+        let q = build_summarize_query("t", &cols).unwrap();
+        assert!(q.contains("'type''with''apos'"));
     }
 }
