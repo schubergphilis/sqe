@@ -18,8 +18,10 @@ Options:
       --stop-on-error        Abort the script on first error (default: continue)
       --embedded             Run the engine in-process (no remote coordinator)
       --memory-limit <SIZE>  Per-process memory pool when --embedded [default: 1GB]
-      --warehouse <PATH>     Override embedded warehouse path (default ~/.sqe/warehouse/)
-      --memory               Skip the persistent catalog; ephemeral session only
+      --warehouse <PATH>     Single catalog at PATH named `iceberg`
+                             (shorthand for --catalog iceberg=PATH)
+      --catalog NAME=PATH    Attach a named persistent catalog (repeatable)
+      --memory               Skip persistent catalogs entirely
   -f, --format <FORMAT>      Output format: table, csv, tsv, json [default: table]
       --tls                  Use HTTPS/TLS
       --insecure             Accept invalid TLS certificates
@@ -102,6 +104,24 @@ sqe-cli --embedded --memory -e "SELECT 1"
 ```
 
 Tables in the warehouse are valid Iceberg. If you later upgrade to a cluster deployment, point the cluster catalog at the same path and the tables come along. No migration, no re-export.
+
+### Multiple catalogs
+
+Attach more than one warehouse with repeated `--catalog NAME=PATH` flags. Each becomes a top-level SQL identifier; cross-catalog joins work without any session-state setup.
+
+```bash
+sqe-cli --embedded \
+    --catalog prod=/data/prod \
+    --catalog stage=/data/stage \
+    -e "SELECT *
+        FROM prod.sales.orders p
+        LEFT JOIN stage.sales.orders s ON p.id = s.id
+        WHERE s.id IS NULL"
+```
+
+The catalog name shows up in `information_schema.tables.table_catalog`, in `.catalogs`, and in 3-part SQL identifiers. Names cannot contain `.` (it would clash with the SQL namespace separator) and cannot repeat (DataFusion's `register_catalog` would silently overwrite).
+
+`--warehouse <path>` remains as a shorthand for `--catalog iceberg=<path>`. The three flags `--memory`, `--warehouse`, and `--catalog` are mutually exclusive. Pick one.
 
 ### Dot-commands
 

@@ -60,17 +60,28 @@ struct Cli {
     #[arg(long, default_value = "1GB")]
     memory_limit: String,
 
-    /// Override the embedded warehouse path. Default is
-    /// `~/.sqe/warehouse/`. Tables created in this directory persist
-    /// across sessions via a SQLite catalog at `<path>/sqe.db`.
-    /// Mutually exclusive with `--memory`.
-    #[arg(long)]
+    /// Override the embedded warehouse path with a single catalog
+    /// named `iceberg`. Shorthand for `--catalog iceberg=<path>`.
+    /// Default is `~/.sqe/warehouse/`. Mutually exclusive with
+    /// `--memory` and with `--catalog`.
+    #[arg(long, conflicts_with_all = ["memory", "catalog"])]
     warehouse: Option<std::path::PathBuf>,
 
-    /// Skip the persistent catalog entirely. `CREATE TABLE` works
+    /// Attach a named persistent Iceberg catalog. Format
+    /// `NAME=PATH`, repeatable. Each catalog gets its own SQLite
+    /// metadata + data root and shows up in 3-part SQL names. For
+    /// example: `--catalog prod=/data/prod --catalog stage=/data/stage`
+    /// then query with `SELECT * FROM prod.sales.orders JOIN
+    /// stage.sales.orders ...`. Mutually exclusive with `--memory`
+    /// and `--warehouse`.
+    #[arg(long, value_parser = parse_catalog_spec, conflicts_with_all = ["memory", "warehouse"])]
+    catalog: Vec<(String, std::path::PathBuf)>,
+
+    /// Skip persistent catalogs entirely. `CREATE TABLE` works
     /// within the session via DataFusion's in-memory catalog but
-    /// nothing survives the process.
-    #[arg(long, default_value_t = false)]
+    /// nothing survives the process. Mutually exclusive with
+    /// `--warehouse` and `--catalog`.
+    #[arg(long, default_value_t = false, conflicts_with_all = ["warehouse", "catalog"])]
     memory: bool,
 
     /// Read SQL statements from a file and execute them in order.
@@ -137,31 +148,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client: Box<dyn SqlClient> = if cli.embedded {
         let limit = sqe_core::parse_memory_limit(&cli.memory_limit).unwrap_or(1024 * 1024 * 1024);
         let mode = if cli.memory {
-            if cli.warehouse.is_some() {
-                return Err(
-                    "--memory and --warehouse are mutually exclusive; pick one".into(),
-                );
-            }
             embedded::WarehouseMode::Memory
+        } else if !cli.catalog.is_empty() {
+            embedded::WarehouseMode::Persistent {
+                catalogs: cli
+                    .catalog
+                    .iter()
+                    .map(|(name, path)| embedded::EmbeddedCatalog {
+                        name: name.clone(),
+                        path: path.clone(),
+                    })
+                    .collect(),
+            }
         } else if let Some(path) = cli.warehouse.clone() {
-            embedded::WarehouseMode::Persistent { path }
+            embedded::WarehouseMode::single(path)
         } else {
             embedded::WarehouseMode::default_persistent()
         };
         let client = embedded::EmbeddedClient::with_warehouse(limit, &mode).await?;
-        match &mode {
-            embedded::WarehouseMode::Memory => eprintln!(
-                "sqe-cli {} embedded engine ({} memory pool, ephemeral)",
-                sqe_core::VERSION,
-                cli.memory_limit
-            ),
-            embedded::WarehouseMode::Persistent { path } => eprintln!(
-                "sqe-cli {} embedded engine ({} memory pool, warehouse: {})",
-                sqe_core::VERSION,
-                cli.memory_limit,
-                path.display()
-            ),
-        }
+        eprintln!(
+            "sqe-cli {} embedded engine ({} memory pool, {})",
+            sqe_core::VERSION,
+            cli.memory_limit,
+            warehouse_banner(&mode)
+        );
         Box::new(client)
     } else if let Some(ref token) = cli.token {
         // Token-based auth: skip username/password
@@ -465,6 +475,53 @@ async fn handle_dot_command(
             false
         }
     }
+}
+
+/// Render the warehouse part of the welcome banner. Memory mode says
+/// `ephemeral`; one persistent catalog says `warehouse: <path>` (the
+/// V2 phrasing); two or more list each as `name=path`.
+fn warehouse_banner(mode: &embedded::WarehouseMode) -> String {
+    match mode {
+        embedded::WarehouseMode::Memory => "ephemeral".to_string(),
+        embedded::WarehouseMode::Persistent { catalogs } if catalogs.is_empty() => {
+            "ephemeral".to_string()
+        }
+        embedded::WarehouseMode::Persistent { catalogs } if catalogs.len() == 1 => {
+            format!("warehouse: {}", catalogs[0].path.display())
+        }
+        embedded::WarehouseMode::Persistent { catalogs } => {
+            let joined: Vec<String> = catalogs
+                .iter()
+                .map(|c| format!("{}={}", c.name, c.path.display()))
+                .collect();
+            format!("catalogs: {}", joined.join(", "))
+        }
+    }
+}
+
+/// Parse `NAME=PATH` for the repeatable `--catalog` flag.
+/// Rejects empty names, paths, and identifiers that contain `.`,
+/// since 3-part SQL identifiers split on `.` and a catalog name
+/// like `prod.eu` would silently misroute. Whitespace around `=`
+/// is allowed for readability.
+fn parse_catalog_spec(s: &str) -> Result<(String, std::path::PathBuf), String> {
+    let (name, path) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected NAME=PATH, got `{s}`"))?;
+    let name = name.trim();
+    let path = path.trim();
+    if name.is_empty() {
+        return Err(format!("catalog name is empty in `{s}`"));
+    }
+    if path.is_empty() {
+        return Err(format!("catalog path is empty in `{s}`"));
+    }
+    if name.contains('.') {
+        return Err(format!(
+            "catalog name `{name}` cannot contain `.` (it would clash with 3-part SQL names)"
+        ));
+    }
+    Ok((name.to_string(), std::path::PathBuf::from(path)))
 }
 
 fn dirs_home() -> std::path::PathBuf {
