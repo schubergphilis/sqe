@@ -103,6 +103,45 @@ sqe-cli --embedded --memory -e "SELECT 1"
 
 Tables in the warehouse are valid Iceberg. If you later upgrade to a cluster deployment, point the cluster catalog at the same path and the tables come along. No migration, no re-export.
 
+### Dot-commands
+
+The REPL recognises sqlite/DuckDB-style commands that start with `.`. They run client-side, never reach the engine, and don't end with `;`:
+
+```
+sqe> .help
+Dot commands:
+  .help                show this list
+  .exit, .quit         leave the REPL
+  .tables [schema]     list tables (optionally filter by schema)
+  .schema <table>      describe a table's columns
+  .catalogs            list catalogs visible to the session
+  .read <path>         execute a SQL script file
+  .timer on|off        toggle per-query elapsed-time output
+  .format [fmt]        show or set output format (table|csv|tsv|json)
+```
+
+Examples:
+
+```
+sqe> .timer on
+Timer: on
+
+sqe> SELECT count(*) FROM read_parquet('events.parquet');
++----------+
+| count(*) |
++----------+
+| 1500000  |
++----------+
+Time: 0.243s
+
+sqe> .tables
+sqe> .schema iceberg.staging.events
+sqe> .read setup.sql
+sqe> .format json
+```
+
+The legacy `\format` and `\q` forms still work for backward compatibility.
+
 ### What embedded mode does not include
 
 - Authentication, RBAC, or column masking. Embedded mode runs as the local user. Use the cluster path when you need policy enforcement.

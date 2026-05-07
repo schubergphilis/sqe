@@ -1,5 +1,6 @@
 mod client;
 mod display;
+mod dotcommands;
 mod embedded;
 mod flight;
 mod http;
@@ -94,7 +95,7 @@ enum Protocol {
     Http,
 }
 
-#[derive(Clone, ValueEnum)]
+#[derive(Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum OutputFormat {
     /// Aligned ASCII table
     Table,
@@ -281,10 +282,10 @@ async fn repl(
 
     let mut format = initial_format;
 
-    eprintln!("Type SQL queries, or \\q to quit. End multi-line queries with ;");
-    eprintln!("Use \\format [table|csv|tsv|json] to change output format.");
+    eprintln!("Type SQL queries, or .help for commands. End multi-line queries with ;");
 
     let mut buf = String::new();
+    let mut timer_on = false;
 
     loop {
         let prompt = if buf.is_empty() { "sqe> " } else { "  -> " };
@@ -301,7 +302,33 @@ async fn repl(
                     continue;
                 }
 
-                // Client-side metacommand: \format [value]
+                // Dot-commands take precedence over SQL parsing. They
+                // only fire on the first line of a multi-line entry —
+                // mid-statement `.foo` is sent as SQL.
+                if buf.is_empty() {
+                    if let Some(parsed) = dotcommands::parse_dot_command(trimmed) {
+                        match parsed {
+                            Ok(cmd) => {
+                                if handle_dot_command(
+                                    cmd,
+                                    client,
+                                    &mut format,
+                                    &mut timer_on,
+                                )
+                                .await
+                                {
+                                    break;
+                                }
+                            }
+                            Err(msg) => eprintln!("Error: {msg}"),
+                        }
+                        continue;
+                    }
+                }
+
+                // Backslash form: \format [value]. Kept for users who
+                // already had it in their muscle memory; new users
+                // should prefer .format.
                 if let Some(rest) = trimmed.strip_prefix("\\format") {
                     let arg = rest.trim();
                     if arg.is_empty() {
@@ -315,7 +342,7 @@ async fn repl(
                     continue;
                 }
 
-                // Client-side: SET format = '...' (intercepted, not sent to server)
+                // SET format = '...' intercepted client-side.
                 {
                     let upper = trimmed.to_ascii_uppercase();
                     let stripped = upper
@@ -341,10 +368,7 @@ async fn repl(
                     let sql = buf.trim().trim_end_matches(';').trim();
                     if !sql.is_empty() {
                         rl.add_history_entry(sql)?;
-                        match client.execute(sql).await {
-                            Ok(result) => display::print_query_result(&result, &format),
-                            Err(e) => eprintln!("Error: {e}"),
-                        }
+                        run_one(client, sql, &format, timer_on).await;
                     }
                     buf.clear();
                 }
@@ -364,6 +388,83 @@ async fn repl(
 
     let _ = rl.save_history(&history_path);
     Ok(())
+}
+
+/// Run one SQL statement and print the result. Wraps the existing
+/// `client.execute` + display call so the REPL and the dot-command
+/// path can share the timer logic.
+async fn run_one(
+    client: &mut dyn SqlClient,
+    sql: &str,
+    format: &OutputFormat,
+    timer_on: bool,
+) {
+    let start = std::time::Instant::now();
+    match client.execute(sql).await {
+        Ok(result) => {
+            display::print_query_result(&result, format);
+            if timer_on {
+                eprintln!("Time: {:.3}s", start.elapsed().as_secs_f64());
+            }
+        }
+        Err(e) => eprintln!("Error: {e}"),
+    }
+}
+
+/// Execute one parsed [`dotcommands::DotCommand`]. Returns `true`
+/// when the command means "leave the REPL" (`.exit` / `.quit`).
+async fn handle_dot_command(
+    cmd: dotcommands::DotCommand,
+    client: &mut dyn SqlClient,
+    format: &mut OutputFormat,
+    timer_on: &mut bool,
+) -> bool {
+    use dotcommands::DotCommand;
+    match cmd {
+        DotCommand::Help => {
+            println!("{}", dotcommands::help_text());
+            false
+        }
+        DotCommand::Exit => true,
+        DotCommand::Tables { schema } => {
+            let q = dotcommands::build_tables_query(schema.as_deref());
+            run_one(client, &q, format, *timer_on).await;
+            false
+        }
+        DotCommand::Schema { table } => {
+            let q = dotcommands::build_schema_query(&table);
+            run_one(client, &q, format, *timer_on).await;
+            false
+        }
+        DotCommand::Catalogs => {
+            let q = dotcommands::build_catalogs_query();
+            run_one(client, q, format, *timer_on).await;
+            false
+        }
+        DotCommand::Read { path } => {
+            // Reuse the same loop as `--file` so error handling and
+            // splitter rules stay in one place.
+            if let Err(e) = run_script(client, &path, format, false).await {
+                eprintln!("Error: {e}");
+            }
+            false
+        }
+        DotCommand::Timer(on) => {
+            *timer_on = on;
+            eprintln!("Timer: {}", if on { "on" } else { "off" });
+            false
+        }
+        DotCommand::Format(opt) => {
+            match opt {
+                None => eprintln!("Output format: {}", format.name()),
+                Some(f) => {
+                    *format = f;
+                    eprintln!("Output format set to: {}", format.name());
+                }
+            }
+            false
+        }
+    }
 }
 
 fn dirs_home() -> std::path::PathBuf {
