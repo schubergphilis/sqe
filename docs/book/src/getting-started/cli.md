@@ -64,18 +64,19 @@ FROM read_parquet(
 
 ### Persistent catalog
 
-By default, `--embedded` attaches a SQLite-backed Iceberg catalog at `~/.sqe/warehouse/`. Tables created in this warehouse survive across sessions:
+By default, `--embedded` attaches a SQLite-backed Iceberg catalog at `~/.sqe/warehouse/`. Tables created here survive across sessions; SQL DDL (`CREATE SCHEMA`, `CREATE TABLE`, `DROP TABLE`, `DROP SCHEMA`) routes through the iceberg catalog without any out-of-band setup:
 
 ```bash
-# Session 1: load + create
+# Session 1: declare a schema and a table via plain SQL
 sqe-cli --embedded -e "CREATE SCHEMA iceberg.staging"
 sqe-cli --embedded -e \
-    "CREATE TABLE iceberg.staging.events (event_id BIGINT, ts TIMESTAMP, kind VARCHAR) \
-     AS SELECT * FROM read_parquet('events.parquet')"
+    "CREATE TABLE iceberg.staging.events (event_id BIGINT, ts TIMESTAMP, kind VARCHAR)"
 
 # Session 2: same warehouse, table is still there
 sqe-cli --embedded -e "SELECT count(*) FROM iceberg.staging.events"
 ```
+
+`CREATE TABLE ... AS SELECT ...` (CTAS) is a known limitation: the embedded mode does not yet have a Parquet writer + iceberg-transaction commit pipeline, so the upstream provider rejects table providers that carry data. Use a separate `CREATE TABLE` (schema only) followed by `INSERT INTO ... SELECT ...` once the embedded INSERT path lands, or load via the cluster path for now.
 
 The on-disk layout:
 
