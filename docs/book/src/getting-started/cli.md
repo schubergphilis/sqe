@@ -189,6 +189,8 @@ Dot commands:
   .exit, .quit         leave the REPL
   .tables [schema]     list tables (optionally filter by schema)
   .schema <table>      describe a table's columns
+  .describe <table>    alias for .schema
+  .summarize <table>   per-column count, distinct, null, min, max
   .catalogs            list catalogs visible to the session
   .read <path>         execute a SQL script file
   .timer on|off        toggle per-query elapsed-time output
@@ -211,8 +213,33 @@ Time: 0.243s
 
 sqe> .tables
 sqe> .schema iceberg.staging.events
+sqe> .summarize iceberg.staging.events
 sqe> .read setup.sql
 sqe> .format json
+```
+
+`.summarize` runs a per-column UNION ALL of `count`, `null_count`,
+`distinct_count`, `min`, and `max`. It is a two-step flow: the REPL
+fetches the column list from `information_schema.columns`, then
+generates and executes the aggregate query. Min/max are cast to
+`VARCHAR` so columns of mixed types render in one table.
+
+### SQL surface
+
+In addition to the standard dialect, embedded mode (and the cluster
+coordinator) supports DuckDB-style projection sugar that DataFusion
+53.1 ships natively:
+
+```sql
+-- Drop columns from the projection.
+SELECT * EXCLUDE (secret, internal_id) FROM users;
+
+-- Substitute a column with an expression while keeping order.
+SELECT * REPLACE (UPPER(name) AS name, total / 100 AS total)
+FROM orders;
+
+-- Native column-level metadata.
+DESCRIBE iceberg.staging.events;
 ```
 
 The legacy `\format` and `\q` forms still work for backward compatibility.
