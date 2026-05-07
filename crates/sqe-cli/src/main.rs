@@ -1,5 +1,6 @@
 mod client;
 mod display;
+mod dotcommands;
 mod embedded;
 mod flight;
 mod http;
@@ -59,6 +60,30 @@ struct Cli {
     #[arg(long, default_value = "1GB")]
     memory_limit: String,
 
+    /// Override the embedded warehouse path with a single catalog
+    /// named `iceberg`. Shorthand for `--catalog iceberg=<path>`.
+    /// Default is `~/.sqe/warehouse/`. Mutually exclusive with
+    /// `--memory` and with `--catalog`.
+    #[arg(long, conflicts_with_all = ["memory", "catalog"])]
+    warehouse: Option<std::path::PathBuf>,
+
+    /// Attach a named persistent Iceberg catalog. Format
+    /// `NAME=PATH`, repeatable. Each catalog gets its own SQLite
+    /// metadata + data root and shows up in 3-part SQL names. For
+    /// example: `--catalog prod=/data/prod --catalog stage=/data/stage`
+    /// then query with `SELECT * FROM prod.sales.orders JOIN
+    /// stage.sales.orders ...`. Mutually exclusive with `--memory`
+    /// and `--warehouse`.
+    #[arg(long, value_parser = parse_catalog_spec, conflicts_with_all = ["memory", "warehouse"])]
+    catalog: Vec<(String, std::path::PathBuf)>,
+
+    /// Skip persistent catalogs entirely. `CREATE TABLE` works
+    /// within the session via DataFusion's in-memory catalog but
+    /// nothing survives the process. Mutually exclusive with
+    /// `--warehouse` and `--catalog`.
+    #[arg(long, default_value_t = false, conflicts_with_all = ["warehouse", "catalog"])]
+    memory: bool,
+
     /// Read SQL statements from a file and execute them in order.
     /// Statements are separated by `;`. When combined with
     /// `-e/--execute`, the script runs first and the `-e` query
@@ -81,7 +106,7 @@ enum Protocol {
     Http,
 }
 
-#[derive(Clone, ValueEnum)]
+#[derive(Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum OutputFormat {
     /// Aligned ASCII table
     Table,
@@ -122,11 +147,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut client: Box<dyn SqlClient> = if cli.embedded {
         let limit = sqe_core::parse_memory_limit(&cli.memory_limit).unwrap_or(1024 * 1024 * 1024);
-        let client = embedded::EmbeddedClient::new(limit)?;
+        let mode = if cli.memory {
+            embedded::WarehouseMode::Memory
+        } else if !cli.catalog.is_empty() {
+            embedded::WarehouseMode::Persistent {
+                catalogs: cli
+                    .catalog
+                    .iter()
+                    .map(|(name, path)| embedded::EmbeddedCatalog {
+                        name: name.clone(),
+                        path: path.clone(),
+                    })
+                    .collect(),
+            }
+        } else if let Some(path) = cli.warehouse.clone() {
+            embedded::WarehouseMode::single(path)
+        } else {
+            embedded::WarehouseMode::default_persistent()
+        };
+        let client = embedded::EmbeddedClient::with_warehouse(limit, &mode).await?;
         eprintln!(
-            "sqe-cli {} embedded engine ({} memory pool)",
+            "sqe-cli {} embedded engine ({} memory pool, {})",
             sqe_core::VERSION,
-            cli.memory_limit
+            cli.memory_limit,
+            warehouse_banner(&mode)
         );
         Box::new(client)
     } else if let Some(ref token) = cli.token {
@@ -248,10 +292,10 @@ async fn repl(
 
     let mut format = initial_format;
 
-    eprintln!("Type SQL queries, or \\q to quit. End multi-line queries with ;");
-    eprintln!("Use \\format [table|csv|tsv|json] to change output format.");
+    eprintln!("Type SQL queries, or .help for commands. End multi-line queries with ;");
 
     let mut buf = String::new();
+    let mut timer_on = false;
 
     loop {
         let prompt = if buf.is_empty() { "sqe> " } else { "  -> " };
@@ -268,7 +312,33 @@ async fn repl(
                     continue;
                 }
 
-                // Client-side metacommand: \format [value]
+                // Dot-commands take precedence over SQL parsing. They
+                // only fire on the first line of a multi-line entry —
+                // mid-statement `.foo` is sent as SQL.
+                if buf.is_empty() {
+                    if let Some(parsed) = dotcommands::parse_dot_command(trimmed) {
+                        match parsed {
+                            Ok(cmd) => {
+                                if handle_dot_command(
+                                    cmd,
+                                    client,
+                                    &mut format,
+                                    &mut timer_on,
+                                )
+                                .await
+                                {
+                                    break;
+                                }
+                            }
+                            Err(msg) => eprintln!("Error: {msg}"),
+                        }
+                        continue;
+                    }
+                }
+
+                // Backslash form: \format [value]. Kept for users who
+                // already had it in their muscle memory; new users
+                // should prefer .format.
                 if let Some(rest) = trimmed.strip_prefix("\\format") {
                     let arg = rest.trim();
                     if arg.is_empty() {
@@ -282,7 +352,7 @@ async fn repl(
                     continue;
                 }
 
-                // Client-side: SET format = '...' (intercepted, not sent to server)
+                // SET format = '...' intercepted client-side.
                 {
                     let upper = trimmed.to_ascii_uppercase();
                     let stripped = upper
@@ -308,10 +378,7 @@ async fn repl(
                     let sql = buf.trim().trim_end_matches(';').trim();
                     if !sql.is_empty() {
                         rl.add_history_entry(sql)?;
-                        match client.execute(sql).await {
-                            Ok(result) => display::print_query_result(&result, &format),
-                            Err(e) => eprintln!("Error: {e}"),
-                        }
+                        run_one(client, sql, &format, timer_on).await;
                     }
                     buf.clear();
                 }
@@ -331,6 +398,130 @@ async fn repl(
 
     let _ = rl.save_history(&history_path);
     Ok(())
+}
+
+/// Run one SQL statement and print the result. Wraps the existing
+/// `client.execute` + display call so the REPL and the dot-command
+/// path can share the timer logic.
+async fn run_one(
+    client: &mut dyn SqlClient,
+    sql: &str,
+    format: &OutputFormat,
+    timer_on: bool,
+) {
+    let start = std::time::Instant::now();
+    match client.execute(sql).await {
+        Ok(result) => {
+            display::print_query_result(&result, format);
+            if timer_on {
+                eprintln!("Time: {:.3}s", start.elapsed().as_secs_f64());
+            }
+        }
+        Err(e) => eprintln!("Error: {e}"),
+    }
+}
+
+/// Execute one parsed [`dotcommands::DotCommand`]. Returns `true`
+/// when the command means "leave the REPL" (`.exit` / `.quit`).
+async fn handle_dot_command(
+    cmd: dotcommands::DotCommand,
+    client: &mut dyn SqlClient,
+    format: &mut OutputFormat,
+    timer_on: &mut bool,
+) -> bool {
+    use dotcommands::DotCommand;
+    match cmd {
+        DotCommand::Help => {
+            println!("{}", dotcommands::help_text());
+            false
+        }
+        DotCommand::Exit => true,
+        DotCommand::Tables { schema } => {
+            let q = dotcommands::build_tables_query(schema.as_deref());
+            run_one(client, &q, format, *timer_on).await;
+            false
+        }
+        DotCommand::Schema { table } => {
+            let q = dotcommands::build_schema_query(&table);
+            run_one(client, &q, format, *timer_on).await;
+            false
+        }
+        DotCommand::Catalogs => {
+            let q = dotcommands::build_catalogs_query();
+            run_one(client, q, format, *timer_on).await;
+            false
+        }
+        DotCommand::Read { path } => {
+            // Reuse the same loop as `--file` so error handling and
+            // splitter rules stay in one place.
+            if let Err(e) = run_script(client, &path, format, false).await {
+                eprintln!("Error: {e}");
+            }
+            false
+        }
+        DotCommand::Timer(on) => {
+            *timer_on = on;
+            eprintln!("Timer: {}", if on { "on" } else { "off" });
+            false
+        }
+        DotCommand::Format(opt) => {
+            match opt {
+                None => eprintln!("Output format: {}", format.name()),
+                Some(f) => {
+                    *format = f;
+                    eprintln!("Output format set to: {}", format.name());
+                }
+            }
+            false
+        }
+    }
+}
+
+/// Render the warehouse part of the welcome banner. Memory mode says
+/// `ephemeral`; one persistent catalog says `warehouse: <path>` (the
+/// V2 phrasing); two or more list each as `name=path`.
+fn warehouse_banner(mode: &embedded::WarehouseMode) -> String {
+    match mode {
+        embedded::WarehouseMode::Memory => "ephemeral".to_string(),
+        embedded::WarehouseMode::Persistent { catalogs } if catalogs.is_empty() => {
+            "ephemeral".to_string()
+        }
+        embedded::WarehouseMode::Persistent { catalogs } if catalogs.len() == 1 => {
+            format!("warehouse: {}", catalogs[0].path.display())
+        }
+        embedded::WarehouseMode::Persistent { catalogs } => {
+            let joined: Vec<String> = catalogs
+                .iter()
+                .map(|c| format!("{}={}", c.name, c.path.display()))
+                .collect();
+            format!("catalogs: {}", joined.join(", "))
+        }
+    }
+}
+
+/// Parse `NAME=PATH` for the repeatable `--catalog` flag.
+/// Rejects empty names, paths, and identifiers that contain `.`,
+/// since 3-part SQL identifiers split on `.` and a catalog name
+/// like `prod.eu` would silently misroute. Whitespace around `=`
+/// is allowed for readability.
+fn parse_catalog_spec(s: &str) -> Result<(String, std::path::PathBuf), String> {
+    let (name, path) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected NAME=PATH, got `{s}`"))?;
+    let name = name.trim();
+    let path = path.trim();
+    if name.is_empty() {
+        return Err(format!("catalog name is empty in `{s}`"));
+    }
+    if path.is_empty() {
+        return Err(format!("catalog path is empty in `{s}`"));
+    }
+    if name.contains('.') {
+        return Err(format!(
+            "catalog name `{name}` cannot contain `.` (it would clash with 3-part SQL names)"
+        ));
+    }
+    Ok((name.to_string(), std::path::PathBuf::from(path)))
 }
 
 fn dirs_home() -> std::path::PathBuf {

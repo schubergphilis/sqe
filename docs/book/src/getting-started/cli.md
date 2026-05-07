@@ -18,6 +18,10 @@ Options:
       --stop-on-error        Abort the script on first error (default: continue)
       --embedded             Run the engine in-process (no remote coordinator)
       --memory-limit <SIZE>  Per-process memory pool when --embedded [default: 1GB]
+      --warehouse <PATH>     Single catalog at PATH named `iceberg`
+                             (shorthand for --catalog iceberg=PATH)
+      --catalog NAME=PATH    Attach a named persistent catalog (repeatable)
+      --memory               Skip persistent catalogs entirely
   -f, --format <FORMAT>      Output format: table, csv, tsv, json [default: table]
       --tls                  Use HTTPS/TLS
       --insecure             Accept invalid TLS certificates
@@ -58,11 +62,111 @@ FROM read_parquet(
 );
 ```
 
-What embedded mode does **not** include in V1:
+### Persistent catalog
 
-- A persistent catalog. There is no `CREATE TABLE` that survives across sessions yet. Query files directly via `read_parquet` instead. A SQLite-backed embedded catalog is planned.
+By default, `--embedded` attaches a SQLite-backed Iceberg catalog at `~/.sqe/warehouse/`. Tables created in this warehouse survive across sessions:
+
+```bash
+# Session 1: load + create
+sqe-cli --embedded -e "CREATE SCHEMA iceberg.staging"
+sqe-cli --embedded -e \
+    "CREATE TABLE iceberg.staging.events (event_id BIGINT, ts TIMESTAMP, kind VARCHAR) \
+     AS SELECT * FROM read_parquet('events.parquet')"
+
+# Session 2: same warehouse, table is still there
+sqe-cli --embedded -e "SELECT count(*) FROM iceberg.staging.events"
+```
+
+The on-disk layout:
+
+```
+~/.sqe/warehouse/
+├── sqe.db              # SQLite catalog (namespaces, table pointers)
+└── iceberg/            # Iceberg metadata + Parquet data files
+    └── staging/
+        └── events/
+            ├── metadata/
+            └── data/
+```
+
+The catalog name is `iceberg`. Three-part identifiers (`iceberg.staging.events`) work; unqualified names resolve against DataFusion's default in-memory catalog, so `SELECT * FROM read_parquet(...)` still works without any catalog interaction.
+
+Override the path:
+
+```bash
+sqe-cli --embedded --warehouse /data/my-warehouse -e "..."
+```
+
+Skip the catalog entirely (ephemeral session, nothing written to disk):
+
+```bash
+sqe-cli --embedded --memory -e "SELECT 1"
+```
+
+Tables in the warehouse are valid Iceberg. If you later upgrade to a cluster deployment, point the cluster catalog at the same path and the tables come along. No migration, no re-export.
+
+### Multiple catalogs
+
+Attach more than one warehouse with repeated `--catalog NAME=PATH` flags. Each becomes a top-level SQL identifier; cross-catalog joins work without any session-state setup.
+
+```bash
+sqe-cli --embedded \
+    --catalog prod=/data/prod \
+    --catalog stage=/data/stage \
+    -e "SELECT *
+        FROM prod.sales.orders p
+        LEFT JOIN stage.sales.orders s ON p.id = s.id
+        WHERE s.id IS NULL"
+```
+
+The catalog name shows up in `information_schema.tables.table_catalog`, in `.catalogs`, and in 3-part SQL identifiers. Names cannot contain `.` (it would clash with the SQL namespace separator) and cannot repeat (DataFusion's `register_catalog` would silently overwrite).
+
+`--warehouse <path>` remains as a shorthand for `--catalog iceberg=<path>`. The three flags `--memory`, `--warehouse`, and `--catalog` are mutually exclusive. Pick one.
+
+### Dot-commands
+
+The REPL recognises sqlite/DuckDB-style commands that start with `.`. They run client-side, never reach the engine, and don't end with `;`:
+
+```
+sqe> .help
+Dot commands:
+  .help                show this list
+  .exit, .quit         leave the REPL
+  .tables [schema]     list tables (optionally filter by schema)
+  .schema <table>      describe a table's columns
+  .catalogs            list catalogs visible to the session
+  .read <path>         execute a SQL script file
+  .timer on|off        toggle per-query elapsed-time output
+  .format [fmt]        show or set output format (table|csv|tsv|json)
+```
+
+Examples:
+
+```
+sqe> .timer on
+Timer: on
+
+sqe> SELECT count(*) FROM read_parquet('events.parquet');
++----------+
+| count(*) |
++----------+
+| 1500000  |
++----------+
+Time: 0.243s
+
+sqe> .tables
+sqe> .schema iceberg.staging.events
+sqe> .read setup.sql
+sqe> .format json
+```
+
+The legacy `\format` and `\q` forms still work for backward compatibility.
+
+### What embedded mode does not include
+
 - Authentication, RBAC, or column masking. Embedded mode runs as the local user. Use the cluster path when you need policy enforcement.
 - Distributed execution. Embedded mode is single-process by design.
+- Concurrent writers. The SQLite catalog is single-process; running two `sqe-cli --embedded` instances against the same warehouse simultaneously will likely produce errors. The cluster path handles concurrent writes correctly.
 
 ## Script files
 
