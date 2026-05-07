@@ -1,6 +1,6 @@
 # Using the CLI
 
-`sqe-cli` is the SQL client. By default it connects to a remote coordinator over Arrow Flight SQL or Trino HTTP. Pass `--embedded` to skip the network entirely and run an in-process engine. That mode is useful for ad-hoc analysis on local Parquet files without standing up a cluster.
+`sqe-cli` is the SQL client. By default it connects to a remote coordinator over Arrow Flight SQL or Trino HTTP. Pass `--embedded` to skip the network entirely and run an in-process engine. That mode is useful for ad-hoc analysis on local Parquet, CSV, or JSON files without standing up a cluster.
 
 ## Usage
 
@@ -60,6 +60,60 @@ FROM read_parquet(
     secret_key  => '...',
     region      => 'eu-central-1'
 );
+```
+
+### File format TVFs
+
+Alongside `read_parquet()`, the embedded engine ships `read_csv()` and `read_json()` for direct file access. They share the same calling convention (positional path, named keyword args) and the same S3 credential bag.
+
+```sql
+-- Local CSV (auto-detect schema, headers on by default)
+SELECT count(*) FROM read_csv('/data/sales.csv');
+
+-- Tab- or semicolon-separated, no header
+SELECT * FROM read_csv('/data/raw.tsv',
+    delimiter   => '\t',
+    has_header  => 'false');
+
+-- NDJSON
+SELECT * FROM read_json('/data/events.jsonl');
+
+-- S3-hosted CSV with inline credentials
+SELECT * FROM read_csv('s3://bucket/sales/*.csv',
+    access_key => 'AKIA...',
+    secret_key => '...',
+    endpoint   => 'http://minio:9000',
+    region     => 'us-east-1');
+```
+
+CSV-specific named args: `delimiter`, `has_header`, `quote`, `escape`, `comment`, `null_regex`, `file_extension`. JSON-specific: `newline_delimited`, `file_extension`.
+
+### Auto-detect: `SELECT * FROM 'file.ext'`
+
+DuckDB-style sugar for "I just want to query this file." The engine looks at the file extension and picks the right reader:
+
+```sql
+SELECT * FROM '/data/sales.parquet';
+SELECT * FROM '/data/events.jsonl';
+SELECT * FROM '/data/log.csv';
+```
+
+Works with globs and S3 URLs too. For S3, you still need credentials configured somewhere (default in `[storage]`, or use `read_csv()`/`read_parquet()` and pass them inline).
+
+### `COPY ... TO 'file'`
+
+Export query results to disk. Format is auto-detected from the extension.
+
+```sql
+COPY (SELECT * FROM iceberg.sales.orders WHERE year = 2026)
+  TO '/exports/orders-2026.parquet';
+
+COPY (SELECT customer_id, total FROM iceberg.sales.orders)
+  TO '/exports/orders.csv';
+
+-- Force a format / pass options
+COPY orders TO '/exports/orders.json'
+  (FORMAT 'json');
 ```
 
 ### Persistent catalog
