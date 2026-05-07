@@ -64,7 +64,7 @@ config:
     ssl_verification: true
 
   catalog:
-    polaris_url: "http://polaris:8181/api/catalog"
+    catalog_url: "http://polaris:8181/api/catalog"
     warehouse: "iceberg"
     metadata_cache_ttl_secs: 30
 

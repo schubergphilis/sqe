@@ -58,7 +58,7 @@ sequenceDiagram
     participant POL as Polaris
     participant DF as DataFusion
 
-    QH->>SC: new(polaris_url, warehouse, user_token)
+    QH->>SC: new(catalog_url, warehouse, user_token)
     SC->>POL: list_namespaces() [user_token]
     POL-->>SC: [ns1, ns2, ns3]
     QH->>DF: register_catalog(warehouse, CatalogProvider)

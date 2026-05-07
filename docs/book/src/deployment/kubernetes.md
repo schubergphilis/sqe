@@ -43,7 +43,7 @@ graph TB
 ```bash
 helm install sqe deploy/helm/sqe/ \
   --set config.auth.keycloak_url=https://keycloak.example.com \
-  --set config.catalog.polaris_url=http://polaris:8181/api/catalog \
+  --set config.catalog.catalog_url=http://polaris:8181/api/catalog \
   --set secrets.SQE_AUTH__CLIENT_SECRET=my-secret \
   --set secrets.SQE_STORAGE__S3_ACCESS_KEY=minioadmin \
   --set secrets.SQE_STORAGE__S3_SECRET_KEY=minioadmin
@@ -61,7 +61,7 @@ helm install sqe deploy/helm/sqe/ \
   --set worker.resources.limits.memory=16Gi \
   --set worker.resources.limits.cpu=8 \
   --set config.auth.keycloak_url=https://keycloak.example.com \
-  --set config.catalog.polaris_url=http://polaris:8181/api/catalog \
+  --set config.catalog.catalog_url=http://polaris:8181/api/catalog \
   --set existingSecret=sqe-credentials
 ```
 

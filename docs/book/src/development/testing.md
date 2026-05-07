@@ -134,7 +134,7 @@ client_id = "root"
 client_secret = "s3cr3t"
 
 [catalog]
-polaris_url = "http://localhost:8181/api/catalog"
+catalog_url = "http://localhost:8181/api/catalog"
 warehouse = "test_warehouse"
 
 [storage]
