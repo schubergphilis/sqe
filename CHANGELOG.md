@@ -6,7 +6,28 @@ All notable changes to SQE are documented in this file.
 
 ### Bug Fixes
 
-- Remove rsa crate — static test keypair eliminates RUSTSEC-2023-0071
+- Flight SQL accepts JWT bearer tokens via the configured provider chain
+
+    Before this fix the coordinator built `SessionManager::new(authenticator)`
+    in `main.rs` / `sqe_server.rs`, which gave Flight SQL only the legacy
+    OIDC password-grant `Authenticator`. Bearer-only credentials (the
+    common case for backend-bridged JWTs from a frontend BFF) returned
+    `NotMyCredentials`, which surfaced to clients as
+    `Authentication failed: credentials not handled by this provider`
+    even when `[[auth.providers]]` declared a `bearer_token` provider
+    that the Trino-compat HTTP path accepted on the same JWT.
+
+    The fix builds the auth chain via `build_auth_chain` once and routes
+    it into both endpoints. Flight SQL now goes through the same chain as
+    Trino HTTP. Adds `SessionManager::with_provider_and_legacy(provider,
+    authenticator)` so the chain handles new requests while the legacy
+    `Authenticator`'s background refresh task keeps existing
+    username/password sessions current.
+
+    Workaround for older builds: put `bearer_token` first in the chain.
+    Once this fix is rolled out, ordering no longer matters.
+
+- Remove rsa crate. Static test keypair eliminates RUSTSEC-2023-0071
 
 Replace runtime RSA key generation in bearer_token tests with a
     pre-generated static PEM keypair. The rsa and pkcs1 dev-dependencies
