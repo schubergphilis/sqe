@@ -59,6 +59,19 @@ struct Cli {
     #[arg(long, default_value = "1GB")]
     memory_limit: String,
 
+    /// Override the embedded warehouse path. Default is
+    /// `~/.sqe/warehouse/`. Tables created in this directory persist
+    /// across sessions via a SQLite catalog at `<path>/sqe.db`.
+    /// Mutually exclusive with `--memory`.
+    #[arg(long)]
+    warehouse: Option<std::path::PathBuf>,
+
+    /// Skip the persistent catalog entirely. `CREATE TABLE` works
+    /// within the session via DataFusion's in-memory catalog but
+    /// nothing survives the process.
+    #[arg(long, default_value_t = false)]
+    memory: bool,
+
     /// Read SQL statements from a file and execute them in order.
     /// Statements are separated by `;`. When combined with
     /// `-e/--execute`, the script runs first and the `-e` query
@@ -122,12 +135,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut client: Box<dyn SqlClient> = if cli.embedded {
         let limit = sqe_core::parse_memory_limit(&cli.memory_limit).unwrap_or(1024 * 1024 * 1024);
-        let client = embedded::EmbeddedClient::new(limit)?;
-        eprintln!(
-            "sqe-cli {} embedded engine ({} memory pool)",
-            sqe_core::VERSION,
-            cli.memory_limit
-        );
+        let mode = if cli.memory {
+            if cli.warehouse.is_some() {
+                return Err(
+                    "--memory and --warehouse are mutually exclusive; pick one".into(),
+                );
+            }
+            embedded::WarehouseMode::Memory
+        } else if let Some(path) = cli.warehouse.clone() {
+            embedded::WarehouseMode::Persistent { path }
+        } else {
+            embedded::WarehouseMode::default_persistent()
+        };
+        let client = embedded::EmbeddedClient::with_warehouse(limit, &mode).await?;
+        match &mode {
+            embedded::WarehouseMode::Memory => eprintln!(
+                "sqe-cli {} embedded engine ({} memory pool, ephemeral)",
+                sqe_core::VERSION,
+                cli.memory_limit
+            ),
+            embedded::WarehouseMode::Persistent { path } => eprintln!(
+                "sqe-cli {} embedded engine ({} memory pool, warehouse: {})",
+                sqe_core::VERSION,
+                cli.memory_limit,
+                path.display()
+            ),
+        }
         Box::new(client)
     } else if let Some(ref token) = cli.token {
         // Token-based auth: skip username/password

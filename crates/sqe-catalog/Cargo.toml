@@ -33,6 +33,12 @@ sql = ["dep:rusqlite", "dep:iceberg-catalog-sql", "dep:sqlx", "iceberg-catalog-l
 # `sql` feature does not pull tls-rustls + tokio-runtime + postgres driver
 # into builds that only want SQLite.
 sql-postgres = ["sql", "sqlx/postgres", "sqlx/runtime-tokio", "sqlx/tls-rustls"]
+# Add-on for `sql`: enable SQLite via sqlx. Used by the embedded sqe-cli
+# path for a persistent local catalog at `~/.sqe/sqe.db`. No TLS, no
+# Postgres driver, just the SQLite backend + tokio runtime that
+# sqlx::any needs. Embedded mode picks this; cluster builds typically
+# want `sql-postgres` instead.
+sql-sqlite = ["sql", "sqlx/sqlite", "sqlx/runtime-tokio"]
 # Hadoop storage-only backend. No extra dependency — the backend scans a
 # warehouse path via `object_store`, which is already linked. Hadoop has
 # no upstream loader counterpart; SQE's hadoop dispatch stays in
