@@ -40,7 +40,8 @@ use tracing::debug;
 use sqe_core::config::StorageConfig;
 
 use crate::file_tvf_common::{
-    parse_file_tvf_args, register_s3_store_if_needed, FileTvfArgs,
+    parse_file_tvf_args, register_http_store_if_needed, register_s3_store_if_needed,
+    rewrite_hf_path_in_place, FileTvfArgs,
 };
 
 const FN_NAME: &str = "read_csv";
@@ -143,10 +144,16 @@ async fn build_csv_listing_table(
     csv_opts: &CsvOpts,
     storage: &StorageConfig,
 ) -> DFResult<Arc<dyn TableProvider>> {
+    // Resolve hf:// to its HTTPS form, then drive HTTPS through the
+    // shared httpfs builder. S3 paths still flow through the S3 helper.
+    let mut args = args.clone();
+    rewrite_hf_path_in_place(FN_NAME, &mut args)?;
+
     let listing_url = ListingTableUrl::parse(&args.path)?;
 
     let tmp_ctx = SessionContext::new();
-    register_s3_store_if_needed(FN_NAME, &tmp_ctx, args, storage)?;
+    register_s3_store_if_needed(FN_NAME, &tmp_ctx, &args, storage)?;
+    register_http_store_if_needed(FN_NAME, &tmp_ctx, &args.path)?;
 
     let mut format = CsvFormat::default();
     if let Some(d) = csv_opts.delimiter {

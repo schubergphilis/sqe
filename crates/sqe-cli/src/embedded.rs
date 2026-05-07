@@ -137,8 +137,16 @@ pub fn build_embedded_context(memory_limit_bytes: usize) -> anyhow::Result<Sessi
 
     let pool_size = memory_limit_bytes.max(64 * 1024 * 1024);
     let pool = Arc::new(FairSpillPool::new(pool_size));
+    // V10: wrap DataFusion's default ObjectStoreRegistry so
+    // `read_csv('https://...')`, `read_parquet('https://...')`, etc. lazily
+    // build an HttpStore for the URL's scheme://host on first request. Keeps
+    // s3 / file behaviour unchanged; only http/https get the lazy build.
+    let registry = Arc::new(sqe_catalog::lazy_object_store::LazyHttpObjectStoreRegistry::new(
+        datafusion::execution::object_store::DefaultObjectStoreRegistry::new(),
+    ));
     let runtime = RuntimeEnvBuilder::new()
         .with_memory_pool(pool)
+        .with_object_store_registry(registry)
         .build_arc()
         .map_err(|e| anyhow::anyhow!("failed to build runtime env: {e}"))?;
 

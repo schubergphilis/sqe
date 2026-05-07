@@ -45,7 +45,16 @@ pub fn build_coordinator_runtime(config: &CoordinatorConfig) -> anyhow::Result<A
     // operators and triggers spill when the limit is reached.
     let memory_pool = Arc::new(FairSpillPool::new(memory_bytes));
 
-    let mut builder = RuntimeEnvBuilder::new().with_memory_pool(memory_pool);
+    // V10 httpfs: wrap the default ObjectStoreRegistry so http(s) URLs in
+    // file-format TVFs (read_csv / read_json / read_parquet) get a backing
+    // HttpStore built lazily on first request. S3 / file paths use the
+    // default registry's existing path.
+    let registry = Arc::new(sqe_catalog::lazy_object_store::LazyHttpObjectStoreRegistry::new(
+        datafusion::execution::object_store::DefaultObjectStoreRegistry::new(),
+    ));
+    let mut builder = RuntimeEnvBuilder::new()
+        .with_memory_pool(memory_pool)
+        .with_object_store_registry(registry);
 
     if config.spill_to_disk {
         // Create spill directory if it doesn't exist
