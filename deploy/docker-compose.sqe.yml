@@ -24,8 +24,8 @@ services:
       SQE_AUTH__CLIENT_ID: "sqe-client"
       SQE_AUTH__CLIENT_SECRET: "${SQE_CLIENT_SECRET:-sqe-secret-change-me}"
       SQE_AUTH__SSL_VERIFICATION: "false"
-      # Catalog — Polaris
-      SQE_CATALOG__POLARIS_URL: "http://polaris:8181/api/catalog"
+      # Catalog — Iceberg REST endpoint (Polaris in this compose stack)
+      SQE_CATALOG__CATALOG_URL: "http://polaris:8181/api/catalog"
       SQE_CATALOG__WAREHOUSE: "main_warehouse"
       SQE_CATALOG__DEFAULT_TABLE_FORMAT_VERSION: "2"
       # Storage — S3 (same as Polaris/Spark)

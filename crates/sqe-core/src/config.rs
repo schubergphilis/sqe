@@ -1009,7 +1009,9 @@ impl SqeConfig {
         }
         if self.catalog.catalog_url.trim().is_empty() {
             errors.push(
-                "catalog.catalog_url is required (legacy `polaris_url` is also accepted)"
+                "catalog.catalog_url is required (TOML field; or env \
+                 SQE_CATALOG__CATALOG_URL). Legacy names `polaris_url` / \
+                 SQE_CATALOG__POLARIS_URL also work via serde alias."
                     .to_string(),
             );
         }
@@ -1454,7 +1456,10 @@ mod tests {
 
     /// Old configs that used `polaris_url` continue to deserialize via the
     /// serde alias. New configs use `catalog_url`. Both populate the same
-    /// in-memory field.
+    /// in-memory field, and a config built from a legacy TOML still passes
+    /// validate() — guarding against any future addition of
+    /// `#[serde(deny_unknown_fields)]` on `CatalogConfig` or its parent
+    /// that would silently drop the alias path.
     #[test]
     fn legacy_polaris_url_alias_deserializes() {
         let new_toml = "[catalog]\ncatalog_url = \"http://new.example.com\"\nwarehouse = \"wh\"\n";
@@ -1469,6 +1474,14 @@ mod tests {
         let old_w: Wrap = toml::from_str(old_toml).expect("legacy TOML deserializes");
         assert_eq!(new_w.catalog.catalog_url, "http://new.example.com");
         assert_eq!(old_w.catalog.catalog_url, "http://old.example.com");
+
+        // Round-trip into a full SqeConfig and validate. Both must pass.
+        let mut full = valid_config();
+        full.catalog = old_w.catalog;
+        assert!(
+            full.validate().is_ok(),
+            "legacy polaris_url config should pass validate()"
+        );
     }
 
     #[test]
