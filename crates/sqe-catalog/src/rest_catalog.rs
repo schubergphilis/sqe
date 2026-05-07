@@ -230,7 +230,7 @@ pub struct SessionCatalog {
     /// revalidation in `load_table`) match on this and error out
     /// when the backend isn't REST.
     inner: CatalogHandle,
-    polaris_url: String,
+    catalog_url: String,
     warehouse: String,
     bearer_token: String,
     token_fingerprint: String,
@@ -252,7 +252,7 @@ pub struct SessionCatalog {
 impl std::fmt::Debug for SessionCatalog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionCatalog")
-            .field("polaris_url", &self.polaris_url)
+            .field("catalog_url", &self.catalog_url)
             .field("warehouse", &self.warehouse)
             .field("token_fingerprint", &self.token_fingerprint)
             .field("circuit_breaker", &self.circuit_breaker.state_label())
@@ -305,7 +305,7 @@ impl SessionCatalog {
         match &config.catalog.backend {
             sqe_core::config::CatalogBackend::Rest => {
                 Self::new(
-                    &config.catalog.polaris_url,
+                    &config.catalog.catalog_url,
                     &config.catalog.warehouse,
                     bearer_token,
                     &config.storage,
@@ -449,7 +449,7 @@ impl SessionCatalog {
 
         Ok(Self {
             inner: CatalogHandle::Other(inner),
-            polaris_url: String::new(),
+            catalog_url: String::new(),
             warehouse: config.catalog.warehouse.clone(),
             bearer_token: bearer_token.to_string(),
             token_fingerprint,
@@ -465,7 +465,7 @@ impl SessionCatalog {
     }
 
     pub async fn new(
-        polaris_url: &str,
+        catalog_url: &str,
         warehouse: &str,
         bearer_token: &str,
         storage_config: &StorageConfig,
@@ -480,7 +480,7 @@ impl SessionCatalog {
         };
 
         info!(
-            polaris_url = polaris_url,
+            catalog_url = catalog_url,
             warehouse = warehouse,
             token_fingerprint = %token_fingerprint,
             "Creating per-session REST catalog"
@@ -492,7 +492,7 @@ impl SessionCatalog {
         props.insert("token".to_string(), bearer_token.to_string());
 
         // Set the REST catalog URI and warehouse
-        props.insert("uri".to_string(), polaris_url.to_string());
+        props.insert("uri".to_string(), catalog_url.to_string());
         props.insert("warehouse".to_string(), warehouse.to_string());
 
         // Inject S3 storage config as properties so that FileIO can be configured
@@ -538,7 +538,7 @@ impl SessionCatalog {
                 .build()
         });
 
-        let catalog_key = format!("{}-{}", polaris_url, token_fingerprint);
+        let catalog_key = format!("{}-{}", catalog_url, token_fingerprint);
         let inner = if let Some(cached) = REST_CATALOG_CACHE.get(&catalog_key).await {
             debug!(token_fingerprint = %token_fingerprint, "REST catalog cache hit");
             cached
@@ -572,7 +572,7 @@ impl SessionCatalog {
 
         Ok(Self {
             inner: CatalogHandle::Rest(inner),
-            polaris_url: polaris_url.to_string(),
+            catalog_url: catalog_url.to_string(),
             warehouse: warehouse.to_string(),
             bearer_token: bearer_token.to_string(),
             token_fingerprint,
@@ -593,9 +593,9 @@ impl SessionCatalog {
         &self.storage_config
     }
 
-    /// Returns the Polaris URL.
-    pub fn polaris_url(&self) -> &str {
-        &self.polaris_url
+    /// Returns the REST catalog URL.
+    pub fn catalog_url(&self) -> &str {
+        &self.catalog_url
     }
 
     /// Returns the warehouse name.
@@ -862,7 +862,7 @@ impl SessionCatalog {
 
     /// Build the Polaris REST URL prefix for this warehouse.
     fn rest_prefix(&self) -> String {
-        let base = self.polaris_url.trim_end_matches('/');
+        let base = self.catalog_url.trim_end_matches('/');
         format!("{base}/v1/{}", self.warehouse)
     }
 
@@ -872,7 +872,7 @@ impl SessionCatalog {
     /// `CatalogHandle::Rest`. Returns an error pointing at the
     /// backend mismatch rather than letting a downstream HTTP call
     /// fail with an opaque "connection refused" against an empty
-    /// polaris_url.
+    /// catalog_url.
     fn require_rest_backend(&self, op: &str) -> sqe_core::Result<()> {
         if matches!(self.inner, CatalogHandle::Rest(_)) {
             Ok(())

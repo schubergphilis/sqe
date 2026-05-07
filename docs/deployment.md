@@ -79,7 +79,7 @@ cargo run --bin sqe-cli -- \
 
 ## 2. Configuration Reference
 
-SQE uses a single TOML file specified via `SQE_CONFIG` environment variable or `--config` flag. All settings have defaults; only `catalog.polaris_url` and an auth source are strictly required.
+SQE uses a single TOML file specified via `SQE_CONFIG` environment variable or `--config` flag. All settings have defaults; only `catalog.catalog_url` (legacy alias `polaris_url`) and an auth source are strictly required.
 
 Every TOML key can be overridden via environment variable using the pattern `SQE_<SECTION>__<KEY>` (double underscore). For example: `SQE_AUTH__CLIENT_ID=my-client`.
 
@@ -161,7 +161,7 @@ Each entry requires a `type` field. Supported types:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `polaris_url` | (required) | Polaris REST Catalog URL |
+| `catalog_url` (alias `polaris_url`) | (required) | Iceberg REST catalog endpoint URL |
 | `warehouse` | `""` | Default warehouse name |
 | `metadata_cache_ttl_secs` | `30` | Table metadata cache TTL |
 | `default_table_format_version` | `2` | Iceberg table format version for new tables |
@@ -280,7 +280,7 @@ type = "bearer_token"
 jwks_url = "https://keycloak.example.com/realms/iceberg/protocol/openid-connect/certs"
 
 [catalog]
-polaris_url = "http://polaris:8181/api/catalog"
+catalog_url = "http://polaris:8181/api/catalog"
 warehouse = "production"
 metadata_cache_ttl_secs = 30
 
@@ -323,14 +323,14 @@ helm install sqe deploy/helm/sqe/ \
   --set config.auth.keycloak_url=https://keycloak.example.com \
   --set config.auth.realm=iceberg \
   --set config.auth.client_id=sqe-client \
-  --set config.catalog.polaris_url=http://polaris:8181/api/catalog \
+  --set config.catalog.catalog_url=http://polaris:8181/api/catalog \
   --set config.catalog.warehouse=production
 
 # Distributed mode (coordinator + 3 workers)
 helm install sqe deploy/helm/sqe/ \
   --set worker.enabled=true \
   --set worker.replicas=3 \
-  --set config.catalog.polaris_url=http://polaris:8181/api/catalog
+  --set config.catalog.catalog_url=http://polaris:8181/api/catalog
 ```
 
 ### Helm values overview
@@ -387,7 +387,7 @@ config:
     client_id: "sqe-client"
     ssl_verification: true
   catalog:
-    polaris_url: "http://polaris:8181/api/catalog"
+    catalog_url: "http://polaris:8181/api/catalog"
     warehouse: "iceberg"
     metadata_cache_ttl_secs: 30
   storage:
@@ -681,13 +681,13 @@ authenticated user session.
 # Polaris (the built-in reference target).
 [catalog]
 type = "rest"
-polaris_url = "http://polaris:8181/api/catalog"
+catalog_url = "http://polaris:8181/api/catalog"
 warehouse = "polaris"
 
 # Nessie via the REST adapter on the same host.
 [catalog]
 type = "rest"
-polaris_url = "http://nessie:19120/iceberg"
+catalog_url = "http://nessie:19120/iceberg"
 warehouse = "main"
 ```
 
@@ -772,7 +772,7 @@ personal access tokens. SQE has an `OidcM2mProvider` in the auth chain.
 ```toml
 [catalog]
 type = "rest"
-polaris_url = "https://<workspace>.cloud.databricks.com/api/2.1/unity-catalog"
+catalog_url = "https://<workspace>.cloud.databricks.com/api/2.1/unity-catalog"
 warehouse = "main"
 
 [[auth.providers]]

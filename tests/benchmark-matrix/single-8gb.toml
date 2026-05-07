@@ -21,7 +21,7 @@ max_result_rows = 0
 timeout_secs = 600
 
 [catalog]
-polaris_url = "http://localhost:18181/api/catalog"
+catalog_url = "http://localhost:18181/api/catalog"
 warehouse = "test_warehouse"
 
 [storage]

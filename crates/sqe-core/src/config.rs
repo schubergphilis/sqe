@@ -614,7 +614,7 @@ fn default_challenge_timeout() -> u64 {
 #[serde(rename_all = "lowercase", tag = "type")]
 pub enum CatalogBackend {
     /// Iceberg REST (Polaris, Nessie, Unity OSS, AWS Glue REST,
-    /// AWS S3 Tables). Configured via `polaris_url` + `warehouse` on
+    /// AWS S3 Tables). Configured via `catalog_url` + `warehouse` on
     /// CatalogConfig. AWS endpoints engage SigV4 automatically when
     /// the server's /v1/config response advertises
     /// `rest.sigv4-enabled=true`.
@@ -662,11 +662,20 @@ pub enum CatalogBackend {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct CatalogConfig {
-    pub polaris_url: String,
+    /// REST catalog endpoint URL. Used by `CatalogBackend::Rest`
+    /// (the default) for Polaris, Nessie, Unity OSS, AWS Glue REST,
+    /// and AWS S3 Tables. Other backends (`Hms`, `Glue`, `Jdbc`,
+    /// `S3tables`) carry their own connection details on the enum
+    /// variant and ignore this field.
+    ///
+    /// Old configs that used `polaris_url` continue to deserialize
+    /// thanks to the serde alias.
+    #[serde(alias = "polaris_url")]
+    pub catalog_url: String,
     #[serde(default)]
     pub warehouse: String,
     /// Backend selector. When omitted from TOML, deserialises to
-    /// `CatalogBackend::Rest` so the existing `polaris_url` field
+    /// `CatalogBackend::Rest` so the existing `catalog_url` field
     /// keeps driving the engine. Non-REST variants source their own
     /// connection details from the enum.
     #[serde(default)]
@@ -998,8 +1007,11 @@ impl SqeConfig {
         if !has_providers && self.auth.client_id.trim().is_empty() {
             errors.push("auth.client_id is required".to_string());
         }
-        if self.catalog.polaris_url.trim().is_empty() {
-            errors.push("catalog.polaris_url is required".to_string());
+        if self.catalog.catalog_url.trim().is_empty() {
+            errors.push(
+                "catalog.catalog_url is required (legacy `polaris_url` is also accepted)"
+                    .to_string(),
+            );
         }
         if !has_providers
             && self.auth.keycloak_url.trim().is_empty()
@@ -1115,7 +1127,11 @@ impl SqeConfig {
         env_override_bool("SQE_AUTH__SSL_VERIFICATION", &mut self.auth.ssl_verification);
 
         // Catalog
-        env_override_str("SQE_CATALOG__POLARIS_URL", &mut self.catalog.polaris_url);
+        // SQE_CATALOG__CATALOG_URL is the canonical env var; the legacy
+        // SQE_CATALOG__POLARIS_URL is honoured first for backwards-compat
+        // and overridden by the new name when both are set.
+        env_override_str("SQE_CATALOG__POLARIS_URL", &mut self.catalog.catalog_url);
+        env_override_str("SQE_CATALOG__CATALOG_URL", &mut self.catalog.catalog_url);
         env_override_str("SQE_CATALOG__WAREHOUSE", &mut self.catalog.warehouse);
         env_override_u64("SQE_CATALOG__METADATA_CACHE_TTL_SECS", &mut self.catalog.metadata_cache_ttl_secs);
         env_override_u8("SQE_CATALOG__DEFAULT_TABLE_FORMAT_VERSION", &mut self.catalog.default_table_format_version);
@@ -1330,7 +1346,7 @@ mod tests {
                 external: None,
             },
             catalog: CatalogConfig {
-                polaris_url: "https://polaris.example.com".to_string(),
+                catalog_url: "https://polaris.example.com".to_string(),
                 warehouse: "wh".to_string(),
                 backend: CatalogBackend::default(),
                 metadata_cache_ttl_secs: 30,
@@ -1370,13 +1386,13 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_missing_polaris_url() {
+    fn test_validate_missing_catalog_url() {
         let mut config = valid_config();
-        config.catalog.polaris_url = String::new();
+        config.catalog.catalog_url = String::new();
         let err = config.validate().unwrap_err().to_string();
         assert!(
-            err.contains("catalog.polaris_url is required"),
-            "Expected polaris_url error, got: {err}"
+            err.contains("catalog.catalog_url is required"),
+            "Expected catalog_url error, got: {err}"
         );
     }
 
@@ -1428,12 +1444,31 @@ mod tests {
     fn test_validate_multiple_errors() {
         let mut config = valid_config();
         config.auth.client_id = String::new();
-        config.catalog.polaris_url = "  ".to_string();
+        config.catalog.catalog_url = "  ".to_string();
         let err = config.validate().unwrap_err().to_string();
         assert!(
-            err.contains("auth.client_id") && err.contains("catalog.polaris_url"),
+            err.contains("auth.client_id") && err.contains("catalog.catalog_url"),
             "Expected multiple errors, got: {err}"
         );
+    }
+
+    /// Old configs that used `polaris_url` continue to deserialize via the
+    /// serde alias. New configs use `catalog_url`. Both populate the same
+    /// in-memory field.
+    #[test]
+    fn legacy_polaris_url_alias_deserializes() {
+        let new_toml = "[catalog]\ncatalog_url = \"http://new.example.com\"\nwarehouse = \"wh\"\n";
+        let old_toml =
+            "[catalog]\npolaris_url = \"http://old.example.com\"\nwarehouse = \"wh\"\n";
+
+        #[derive(serde::Deserialize)]
+        struct Wrap {
+            catalog: CatalogConfig,
+        }
+        let new_w: Wrap = toml::from_str(new_toml).expect("new TOML deserializes");
+        let old_w: Wrap = toml::from_str(old_toml).expect("legacy TOML deserializes");
+        assert_eq!(new_w.catalog.catalog_url, "http://new.example.com");
+        assert_eq!(old_w.catalog.catalog_url, "http://old.example.com");
     }
 
     #[test]

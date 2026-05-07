@@ -16,7 +16,7 @@ has no upstream loader equivalent.
 
 | Backend  | `type` value | Required keys | Optional keys | Cargo feature | Vendored crate |
 |----------|--------------|---------------|---------------|---------------|----------------|
-| REST     | `rest` (default) | `polaris_url`, `warehouse` (on `[catalog]`) | bearer-token / OAuth headers via runtime auth | `rest` (always) | `iceberg-catalog-rest` |
+| REST     | `rest` (default) | `catalog_url`, `warehouse` (on `[catalog]`) | bearer-token / OAuth headers via runtime auth | `rest` (always) | `iceberg-catalog-rest` |
 | HMS      | `hms` | `uri`, `warehouse` | | `hms` | `iceberg-catalog-hms` |
 | Glue     | `glue` | `region`, `warehouse` | `endpoint` | `glue` | `iceberg-catalog-glue` |
 | S3 Tables | `s3tables` | `table_bucket_arn` | `endpoint_url` | `s3tables` | `iceberg-catalog-s3tables` |
@@ -27,7 +27,7 @@ has no upstream loader equivalent.
 
 ```toml
 [catalog]
-polaris_url = "https://polaris.example.com:18181/api/catalog"
+catalog_url = "https://polaris.example.com:18181/api/catalog"
 warehouse   = "test_warehouse"
 
 # `backend` defaults to "rest"; the block can be omitted.

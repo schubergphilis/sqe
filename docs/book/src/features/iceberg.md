@@ -49,7 +49,7 @@ SQE keeps the catalog choice as a runtime configuration concern. Every catalog b
 | JDBC (Postgres / MySQL / SQLite) | `jdbc` | iceberg-catalog-sql | DB credentials | live verified (Postgres) |
 | Hadoop / storage-only | `hadoop` | object_store path scan | none | live verified, read-only |
 
-There are two ways into AWS-managed Iceberg. The **REST path** (`type = "rest"` with the Glue REST or S3 Tables REST endpoint as `polaris_url`) speaks the Iceberg REST protocol that AWS exposes on top of these services. The **native SDK path** (`type = "glue"` or `type = "s3tables"`) goes directly through `aws-sdk-glue` or `aws-sdk-s3tables` without REST. Both work; the SDK path is currently more maintained upstream and avoids the SigV4 signing patches.
+There are two ways into AWS-managed Iceberg. The **REST path** (`type = "rest"` with the Glue REST or S3 Tables REST endpoint as `catalog_url`) speaks the Iceberg REST protocol that AWS exposes on top of these services. The **native SDK path** (`type = "glue"` or `type = "s3tables"`) goes directly through `aws-sdk-glue` or `aws-sdk-s3tables` without REST. Both work; the SDK path is currently more maintained upstream and avoids the SigV4 signing patches.
 
 The five non-Hadoop backends share one dispatch path through the upstream `iceberg-catalog-loader` crate. SQE's `for_session_other_backend` translates the typed `CatalogBackend` enum into a uniform `(catalog_type, name, props)` tuple and hands it to `iceberg_catalog_loader::load(type)`. The loader picks the right `CatalogBuilder` (REST / Glue / S3 Tables / HMS / SQL) and returns an `Arc<dyn iceberg::Catalog>`. Hadoop is the lone outlier because it is filesystem-only; its dispatch stays in `crates/sqe-catalog/src/backends/hadoop.rs`.
 
