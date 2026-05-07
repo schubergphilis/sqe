@@ -182,7 +182,7 @@ impl TableProvider for SqeTableProvider {
 
         let mut exec = crate::iceberg_scan::IcebergScanExec::new_with_filters_and_metrics(
             self.table.clone(),
-            projected_schema,
+            projected_schema.clone(),
             projected_columns,
             predicates,
             filters.to_vec(),
@@ -196,6 +196,32 @@ impl TableProvider for SqeTableProvider {
         exec = exec
             .with_small_file_threshold(self.small_file_threshold_bytes)
             .with_manifest_concurrency(self.manifest_concurrency);
+
+        // Pre-compute per-column min/max/null_count from manifest entries so
+        // DataFusion's join-order optimizer sees real selectivity and picks
+        // sensible build sides. Falls back to row-count-only stats if the
+        // manifest read fails — incomplete stats are better than blocking
+        // the scan, and the existing fallback path stays correct.
+        match crate::iceberg_scan::compute_table_statistics(
+            &self.table,
+            self.snapshot_id,
+            projected_schema.as_ref(),
+            self.manifest_concurrency,
+        )
+        .await
+        {
+            Ok(stats) => {
+                exec = exec.with_cached_statistics(stats);
+            }
+            Err(e) => {
+                debug!(
+                    error = %e,
+                    table = %self.table.identifier(),
+                    "Failed to pre-compute manifest column stats; using row-count fallback"
+                );
+            }
+        }
+
         Ok(Arc::new(exec))
     }
 }
