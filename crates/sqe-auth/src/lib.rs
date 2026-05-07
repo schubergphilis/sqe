@@ -17,6 +17,7 @@ pub mod factory;
 pub mod pending_auth;
 pub mod device_code;
 pub mod auth_code;
+pub mod per_catalog;
 
 /// Deprecated: use `oidc_password` instead.
 #[deprecated(note = "renamed to oidc_password")]
