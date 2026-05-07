@@ -307,7 +307,9 @@ pub struct EmbeddedClient {
 impl EmbeddedClient {
     /// Build a memory-only embedded client. Sufficient for ad-hoc
     /// `read_parquet` queries; `CREATE TABLE` lives only for the
-    /// session.
+    /// session. Used by tests; production paths go through
+    /// [`Self::with_warehouse`].
+    #[allow(dead_code)]
     pub fn new(memory_limit_bytes: usize) -> anyhow::Result<Self> {
         Ok(Self {
             ctx: build_embedded_context(memory_limit_bytes)?,
@@ -408,6 +410,69 @@ mod tests {
             .expect("query");
         assert_eq!(result.columns, vec!["Int64(1)".to_string()]);
         assert!(result.rows.is_empty());
+    }
+
+    /// V9: `SELECT * EXCLUDE (col)` removes the named column from the
+    /// projection. DataFusion 53.1 supports this natively under the
+    /// generic dialect; the test pins behaviour so a future DF upgrade
+    /// can not silently regress.
+    #[tokio::test]
+    async fn select_star_exclude_drops_columns() {
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
+        let r = client
+            .execute(
+                "WITH t(id, name, secret) AS \
+                 (VALUES (1, 'alice', 'xyz'), (2, 'bob', 'abc')) \
+                 SELECT * EXCLUDE (secret) FROM t",
+            )
+            .await
+            .expect("query");
+        assert_eq!(r.columns, vec!["id".to_string(), "name".to_string()]);
+        assert_eq!(r.rows.len(), 2);
+    }
+
+    /// V9: `SELECT * REPLACE (expr AS col)` substitutes a column with a
+    /// computed expression while keeping the column ordering. Native in
+    /// DataFusion 53.1.
+    #[tokio::test]
+    async fn select_star_replace_substitutes_columns() {
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
+        let r = client
+            .execute(
+                "WITH t(id, name) AS \
+                 (VALUES (1, 'alice'), (2, 'bob')) \
+                 SELECT * REPLACE (UPPER(name) AS name) FROM t \
+                 ORDER BY id",
+            )
+            .await
+            .expect("query");
+        assert_eq!(r.columns, vec!["id".to_string(), "name".to_string()]);
+        assert_eq!(r.rows[0][1], "ALICE");
+        assert_eq!(r.rows[1][1], "BOB");
+    }
+
+    /// V9: DESCRIBE returns a (column_name, data_type, is_nullable)
+    /// projection. DataFusion-native; no SQE-side wiring needed.
+    #[tokio::test]
+    async fn describe_table_returns_column_metadata() {
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
+        client
+            .execute("CREATE TABLE t AS SELECT 1::INT AS x, 'hi' AS y")
+            .await
+            .expect("create table");
+
+        let r = client.execute("DESCRIBE t").await.expect("describe");
+        assert_eq!(
+            r.columns,
+            vec![
+                "column_name".to_string(),
+                "data_type".to_string(),
+                "is_nullable".to_string(),
+            ]
+        );
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0][0], "x");
+        assert_eq!(r.rows[1][0], "y");
     }
 
     /// Memory limit below the floor (64 MB) is clamped, not rejected.

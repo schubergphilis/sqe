@@ -260,14 +260,55 @@ async fn run_script(
     let contents = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
 
+    // Local format / timer that .format and .timer dot-commands can
+    // mutate without leaking back into the caller. Scripts are
+    // typically one-shot, so per-script overrides are fine.
+    let mut local_format = format.clone();
+    let mut timer_on = false;
+
     let mut failures = 0usize;
     for (idx, stmt) in script::split_statements(&contents).into_iter().enumerate() {
         let trimmed = stmt.trim();
         if trimmed.is_empty() {
             continue;
         }
+
+        // Dot-commands work in scripts too: `.summarize tbl`,
+        // `.tables`, `.schema tbl`, etc. Mirrors the REPL behaviour
+        // so a script can preview a table's stats without the user
+        // hand-rolling a UNION ALL. `.read` inside a script is
+        // refused (would be recursive); use multiple `--file` flags
+        // or concatenate the scripts.
+        if let Some(parsed) = dotcommands::parse_dot_command(trimmed) {
+            match parsed {
+                Ok(dotcommands::DotCommand::Read { .. }) => {
+                    eprintln!(
+                        "[stmt {}] .read is not supported inside a script; use multiple --file flags",
+                        idx + 1
+                    );
+                    failures += 1;
+                    if stop_on_error {
+                        return Err(
+                            format!("aborted after statement {}", idx + 1).into()
+                        );
+                    }
+                }
+                Ok(cmd) => {
+                    handle_dot_command(cmd, client, &mut local_format, &mut timer_on).await;
+                }
+                Err(msg) => {
+                    eprintln!("[stmt {}] dot-command error: {msg}", idx + 1);
+                    failures += 1;
+                    if stop_on_error {
+                        return Err(format!("aborted after statement {}", idx + 1).into());
+                    }
+                }
+            }
+            continue;
+        }
+
         match client.execute(trimmed).await {
-            Ok(result) => display::print_query_result(&result, format),
+            Ok(result) => display::print_query_result(&result, &local_format),
             Err(e) => {
                 eprintln!("[stmt {}] error: {e}", idx + 1);
                 failures += 1;
@@ -447,6 +488,31 @@ async fn handle_dot_command(
             run_one(client, &q, format, *timer_on).await;
             false
         }
+        DotCommand::Summarize { table } => {
+            // Two-step: fetch (column_name, data_type) from the
+            // information schema, then build a UNION ALL of per-column
+            // aggregates and execute that against the same client.
+            let columns_query = dotcommands::build_schema_query(&table);
+            match client.execute(&columns_query).await {
+                Ok(result) => {
+                    let columns: Vec<(String, String)> = result
+                        .rows
+                        .iter()
+                        .filter_map(|row| {
+                            let name = row.first()?.clone();
+                            let data_type = row.get(1).cloned().unwrap_or_default();
+                            Some((name, data_type))
+                        })
+                        .collect();
+                    match dotcommands::build_summarize_query(&table, &columns) {
+                        Some(q) => run_one(client, &q, format, *timer_on).await,
+                        None => eprintln!("No columns found for table `{table}`."),
+                    }
+                }
+                Err(e) => eprintln!("Error fetching columns for `{table}`: {e}"),
+            }
+            false
+        }
         DotCommand::Catalogs => {
             let q = dotcommands::build_catalogs_query();
             run_one(client, q, format, *timer_on).await;
@@ -454,8 +520,16 @@ async fn handle_dot_command(
         }
         DotCommand::Read { path } => {
             // Reuse the same loop as `--file` so error handling and
-            // splitter rules stay in one place.
-            if let Err(e) = run_script(client, &path, format, false).await {
+            // splitter rules stay in one place. `run_script` now
+            // dispatches dot-commands itself, which means
+            // `handle_dot_command` -> `run_script` -> `handle_dot_command`
+            // is mutually recursive across an `async fn` boundary.
+            // Box::pin breaks the cycle so the compiler accepts it
+            // without requiring a generated state machine of unbounded
+            // size. Scripts that try to `.read` themselves are caught
+            // upstream in `run_script`.
+            let res = Box::pin(run_script(client, &path, format, false)).await;
+            if let Err(e) = res {
                 eprintln!("Error: {e}");
             }
             false
