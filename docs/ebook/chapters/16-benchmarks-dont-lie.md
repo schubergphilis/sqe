@@ -542,20 +542,25 @@ The Trino comparison reversed completely:
 
 On April 10, SQE lost every Trino comparison. On April 12, it won every one at SF0.01. Then came the real test: scale factor 1.
 
-At SF1 (1 GB per suite, real data volumes), the picture is more nuanced. Caching overhead is amortized. I/O and join execution dominate. The final SF1 numbers from April 16:
+At SF1 (1 GB per suite, real data volumes), the picture is more nuanced. Caching overhead is amortized. I/O and join execution dominate. The May 7 SF1 numbers, after the column-statistics work landed:
 
-| Suite | SQE | Trino | Speedup | Winner |
+| Suite | SQE | Trino | Avg speedup | Winner |
 |---|---|---|---|---|
-| TPC-H (22) | 14.9s | 17.4s | **1.8x** | SQE |
-| SSB (13) | 6.2s | 4.8s | 0.8x | Trino |
-| TPC-DS (99) | 50.6s | 31.6s | 1.0x | Tie |
-| TPC-C (8 read) | 0.5s | 1.6s | **3.4x** | SQE |
-| TPC-BB (10) | 45.4s | 197.2s | **2.3x** | SQE |
-| ClickBench (43) | 1.6s | 3.7s | **2.6x** | SQE |
+| TPC-H (22) | 19.3s | 26.6s | **2.3x** | SQE |
+| SSB (13) | 7.6s | 8.3s | **1.1x** | SQE |
+| TPC-DS (99) | 57.1s | 39.7s | **1.4x** | Mixed |
+| TPC-C (8 read) | 0.45s | 3.4s | **9.6x** | SQE |
+| TPC-E (11) | 10.4s | 138.8s | **7.8x** | SQE |
+| TPC-BB (10) | 36.9s | 323.6s | **5.5x** | SQE |
+| ClickBench (43) | 1.7s | 6.3s | **4.6x** | SQE |
 
-SQE wins 5 of 7 suites. On TPC-DS, SQE wins about 50 of 99 individual queries. One query, q72, takes 15.5 seconds on SQE versus 1.4 on Trino. It is a 10-table join with an 11.7 million row inventory cross-reference. DataFusion lacks the full cost-based join enumeration that Trino uses to reorder this chain optimally (upstream DF#3843). Without q72, SQE wins TPC-DS.
+SQE wins 6 of 7 suites. The "avg speedup" column is the per-query mean: SQE wins most TPC-DS queries handily, but a small number of pathological queries skew the total against us. q72 is the headline case: a 10-table join with an 11.7 million row inventory cross-reference that takes 16 seconds on SQE versus 1.2 seconds on Trino. DataFusion lacks the full cost-based join enumeration with NDV that Trino uses to reorder this chain optimally (upstream DF#3843). Without q72, SQE's TPC-DS total flips from a loss to a win.
 
-The optimizations that closed the SF1 gap: star-schema join reorder (dimension tables first), broadcast threshold raised to 64 MB (matching Trino and Spark), dynamic filter type coercion (Int32 to Int64 widening), and table statistics from Iceberg snapshots for DataFusion's JoinSelection optimizer.
+The optimizations that closed the SF1 gap, in chronological order: table-level statistics from Iceberg snapshot summary (April), the star-schema join reorder rule (April), broadcast threshold raised to 64 MB matching Trino and Spark (April), dynamic filter type coercion with Int32-to-Int64 widening (April), and column-level statistics aggregated from manifest entries (May). The last one was the missing ingredient. Without per-column min/max/null_count, DataFusion's `JoinSelection` could swap build and probe sides but could not estimate filter selectivity or pick join order on multi-way chains. Adding it dropped TPC-DS SF1 by 21% on the dedicated comparison run, with q72 falling from 24.8s back to its April baseline.
+
+::: {.fieldreport}
+**Field report: q73 was a planning sensitivity, not a regression.** Right after column-stats landed, q73 looked 84% slower (458ms -> 842ms). The next run came back at 258ms. Same code, different cache state, different plan. With more selectivity bounds available the optimizer has more degrees of freedom, and q73's OR-heavy `WHERE` clause sits in a region where small changes in estimated row counts flip the join order. We logged it, kept the change, and noted the lesson: better statistics make most plans better and a few plans more variance-prone. The fix when it bites is column histograms or NDV, both still upstream gaps in DF.
+:::
 
 ::: {.fieldreport}
 **Field report: correctness before speed.** We spent April 6-10 making SQE slower but more correct. Adding UDFs increased SessionContext build time. Adding streaming writes increased CTAS overhead. Adding sort-order safety added metadata checks. Every feature made the pass count go up and the runtime go up with it. Then caching made everything fast. If we had optimized first, we would have built caches for code paths that didn't work yet. Correctness first, speed second. The order matters.

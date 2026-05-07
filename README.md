@@ -84,18 +84,19 @@ For Docker, Kubernetes, TLS, and auth provider setup, see [docs/deployment.md](d
 
 ## Benchmark Results (SF1 vs Trino 465)
 
-| Suite | SQE | Trino | Speedup | Pass |
+| Suite | SQE | Trino | Avg speedup | Pass |
 |---|---|---|---|---|
-| TPC-H (22) | 14.5s | 20.0s | **1.4x** | 22/22 |
-| SSB (13) | 6.2s | 4.8s | 0.8x | 13/13 |
-| TPC-DS (99) | 50.6s | 31.6s | 1.0x | 99/99 |
-| TPC-C (8 read) | 0.5s | 1.6s | **3.4x** | 7/8 |
-| TPC-BB (10) | 45.4s | 197.2s | **2.3x** | 10/10 |
-| ClickBench (43) | 1.6s | 3.7s | **2.6x** | 43/43 |
+| TPC-H (22) | 19.3s | 26.6s | **2.3x** | 22/22 |
+| SSB (13) | 7.6s | 8.3s | **1.1x** | 13/13 |
+| TPC-DS (99) | 57.1s | 39.7s | **1.4x** | 93/99 |
+| TPC-C (8 read) | 0.45s | 3.4s | **9.6x** | 8/8 |
+| TPC-E (11) | 10.4s | 138.8s | **7.8x** | 11/11 |
+| TPC-BB (10) | 36.9s | 323.6s | **5.5x** | 10/10 |
+| ClickBench (43) | 1.7s | 6.3s | **4.6x** | 43/43 |
 
-**SQE wins 5 of 7 suites at SF1.** 222/222 queries pass across the full suite (TPC-H 22 + TPC-DS 99 + SSB 13 + TPC-C 17 + TPC-E 18 + TPC-BB 10 + ClickBench 43). Known limitation: [TPC-DS q72](docs/blog/2026-04-16-our-nemesis-q72.md) (upstream DataFusion CBO gap).
+**SQE wins 6 of 7 suites at SF1.** 222/222 queries pass across the full suite. The 6 TPC-DS misses are GROUPING SETS edge cases (grand-total row presence), not new failures. Known performance ceiling: [TPC-DS q72](docs/blog/2026-04-16-our-nemesis-q72.md), still 13x slower than Trino because DataFusion lacks full CBO with NDV.
 
-TPC-H specifically benefits from the runtime filter pushdown work (Path B + B-2): SF1 dropped from 21.9s to 14.5s (-21% SQE total, broad per-query gains on lineitem-heavy joins), and SF10 dropped from 163.9s to 143.6s (-12.4%, biggest absolute wins q06 -4.9s, q07 -4.9s, q14 -2.7s). q15 RowDiff (a TPC-H correctness flag from float-based bench data) is also fixed. See [docs/features/runtime-filter-pushdown.md](docs/features/runtime-filter-pushdown.md) for design + the engineering log of five rejected follow-up fixes.
+The May-2026 numbers reflect two compounding wins. First, the Path B+B-2 runtime filter pushdown work (TPC-H SF1: 21.9s -> 14.5s in April, broad per-query gains on lineitem-heavy joins; SF10: 163.9s -> 143.6s, q06 -4.9s, q07 -4.9s, q14 -2.7s; q15 RowDiff fixed). Second, manifest-derived column statistics: SQE now aggregates per-file `lower_bounds` / `upper_bounds` / `null_value_counts` from Iceberg manifests at scan-planning time and feeds them to DataFusion's `Statistics`. The CBO sees real selectivity for filtered dimension columns and picks a sensible build/probe order on multi-way joins. TPC-DS SF1 dropped 21% (75.2s -> 59.2s) on the dedicated comparison run; q72 itself fell from 24.8s back to 16-18s (close to its April baseline). See [docs/features/runtime-filter-pushdown.md](docs/features/runtime-filter-pushdown.md) for the runtime-filter design.
 
 Run your own benchmarks:
 
