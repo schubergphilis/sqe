@@ -60,6 +60,35 @@ impl SessionManager {
         }
     }
 
+    /// Create a `SessionManager` that authenticates via a pluggable provider
+    /// (typically an [`AuthChain`]) but keeps the legacy [`Authenticator`]
+    /// around for the username/password token cache lookup path in
+    /// [`Self::get_session`].
+    ///
+    /// This is the production wiring when `[[auth.providers]]` is non-empty:
+    /// the chain handles `bearer_token`, `client_credentials`, `mtls`, etc.
+    /// and the same `Authenticator` instance whose `start_refresh_task` is
+    /// already running stays attached so legacy username/password sessions
+    /// continue to refresh in the background.
+    ///
+    /// Without this constructor the Flight SQL handshake path (which routes
+    /// through `auth_provider.authenticate`) sees only the legacy
+    /// `Authenticator` and rejects every bearer-only credential as
+    /// `NotMyCredentials` — even when the user's config declares a
+    /// `bearer_token` provider that the Trino-compat HTTP path uses
+    /// successfully.
+    pub fn with_provider_and_legacy(
+        provider: Arc<dyn AuthProvider>,
+        legacy_authenticator: Arc<Authenticator>,
+    ) -> Self {
+        Self {
+            auth_provider: provider,
+            legacy_authenticator: Some(legacy_authenticator),
+            sessions: DashMap::new(),
+            metrics: None,
+        }
+    }
+
     /// Attach Prometheus metrics registry for tracking token refresh events.
     pub fn with_metrics(mut self, metrics: Arc<sqe_metrics::MetricsRegistry>) -> Self {
         self.metrics = Some(metrics);
@@ -694,5 +723,143 @@ mod tests {
         let removed = manager.sweep_expired_sessions(large_timeout, large_timeout);
         assert_eq!(removed, 0, "No active sessions should be swept");
         assert_eq!(manager.sessions.len(), 10, "All sessions should survive the sweep");
+    }
+
+    // -----------------------------------------------------------------------
+    // Bug regression: Flight SQL bearer-only auth via the production wiring.
+    //
+    // Before the fix, `SessionManager::new(authenticator)` was the only
+    // constructor used in production. The legacy `Authenticator` answers
+    // `NotMyCredentials` for bearer-only credentials, and that error
+    // surfaced to Flight clients as
+    //
+    //   "Authentication failed: credentials not handled by this provider"
+    //
+    // even when the user's config declared a `bearer_token` provider that
+    // the Trino HTTP path was happily using. The fix routes the chain
+    // (built once via `build_auth_chain`) into `SessionManager` via
+    // `with_provider_and_legacy`. These tests lock the contract.
+    // -----------------------------------------------------------------------
+
+    /// A fake bearer provider that mirrors `BearerTokenProvider`'s contract
+    /// (NotMyCredentials when `bearer_token` is empty, Ok(Identity) when
+    /// it is non-empty) without any JWKS network calls.
+    struct StubBearerProvider {
+        user_id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl AuthProvider for StubBearerProvider {
+        async fn authenticate(
+            &self,
+            credentials: &FlightCredentials,
+        ) -> Result<Identity, sqe_auth::AuthError> {
+            match &credentials.bearer_token {
+                Some(t) if !t.is_empty() => Ok(Identity {
+                    user_id: self.user_id.clone(),
+                    display_name: self.user_id.clone(),
+                    roles: vec!["analyst".to_string()],
+                    catalog_token: Some(t.clone()),
+                    refresh_token: None,
+                }),
+                _ => Err(sqe_auth::AuthError::NotMyCredentials),
+            }
+        }
+    }
+
+    /// Reproduce the Flight bearer-only path against a chain that mirrors
+    /// the user's two-provider config (`oidc_password` first, `bearer_token`
+    /// second). The chain falls through to the bearer provider and the
+    /// session is created. Without `with_provider_and_legacy` this test
+    /// would not even compile; it locks the fix in place.
+    #[tokio::test]
+    async fn flight_bearer_only_auth_succeeds_with_chain_wiring() {
+        use sqe_auth::AuthChain;
+
+        let legacy = make_authenticator().await;
+
+        // Chain order matches the buggy config in the user report: the
+        // username/password provider sits first.
+        let chain = AuthChain::new(vec![
+            // The legacy Authenticator demands username + password; treat
+            // it as the `oidc_password` slot.
+            Arc::clone(&legacy) as Arc<dyn AuthProvider>,
+            Arc::new(StubBearerProvider {
+                user_id: "alice".to_string(),
+            }),
+        ]);
+
+        let manager = SessionManager::with_provider_and_legacy(
+            Arc::new(chain),
+            Arc::clone(&legacy),
+        );
+
+        let creds = FlightCredentials {
+            bearer_token: Some("eyJtest.payload.sig".to_string()),
+            ..Default::default()
+        };
+
+        let session = manager
+            .authenticate_credentials(&creds)
+            .await
+            .expect("chain wiring must let bearer-only credentials through");
+
+        assert_eq!(session.user.username, "alice");
+        assert_eq!(session.access_token, "eyJtest.payload.sig");
+    }
+
+    /// Negative control: the legacy single-Authenticator wiring (the
+    /// production wiring in main.rs / sqe_server.rs before this fix)
+    /// rejects bearer-only credentials with the user-reported error
+    /// string. Documents the bug and prevents accidental regression.
+    #[tokio::test]
+    async fn flight_bearer_only_auth_fails_with_legacy_wiring() {
+        let legacy = make_authenticator().await;
+        let manager = SessionManager::new(legacy);
+
+        let creds = FlightCredentials {
+            bearer_token: Some("eyJtest.payload.sig".to_string()),
+            ..Default::default()
+        };
+
+        let result = manager.authenticate_credentials(&creds).await;
+        let err = result.expect_err("legacy wiring must reject bearer-only");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("credentials not handled by this provider"),
+            "expected the documented bug error string, got: {msg}"
+        );
+    }
+
+    /// Workaround for users on builds that predate this fix: putting
+    /// `bearer_token` first in the chain. Verify the fix preserves the
+    /// workaround so reordering still works once users adopt the fix.
+    #[tokio::test]
+    async fn bearer_first_chain_order_also_works() {
+        use sqe_auth::AuthChain;
+
+        let legacy = make_authenticator().await;
+        let chain = AuthChain::new(vec![
+            Arc::new(StubBearerProvider {
+                user_id: "alice".to_string(),
+            }),
+            Arc::clone(&legacy) as Arc<dyn AuthProvider>,
+        ]);
+
+        let manager = SessionManager::with_provider_and_legacy(
+            Arc::new(chain),
+            Arc::clone(&legacy),
+        );
+
+        let creds = FlightCredentials {
+            bearer_token: Some("eyJtest.payload.sig".to_string()),
+            ..Default::default()
+        };
+
+        let session = manager
+            .authenticate_credentials(&creds)
+            .await
+            .expect("bearer-first chain order must also succeed");
+        assert_eq!(session.user.username, "alice");
     }
 }

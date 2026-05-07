@@ -316,4 +316,135 @@ mod tests {
         assert_eq!(one.len(), 1);
         assert!(!one.is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // Bug regression: bearer-only credentials must skip a username/password
+    // provider sitting first in the chain.
+    //
+    // The user's hypothesis was that NotMyCredentials is being converted to
+    // AuthFailed somewhere in the chain. This test proves the chain control
+    // flow itself is correct: a provider that demands username + password
+    // must return NotMyCredentials for bearer-only credentials, and the
+    // chain must continue to the next provider.
+    // -----------------------------------------------------------------------
+
+    /// A provider that requires `username` + `password`, returning
+    /// `NotMyCredentials` when either is missing. Mirrors the real
+    /// `OidcPasswordProvider` and the legacy `Authenticator::authenticate`
+    /// shape so this regression test covers the exact production case
+    /// without making any network calls.
+    struct UsernamePasswordOnlyProvider;
+
+    #[async_trait]
+    impl AuthProvider for UsernamePasswordOnlyProvider {
+        async fn authenticate(
+            &self,
+            credentials: &FlightCredentials,
+        ) -> Result<Identity, AuthError> {
+            match (&credentials.username, &credentials.password) {
+                (Some(u), Some(p)) if !u.is_empty() && !p.is_empty() => Ok(Identity {
+                    user_id: u.clone(),
+                    display_name: u.clone(),
+                    roles: vec!["user".to_string()],
+                    catalog_token: Some(p.clone()),
+                    refresh_token: None,
+                }),
+                _ => Err(AuthError::NotMyCredentials),
+            }
+        }
+    }
+
+    /// A provider that accepts any non-empty `bearer_token`. Mirrors the
+    /// detect-and-validate shape of `BearerTokenProvider` without doing
+    /// JWKS network calls.
+    struct BearerOnlyProvider;
+
+    #[async_trait]
+    impl AuthProvider for BearerOnlyProvider {
+        async fn authenticate(
+            &self,
+            credentials: &FlightCredentials,
+        ) -> Result<Identity, AuthError> {
+            match &credentials.bearer_token {
+                Some(t) if !t.is_empty() => Ok(Identity {
+                    user_id: "bearer-user".to_string(),
+                    display_name: "bearer-user".to_string(),
+                    roles: vec!["api".to_string()],
+                    catalog_token: Some(t.clone()),
+                    refresh_token: None,
+                }),
+                _ => Err(AuthError::NotMyCredentials),
+            }
+        }
+    }
+
+    /// The user's reported scenario: Flight SQL hands the chain a JWT in
+    /// `bearer_token` only (no username, no password). The chain must skip
+    /// the OIDC password provider that sits first and let the bearer
+    /// provider succeed.
+    #[tokio::test]
+    async fn chain_bearer_only_credentials_skip_oidc_password_first() {
+        let chain = AuthChain::new(vec![
+            Arc::new(UsernamePasswordOnlyProvider),
+            Arc::new(BearerOnlyProvider),
+        ]);
+
+        let creds = FlightCredentials {
+            bearer_token: Some("eyJtest.payload.sig".to_string()),
+            ..Default::default()
+        };
+
+        let identity = chain
+            .authenticate(&creds)
+            .await
+            .expect("chain must fall through to bearer provider");
+        assert_eq!(identity.user_id, "bearer-user");
+        assert_eq!(identity.catalog_token.as_deref(), Some("eyJtest.payload.sig"));
+    }
+
+    /// Documented workaround: putting `bearer_token` before `oidc_password`
+    /// in the provider chain. The bearer provider sees the JWT first and
+    /// succeeds without ever consulting the username/password provider.
+    /// Lock the contract so users on older builds know the workaround
+    /// stays viable.
+    #[tokio::test]
+    async fn chain_bearer_first_workaround_succeeds() {
+        let chain = AuthChain::new(vec![
+            Arc::new(BearerOnlyProvider),
+            Arc::new(UsernamePasswordOnlyProvider),
+        ]);
+
+        let creds = FlightCredentials {
+            bearer_token: Some("eyJtest.payload.sig".to_string()),
+            ..Default::default()
+        };
+
+        let identity = chain
+            .authenticate(&creds)
+            .await
+            .expect("bearer-first chain must succeed on bearer credentials");
+        assert_eq!(identity.user_id, "bearer-user");
+    }
+
+    /// Username/password credentials still work after the bearer-first
+    /// workaround: bearer skips, oidc_password handles.
+    #[tokio::test]
+    async fn chain_bearer_first_falls_through_for_username_password() {
+        let chain = AuthChain::new(vec![
+            Arc::new(BearerOnlyProvider),
+            Arc::new(UsernamePasswordOnlyProvider),
+        ]);
+
+        let creds = FlightCredentials {
+            username: Some("alice".to_string()),
+            password: Some("secret".to_string()),
+            ..Default::default()
+        };
+
+        let identity = chain
+            .authenticate(&creds)
+            .await
+            .expect("chain must fall through bearer to oidc_password");
+        assert_eq!(identity.user_id, "alice");
+    }
 }

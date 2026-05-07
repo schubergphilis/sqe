@@ -354,7 +354,21 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     let authenticator = Arc::new(sqe_auth::Authenticator::new(&config.auth).await?);
     authenticator.start_refresh_task();
 
-    let session_manager = Arc::new(SessionManager::new(authenticator.clone()));
+    // Build the auth provider chain from `[[auth.providers]]`. Both Flight
+    // SQL (via SessionManager) and the Trino-compat HTTP path use the
+    // same chain so the two endpoints accept the same set of credentials.
+    // For configs without `[[auth.providers]]` the chain wraps the legacy
+    // Authenticator and behaviour is unchanged.
+    let auth_chain: Arc<dyn sqe_auth::AuthProvider> =
+        Arc::new(sqe_auth::build_auth_chain(&config.auth).await?);
+
+    // SessionManager authenticates new Flight SQL requests through the
+    // chain; the legacy Authenticator stays attached so its background
+    // refresh task continues to keep username/password tokens current.
+    let session_manager = Arc::new(SessionManager::with_provider_and_legacy(
+        Arc::clone(&auth_chain),
+        authenticator.clone(),
+    ));
 
     // Policy
     let policy_enforcer: Arc<dyn sqe_policy::PolicyEnforcer> =
@@ -579,22 +593,11 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         metrics.clone(),
     );
 
-    // Build bearer token auth chain for Trino-compat HTTP bearer token validation.
+    // Bearer auth chain for the Trino-compat HTTP path. Reuses the same
+    // chain instance the Flight SQL path uses so both endpoints accept
+    // the same credentials with identical provider behaviour.
     let bearer_provider: Option<Arc<dyn sqe_auth::AuthProvider>> =
-        match sqe_auth::build_auth_chain(&config.auth).await {
-            Ok(chain) => {
-                tracing::info!("Bearer token auth chain built for Trino-compat endpoint");
-                Some(Arc::new(chain))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "Failed to build bearer auth chain; bearer token auth will be disabled \
-                     for Trino-compat"
-                );
-                None
-            }
-        };
+        Some(Arc::clone(&auth_chain));
 
     // Construct OAuth2 external auth state from [auth.external] config (if present).
     let oauth2_state: Option<Arc<sqe_trino_compat::oauth2::OAuth2State>> =
