@@ -1,7 +1,9 @@
 mod client;
 mod display;
+mod embedded;
 mod flight;
 mod http;
+mod script;
 
 use clap::{Parser, ValueEnum};
 use client::SqlClient;
@@ -44,6 +46,31 @@ struct Cli {
     /// Accept invalid TLS certificates (insecure, use for development only)
     #[arg(long, default_value_t = false)]
     insecure: bool,
+
+    /// Run an in-process engine instead of connecting to a remote
+    /// coordinator. No auth, no Polaris, no network listeners. The
+    /// `read_parquet(...)` TVF lets you query files directly.
+    #[arg(long, default_value_t = false)]
+    embedded: bool,
+
+    /// Per-process query memory limit when running embedded. Accepts
+    /// suffixes (`512MB`, `2GB`, ...). Floored to 64MB. Ignored
+    /// unless `--embedded` is set.
+    #[arg(long, default_value = "1GB")]
+    memory_limit: String,
+
+    /// Read SQL statements from a file and execute them in order.
+    /// Statements are separated by `;`. When combined with
+    /// `-e/--execute`, the script runs first and the `-e` query
+    /// follows. (No short alias because `-f` is already taken by
+    /// `--format`.)
+    #[arg(long)]
+    file: Option<std::path::PathBuf>,
+
+    /// On `-f`, abort on the first failing statement. By default
+    /// errors are printed and execution continues.
+    #[arg(long, default_value_t = false)]
+    stop_on_error: bool,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -93,7 +120,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let scheme = if cli.tls { "https" } else { "http" };
 
-    let mut client: Box<dyn SqlClient> = if let Some(ref token) = cli.token {
+    let mut client: Box<dyn SqlClient> = if cli.embedded {
+        let limit = sqe_core::parse_memory_limit(&cli.memory_limit).unwrap_or(1024 * 1024 * 1024);
+        let client = embedded::EmbeddedClient::new(limit)?;
+        eprintln!(
+            "sqe-cli {} embedded engine ({} memory pool)",
+            sqe_core::VERSION,
+            cli.memory_limit
+        );
+        Box::new(client)
+    } else if let Some(ref token) = cli.token {
         // Token-based auth: skip username/password
         match cli.protocol {
             Protocol::Flight => {
@@ -132,24 +168,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let proto_label = match cli.protocol {
-        Protocol::Flight => "flight",
-        Protocol::Http => "http",
-    };
-    eprintln!(
-        "sqe-cli {} connected to {scheme}://{}:{} ({proto_label})",
-        sqe_core::VERSION,
-        cli.host,
-        cli.port
-    );
+    if !cli.embedded {
+        let proto_label = match cli.protocol {
+            Protocol::Flight => "flight",
+            Protocol::Http => "http",
+        };
+        eprintln!(
+            "sqe-cli {} connected to {scheme}://{}:{} ({proto_label})",
+            sqe_core::VERSION,
+            cli.host,
+            cli.port
+        );
+    }
+
+    // Script file runs first, then -e, then REPL falls through if neither
+    // returns non-interactive.
+    let mut ran_non_interactive = false;
+    if let Some(ref path) = cli.file {
+        run_script(client.as_mut(), path, &cli.format, cli.stop_on_error).await?;
+        ran_non_interactive = true;
+    }
 
     if let Some(sql) = cli.execute {
         let result = client.execute(&sql).await?;
         display::print_query_result(&result, &cli.format);
+        ran_non_interactive = true;
+    }
+
+    if ran_non_interactive {
         return Ok(());
     }
 
     repl(client.as_mut(), cli.format).await
+}
+
+/// Read a SQL script from `path`, split on top-level `;`, and execute
+/// statements in order. With `stop_on_error = false` (the default),
+/// errors are printed to stderr and execution continues to the next
+/// statement.
+async fn run_script(
+    client: &mut dyn SqlClient,
+    path: &std::path::Path,
+    format: &OutputFormat,
+    stop_on_error: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+
+    let mut failures = 0usize;
+    for (idx, stmt) in script::split_statements(&contents).into_iter().enumerate() {
+        let trimmed = stmt.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match client.execute(trimmed).await {
+            Ok(result) => display::print_query_result(&result, format),
+            Err(e) => {
+                eprintln!("[stmt {}] error: {e}", idx + 1);
+                failures += 1;
+                if stop_on_error {
+                    return Err(format!("aborted after statement {}", idx + 1).into());
+                }
+            }
+        }
+    }
+    if failures > 0 && !stop_on_error {
+        eprintln!("{failures} statement(s) failed; continued because --stop-on-error not set");
+    }
+    Ok(())
 }
 
 async fn repl(

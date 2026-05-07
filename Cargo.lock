@@ -6151,6 +6151,7 @@ dependencies = [
 name = "sqe-cli"
 version = "0.15.0"
 dependencies = [
+ "anyhow",
  "arrow",
  "arrow-array",
  "arrow-flight",
@@ -6159,6 +6160,8 @@ dependencies = [
  "base64",
  "bytes",
  "clap",
+ "datafusion",
+ "datafusion-functions-json",
  "futures",
  "prost",
  "reqwest",
@@ -6166,7 +6169,10 @@ dependencies = [
  "rustyline",
  "serde",
  "serde_json",
+ "sqe-catalog",
  "sqe-core",
+ "sqe-policy",
+ "sqe-trino-functions",
  "tokio",
  "tonic",
  "url",

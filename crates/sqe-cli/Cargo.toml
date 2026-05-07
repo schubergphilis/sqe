@@ -9,10 +9,15 @@ path = "src/main.rs"
 
 [dependencies]
 sqe-core = { path = "../sqe-core" }
+sqe-catalog = { path = "../sqe-catalog" }
+sqe-trino-functions = { path = "../sqe-trino-functions" }
+sqe-policy = { path = "../sqe-policy" }
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
+datafusion = { workspace = true }
+datafusion-functions-json = { workspace = true }
 tonic = { workspace = true, features = ["transport", "tls-native-roots"] }
 tokio = { workspace = true }
 futures = { workspace = true }
@@ -27,3 +32,4 @@ rpassword = "7"
 reqwest = { workspace = true }
 url = { workspace = true }
 async-trait = { workspace = true }
+anyhow = { workspace = true }
