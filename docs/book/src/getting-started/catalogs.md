@@ -93,6 +93,70 @@ Each catalog uses its own backend dispatch path (REST + bearer token, native AWS
 
 The legacy single-catalog form (the `[catalog]` block alone, no `[catalogs.*]`) keeps working unchanged. Existing deployments need no migration.
 
+### Per-catalog auth and storage
+
+Each catalog can override the global session bearer token and the global S3 credentials via optional `[catalogs.<name>.auth]` and `[catalogs.<name>.storage]` blocks. Federation across organisations becomes a config change rather than a separate deployment.
+
+```toml
+# Default Polaris uses the user's session token (V6 behaviour).
+[catalogs.polaris]
+catalog_url = "http://polaris:8181/api/catalog"
+warehouse = "main"
+[catalogs.polaris.backend]
+type = "rest"
+
+# A partner Polaris uses its own OAuth client and S3 bucket.
+[catalogs.partner]
+catalog_url = "https://partner.com/iceberg"
+warehouse = "shared"
+[catalogs.partner.backend]
+type = "rest"
+[catalogs.partner.auth]
+type = "client_credentials"
+token_endpoint = "https://partner.com/oauth/tokens"
+client_id = "sqe-partner"
+client_secret = "..."   # use env override SQE__catalogs__partner__auth__client_secret
+[catalogs.partner.storage]
+s3_endpoint = "https://partner-s3.example.com"
+s3_region = "us-east-1"
+s3_access_key = "..."
+s3_secret_key = "..."
+
+# A public Nessie endpoint we read anonymously.
+[catalogs.public_archive]
+catalog_url = "https://nessie.public.example.com/iceberg"
+warehouse = "public"
+[catalogs.public_archive.backend]
+type = "rest"
+[catalogs.public_archive.auth]
+type = "anonymous"
+
+# AWS Glue lets the AWS SDK provider chain handle auth.
+[catalogs.aws_glue]
+[catalogs.aws_glue.backend]
+type = "glue"
+region = "eu-central-1"
+warehouse = "s3://wh/"
+[catalogs.aws_glue.auth]
+type = "aws"
+```
+
+#### `[catalogs.<name>.auth].type` values
+
+| `type` | What it does | When to use |
+|---|---|---|
+| `session_bearer` (default) | Pass the user's session bearer token through unchanged | One OIDC provider fronts every Iceberg REST endpoint (the common case) |
+| `client_credentials` | Cluster-level OAuth2 `client_credentials` grant against the catalog's own token endpoint | Federation with a partner Iceberg REST that has its own OAuth |
+| `anonymous` | No `Authorization` header | Public read-only Nessie or Polaris |
+| `static` | Pre-issued bearer token | Internal gateway with a fixed key, integration tests |
+| `aws` | AWS SDK provider chain | Glue / S3 Tables native backends, AWS REST endpoints with SigV4 |
+
+#### `[catalogs.<name>.storage]` overrides
+
+The block accepts the same keys as the top-level `[storage]` block: `s3_endpoint`, `s3_region`, `s3_access_key`, `s3_secret_key`, `s3_path_style`, `s3_allow_http`. Iceberg credential vending from REST catalogs still wins per-table over both this and the global block, so you only need to fill out per-catalog storage when the catalog does not vend credentials (Hadoop, raw Iceberg over Ceph, etc.) or when the underlying buckets live behind different S3 endpoints.
+
+Today storage overrides apply at scan / write time. The `client_credentials` token is fetched once at session-build time and reused for the session lifetime; refresh-on-expiry is a future change.
+
 ## REST: Polaris, Nessie, Unity OSS, AWS Glue REST, AWS S3 Tables REST
 
 The default. Most production deployments speak Iceberg REST.
