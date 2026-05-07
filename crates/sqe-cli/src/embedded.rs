@@ -142,7 +142,13 @@ pub fn build_embedded_context(memory_limit_bytes: usize) -> anyhow::Result<Sessi
         .build_arc()
         .map_err(|e| anyhow::anyhow!("failed to build runtime env: {e}"))?;
 
-    let mut ctx = SessionContext::new_with_config_rt(session_config, runtime);
+    let ctx = SessionContext::new_with_config_rt(session_config, runtime);
+
+    // V8: enable `SELECT * FROM 'file.parquet'` auto-detection. The wrapped
+    // catalog list resolves quoted-string table names against
+    // ListingTableFactory by extension (parquet / csv / json / avro).
+    let ctx = ctx.enable_url_table();
+    let mut ctx = ctx;
 
     // Scalar UDFs.
     ctx.register_udf(sqe_policy::sha256_udf::sha256_udf());
@@ -158,13 +164,25 @@ pub fn build_embedded_context(memory_limit_bytes: usize) -> anyhow::Result<Sessi
     datafusion_functions_json::register_all(&mut ctx)
         .map_err(|e| anyhow::anyhow!("failed to register JSON functions: {e}"))?;
 
-    // `read_parquet(path, ...)` TVF for direct file access. Embedded
-    // mode passes a default `StorageConfig` so users can still hit S3
-    // by supplying inline credentials in the TVF call. Filesystem
-    // paths work without any storage config.
+    // File-format TVFs for direct file access. Embedded mode passes a
+    // default `StorageConfig` so users can still hit S3 by supplying inline
+    // credentials in the TVF call. Filesystem paths work without any storage
+    // config.
     ctx.register_udtf(
         "read_parquet",
         Arc::new(sqe_catalog::read_parquet::ReadParquetFunction::new(
+            StorageConfig::default(),
+        )),
+    );
+    ctx.register_udtf(
+        "read_csv",
+        Arc::new(sqe_catalog::read_csv::ReadCsvFunction::new(
+            StorageConfig::default(),
+        )),
+    );
+    ctx.register_udtf(
+        "read_json",
+        Arc::new(sqe_catalog::read_json::ReadJsonFunction::new(
             StorageConfig::default(),
         )),
     );
@@ -307,7 +325,9 @@ pub struct EmbeddedClient {
 impl EmbeddedClient {
     /// Build a memory-only embedded client. Sufficient for ad-hoc
     /// `read_parquet` queries; `CREATE TABLE` lives only for the
-    /// session.
+    /// session. Used by tests; production paths go through
+    /// [`Self::with_warehouse`].
+    #[allow(dead_code)]
     pub fn new(memory_limit_bytes: usize) -> anyhow::Result<Self> {
         Ok(Self {
             ctx: build_embedded_context(memory_limit_bytes)?,
@@ -646,5 +666,140 @@ mod tests {
         // Sanity: the session works.
         let r = c.execute("SELECT 1").await.expect("query");
         assert_eq!(r.rows, vec![vec!["1".to_string()]]);
+    }
+
+    /// V8: `read_csv()` round-trips a local CSV file. The TVF wraps a
+    /// `ListingTable` over `CsvFormat` and the embedded mode passes the
+    /// default `StorageConfig`, so filesystem paths just work.
+    /// Multi-thread flavor required: schema inference uses `block_in_place`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_csv_tvf_local_file() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("data.csv");
+        let mut f = std::fs::File::create(&path).expect("create csv");
+        writeln!(f, "id,name").expect("header");
+        writeln!(f, "1,alice").expect("row1");
+        writeln!(f, "2,bob").expect("row2");
+        drop(f);
+
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
+        let sql = format!(
+            "SELECT count(*) AS n FROM read_csv('{}')",
+            path.display()
+        );
+        let result = client.execute(&sql).await.expect("query");
+        assert_eq!(result.columns, vec!["n".to_string()]);
+        assert_eq!(result.rows, vec![vec!["2".to_string()]]);
+    }
+
+    /// V8: `read_json()` over an NDJSON file. Each line is one record;
+    /// schema inference picks both columns up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_json_tvf_local_file() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("events.json");
+        let mut f = std::fs::File::create(&path).expect("create json");
+        writeln!(f, "{{\"id\": 1, \"name\": \"alice\"}}").expect("row1");
+        writeln!(f, "{{\"id\": 2, \"name\": \"bob\"}}").expect("row2");
+        drop(f);
+
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
+        let sql = format!(
+            "SELECT count(*) AS n FROM read_json('{}')",
+            path.display()
+        );
+        let result = client.execute(&sql).await.expect("query");
+        assert_eq!(result.rows, vec![vec!["2".to_string()]]);
+    }
+
+    /// V8: `SELECT * FROM 'file.csv'` auto-detect via DataFusion's
+    /// `enable_url_table()`. The `DynamicFileCatalog` resolves the
+    /// quoted-string table name against `ListingTableFactory`, picking
+    /// `CsvFormat` from the `.csv` extension.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn select_from_quoted_csv_path_auto_detects() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("auto.csv");
+        let mut f = std::fs::File::create(&path).expect("create csv");
+        writeln!(f, "x").expect("header");
+        writeln!(f, "10").expect("row1");
+        writeln!(f, "20").expect("row2");
+        writeln!(f, "30").expect("row3");
+        drop(f);
+
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
+        let sql = format!("SELECT count(*) AS n FROM '{}'", path.display());
+        let result = client.execute(&sql).await.expect("query");
+        assert_eq!(result.rows, vec![vec!["3".to_string()]]);
+    }
+
+    /// V8: `COPY (SELECT ...) TO 'file.parquet'` writes a Parquet file via
+    /// DataFusion's native `CopyTo` planner node. Round-trip via
+    /// `read_parquet()` proves the data lands and the format is correct.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copy_to_parquet_round_trip() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("out.parquet");
+
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
+        let copy_sql = format!(
+            "COPY (SELECT 1 AS x, 'a' AS y UNION ALL SELECT 2, 'b') TO '{}'",
+            path.display()
+        );
+        client.execute(&copy_sql).await.expect("copy");
+
+        let count_sql = format!(
+            "SELECT count(*) AS n FROM read_parquet('{}')",
+            path.display()
+        );
+        let result = client.execute(&count_sql).await.expect("read");
+        assert_eq!(result.rows, vec![vec!["2".to_string()]]);
+    }
+
+    /// V8: `COPY ... TO 'file.csv'` writes CSV. Round-trip via `read_csv()`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copy_to_csv_round_trip() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("out.csv");
+
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
+        let copy_sql = format!(
+            "COPY (SELECT 1 AS x, 'a' AS y UNION ALL SELECT 2, 'b') TO '{}'",
+            path.display()
+        );
+        client.execute(&copy_sql).await.expect("copy");
+
+        let count_sql = format!(
+            "SELECT count(*) AS n FROM read_csv('{}')",
+            path.display()
+        );
+        let result = client.execute(&count_sql).await.expect("read");
+        assert_eq!(result.rows, vec![vec!["2".to_string()]]);
+    }
+
+    /// V8: `read_csv()` honours the `delimiter` named argument. We use `;`
+    /// as the separator (tab characters round-trip through the DataFusion
+    /// SQL parser awkwardly).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_csv_tvf_custom_delimiter() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("semi.csv");
+        let mut f = std::fs::File::create(&path).expect("create csv");
+        writeln!(f, "id;name").expect("header");
+        writeln!(f, "1;alice").expect("row1");
+        writeln!(f, "2;bob").expect("row2");
+        drop(f);
+
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
+        let sql = format!(
+            "SELECT count(*) AS n FROM read_csv('{}', delimiter => ';')",
+            path.display()
+        );
+        let result = client.execute(&sql).await.expect("query");
+        assert_eq!(result.rows, vec![vec!["2".to_string()]]);
     }
 }
