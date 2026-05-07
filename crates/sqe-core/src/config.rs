@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -6,7 +8,21 @@ pub struct SqeConfig {
     #[serde(default)]
     pub worker: WorkerConfig,
     pub auth: AuthConfig,
+    /// Legacy single-catalog block. Always present for backwards
+    /// compatibility. Operators starting fresh should usually use
+    /// `[catalogs.NAME]` blocks instead and leave `[catalog]` minimal
+    /// (a placeholder REST URL satisfies the deserializer; flatten
+    /// drops it when `catalogs` is non-empty and the operator hasn't
+    /// named the legacy block via `default_catalog`).
     pub catalog: CatalogConfig,
+    /// Named catalog map. Each entry is a full `CatalogConfig`,
+    /// including its own `[catalogs.<name>.backend]` block, so you
+    /// can attach Polaris alongside Nessie, AWS Glue, S3 Tables, HMS,
+    /// JDBC, or Hadoop in the same coordinator. The map is keyed
+    /// by the SQL identifier the catalog is exposed as. Empty
+    /// (the default) means "use the legacy `[catalog]` block only".
+    #[serde(default)]
+    pub catalogs: HashMap<String, CatalogConfig>,
     #[serde(default)]
     pub storage: StorageConfig,
     #[serde(default)]
@@ -55,6 +71,15 @@ impl SortMode {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct QueryConfig {
+    /// Default catalog for unqualified SQL identifiers. When unset
+    /// (the common case), SQE picks `iceberg` if the legacy
+    /// `[catalog]` block is the sole catalog, otherwise the first
+    /// alphabetically-sorted name from `[catalogs.*]`. Set this
+    /// when you've named the legacy `[catalog]` block via the
+    /// flattened name (see `SqeConfig::flattened_catalogs`) and want
+    /// it to be the default rather than the alphabetic winner.
+    #[serde(default)]
+    pub default_catalog: Option<String>,
     /// Maximum query execution time in seconds. Default: 300 (5 minutes).
     #[serde(default = "default_query_timeout")]
     pub timeout_secs: u64,
@@ -127,6 +152,7 @@ pub struct QueryConfig {
 impl Default for QueryConfig {
     fn default() -> Self {
         Self {
+            default_catalog: None,
             timeout_secs: default_query_timeout(),
             role_overrides: std::collections::HashMap::new(),
             max_result_rows: default_max_result_rows(),
@@ -994,6 +1020,91 @@ fn default_per_user_rpm() -> u32 { 60 }
 fn default_global_rpm() -> u32 { 1000 }
 
 impl SqeConfig {
+    /// Default name for the legacy `[catalog]` block when the new
+    /// `[catalogs.*]` map is also populated. Picked to match what
+    /// embedded mode (`sqe-cli --warehouse <path>`) calls its
+    /// single catalog so users moving between embedded and cluster
+    /// see the same SQL identifier.
+    pub const LEGACY_CATALOG_NAME: &'static str = "iceberg";
+
+    /// Flatten the legacy `[catalog]` block plus the `[catalogs.*]`
+    /// map into a single ordered list of named catalogs. Order is
+    /// stable: legacy block first if it's the only one, otherwise
+    /// `[catalogs.*]` entries in alphabetical order, with the legacy
+    /// block joining only when explicitly named via
+    /// `query.default_catalog == Self::LEGACY_CATALOG_NAME` or when
+    /// `[catalogs.*]` is empty.
+    ///
+    /// Practical outcomes:
+    /// - Legacy single-catalog config: returns one entry,
+    ///   `("iceberg", &self.catalog)`.
+    /// - Pure new-style config (only `[catalogs.*]` set, no
+    ///   `default_catalog`): returns the named catalogs sorted by
+    ///   name. The legacy `[catalog]` block exists in the struct but
+    ///   is dropped — operators set it to a placeholder REST URL to
+    ///   satisfy the deserializer and the runtime ignores it.
+    /// - Mixed (`[catalogs.*]` populated AND `default_catalog =
+    ///   "iceberg"`): legacy block joins under name "iceberg",
+    ///   alongside the named entries.
+    ///
+    /// The returned `&CatalogConfig` references borrow from `self`,
+    /// so the caller doesn't pay clone cost during dispatch.
+    pub fn flattened_catalogs(&self) -> Vec<(String, &CatalogConfig)> {
+        if self.catalogs.is_empty() {
+            return vec![(Self::LEGACY_CATALOG_NAME.to_string(), &self.catalog)];
+        }
+        let mut out: Vec<(String, &CatalogConfig)> = self
+            .catalogs
+            .iter()
+            .map(|(k, v)| (k.clone(), v))
+            .collect();
+        // Stable order so DataFusion catalog registration produces a
+        // deterministic information_schema ordering and the welcome
+        // banner is reproducible.
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // If the operator explicitly named the legacy block, fold it
+        // in (or replace if the name collides).
+        if let Some(name) = self
+            .query
+            .default_catalog
+            .as_deref()
+            .filter(|n| !n.is_empty())
+        {
+            // Remove any existing entry with the legacy name so the
+            // legacy block wins (operator set it explicitly; that's
+            // an opt-in to use the legacy block as that name).
+            out.retain(|(n, _)| n != name);
+            out.push((name.to_string(), &self.catalog));
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        out
+    }
+
+    /// The name of the catalog that DataFusion treats as the
+    /// "default" for unqualified table names. Resolution order:
+    /// 1. `query.default_catalog` if set and non-empty.
+    /// 2. The first entry from `flattened_catalogs()`.
+    /// 3. `Self::LEGACY_CATALOG_NAME` as a last resort (no
+    ///    catalogs flattened, which is a config error caught
+    ///    elsewhere).
+    pub fn resolve_default_catalog(&self) -> String {
+        if let Some(name) = self
+            .query
+            .default_catalog
+            .as_deref()
+            .filter(|n| !n.is_empty())
+        {
+            return name.to_string();
+        }
+        self.flattened_catalogs()
+            .first()
+            .map(|(n, _)| n.clone())
+            .unwrap_or_else(|| Self::LEGACY_CATALOG_NAME.to_string())
+    }
+}
+
+impl SqeConfig {
     /// Validate configuration: required fields and port conflicts.
     pub fn validate(&self) -> crate::error::Result<()> {
         let mut errors = Vec::new();
@@ -1358,6 +1469,7 @@ mod tests {
                 parquet_compression: "zstd".to_string(),
                 manifest_concurrency: 64,
             },
+            catalogs: HashMap::new(),
             storage: StorageConfig::default(),
             policy: PolicyConfig::default(),
             access_control: AccessControlConfig::default(),
@@ -1482,6 +1594,190 @@ mod tests {
             full.validate().is_ok(),
             "legacy polaris_url config should pass validate()"
         );
+    }
+
+    /// Legacy single-catalog config: flattening yields one entry
+    /// named `iceberg` (the canonical embedded-mode name) and
+    /// `resolve_default_catalog()` returns it.
+    #[test]
+    fn flatten_with_only_legacy_catalog() {
+        let cfg = valid_config();
+        let flat = cfg.flattened_catalogs();
+        assert_eq!(flat.len(), 1);
+        assert_eq!(flat[0].0, SqeConfig::LEGACY_CATALOG_NAME);
+        assert_eq!(cfg.resolve_default_catalog(), "iceberg");
+    }
+
+    /// New-style config with a single named catalog: flattening
+    /// uses that name and the legacy block is dropped.
+    #[test]
+    fn flatten_with_named_catalog_drops_legacy() {
+        let mut cfg = valid_config();
+        cfg.catalogs.insert(
+            "polaris".to_string(),
+            CatalogConfig {
+                catalog_url: "http://polaris:8181".to_string(),
+                warehouse: "main".to_string(),
+                backend: CatalogBackend::default(),
+                metadata_cache_ttl_secs: 30,
+                default_table_format_version: 2,
+                trust_sort_order: false,
+                small_file_threshold_mb: 3,
+                parquet_compression: "zstd".to_string(),
+                manifest_concurrency: 64,
+            },
+        );
+        let flat = cfg.flattened_catalogs();
+        assert_eq!(flat.len(), 1);
+        assert_eq!(flat[0].0, "polaris");
+        assert_eq!(cfg.resolve_default_catalog(), "polaris");
+    }
+
+    /// Two named catalogs: alphabetical order, first becomes default
+    /// unless the operator names one explicitly.
+    #[test]
+    fn flatten_sorts_named_catalogs() {
+        let mut cfg = valid_config();
+        for name in ["zeta", "alpha", "mid"] {
+            cfg.catalogs.insert(
+                name.to_string(),
+                CatalogConfig {
+                    catalog_url: "http://x".to_string(),
+                    warehouse: name.to_string(),
+                    backend: CatalogBackend::default(),
+                    metadata_cache_ttl_secs: 30,
+                    default_table_format_version: 2,
+                    trust_sort_order: false,
+                    small_file_threshold_mb: 3,
+                    parquet_compression: "zstd".to_string(),
+                    manifest_concurrency: 64,
+                },
+            );
+        }
+        let names: Vec<String> = cfg
+            .flattened_catalogs()
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+        assert_eq!(cfg.resolve_default_catalog(), "alpha");
+    }
+
+    /// Operator-set `default_catalog` overrides alphabetical pick
+    /// AND folds the legacy `[catalog]` block in under that name.
+    /// The mixed-mode use case: one Polaris cluster `[catalog]`
+    /// kept for backwards-compat, plus a Glue `[catalogs.glue]`
+    /// for new tables, with Polaris remaining the default.
+    #[test]
+    fn default_catalog_can_promote_legacy_block() {
+        let mut cfg = valid_config();
+        cfg.query.default_catalog = Some("legacy_polaris".to_string());
+        cfg.catalogs.insert(
+            "glue".to_string(),
+            CatalogConfig {
+                catalog_url: "".to_string(),
+                warehouse: "s3://wh/".to_string(),
+                backend: CatalogBackend::default(),
+                metadata_cache_ttl_secs: 30,
+                default_table_format_version: 2,
+                trust_sort_order: false,
+                small_file_threshold_mb: 3,
+                parquet_compression: "zstd".to_string(),
+                manifest_concurrency: 64,
+            },
+        );
+        let flat = cfg.flattened_catalogs();
+        let names: Vec<String> = flat.iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(names, vec!["glue", "legacy_polaris"]);
+        // glue wins the alphabetic tiebreak; that's intentional.
+        // The operator can pick legacy_polaris explicitly:
+        assert_eq!(cfg.resolve_default_catalog(), "legacy_polaris");
+    }
+
+    /// Empty `default_catalog = ""` is treated as unset (operator
+    /// may have left an empty placeholder in TOML during a rollout).
+    #[test]
+    fn empty_default_catalog_string_is_treated_as_unset() {
+        let mut cfg = valid_config();
+        cfg.query.default_catalog = Some("".to_string());
+        // No named catalogs, only the legacy block: should still
+        // resolve to the canonical legacy name.
+        assert_eq!(cfg.resolve_default_catalog(), "iceberg");
+    }
+
+    /// End-to-end TOML deserialization: the documented shape with
+    /// Polaris + Nessie + AWS Glue + S3 Tables in one config
+    /// round-trips through serde and `flattened_catalogs()` returns
+    /// the four named entries.
+    #[test]
+    fn multi_backend_toml_round_trips() {
+        let toml = r#"
+[coordinator]
+flight_sql_port = 50051
+trino_http_port = 8080
+mode = "hybrid"
+
+[auth]
+keycloak_url = "https://kc.example.com"
+client_id = "sqe-client"
+
+# Legacy single-catalog block kept as a backwards-compat placeholder.
+# Operators leaving this minimal must populate `[catalogs.*]` below.
+[catalog]
+catalog_url = ""
+
+[catalogs.polaris]
+catalog_url = "http://polaris:8181/api/catalog"
+warehouse = "main"
+[catalogs.polaris.backend]
+type = "rest"
+
+[catalogs.nessie]
+catalog_url = "http://nessie:19120/iceberg"
+warehouse = "lake"
+[catalogs.nessie.backend]
+type = "rest"
+
+[catalogs.aws_glue]
+catalog_url = ""
+[catalogs.aws_glue.backend]
+type = "glue"
+region = "eu-central-1"
+warehouse = "s3://my-bucket/wh"
+
+[catalogs.aws_s3tables]
+catalog_url = ""
+[catalogs.aws_s3tables.backend]
+type = "s3tables"
+table_bucket_arn = "arn:aws:s3tables:eu-west-1:123456789012:bucket/my-bucket"
+"#;
+        let cfg: SqeConfig = toml::from_str(toml).expect("multi-backend TOML deserializes");
+        let names: Vec<String> = cfg
+            .flattened_catalogs()
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["aws_glue", "aws_s3tables", "nessie", "polaris"],
+            "named catalogs sorted alphabetically",
+        );
+        // The legacy [catalog] block has an empty catalog_url; with
+        // no `default_catalog` set, it is dropped.
+        assert!(!names.contains(&"iceberg".to_string()));
+        // Each backend variant deserialised correctly:
+        assert!(matches!(
+            cfg.catalogs["polaris"].backend,
+            CatalogBackend::Rest
+        ));
+        assert!(matches!(
+            cfg.catalogs["aws_glue"].backend,
+            CatalogBackend::Glue { .. }
+        ));
+        assert!(matches!(
+            cfg.catalogs["aws_s3tables"].backend,
+            CatalogBackend::S3tables { .. }
+        ));
     }
 
     #[test]
