@@ -51,27 +51,62 @@ use sqe_core::config::StorageConfig;
 
 use crate::client::{QueryResult, SqlClient};
 
-/// How the embedded engine stores user data.
+/// One persistent Iceberg catalog the embedded engine attaches.
+///
+/// Every entry produces an independent SQLite catalog at
+/// `<path>/sqe.db` plus data files under `<path>/iceberg/`,
+/// registered with DataFusion under `name`. Cross-catalog joins
+/// like `SELECT * FROM prod.sales.orders JOIN stage.sales.orders`
+/// work as long as both catalogs are attached.
+#[derive(Debug, Clone)]
+pub struct EmbeddedCatalog {
+    /// Catalog identifier used in 3-part SQL names. Must be a valid
+    /// SQL identifier; we don't currently quote it on the wire.
+    pub name: String,
+    /// Filesystem path to the warehouse root.
+    pub path: PathBuf,
+}
+
+/// What the embedded engine attaches at startup.
 #[derive(Debug, Clone)]
 pub enum WarehouseMode {
     /// Ephemeral. `CREATE TABLE foo AS SELECT ...` works within the
     /// session via DataFusion's default in-memory catalog, but
     /// nothing persists across processes.
     Memory,
-    /// Persistent. SQLite catalog at `<path>/sqe.db`, Iceberg data
-    /// files under `<path>/iceberg/`. Survives process restarts.
-    Persistent { path: PathBuf },
+    /// Attach one or more named persistent catalogs. Order is
+    /// preserved for the welcome banner. Empty Vec is equivalent
+    /// to [`WarehouseMode::Memory`] (handled at attach time so
+    /// callers don't need to special-case it).
+    Persistent { catalogs: Vec<EmbeddedCatalog> },
 }
 
 impl WarehouseMode {
-    /// Default location: `~/.sqe/warehouse/`. Falls back to a
-    /// process-local `./.sqe-warehouse/` when `HOME` is unset
-    /// (some CI runners).
+    /// Default: a single catalog named `iceberg` at
+    /// `~/.sqe/warehouse/`. Falls back to a process-local
+    /// `./.sqe-warehouse/` when `HOME` is unset (some CI runners).
     pub fn default_persistent() -> Self {
         let path = std::env::var_os("HOME")
             .map(|h| PathBuf::from(h).join(".sqe").join("warehouse"))
             .unwrap_or_else(|| PathBuf::from("./.sqe-warehouse"));
-        WarehouseMode::Persistent { path }
+        WarehouseMode::Persistent {
+            catalogs: vec![EmbeddedCatalog {
+                name: "iceberg".to_string(),
+                path,
+            }],
+        }
+    }
+
+    /// Build a `Persistent` mode from a single warehouse path,
+    /// keeping the legacy `iceberg` catalog name. Used by the
+    /// `--warehouse <path>` CLI flag for backwards compatibility.
+    pub fn single(path: PathBuf) -> Self {
+        WarehouseMode::Persistent {
+            catalogs: vec![EmbeddedCatalog {
+                name: "iceberg".to_string(),
+                path,
+            }],
+        }
     }
 }
 
@@ -136,33 +171,55 @@ pub fn build_embedded_context(memory_limit_bytes: usize) -> anyhow::Result<Sessi
     Ok(ctx)
 }
 
-/// Async variant of [`build_embedded_context`] that also attaches a
-/// persistent Iceberg catalog when `mode` is
-/// [`WarehouseMode::Persistent`]. The catalog is registered as
-/// `iceberg` and becomes the default catalog for unqualified queries
-/// so `CREATE TABLE foo AS SELECT ...` lands data in the warehouse.
+/// Async variant of [`build_embedded_context`] that also attaches
+/// any persistent Iceberg catalogs declared in `mode`. Each catalog
+/// becomes a top-level SQL identifier so `<catalog>.<schema>.<table>`
+/// resolves the right one and cross-catalog joins work without any
+/// session-state setup.
 ///
-/// Side effect: creates `<path>` and `<path>/iceberg/` if missing.
-/// The SQLite database itself is created on first connect by
-/// `iceberg-catalog-sql`.
+/// Side effect: creates `<path>` and `<path>/iceberg/` for each
+/// catalog if missing. The SQLite database itself is created on
+/// first connect by `iceberg-catalog-sql`.
 pub async fn build_embedded_context_with_warehouse(
     memory_limit_bytes: usize,
     mode: &WarehouseMode,
 ) -> anyhow::Result<SessionContext> {
     let ctx = build_embedded_context(memory_limit_bytes)?;
-    let path = match mode {
+    let catalogs = match mode {
         WarehouseMode::Memory => return Ok(ctx),
-        WarehouseMode::Persistent { path } => path,
+        WarehouseMode::Persistent { catalogs } if catalogs.is_empty() => return Ok(ctx),
+        WarehouseMode::Persistent { catalogs } => catalogs,
     };
 
-    attach_sqlite_catalog(&ctx, path).await?;
+    // Reject duplicate catalog names early — DataFusion's
+    // `register_catalog` overwrites silently and the user would lose
+    // a catalog without a clear error.
+    let mut seen = std::collections::HashSet::new();
+    for c in catalogs {
+        if !seen.insert(c.name.clone()) {
+            return Err(anyhow::anyhow!(
+                "catalog name `{}` repeated — pick a unique name per --catalog",
+                c.name
+            ));
+        }
+    }
+
+    for c in catalogs {
+        attach_sqlite_catalog(&ctx, &c.name, &c.path)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to attach catalog `{}`: {e}", c.name))?;
+    }
     Ok(ctx)
 }
 
 /// Initialise `<path>/sqe.db` as the Iceberg metadata store and
 /// `<path>/iceberg/` as the data file root, then register the result
-/// with `ctx` under the catalog name `iceberg`.
-async fn attach_sqlite_catalog(ctx: &SessionContext, path: &Path) -> anyhow::Result<()> {
+/// with `ctx` under the given catalog `name`.
+async fn attach_sqlite_catalog(
+    ctx: &SessionContext,
+    name: &str,
+    path: &Path,
+) -> anyhow::Result<()> {
     std::fs::create_dir_all(path)
         .map_err(|e| anyhow::anyhow!("failed to create warehouse dir {}: {e}", path.display()))?;
     let data_root = path.join("iceberg");
@@ -187,6 +244,15 @@ async fn attach_sqlite_catalog(ctx: &SessionContext, path: &Path) -> anyhow::Res
     props.insert(SQL_CATALOG_PROP_URI.to_string(), uri);
     props.insert(SQL_CATALOG_PROP_WAREHOUSE.to_string(), warehouse_uri);
 
+    // The builder's `name` parameter is NOT just diagnostic — it
+    // becomes the `catalog_name` row key inside the SQLite
+    // `iceberg_namespace_properties` and `iceberg_tables` tables, so
+    // namespaces and tables are scoped per-name. We deliberately keep
+    // the same fixed name across every embedded warehouse so each
+    // SQLite file holds a single coherent scope. Catalog separation
+    // for the user comes from each catalog living in its own SQLite
+    // file (separate `path`); the user-facing identifier is set by
+    // `ctx.register_catalog(name, ...)` below.
     let catalog = SqlCatalogBuilder::default()
         .load("sqe-embedded".to_string(), props)
         .await
@@ -196,7 +262,7 @@ async fn attach_sqlite_catalog(ctx: &SessionContext, path: &Path) -> anyhow::Res
         .await
         .map_err(|e| anyhow::anyhow!("IcebergCatalogProvider build failed: {e}"))?;
 
-    ctx.register_catalog("iceberg", Arc::new(provider));
+    ctx.register_catalog(name, Arc::new(provider));
     Ok(())
 }
 
@@ -318,11 +384,158 @@ mod tests {
     #[test]
     fn default_persistent_returns_a_path() {
         match WarehouseMode::default_persistent() {
-            WarehouseMode::Persistent { path } => {
-                assert!(!path.as_os_str().is_empty(), "warehouse path must not be empty");
+            WarehouseMode::Persistent { catalogs } => {
+                assert_eq!(catalogs.len(), 1);
+                assert_eq!(catalogs[0].name, "iceberg");
+                assert!(
+                    !catalogs[0].path.as_os_str().is_empty(),
+                    "warehouse path must not be empty"
+                );
             }
             WarehouseMode::Memory => panic!("default_persistent must not be Memory"),
         }
+    }
+
+    /// `single(path)` keeps the legacy single-catalog name `iceberg`.
+    /// Locks the backwards-compat contract for `--warehouse <path>`.
+    #[test]
+    fn single_warehouse_uses_iceberg_name() {
+        let m = WarehouseMode::single(PathBuf::from("/tmp/foo"));
+        match m {
+            WarehouseMode::Persistent { catalogs } => {
+                assert_eq!(catalogs.len(), 1);
+                assert_eq!(catalogs[0].name, "iceberg");
+            }
+            _ => panic!("single must be Persistent"),
+        }
+    }
+
+    /// Build is rejected when two `--catalog` entries pick the same name.
+    /// Without this guard DataFusion's `register_catalog` would silently
+    /// overwrite and the user would lose data without a clear error.
+    #[tokio::test]
+    async fn duplicate_catalog_names_are_rejected() {
+        let tmp1 = tempfile::tempdir().expect("tempdir1");
+        let tmp2 = tempfile::tempdir().expect("tempdir2");
+        let mode = WarehouseMode::Persistent {
+            catalogs: vec![
+                EmbeddedCatalog {
+                    name: "shared".into(),
+                    path: tmp1.path().to_path_buf(),
+                },
+                EmbeddedCatalog {
+                    name: "shared".into(),
+                    path: tmp2.path().to_path_buf(),
+                },
+            ],
+        };
+        let result = EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode).await;
+        let err = result
+            .map(|_| ())
+            .expect_err("duplicate names must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("repeated"),
+            "expected duplicate-name error, got: {msg}"
+        );
+    }
+
+    /// Two catalogs registered side by side must both be visible via
+    /// information_schema.schemata. The smoke for cross-catalog
+    /// access; locks the contract that the DataFusion catalog name
+    /// matches what the user passed on `--catalog NAME=PATH`.
+    #[tokio::test]
+    async fn two_catalogs_both_visible() {
+        use iceberg::{Catalog, NamespaceIdent, TableCreation};
+        use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
+
+        let tmp_a = tempfile::tempdir().expect("tempdir a");
+        let tmp_b = tempfile::tempdir().expect("tempdir b");
+
+        // Bootstrap a namespace + table in each via the iceberg API.
+        for (name, dir) in &[("a", tmp_a.path()), ("b", tmp_b.path())] {
+            std::fs::create_dir_all(dir.join("iceberg")).expect("data dir");
+            let abs = dir.canonicalize().expect("canonicalize");
+            let mut props = HashMap::new();
+            props.insert(
+                SQL_CATALOG_PROP_URI.to_string(),
+                format!("sqlite://{}?mode=rwc", abs.join("sqe.db").display()),
+            );
+            props.insert(
+                SQL_CATALOG_PROP_WAREHOUSE.to_string(),
+                format!("file://{}", abs.join("iceberg").display()),
+            );
+            // Use the same fixed name as production code so the
+            // bootstrap writes into the same `catalog_name` scope
+            // the attach path reads. See the comment in
+            // `attach_sqlite_catalog`.
+            let cat = SqlCatalogBuilder::default()
+                .load("sqe-embedded".to_string(), props)
+                .await
+                .expect("bootstrap catalog");
+            let ns = NamespaceIdent::new(format!("ns_{name}"));
+            cat.create_namespace(&ns, HashMap::new())
+                .await
+                .expect("create_namespace");
+            let schema = IcebergSchema::builder()
+                .with_fields(vec![NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                )
+                .into()])
+                .build()
+                .expect("schema");
+            cat.create_table(
+                &ns,
+                TableCreation::builder()
+                    .name(format!("t_{name}"))
+                    .schema(schema)
+                    .build(),
+            )
+            .await
+            .expect("create_table");
+        }
+
+        let mode = WarehouseMode::Persistent {
+            catalogs: vec![
+                EmbeddedCatalog {
+                    name: "left".into(),
+                    path: tmp_a.path().to_path_buf(),
+                },
+                EmbeddedCatalog {
+                    name: "right".into(),
+                    path: tmp_b.path().to_path_buf(),
+                },
+            ],
+        };
+
+        let mut c = EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode)
+            .await
+            .expect("two-catalog client builds");
+
+        let r = c
+            .execute(
+                "SELECT table_catalog, table_schema, table_name \
+                 FROM information_schema.tables \
+                 WHERE table_catalog IN ('left', 'right') \
+                 ORDER BY table_catalog, table_schema, table_name",
+            )
+            .await
+            .expect("information_schema");
+        // Each catalog produces one user table plus iceberg metadata
+        // pseudo-tables. We only assert the user tables are there
+        // under the right catalog name.
+        let has_left = r
+            .rows
+            .iter()
+            .any(|row| row[0] == "left" && row[1] == "ns_a" && row[2] == "t_a");
+        let has_right = r
+            .rows
+            .iter()
+            .any(|row| row[0] == "right" && row[1] == "ns_b" && row[2] == "t_b");
+        assert!(has_left, "left catalog missing; rows: {:?}", r.rows);
+        assert!(has_right, "right catalog missing; rows: {:?}", r.rows);
     }
 
     /// Persistence smoke: create a namespace and a table out-of-band
@@ -338,9 +551,7 @@ mod tests {
         use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
 
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mode = WarehouseMode::Persistent {
-            path: tmp.path().to_path_buf(),
-        };
+        let mode = WarehouseMode::single(tmp.path().to_path_buf());
 
         // Phase 1: bootstrap a namespace + table directly via the
         // iceberg::Catalog so the catalog file has something to find.
