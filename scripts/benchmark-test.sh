@@ -315,23 +315,42 @@ for BENCH in "${BENCHMARKS[@]}"; do
     echo "  ✓ Generated in $((GEN_END - GEN_START))s"
 
     # ── Step 2: Load ──────────────────────────────────────────
+    #
+    # We retry the load step once on failure. Polaris occasionally returns a
+    # 403 "Access Key Id does not exist" from RustFS when writing the first
+    # metadata file for a large CTAS — the auth state recovers within a few
+    # seconds. The `--clean` flag makes the load idempotent (drop + reload),
+    # so a second attempt is safe; if both fail it's a real failure, not a
+    # transient blip. Tracked at ~3% rate in the May-2026 SF1 sweeps.
     echo ""
     echo "  [2/3] Loading into SQE..."
     LOAD_START=$(date +%s)
-    if ! "$BENCH_BIN" load "$BENCH" \
-        --scale "$BENCH_SCALE" \
-        --data "$BENCH_DATA_DIR" \
-        --protocol "$BENCH_PROTOCOL" \
-        --host "$BENCH_HOST" \
-        --port "$BENCH_PORT" \
-        --username "$SQE_USERNAME" \
-        --password "$SQE_PASSWORD" \
-        --s3-access-key "$S3_ACCESS_KEY" \
-        --s3-secret-key "$S3_SECRET_KEY" \
-        --s3-endpoint "$S3_ENDPOINT" \
-        --s3-region "$S3_REGION" \
-        --clean 2>&1; then
-        echo "  ✗ Load FAILED for $BENCH"
+    LOAD_ATTEMPTS=2
+    LOAD_OK=0
+    for attempt in $(seq 1 "$LOAD_ATTEMPTS"); do
+        if "$BENCH_BIN" load "$BENCH" \
+            --scale "$BENCH_SCALE" \
+            --data "$BENCH_DATA_DIR" \
+            --protocol "$BENCH_PROTOCOL" \
+            --host "$BENCH_HOST" \
+            --port "$BENCH_PORT" \
+            --username "$SQE_USERNAME" \
+            --password "$SQE_PASSWORD" \
+            --s3-access-key "$S3_ACCESS_KEY" \
+            --s3-secret-key "$S3_SECRET_KEY" \
+            --s3-endpoint "$S3_ENDPOINT" \
+            --s3-region "$S3_REGION" \
+            --clean 2>&1; then
+            LOAD_OK=1
+            break
+        fi
+        if [ "$attempt" -lt "$LOAD_ATTEMPTS" ]; then
+            echo "  ⚠ Load attempt $attempt failed, retrying after 3s..."
+            sleep 3
+        fi
+    done
+    if [ "$LOAD_OK" -ne 1 ]; then
+        echo "  ✗ Load FAILED for $BENCH after $LOAD_ATTEMPTS attempts"
         RESULTS+=("$BENCH: LOAD_FAILED")
         TOTAL_ERROR=$((TOTAL_ERROR + 1))
         continue
