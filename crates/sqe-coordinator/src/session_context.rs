@@ -150,12 +150,31 @@ pub async fn create_session_context(
 
             // Build one SessionCatalog + SqeCatalogProvider per
             // entry from `flattened`. Each catalog gets its own
-            // per-session connection (with the same bearer token);
-            // we register them all under their declared SQL name so
-            // 3-part identifiers like `polaris.sales.orders` and
-            // cross-catalog joins like `polaris.sales.orders LEFT
-            // JOIN nessie.archive.orders` work without further
-            // session state.
+            // per-session connection. Two per-catalog overrides
+            // resolved here (V7):
+            //
+            //   * `cat_cfg.auth` — when present, replaces the
+            //     session bearer for this catalog only. Variants:
+            //     SessionBearer (default), Static, Anonymous,
+            //     ClientCredentials, Aws. Federated deployments
+            //     where one catalog speaks Polaris (session token)
+            //     and another speaks a partner Iceberg REST endpoint
+            //     behind its own OAuth client now configure both in
+            //     one TOML.
+            //
+            //   * `cat_cfg.storage` — when present, overrides the
+            //     coordinator-wide `[storage]` block for this
+            //     catalog. The override flows into `for_session_with`
+            //     and into `SqeCatalogProvider`, so scan / write
+            //     paths for this catalog hit the right S3 endpoint
+            //     and region. Iceberg credential vending from REST
+            //     catalogs still wins per-table over both.
+            //
+            // 3-part SQL identifiers work without session-state setup
+            // because every catalog registers under its declared SQL
+            // name. Cross-catalog joins like `polaris.sales.orders
+            // LEFT JOIN nessie.archive.orders` flow through the
+            // standard DataFusion path.
             //
             // The first entry in `flattened` is treated as the
             // "primary" — its `SessionCatalog` is what
@@ -163,16 +182,28 @@ pub async fn create_session_context(
             // `session_catalog_for_return` path use. Operators
             // running mixed Polaris+Glue (or whatever) deployments
             // pick the primary by name via `query.default_catalog`.
-            let storage_clone = config.storage.clone();
+            let global_storage = config.storage.clone();
             let mut primary_session_catalog: Option<Arc<SessionCatalog>> = None;
 
             for (cat_name, cat_cfg) in &flattened {
+                let auth = cat_cfg.auth.clone().unwrap_or_default();
+                let bearer = sqe_auth::per_catalog::resolve_bearer(
+                    &auth,
+                    &session.access_token,
+                )
+                .await
+                .map_err(Arc::new)?;
+                let storage = cat_cfg
+                    .storage
+                    .clone()
+                    .unwrap_or_else(|| global_storage.clone());
+
                 let session_catalog = Arc::new(
                     SessionCatalog::for_session_with(
                         cat_cfg,
-                        &storage_clone,
+                        &storage,
                         table_cache.cloned(),
-                        &session.access_token,
+                        &bearer,
                     )
                     .await
                     .map_err(Arc::new)?,
@@ -180,7 +211,7 @@ pub async fn create_session_context(
 
                 let mut catalog_provider = SqeCatalogProvider::try_new_with_policy(
                     session_catalog.clone(),
-                    storage_clone.clone(),
+                    storage.clone(),
                     cat_cfg.warehouse.clone(),
                     policy_store.cloned(),
                     Some(session.user.clone()),

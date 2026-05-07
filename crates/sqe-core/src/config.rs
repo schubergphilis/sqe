@@ -686,6 +686,54 @@ pub enum CatalogBackend {
     },
 }
 
+/// Per-catalog auth strategy. When present on a `CatalogConfig`,
+/// overrides the session bearer token for that catalog only. Used
+/// for federation where one catalog speaks to Polaris (session
+/// token) and a sibling speaks to a partner Iceberg REST endpoint
+/// behind its own OAuth client.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CatalogAuthConfig {
+    /// Use the user's session bearer token from the top-level
+    /// `[auth]` block. This is the default and matches V6
+    /// behaviour. Configured explicitly only when the operator
+    /// wants the intent visible in the TOML.
+    SessionBearer,
+    /// A pre-issued static bearer token. Read from a separate
+    /// secrets file or env override at deploy time. Useful for
+    /// internal gateways and integration tests.
+    Static { token: String },
+    /// No `Authorization` header at all. Used for public Nessie
+    /// read-only access and other anonymous endpoints.
+    Anonymous,
+    /// OAuth2 `client_credentials` grant against a per-catalog
+    /// token endpoint. The token is fetched at session-build time
+    /// and reused for the session lifetime; refresh on expiry is
+    /// a future change.
+    ClientCredentials {
+        /// Full URL of the token endpoint (e.g.
+        /// `https://partner.com/oauth/tokens`).
+        token_endpoint: String,
+        client_id: String,
+        client_secret: String,
+        /// Optional scope passed in the form body. Defaults to
+        /// `PRINCIPAL_ROLE:ALL` for Polaris compatibility.
+        #[serde(default)]
+        scope: Option<String>,
+    },
+    /// Rely on the AWS SDK provider chain. Used by `glue` and
+    /// `s3tables` backends and by AWS REST endpoints that engage
+    /// SigV4 based on `/v1/config`. No token is fetched at the
+    /// SQE level; the AWS SDK handles credentials.
+    Aws,
+}
+
+impl Default for CatalogAuthConfig {
+    fn default() -> Self {
+        CatalogAuthConfig::SessionBearer
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct CatalogConfig {
     /// REST catalog endpoint URL. Used by `CatalogBackend::Rest`
@@ -747,6 +795,25 @@ pub struct CatalogConfig {
     /// Default: 64.
     #[serde(default = "default_manifest_concurrency")]
     pub manifest_concurrency: usize,
+    /// Per-catalog auth override. When unset (the common case),
+    /// SQE uses the user's session bearer token from the top-level
+    /// `[auth]` block, matching V6 behaviour. Set this on
+    /// `[catalogs.<name>.auth]` blocks when one catalog needs a
+    /// different token source: a partner Polaris with its own
+    /// OAuth client, an anonymous Nessie read-only endpoint, an
+    /// AWS-SDK-provider-chain Glue endpoint, etc.
+    #[serde(default)]
+    pub auth: Option<CatalogAuthConfig>,
+    /// Per-catalog storage override. When unset, the global
+    /// `[storage]` block applies. Set this on
+    /// `[catalogs.<name>.storage]` to point a single catalog at a
+    /// different S3 endpoint, region, or credential pair (e.g.
+    /// one Ceph cluster + one AWS S3, or a partner bucket with
+    /// its own access key). Iceberg credential vending from REST
+    /// catalogs still wins per-table over both this and the
+    /// global block.
+    #[serde(default)]
+    pub storage: Option<StorageConfig>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -1468,6 +1535,8 @@ mod tests {
                 small_file_threshold_mb: 3,
                 parquet_compression: "zstd".to_string(),
                 manifest_concurrency: 64,
+                auth: None,
+                storage: None,
             },
             catalogs: HashMap::new(),
             storage: StorageConfig::default(),
@@ -1625,6 +1694,8 @@ mod tests {
                 small_file_threshold_mb: 3,
                 parquet_compression: "zstd".to_string(),
                 manifest_concurrency: 64,
+                auth: None,
+                storage: None,
             },
         );
         let flat = cfg.flattened_catalogs();
@@ -1651,6 +1722,8 @@ mod tests {
                     small_file_threshold_mb: 3,
                     parquet_compression: "zstd".to_string(),
                     manifest_concurrency: 64,
+                    auth: None,
+                    storage: None,
                 },
             );
         }
@@ -1684,6 +1757,8 @@ mod tests {
                 small_file_threshold_mb: 3,
                 parquet_compression: "zstd".to_string(),
                 manifest_concurrency: 64,
+                auth: None,
+                storage: None,
             },
         );
         let flat = cfg.flattened_catalogs();
@@ -1777,6 +1852,105 @@ table_bucket_arn = "arn:aws:s3tables:eu-west-1:123456789012:bucket/my-bucket"
         assert!(matches!(
             cfg.catalogs["aws_s3tables"].backend,
             CatalogBackend::S3tables { .. }
+        ));
+    }
+
+    /// V7: per-catalog auth + storage overrides round-trip through
+    /// the TOML deserializer, including all four `CatalogAuthConfig`
+    /// variants and a per-catalog `[storage]` block that points at
+    /// a different S3 endpoint.
+    #[test]
+    fn per_catalog_auth_and_storage_overrides_deserialize() {
+        let toml = r#"
+[coordinator]
+flight_sql_port = 50051
+trino_http_port = 8080
+mode = "hybrid"
+
+[auth]
+keycloak_url = "https://kc.example.com"
+client_id = "sqe-client"
+
+[catalog]
+catalog_url = ""
+
+[catalogs.polaris]
+catalog_url = "http://polaris:8181/api/catalog"
+warehouse = "main"
+[catalogs.polaris.backend]
+type = "rest"
+# auth omitted: defaults to SessionBearer
+
+[catalogs.partner_polaris]
+catalog_url = "https://partner.com/iceberg"
+warehouse = "shared"
+[catalogs.partner_polaris.backend]
+type = "rest"
+[catalogs.partner_polaris.auth]
+type = "client_credentials"
+token_endpoint = "https://partner.com/oauth/tokens"
+client_id = "sqe-partner"
+client_secret = "secret-from-env"
+[catalogs.partner_polaris.storage]
+s3_endpoint = "https://partner-s3.example.com"
+s3_region = "us-east-1"
+s3_access_key = "partner-key"
+s3_secret_key = "partner-secret"
+
+[catalogs.public_nessie]
+catalog_url = "https://nessie.public.example.com/iceberg"
+warehouse = "public"
+[catalogs.public_nessie.backend]
+type = "rest"
+[catalogs.public_nessie.auth]
+type = "anonymous"
+
+[catalogs.aws_glue]
+catalog_url = ""
+[catalogs.aws_glue.backend]
+type = "glue"
+region = "eu-central-1"
+warehouse = "s3://wh/"
+[catalogs.aws_glue.auth]
+type = "aws"
+"#;
+        let cfg: SqeConfig = toml::from_str(toml).expect("V7 TOML deserializes");
+
+        // Default (omitted) is SessionBearer (None on the field).
+        assert!(cfg.catalogs["polaris"].auth.is_none());
+        assert!(cfg.catalogs["polaris"].storage.is_none());
+
+        // Partner has both overrides.
+        match &cfg.catalogs["partner_polaris"].auth {
+            Some(CatalogAuthConfig::ClientCredentials {
+                token_endpoint,
+                client_id,
+                client_secret,
+                scope,
+            }) => {
+                assert_eq!(token_endpoint, "https://partner.com/oauth/tokens");
+                assert_eq!(client_id, "sqe-partner");
+                assert_eq!(client_secret, "secret-from-env");
+                assert!(scope.is_none(), "scope is optional, defaults to None");
+            }
+            other => panic!("partner_polaris auth wrong variant: {other:?}"),
+        }
+        let partner_storage = cfg.catalogs["partner_polaris"]
+            .storage
+            .as_ref()
+            .expect("partner has storage override");
+        assert_eq!(partner_storage.s3_endpoint, "https://partner-s3.example.com");
+        assert_eq!(partner_storage.s3_region, "us-east-1");
+        assert_eq!(partner_storage.s3_access_key, "partner-key");
+
+        // Anonymous + AWS variants:
+        assert!(matches!(
+            cfg.catalogs["public_nessie"].auth,
+            Some(CatalogAuthConfig::Anonymous)
+        ));
+        assert!(matches!(
+            cfg.catalogs["aws_glue"].auth,
+            Some(CatalogAuthConfig::Aws)
         ));
     }
 
