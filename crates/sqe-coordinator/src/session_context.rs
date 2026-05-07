@@ -76,11 +76,19 @@ pub async fn create_session_context(
                 "SessionContext cache miss — building new context"
             );
 
-            let catalog_name = if config.catalog.warehouse.is_empty() {
-                "default".to_string()
-            } else {
-                config.catalog.warehouse.clone()
-            };
+            // Multi-catalog: build the named list from
+            // `flattened_catalogs()` (legacy `[catalog]` block joins
+            // under `iceberg` when no `[catalogs.*]` are set; otherwise
+            // the named map drives, alphabetically sorted, with the
+            // legacy block folded in only when `default_catalog` names
+            // it explicitly). The "default" catalog DataFusion uses
+            // for unqualified names is `resolve_default_catalog()`.
+            let flattened: Vec<(String, sqe_core::config::CatalogConfig)> = config
+                .flattened_catalogs()
+                .into_iter()
+                .map(|(n, c)| (n, c.clone()))
+                .collect();
+            let catalog_name = config.resolve_default_catalog();
 
             let session_config = SessionConfig::new()
                 .with_information_schema(true)
@@ -140,46 +148,75 @@ pub async fn create_session_context(
                 .expect("MemoryCatalogProvider always accepts schema registration");
             ctx.register_catalog("datafusion", df_catalog);
 
-            // Create a per-session catalog connected to Polaris with the user's bearer token.
-            // Pass the shared global table metadata cache so Polaris REST round-trips are
-            // skipped for tables that have already been loaded within the TTL window.
-            let session_catalog = Arc::new(
-                SessionCatalog::for_session(
-                    config,
-                    table_cache.cloned(),
-                    &session.access_token,
+            // Build one SessionCatalog + SqeCatalogProvider per
+            // entry from `flattened`. Each catalog gets its own
+            // per-session connection (with the same bearer token);
+            // we register them all under their declared SQL name so
+            // 3-part identifiers like `polaris.sales.orders` and
+            // cross-catalog joins like `polaris.sales.orders LEFT
+            // JOIN nessie.archive.orders` work without further
+            // session state.
+            //
+            // The first entry in `flattened` is treated as the
+            // "primary" — its `SessionCatalog` is what
+            // `system.runtime.*` introspection and the legacy
+            // `session_catalog_for_return` path use. Operators
+            // running mixed Polaris+Glue (or whatever) deployments
+            // pick the primary by name via `query.default_catalog`.
+            let storage_clone = config.storage.clone();
+            let mut primary_session_catalog: Option<Arc<SessionCatalog>> = None;
+
+            for (cat_name, cat_cfg) in &flattened {
+                let session_catalog = Arc::new(
+                    SessionCatalog::for_session_with(
+                        cat_cfg,
+                        &storage_clone,
+                        table_cache.cloned(),
+                        &session.access_token,
+                    )
+                    .await
+                    .map_err(Arc::new)?,
+                );
+
+                let mut catalog_provider = SqeCatalogProvider::try_new_with_policy(
+                    session_catalog.clone(),
+                    storage_clone.clone(),
+                    cat_cfg.warehouse.clone(),
+                    policy_store.cloned(),
+                    Some(session.user.clone()),
                 )
                 .await
-                .map_err(Arc::new)?,
-            );
+                .map_err(Arc::new)?;
+                if let Some(m) = prom_metrics {
+                    catalog_provider = catalog_provider.with_metrics(Arc::clone(m));
+                }
+                let small_file_threshold_bytes =
+                    cat_cfg.small_file_threshold_mb.saturating_mul(1024 * 1024);
+                catalog_provider =
+                    catalog_provider.with_small_file_threshold(small_file_threshold_bytes);
+                catalog_provider =
+                    catalog_provider.with_manifest_concurrency(cat_cfg.manifest_concurrency);
 
-            // Clone before moving into SqeCatalogProvider (which consumes the Arc)
+                ctx.register_catalog(cat_name, Arc::new(catalog_provider));
+
+                if primary_session_catalog.is_none() {
+                    primary_session_catalog = Some(session_catalog);
+                }
+            }
+
+            // Hold onto the primary for downstream consumers that
+            // expect a single SessionCatalog (system.runtime.*,
+            // SessionCatalog return value). Multi-catalog access
+            // for queries flows through DataFusion's CatalogProvider
+            // registration above; this is purely the legacy
+            // bookkeeping handle.
+            let session_catalog = primary_session_catalog.ok_or_else(|| {
+                Arc::new(SqeError::Config(
+                    "no catalogs configured; populate `[catalog]` or `[catalogs.*]`".into(),
+                ))
+            })?;
             let session_catalog_for_return = session_catalog.clone();
             let session_catalog_for_system = session_catalog.clone();
-
-            // Create the DataFusion CatalogProvider from the session catalog,
-            // passing policy store and session user for information_schema column filtering.
-            let mut catalog_provider = SqeCatalogProvider::try_new_with_policy(
-                session_catalog,
-                config.storage.clone(),
-                config.catalog.warehouse.clone(),
-                policy_store.cloned(),
-                Some(session.user.clone()),
-            )
-            .await
-            .map_err(Arc::new)?;
-            if let Some(m) = prom_metrics {
-                catalog_provider = catalog_provider.with_metrics(Arc::clone(m));
-            }
-            // Apply the small-file direct-read threshold from catalog config.
-            // Convert MB to bytes; 0 MB disables the fast path.
-            let small_file_threshold_bytes = config.catalog.small_file_threshold_mb
-                .saturating_mul(1024 * 1024);
-            catalog_provider = catalog_provider.with_small_file_threshold(small_file_threshold_bytes);
-            catalog_provider = catalog_provider
-                .with_manifest_concurrency(config.catalog.manifest_concurrency);
-
-            ctx.register_catalog(&catalog_name, Arc::new(catalog_provider));
 
             // Register the system catalog for Trino JDBC metadata browsing
             // (system.jdbc.types, system.jdbc.catalogs, system.jdbc.schemas, etc.)
