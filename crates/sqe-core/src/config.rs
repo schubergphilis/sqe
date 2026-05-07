@@ -691,13 +691,14 @@ pub enum CatalogBackend {
 /// for federation where one catalog speaks to Polaris (session
 /// token) and a sibling speaks to a partner Iceberg REST endpoint
 /// behind its own OAuth client.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CatalogAuthConfig {
     /// Use the user's session bearer token from the top-level
     /// `[auth]` block. This is the default and matches V6
     /// behaviour. Configured explicitly only when the operator
     /// wants the intent visible in the TOML.
+    #[default]
     SessionBearer,
     /// A pre-issued static bearer token. Read from a separate
     /// secrets file or env override at deploy time. Useful for
@@ -728,11 +729,6 @@ pub enum CatalogAuthConfig {
     Aws,
 }
 
-impl Default for CatalogAuthConfig {
-    fn default() -> Self {
-        CatalogAuthConfig::SessionBearer
-    }
-}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct CatalogConfig {
