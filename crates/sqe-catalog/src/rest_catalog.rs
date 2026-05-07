@@ -302,21 +302,38 @@ impl SessionCatalog {
         table_cache: Option<TableMetadataCache>,
         bearer_token: &str,
     ) -> sqe_core::Result<Self> {
-        match &config.catalog.backend {
+        Self::for_session_with(&config.catalog, &config.storage, table_cache, bearer_token).await
+    }
+
+    /// Per-catalog variant of `for_session`. Takes a single
+    /// `CatalogConfig` rather than reaching into `SqeConfig.catalog`,
+    /// so the multi-catalog cluster path can build one
+    /// `SessionCatalog` per entry in `[catalogs.*]`. The `storage`
+    /// argument is shared across all catalogs because S3 credentials
+    /// today are a coordinator-wide concern (per-catalog credential
+    /// scoping is a future change).
+    pub async fn for_session_with(
+        catalog: &sqe_core::config::CatalogConfig,
+        storage: &sqe_core::config::StorageConfig,
+        table_cache: Option<TableMetadataCache>,
+        bearer_token: &str,
+    ) -> sqe_core::Result<Self> {
+        match &catalog.backend {
             sqe_core::config::CatalogBackend::Rest => {
                 Self::new(
-                    &config.catalog.catalog_url,
-                    &config.catalog.warehouse,
+                    &catalog.catalog_url,
+                    &catalog.warehouse,
                     bearer_token,
-                    &config.storage,
+                    storage,
                     table_cache,
                     None,
                     None,
                 )
                 .await
             }
-            other => Self::for_session_other_backend(
-                config,
+            other => Self::for_session_other_backend_with(
+                catalog,
+                storage,
                 bearer_token,
                 table_cache.unwrap_or_else(|| TableMetadataCache::new(0)),
                 other,
@@ -325,12 +342,12 @@ impl SessionCatalog {
         }
     }
 
-    /// Build a `SessionCatalog` over a non-REST backend. Pulled out
-    /// of `for_session` so the REST fast path stays a single
-    /// straight-line constructor and the per-backend feature gates
-    /// stay localised.
-    async fn for_session_other_backend(
-        config: &SqeConfig,
+    /// Per-catalog variant. Same logic as `for_session_other_backend`
+    /// but scoped to a single `CatalogConfig` so the multi-catalog
+    /// path can iterate over `[catalogs.*]` entries.
+    async fn for_session_other_backend_with(
+        catalog: &sqe_core::config::CatalogConfig,
+        storage: &sqe_core::config::StorageConfig,
         bearer_token: &str,
         table_cache: TableMetadataCache,
         backend: &sqe_core::config::CatalogBackend,
@@ -450,10 +467,10 @@ impl SessionCatalog {
         Ok(Self {
             inner: CatalogHandle::Other(inner),
             catalog_url: String::new(),
-            warehouse: config.catalog.warehouse.clone(),
+            warehouse: catalog.warehouse.clone(),
             bearer_token: bearer_token.to_string(),
             token_fingerprint,
-            storage_config: config.storage.clone(),
+            storage_config: storage.clone(),
             http_client: reqwest::Client::new(),
             circuit_breaker: Arc::new(CircuitBreaker::new(
                 "non-rest-catalog",

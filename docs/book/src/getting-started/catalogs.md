@@ -24,6 +24,75 @@ All six are smoke-tested in CI. Two of them, Glue and S3 Tables,
 are verified live against production AWS deployments (account
 `311141556126`, eu-central-1 and eu-west-1).
 
+## Multiple catalogs in one coordinator
+
+SQE supports attaching several named catalogs (potentially of different backend types) to one coordinator. Each one becomes a top-level SQL identifier and cross-catalog joins work without any session-state setup.
+
+```toml
+# Legacy single-catalog block kept as a placeholder for backwards
+# compatibility. When `[catalogs.*]` is populated the legacy block
+# is dropped unless `query.default_catalog` names it explicitly.
+[catalog]
+catalog_url = ""
+
+[catalogs.polaris]
+catalog_url = "http://polaris:8181/api/catalog"
+warehouse = "production"
+
+[catalogs.polaris.backend]
+type = "rest"
+
+[catalogs.nessie]
+catalog_url = "http://nessie:19120/iceberg"
+warehouse = "lake"
+
+[catalogs.nessie.backend]
+type = "rest"
+
+[catalogs.aws_glue]
+catalog_url = ""
+[catalogs.aws_glue.backend]
+type = "glue"
+region = "eu-central-1"
+warehouse = "s3://my-bucket/wh"
+
+[catalogs.aws_s3tables]
+catalog_url = ""
+[catalogs.aws_s3tables.backend]
+type = "s3tables"
+table_bucket_arn = "arn:aws:s3tables:eu-west-1:123456789012:bucket/my-bucket"
+
+[catalogs.legacy_hms]
+catalog_url = ""
+[catalogs.legacy_hms.backend]
+type = "hms"
+uri = "metastore.example.com:9083"
+warehouse = "s3a://my-bucket/wh"
+
+[query]
+# Optional. Picks the catalog DataFusion uses for unqualified
+# names. Defaults to the first entry from `[catalogs.*]` sorted
+# alphabetically (so `aws_glue` would win the example above).
+default_catalog = "polaris"
+```
+
+3-part SQL identifiers route to the right catalog:
+
+```sql
+SELECT *
+FROM polaris.sales.orders p
+LEFT JOIN nessie.archive.orders n ON p.id = n.id
+WHERE n.id IS NULL;
+
+SELECT count(*) FROM aws_glue.iceberg_demo_analytics.iceberg_user_events;
+
+SELECT * FROM aws_s3tables.testnamespace.daily_sales LIMIT 10;
+```
+
+Each catalog uses its own backend dispatch path (REST + bearer token, native AWS SDK, Thrift, etc.). The user's bearer token from the session auth applies to all REST catalogs registered. Per-catalog credential scoping is a future change; today storage credentials are coordinator-wide.
+
+The legacy single-catalog form (the `[catalog]` block alone, no `[catalogs.*]`) keeps working unchanged. Existing deployments need no migration.
+
 ## REST: Polaris, Nessie, Unity OSS, AWS Glue REST, AWS S3 Tables REST
 
 The default. Most production deployments speak Iceberg REST.
