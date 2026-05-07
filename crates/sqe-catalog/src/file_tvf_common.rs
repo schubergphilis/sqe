@@ -33,6 +33,7 @@ use datafusion::error::Result as DFResult;
 use datafusion::execution::context::SessionContext;
 use datafusion_expr::Expr;
 use object_store::aws::AmazonS3Builder;
+use object_store::http::HttpBuilder;
 
 use sqe_core::config::StorageConfig;
 
@@ -57,6 +58,92 @@ pub fn scalar_to_str(sv: &ScalarValue) -> Option<&str> {
 /// Returns `true` when the path looks like an S3 URL.
 pub fn is_s3_path(path: &str) -> bool {
     path.starts_with("s3://") || path.starts_with("s3a://")
+}
+
+/// Returns `true` when the path looks like an HTTP / HTTPS URL.
+/// (HuggingFace `hf://` URLs are resolved to HTTPS upstream of this
+/// helper.)
+pub fn is_http_path(path: &str) -> bool {
+    path.starts_with("https://") || path.starts_with("http://")
+}
+
+/// Returns `true` when the path looks like a HuggingFace Hub URL.
+/// Format: `hf://datasets/<org>/<name>[@<revision>]/<path>` or
+/// `hf://models/<org>/<name>[@<revision>]/<path>`.
+pub fn is_hf_path(path: &str) -> bool {
+    path.starts_with("hf://")
+}
+
+/// Resolve an `hf://` URL to the corresponding HuggingFace Hub HTTPS
+/// download URL. Returns `None` if the path does not match the
+/// expected shape.
+///
+/// Format (matches the DuckDB `hf://` extension):
+///
+/// ```text
+/// hf://datasets/<owner>/<name>/<path>[?revision=<rev>]
+/// hf://models/<owner>/<name>/<path>[?revision=<rev>]
+/// hf://spaces/<owner>/<name>/<path>[?revision=<rev>]
+/// ```
+///
+/// Examples:
+///
+/// ```text
+/// hf://datasets/squad/plain_text/train-00000-of-00001.parquet
+///   -> https://huggingface.co/datasets/squad/plain_text/resolve/main/train-00000-of-00001.parquet
+///
+/// hf://datasets/squad/plain_text/train-00000-of-00001.parquet?revision=v1.0.0
+///   -> https://huggingface.co/datasets/squad/plain_text/resolve/v1.0.0/train-00000-of-00001.parquet
+/// ```
+///
+/// The owner/name shape is whatever HF stores; SQE does not enforce
+/// namespace rules. The revision defaults to `main`. Only the leftmost
+/// `<owner>/<name>` is treated as the repo identifier; everything after
+/// is the in-repo file path.
+pub fn resolve_hf_url(path: &str) -> Option<String> {
+    let after_scheme = path.strip_prefix("hf://")?;
+
+    // Strip the optional `?revision=<rev>` query parameter. Anything
+    // else after `?` is rejected so a typo doesn't silently fall
+    // through to `main`.
+    let (path_only, revision) = match after_scheme.split_once('?') {
+        Some((p, q)) => match q.strip_prefix("revision=") {
+            Some(r) if !r.is_empty() => (p, r.to_string()),
+            _ => return None,
+        },
+        None => (after_scheme, "main".to_string()),
+    };
+
+    let mut parts = path_only.splitn(2, '/');
+    let kind = parts.next()?;
+    if !matches!(kind, "datasets" | "models" | "spaces") {
+        return None;
+    }
+    let rest = parts.next()?;
+
+    // Repo id is `<owner>/<name>`; the rest is the in-repo file path.
+    // Both segments must be non-empty, and there must be a file path.
+    let mut rest_parts = rest.splitn(3, '/');
+    let owner = rest_parts.next()?;
+    let name = rest_parts.next()?;
+    let file_path = rest_parts.next()?;
+
+    if owner.is_empty() || name.is_empty() || file_path.is_empty() {
+        return None;
+    }
+
+    // `datasets` and `spaces` carry their kind prefix in HF's URL
+    // scheme; `models` is bare `<owner>/<name>`.
+    let prefix = match kind {
+        "datasets" => "/datasets",
+        "spaces" => "/spaces",
+        "models" => "",
+        _ => unreachable!("filtered above"),
+    };
+
+    Some(format!(
+        "https://huggingface.co{prefix}/{owner}/{name}/resolve/{revision}/{file_path}"
+    ))
 }
 
 /// Extract the bucket name from an `s3://bucket/...` or `s3a://bucket/...` URL.
@@ -258,6 +345,72 @@ pub fn register_s3_store_if_needed(
     Ok(())
 }
 
+/// V10 httpfs: build an object store rooted at the URL's `scheme://host`
+/// and register it on the supplied context. `object_store::http::HttpStore`
+/// supports HTTP range requests, which is enough for parquet metadata
+/// reads; CSV / JSON readers slurp the whole file. No-op for non-HTTP
+/// paths.
+///
+/// Each unique (scheme, host, port) tuple gets one registration on the
+/// context. DataFusion `register_object_store` is idempotent: re-registering
+/// the same URL replaces the previous handle, which is fine because every
+/// call we make builds an equivalent store.
+pub fn register_http_store_if_needed(
+    fn_name: &str,
+    ctx: &SessionContext,
+    path: &str,
+) -> DFResult<()> {
+    if !is_http_path(path) {
+        return Ok(());
+    }
+    let parsed = url::Url::parse(path).map_err(|e| {
+        datafusion::error::DataFusionError::Plan(format!(
+            "{fn_name}: failed to parse URL '{path}': {e}"
+        ))
+    })?;
+    let host = parsed.host_str().ok_or_else(|| {
+        datafusion::error::DataFusionError::Plan(format!(
+            "{fn_name}: URL '{path}' is missing a host"
+        ))
+    })?;
+    let scheme = parsed.scheme();
+    let base = match parsed.port() {
+        Some(p) => format!("{scheme}://{host}:{p}"),
+        None => format!("{scheme}://{host}"),
+    };
+
+    let http_store = HttpBuilder::new()
+        .with_url(&base)
+        .build()
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+
+    let store_url = url::Url::parse(&base).map_err(|e| {
+        datafusion::error::DataFusionError::Plan(format!(
+            "{fn_name}: failed to build object-store URL: {e}"
+        ))
+    })?;
+    ctx.register_object_store(&store_url, Arc::new(http_store));
+    Ok(())
+}
+
+/// Resolve an `hf://` URL to its HTTPS form, leaving everything else
+/// untouched. Mutates `args.path` so the rest of the TVF pipeline only
+/// has to know HTTPS / S3 / local-fs cases.
+pub fn rewrite_hf_path_in_place(fn_name: &str, args: &mut FileTvfArgs) -> DFResult<()> {
+    if !is_hf_path(&args.path) {
+        return Ok(());
+    }
+    let resolved = resolve_hf_url(&args.path).ok_or_else(|| {
+        datafusion::error::DataFusionError::Plan(format!(
+            "{fn_name}: malformed HuggingFace URL '{}'; \
+             expected hf://(datasets|models|spaces)/<org>/<name>[@<revision>]/<path>",
+            args.path
+        ))
+    })?;
+    args.path = resolved;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +524,121 @@ mod tests {
             ..StorageConfig::default()
         };
         assert!(build_s3_store("read_csv", &args, &storage).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // V10 httpfs + HF URL resolution
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn http_path_detection() {
+        assert!(is_http_path("https://example.com/file.parquet"));
+        assert!(is_http_path("http://internal/data.csv"));
+        assert!(!is_http_path("/local/file"));
+        assert!(!is_http_path("s3://bucket/file"));
+        assert!(!is_http_path("hf://datasets/x/y/f"));
+    }
+
+    #[test]
+    fn hf_path_detection() {
+        assert!(is_hf_path("hf://datasets/squad/plain/train.parquet"));
+        assert!(!is_hf_path("https://huggingface.co/..."));
+        assert!(!is_hf_path("/local/file"));
+    }
+
+    #[test]
+    fn hf_dataset_resolves_with_default_revision() {
+        let r = resolve_hf_url("hf://datasets/squad/plain/train.parquet").unwrap();
+        assert_eq!(
+            r,
+            "https://huggingface.co/datasets/squad/plain/resolve/main/train.parquet"
+        );
+    }
+
+    #[test]
+    fn hf_dataset_with_explicit_revision() {
+        let r = resolve_hf_url(
+            "hf://datasets/squad/plain/train.parquet?revision=v1.0.0",
+        )
+        .unwrap();
+        assert_eq!(
+            r,
+            "https://huggingface.co/datasets/squad/plain/resolve/v1.0.0/train.parquet"
+        );
+    }
+
+    #[test]
+    fn hf_model_path_uses_no_prefix() {
+        let r = resolve_hf_url("hf://models/bert-base/uncased/config.json").unwrap();
+        assert_eq!(
+            r,
+            "https://huggingface.co/bert-base/uncased/resolve/main/config.json"
+        );
+    }
+
+    #[test]
+    fn hf_spaces_path_uses_spaces_prefix() {
+        let r = resolve_hf_url("hf://spaces/org/space/file.txt").unwrap();
+        assert_eq!(
+            r,
+            "https://huggingface.co/spaces/org/space/resolve/main/file.txt"
+        );
+    }
+
+    #[test]
+    fn hf_unknown_kind_returns_none() {
+        assert!(resolve_hf_url("hf://things/org/name/file").is_none());
+    }
+
+    #[test]
+    fn hf_missing_file_path_returns_none() {
+        // owner/name with no in-repo file path.
+        assert!(resolve_hf_url("hf://datasets/squad/plain").is_none());
+    }
+
+    #[test]
+    fn hf_empty_revision_is_rejected() {
+        assert!(
+            resolve_hf_url("hf://datasets/squad/plain/train.parquet?revision=").is_none()
+        );
+    }
+
+    #[test]
+    fn hf_unknown_query_param_is_rejected() {
+        // Catch typos like `?rev=` instead of silently defaulting to `main`.
+        assert!(
+            resolve_hf_url("hf://datasets/squad/plain/train.parquet?rev=v1.0").is_none()
+        );
+    }
+
+    #[test]
+    fn rewrite_hf_path_in_place_resolves() {
+        let mut args = FileTvfArgs {
+            path: "hf://datasets/squad/plain/train.parquet".to_string(),
+            ..Default::default()
+        };
+        rewrite_hf_path_in_place("read_parquet", &mut args).unwrap();
+        assert!(args.path.starts_with("https://huggingface.co/datasets/squad/"));
+    }
+
+    #[test]
+    fn rewrite_hf_path_in_place_leaves_https_untouched() {
+        let mut args = FileTvfArgs {
+            path: "https://example.com/file.parquet".to_string(),
+            ..Default::default()
+        };
+        rewrite_hf_path_in_place("read_parquet", &mut args).unwrap();
+        assert_eq!(args.path, "https://example.com/file.parquet");
+    }
+
+    #[test]
+    fn rewrite_hf_path_in_place_errors_on_malformed_hf_url() {
+        let mut args = FileTvfArgs {
+            path: "hf://datasets/just-an-org".to_string(),
+            ..Default::default()
+        };
+        let r = rewrite_hf_path_in_place("read_parquet", &mut args);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("malformed HuggingFace URL"));
     }
 }

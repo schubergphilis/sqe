@@ -100,6 +100,49 @@ SELECT * FROM '/data/log.csv';
 
 Works with globs and S3 URLs too. For S3, you still need credentials configured somewhere (default in `[storage]`, or use `read_csv()`/`read_parquet()` and pass them inline).
 
+### HTTP / HTTPS URLs
+
+Every file-format TVF and the `SELECT * FROM 'file.ext'` auto-detect accept HTTP and HTTPS URLs out of the box:
+
+```sql
+-- Public CSV from any HTTP(S) host
+SELECT count(*) FROM read_csv(
+  'https://raw.githubusercontent.com/datasciencedojo/datasets/master/titanic.csv'
+);
+
+-- Auto-detect on a quoted URL
+SELECT count(*) FROM
+  'https://raw.githubusercontent.com/datasciencedojo/datasets/master/titanic.csv';
+
+-- Parquet over HTTP (range-request reads, no full download)
+SELECT count(*) FROM read_parquet('https://example.com/dataset.parquet');
+```
+
+The engine builds an HTTP object store on first request per `scheme://host[:port]` and caches it for the rest of the session. No configuration needed.
+
+### HuggingFace Hub: `hf://`
+
+`hf://` URLs resolve to public HuggingFace Hub download URLs:
+
+```sql
+-- hf://datasets/<owner>/<name>/<path>
+SELECT * FROM read_csv(
+  'hf://datasets/datasets-examples/doc-formats-csv-1/data.csv'
+);
+
+-- Pin a revision via ?revision=
+SELECT * FROM read_parquet(
+  'hf://datasets/squad/plain_text/train.parquet?revision=v1.0.0'
+);
+
+-- Models and Spaces work the same way
+SELECT * FROM read_json('hf://models/<owner>/<name>/config.json');
+```
+
+The resolver expands `hf://datasets/<owner>/<name>/<path>` to `https://huggingface.co/datasets/<owner>/<name>/resolve/<rev>/<path>` and routes through the same HTTP object store as raw HTTPS URLs. Default revision is `main`.
+
+Public datasets work without any auth. Private datasets are not yet supported (HF token plumbing is on the roadmap).
+
 ### `COPY ... TO 'file'`
 
 Export query results to disk. Format is auto-detected from the extension.

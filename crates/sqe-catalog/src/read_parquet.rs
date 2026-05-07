@@ -37,13 +37,30 @@ use tracing::debug;
 use sqe_core::config::StorageConfig;
 
 /// Named keyword arguments accepted by `read_parquet()`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ReadParquetArgs {
     path: String,
     access_key: Option<String>,
     secret_key: Option<String>,
     endpoint: Option<String>,
     region: Option<String>,
+}
+
+impl ReadParquetArgs {
+    /// Construct a new `ReadParquetArgs` with `path` replaced. Used when
+    /// the caller resolves an `hf://` URL to its HTTPS form before
+    /// schema inference. Returns a fresh value rather than mutating
+    /// the input so the original `args` borrow stays valid.
+    #[allow(dead_code)]
+    fn clone_with_path(&self, path: String) -> Self {
+        Self {
+            path,
+            access_key: self.access_key.clone(),
+            secret_key: self.secret_key.clone(),
+            endpoint: self.endpoint.clone(),
+            region: self.region.clone(),
+        }
+    }
 }
 
 /// Parse a `ScalarValue::Utf8` or `ScalarValue::LargeUtf8` to `&str`.
@@ -192,6 +209,24 @@ async fn build_listing_table(
     args: &ReadParquetArgs,
     storage: &StorageConfig,
 ) -> DFResult<Arc<dyn TableProvider>> {
+    // V10: resolve hf:// to its HTTPS form before URL parsing so HF
+    // dataset / model paths flow through the same httpfs path as raw
+    // HTTPS URLs.
+    let mut args_local;
+    let args = if crate::file_tvf_common::is_hf_path(&args.path) {
+        args_local = args.clone_with_path(args.path.clone());
+        let tmp = crate::file_tvf_common::resolve_hf_url(&args.path).ok_or_else(|| {
+            datafusion::error::DataFusionError::Plan(format!(
+                "read_parquet: malformed HuggingFace URL '{}'",
+                args.path
+            ))
+        })?;
+        args_local.path = tmp;
+        &args_local
+    } else {
+        args
+    };
+
     let listing_url = ListingTableUrl::parse(&args.path)?;
 
     // Create a temporary session context so we can register an object store
@@ -215,6 +250,15 @@ async fn build_listing_table(
             )))?;
         tmp_ctx.register_object_store(&store_url, Arc::new(s3));
         debug!(path = %args.path, "Registered S3 object store for read_parquet");
+    } else {
+        // V10 httpfs: HTTPS / HTTP paths use the shared HttpStore
+        // builder. Parquet metadata reads need range requests, which
+        // object_store::http supports.
+        crate::file_tvf_common::register_http_store_if_needed(
+            "read_parquet",
+            &tmp_ctx,
+            &args.path,
+        )?;
     }
     // For local paths DataFusion's default LocalFileSystem is used automatically.
 
