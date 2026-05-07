@@ -6160,6 +6160,7 @@ dependencies = [
  "base64",
  "bytes",
  "clap",
+ "dashmap",
  "datafusion",
  "datafusion-functions-json",
  "futures",

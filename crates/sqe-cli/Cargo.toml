@@ -24,6 +24,10 @@ datafusion-functions-json = { workspace = true }
 iceberg = { workspace = true }
 iceberg-catalog-sql = { workspace = true }
 iceberg-datafusion = { workspace = true }
+# DashMap powers the writable catalog's per-name schema cache; same
+# concurrency-friendly map iceberg-datafusion uses for its own
+# table-level cache.
+dashmap = { workspace = true }
 tonic = { workspace = true, features = ["transport", "tls-native-roots"] }
 tokio = { workspace = true }
 futures = { workspace = true }

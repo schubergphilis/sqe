@@ -46,8 +46,9 @@ use iceberg::CatalogBuilder;
 use iceberg_catalog_sql::{
     SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlCatalogBuilder,
 };
-use iceberg_datafusion::IcebergCatalogProvider;
 use sqe_core::config::StorageConfig;
+
+use crate::writable_iceberg_catalog::WritableIcebergCatalog;
 
 use crate::client::{QueryResult, SqlClient};
 
@@ -177,17 +178,27 @@ pub fn build_embedded_context(memory_limit_bytes: usize) -> anyhow::Result<Sessi
 /// resolves the right one and cross-catalog joins work without any
 /// session-state setup.
 ///
+/// Returns the [`SessionContext`] paired with a map of attached
+/// iceberg catalogs keyed by user-facing name. The map lets the SQL
+/// DDL interceptor route `CREATE SCHEMA <cat>.<ns>` directly to
+/// `iceberg::Catalog::create_namespace` rather than DataFusion's
+/// CatalogProvider (which `iceberg-datafusion` doesn't implement).
+///
 /// Side effect: creates `<path>` and `<path>/iceberg/` for each
 /// catalog if missing. The SQLite database itself is created on
 /// first connect by `iceberg-catalog-sql`.
 pub async fn build_embedded_context_with_warehouse(
     memory_limit_bytes: usize,
     mode: &WarehouseMode,
-) -> anyhow::Result<SessionContext> {
+) -> anyhow::Result<(SessionContext, IcebergCatalogMap)> {
     let ctx = build_embedded_context(memory_limit_bytes)?;
+    let mut iceberg_catalogs: IcebergCatalogMap = HashMap::new();
+
     let catalogs = match mode {
-        WarehouseMode::Memory => return Ok(ctx),
-        WarehouseMode::Persistent { catalogs } if catalogs.is_empty() => return Ok(ctx),
+        WarehouseMode::Memory => return Ok((ctx, iceberg_catalogs)),
+        WarehouseMode::Persistent { catalogs } if catalogs.is_empty() => {
+            return Ok((ctx, iceberg_catalogs));
+        }
         WarehouseMode::Persistent { catalogs } => catalogs,
     };
 
@@ -205,21 +216,32 @@ pub async fn build_embedded_context_with_warehouse(
     }
 
     for c in catalogs {
-        attach_sqlite_catalog(&ctx, &c.name, &c.path)
+        let handle = attach_sqlite_catalog(&ctx, &c.name, &c.path)
             .await
             .map_err(|e| anyhow::anyhow!("failed to attach catalog `{}`: {e}", c.name))?;
+        iceberg_catalogs.insert(c.name.clone(), handle);
     }
-    Ok(ctx)
+    Ok((ctx, iceberg_catalogs))
 }
+
+/// Map of iceberg catalogs keyed by user-facing name, available to
+/// the DDL interceptor for write operations.
+pub type IcebergCatalogMap = HashMap<String, Arc<dyn iceberg::Catalog>>;
 
 /// Initialise `<path>/sqe.db` as the Iceberg metadata store and
 /// `<path>/iceberg/` as the data file root, then register the result
 /// with `ctx` under the given catalog `name`.
+/// Returns the `Arc<dyn iceberg::Catalog>` after wiring it into the
+/// DataFusion session. Caller stores the returned handle so DDL
+/// interceptors (CREATE SCHEMA / CREATE TABLE on the iceberg catalog
+/// surface) can route directly to the catalog API instead of through
+/// DataFusion's CatalogProvider, which doesn't implement writes for
+/// `iceberg-datafusion`'s provider.
 async fn attach_sqlite_catalog(
     ctx: &SessionContext,
     name: &str,
     path: &Path,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Arc<dyn iceberg::Catalog>> {
     std::fs::create_dir_all(path)
         .map_err(|e| anyhow::anyhow!("failed to create warehouse dir {}: {e}", path.display()))?;
     let data_root = path.join("iceberg");
@@ -253,25 +275,33 @@ async fn attach_sqlite_catalog(
     // for the user comes from each catalog living in its own SQLite
     // file (separate `path`); the user-facing identifier is set by
     // `ctx.register_catalog(name, ...)` below.
-    let catalog = SqlCatalogBuilder::default()
-        .load("sqe-embedded".to_string(), props)
-        .await
-        .map_err(|e| anyhow::anyhow!("SQLite catalog open failed: {e}"))?;
+    let catalog: Arc<dyn iceberg::Catalog> = Arc::new(
+        SqlCatalogBuilder::default()
+            .load("sqe-embedded".to_string(), props)
+            .await
+            .map_err(|e| anyhow::anyhow!("SQLite catalog open failed: {e}"))?,
+    );
 
-    let provider = IcebergCatalogProvider::try_new(Arc::new(catalog))
-        .await
-        .map_err(|e| anyhow::anyhow!("IcebergCatalogProvider build failed: {e}"))?;
+    let provider = WritableIcebergCatalog::try_new(catalog.clone()).await?;
 
     ctx.register_catalog(name, Arc::new(provider));
-    Ok(())
+    Ok(catalog)
 }
 
 /// `SqlClient` impl backed by an in-process [`SessionContext`].
 ///
 /// Mirrors the network clients (`flight.rs`, `http.rs`) so the CLI's
 /// REPL and one-shot paths don't need to special-case embedded mode.
+/// The `iceberg_catalogs` map keeps strong references to the
+/// catalog handles even though `WritableIcebergCatalog` already
+/// holds its own clone — this stays around so a future CTAS path
+/// can reach the iceberg API for the Parquet-write + commit step
+/// without going through `Arc::downgrade` gymnastics on the
+/// CatalogProvider trait object.
 pub struct EmbeddedClient {
     ctx: SessionContext,
+    #[allow(dead_code)]
+    iceberg_catalogs: IcebergCatalogMap,
 }
 
 impl EmbeddedClient {
@@ -281,18 +311,23 @@ impl EmbeddedClient {
     pub fn new(memory_limit_bytes: usize) -> anyhow::Result<Self> {
         Ok(Self {
             ctx: build_embedded_context(memory_limit_bytes)?,
+            iceberg_catalogs: HashMap::new(),
         })
     }
 
     /// Build an embedded client with a chosen warehouse mode.
     /// `Persistent` attaches a SQLite-backed Iceberg catalog;
-    /// `Memory` matches the legacy `new()` behaviour.
+    /// `Memory` matches the legacy `new()` behaviour with no
+    /// iceberg catalogs attached.
     pub async fn with_warehouse(
         memory_limit_bytes: usize,
         mode: &WarehouseMode,
     ) -> anyhow::Result<Self> {
+        let (ctx, iceberg_catalogs) =
+            build_embedded_context_with_warehouse(memory_limit_bytes, mode).await?;
         Ok(Self {
-            ctx: build_embedded_context_with_warehouse(memory_limit_bytes, mode).await?,
+            ctx,
+            iceberg_catalogs,
         })
     }
 }
@@ -300,6 +335,12 @@ impl EmbeddedClient {
 #[async_trait]
 impl SqlClient for EmbeddedClient {
     async fn execute(&mut self, sql: &str) -> Result<QueryResult, Box<dyn std::error::Error>> {
+        // No SQL interceptor needed: WritableIcebergCatalog routes
+        // CREATE SCHEMA / DROP SCHEMA / CREATE TABLE / DROP TABLE
+        // through the standard DataFusion CatalogProvider trait, which
+        // dispatches to the underlying iceberg::Catalog. Reads also
+        // go through the same provider since it composes the upstream
+        // IcebergSchemaProvider for namespace contents.
         let df = self.ctx.sql(sql).await?;
         // Snapshot the DataFrame schema before collecting so we still
         // emit column names when the query produces zero batches (an
@@ -538,63 +579,29 @@ mod tests {
         assert!(has_right, "right catalog missing; rows: {:?}", r.rows);
     }
 
-    /// Persistence smoke: create a namespace and a table out-of-band
-    /// via the iceberg::Catalog API, then attach a fresh client and
-    /// confirm SHOW TABLES sees it. CREATE TABLE through DataFusion's
-    /// SQL path is V3 work — `IcebergCatalogProvider` (the iceberg-rust
-    /// bridge) doesn't implement `register_schema` / `register_table`,
-    /// so DDL has to route through the iceberg::Catalog trait directly.
-    /// V2 ships the read side; V3 adds the SQL DDL interceptor.
+    /// Persistence smoke: create a namespace and table via SQL,
+    /// drop the client, build a fresh one against the same warehouse,
+    /// and confirm both are visible. End-to-end exercise of the
+    /// V5 `WritableIcebergCatalog` write path: every operation goes
+    /// through DataFusion's SQL surface, no out-of-band bootstrap.
     #[tokio::test]
     async fn persistent_warehouse_survives_client_restart() {
-        use iceberg::{Catalog, NamespaceIdent, TableCreation};
-        use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
-
         let tmp = tempfile::tempdir().expect("tempdir");
         let mode = WarehouseMode::single(tmp.path().to_path_buf());
 
-        // Phase 1: bootstrap a namespace + table directly via the
-        // iceberg::Catalog so the catalog file has something to find.
-        // Mirrors what V3's CREATE TABLE interceptor will eventually do.
+        // Phase 1: create namespace + table via SQL.
         {
-            std::fs::create_dir_all(tmp.path().join("iceberg"))
-                .expect("warehouse data dir");
-            let abs = tmp.path().canonicalize().expect("canonicalize tmp");
-            let mut props = std::collections::HashMap::new();
-            props.insert(
-                SQL_CATALOG_PROP_URI.to_string(),
-                format!("sqlite://{}?mode=rwc", abs.join("sqe.db").display()),
-            );
-            props.insert(
-                SQL_CATALOG_PROP_WAREHOUSE.to_string(),
-                format!("file://{}", abs.join("iceberg").display()),
-            );
-            let catalog = SqlCatalogBuilder::default()
-                .load("sqe-embedded".to_string(), props)
+            let mut c = EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode)
                 .await
-                .expect("bootstrap catalog open");
-            let ns = NamespaceIdent::new("test_ns".into());
-            catalog
-                .create_namespace(&ns, std::collections::HashMap::new())
+                .expect("first client");
+            c.execute("CREATE SCHEMA iceberg.test_ns")
                 .await
-                .expect("create_namespace");
-            let schema = IcebergSchema::builder()
-                .with_fields(vec![
-                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long))
-                        .into(),
-                    NestedField::optional(2, "msg", Type::Primitive(PrimitiveType::String))
-                        .into(),
-                ])
-                .build()
-                .expect("schema");
-            let creation = TableCreation::builder()
-                .name("greetings".into())
-                .schema(schema)
-                .build();
-            catalog
-                .create_table(&ns, creation)
-                .await
-                .expect("create_table");
+                .expect("CREATE SCHEMA");
+            c.execute(
+                "CREATE TABLE iceberg.test_ns.greetings (id BIGINT, msg VARCHAR)",
+            )
+            .await
+            .expect("CREATE TABLE");
         }
 
         // Phase 2: build the embedded client, confirm the iceberg
