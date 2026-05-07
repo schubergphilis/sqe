@@ -23,10 +23,16 @@
 //! the row level only — it cannot skip Parquet row groups whose min/max
 //! covers the full FK range. Bloom filters give exact-membership skipping
 //! per row group at a tiny storage cost (~0.5-3 KB per file per column at
-//! the default 1% FPP). The `_sk` and `_id` suffixes are the standard FK
-//! convention in TPC-DS, TPC-H, SSB, and most Kimball-style schemas, so
-//! the heuristic is conservative and false positives only cost extra
-//! bloom-filter bytes, not correctness.
+//! the default 1% FPP).
+//!
+//! Auto-detection currently matches only the `_sk` suffix. The TPC-DS,
+//! SSB, and TPC-BB benchmarks use this exclusively, which is where the
+//! q88 / q21 / q39 wins come from. The broader `_id` suffix was tempting
+//! but matches too many non-FK columns in real schemas: UUIDs stored as
+//! Long (`transaction_id`, `correlation_id`, `trace_id`, `event_id`)
+//! where every value is unique and a bloom filter buys nothing while
+//! costing footer bytes. Operators with Kimball-style `_id` FK columns
+//! can opt them in explicitly via `write.parquet.bloom-filter-columns`.
 //!
 //! ## Design
 //!
@@ -147,16 +153,16 @@ pub fn build_writer_props(
 /// Pick FK-shaped integer columns from the schema for default bloom filtering.
 ///
 /// A column is treated as a foreign-key candidate when its name ends in
-/// `_sk` or `_id` (case-sensitive, matching the TPC-DS / Kimball
-/// convention) and its primitive type is `Int` or `Long`. Other types
-/// (strings, decimals, dates, floats) are skipped: bloom filters on
-/// strings work but most string FKs are low-cardinality codes where
-/// dictionary encoding already covers skipping; floats and decimals
-/// rarely participate in equi-joins.
+/// `_sk` (the TPC-DS / Kimball "surrogate key" convention) AND its
+/// primitive type is `Int` or `Long`. Strings, decimals, dates, floats,
+/// and `_id`-suffixed columns are skipped: see the module docs for why
+/// `_id` is intentional opt-in rather than auto-detected.
 ///
-/// Returns column names in schema order, deduplicated. The caller still
-/// validates each name against the schema so unknown columns log a
-/// warning rather than panic.
+/// The schema field iteration follows iceberg's authoritative field
+/// order, which is part of the schema spec and stable across writers
+/// reading the same metadata snapshot. Returned names preserve that
+/// order. The caller still validates each name against the schema so
+/// unknown columns log a warning rather than panic.
 pub fn auto_detect_fk_columns(schema: &IcebergSchema) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for field in schema.as_struct().fields() {
@@ -173,8 +179,14 @@ pub fn auto_detect_fk_columns(schema: &IcebergSchema) -> Vec<String> {
     out
 }
 
+/// Return true when `name` looks like a TPC-DS / Kimball surrogate key.
+///
+/// We require the suffix `_sk` *plus* at least one character of prefix
+/// (so a column literally named `_sk` is not auto-bloomed; that's
+/// almost certainly a typo). `_id` is deliberately excluded — see the
+/// module-level docs.
 fn is_fk_name(name: &str) -> bool {
-    name.ends_with("_sk") || name.ends_with("_id")
+    name.len() > 3 && name.ends_with("_sk")
 }
 
 fn is_integer_primitive(ty: &Type) -> bool {
@@ -241,7 +253,8 @@ mod tests {
 
     /// Schema modelling a small TPC-DS-style fact table with both FK and
     /// non-FK columns of varied types — used to exercise the auto-detect
-    /// heuristic.
+    /// heuristic. Includes a Long-typed `transaction_id` to assert that
+    /// `_id`-suffixed columns are NOT auto-bloomed; see module docs.
     fn schema_fact_table() -> IcebergSchema {
         IcebergSchema::builder()
             .with_fields(vec![
@@ -253,10 +266,16 @@ mod tests {
                     .into(),
                 NestedField::required(4, "i_item_id", Type::Primitive(PrimitiveType::String))
                     .into(),
-                NestedField::optional(5, "ss_quantity", Type::Primitive(PrimitiveType::Int))
+                NestedField::optional(
+                    5,
+                    "transaction_id",
+                    Type::Primitive(PrimitiveType::Long),
+                )
+                .into(),
+                NestedField::optional(6, "ss_quantity", Type::Primitive(PrimitiveType::Int))
                     .into(),
                 NestedField::optional(
-                    6,
+                    7,
                     "ss_sales_price",
                     Type::Primitive(PrimitiveType::Double),
                 )
@@ -268,10 +287,11 @@ mod tests {
 
     #[test]
     fn bloom_filter_auto_detects_integer_fk_columns_by_default() {
-        // No properties at all means default: auto-detect FK-shaped
-        // integer columns. The string `i_item_id` is rejected (wrong
-        // type) and `ss_quantity`/`ss_sales_price` are rejected (no FK
-        // suffix or wrong type).
+        // No properties at all means default: auto-detect _sk-suffixed
+        // integer columns. Skipped: `i_item_id` (wrong type AND _id
+        // suffix), `transaction_id` (Long but _id suffix is opt-in
+        // only — see module docs), `ss_quantity` (no FK suffix),
+        // `ss_sales_price` (Double).
         let props = HashMap::new();
         let schema = schema_fact_table();
         let w = build_writer_props(&props, &schema, Compression::UNCOMPRESSED);
@@ -280,16 +300,60 @@ mod tests {
             assert!(
                 w.bloom_filter_properties(&ColumnPath::new(vec![fk.to_string()]))
                     .is_some(),
-                "{fk} should be auto-bloomed (integer FK)"
+                "{fk} should be auto-bloomed (integer FK ending in _sk)"
             );
         }
-        for non_fk in ["i_item_id", "ss_quantity", "ss_sales_price"] {
+        for non_fk in [
+            "i_item_id",
+            "transaction_id",
+            "ss_quantity",
+            "ss_sales_price",
+        ] {
             assert!(
                 w.bloom_filter_properties(&ColumnPath::new(vec![non_fk.to_string()]))
                     .is_none(),
-                "{non_fk} should NOT be auto-bloomed"
+                "{non_fk} should NOT be auto-bloomed (only _sk integer columns auto-bloom)"
             );
         }
+    }
+
+    /// `_id` columns can still be bloomed if explicitly listed. This
+    /// proves the module-doc claim that operators with Kimball-style
+    /// schemas can opt in.
+    #[test]
+    fn id_suffix_works_when_explicitly_listed() {
+        let mut props = HashMap::new();
+        props.insert(
+            PROP_BLOOM_FILTER_COLUMNS.to_string(),
+            "transaction_id".to_string(),
+        );
+        let schema = schema_fact_table();
+        let w = build_writer_props(&props, &schema, Compression::UNCOMPRESSED);
+
+        assert!(
+            w.bloom_filter_properties(&ColumnPath::new(vec!["transaction_id".to_string()]))
+                .is_some(),
+            "explicit `_id` column should be bloomed when listed"
+        );
+    }
+
+    /// Edge-case: a column literally named `_sk` (no prefix) is NOT
+    /// auto-bloomed. Almost certainly a typo, and `is_fk_name` guards
+    /// for it explicitly.
+    #[test]
+    fn bare_sk_suffix_is_not_auto_bloomed() {
+        use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+        let schema = Schema::builder()
+            .with_fields(vec![NestedField::required(
+                1,
+                "_sk",
+                Type::Primitive(PrimitiveType::Long),
+            )
+            .into()])
+            .build()
+            .expect("schema");
+        let cols = auto_detect_fk_columns(&schema);
+        assert!(cols.is_empty(), "bare `_sk` should not match");
     }
 
     #[test]
@@ -338,10 +402,12 @@ mod tests {
     fn auto_detect_skips_string_fk() {
         // String columns are skipped even with FK suffixes — most string
         // FKs are low-cardinality codes where dictionary encoding already
-        // gives row-group skipping. See module docs.
+        // gives row-group skipping. See module docs. Likewise the
+        // Long-typed `transaction_id` is skipped because `_id` is opt-in.
         let schema = schema_fact_table();
         let cols = auto_detect_fk_columns(&schema);
         assert!(!cols.contains(&"i_item_id".to_string()));
+        assert!(!cols.contains(&"transaction_id".to_string()));
         assert_eq!(cols, vec!["ss_item_sk", "ss_store_sk", "ss_promo_sk"]);
     }
 
