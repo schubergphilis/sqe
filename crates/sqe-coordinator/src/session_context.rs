@@ -114,7 +114,7 @@ pub async fn create_session_context(
                 .set_bool("datafusion.execution.parquet.pushdown_filters", true)
                 .set_bool("datafusion.execution.parquet.reorder_filters", true);
 
-            let mut ctx = if let Some(rt) = runtime {
+            let ctx = if let Some(rt) = runtime {
                 // Use the shared coordinator runtime (FairSpillPool with spill-to-disk)
                 SessionContext::new_with_config_rt(session_config, Arc::clone(rt))
             } else {
@@ -137,6 +137,16 @@ pub async fn create_session_context(
                     SessionContext::new_with_config(session_config)
                 }
             };
+
+            // V8: enable DuckDB-style `SELECT * FROM 'file.parquet'` auto-detection.
+            // DataFusion's DynamicFileCatalog wraps the current catalog list in a
+            // factory that resolves quoted-string table names against ListingTableFactory
+            // when nothing else matches. Extension drives the format (parquet / csv /
+            // json / avro). Must run before catalog registrations because it
+            // replaces the catalog list pointer; subsequent register_catalog calls
+            // attach to the wrapped list.
+            let ctx = ctx.enable_url_table();
+            let mut ctx = ctx;
 
             // Register DataFusion's built-in in-memory catalog so DML helpers can register
             // temporary MemTables under `datafusion.public.<name>` without hitting the
@@ -347,6 +357,25 @@ pub async fn create_session_context(
             ctx.register_udtf(
                 "read_parquet",
                 Arc::new(sqe_catalog::read_parquet::ReadParquetFunction::new(
+                    config.storage.clone(),
+                )),
+            );
+
+            // V8: read_csv() and read_json() TVFs alongside read_parquet().
+            // Same calling convention (positional path + named kw args);
+            // CSV-specific args: delimiter, has_header, quote, escape,
+            // comment, null_regex, file_extension. JSON-specific args:
+            // newline_delimited, file_extension. S3 credentials + endpoint
+            // overrides flow through the shared file_tvf_common helpers.
+            ctx.register_udtf(
+                "read_csv",
+                Arc::new(sqe_catalog::read_csv::ReadCsvFunction::new(
+                    config.storage.clone(),
+                )),
+            );
+            ctx.register_udtf(
+                "read_json",
+                Arc::new(sqe_catalog::read_json::ReadJsonFunction::new(
                     config.storage.clone(),
                 )),
             );
