@@ -37,7 +37,7 @@ realm = "iceberg"                               # Your realm
 client_id = "sqe-client"                        # OIDC client ID
 
 [catalog]
-polaris_url = "http://your-polaris:8181/api/catalog"
+catalog_url = "http://your-polaris:8181/api/catalog"
 warehouse = "your-warehouse"
 
 [storage]

@@ -43,7 +43,7 @@ struct HealthState {
     started_at: Instant,
     role: &'static str,
     worker_registry: Option<Arc<sqe_coordinator::worker_registry::WorkerRegistry>>,
-    polaris_url: String,
+    catalog_url: String,
 }
 
 async fn healthz() -> &'static str {
@@ -61,9 +61,9 @@ async fn readyz(
     let mut all_healthy = true;
 
     // Check Polaris catalog reachability
-    if !state.polaris_url.is_empty() {
+    if !state.catalog_url.is_empty() {
         let polaris_ok = reqwest::Client::new()
-            .get(format!("{}/api/catalog/v1/config", state.polaris_url))
+            .get(format!("{}/api/catalog/v1/config", state.catalog_url))
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
@@ -382,7 +382,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         } else {
             Some(worker_registry.clone())
         },
-        polaris_url: config.catalog.polaris_url.clone(),
+        catalog_url: config.catalog.catalog_url.clone(),
     });
     start_health_server(health_port, health_state);
 
@@ -691,7 +691,7 @@ async fn run_worker(config: SqeConfig) -> anyhow::Result<()> {
         started_at,
         role: "worker",
         worker_registry: None,
-        polaris_url: String::new(), // workers do not connect to Polaris directly
+        catalog_url: String::new(), // workers do not connect to Polaris directly
     });
     start_health_server(health_port, health_state);
 
@@ -882,7 +882,7 @@ mod tests {
             started_at: Instant::now(),
             role: "coordinator",
             worker_registry: None,
-            polaris_url: String::new(),
+            catalog_url: String::new(),
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -898,7 +898,7 @@ mod tests {
             started_at: Instant::now(),
             role: "worker",
             worker_registry: None,
-            polaris_url: String::new(),
+            catalog_url: String::new(),
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -920,7 +920,7 @@ mod tests {
             started_at: Instant::now(),
             role: "coordinator",
             worker_registry: Some(registry),
-            polaris_url: String::new(),
+            catalog_url: String::new(),
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -933,13 +933,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_readyz_ready() {
-        // With an empty polaris_url, no Polaris check is performed — always healthy.
+        // With an empty catalog_url, no catalog reachability check is performed.
         let state = Arc::new(HealthState {
             ready: Arc::new(AtomicBool::new(true)),
             started_at: Instant::now(),
             role: "coordinator",
             worker_registry: None,
-            polaris_url: String::new(),
+            catalog_url: String::new(),
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -953,7 +953,7 @@ mod tests {
             started_at: Instant::now(),
             role: "coordinator",
             worker_registry: None,
-            polaris_url: String::new(),
+            catalog_url: String::new(),
         });
 
         let response = readyz(axum::extract::State(state)).await;
