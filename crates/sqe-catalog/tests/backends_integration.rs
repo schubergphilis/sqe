@@ -456,7 +456,12 @@ warehouse = "{warehouse}"
 
         // REST-only path: create_view should fail fast with a clear
         // "requires REST" error rather than an opaque HTTP failure
-        // against an empty polaris_url.
+        // against an empty catalog_url. The TOML at the top of this
+        // test deliberately uses the legacy `polaris_url` field name
+        // so toml::from_str exercises the serde alias on the parser
+        // path. The dispatch path itself does not read catalog_url
+        // for the JDBC backend — alias coverage in dispatch is by
+        // serde, not by code in catalog_ops.
         let view_err = session_catalog
             .create_view(&ns, "should_not_create", "SELECT 1", &serde_json::json!({}))
             .await

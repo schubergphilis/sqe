@@ -45,12 +45,12 @@ token_refresh_buffer_secs = 60  # Refresh tokens this many seconds before expiry
 ssl_verification = true         # Set false for dev (self-signed certs)
 
 [catalog]
-polaris_url = "http://polaris:8181/api/catalog"   # REST catalog endpoint
+catalog_url = "http://polaris:8181/api/catalog"   # REST catalog endpoint
 warehouse = "iceberg"           # warehouse identifier the catalog expects
 metadata_cache_ttl_secs = 30    # Table metadata cache TTL
 default_table_format_version = 2 # Iceberg table format version (2 or 3)
 
-# `polaris_url` accepts any Iceberg REST endpoint. SQE has been
+# `catalog_url` accepts any Iceberg REST endpoint. SQE has been
 # verified live against Apache Polaris, Project Nessie 0.107+,
 # Unity Catalog OSS, AWS Glue Iceberg REST, and AWS S3 Tables REST.
 # For AWS REST endpoints the vendored REST client signs requests
@@ -58,7 +58,7 @@ default_table_format_version = 2 # Iceberg table format version (2 or 3)
 # in its /v1/config defaults.
 
 # When `[catalog.backend]` is omitted, SQE defaults to `type = "rest"`
-# and uses `polaris_url` + `warehouse` above. To target a non-REST
+# and uses `catalog_url` + `warehouse` above. To target a non-REST
 # catalog (HMS, AWS Glue native, AWS S3 Tables native, JDBC, Hadoop),
 # set the backend block explicitly. See `docs/book/src/getting-started/
 # catalogs.md` for the full per-backend reference.
@@ -156,7 +156,8 @@ Every config field can be overridden via environment variable. Convention: `SQE_
 | `SQE_AUTH__TOKEN_REFRESH_BUFFER_SECS` | `auth.token_refresh_buffer_secs` | u64 |
 | `SQE_AUTH__SSL_VERIFICATION` | `auth.ssl_verification` | bool |
 | **Catalog** | | |
-| `SQE_CATALOG__POLARIS_URL` | `catalog.polaris_url` | string |
+| `SQE_CATALOG__CATALOG_URL` | `catalog.catalog_url` | string |
+| `SQE_CATALOG__POLARIS_URL` | `catalog.catalog_url` (legacy alias) | string |
 | `SQE_CATALOG__WAREHOUSE` | `catalog.warehouse` | string |
 | `SQE_CATALOG__METADATA_CACHE_TTL_SECS` | `catalog.metadata_cache_ttl_secs` | u64 |
 | `SQE_CATALOG__DEFAULT_TABLE_FORMAT_VERSION` | `catalog.default_table_format_version` | u8 |
@@ -237,7 +238,7 @@ At least one of `keycloak_url` or `token_endpoint` must be configured. If both a
 SQE validates config at startup and fails fast on errors:
 
 - `auth.client_id` must not be empty
-- `catalog.polaris_url` must not be empty
+- `catalog.catalog_url` must not be empty
 - At least one of `auth.keycloak_url` or `auth.token_endpoint` must be set
 - `coordinator.flight_sql_port` must differ from `coordinator.trino_http_port`
 - `coordinator.flight_sql_port` must differ from `metrics.prometheus_port`

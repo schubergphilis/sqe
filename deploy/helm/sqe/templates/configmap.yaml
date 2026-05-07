@@ -28,7 +28,7 @@ data:
     ssl_verification = {{ .Values.config.auth.ssl_verification }}
 
     [catalog]
-    polaris_url = {{ .Values.config.catalog.polaris_url | quote }}
+    catalog_url = {{ .Values.config.catalog.catalog_url | quote }}
     warehouse = {{ .Values.config.catalog.warehouse | quote }}
     metadata_cache_ttl_secs = {{ .Values.config.catalog.metadata_cache_ttl_secs }}
 

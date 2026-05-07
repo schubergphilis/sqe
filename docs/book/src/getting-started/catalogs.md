@@ -13,7 +13,7 @@ just a warehouse path to walk.
 
 | Backend  | `type` value | Required keys | Optional keys | Cargo feature | Vendored crate |
 |----------|--------------|---------------|---------------|---------------|----------------|
-| REST     | `rest` (default) | `polaris_url`, `warehouse` (on `[catalog]`) | bearer / OAuth headers via runtime auth | `rest` (always) | `iceberg-catalog-rest` |
+| REST     | `rest` (default) | `catalog_url`, `warehouse` (on `[catalog]`) | bearer / OAuth headers via runtime auth | `rest` (always) | `iceberg-catalog-rest` |
 | HMS      | `hms` | `uri`, `warehouse` | | `hms` | `iceberg-catalog-hms` |
 | Glue     | `glue` | `region`, `warehouse` | `endpoint` | `glue` | `iceberg-catalog-glue` |
 | S3 Tables | `s3tables` | `table_bucket_arn` | `endpoint_url` | `s3tables` | `iceberg-catalog-s3tables` |
@@ -30,7 +30,7 @@ The default. Most production deployments speak Iceberg REST.
 
 ```toml
 [catalog]
-polaris_url = "https://polaris.example.com:18181/api/catalog"
+catalog_url = "https://polaris.example.com:18181/api/catalog"
 warehouse   = "production_warehouse"
 
 [catalog.backend]
