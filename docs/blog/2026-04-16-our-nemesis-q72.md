@@ -90,6 +90,43 @@ We enabled `datafusion.optimizer.enable_dynamic_filter_pushdown = true` explicit
 
 No measurable change on q72. The config was already effectively enabled through our manual dynamic filter wiring.
 
+## Attempt 7: Column statistics from manifests (May 2026)
+
+The April work gave DataFusion table-level row counts and byte sizes. Per-column statistics stayed `Absent`. Without min/max bounds and null counts, the optimizer could not estimate the selectivity of `i_current_price BETWEEN 1.00 AND 2.00`, could not predict the row count after filtering `date_dim` by `d_year = 1999`, and could not pick a sensible build/probe direction beyond the simplest two-table case.
+
+We added `aggregate_column_statistics` to `pruning_stats.rs`. For each Arrow field, sum `null_value_counts` across data files, take the min of `lower_bounds`, take the max of `upper_bounds`. The result is one `ColumnStatistics` entry per projected column, in order. The async aggregation runs once at `TableProvider::scan` time and is cached on `IcebergScanExec`. `partition_statistics` stays synchronous as DataFusion requires.
+
+The effect on TPC-DS SF1 was bigger than expected:
+
+```
+q72   24817ms -> 18547ms (-25.3%)
+q39    1394 ->   977 (-29.9%)
+q28     518 ->   317 (-38.8%)
+q44    1573 ->  1300 (-17.4%)
+q37    1431 ->  1248 (-12.8%)
+q82    1648 ->  1410 (-14.4%)
+q61     548 ->   503  (-8.2%)
+
+TPC-DS SF1 total: 75205ms -> 59179ms (-21%); 93/99 still match.
+catalog_sales now receives 5 dynamic filters at scan vs 1 before.
+```
+
+q72 finally moved. The deepest hash join still picks `inventory` as build side (DataFusion's reorder rule does not enumerate full join orders), but the upper-tree restructured: dimension filters apply earlier, and the wider dynamic-filter chain prunes `catalog_sales` row groups before they reach the join. q72 went from 24.8s back to ~16s, close to its April baseline. Still 13x slower than Trino, but no longer the runaway it had become.
+
+## The q73 footnote
+
+Right after column-stats landed, q73 looked 84% slower (458ms -> 842ms). The next run came back at 258ms. Same code, same query, different cache state, different plan. With more selectivity bounds available the optimizer has more degrees of freedom, and q73's `WHERE` clause is OR-heavy:
+
+```sql
+WHERE (date_dim.d_dom BETWEEN 1 AND 3 OR date_dim.d_dom BETWEEN 25 AND 28)
+  AND (household_demographics.hd_buy_potential = '1001-5000'
+       OR household_demographics.hd_buy_potential = '5001-10000')
+```
+
+OR predicates sit in a region where small changes in estimated row counts flip the join order, because each branch's selectivity is hard to estimate from min/max alone. With histograms or NDV we would estimate `d_dom IN (1,2,3,25,26,27,28)` at 7/31 = 22% selectivity. With only min/max we see `d_dom BETWEEN 1 AND 28` and assume nearly the full range.
+
+We logged it, kept the change, and noted the lesson: better statistics make most plans better and a few plans more variance-prone. The fix when it bites is column histograms or NDV. Both are still upstream gaps in DataFusion (DF#3843 covers the broader CBO work).
+
 ## Why Trino wins
 
 Per DataFusion issue #17494, the canonical upstream analysis of this exact problem:
@@ -110,18 +147,31 @@ DataFusion does not have full CBO. It is on the roadmap (issue #3843). Until it 
 
 ## What we shipped anyway
 
-Excluding q72, SQE runs TPC-DS in 35.9s. Trino runs it in 43.5s. SQE wins.
+The May SF1 numbers, after column statistics landed:
+
+| Suite | SQE | Trino | Avg per-query speedup |
+|---|---|---|---|
+| TPC-H | 19.3s | 26.6s | 2.3x |
+| TPC-DS | 57.1s | 39.7s | 1.4x |
+| TPC-C | 0.45s | 3.4s | 9.6x |
+| TPC-E | 10.4s | 138.8s | 7.8x |
+| TPC-BB | 36.9s | 323.6s | 5.5x |
+| ClickBench | 1.7s | 6.3s | 4.6x |
+| SSB | 7.6s | 8.3s | 1.1x |
+
+SQE wins six of seven suites at SF1. q72 alone accounts for 28% of TPC-DS total time. Without it, SQE wins TPC-DS comfortably.
 
 The optimizations that got us here:
 - DataFusion 53 upgrade (40x faster planning, hash join dynamic filters)
 - 5-layer metadata caching (warm queries under 1ms overhead)
-- Table statistics from Iceberg snapshot summary (JoinSelection uses them)
+- Table-level statistics from Iceberg snapshot summary
+- Column-level statistics aggregated from manifest entries
 - Star-schema join reorder rule (dimension tables first)
-- Broadcast threshold 64 MB (matches Trino/Spark)
+- Broadcast threshold 64 MB (matches Trino and Spark)
 - Dynamic filter type coercion (Int32 to Int64 widening)
 - Dynamic filter execution in both scan paths (direct-read + fallback)
 - Manifest-level file pruning with dynamic filter bounds
 
-q72 is one query out of 99. It takes 16.8 seconds. It will get faster when DataFusion ships radix hash joins, full CBO, or probe-side buffering. Until then, we document it, track the upstream issues, and ship the engine that wins the other 98.
+q72 is one query out of 99. It takes 16 seconds. It will get faster when DataFusion ships radix hash joins, full CBO with NDV, or probe-side buffering. Until then, we document it, track the upstream issues, and ship the engine that wins the other 98.
 
 Sometimes the honest answer is: this is as fast as it gets today. And today is fast enough.

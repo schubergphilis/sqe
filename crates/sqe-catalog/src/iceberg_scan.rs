@@ -114,6 +114,16 @@ pub struct IcebergScanExec {
     /// GET. This field sets how many of those GETs are in flight at once via
     /// `buffer_unordered`. Defaults to [`DEFAULT_DIRECT_READ_CONCURRENCY`].
     direct_read_concurrency: usize,
+    /// Pre-computed table statistics aggregated from manifest entries.
+    ///
+    /// Populated at scan-planning time by `table_provider::scan` (which is
+    /// async and can read manifests). Contains per-column min/max/null_count
+    /// in addition to the snapshot summary's row count and byte size. When
+    /// present, returned verbatim from `partition_statistics`; otherwise the
+    /// scan falls back to the snapshot-summary path with column stats
+    /// `Absent`. Storing `Statistics` directly (rather than recomputing it)
+    /// keeps `partition_statistics` synchronous as DataFusion requires.
+    cached_statistics: Option<datafusion::common::Statistics>,
 }
 
 impl IcebergScanExec {
@@ -184,7 +194,17 @@ impl IcebergScanExec {
             }
         };
         let properties = Arc::new(PlanProperties::new(eq_props, Partitioning::UnknownPartitioning(1), EmissionType::Incremental, Boundedness::Bounded));
-        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![], manifest_concurrency: DEFAULT_MANIFEST_CONCURRENCY, direct_read_concurrency: DEFAULT_DIRECT_READ_CONCURRENCY }
+        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![], manifest_concurrency: DEFAULT_MANIFEST_CONCURRENCY, direct_read_concurrency: DEFAULT_DIRECT_READ_CONCURRENCY, cached_statistics: None }
+    }
+
+    /// Attach pre-computed statistics aggregated from Iceberg manifests.
+    ///
+    /// Call from an async planning context (e.g. `TableProvider::scan`) before
+    /// returning the scan node so DataFusion's `partition_statistics` query
+    /// returns full per-column bounds rather than the row-count-only fallback.
+    pub fn with_cached_statistics(mut self, stats: datafusion::common::Statistics) -> Self {
+        self.cached_statistics = Some(stats);
+        self
     }
 
     /// Set the snapshot ID for time travel queries.
@@ -271,6 +291,7 @@ impl IcebergScanExec {
             pushed_down_filters: filters,
             manifest_concurrency: self.manifest_concurrency,
             direct_read_concurrency: self.direct_read_concurrency,
+            cached_statistics: self.cached_statistics.clone(),
         }
     }
 
@@ -491,14 +512,21 @@ impl ExecutionPlan for IcebergScanExec {
 
     /// Provide table statistics from Iceberg snapshot metadata for cost-based optimization.
     ///
-    /// DataFusion's JoinSelection optimizer uses these to:
+    /// DataFusion's JoinSelection and join-reordering optimizers use these to:
     /// 1. Put the smaller table on the build side of hash joins
     /// 2. Choose CollectLeft mode for small tables (broadcast)
+    /// 3. Estimate filter selectivity (column min/max bounds)
+    /// 4. Order multi-way joins by intermediate cardinality
     ///
-    /// Statistics come from the current snapshot's summary (synchronous — metadata
-    /// is already loaded in the Table object, no S3 I/O needed).
+    /// When `cached_statistics` is populated (via `with_cached_statistics`), the
+    /// pre-computed manifest aggregation is returned. Otherwise we fall back to
+    /// the snapshot summary's row count and byte size with column stats absent.
     fn partition_statistics(&self, _partition: Option<usize>) -> DFResult<datafusion::common::Statistics> {
         use datafusion::common::{stats::Precision, ColumnStatistics, Statistics};
+
+        if let Some(cached) = &self.cached_statistics {
+            return Ok(cached.clone());
+        }
 
         let metadata = self.table.metadata();
         let snapshot = match metadata.current_snapshot() {
@@ -1148,6 +1176,83 @@ async fn collect_data_files_for_pruning(
         .collect();
 
     Ok(data_files)
+}
+
+/// Reads all data-file manifest entries for a snapshot and aggregates their
+/// per-column statistics into a DataFusion `Statistics`.
+///
+/// This is the async hook that lets us bypass the constraint that
+/// `ExecutionPlan::partition_statistics` is synchronous: callers that already
+/// hold an async runtime (e.g. `TableProvider::scan`) compute the result once
+/// and stash it on `IcebergScanExec` via `with_cached_statistics`.
+///
+/// `arrow_schema` should match the projection the scan node will return so
+/// the `column_statistics` array indexes line up with what DataFusion sees.
+/// Returns row count, byte size, and per-column min/max/null counts; distinct
+/// counts and sums stay `Absent` (Iceberg manifests don't carry them).
+pub async fn compute_table_statistics(
+    table: &Table,
+    snapshot_id: Option<i64>,
+    arrow_schema: &arrow::datatypes::Schema,
+    concurrency: usize,
+) -> DFResult<datafusion::common::Statistics> {
+    let metadata_ref = table.metadata_ref();
+    let snapshot = if let Some(sid) = snapshot_id {
+        match metadata_ref.snapshot_by_id(sid) {
+            Some(s) => s,
+            None => {
+                return Ok(datafusion::common::Statistics::new_unknown(arrow_schema));
+            }
+        }
+    } else {
+        match metadata_ref.current_snapshot() {
+            Some(s) => s,
+            None => {
+                return Ok(datafusion::common::Statistics::new_unknown(arrow_schema));
+            }
+        }
+    };
+
+    let cache = table.object_cache();
+    let manifest_list = cache
+        .get_manifest_list(snapshot, &metadata_ref)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    let concurrency = concurrency.max(1);
+    let manifests: Vec<Arc<iceberg::spec::Manifest>> = futures::stream::iter(
+        manifest_list.entries().iter().cloned(),
+    )
+    .map(|mf| {
+        let cache = cache.clone();
+        async move { cache.get_manifest(&mf).await }
+    })
+    .buffer_unordered(concurrency)
+    .try_collect()
+    .await
+    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    let data_files: Vec<DataFile> = manifests
+        .into_iter()
+        .flat_map(|manifest| {
+            manifest
+                .entries()
+                .iter()
+                .filter(|entry| {
+                    entry.status() != ManifestStatus::Deleted
+                        && entry.data_file().content_type() == DataContentType::Data
+                })
+                .map(|entry| entry.data_file().clone())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    let iceberg_schema = table.metadata().current_schema();
+    Ok(crate::pruning_stats::aggregate_table_statistics(
+        &data_files,
+        arrow_schema,
+        iceberg_schema,
+    ))
 }
 
 /// Default target size for file coalescing: 64 MB.
