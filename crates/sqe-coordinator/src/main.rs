@@ -140,8 +140,26 @@ async fn async_main() -> anyhow::Result<()> {
     let authenticator = Arc::new(sqe_auth::Authenticator::new(&config.auth).await?);
     authenticator.start_refresh_task();
 
-    // Initialize session manager
-    let session_manager = Arc::new(SessionManager::new(authenticator.clone()));
+    // Build the auth provider chain from `[[auth.providers]]`. The chain
+    // dispatches to `oidc_password`, `bearer_token`, `client_credentials`,
+    // `mtls`, etc. based on the credential shape. Without this wiring the
+    // Flight SQL handshake path saw only the legacy Authenticator and
+    // rejected every bearer-only request as `NotMyCredentials` — even
+    // when the same JWT was accepted by the Trino-compat HTTP path
+    // (which has always had its own chain). When `[[auth.providers]]`
+    // is empty, build_auth_chain wraps the legacy Authenticator in a
+    // single-provider chain so behaviour is unchanged for legacy
+    // configs.
+    let auth_chain: Arc<dyn sqe_auth::AuthProvider> =
+        Arc::new(sqe_auth::build_auth_chain(&config.auth).await?);
+
+    // Initialize session manager. The chain authenticates new requests;
+    // the legacy Authenticator stays attached so the background refresh
+    // task it owns continues to keep username/password tokens current.
+    let session_manager = Arc::new(SessionManager::with_provider_and_legacy(
+        Arc::clone(&auth_chain),
+        authenticator.clone(),
+    ));
 
     // Initialize policy (passthrough)
     let policy_enforcer: Arc<dyn sqe_policy::PolicyEnforcer> =
@@ -263,23 +281,12 @@ async fn async_main() -> anyhow::Result<()> {
         metrics.clone(),
     );
 
-    // Build bearer token auth chain for Trino-compat HTTP bearer token validation.
-    // This uses the same provider chain configured in [auth.providers], which may
-    // include a BearerTokenProvider with JWKS validation.
+    // Bearer auth chain for the Trino-compat HTTP path. Reuses the same
+    // chain instance the Flight SQL path uses (built above via
+    // `build_auth_chain` and stored in `auth_chain`) so both endpoints
+    // see identical provider behaviour.
     let bearer_provider: Option<Arc<dyn sqe_auth::AuthProvider>> =
-        match sqe_auth::build_auth_chain(&config.auth).await {
-            Ok(chain) => {
-                tracing::info!("Bearer token auth chain built for Trino-compat endpoint");
-                Some(Arc::new(chain))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "Failed to build bearer auth chain; bearer token auth will be disabled for Trino-compat"
-                );
-                None
-            }
-        };
+        Some(Arc::clone(&auth_chain));
 
     // Construct OAuth2 external auth state from [auth.external] config (if present).
     let oauth2_state: Option<Arc<sqe_trino_compat::oauth2::OAuth2State>> =
