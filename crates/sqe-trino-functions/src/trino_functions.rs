@@ -45,6 +45,7 @@ pub fn register_trino_functions(ctx: &datafusion::prelude::SessionContext) {
 
     // Conditional / type functions
     ctx.register_udf(ScalarUDF::from(TrinoIf));
+    ctx.register_udf(ScalarUDF::from(TrinoIff));
     ctx.register_udf(ScalarUDF::from(TypeOf));
 
     // Date formatting / parsing (Trino compat)
@@ -950,7 +951,60 @@ impl ScalarUDFImpl for TrinoDate {
     }
 }
 
-// ─── if(condition, then, else) ───────────────────────────────────────────────
+// ─── if(condition, then, else) and iff(condition, then, else) ──────────────
+//
+// Both Trino's `if()` and Snowflake's `iff()` have identical 3-arg semantics:
+// boolean condition, then-branch, else-branch. NULL condition resolves to the
+// else branch (Snowflake spec). They differ only in the public name, so the
+// invoke logic is shared.
+
+fn invoke_if_impl(args: ScalarFunctionArgs, fn_name: &str) -> DFResult<ColumnarValue> {
+    use datafusion::common::ScalarValue;
+
+    let nrows = args.number_rows;
+    let condition = &args.args[0];
+    let then_val = &args.args[1];
+    let else_val = &args.args[2];
+
+    let mask: BooleanArray = match condition {
+        ColumnarValue::Array(arr) => arr
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!("{fn_name}(): condition must be boolean"))
+            })?
+            .clone(),
+        ColumnarValue::Scalar(ScalarValue::Boolean(Some(b))) => {
+            BooleanArray::from(vec![*b; nrows])
+        }
+        ColumnarValue::Scalar(ScalarValue::Boolean(None)) => {
+            BooleanArray::from(vec![false; nrows])
+        }
+        other => {
+            return Err(DataFusionError::Internal(format!(
+                "{fn_name}(): unsupported condition type {other:?}"
+            )))
+        }
+    };
+
+    let to_array = |cv: &ColumnarValue, n: usize| -> DFResult<ArrayRef> {
+        match cv {
+            ColumnarValue::Array(a) => Ok(Arc::clone(a)),
+            ColumnarValue::Scalar(sv) => sv.to_array_of_size(n).map_err(|e| {
+                DataFusionError::Internal(format!("{fn_name}(): scalar expansion failed: {e}"))
+            }),
+        }
+    };
+
+    let then_arr = to_array(then_val, nrows)?;
+    let else_arr = to_array(else_val, nrows)?;
+
+    let result = zip(&mask, &then_arr, &else_arr).map_err(|e| {
+        DataFusionError::Internal(format!("{fn_name}(): zip failed: {e}"))
+    })?;
+
+    Ok(ColumnarValue::Array(result))
+}
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct TrinoIf;
@@ -971,60 +1025,42 @@ impl ScalarUDFImpl for TrinoIf {
     }
 
     fn return_type(&self, args: &[DataType]) -> DFResult<DataType> {
-        // Return type matches the then/else args (arg[1]).
         args.get(1)
             .cloned()
             .ok_or_else(|| DataFusionError::Internal("if() needs 3 args".to_string()))
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        use datafusion::common::ScalarValue;
+        invoke_if_impl(args, "if")
+    }
+}
 
-        let nrows = args.number_rows;
-        let condition = &args.args[0];
-        let then_val = &args.args[1];
-        let else_val = &args.args[2];
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct TrinoIff;
 
-        // Expand condition to BooleanArray.
-        let mask: BooleanArray = match condition {
-            ColumnarValue::Array(arr) => arr
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| {
-                    DataFusionError::Internal("if(): condition must be boolean".to_string())
-                })?
-                .clone(),
-            ColumnarValue::Scalar(ScalarValue::Boolean(Some(b))) => {
-                BooleanArray::from(vec![*b; nrows])
-            }
-            ColumnarValue::Scalar(ScalarValue::Boolean(None)) => {
-                BooleanArray::from(vec![false; nrows])
-            }
-            other => {
-                return Err(DataFusionError::Internal(format!(
-                    "if(): unsupported condition type {other:?}"
-                )))
-            }
-        };
+impl ScalarUDFImpl for TrinoIff {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 
-        // Expand then / else to arrays.
-        let to_array = |cv: &ColumnarValue, n: usize| -> DFResult<ArrayRef> {
-            match cv {
-                ColumnarValue::Array(a) => Ok(Arc::clone(a)),
-                ColumnarValue::Scalar(sv) => sv.to_array_of_size(n).map_err(|e| {
-                    DataFusionError::Internal(format!("if(): scalar expansion failed: {e}"))
-                }),
-            }
-        };
+    fn name(&self) -> &str {
+        "iff"
+    }
 
-        let then_arr = to_array(then_val, nrows)?;
-        let else_arr = to_array(else_val, nrows)?;
+    fn signature(&self) -> &Signature {
+        static SIG: std::sync::LazyLock<Signature> =
+            std::sync::LazyLock::new(|| Signature::any(3, Volatility::Immutable));
+        &SIG
+    }
 
-        let result = zip(&mask, &then_arr, &else_arr).map_err(|e| {
-            DataFusionError::Internal(format!("if(): zip failed: {e}"))
-        })?;
+    fn return_type(&self, args: &[DataType]) -> DFResult<DataType> {
+        args.get(1)
+            .cloned()
+            .ok_or_else(|| DataFusionError::Internal("iff() needs 3 args".to_string()))
+    }
 
-        Ok(ColumnarValue::Array(result))
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        invoke_if_impl(args, "iff")
     }
 }
 
@@ -2620,6 +2656,90 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!(v, 20);
+    }
+
+    // ── iff() tests (Snowflake alias of if) ─────────────────────────────────
+
+    #[tokio::test]
+    async fn snowflake_iff_true_branch() {
+        let ctx = SessionContext::new();
+        register_trino_functions(&ctx);
+        let batches = ctx
+            .sql("SELECT iff(TRUE, 'yes', 'no')")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let col = batches[0].column(0);
+        let v = col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0);
+        assert_eq!(v, "yes");
+    }
+
+    #[tokio::test]
+    async fn snowflake_iff_false_branch() {
+        let ctx = SessionContext::new();
+        register_trino_functions(&ctx);
+        let batches = ctx
+            .sql("SELECT iff(FALSE, 'yes', 'no')")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let col = batches[0].column(0);
+        let v = col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0);
+        assert_eq!(v, "no");
+    }
+
+    #[tokio::test]
+    async fn snowflake_iff_null_condition_returns_else() {
+        // Snowflake spec: NULL condition is treated as false, returns expr2.
+        let ctx = SessionContext::new();
+        register_trino_functions(&ctx);
+        let batches = ctx
+            .sql("SELECT iff(CAST(NULL AS BOOLEAN), 'yes', 'no')")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let col = batches[0].column(0);
+        let v = col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0);
+        assert_eq!(v, "no");
+    }
+
+    #[tokio::test]
+    async fn snowflake_iff_with_predicate() {
+        // iff(1 = 1, 10, 20) -> 10 — same shape as the if() test for parity.
+        let ctx = SessionContext::new();
+        register_trino_functions(&ctx);
+        let batches = ctx
+            .sql("SELECT iff(1 = 1, 10, 20)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let col = batches[0].column(0);
+        let v = col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(v, 10);
     }
 
     // ── date_format tests ────────────────────────────────────────────────────
