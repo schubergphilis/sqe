@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 sqe-core = { path = "../sqe-core" }
-sqe-catalog = { path = "../sqe-catalog", default-features = false, features = ["rest", "sql-sqlite", "hadoop"] }
+sqe-catalog = { path = "../sqe-catalog", default-features = false, features = ["rest", "sql-sqlite", "hadoop", "delta"] }
 sqe-trino-functions = { path = "../sqe-trino-functions" }
 sqe-policy = { path = "../sqe-policy" }
 arrow = { workspace = true }
