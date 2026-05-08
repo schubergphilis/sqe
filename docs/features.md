@@ -1,31 +1,40 @@
-# SQL Feature Comparison: SQE vs Trino vs Spark SQL
+# SQL Feature Comparison: SQE vs Trino vs Spark SQL vs DuckDB
 
-SQE is built on **Apache DataFusion 52** which provides the SQL execution engine. All standard SQL features come from DataFusion; SQE adds catalog integration (Polaris/Iceberg), pluggable auth, distributed execution, and DDL routing.
+SQE is built on **Apache DataFusion 53.1** which provides the SQL execution engine. All standard SQL features come from DataFusion; SQE adds catalog integration (Polaris / Iceberg / Glue / HMS / Nessie / S3 Tables / JDBC / Hadoop), pluggable auth, distributed execution, DDL routing, and a single-binary embedded mode that competes with DuckDB on laptop analytics.
 
-> For a detailed function-by-function Trino compatibility matrix, see [trino-compatibility.md](trino-compatibility.md).
+> For a detailed function-by-function Trino compatibility matrix, see [trino-compatibility.md](trino-compatibility.md). For the audit-driven DuckDB compatibility track (V8 through V12.1, with status per item), see [duckdb-comparision.md](duckdb-comparision.md). For the embedded CLI reference, see [cli-embedded.md](cli-embedded.md).
 
 ## Quick Summary
 
-| Category | SQE (DataFusion 52) | Trino | Spark SQL |
-|----------|:---:|:---:|:---:|
-| Window functions | ✅ Full | ✅ Full | ✅ Full |
-| Aggregate functions | ✅ Full | ✅ Full | ✅ Full |
-| Joins | ✅ Full (7 types) | ✅ Full | ✅ Full |
-| Subqueries | ✅ Full | ✅ Full | ✅ Full |
-| CTEs | ✅ WITH + recursive | ✅ WITH + recursive | ✅ WITH + recursive |
-| Set operations | ✅ Full | ✅ Full | ✅ Full |
-| JSON | ⚠️ Partial | ✅ Full | ✅ Full |
-| Array/Map types | ⚠️ Partial | ✅ Full | ✅ Full |
-| MERGE INTO | ✅ CoW | ✅ | ✅ |
-| DELETE | ✅ CoW | ✅ | ✅ |
-| UPDATE | ✅ CoW | ✅ | ✅ |
-| PIVOT/UNPIVOT | ❌ | ❌ | ⚠️ PIVOT only |
-| QUALIFY | ❌ | ❌ | ❌ |
-| Lambda expressions | ❌ | ✅ | ✅ |
-| GROUPING SETS | ✅ | ✅ | ✅ |
-| Iceberg time travel | ❌ | ✅ | ✅ |
-| Federated queries | ❌ | ✅ (connectors) | ✅ (connectors) |
-| UDFs | ⚠️ Rust API only | ✅ Java/Python | ✅ Java/Scala/Python |
+| Category | SQE (DataFusion 53.1) | Trino | Spark SQL | DuckDB |
+|----------|:---:|:---:|:---:|:---:|
+| Window functions | ✅ Full | ✅ Full | ✅ Full | ✅ Full |
+| Aggregate functions | ✅ Full | ✅ Full | ✅ Full | ✅ Full |
+| Joins | ✅ Full (7 types) | ✅ Full | ✅ Full | ✅ Full |
+| Subqueries | ✅ Full | ✅ Full | ✅ Full | ✅ Full |
+| CTEs | ✅ WITH + recursive | ✅ WITH + recursive | ✅ WITH + recursive | ✅ WITH + recursive |
+| Set operations | ✅ Full | ✅ Full | ✅ Full | ✅ Full |
+| JSON | ✅ via `datafusion-functions-json` | ✅ Full | ✅ Full | ✅ Full |
+| Array/Map types | ⚠️ Partial | ✅ Full | ✅ Full | ✅ Full |
+| MERGE INTO | ✅ CoW + MoR (V12) | ✅ | ✅ | ❌ |
+| DELETE | ✅ CoW + MoR (V12) | ✅ | ✅ | ✅ |
+| UPDATE | ✅ CoW + MoR (V12) | ✅ | ✅ | ✅ |
+| PIVOT/UNPIVOT | ❌ | ❌ | ⚠️ PIVOT only | ✅ |
+| QUALIFY | ❌ | ❌ | ❌ | ✅ |
+| Lambda expressions | ❌ | ✅ | ✅ | ✅ |
+| GROUPING SETS | ✅ | ✅ | ✅ | ✅ |
+| Iceberg time travel | ✅ FOR VERSION/SYSTEM\_TIME AS OF | ✅ | ✅ | ⚠️ Read-only via extension |
+| Iceberg branches & tags | ✅ ALTER TABLE CREATE BRANCH/TAG | ⚠️ Limited | ✅ | ❌ |
+| Delta Lake read | ✅ `read_delta()` (V11) | ⚠️ via connector | ✅ Native | ✅ via extension |
+| File-format TVFs | ✅ `read_parquet`/`read_csv`/`read_json`/`read_delta` | ⚠️ Hive table only | ✅ | ✅ |
+| `SELECT * FROM 'file.ext'` auto-detect | ✅ (V8) | ❌ | ❌ | ✅ |
+| HuggingFace `hf://` URLs | ✅ TVF + auto-detect (V10/V12) | ❌ | ❌ | ✅ via extension |
+| HTTPS / `httpfs` | ✅ (V10) | ⚠️ HTTP table function | ❌ | ✅ via extension |
+| Federated queries | ❌ | ✅ (connectors) | ✅ (connectors) | ⚠️ Postgres / SQLite extensions |
+| UDFs | ⚠️ Rust API only | ✅ Java/Python | ✅ Java/Scala/Python | ✅ Python / C++ |
+| Single-binary embedded mode | ✅ (V8/V11) | ❌ Cluster only | ❌ Cluster only | ✅ Default |
+| Distributed execution | ✅ Coordinator + workers | ✅ Coordinator + workers | ✅ Driver + executors | ❌ Single-process |
+| OIDC bearer-token passthrough | ✅ Per-user identity | ❌ Service account | ❌ Service account | ❌ |
 
 ---
 
@@ -52,7 +61,7 @@ SQE is built on **Apache DataFusion 52** which provides the SQL execution engine
 | `RANGE BETWEEN ... AND ...` | ✅ | ✅ | ✅ |
 | `GROUPS BETWEEN` | ✅ | ❌ | ❌ |
 
-**Example — works identically in SQE:**
+**Example, works identically in SQE:**
 
 ```sql
 SELECT
@@ -397,15 +406,39 @@ FROM orders;
 
 ## Key Advantages of SQE over Trino
 
-1. **Arrow-native** — no serialization overhead; Flight SQL transfers columnar Arrow batches directly
-2. **Rust performance** — no JVM GC pauses, lower memory footprint, faster startup
-3. **Fine-grained security** — row-level filters and column masks via OPA/Cedar policy engine (planned), enforced at the query plan level before optimization
-4. **Bearer token passthrough** — every query runs as the authenticated user against Polaris; no service account with god-mode access
-5. **Iceberg-native** — built specifically for Iceberg via iceberg-rust; no connector abstraction layer
+1. **Arrow-native**: no serialization overhead; Flight SQL transfers columnar Arrow batches directly
+2. **Rust performance**: no JVM GC pauses, lower memory footprint, faster startup
+3. **Fine-grained security**: row-level filters and column masks via OPA/Cedar policy engine, enforced at the query plan level before optimization
+4. **Bearer token passthrough**: every query runs as the authenticated user against Polaris; no service account with god-mode access
+5. **Iceberg-native**: built specifically for Iceberg via iceberg-rust; no connector abstraction layer
+
+## Key Advantages of SQE over DuckDB
+
+The V8-V12 audit closed the file-format TVF and httpfs / hf:// gaps. SQE now matches DuckDB on the embedded developer-experience side and keeps several distributed-engine differentiators DuckDB cannot match in its single-process model.
+
+1. **OIDC bearer-token passthrough**: every query runs as the authenticated user. No service account. DuckDB has no concept of an authenticated user.
+2. **Distributed execution**: coordinator + stateless workers, shuffle, spill across machines, adaptive sort. DuckDB is single-process.
+3. **Multi-catalog cluster**: Polaris, Nessie, AWS Glue, Hive Metastore, JDBC, AWS S3 Tables, Hadoop in one engine, behind one auth chain. DuckDB is extension-by-extension and runs on one machine.
+4. **Iceberg V3 read AND write**: position deletes, equality deletes, MoR + CoW for DELETE / UPDATE / MERGE, branches, tags, partition evolution, schema evolution, nanosecond timestamps, column defaults. DuckDB's Iceberg extension is read-only.
+5. **Trino HTTP wire compatibility**: dbt models that work against Trino 465 work against SQE without changes. DuckDB has no Trino wire support.
+6. **One binary, two modes**: the same `sqe` binary serves both the embedded laptop persona and the cluster mode. Same SQL surface, same TVFs, same dot-commands. See [`cli-embedded.md`](cli-embedded.md).
+
+## What DuckDB still has that SQE does not
+
+The V12.x roadmap and parser-blocked items both feed this list. None of these are on the immediate roadmap.
+
+1. **PIVOT / UNPIVOT / QUALIFY / ASOF JOIN / FROM-first syntax**: DataFusion parser does not support. Tracked upstream.
+2. **List comprehensions and lambda expressions**: same, parser-blocked.
+3. **Spatial, vector search, full-text search, Excel, Postgres scanner**: out of scope for our positioning. Use the right tool for each.
+4. **A 30 MB binary**: SQE's embedded build lands around 180 MB. The floor is higher because DataFusion + iceberg-rust + AWS SDK + delta-rs add up.
+5. **Glob expansion on `hf://` URLs (`**/*.parquet`)**: V12.2 in progress; the HF tree-API cache prerequisite shipped on `feat/hf-tree-cache`.
+6. **Smart-CSV inference deeper than extension**: DuckDB samples bytes to detect delimiter, quote, header. SQE's V12 follow-up uses extension-based heuristics; byte-sampling is a future enhancement.
+
+For the audit-driven detail with per-item status, see [`duckdb-comparision.md`](duckdb-comparision.md). For the user-facing "how did we get here" narrative, see [the blog](blog/2026-05-07-accidentally-duckdb.md) and ebook chapter [16d "The DuckDB Drift"](ebook/chapters/16d-the-duckdb-drift.md).
 
 ## Key Limitations vs Trino
 
-1. **No federated queries** — SQE reads only from Iceberg/Polaris (Trino has 50+ connectors)
-2. **No UDFs in SQL** — custom functions require Rust; no CREATE FUNCTION support
-3. **No time travel** — snapshot/AS OF queries not yet implemented
-4. **No Merge-on-Read** — row-level mutations use Copy-on-Write (full file rewrite); MoR with position deletes planned for write-heavy workloads
+1. **No federated queries**: SQE reads only from Iceberg / Polaris / Glue / HMS / Nessie / S3 Tables / JDBC (Trino has 50+ connectors)
+2. **No UDFs in SQL**: custom functions require Rust; no CREATE FUNCTION support
+3. **Trino-style ASOF JOIN**: not yet implemented (DataFusion parser limitation)
+4. **PIVOT / UNPIVOT / QUALIFY**: parser-blocked upstream
