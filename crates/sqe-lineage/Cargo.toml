@@ -24,3 +24,4 @@ thiserror = { workspace = true }
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
 tempfile = "3"
+wiremock = "0.6"
