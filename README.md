@@ -49,7 +49,7 @@ For detailed Mermaid diagrams (query pipeline, crate dependencies, caching layer
 - **Performance**: 5-layer caching, star-schema join reorder, dynamic filter pushdown, ZSTD compression
 - **Security**: 43/43 audit findings resolved. See [docs/issues.md](docs/issues.md)
 - **File-format TVFs**: `read_parquet`, `read_csv`, `read_json`, `read_delta` against local filesystem, S3, HTTPS, and HuggingFace `hf://` URLs. Quoted-string auto-detect: `SELECT * FROM '/data/sales.parquet'` and `SELECT * FROM 'hf://datasets/foo/bar/data.csv'` work without registering a table. Smart `read_csv` detects delimiter (`.tsv` -> tab, `.psv` -> pipe) and compression (`.csv.gz`, `.tsv.zst`) from the path.
-- **Embedded mode**: One binary, no cluster, no catalog server. `sqe` opens a CLI with the same SQL surface as the cluster mode. Persistent SQLite-backed Iceberg catalogs at `~/.sqe/warehouse/` survive restarts. Cross-catalog joins across multiple `--catalog NAME=PATH` mounts.
+- **Embedded mode**: One binary, no cluster, no catalog server. `sqe-cli --embedded` opens a CLI with the same SQL surface as the cluster mode. Persistent SQLite-backed Iceberg catalogs at `~/.sqe/warehouse/` survive restarts. Cross-catalog joins across multiple `--catalog NAME=PATH` mounts. Full reference: [`docs/cli-embedded.md`](docs/cli-embedded.md).
 
 ## Getting Started
 
@@ -65,8 +65,8 @@ configs and verification queries, see [`QUICKSTART.md`](QUICKSTART.md).
 ### Quick start (embedded, no server)
 
 ```bash
-cargo install --path crates/sqe-cli  # or `brew install schubergphilis/tap/sqe`
-sqe                                  # opens CLI; persistent warehouse at ~/.sqe/warehouse/
+cargo install --path crates/sqe-cli
+sqe-cli --embedded                                  # opens CLI; persistent warehouse at ~/.sqe/warehouse/
 
 # Query files directly. No CREATE EXTERNAL TABLE.
 sqe> SELECT * FROM '/data/sales.parquet' LIMIT 5;
@@ -182,6 +182,8 @@ Full configuration reference: [docs/deployment.md](docs/deployment.md).
 | [Iceberg Matrix Comparison](docs/iceberg-matrix-compare.md) | V2/V3 side-by-side against 20 other engines |
 | [Trino Compatibility](docs/trino-compatibility.md) | SQL feature matrix vs Trino (~96% coverage) |
 | [DuckDB Comparison](docs/duckdb-comparision.md) | What SQE has that DuckDB lacks, and vice versa, with V8-V12 audit trail |
+| [Embedded CLI Reference](docs/cli-embedded.md) | All flags, dot-commands, TVFs, catalog backends (S3 Tables, Glue, HMS, JDBC), storage backends (S3, R2, MinIO, ADLS, GCS), write paths in one place |
+| [SQL Feature Comparison](docs/features.md) | SQE vs Trino vs Spark SQL vs DuckDB across window / aggregate / DML / Iceberg / file-format TVFs |
 | [Catalog Backends](docs/catalogs.md) | Per-backend TOML, credentials, verification queries |
 | [Roadmap](docs/roadmap.md) | Full feature checklist (completed, in progress, planned) |
 | [Security Audit](docs/issues.md) | 43 findings, all resolved |
