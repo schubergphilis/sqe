@@ -140,6 +140,42 @@ Item 6.
   filesystem path or S3 URI.
 - Cluster mode: same, behind whatever auth the catalog's storage block declares.
 
+V11 ships the `read_delta()` TVF rather than a catalog backend. CLI users
+can query a Delta root directly:
+
+```sql
+SELECT * FROM read_delta('/data/delta/sales');
+SELECT * FROM read_delta('s3://bucket/delta/orders', access_key => '...');
+SELECT * FROM read_delta('/data/delta/sales', version => '5');
+```
+
+Read-only; the writer pipeline lives in a follow-up. Cluster `[catalogs.X]
+type = "delta"` registration is the next step on top of the TVF.
+
+### V12: hf:// in URL-table auto-detect
+
+Closes a V10 follow-up. V10 made `read_csv('hf://...')` work but
+`SELECT * FROM 'hf://...'` (the URL-table auto-detect path) still failed
+with "table not found" because DataFusion's `enable_url_table()` does
+not recognise the `hf` scheme.
+
+V12 adds an SQL pre-rewriter: `'hf://...'` quoted literals are resolved
+to their HTTPS equivalent before DataFusion sees the SQL. The resulting
+URL flows through V10's `LazyHttpObjectStoreRegistry` and detects format
+from the file extension (`.csv`, `.parquet`, `.json`).
+
+```sql
+-- All of these now work:
+SELECT * FROM 'hf://datasets/datasets-examples/doc-formats-csv-1/data.csv';
+SELECT * FROM 'hf://datasets/squad/plain_text/train-00000-of-00001.parquet';
+SELECT * FROM 'hf://datasets/foo/bar/data.csv?revision=v1.0';
+```
+
+Out of scope for V12 (deferred): glob patterns (`**/*.parquet`) and the
+`@~parquet` revision spec for HuggingFace's auto-generated parquet view.
+DuckDB supports both via their httpfs extension; SQE follows up once
+DataFusion's `ListingTableUrl` learns about virtual revisions.
+
 ## Out of scope (DataFusion-blocked or niche)
 
 Items the audit lists as not landing in this cycle. The header notes whether the

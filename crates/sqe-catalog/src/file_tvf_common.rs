@@ -29,7 +29,7 @@
 use std::sync::Arc;
 
 use datafusion::common::{plan_err, ScalarValue};
-use datafusion::error::Result as DFResult;
+use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::context::SessionContext;
 use datafusion_expr::Expr;
 use object_store::aws::AmazonS3Builder;
@@ -411,6 +411,80 @@ pub fn rewrite_hf_path_in_place(fn_name: &str, args: &mut FileTvfArgs) -> DFResu
     Ok(())
 }
 
+/// V12: pre-rewrite `'hf://...'` string literals in raw SQL to their HTTPS
+/// equivalent so DataFusion's URL-table auto-detect (`SELECT * FROM 'url'`)
+/// flows through V10's [`LazyHttpObjectStoreRegistry`] and finds an
+/// HttpStore for huggingface.co.
+///
+/// Without this, `SELECT * FROM 'hf://datasets/foo/data.csv'` fails with
+/// "table not found" because DataFusion's `enable_url_table()` doesn't
+/// recognise the `hf` scheme. The TVF path (`read_csv('hf://...')`) is
+/// unaffected; it already calls [`rewrite_hf_path_in_place`] on the
+/// parsed argument.
+///
+/// Scans only single-quoted string literals containing `hf://`. Strings
+/// outside `hf://` patterns flow through unchanged. A malformed hf://
+/// string yields a parse error rather than silent failure so a typo in
+/// the dataset path doesn't fall back to "table not found".
+pub fn rewrite_hf_urls_in_sql(sql: &str) -> DFResult<std::borrow::Cow<'_, str>> {
+    if !sql.contains("hf://") {
+        return Ok(std::borrow::Cow::Borrowed(sql));
+    }
+
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.char_indices().peekable();
+
+    while let Some((i, c)) = chars.next() {
+        if c != '\'' {
+            out.push(c);
+            continue;
+        }
+
+        // Find the matching closing quote. SQL doubles single quotes to
+        // escape (e.g. 'O''Brien'); we skip past the doubled pair.
+        let start = i + 1;
+        let mut end = start;
+        let mut found = false;
+        while let Some((j, qc)) = chars.next() {
+            if qc == '\'' {
+                if matches!(chars.peek(), Some(&(_, '\''))) {
+                    chars.next();
+                    continue;
+                }
+                end = j;
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            // Unterminated string. Let DataFusion's parser raise the
+            // error with its richer diagnostics; just emit the raw text.
+            out.push('\'');
+            out.push_str(&sql[start..]);
+            return Ok(std::borrow::Cow::Owned(out));
+        }
+
+        let inner = &sql[start..end];
+        let rewritten = if inner.starts_with("hf://") {
+            resolve_hf_url(inner).ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "rewrite_hf_urls_in_sql: malformed HuggingFace URL '{inner}'; \
+                     expected hf://(datasets|models|spaces)/<org>/<name>/<path>[?revision=<rev>]"
+                ))
+            })?
+        } else {
+            inner.to_string()
+        };
+
+        out.push('\'');
+        out.push_str(&rewritten);
+        out.push('\'');
+    }
+
+    Ok(std::borrow::Cow::Owned(out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,6 +509,83 @@ mod tests {
         assert!(is_s3_path("s3a://bucket/file"));
         assert!(!is_s3_path("/local/file"));
         assert!(!is_s3_path("relative/file"));
+    }
+
+    #[test]
+    fn rewrite_hf_urls_in_sql_no_op_when_absent() {
+        let sql = "SELECT 1";
+        let out = rewrite_hf_urls_in_sql(sql).unwrap();
+        assert_eq!(out, sql);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn rewrite_hf_urls_in_sql_substitutes_select_from() {
+        let sql = "SELECT count(*) FROM 'hf://datasets/foo/bar/data.csv'";
+        let out = rewrite_hf_urls_in_sql(sql).unwrap();
+        assert_eq!(
+            out,
+            "SELECT count(*) FROM 'https://huggingface.co/datasets/foo/bar/resolve/main/data.csv'"
+        );
+    }
+
+    #[test]
+    fn rewrite_hf_urls_in_sql_handles_revision_param() {
+        let sql = "SELECT * FROM 'hf://datasets/foo/bar/data.parquet?revision=v1'";
+        let out = rewrite_hf_urls_in_sql(sql).unwrap();
+        assert_eq!(
+            out,
+            "SELECT * FROM 'https://huggingface.co/datasets/foo/bar/resolve/v1/data.parquet'"
+        );
+    }
+
+    #[test]
+    fn rewrite_hf_urls_in_sql_leaves_other_strings_alone() {
+        let sql = "SELECT 'foo', name FROM t WHERE name = 'O''Brien'";
+        let out = rewrite_hf_urls_in_sql(sql).unwrap();
+        assert_eq!(out, sql);
+    }
+
+    #[test]
+    fn rewrite_hf_urls_in_sql_multiple_occurrences() {
+        let sql = "SELECT * FROM 'hf://datasets/a/b/x.csv' UNION ALL \
+                   SELECT * FROM 'hf://datasets/a/b/y.csv'";
+        let out = rewrite_hf_urls_in_sql(sql).unwrap();
+        assert!(out.contains("https://huggingface.co/datasets/a/b/resolve/main/x.csv"));
+        assert!(out.contains("https://huggingface.co/datasets/a/b/resolve/main/y.csv"));
+        assert!(!out.contains("hf://"));
+    }
+
+    #[test]
+    fn rewrite_hf_urls_in_sql_rejects_malformed() {
+        let sql = "SELECT * FROM 'hf://malformed'";
+        let err = rewrite_hf_urls_in_sql(sql).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("malformed HuggingFace URL"),
+            "expected malformed-URL error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn rewrite_hf_urls_in_sql_models_and_spaces_kinds() {
+        // Models have no /datasets/ prefix in the resolved URL.
+        let sql = "SELECT * FROM 'hf://models/openai/clip-vit/config.json'";
+        let out = rewrite_hf_urls_in_sql(sql).unwrap();
+        assert!(out.contains("https://huggingface.co/openai/clip-vit/resolve/main/config.json"));
+
+        let sql = "SELECT * FROM 'hf://spaces/team/demo/app.py'";
+        let out = rewrite_hf_urls_in_sql(sql).unwrap();
+        assert!(out.contains("https://huggingface.co/spaces/team/demo/resolve/main/app.py"));
+    }
+
+    #[test]
+    fn rewrite_hf_urls_in_sql_unterminated_string_passes_through() {
+        // Let DataFusion's parser raise the error rather than silently
+        // truncating. The rewriter must not panic.
+        let sql = "SELECT * FROM 'hf://datasets/foo/bar/data.csv";
+        let _out = rewrite_hf_urls_in_sql(sql).unwrap();
+        // No assertion on content; we just want this to not panic.
     }
 
     #[test]
