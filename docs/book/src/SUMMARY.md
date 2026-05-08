@@ -39,6 +39,29 @@
 
 ---
 
+# SQL Reference
+
+- [Overview](./sql-reference/index.md)
+  - [Conditional and null-handling](./sql-reference/conditional.md)
+  - [String](./sql-reference/string.md)
+  - [Math](./sql-reference/math.md)
+  - [Date and time](./sql-reference/datetime.md)
+  - [Array, map, struct](./sql-reference/array-map.md)
+  - [JSON](./sql-reference/json.md)
+  - [Encoding, hashing, URL](./sql-reference/encoding-url.md)
+  - [Aggregate functions](./sql-reference/aggregate.md)
+  - [Window functions](./sql-reference/window.md)
+  - [Table-valued functions](./sql-reference/table-functions.md)
+  - [DDL](./sql-reference/ddl.md)
+  - [DML](./sql-reference/dml.md)
+  - [CALL procedures](./sql-reference/procedures.md)
+  - [GRANT and REVOKE](./sql-reference/grant-revoke.md)
+  - [SHOW and EXPLAIN](./sql-reference/show-explain.md)
+  - [Operators](./sql-reference/operators.md)
+  - [Dot-commands](./sql-reference/dot-commands.md)
+
+---
+
 # Getting Started
 
 - [Quickstart](./getting-started/quickstart.md)
