@@ -173,6 +173,24 @@ fn trace_projection(p: &Projection, child_trace: ColumnTrace) -> ColumnTrace {
         .collect()
 }
 
+/// Append the deps of `expr`'s column refs (mapped through the input plan)
+/// to every output column in `child_trace`, tagged with `transformation`.
+fn attach_indirect(
+    child_trace: &mut ColumnTrace,
+    input: &LogicalPlan,
+    expr: &Expr,
+    transformation: Transformation,
+) {
+    let refs = expr.column_refs();
+    let extras = deps_for_refs(&refs, input, child_trace, &transformation);
+    if extras.is_empty() {
+        return;
+    }
+    for out in child_trace.iter_mut() {
+        out.extend(extras.iter().cloned());
+    }
+}
+
 /// Walk a `LogicalPlan` bottom-up and emit per-output-column lineage
 /// (`ColumnTrace[i]` lists leaf-column deps for output column i).
 pub fn trace_plan(plan: &LogicalPlan) -> ColumnTrace {
@@ -182,7 +200,12 @@ pub fn trace_plan(plan: &LogicalPlan) -> ColumnTrace {
             let child = trace_plan(p.input.as_ref());
             trace_projection(p, child)
         }
-        // Unknown nodes -> empty trace. Subsequent E6-E10 tasks fill these in.
+        LogicalPlan::Filter(f) => {
+            let mut t = trace_plan(f.input.as_ref());
+            attach_indirect(&mut t, f.input.as_ref(), &f.predicate, indirect_filter());
+            t
+        }
+        // Unknown nodes -> empty trace. Subsequent E7-E10 tasks fill these in.
         _ => Vec::new(),
     }
 }
