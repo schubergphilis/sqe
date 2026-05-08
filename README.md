@@ -48,6 +48,8 @@ For detailed Mermaid diagrams (query pipeline, crate dependencies, caching layer
 - **Observability**: OpenTelemetry, Prometheus, JSON audit log, `system.runtime.queries` virtual table
 - **Performance**: 5-layer caching, star-schema join reorder, dynamic filter pushdown, ZSTD compression
 - **Security**: 43/43 audit findings resolved. See [docs/issues.md](docs/issues.md)
+- **File-format TVFs**: `read_parquet`, `read_csv`, `read_json`, `read_delta` against local filesystem, S3, HTTPS, and HuggingFace `hf://` URLs. Quoted-string auto-detect: `SELECT * FROM '/data/sales.parquet'` and `SELECT * FROM 'hf://datasets/foo/bar/data.csv'` work without registering a table. Smart `read_csv` detects delimiter (`.tsv` -> tab, `.psv` -> pipe) and compression (`.csv.gz`, `.tsv.zst`) from the path.
+- **Embedded mode**: One binary, no cluster, no catalog server. `sqe` opens a CLI with the same SQL surface as the cluster mode. Persistent SQLite-backed Iceberg catalogs at `~/.sqe/warehouse/` survive restarts. Cross-catalog joins across multiple `--catalog NAME=PATH` mounts.
 
 ## Getting Started
 
@@ -60,7 +62,20 @@ configs and verification queries, see [`QUICKSTART.md`](QUICKSTART.md).
 - **Rust 1.88+** ([rustup.rs](https://rustup.rs/))
 - **Docker** and Docker Compose (only for the bundled local stack)
 
-### Quick start (local Polaris stack)
+### Quick start (embedded, no server)
+
+```bash
+cargo install --path crates/sqe-cli  # or `brew install schubergphilis/tap/sqe`
+sqe                                  # opens CLI; persistent warehouse at ~/.sqe/warehouse/
+
+# Query files directly. No CREATE EXTERNAL TABLE.
+sqe> SELECT * FROM '/data/sales.parquet' LIMIT 5;
+sqe> SELECT * FROM read_csv('s3://bucket/orders.tsv.gz');
+sqe> SELECT * FROM 'hf://datasets/squad/plain_text/train-00000-of-00001.parquet' LIMIT 5;
+sqe> SELECT * FROM read_delta('/data/delta/sales', version => '5');
+```
+
+### Quick start (cluster mode against local Polaris stack)
 
 ```bash
 # Start the test stack (Polaris + S3 + SQE)
@@ -166,6 +181,7 @@ Full configuration reference: [docs/deployment.md](docs/deployment.md).
 | [Iceberg Matrix](docs/iceberg-matrix.md) | Per-cell SQE coverage on the public scoreboard (166/189, 87.8%) |
 | [Iceberg Matrix Comparison](docs/iceberg-matrix-compare.md) | V2/V3 side-by-side against 20 other engines |
 | [Trino Compatibility](docs/trino-compatibility.md) | SQL feature matrix vs Trino (~96% coverage) |
+| [DuckDB Comparison](docs/duckdb-comparision.md) | What SQE has that DuckDB lacks, and vice versa, with V8-V12 audit trail |
 | [Catalog Backends](docs/catalogs.md) | Per-backend TOML, credentials, verification queries |
 | [Roadmap](docs/roadmap.md) | Full feature checklist (completed, in progress, planned) |
 | [Security Audit](docs/issues.md) | 43 findings, all resolved |
@@ -186,6 +202,7 @@ Full configuration reference: [docs/deployment.md](docs/deployment.md).
 | [The Iceberg Matrix and the Quiet Bug Hiding in V3](docs/blog/2026-04-26-the-matrix-and-the-quiet-bug.md) | Integration tests find what unit tests miss |
 | [Why a Public Iceberg Matrix Beats Vendor Spec Sheets](docs/blog/2026-04-29-the-iceberg-matrix-as-a-scoreboard.md) | A scoreboard for the lakehouse ecosystem |
 | [SQE Talks to Five Catalogs Now: HMS, Nessie, Glue, JDBC, S3 Tables](docs/blog/2026-04-29-five-catalogs-live.md) | The live verification phase + AWS SigV4 |
+| [How we accidentally created a DuckDB](docs/blog/2026-05-07-accidentally-duckdb.md) | V8-V12: file-format TVFs, hf://, Delta, smarter read_csv |
 
 ## Book
 
