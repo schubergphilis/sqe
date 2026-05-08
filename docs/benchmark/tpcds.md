@@ -30,13 +30,7 @@ The headline scale. Q72 dominates the per-query view as the dark band near the b
 
 ## SF10
 
-Two runs to date. The q72 problem widens at SF10; everything else stays proportional.
-
-![TPC-DS SF10 total](./charts/tpcds-sf10-total.png)
-
-![TPC-DS SF10 per-query](./charts/tpcds-sf10-per-query.png)
-
-![TPC-DS SF10 pass](./charts/tpcds-sf10-pass.png)
+No clean runs at SF10 yet. Both attempted runs errored on q72-related plan failures and were dropped from the timeline. Will fill in once we have a clean run.
 
 ## Implementation references
 
