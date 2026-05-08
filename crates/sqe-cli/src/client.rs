@@ -1,4 +1,5 @@
 /// Common result type returned by both Flight and HTTP clients.
+#[derive(Debug)]
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<String>>,
