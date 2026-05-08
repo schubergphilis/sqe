@@ -19,6 +19,7 @@ pub mod parquet_writer_config;
 pub mod pruning_stats;
 pub mod puffin_stats;
 pub mod file_tvf_common;
+pub mod hf_tree_cache;
 pub mod lazy_object_store;
 pub mod read_csv;
 #[cfg(feature = "delta")]
