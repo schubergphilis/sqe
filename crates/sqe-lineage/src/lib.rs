@@ -14,3 +14,4 @@ pub use observer::{
     QueryFailCtx, QueryStartCtx, UserCtx,
 };
 pub use sink::{MultiSink, Sink, SinkError};
+pub use emitter::{spawn_emitter, EmitterConfig};
