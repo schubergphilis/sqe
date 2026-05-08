@@ -13,3 +13,4 @@ pub use observer::{
     ChannelObserver, LineageHint, LineageMsg, LineageObserver, PlanOrHint, QueryCompleteCtx,
     QueryFailCtx, QueryStartCtx, UserCtx,
 };
+pub use sink::{MultiSink, Sink, SinkError};
