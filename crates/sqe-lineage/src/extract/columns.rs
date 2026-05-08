@@ -7,7 +7,9 @@
 
 use crate::event::Transformation;
 use datafusion::common::Column;
-use datafusion::logical_expr::{Aggregate, Expr, Join, LogicalPlan, Projection, TableScan};
+use datafusion::logical_expr::{
+    Aggregate, Expr, Join, LogicalPlan, Projection, Sort, TableScan, Union,
+};
 use std::collections::HashSet;
 
 #[derive(Clone, Debug)]
@@ -316,6 +318,45 @@ fn trace_join(j: &Join) -> ColumnTrace {
     out
 }
 
+/// Union column trace rule (E9).
+///
+/// Output column i merges deps from each input child's column at position i.
+fn trace_union(u: &Union) -> ColumnTrace {
+    let child_traces: Vec<ColumnTrace> =
+        u.inputs.iter().map(|child| trace_plan(child)).collect();
+    let width = child_traces
+        .iter()
+        .map(|t| t.len())
+        .max()
+        .unwrap_or(0);
+
+    (0..width)
+        .map(|i| {
+            let mut merged: Vec<ColumnDep> = Vec::new();
+            for ct in &child_traces {
+                if let Some(deps) = ct.get(i) {
+                    merged.extend(deps.iter().cloned());
+                }
+            }
+            merged
+        })
+        .collect()
+}
+
+/// Sort column trace rule (E9): passthrough on outputs; every column
+/// referenced by a sort key adds an INDIRECT/SORT dep to all outputs.
+fn trace_sort(s: &Sort, mut child_trace: ColumnTrace) -> ColumnTrace {
+    for sort_expr in &s.expr {
+        attach_indirect(
+            &mut child_trace,
+            s.input.as_ref(),
+            &sort_expr.expr,
+            indirect_sort(),
+        );
+    }
+    child_trace
+}
+
 /// Walk a `LogicalPlan` bottom-up and emit per-output-column lineage
 /// (`ColumnTrace[i]` lists leaf-column deps for output column i).
 pub fn trace_plan(plan: &LogicalPlan) -> ColumnTrace {
@@ -335,7 +376,15 @@ pub fn trace_plan(plan: &LogicalPlan) -> ColumnTrace {
             trace_aggregate(a, child)
         }
         LogicalPlan::Join(j) => trace_join(j),
-        // Unknown nodes -> empty trace. Subsequent E9-E10 tasks fill these in.
+        LogicalPlan::Union(u) => trace_union(u),
+        LogicalPlan::Sort(s) => {
+            let child = trace_plan(s.input.as_ref());
+            trace_sort(s, child)
+        }
+        LogicalPlan::Limit(l) => trace_plan(l.input.as_ref()),
+        LogicalPlan::Distinct(d) => trace_plan(d.input().as_ref()),
+        LogicalPlan::SubqueryAlias(s) => trace_plan(s.input.as_ref()),
+        // Unknown nodes -> empty trace. Subsequent E10 task fills in Window.
         _ => Vec::new(),
     }
 }
