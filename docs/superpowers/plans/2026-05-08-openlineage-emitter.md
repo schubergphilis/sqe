@@ -592,7 +592,7 @@ pub fn spawn_emitter(
 fn build_start(c: &QueryStartCtx, cfg: &EmitterConfig) -> RunEvent { /* ... */ }
 fn build_complete(c: &QueryCompleteCtx, cfg: &EmitterConfig) -> RunEvent {
     let (inputs, outputs) = match &c.plan {
-        Some(PlanOrHint::Plan(p)) => extract::extract_lineage(p, &cfg.catalog_lookup),
+        Some(PlanOrHint::Plan(p)) => extract::extract_lineage(p.as_ref(), &cfg.catalog_lookup),  // p: &Box<LogicalPlan>; deref via as_ref()
         Some(PlanOrHint::Hint(h)) => extract::extract_from_hint(h, &cfg.catalog_lookup),
         None => (vec![], vec![]),
     };
@@ -1747,7 +1747,7 @@ if let Some(obs) = &self.lineage {
 
 - [ ] **Step 2: Thread `captured_plan` out of `execute_query`**
 
-Change `execute_query` signature to accept `&mut Option<PlanOrHint>` and assign `*plan_out = Some(PlanOrHint::Plan(enforced_plan.clone()))` after policy enforcement (around current line 1172 in `query_handler.rs`).
+Change `execute_query` signature to accept `&mut Option<PlanOrHint>` and assign `*plan_out = Some(PlanOrHint::Plan(Box::new(enforced_plan.clone())))` after policy enforcement (around current line 1172 in `query_handler.rs`). Note: `PlanOrHint::Plan` carries a `Box<LogicalPlan>` to satisfy `clippy::large_enum_variant` (decided in Task C1).
 
 For DDL handlers (`handle_drop`, `handle_create_view`, etc.) build `LineageHint::DdlSchema { ... }` and assign the same way.
 
