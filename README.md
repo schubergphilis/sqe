@@ -65,7 +65,7 @@ configs and verification queries, see [`QUICKSTART.md`](QUICKSTART.md).
 ### Quick start (embedded, no server)
 
 ```bash
-cargo install --path crates/sqe-cli  # or `brew install schubergphilis/tap/sqe`
+cargo install --path crates/sqe-cli
 sqe                                  # opens CLI; persistent warehouse at ~/.sqe/warehouse/
 
 # Query files directly. No CREATE EXTERNAL TABLE.
@@ -182,6 +182,8 @@ Full configuration reference: [docs/deployment.md](docs/deployment.md).
 | [Iceberg Matrix Comparison](docs/iceberg-matrix-compare.md) | V2/V3 side-by-side against 20 other engines |
 | [Trino Compatibility](docs/trino-compatibility.md) | SQL feature matrix vs Trino (~96% coverage) |
 | [DuckDB Comparison](docs/duckdb-comparision.md) | What SQE has that DuckDB lacks, and vice versa, with V8-V12 audit trail |
+| [Embedded CLI Reference](docs/cli-embedded.md) | All flags, dot-commands, TVFs, catalog backends (S3 Tables, Glue, HMS, JDBC), storage backends (S3, R2, MinIO, ADLS, GCS), write paths in one place |
+| [SQL Feature Comparison](docs/features.md) | SQE vs Trino vs Spark SQL vs DuckDB across window / aggregate / DML / Iceberg / file-format TVFs |
 | [Catalog Backends](docs/catalogs.md) | Per-backend TOML, credentials, verification queries |
 | [Roadmap](docs/roadmap.md) | Full feature checklist (completed, in progress, planned) |
 | [Security Audit](docs/issues.md) | 43 findings, all resolved |

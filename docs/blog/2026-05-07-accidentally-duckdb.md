@@ -170,9 +170,59 @@ The Trino-compatible distributed engine still has the bigger roadmap. Iceberg V3
 If you reached this far and the embedded mode story is what you wanted: try it.
 
 ```bash
-brew install schubergphilis/tap/sqe
+cargo install --path crates/sqe-cli
 sqe
 sqe> SELECT * FROM 'hf://datasets/squad/plain_text/train-00000-of-00001.parquet' LIMIT 5;
 ```
 
 If the cluster mode is what you wanted: that is still the default.
+
+## Side by side with DuckDB
+
+The fair test is the one a developer actually runs. We pulled a public Parquet from DuckDB's own blob store and timed `CREATE TABLE AS SELECT` in both engines on the same machine.
+
+The SQE CLI:
+
+```text
+sqe> .help
+Dot commands:
+  .help                show this list
+  .exit, .quit         leave the REPL
+  .tables [schema]     list tables (optionally filter by schema)
+  .schema <table>      describe a table's columns
+  .catalogs            list catalogs visible to the session
+  .read <path>         execute a SQL script file
+  .timer on|off        toggle per-query elapsed-time output
+  .format [fmt]        show or set output format (table|csv|tsv|json)
+
+SQL: type a query and end it with `;`. End-of-input or .exit to quit.
+
+sqe> .timer on
+Timer: on
+sqe> create table test2 as select * from read_parquet(
+       'https://blobs.duckdb.org/train_services.parquet');
+(0 rows)
+Time: 1.618s
+```
+
+The same query in DuckDB v1.4.4:
+
+```text
+DuckDB v1.4.4 (Andium) 6ddac802ff
+Enter ".help" for usage hints.
+Connected to a transient in-memory database.
+D .timer on
+D create table test2 as select * from read_parquet(
+    'https://blobs.duckdb.org/train_services.parquet');
+Run Time (s): real 1.815 user 0.237842 sys 0.132715
+```
+
+SQE: 1.618s. DuckDB: 1.815s. Same machine. Same query. Same source. SQE wins by about 200ms on a network-bound load.
+
+Two notes on the comparison.
+
+The result is partly DataFusion's Parquet reader being well-tuned, partly that V10's `LazyHttpObjectStoreRegistry` reuses the HTTP connection across the file's row groups, partly that we pay the JVM-free Rust startup cost only once. SQE in embedded mode does not load a Polaris catalog or boot any worker fragments; the binary that opens the prompt is the binary that runs the query.
+
+This is one query against one URL. Real workloads bounce between local Parquet, S3 buckets, hf:// datasets, and Iceberg tables in a Polaris catalog. The 200 ms is not a benchmark claim. It is a smoke test that says "the embedded mode is at least as fast as DuckDB on the basic file-load case." We have not yet built a head-to-head benchmark suite for embedded mode; the existing TPC-H / TPC-DS / SSB / ClickBench results are all in cluster mode against Trino 465.
+
+The dot-command surface is the part the screenshot above probably told you faster. SQE's REPL has the same dot commands DuckDB users type without thinking: `.tables`, `.schema`, `.catalogs`, `.read`, `.timer`, `.format`. Plus `.help`. Plus `.exit` and `.quit`. Each maps to either a built-in REPL action or a standard SQL query that DataFusion already knows how to run. The hardest part of writing the dot-command layer was getting `.timer on` to wrap the `df.collect().await` call cleanly without leaking timing into the test paths.
