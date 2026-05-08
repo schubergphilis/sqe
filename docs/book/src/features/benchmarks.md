@@ -2,6 +2,8 @@
 
 SQE ships with `sqe-bench`, a Rust CLI tool that generates benchmark data, loads it into SQE via the `read_parquet()` TVF, and runs query suites to validate SQL correctness and measure query performance.
 
+For the longitudinal view (every benchmark JSON in `benchmarks/results/` plotted across time, per-suite, per-scale, per-query heatmaps), see [`docs/benchmark/`](../../../benchmark/index.md). Charts auto-regenerate from the committed JSONs via `make benchmark-charts`.
+
 ## Available Benchmarks
 
 | Benchmark | Queries | Tables | Focus |

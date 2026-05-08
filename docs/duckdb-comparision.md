@@ -76,8 +76,8 @@ state.
 | `httpfs` (HTTP/HTTPS/S3 filesystem) | `LazyHttpObjectStoreRegistry` lazily builds `HttpStore` for any `scheme://host` on first request; works in TVFs and URL-table auto-detect | **done** (V10) |
 | `aws` (SDK provider chain) | falls back to env / `~/.aws/credentials` / IMDS / IRSA when inline creds absent | **done** (V10) |
 | Cloudflare R2 | works as S3-compatible: pass `endpoint => 'https://<account>.r2.cloudflarestorage.com'` and `region => 'auto'` | **done** (S3-compat) |
-| `azure` (ADLS Gen2 / Blob) | not linked; one-line `Cargo.toml` feature flip + register helper | follow-up |
-| `gcp` (GCS) | not linked; same shape as Azure | follow-up |
+| `azure` (ADLS Gen2 / Blob) | full: shared key, SAS, Azurite emulator; `abfss://` + `azure://` + `az://` URL schemes; `azure_*` inline TVF args; `[storage.azure*]` config block | **done** |
+| `gcp` (GCS) | full: service-account JSON path or inline + ADC fallback; `gs://` + `gcs://` URL schemes; `gcs_*` inline TVF args; `[storage.gcs*]` config block | **done** |
 | `iceberg` | stronger than DuckDB (full read+write, V3, multi-catalog, OIDC vending, branches, MoR + CoW) | **done** |
 | `delta` (Delta Lake) | `read_delta()` TVF read-only | **done** (V11) |
 | `parquet` | have | done |
