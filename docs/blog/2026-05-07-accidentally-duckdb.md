@@ -171,7 +171,7 @@ If you reached this far and the embedded mode story is what you wanted: try it.
 
 ```bash
 cargo install --path crates/sqe-cli
-sqe
+sqe-cli --embedded
 sqe> SELECT * FROM 'hf://datasets/squad/plain_text/train-00000-of-00001.parquet' LIMIT 5;
 ```
 

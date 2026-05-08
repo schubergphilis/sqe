@@ -40,6 +40,17 @@
 - [x] PARTITIONED BY for the six standard Iceberg transforms (identity, year, month, day, hour, bucket, truncate, void)
 - [x] V3 features end-to-end (TIMESTAMP_NS, column defaults, equality-delete UPDATE on identifier-fields, partition evolution, branching/tagging)
 
+### File-format TVFs and embedded persona (V8 through V12.1)
+
+- [x] V8: `read_parquet` / `read_csv` / `read_json` / `read_avro` TVFs; `SELECT * FROM 'file.ext'` quoted-string auto-detect; `COPY (...) TO 'path' (FORMAT ...)` (DuckDB-parity)
+- [x] V9: `.describe`, `.summarize`, `.tables`, `.catalogs`, `.timer`, `.format`, `.read` dot-commands; `SELECT * EXCLUDE` / `REPLACE` documented (DataFusion-native)
+- [x] V10: `LazyHttpObjectStoreRegistry` lazy HTTPS object-store; HuggingFace `hf://(datasets|models|spaces)/<owner>/<name>/<path>?revision=<rev>` resolver; AWS provider chain fallback for embedded mode
+- [x] V11: `read_delta()` TVF (deltalake-core 0.32.1; time travel via `version` / `timestamp`)
+- [x] V12: `'hf://...'` quoted-string auto-detect via SQL pre-rewriter
+- [x] V12.1: hf:// inline `@<rev>` revision spec + `@~parquet` auto-generated parquet view (`refs/convert/parquet`)
+- [x] V12 follow-up: smart `read_csv` (extension-based delimiter/codec, DuckDB-style `sep`/`delim`/`header`/`nullstr`/`compress` aliases)
+- [x] HuggingFace tree-API cache module with TTL + `Link` pagination (V12.2 prerequisite)
+
 ### Catalogs
 
 - [x] Apache Polaris (Iceberg REST, default)
@@ -74,6 +85,8 @@
 - [ ] CoW DML scales to TPC-E SF100 (`cow-dml-parallel-streaming`: parallelise per-file rewrite + stream writes + drop double-WHERE; targets `trade_result_update_holding` under 120 s at SF100)
 - [ ] Parallel + streaming generation for the other 6 benchmarks (SSB, TPC-DS, TPC-C, TPC-E, TPC-BB, ClickBench)
 - [ ] Snowflake Horizon catalog: live integration test against a real Snowflake account (currently REST-compatible, no live test)
+- [ ] V12.2: custom `HfObjectStore` plugged into `LazyHttpObjectStoreRegistry` so `SELECT * FROM 'hf://datasets/foo/bar/**/*.parquet'` enumerates files via the HF tree API and the V12 SQL pre-rewriter retires (design in `docs/hf-glob-research.md`)
+- [ ] Embedded mode: register HMS / Glue / S3 Tables / JDBC-Postgres catalogs through `--catalog NAME=PATH` (cluster mode supports all five; embedded mode is currently SQLite-only)
 
 ## Planned
 
@@ -84,6 +97,8 @@
 - [ ] Sort-on-write enforcement (writer pass after planner)
 - [ ] Semantic AI layer (RDF/SPARQL, property graph, vector search)
 - [ ] Hash join spill support (DataFusion upstream DF#17267)
+- [ ] Azure ADLS Gen2 / GCS object stores (one-line `Cargo.toml` feature flip + `register_*_store_if_needed` helpers; tracked in [`cli-embedded.md`](cli-embedded.md))
+- [ ] Smart-CSV byte sampling (current `read_csv` infers delimiter / codec from path extension; DuckDB samples bytes for the same)
 
 ## Blocked upstream
 
