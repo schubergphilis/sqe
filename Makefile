@@ -24,8 +24,8 @@ BIN_CLI      := sqe-cli
 BIN_SERVER   := sqe-server
 
 .PHONY: help all dev release rustbook ebook ebook-pdf ebook-epub ebook-html \
-        test clippy fmt fmt-check clean clean-rust clean-rustbook clean-ebook \
-        check-tools
+        benchmark-charts test clippy fmt fmt-check clean clean-rust clean-rustbook \
+        clean-ebook clean-benchmark-charts check-tools
 
 # ── Default target ────────────────────────────────────────────────────────
 help:
@@ -40,11 +40,12 @@ help:
 	@echo "    make fmt-check    cargo fmt --all --check"
 	@echo ""
 	@echo "  Documentation:"
-	@echo "    make rustbook     Build the mdbook (HTML) at $(BOOK_OUT)"
-	@echo "    make ebook        Build the ebook (PDF + EPUB) under $(EBOOK_DIR)/build"
-	@echo "    make ebook-pdf    Build only the PDF"
-	@echo "    make ebook-epub   Build only the EPUB"
-	@echo "    make ebook-html   Build a self-contained HTML version"
+	@echo "    make rustbook         Build the mdbook (HTML) at $(BOOK_OUT)"
+	@echo "    make ebook            Build the ebook (PDF + EPUB) under $(EBOOK_DIR)/build"
+	@echo "    make ebook-pdf        Build only the PDF"
+	@echo "    make ebook-epub       Build only the EPUB"
+	@echo "    make ebook-html       Build a self-contained HTML version"
+	@echo "    make benchmark-charts Re-render docs/benchmark/charts/ from benchmarks/results/*.json"
 	@echo ""
 	@echo "  Combined:"
 	@echo "    make all          dev build + rustbook + ebook"
@@ -116,8 +117,25 @@ ebook-html:
 	@echo "==> Building ebook HTML"
 	$(MAKE) -C $(EBOOK_DIR) html
 
+# ── Docs: benchmark history charts ────────────────────────────────────────
+# Walks benchmarks/results/*.json and re-renders docs/benchmark/charts/.
+# Needs matplotlib in a Python venv. The script self-tests for matplotlib
+# and prints how to set it up if missing.
+BENCH_PY ?= /tmp/sqe-bench-env/bin/python3
+
+benchmark-charts:
+	@if [ ! -x "$(BENCH_PY)" ]; then \
+		echo "Python venv with matplotlib not found at $(BENCH_PY)."; \
+		echo "Set it up once with:"; \
+		echo "  uv venv /tmp/sqe-bench-env && uv pip install --python $(BENCH_PY) matplotlib"; \
+		echo "Then re-run \`make benchmark-charts\`."; \
+		exit 1; \
+	fi
+	@echo "==> Rendering benchmark charts -> docs/benchmark/charts/"
+	$(BENCH_PY) scripts/render-benchmark-charts.py
+
 # ── Cleanup ───────────────────────────────────────────────────────────────
-clean: clean-rust clean-rustbook clean-ebook
+clean: clean-rust clean-rustbook clean-ebook clean-benchmark-charts
 
 clean-rust:
 	@echo "==> cargo clean"
@@ -130,6 +148,10 @@ clean-rustbook:
 clean-ebook:
 	@echo "==> Cleaning ebook build artefacts"
 	$(MAKE) -C $(EBOOK_DIR) clean
+
+clean-benchmark-charts:
+	@echo "==> Removing docs/benchmark/charts/"
+	rm -rf docs/benchmark/charts
 
 # ── Diagnostics ───────────────────────────────────────────────────────────
 check-tools:
