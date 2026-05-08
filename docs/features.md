@@ -279,9 +279,9 @@ FROM orders;
 | `GREATEST(a, b, ...)` | ✅ | ✅ | ✅ |
 | `LEAST(a, b, ...)` | ✅ | ✅ | ✅ |
 | `NVL` / `NVL2` | ✅ | ❌ | ✅ |
-| `IF(cond, then, else)` | ❌ | ✅ | ✅ |
+| `IF(cond, then, else)` | ✅ via `sqe-trino-functions` | ✅ | ✅ |
 | `IIF` | ❌ | ❌ | ❌ |
-| `DECODE` | ❌ | ❌ | ✅ |
+| `DECODE` (Oracle-style) | ❌ | ❌ | ✅ |
 
 ---
 
