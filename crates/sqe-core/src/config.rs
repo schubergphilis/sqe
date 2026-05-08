@@ -848,6 +848,28 @@ pub struct StorageConfig {
     /// Default: 4. Set higher (8-16) for WAN or high-latency storage.
     #[serde(default = "default_prefetch_concurrency")]
     pub prefetch_concurrency: usize,
+
+    // ── Azure ADLS Gen2 / Blob ──────────────────────────────────────────
+    /// Azure storage account name (required for shared-key / SAS auth).
+    #[serde(default)]
+    pub azure_account: String,
+    /// Azure storage account access key (shared-key auth).
+    #[serde(default)]
+    pub azure_access_key: String,
+    /// Azure SAS token (alternative to shared key).
+    #[serde(default)]
+    pub azure_sas_token: String,
+    /// Use the Azurite storage emulator (for local development).
+    #[serde(default)]
+    pub azure_use_emulator: bool,
+
+    // ── Google Cloud Storage ────────────────────────────────────────────
+    /// Path to a GCP service-account JSON key file.
+    #[serde(default)]
+    pub gcs_service_account_path: String,
+    /// Inline GCP service-account JSON key contents.
+    #[serde(default)]
+    pub gcs_service_account_key: String,
 }
 
 impl Default for StorageConfig {
@@ -865,6 +887,12 @@ impl Default for StorageConfig {
             max_concurrent_files: default_max_concurrent_files(),
             prefetch_buffer: default_prefetch_buffer(),
             prefetch_concurrency: default_prefetch_concurrency(),
+            azure_account: String::new(),
+            azure_access_key: String::new(),
+            azure_sas_token: String::new(),
+            azure_use_emulator: false,
+            gcs_service_account_path: String::new(),
+            gcs_service_account_key: String::new(),
         }
     }
 }
@@ -891,6 +919,12 @@ impl std::fmt::Debug for StorageConfig {
             .field("max_concurrent_files", &self.max_concurrent_files)
             .field("prefetch_buffer", &self.prefetch_buffer)
             .field("prefetch_concurrency", &self.prefetch_concurrency)
+            .field("azure_account", &self.azure_account)
+            .field("azure_access_key", &"[REDACTED]")
+            .field("azure_sas_token", &"[REDACTED]")
+            .field("azure_use_emulator", &self.azure_use_emulator)
+            .field("gcs_service_account_path", &self.gcs_service_account_path)
+            .field("gcs_service_account_key", &"[REDACTED]")
             .finish()
     }
 }
@@ -1321,6 +1355,12 @@ impl SqeConfig {
         env_override_bool("SQE_STORAGE__S3_PATH_STYLE", &mut self.storage.s3_path_style);
         env_override_bool("SQE_STORAGE__S3_ALLOW_HTTP", &mut self.storage.s3_allow_http);
         env_override_usize("SQE_STORAGE__PREFETCH_CONCURRENCY", &mut self.storage.prefetch_concurrency);
+        env_override_str("SQE_STORAGE__AZURE_ACCOUNT", &mut self.storage.azure_account);
+        env_override_str("SQE_STORAGE__AZURE_ACCESS_KEY", &mut self.storage.azure_access_key);
+        env_override_str("SQE_STORAGE__AZURE_SAS_TOKEN", &mut self.storage.azure_sas_token);
+        env_override_bool("SQE_STORAGE__AZURE_USE_EMULATOR", &mut self.storage.azure_use_emulator);
+        env_override_str("SQE_STORAGE__GCS_SERVICE_ACCOUNT_PATH", &mut self.storage.gcs_service_account_path);
+        env_override_str("SQE_STORAGE__GCS_SERVICE_ACCOUNT_KEY", &mut self.storage.gcs_service_account_key);
 
         // Policy
         env_override_str("SQE_POLICY__ENGINE", &mut self.policy.engine);

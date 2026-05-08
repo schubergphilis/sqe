@@ -249,28 +249,67 @@ Public datasets work anonymously. Private datasets read `HF_TOKEN` from the envi
 
 Globs (`**/*.parquet`) on hf:// URLs are tracked for V12.2; today the path must point to a specific file.
 
-### Azure ADLS Gen2
+### Azure ADLS Gen2 / Blob
 
-**Not currently linked.** Adding it is a Cargo feature flip in the workspace `Cargo.toml`:
-
-```toml
-object_store = { version = "0.13", features = ["aws", "http", "azure"] }
-```
-
-Plus a `register_azure_store_if_needed` helper alongside the S3 / HTTP helpers in `crates/sqe-catalog/src/file_tvf_common.rs`. Pull request welcome.
-
-When wired, the URL form is:
+Three URL forms accepted: `abfss://<container>@<account>.dfs.core.windows.net/<path>` (Hadoop-style), `abfs://...` (plaintext), or the shorthand `azure://<container>/<path>` / `az://<container>/<path>` with the account from config.
 
 ```sql
+-- Shared key
 SELECT * FROM read_parquet(
-    'azure://account/container/path/data.parquet',
-    azure_access_key => '<key>'
+    'abfss://my-container@myaccount.dfs.core.windows.net/data.parquet',
+    azure_access_key => '<storage-account-key>'
 );
+
+-- SAS token
+SELECT * FROM read_csv(
+    'abfss://logs@myaccount.dfs.core.windows.net/events.csv',
+    azure_sas_token => 'sv=2024-08-04&ss=b&...'
+);
+
+-- Azurite emulator (local dev)
+SELECT * FROM read_parquet('azure://devstoreaccount1/test/data.parquet');
+```
+
+Permanent config:
+
+```toml
+[storage]
+azure_account      = "myaccount"
+azure_access_key   = "<storage-account-key>"
+# OR:
+azure_sas_token    = "sv=2024-08-04&..."
+azure_use_emulator = false
 ```
 
 ### Google Cloud Storage (GCS)
 
-**Not currently linked.** Same shape as Azure: add `gcp` to the `object_store` features list, register a builder helper. URL form when wired: `gs://bucket/path/data.parquet`.
+`gs://` and `gcs://` URLs both work. Auth is a service-account JSON file path, an inline JSON key, or Application Default Credentials.
+
+```sql
+-- Service-account JSON file
+SELECT * FROM read_parquet(
+    'gs://my-bucket/data.parquet',
+    gcs_service_account_path => '/var/secrets/gcs-key.json'
+);
+
+-- Inline JSON key
+SELECT * FROM read_csv(
+    'gs://my-bucket/data.csv',
+    gcs_service_account_key => '{"type":"service_account",...}'
+);
+
+-- ADC (gcloud config / GCE metadata / GKE Workload Identity)
+SELECT * FROM read_parquet('gs://my-bucket/data.parquet');
+```
+
+Permanent config:
+
+```toml
+[storage]
+gcs_service_account_path = "/var/secrets/gcs-key.json"
+# OR inline:
+gcs_service_account_key  = "{\"type\":\"service_account\",...}"
+```
 
 ## Catalogs
 

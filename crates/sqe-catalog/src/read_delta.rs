@@ -212,6 +212,60 @@ fn build_storage_options(
     if storage.s3_allow_http {
         out.insert("AWS_ALLOW_HTTP".to_string(), "true".to_string());
     }
+
+    // Azure: deltalake reads AZURE_* keys.
+    let azure_account = args
+        .azure_account
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(storage.azure_account.as_str());
+    let azure_access_key = args
+        .azure_access_key
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(storage.azure_access_key.as_str());
+    let azure_sas_token = args
+        .azure_sas_token
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(storage.azure_sas_token.as_str());
+    if !azure_account.is_empty() {
+        out.insert("AZURE_STORAGE_ACCOUNT_NAME".to_string(), azure_account.to_string());
+    }
+    if !azure_access_key.is_empty() {
+        out.insert("AZURE_STORAGE_ACCOUNT_KEY".to_string(), azure_access_key.to_string());
+    }
+    if !azure_sas_token.is_empty() {
+        out.insert("AZURE_STORAGE_SAS_TOKEN".to_string(), azure_sas_token.to_string());
+    }
+    if storage.azure_use_emulator {
+        out.insert("AZURE_USE_EMULATOR".to_string(), "true".to_string());
+    }
+
+    // GCS: deltalake reads GOOGLE_* keys.
+    let gcs_path = args
+        .gcs_service_account_path
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(storage.gcs_service_account_path.as_str());
+    let gcs_key = args
+        .gcs_service_account_key
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(storage.gcs_service_account_key.as_str());
+    if !gcs_path.is_empty() {
+        out.insert(
+            "GOOGLE_SERVICE_ACCOUNT_PATH".to_string(),
+            gcs_path.to_string(),
+        );
+    }
+    if !gcs_key.is_empty() {
+        out.insert(
+            "GOOGLE_SERVICE_ACCOUNT_KEY".to_string(),
+            gcs_key.to_string(),
+        );
+    }
+
     out
 }
 
@@ -233,6 +287,7 @@ mod tests {
             secret_key: Some("SECRET".to_string()),
             endpoint: Some("http://minio:9000".to_string()),
             region: Some("eu-west-1".to_string()),
+            ..FileTvfArgs::default()
         };
         let storage = StorageConfig {
             s3_allow_http: true,
@@ -253,6 +308,39 @@ mod tests {
     }
 
     #[test]
+    fn storage_options_populated_for_azure() {
+        let args = FileTvfArgs {
+            path: "abfss://container@account.dfs.core.windows.net/delta".to_string(),
+            azure_account: Some("account".to_string()),
+            azure_access_key: Some("AZ_KEY".to_string()),
+            ..FileTvfArgs::default()
+        };
+        let opts = build_storage_options(&args, &StorageConfig::default());
+        assert_eq!(
+            opts.get("AZURE_STORAGE_ACCOUNT_NAME").map(|s| s.as_str()),
+            Some("account")
+        );
+        assert_eq!(
+            opts.get("AZURE_STORAGE_ACCOUNT_KEY").map(|s| s.as_str()),
+            Some("AZ_KEY")
+        );
+    }
+
+    #[test]
+    fn storage_options_populated_for_gcs() {
+        let args = FileTvfArgs {
+            path: "gs://bucket/delta".to_string(),
+            gcs_service_account_path: Some("/var/secrets/gcs.json".to_string()),
+            ..FileTvfArgs::default()
+        };
+        let opts = build_storage_options(&args, &StorageConfig::default());
+        assert_eq!(
+            opts.get("GOOGLE_SERVICE_ACCOUNT_PATH").map(|s| s.as_str()),
+            Some("/var/secrets/gcs.json")
+        );
+    }
+
+    #[test]
     fn storage_options_falls_back_to_storage_config() {
         let args = FileTvfArgs {
             path: "s3://bucket/delta".to_string(),
@@ -260,6 +348,7 @@ mod tests {
             secret_key: None,
             endpoint: None,
             region: None,
+            ..FileTvfArgs::default()
         };
         let storage = StorageConfig {
             s3_access_key: "config-akid".to_string(),
