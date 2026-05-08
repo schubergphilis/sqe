@@ -24,10 +24,11 @@ Implementation lives in `crates/sqe-catalog/src/file_tvf_common.rs` and `crates/
 | rustfs | `s3://bucket/key` | yes | yes | yes | yes | Same as MinIO. |
 | HTTPS | `https://host/path` | yes | yes | partial | no | Lazy `HttpStore` per host (V10). Read-only. |
 | HuggingFace | `hf://datasets/...` | yes | yes | no | no | V10 + V12.1. Auto-resolves to HTTPS. Read-only. |
-| Azure ADLS Gen2 | `abfss://container@account/path` | **opt-in** | when wired | when wired | when wired | Cargo feature flip; see below. |
-| Google Cloud Storage | `gs://bucket/path` | **opt-in** | when wired | when wired | when wired | Cargo feature flip; see below. |
+| Azure ADLS Gen2 | `abfss://container@account.dfs.core.windows.net/path` | yes | yes | yes | yes | Shared key, SAS, and Azurite emulator supported. |
+| Azure (shorthand) | `azure://container/path`, `az://container/path` | yes | yes | yes | yes | Account name from `[storage.azure]` or `azure_account => '...'`. |
+| Google Cloud Storage | `gs://bucket/path`, `gcs://bucket/path` | yes | yes | yes | yes | Service-account JSON path or inline; ADC fallback when neither set. |
 
-"Default build" means the cargo workspace ships the driver linked. For ADLS / GCS, you need a one-line feature flip plus an init helper, then rebuild.
+All backends ship in the default `cargo build`. The `object_store` workspace dependency is built with `aws`, `http`, `azure`, and `gcp` features; no opt-in feature flip needed.
 
 ## Local filesystem
 
@@ -180,69 +181,80 @@ Glob expansion (`**/*.parquet`) on `hf://` is tracked for V12.2; today the path 
 
 See [File-format TVFs](../features/file-format-tvfs.md) for the full path-form table.
 
-## Azure ADLS Gen2
+## Azure ADLS Gen2 / Blob
 
-**Status: not linked in the default build.** Adding it is a one-line `Cargo.toml` change plus a small registration helper. The underlying object_store crate already supports Azure; we leave it off the default to keep the binary slim.
+Three URL shapes are accepted:
 
-### Wire it up
+| URL form | When to use |
+|---|---|
+| `abfss://<container>@<account>.dfs.core.windows.net/<path>` | Hadoop-style; account encoded in URL. Most portable across tools. |
+| `abfs://...` | Same shape, plaintext variant. Avoid in production. |
+| `azure://<container>/<path>`, `az://<container>/<path>` | Shorthand. Account comes from `[storage.azure]` or the `azure_account` inline arg. |
 
-In the workspace `Cargo.toml`, add `azure` to the `object_store` features list:
-
-```toml
-[workspace.dependencies]
-object_store = { version = "0.13", features = ["aws", "http", "azure"] }
-```
-
-Then add a `register_azure_store_if_needed` helper alongside the existing S3 / HTTP helpers in `crates/sqe-catalog/src/file_tvf_common.rs`. The pattern is the same as `register_s3_store_if_needed`: read credentials from inline args or `[storage.azure]`, build an `AzureBuilder`, register in the session's object-store map.
-
-PR welcome. The work is small and the test pattern is already in place for S3 / HTTP / HF.
-
-### URL form when wired
+Three auth methods:
 
 ```sql
+-- 1. Shared key (storage account key)
 SELECT * FROM read_parquet(
-    'abfss://container@account.dfs.core.windows.net/path/data.parquet',
-    azure_access_key => '<key>'
+    'abfss://my-container@myaccount.dfs.core.windows.net/path/data.parquet',
+    azure_access_key => '<storage-account-key>'
 );
+
+-- 2. SAS token (sub-account scope)
+SELECT * FROM read_csv(
+    'abfss://logs@myaccount.dfs.core.windows.net/2026-05-08/events.csv',
+    azure_sas_token => 'sv=2024-08-04&ss=b&srt=sco&sp=r...'
+);
+
+-- 3. Azurite emulator (local development)
+SELECT * FROM read_parquet('azure://devstoreaccount1/test/data.parquet');
 ```
 
-Or with shared key in `[storage.azure]`:
+For permanent setup put credentials in `[storage.azure]`:
 
 ```toml
-[storage.azure]
-account_name = "myaccount"
-access_key   = "<storage-account-key>"
+[storage]
+azure_account     = "myaccount"
+azure_access_key  = "<storage-account-key>"
+# OR:
+azure_sas_token   = "sv=2024-08-04&..."
+# Local development against Azurite:
+azure_use_emulator = true
 ```
 
-OAuth2 / managed-identity auth is on the same wire-up PR.
+OAuth2 / managed-identity auth is not yet wired through the inline args; service-account flows go through the AWS-style env-var fallback that `object_store::azure::MicrosoftAzureBuilder` provides.
 
 ## Google Cloud Storage
 
-**Status: not linked in the default build.** Same shape as Azure: a Cargo feature flip plus a registration helper.
-
-### Wire it up
-
-```toml
-[workspace.dependencies]
-object_store = { version = "0.13", features = ["aws", "http", "gcp"] }
-```
-
-Plus a `register_gcs_store_if_needed` helper. Service-account JSON credentials read from `GOOGLE_APPLICATION_CREDENTIALS` work via the underlying `gcp` driver.
-
-### URL form when wired
-
 ```sql
+-- 1. Service-account JSON file
 SELECT * FROM read_parquet(
-    'gs://bucket/path/data.parquet'
+    'gs://my-bucket/path/data.parquet',
+    gcs_service_account_path => '/var/secrets/gcs-key.json'
 );
+
+-- 2. Inline service-account JSON
+SELECT * FROM read_csv(
+    'gs://my-bucket/data.csv',
+    gcs_service_account_key => '{"type":"service_account",...}'
+);
+
+-- 3. Application Default Credentials (gcloud config / GCE metadata / GKE Workload Identity)
+SELECT * FROM read_parquet('gs://my-bucket/data.parquet');
 ```
+
+For permanent setup:
 
 ```toml
-[storage.gcs]
-service_account_path = "/var/secrets/gcs-key.json"
+[storage]
+gcs_service_account_path = "/var/secrets/gcs-key.json"
+# OR inline:
+gcs_service_account_key  = "{\"type\":\"service_account\",...}"
 ```
 
-ADC (Application Default Credentials) chain works the same way as AWS provider chain: env var, gcloud config, GCE metadata server, Workload Identity on GKE.
+When neither is set the underlying GCS driver falls back to ADC: `GOOGLE_APPLICATION_CREDENTIALS` env var, `gcloud config`, GCE metadata server, GKE Workload Identity. No SQE config needed for the workload-identity path.
+
+The `gcs://` scheme is also accepted as a synonym for `gs://`.
 
 ## Per-query vs configured
 
@@ -264,8 +276,10 @@ Catalogs name tables; storage holds bytes. Iceberg already separates these in th
 
 ## Implementation references
 
-- `crates/sqe-catalog/src/file_tvf_common.rs`: shared inline-arg parsing for `read_parquet` / `read_csv` / `read_json` / `read_delta`. Decides which object-store driver to use based on URL scheme.
-- `crates/sqe-catalog/src/lazy_object_store.rs`: V10's lazy HTTPS object-store registry. Same shape as the future Azure / GCS lazy registries.
-- `crates/sqe-catalog/src/s3_store.rs`: AWS S3 driver registration with provider-chain fallback.
+- `crates/sqe-catalog/src/file_tvf_common.rs`: shared inline-arg parsing for `read_parquet` / `read_csv` / `read_json` / `read_delta`. URL-scheme dispatch via `is_s3_path`, `is_http_path`, `is_hf_path`, `is_azure_path`, `is_gcs_path`.
+  - `register_s3_store_if_needed`, `register_azure_store_if_needed`, `register_gcs_store_if_needed`, `register_http_store_if_needed`: per-backend `SessionContext` registration.
+  - `extract_bucket`, `extract_azure_container_account`, `extract_gcs_bucket`: URL parsers.
+- `crates/sqe-catalog/src/lazy_object_store.rs`: V10's lazy HTTPS object-store registry.
 - `crates/sqe-catalog/src/iceberg_storage.rs`: catalog-backed storage credential resolution (vended creds vs static `[storage]`).
+- Workspace `Cargo.toml` line 37: `object_store = { ..., features = ["aws", "http", "azure", "gcp"] }`.
 - The DuckDB-comparison audit row for backends lives in [`docs/duckdb-comparision.md`](../../../duckdb-comparision.md).

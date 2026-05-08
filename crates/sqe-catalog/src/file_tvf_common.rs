@@ -33,18 +33,42 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::context::SessionContext;
 use datafusion_expr::Expr;
 use object_store::aws::AmazonS3Builder;
+use object_store::azure::MicrosoftAzureBuilder;
+use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::http::HttpBuilder;
 
 use sqe_core::config::StorageConfig;
 
-/// Path + S3 credential bag shared by every `read_*()` TVF.
+/// Path + storage credential bag shared by every `read_*()` TVF.
+///
+/// The S3 fields (`access_key`, `secret_key`, `endpoint`, `region`) cover
+/// AWS S3 and S3-compatible backends (R2, MinIO, Ceph, SeaweedFS, etc.).
+/// The Azure fields cover ADLS Gen2 / Blob Storage. The GCS fields cover
+/// Google Cloud Storage. All are optional; falling back to the
+/// coordinator-wide [`StorageConfig`] defaults when absent.
 #[derive(Debug, Clone, Default)]
 pub struct FileTvfArgs {
     pub path: String,
+
+    // ── S3-family ───────────────────────────────────────────────────────
     pub access_key: Option<String>,
     pub secret_key: Option<String>,
     pub endpoint: Option<String>,
     pub region: Option<String>,
+
+    // ── Azure ADLS Gen2 / Blob ──────────────────────────────────────────
+    /// Storage account name. Required for shared-key auth, optional for
+    /// `abfss://<container>@<account>.dfs.core.windows.net/...` URLs which
+    /// already encode the account.
+    pub azure_account: Option<String>,
+    pub azure_access_key: Option<String>,
+    pub azure_sas_token: Option<String>,
+
+    // ── Google Cloud Storage ────────────────────────────────────────────
+    /// Path to a GCP service-account JSON key file.
+    pub gcs_service_account_path: Option<String>,
+    /// Inline service-account JSON (alternative to `gcs_service_account_path`).
+    pub gcs_service_account_key: Option<String>,
 }
 
 /// Parse a `ScalarValue::Utf8` / `LargeUtf8` to `&str`.
@@ -72,6 +96,71 @@ pub fn is_http_path(path: &str) -> bool {
 /// `hf://models/<org>/<name>[@<revision>]/<path>`.
 pub fn is_hf_path(path: &str) -> bool {
     path.starts_with("hf://")
+}
+
+/// Returns `true` when the path looks like an Azure ADLS Gen2 / Blob URL.
+///
+/// Accepted schemes:
+/// - `abfss://<container>@<account>.dfs.core.windows.net/<path>` (Hadoop / standard form, TLS)
+/// - `abfs://<container>@<account>.dfs.core.windows.net/<path>` (plaintext variant)
+/// - `azure://<container>/<path>` (object_store crate's preferred shorthand)
+/// - `az://<container>/<path>` (alternate shorthand)
+pub fn is_azure_path(path: &str) -> bool {
+    path.starts_with("abfss://")
+        || path.starts_with("abfs://")
+        || path.starts_with("azure://")
+        || path.starts_with("az://")
+}
+
+/// Returns `true` when the path looks like a Google Cloud Storage URL.
+///
+/// Accepted schemes:
+/// - `gs://<bucket>/<path>` (standard form)
+/// - `gcs://<bucket>/<path>` (alternate)
+pub fn is_gcs_path(path: &str) -> bool {
+    path.starts_with("gs://") || path.starts_with("gcs://")
+}
+
+/// Extract `(container, account)` from an Azure URL.
+///
+/// `abfss://<container>@<account>.dfs.core.windows.net/<path>` -> `(container, account)`.
+/// `azure://<container>/<path>` and `az://<container>/<path>` -> `(container, "")`. The
+/// account in the shorthand forms must come from `[storage.azure]` or `azure_account`
+/// inline argument.
+pub fn extract_azure_container_account(path: &str) -> Option<(String, String)> {
+    if let Some(rest) = path.strip_prefix("abfss://").or_else(|| path.strip_prefix("abfs://")) {
+        let (auth, _) = rest.split_once('/').unwrap_or((rest, ""));
+        let (container, host) = auth.split_once('@')?;
+        if container.is_empty() || host.is_empty() {
+            return None;
+        }
+        let account = host
+            .split_once('.')
+            .map(|(a, _)| a.to_string())
+            .unwrap_or_else(|| host.to_string());
+        return Some((container.to_string(), account));
+    }
+    if let Some(rest) = path.strip_prefix("azure://").or_else(|| path.strip_prefix("az://")) {
+        let container = rest.split('/').next()?;
+        if container.is_empty() {
+            return None;
+        }
+        return Some((container.to_string(), String::new()));
+    }
+    None
+}
+
+/// Extract the bucket name from a `gs://bucket/...` or `gcs://bucket/...` URL.
+pub fn extract_gcs_bucket(path: &str) -> Option<&str> {
+    let after_scheme = path
+        .strip_prefix("gs://")
+        .or_else(|| path.strip_prefix("gcs://"))?;
+    let bucket = after_scheme.split('/').next()?;
+    if bucket.is_empty() {
+        None
+    } else {
+        Some(bucket)
+    }
 }
 
 /// Resolve an `hf://` URL to the corresponding HuggingFace Hub HTTPS
@@ -279,6 +368,11 @@ where
                     "secret_key" => out.secret_key = Some(value),
                     "endpoint" => out.endpoint = Some(value),
                     "region" => out.region = Some(value),
+                    "azure_account" => out.azure_account = Some(value),
+                    "azure_access_key" => out.azure_access_key = Some(value),
+                    "azure_sas_token" => out.azure_sas_token = Some(value),
+                    "gcs_service_account_path" => out.gcs_service_account_path = Some(value),
+                    "gcs_service_account_key" => out.gcs_service_account_key = Some(value),
                     other => {
                         if !extra(other, &value) {
                             return plan_err!(
@@ -440,6 +534,185 @@ pub fn register_http_store_if_needed(
         ))
     })?;
     ctx.register_object_store(&store_url, Arc::new(http_store));
+    Ok(())
+}
+
+/// Build an [`object_store::azure::MicrosoftAzure`] from inline TVF args
+/// with fallback to the coordinator-wide [`StorageConfig`] defaults.
+pub fn build_azure_store(
+    fn_name: &str,
+    args: &FileTvfArgs,
+    storage: &StorageConfig,
+) -> DFResult<object_store::azure::MicrosoftAzure> {
+    let (container, account_from_url) = extract_azure_container_account(&args.path)
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "{fn_name}: could not parse container / account from Azure URL '{}'",
+                args.path
+            ))
+        })?;
+
+    // Account: URL form > inline arg > config.
+    let account = if !account_from_url.is_empty() {
+        account_from_url
+    } else if let Some(a) = args.azure_account.as_deref().filter(|s| !s.is_empty()) {
+        a.to_string()
+    } else if !storage.azure_account.is_empty() {
+        storage.azure_account.clone()
+    } else if storage.azure_use_emulator {
+        // Azurite default account name; the builder's emulator path overrides this.
+        "devstoreaccount1".to_string()
+    } else {
+        return Err(DataFusionError::Plan(format!(
+            "{fn_name}: Azure account name is required: pass `azure_account => '...'`, \
+             set `[storage.azure].account`, or use an `abfss://<container>@<account>...` URL"
+        )));
+    };
+
+    let access_key = args
+        .azure_access_key
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(storage.azure_access_key.as_str());
+
+    let sas_token = args
+        .azure_sas_token
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(storage.azure_sas_token.as_str());
+
+    let mut builder = MicrosoftAzureBuilder::new()
+        .with_account(&account)
+        .with_container_name(&container);
+
+    if !access_key.is_empty() {
+        builder = builder.with_access_key(access_key);
+    }
+    if !sas_token.is_empty() {
+        // The builder's `with_config` takes typed keys; a SAS token is a
+        // bag of query parameters, fed verbatim.
+        builder = builder.with_config(
+            object_store::azure::AzureConfigKey::SasKey,
+            sas_token,
+        );
+    }
+    if storage.azure_use_emulator {
+        builder = builder.with_use_emulator(true);
+    }
+
+    builder
+        .build()
+        .map_err(|e| DataFusionError::External(Box::new(e)))
+}
+
+/// If `args.path` is an Azure URL, register a [`MicrosoftAzure`] object
+/// store on the supplied [`SessionContext`] under the container-scoped URL.
+/// No-op for non-Azure paths.
+pub fn register_azure_store_if_needed(
+    fn_name: &str,
+    ctx: &SessionContext,
+    args: &FileTvfArgs,
+    storage: &StorageConfig,
+) -> DFResult<()> {
+    if !is_azure_path(&args.path) {
+        return Ok(());
+    }
+    let store = build_azure_store(fn_name, args, storage)?;
+    let (container, _account) = extract_azure_container_account(&args.path)
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "{fn_name}: could not parse container from Azure URL '{}'",
+                args.path
+            ))
+        })?;
+    // Pick the same scheme the user gave us so DataFusion's URL matcher
+    // (which keys on scheme + host) finds the store on subsequent reads.
+    let scheme = if args.path.starts_with("abfss://") {
+        "abfss"
+    } else if args.path.starts_with("abfs://") {
+        "abfs"
+    } else if args.path.starts_with("azure://") {
+        "azure"
+    } else {
+        "az"
+    };
+    let store_url = url::Url::parse(&format!("{scheme}://{container}")).map_err(|e| {
+        DataFusionError::Plan(format!("{fn_name}: failed to build Azure store URL: {e}"))
+    })?;
+    ctx.register_object_store(&store_url, Arc::new(store));
+    Ok(())
+}
+
+/// Build an [`object_store::gcp::GoogleCloudStorage`] from inline TVF args
+/// with fallback to the coordinator-wide [`StorageConfig`] defaults.
+pub fn build_gcs_store(
+    fn_name: &str,
+    args: &FileTvfArgs,
+    storage: &StorageConfig,
+) -> DFResult<object_store::gcp::GoogleCloudStorage> {
+    let bucket = extract_gcs_bucket(&args.path).ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "{fn_name}: could not parse bucket from GCS URL '{}'",
+            args.path
+        ))
+    })?;
+
+    let mut builder = GoogleCloudStorageBuilder::new().with_bucket_name(bucket);
+
+    let key_path = args
+        .gcs_service_account_path
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(storage.gcs_service_account_path.as_str());
+
+    let key_inline = args
+        .gcs_service_account_key
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(storage.gcs_service_account_key.as_str());
+
+    if !key_path.is_empty() {
+        builder = builder.with_service_account_path(key_path);
+    } else if !key_inline.is_empty() {
+        builder = builder.with_service_account_key(key_inline);
+    }
+    // When both are empty the builder will use Application Default
+    // Credentials: env (`GOOGLE_APPLICATION_CREDENTIALS`), gcloud config,
+    // GCE metadata server, GKE Workload Identity.
+
+    builder
+        .build()
+        .map_err(|e| DataFusionError::External(Box::new(e)))
+}
+
+/// If `args.path` is a GCS URL, register a [`GoogleCloudStorage`] object
+/// store on the supplied [`SessionContext`] under the bucket-scoped URL.
+/// No-op for non-GCS paths.
+pub fn register_gcs_store_if_needed(
+    fn_name: &str,
+    ctx: &SessionContext,
+    args: &FileTvfArgs,
+    storage: &StorageConfig,
+) -> DFResult<()> {
+    if !is_gcs_path(&args.path) {
+        return Ok(());
+    }
+    let store = build_gcs_store(fn_name, args, storage)?;
+    let bucket = extract_gcs_bucket(&args.path).ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "{fn_name}: could not parse bucket from GCS URL '{}'",
+            args.path
+        ))
+    })?;
+    let scheme = if args.path.starts_with("gcs://") {
+        "gcs"
+    } else {
+        "gs"
+    };
+    let store_url = url::Url::parse(&format!("{scheme}://{bucket}")).map_err(|e| {
+        DataFusionError::Plan(format!("{fn_name}: failed to build GCS store URL: {e}"))
+    })?;
+    ctx.register_object_store(&store_url, Arc::new(store));
     Ok(())
 }
 
@@ -795,6 +1068,7 @@ mod tests {
             secret_key: Some("SECRET".to_string()),
             endpoint: Some("http://localhost:9000".to_string()),
             region: Some("us-east-1".to_string()),
+            ..FileTvfArgs::default()
         };
         let storage = StorageConfig {
             s3_allow_http: true,
@@ -821,6 +1095,90 @@ mod tests {
         assert!(is_hf_path("hf://datasets/squad/plain/train.parquet"));
         assert!(!is_hf_path("https://huggingface.co/..."));
         assert!(!is_hf_path("/local/file"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Azure ADLS Gen2 / Blob URL parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn azure_path_detection() {
+        assert!(is_azure_path(
+            "abfss://container@account.dfs.core.windows.net/path/file.parquet"
+        ));
+        assert!(is_azure_path(
+            "abfs://container@account.dfs.core.windows.net/path/file.parquet"
+        ));
+        assert!(is_azure_path("azure://container/path/file.parquet"));
+        assert!(is_azure_path("az://container/path/file.parquet"));
+        assert!(!is_azure_path("s3://bucket/file"));
+        assert!(!is_azure_path("https://example.com/file"));
+        assert!(!is_azure_path("/local/file"));
+    }
+
+    #[test]
+    fn azure_extract_container_account_from_abfss() {
+        let r = extract_azure_container_account(
+            "abfss://mycontainer@myaccount.dfs.core.windows.net/dir/file.parquet",
+        )
+        .unwrap();
+        assert_eq!(r, ("mycontainer".to_string(), "myaccount".to_string()));
+    }
+
+    #[test]
+    fn azure_extract_container_account_from_abfs() {
+        let r = extract_azure_container_account(
+            "abfs://c@a.dfs.core.windows.net/x/y.parquet",
+        )
+        .unwrap();
+        assert_eq!(r, ("c".to_string(), "a".to_string()));
+    }
+
+    #[test]
+    fn azure_extract_container_from_short_form() {
+        // azure:// and az:// shorthand: account comes from config / inline arg.
+        let r = extract_azure_container_account("azure://mycontainer/dir/file.parquet").unwrap();
+        assert_eq!(r, ("mycontainer".to_string(), String::new()));
+
+        let r = extract_azure_container_account("az://c2/file").unwrap();
+        assert_eq!(r, ("c2".to_string(), String::new()));
+    }
+
+    #[test]
+    fn azure_extract_returns_none_on_malformed() {
+        // Missing container@account separator on abfss.
+        assert!(extract_azure_container_account(
+            "abfss://account.dfs.core.windows.net/path"
+        )
+        .is_none());
+        // Empty container.
+        assert!(extract_azure_container_account(
+            "abfss://@account.dfs.core.windows.net/path"
+        )
+        .is_none());
+        // Not an Azure URL.
+        assert!(extract_azure_container_account("s3://bucket/path").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Google Cloud Storage URL parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gcs_path_detection() {
+        assert!(is_gcs_path("gs://bucket/path/file.parquet"));
+        assert!(is_gcs_path("gcs://bucket/path/file.parquet"));
+        assert!(!is_gcs_path("s3://bucket/file"));
+        assert!(!is_gcs_path("https://storage.googleapis.com/..."));
+        assert!(!is_gcs_path("/local/file"));
+    }
+
+    #[test]
+    fn gcs_extract_bucket() {
+        assert_eq!(extract_gcs_bucket("gs://my-bucket/key.parquet"), Some("my-bucket"));
+        assert_eq!(extract_gcs_bucket("gcs://b/x"), Some("b"));
+        assert_eq!(extract_gcs_bucket("gs://"), None);
+        assert_eq!(extract_gcs_bucket("s3://bucket/key"), None);
     }
 
     #[test]

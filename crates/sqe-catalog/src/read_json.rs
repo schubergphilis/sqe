@@ -34,8 +34,9 @@ use tracing::debug;
 use sqe_core::config::StorageConfig;
 
 use crate::file_tvf_common::{
-    parse_file_tvf_args, register_http_store_if_needed, register_s3_store_if_needed,
-    rewrite_hf_path_in_place, FileTvfArgs,
+    parse_file_tvf_args, register_azure_store_if_needed, register_gcs_store_if_needed,
+    register_http_store_if_needed, register_s3_store_if_needed, rewrite_hf_path_in_place,
+    FileTvfArgs,
 };
 
 const FN_NAME: &str = "read_json";
@@ -108,6 +109,8 @@ async fn build_json_listing_table(
 
     let tmp_ctx = SessionContext::new();
     register_s3_store_if_needed(FN_NAME, &tmp_ctx, &args, storage)?;
+    register_azure_store_if_needed(FN_NAME, &tmp_ctx, &args, storage)?;
+    register_gcs_store_if_needed(FN_NAME, &tmp_ctx, &args, storage)?;
     register_http_store_if_needed(FN_NAME, &tmp_ctx, &args.path)?;
 
     let mut format = JsonFormat::default();
