@@ -23,14 +23,28 @@ graph LR
 - **Fine-grained security** — row filters and column masks enforced at the logical plan level, before the optimizer runs. Invisible columns, transparent row filtering, no information leakage.
 - **Rust performance** — single binary, no JVM, no GC pauses, predictable memory usage, fast startup.
 
-## Quick Start
+## Quick Start (embedded, no server)
+
+```bash
+cargo install --path crates/sqe-cli
+sqe-cli --embedded                    # ~/.sqe/warehouse persistent Iceberg catalog
+
+sqe> SELECT * FROM '/data/sales.parquet' LIMIT 5;
+sqe> SELECT * FROM read_csv('s3://bucket/orders.tsv.gz');
+sqe> SELECT * FROM 'hf://datasets/squad/plain_text/train-00000-of-00001.parquet';
+sqe> SELECT * FROM read_delta('/data/delta/sales', version => '5');
+```
+
+Full embedded reference: [`cli-embedded.md`](../../cli-embedded.md). DuckDB comparison: [`duckdb-comparision.md`](../../duckdb-comparision.md).
+
+## Quick Start (cluster mode)
 
 ```bash
 # Build
-cargo build --release --bin sqe-server --bin sqe-cli
+cargo build --release --bin sqe-coordinator --bin sqe-cli
 
-# Start coordinator (single-node, default mode)
-SQE_CONFIG=sqe.toml ./target/release/sqe-server
+# Start coordinator
+SQE_CONFIG=sqe.toml ./target/release/sqe-coordinator
 
 # Connect
 ./target/release/sqe-cli --host localhost --port 50051
@@ -38,4 +52,4 @@ SQE_CONFIG=sqe.toml ./target/release/sqe-server
 
 ## Project Status
 
-SQE is in active development. The single-node engine (Phase 1-2) is functional with Keycloak auth, Polaris catalog, Flight SQL, read/write queries, and observability. Distributed execution (Phase 3) and security policy enforcement (Phase 5) are in design.
+SQE is production-ready against Apache Iceberg. The cluster mode runs distributed (coordinator + stateless workers) with OIDC bearer-token passthrough, Polaris / Nessie / Glue / HMS / S3 Tables / JDBC / Hadoop catalogs, and 167/189 (88.4%) on the public Iceberg matrix scoreboard. The embedded mode (V8 through V12.1) adds DuckDB-style file-format TVFs (`read_csv`, `read_json`, `read_delta`), HuggingFace `hf://` URLs, and a single-binary CLI for laptop analytics.
