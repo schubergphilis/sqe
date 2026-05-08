@@ -12,6 +12,7 @@ members = [
     "crates/sqe-worker",
     "crates/sqe-trino-compat",
     "crates/sqe-metrics",
+    "crates/sqe-lineage",
     "crates/sqe-cli",
     "crates/sqe-bench",
     "xtask",
