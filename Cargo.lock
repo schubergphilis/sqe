@@ -6668,6 +6668,7 @@ dependencies = [
  "sqe-core",
  "sqe-metrics",
  "sqe-sql",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
