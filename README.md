@@ -49,6 +49,7 @@ For detailed Mermaid diagrams (query pipeline, crate dependencies, caching layer
 - **Performance**: 5-layer caching, star-schema join reorder, dynamic filter pushdown, ZSTD compression
 - **Security**: 43/43 audit findings resolved. See [docs/issues.md](docs/issues.md)
 - **File-format TVFs**: `read_parquet`, `read_csv`, `read_json`, `read_delta` against local filesystem, S3, HTTPS, and HuggingFace `hf://` URLs. Quoted-string auto-detect: `SELECT * FROM '/data/sales.parquet'` and `SELECT * FROM 'hf://datasets/foo/bar/data.csv'` work without registering a table. Smart `read_csv` detects delimiter (`.tsv` -> tab, `.psv` -> pipe) and compression (`.csv.gz`, `.tsv.zst`) from the path.
+- **Storage backends**: AWS S3, Cloudflare R2, MinIO / Ceph / SeaweedFS / Garage / rustfs (S3-compatible), Azure ADLS Gen2 / Blob (`abfss://`, `azure://`, `az://`), Google Cloud Storage (`gs://`, `gcs://`), HTTPS, HuggingFace `hf://`, local filesystem. Per-query inline credentials or engine-wide `[storage]` config. See [`docs/book/src/getting-started/storage-backends.md`](docs/book/src/getting-started/storage-backends.md).
 - **Embedded mode**: One binary, no cluster, no catalog server. `sqe-cli --embedded` opens a CLI with the same SQL surface as the cluster mode. Persistent SQLite-backed Iceberg catalogs at `~/.sqe/warehouse/` survive restarts. Cross-catalog joins across multiple `--catalog NAME=PATH` mounts. Full reference: [`docs/cli-embedded.md`](docs/cli-embedded.md).
 
 ## Getting Started
@@ -111,6 +112,8 @@ For Docker, Kubernetes, TLS, and auth provider setup, see [docs/deployment.md](d
 
 **SQE wins 6 of 7 suites at SF1.** 222/222 queries pass across the full suite. The 6 TPC-DS misses are GROUPING SETS edge cases (grand-total row presence), not new failures. Known performance ceiling: [TPC-DS q72](docs/blog/2026-04-16-our-nemesis-q72.md), still 13x slower than Trino because DataFusion lacks full CBO with NDV.
 
+For the longitudinal view (every benchmark JSON in `benchmarks/results/` plotted across time, per-suite, per-scale, per-query heatmaps), see [`docs/benchmark/`](docs/benchmark/index.md). Charts auto-regenerate from the committed JSONs via `make benchmark-charts`.
+
 The May-2026 numbers reflect two compounding wins. First, the Path B+B-2 runtime filter pushdown work (TPC-H SF1: 21.9s -> 14.5s in April, broad per-query gains on lineitem-heavy joins; SF10: 163.9s -> 143.6s, q06 -4.9s, q07 -4.9s, q14 -2.7s; q15 RowDiff fixed). Second, manifest-derived column statistics: SQE now aggregates per-file `lower_bounds` / `upper_bounds` / `null_value_counts` from Iceberg manifests at scan-planning time and feeds them to DataFusion's `Statistics`. The CBO sees real selectivity for filtered dimension columns and picks a sensible build/probe order on multi-way joins. TPC-DS SF1 dropped 21% (75.2s -> 59.2s) on the dedicated comparison run; q72 itself fell from 24.8s back to 16-18s (close to its April baseline). See [docs/features/runtime-filter-pushdown.md](docs/features/runtime-filter-pushdown.md) for the runtime-filter design.
 
 Run your own benchmarks:
@@ -168,7 +171,7 @@ Full configuration reference: [docs/deployment.md](docs/deployment.md).
 | Table Format | Apache Iceberg v2 / v3 |
 | Catalog | Apache Polaris (default), Project Nessie, Unity Catalog OSS, AWS Glue (native), AWS S3 Tables (native), Hive Metastore, JDBC (Postgres/MySQL/SQLite), Hadoop storage-only. Loader-based dispatch via the upstream `iceberg-catalog-loader` factory |
 | Wire Protocol | Arrow Flight SQL + Trino HTTP |
-| Storage | S3-compatible (AWS, Ceph, R2, rustfs) + local filesystem |
+| Storage | AWS S3, Cloudflare R2, MinIO / Ceph / SeaweedFS / Garage / rustfs (S3-compatible), Azure ADLS Gen2 / Blob, Google Cloud Storage, HTTPS, HuggingFace `hf://`, local filesystem |
 | Observability | OpenTelemetry + Prometheus |
 | License | Apache 2.0 |
 
@@ -178,12 +181,15 @@ Full configuration reference: [docs/deployment.md](docs/deployment.md).
 |-----|------|
 | [Architecture](docs/architecture.md) | Mermaid diagrams: query pipeline, crate deps, caching, distributed |
 | [Deployment](docs/deployment.md) | Docker Compose, Kubernetes, TLS, auth providers, monitoring |
-| [Iceberg Matrix](docs/iceberg-matrix.md) | Per-cell SQE coverage on the public scoreboard (166/189, 87.8%) |
+| [Iceberg Matrix](docs/iceberg-matrix.md) | Per-cell SQE coverage on the public scoreboard (167/189, 88.4%) |
+| [Benchmark history](docs/benchmark/index.md) | Total / per-query / pass-count over time for every TPC suite at SF0.1 / SF1 / SF10 |
 | [Iceberg Matrix Comparison](docs/iceberg-matrix-compare.md) | V2/V3 side-by-side against 20 other engines |
 | [Trino Compatibility](docs/trino-compatibility.md) | SQL feature matrix vs Trino (~96% coverage) |
 | [DuckDB Comparison](docs/duckdb-comparision.md) | What SQE has that DuckDB lacks, and vice versa, with V8-V12 audit trail |
 | [Embedded CLI Reference](docs/cli-embedded.md) | All flags, dot-commands, TVFs, catalog backends (S3 Tables, Glue, HMS, JDBC), storage backends (S3, R2, MinIO, ADLS, GCS), write paths in one place |
 | [SQL Feature Comparison](docs/features.md) | SQE vs Trino vs Spark SQL vs DuckDB across window / aggregate / DML / Iceberg / file-format TVFs |
+| [SQL Reference (rust book)](docs/book/src/sql-reference/index.md) | 18 pages: every function, statement, operator, TVF, CALL procedure, GRANT extension, with origin (datafusion / sqe-trino-functions / sqe-policy / sqe-sql) and Trino / Snowflake / Spark / DuckDB alias columns |
+| [Storage Backends](docs/book/src/getting-started/storage-backends.md) | S3, R2, MinIO/Ceph, Azure ADLS Gen2, Google Cloud Storage, HTTPS, hf:// |
 | [Catalog Backends](docs/catalogs.md) | Per-backend TOML, credentials, verification queries |
 | [Roadmap](docs/roadmap.md) | Full feature checklist (completed, in progress, planned) |
 | [Security Audit](docs/issues.md) | 43 findings, all resolved |
