@@ -28,13 +28,7 @@ The 5.5x speedup vs Trino at SF1 reflects the structured-query subset; the JSON 
 
 ## SF10
 
-Two runs.
-
-![TPC-BB SF10 total](./charts/tpcbb-sf10-total.png)
-
-![TPC-BB SF10 per-query](./charts/tpcbb-sf10-per-query.png)
-
-![TPC-BB SF10 pass](./charts/tpcbb-sf10-pass.png)
+No clean runs at SF10 yet. The two attempted runs both errored and were dropped from the timeline.
 
 ## Implementation references
 
