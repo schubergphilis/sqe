@@ -279,9 +279,10 @@ FROM orders;
 | `GREATEST(a, b, ...)` | ✅ | ✅ | ✅ |
 | `LEAST(a, b, ...)` | ✅ | ✅ | ✅ |
 | `NVL` / `NVL2` | ✅ | ❌ | ✅ |
-| `IF(cond, then, else)` | ✅ via `sqe-trino-functions` | ✅ | ✅ |
-| `IIF` | ❌ | ❌ | ❌ |
-| `DECODE` (Oracle-style) | ❌ | ❌ | ✅ |
+| `IF(cond, then, else)` (Trino) | ✅ via `sqe-trino-functions` | ✅ | ✅ |
+| `IFF(cond, then, else)` (Snowflake) | ✅ via `sqe-trino-functions` | ❌ | ❌ |
+| `IIF` (T-SQL) | ❌ | ❌ | ❌ |
+| `DECODE` (Oracle / Snowflake conditional) | ❌ name collides with binary `decode()` | ❌ | ✅ |
 
 ---
 
