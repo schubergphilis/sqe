@@ -6,7 +6,7 @@
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::TableReference;
 use datafusion::datasource::{provider_as_source, MemTable};
-use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
+use datafusion::logical_expr::{col, lit, Expr, LogicalPlan, LogicalPlanBuilder};
 use sqe_lineage::extract::columns;
 use std::sync::Arc;
 
@@ -62,4 +62,59 @@ fn table_scan_emits_one_identity_dep_per_column() {
     assert_eq!(dep.field, "amount");
     assert_eq!(dep.transformation.kind, "DIRECT");
     assert_eq!(dep.transformation.subtype, "IDENTITY");
+}
+
+#[test]
+fn projection_passthrough_is_identity() {
+    let plan = build_simple_scan(
+        "polaris",
+        "sales",
+        "orders",
+        &[("id", DataType::Int64), ("amount", DataType::Float64)],
+    );
+    let plan = LogicalPlanBuilder::from(plan)
+        .project(vec![col("id"), col("amount")])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let trace = columns::trace_plan(&plan);
+    assert_eq!(trace.len(), 2);
+
+    // Bare column refs preserve the upstream IDENTITY
+    assert_eq!(trace[0].len(), 1);
+    assert_eq!(trace[0][0].field, "id");
+    assert_eq!(trace[0][0].transformation.subtype, "IDENTITY");
+    assert_eq!(trace[1].len(), 1);
+    assert_eq!(trace[1][0].field, "amount");
+    assert_eq!(trace[1][0].transformation.subtype, "IDENTITY");
+}
+
+#[test]
+fn projection_expr_is_transformation() {
+    let plan = build_simple_scan(
+        "polaris",
+        "sales",
+        "orders",
+        &[("id", DataType::Int64), ("amount", DataType::Float64)],
+    );
+    let doubled: Expr = (col("amount") * lit(2_i64)).alias("doubled");
+    let plan = LogicalPlanBuilder::from(plan)
+        .project(vec![col("id"), doubled])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let trace = columns::trace_plan(&plan);
+    assert_eq!(trace.len(), 2);
+
+    // id passthrough remains IDENTITY
+    assert_eq!(trace[0][0].field, "id");
+    assert_eq!(trace[0][0].transformation.subtype, "IDENTITY");
+
+    // doubled column references `amount` with TRANSFORMATION (computation)
+    assert_eq!(trace[1].len(), 1, "doubled has one input dep: amount");
+    assert_eq!(trace[1][0].field, "amount");
+    assert_eq!(trace[1][0].transformation.kind, "DIRECT");
+    assert_eq!(trace[1][0].transformation.subtype, "TRANSFORMATION");
 }
