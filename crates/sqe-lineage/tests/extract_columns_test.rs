@@ -326,3 +326,133 @@ fn join_passes_through_each_side_with_indirect_join_on_predicate() {
         );
     }
 }
+
+#[test]
+fn union_merges_traces_by_position() {
+    let left = build_simple_scan(
+        "polaris",
+        "sales",
+        "orders_2024",
+        &[("id", DataType::Int64), ("amount", DataType::Float64)],
+    );
+    let right = build_simple_scan(
+        "polaris",
+        "sales",
+        "orders_2025",
+        &[("id", DataType::Int64), ("amount", DataType::Float64)],
+    );
+    let plan = LogicalPlanBuilder::from(left)
+        .union(right)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let trace = columns::trace_plan(&plan);
+    assert_eq!(trace.len(), 2);
+
+    // Output[0] (id) merges deps from both inputs at position 0
+    let id_tables: Vec<&str> = trace[0].iter().map(|d| d.table.as_str()).collect();
+    assert!(
+        id_tables.contains(&"orders_2024"),
+        "id should include left source"
+    );
+    assert!(
+        id_tables.contains(&"orders_2025"),
+        "id should include right source"
+    );
+
+    // Output[1] (amount) same
+    let amount_tables: Vec<&str> = trace[1].iter().map(|d| d.table.as_str()).collect();
+    assert!(amount_tables.contains(&"orders_2024"));
+    assert!(amount_tables.contains(&"orders_2025"));
+}
+
+#[test]
+fn sort_adds_indirect_sort_deps() {
+    let plan = build_simple_scan(
+        "polaris",
+        "sales",
+        "orders",
+        &[("id", DataType::Int64), ("amount", DataType::Float64)],
+    );
+    let plan = LogicalPlanBuilder::from(plan)
+        .sort(vec![col("amount").sort(true, false)])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let trace = columns::trace_plan(&plan);
+    assert_eq!(trace.len(), 2);
+
+    // Both outputs keep IDENTITY plus pick up an INDIRECT/SORT on `amount`
+    for (idx, name) in [(0, "id"), (1, "amount")] {
+        let sort_dep = trace[idx]
+            .iter()
+            .find(|d| d.transformation.subtype == "SORT")
+            .unwrap_or_else(|| panic!("{name} should have SORT dep"));
+        assert_eq!(sort_dep.transformation.kind, "INDIRECT");
+        assert_eq!(sort_dep.field, "amount");
+    }
+}
+
+#[test]
+fn limit_passes_through() {
+    let plan = build_simple_scan(
+        "polaris",
+        "sales",
+        "orders",
+        &[("id", DataType::Int64), ("amount", DataType::Float64)],
+    );
+    let plan = LogicalPlanBuilder::from(plan)
+        .limit(0, Some(10))
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let trace = columns::trace_plan(&plan);
+    assert_eq!(trace.len(), 2);
+    assert_eq!(trace[0][0].transformation.subtype, "IDENTITY");
+    assert_eq!(trace[1][0].transformation.subtype, "IDENTITY");
+}
+
+#[test]
+fn distinct_passes_through() {
+    let plan = build_simple_scan(
+        "polaris",
+        "sales",
+        "orders",
+        &[("id", DataType::Int64), ("amount", DataType::Float64)],
+    );
+    let plan = LogicalPlanBuilder::from(plan)
+        .distinct()
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let trace = columns::trace_plan(&plan);
+    assert_eq!(trace.len(), 2);
+    assert_eq!(trace[0][0].transformation.subtype, "IDENTITY");
+    assert_eq!(trace[1][0].transformation.subtype, "IDENTITY");
+}
+
+#[test]
+fn subquery_alias_passes_through() {
+    let plan = build_simple_scan(
+        "polaris",
+        "sales",
+        "orders",
+        &[("id", DataType::Int64), ("amount", DataType::Float64)],
+    );
+    let plan = LogicalPlanBuilder::from(plan)
+        .alias("o")
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let trace = columns::trace_plan(&plan);
+    assert_eq!(trace.len(), 2);
+    assert_eq!(trace[0][0].field, "id");
+    assert_eq!(trace[0][0].transformation.subtype, "IDENTITY");
+    assert_eq!(trace[1][0].field, "amount");
+    assert_eq!(trace[1][0].transformation.subtype, "IDENTITY");
+}
