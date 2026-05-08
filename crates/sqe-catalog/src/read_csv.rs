@@ -16,19 +16,33 @@
 //!     has_header  => 'true');
 //! ```
 //!
-//! The implementation wraps DataFusion 53's [`CsvFormat`] in a
-//! [`ListingTable`], using the same `block_in_place`-driven async-from-sync
-//! bridge as `read_parquet`. CSV-specific named args (`delimiter`,
-//! `has_header`, `quote`, `escape`, `comment`, `null_regex`) flow into the
-//! [`CsvFormat`] builder.
+//! ## Named arguments (DuckDB-parity)
 //!
-//! Compression is not exposed yet; CSV reading from gzipped files works only
-//! when DataFusion's `compression` feature is on (default).
+//! - `delimiter` (alias `delim`, `sep`): single ASCII byte. Default
+//!   auto-detected from extension (`.tsv` -> tab, `.psv` -> pipe, `.ssv` -> semicolon, `.csv` -> comma).
+//! - `has_header` (alias `header`): boolean. Default `true`.
+//! - `quote`: single ASCII byte. DataFusion default `"`.
+//! - `escape`: single ASCII byte.
+//! - `comment`: single ASCII byte. Lines starting with this are skipped.
+//! - `null_regex` (alias `nullstr`): regex for null values.
+//! - `compression` (alias `compress`): `auto` (default), `gzip`, `bz2`, `xz`,
+//!   `zstd`, or `none`. `auto` reads the file extension chain (`.csv.gz`,
+//!   `.tsv.zst`, etc.).
+//! - `file_extension`: glob extension for directory listings; default
+//!   matches the path's outer extension.
+//!
+//! ## Implementation
+//!
+//! The TVF wraps DataFusion 53's [`CsvFormat`] in a [`ListingTable`], using
+//! the same `block_in_place`-driven async-from-sync bridge as `read_parquet`.
+//! Hf:// URLs are resolved to HTTPS upstream; S3 stores get registered on
+//! demand from inline credentials or [`StorageConfig`] defaults.
 
 use std::sync::Arc;
 
 use datafusion::catalog::{TableFunctionImpl, TableProvider};
 use datafusion::datasource::file_format::csv::CsvFormat;
+use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
@@ -56,6 +70,73 @@ struct CsvOpts {
     comment: Option<u8>,
     null_regex: Option<String>,
     file_extension: Option<String>,
+    /// `None` means use auto-detect from the path; `Some` overrides it.
+    compression: Option<FileCompressionType>,
+}
+
+/// Detect a delimiter from a path's outer extension. Matches DuckDB's
+/// `read_csv` heuristics.
+fn delimiter_for_extension(path: &str) -> Option<u8> {
+    // Strip a trailing compression extension first (.gz, .bz2, .xz, .zst).
+    let stripped = strip_compression_ext(path);
+    let lower = stripped.to_ascii_lowercase();
+    if lower.ends_with(".tsv") {
+        Some(b'\t')
+    } else if lower.ends_with(".psv") {
+        Some(b'|')
+    } else if lower.ends_with(".ssv") {
+        Some(b';')
+    } else if lower.ends_with(".csv") {
+        Some(b',')
+    } else {
+        None
+    }
+}
+
+/// Strip a compression suffix from a path, returning the inner path.
+/// `data.csv.gz` -> `data.csv`. Used so `delimiter_for_extension` and the
+/// `file_extension` listing knob look at the format extension, not the
+/// codec extension.
+fn strip_compression_ext(path: &str) -> &str {
+    for ext in [".gz", ".gzip", ".bz2", ".bzip2", ".xz", ".zst", ".zstd"] {
+        if path.to_ascii_lowercase().ends_with(ext) {
+            return &path[..path.len() - ext.len()];
+        }
+    }
+    path
+}
+
+/// Parse a `compression => '<value>'` named arg. Accepts `auto`, `gzip`,
+/// `bz2`, `xz`, `zstd`, `none`, plus DuckDB-friendly aliases.
+fn parse_compression(value: &str) -> DFResult<Option<FileCompressionType>> {
+    match value.to_ascii_lowercase().as_str() {
+        "auto" | "" => Ok(None),
+        "none" | "uncompressed" | "off" => Ok(Some(FileCompressionType::UNCOMPRESSED)),
+        "gz" | "gzip" => Ok(Some(FileCompressionType::GZIP)),
+        "bz2" | "bzip2" => Ok(Some(FileCompressionType::BZIP2)),
+        "xz" => Ok(Some(FileCompressionType::XZ)),
+        "zst" | "zstd" => Ok(Some(FileCompressionType::ZSTD)),
+        other => Err(DataFusionError::Plan(format!(
+            "{FN_NAME}: 'compression' must be one of auto, none, gzip, bz2, xz, zstd; got '{other}'"
+        ))),
+    }
+}
+
+/// Map a path's compression extension to a [`FileCompressionType`].
+/// Returns `Uncompressed` if the path has no recognised codec suffix.
+fn compression_from_extension(path: &str) -> FileCompressionType {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".gz") || lower.ends_with(".gzip") {
+        FileCompressionType::GZIP
+    } else if lower.ends_with(".bz2") || lower.ends_with(".bzip2") {
+        FileCompressionType::BZIP2
+    } else if lower.ends_with(".xz") {
+        FileCompressionType::XZ
+    } else if lower.ends_with(".zst") || lower.ends_with(".zstd") {
+        FileCompressionType::ZSTD
+    } else {
+        FileCompressionType::UNCOMPRESSED
+    }
 }
 
 fn parse_single_byte(key: &str, value: &str) -> DFResult<u8> {
@@ -96,10 +177,14 @@ impl TableFunctionImpl for ReadCsvFunction {
 
         let args = parse_file_tvf_args(FN_NAME, exprs, |key, value| {
             let res: DFResult<()> = match key {
-                "delimiter" => parse_single_byte("delimiter", value).map(|b| {
+                // DuckDB uses `delim` and `sep`; CSV traditionalists use
+                // `delimiter`. Accept all three.
+                "delimiter" | "delim" | "sep" => parse_single_byte(key, value).map(|b| {
                     csv_opts.delimiter = Some(b);
                 }),
-                "has_header" => parse_bool("has_header", value).map(|b| {
+                // `header` is the DuckDB spelling; `has_header` is what
+                // DataFusion uses. Either works.
+                "has_header" | "header" => parse_bool(key, value).map(|b| {
                     csv_opts.has_header = Some(b);
                 }),
                 "quote" => parse_single_byte("quote", value).map(|b| {
@@ -111,7 +196,8 @@ impl TableFunctionImpl for ReadCsvFunction {
                 "comment" => parse_single_byte("comment", value).map(|b| {
                     csv_opts.comment = Some(b);
                 }),
-                "null_regex" => {
+                // `nullstr` is DuckDB; `null_regex` is the underlying knob.
+                "null_regex" | "nullstr" => {
                     csv_opts.null_regex = Some(value.to_string());
                     Ok(())
                 }
@@ -119,6 +205,9 @@ impl TableFunctionImpl for ReadCsvFunction {
                     csv_opts.file_extension = Some(value.to_string());
                     Ok(())
                 }
+                "compression" | "compress" => parse_compression(value).map(|c| {
+                    csv_opts.compression = c;
+                }),
                 _ => return false,
             };
             if let Err(e) = res {
@@ -139,6 +228,34 @@ impl TableFunctionImpl for ReadCsvFunction {
     }
 }
 
+/// Pull the file extension from a path, including the compression suffix
+/// if present. `'/data/x.csv.gz'` -> `'.csv.gz'`. Falls back to `'.csv'`
+/// when the path is a glob or has no extension.
+fn derive_file_extension(path: &str) -> String {
+    // Drop directory parts.
+    let basename = path.rsplit('/').next().unwrap_or(path);
+    // If the basename contains glob characters we use the conservative
+    // default; ListingTable's globbing will pick up files by that suffix.
+    if basename.contains('*') || basename.contains('?') {
+        return ".csv".to_string();
+    }
+    // Find the LAST dot for the codec suffix, then check if the byte
+    // before that suffix is also a recognized format extension.
+    let lower = basename.to_ascii_lowercase();
+    let codecs = [".gz", ".gzip", ".bz2", ".bzip2", ".xz", ".zst", ".zstd"];
+    for c in codecs {
+        if let Some(stripped) = lower.strip_suffix(c) {
+            if let Some(dot) = stripped.rfind('.') {
+                return format!("{}{c}", &stripped[dot..]);
+            }
+        }
+    }
+    if let Some(dot) = basename.rfind('.') {
+        return basename[dot..].to_string();
+    }
+    ".csv".to_string()
+}
+
 async fn build_csv_listing_table(
     args: &FileTvfArgs,
     csv_opts: &CsvOpts,
@@ -156,9 +273,15 @@ async fn build_csv_listing_table(
     register_http_store_if_needed(FN_NAME, &tmp_ctx, &args.path)?;
 
     let mut format = CsvFormat::default();
-    if let Some(d) = csv_opts.delimiter {
+
+    // Delimiter: explicit > extension-based detection > DataFusion default.
+    let delimiter = csv_opts
+        .delimiter
+        .or_else(|| delimiter_for_extension(&args.path));
+    if let Some(d) = delimiter {
         format = format.with_delimiter(d);
     }
+
     if let Some(h) = csv_opts.has_header {
         format = format.with_has_header(h);
     }
@@ -175,7 +298,20 @@ async fn build_csv_listing_table(
         format = format.with_null_regex(Some(re.clone()));
     }
 
-    let extension = csv_opts.file_extension.as_deref().unwrap_or(".csv");
+    // Compression: explicit > extension-based detection > UNCOMPRESSED.
+    let compression = csv_opts
+        .compression
+        .unwrap_or_else(|| compression_from_extension(&args.path));
+    format = format.with_file_compression_type(compression);
+
+    // file_extension: explicit > derived from the path (skipping the
+    // compression suffix). If a user passes 'data.tsv.gz' we still want
+    // the listing to match '.tsv.gz' for directory globs.
+    let derived_extension = derive_file_extension(&args.path);
+    let extension = csv_opts
+        .file_extension
+        .as_deref()
+        .unwrap_or(derived_extension.as_str());
     let listing_options = ListingOptions::new(Arc::new(format)).with_file_extension(extension);
 
     let schema = listing_options
@@ -226,5 +362,87 @@ mod tests {
     #[test]
     fn parse_bool_rejects_garbage() {
         assert!(parse_bool("has_header", "maybe").is_err());
+    }
+
+    #[test]
+    fn delimiter_for_extension_picks_per_format() {
+        assert_eq!(delimiter_for_extension("data.csv"), Some(b','));
+        assert_eq!(delimiter_for_extension("data.tsv"), Some(b'\t'));
+        assert_eq!(delimiter_for_extension("data.psv"), Some(b'|'));
+        assert_eq!(delimiter_for_extension("data.ssv"), Some(b';'));
+        assert_eq!(delimiter_for_extension("data.txt"), None);
+    }
+
+    #[test]
+    fn delimiter_for_extension_strips_compression() {
+        // .csv.gz -> still ',' (TSV-and-gz means tab)
+        assert_eq!(delimiter_for_extension("data.csv.gz"), Some(b','));
+        assert_eq!(delimiter_for_extension("data.tsv.bz2"), Some(b'\t'));
+        assert_eq!(delimiter_for_extension("data.tsv.zst"), Some(b'\t'));
+        assert_eq!(delimiter_for_extension("data.psv.xz"), Some(b'|'));
+    }
+
+    #[test]
+    fn compression_from_extension_recognises_codecs() {
+        assert!(matches!(
+            compression_from_extension("data.csv.gz"),
+            FileCompressionType::GZIP
+        ));
+        assert!(matches!(
+            compression_from_extension("data.csv.bz2"),
+            FileCompressionType::BZIP2
+        ));
+        assert!(matches!(
+            compression_from_extension("data.csv.xz"),
+            FileCompressionType::XZ
+        ));
+        assert!(matches!(
+            compression_from_extension("data.csv.zst"),
+            FileCompressionType::ZSTD
+        ));
+        assert!(matches!(
+            compression_from_extension("data.csv"),
+            FileCompressionType::UNCOMPRESSED
+        ));
+    }
+
+    #[test]
+    fn parse_compression_accepts_aliases() {
+        assert!(parse_compression("auto").unwrap().is_none());
+        assert!(matches!(
+            parse_compression("gzip").unwrap(),
+            Some(FileCompressionType::GZIP)
+        ));
+        assert!(matches!(
+            parse_compression("gz").unwrap(),
+            Some(FileCompressionType::GZIP)
+        ));
+        assert!(matches!(
+            parse_compression("zstd").unwrap(),
+            Some(FileCompressionType::ZSTD)
+        ));
+        assert!(matches!(
+            parse_compression("zst").unwrap(),
+            Some(FileCompressionType::ZSTD)
+        ));
+        assert!(matches!(
+            parse_compression("none").unwrap(),
+            Some(FileCompressionType::UNCOMPRESSED)
+        ));
+    }
+
+    #[test]
+    fn parse_compression_rejects_garbage() {
+        assert!(parse_compression("rar").is_err());
+    }
+
+    #[test]
+    fn derive_file_extension_handles_compression() {
+        assert_eq!(derive_file_extension("/data/x.csv"), ".csv");
+        assert_eq!(derive_file_extension("/data/x.csv.gz"), ".csv.gz");
+        assert_eq!(derive_file_extension("/data/x.tsv.zst"), ".tsv.zst");
+        assert_eq!(derive_file_extension("/data/x.psv.xz"), ".psv.xz");
+        assert_eq!(derive_file_extension("/data/glob/*.csv"), ".csv");
+        assert_eq!(derive_file_extension("/data/no_extension"), ".csv");
     }
 }
