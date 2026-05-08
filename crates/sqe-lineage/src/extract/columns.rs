@@ -6,6 +6,7 @@
 //! the list of leaf-column dependencies. Tasks E4-E12 wire up per-node rules.
 
 use crate::event::Transformation;
+use datafusion::logical_expr::{LogicalPlan, TableScan};
 
 #[derive(Clone, Debug)]
 pub struct ColumnDep {
@@ -50,6 +51,60 @@ fn make(kind: &str, subtype: &str, masking: bool) -> Transformation {
         subtype: subtype.into(),
         description: String::new(),
         masking,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-node trace rules. `trace_plan` walks the plan bottom-up and dispatches
+// by node kind. Unknown nodes return an empty trace (conservative for v1).
+// ---------------------------------------------------------------------------
+
+/// Parse a (possibly quoted) qualified table name into (catalog, schema, table)
+/// applying the same fallback rules as `extract::datasets::parse_table_ref`.
+fn parse_table_ref(name: &str) -> (String, String, String) {
+    let parts: Vec<String> = name
+        .split('.')
+        .map(|s| s.trim_matches('"').to_string())
+        .collect();
+    match parts.len() {
+        3 => (parts[0].clone(), parts[1].clone(), parts[2].clone()),
+        2 => ("default".to_string(), parts[0].clone(), parts[1].clone()),
+        1 => (
+            "default".to_string(),
+            "default".to_string(),
+            parts[0].clone(),
+        ),
+        _ => (String::new(), String::new(), name.to_string()),
+    }
+}
+
+/// TableScan column trace rule (E4): each scan column emits one
+/// `ColumnDep` with `direct_identity()`. Terminal node, no recursion.
+fn trace_table_scan(ts: &TableScan) -> ColumnTrace {
+    let (catalog, schema, table) = parse_table_ref(&ts.table_name.to_string());
+    ts.source
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| {
+            vec![ColumnDep {
+                catalog: catalog.clone(),
+                schema: schema.clone(),
+                table: table.clone(),
+                field: f.name().clone(),
+                transformation: direct_identity(),
+            }]
+        })
+        .collect()
+}
+
+/// Walk a `LogicalPlan` bottom-up and emit per-output-column lineage
+/// (`ColumnTrace[i]` lists leaf-column deps for output column i).
+pub fn trace_plan(plan: &LogicalPlan) -> ColumnTrace {
+    match plan {
+        LogicalPlan::TableScan(ts) => trace_table_scan(ts),
+        // Unknown nodes -> empty trace. Subsequent E5-E10 tasks fill these in.
+        _ => Vec::new(),
     }
 }
 
