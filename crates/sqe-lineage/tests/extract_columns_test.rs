@@ -162,3 +162,87 @@ fn filter_adds_indirect_to_all_outputs() {
     assert_eq!(amount_filter_dep.transformation.kind, "INDIRECT");
     assert_eq!(amount_filter_dep.field, "amount");
 }
+
+#[test]
+fn aggregate_groupby_preserves_identity() {
+    use datafusion::functions_aggregate::expr_fn::sum;
+
+    let plan = build_simple_scan(
+        "polaris",
+        "sales",
+        "orders",
+        &[("id", DataType::Int64), ("amount", DataType::Float64)],
+    );
+    let plan = LogicalPlanBuilder::from(plan)
+        .aggregate(vec![col("id")], vec![sum(col("amount")).alias("total")])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let trace = columns::trace_plan(&plan);
+    assert_eq!(trace.len(), 2, "id (group) + total (agg)");
+
+    // group-by id keeps IDENTITY
+    assert_eq!(trace[0].len(), 1);
+    assert_eq!(trace[0][0].field, "id");
+    assert_eq!(trace[0][0].transformation.subtype, "IDENTITY");
+
+    // total: AGGREGATION on amount + INDIRECT/GROUP_BY on id
+    let agg_dep = trace[1]
+        .iter()
+        .find(|d| d.transformation.subtype == "AGGREGATION")
+        .expect("total has DIRECT/AGGREGATION");
+    assert_eq!(agg_dep.transformation.kind, "DIRECT");
+    assert_eq!(agg_dep.field, "amount");
+
+    let gb_dep = trace[1]
+        .iter()
+        .find(|d| d.transformation.subtype == "GROUP_BY")
+        .expect("total has INDIRECT/GROUP_BY");
+    assert_eq!(gb_dep.transformation.kind, "INDIRECT");
+    assert_eq!(gb_dep.field, "id");
+}
+
+#[test]
+fn aggregate_groupby_adds_indirect_to_all_aggs() {
+    use datafusion::functions_aggregate::expr_fn::{count, sum};
+
+    let plan = build_simple_scan(
+        "polaris",
+        "sales",
+        "orders",
+        &[("id", DataType::Int64), ("amount", DataType::Float64)],
+    );
+    let plan = LogicalPlanBuilder::from(plan)
+        .aggregate(
+            vec![col("id")],
+            vec![
+                sum(col("amount")).alias("total"),
+                count(col("amount")).alias("n"),
+            ],
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let trace = columns::trace_plan(&plan);
+    assert_eq!(trace.len(), 3);
+
+    // Both aggregates carry an INDIRECT/GROUP_BY referencing `id`
+    for (label, idx) in [("total", 1usize), ("n", 2usize)] {
+        let gb = trace[idx]
+            .iter()
+            .find(|d| d.transformation.subtype == "GROUP_BY")
+            .unwrap_or_else(|| panic!("{label} should have GROUP_BY dep"));
+        assert_eq!(gb.transformation.kind, "INDIRECT");
+        assert_eq!(gb.field, "id");
+    }
+
+    // The group-by column itself should NOT have a self-GROUP_BY dep
+    assert!(
+        trace[0]
+            .iter()
+            .all(|d| d.transformation.subtype != "GROUP_BY"),
+        "group-by column should not have its own GROUP_BY dep"
+    );
+}

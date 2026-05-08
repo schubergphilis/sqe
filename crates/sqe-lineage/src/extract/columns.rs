@@ -7,7 +7,7 @@
 
 use crate::event::Transformation;
 use datafusion::common::Column;
-use datafusion::logical_expr::{Expr, LogicalPlan, Projection, TableScan};
+use datafusion::logical_expr::{Aggregate, Expr, LogicalPlan, Projection, TableScan};
 use std::collections::HashSet;
 
 #[derive(Clone, Debug)]
@@ -191,6 +191,65 @@ fn attach_indirect(
     }
 }
 
+/// Aggregate column trace rule (E7).
+///
+/// Output schema is `group_expr` columns followed by `aggr_expr` columns.
+/// - Group-by column: bare ref preserves IDENTITY; computed expr -> TRANSFORMATION.
+/// - Aggregate column: AGGREGATION on its argument columns plus INDIRECT/GROUP_BY
+///   for every group-by column referenced.
+fn trace_aggregate(a: &Aggregate, child_trace: ColumnTrace) -> ColumnTrace {
+    let input = a.input.as_ref();
+
+    // 1. Trace each group-by column.
+    let group_traces: Vec<Vec<ColumnDep>> = a
+        .group_expr
+        .iter()
+        .map(|e| {
+            let bare = unwrap_alias(e);
+            if let Expr::Column(c) = bare {
+                if let Some(idx) = column_index(input, c) {
+                    if let Some(deps) = child_trace.get(idx) {
+                        return deps.clone();
+                    }
+                }
+                Vec::new()
+            } else {
+                let refs = e.column_refs();
+                deps_for_refs(&refs, input, &child_trace, &direct_transformation())
+            }
+        })
+        .collect();
+
+    // 2. Build the INDIRECT/GROUP_BY deps to attach to every aggregated column.
+    let mut group_indirect: Vec<ColumnDep> = Vec::new();
+    for e in &a.group_expr {
+        let refs = e.column_refs();
+        group_indirect.extend(deps_for_refs(
+            &refs,
+            input,
+            &child_trace,
+            &indirect_groupby(),
+        ));
+    }
+
+    // 3. Trace each aggregate column: AGGREGATION on argument columns + GROUP_BY indirect.
+    let agg_traces: Vec<Vec<ColumnDep>> = a
+        .aggr_expr
+        .iter()
+        .map(|e| {
+            let refs = e.column_refs();
+            let mut deps =
+                deps_for_refs(&refs, input, &child_trace, &direct_aggregation());
+            deps.extend(group_indirect.iter().cloned());
+            deps
+        })
+        .collect();
+
+    let mut out: ColumnTrace = group_traces;
+    out.extend(agg_traces);
+    out
+}
+
 /// Walk a `LogicalPlan` bottom-up and emit per-output-column lineage
 /// (`ColumnTrace[i]` lists leaf-column deps for output column i).
 pub fn trace_plan(plan: &LogicalPlan) -> ColumnTrace {
@@ -205,7 +264,11 @@ pub fn trace_plan(plan: &LogicalPlan) -> ColumnTrace {
             attach_indirect(&mut t, f.input.as_ref(), &f.predicate, indirect_filter());
             t
         }
-        // Unknown nodes -> empty trace. Subsequent E7-E10 tasks fill these in.
+        LogicalPlan::Aggregate(a) => {
+            let child = trace_plan(a.input.as_ref());
+            trace_aggregate(a, child)
+        }
+        // Unknown nodes -> empty trace. Subsequent E8-E10 tasks fill these in.
         _ => Vec::new(),
     }
 }
