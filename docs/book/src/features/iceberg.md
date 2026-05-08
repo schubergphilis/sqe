@@ -17,16 +17,16 @@ The matrix score against [icebergmatrix.org](https://icebergmatrix.org) is 167/1
 ```mermaid
 graph TB
     subgraph SQE
-        SC["SessionCatalog<br/>(per-user token)"]
-        TP["IcebergTableProvider<br/>(DataFusion TableProvider)"]
-        WR["Writer<br/>(Parquet output)"]
+        SC["SessionCatalog<br/>per-user token"]
+        TP["IcebergTableProvider<br/>DataFusion TableProvider"]
+        WR["Writer<br/>Parquet output"]
     end
 
-    SC -->|REST API + bearer / SigV4| CAT["Catalog backend<br/>(Polaris / Nessie / Glue REST /<br/>S3 Tables / Unity / HMS / JDBC / Hadoop)"]
+    SC -->|REST API + bearer or SigV4| CAT["Catalog backend<br/>Polaris, Nessie, Glue REST,<br/>S3 Tables, Unity, HMS, JDBC, Hadoop"]
     CAT -->|table metadata| SC
-    CAT -->|S3 credentials<br/>(credential vending)| SC
+    CAT -->|S3 credentials<br/>credential vending| SC
 
-    TP -->|read Parquet| OS["S3-compatible storage<br/>(AWS / Ceph / R2 / rustfs)"]
+    TP -->|read Parquet| OS["Object storage<br/>AWS S3, GCS, ADLS Gen2, R2,<br/>Ceph, MinIO, rustfs"]
     WR -->|write Parquet| OS
 
     SC -->|commit| CAT
@@ -34,7 +34,7 @@ graph TB
 
 ## Supported catalogs
 
-SQE keeps the catalog choice as a runtime configuration concern. Every catalog below ships compiled in by default; pick one in `[catalog.backend]`. See [Catalog backends](../getting-started/catalogs.md) for the full per-backend recipe with TOML examples and verification queries.
+SQE keeps the catalog choice as a runtime configuration concern. Every catalog below ships compiled in by default; pick one in `[catalog.backend]`. See [Catalog backends](../getting-started/catalogs.md) for the full per-backend recipe with TOML examples and verification queries. For where the data files live (S3, R2, GCS, ADLS Gen2, HTTPS, `hf://`), see [Storage backends](../getting-started/storage-backends.md).
 
 | Catalog | `type` | Transport | Auth | Status |
 |---|---|---|---|---|

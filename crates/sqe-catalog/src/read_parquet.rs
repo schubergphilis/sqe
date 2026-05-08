@@ -37,13 +37,18 @@ use tracing::debug;
 use sqe_core::config::StorageConfig;
 
 /// Named keyword arguments accepted by `read_parquet()`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct ReadParquetArgs {
     path: String,
     access_key: Option<String>,
     secret_key: Option<String>,
     endpoint: Option<String>,
     region: Option<String>,
+    azure_account: Option<String>,
+    azure_access_key: Option<String>,
+    azure_sas_token: Option<String>,
+    gcs_service_account_path: Option<String>,
+    gcs_service_account_key: Option<String>,
 }
 
 impl ReadParquetArgs {
@@ -53,12 +58,25 @@ impl ReadParquetArgs {
     /// the input so the original `args` borrow stays valid.
     #[allow(dead_code)]
     fn clone_with_path(&self, path: String) -> Self {
-        Self {
-            path,
+        let mut out = self.clone();
+        out.path = path;
+        out
+    }
+
+    /// Project this struct onto the shared [`FileTvfArgs`] shape so the
+    /// common register helpers (Azure / GCS) can be called.
+    fn as_file_tvf_args(&self) -> crate::file_tvf_common::FileTvfArgs {
+        crate::file_tvf_common::FileTvfArgs {
+            path: self.path.clone(),
             access_key: self.access_key.clone(),
             secret_key: self.secret_key.clone(),
             endpoint: self.endpoint.clone(),
             region: self.region.clone(),
+            azure_account: self.azure_account.clone(),
+            azure_access_key: self.azure_access_key.clone(),
+            azure_sas_token: self.azure_sas_token.clone(),
+            gcs_service_account_path: self.gcs_service_account_path.clone(),
+            gcs_service_account_key: self.gcs_service_account_key.clone(),
         }
     }
 }
@@ -97,6 +115,11 @@ fn parse_args(exprs: &[Expr]) -> DFResult<ReadParquetArgs> {
     let mut secret_key: Option<String> = None;
     let mut endpoint: Option<String> = None;
     let mut region: Option<String> = None;
+    let mut azure_account: Option<String> = None;
+    let mut azure_access_key: Option<String> = None;
+    let mut azure_sas_token: Option<String> = None;
+    let mut gcs_service_account_path: Option<String> = None;
+    let mut gcs_service_account_key: Option<String> = None;
 
     // Remaining args are named: `name => 'value'` which the planner represents
     // as `BinaryExpr { left: Column { name }, op: Eq, right: Literal(value) }`.
@@ -135,10 +158,17 @@ fn parse_args(exprs: &[Expr]) -> DFResult<ReadParquetArgs> {
                     "secret_key" => secret_key = Some(value),
                     "endpoint" => endpoint = Some(value),
                     "region" => region = Some(value),
+                    "azure_account" => azure_account = Some(value),
+                    "azure_access_key" => azure_access_key = Some(value),
+                    "azure_sas_token" => azure_sas_token = Some(value),
+                    "gcs_service_account_path" => gcs_service_account_path = Some(value),
+                    "gcs_service_account_key" => gcs_service_account_key = Some(value),
                     unknown => {
                         return plan_err!(
                             "read_parquet: unknown named argument '{unknown}'; \
-                             supported: access_key, secret_key, endpoint, region"
+                             supported: access_key, secret_key, endpoint, region, \
+                             azure_account, azure_access_key, azure_sas_token, \
+                             gcs_service_account_path, gcs_service_account_key"
                         );
                     }
                 }
@@ -152,7 +182,18 @@ fn parse_args(exprs: &[Expr]) -> DFResult<ReadParquetArgs> {
         }
     }
 
-    Ok(ReadParquetArgs { path, access_key, secret_key, endpoint, region })
+    Ok(ReadParquetArgs {
+        path,
+        access_key,
+        secret_key,
+        endpoint,
+        region,
+        azure_account,
+        azure_access_key,
+        azure_sas_token,
+        gcs_service_account_path,
+        gcs_service_account_key,
+    })
 }
 
 /// Returns `true` when the path looks like an S3 URL.
@@ -250,6 +291,24 @@ async fn build_listing_table(
             )))?;
         tmp_ctx.register_object_store(&store_url, Arc::new(s3));
         debug!(path = %args.path, "Registered S3 object store for read_parquet");
+    } else if crate::file_tvf_common::is_azure_path(&args.path) {
+        let common_args = args.as_file_tvf_args();
+        crate::file_tvf_common::register_azure_store_if_needed(
+            "read_parquet",
+            &tmp_ctx,
+            &common_args,
+            storage,
+        )?;
+        debug!(path = %args.path, "Registered Azure object store for read_parquet");
+    } else if crate::file_tvf_common::is_gcs_path(&args.path) {
+        let common_args = args.as_file_tvf_args();
+        crate::file_tvf_common::register_gcs_store_if_needed(
+            "read_parquet",
+            &tmp_ctx,
+            &common_args,
+            storage,
+        )?;
+        debug!(path = %args.path, "Registered GCS object store for read_parquet");
     } else {
         // V10 httpfs: HTTPS / HTTP paths use the shared HttpStore
         // builder. Parquet metadata reads need range requests, which
@@ -502,6 +561,7 @@ mod tests {
             secret_key: Some("SECRET".to_string()),
             endpoint: Some("http://localhost:9000".to_string()),
             region: Some("us-east-1".to_string()),
+            ..ReadParquetArgs::default()
         };
         let storage = StorageConfig {
             s3_allow_http: true,
@@ -520,6 +580,7 @@ mod tests {
             secret_key: None,
             endpoint: None,
             region: None,
+            ..ReadParquetArgs::default()
         };
         let storage = StorageConfig {
             s3_access_key: "config-akid".to_string(),
