@@ -383,7 +383,15 @@ impl SqlClient for EmbeddedClient {
         // dispatches to the underlying iceberg::Catalog. Reads also
         // go through the same provider since it composes the upstream
         // IcebergSchemaProvider for namespace contents.
-        let df = self.ctx.sql(sql).await?;
+        //
+        // V12: pre-rewrite `'hf://...'` quoted literals to their HTTPS
+        // equivalent. This makes `SELECT * FROM 'hf://...'` (URL-table
+        // auto-detect) flow through V10's LazyHttpObjectStoreRegistry the
+        // same way `SELECT * FROM 'https://...'` already does. The TVF
+        // path (`read_csv('hf://...')`) is unaffected; it does its own
+        // rewrite via `rewrite_hf_path_in_place` inside the TVF.
+        let rewritten = sqe_catalog::file_tvf_common::rewrite_hf_urls_in_sql(sql)?;
+        let df = self.ctx.sql(rewritten.as_ref()).await?;
         // Snapshot the DataFrame schema before collecting so we still
         // emit column names when the query produces zero batches (an
         // optimizer collapse like `WHERE FALSE` yields an EmptyExec).
@@ -863,6 +871,41 @@ mod tests {
         );
         let result = client.execute(&count_sql).await.expect("read");
         assert_eq!(result.rows, vec![vec!["2".to_string()]]);
+    }
+
+    /// V12: `SELECT * FROM 'hf://...'` (URL-table auto-detect) rewrites the
+    /// hf:// URL to its HTTPS equivalent before DataFusion sees the SQL.
+    /// Proof: the resulting error mentions `https://huggingface.co/...`
+    /// rather than `'hf://...' table not found`. We don't actually fetch
+    /// from HuggingFace in a unit test; we only assert the rewrite ran.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn select_from_hf_url_rewrites_to_https() {
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
+        // Use a path that almost certainly does not exist so the fetch
+        // itself fails. The rewrite must have happened first; otherwise
+        // we'd see "table not found" with the literal hf:// URL.
+        let sql = "SELECT * FROM 'hf://datasets/sqe-tests-not-real/v12-rewrite/data.csv'";
+        let err = client.execute(sql).await.expect_err("hf:// URL must rewrite");
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains("'hf://"),
+            "rewrite must consume the hf:// literal; error: {msg}"
+        );
+    }
+
+    /// V12: malformed hf:// URLs surface a parse error early, before the
+    /// network roundtrip. Without the rewrite, DataFusion would emit
+    /// "table not found" with no hint about the URL shape.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn select_from_malformed_hf_url_errors_with_diagnostic() {
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
+        let sql = "SELECT * FROM 'hf://malformed'";
+        let err = client.execute(sql).await.expect_err("malformed hf:// must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("malformed HuggingFace URL"),
+            "expected diagnostic from rewriter, got: {msg}"
+        );
     }
 
     /// V8: `read_csv()` honours the `delimiter` named argument. We use `;`
