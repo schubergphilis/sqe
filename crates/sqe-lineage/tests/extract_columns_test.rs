@@ -4,9 +4,9 @@
 //! is supposed to encode (IDENTITY/TRANSFORMATION/AGGREGATION/etc).
 
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
-use datafusion::common::TableReference;
+use datafusion::common::{Column, TableReference};
 use datafusion::datasource::{provider_as_source, MemTable};
-use datafusion::logical_expr::{col, lit, Expr, LogicalPlan, LogicalPlanBuilder};
+use datafusion::logical_expr::{col, lit, Expr, JoinType, LogicalPlan, LogicalPlanBuilder};
 use sqe_lineage::extract::columns;
 use std::sync::Arc;
 
@@ -245,4 +245,84 @@ fn aggregate_groupby_adds_indirect_to_all_aggs() {
             .all(|d| d.transformation.subtype != "GROUP_BY"),
         "group-by column should not have its own GROUP_BY dep"
     );
+}
+
+#[test]
+fn join_passes_through_each_side_with_indirect_join_on_predicate() {
+    let left = build_simple_scan(
+        "polaris",
+        "sales",
+        "orders",
+        &[("id", DataType::Int64), ("amount", DataType::Float64)],
+    );
+    let right = build_simple_scan(
+        "polaris",
+        "sales",
+        "customers",
+        &[("id", DataType::Int64), ("region", DataType::Utf8)],
+    );
+
+    let plan = LogicalPlanBuilder::from(left)
+        .join(
+            right,
+            JoinType::Inner,
+            (
+                vec![Column::new(Some("orders"), "id")],
+                vec![Column::new(Some("customers"), "id")],
+            ),
+            None,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let trace = columns::trace_plan(&plan);
+    assert_eq!(trace.len(), 4, "left.id, left.amount, right.id, right.region");
+
+    // Each output column has an IDENTITY dep from its source side
+    let id_left = &trace[0];
+    let id_left_identity = id_left
+        .iter()
+        .find(|d| d.transformation.subtype == "IDENTITY")
+        .expect("left.id has IDENTITY dep");
+    assert_eq!(id_left_identity.table, "orders");
+    assert_eq!(id_left_identity.field, "id");
+
+    let amount = &trace[1];
+    let amount_identity = amount
+        .iter()
+        .find(|d| d.transformation.subtype == "IDENTITY")
+        .expect("amount has IDENTITY dep");
+    assert_eq!(amount_identity.table, "orders");
+
+    let id_right = &trace[2];
+    let id_right_identity = id_right
+        .iter()
+        .find(|d| d.transformation.subtype == "IDENTITY")
+        .expect("right.id has IDENTITY dep");
+    assert_eq!(id_right_identity.table, "customers");
+
+    let region = &trace[3];
+    let region_identity = region
+        .iter()
+        .find(|d| d.transformation.subtype == "IDENTITY")
+        .expect("region has IDENTITY dep");
+    assert_eq!(region_identity.table, "customers");
+
+    // Every output column has INDIRECT/JOIN deps from join predicate columns
+    for (idx, name) in [(0, "id_left"), (1, "amount"), (2, "id_right"), (3, "region")] {
+        let join_deps: Vec<&str> = trace[idx]
+            .iter()
+            .filter(|d| d.transformation.subtype == "JOIN")
+            .map(|d| d.field.as_str())
+            .collect();
+        assert!(
+            !join_deps.is_empty(),
+            "{name} should have INDIRECT/JOIN deps"
+        );
+        assert!(
+            join_deps.contains(&"id"),
+            "{name} should reference `id` via JOIN"
+        );
+    }
 }

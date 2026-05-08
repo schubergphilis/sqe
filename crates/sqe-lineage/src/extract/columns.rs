@@ -7,7 +7,7 @@
 
 use crate::event::Transformation;
 use datafusion::common::Column;
-use datafusion::logical_expr::{Aggregate, Expr, LogicalPlan, Projection, TableScan};
+use datafusion::logical_expr::{Aggregate, Expr, Join, LogicalPlan, Projection, TableScan};
 use std::collections::HashSet;
 
 #[derive(Clone, Debug)]
@@ -250,6 +250,72 @@ fn trace_aggregate(a: &Aggregate, child_trace: ColumnTrace) -> ColumnTrace {
     out
 }
 
+/// Join column trace rule (E8).
+///
+/// Output schema is left's columns followed by right's. Each output passes
+/// through its source side's lineage. Every column referenced by the join
+/// predicate (`on` pairs and optional `filter`) adds an INDIRECT/JOIN dep
+/// to all output columns.
+fn trace_join(j: &Join) -> ColumnTrace {
+    let left_trace = trace_plan(j.left.as_ref());
+    let right_trace = trace_plan(j.right.as_ref());
+
+    let mut out: ColumnTrace = left_trace.clone();
+    out.extend(right_trace.clone());
+
+    // Collect deps from every column referenced in the join predicate (both
+    // left and right sides), classified by which child plan owns the column.
+    let mut indirect: Vec<ColumnDep> = Vec::new();
+    let join_t = indirect_join();
+
+    let mut add_from_expr = |e: &Expr| {
+        let refs = e.column_refs();
+        for c in &refs {
+            if let Some(idx) = column_index(j.left.as_ref(), c) {
+                if let Some(deps) = left_trace.get(idx) {
+                    for dep in deps {
+                        indirect.push(ColumnDep {
+                            catalog: dep.catalog.clone(),
+                            schema: dep.schema.clone(),
+                            table: dep.table.clone(),
+                            field: dep.field.clone(),
+                            transformation: join_t.clone(),
+                        });
+                    }
+                }
+            } else if let Some(idx) = column_index(j.right.as_ref(), c) {
+                if let Some(deps) = right_trace.get(idx) {
+                    for dep in deps {
+                        indirect.push(ColumnDep {
+                            catalog: dep.catalog.clone(),
+                            schema: dep.schema.clone(),
+                            table: dep.table.clone(),
+                            field: dep.field.clone(),
+                            transformation: join_t.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    };
+
+    for (l, r) in &j.on {
+        add_from_expr(l);
+        add_from_expr(r);
+    }
+    if let Some(f) = &j.filter {
+        add_from_expr(f);
+    }
+
+    if !indirect.is_empty() {
+        for col_trace in out.iter_mut() {
+            col_trace.extend(indirect.iter().cloned());
+        }
+    }
+
+    out
+}
+
 /// Walk a `LogicalPlan` bottom-up and emit per-output-column lineage
 /// (`ColumnTrace[i]` lists leaf-column deps for output column i).
 pub fn trace_plan(plan: &LogicalPlan) -> ColumnTrace {
@@ -268,7 +334,8 @@ pub fn trace_plan(plan: &LogicalPlan) -> ColumnTrace {
             let child = trace_plan(a.input.as_ref());
             trace_aggregate(a, child)
         }
-        // Unknown nodes -> empty trace. Subsequent E8-E10 tasks fill these in.
+        LogicalPlan::Join(j) => trace_join(j),
+        // Unknown nodes -> empty trace. Subsequent E9-E10 tasks fill these in.
         _ => Vec::new(),
     }
 }
