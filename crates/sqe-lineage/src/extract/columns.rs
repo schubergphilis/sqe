@@ -6,7 +6,9 @@
 //! the list of leaf-column dependencies. Tasks E4-E12 wire up per-node rules.
 
 use crate::event::Transformation;
-use datafusion::logical_expr::{LogicalPlan, TableScan};
+use datafusion::common::Column;
+use datafusion::logical_expr::{Expr, LogicalPlan, Projection, TableScan};
+use std::collections::HashSet;
 
 #[derive(Clone, Debug)]
 pub struct ColumnDep {
@@ -98,12 +100,89 @@ fn trace_table_scan(ts: &TableScan) -> ColumnTrace {
         .collect()
 }
 
+/// Strip an outer `Expr::Alias` to inspect the underlying expression shape.
+fn unwrap_alias(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Alias(a) => unwrap_alias(&a.expr),
+        other => other,
+    }
+}
+
+/// Look up the index of a `Column` ref inside an input plan's schema.
+fn column_index(plan: &LogicalPlan, col: &Column) -> Option<usize> {
+    plan.schema().maybe_index_of_column(col)
+}
+
+/// Collect all column-ref deps for an expression by mapping each `&Column`
+/// referenced in the expression through the child trace.
+fn deps_for_refs(
+    refs: &HashSet<&Column>,
+    input: &LogicalPlan,
+    child_trace: &ColumnTrace,
+    transformation: &Transformation,
+) -> Vec<ColumnDep> {
+    let mut out = Vec::new();
+    for c in refs {
+        let Some(idx) = column_index(input, c) else {
+            continue;
+        };
+        let Some(child_deps) = child_trace.get(idx) else {
+            continue;
+        };
+        for dep in child_deps {
+            out.push(ColumnDep {
+                catalog: dep.catalog.clone(),
+                schema: dep.schema.clone(),
+                table: dep.table.clone(),
+                field: dep.field.clone(),
+                transformation: transformation.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// Projection column trace rule (E5).
+///
+/// Bare column refs (`Expr::Column` after stripping aliases) preserve the
+/// upstream transformation (typically IDENTITY). Any other shape is treated
+/// as a real computation and gets `direct_transformation()`.
+fn trace_projection(p: &Projection, child_trace: ColumnTrace) -> ColumnTrace {
+    p.expr
+        .iter()
+        .map(|e| {
+            let bare = unwrap_alias(e);
+            if let Expr::Column(c) = bare {
+                // Pure passthrough: copy the child trace at the column's index
+                if let Some(idx) = column_index(p.input.as_ref(), c) {
+                    if let Some(deps) = child_trace.get(idx) {
+                        return deps.clone();
+                    }
+                }
+                Vec::new()
+            } else {
+                let refs = e.column_refs();
+                deps_for_refs(
+                    &refs,
+                    p.input.as_ref(),
+                    &child_trace,
+                    &direct_transformation(),
+                )
+            }
+        })
+        .collect()
+}
+
 /// Walk a `LogicalPlan` bottom-up and emit per-output-column lineage
 /// (`ColumnTrace[i]` lists leaf-column deps for output column i).
 pub fn trace_plan(plan: &LogicalPlan) -> ColumnTrace {
     match plan {
         LogicalPlan::TableScan(ts) => trace_table_scan(ts),
-        // Unknown nodes -> empty trace. Subsequent E5-E10 tasks fill these in.
+        LogicalPlan::Projection(p) => {
+            let child = trace_plan(p.input.as_ref());
+            trace_projection(p, child)
+        }
+        // Unknown nodes -> empty trace. Subsequent E6-E10 tasks fill these in.
         _ => Vec::new(),
     }
 }
