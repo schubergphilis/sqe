@@ -8,3 +8,8 @@ pub mod observer;
 pub mod emitter;
 pub mod sink;
 pub mod sinks;
+
+pub use observer::{
+    ChannelObserver, LineageHint, LineageMsg, LineageObserver, PlanOrHint, QueryCompleteCtx,
+    QueryFailCtx, QueryStartCtx, UserCtx,
+};
