@@ -49,7 +49,7 @@ For detailed Mermaid diagrams (query pipeline, crate dependencies, caching layer
 - **Performance**: 5-layer caching, star-schema join reorder, dynamic filter pushdown, ZSTD compression
 - **Security**: 43/43 audit findings resolved. See [docs/issues.md](docs/issues.md)
 - **File-format TVFs**: `read_parquet`, `read_csv`, `read_json`, `read_delta` against local filesystem, S3, HTTPS, and HuggingFace `hf://` URLs. Quoted-string auto-detect: `SELECT * FROM '/data/sales.parquet'` and `SELECT * FROM 'hf://datasets/foo/bar/data.csv'` work without registering a table. Smart `read_csv` detects delimiter (`.tsv` -> tab, `.psv` -> pipe) and compression (`.csv.gz`, `.tsv.zst`) from the path.
-- **Embedded mode**: One binary, no cluster, no catalog server. `sqe` opens a CLI with the same SQL surface as the cluster mode. Persistent SQLite-backed Iceberg catalogs at `~/.sqe/warehouse/` survive restarts. Cross-catalog joins across multiple `--catalog NAME=PATH` mounts.
+- **Embedded mode**: One binary, no cluster, no catalog server. `sqe-cli --embedded` opens a CLI with the same SQL surface as the cluster mode. Persistent SQLite-backed Iceberg catalogs at `~/.sqe/warehouse/` survive restarts. Cross-catalog joins across multiple `--catalog NAME=PATH` mounts. Full reference: [`docs/cli-embedded.md`](docs/cli-embedded.md).
 
 ## Getting Started
 
@@ -66,7 +66,7 @@ configs and verification queries, see [`QUICKSTART.md`](QUICKSTART.md).
 
 ```bash
 cargo install --path crates/sqe-cli
-sqe                                  # opens CLI; persistent warehouse at ~/.sqe/warehouse/
+sqe-cli --embedded                                  # opens CLI; persistent warehouse at ~/.sqe/warehouse/
 
 # Query files directly. No CREATE EXTERNAL TABLE.
 sqe> SELECT * FROM '/data/sales.parquet' LIMIT 5;

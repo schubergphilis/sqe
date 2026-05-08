@@ -1,6 +1,6 @@
 # SQE Embedded CLI Reference
 
-`sqe` is the SQE binary in single-process mode. No coordinator, no workers, no network listeners. The same DataFusion tuning, the same Iceberg writers, and the same `read_*()` TVFs the cluster mode ships with, all in one binary.
+The `sqe-cli` binary in single-process mode runs the engine in-process. No coordinator, no workers, no network listeners. The same DataFusion tuning, the same Iceberg writers, and the same `read_*()` TVFs the cluster mode ships with, all in one binary.
 
 This document is the reference for everything you can do from the prompt: launch modes, dot commands, file readers, storage backends (S3, S3 Tables, R2, MinIO, ADLS, GCS), catalog backends, write paths.
 
@@ -11,17 +11,28 @@ For cluster-mode flags and Polaris setup, see [`deployment.md`](./deployment.md)
 ```bash
 cargo install --path crates/sqe-cli
 # or build from source
-cargo build --release -p sqe-cli && cp target/release/sqe ~/.local/bin/
+cargo build --release -p sqe-cli && cp target/release/sqe-cli ~/.local/bin/
 ```
+
+The binary name is `sqe-cli`. Many users add a shell alias so embedded mode is the short form:
+
+```bash
+# zsh / bash
+alias sqe='sqe-cli --embedded'
+
+# now: `sqe`, `sqe -e "..."`, `sqe --warehouse /path`
+```
+
+Examples below show the long form (`sqe-cli --embedded ...`). With the alias they become `sqe ...`.
 
 Default launch attaches a persistent SQLite-backed Iceberg catalog at `~/.sqe/warehouse/`:
 
 ```bash
-sqe                               # ~/.sqe/warehouse named `iceberg`
-sqe --warehouse ./local           # ./local named `iceberg`
-sqe --catalog prod=/data/prod \
-    --catalog stage=/data/stage   # multi-catalog mount
-sqe --memory                      # session-only, no disk persistence
+sqe-cli --embedded                               # ~/.sqe/warehouse named `iceberg`
+sqe-cli --embedded --warehouse ./local           # ./local named `iceberg`
+sqe-cli --embedded --catalog prod=/data/prod \
+    --catalog stage=/data/stage                  # multi-catalog mount
+sqe-cli --embedded --memory                      # session-only, no disk persistence
 ```
 
 Mutually exclusive: `--memory` / `--warehouse` / `--catalog`.
@@ -30,7 +41,7 @@ Mutually exclusive: `--memory` / `--warehouse` / `--catalog`.
 
 | Flag | Default | What it does |
 |---|---|---|
-| `--embedded` | implied by `sqe` binary | run in-process (no remote coordinator) |
+| `--embedded` | off | run in-process (no remote coordinator). With this off, `sqe-cli` connects to a remote coordinator on `--host`/`--port`. |
 | `--memory-limit` | `1GB` | per-process query memory pool. Floored at 64 MB. |
 | `--warehouse PATH` | `~/.sqe/warehouse/` | shorthand for `--catalog iceberg=PATH` |
 | `--catalog NAME=PATH` | (repeatable) | attach a named persistent Iceberg catalog |
@@ -268,8 +279,8 @@ Embedded mode attaches one or more named Iceberg catalogs. Each catalog is a SQL
 ### Default `iceberg` catalog
 
 ```bash
-sqe                                   # ~/.sqe/warehouse/sqe.db + .../iceberg/
-sqe --warehouse /data/local           # /data/local/sqe.db + /data/local/iceberg/
+sqe-cli --embedded                                   # ~/.sqe/warehouse/sqe.db + .../iceberg/
+sqe-cli --embedded --warehouse /data/local           # /data/local/sqe.db + /data/local/iceberg/
 ```
 
 ```sql
@@ -277,14 +288,14 @@ sqe> CREATE SCHEMA iceberg.staging;
 sqe> CREATE TABLE iceberg.staging.orders (id BIGINT, total DECIMAL(18,2));
 sqe> INSERT INTO iceberg.staging.orders VALUES (1, 99.95);
 sqe> .quit
-$ sqe                                 # restart, table survives
+$ sqe-cli --embedded                                 # restart, table survives
 sqe> SELECT * FROM iceberg.staging.orders;
 ```
 
 ### Multiple catalogs
 
 ```bash
-sqe --catalog prod=/data/prod \
+sqe-cli --embedded --catalog prod=/data/prod \
     --catalog stage=/data/stage
 ```
 
@@ -483,7 +494,7 @@ SELECT count(*) FROM read_csv(
 ### One-shot SQL via shell
 
 ```bash
-sqe -e "SELECT count(*) FROM read_parquet('s3://bucket/sales/*.parquet')" \
+sqe-cli --embedded -e "SELECT count(*) FROM read_parquet('s3://bucket/sales/*.parquet')" \
     --format csv
 ```
 
@@ -499,7 +510,7 @@ CREATE TABLE iceberg.report.daily AS
   GROUP BY 1;
 " > daily.sql
 
-sqe --file daily.sql --stop-on-error
+sqe-cli --embedded --file daily.sql --stop-on-error
 ```
 
 ## Differences from cluster mode
