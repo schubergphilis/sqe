@@ -20,3 +20,6 @@ tracing = { workspace = true }
 prometheus = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+insta = { version = "1", features = ["json"] }
