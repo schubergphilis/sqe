@@ -118,3 +118,47 @@ fn projection_expr_is_transformation() {
     assert_eq!(trace[1][0].transformation.kind, "DIRECT");
     assert_eq!(trace[1][0].transformation.subtype, "TRANSFORMATION");
 }
+
+#[test]
+fn filter_adds_indirect_to_all_outputs() {
+    let plan = build_simple_scan(
+        "polaris",
+        "sales",
+        "orders",
+        &[("id", DataType::Int64), ("amount", DataType::Float64)],
+    );
+    let plan = LogicalPlanBuilder::from(plan)
+        .project(vec![col("id"), col("amount")])
+        .unwrap()
+        .filter(col("amount").gt(lit(100_i64)))
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let trace = columns::trace_plan(&plan);
+    assert_eq!(trace.len(), 2);
+
+    // trace[0] = id: still has direct IDENTITY + an INDIRECT/FILTER on `amount`
+    let id_subtypes: Vec<&str> = trace[0]
+        .iter()
+        .map(|d| d.transformation.subtype.as_str())
+        .collect();
+    assert!(
+        id_subtypes.contains(&"IDENTITY"),
+        "id keeps IDENTITY through filter"
+    );
+    let id_filter_dep = trace[0]
+        .iter()
+        .find(|d| d.transformation.subtype == "FILTER")
+        .expect("id has INDIRECT/FILTER dep");
+    assert_eq!(id_filter_dep.transformation.kind, "INDIRECT");
+    assert_eq!(id_filter_dep.field, "amount");
+
+    // trace[1] = amount: same pattern, plus a self-FILTER on amount
+    let amount_filter_dep = trace[1]
+        .iter()
+        .find(|d| d.transformation.subtype == "FILTER")
+        .expect("amount has INDIRECT/FILTER dep");
+    assert_eq!(amount_filter_dep.transformation.kind, "INDIRECT");
+    assert_eq!(amount_filter_dep.field, "amount");
+}
