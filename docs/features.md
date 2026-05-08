@@ -23,8 +23,10 @@ SQE is built on **Apache DataFusion 53.1** which provides the SQL execution engi
 | QUALIFY | ❌ | ❌ | ❌ | ✅ |
 | Lambda expressions | ❌ | ✅ | ✅ | ✅ |
 | GROUPING SETS | ✅ | ✅ | ✅ | ✅ |
-| Iceberg time travel | ✅ FOR VERSION/SYSTEM\_TIME AS OF | ✅ | ✅ | ⚠️ Read-only via extension |
-| Iceberg branches & tags | ✅ ALTER TABLE CREATE BRANCH/TAG | ⚠️ Limited | ✅ | ❌ |
+| Iceberg time travel | ✅ FOR VERSION / SYSTEM\_TIME AS OF | ✅ | ✅ | ⚠️ Read-only via extension |
+| Iceberg branches & tags | ✅ ALTER TABLE CREATE BRANCH / TAG | ⚠️ Limited | ✅ | ❌ |
+| Iceberg compaction (`rewrite_data_files`) | ✅ CALL system.rewrite_data_files() | ✅ OPTIMIZE | ✅ | ❌ |
+| Iceberg maintenance procedures | ✅ expire_snapshots / remove_orphan_files / rewrite_manifests | ✅ | ✅ | ❌ |
 | Delta Lake read | ✅ `read_delta()` (V11) | ⚠️ via connector | ✅ Native | ✅ via extension |
 | File-format TVFs | ✅ `read_parquet`/`read_csv`/`read_json`/`read_delta` | ⚠️ Hive table only | ✅ | ✅ |
 | `SELECT * FROM 'file.ext'` auto-detect | ✅ (V8) | ❌ | ❌ | ✅ |
@@ -178,8 +180,8 @@ FROM orders;
 | `MAKE_DATE` | ✅ | ❌ | ✅ |
 | `MAKE_TIMESTAMP` | ✅ | ❌ | ✅ |
 | `FROM_UNIXTIME` | ✅ | ✅ | ✅ |
-| `DATE_ADD`, `DATE_SUB` | ❌ | ✅ | ✅ |
-| `DATEDIFF` | ❌ | ✅ | ✅ |
+| `DATE_ADD`, `DATE_SUB` | ✅ via `sqe-trino-functions` | ✅ | ✅ |
+| `DATEDIFF` | ✅ via `sqe-trino-functions` | ✅ | ✅ |
 | Timezone (`AT TIME ZONE`) | ✅ | ✅ | ✅ |
 | `EPOCH` | ✅ | ✅ | ✅ |
 
@@ -277,9 +279,10 @@ FROM orders;
 | `GREATEST(a, b, ...)` | ✅ | ✅ | ✅ |
 | `LEAST(a, b, ...)` | ✅ | ✅ | ✅ |
 | `NVL` / `NVL2` | ✅ | ❌ | ✅ |
-| `IF(cond, then, else)` | ❌ | ✅ | ✅ |
-| `IIF` | ❌ | ❌ | ❌ |
-| `DECODE` | ❌ | ❌ | ✅ |
+| `IF(cond, then, else)` (Trino) | ✅ via `sqe-trino-functions` | ✅ | ✅ |
+| `IFF(cond, then, else)` (Snowflake) | ✅ via `sqe-trino-functions` | ❌ | ❌ |
+| `IIF` (T-SQL) | ❌ | ❌ | ❌ |
+| `DECODE` (Oracle / Snowflake conditional) | ❌ name collides with binary `decode()` | ❌ | ✅ |
 
 ---
 
@@ -336,11 +339,15 @@ FROM orders;
 | `MERGE INTO` | ✅ (CoW) | ✅ | ✅ |
 | `DELETE FROM` | ✅ (CoW) | ✅ | ✅ |
 | `UPDATE` | ✅ (CoW) | ✅ | ✅ |
-| `ALTER TABLE ADD COLUMN` | 🔜 | ✅ | ✅ |
-| `ALTER TABLE DROP COLUMN` | 🔜 | ✅ | ✅ |
+| `ALTER TABLE ADD COLUMN` | ✅ (with `DEFAULT`) | ✅ | ✅ |
+| `ALTER TABLE DROP COLUMN` | ✅ (with `IF EXISTS`) | ✅ | ✅ |
+| `ALTER TABLE RENAME COLUMN` | ✅ | ✅ | ✅ |
+| `ALTER TABLE ALTER COLUMN ... SET / DROP NOT NULL` | ✅ | ✅ | ✅ |
+| `ALTER COLUMN ... SET DEFAULT` | ✅ (Iceberg V3 column defaults) | ⚠️ | ⚠️ |
+| `ALTER TABLE ADD / DROP PARTITION FIELD` | ✅ Iceberg partition evolution | ✅ | ✅ |
 | `CREATE SCHEMA` | ✅ | ✅ | ✅ |
 | `DROP SCHEMA` | ✅ | ✅ | ✅ |
-| `TRUNCATE TABLE` | ❌ | ✅ | ✅ |
+| `TRUNCATE TABLE` | ✅ rewrites to `DELETE FROM` | ✅ | ✅ |
 
 ---
 
@@ -348,17 +355,29 @@ FROM orders;
 
 | Feature | SQE | Trino + Iceberg | Spark + Iceberg |
 |---------|:---:|:---:|:---:|
-| Partition pruning | ⚠️ Basic | ✅ Full | ✅ Full |
-| Time travel (`AS OF`) | ❌ | ✅ | ✅ |
-| Snapshot queries | ❌ | ✅ | ✅ |
-| Schema evolution | ✅ via Polaris | ✅ | ✅ |
-| Hidden partitioning | ✅ via metadata | ✅ | ✅ |
-| Merge-on-Read deletes | 🔜 | ✅ | ✅ |
-| Copy-on-Write deletes | ✅ | ✅ | ✅ |
-| Compaction | ❌ | ✅ OPTIMIZE | ✅ rewrite_data_files |
-| Manifest caching | 🔜 | ✅ | ✅ |
-| Row-level security | 🔜 OPA/Cedar | ❌ needs Ranger | ❌ needs Ranger |
-| Column masking | 🔜 OPA/Cedar | ❌ | ❌ |
+| Partition pruning (predicate -> manifest filter) | ✅ Full | ✅ Full | ✅ Full |
+| Hidden partitioning (transforms: bucket, truncate, year, month, day, hour) | ✅ | ✅ | ✅ |
+| Schema evolution (add / drop / rename / promote / set null) | ✅ | ✅ | ✅ |
+| Partition evolution (add / drop / rename partition field) | ✅ | ✅ | ✅ |
+| Iceberg V3 (column defaults, nanosecond timestamps, geometry/geography stubs) | ✅ | ⚠️ Partial | ⚠️ Partial |
+| Time travel (`FOR VERSION AS OF`, `FOR SYSTEM_TIME AS OF`) | ✅ | ✅ | ✅ |
+| Snapshot queries (`table$snapshots`, `table_snapshots()` TVF) | ✅ Trino + DuckDB syntax | ✅ | ✅ |
+| Metadata TVFs (`table_history`, `table_files`, `table_partitions`, `table_manifests`, `table_refs`) | ✅ | ✅ | ✅ |
+| Merge-on-Read deletes (position + equality) | ✅ V12 | ✅ | ✅ |
+| Copy-on-Write deletes | ✅ default | ✅ | ✅ |
+| `CALL system.rewrite_data_files()` (compaction with bin-packing) | ✅ | ✅ OPTIMIZE | ✅ |
+| `CALL system.expire_snapshots()` | ✅ | ✅ | ✅ |
+| `CALL system.remove_orphan_files()` | ✅ | ✅ | ✅ |
+| `CALL system.rewrite_manifests()` | ✅ | ✅ | ✅ |
+| `suggest_bloom_filter_columns()` | ✅ SQE-specific | ❌ | ❌ |
+| Manifest caching (in-process moka cache) | ✅ | ✅ | ✅ |
+| Branches and tags (`ALTER TABLE CREATE BRANCH/TAG`, query `table@branch`) | ✅ | ⚠️ Limited | ✅ |
+| Position deletes | ✅ | ✅ | ✅ |
+| Equality deletes | ⚠️ Read; write deferred | ✅ | ✅ |
+| MERGE INTO (CoW + MoR) | ✅ V12 | ✅ | ✅ |
+| Row-level security | ✅ OPA / Cedar plan rewrite | ❌ needs Ranger | ❌ needs Ranger |
+| Column masking | ✅ OPA / Cedar plan rewrite | ❌ | ❌ |
+| Per-user OIDC bearer to Polaris / S3 | ✅ | ❌ service account | ❌ service account |
 
 ---
 
@@ -369,9 +388,11 @@ FROM orders;
 | `SHOW CATALOGS` | ✅ | ✅ | ✅ |
 | `SHOW SCHEMAS` | ✅ | ✅ | ✅ |
 | `SHOW TABLES` | ✅ | ✅ | ✅ |
-| `SHOW COLUMNS` | ⚠️ via info_schema | ✅ | ✅ |
+| `SHOW COLUMNS FROM ns.table` | ✅ Trino syntax (rewrites to `information_schema`) | ✅ | ✅ |
 | `SHOW CREATE TABLE` | ❌ | ✅ | ✅ |
-| `DESCRIBE table` | ⚠️ via info_schema | ✅ | ✅ |
+| `DESCRIBE table` | ✅ DataFusion native | ✅ | ✅ |
+| `SUMMARIZE table` (column stats) | ✅ V9 | ❌ | ❌ |
+| CLI `.schema` / `.describe` / `.summarize` | ✅ embedded mode V9 | n/a | n/a |
 | `information_schema.tables` | ✅ | ✅ | ✅ |
 | `information_schema.columns` | ✅ | ✅ | ✅ |
 | `information_schema.schemata` | ✅ | ✅ | ✅ |
