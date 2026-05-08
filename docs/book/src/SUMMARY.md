@@ -32,6 +32,7 @@
 - [Iceberg Integration](./features/iceberg.md)
 - [Write Path](./features/write-path.md)
 - [read\_parquet TVF](./features/read-parquet.md)
+- [File-format TVFs (read\_csv / read\_json / read\_delta)](./features/file-format-tvfs.md)
 - [Observability](./features/observability.md)
 - [Trino Compatibility](./features/trino-compatibility.md)
 - [Benchmark Suite](./features/benchmarks.md)
