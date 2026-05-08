@@ -54,6 +54,12 @@ glue = ["dep:iceberg-catalog-glue", "iceberg-catalog-loader/glue"]
 # the aws-config + aws-sdk runtime already pulled by `glue`, so the
 # incremental binary cost is small (~5-10 MB).
 s3tables = ["dep:iceberg-catalog-s3tables", "iceberg-catalog-loader/s3tables"]
+# Delta Lake read support via delta-rs (deltalake-core 0.32 — pinned to
+# DataFusion 53.1, same as our coordinator). Optional and gated so a
+# slim REST-only build does not pull in the delta_kernel crate or its
+# transitive S3 / Azure cloud handlers. Embedded mode enables it; the
+# cluster default leaves it off until ops asks for Delta tables.
+delta = ["dep:deltalake-core"]
 
 [dependencies]
 sqe-core = { path = "../sqe-core" }
@@ -104,6 +110,7 @@ iceberg-catalog-glue = { workspace = true, optional = true }
 iceberg-catalog-sql = { workspace = true, optional = true }
 iceberg-catalog-s3tables = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
+deltalake-core = { version = "0.32.1", features = ["datafusion", "rustls", "cloud"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
