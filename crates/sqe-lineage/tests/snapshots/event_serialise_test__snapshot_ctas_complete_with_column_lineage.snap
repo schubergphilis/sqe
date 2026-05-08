@@ -1,0 +1,66 @@
+---
+source: crates/sqe-lineage/tests/event_serialise_test.rs
+assertion_line: 127
+expression: ev
+---
+{
+  "eventType": "COMPLETE",
+  "eventTime": "2026-05-08T10:00:01Z",
+  "producer": "https://github.com/sbp/sqe/v0.1.0",
+  "schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json",
+  "run": {
+    "runId": "550e8400-e29b-41d4-a716-446655440000",
+    "facets": {
+      "nominalTime": {
+        "nominalStartTime": "2026-05-08T10:00:00Z"
+      }
+    }
+  },
+  "job": {
+    "namespace": "sqe",
+    "name": "ctas:def",
+    "facets": {
+      "sql": {
+        "query": "SELECT 1",
+        "dialect": "sqe"
+      }
+    }
+  },
+  "inputs": [
+    {
+      "namespace": "https://polaris.example/api/catalog",
+      "name": "sales.orders",
+      "facets": {}
+    }
+  ],
+  "outputs": [
+    {
+      "namespace": "https://polaris.example/api/catalog",
+      "name": "sales.archive",
+      "facets": {},
+      "outputFacets": {
+        "columnLineage": {
+          "fields": {
+            "doubled": {
+              "inputFields": [
+                {
+                  "namespace": "https://polaris.example/api/catalog",
+                  "name": "sales.orders",
+                  "field": "amount",
+                  "transformations": [
+                    {
+                      "type": "DIRECT",
+                      "subtype": "TRANSFORMATION",
+                      "description": "amount * 2",
+                      "masking": false
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
+}
