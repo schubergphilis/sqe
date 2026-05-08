@@ -194,6 +194,20 @@ pub fn build_embedded_context(memory_limit_bytes: usize) -> anyhow::Result<Sessi
             StorageConfig::default(),
         )),
     );
+    // V11: Delta Lake reader. Wraps deltalake::open_table so users can
+    // query a Delta table root directly:
+    //   SELECT count(*) FROM read_delta('/data/delta/sales');
+    //   SELECT * FROM read_delta('s3://bucket/delta/orders',
+    //     access_key => 'AKIA...', secret_key => '...');
+    // Time-travel via version => '<int>' or timestamp => '<RFC3339>'.
+    // The CLI's Cargo.toml enables the sqe-catalog `delta` feature
+    // unconditionally, so this registration always runs.
+    ctx.register_udtf(
+        "read_delta",
+        Arc::new(sqe_catalog::read_delta::ReadDeltaFunction::new(
+            StorageConfig::default(),
+        )),
+    );
 
     Ok(ctx)
 }
