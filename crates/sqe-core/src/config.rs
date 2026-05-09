@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct SqeConfig {
@@ -969,6 +969,8 @@ pub struct MetricsConfig {
     /// Set to 1.0 to trace all queries (expensive). Set to 0.0 to disable tracing.
     #[serde(default = "default_trace_sample_rate")]
     pub trace_sample_rate: f64,
+    #[serde(default)]
+    pub openlineage: OpenLineageConfig,
 }
 
 fn default_trace_sample_rate() -> f64 {
@@ -982,8 +984,88 @@ impl Default for MetricsConfig {
             otlp_endpoint: String::new(),
             audit_log_path: String::new(),
             trace_sample_rate: default_trace_sample_rate(),
+            openlineage: OpenLineageConfig::default(),
         }
     }
+}
+
+/// OpenLineage emitter configuration.
+///
+/// Controls whether SQE emits OpenLineage events for executed statements
+/// and where those events are delivered (file sink, HTTP endpoint, or both).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OpenLineageConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ol_job_namespace")]
+    pub job_namespace: String,
+    #[serde(default)]
+    pub producer: String,
+    #[serde(default)]
+    pub emit_selects: bool,
+    #[serde(default)]
+    pub file_path: String,
+    #[serde(default)]
+    pub http_endpoint: String,
+    #[serde(default = "default_ol_auth_mode")]
+    pub auth_mode: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_ol_http_timeout")]
+    pub http_timeout_ms: u64,
+    #[serde(default = "default_ol_http_retry")]
+    pub http_retry_attempts: u32,
+    #[serde(default)]
+    pub spool_path: String,
+    #[serde(default = "default_ol_spool_cap")]
+    pub spool_max_bytes: u64,
+    #[serde(default = "default_ol_replay_secs")]
+    pub replay_interval_secs: u64,
+    #[serde(default = "default_ol_channel_cap")]
+    pub channel_capacity: usize,
+}
+
+impl Default for OpenLineageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            job_namespace: default_ol_job_namespace(),
+            producer: String::new(),
+            emit_selects: false,
+            file_path: String::new(),
+            http_endpoint: String::new(),
+            auth_mode: default_ol_auth_mode(),
+            api_key: String::new(),
+            http_timeout_ms: default_ol_http_timeout(),
+            http_retry_attempts: default_ol_http_retry(),
+            spool_path: String::new(),
+            spool_max_bytes: default_ol_spool_cap(),
+            replay_interval_secs: default_ol_replay_secs(),
+            channel_capacity: default_ol_channel_cap(),
+        }
+    }
+}
+
+fn default_ol_job_namespace() -> String {
+    "sqe".into()
+}
+fn default_ol_auth_mode() -> String {
+    "none".into()
+}
+fn default_ol_http_timeout() -> u64 {
+    5000
+}
+fn default_ol_http_retry() -> u32 {
+    1
+}
+fn default_ol_spool_cap() -> u64 {
+    100 * 1024 * 1024
+}
+fn default_ol_replay_secs() -> u64 {
+    30
+}
+fn default_ol_channel_cap() -> usize {
+    10_000
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -2275,5 +2357,62 @@ type = "aws"
         assert_eq!(config.persistence, "file");
         assert_eq!(config.persistence_path, "/var/data/sessions.json");
         assert_eq!(config.snapshot_interval_secs, 30);
+    }
+
+    // -----------------------------------------------------------------------
+    // OpenLineage config tests
+    // -----------------------------------------------------------------------
+
+    /// Minimal skeleton TOML (coordinator/auth/catalog blocks) so a full
+    /// `SqeConfig` deserialises in OpenLineage tests. Only `catalog.catalog_url`
+    /// is structurally required; everything else has serde defaults.
+    const OL_TEST_SKELETON: &str = r#"
+[coordinator]
+[auth]
+[catalog]
+catalog_url = "http://polaris.example/api/catalog"
+"#;
+
+    #[test]
+    fn openlineage_config_parses_from_toml() {
+        let body = r#"
+[metrics]
+prometheus_port = 9090
+otlp_endpoint = ""
+
+[metrics.openlineage]
+enabled = true
+job_namespace = "sqe-prod"
+emit_selects = true
+file_path = "/var/log/ol.jsonl"
+http_endpoint = "https://marquez.example/api/v1/lineage"
+auth_mode = "bearer"
+api_key = "secret"
+spool_path = "/var/spool/sqe-ol"
+spool_max_bytes = 209715200
+"#;
+        let toml = format!("{OL_TEST_SKELETON}{body}");
+        let cfg: SqeConfig = toml::from_str(&toml).unwrap();
+        let ol = &cfg.metrics.openlineage;
+        assert!(ol.enabled);
+        assert_eq!(ol.job_namespace, "sqe-prod");
+        assert!(ol.emit_selects);
+        assert_eq!(ol.spool_max_bytes, 209715200);
+    }
+
+    #[test]
+    fn openlineage_config_uses_defaults_when_omitted() {
+        let body = r#"
+[metrics]
+prometheus_port = 9090
+otlp_endpoint = ""
+"#;
+        let toml = format!("{OL_TEST_SKELETON}{body}");
+        let cfg: SqeConfig = toml::from_str(&toml).unwrap();
+        let ol = &cfg.metrics.openlineage;
+        assert!(!ol.enabled);
+        assert_eq!(ol.job_namespace, "sqe");
+        assert_eq!(ol.spool_max_bytes, 100 * 1024 * 1024);
+        assert_eq!(ol.channel_capacity, 10000);
     }
 }
