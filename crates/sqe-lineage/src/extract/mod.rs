@@ -10,11 +10,12 @@ pub mod datasets;
 pub mod columns;
 
 use crate::event::{
-    DataSourceFacet, DatasetFacets, InputDataset, OutputDataset, OutputDatasetFacets, SchemaFacet,
-    SchemaField,
+    ColumnLineageEntry, ColumnLineageFacet, ColumnLineageInput, DataSourceFacet, DatasetFacets,
+    InputDataset, OutputDataset, OutputDatasetFacets, SchemaFacet, SchemaField,
 };
 use crate::observer::LineageHint;
-use datafusion::logical_expr::LogicalPlan;
+use datafusion::logical_expr::{DdlStatement, LogicalPlan};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Catalog-name -> namespace-URI lookup, threaded through the emitter so dataset
@@ -23,13 +24,74 @@ pub type CatalogLookup = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
 /// Extract input + output datasets (with column lineage on outputs) from a
 /// DataFusion `LogicalPlan`.
-///
-/// Phase E stub: returns `(vec![], vec![])`.
 pub fn extract_lineage(
-    _plan: &LogicalPlan,
-    _lookup: &CatalogLookup,
+    plan: &LogicalPlan,
+    lookup: &CatalogLookup,
 ) -> (Vec<InputDataset>, Vec<OutputDataset>) {
-    (vec![], vec![])
+    let inputs = datasets::extract_inputs(plan, lookup);
+    let mut outputs = datasets::extract_outputs(plan, lookup);
+
+    // For DML/DDL writes, attach column lineage by tracing the source plan
+    // and projecting it onto the target schema by ordinal.
+    if let Some(out) = outputs.first_mut() {
+        if let Some(source_plan) = source_of_write(plan) {
+            let trace = columns::trace_plan(source_plan);
+            let target_fields = output_field_names(source_plan);
+            out.outputFacets.columnLineage =
+                Some(build_column_lineage_facet(&target_fields, &trace, lookup));
+        }
+    }
+
+    (inputs, outputs)
+}
+
+/// For a write plan, return the source `LogicalPlan` whose columns feed the
+/// target. INSERT / CTAS / CREATE VIEW all expose the SELECT subplan via the
+/// `input` field; non-write plans return `None`.
+fn source_of_write(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+    match plan {
+        LogicalPlan::Dml(stmt) => Some(stmt.input.as_ref()),
+        LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(c)) => Some(c.input.as_ref()),
+        LogicalPlan::Ddl(DdlStatement::CreateView(c)) => Some(c.input.as_ref()),
+        _ => None,
+    }
+}
+
+/// Column names of the source plan in order. By spec §5.3 the planner has
+/// already aligned source columns with target schema by position, so the
+/// source plan's schema field names are the target column names.
+fn output_field_names(source: &LogicalPlan) -> Vec<String> {
+    source
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect()
+}
+
+/// Build the `ColumnLineageFacet` from a positional target-field list and a
+/// source-plan column trace, mapping each `ColumnDep` through `lookup` to the
+/// OL `(namespace, name)` pair.
+fn build_column_lineage_facet(
+    fields: &[String],
+    trace: &columns::ColumnTrace,
+    lookup: &CatalogLookup,
+) -> ColumnLineageFacet {
+    let mut map: BTreeMap<String, ColumnLineageEntry> = BTreeMap::new();
+    for (i, name) in fields.iter().enumerate() {
+        let Some(deps) = trace.get(i) else { continue };
+        let inputs: Vec<ColumnLineageInput> = deps
+            .iter()
+            .map(|d| ColumnLineageInput {
+                namespace: lookup(&d.catalog),
+                name: format!("{}.{}", d.schema, d.table),
+                field: d.field.clone(),
+                transformations: vec![d.transformation.clone()],
+            })
+            .collect();
+        map.insert(name.clone(), ColumnLineageEntry { inputFields: inputs });
+    }
+    ColumnLineageFacet { fields: map }
 }
 
 /// Extract output dataset from a DDL hint (CREATE TABLE / DROP / ALTER carry
