@@ -53,7 +53,7 @@ pub async fn build_catalog(
     let result = match kind {
         CatalogKind::Sqlite => build_sqlite(location, options).await,
         CatalogKind::IcebergRest => build_iceberg_rest(location, options, secrets).await,
-        CatalogKind::Glue => Err(error_not_yet("glue")),
+        CatalogKind::Glue => build_glue(location, options, secrets).await,
         CatalogKind::S3Tables => Err(error_not_yet("s3tables")),
         CatalogKind::Hms => Err(error_not_yet("hms")),
         CatalogKind::Jdbc => Err(error_not_yet("jdbc")),
@@ -253,4 +253,146 @@ async fn build_iceberg_rest(
     _secrets: &SecretStore,
 ) -> Result<Arc<dyn iceberg::Catalog>, String> {
     Err("TYPE iceberg_rest requires the `rest` cargo feature on sqe-catalog".to_string())
+}
+
+/// Resolve a `SECRET <name>` option against the secret store and
+/// translate the resulting `Secret::Aws` into the `(access_key,
+/// secret_key, session_token, region, profile)` props the upstream
+/// AWS catalog builders consume. Returns `Ok(None)` when no SECRET
+/// is set; the AWS default credential chain handles that case at the
+/// builder layer.
+///
+/// `kind_label` is interpolated into the wrong-kind error so the
+/// caller does not need to format twice ("glue", "s3tables").
+#[cfg(any(feature = "glue", feature = "s3tables"))]
+fn aws_secret_to_props(
+    options: &BTreeMap<String, OptionValue>,
+    secrets: &SecretStore,
+    kind_label: &str,
+) -> Result<Option<AwsProps>, String> {
+    let Some(secret_ref) = options.get("SECRET").and_then(OptionValue::as_secret_ref) else {
+        return Ok(None);
+    };
+    let secret = secrets.get(secret_ref)?;
+    match &secret {
+        Secret::Aws {
+            access_key,
+            secret_key,
+            session_token,
+            region,
+            profile,
+        } => Ok(Some(AwsProps {
+            access_key: access_key.clone(),
+            secret_key: secret_key.clone(),
+            session_token: session_token.clone(),
+            region: region.clone(),
+            profile: profile.clone(),
+        })),
+        other => Err(format!(
+            "secret '{secret_ref}' is type {} but TYPE {kind_label} expects aws",
+            other.type_name()
+        )),
+    }
+}
+
+#[cfg(any(feature = "glue", feature = "s3tables"))]
+struct AwsProps {
+    access_key: Option<String>,
+    secret_key: Option<String>,
+    session_token: Option<String>,
+    region: Option<String>,
+    profile: Option<String>,
+}
+
+/// Build an AWS Glue Data Catalog (`iceberg_catalog_glue`).
+///
+/// `location` is the Glue catalog ARN
+/// (`arn:aws:glue:<region>:<account>:catalog/<name>`) — currently
+/// surfaced through the Glue builder's `URI` prop, which doubles as
+/// the LocalStack endpoint for tests. Required: `WAREHOUSE`. Optional:
+/// `SECRET <name>` referencing `Secret::Aws`, `REGION`, `ENDPOINT_URL`
+/// (overrides location-derived endpoint).
+///
+/// AWS credential resolution order matches `build_aws_config` from
+/// `aws_config.rs`: explicit SECRET props win, then env, then shared
+/// credentials, then IMDS / ECS / EKS Pod Identity. The `REGION`
+/// option overrides the secret-supplied region.
+#[cfg(feature = "glue")]
+async fn build_glue(
+    location: &str,
+    options: &BTreeMap<String, OptionValue>,
+    secrets: &SecretStore,
+) -> Result<Arc<dyn iceberg::Catalog>, String> {
+    use std::collections::HashMap;
+
+    use iceberg::CatalogBuilder;
+    use iceberg_catalog_glue::{
+        AWS_ACCESS_KEY_ID, AWS_PROFILE_NAME, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY,
+        AWS_SESSION_TOKEN, GLUE_CATALOG_PROP_WAREHOUSE, GlueCatalogBuilder,
+    };
+
+    let trimmed = location.trim();
+    let warehouse = options
+        .get("WAREHOUSE")
+        .and_then(OptionValue::as_str)
+        .ok_or_else(|| "option `WAREHOUSE` is required for TYPE glue".to_string())?;
+
+    let mut props: HashMap<String, String> = HashMap::new();
+    props.insert(GLUE_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.to_string());
+
+    // The Glue builder's `URI` prop carries the AWS endpoint. The
+    // ATTACH `<location>` is the catalog ARN; we forward it as the
+    // SDK's endpoint hint when ENDPOINT_URL is not set explicitly,
+    // matching what LocalStack callers expect.
+    if let Some(endpoint) = options.get("ENDPOINT_URL").and_then(OptionValue::as_str) {
+        props.insert(
+            iceberg_catalog_glue::GLUE_CATALOG_PROP_URI.to_string(),
+            endpoint.to_string(),
+        );
+    } else if !trimmed.is_empty() && !trimmed.starts_with("arn:") {
+        // Bare URL (LocalStack, AWS endpoint test). ARNs don't go
+        // into `uri`; the AWS SDK derives the endpoint from region
+        // when uri is unset.
+        props.insert(
+            iceberg_catalog_glue::GLUE_CATALOG_PROP_URI.to_string(),
+            trimmed.to_string(),
+        );
+    }
+
+    if let Some(aws) = aws_secret_to_props(options, secrets, "glue")? {
+        if let (Some(ak), Some(sk)) = (aws.access_key, aws.secret_key) {
+            props.insert(AWS_ACCESS_KEY_ID.to_string(), ak);
+            props.insert(AWS_SECRET_ACCESS_KEY.to_string(), sk);
+        }
+        if let Some(st) = aws.session_token {
+            props.insert(AWS_SESSION_TOKEN.to_string(), st);
+        }
+        if let Some(r) = aws.region {
+            props.insert(AWS_REGION_NAME.to_string(), r);
+        }
+        if let Some(p) = aws.profile {
+            props.insert(AWS_PROFILE_NAME.to_string(), p);
+        }
+    }
+
+    // REGION option always wins over secret-supplied region.
+    if let Some(r) = options.get("REGION").and_then(OptionValue::as_str) {
+        props.insert(AWS_REGION_NAME.to_string(), r.to_string());
+    }
+
+    let catalog = GlueCatalogBuilder::default()
+        .load("sqe-attached-glue".to_string(), props)
+        .await
+        .map_err(|e| format!("AWS Glue catalog open failed: {e}"))?;
+
+    Ok(Arc::new(catalog))
+}
+
+#[cfg(not(feature = "glue"))]
+async fn build_glue(
+    _location: &str,
+    _options: &BTreeMap<String, OptionValue>,
+    _secrets: &SecretStore,
+) -> Result<Arc<dyn iceberg::Catalog>, String> {
+    Err("TYPE glue requires the `glue` cargo feature on sqe-catalog".to_string())
 }
