@@ -426,6 +426,26 @@ fn trace_window(w: &Window, mut child_trace: ColumnTrace) -> ColumnTrace {
     out
 }
 
+/// Extension column trace rule (E11).
+///
+/// Generic passthrough: walk into the (single) child plan and forward its
+/// trace unchanged. Most SQE policy-mask extensions wrap a Projection that
+/// already encodes the mask shape, so the surrounding Extension behaves like
+/// a no-op for column lineage. Multi-input extensions return an empty trace.
+///
+// v1: passthrough; SQE policy-mask annotation in v2 (spec §5.2 row "Extension")
+// TODO(spec §5.2): when a SQE policy-mask extension wraps a Projection that
+// replaces a Column ref with a non-Column expression, mark those output deps
+// with `masked()`. Deferred until we have a concrete policy node to dispatch
+// on without coupling `sqe-lineage` to `sqe-policy`.
+fn trace_extension(e: &datafusion::logical_expr::Extension) -> ColumnTrace {
+    let inputs = e.node.inputs();
+    if inputs.len() == 1 {
+        return trace_plan(inputs[0]);
+    }
+    Vec::new()
+}
+
 /// Walk a `LogicalPlan` bottom-up and emit per-output-column lineage
 /// (`ColumnTrace[i]` lists leaf-column deps for output column i).
 pub fn trace_plan(plan: &LogicalPlan) -> ColumnTrace {
@@ -457,6 +477,7 @@ pub fn trace_plan(plan: &LogicalPlan) -> ColumnTrace {
             let child = trace_plan(w.input.as_ref());
             trace_window(w, child)
         }
+        LogicalPlan::Extension(e) => trace_extension(e),
         // Unknown nodes -> empty trace.
         _ => Vec::new(),
     }

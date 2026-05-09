@@ -557,6 +557,84 @@ fn window_with_args_marks_args_direct_window() {
     let _ = direct_window;
 }
 
+/// Minimal `UserDefinedLogicalNodeCore` impl that wraps a single child plan
+/// and exposes its schema unchanged. Used to verify that `Extension` nodes
+/// are handled as passthrough by `trace_plan`.
+#[derive(Debug, Hash, PartialEq, Eq)]
+struct PassthroughExt {
+    name: &'static str,
+    input: LogicalPlan,
+    schema: datafusion::common::DFSchemaRef,
+}
+
+// `DFSchema` does not implement `PartialOrd`; provide a trivial impl so the
+// node satisfies the `UserDefinedLogicalNodeCore` bounds.
+impl PartialOrd for PassthroughExt {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match self.name.partial_cmp(other.name)? {
+            std::cmp::Ordering::Equal => self.input.partial_cmp(&other.input),
+            other => Some(other),
+        }
+    }
+}
+
+impl datafusion::logical_expr::UserDefinedLogicalNodeCore for PassthroughExt {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn inputs(&self) -> Vec<&LogicalPlan> {
+        vec![&self.input]
+    }
+    fn schema(&self) -> &datafusion::common::DFSchemaRef {
+        &self.schema
+    }
+    fn expressions(&self) -> Vec<Expr> {
+        vec![]
+    }
+    fn fmt_for_explain(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.name)
+    }
+    fn with_exprs_and_inputs(
+        &self,
+        _exprs: Vec<Expr>,
+        inputs: Vec<LogicalPlan>,
+    ) -> datafusion::common::Result<Self> {
+        Ok(Self {
+            name: self.name,
+            input: inputs.into_iter().next().expect("one input"),
+            schema: self.schema.clone(),
+        })
+    }
+}
+
+#[test]
+fn extension_node_passes_through() {
+    let scan = build_simple_scan(
+        "polaris",
+        "sales",
+        "orders",
+        &[("id", DataType::Int64), ("amount", DataType::Float64)],
+    );
+    let schema = scan.schema().clone();
+    let ext_node = PassthroughExt {
+        name: "sqe_policy_mask",
+        input: scan,
+        schema,
+    };
+    let plan = LogicalPlan::Extension(datafusion::logical_expr::Extension {
+        node: Arc::new(ext_node),
+    });
+
+    let trace = columns::trace_plan(&plan);
+    assert_eq!(trace.len(), 2);
+
+    // Passthrough preserves IDENTITY for both columns.
+    assert_eq!(trace[0][0].field, "id");
+    assert_eq!(trace[0][0].transformation.subtype, "IDENTITY");
+    assert_eq!(trace[1][0].field, "amount");
+    assert_eq!(trace[1][0].transformation.subtype, "IDENTITY");
+}
+
 #[test]
 fn subquery_alias_passes_through() {
     let plan = build_simple_scan(
