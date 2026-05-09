@@ -25,6 +25,7 @@ use reqwest::header::HeaderMap;
 use reqwest::{Client, IntoUrl, Method, Request, RequestBuilder, Response};
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
+use tracing::{debug, warn};
 
 use crate::types::{ErrorResponse, TokenResponse};
 use crate::{GCP_CLOUD_PLATFORM_SCOPE, RestCatalogConfig};
@@ -270,6 +271,21 @@ impl HttpClient {
         let token = self.token.lock().await.clone();
 
         if self.credential.is_none() && token.is_none() && self.gcp_credential.is_none() {
+            // No auth configured at all. The endpoint may permit anonymous
+            // access. Log so an operator can correlate against the
+            // server-side access log: an unexpected presence of this
+            // path under load was the smoking gun for the
+            // "concurrent bearer dropped" bug. Path only, never the
+            // full URL (would leak names of catalogs/tables on the
+            // wire).
+            warn!(
+                method = %req.method(),
+                path = req.url().path(),
+                "Outbound REST request issued WITHOUT Authorization \
+                 (no token, no credential, no GCP creds). If this is \
+                 unexpected, the bearer was lost between session setup \
+                 and outbound request."
+            );
             return Ok(());
         }
 
@@ -289,6 +305,18 @@ impl HttpClient {
             }
         };
 
+        // Defensive guard: a token of length 0 must never go on the
+        // wire as `Authorization: Bearer ` (empty bearer). That fails
+        // 401 at the server with no useful diagnostic and used to be
+        // mistranslated to TABLE_NOT_FOUND downstream.
+        if token.is_empty() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Refusing to send empty bearer token: catalog auth is \
+                 misconfigured (token resolved to empty string).",
+            ));
+        }
+
         // Insert token in request.
         req.headers_mut().insert(
             http::header::AUTHORIZATION,
@@ -299,6 +327,19 @@ impl HttpClient {
                 )
                 .with_source(e)
             })?,
+        );
+
+        // Diagnostic trace at the moment the request gains its
+        // Authorization header. Records token length only, never the
+        // value, never any byte that could be reversed back into the
+        // token. Combined with the warn! above, the SQE log alone
+        // can answer "did this outbound call have a bearer?" without
+        // cross-referencing the catalog's access log.
+        debug!(
+            method = %req.method(),
+            path = req.url().path(),
+            token_len = token.len(),
+            "Outbound REST request authenticated with Bearer token"
         );
 
         Ok(())
