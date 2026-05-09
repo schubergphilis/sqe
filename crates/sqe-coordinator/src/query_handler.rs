@@ -75,6 +75,12 @@ pub struct QueryHandler {
     credential_tracker: Option<Arc<CredentialRefreshTracker>>,
     metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
     audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
+    /// Optional OpenLineage observer. When set and the statement kind is
+    /// emit-eligible (see `should_emit`), `execute()` calls
+    /// `on_query_start` / `on_query_complete` / `on_query_fail` around the
+    /// dispatch.
+    #[allow(dead_code)] // wired into execute() in G3
+    lineage: Option<Arc<dyn sqe_lineage::LineageObserver>>,
     query_tracker: Arc<QueryTracker>,
     query_cache: Option<Arc<ResultCache>>,
     /// Semaphore limiting concurrent query execution.
@@ -106,6 +112,7 @@ impl QueryHandler {
         query_tracker: Arc<QueryTracker>,
         query_cache: Option<Arc<ResultCache>>,
         grant_backend: Option<Arc<dyn GrantBackend>>,
+        lineage: Option<Arc<dyn sqe_lineage::LineageObserver>>,
     ) -> sqe_core::Result<Self> {
         let catalog_ops = CatalogOps::new(config.clone());
         let mut write_handler = WriteHandler::new(config.clone());
@@ -153,6 +160,7 @@ impl QueryHandler {
             credential_tracker,
             metrics,
             audit,
+            lineage,
             query_tracker,
             query_cache,
             query_semaphore,
