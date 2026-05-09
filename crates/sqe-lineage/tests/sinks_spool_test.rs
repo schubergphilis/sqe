@@ -156,8 +156,20 @@ async fn spool_drains_when_http_recovers() {
     let live = dir.path().join("spool.jsonl");
     assert!(std::fs::metadata(&live).unwrap().len() > 0);
 
-    // Wait for at least one replay tick
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait long enough for at least one replay tick + drain. The replay loop
+    // wakes every 100ms; under parallel test load a single 300ms wait is too
+    // tight, so we poll up to 2s for the spool dir to empty.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let total: u64 = std::fs::read_dir(dir.path()).unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| std::fs::metadata(e.path()).ok().map(|m| m.len()))
+            .sum();
+        if total == 0 || std::time::Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // After replay, the rotated file should be drained.
     // Live file may exist but be empty (or rotated away).
