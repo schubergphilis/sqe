@@ -1829,17 +1829,30 @@ git commit -am "feat(server): construct LineageObserver from config"
 
 ### Task H2: Plumb observer into `embedded.rs`
 
-- [ ] **Step 1: Add observer parameter to EmbeddedClient::new**
+**Status: deferred (no-op for v1).**
 
-Mirror Task G1 but for `crates/sqe-cli/src/embedded.rs::EmbeddedClient`. Default at all CLI call sites is `None`.
+The `EmbeddedClient` in `crates/sqe-cli/src/embedded.rs` does not construct a
+`QueryHandler`. It builds a raw `SessionContext` directly and dispatches SQL
+through DataFusion's `ctx.sql(...)` path, bypassing the coordinator pipeline
+where `should_emit` and the observer hooks live. The file's own header comment
+(lines 26-34) explains the duplication is intentional: plumbing `SqeConfig`,
+`PolicyStore`, `QueryTracker`, and `MetricsRegistry` through to the embedded
+path would bloat the cluster path for the embedded use case.
 
-- [ ] **Step 2: Build, run tests**
+Wiring an observer here would require either (a) refactoring `EmbeddedClient`
+to go through `QueryHandler`, which is out of scope for the OL emitter
+project, or (b) a parallel emit path that intercepts `ctx.sql(...)` calls
+and replays the LogicalPlan through the extractor. Both are larger pieces of
+work than v1 budgets for. The CLI is also a single-user, ad-hoc tool where
+lineage is less load-bearing than in the multi-user coordinator.
 
-- [ ] **Step 3: Commit**
+When the embedded path needs lineage, the cleanest option is path (a): unify
+on `QueryHandler` and accept the resulting plumbing. Tracking is left to a
+follow-up issue rather than an in-place stub here, because adding an unused
+parameter to `EmbeddedClient::new(...)` would imply support that doesn't
+exist.
 
-```bash
-git commit -am "feat(cli): plumb optional observer through EmbeddedClient"
-```
+- [x] **Step 1: Determined H2 is a no-op for v1; documented the deferral here.**
 
 ---
 
