@@ -32,6 +32,9 @@ SQE is built on **Apache DataFusion 53.1** which provides the SQL execution engi
 | `SELECT * FROM 'file.ext'` auto-detect | ✅ (V8) | ❌ | ❌ | ✅ |
 | HuggingFace `hf://` URLs | ✅ TVF + auto-detect (V10/V12) | ❌ | ❌ | ✅ via extension |
 | HTTPS / `httpfs` | ✅ (V10) | ⚠️ HTTP table function | ❌ | ✅ via extension |
+| AWS S3 / S3-compatible (R2 / MinIO / Ceph / SeaweedFS / Garage) | ✅ provider chain + inline | ✅ | ✅ | ✅ via extension |
+| Azure ADLS Gen2 / Blob | ✅ shared key + SAS + Azurite; `abfss://`/`azure://`/`az://` | ✅ | ✅ | ✅ via extension |
+| Google Cloud Storage | ✅ service-account JSON or ADC; `gs://`/`gcs://` | ✅ | ✅ | ✅ via extension |
 | Federated queries | ❌ | ✅ (connectors) | ✅ (connectors) | ⚠️ Postgres / SQLite extensions |
 | UDFs | ⚠️ Rust API only | ✅ Java/Python | ✅ Java/Scala/Python | ✅ Python / C++ |
 | Single-binary embedded mode | ✅ (V8/V11) | ❌ Cluster only | ❌ Cluster only | ✅ Default |

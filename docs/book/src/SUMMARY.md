@@ -66,6 +66,7 @@
 
 - [Quickstart](./getting-started/quickstart.md)
 - [Catalog backends](./getting-started/catalogs.md)
+- [Storage backends (S3 / R2 / GCS / ADLS / HTTPS / hf://)](./getting-started/storage-backends.md)
 - [Building from Source](./getting-started/building.md)
 - [Using the CLI](./getting-started/cli.md)
 

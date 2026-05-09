@@ -144,8 +144,11 @@ The reference docs:
 | [DuckDB Comparison](docs/duckdb-comparision.md) | Symmetry between SQE and DuckDB on the embedded side |
 | [Embedded CLI Reference](docs/cli-embedded.md) | All flags, dot-commands, TVFs, catalog backends, storage backends |
 | [SQL Feature Comparison](docs/features.md) | SQE vs Trino vs Spark SQL vs DuckDB across windows, aggregates, DML, Iceberg, file-format TVFs |
+| [SQL Reference (book)](docs/book/src/sql-reference/index.md) | Every function, statement, operator, TVF, CALL procedure, GRANT extension, with origin and Trino / Snowflake / Spark / DuckDB alias columns |
 | [Catalog Backends](docs/catalogs.md) | Per-backend TOML, credentials, verification queries |
+| [Storage Backends](docs/book/src/getting-started/storage-backends.md) | S3, R2, MinIO/Ceph, Azure ADLS Gen2, Google Cloud Storage, HTTPS, hf:// |
 | [Operations: OpenLineage](docs/book/src/operations/openlineage.md) | Lineage emit, sinks, troubleshooting |
+| [Benchmark history](docs/benchmark/index.md) | Per-suite, per-scale, per-query plots over time |
 | [Roadmap](docs/roadmap.md) | Full feature checklist |
 | [Security Audit](docs/issues.md) | 43 findings, all resolved |
 
@@ -209,9 +212,10 @@ Full archive in [`docs/blog/`](docs/blog/).
 | Table Format | Apache Iceberg V2 / V3 |
 | Catalogs | Polaris, Nessie, Unity Catalog OSS, AWS Glue, AWS S3 Tables, Hive Metastore, JDBC, Hadoop |
 | Wire Protocols | Arrow Flight SQL + Trino HTTP |
-| Storage | S3, Ceph, R2, ADLS, GCS, local filesystem, HuggingFace `hf://` |
+| Storage | S3, Ceph, R2, ADLS Gen2, GCS, local filesystem, HuggingFace `hf://` |
 | Observability | OpenTelemetry, Prometheus, OpenLineage 2-0-2 |
 | License | Apache 2.0 |
+
 
 ## Contributing
 
