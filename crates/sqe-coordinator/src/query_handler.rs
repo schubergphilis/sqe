@@ -830,6 +830,21 @@ impl QueryHandler {
                         )
                         .await
                 }
+
+                // ATTACH/DETACH/CREATE SECRET/DROP SECRET/SHOW SECRETS:
+                // parser-side only in this change. The runtime catalog
+                // registry and secret store handlers land in a follow-up
+                // phase of the ATTACH plan. Surface a precise error so users
+                // hitting this on the feature branch see the right signal.
+                StatementKind::Attach(_)
+                | StatementKind::Detach(_)
+                | StatementKind::CreateSecret(_)
+                | StatementKind::DropSecret(_)
+                | StatementKind::ShowSecrets => Err(SqeError::NotImplemented(
+                    "ATTACH/DETACH/CREATE SECRET/DROP SECRET/SHOW SECRETS: parser landed; \
+                     runtime handlers ship in a later phase of the ATTACH plan"
+                        .to_string(),
+                )),
             }
         };
 
