@@ -1046,6 +1046,39 @@ impl Default for OpenLineageConfig {
     }
 }
 
+impl OpenLineageConfig {
+    /// Validate that the OpenLineage configuration is internally consistent.
+    ///
+    /// Rules:
+    /// - When enabled, at least one sink (file_path or http_endpoint) must be set.
+    /// - `auth_mode = "bearer"` requires `api_key` to be set.
+    /// - `spool_path` only makes sense when `http_endpoint` is set (the spool
+    ///   buffers events that fail to deliver over HTTP).
+    /// - When enabled, `spool_max_bytes` must be at least 1 MiB so the spool
+    ///   has room for at least a few events.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.enabled && self.file_path.is_empty() && self.http_endpoint.is_empty() {
+            return Err(
+                "openlineage.enabled requires at least one of file_path or http_endpoint".into(),
+            );
+        }
+        if self.auth_mode == "bearer" && self.api_key.is_empty() {
+            return Err(
+                "openlineage.auth_mode = \"bearer\" requires api_key to be set".into(),
+            );
+        }
+        if !self.spool_path.is_empty() && self.http_endpoint.is_empty() {
+            return Err(
+                "openlineage.spool_path requires http_endpoint to be set".into(),
+            );
+        }
+        if self.enabled && self.spool_max_bytes < 1024 * 1024 {
+            return Err("openlineage.spool_max_bytes must be at least 1 MiB".into());
+        }
+        Ok(())
+    }
+}
+
 fn default_ol_job_namespace() -> String {
     "sqe".into()
 }
@@ -2494,5 +2527,61 @@ otlp_endpoint = ""
         std::env::remove_var("SQE_METRICS__OPENLINEAGE__ENABLED");
         std::env::remove_var("SQE_METRICS__OPENLINEAGE__SPOOL_MAX_BYTES");
         std::env::remove_var("SQE_METRICS__OPENLINEAGE__CHANNEL_CAPACITY");
+    }
+
+    #[test]
+    fn validate_rejects_enabled_without_sinks() {
+        let cfg = OpenLineageConfig {
+            enabled: true,
+            ..OpenLineageConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("at least one of file_path or http_endpoint"));
+    }
+
+    #[test]
+    fn validate_rejects_bearer_without_api_key() {
+        let cfg = OpenLineageConfig {
+            enabled: true,
+            file_path: "/tmp/ol.jsonl".into(),
+            auth_mode: "bearer".into(),
+            ..OpenLineageConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("requires api_key"));
+    }
+
+    #[test]
+    fn validate_rejects_spool_without_http() {
+        let cfg = OpenLineageConfig {
+            enabled: true,
+            file_path: "/tmp/ol.jsonl".into(),
+            spool_path: "/tmp/spool".into(),
+            ..OpenLineageConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("spool_path requires http_endpoint"));
+    }
+
+    #[test]
+    fn validate_rejects_tiny_spool_cap() {
+        let cfg = OpenLineageConfig {
+            enabled: true,
+            file_path: "/tmp/ol.jsonl".into(),
+            spool_max_bytes: 1024, // 1 KiB, well under 1 MiB
+            ..OpenLineageConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("at least 1 MiB"));
+    }
+
+    #[test]
+    fn validate_passes_with_valid_config() {
+        let cfg = OpenLineageConfig {
+            enabled: true,
+            file_path: "/tmp/ol.jsonl".into(),
+            ..OpenLineageConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
     }
 }
