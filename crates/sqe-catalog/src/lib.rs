@@ -35,6 +35,7 @@ pub mod topk;
 pub mod system_jdbc;
 pub mod system_metadata;
 pub mod system_runtime;
+pub mod writable_iceberg_catalog;
 
 pub use access_control::AccessControlClient;
 #[cfg(any(feature = "glue", feature = "s3tables"))]
