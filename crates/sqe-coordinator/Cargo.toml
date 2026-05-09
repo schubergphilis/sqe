@@ -70,6 +70,11 @@ tracing-opentelemetry = { workspace = true }
 toml = { workspace = true }
 sqe-core = { path = "../sqe-core" }
 sqe-auth = { path = "../sqe-auth" }
+# Tests for the runtime catalog registry build a real SQLite-backed
+# Iceberg catalog at a tempdir, so we need the `sql-sqlite` feature
+# on top of the default set (`sql-postgres`, `glue`, ...). Cargo
+# unifies dev + non-dev features so this stays additive.
+sqe-catalog = { path = "../sqe-catalog", features = ["sql-sqlite"] }
 sqe-sql = { path = "../sqe-sql" }
 sqe-policy = { path = "../sqe-policy" }
 sqe-planner = { path = "../sqe-planner" }
