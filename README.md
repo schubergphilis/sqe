@@ -2,14 +2,28 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-**An Iceberg-first SQL engine. Embedded as one binary on your laptop. Distributed across a cluster. Same SQL, same Iceberg, same identity model.**
+**An Iceberg-first SQL server that scales.** Run SQE embedded as one binary on your laptop, or distributed across a cluster of stateless workers behind an Arrow Flight SQL or Trino HTTP endpoint. Same SQL surface, same Iceberg semantics, same identity model.
 
 SQE is a Rust-based SQL query engine for [Apache Iceberg](https://iceberg.apache.org/) tables, built on [DataFusion 53.1](https://datafusion.apache.org/) and [iceberg-rust](https://github.com/apache/iceberg-rust). Every query runs as the authenticated user. No service account. No shared root.
 
 ```bash
-cargo install --path crates/sqe-cli
-sqe-cli --embedded
-sqe> SELECT * FROM 's3://datalake/sales/2026/*.parquet' WHERE region = 'EU';
+# Point SQE at AWS S3 Tables (managed Iceberg) and run it as a SQL server.
+cat > sqe.toml <<'EOF'
+[catalog]
+type             = "s3tables"
+table_bucket_arn = "arn:aws:s3tables:us-east-1:ACCOUNT:bucket/sales"
+EOF
+
+cargo run --release --bin sqe-coordinator -- sqe.toml &
+cargo run --bin sqe-cli -- --host localhost --port 50051
+
+# Iceberg time travel + manifest-derived stats + per-query identity.
+sqe> SELECT customer_id, sum(amount)
+  ...> FROM s3tables.sales.orders FOR TIMESTAMP AS OF '2026-04-01'
+  ...> WHERE region = 'EU' GROUP BY customer_id;
+
+# Snapshot history straight from the metadata.
+sqe> SELECT snapshot_id, committed_at FROM s3tables.sales."orders$snapshots";
 ```
 
 ## Why it is cool
