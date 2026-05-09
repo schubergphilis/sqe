@@ -871,7 +871,7 @@ Features that need more upstream work or are lower ROI:
 - **Shredded variant.** Wait for variant base.
 - **Vector type.** Iceberg V3 vector spec not finalized.
 - **Multi-arg transforms.** Spec alignment in progress on Java side.
-- **Lineage.** Add OpenLineage emitter once a user asks for it.
+- **Lineage.** ~~Add OpenLineage emitter once a user asks for it.~~ Shipped on `feat/openlineage-emitter` (v0.16). New `sqe-lineage` crate, OL 2-0-2 RunEvents on INSERT/CTAS/MERGE/UPDATE/DELETE/DDL, column-level lineage facet, file + HTTP sinks with disk-spool fallback. See `crates/sqe-lineage/` and `docs/book/src/operations/openlineage.md`.
 
 When these land upstream, each is a 1-2 week addition.
 

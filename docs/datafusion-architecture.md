@@ -238,7 +238,8 @@ sovereign-query-engine/
 │   ├── sqe-coordinator/    # Scheduler, Flight SQL server, session management
 │   ├── sqe-worker/         # Executor, DataFusion runtime, Flight client
 │   ├── sqe-trino-compat/   # Optional Trino wire protocol adapter
-│   └── sqe-metrics/        # Prometheus exporter, OTel integration
+│   ├── sqe-metrics/        # Prometheus exporter, OTel integration
+│   └── sqe-lineage/        # OpenLineage 2-0-2 emitter (column-level lineage; file + HTTP sinks; disk-spool fallback)
 ├── docker/
 │   ├── Dockerfile.coordinator
 │   ├── Dockerfile.worker

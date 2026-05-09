@@ -80,6 +80,12 @@
 
 ---
 
+# Operations
+
+- [Lineage (OpenLineage)](./operations/openlineage.md)
+
+---
+
 # Development
 
 - [Rust Crate Structure](./development/crates.md)

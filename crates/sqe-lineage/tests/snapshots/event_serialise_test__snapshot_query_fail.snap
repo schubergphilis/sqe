@@ -1,0 +1,35 @@
+---
+source: crates/sqe-lineage/tests/event_serialise_test.rs
+assertion_line: 154
+expression: ev
+---
+{
+  "eventType": "FAIL",
+  "eventTime": "2026-05-08T10:00:01Z",
+  "producer": "https://github.com/sbp/sqe/v0.1.0",
+  "schemaURL": "https://openlineage.io/spec/2-0-2/OpenLineage.json",
+  "run": {
+    "runId": "550e8400-e29b-41d4-a716-446655440000",
+    "facets": {
+      "nominalTime": {
+        "nominalStartTime": "2026-05-08T10:00:00Z"
+      },
+      "errorMessage": {
+        "message": "table not found: missing_table",
+        "programmingLanguage": "sql"
+      }
+    }
+  },
+  "job": {
+    "namespace": "sqe",
+    "name": "query:err",
+    "facets": {
+      "sql": {
+        "query": "SELECT 1",
+        "dialect": "sqe"
+      }
+    }
+  },
+  "inputs": [],
+  "outputs": []
+}

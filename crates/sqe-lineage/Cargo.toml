@@ -1,0 +1,27 @@
+[package]
+name = "sqe-lineage"
+version = "0.15.0"
+edition = "2021"
+
+[dependencies]
+sqe-core = { path = "../sqe-core" }
+sqe-sql = { path = "../sqe-sql" }
+sqe-auth = { path = "../sqe-auth" }
+sqe-metrics = { path = "../sqe-metrics" }
+datafusion = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true, features = ["serde"] }
+reqwest = { workspace = true, features = ["gzip", "http2"] }
+tracing = { workspace = true }
+prometheus = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+insta = { version = "1", features = ["json"] }
+tempfile = "3"
+wiremock = "0.6"
