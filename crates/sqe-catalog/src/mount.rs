@@ -25,7 +25,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use sqe_core::SecretStore;
+use sqe_core::{Secret, SecretStore};
 use sqe_sql::{CatalogKind, OptionValue};
 
 /// Build an `iceberg::Catalog` from an ATTACH option dictionary.
@@ -50,10 +50,9 @@ pub async fn build_catalog(
     options: &BTreeMap<String, OptionValue>,
     secrets: &SecretStore,
 ) -> Result<Arc<dyn iceberg::Catalog>, String> {
-    let _ = secrets; // used by per-backend helpers as they come online
     let result = match kind {
         CatalogKind::Sqlite => build_sqlite(location, options).await,
-        CatalogKind::IcebergRest => Err(error_not_yet("iceberg_rest")),
+        CatalogKind::IcebergRest => build_iceberg_rest(location, options, secrets).await,
         CatalogKind::Glue => Err(error_not_yet("glue")),
         CatalogKind::S3Tables => Err(error_not_yet("s3tables")),
         CatalogKind::Hms => Err(error_not_yet("hms")),
@@ -175,4 +174,83 @@ async fn build_sqlite(
          (or `sql-postgres` for `TYPE jdbc`)"
             .to_string(),
     )
+}
+
+/// Build an Iceberg REST catalog (`iceberg_catalog_rest`).
+///
+/// `location` is the REST URL (e.g. `https://polaris/api/catalog`).
+/// Required option: `WAREHOUSE`. Optional: `SECRET <name>` referencing
+/// a `Secret::Bearer { token }`, or `TOKEN '<value>'` for an inline
+/// token (less safe, but useful for prototyping). `PREFIX '<value>'`
+/// passes through a non-standard API prefix.
+///
+/// Polaris, Nessie, Unity OSS, Glue's REST endpoint, and the
+/// federated AWS S3 Tables REST endpoint all flow through this builder.
+#[cfg(feature = "rest")]
+async fn build_iceberg_rest(
+    location: &str,
+    options: &BTreeMap<String, OptionValue>,
+    secrets: &SecretStore,
+) -> Result<Arc<dyn iceberg::Catalog>, String> {
+    use std::collections::HashMap;
+
+    use iceberg::CatalogBuilder;
+    use iceberg_catalog_rest::{
+        REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
+    };
+
+    let trimmed = location.trim();
+    if trimmed.is_empty() {
+        return Err("location must not be empty for TYPE iceberg_rest".to_string());
+    }
+
+    let warehouse = options
+        .get("WAREHOUSE")
+        .and_then(OptionValue::as_str)
+        .ok_or_else(|| "option `WAREHOUSE` is required for TYPE iceberg_rest".to_string())?;
+
+    let mut props: HashMap<String, String> = HashMap::new();
+    props.insert(REST_CATALOG_PROP_URI.to_string(), trimmed.to_string());
+    props.insert(REST_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.to_string());
+
+    // SECRET (preferred) and TOKEN (inline) both end up in the
+    // `token` prop the REST catalog reads. SECRET wins when both are
+    // present so users can override an inline value by name.
+    if let Some(token) = options.get("TOKEN").and_then(OptionValue::as_str) {
+        props.insert("token".to_string(), token.to_string());
+    }
+    if let Some(secret_ref) = options.get("SECRET").and_then(OptionValue::as_secret_ref) {
+        let secret = secrets.get(secret_ref)?;
+        match &secret {
+            Secret::Bearer { token } => {
+                props.insert("token".to_string(), token.clone());
+            }
+            other => {
+                return Err(format!(
+                    "secret '{secret_ref}' is type {} but TYPE iceberg_rest expects bearer",
+                    other.type_name()
+                ));
+            }
+        }
+    }
+
+    if let Some(prefix) = options.get("PREFIX").and_then(OptionValue::as_str) {
+        props.insert("prefix".to_string(), prefix.to_string());
+    }
+
+    let catalog = RestCatalogBuilder::default()
+        .load("sqe-attached-rest".to_string(), props)
+        .await
+        .map_err(|e| format!("Iceberg REST catalog open failed: {e}"))?;
+
+    Ok(Arc::new(catalog))
+}
+
+#[cfg(not(feature = "rest"))]
+async fn build_iceberg_rest(
+    _location: &str,
+    _options: &BTreeMap<String, OptionValue>,
+    _secrets: &SecretStore,
+) -> Result<Arc<dyn iceberg::Catalog>, String> {
+    Err("TYPE iceberg_rest requires the `rest` cargo feature on sqe-catalog".to_string())
 }

@@ -145,3 +145,7 @@ sqe-auth = { path = "../sqe-auth" }
 # `[catalog.backend]` block into `SqeConfig` rather than constructing
 # all 14 SqeConfig fields by hand.
 toml = "0.8"
+# HTTP fixture server for the iceberg-rest mount tests. Same crate
+# `sqe-lineage` already pulls into the workspace; the version is pinned
+# at 0.6 there too.
+wiremock = "0.6"
