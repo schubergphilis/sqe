@@ -1,0 +1,178 @@
+//! Runtime catalog construction for `ATTACH ... (TYPE <kind>, ...)`.
+//!
+//! `build_catalog` is the single dispatch the coordinator and embedded
+//! query handler call when the parser produces an [`AttachStatement`].
+//! Each per-kind helper translates the SQL option dictionary plus the
+//! optional secret reference into the `(name, props)` shape the
+//! upstream `iceberg-catalog-*` builders consume, then returns an
+//! `Arc<dyn iceberg::Catalog>` ready to register with DataFusion.
+//!
+//! Backends mirror what the cluster's TOML-driven `for_session_with`
+//! path in `rest_catalog.rs` already wires; the SQL surface is
+//! additive, not a reimplementation.
+//!
+//! Spec: `docs/superpowers/specs/2026-05-09-attach-catalog-and-secrets-design.md` §5.3
+//!
+//! All public errors are returned as `String` rather than `SqeError`
+//! to keep the boundary narrow. The coordinator wraps them into the
+//! ambient error type at the call site.
+//!
+//! Option keys are case-insensitive but are normalised to ASCII
+//! uppercase by the parser, so all lookups in this module use the
+//! upper-case spelling: `WAREHOUSE`, `SECRET`, `TOKEN`, `PREFIX`,
+//! `REGION`, `ENDPOINT_URL`, `AUTH_MODE`.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use sqe_core::SecretStore;
+use sqe_sql::{CatalogKind, OptionValue};
+
+/// Build an `iceberg::Catalog` from an ATTACH option dictionary.
+///
+/// `location` is the per-backend primary identifier (REST URL, JDBC
+/// URL, ARN, filesystem path, ...). `kind` selects the dispatch.
+/// `options` is the post-parser uppercase-keyed dictionary.
+/// `secrets` is the in-memory secret store; the `SECRET <name>`
+/// option is resolved against it.
+///
+/// # Errors
+///
+/// Returns `Err(String)` on:
+/// - Unknown or wrong-typed secret reference
+/// - Missing required option
+/// - Backend not compiled in (cargo feature off)
+/// - Builder construction failure (network reach, malformed
+///   location, sqlx driver missing, etc.)
+pub async fn build_catalog(
+    location: &str,
+    kind: CatalogKind,
+    options: &BTreeMap<String, OptionValue>,
+    secrets: &SecretStore,
+) -> Result<Arc<dyn iceberg::Catalog>, String> {
+    let _ = secrets; // used by per-backend helpers as they come online
+    let result = match kind {
+        CatalogKind::Sqlite => build_sqlite(location, options).await,
+        CatalogKind::IcebergRest => Err(error_not_yet("iceberg_rest")),
+        CatalogKind::Glue => Err(error_not_yet("glue")),
+        CatalogKind::S3Tables => Err(error_not_yet("s3tables")),
+        CatalogKind::Hms => Err(error_not_yet("hms")),
+        CatalogKind::Jdbc => Err(error_not_yet("jdbc")),
+        CatalogKind::Hadoop => Err(error_not_yet("hadoop")),
+    };
+    result.map_err(|e| format!("ATTACH (TYPE {}) failed: {e}", kind.name()))
+}
+
+fn error_not_yet(kind: &str) -> String {
+    format!("TYPE {kind} not yet supported in this build")
+}
+
+// ---------------------------------------------------------------------------
+// Per-backend builders.
+//
+// Each helper is small on purpose: pull the options it needs, build
+// the props HashMap, hand off to the upstream `CatalogBuilder`. Cargo
+// feature gates mirror the gates on `sqe_catalog`'s top-level features
+// so a slim build (e.g. `--no-default-features --features rest,hadoop`)
+// rejects the unsupported kinds with a clear "feature not enabled"
+// message rather than a link error.
+// ---------------------------------------------------------------------------
+
+/// Build a SQLite-backed Iceberg catalog (`iceberg_catalog_sql`).
+///
+/// `location` is the SQLite database path. Two shapes accepted:
+/// - bare filesystem path: `/var/lib/sqe/wh` -> db at `<path>/sqe.db`,
+///   warehouse data at `<path>/iceberg/` (mirrors the embedded
+///   `--catalog NAME=PATH` flag default in `crates/sqe-cli/src/embedded.rs`)
+/// - explicit URL: `sqlite:///abs/path/db.sqlite?mode=rwc`
+///
+/// `WAREHOUSE` option overrides the derived `<path>/iceberg/` data
+/// directory. Required for the URL-shape; optional for bare paths.
+///
+/// Mirrors `attach_sqlite_catalog` in `crates/sqe-cli/src/embedded.rs`.
+#[cfg(feature = "sql-sqlite")]
+async fn build_sqlite(
+    location: &str,
+    options: &BTreeMap<String, OptionValue>,
+) -> Result<Arc<dyn iceberg::Catalog>, String> {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    use iceberg::CatalogBuilder;
+    use iceberg_catalog_sql::{
+        SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlCatalogBuilder,
+    };
+
+    let trimmed = location.trim();
+    if trimmed.is_empty() {
+        return Err("location must not be empty for TYPE sqlite".to_string());
+    }
+
+    // Resolve the SQLite URL plus the warehouse data directory. The
+    // bare-path shape mirrors what `EmbeddedCatalog` does today: the
+    // location IS the warehouse root, the db file lives next to a
+    // sibling `iceberg/` data dir.
+    let (db_url, default_warehouse) = if trimmed.starts_with("sqlite:") {
+        // URL shape: caller picked the db path explicitly. The
+        // warehouse must come from the WAREHOUSE option because we
+        // can't infer a sibling directory from the URL safely.
+        (trimmed.to_string(), None)
+    } else {
+        let path = PathBuf::from(trimmed);
+        std::fs::create_dir_all(&path).map_err(|e| {
+            format!(
+                "could not create warehouse directory {}: {e}",
+                path.display()
+            )
+        })?;
+        let abs = path.canonicalize().map_err(|e| {
+            format!("could not canonicalise warehouse path {}: {e}", path.display())
+        })?;
+        let data_root = abs.join("iceberg");
+        std::fs::create_dir_all(&data_root)
+            .map_err(|e| format!("could not create data dir {}: {e}", data_root.display()))?;
+        let db_path = abs.join("sqe.db");
+        // `mode=rwc` tells SQLite to create the db file if missing;
+        // sqlx defaults to read-write without create and fails on
+        // first run otherwise.
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let warehouse = format!("file://{}", data_root.display());
+        (url, Some(warehouse))
+    };
+
+    let warehouse = match options.get("WAREHOUSE").and_then(OptionValue::as_str) {
+        Some(w) => w.to_string(),
+        None => default_warehouse.ok_or_else(|| {
+            "option `WAREHOUSE` is required for TYPE sqlite when location is a sqlite:// URL"
+                .to_string()
+        })?,
+    };
+
+    let mut props = HashMap::new();
+    props.insert(SQL_CATALOG_PROP_URI.to_string(), db_url);
+    props.insert(SQL_CATALOG_PROP_WAREHOUSE.to_string(), warehouse);
+
+    // The builder's `name` is recorded as the row scope inside the
+    // SQLite metadata tables. Embedded mode uses a fixed name so
+    // every db file holds a single coherent scope; mirror that here.
+    // The user-facing catalog identifier comes from
+    // `register_catalog(name, ...)` at the coordinator level.
+    let catalog = SqlCatalogBuilder::default()
+        .load("sqe-attached".to_string(), props)
+        .await
+        .map_err(|e| format!("SQLite catalog open failed: {e}"))?;
+
+    Ok(Arc::new(catalog))
+}
+
+#[cfg(not(feature = "sql-sqlite"))]
+async fn build_sqlite(
+    _location: &str,
+    _options: &BTreeMap<String, OptionValue>,
+) -> Result<Arc<dyn iceberg::Catalog>, String> {
+    Err(
+        "TYPE sqlite requires the `sql-sqlite` cargo feature on sqe-catalog \
+         (or `sql-postgres` for `TYPE jdbc`)"
+            .to_string(),
+    )
+}
