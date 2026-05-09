@@ -9,7 +9,10 @@
 pub mod datasets;
 pub mod columns;
 
-use crate::event::{InputDataset, OutputDataset};
+use crate::event::{
+    DataSourceFacet, DatasetFacets, InputDataset, OutputDataset, OutputDatasetFacets, SchemaFacet,
+    SchemaField,
+};
 use crate::observer::LineageHint;
 use datafusion::logical_expr::LogicalPlan;
 use std::sync::Arc;
@@ -31,11 +34,40 @@ pub fn extract_lineage(
 
 /// Extract output dataset from a DDL hint (CREATE TABLE / DROP / ALTER carry
 /// no source plan but do have target schema).
-///
-/// Phase E stub.
 pub fn extract_from_hint(
-    _hint: &LineageHint,
-    _lookup: &CatalogLookup,
+    hint: &LineageHint,
+    lookup: &CatalogLookup,
 ) -> (Vec<InputDataset>, Vec<OutputDataset>) {
-    (vec![], vec![])
+    match hint {
+        LineageHint::DdlSchema {
+            catalog,
+            schema,
+            table,
+            columns,
+        } => {
+            let namespace = lookup(catalog);
+            let schema_facet = SchemaFacet {
+                fields: columns
+                    .iter()
+                    .map(|(name, ty)| SchemaField {
+                        name: name.clone(),
+                        field_type: ty.clone(),
+                    })
+                    .collect(),
+            };
+            let output = OutputDataset {
+                namespace: namespace.clone(),
+                name: format!("{schema}.{table}"),
+                facets: DatasetFacets {
+                    schema: Some(schema_facet),
+                    dataSource: Some(DataSourceFacet {
+                        name: catalog.clone(),
+                        uri: namespace,
+                    }),
+                },
+                outputFacets: OutputDatasetFacets::default(),
+            };
+            (vec![], vec![output])
+        }
+    }
 }
