@@ -6,7 +6,9 @@
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::{Column, TableReference};
 use datafusion::datasource::{provider_as_source, MemTable};
-use datafusion::logical_expr::{col, lit, Expr, JoinType, LogicalPlan, LogicalPlanBuilder};
+use datafusion::logical_expr::{
+    col, lit, Expr, ExprFunctionExt, JoinType, LogicalPlan, LogicalPlanBuilder,
+};
 use sqe_lineage::extract::columns;
 use std::sync::Arc;
 
@@ -433,6 +435,126 @@ fn distinct_passes_through() {
     assert_eq!(trace.len(), 2);
     assert_eq!(trace[0][0].transformation.subtype, "IDENTITY");
     assert_eq!(trace[1][0].transformation.subtype, "IDENTITY");
+}
+
+#[test]
+fn window_args_direct_partition_indirect() {
+    use datafusion::functions_window::expr_fn::row_number;
+
+    let plan = build_simple_scan(
+        "polaris",
+        "events",
+        "logins",
+        &[
+            ("user_id", DataType::Int64),
+            ("ts", DataType::Int64),
+            ("amount", DataType::Float64),
+        ],
+    );
+
+    let win = row_number()
+        .partition_by(vec![col("user_id")])
+        .order_by(vec![col("ts").sort(true, false)])
+        .build()
+        .unwrap()
+        .alias("rn");
+
+    let plan = LogicalPlanBuilder::from(plan)
+        .window(vec![win])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let trace = columns::trace_plan(&plan);
+    // Output schema is input + window_expr columns: user_id, ts, amount, rn
+    assert_eq!(trace.len(), 4);
+
+    // Inputs (positions 0..3) pass through with IDENTITY
+    for (idx, deps) in trace.iter().enumerate().take(3) {
+        let identity = deps
+            .iter()
+            .find(|d| d.transformation.subtype == "IDENTITY")
+            .unwrap_or_else(|| panic!("input column {idx} keeps IDENTITY"));
+        assert_eq!(identity.transformation.kind, "DIRECT");
+
+        // Each input also picks up an INDIRECT/WINDOW dep on user_id
+        let win_dep = deps
+            .iter()
+            .find(|d| {
+                d.transformation.subtype == "WINDOW" && d.transformation.kind == "INDIRECT"
+            })
+            .unwrap_or_else(|| panic!("input column {idx} picks up INDIRECT/WINDOW"));
+        // The user_id and ts are both referenced by partition/order; at minimum
+        // the partition column must show up
+        let _ = win_dep;
+    }
+
+    // The collected INDIRECT/WINDOW deps over all inputs reference both
+    // user_id (partition) and ts (order_by)
+    let win_field_set: std::collections::HashSet<&str> = trace[0]
+        .iter()
+        .filter(|d| {
+            d.transformation.subtype == "WINDOW" && d.transformation.kind == "INDIRECT"
+        })
+        .map(|d| d.field.as_str())
+        .collect();
+    assert!(win_field_set.contains("user_id"));
+    assert!(win_field_set.contains("ts"));
+
+    // Output[3] is the window function result: DIRECT/WINDOW on its arg columns
+    // (row_number has no args, so the only deps come from partition/order_by);
+    // we still expect WINDOW deps and no IDENTITY deps for the new column.
+    let rn = &trace[3];
+    let rn_subtypes: std::collections::HashSet<&str> =
+        rn.iter().map(|d| d.transformation.subtype.as_str()).collect();
+    assert!(
+        rn_subtypes.contains("WINDOW"),
+        "row_number column has WINDOW deps"
+    );
+}
+
+#[test]
+fn window_with_args_marks_args_direct_window() {
+    use datafusion::functions_window::expr_fn::lag;
+
+    let plan = build_simple_scan(
+        "polaris",
+        "events",
+        "logins",
+        &[
+            ("user_id", DataType::Int64),
+            ("ts", DataType::Int64),
+            ("amount", DataType::Float64),
+        ],
+    );
+
+    // LAG(amount) OVER (PARTITION BY user_id ORDER BY ts)
+    let win = lag(col("amount"), None, None)
+        .partition_by(vec![col("user_id")])
+        .order_by(vec![col("ts").sort(true, false)])
+        .build()
+        .unwrap()
+        .alias("prev_amount");
+
+    let plan = LogicalPlanBuilder::from(plan)
+        .window(vec![win])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let trace = columns::trace_plan(&plan);
+    assert_eq!(trace.len(), 4);
+
+    // The window output column has a DIRECT/WINDOW dep on the arg `amount`
+    let direct_window = trace[3]
+        .iter()
+        .find(|d| {
+            d.transformation.subtype == "WINDOW"
+                && d.transformation.kind == "DIRECT"
+                && d.field == "amount"
+        })
+        .expect("prev_amount has DIRECT/WINDOW on `amount`");
+    let _ = direct_window;
 }
 
 #[test]

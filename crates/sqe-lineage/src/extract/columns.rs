@@ -8,7 +8,7 @@
 use crate::event::Transformation;
 use datafusion::common::Column;
 use datafusion::logical_expr::{
-    Aggregate, Expr, Join, LogicalPlan, Projection, Sort, TableScan, Union,
+    Aggregate, Expr, Join, LogicalPlan, Projection, Sort, TableScan, Union, Window,
 };
 use std::collections::HashSet;
 
@@ -357,6 +357,75 @@ fn trace_sort(s: &Sort, mut child_trace: ColumnTrace) -> ColumnTrace {
     child_trace
 }
 
+/// Window column trace rule (E10).
+///
+/// Output schema = input columns followed by window_expr columns. Each window
+/// output column gets DIRECT/WINDOW deps on its `args` columns and
+/// INDIRECT/WINDOW deps on partition_by + order_by columns. The same
+/// INDIRECT/WINDOW deps are also attached to every input column (consistent
+/// with Filter/Sort/Join rules: indirect deps reach all outputs).
+fn trace_window(w: &Window, mut child_trace: ColumnTrace) -> ColumnTrace {
+    let input = w.input.as_ref();
+
+    // Collect INDIRECT/WINDOW deps from every window expr's partition_by/order_by.
+    // Window expressions are typically aliased (`<fn>(...) OVER (...) AS name`),
+    // so strip the outer alias before matching the window-function shape.
+    let mut indirect_deps: Vec<ColumnDep> = Vec::new();
+    let indirect_t = indirect_window();
+    for expr in &w.window_expr {
+        if let Expr::WindowFunction(boxed) = unwrap_alias(expr) {
+            let params = &boxed.params;
+            for pb in &params.partition_by {
+                let refs = pb.column_refs();
+                indirect_deps.extend(deps_for_refs(
+                    &refs,
+                    input,
+                    &child_trace,
+                    &indirect_t,
+                ));
+            }
+            for ob in &params.order_by {
+                let refs = ob.expr.column_refs();
+                indirect_deps.extend(deps_for_refs(
+                    &refs,
+                    input,
+                    &child_trace,
+                    &indirect_t,
+                ));
+            }
+        }
+    }
+
+    // For each window expression, build its own output trace: DIRECT/WINDOW on
+    // arg columns + the same INDIRECT/WINDOW deps from partition_by/order_by.
+    // Compute these BEFORE mutating `child_trace` so the DIRECT/WINDOW deps don't
+    // pick up the INDIRECT/WINDOW entries we are about to append.
+    let mut win_traces: ColumnTrace = Vec::with_capacity(w.window_expr.len());
+    let direct_t = direct_window();
+    for expr in &w.window_expr {
+        let mut deps: Vec<ColumnDep> = Vec::new();
+        if let Expr::WindowFunction(boxed) = unwrap_alias(expr) {
+            for arg in &boxed.params.args {
+                let refs = arg.column_refs();
+                deps.extend(deps_for_refs(&refs, input, &child_trace, &direct_t));
+            }
+        }
+        deps.extend(indirect_deps.iter().cloned());
+        win_traces.push(deps);
+    }
+
+    // Attach INDIRECT/WINDOW deps to every existing (input) output column.
+    if !indirect_deps.is_empty() {
+        for col_trace in child_trace.iter_mut() {
+            col_trace.extend(indirect_deps.iter().cloned());
+        }
+    }
+
+    let mut out: ColumnTrace = child_trace;
+    out.extend(win_traces);
+    out
+}
+
 /// Walk a `LogicalPlan` bottom-up and emit per-output-column lineage
 /// (`ColumnTrace[i]` lists leaf-column deps for output column i).
 pub fn trace_plan(plan: &LogicalPlan) -> ColumnTrace {
@@ -384,7 +453,11 @@ pub fn trace_plan(plan: &LogicalPlan) -> ColumnTrace {
         LogicalPlan::Limit(l) => trace_plan(l.input.as_ref()),
         LogicalPlan::Distinct(d) => trace_plan(d.input().as_ref()),
         LogicalPlan::SubqueryAlias(s) => trace_plan(s.input.as_ref()),
-        // Unknown nodes -> empty trace. Subsequent E10 task fills in Window.
+        LogicalPlan::Window(w) => {
+            let child = trace_plan(w.input.as_ref());
+            trace_window(w, child)
+        }
+        // Unknown nodes -> empty trace.
         _ => Vec::new(),
     }
 }
