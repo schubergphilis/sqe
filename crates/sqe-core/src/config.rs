@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct SqeConfig {
@@ -1003,6 +1003,8 @@ pub struct MetricsConfig {
     /// Set to 1.0 to trace all queries (expensive). Set to 0.0 to disable tracing.
     #[serde(default = "default_trace_sample_rate")]
     pub trace_sample_rate: f64,
+    #[serde(default)]
+    pub openlineage: OpenLineageConfig,
 }
 
 fn default_trace_sample_rate() -> f64 {
@@ -1016,8 +1018,121 @@ impl Default for MetricsConfig {
             otlp_endpoint: String::new(),
             audit_log_path: String::new(),
             trace_sample_rate: default_trace_sample_rate(),
+            openlineage: OpenLineageConfig::default(),
         }
     }
+}
+
+/// OpenLineage emitter configuration.
+///
+/// Controls whether SQE emits OpenLineage events for executed statements
+/// and where those events are delivered (file sink, HTTP endpoint, or both).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OpenLineageConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ol_job_namespace")]
+    pub job_namespace: String,
+    #[serde(default)]
+    pub producer: String,
+    #[serde(default)]
+    pub emit_selects: bool,
+    #[serde(default)]
+    pub file_path: String,
+    #[serde(default)]
+    pub http_endpoint: String,
+    #[serde(default = "default_ol_auth_mode")]
+    pub auth_mode: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_ol_http_timeout")]
+    pub http_timeout_ms: u64,
+    #[serde(default = "default_ol_http_retry")]
+    pub http_retry_attempts: u32,
+    #[serde(default)]
+    pub spool_path: String,
+    #[serde(default = "default_ol_spool_cap")]
+    pub spool_max_bytes: u64,
+    #[serde(default = "default_ol_replay_secs")]
+    pub replay_interval_secs: u64,
+    #[serde(default = "default_ol_channel_cap")]
+    pub channel_capacity: usize,
+}
+
+impl Default for OpenLineageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            job_namespace: default_ol_job_namespace(),
+            producer: String::new(),
+            emit_selects: false,
+            file_path: String::new(),
+            http_endpoint: String::new(),
+            auth_mode: default_ol_auth_mode(),
+            api_key: String::new(),
+            http_timeout_ms: default_ol_http_timeout(),
+            http_retry_attempts: default_ol_http_retry(),
+            spool_path: String::new(),
+            spool_max_bytes: default_ol_spool_cap(),
+            replay_interval_secs: default_ol_replay_secs(),
+            channel_capacity: default_ol_channel_cap(),
+        }
+    }
+}
+
+impl OpenLineageConfig {
+    /// Validate that the OpenLineage configuration is internally consistent.
+    ///
+    /// Rules:
+    /// - When enabled, at least one sink (file_path or http_endpoint) must be set.
+    /// - `auth_mode = "bearer"` requires `api_key` to be set.
+    /// - `spool_path` only makes sense when `http_endpoint` is set (the spool
+    ///   buffers events that fail to deliver over HTTP).
+    /// - When enabled, `spool_max_bytes` must be at least 1 MiB so the spool
+    ///   has room for at least a few events.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.enabled && self.file_path.is_empty() && self.http_endpoint.is_empty() {
+            return Err(
+                "openlineage.enabled requires at least one of file_path or http_endpoint".into(),
+            );
+        }
+        if self.auth_mode == "bearer" && self.api_key.is_empty() {
+            return Err(
+                "openlineage.auth_mode = \"bearer\" requires api_key to be set".into(),
+            );
+        }
+        if !self.spool_path.is_empty() && self.http_endpoint.is_empty() {
+            return Err(
+                "openlineage.spool_path requires http_endpoint to be set".into(),
+            );
+        }
+        if self.enabled && self.spool_max_bytes < 1024 * 1024 {
+            return Err("openlineage.spool_max_bytes must be at least 1 MiB".into());
+        }
+        Ok(())
+    }
+}
+
+fn default_ol_job_namespace() -> String {
+    "sqe".into()
+}
+fn default_ol_auth_mode() -> String {
+    "none".into()
+}
+fn default_ol_http_timeout() -> u64 {
+    5000
+}
+fn default_ol_http_retry() -> u32 {
+    1
+}
+fn default_ol_spool_cap() -> u64 {
+    100 * 1024 * 1024
+}
+fn default_ol_replay_secs() -> u64 {
+    30
+}
+fn default_ol_channel_cap() -> usize {
+    10_000
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1369,6 +1484,64 @@ impl SqeConfig {
         env_override_u16("SQE_METRICS__PROMETHEUS_PORT", &mut self.metrics.prometheus_port);
         env_override_str("SQE_METRICS__OTLP_ENDPOINT", &mut self.metrics.otlp_endpoint);
         env_override_str("SQE_METRICS__AUDIT_LOG_PATH", &mut self.metrics.audit_log_path);
+
+        // Metrics: OpenLineage
+        env_override_bool(
+            "SQE_METRICS__OPENLINEAGE__ENABLED",
+            &mut self.metrics.openlineage.enabled,
+        );
+        env_override_str(
+            "SQE_METRICS__OPENLINEAGE__JOB_NAMESPACE",
+            &mut self.metrics.openlineage.job_namespace,
+        );
+        env_override_str(
+            "SQE_METRICS__OPENLINEAGE__PRODUCER",
+            &mut self.metrics.openlineage.producer,
+        );
+        env_override_bool(
+            "SQE_METRICS__OPENLINEAGE__EMIT_SELECTS",
+            &mut self.metrics.openlineage.emit_selects,
+        );
+        env_override_str(
+            "SQE_METRICS__OPENLINEAGE__FILE_PATH",
+            &mut self.metrics.openlineage.file_path,
+        );
+        env_override_str(
+            "SQE_METRICS__OPENLINEAGE__HTTP_ENDPOINT",
+            &mut self.metrics.openlineage.http_endpoint,
+        );
+        env_override_str(
+            "SQE_METRICS__OPENLINEAGE__AUTH_MODE",
+            &mut self.metrics.openlineage.auth_mode,
+        );
+        env_override_str(
+            "SQE_METRICS__OPENLINEAGE__API_KEY",
+            &mut self.metrics.openlineage.api_key,
+        );
+        env_override_u64(
+            "SQE_METRICS__OPENLINEAGE__HTTP_TIMEOUT_MS",
+            &mut self.metrics.openlineage.http_timeout_ms,
+        );
+        env_override_u32(
+            "SQE_METRICS__OPENLINEAGE__HTTP_RETRY_ATTEMPTS",
+            &mut self.metrics.openlineage.http_retry_attempts,
+        );
+        env_override_str(
+            "SQE_METRICS__OPENLINEAGE__SPOOL_PATH",
+            &mut self.metrics.openlineage.spool_path,
+        );
+        env_override_u64(
+            "SQE_METRICS__OPENLINEAGE__SPOOL_MAX_BYTES",
+            &mut self.metrics.openlineage.spool_max_bytes,
+        );
+        env_override_u64(
+            "SQE_METRICS__OPENLINEAGE__REPLAY_INTERVAL_SECS",
+            &mut self.metrics.openlineage.replay_interval_secs,
+        );
+        env_override_usize(
+            "SQE_METRICS__OPENLINEAGE__CHANNEL_CAPACITY",
+            &mut self.metrics.openlineage.channel_capacity,
+        );
 
         // Rate limit
         env_override_bool("SQE_RATE_LIMIT__ENABLED", &mut self.rate_limit.enabled);
@@ -2315,5 +2488,140 @@ type = "aws"
         assert_eq!(config.persistence, "file");
         assert_eq!(config.persistence_path, "/var/data/sessions.json");
         assert_eq!(config.snapshot_interval_secs, 30);
+    }
+
+    // -----------------------------------------------------------------------
+    // OpenLineage config tests
+    // -----------------------------------------------------------------------
+
+    /// Minimal skeleton TOML (coordinator/auth/catalog blocks) so a full
+    /// `SqeConfig` deserialises in OpenLineage tests. Only `catalog.catalog_url`
+    /// is structurally required; everything else has serde defaults.
+    const OL_TEST_SKELETON: &str = r#"
+[coordinator]
+[auth]
+[catalog]
+catalog_url = "http://polaris.example/api/catalog"
+"#;
+
+    #[test]
+    fn openlineage_config_parses_from_toml() {
+        let body = r#"
+[metrics]
+prometheus_port = 9090
+otlp_endpoint = ""
+
+[metrics.openlineage]
+enabled = true
+job_namespace = "sqe-prod"
+emit_selects = true
+file_path = "/var/log/ol.jsonl"
+http_endpoint = "https://marquez.example/api/v1/lineage"
+auth_mode = "bearer"
+api_key = "secret"
+spool_path = "/var/spool/sqe-ol"
+spool_max_bytes = 209715200
+"#;
+        let toml = format!("{OL_TEST_SKELETON}{body}");
+        let cfg: SqeConfig = toml::from_str(&toml).unwrap();
+        let ol = &cfg.metrics.openlineage;
+        assert!(ol.enabled);
+        assert_eq!(ol.job_namespace, "sqe-prod");
+        assert!(ol.emit_selects);
+        assert_eq!(ol.spool_max_bytes, 209715200);
+    }
+
+    #[test]
+    fn openlineage_config_uses_defaults_when_omitted() {
+        let body = r#"
+[metrics]
+prometheus_port = 9090
+otlp_endpoint = ""
+"#;
+        let toml = format!("{OL_TEST_SKELETON}{body}");
+        let cfg: SqeConfig = toml::from_str(&toml).unwrap();
+        let ol = &cfg.metrics.openlineage;
+        assert!(!ol.enabled);
+        assert_eq!(ol.job_namespace, "sqe");
+        assert_eq!(ol.spool_max_bytes, 100 * 1024 * 1024);
+        assert_eq!(ol.channel_capacity, 10000);
+    }
+
+    #[test]
+    fn env_overrides_apply_to_openlineage() {
+        // Use unique env-var values per test scope to avoid cross-test leakage,
+        // and guard with the same lock pattern as other env-touching tests if
+        // any are added later. Set, override, assert, then clear.
+        std::env::set_var("SQE_METRICS__OPENLINEAGE__ENABLED", "true");
+        std::env::set_var("SQE_METRICS__OPENLINEAGE__SPOOL_MAX_BYTES", "999");
+        std::env::set_var("SQE_METRICS__OPENLINEAGE__CHANNEL_CAPACITY", "42");
+
+        let mut cfg = valid_config();
+        cfg.apply_env_overrides();
+
+        assert!(cfg.metrics.openlineage.enabled);
+        assert_eq!(cfg.metrics.openlineage.spool_max_bytes, 999);
+        assert_eq!(cfg.metrics.openlineage.channel_capacity, 42);
+
+        // Cleanup so other tests in this process aren't affected.
+        std::env::remove_var("SQE_METRICS__OPENLINEAGE__ENABLED");
+        std::env::remove_var("SQE_METRICS__OPENLINEAGE__SPOOL_MAX_BYTES");
+        std::env::remove_var("SQE_METRICS__OPENLINEAGE__CHANNEL_CAPACITY");
+    }
+
+    #[test]
+    fn validate_rejects_enabled_without_sinks() {
+        let cfg = OpenLineageConfig {
+            enabled: true,
+            ..OpenLineageConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("at least one of file_path or http_endpoint"));
+    }
+
+    #[test]
+    fn validate_rejects_bearer_without_api_key() {
+        let cfg = OpenLineageConfig {
+            enabled: true,
+            file_path: "/tmp/ol.jsonl".into(),
+            auth_mode: "bearer".into(),
+            ..OpenLineageConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("requires api_key"));
+    }
+
+    #[test]
+    fn validate_rejects_spool_without_http() {
+        let cfg = OpenLineageConfig {
+            enabled: true,
+            file_path: "/tmp/ol.jsonl".into(),
+            spool_path: "/tmp/spool".into(),
+            ..OpenLineageConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("spool_path requires http_endpoint"));
+    }
+
+    #[test]
+    fn validate_rejects_tiny_spool_cap() {
+        let cfg = OpenLineageConfig {
+            enabled: true,
+            file_path: "/tmp/ol.jsonl".into(),
+            spool_max_bytes: 1024, // 1 KiB, well under 1 MiB
+            ..OpenLineageConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("at least 1 MiB"));
+    }
+
+    #[test]
+    fn validate_passes_with_valid_config() {
+        let cfg = OpenLineageConfig {
+            enabled: true,
+            file_path: "/tmp/ol.jsonl".into(),
+            ..OpenLineageConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
     }
 }

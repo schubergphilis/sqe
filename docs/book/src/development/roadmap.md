@@ -20,11 +20,15 @@ gantt
     Phase 4 - Pluggable Auth     :done, p4, 2026-03, 2026-04
     Phase 4b - Streaming/Distributed :done, p4b, 2026-04, 2026-04
 
+    section Shipped
+    Phase 2c - dbt Compatibility :done, p2c, 2026-03, 2026-04
+    Phase 5 - Pluggable Catalogs :done, p5, 2026-04, 2026-05
+    Phase 7 - Iceberg V3         :done, p7, 2026-04, 2026-05
+    Phase 9 - OpenLineage        :done, p9, 2026-05, 2026-05
+
     section Next
-    Phase 5 - Pluggable Catalogs :active, p5, 2026-04, 2026-06
-    Phase 6 - Security Policies  :p6, 2026-06, 2026-08
-    Phase 7 - dbt + Iceberg v3   :p7, 2026-07, 2026-09
-    Phase 8 - Trino Decommission :p8, 2026-09, 2026-11
+    Phase 6 - Security Policies  :p6, 2026-05, 2026-07
+    Phase 8 - Trino Decommission :p8, 2026-07, 2026-09
 ```
 
 ---
@@ -56,7 +60,7 @@ SQL write operations and catalog DDL.
 - OpenTelemetry export (OTLP/gRPC)
 - Trino-compatible HTTP endpoint
 
-## Phase 2c — dbt Compatibility (Active)
+## Phase 2c — dbt Compatibility (Done)
 
 Native dbt support via `dbt-sqe` adapter over ADBC Flight SQL.
 
@@ -64,12 +68,14 @@ Native dbt support via `dbt-sqe` adapter over ADBC Flight SQL.
 - `dbt-sqe` Python adapter (connection manager, materializations)
 - `ALTER TABLE RENAME`
 - dbt `table`, `view`, and append-only `incremental` materializations
+- `incremental` with `merge` strategy (CoW + MoR)
+- Adapter lives at `adapters/dbt-sqe/dbt/`
 
 ---
 
 ## Phase 3 — Row-Level Writes (Done)
 
-DELETE FROM, UPDATE, and MERGE INTO are implemented via Copy-on-Write using the [risingwavelabs/iceberg-rust](https://github.com/risingwavelabs/iceberg-rust) fork (rev `1978911ec4`), which provides `rewrite_files()` transaction support.
+DELETE FROM, UPDATE, and MERGE INTO are implemented via Copy-on-Write using the iceberg-rust fork vendored at `vendor/iceberg-rust/` (DF 53.1 + Arrow 58 rebase of `risingwavelabs/iceberg-rust`), which provides `rewrite_files()` transaction support.
 
 ### Strategy: Copy-on-Write
 
@@ -106,13 +112,13 @@ CoW rewrites affected data files entirely. MoR has shipped: set `TBLPROPERTIES (
 
 ### Iceberg Dependency
 
-Uses `risingwavelabs/iceberg-rust` fork (rev `1978911ec4`) for `rewrite_files()`. When upstream iceberg-rust ships `OverwriteAction` (tracked in Epic #2186), the dependency can be migrated back to the official crate.
+Uses the iceberg-rust fork vendored at `vendor/iceberg-rust/` for `rewrite_files()`. When upstream apache/iceberg-rust ships `OverwriteAction` (tracked in Epic #2186), the dependency can be migrated back to the official crate.
 
 ### SQE Changes
 
 | File | Change |
 |---|---|
-| `Cargo.toml` | Switched to risingwavelabs/iceberg-rust fork |
+| `Cargo.toml` | Vendored iceberg-rust fork (DF 53 + Arrow 58 rebase) at `vendor/iceberg-rust/` |
 | `crates/sqe-coordinator/src/delete_handler.rs` | DELETE FROM execution via CoW |
 | `crates/sqe-coordinator/src/update_handler.rs` | UPDATE execution via CoW |
 | `crates/sqe-coordinator/src/merge_handler.rs` | MERGE INTO execution via CoW |
@@ -121,39 +127,36 @@ Uses `risingwavelabs/iceberg-rust` fork (rev `1978911ec4`) for `rewrite_files()`
 
 ---
 
-## Phase 7 — Iceberg v3 & Fixes (Blocked)
+## Phase 7 — Iceberg V3 (Done)
 
-Upgrade to Iceberg table format v3 and address gaps found during Phase 2-3 usage. **Blocked:** iceberg-rust v3 format support not yet shipped; RisingWave fork pinned to 0.8.0/DF 52 for `rewrite_files()`. Track upstream apache/iceberg-rust for v3 and `OverwriteAction`.
+Iceberg V3 table format support landed end-to-end. The vendored fork at `vendor/iceberg-rust/` is rebased onto DataFusion 53.1 + Arrow 58 and carries V3 spec coverage. SQE Iceberg matrix score: 167/189 = 88.4% (per `docs/iceberg-matrix.md`).
 
-### Iceberg v3 Features
+### V3 Features Shipped
 
-| Feature | v2 | v3 | SQE Benefit |
-|---|---|---|---|
-| Multi-arg transforms | No | Yes | Better partitioning (e.g., `bucket(16, col)`) |
-| Default values | No | Yes | `ALTER TABLE ADD COLUMN ... DEFAULT` |
-| Row lineage | No | Yes | Track which operation produced each row |
-| Variant type | No | Yes | Semi-structured data without JSON strings |
-| Geo types | No | Yes | Spatial query support |
+| Feature | Status |
+|---|---|
+| Default values (`ALTER TABLE ADD COLUMN ... DEFAULT`) | Done |
+| Schema evolution (`ALTER TABLE ADD/DROP COLUMN`) | Done |
+| Nanosecond timestamps (`TIMESTAMP_NS`, `TIMESTAMPTZ_NS`) | Done |
+| Partition evolution | Done |
+| Equality deletes + position deletes (MoR) | Done |
 
-### Known Issues to Fix
+### V3 Features Still Blocked Upstream
 
-Based on Phase 2/2c usage, expected fixes include:
+| Feature | Blocker |
+|---|---|
+| Variant type | iceberg-rust [#2188](https://github.com/apache/iceberg-rust/pull/2188) not merged |
+| Geometry type | DataFusion UDT [#12644](https://github.com/apache/datafusion/issues/12644) |
+| Vector / Embedding type | Iceberg V3 vector spec not finalised |
+| Multi-arg partition transforms | Iceberg Java spec alignment in progress |
+| Row lineage | Deferred upstream |
 
-- **Metadata caching edge cases** — stale schema after `ALTER TABLE`
-- **Large result set streaming** — backpressure handling for Flight SQL `do_get`
-- **Error messages** — improve user-facing errors for catalog/auth failures
-- **Schema evolution** — `ALTER TABLE ADD COLUMN`, `ALTER TABLE DROP COLUMN`
-- **Partition pruning accuracy** — ensure all predicate types push down correctly
-- **Timestamp timezone handling** — Iceberg timestamptz vs DataFusion timestamp semantics
-- **Nested type support** — struct, list, map columns in reads and writes
+### Other Hardening
 
-### Deliverables
-
-- Bump iceberg-rust to version with v3 table format support
-- `ALTER TABLE ADD COLUMN` / `DROP COLUMN`
-- Fix metadata cache invalidation on DDL
-- Improve error messages and user experience
-- Address any issues found during dbt/MERGE testing
+- Metadata cache invalidation on DDL
+- Large result-set streaming (Flight SQL `do_get` back-pressure)
+- Error messages tuned for catalog and auth failures
+- Partition pruning across all predicate types
 
 ---
 
@@ -200,19 +203,21 @@ graph TB
 
 ---
 
-## Phase 5 — Pluggable Catalogs (Next)
+## Phase 5 — Pluggable Catalogs (Done)
 
-Replace the hard-coded Polaris REST catalog with a `CatalogBackend` trait.
+`CatalogBackend` trait replaced the hard-coded Polaris REST catalog. Seven catalog backends ship today:
 
-| Backend | Notes |
+| Backend | Status |
 |---|---|
-| `IcebergRestBackend` | Current default — Polaris, Lakeformation REST |
-| `AwsGlueBackend` | AWS SDK; IAM auth |
-| `NessieBackend` | Project Nessie REST API; branch/tag awareness |
-| `HiveMetastoreBackend` | Thrift HMS; legacy warehouse migration |
-| `StorageOnlyBackend` | Scan base path for metadata; no catalog server |
+| Iceberg REST (Polaris, Lakeformation) | Done — default |
+| AWS Glue | Done |
+| Nessie | Done |
+| Hive Metastore (Thrift) | Done |
+| AWS S3 Tables | Done |
+| Snowflake Horizon (REST-compatible) | Done |
+| JDBC | Done |
 
-Multi-cloud storage via `object_store`: S3 (+ endpoint override for R2/Ceph/Garage), Azure ADLS Gen2/Blob, GCS, local filesystem. Delta Lake support (`delta-rs`) as optional Cargo feature.
+Multi-cloud storage via `object_store`: S3 (+ endpoint override for R2, Ceph, Garage, MinIO), Azure ADLS Gen2/Blob, GCS, local filesystem. Engine-side session-manager wiring for Delta + remaining edge cases is the only deferred item; tracked in `nextsteps.md`.
 
 ---
 
@@ -229,7 +234,20 @@ Fine-grained access control via LogicalPlan rewriting.
 
 ---
 
-## Phase 7 — Performance & Reliability Testing (Planned)
+## Phase 9 — OpenLineage Emitter (Done)
+
+Coordinator-side OpenLineage 2-0-2 emitter with column-level lineage. Off by default; zero hot-path overhead when disabled.
+
+- `sqe-lineage` crate: event types, observer, emitter task, file/HTTP/spool sinks, multi-catalog dataset extractor, column-lineage trace rules across 11 LogicalPlan node types
+- `OpenLineageConfig` in `sqe-core` with TOML + env-var overrides + startup validation
+- Hooks in `QueryHandler::execute_statement` (START / COMPLETE / FAIL)
+- Documented at `docs/book/src/operations/openlineage.md`
+
+Deferrals (documented): mTLS, per-event user-OIDC bearer forwarding, MERGE per-branch column annotations, embedded CLI emit, DDL hint extraction.
+
+---
+
+## Phase 10 — Performance & Reliability Testing (Planned)
 
 Validate SQE is production-ready through systematic benchmarking and reliability testing.
 

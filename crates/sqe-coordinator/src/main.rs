@@ -270,6 +270,7 @@ async fn async_main() -> anyhow::Result<()> {
             query_tracker,
             query_cache,
             grant_backend,
+            None, // lineage observer — wired in a later phase
         )?
         .with_table_cache(table_cache)
         .with_session_manager(session_manager.clone()),

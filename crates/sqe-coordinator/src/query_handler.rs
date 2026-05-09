@@ -75,6 +75,11 @@ pub struct QueryHandler {
     credential_tracker: Option<Arc<CredentialRefreshTracker>>,
     metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
     audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
+    /// Optional OpenLineage observer. When set and the statement kind is
+    /// emit-eligible (see `should_emit`), `execute()` calls
+    /// `on_query_start` / `on_query_complete` / `on_query_fail` around the
+    /// dispatch.
+    lineage: Option<Arc<dyn sqe_lineage::LineageObserver>>,
     query_tracker: Arc<QueryTracker>,
     query_cache: Option<Arc<ResultCache>>,
     /// Semaphore limiting concurrent query execution.
@@ -106,6 +111,7 @@ impl QueryHandler {
         query_tracker: Arc<QueryTracker>,
         query_cache: Option<Arc<ResultCache>>,
         grant_backend: Option<Arc<dyn GrantBackend>>,
+        lineage: Option<Arc<dyn sqe_lineage::LineageObserver>>,
     ) -> sqe_core::Result<Self> {
         let catalog_ops = CatalogOps::new(config.clone());
         let mut write_handler = WriteHandler::new(config.clone());
@@ -153,6 +159,7 @@ impl QueryHandler {
             credential_tracker,
             metrics,
             audit,
+            lineage,
             query_tracker,
             query_cache,
             query_semaphore,
@@ -302,6 +309,9 @@ impl QueryHandler {
 
         // Generate a query ID for lifecycle tracking
         let query_id = uuid::Uuid::now_v7();
+        // Wall-clock start timestamp for OpenLineage. The Instant `start`
+        // already captured monotonic time but OL events need RFC3339 timestamps.
+        let ol_started_at = chrono::Utc::now();
         info!(
             query_id = %query_id,
             username = %session.user.username,
@@ -318,6 +328,28 @@ impl QueryHandler {
             session.user.roles.clone(),
         );
 
+        // OpenLineage: emit START event. The observer is sync and best-effort;
+        // failures inside the observer (full channel, etc.) increment a metric
+        // but do not affect query execution.
+        let ol_emit = self.lineage.is_some()
+            && should_emit(&kind, &self.config.metrics.openlineage);
+        if ol_emit {
+            if let Some(ref obs) = self.lineage {
+                obs.on_query_start(sqe_lineage::QueryStartCtx {
+                    run_id: query_id,
+                    job_namespace: self.config.metrics.openlineage.job_namespace.clone(),
+                    sql: sql.to_string(),
+                    user: sqe_lineage::UserCtx {
+                        username: session.user.username.clone(),
+                        bearer: Some(session.access_token.clone()),
+                    },
+                    session_id: session.id.clone(),
+                    started_at: ol_started_at,
+                    statement_kind: kind_name.clone(),
+                });
+            }
+        }
+
         // Check result cache for read queries (before execution)
         if let StatementKind::Query(_) = &kind {
             if let Some(ref cache) = self.query_cache {
@@ -328,6 +360,33 @@ impl QueryHandler {
                     if let Some(ref metrics) = self.metrics {
                         metrics.query_count.with_label_values(&["success", &kind_name]).inc();
                         metrics.rows_returned.inc_by(rows as f64);
+                    }
+                    // OpenLineage: cache hits still get a COMPLETE event so the
+                    // run shows up end-to-end. The plan field is None because
+                    // the post-policy plan was not re-derived on the fast path.
+                    if ol_emit {
+                        if let Some(ref obs) = self.lineage {
+                            let ol_ended_at = chrono::Utc::now();
+                            obs.on_query_complete(sqe_lineage::QueryCompleteCtx {
+                                run_id: query_id,
+                                job_namespace: self.config.metrics.openlineage.job_namespace.clone(),
+                                sql: sql.to_string(),
+                                user: sqe_lineage::UserCtx {
+                                    username: session.user.username.clone(),
+                                    bearer: Some(session.access_token.clone()),
+                                },
+                                session_id: session.id.clone(),
+                                started_at: ol_started_at,
+                                ended_at: ol_ended_at,
+                                duration: ol_ended_at
+                                    .signed_duration_since(ol_started_at)
+                                    .to_std()
+                                    .unwrap_or_default(),
+                                statement_kind: kind_name.clone(),
+                                rows_returned: rows,
+                                plan: None,
+                            });
+                        }
                     }
                     return Ok(cached.batches.clone());
                 }
@@ -342,9 +401,13 @@ impl QueryHandler {
         let timeout_duration = Duration::from_secs(timeout_secs);
 
         let plan_metrics = Arc::new(Mutex::new(PlanMetrics::default()));
+        // Slot for the lineage observer's plan capture. `execute_query`
+        // populates this after policy enforcement; non-Query branches leave
+        // it as None and the observer falls back to plan-less inputs/outputs.
+        let mut captured_plan: Option<sqe_lineage::PlanOrHint> = None;
         let execution_future = async {
             match &kind {
-                StatementKind::Query(_) => self.execute_query(session, sql, &query_id, &plan_metrics).await,
+                StatementKind::Query(_) => self.execute_query(session, sql, &query_id, &plan_metrics, &mut captured_plan).await,
 
                 StatementKind::ShowCatalogs => self.handle_show_catalogs(session).await,
 
@@ -481,7 +544,13 @@ impl QueryHandler {
                             let select_sql = format!("{query}");
                             let (ctx, _) = self.create_session_context(session).await?;
                             let result = self.write_handler
-                                .handle_ctas_streaming(session, stmt, &ctx, &select_sql)
+                                .handle_ctas_streaming(
+                                    session,
+                                    stmt,
+                                    &ctx,
+                                    &select_sql,
+                                    &mut captured_plan,
+                                )
                                 .await;
                             crate::session_context::invalidate_all_session_caches();
                             result
@@ -504,7 +573,13 @@ impl QueryHandler {
                             })?;
                         let (ctx, _) = self.create_session_context(session).await?;
                         self.write_handler
-                            .handle_insert_streaming(session, stmt, &ctx, &select_sql)
+                            .handle_insert_streaming(
+                                session,
+                                stmt,
+                                &ctx,
+                                &select_sql,
+                                &mut captured_plan,
+                            )
                             .await
                     } else {
                         Err(SqeError::Execution("Expected Insert statement".into()))
@@ -522,7 +597,13 @@ impl QueryHandler {
                     // matches prior behaviour; `merge-on-read` routes to position
                     // or equality deletes depending on declared primary key.
                     self.write_handler
-                        .handle_delete_dispatch(session, stmt, session_catalog, &ctx)
+                        .handle_delete_dispatch(
+                            session,
+                            stmt,
+                            session_catalog,
+                            &ctx,
+                            &mut captured_plan,
+                        )
                         .await
                 }
 
@@ -532,7 +613,13 @@ impl QueryHandler {
                     // matches prior behaviour; `merge-on-read` routes to the
                     // equality-delete path when the table has a declared PK.
                     self.write_handler
-                        .handle_update_dispatch(session, stmt, session_catalog, &ctx)
+                        .handle_update_dispatch(
+                            session,
+                            stmt,
+                            session_catalog,
+                            &ctx,
+                            &mut captured_plan,
+                        )
                         .await
                 }
 
@@ -564,7 +651,17 @@ impl QueryHandler {
                     let delete_kind = sqe_sql::parse_and_classify(&delete_sql)?;
                     if let StatementKind::Delete(delete_stmt) = delete_kind {
                         let (ctx, session_catalog) = self.create_session_context(session).await?;
-                        self.write_handler.handle_delete(session, &delete_stmt, session_catalog, &ctx).await
+                        // Route through dispatch so OL lineage capture covers
+                        // TRUNCATE the same way it covers a normal DELETE.
+                        self.write_handler
+                            .handle_delete_dispatch(
+                                session,
+                                &delete_stmt,
+                                session_catalog,
+                                &ctx,
+                                &mut captured_plan,
+                            )
+                            .await
                     } else {
                         Err(SqeError::Execution("Failed to rewrite TRUNCATE as DELETE".into()))
                     }
@@ -651,13 +748,32 @@ impl QueryHandler {
                         ));
                     };
                     let (ctx, session_catalog) = self.create_session_context(session).await?;
-                    let source_batches =
-                        self.execute_query(session, &source_sql, &query_id, &plan_metrics).await?;
+                    // Capture the MERGE source plan from `execute_query`. The
+                    // lineage for a MERGE event should describe the source's
+                    // TableScans as inputs and the target as the output, so
+                    // the write handler re-wraps this source plan as a
+                    // synthetic INSERT against the target.
+                    let mut merge_source_plan: Option<sqe_lineage::PlanOrHint> = None;
+                    let source_batches = self
+                        .execute_query(session, &source_sql, &query_id, &plan_metrics, &mut merge_source_plan)
+                        .await?;
+                    let merge_source_logical = match merge_source_plan {
+                        Some(sqe_lineage::PlanOrHint::Plan(p)) => Some(*p),
+                        _ => None,
+                    };
                     // Dispatch on `write.merge.mode` table property. Default CoW
                     // matches prior behaviour; `merge-on-read` routes to the
                     // equality-delete path when the target has a declared PK.
                     self.write_handler
-                        .handle_merge_dispatch(session, stmt, source_batches, session_catalog, &ctx)
+                        .handle_merge_dispatch(
+                            session,
+                            stmt,
+                            source_batches,
+                            session_catalog,
+                            &ctx,
+                            merge_source_logical,
+                            &mut captured_plan,
+                        )
                         .await
                 }
             }
@@ -784,6 +900,58 @@ impl QueryHandler {
             // when streaming is wired in it will reflect true first-row latency.
             if status == "success" && rows > 0 {
                 metrics.time_to_first_row.observe(duration.as_secs_f64());
+            }
+        }
+
+        // OpenLineage: emit COMPLETE on success or FAIL on error. The
+        // captured plan (Some when execute_query ran; None for DDL/DML branches
+        // that did not populate it) flows into the observer so the lineage
+        // extractor can build inputs/outputs/columnLineage facets.
+        if ol_emit {
+            if let Some(ref obs) = self.lineage {
+                let ol_ended_at = chrono::Utc::now();
+                let ol_duration = ol_ended_at
+                    .signed_duration_since(ol_started_at)
+                    .to_std()
+                    .unwrap_or_default();
+                match &result {
+                    Ok(_) => {
+                        obs.on_query_complete(sqe_lineage::QueryCompleteCtx {
+                            run_id: query_id,
+                            job_namespace: self.config.metrics.openlineage.job_namespace.clone(),
+                            sql: sql.to_string(),
+                            user: sqe_lineage::UserCtx {
+                                username: session.user.username.clone(),
+                                bearer: Some(session.access_token.clone()),
+                            },
+                            session_id: session.id.clone(),
+                            started_at: ol_started_at,
+                            ended_at: ol_ended_at,
+                            duration: ol_duration,
+                            statement_kind: kind_name.clone(),
+                            rows_returned: rows,
+                            plan: captured_plan.take(),
+                        });
+                    }
+                    Err(e) => {
+                        obs.on_query_fail(sqe_lineage::QueryFailCtx {
+                            run_id: query_id,
+                            job_namespace: self.config.metrics.openlineage.job_namespace.clone(),
+                            sql: sql.to_string(),
+                            user: sqe_lineage::UserCtx {
+                                username: session.user.username.clone(),
+                                bearer: Some(session.access_token.clone()),
+                            },
+                            session_id: session.id.clone(),
+                            started_at: ol_started_at,
+                            ended_at: ol_ended_at,
+                            duration: ol_duration,
+                            statement_kind: kind_name.clone(),
+                            error_message: e.to_string(),
+                            plan: captured_plan.take(),
+                        });
+                    }
+                }
             }
         }
 
@@ -1129,13 +1297,20 @@ impl QueryHandler {
     /// distribute the scan work across available workers via [`try_distribute`].
     /// If distribution is not possible (single-node mode, no healthy workers,
     /// too few files, or complex multi-table plans), the query executes locally.
-    #[tracing::instrument(skip(self, session, sql, query_id, plan_metrics), fields(username = %session.user.username))]
+    ///
+    /// `plan_out` is an out-parameter that, when present, receives the
+    /// post-policy logical plan as a [`sqe_lineage::PlanOrHint::Plan`] so the
+    /// caller can pass it to the OpenLineage observer's complete/fail hook.
+    /// Plan capture happens after policy enforcement so the emitted lineage
+    /// reflects the user's *enforced* view, not the raw user query.
+    #[tracing::instrument(skip(self, session, sql, query_id, plan_metrics, plan_out), fields(username = %session.user.username))]
     async fn execute_query(
         &self,
         session: &Session,
         sql: &str,
         query_id: &uuid::Uuid,
         plan_metrics: &Arc<Mutex<PlanMetrics>>,
+        plan_out: &mut Option<sqe_lineage::PlanOrHint>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
 
@@ -1172,6 +1347,11 @@ impl QueryHandler {
             .await?;
 
         debug!("Policy-enforced plan: {:?}", enforced_plan);
+
+        // Capture the enforced plan for OpenLineage extraction. Cloning into
+        // a Box keeps the lineage path independent of DataFusion's
+        // execute_logical_plan consumption pattern below.
+        *plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(enforced_plan.clone())));
 
         // Create a new DataFrame from the enforced plan
         let enforced_df = ctx
@@ -3351,6 +3531,23 @@ fn extract_otel_table_info(kind: &StatementKind) -> Option<(Option<String>, Opti
     }
 }
 
+/// Decide whether a statement should produce OpenLineage events.
+///
+/// - SELECT (`Query`): opt-in via `cfg.emit_selects` -- read-only queries
+///   are noisy and lineage tools rarely need them.
+/// - Maintenance procedures (`Procedure`): never emit. CALL system.optimize,
+///   expire_snapshots, etc. mutate snapshot history but produce no
+///   user-visible inputs/outputs that matter to lineage.
+/// - Everything else (DML writes, DDL, SHOW commands, transactions, USE,
+///   GRANT/REVOKE): always emit. Sinks decide what to do with metadata events.
+fn should_emit(kind: &StatementKind, cfg: &sqe_core::config::OpenLineageConfig) -> bool {
+    match kind {
+        StatementKind::Query(_) => cfg.emit_selects,
+        StatementKind::Procedure(_) => false,
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3590,5 +3787,49 @@ mod tests {
             result.is_err(),
             "DENY should not parse as valid SQL in sqlparser 0.54"
         );
+    }
+
+    // ── should_emit (OpenLineage gating) tests ─────────────────────────
+
+    fn ol_cfg(emit_selects: bool) -> sqe_core::config::OpenLineageConfig {
+        sqe_core::config::OpenLineageConfig {
+            emit_selects,
+            ..sqe_core::config::OpenLineageConfig::default()
+        }
+    }
+
+    #[test]
+    fn should_emit_select_respects_emit_selects_flag() {
+        let kind = parse_and_classify("SELECT 1").expect("parse SELECT");
+        assert!(matches!(kind, StatementKind::Query(_)));
+        assert!(!should_emit(&kind, &ol_cfg(false)));
+        assert!(should_emit(&kind, &ol_cfg(true)));
+    }
+
+    #[test]
+    fn should_emit_maintenance_procedure_never_emits() {
+        // CALL system.rewrite_data_files is classified as Procedure, the
+        // maintenance variant. Lineage events for snapshot rewrites add
+        // noise without a meaningful input/output set.
+        let kind = parse_and_classify("CALL system.rewrite_data_files(table => 'ns.t')")
+            .expect("parse CALL");
+        assert!(matches!(kind, StatementKind::Procedure(_)));
+        assert!(!should_emit(&kind, &ol_cfg(false)));
+        assert!(!should_emit(&kind, &ol_cfg(true)));
+    }
+
+    #[test]
+    fn should_emit_dml_always_emits_regardless_of_emit_selects() {
+        let kind = parse_and_classify("INSERT INTO t VALUES (1)").expect("parse INSERT");
+        assert!(matches!(kind, StatementKind::Insert(_)));
+        assert!(should_emit(&kind, &ol_cfg(false)));
+        assert!(should_emit(&kind, &ol_cfg(true)));
+    }
+
+    #[test]
+    fn should_emit_ddl_always_emits() {
+        let kind = parse_and_classify("CREATE TABLE t (id INT)").expect("parse CREATE TABLE");
+        assert!(matches!(kind, StatementKind::CreateTable(_)));
+        assert!(should_emit(&kind, &ol_cfg(false)));
     }
 }

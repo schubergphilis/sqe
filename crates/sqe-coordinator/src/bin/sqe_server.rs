@@ -561,6 +561,11 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         _ => None,
     };
 
+    // OpenLineage observer (optional). When [metrics.openlineage] enabled = true,
+    // build the configured sinks (file and/or HTTP+spool), spawn the emitter task,
+    // and hand back a ChannelObserver wired to the bounded mpsc.
+    let lineage_obs = build_lineage_observer(&config)?;
+
     // Query handler
     let query_handler = Arc::new(
         QueryHandler::new(
@@ -582,6 +587,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             query_tracker,
             query_cache,
             grant_backend,
+            lineage_obs,
         )?
         .with_table_cache(table_cache)
         .with_session_manager(session_manager.clone()),
@@ -740,6 +746,152 @@ async fn run_worker(config: SqeConfig) -> anyhow::Result<()> {
 
     tracing::info!("SQE worker shut down");
     Ok(())
+}
+
+// ── OpenLineage observer construction ─────────────────────────
+
+/// Build the [`sqe_lineage::LineageObserver`] from `[metrics.openlineage]`.
+///
+/// Returns `None` when the section is disabled (the default). When enabled,
+/// validates the config, opens the configured sinks (file and/or HTTP, with
+/// optional disk spool wrapping HTTP), spawns the emitter background task,
+/// and returns a [`sqe_lineage::ChannelObserver`] wired to a bounded mpsc.
+///
+/// The emitter `JoinHandle` is intentionally dropped: the bounded mpsc keeps
+/// the task alive for the process lifetime, mirroring the SpoolSink replay
+/// task pattern.
+fn build_lineage_observer(
+    config: &SqeConfig,
+) -> anyhow::Result<Option<Arc<dyn sqe_lineage::LineageObserver>>> {
+    if !config.metrics.openlineage.enabled {
+        return Ok(None);
+    }
+
+    config
+        .metrics
+        .openlineage
+        .validate()
+        .map_err(|e| anyhow::anyhow!("openlineage config: {e}"))?;
+
+    let ol = &config.metrics.openlineage;
+
+    let mut sinks: Vec<Arc<dyn sqe_lineage::Sink>> = Vec::new();
+
+    // File sink
+    if !ol.file_path.is_empty() {
+        sinks.push(Arc::new(
+            sqe_lineage::sinks::file::FileSink::new(&ol.file_path)
+                .map_err(|e| anyhow::anyhow!("openlineage file sink: {e}"))?,
+        ));
+    }
+
+    // HTTP sink (optionally wrapped by SpoolSink)
+    if !ol.http_endpoint.is_empty() {
+        let auth = match ol.auth_mode.as_str() {
+            "none" => sqe_lineage::sinks::http::AuthMode::None,
+            "bearer" => sqe_lineage::sinks::http::AuthMode::Bearer(ol.api_key.clone()),
+            "user_token" => {
+                // Per-event user token requires per-event sink construction; for v1
+                // the emitter task uses the configured api_key as a fallback when
+                // auth_mode is user_token. The actual per-event token forwarding is
+                // wired in a future task; for now treat user_token like bearer.
+                tracing::warn!(
+                    "openlineage auth_mode=user_token not yet fully wired; \
+                     using static api_key as fallback"
+                );
+                sqe_lineage::sinks::http::AuthMode::Bearer(ol.api_key.clone())
+            }
+            other => {
+                return Err(anyhow::anyhow!(
+                    "openlineage auth_mode '{other}' is not recognised; \
+                     expected one of: none, bearer, user_token"
+                ));
+            }
+        };
+
+        let http = sqe_lineage::sinks::http::HttpSink::new(sqe_lineage::sinks::http::HttpConfig {
+            endpoint: ol.http_endpoint.clone(),
+            auth,
+            timeout_ms: ol.http_timeout_ms,
+            retry_attempts: ol.http_retry_attempts,
+        })
+        .map_err(|e| anyhow::anyhow!("openlineage http sink: {e}"))?;
+
+        let sink: Arc<dyn sqe_lineage::Sink> = if !ol.spool_path.is_empty() {
+            sqe_lineage::sinks::spool::SpoolSink::wrap(
+                Arc::new(http),
+                sqe_lineage::sinks::spool::SpoolConfig {
+                    path: std::path::PathBuf::from(&ol.spool_path),
+                    max_bytes: ol.spool_max_bytes,
+                    replay_interval: std::time::Duration::from_secs(ol.replay_interval_secs),
+                },
+            )
+        } else {
+            Arc::new(http)
+        };
+        sinks.push(sink);
+    }
+
+    let multi = Arc::new(sqe_lineage::MultiSink::new(sinks));
+
+    let (tx, rx) = tokio::sync::mpsc::channel(ol.channel_capacity);
+
+    // TODO: register dropped_events counter with prometheus_registry().
+    // Same pattern as MultiSink::errors in D1: registration is a follow-up.
+    // The counter increments in memory; it just won't appear on /metrics yet.
+    let drop_counter = prometheus::IntCounter::new(
+        "sqe_lineage_dropped_events_total",
+        "OL events dropped due to channel back-pressure",
+    )
+    .expect("static prometheus opts cannot fail");
+
+    // Build catalog lookup from flattened catalog config: name -> REST URL,
+    // with `sqe://<name>` fallback when no URL is configured.
+    let catalog_lookup_map: std::collections::HashMap<String, String> = config
+        .flattened_catalogs()
+        .iter()
+        .map(|(name, c)| (name.clone(), c.catalog_url.clone()))
+        .collect();
+    let catalog_lookup: sqe_lineage::extract::CatalogLookup =
+        Arc::new(move |name: &str| {
+            catalog_lookup_map
+                .get(name)
+                .cloned()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("sqe://{name}"))
+        });
+
+    let producer = if ol.producer.is_empty() {
+        format!("https://github.com/sbp/sqe/v{}", env!("CARGO_PKG_VERSION"))
+    } else {
+        ol.producer.clone()
+    };
+
+    let cfg = Arc::new(sqe_lineage::EmitterConfig {
+        job_namespace: ol.job_namespace.clone(),
+        producer,
+        catalog_lookup,
+    });
+
+    // Spawn the emitter background task. The JoinHandle is intentionally
+    // dropped: the bounded mpsc keeps the task alive for the process
+    // lifetime (the Sender lives in the ChannelObserver below; the
+    // Receiver lives in the spawned task).
+    sqe_lineage::spawn_emitter(rx, multi, cfg);
+
+    tracing::info!(
+        file_sink = !ol.file_path.is_empty(),
+        http_sink = !ol.http_endpoint.is_empty(),
+        spool = !ol.spool_path.is_empty(),
+        emit_selects = ol.emit_selects,
+        channel_capacity = ol.channel_capacity,
+        "OpenLineage emitter enabled"
+    );
+
+    Ok(Some(Arc::new(sqe_lineage::ChannelObserver::new(
+        tx,
+        drop_counter,
+    ))))
 }
 
 // ── External auth (OAuth2) construction ───────────────────────
