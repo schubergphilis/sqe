@@ -3359,6 +3359,24 @@ fn extract_otel_table_info(kind: &StatementKind) -> Option<(Option<String>, Opti
     }
 }
 
+/// Decide whether a statement should produce OpenLineage events.
+///
+/// - SELECT (`Query`): opt-in via `cfg.emit_selects` -- read-only queries
+///   are noisy and lineage tools rarely need them.
+/// - Maintenance procedures (`Procedure`): never emit. CALL system.optimize,
+///   expire_snapshots, etc. mutate snapshot history but produce no
+///   user-visible inputs/outputs that matter to lineage.
+/// - Everything else (DML writes, DDL, SHOW commands, transactions, USE,
+///   GRANT/REVOKE): always emit. Sinks decide what to do with metadata events.
+#[allow(dead_code)] // wired into execute() in G3
+fn should_emit(kind: &StatementKind, cfg: &sqe_core::config::OpenLineageConfig) -> bool {
+    match kind {
+        StatementKind::Query(_) => cfg.emit_selects,
+        StatementKind::Procedure(_) => false,
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3598,5 +3616,49 @@ mod tests {
             result.is_err(),
             "DENY should not parse as valid SQL in sqlparser 0.54"
         );
+    }
+
+    // ── should_emit (OpenLineage gating) tests ─────────────────────────
+
+    fn ol_cfg(emit_selects: bool) -> sqe_core::config::OpenLineageConfig {
+        sqe_core::config::OpenLineageConfig {
+            emit_selects,
+            ..sqe_core::config::OpenLineageConfig::default()
+        }
+    }
+
+    #[test]
+    fn should_emit_select_respects_emit_selects_flag() {
+        let kind = parse_and_classify("SELECT 1").expect("parse SELECT");
+        assert!(matches!(kind, StatementKind::Query(_)));
+        assert!(!should_emit(&kind, &ol_cfg(false)));
+        assert!(should_emit(&kind, &ol_cfg(true)));
+    }
+
+    #[test]
+    fn should_emit_maintenance_procedure_never_emits() {
+        // CALL system.rewrite_data_files is classified as Procedure, the
+        // maintenance variant. Lineage events for snapshot rewrites add
+        // noise without a meaningful input/output set.
+        let kind = parse_and_classify("CALL system.rewrite_data_files(table => 'ns.t')")
+            .expect("parse CALL");
+        assert!(matches!(kind, StatementKind::Procedure(_)));
+        assert!(!should_emit(&kind, &ol_cfg(false)));
+        assert!(!should_emit(&kind, &ol_cfg(true)));
+    }
+
+    #[test]
+    fn should_emit_dml_always_emits_regardless_of_emit_selects() {
+        let kind = parse_and_classify("INSERT INTO t VALUES (1)").expect("parse INSERT");
+        assert!(matches!(kind, StatementKind::Insert(_)));
+        assert!(should_emit(&kind, &ol_cfg(false)));
+        assert!(should_emit(&kind, &ol_cfg(true)));
+    }
+
+    #[test]
+    fn should_emit_ddl_always_emits() {
+        let kind = parse_and_classify("CREATE TABLE t (id INT)").expect("parse CREATE TABLE");
+        assert!(matches!(kind, StatementKind::CreateTable(_)));
+        assert!(should_emit(&kind, &ol_cfg(false)));
     }
 }
