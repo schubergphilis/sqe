@@ -264,6 +264,23 @@ impl std::fmt::Display for SqeErrorCode {
 /// Classify a [`SqeError::Catalog`] message into a specific error code.
 fn classify_catalog_error(msg: &str) -> SqeErrorCode {
     let lower = msg.to_lowercase();
+    // Auth failures from the catalog must be classified BEFORE the
+    // not-found / 404 branches. A 401 / 403 response from Polaris (or
+    // a circuit-breaker open after a wave of 401s) used to fall
+    // through to "table not found" because the iceberg-rust error
+    // text contained the word "found" elsewhere or because the
+    // breaker message was opaque. That sent users hunting for tables
+    // that exist when the actual cause was an Authorization header
+    // that did not reach the catalog. Surface the real cause.
+    if lower.contains("401")
+        || lower.contains("unauthorized")
+        || lower.contains("www-authenticate")
+    {
+        return SqeErrorCode::AuthenticationFailed;
+    }
+    if lower.contains("403") || lower.contains("forbidden") {
+        return SqeErrorCode::AccessDenied;
+    }
     if (lower.contains("not found") || lower.contains("http 404")) && lower.contains("view") {
         SqeErrorCode::ViewNotFound
     } else if (lower.contains("not found") || lower.contains("http 404"))
@@ -548,6 +565,51 @@ mod tests {
         let code = err.error_code();
         assert_eq!(code, SqeErrorCode::DuplicateTable);
         assert!(code.is_user_error());
+    }
+
+    #[test]
+    fn error_code_catalog_401_classifies_as_authentication_failed() {
+        // The exact error text dbt users were seeing while the bearer-drop
+        // race was active. Must NOT classify as TableNotFound.
+        let err = SqeError::Catalog(
+            "Failed to list namespaces: Unexpected, context: \
+             { status: 401 Unauthorized, headers: { www-authenticate: \"Bearer\" } }"
+                .into(),
+        );
+        let code = err.error_code();
+        assert_eq!(code, SqeErrorCode::AuthenticationFailed);
+        assert!(code.is_user_error());
+        assert_eq!(code.name(), "AUTHENTICATION_FAILED");
+    }
+
+    #[test]
+    fn error_code_catalog_403_classifies_as_access_denied() {
+        let err = SqeError::Catalog(
+            "Failed to load table: 403 Forbidden: principal not authorised".into(),
+        );
+        let code = err.error_code();
+        assert_eq!(code, SqeErrorCode::AccessDenied);
+        assert_eq!(code.name(), "ACCESS_DENIED");
+    }
+
+    #[test]
+    fn error_code_catalog_unauthorized_word_alone_classifies_as_auth() {
+        // Some catalogs (HMS, Glue) format the error without an HTTP code
+        // but still include "unauthorized" or "www-authenticate".
+        let err = SqeError::Catalog("AccessDenied: unauthorized request".into());
+        let code = err.error_code();
+        assert_eq!(code, SqeErrorCode::AuthenticationFailed);
+    }
+
+    #[test]
+    fn error_code_catalog_table_with_404_still_classifies_as_table_not_found() {
+        // Regression: the new auth-first branch must not steal genuine
+        // not-found errors that don't mention auth.
+        let err = SqeError::Catalog(
+            "Failed to load table: HTTP 404 Not Found: orders".into(),
+        );
+        let code = err.error_code();
+        assert_eq!(code, SqeErrorCode::TableNotFound);
     }
 
     #[test]
