@@ -2,6 +2,7 @@ use sqlparser::ast::{AlterTableOperation, ObjectType, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
+use crate::attach::{AttachStatement, CreateSecretStatement, DetachStatement, DropSecretStatement};
 use crate::ddl::{try_parse_ref_ddl, RefDdl};
 use crate::partition_evolution::{try_parse_partition_evolution, PartitionEvolution};
 use crate::procedures::{try_parse_call, ProcedureCall};
@@ -96,6 +97,21 @@ pub enum StatementKind {
     /// variant carries the pre-parsed `PartitionEvolution` and routes through
     /// a dedicated coordinator handler.
     PartitionEvolution(Box<PartitionEvolution>),
+    /// `ATTACH '<location>' AS <name> (TYPE <kind>, ...)` — register a new
+    /// Iceberg catalog at runtime. sqlparser-rs has no native AST for the
+    /// SQE/DuckDB option list, so this variant carries the pre-parsed
+    /// `AttachStatement` and routes through a dedicated coordinator handler.
+    Attach(Box<AttachStatement>),
+    /// `DETACH <name>` — unregister a runtime-attached catalog.
+    Detach(Box<DetachStatement>),
+    /// `CREATE SECRET <name> (TYPE <kind>, ...)` — store credentials in the
+    /// process-global in-memory secret store.
+    CreateSecret(Box<CreateSecretStatement>),
+    /// `DROP SECRET <name>` — remove a secret. Errors if any attached catalog
+    /// still references it.
+    DropSecret(Box<DropSecretStatement>),
+    /// `SHOW SECRETS` — list secret names and their kinds (never the values).
+    ShowSecrets,
 }
 
 impl StatementKind {
@@ -140,6 +156,11 @@ impl StatementKind {
             StatementKind::RefDdl(_) => "refddl",
             StatementKind::SetWriteBranch(_) => "setwritebranch",
             StatementKind::PartitionEvolution(_) => "partitionevolution",
+            StatementKind::Attach(_) => "attach",
+            StatementKind::Detach(_) => "detach",
+            StatementKind::CreateSecret(_) => "create_secret",
+            StatementKind::DropSecret(_) => "drop_secret",
+            StatementKind::ShowSecrets => "show_secrets",
         }
     }
 

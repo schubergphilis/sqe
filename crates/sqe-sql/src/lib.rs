@@ -1,3 +1,4 @@
+pub mod attach;
 pub mod catalog_qualifiers;
 pub mod classifier;
 pub mod ddl;
@@ -8,6 +9,10 @@ pub mod time_travel;
 pub mod trino_compat;
 pub mod v3_types;
 
+pub use attach::{
+    AttachStatement, CatalogKind, CreateSecretStatement, DetachStatement, DropSecretStatement,
+    OptionValue, SecretKind,
+};
 pub use catalog_qualifiers::extract_catalog_qualifiers;
 pub use classifier::{parse_and_classify, CheckAccessParams, ShowGrantsTarget, StatementKind};
 pub use ddl::{try_parse_ref_ddl, BranchRetention, RefDdl};
