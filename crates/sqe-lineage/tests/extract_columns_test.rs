@@ -636,6 +636,66 @@ fn extension_node_passes_through() {
 }
 
 #[test]
+fn dml_insert_source_plan_traces_inputs() {
+    // E12 regression sanity check: DataFusion 53.1 has no `Merge` LogicalPlan
+    // variant; MERGE is not represented as a single node. We verify the
+    // dataset-level path stays intact for INSERT by tracing the SELECT
+    // subplan of an `INSERT INTO ... SELECT id, amount FROM orders`.
+    use datafusion::logical_expr::dml::InsertOp;
+    use datafusion::logical_expr::col;
+
+    let scan = build_simple_scan(
+        "polaris",
+        "sales",
+        "orders",
+        &[("id", DataType::Int64), ("amount", DataType::Float64)],
+    );
+    let arrow_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("amount", DataType::Float64, false),
+    ]));
+    let mem = MemTable::try_new(arrow_schema, vec![vec![]]).unwrap();
+    let provider: Arc<dyn datafusion::catalog::TableProvider> = Arc::new(mem);
+    let target_ref = TableReference::full("polaris", "sales", "archive");
+
+    let select = LogicalPlanBuilder::from(scan)
+        .project(vec![col("id"), col("amount")])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let insert = LogicalPlanBuilder::insert_into(
+        select,
+        target_ref,
+        provider_as_source(provider),
+        InsertOp::Append,
+    )
+    .unwrap()
+    .build()
+    .unwrap();
+
+    // `trace_plan` itself currently returns an empty trace for `Dml` (E12 stub);
+    // the actual column lineage is recovered by tracing the source subplan,
+    // which is exactly what `extract_lineage` will do in E14.
+    if let LogicalPlan::Dml(stmt) = &insert {
+        let trace = columns::trace_plan(stmt.input.as_ref());
+        assert_eq!(trace.len(), 2);
+        assert_eq!(trace[0][0].field, "id");
+        assert_eq!(trace[0][0].transformation.subtype, "IDENTITY");
+        assert_eq!(trace[1][0].field, "amount");
+        assert_eq!(trace[1][0].transformation.subtype, "IDENTITY");
+    } else {
+        panic!("expected LogicalPlan::Dml");
+    }
+
+    // `trace_plan` on the Dml node itself returns an empty trace until E14
+    // wires `extract_lineage` to descend into the source subplan and project
+    // it onto the target schema.
+    let dml_trace = columns::trace_plan(&insert);
+    assert!(dml_trace.is_empty());
+}
+
+#[test]
 fn subquery_alias_passes_through() {
     let plan = build_simple_scan(
         "polaris",
