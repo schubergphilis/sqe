@@ -17,6 +17,7 @@ pub mod incremental_provider;
 pub mod incremental_scan;
 pub mod info_schema;
 pub mod late_materialize;
+pub mod mount;
 pub mod parquet_writer_config;
 pub mod pruning_stats;
 pub mod puffin_stats;
@@ -44,6 +45,7 @@ pub use catalog_provider::SqeCatalogProvider;
 pub use circuit_breaker::CircuitBreaker;
 pub use footer_cache::FooterCache;
 pub use iceberg_scan::IcebergScanExec;
+pub use mount::build_catalog;
 pub use rest_catalog::{SessionCatalog, TableMetadataCache};
 pub use iceberg_scan::coalesce_file_entries;
 pub use s3_io::{
