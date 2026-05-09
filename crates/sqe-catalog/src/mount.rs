@@ -55,7 +55,7 @@ pub async fn build_catalog(
         CatalogKind::IcebergRest => build_iceberg_rest(location, options, secrets).await,
         CatalogKind::Glue => build_glue(location, options, secrets).await,
         CatalogKind::S3Tables => build_s3tables(location, options, secrets).await,
-        CatalogKind::Hms => Err(error_not_yet("hms")),
+        CatalogKind::Hms => build_hms(location, options, secrets).await,
         CatalogKind::Jdbc => Err(error_not_yet("jdbc")),
         CatalogKind::Hadoop => Err(error_not_yet("hadoop")),
     };
@@ -483,4 +483,117 @@ async fn build_s3tables(
     _secrets: &SecretStore,
 ) -> Result<Arc<dyn iceberg::Catalog>, String> {
     Err("TYPE s3tables requires the `s3tables` cargo feature on sqe-catalog".to_string())
+}
+
+/// Build a Hive Metastore catalog (`iceberg_catalog_hms`).
+///
+/// `location` is the Thrift URL (`thrift://hms.example.com:9083`).
+/// Required: `WAREHOUSE`. Optional: `AUTH_MODE` (`none` | `kerberos`
+/// | `plain`); `SECRET <name>` referencing `Secret::Basic` is
+/// required when `AUTH_MODE = plain`.
+///
+/// The upstream `HmsCatalogBuilder` accepts the props but does not
+/// natively consume SASL/PLAIN credentials yet (tracked upstream).
+/// This builder validates the SQL contract: `AUTH_MODE = plain`
+/// without a Basic secret is a parse-time error so misconfiguration
+/// surfaces here rather than at first thrift call. Threading the
+/// resolved username/password into the upstream builder is a
+/// follow-up once iceberg-catalog-hms grows the corresponding
+/// props.
+#[cfg(feature = "hms")]
+async fn build_hms(
+    location: &str,
+    options: &BTreeMap<String, OptionValue>,
+    secrets: &SecretStore,
+) -> Result<Arc<dyn iceberg::Catalog>, String> {
+    use std::collections::HashMap;
+
+    use iceberg::CatalogBuilder;
+    use iceberg_catalog_hms::{
+        HMS_CATALOG_PROP_URI, HMS_CATALOG_PROP_WAREHOUSE, HmsCatalogBuilder,
+    };
+
+    let trimmed = location.trim();
+    if trimmed.is_empty() {
+        return Err("location must not be empty for TYPE hms".to_string());
+    }
+    // Spec form is `thrift://host:port`; the upstream builder
+    // expects a bare `host:port` socket address (it calls
+    // `to_socket_addrs()` directly). Strip the scheme so SQL users
+    // can write the natural URL form.
+    let address = trimmed.strip_prefix("thrift://").unwrap_or(trimmed);
+
+    let warehouse = options
+        .get("WAREHOUSE")
+        .and_then(OptionValue::as_str)
+        .ok_or_else(|| "option `WAREHOUSE` is required for TYPE hms".to_string())?;
+
+    // AUTH_MODE / SECRET validation. The upstream builder doesn't
+    // actually consume basic-auth creds today; we still enforce the
+    // SQL contract so users aren't surprised at first thrift call.
+    let auth_mode = options
+        .get("AUTH_MODE")
+        .and_then(OptionValue::as_str)
+        .unwrap_or("none")
+        .to_ascii_lowercase();
+    match auth_mode.as_str() {
+        "none" | "kerberos" => {
+            // Ignore SECRET in these modes; SECRET only makes sense
+            // for `plain`. We don't error to keep the option list
+            // forward-compatible.
+        }
+        "plain" => {
+            let secret_ref = options
+                .get("SECRET")
+                .and_then(OptionValue::as_secret_ref)
+                .ok_or_else(|| {
+                    "option `SECRET <name>` is required when `AUTH_MODE = plain` for TYPE hms"
+                        .to_string()
+                })?;
+            let secret = secrets.get(secret_ref)?;
+            match &secret {
+                Secret::Basic { .. } => {
+                    // Fields will be threaded through once the
+                    // upstream HMS builder grows SASL/PLAIN props.
+                    // TODO(spec §4.4): once iceberg-catalog-hms
+                    // accepts username/password props, plumb the
+                    // basic creds into the props HashMap here.
+                }
+                other => {
+                    return Err(format!(
+                        "secret '{secret_ref}' is type {} but TYPE hms with AUTH_MODE plain expects basic",
+                        other.type_name()
+                    ));
+                }
+            }
+        }
+        other => {
+            return Err(format!(
+                "AUTH_MODE '{other}' is not supported (expected one of: none, kerberos, plain)"
+            ));
+        }
+    }
+
+    let mut props: HashMap<String, String> = HashMap::new();
+    props.insert(HMS_CATALOG_PROP_URI.to_string(), address.to_string());
+    props.insert(
+        HMS_CATALOG_PROP_WAREHOUSE.to_string(),
+        warehouse.to_string(),
+    );
+
+    let catalog = HmsCatalogBuilder::default()
+        .load("sqe-attached-hms".to_string(), props)
+        .await
+        .map_err(|e| format!("Hive Metastore catalog open failed: {e}"))?;
+
+    Ok(Arc::new(catalog))
+}
+
+#[cfg(not(feature = "hms"))]
+async fn build_hms(
+    _location: &str,
+    _options: &BTreeMap<String, OptionValue>,
+    _secrets: &SecretStore,
+) -> Result<Arc<dyn iceberg::Catalog>, String> {
+    Err("TYPE hms requires the `hms` cargo feature on sqe-catalog".to_string())
 }
