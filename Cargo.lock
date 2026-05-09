@@ -6636,6 +6636,7 @@ dependencies = [
  "moka",
  "opentelemetry",
  "parquet",
+ "prometheus",
  "prost",
  "reqwest 0.12.28",
  "serde",

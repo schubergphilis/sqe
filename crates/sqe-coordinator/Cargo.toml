@@ -55,6 +55,7 @@ parquet = { workspace = true }
 sqe-metrics = { path = "../sqe-metrics" }
 sqe-trino-compat = { path = "../sqe-trino-compat" }
 sqe-lineage = { path = "../sqe-lineage" }
+prometheus = { workspace = true }
 chrono = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }
