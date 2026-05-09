@@ -2,7 +2,7 @@
 
 ## Summary
 
-Row-level write operations (MERGE INTO, DELETE FROM, UPDATE) are **implemented** for Iceberg tables via Copy-on-Write using the [risingwavelabs/iceberg-rust](https://github.com/risingwavelabs/iceberg-rust) fork (rev `1978911ec4`), which provides the `rewrite_files()` transaction API.
+Row-level write operations (MERGE INTO, DELETE FROM, UPDATE) are **implemented** for Iceberg tables via Copy-on-Write using the iceberg-rust fork vendored at `vendor/iceberg-rust/`, which provides the `rewrite_files()` transaction API. The fork tracks `risingwavelabs/iceberg-rust` and is rebased onto DataFusion 53.1 + Arrow 58 (see `docs/blog/2026-04-14-datafusion-53-and-the-iceberg-fork.md`).
 
 ## Motivation
 
@@ -32,7 +32,7 @@ SQE needed row-level mutations to be a viable Trino replacement:
 
 ### Iceberg Dependency
 
-Uses `risingwavelabs/iceberg-rust` fork (rev `1978911ec4`) for `rewrite_files()` transaction support. When upstream iceberg-rust ships `OverwriteAction` (tracked in Epic #2186), the dependency can be migrated back to the official crate.
+Uses the iceberg-rust fork vendored at `vendor/iceberg-rust/` (DF 53 + Arrow 58 rebase of `risingwavelabs/iceberg-rust`) for `rewrite_files()` transaction support. When upstream iceberg-rust ships `OverwriteAction` (tracked in Epic #2186), the dependency can be migrated back to the official crate.
 
 ### Future: Merge-on-Read
 
@@ -162,7 +162,7 @@ MERGE INTO target USING source ON condition
 
 | File | Change |
 |------|--------|
-| `Cargo.toml` | Switched to risingwavelabs/iceberg-rust fork (rev `1978911ec4`) |
+| `Cargo.toml` | Vendored iceberg-rust fork at `vendor/iceberg-rust/` (DF 53 + Arrow 58 rebase) |
 | `crates/sqe-coordinator/src/merge_handler.rs` | MERGE INTO execution via CoW |
 | `crates/sqe-coordinator/src/delete_handler.rs` | DELETE FROM execution via CoW |
 | `crates/sqe-coordinator/src/update_handler.rs` | UPDATE execution via CoW |

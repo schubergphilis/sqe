@@ -179,7 +179,7 @@ Full configuration reference: [docs/deployment.md](docs/deployment.md).
 |-----|------|
 | [Architecture](docs/architecture.md) | Mermaid diagrams: query pipeline, crate deps, caching, distributed |
 | [Deployment](docs/deployment.md) | Docker Compose, Kubernetes, TLS, auth providers, monitoring |
-| [Iceberg Matrix](docs/iceberg-matrix.md) | Per-cell SQE coverage on the public scoreboard (166/189, 87.8%) |
+| [Iceberg Matrix](docs/iceberg-matrix.md) | Per-cell SQE coverage on the public scoreboard (167/189, 88.4%) |
 | [Iceberg Matrix Comparison](docs/iceberg-matrix-compare.md) | V2/V3 side-by-side against 20 other engines |
 | [Trino Compatibility](docs/trino-compatibility.md) | SQL feature matrix vs Trino (~96% coverage) |
 | [DuckDB Comparison](docs/duckdb-comparision.md) | What SQE has that DuckDB lacks, and vice versa, with V8-V12 audit trail |
