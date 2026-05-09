@@ -54,6 +54,7 @@ iceberg = { workspace = true }
 parquet = { workspace = true }
 sqe-metrics = { path = "../sqe-metrics" }
 sqe-trino-compat = { path = "../sqe-trino-compat" }
+sqe-lineage = { path = "../sqe-lineage" }
 chrono = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }

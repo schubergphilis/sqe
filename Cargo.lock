@@ -6644,6 +6644,7 @@ dependencies = [
  "sqe-auth",
  "sqe-catalog",
  "sqe-core",
+ "sqe-lineage",
  "sqe-metrics",
  "sqe-planner",
  "sqe-policy",
