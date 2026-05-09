@@ -1,4 +1,6 @@
 pub mod access_control;
+#[cfg(any(feature = "glue", feature = "s3tables"))]
+pub mod aws_config;
 pub mod backends;
 pub mod circuit_breaker;
 pub mod grant_chameleon;
@@ -35,6 +37,8 @@ pub mod system_metadata;
 pub mod system_runtime;
 
 pub use access_control::AccessControlClient;
+#[cfg(any(feature = "glue", feature = "s3tables"))]
+pub use aws_config::build_aws_config;
 pub use catalog_provider::SqeCatalogProvider;
 pub use circuit_breaker::CircuitBreaker;
 pub use footer_cache::FooterCache;
