@@ -1412,6 +1412,64 @@ impl SqeConfig {
         env_override_str("SQE_METRICS__OTLP_ENDPOINT", &mut self.metrics.otlp_endpoint);
         env_override_str("SQE_METRICS__AUDIT_LOG_PATH", &mut self.metrics.audit_log_path);
 
+        // Metrics: OpenLineage
+        env_override_bool(
+            "SQE_METRICS__OPENLINEAGE__ENABLED",
+            &mut self.metrics.openlineage.enabled,
+        );
+        env_override_str(
+            "SQE_METRICS__OPENLINEAGE__JOB_NAMESPACE",
+            &mut self.metrics.openlineage.job_namespace,
+        );
+        env_override_str(
+            "SQE_METRICS__OPENLINEAGE__PRODUCER",
+            &mut self.metrics.openlineage.producer,
+        );
+        env_override_bool(
+            "SQE_METRICS__OPENLINEAGE__EMIT_SELECTS",
+            &mut self.metrics.openlineage.emit_selects,
+        );
+        env_override_str(
+            "SQE_METRICS__OPENLINEAGE__FILE_PATH",
+            &mut self.metrics.openlineage.file_path,
+        );
+        env_override_str(
+            "SQE_METRICS__OPENLINEAGE__HTTP_ENDPOINT",
+            &mut self.metrics.openlineage.http_endpoint,
+        );
+        env_override_str(
+            "SQE_METRICS__OPENLINEAGE__AUTH_MODE",
+            &mut self.metrics.openlineage.auth_mode,
+        );
+        env_override_str(
+            "SQE_METRICS__OPENLINEAGE__API_KEY",
+            &mut self.metrics.openlineage.api_key,
+        );
+        env_override_u64(
+            "SQE_METRICS__OPENLINEAGE__HTTP_TIMEOUT_MS",
+            &mut self.metrics.openlineage.http_timeout_ms,
+        );
+        env_override_u32(
+            "SQE_METRICS__OPENLINEAGE__HTTP_RETRY_ATTEMPTS",
+            &mut self.metrics.openlineage.http_retry_attempts,
+        );
+        env_override_str(
+            "SQE_METRICS__OPENLINEAGE__SPOOL_PATH",
+            &mut self.metrics.openlineage.spool_path,
+        );
+        env_override_u64(
+            "SQE_METRICS__OPENLINEAGE__SPOOL_MAX_BYTES",
+            &mut self.metrics.openlineage.spool_max_bytes,
+        );
+        env_override_u64(
+            "SQE_METRICS__OPENLINEAGE__REPLAY_INTERVAL_SECS",
+            &mut self.metrics.openlineage.replay_interval_secs,
+        );
+        env_override_usize(
+            "SQE_METRICS__OPENLINEAGE__CHANNEL_CAPACITY",
+            &mut self.metrics.openlineage.channel_capacity,
+        );
+
         // Rate limit
         env_override_bool("SQE_RATE_LIMIT__ENABLED", &mut self.rate_limit.enabled);
         env_override_u32("SQE_RATE_LIMIT__PER_USER_QUERIES_PER_MINUTE", &mut self.rate_limit.per_user_queries_per_minute);
@@ -2414,5 +2472,27 @@ otlp_endpoint = ""
         assert_eq!(ol.job_namespace, "sqe");
         assert_eq!(ol.spool_max_bytes, 100 * 1024 * 1024);
         assert_eq!(ol.channel_capacity, 10000);
+    }
+
+    #[test]
+    fn env_overrides_apply_to_openlineage() {
+        // Use unique env-var values per test scope to avoid cross-test leakage,
+        // and guard with the same lock pattern as other env-touching tests if
+        // any are added later. Set, override, assert, then clear.
+        std::env::set_var("SQE_METRICS__OPENLINEAGE__ENABLED", "true");
+        std::env::set_var("SQE_METRICS__OPENLINEAGE__SPOOL_MAX_BYTES", "999");
+        std::env::set_var("SQE_METRICS__OPENLINEAGE__CHANNEL_CAPACITY", "42");
+
+        let mut cfg = valid_config();
+        cfg.apply_env_overrides();
+
+        assert!(cfg.metrics.openlineage.enabled);
+        assert_eq!(cfg.metrics.openlineage.spool_max_bytes, 999);
+        assert_eq!(cfg.metrics.openlineage.channel_capacity, 42);
+
+        // Cleanup so other tests in this process aren't affected.
+        std::env::remove_var("SQE_METRICS__OPENLINEAGE__ENABLED");
+        std::env::remove_var("SQE_METRICS__OPENLINEAGE__SPOOL_MAX_BYTES");
+        std::env::remove_var("SQE_METRICS__OPENLINEAGE__CHANNEL_CAPACITY");
     }
 }
