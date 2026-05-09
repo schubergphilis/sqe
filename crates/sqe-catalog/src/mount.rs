@@ -54,7 +54,7 @@ pub async fn build_catalog(
         CatalogKind::Sqlite => build_sqlite(location, options).await,
         CatalogKind::IcebergRest => build_iceberg_rest(location, options, secrets).await,
         CatalogKind::Glue => build_glue(location, options, secrets).await,
-        CatalogKind::S3Tables => Err(error_not_yet("s3tables")),
+        CatalogKind::S3Tables => build_s3tables(location, options, secrets).await,
         CatalogKind::Hms => Err(error_not_yet("hms")),
         CatalogKind::Jdbc => Err(error_not_yet("jdbc")),
         CatalogKind::Hadoop => Err(error_not_yet("hadoop")),
@@ -395,4 +395,92 @@ async fn build_glue(
     _secrets: &SecretStore,
 ) -> Result<Arc<dyn iceberg::Catalog>, String> {
     Err("TYPE glue requires the `glue` cargo feature on sqe-catalog".to_string())
+}
+
+/// Build an AWS S3 Tables catalog (`iceberg_catalog_s3tables`).
+///
+/// `location` is the table-bucket ARN
+/// (`arn:aws:s3tables:<region>:<account>:bucket/<name>`) and goes
+/// into the `table_bucket_arn` prop. Optional: `SECRET <name>`,
+/// `REGION`, `ENDPOINT_URL` (LocalStack support).
+///
+/// The s3tables crate keeps its AWS prop name constants private to
+/// the module, so we use the matching string literals here. The
+/// upstream `create_sdk_config` reads these by name.
+#[cfg(feature = "s3tables")]
+async fn build_s3tables(
+    location: &str,
+    options: &BTreeMap<String, OptionValue>,
+    secrets: &SecretStore,
+) -> Result<Arc<dyn iceberg::Catalog>, String> {
+    use std::collections::HashMap;
+
+    use iceberg::CatalogBuilder;
+    use iceberg_catalog_s3tables::{
+        S3TABLES_CATALOG_PROP_ENDPOINT_URL, S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN,
+        S3TablesCatalogBuilder,
+    };
+
+    // String literals matching the s3tables crate's private utils
+    // constants. Kept here because the s3tables module does not
+    // re-export them (utils is `mod utils`, not `pub mod utils`).
+    const AWS_REGION_NAME: &str = "region_name";
+    const AWS_ACCESS_KEY_ID: &str = "aws_access_key_id";
+    const AWS_SECRET_ACCESS_KEY: &str = "aws_secret_access_key";
+    const AWS_SESSION_TOKEN: &str = "aws_session_token";
+    const AWS_PROFILE_NAME: &str = "profile_name";
+
+    let trimmed = location.trim();
+    if trimmed.is_empty() {
+        return Err("location must not be empty for TYPE s3tables".to_string());
+    }
+
+    let mut props: HashMap<String, String> = HashMap::new();
+    props.insert(
+        S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN.to_string(),
+        trimmed.to_string(),
+    );
+
+    if let Some(endpoint) = options.get("ENDPOINT_URL").and_then(OptionValue::as_str) {
+        props.insert(
+            S3TABLES_CATALOG_PROP_ENDPOINT_URL.to_string(),
+            endpoint.to_string(),
+        );
+    }
+
+    if let Some(aws) = aws_secret_to_props(options, secrets, "s3tables")? {
+        if let (Some(ak), Some(sk)) = (aws.access_key, aws.secret_key) {
+            props.insert(AWS_ACCESS_KEY_ID.to_string(), ak);
+            props.insert(AWS_SECRET_ACCESS_KEY.to_string(), sk);
+        }
+        if let Some(st) = aws.session_token {
+            props.insert(AWS_SESSION_TOKEN.to_string(), st);
+        }
+        if let Some(r) = aws.region {
+            props.insert(AWS_REGION_NAME.to_string(), r);
+        }
+        if let Some(p) = aws.profile {
+            props.insert(AWS_PROFILE_NAME.to_string(), p);
+        }
+    }
+
+    if let Some(r) = options.get("REGION").and_then(OptionValue::as_str) {
+        props.insert(AWS_REGION_NAME.to_string(), r.to_string());
+    }
+
+    let catalog = S3TablesCatalogBuilder::default()
+        .load("sqe-attached-s3tables".to_string(), props)
+        .await
+        .map_err(|e| format!("AWS S3 Tables catalog open failed: {e}"))?;
+
+    Ok(Arc::new(catalog))
+}
+
+#[cfg(not(feature = "s3tables"))]
+async fn build_s3tables(
+    _location: &str,
+    _options: &BTreeMap<String, OptionValue>,
+    _secrets: &SecretStore,
+) -> Result<Arc<dyn iceberg::Catalog>, String> {
+    Err("TYPE s3tables requires the `s3tables` cargo feature on sqe-catalog".to_string())
 }
