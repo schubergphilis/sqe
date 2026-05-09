@@ -45,7 +45,7 @@ For detailed Mermaid diagrams (query pipeline, crate dependencies, caching layer
 - **Protocols**: Arrow Flight SQL (primary) + Trino HTTP (compatibility)
 - **Auth**: Pluggable chain -- OIDC, bearer token, API key, mTLS, anonymous, AWS IAM, device code, token exchange
 - **Distributed**: Coordinator-worker architecture with shuffle, spill-to-disk, adaptive sort
-- **Observability**: OpenTelemetry, Prometheus, JSON audit log, `system.runtime.queries` virtual table
+- **Observability**: OpenTelemetry, Prometheus, JSON audit log, `system.runtime.queries` virtual table, OpenLineage 2-0-2 emitter (column-level lineage on writes; file + HTTP sinks with disk-spool fallback; off by default)
 - **Performance**: 5-layer caching, star-schema join reorder, dynamic filter pushdown, ZSTD compression
 - **Security**: 43/43 audit findings resolved. See [docs/issues.md](docs/issues.md)
 - **File-format TVFs**: `read_parquet`, `read_csv`, `read_json`, `read_delta` against local filesystem, S3, HTTPS, and HuggingFace `hf://` URLs. Quoted-string auto-detect: `SELECT * FROM '/data/sales.parquet'` and `SELECT * FROM 'hf://datasets/foo/bar/data.csv'` work without registering a table. Smart `read_csv` detects delimiter (`.tsv` -> tab, `.psv` -> pipe) and compression (`.csv.gz`, `.tsv.zst`) from the path.
@@ -134,6 +134,7 @@ BENCH_SCALE=1 ./scripts/benchmark-test.sh --compare-trino tpch tpcds ssb clickbe
 | `sqe-worker` | Stateless DataFusion executor |
 | `sqe-cli` | Interactive SQL client |
 | `sqe-metrics` | Prometheus, OpenTelemetry, audit logger |
+| `sqe-lineage` | OpenLineage 2-0-2 emitter; column-level lineage; file + HTTP sinks with disk-spool fallback |
 | `sqe-trino-compat` | Trino wire protocol |
 | `sqe-bench` | Benchmark suite (7 suites, 222 queries) |
 

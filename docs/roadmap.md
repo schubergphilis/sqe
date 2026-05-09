@@ -76,6 +76,7 @@
 - [x] Parallel + streaming TPC-H data generation (SF1000 in 6:23 on 32 cores)
 - [x] dbt adapter (dbt-sqe via ADBC Flight SQL)
 - [x] OpenTelemetry + Prometheus + JSON audit log + `system.runtime.queries` virtual table
+- [x] OpenLineage 2-0-2 emitter (`sqe-lineage` crate; column-level lineage on INSERT/CTAS/MERGE/UPDATE/DELETE/DDL; file + HTTP sinks; disk-spool fallback; off by default). See `docs/book/src/operations/openlineage.md`.
 - [x] OSS release preparation (Apache 2.0, CONTRIBUTING.md, docs)
 
 ## In Progress
