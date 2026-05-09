@@ -4,6 +4,9 @@ use std::sync::Arc;
 use arrow::compute::filter_record_batch;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
+use datafusion::common::TableReference;
+use datafusion::datasource::{provider_as_source, MemTable};
+use datafusion::logical_expr::{dml::InsertOp, LogicalPlan, LogicalPlanBuilder};
 use datafusion::prelude::SessionContext as DFSessionContext;
 use futures::{StreamExt, TryStreamExt};
 use iceberg::arrow::arrow_type_to_type;
@@ -48,6 +51,66 @@ fn affected_rows_batch(count: usize) -> Vec<RecordBatch> {
     }
 }
 
+/// Wrap a source SELECT `LogicalPlan` in a synthetic `LogicalPlan::Dml::Insert`
+/// targeting the given (catalog, namespace, table) tuple, so the OpenLineage
+/// extractor can produce both inputs (via the source's TableScans) and outputs
+/// (via the wrapper's table_name) plus column lineage.
+///
+/// The write path does not normally plan the full INSERT statement through
+/// DataFusion: it parses the SELECT, plans that, then streams batches to a
+/// Parquet writer and commits via Iceberg. The lineage extractor needs a
+/// write-shaped plan (`LogicalPlan::Dml`) to recognise an output dataset and
+/// fan out column lineage. We synthesise that wrapper here purely for lineage
+/// capture; the wrapper plan is never executed.
+///
+/// The target schema is derived from `source.schema()` so column-name
+/// alignment matches what the writer will persist (DataFusion's planner has
+/// already projected source columns to the target shape by ordinal — see
+/// design spec §5.3).
+fn build_lineage_insert_plan(
+    source: LogicalPlan,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+) -> sqe_core::Result<LogicalPlan> {
+    let arrow_schema: ArrowSchema = source.schema().as_arrow().clone();
+    let target_mem = MemTable::try_new(Arc::new(arrow_schema), vec![vec![]])
+        .map_err(|e| SqeError::Execution(format!("Failed to build lineage target stub: {e}")))?;
+    let target_provider: Arc<dyn datafusion::catalog::TableProvider> = Arc::new(target_mem);
+    let target_ref = TableReference::full(
+        catalog.to_string(),
+        namespace.to_string(),
+        table.to_string(),
+    );
+    LogicalPlanBuilder::insert_into(
+        source,
+        target_ref,
+        provider_as_source(target_provider),
+        InsertOp::Append,
+    )
+    .map_err(|e| SqeError::Execution(format!("Failed to build lineage INSERT wrapper: {e}")))?
+    .build()
+    .map_err(|e| SqeError::Execution(format!("Failed to build lineage plan: {e}")))
+}
+
+/// Resolve the (catalog, namespace, table) tuple used to label a write target
+/// in OL events. SQE's catalog name is whatever `resolve_default_catalog()`
+/// returns; the OL `catalog_lookup` falls back to `sqe://<name>` when the
+/// operator hasn't configured an explicit URL for it.
+fn lineage_target_parts(
+    config: &SqeConfig,
+    table_ident: &TableIdent,
+) -> (String, String, String) {
+    let catalog = config.resolve_default_catalog();
+    // `NamespaceIdent::Display` joins parts with a literal dot, which matches
+    // how the OL extractor parses `<catalog>.<schema>.<table>` (it splits on
+    // dots in `parse_table_ref`). `to_url_string` uses the unit separator
+    // and would be misread as a single-segment name.
+    let namespace = table_ident.namespace().to_string();
+    let table = table_ident.name().to_string();
+    (catalog, namespace, table)
+}
+
 /// Handles write operations: CTAS (CREATE TABLE AS SELECT) and INSERT INTO SELECT.
 ///
 /// Write handlers receive already-executed RecordBatches from the query pipeline
@@ -84,6 +147,51 @@ impl WriteHandler {
     /// Return the Parquet compression codec from config.
     fn compression(&self) -> parquet::basic::Compression {
         parse_parquet_compression(&self.config.catalog.parquet_compression)
+    }
+
+    /// Best-effort capture of a self-referential write plan (DELETE / UPDATE
+    /// against a single target). Plans `SELECT * FROM <target>`, wraps it in a
+    /// synthetic INSERT to the same target, and stores the wrapper in
+    /// `plan_out`. The wrapper is not executed; it exists purely so the OL
+    /// extractor can recognise inputs (the target's TableScan), the output
+    /// dataset, and identity column lineage between them.
+    ///
+    /// On any planning error this becomes a no-op: lineage capture must not
+    /// fail the write.
+    async fn capture_self_lineage(
+        &self,
+        ctx: &DFSessionContext,
+        table_ident: &TableIdent,
+        table_factor_name: &sqlparser::ast::ObjectName,
+        plan_out: &mut Option<sqe_lineage::PlanOrHint>,
+    ) {
+        let select_sql = format!("SELECT * FROM {table_factor_name}");
+        let df = match ctx.sql(&select_sql).await {
+            Ok(df) => df,
+            Err(e) => {
+                tracing::debug!(
+                    table = %table_ident,
+                    error = %e,
+                    "lineage capture: failed to plan self-scan; skipping"
+                );
+                return;
+            }
+        };
+        let source_plan = df.logical_plan().clone();
+        let (lin_catalog, lin_namespace, lin_table) =
+            lineage_target_parts(&self.config, table_ident);
+        match build_lineage_insert_plan(source_plan, &lin_catalog, &lin_namespace, &lin_table) {
+            Ok(wrapper) => {
+                *plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(wrapper)));
+            }
+            Err(e) => {
+                tracing::debug!(
+                    table = %table_ident,
+                    error = %e,
+                    "lineage capture: failed to build INSERT wrapper; skipping"
+                );
+            }
+        }
     }
 
     /// Emit a Puffin NDV sidecar for the most recent snapshot, if opted in.
@@ -315,13 +423,14 @@ impl WriteHandler {
     ///
     /// Peak memory is O(batch_size) instead of O(total_rows). Critical for large
     /// CTAS loads (SF1 lineorder, store_sales, etc.) that OOM with `df.collect()`.
-    #[instrument(skip(self, session, stmt, ctx, select_sql), fields(username = %session.user.username))]
+    #[instrument(skip(self, session, stmt, ctx, select_sql, plan_out), fields(username = %session.user.username))]
     pub async fn handle_ctas_streaming(
         &self,
         session: &Session,
         stmt: &Statement,
         ctx: &DFSessionContext,
         select_sql: &str,
+        plan_out: &mut Option<sqe_lineage::PlanOrHint>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let (table_name, _or_replace) = match stmt {
             Statement::CreateTable(ct) => {
@@ -378,6 +487,19 @@ impl WriteHandler {
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to load created table: {e}")))?;
 
+        // Capture the SELECT plan as a synthetic INSERT-into-target wrapper for
+        // OpenLineage extraction. The wrapper is never executed; it lets the
+        // extractor walk the source plan for inputs + column lineage and the
+        // wrapper for the output dataset.
+        let source_plan = df.logical_plan().clone();
+        let (lin_catalog, lin_namespace, lin_table) =
+            lineage_target_parts(&self.config, &table_ident);
+        if let Ok(wrapper) =
+            build_lineage_insert_plan(source_plan, &lin_catalog, &lin_namespace, &lin_table)
+        {
+            *plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(wrapper)));
+        }
+
         // Execute the SELECT and stream batches directly to the Parquet writer.
         let stream = df
             .execute_stream()
@@ -422,13 +544,14 @@ impl WriteHandler {
     ///
     /// Streams batches from the SELECT directly to the Parquet writer without
     /// buffering the full result set. Peak memory is O(batch_size).
-    #[instrument(skip(self, session, stmt, ctx, select_sql), fields(username = %session.user.username))]
+    #[instrument(skip(self, session, stmt, ctx, select_sql, plan_out), fields(username = %session.user.username))]
     pub async fn handle_insert_streaming(
         &self,
         session: &Session,
         stmt: &Statement,
         ctx: &DFSessionContext,
         select_sql: &str,
+        plan_out: &mut Option<sqe_lineage::PlanOrHint>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_name = match stmt {
             Statement::Insert(ins) => match &ins.table {
@@ -465,6 +588,19 @@ impl WriteHandler {
             .sql(select_sql)
             .await
             .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
+
+        // Capture the SELECT plan as a synthetic INSERT-into-target wrapper so
+        // OL extraction recovers inputs + outputs + column lineage. The
+        // wrapper is purely a lineage shape; the actual write goes through
+        // the streaming Parquet writer below.
+        let source_plan = df.logical_plan().clone();
+        let (lin_catalog, lin_namespace, lin_table) =
+            lineage_target_parts(&self.config, &table_ident);
+        if let Ok(wrapper) =
+            build_lineage_insert_plan(source_plan, &lin_catalog, &lin_namespace, &lin_table)
+        {
+            *plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(wrapper)));
+        }
 
         let stream = df
             .execute_stream()
@@ -1261,6 +1397,7 @@ impl WriteHandler {
         stmt: &Statement,
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
+        plan_out: &mut Option<sqe_lineage::PlanOrHint>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         // Peek at the target table to read its properties. Any parse or
         // load error falls through to the default CoW path, which surfaces
@@ -1285,6 +1422,14 @@ impl WriteHandler {
         let Ok(table) = catalog.load_table(&table_ident).await else {
             return self.handle_delete(session, stmt, catalog, ctx).await;
         };
+
+        // Capture lineage: a DELETE rewrites the target in place, so the
+        // OL plan is `target -> target` with identity column lineage. We
+        // synthesise this by planning `SELECT * FROM target` and wrapping
+        // it in a synthetic INSERT against the same target. Errors are
+        // swallowed because lineage capture is best-effort.
+        self.capture_self_lineage(ctx, &table_ident, table_factor_name, plan_out)
+            .await;
 
         let mode = resolve_delete_mode(table.metadata().properties())?;
 
@@ -1474,6 +1619,7 @@ impl WriteHandler {
         stmt: &Statement,
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
+        plan_out: &mut Option<sqe_lineage::PlanOrHint>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         // Peek at the target table to read its properties.
         let update_table = match stmt {
@@ -1491,6 +1637,12 @@ impl WriteHandler {
         let Ok(table) = catalog.load_table(&table_ident).await else {
             return self.handle_update(session, stmt, catalog, ctx).await;
         };
+
+        // Capture lineage: UPDATE rewrites target rows in place. v1 emits
+        // identity column lineage; richer per-column SET-expression tracing
+        // is deferred. See `capture_self_lineage` for details.
+        self.capture_self_lineage(ctx, &table_ident, table_factor_name, plan_out)
+            .await;
 
         let mode = resolve_update_mode(table.metadata().properties())?;
 
@@ -2124,6 +2276,7 @@ impl WriteHandler {
     /// - `merge-on-read`: route to `handle_merge_equality` when the table
     ///   declares a primary key. Without a PK we fall back to CoW because
     ///   the MATCHED clauses need old-row keys for the equality delete.
+    #[allow(clippy::too_many_arguments)]
     pub async fn handle_merge_dispatch(
         &self,
         session: &Session,
@@ -2131,6 +2284,8 @@ impl WriteHandler {
         source_batches: Vec<RecordBatch>,
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
+        source_plan: Option<LogicalPlan>,
+        plan_out: &mut Option<sqe_lineage::PlanOrHint>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         // Peek at the target table to read its properties.
         let merge_table = match stmt {
@@ -2160,6 +2315,34 @@ impl WriteHandler {
                 .handle_merge(session, stmt, source_batches, catalog, ctx)
                 .await;
         };
+
+        // Capture lineage. The MERGE source SELECT was already planned and
+        // executed by the caller. We re-wrap that source plan as a synthetic
+        // INSERT into the target so OL events carry inputs (the source's
+        // TableScans), output (the target), and identity column lineage.
+        // v1 emits identity transformations; per-clause MERGE_INSERT /
+        // MERGE_UPDATE annotation is deferred (spec §5.3 v1 limitation).
+        if let Some(src_plan) = source_plan {
+            let (lin_catalog, lin_namespace, lin_table) =
+                lineage_target_parts(&self.config, &table_ident);
+            match build_lineage_insert_plan(
+                src_plan,
+                &lin_catalog,
+                &lin_namespace,
+                &lin_table,
+            ) {
+                Ok(wrapper) => {
+                    *plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(wrapper)));
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        table = %table_ident,
+                        error = %e,
+                        "lineage capture: failed to build MERGE INSERT wrapper; skipping"
+                    );
+                }
+            }
+        }
 
         let mode = resolve_merge_mode(table.metadata().properties())?;
         match mode {

@@ -544,7 +544,13 @@ impl QueryHandler {
                             let select_sql = format!("{query}");
                             let (ctx, _) = self.create_session_context(session).await?;
                             let result = self.write_handler
-                                .handle_ctas_streaming(session, stmt, &ctx, &select_sql)
+                                .handle_ctas_streaming(
+                                    session,
+                                    stmt,
+                                    &ctx,
+                                    &select_sql,
+                                    &mut captured_plan,
+                                )
                                 .await;
                             crate::session_context::invalidate_all_session_caches();
                             result
@@ -567,7 +573,13 @@ impl QueryHandler {
                             })?;
                         let (ctx, _) = self.create_session_context(session).await?;
                         self.write_handler
-                            .handle_insert_streaming(session, stmt, &ctx, &select_sql)
+                            .handle_insert_streaming(
+                                session,
+                                stmt,
+                                &ctx,
+                                &select_sql,
+                                &mut captured_plan,
+                            )
                             .await
                     } else {
                         Err(SqeError::Execution("Expected Insert statement".into()))
@@ -585,7 +597,13 @@ impl QueryHandler {
                     // matches prior behaviour; `merge-on-read` routes to position
                     // or equality deletes depending on declared primary key.
                     self.write_handler
-                        .handle_delete_dispatch(session, stmt, session_catalog, &ctx)
+                        .handle_delete_dispatch(
+                            session,
+                            stmt,
+                            session_catalog,
+                            &ctx,
+                            &mut captured_plan,
+                        )
                         .await
                 }
 
@@ -595,7 +613,13 @@ impl QueryHandler {
                     // matches prior behaviour; `merge-on-read` routes to the
                     // equality-delete path when the table has a declared PK.
                     self.write_handler
-                        .handle_update_dispatch(session, stmt, session_catalog, &ctx)
+                        .handle_update_dispatch(
+                            session,
+                            stmt,
+                            session_catalog,
+                            &ctx,
+                            &mut captured_plan,
+                        )
                         .await
                 }
 
@@ -627,7 +651,17 @@ impl QueryHandler {
                     let delete_kind = sqe_sql::parse_and_classify(&delete_sql)?;
                     if let StatementKind::Delete(delete_stmt) = delete_kind {
                         let (ctx, session_catalog) = self.create_session_context(session).await?;
-                        self.write_handler.handle_delete(session, &delete_stmt, session_catalog, &ctx).await
+                        // Route through dispatch so OL lineage capture covers
+                        // TRUNCATE the same way it covers a normal DELETE.
+                        self.write_handler
+                            .handle_delete_dispatch(
+                                session,
+                                &delete_stmt,
+                                session_catalog,
+                                &ctx,
+                                &mut captured_plan,
+                            )
+                            .await
                     } else {
                         Err(SqeError::Execution("Failed to rewrite TRUNCATE as DELETE".into()))
                     }
@@ -714,19 +748,32 @@ impl QueryHandler {
                         ));
                     };
                     let (ctx, session_catalog) = self.create_session_context(session).await?;
-                    // The MERGE source SELECT produces its own logical plan,
-                    // but lineage for the MERGE statement should reflect the
-                    // *target* write, not the source. Discard the source plan
-                    // capture into a local sink so it does not overwrite any
-                    // hint we want to attach to the outer MERGE event.
-                    let mut _merge_source_plan: Option<sqe_lineage::PlanOrHint> = None;
-                    let source_batches =
-                        self.execute_query(session, &source_sql, &query_id, &plan_metrics, &mut _merge_source_plan).await?;
+                    // Capture the MERGE source plan from `execute_query`. The
+                    // lineage for a MERGE event should describe the source's
+                    // TableScans as inputs and the target as the output, so
+                    // the write handler re-wraps this source plan as a
+                    // synthetic INSERT against the target.
+                    let mut merge_source_plan: Option<sqe_lineage::PlanOrHint> = None;
+                    let source_batches = self
+                        .execute_query(session, &source_sql, &query_id, &plan_metrics, &mut merge_source_plan)
+                        .await?;
+                    let merge_source_logical = match merge_source_plan {
+                        Some(sqe_lineage::PlanOrHint::Plan(p)) => Some(*p),
+                        _ => None,
+                    };
                     // Dispatch on `write.merge.mode` table property. Default CoW
                     // matches prior behaviour; `merge-on-read` routes to the
                     // equality-delete path when the target has a declared PK.
                     self.write_handler
-                        .handle_merge_dispatch(session, stmt, source_batches, session_catalog, &ctx)
+                        .handle_merge_dispatch(
+                            session,
+                            stmt,
+                            source_batches,
+                            session_catalog,
+                            &ctx,
+                            merge_source_logical,
+                            &mut captured_plan,
+                        )
                         .await
                 }
             }
