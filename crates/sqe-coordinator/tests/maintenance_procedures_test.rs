@@ -178,7 +178,7 @@ async fn rewrite_data_files_actually_compacts_parquet() {
     let pre_files = handler
         .execute(
             &session,
-            &format!("SELECT COUNT(*) FROM table_files('default', 'maint_rewrite_compaction_test')"),
+            "SELECT COUNT(*) FROM table_files('default', 'maint_rewrite_compaction_test')",
         )
         .await
         .expect("table_files pre-rewrite");
@@ -247,7 +247,7 @@ async fn rewrite_data_files_actually_compacts_parquet() {
     let post_files = handler
         .execute(
             &session,
-            &format!("SELECT COUNT(*) FROM table_files('default', 'maint_rewrite_compaction_test')"),
+            "SELECT COUNT(*) FROM table_files('default', 'maint_rewrite_compaction_test')",
         )
         .await
         .expect("table_files post-rewrite");

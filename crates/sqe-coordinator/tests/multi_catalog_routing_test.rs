@@ -73,6 +73,8 @@ fn handler(config: SqeConfig) -> sqe_coordinator::QueryHandler {
         None,
         None,
         None,
+        sqe_coordinator::RuntimeCatalogRegistry::default(),
+        sqe_core::SecretStore::default(),
     )
     .expect("QueryHandler::new succeeds")
 }
