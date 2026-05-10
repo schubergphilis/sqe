@@ -506,7 +506,18 @@ impl SessionCatalog {
         let mut props = HashMap::new();
         // Set the bearer token; iceberg-rust's RestCatalog reads the "token" prop
         // and uses it in the Authorization: Bearer header.
-        props.insert("token".to_string(), bearer_token.to_string());
+        //
+        // Per `crates/sqe-auth/src/per_catalog.rs`, an empty bearer is the
+        // documented signal for "no Authorization header" (Anonymous / Aws
+        // catalogs, sessions before OIDC has issued a token). Inserting
+        // "token" -> "" makes iceberg-rust treat the catalog as authenticated
+        // with an empty bearer, which the recent defensive guard in
+        // `HttpClient::authenticate` correctly rejects, but only at request
+        // time. We refuse it here at construction time so the misconfiguration
+        // surfaces with a clearer call stack and never reaches the wire.
+        if !bearer_token.is_empty() {
+            props.insert("token".to_string(), bearer_token.to_string());
+        }
 
         // Set the REST catalog URI and warehouse
         props.insert("uri".to_string(), catalog_url.to_string());

@@ -55,6 +55,15 @@ pub(crate) struct HttpClient {
     /// bypassed and outgoing requests are signed with SigV4 instead.
     #[cfg(feature = "aws-sigv4")]
     sigv4_signer: Option<crate::sigv4::SigV4Signer>,
+    /// Whether this client was constructed with *any* form of
+    /// authentication (token, credential, or GCP service account).
+    /// When true, [`authenticate`] refuses to send a request with no
+    /// `Authorization` header even if the live token has been cleared
+    /// out from under it. This catches the regression in
+    /// <https://sbp.gitlab.schubergphilis.com/.../sqlengine/-/issues/2>
+    /// where some outbound REST calls were arriving at Polaris without
+    /// the bearer header under concurrency.
+    auth_required: bool,
 }
 
 impl Debug for HttpClient {
@@ -69,17 +78,28 @@ impl Debug for HttpClient {
 impl HttpClient {
     /// Create a new http client.
     pub fn new(cfg: &RestCatalogConfig) -> Result<Self> {
+        let token = cfg.token();
+        let credential = cfg.credential();
+        let gcp_credential = cfg.gcp_credential();
+        // Track whether the caller intends this client to be
+        // authenticated. Used by [`authenticate`] to refuse silent
+        // unauthenticated requests if the live token is later lost.
+        let auth_required =
+            token.as_deref().is_some_and(|t| !t.is_empty())
+                || credential.is_some()
+                || gcp_credential.is_some();
         Ok(HttpClient {
             client: cfg.client().unwrap_or_default(),
-            token: Mutex::new(cfg.token()),
+            token: Mutex::new(token),
             token_endpoint: cfg.get_token_endpoint(),
-            credential: cfg.credential(),
+            credential,
             extra_headers: cfg.extra_headers()?,
             extra_oauth_params: cfg.extra_oauth_params(),
             disable_header_redaction: cfg.disable_header_redaction(),
-            gcp_credential: cfg.gcp_credential(),
+            gcp_credential,
             #[cfg(feature = "aws-sigv4")]
             sigv4_signer: build_sigv4_signer(cfg),
+            auth_required,
         })
     }
 
@@ -93,15 +113,31 @@ impl HttpClient {
             .transpose()?
             .unwrap_or(self.extra_headers);
 
+        // Preserve the original auth-required flag across updates.
+        // The merge in [`RestCatalogConfig::merge_with_config`] folds
+        // in the server's `/v1/config` response; if a server-side
+        // override silently clobbers the user-supplied token (e.g.
+        // overrides "token" -> "" or omits it entirely while the user
+        // had one), the live `cfg` would resolve to no auth. Without
+        // this flag we'd construct a client that quietly drops the
+        // bearer on every outbound request and 401s downstream.
+        let merged_token = cfg.token().or_else(|| self.token.into_inner());
+        let merged_credential = cfg.credential().or(self.credential);
+        let merged_gcp = cfg.gcp_credential().or(self.gcp_credential);
+        let auth_required = self.auth_required
+            || merged_token.as_deref().is_some_and(|t| !t.is_empty())
+            || merged_credential.is_some()
+            || merged_gcp.is_some();
+
         Ok(HttpClient {
             client: cfg.client().unwrap_or(self.client),
-            token: Mutex::new(cfg.token().or_else(|| self.token.into_inner())),
+            token: Mutex::new(merged_token),
             token_endpoint: if !cfg.get_token_endpoint().is_empty() {
                 cfg.get_token_endpoint()
             } else {
                 self.token_endpoint
             },
-            credential: cfg.credential().or(self.credential),
+            credential: merged_credential,
             extra_headers,
             extra_oauth_params: if !cfg.extra_oauth_params().is_empty() {
                 cfg.extra_oauth_params()
@@ -109,7 +145,7 @@ impl HttpClient {
                 self.extra_oauth_params
             },
             disable_header_redaction: cfg.disable_header_redaction(),
-            gcp_credential: cfg.gcp_credential().or(self.gcp_credential),
+            gcp_credential: merged_gcp,
             // The user config doesn't carry SigV4 props on the first
             // pass; the AWS endpoint advertises them in its
             // `/v1/config` response, which lands here through
@@ -117,6 +153,7 @@ impl HttpClient {
             // the merged props.
             #[cfg(feature = "aws-sigv4")]
             sigv4_signer: build_sigv4_signer(cfg).or(self.sigv4_signer),
+            auth_required,
         })
     }
 
@@ -271,13 +308,32 @@ impl HttpClient {
         let token = self.token.lock().await.clone();
 
         if self.credential.is_none() && token.is_none() && self.gcp_credential.is_none() {
-            // No auth configured at all. The endpoint may permit anonymous
-            // access. Log so an operator can correlate against the
-            // server-side access log: an unexpected presence of this
-            // path under load was the smoking gun for the
-            // "concurrent bearer dropped" bug. Path only, never the
-            // full URL (would leak names of catalogs/tables on the
-            // wire).
+            if self.auth_required {
+                // Defensive guard for issue #2. If this client was
+                // constructed with a token / credential / GCP creds
+                // (auth_required = true) but the live state has none,
+                // the bearer was lost somewhere between session setup
+                // and the outbound request. Refuse to send the
+                // request unauthenticated; the catch downstream
+                // (Polaris 401, mistranslated to TABLE_NOT_FOUND in
+                // older builds) is exactly what we want to avoid.
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Refusing to send outbound REST request without \
+                         Authorization: client was configured with \
+                         authentication but the live token has been \
+                         cleared. Method={} path={}",
+                        req.method(),
+                        req.url().path(),
+                    ),
+                ));
+            }
+            // Genuinely-unauthenticated path: the endpoint permits
+            // anonymous access. Still log so an operator can correlate
+            // against the server-side access log if a 401 surfaces.
+            // Path only, never the full URL (would leak names of
+            // catalogs/tables on the wire).
             warn!(
                 method = %req.method(),
                 path = req.url().path(),
