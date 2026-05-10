@@ -142,6 +142,42 @@ impl StatementKind {
             StatementKind::PartitionEvolution(_) => "partitionevolution",
         }
     }
+
+    /// Borrow the underlying parsed `sqlparser::ast::Statement` when
+    /// this kind wraps one. Returns `None` for variants that are
+    /// pre-parsed into custom shapes (RefDdl, PartitionEvolution,
+    /// Procedure, ExplainFull, ShowSchemas, ShowTables, ShowStats,
+    /// ShowGrants, SetWriteBranch, Use, Truncate, Begin/Commit/Rollback).
+    ///
+    /// Used by the coordinator to walk the AST for cross-cutting
+    /// validations (e.g. unknown catalog qualifier in 3-part names)
+    /// without enumerating every variant by hand.
+    pub fn statement(&self) -> Option<&Statement> {
+        match self {
+            StatementKind::Query(s)
+            | StatementKind::CreateTable(s)
+            | StatementKind::Ctas(s)
+            | StatementKind::Insert(s)
+            | StatementKind::Merge(s)
+            | StatementKind::Delete(s)
+            | StatementKind::Update(s)
+            | StatementKind::Drop(s)
+            | StatementKind::Rename(s)
+            | StatementKind::AlterSchema(s)
+            | StatementKind::CreateView(s)
+            | StatementKind::DropView(s)
+            | StatementKind::CreateSchema(s)
+            | StatementKind::DropSchema(s)
+            | StatementKind::Grant(s)
+            | StatementKind::Revoke(s)
+            | StatementKind::Utility(s)
+            | StatementKind::ShowCreateTable(s)
+            | StatementKind::Call(s)
+            | StatementKind::AlterTableProps(s)
+            | StatementKind::Comment(s) => Some(s.as_ref()),
+            _ => None,
+        }
+    }
 }
 
 /// Parse a SQL string and classify the first statement.
