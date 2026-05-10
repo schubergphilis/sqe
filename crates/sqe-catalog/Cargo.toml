@@ -115,6 +115,9 @@ deltalake-core = { version = "0.32.1", features = ["datafusion", "rustls", "clou
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing-subscriber = { workspace = true }
+wiremock = "0.6"
+uuid = { workspace = true, features = ["v4"] }
 sqe-auth = { path = "../sqe-auth" }
 # Used in the Phase O+ integration test to deserialise an inline
 # `[catalog.backend]` block into `SqeConfig` rather than constructing
