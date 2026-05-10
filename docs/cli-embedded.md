@@ -374,20 +374,36 @@ SELECT * FROM read_parquet(
 
 For full S3 Tables read + write from embedded mode, track [`docs/catalogs.md`](./catalogs.md) for the embedded-S3-Tables follow-up.
 
+### Runtime catalog mounts via `ATTACH`
+
+Embedded mode supports the same SQL `ATTACH` / `DETACH` and `CREATE` / `DROP` / `SHOW SECRETS` primitives as the cluster server. Use them to mount any of the six supported backends from the REPL without editing TOML or restarting:
+
+```sql
+sqe> CREATE SECRET prod (TYPE bearer, TOKEN 'eyJ...');
+sqe> ATTACH 'http://catalog.example.com/api/catalog' AS prod_cat
+       (TYPE iceberg_rest, WAREHOUSE 'analytics', SECRET prod);
+sqe> SELECT * FROM prod_cat.sales.orders LIMIT 5;
+sqe> DETACH prod_cat;
+```
+
+Full reference: [`docs/book/src/operations/catalogs.md`](book/src/operations/catalogs.md). The supported `TYPE` values are `iceberg_rest`, `glue`, `s3tables`, `hms`, `jdbc`, `sqlite`, and `hadoop`.
+
+ATTACH is process-local. The registry and the secret store are wiped on CLI exit; persistent catalogs still go through `--catalog NAME=PATH` or the default `~/.sqe/warehouse/`.
+
 ### HMS, AWS Glue, JDBC, Nessie
 
-Same story as S3 Tables. Cluster mode supports all five backends via the upstream `iceberg-catalog-loader`. Embedded mode currently restricts persistent catalogs to SQLite-backed local Iceberg. The cluster mode is the path for shared HMS / Glue / Nessie warehouses.
+Both cluster mode and embedded mode now support all six backends. Cluster mode reads them from `[catalogs.*]` TOML; embedded mode supports both startup flags (SQLite via `--catalog`) and runtime SQL `ATTACH` for any backend.
 
 The matrix:
 
-| Backend | Cluster mode | Embedded mode |
-|---|---|---|
-| Iceberg REST (Polaris, Nessie, Unity) | yes | follow-up |
-| AWS Glue | yes | follow-up |
-| AWS S3 Tables | yes | follow-up (TVF read-only today) |
-| Hive Metastore | yes | follow-up |
-| JDBC (Postgres / MySQL / SQLite) | yes | yes (SQLite default; Postgres follow-up) |
-| Hadoop (storage-only) | yes | yes (file:// path scan) |
+| Backend | Cluster mode (TOML) | Embedded mode (`--catalog`) | Embedded mode (`ATTACH`) |
+|---|---|---|---|
+| Iceberg REST (Polaris, Nessie, Unity) | yes | no | yes |
+| AWS Glue | yes | no | yes |
+| AWS S3 Tables | yes | no | yes |
+| Hive Metastore | yes | no | yes |
+| JDBC (Postgres / MySQL / SQLite) | yes | SQLite only | yes |
+| Hadoop (storage-only) | yes | yes (file:// path scan) | yes |
 
 ## Writing data
 
