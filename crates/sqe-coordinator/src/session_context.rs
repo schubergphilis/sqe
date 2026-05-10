@@ -12,6 +12,7 @@ use sqe_core::{Session, SqeConfig, SqeError};
 use sqe_policy::PolicyStore;
 
 use crate::query_tracker::QueryTracker;
+use crate::runtime_catalog::RuntimeCatalogRegistry;
 
 /// Per-user SessionContext cache keyed by token fingerprint.
 ///
@@ -48,7 +49,7 @@ static SESSION_CONTEXT_CACHE: LazyLock<Cache<String, (SessionContext, Arc<Sessio
 /// On a cache hit the `SessionContext` and `SessionCatalog` are cloned in O(1)
 /// and returned immediately, skipping all registration work.
 #[allow(clippy::too_many_arguments)]
-#[tracing::instrument(skip(config, session, policy_store, query_tracker, runtime, prom_metrics, table_cache), fields(username = %session.user.username))]
+#[tracing::instrument(skip(config, session, policy_store, query_tracker, runtime, prom_metrics, table_cache, runtime_catalogs), fields(username = %session.user.username))]
 pub async fn create_session_context(
     config: &SqeConfig,
     session: &Session,
@@ -57,6 +58,7 @@ pub async fn create_session_context(
     runtime: Option<&Arc<RuntimeEnv>>,
     prom_metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
     table_cache: Option<&TableMetadataCache>,
+    runtime_catalogs: &RuntimeCatalogRegistry,
 ) -> sqe_core::Result<(SessionContext, Arc<SessionCatalog>)> {
     // --- Cache key: username + token fingerprint ---
     // Different tokens from the same user must not share a stale SessionCatalog.
@@ -69,6 +71,7 @@ pub async fn create_session_context(
     // both miss the cache and build redundant SessionContexts. moka coalesces
     // concurrent callers into a single init future.
     let username = session.user.username.clone();
+    let attached_providers = runtime_catalogs.providers();
     let result = SESSION_CONTEXT_CACHE
         .try_get_with(cache_key.clone(), async {
             debug!(
@@ -343,6 +346,14 @@ pub async fn create_session_context(
             )
             .with_runtime(runtime_schema);
             ctx.register_catalog("system", Arc::new(system_catalog));
+
+            // Register any catalogs attached at runtime via ATTACH.
+            // The providers snapshot was taken before the cache future was
+            // entered, so it reflects the registry state at the moment of
+            // the cache miss.
+            for (name, provider) in &attached_providers {
+                ctx.register_catalog(name.clone(), Arc::clone(provider));
+            }
 
             // Register the sha256() scalar function for column masking.
             // DataFusion does not ship a built-in sha256 — we provide one via sqe-policy.
