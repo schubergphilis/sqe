@@ -274,9 +274,8 @@ async fn drop_secret_in_use_by_attached_catalog_errors() {
         kind: CatalogKind::Sqlite,
         options: opts,
     };
-    let ctx = datafusion::prelude::SessionContext::new();
     catalogs
-        .attach(&stmt, &secrets, &ctx)
+        .attach(&stmt, &secrets)
         .await
         .expect("attach for in-use setup");
 

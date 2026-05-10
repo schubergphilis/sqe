@@ -253,6 +253,7 @@ impl QueryHandler {
             .collect();
         names.push("system".to_string());
         names.push("datafusion".to_string());
+        names.extend(self.runtime_catalogs.list());
         names.sort();
         names.dedup();
         names
@@ -846,15 +847,9 @@ impl QueryHandler {
                         .await
                 }
 
-                StatementKind::Attach(stmt) => {
-                    let (ctx, _) = self.create_session_context(session).await?;
-                    self.handle_attach(stmt, &ctx).await
-                }
+                StatementKind::Attach(stmt) => self.handle_attach(stmt).await,
 
-                StatementKind::Detach(stmt) => {
-                    let (ctx, _) = self.create_session_context(session).await?;
-                    self.handle_detach(stmt, &ctx).await
-                }
+                StatementKind::Detach(stmt) => self.handle_detach(stmt),
 
                 StatementKind::CreateSecret(stmt) => self.handle_create_secret(stmt),
 
@@ -1939,6 +1934,7 @@ impl QueryHandler {
             Some(&self.runtime),
             self.metrics.as_ref(),
             self.table_cache.as_ref(),
+            &self.runtime_catalogs,
         )
         .await
     }
@@ -3123,10 +3119,9 @@ impl QueryHandler {
     async fn handle_attach(
         &self,
         stmt: &sqe_sql::AttachStatement,
-        ctx: &SessionContext,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         self.runtime_catalogs
-            .attach(stmt, &self.secrets, ctx)
+            .attach(stmt, &self.secrets)
             .await
             .map_err(SqeError::Execution)?;
         crate::session_context::invalidate_all_session_caches();
@@ -3134,13 +3129,12 @@ impl QueryHandler {
         Ok(vec![])
     }
 
-    async fn handle_detach(
+    fn handle_detach(
         &self,
         stmt: &sqe_sql::DetachStatement,
-        ctx: &SessionContext,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         self.runtime_catalogs
-            .detach(&stmt.name, ctx)
+            .detach(&stmt.name)
             .map_err(SqeError::Execution)?;
         crate::session_context::invalidate_all_session_caches();
         info!(catalog = %stmt.name, "DETACH complete");
