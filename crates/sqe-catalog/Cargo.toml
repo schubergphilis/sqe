@@ -49,11 +49,24 @@ hadoop = []
 hms = ["dep:iceberg-catalog-hms", "iceberg-catalog-loader/hms"]
 # AWS Glue Data Catalog. Vendored from apache/iceberg-rust v0.9.0;
 # pulls in aws-sdk-glue + aws-config only when this feature is enabled.
-glue = ["dep:iceberg-catalog-glue", "iceberg-catalog-loader/glue"]
+# Co-engages aws-config + aws-credential-types so the credential layering
+# helper in `aws_config.rs` can name `SdkConfig` / `Credentials` directly.
+glue = [
+    "dep:iceberg-catalog-glue",
+    "iceberg-catalog-loader/glue",
+    "dep:aws-config",
+    "dep:aws-credential-types",
+]
 # AWS S3 Tables (managed Iceberg). Pulls in aws-sdk-s3tables. Shares
 # the aws-config + aws-sdk runtime already pulled by `glue`, so the
-# incremental binary cost is small (~5-10 MB).
-s3tables = ["dep:iceberg-catalog-s3tables", "iceberg-catalog-loader/s3tables"]
+# incremental binary cost is small (~5-10 MB). Same `dep:aws-config` /
+# `dep:aws-credential-types` co-engagement as `glue`.
+s3tables = [
+    "dep:iceberg-catalog-s3tables",
+    "iceberg-catalog-loader/s3tables",
+    "dep:aws-config",
+    "dep:aws-credential-types",
+]
 # Delta Lake read support via delta-rs (deltalake-core 0.32 — pinned to
 # DataFusion 53.1, same as our coordinator). Optional and gated so a
 # slim REST-only build does not pull in the delta_kernel crate or its
@@ -63,6 +76,7 @@ delta = ["dep:deltalake-core"]
 
 [dependencies]
 sqe-core = { path = "../sqe-core" }
+sqe-sql = { path = "../sqe-sql" }
 sqe-policy = { path = "../sqe-policy" }
 sqe-metrics = { path = "../sqe-metrics" }
 datafusion = { workspace = true }
@@ -111,6 +125,14 @@ iceberg-catalog-sql = { workspace = true, optional = true }
 iceberg-catalog-s3tables = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 deltalake-core = { version = "0.32.1", features = ["datafusion", "rustls", "cloud"], optional = true }
+# AWS SDK shared config used by `aws_config.rs` to layer ATTACH options +
+# secrets on top of the default credential chain. Pinned to the same
+# versions aws-sdk-glue / aws-sdk-s3tables already pull in transitively.
+# Kept as direct deps so the credential-layering helper can name the
+# `SdkConfig` / `Credentials` types directly without going through one
+# of the SDK crates' re-exports.
+aws-config = { version = "1.8", optional = true }
+aws-credential-types = { version = "1.2", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
