@@ -213,6 +213,36 @@ impl QueryHandler {
         &self.write_handler
     }
 
+    /// Compute the set of catalog names that the coordinator will
+    /// register on every session context. The pre-flight unknown-
+    /// qualifier check compares the leading component of any 3-part
+    /// identifier against this set.
+    ///
+    /// Sources:
+    /// 1. `config.flattened_catalogs()` - the legacy `[catalog]` block
+    ///    plus any `[catalogs.<name>]` map entries. This matches the
+    ///    list `session_context::create_session_context` registers.
+    /// 2. The two coordinator-registered system catalogs `system`
+    ///    (Trino JDBC metadata + `system.runtime.*`) and `datafusion`
+    ///    (in-memory scratch catalog used by the IN-subquery
+    ///    rewriter).
+    ///
+    /// Returned in stable sorted order so the error message reads the
+    /// same across runs.
+    fn known_catalog_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .config
+            .flattened_catalogs()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        names.push("system".to_string());
+        names.push("datafusion".to_string());
+        names.sort();
+        names.dedup();
+        names
+    }
+
     /// Execute a SQL statement for the given session and return collected RecordBatches.
     #[tracing::instrument(
         skip(self, session, sql),
@@ -293,6 +323,30 @@ impl QueryHandler {
         let classify_sql = sqe_sql::normalize_partitioned_by(&classify_sql);
         let kind = parse_and_classify(&classify_sql)?;
         let kind_name = kind.name().to_string();
+
+        // Pre-flight: when a 3-part identifier names a catalog that the
+        // coordinator has not registered, fail fast with a clear error
+        // instead of letting DataFusion silently fall back to the
+        // session-default catalog. The silent fallback produces
+        // confusing "namespace does not exist" errors against the
+        // wrong warehouse and was the original symptom of issue #1.
+        if let Some(stmt) = kind.statement() {
+            let qualifiers = sqe_sql::extract_catalog_qualifiers(stmt);
+            if !qualifiers.is_empty() {
+                let known = self.known_catalog_names();
+                if let Some(unknown) =
+                    qualifiers.iter().find(|q| !known.iter().any(|k| k == *q))
+                {
+                    return Err(SqeError::Catalog(format!(
+                        "unknown catalog '{}' in 3-part identifier; configured \
+                         catalogs are {:?}. Use TOML `[catalogs.<name>]` to declare \
+                         additional catalogs, or `ATTACH` at runtime once that lands.",
+                        unknown, known
+                    )));
+                }
+            }
+        }
+
         let span = Span::current();
         span.record("statement_type", kind_name.as_str());
         span.record("db.operation.name", kind_name.as_str());
@@ -1085,6 +1139,25 @@ impl QueryHandler {
                  use execute() for DML and metadata statements"
                     .into(),
             ));
+        }
+
+        // Pre-flight: same unknown-catalog-qualifier check as execute().
+        // See `execute()` for the rationale.
+        if let Some(stmt) = kind.statement() {
+            let qualifiers = sqe_sql::extract_catalog_qualifiers(stmt);
+            if !qualifiers.is_empty() {
+                let known = self.known_catalog_names();
+                if let Some(unknown) =
+                    qualifiers.iter().find(|q| !known.iter().any(|k| k == *q))
+                {
+                    return Err(SqeError::Catalog(format!(
+                        "unknown catalog '{}' in 3-part identifier; configured \
+                         catalogs are {:?}. Use TOML `[catalogs.<name>]` to declare \
+                         additional catalogs, or `ATTACH` at runtime once that lands.",
+                        unknown, known
+                    )));
+                }
+            }
         }
 
         // --- Start tracker ----------------------------------------------------
