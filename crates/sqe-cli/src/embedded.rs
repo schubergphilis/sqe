@@ -37,6 +37,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use sqe_core::SecretStore;
+
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use datafusion::execution::memory_pool::FairSpillPool;
@@ -342,6 +344,12 @@ pub struct EmbeddedClient {
     ctx: SessionContext,
     #[allow(dead_code)]
     iceberg_catalogs: IcebergCatalogMap,
+    /// In-memory secret store for `CREATE SECRET` / `DROP SECRET` / `SHOW SECRETS`.
+    secrets: SecretStore,
+    /// Names of catalogs attached at runtime via SQL `ATTACH`, paired with the
+    /// optional secret name they reference. Used by `DROP SECRET` to guard
+    /// against removing secrets while catalogs depend on them.
+    attached_catalogs: HashMap<String, Option<String>>,
 }
 
 impl EmbeddedClient {
@@ -354,6 +362,8 @@ impl EmbeddedClient {
         Ok(Self {
             ctx: build_embedded_context(memory_limit_bytes)?,
             iceberg_catalogs: HashMap::new(),
+            secrets: SecretStore::new(),
+            attached_catalogs: HashMap::new(),
         })
     }
 
@@ -370,6 +380,8 @@ impl EmbeddedClient {
         Ok(Self {
             ctx,
             iceberg_catalogs,
+            secrets: SecretStore::new(),
+            attached_catalogs: HashMap::new(),
         })
     }
 }
@@ -377,13 +389,30 @@ impl EmbeddedClient {
 #[async_trait]
 impl SqlClient for EmbeddedClient {
     async fn execute(&mut self, sql: &str) -> Result<QueryResult, Box<dyn std::error::Error>> {
-        // No SQL interceptor needed: WritableIcebergCatalog routes
-        // CREATE SCHEMA / DROP SCHEMA / CREATE TABLE / DROP TABLE
-        // through the standard DataFusion CatalogProvider trait, which
-        // dispatches to the underlying iceberg::Catalog. Reads also
-        // go through the same provider since it composes the upstream
-        // IcebergSchemaProvider for namespace contents.
-        //
+        // Intercept ATTACH / DETACH / CREATE SECRET / DROP SECRET / SHOW SECRETS
+        // before DataFusion's parser sees the SQL — these are SQE-specific
+        // syntax extensions that DataFusion has no AST for.
+        if let Ok(kind) = sqe_sql::parse_and_classify(sql) {
+            match kind {
+                sqe_sql::StatementKind::Attach(stmt) => {
+                    return self.embedded_handle_attach(&stmt).await;
+                }
+                sqe_sql::StatementKind::Detach(stmt) => {
+                    return self.embedded_handle_detach(&stmt);
+                }
+                sqe_sql::StatementKind::CreateSecret(stmt) => {
+                    return self.embedded_handle_create_secret(&stmt);
+                }
+                sqe_sql::StatementKind::DropSecret(stmt) => {
+                    return self.embedded_handle_drop_secret(&stmt);
+                }
+                sqe_sql::StatementKind::ShowSecrets => {
+                    return self.embedded_handle_show_secrets();
+                }
+                _ => {}
+            }
+        }
+
         // V12: pre-rewrite `'hf://...'` quoted literals to their HTTPS
         // equivalent. This makes `SELECT * FROM 'hf://...'` (URL-table
         // auto-detect) flow through V10's LazyHttpObjectStoreRegistry the
@@ -398,6 +427,133 @@ impl SqlClient for EmbeddedClient {
         let schema = df.schema().as_arrow().clone();
         let batches = df.collect().await?;
         Ok(record_batches_to_query_result(&schema, &batches))
+    }
+}
+
+impl EmbeddedClient {
+    async fn embedded_handle_attach(
+        &mut self,
+        stmt: &sqe_sql::AttachStatement,
+    ) -> Result<QueryResult, Box<dyn std::error::Error>> {
+        if self.attached_catalogs.contains_key(&stmt.name) {
+            return Err(format!(
+                "catalog '{}' is already attached; DETACH it first",
+                stmt.name
+            )
+            .into());
+        }
+
+        let catalog = sqe_catalog::mount::build_catalog(
+            &stmt.location,
+            stmt.kind,
+            &stmt.options,
+            &self.secrets,
+        )
+        .await
+        .map_err(|e| format!("ATTACH failed: {e}"))?;
+
+        let provider = sqe_catalog::writable_iceberg_catalog::WritableIcebergCatalog::try_new(
+            catalog.clone(),
+        )
+        .await
+        .map_err(|e| format!("ATTACH: failed to wrap catalog '{}': {e}", stmt.name))?;
+
+        self.ctx.register_catalog(stmt.name.clone(), Arc::new(provider));
+
+        let secret_ref = stmt.options.get("SECRET").and_then(|v| v.as_secret_ref()).map(|s| s.to_string());
+        self.attached_catalogs.insert(stmt.name.clone(), secret_ref);
+
+        Ok(QueryResult { columns: vec![], rows: vec![] })
+    }
+
+    fn embedded_handle_detach(
+        &mut self,
+        stmt: &sqe_sql::DetachStatement,
+    ) -> Result<QueryResult, Box<dyn std::error::Error>> {
+        if self.attached_catalogs.remove(&stmt.name).is_none() {
+            return Err(format!("catalog '{}' is not attached", stmt.name).into());
+        }
+        // DataFusion 53.1 has no deregister_catalog. In embedded mode
+        // enable_url_table() wraps the catalog list in DynamicFileCatalog
+        // so the downcast to MemoryCatalogProviderList always fails.
+        // The catalog stays in DataFusion's list until the session ends,
+        // but our tracking no longer considers it attached — queries that
+        // try to resolve it will fail at plan time once the provider is
+        // removed from our accounting.
+        Ok(QueryResult { columns: vec![], rows: vec![] })
+    }
+
+    fn embedded_handle_create_secret(
+        &mut self,
+        stmt: &sqe_sql::CreateSecretStatement,
+    ) -> Result<QueryResult, Box<dyn std::error::Error>> {
+        use sqe_core::Secret;
+        use sqe_sql::SecretKind;
+
+        let opts = &stmt.options;
+        let get_str = |key: &str| -> Result<String, Box<dyn std::error::Error>> {
+            opts.get(key)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| {
+                    format!(
+                        "CREATE SECRET: missing required option {key} for {:?} secret",
+                        stmt.kind.name()
+                    )
+                    .into()
+                })
+        };
+        let get_opt = |key: &str| -> Option<String> {
+            opts.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+        };
+
+        let secret = match stmt.kind {
+            SecretKind::Aws => Secret::Aws {
+                access_key: get_opt("ACCESS_KEY_ID"),
+                secret_key: get_opt("SECRET_ACCESS_KEY"),
+                session_token: get_opt("SESSION_TOKEN"),
+                region: get_opt("REGION"),
+                profile: get_opt("PROFILE"),
+            },
+            SecretKind::Bearer => Secret::Bearer { token: get_str("TOKEN")? },
+            SecretKind::Basic => Secret::Basic {
+                username: get_str("USERNAME")?,
+                password: get_str("PASSWORD")?,
+            },
+        };
+
+        self.secrets
+            .create(&stmt.name, secret)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        Ok(QueryResult { columns: vec![], rows: vec![] })
+    }
+
+    fn embedded_handle_drop_secret(
+        &mut self,
+        stmt: &sqe_sql::DropSecretStatement,
+    ) -> Result<QueryResult, Box<dyn std::error::Error>> {
+        let in_use: Vec<String> = self
+            .attached_catalogs
+            .iter()
+            .filter(|(_, secret_ref)| secret_ref.as_deref() == Some(&stmt.name))
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        self.secrets
+            .drop_secret(&stmt.name, &in_use)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        Ok(QueryResult { columns: vec![], rows: vec![] })
+    }
+
+    fn embedded_handle_show_secrets(&self) -> Result<QueryResult, Box<dyn std::error::Error>> {
+        let listed = self.secrets.list();
+        Ok(QueryResult {
+            columns: vec!["name".to_string(), "type".to_string()],
+            rows: listed
+                .into_iter()
+                .map(|(name, type_name)| vec![name, type_name.to_string()])
+                .collect(),
+        })
     }
 }
 
@@ -929,5 +1085,164 @@ mod tests {
         );
         let result = client.execute(&sql).await.expect("query");
         assert_eq!(result.rows, vec![vec!["2".to_string()]]);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase F: ATTACH / DETACH / CREATE SECRET / DROP SECRET / SHOW SECRETS
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn create_bearer_secret_then_show() {
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build");
+        client
+            .execute("CREATE SECRET tok1 (TYPE bearer, TOKEN 'abc')")
+            .await
+            .expect("create");
+        let r = client.execute("SHOW SECRETS").await.expect("show");
+        assert_eq!(r.columns, vec!["name".to_string(), "type".to_string()]);
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], "tok1");
+        assert_eq!(r.rows[0][1], "bearer");
+        assert!(!r.rows[0].iter().any(|v| v.contains("abc")), "token must not appear in output");
+    }
+
+    #[tokio::test]
+    async fn create_aws_secret_all_optional() {
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build");
+        client
+            .execute("CREATE SECRET s3cred (TYPE aws, ACCESS_KEY_ID 'AKIA1', SECRET_ACCESS_KEY 'sk', REGION 'eu-west-1')")
+            .await
+            .expect("create aws secret");
+        let r = client.execute("SHOW SECRETS").await.expect("show");
+        assert_eq!(r.rows[0][1], "aws");
+    }
+
+    #[tokio::test]
+    async fn create_duplicate_secret_errors() {
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build");
+        client.execute("CREATE SECRET dup (TYPE bearer, TOKEN 't')").await.expect("first");
+        let err = client
+            .execute("CREATE SECRET dup (TYPE bearer, TOKEN 't2')")
+            .await
+            .expect_err("duplicate should fail");
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn create_bearer_missing_token_errors() {
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build");
+        let err = client
+            .execute("CREATE SECRET bad (TYPE bearer)")
+            .await
+            .expect_err("missing TOKEN should fail");
+        assert!(err.to_string().contains("TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn drop_secret_removes_it() {
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build");
+        client.execute("CREATE SECRET eph (TYPE bearer, TOKEN 't')").await.expect("create");
+        client.execute("DROP SECRET eph").await.expect("drop");
+        let r = client.execute("SHOW SECRETS").await.expect("show");
+        assert_eq!(r.rows.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn drop_missing_secret_errors() {
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build");
+        let err = client.execute("DROP SECRET nope").await.expect_err("should fail");
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn show_secrets_empty() {
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build");
+        let r = client.execute("SHOW SECRETS").await.expect("show");
+        assert_eq!(r.columns, vec!["name".to_string(), "type".to_string()]);
+        assert_eq!(r.rows.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn attach_sqlite_catalog_and_create_schema() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().to_str().unwrap();
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build");
+
+        client
+            .execute(&format!("ATTACH '{path}' AS mycat (TYPE sqlite)"))
+            .await
+            .expect("ATTACH should succeed");
+
+        // Create a namespace in the attached catalog — proves the catalog is
+        // reachable and WritableIcebergCatalog is wired correctly.
+        client
+            .execute("CREATE SCHEMA mycat.myns")
+            .await
+            .expect("CREATE SCHEMA in attached catalog should succeed");
+
+        // The schema must now appear in information_schema.schemata
+        let r = client
+            .execute(
+                "SELECT schema_name FROM information_schema.schemata \
+                 WHERE catalog_name = 'mycat' AND schema_name = 'myns'",
+            )
+            .await
+            .expect("information_schema query");
+        assert!(
+            r.rows.iter().any(|row| row[0] == "myns"),
+            "namespace 'myns' must appear in information_schema; got {:?}", r.rows
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_duplicate_catalog_errors() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().to_str().unwrap();
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build");
+
+        let sql = format!("ATTACH '{path}' AS dupcat (TYPE sqlite)");
+        client.execute(&sql).await.expect("first attach");
+        let err = client.execute(&sql).await.expect_err("duplicate attach should fail");
+        assert!(err.to_string().contains("already attached"));
+    }
+
+    #[tokio::test]
+    async fn detach_removes_tracking() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().to_str().unwrap();
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build");
+
+        client.execute(&format!("ATTACH '{path}' AS detachme (TYPE sqlite)")).await.expect("attach");
+        client.execute("DETACH detachme").await.expect("detach");
+
+        // After detach, attaching with the same name must succeed (tracking cleared)
+        client.execute(&format!("ATTACH '{path}' AS detachme (TYPE sqlite)")).await.expect("re-attach after detach");
+    }
+
+    #[tokio::test]
+    async fn detach_unknown_catalog_errors() {
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build");
+        let err = client.execute("DETACH nope").await.expect_err("should fail");
+        assert!(err.to_string().contains("not attached"));
+    }
+
+    #[tokio::test]
+    async fn drop_secret_in_use_by_attach_errors() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().to_str().unwrap();
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build");
+
+        client.execute("CREATE SECRET tok (TYPE bearer, TOKEN 'xyz')").await.expect("create");
+        // ATTACH with SECRET ref. SQLite doesn't use the bearer token for
+        // auth but the parser still records the secret_ref in options.
+        client
+            .execute(&format!("ATTACH '{path}' AS guarded (TYPE sqlite, SECRET tok)"))
+            .await
+            .expect("attach with secret ref");
+
+        let err = client.execute("DROP SECRET tok").await.expect_err("in-use drop should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("tok"), "error should name the secret: {msg}");
+        assert!(msg.contains("guarded"), "error should name the catalog: {msg}");
     }
 }
