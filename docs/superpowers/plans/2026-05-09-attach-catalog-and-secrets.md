@@ -532,10 +532,10 @@ Cover: ATTACH/DETACH syntax, per-backend examples, SHOW CATALOGS output, CREATE/
 
 Voice rules: no emdash/endash/Unicode arrows, no AI tells.
 
-- [ ] Step 1: Write
-- [ ] Step 2: `grep -nE '(—|–|→)' ...` zero hits
-- [ ] Step 3: `mdbook build` clean
-- [ ] Step 4: Commit `docs(book): ATTACH catalog and secrets chapter`
+- [x] Step 1: Write — `docs/book/src/operations/catalogs.md` (operator reference) + `docs/ebook/chapters/06c-attaching-at-runtime.md` (narrative)
+- [x] Step 2: `grep -nE '(—|–|→)' ...` zero hits
+- [x] Step 3: `mdbook build` clean
+- [x] Step 4: Commit `docs(book): ATTACH catalog and secrets chapter`
 
 ### Task H2: README + cli-embedded.md + roadmap
 
