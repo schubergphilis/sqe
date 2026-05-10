@@ -63,6 +63,7 @@
 - [x] JDBC: PostgreSQL, MySQL, SQLite (live test against `docker-compose.test.yml` postgres at V2 and V3)
 - [x] Hadoop storage-only (warehouse path scanner, read-only)
 - [x] Generic loader dispatch through upstream `iceberg-catalog-loader` factory; per-backend wrapper code deleted
+- [x] Runtime catalog mounting via SQL `ATTACH` / `DETACH` and credential management via `CREATE` / `DROP` / `SHOW SECRETS` (DuckDB-shape syntax; same six backends plus SQLite for local prototyping). See `docs/book/src/operations/catalogs.md`.
 
 ### Auth and security
 
@@ -87,7 +88,6 @@
 - [ ] Parallel + streaming generation for the other 6 benchmarks (SSB, TPC-DS, TPC-C, TPC-E, TPC-BB, ClickBench)
 - [ ] Snowflake Horizon catalog: live integration test against a real Snowflake account (currently REST-compatible, no live test)
 - [ ] V12.2: custom `HfObjectStore` plugged into `LazyHttpObjectStoreRegistry` so `SELECT * FROM 'hf://datasets/foo/bar/**/*.parquet'` enumerates files via the HF tree API and the V12 SQL pre-rewriter retires (design in `docs/hf-glob-research.md`)
-- [ ] Embedded mode: register HMS / Glue / S3 Tables / JDBC-Postgres catalogs through `--catalog NAME=PATH` (cluster mode supports all five; embedded mode is currently SQLite-only)
 
 ## Planned
 

@@ -32,7 +32,7 @@ sqe> SELECT snapshot_id, committed_at FROM s3tables.sales."orders$snapshots";
 
 **Wins six of seven benchmark suites against Trino 465 at SF1.** TPC-H, SSB, TPC-DS, TPC-C, TPC-E, TPC-BB, ClickBench. 222 of 222 queries pass. Tables and method below.
 
-**One binary scales from CLI to cluster.** `sqe-cli --embedded` is a DuckDB-class single-process engine with the same SQL surface as the distributed coordinator. Persistent SQLite-backed Iceberg catalogs at `~/.sqe/warehouse/` survive restarts. Cross-catalog joins across multiple `--catalog NAME=PATH` mounts.
+**One binary scales from CLI to cluster.** `sqe-cli --embedded` is a DuckDB-class single-process engine with the same SQL surface as the distributed coordinator. Persistent SQLite-backed Iceberg catalogs at `~/.sqe/warehouse/` survive restarts. Cross-catalog joins across multiple `--catalog NAME=PATH` mounts, plus runtime mounts via SQL `ATTACH` against any of the six supported backends (REST, Glue, S3 Tables, HMS, JDBC, SQLite).
 
 **Multi-catalog and multi-cloud, in one engine.** Apache Polaris, Project Nessie, Unity Catalog OSS, AWS Glue (native SDK), AWS S3 Tables (native SDK), Hive Metastore, JDBC (Postgres, MySQL, SQLite), and Hadoop storage-only. Object stores: S3 (with endpoint override for Ceph, R2, Garage, MinIO), Azure ADLS, GCS, local filesystem, HuggingFace `hf://`.
 
@@ -122,9 +122,14 @@ sqe> SELECT * FROM '/data/sales.parquet' LIMIT 5;
 sqe> SELECT * FROM read_csv('s3://bucket/orders.tsv.gz');
 sqe> SELECT * FROM 'hf://datasets/squad/plain_text/train-00000-of-00001.parquet' LIMIT 5;
 sqe> SELECT * FROM read_delta('/data/delta/sales', version => '5');
+
+sqe> CREATE SECRET partner (TYPE bearer, TOKEN 'eyJ...');
+sqe> ATTACH 'http://catalog.example.com/api/catalog' AS partner_cat
+       (TYPE iceberg_rest, WAREHOUSE 'analytics', SECRET partner);
+sqe> SELECT * FROM partner_cat.sales.orders LIMIT 10;
 ```
 
-Full embedded reference: [`docs/cli-embedded.md`](docs/cli-embedded.md).
+Full embedded reference: [`docs/cli-embedded.md`](docs/cli-embedded.md). Runtime ATTACH / SECRET reference: [`docs/book/src/operations/catalogs.md`](docs/book/src/operations/catalogs.md).
 
 ### Cluster mode (Polaris + S3 + SQE locally)
 
