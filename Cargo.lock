@@ -6607,6 +6607,7 @@ dependencies = [
  "sqe-catalog",
  "sqe-core",
  "sqe-policy",
+ "sqe-sql",
  "sqe-trino-functions",
  "tempfile",
  "tokio",
@@ -6669,6 +6670,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
