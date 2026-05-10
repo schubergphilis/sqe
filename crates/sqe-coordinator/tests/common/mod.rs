@@ -1,5 +1,6 @@
 //! Shared helpers for integration test binaries.
 //! Each file in tests/ is its own binary; include this via `mod common;`.
+#![allow(dead_code)]
 
 use std::sync::Arc;
 
@@ -62,6 +63,8 @@ pub async fn setup_handler() -> (sqe_core::Session, sqe_coordinator::QueryHandle
         policy, None, config, None, None, None, None, query_tracker, query_cache,
         None, // grant_backend
         None, // lineage observer
+        sqe_coordinator::RuntimeCatalogRegistry::default(),
+        sqe_core::SecretStore::default(),
     ).expect("Failed to create QueryHandler");
     (session, handler)
 }

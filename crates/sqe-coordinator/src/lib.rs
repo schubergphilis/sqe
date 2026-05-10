@@ -12,6 +12,7 @@ pub mod memory;
 pub mod mode;
 pub mod query_handler;
 pub mod runtime;
+pub mod runtime_catalog;
 pub mod session_context;
 pub mod query_cache;
 pub mod query_tracker;
@@ -26,6 +27,7 @@ pub mod writer;
 
 pub use mode::Mode;
 pub use query_handler::QueryHandler;
+pub use runtime_catalog::{AttachedCatalog, RuntimeCatalogRegistry};
 pub use session_manager::SessionManager;
 
 /// Test-only re-exports used by integration tests under `tests/`.

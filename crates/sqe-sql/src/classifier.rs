@@ -2,6 +2,11 @@ use sqlparser::ast::{AlterTableOperation, ObjectType, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
+use crate::attach::{
+    is_show_secrets, try_parse_attach, try_parse_create_secret, try_parse_detach,
+    try_parse_drop_secret, AttachStatement, CreateSecretStatement, DetachStatement,
+    DropSecretStatement,
+};
 use crate::ddl::{try_parse_ref_ddl, RefDdl};
 use crate::partition_evolution::{try_parse_partition_evolution, PartitionEvolution};
 use crate::procedures::{try_parse_call, ProcedureCall};
@@ -96,6 +101,21 @@ pub enum StatementKind {
     /// variant carries the pre-parsed `PartitionEvolution` and routes through
     /// a dedicated coordinator handler.
     PartitionEvolution(Box<PartitionEvolution>),
+    /// `ATTACH '<location>' AS <name> (TYPE <kind>, ...)` — register a new
+    /// Iceberg catalog at runtime. sqlparser-rs has no native AST for the
+    /// SQE/DuckDB option list, so this variant carries the pre-parsed
+    /// `AttachStatement` and routes through a dedicated coordinator handler.
+    Attach(Box<AttachStatement>),
+    /// `DETACH <name>` — unregister a runtime-attached catalog.
+    Detach(Box<DetachStatement>),
+    /// `CREATE SECRET <name> (TYPE <kind>, ...)` — store credentials in the
+    /// process-global in-memory secret store.
+    CreateSecret(Box<CreateSecretStatement>),
+    /// `DROP SECRET <name>` — remove a secret. Errors if any attached catalog
+    /// still references it.
+    DropSecret(Box<DropSecretStatement>),
+    /// `SHOW SECRETS` — list secret names and their kinds (never the values).
+    ShowSecrets,
 }
 
 impl StatementKind {
@@ -140,6 +160,11 @@ impl StatementKind {
             StatementKind::RefDdl(_) => "refddl",
             StatementKind::SetWriteBranch(_) => "setwritebranch",
             StatementKind::PartitionEvolution(_) => "partitionevolution",
+            StatementKind::Attach(_) => "attach",
+            StatementKind::Detach(_) => "detach",
+            StatementKind::CreateSecret(_) => "create_secret",
+            StatementKind::DropSecret(_) => "drop_secret",
+            StatementKind::ShowSecrets => "show_secrets",
         }
     }
 
@@ -271,6 +296,40 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
         // only Hive-style PARTITION (col=val), so we intercept here.
         if let Some(pe) = try_parse_partition_evolution(trimmed)? {
             return Ok(StatementKind::PartitionEvolution(Box::new(pe)));
+        }
+    }
+
+    // ATTACH/DETACH/CREATE SECRET/DROP SECRET/SHOW SECRETS: SQE extensions
+    // that sqlparser-rs does not understand. Match these before falling
+    // through to sqlparser so the user sees a precise diagnostic if they
+    // get the option-list shape wrong, and so SHOW SECRETS doesn't get
+    // mis-classified as a generic SHOW variable.
+    if is_show_secrets(trimmed) {
+        return Ok(StatementKind::ShowSecrets);
+    }
+    if upper.starts_with("ATTACH ") {
+        if let Some(stmt) = try_parse_attach(trimmed)? {
+            return Ok(StatementKind::Attach(Box::new(stmt)));
+        }
+        // Fell through: legacy SQLite `ATTACH '<file>' AS <name>` shape, or a
+        // malformed input. Hand to sqlparser; it will produce
+        // `Statement::AttachDatabase` which the classifier currently has no
+        // arm for, so the existing NotImplemented error surfaces (preserving
+        // old behaviour for any SQL that worked before this change).
+    }
+    if upper.starts_with("DETACH ") || upper == "DETACH" {
+        if let Some(stmt) = try_parse_detach(trimmed)? {
+            return Ok(StatementKind::Detach(Box::new(stmt)));
+        }
+    }
+    if upper.starts_with("CREATE SECRET ") {
+        if let Some(stmt) = try_parse_create_secret(trimmed)? {
+            return Ok(StatementKind::CreateSecret(Box::new(stmt)));
+        }
+    }
+    if upper.starts_with("DROP SECRET ") {
+        if let Some(stmt) = try_parse_drop_secret(trimmed)? {
+            return Ok(StatementKind::DropSecret(Box::new(stmt)));
         }
     }
 

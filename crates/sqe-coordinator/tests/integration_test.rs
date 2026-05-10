@@ -72,6 +72,8 @@ async fn test_simple_select() {
         policy, None, config, None, None, None, None, query_tracker, None,
         None, // grant_backend
         None, // lineage observer
+        sqe_coordinator::RuntimeCatalogRegistry::default(),
+        sqe_core::SecretStore::default(),
     ).expect("Failed to create QueryHandler");
 
     let batches = handler
@@ -400,6 +402,8 @@ async fn test_distributed_select() {
         policy, None, config, Some(registry), None, None, None, query_tracker, None,
         None, // grant_backend
         None, // lineage observer
+        sqe_coordinator::RuntimeCatalogRegistry::default(),
+        sqe_core::SecretStore::default(),
     ).expect("Failed to create QueryHandler");
 
     // First create a test table
@@ -1712,6 +1716,8 @@ async fn test_different_user_catalog_visibility() {
             None,
             None, // grant_backend
             None, // lineage observer
+            sqe_coordinator::RuntimeCatalogRegistry::default(),
+            sqe_core::SecretStore::default(),
         ).expect("Failed to create QueryHandler");
 
     // adminuser has catalog_admin + table_reader + data_writer roles
@@ -1821,6 +1827,8 @@ async fn test_trino_http_query() {
         None,
         None, // grant_backend
         None, // lineage observer
+        sqe_coordinator::RuntimeCatalogRegistry::default(),
+        sqe_core::SecretStore::default(),
     ).expect("Failed to create QueryHandler"));
 
     // Bind to port 0 to get an OS-assigned free port
