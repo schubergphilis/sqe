@@ -543,22 +543,20 @@ Voice rules: no emdash/endash/Unicode arrows, no AI tells.
 - docs/cli-embedded.md: section linking to the new chapter; note that the URL/ARN forms of `--catalog` are now redundant.
 - docs/roadmap.md: move the embedded-catalog item from "Open" to "Shipped".
 
-- [ ] Step 1: Edit
-- [ ] Step 2: Voice check
-- [ ] Step 3: Commit `docs: README + cli-embedded.md + roadmap for ATTACH`
+- [x] Step 1: Edit (README.md, docs/cli-embedded.md, docs/roadmap.md)
+- [x] Step 2: Voice check (zero emdash / endash / arrow hits)
+- [x] Step 3: Commit `docs: README + cli-embedded.md + roadmap for ATTACH`
 
 ### Task H3: Blog post
 
 **Files:**
-- Create: `docs/blog/2026-05-09-attach-catalog.md`
+- Create: `docs/blog/2026-05-10-attach-catalog-and-secrets.md`
 
-Operator-facing post (1500-2500 words). Lead with the use case ("you have one Iceberg engine, you want to talk to all your existing catalogs"). Walk through three real examples: REST against Polaris, Glue with the AWS chain, SQLite for local prototyping. Close with the v2 deferrals (persistence, encryption, OPA-gated ATTACH).
+Operator-facing post. Leads with the analyst's use case, walks through the parser, secret store, the lifecycle bug found in Phase G, and the registry pattern. Closes with v2 deferrals (persistence, encryption, OPA-gated ATTACH).
 
-Voice: same rules as ebook chapters.
-
-- [ ] Step 1: Write
-- [ ] Step 2: Voice check (zero emdash + zero AI tells)
-- [ ] Step 3: Commit `docs(blog): ATTACH catalog and secrets`
+- [x] Step 1: Write
+- [x] Step 2: Voice check (zero emdash + zero AI tells)
+- [x] Step 3: Commit `docs(blog): ATTACH catalog and secrets`
 
 ---
 
