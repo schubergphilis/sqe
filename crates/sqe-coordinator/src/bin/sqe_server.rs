@@ -588,6 +588,8 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             query_cache,
             grant_backend,
             lineage_obs,
+            sqe_coordinator::RuntimeCatalogRegistry::default(),
+            sqe_core::SecretStore::default(),
         )?
         .with_table_cache(table_cache)
         .with_session_manager(session_manager.clone()),

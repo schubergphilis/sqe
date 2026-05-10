@@ -14,7 +14,7 @@ use tracing::{debug, info, warn, Span};
 
 use sqlparser::ast::{Statement, TableFactor};
 use sqe_catalog::{IcebergScanExec, SessionCatalog};
-use sqe_core::{QueryConfig, Session, SortMode, SqeConfig, SqeError};
+use sqe_core::{QueryConfig, SecretStore, Session, SortMode, SqeConfig, SqeError};
 
 use crate::adaptive_sort;
 use sqe_policy::{PolicyEnforcer, PolicyStore};
@@ -28,6 +28,7 @@ use crate::credential_refresh::CredentialRefreshTracker;
 use crate::maintenance::MaintenanceHandler;
 use crate::query_cache::ResultCache;
 use crate::query_tracker::{FragmentState, QueryTracker};
+use crate::runtime_catalog::RuntimeCatalogRegistry;
 use crate::write_handler::WriteHandler;
 
 /// Per-query resource metrics extracted from the executed physical plan tree.
@@ -96,6 +97,16 @@ pub struct QueryHandler {
     /// Session manager used for `SET WRITE_BRANCH` mutations.
     /// Optional so in-process tests can construct a QueryHandler without it.
     session_manager: Option<Arc<crate::session_manager::SessionManager>>,
+    /// Process-local registry of catalogs added via SQL `ATTACH`.
+    /// Default-constructed registries are empty and impose no behaviour
+    /// change for callers that never issue `ATTACH`. Cloning shares the
+    /// underlying map so multiple handlers (Flight SQL, Trino) see the
+    /// same attached set.
+    runtime_catalogs: RuntimeCatalogRegistry,
+    /// Process-global in-memory secret store for `CREATE SECRET`. Same
+    /// rationale as `runtime_catalogs`: a default-constructed store is
+    /// empty and acts as a no-op until SQL populates it.
+    secrets: SecretStore,
 }
 
 impl QueryHandler {
@@ -112,6 +123,8 @@ impl QueryHandler {
         query_cache: Option<Arc<ResultCache>>,
         grant_backend: Option<Arc<dyn GrantBackend>>,
         lineage: Option<Arc<dyn sqe_lineage::LineageObserver>>,
+        runtime_catalogs: RuntimeCatalogRegistry,
+        secrets: SecretStore,
     ) -> sqe_core::Result<Self> {
         let catalog_ops = CatalogOps::new(config.clone());
         let mut write_handler = WriteHandler::new(config.clone());
@@ -167,6 +180,8 @@ impl QueryHandler {
             table_cache: None,
             grant_backend,
             session_manager: None,
+            runtime_catalogs,
+            secrets,
         })
     }
 
@@ -831,20 +846,21 @@ impl QueryHandler {
                         .await
                 }
 
-                // ATTACH/DETACH/CREATE SECRET/DROP SECRET/SHOW SECRETS:
-                // parser-side only in this change. The runtime catalog
-                // registry and secret store handlers land in a follow-up
-                // phase of the ATTACH plan. Surface a precise error so users
-                // hitting this on the feature branch see the right signal.
-                StatementKind::Attach(_)
-                | StatementKind::Detach(_)
-                | StatementKind::CreateSecret(_)
-                | StatementKind::DropSecret(_)
-                | StatementKind::ShowSecrets => Err(SqeError::NotImplemented(
-                    "ATTACH/DETACH/CREATE SECRET/DROP SECRET/SHOW SECRETS: parser landed; \
-                     runtime handlers ship in a later phase of the ATTACH plan"
-                        .to_string(),
-                )),
+                StatementKind::Attach(stmt) => {
+                    let (ctx, _) = self.create_session_context(session).await?;
+                    self.handle_attach(stmt, &ctx).await
+                }
+
+                StatementKind::Detach(stmt) => {
+                    let (ctx, _) = self.create_session_context(session).await?;
+                    self.handle_detach(stmt, &ctx).await
+                }
+
+                StatementKind::CreateSecret(stmt) => self.handle_create_secret(stmt),
+
+                StatementKind::DropSecret(stmt) => self.handle_drop_secret(stmt),
+
+                StatementKind::ShowSecrets => self.handle_show_secrets(),
             }
         };
 
@@ -3096,6 +3112,117 @@ impl QueryHandler {
 
         let batch = RecordBatch::try_new(schema, vec![name_array, row_array, file_array, size_array])
             .map_err(|e| SqeError::Execution(format!("Failed to build SHOW STATS result: {e}")))?;
+
+        Ok(vec![batch])
+    }
+
+    // -----------------------------------------------------------------------
+    // ATTACH / DETACH / CREATE SECRET / DROP SECRET / SHOW SECRETS handlers
+    // -----------------------------------------------------------------------
+
+    async fn handle_attach(
+        &self,
+        stmt: &sqe_sql::AttachStatement,
+        ctx: &SessionContext,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        self.runtime_catalogs
+            .attach(stmt, &self.secrets, ctx)
+            .await
+            .map_err(SqeError::Execution)?;
+        crate::session_context::invalidate_all_session_caches();
+        info!(catalog = %stmt.name, kind = %stmt.kind.name(), "ATTACH complete");
+        Ok(vec![])
+    }
+
+    async fn handle_detach(
+        &self,
+        stmt: &sqe_sql::DetachStatement,
+        ctx: &SessionContext,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        self.runtime_catalogs
+            .detach(&stmt.name, ctx)
+            .map_err(SqeError::Execution)?;
+        crate::session_context::invalidate_all_session_caches();
+        info!(catalog = %stmt.name, "DETACH complete");
+        Ok(vec![])
+    }
+
+    fn handle_create_secret(
+        &self,
+        stmt: &sqe_sql::CreateSecretStatement,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        use sqe_core::Secret;
+        use sqe_sql::SecretKind;
+
+        let opts = &stmt.options;
+        let get_str = |key: &str| -> Result<String, SqeError> {
+            opts.get(key)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| SqeError::Execution(format!(
+                    "CREATE SECRET: missing required option {key} for {:?} secret",
+                    stmt.kind.name()
+                )))
+        };
+        let get_opt = |key: &str| -> Option<String> {
+            opts.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+        };
+
+        let secret = match stmt.kind {
+            SecretKind::Aws => Secret::Aws {
+                access_key: get_opt("ACCESS_KEY_ID"),
+                secret_key: get_opt("SECRET_ACCESS_KEY"),
+                session_token: get_opt("SESSION_TOKEN"),
+                region: get_opt("REGION"),
+                profile: get_opt("PROFILE"),
+            },
+            SecretKind::Bearer => Secret::Bearer {
+                token: get_str("TOKEN")?,
+            },
+            SecretKind::Basic => Secret::Basic {
+                username: get_str("USERNAME")?,
+                password: get_str("PASSWORD")?,
+            },
+        };
+
+        self.secrets
+            .create(&stmt.name, secret)
+            .map_err(SqeError::Execution)?;
+        info!(name = %stmt.name, kind = %stmt.kind.name(), "CREATE SECRET complete");
+        Ok(vec![])
+    }
+
+    fn handle_drop_secret(
+        &self,
+        stmt: &sqe_sql::DropSecretStatement,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let in_use = self.runtime_catalogs.referenced_secrets(&stmt.name);
+        self.secrets
+            .drop_secret(&stmt.name, &in_use)
+            .map_err(SqeError::Execution)?;
+        info!(name = %stmt.name, "DROP SECRET complete");
+        Ok(vec![])
+    }
+
+    fn handle_show_secrets(&self) -> sqe_core::Result<Vec<RecordBatch>> {
+        let listed = self.secrets.list();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("type", DataType::Utf8, false),
+        ]));
+
+        let mut name_b = StringBuilder::new();
+        let mut type_b = StringBuilder::new();
+        for (name, type_name) in &listed {
+            name_b.append_value(name);
+            type_b.append_value(type_name);
+        }
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(name_b.finish()) as ArrayRef, Arc::new(type_b.finish()) as ArrayRef],
+        )
+        .map_err(|e| SqeError::Execution(format!("Failed to build SHOW SECRETS result: {e}")))?;
 
         Ok(vec![batch])
     }
