@@ -2199,20 +2199,10 @@ impl QueryHandler {
         .await?;
 
         // If a filter is provided, use it as the namespace; otherwise list all namespaces
-        let namespaces = if filter.is_empty() {
-            session_catalog.list_namespaces().await?
-        } else {
-            // Parse the filter — strip any "IN" prefix that sqlparser may add
-            let ns_name = filter
-                .trim()
-                .trim_start_matches("IN")
-                .trim()
-                .to_string();
-            if ns_name.is_empty() {
-                session_catalog.list_namespaces().await?
-            } else {
-                vec![iceberg::NamespaceIdent::new(ns_name)]
-            }
+        let ns_name = parse_show_tables_namespace(filter);
+        let namespaces = match ns_name {
+            None => session_catalog.list_namespaces().await?,
+            Some(name) => vec![iceberg::NamespaceIdent::new(name)],
         };
 
         let schema = Arc::new(Schema::new(vec![
@@ -3757,6 +3747,63 @@ fn should_emit(kind: &StatementKind, cfg: &sqe_core::config::OpenLineageConfig) 
     }
 }
 
+/// Extract the target namespace name from sqlparser's `ShowStatementIn`
+/// stringification, returned by `StatementKind::ShowTables(filter)`.
+///
+/// Returns `None` when the filter is empty (caller should list every
+/// namespace) and `Some(name)` for a single-segment namespace.
+///
+/// Handles every shape sqlparser can render for `SHOW TABLES`:
+///
+/// - `""` (no filter)              -> `None`
+/// - `IN analytics_db`              -> `Some("analytics_db")`
+/// - `FROM analytics_db`            -> `Some("analytics_db")`
+/// - `IN "analytics_db"`            -> `Some("analytics_db")` (strips wrapping quotes)
+/// - `IN main_warehouse.analytics_db`        -> `Some("analytics_db")` (drops catalog qualifier)
+/// - `IN "main_warehouse"."analytics_db"`    -> `Some("analytics_db")` (both)
+///
+/// The Polaris namespace API stores names verbatim. Earlier code did
+/// `trim_start_matches("IN")` and used the result as-is, which made
+/// `SHOW TABLES IN "analytics_db"` look up a namespace literally named
+/// `"analytics_db"` (with the quote characters in it). The Flight SQL
+/// `do_get_tables` handler emits the quoted form, so DBeaver's database
+/// tree showed every schema as empty.
+fn parse_show_tables_namespace(filter: &str) -> Option<String> {
+    let raw = filter.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // sqlparser renders the IN/FROM keyword followed by a space.
+    // Match either prefix; fall through to the raw input if neither
+    // is present (some callers pass the bare namespace already).
+    let after_kw = raw
+        .strip_prefix("IN ")
+        .or_else(|| raw.strip_prefix("FROM "))
+        .or_else(|| raw.strip_prefix("in "))
+        .or_else(|| raw.strip_prefix("from "))
+        .unwrap_or(raw)
+        .trim();
+    if after_kw.is_empty() {
+        return None;
+    }
+    // Take the last dotted segment so a `cat.schema` qualifier reduces
+    // to `schema`. Polaris namespaces are single-segment in this
+    // codebase; a multi-level Iceberg namespace would still resolve
+    // through the trailing segment which matches the historical
+    // behaviour for unqualified inputs.
+    let last_segment = after_kw.rsplit('.').next().unwrap_or(after_kw).trim();
+    // Strip wrapping double quotes if present.
+    let unquoted = last_segment
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(last_segment);
+    if unquoted.is_empty() {
+        None
+    } else {
+        Some(unquoted.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3823,6 +3870,81 @@ mod tests {
         config.role_overrides.insert("admin".to_string(), 600);
         let session = test_session(vec![]);
         assert_eq!(timeout_for_session(&config, &session), 300);
+    }
+
+    // ── parse_show_tables_namespace ──────────────────────────────
+    // Regression coverage for the "DBeaver shows empty schemas" bug:
+    // sqlparser stringifies `SHOW TABLES IN "analytics_db"` as
+    // `IN "analytics_db"`, and the old code stripped the keyword but
+    // not the surrounding quotes. The Polaris namespace lookup was
+    // then asking for a namespace literally named `"analytics_db"`.
+
+    #[test]
+    fn parse_show_tables_namespace_empty_returns_none() {
+        assert_eq!(parse_show_tables_namespace(""), None);
+        assert_eq!(parse_show_tables_namespace("   "), None);
+    }
+
+    #[test]
+    fn parse_show_tables_namespace_unquoted() {
+        assert_eq!(
+            parse_show_tables_namespace("IN analytics_db"),
+            Some("analytics_db".to_string())
+        );
+        assert_eq!(
+            parse_show_tables_namespace("FROM analytics_db"),
+            Some("analytics_db".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_show_tables_namespace_quoted_strips_quotes() {
+        assert_eq!(
+            parse_show_tables_namespace(r#"IN "analytics_db""#),
+            Some("analytics_db".to_string())
+        );
+        assert_eq!(
+            parse_show_tables_namespace(r#"FROM "analytics_db""#),
+            Some("analytics_db".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_show_tables_namespace_qualified_drops_catalog() {
+        assert_eq!(
+            parse_show_tables_namespace("IN main_warehouse.analytics_db"),
+            Some("analytics_db".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_show_tables_namespace_quoted_qualified() {
+        assert_eq!(
+            parse_show_tables_namespace(r#"IN "main_warehouse"."analytics_db""#),
+            Some("analytics_db".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_show_tables_namespace_bare_name_no_keyword() {
+        // Some callers pass the bare namespace already.
+        assert_eq!(
+            parse_show_tables_namespace("analytics_db"),
+            Some("analytics_db".to_string())
+        );
+        assert_eq!(
+            parse_show_tables_namespace(r#""analytics_db""#),
+            Some("analytics_db".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_show_tables_namespace_lowercase_keyword() {
+        // sqlparser usually upper-cases but defend against either form.
+        assert_eq!(
+            parse_show_tables_namespace("in analytics_db"),
+            Some("analytics_db".to_string())
+        );
     }
 
     #[test]
