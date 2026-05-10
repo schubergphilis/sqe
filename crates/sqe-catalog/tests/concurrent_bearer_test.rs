@@ -447,6 +447,149 @@ async fn capture_layer_observes_unauth_warn() {
     );
 }
 
+/// Verifies the defensive guard added for issue #2: a `RestCatalog`
+/// that was constructed with a bearer token must refuse to issue an
+/// outbound REST call without `Authorization` if the live token has
+/// been cleared after init.
+///
+/// We construct the catalog the normal way (token in props, init runs,
+/// `auth_required` flag flips to true), then call the public
+/// `invalidate_token()` to simulate the end state of any race that
+/// would leave the mutex holding `None` while `auth_required` says we
+/// should still be authenticated. The next `list_namespaces` call must
+/// hit the new guard at `client::authenticate` and surface a clear
+/// `DataInvalid` error rather than silently going on the wire bare.
+#[tokio::test(flavor = "current_thread")]
+async fn auth_required_guard_refuses_unauthed_request_after_token_cleared() {
+    use iceberg::{Catalog, CatalogBuilder};
+    use iceberg_catalog_rest::RestCatalogBuilder;
+    use std::collections::HashMap;
+
+    let server = MockServer::start().await;
+    polaris_mock(&server, std::time::Duration::ZERO).await;
+
+    // Build a RestCatalog with a token so `auth_required = true`
+    // propagates through both `HttpClient::new` and `update_with`.
+    let mut props = HashMap::new();
+    props.insert("uri".to_string(), server.uri());
+    props.insert("token".to_string(), "live-token-xyz".to_string());
+    props.insert("warehouse".to_string(), "test-warehouse".to_string());
+    let catalog = RestCatalogBuilder::default()
+        .load("auth-required-guard".to_string(), props)
+        .await
+        .expect("RestCatalogBuilder accepts an authenticated build");
+
+    // Drive one successful call so the OnceCell context is initialised
+    // with a live token. Without this the invalidate_token below
+    // would race the init future and the assertion below would just
+    // re-test the no-auth-at-all path.
+    catalog
+        .list_namespaces(None)
+        .await
+        .expect("first list_namespaces should authenticate cleanly");
+
+    // Now simulate the end state of any concurrency race that drops
+    // the token: clear it directly via the public API.
+    catalog
+        .invalidate_token()
+        .await
+        .expect("invalidate_token is infallible");
+
+    // The next call must hit the auth_required guard and fail with a
+    // DataInvalid error containing "Refusing to send outbound REST
+    // request without Authorization". It must NOT silently send a bare
+    // request to the wiremock server.
+    let err = catalog
+        .list_namespaces(None)
+        .await
+        .expect_err("list_namespaces after invalidate_token should fail loudly");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Refusing to send outbound REST request without Authorization"),
+        "Expected the auth_required guard message; got: {msg}",
+    );
+
+    // Server should NOT have seen a second outbound call without auth.
+    // wiremock's catch-all 401 mock would have responded if the request
+    // had escaped the guard. The request log lets us assert exactly
+    // that.
+    let request_log = format_request_log(&server).await;
+    let unauth_outbound_count = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| {
+            r.headers.get("authorization").is_none()
+                && r.headers.get("Authorization").is_none()
+        })
+        .count();
+    assert_eq!(
+        unauth_outbound_count, 0,
+        "An unauthenticated request reached the wiremock server even though \
+         the auth_required guard should have rejected it.\n\n{request_log}",
+    );
+}
+
+/// Verifies SQE's own construction-time guard: passing an empty bearer
+/// to `SessionCatalog::new` must NOT result in `"token" -> ""` landing
+/// in the props map handed to `iceberg-catalog-rest`. The previous
+/// behaviour silently sent `Bearer ` (literal empty) on the wire.
+///
+/// We can't easily inspect the internal props after construction, so
+/// instead we drive a call through and assert the request that reached
+/// the wiremock server carried no `Authorization` header at all (the
+/// "empty token means anonymous catalog" contract from
+/// `crates/sqe-auth/src/per_catalog.rs`). Before the fix this call
+/// would have arrived with `Authorization: Bearer ` and Polaris would
+/// have 401'd; the iceberg-rust empty-bearer guard later masked it as
+/// a `DataInvalid` error.
+#[tokio::test(flavor = "current_thread")]
+async fn empty_bearer_does_not_inject_token_prop() {
+    let server = MockServer::start().await;
+    // Permissive: respond 200 to any GET regardless of auth so we can
+    // observe what header (if any) SQE actually sent.
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"overrides":{},"defaults":{},"namespaces":[]}"#),
+        )
+        .mount(&server)
+        .await;
+
+    // Empty bearer signals an Anonymous catalog per
+    // `resolve_bearer(CatalogAuthConfig::Anonymous, _)`. SessionCatalog
+    // must accept this and skip the token prop entirely.
+    let session = make_session(&server.uri(), "").await;
+
+    // One call drives the OnceCell init and the first outbound REST
+    // request. Either Ok or Err is acceptable here as long as the
+    // request body shape is correct.
+    let _ = session.list_namespaces().await;
+
+    let received = server.received_requests().await.unwrap_or_default();
+    assert!(
+        !received.is_empty(),
+        "wiremock saw no requests; the test isn't exercising the wire path",
+    );
+
+    for req in &received {
+        let auth = req
+            .headers
+            .get("authorization")
+            .or_else(|| req.headers.get("Authorization"));
+        assert!(
+            auth.is_none(),
+            "Empty-bearer SessionCatalog sent an Authorization header on \
+             {} {} (was {:?}). The Anonymous-catalog contract is broken.",
+            req.method,
+            req.url.path(),
+            auth,
+        );
+    }
+}
+
 /// Same shape as the multi_thread test, but with current_thread + a
 /// low concurrency. Acts as the baseline: if the bug only repros on
 /// multi_thread, the warn count here should stay at zero. If we see
