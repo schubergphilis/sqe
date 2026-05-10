@@ -1,3 +1,4 @@
+pub mod catalog_qualifiers;
 pub mod classifier;
 pub mod ddl;
 pub mod partition;
@@ -7,6 +8,7 @@ pub mod time_travel;
 pub mod trino_compat;
 pub mod v3_types;
 
+pub use catalog_qualifiers::extract_catalog_qualifiers;
 pub use classifier::{parse_and_classify, CheckAccessParams, ShowGrantsTarget, StatementKind};
 pub use ddl::{try_parse_ref_ddl, BranchRetention, RefDdl};
 pub use partition::normalize_partitioned_by;
