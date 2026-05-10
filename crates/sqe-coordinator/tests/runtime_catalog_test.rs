@@ -3,12 +3,14 @@
 //! Each test attaches a real SQLite-backed Iceberg catalog over a
 //! tempdir warehouse. Using `CatalogKind::Sqlite` keeps the wiring
 //! end to end (parser AST -> mount::build_catalog -> sqlx ->
-//! WritableIcebergCatalog -> SessionContext) without standing up a
-//! REST endpoint or AWS fixture.
+//! WritableIcebergCatalog) without standing up a REST endpoint or AWS
+//! fixture. The registry itself no longer touches DataFusion — every
+//! attached catalog's `CatalogProvider` is exposed via `providers()`
+//! and re-registered into each new `SessionContext` by
+//! `create_session_context`.
 
 use std::collections::BTreeMap;
 
-use datafusion::execution::context::SessionContext;
 use sqe_coordinator::RuntimeCatalogRegistry;
 use sqe_core::SecretStore;
 use sqe_sql::{AttachStatement, CatalogKind, OptionValue};
@@ -32,11 +34,10 @@ fn sqlite_attach(name: &str, dir: &TempDir) -> AttachStatement {
 async fn attach_then_list_returns_name() {
     let registry = RuntimeCatalogRegistry::new();
     let secrets = SecretStore::new();
-    let ctx = SessionContext::new();
     let dir = tempfile::tempdir().expect("tempdir");
 
     registry
-        .attach(&sqlite_attach("foo", &dir), &secrets, &ctx)
+        .attach(&sqlite_attach("foo", &dir), &secrets)
         .await
         .expect("first attach succeeds");
 
@@ -47,16 +48,15 @@ async fn attach_then_list_returns_name() {
 async fn attach_duplicate_name_errors() {
     let registry = RuntimeCatalogRegistry::new();
     let secrets = SecretStore::new();
-    let ctx = SessionContext::new();
     let dir = tempfile::tempdir().expect("tempdir");
 
     registry
-        .attach(&sqlite_attach("foo", &dir), &secrets, &ctx)
+        .attach(&sqlite_attach("foo", &dir), &secrets)
         .await
         .expect("first attach succeeds");
 
     let err = registry
-        .attach(&sqlite_attach("foo", &dir), &secrets, &ctx)
+        .attach(&sqlite_attach("foo", &dir), &secrets)
         .await
         .expect_err("duplicate attach should error");
     assert!(
@@ -70,10 +70,9 @@ async fn attach_duplicate_name_errors() {
 #[tokio::test]
 async fn detach_unknown_errors() {
     let registry = RuntimeCatalogRegistry::new();
-    let ctx = SessionContext::new();
 
     let err = registry
-        .detach("nope", &ctx)
+        .detach("nope")
         .expect_err("detaching an unknown catalog should error");
     assert!(
         err.contains("not attached"),
@@ -85,24 +84,18 @@ async fn detach_unknown_errors() {
 async fn detach_then_attach_again_works() {
     let registry = RuntimeCatalogRegistry::new();
     let secrets = SecretStore::new();
-    let ctx = SessionContext::new();
     let dir = tempfile::tempdir().expect("tempdir");
 
     registry
-        .attach(&sqlite_attach("foo", &dir), &secrets, &ctx)
+        .attach(&sqlite_attach("foo", &dir), &secrets)
         .await
         .expect("first attach succeeds");
 
-    registry
-        .detach("foo", &ctx)
-        .expect("first detach succeeds");
+    registry.detach("foo").expect("first detach succeeds");
     assert!(registry.list().is_empty());
 
-    // The fresh `SessionContext::new()` uses a `MemoryCatalogProviderList`
-    // directly (no `enable_url_table` wrapping), so the detach above
-    // also cleared DataFusion's view. A re-attach must not collide.
     registry
-        .attach(&sqlite_attach("foo", &dir), &secrets, &ctx)
+        .attach(&sqlite_attach("foo", &dir), &secrets)
         .await
         .expect("re-attach after detach should succeed");
 
@@ -113,7 +106,6 @@ async fn detach_then_attach_again_works() {
 async fn referenced_secrets_lists_consumers() {
     let registry = RuntimeCatalogRegistry::new();
     let secrets = SecretStore::new();
-    let ctx = SessionContext::new();
     let dir_a = tempfile::tempdir().expect("tempdir");
     let dir_b = tempfile::tempdir().expect("tempdir");
 
@@ -133,11 +125,11 @@ async fn referenced_secrets_lists_consumers() {
     );
 
     registry
-        .attach(&stmt_a, &secrets, &ctx)
+        .attach(&stmt_a, &secrets)
         .await
         .expect("attach cat_a");
     registry
-        .attach(&stmt_b, &secrets, &ctx)
+        .attach(&stmt_b, &secrets)
         .await
         .expect("attach cat_b");
 
@@ -154,12 +146,11 @@ async fn referenced_secrets_lists_consumers() {
 async fn referenced_secrets_empty_when_no_consumers() {
     let registry = RuntimeCatalogRegistry::new();
     let secrets = SecretStore::new();
-    let ctx = SessionContext::new();
     let dir = tempfile::tempdir().expect("tempdir");
 
     // Attach without any SECRET option.
     registry
-        .attach(&sqlite_attach("plain", &dir), &secrets, &ctx)
+        .attach(&sqlite_attach("plain", &dir), &secrets)
         .await
         .expect("attach without secret");
 
@@ -168,26 +159,26 @@ async fn referenced_secrets_empty_when_no_consumers() {
 }
 
 #[tokio::test]
-async fn attach_registers_with_session_context() {
+async fn providers_returns_attached_catalogs() {
     let registry = RuntimeCatalogRegistry::new();
     let secrets = SecretStore::new();
-    let ctx = SessionContext::new();
     let dir = tempfile::tempdir().expect("tempdir");
 
-    // Sanity check: name not present before attach.
     assert!(
-        ctx.catalog("foo").is_none(),
-        "fresh SessionContext should not know about 'foo' yet"
+        registry.providers().is_empty(),
+        "fresh registry should expose no providers"
     );
 
     registry
-        .attach(&sqlite_attach("foo", &dir), &secrets, &ctx)
+        .attach(&sqlite_attach("foo", &dir), &secrets)
         .await
         .expect("attach succeeds");
 
-    let provider = ctx.catalog("foo").expect("catalog 'foo' is registered");
+    let providers = registry.providers();
+    assert_eq!(providers.len(), 1, "one catalog attached");
+    assert_eq!(providers[0].0, "foo");
     // The default fresh SQLite catalog has no namespaces, so
     // `schema_names` returns an empty list. Calling it exercises the
     // wired `WritableIcebergCatalog` end to end.
-    assert!(provider.schema_names().is_empty());
+    assert!(providers[0].1.schema_names().is_empty());
 }
