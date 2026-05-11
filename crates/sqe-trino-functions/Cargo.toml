@@ -1,6 +1,6 @@
 [package]
 name = "sqe-trino-functions"
-version = "0.15.0"
+version = "0.31.4"
 edition = "2021"
 
 # Trino-compatible scalar UDFs for DataFusion.
