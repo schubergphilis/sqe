@@ -312,6 +312,25 @@ fn classify_catalog_error(msg: &str) -> SqeErrorCode {
 /// Classify a [`SqeError::Execution`] message into a specific error code.
 fn classify_execution_error(msg: &str) -> SqeErrorCode {
     let lower = msg.to_lowercase();
+    // Auth/access patterns must run before any other keyword check.
+    // Polaris's 401/403 bodies are wrapped through the write path as
+    // `SqeError::Execution(...)` (commit failures, INSERT/CTAS transactions),
+    // so `classify_catalog_error` never sees them. Without this branch the
+    // error falls through to `ExecutionFailed`, the auto-recovery in
+    // `query_handler::execute` does not fire (it only triggers on
+    // `AuthenticationFailed`/`AccessDenied`), and the stale-bearer in
+    // REST_CATALOG_CACHE keeps producing 401s until the 5-minute TTL.
+    // Reproducer: dbt seed loads `customers` (8s), then `orders` 401s on
+    // commit when Keycloak's access-token TTL boundary is crossed mid-run.
+    if lower.contains("401 unauthorized")
+        || lower.contains("www-authenticate")
+        || lower.contains("authentication failed")
+    {
+        return SqeErrorCode::AuthenticationFailed;
+    }
+    if lower.contains("403 forbidden") {
+        return SqeErrorCode::AccessDenied;
+    }
     // TypeMismatch must be checked BEFORE FunctionNotFound because DataFusion
     // concatenates both messages: "TypeSignatureClass... No function matches..."
     if lower.contains("typesignatureclass")
@@ -557,6 +576,43 @@ mod tests {
         let code = err.error_code();
         assert_eq!(code, SqeErrorCode::TableNotFound);
         assert!(code.is_user_error());
+    }
+
+    #[test]
+    fn classify_execution_401_as_authentication_failed() {
+        // Polaris commit failures (INSERT, CTAS, MERGE) wrap the HTTP
+        // response body inside SqeError::Execution. Without this, the
+        // automatic REST_CATALOG_CACHE eviction in query_handler::execute
+        // does not fire because it gates on AuthenticationFailed.
+        let err = SqeError::Execution(
+            "Query execution error: Failed to commit INSERT transaction: \
+             Unexpected, context: { status: 401 Unauthorized, \
+             headers: {\"www-authenticate\": \"Bearer\"} }".into(),
+        );
+        assert_eq!(err.error_code(), SqeErrorCode::AuthenticationFailed);
+    }
+
+    #[test]
+    fn classify_execution_403_as_access_denied() {
+        let err = SqeError::Execution(
+            "Query execution error: Failed to create table: \
+             Unexpected, context: { status: 403 Forbidden, \
+             headers: {\"content-type\": \"application/json\"} }".into(),
+        );
+        assert_eq!(err.error_code(), SqeErrorCode::AccessDenied);
+    }
+
+    #[test]
+    fn classify_execution_auth_check_does_not_swallow_table_not_found() {
+        // Some Polaris error bodies include the word "Authentication" or
+        // "table not found" inside a quoted JSON field. The 401/403 check
+        // is specifically gated on status-code substrings ("401 unauthorized",
+        // "403 forbidden") so a regular table-not-found error still routes
+        // to TableNotFound, not AuthenticationFailed.
+        let err = SqeError::Execution(
+            "Query execution error: table 'orders' not found in catalog".into(),
+        );
+        assert_eq!(err.error_code(), SqeErrorCode::TableNotFound);
     }
 
     #[test]
