@@ -6472,7 +6472,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-auth"
-version = "0.15.0"
+version = "0.31.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6499,7 +6499,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-bench"
-version = "0.15.0"
+version = "0.31.4"
 dependencies = [
  "anyhow",
  "arrow",
@@ -6527,7 +6527,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-catalog"
-version = "0.15.0"
+version = "0.31.4"
 dependencies = [
  "anyhow",
  "arrow",
@@ -6580,7 +6580,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-cli"
-version = "0.15.0"
+version = "0.31.4"
 dependencies = [
  "anyhow",
  "arrow",
@@ -6617,7 +6617,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-coordinator"
-version = "0.15.0"
+version = "0.31.4"
 dependencies = [
  "anyhow",
  "arrow",
@@ -6675,7 +6675,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-core"
-version = "0.15.0"
+version = "0.31.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6691,7 +6691,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-lineage"
-version = "0.15.0"
+version = "0.31.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6716,7 +6716,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-metrics"
-version = "0.15.0"
+version = "0.31.4"
 dependencies = [
  "axum",
  "chrono",
@@ -6738,7 +6738,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-planner"
-version = "0.15.0"
+version = "0.31.4"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -6754,7 +6754,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-policy"
-version = "0.15.0"
+version = "0.31.4"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -6773,7 +6773,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-sql"
-version = "0.15.0"
+version = "0.31.4"
 dependencies = [
  "chrono",
  "sqe-core",
@@ -6783,7 +6783,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-trino-compat"
-version = "0.15.0"
+version = "0.31.4"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -6806,7 +6806,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-trino-functions"
-version = "0.15.0"
+version = "0.31.4"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -6826,7 +6826,7 @@ dependencies = [
 
 [[package]]
 name = "sqe-worker"
-version = "0.15.0"
+version = "0.31.4"
 dependencies = [
  "ahash",
  "anyhow",
