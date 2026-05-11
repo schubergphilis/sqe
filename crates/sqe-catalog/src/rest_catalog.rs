@@ -45,6 +45,42 @@ struct CachedTableEntry {
 ///
 /// Use [`TableMetadataCache::invalidate`] after any DDL/DML that changes table
 /// structure (DROP TABLE, ALTER TABLE, INSERT, MERGE, DELETE).
+///
+/// Process-global cache of `RestCatalog` instances, keyed by
+/// `format!("{catalog_url}-{token_fingerprint}")`. Each entry holds an
+/// `Arc<RwLock<RestCatalog>>` that bakes in the bearer token at construction
+/// time, so when Polaris-side token expiry crosses the 5-minute TTL boundary
+/// the cached entry returns 401 on every subsequent call. Issue #20 covers
+/// the symptom (dbt models 401'ing partway through a run) and the matching
+/// `invalidate_rest_catalog_cache_all` below is the error-driven escape
+/// hatch called from the query handler whenever a catalog op surfaces an
+/// `AuthenticationFailed`.
+pub(crate) static REST_CATALOG_CACHE: std::sync::LazyLock<
+    moka::future::Cache<String, Arc<RwLock<RestCatalog>>>,
+> = std::sync::LazyLock::new(|| {
+    moka::future::Cache::builder()
+        .max_capacity(100)
+        .time_to_live(std::time::Duration::from_secs(300))
+        .build()
+});
+
+/// Drop every cached `RestCatalog` entry. Called from the query handler when a
+/// catalog operation surfaces 401/403, so the next query rebuilds the catalog
+/// with whatever bearer the session has at that point (either a refreshed
+/// token from the background refresher, or a fresh OIDC exchange after the
+/// client re-authenticates).
+///
+/// Heavy hammer rather than per-entry invalidation: SQE does not maintain a
+/// `username -> token_fingerprint` reverse index, so we cannot scope the
+/// eviction to one user without a side-band map. Auth failures are rare; the
+/// rebuild cost is amortised across however many entries were cached (max 100,
+/// ~250 ms each, but lazily on next access — not all at once).
+pub async fn invalidate_rest_catalog_cache_all() {
+    REST_CATALOG_CACHE.invalidate_all();
+    REST_CATALOG_CACHE.run_pending_tasks().await;
+    debug!("REST_CATALOG_CACHE invalidated (auth failure recovery)");
+}
+
 #[derive(Clone)]
 pub struct TableMetadataCache {
     /// Long-lived cache (1 hour hard TTL) holding table metadata + ETag.
@@ -554,18 +590,6 @@ impl SessionCatalog {
         // Storage factory (OpenDAL S3) is configured automatically from the s3.*
         // properties in the props HashMap — no explicit with_storage_factory() needed.
         //
-        // Cache RestCatalog instances by token fingerprint to avoid the expensive
-        // (~250ms) per-query creation cost. The catalog is safe to reuse because
-        // iceberg-rust's RestCatalog is stateless (each loadTable call goes to Polaris).
-        static REST_CATALOG_CACHE: std::sync::LazyLock<
-            moka::future::Cache<String, Arc<RwLock<RestCatalog>>>
-        > = std::sync::LazyLock::new(|| {
-            moka::future::Cache::builder()
-                .max_capacity(100)
-                .time_to_live(std::time::Duration::from_secs(300)) // 5 min
-                .build()
-        });
-
         let catalog_key = format!("{}-{}", catalog_url, token_fingerprint);
         let inner = if let Some(cached) = REST_CATALOG_CACHE.get(&catalog_key).await {
             debug!(token_fingerprint = %token_fingerprint, "REST catalog cache hit");
