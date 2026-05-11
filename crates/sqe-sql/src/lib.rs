@@ -18,7 +18,7 @@ pub use classifier::{parse_and_classify, CheckAccessParams, ShowGrantsTarget, St
 pub use ddl::{try_parse_ref_ddl, BranchRetention, RefDdl};
 pub use partition::normalize_partitioned_by;
 pub use partition_evolution::{try_parse_partition_evolution, PartitionEvolution};
-pub use procedures::{try_parse_call, ProcedureCall, TableRef};
+pub use procedures::{try_parse_call, NamespaceRef, ProcedureCall, TableRef};
 pub use time_travel::{
     extract_incremental_spec, extract_time_travel_spec, IncrementalSpec, TimeTravelSpec, VersionRef,
 };

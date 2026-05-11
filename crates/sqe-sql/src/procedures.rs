@@ -70,6 +70,17 @@ pub enum ProcedureCall {
         /// finished-query records examined.
         history_limit: Option<usize>,
     },
+    /// Sweep a namespace's warehouse prefix for S3 directories that are not
+    /// registered as tables in the catalog. Default `dry_run = true` reports
+    /// what would be deleted; `dry_run => false` actually deletes via the
+    /// table-namespace's FileIO. Targets one namespace at a time; the catalog
+    /// component is resolved against the session's bound catalog.
+    PurgeOrphanLocations {
+        namespace: NamespaceRef,
+        /// When true (default), only enumerate and report. When false,
+        /// delete the orphan prefixes.
+        dry_run: bool,
+    },
 }
 
 impl ProcedureCall {
@@ -81,18 +92,68 @@ impl ProcedureCall {
             ProcedureCall::RemoveOrphanFiles { .. } => "remove_orphan_files",
             ProcedureCall::RewriteManifests { .. } => "rewrite_manifests",
             ProcedureCall::SuggestBloomFilterColumns { .. } => "suggest_bloom_filter_columns",
+            ProcedureCall::PurgeOrphanLocations { .. } => "purge_orphan_locations",
         }
     }
 
-    /// The target table for the procedure. All maintenance procedures target
-    /// a single table, so this is always present.
-    pub fn table(&self) -> &TableRef {
+    /// The target table for table-targeted procedures. Returns `None` for
+    /// namespace-targeted procedures like `PurgeOrphanLocations`.
+    pub fn table(&self) -> Option<&TableRef> {
         match self {
             ProcedureCall::RewriteDataFiles { table, .. }
             | ProcedureCall::ExpireSnapshots { table, .. }
             | ProcedureCall::RemoveOrphanFiles { table, .. }
             | ProcedureCall::RewriteManifests { table }
-            | ProcedureCall::SuggestBloomFilterColumns { table, .. } => table,
+            | ProcedureCall::SuggestBloomFilterColumns { table, .. } => Some(table),
+            ProcedureCall::PurgeOrphanLocations { .. } => None,
+        }
+    }
+
+    /// Display label for audit logs. Returns the table identifier for
+    /// table-targeted procedures, the namespace identifier for
+    /// namespace-targeted ones.
+    pub fn target_label(&self) -> String {
+        match self {
+            ProcedureCall::PurgeOrphanLocations { namespace, .. } => namespace.as_string(),
+            _ => self
+                .table()
+                .map(|t| t.as_string())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// A parsed 1- or 2-part namespace reference. Mirrors [`TableRef`] but with
+/// no `name` segment. Catalog prefix is retained for display; handlers
+/// resolve against the session's bound catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceRef {
+    pub catalog: Option<String>,
+    pub namespace: String,
+}
+
+impl NamespaceRef {
+    pub fn parse(s: &str) -> sqe_core::Result<Self> {
+        let parts: Vec<&str> = s.split('.').map(|p| p.trim()).collect();
+        match parts.as_slice() {
+            [ns] => Ok(Self {
+                catalog: None,
+                namespace: (*ns).to_string(),
+            }),
+            [cat, ns] => Ok(Self {
+                catalog: Some((*cat).to_string()),
+                namespace: (*ns).to_string(),
+            }),
+            _ => Err(SqeError::Execution(format!(
+                "Invalid namespace reference in CALL: '{s}' (expected 1 or 2 dotted parts)"
+            ))),
+        }
+    }
+
+    pub fn as_string(&self) -> String {
+        match &self.catalog {
+            Some(c) => format!("{c}.{}", self.namespace),
+            None => self.namespace.clone(),
         }
     }
 }
@@ -171,7 +232,47 @@ pub fn try_parse_call(stmt: &Statement) -> sqe_core::Result<Option<ProcedureCall
         "remove_orphan_files" => parse_remove_orphan_files(args).map(Some),
         "rewrite_manifests" => parse_rewrite_manifests(args).map(Some),
         "suggest_bloom_filter_columns" => parse_suggest_bloom_filter_columns(args).map(Some),
+        "purge_orphan_locations" => parse_purge_orphan_locations(args).map(Some),
         _ => Ok(None),
+    }
+}
+
+/// Parse `CALL system.purge_orphan_locations(namespace => 'ns'[, dry_run => true|false])`.
+///
+/// `dry_run` defaults to `true` so a typo like `CALL system.purge_orphan_locations(namespace => 'ns')`
+/// is a safe report-only operation. Operators must explicitly pass `dry_run => false`
+/// to actually delete.
+fn parse_purge_orphan_locations(mut args: Vec<(String, Expr)>) -> sqe_core::Result<ProcedureCall> {
+    let namespace = take_namespace(&mut args)?;
+    let dry_run = take_option(&mut args, "dry_run", |e| expect_bool(e, "dry_run"))?
+        .unwrap_or(true);
+    expect_no_remaining(&args, "purge_orphan_locations")?;
+    Ok(ProcedureCall::PurgeOrphanLocations {
+        namespace,
+        dry_run,
+    })
+}
+
+fn take_namespace(args: &mut Vec<(String, Expr)>) -> sqe_core::Result<NamespaceRef> {
+    let pos = args
+        .iter()
+        .position(|(k, _)| k.eq_ignore_ascii_case("namespace"))
+        .ok_or_else(|| {
+            SqeError::Execution(
+                "CALL system.purge_orphan_locations requires a `namespace => 'ns'` argument".into(),
+            )
+        })?;
+    let (_, expr) = args.remove(pos);
+    let s = expect_string(&expr, "namespace")?;
+    NamespaceRef::parse(&s)
+}
+
+fn expect_bool(expr: &Expr, field: &str) -> sqe_core::Result<bool> {
+    match expr {
+        Expr::Value(Value::Boolean(b)) => Ok(*b),
+        other => Err(SqeError::Execution(format!(
+            "Expected boolean literal for '{field}', got: {other}"
+        ))),
     }
 }
 
@@ -568,7 +669,58 @@ mod tests {
         let stmt = parse_first("CALL system.rewrite_data_files(table => 'ns.t')");
         let call = try_parse_call(&stmt).unwrap().expect("match");
         assert_eq!(call.name(), "rewrite_data_files");
-        assert_eq!(call.table().as_string(), "ns.t");
+        assert_eq!(call.table().unwrap().as_string(), "ns.t");
+    }
+
+    #[test]
+    fn parses_purge_orphan_locations_defaults_dry_run_true() {
+        let stmt = parse_first("CALL system.purge_orphan_locations(namespace => 'dev_silver')");
+        let call = try_parse_call(&stmt).unwrap().expect("match");
+        assert_eq!(call.name(), "purge_orphan_locations");
+        assert!(call.table().is_none());
+        match call {
+            ProcedureCall::PurgeOrphanLocations { namespace, dry_run } => {
+                assert_eq!(namespace.as_string(), "dev_silver");
+                assert!(dry_run, "dry_run must default to true");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_purge_orphan_locations_with_dry_run_false() {
+        let stmt = parse_first(
+            "CALL system.purge_orphan_locations(namespace => 'main_warehouse.dev_silver', dry_run => false)",
+        );
+        let call = try_parse_call(&stmt).unwrap().expect("match");
+        match call {
+            ProcedureCall::PurgeOrphanLocations { namespace, dry_run } => {
+                assert_eq!(namespace.as_string(), "main_warehouse.dev_silver");
+                assert_eq!(namespace.catalog.as_deref(), Some("main_warehouse"));
+                assert_eq!(namespace.namespace, "dev_silver");
+                assert!(!dry_run);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn purge_orphan_locations_rejects_unknown_arg() {
+        let stmt = parse_first(
+            "CALL system.purge_orphan_locations(namespace => 'ns', force => true)",
+        );
+        let err = try_parse_call(&stmt).expect_err("unknown arg should reject");
+        assert!(
+            err.to_string().contains("force"),
+            "error must name the offending arg: {err}"
+        );
+    }
+
+    #[test]
+    fn purge_orphan_locations_requires_namespace() {
+        let stmt = parse_first("CALL system.purge_orphan_locations(dry_run => true)");
+        let err = try_parse_call(&stmt).expect_err("missing namespace should reject");
+        assert!(err.to_string().contains("namespace"));
     }
 
     #[test]
