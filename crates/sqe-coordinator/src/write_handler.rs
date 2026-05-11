@@ -17,7 +17,7 @@ use iceberg::table::Table as IcebergTable;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, TableCreation, TableIdent};
 use sqlparser::ast::Statement;
-use tracing::info;
+use tracing::{info, warn};
 
 use sqe_catalog::puffin_stats::{
     puffin_stats_enabled, write_puffin_sidecar,
@@ -109,6 +109,61 @@ fn lineage_target_parts(
     let namespace = table_ident.namespace().to_string();
     let table = table_ident.name().to_string();
     (catalog, namespace, table)
+}
+
+/// Best-effort cleanup of a partially-created CTAS table.
+///
+/// Both CTAS paths (`handle_ctas`, `handle_ctas_streaming`) follow the same
+/// three-step pattern: (1) `catalog.create_table()` registers in Polaris and
+/// writes `metadata/00000-*.json`, (2) the write loop streams parquet to the
+/// table location, (3) a fast-append transaction commits the new snapshot. If
+/// step 2 or step 3 fails the catalog still has the registered (snapshot-less)
+/// entry and the S3 prefix is populated with one or both of:
+///
+///   - `metadata/00000-*.json` from step 1
+///   - `data/*.parquet` from step 2
+///
+/// Without rollback, the next CTAS targeting the same logical name hits
+/// Polaris's location-conflict check (the `metadata.json` already there) and
+/// returns 403 forever — until an operator runs `rm -rf` on S3 or
+/// `system.purge_orphan_locations` (when that lands). The morning of
+/// 2026-05-11 we observed this loop three times in a row across one dbt
+/// session.
+///
+/// This helper undoes step 1 + step 2: delete the S3 prefix, then drop the
+/// catalog entry. Both calls are best-effort and only warn on failure — the
+/// original error from the CTAS is what the caller propagates.
+async fn rollback_ctas_partial_create(
+    catalog: &Arc<dyn Catalog>,
+    table: &IcebergTable,
+    table_ident: &TableIdent,
+) {
+    let location = table.metadata().location();
+    let file_io = table.file_io();
+    match file_io.delete_prefix(location).await {
+        Ok(_) => info!(
+            table = %table_ident,
+            location,
+            "CTAS rollback: deleted S3 prefix"
+        ),
+        Err(e) => warn!(
+            table = %table_ident,
+            location,
+            error = %e,
+            "CTAS rollback: failed to delete S3 prefix — orphan data may remain"
+        ),
+    }
+    match catalog.drop_table(table_ident).await {
+        Ok(_) => info!(
+            table = %table_ident,
+            "CTAS rollback: dropped catalog entry"
+        ),
+        Err(e) => warn!(
+            table = %table_ident,
+            error = %e,
+            "CTAS rollback: failed to drop catalog entry — orphan registration may remain"
+        ),
+    }
 }
 
 /// Handles write operations: CTAS (CREATE TABLE AS SELECT) and INSERT INTO SELECT.
@@ -360,54 +415,70 @@ impl WriteHandler {
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to load created table: {e}")))?;
 
-        // Write data files (skip if no data)
+        // Everything after `catalog.create_table` is wrapped so a failure in
+        // the write or commit triggers a rollback of the partially-created
+        // table (drop catalog entry + delete S3 prefix). Without this the
+        // next CTAS at the same target gets a 403 from Polaris's
+        // location-uniqueness check.
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        if total_rows > 0 {
-            // Clone batches cheaply for the Puffin sidecar when the table has
-            // opted in. RecordBatch clones are Arc bumps, not data copies.
-            let stats_snapshot: Option<Vec<RecordBatch>> =
-                puffin_stats_enabled(table.metadata().properties())
-                    .then(|| batches.clone());
+        let post_create: sqe_core::Result<()> = async {
+            if total_rows > 0 {
+                // Clone batches cheaply for the Puffin sidecar when the table
+                // has opted in. RecordBatch clones are Arc bumps, not data
+                // copies.
+                let stats_snapshot: Option<Vec<RecordBatch>> =
+                    puffin_stats_enabled(table.metadata().properties())
+                        .then(|| batches.clone());
 
-            let data_files = write_data_files_with_metrics(
-                &table,
-                batches,
-                "ctas",
-                self.metrics.as_ref(),
-                self.compression(),
-            )
-            .await?;
+                let data_files = write_data_files_with_metrics(
+                    &table,
+                    batches,
+                    "ctas",
+                    self.metrics.as_ref(),
+                    self.compression(),
+                )
+                .await?;
 
-            if !data_files.is_empty() {
-                // Commit data files via fast-append transaction
-                let tx = Transaction::new(&table);
-                let action = tx.fast_append().add_data_files(data_files);
+                if !data_files.is_empty() {
+                    let tx = Transaction::new(&table);
+                    let action = tx.fast_append().add_data_files(data_files);
+                    let tx = action.apply(tx).map_err(|e| {
+                        SqeError::Execution(format!("Failed to apply fast append: {e}"))
+                    })?;
+                    tx.commit(catalog.as_ref()).await.map_err(|e| {
+                        SqeError::Execution(format!("Failed to commit CTAS transaction: {e}"))
+                    })?;
 
-                let tx = action.apply(tx).map_err(|e| {
-                    SqeError::Execution(format!("Failed to apply fast append: {e}"))
-                })?;
-
-                tx.commit(catalog.as_ref()).await.map_err(|e| {
-                    SqeError::Execution(format!("Failed to commit CTAS transaction: {e}"))
-                })?;
-
-                if let Some(stats_batches) = stats_snapshot {
-                    self.maybe_emit_puffin_sidecar(&catalog, &table_ident, &stats_batches)
-                        .await;
+                    if let Some(stats_batches) = stats_snapshot {
+                        self.maybe_emit_puffin_sidecar(&catalog, &table_ident, &stats_batches)
+                            .await;
+                    }
                 }
-            }
 
-            info!(
-                table = %table_ident,
-                total_rows,
-                "CTAS committed successfully"
-            );
-        } else {
-            info!(
-                table = %table_ident,
-                "CTAS created empty table (no data to write)"
-            );
+                info!(
+                    table = %table_ident,
+                    total_rows,
+                    "CTAS committed successfully"
+                );
+            } else {
+                info!(
+                    table = %table_ident,
+                    "CTAS created empty table (no data to write)"
+                );
+            }
+            Ok(())
         }
+        .await;
+
+        if let Err(ref err) = post_create {
+            warn!(
+                table = %table_ident,
+                error = %err,
+                "CTAS failed after create_table; rolling back to prevent orphan"
+            );
+            rollback_ctas_partial_create(&catalog, &table, &table_ident).await;
+        }
+        post_create?;
 
         Ok(vec![]) // DDL success, no result rows
     }
@@ -500,42 +571,58 @@ impl WriteHandler {
             *plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(wrapper)));
         }
 
-        // Execute the SELECT and stream batches directly to the Parquet writer.
-        let stream = df
-            .execute_stream()
-            .await
-            .map_err(|e| SqeError::Execution(format!("Failed to start execution stream: {e}")))?;
-
-        let (data_files, total_rows) = write_data_files_streaming_with_metrics(
-            &table,
-            stream,
-            "ctas",
-            self.metrics.as_ref(),
-            self.compression(),
-        )
-        .await?;
-
-        if !data_files.is_empty() {
-            let tx = Transaction::new(&table);
-            let action = tx.fast_append().add_data_files(data_files);
-            let tx = action
-                .apply(tx)
-                .map_err(|e| SqeError::Execution(format!("Failed to apply fast append: {e}")))?;
-            tx.commit(catalog.as_ref()).await.map_err(|e| {
-                SqeError::Execution(format!("Failed to commit CTAS transaction: {e}"))
+        // Stream + commit wrapped so any failure after `catalog.create_table`
+        // rolls back the partially-created table. Same rationale as the
+        // non-streaming `handle_ctas` path: a failed write or commit leaves
+        // the catalog entry plus S3 prefix in place, which Polaris's
+        // location-uniqueness check rejects on every retry.
+        let post_create: sqe_core::Result<()> = async {
+            let stream = df.execute_stream().await.map_err(|e| {
+                SqeError::Execution(format!("Failed to start execution stream: {e}"))
             })?;
 
-            info!(
-                table = %table_ident,
-                total_rows,
-                "CTAS committed successfully (streaming)"
-            );
-        } else {
-            info!(
-                table = %table_ident,
-                "CTAS created empty table (no data to write)"
-            );
+            let (data_files, total_rows) = write_data_files_streaming_with_metrics(
+                &table,
+                stream,
+                "ctas",
+                self.metrics.as_ref(),
+                self.compression(),
+            )
+            .await?;
+
+            if !data_files.is_empty() {
+                let tx = Transaction::new(&table);
+                let action = tx.fast_append().add_data_files(data_files);
+                let tx = action.apply(tx).map_err(|e| {
+                    SqeError::Execution(format!("Failed to apply fast append: {e}"))
+                })?;
+                tx.commit(catalog.as_ref()).await.map_err(|e| {
+                    SqeError::Execution(format!("Failed to commit CTAS transaction: {e}"))
+                })?;
+                info!(
+                    table = %table_ident,
+                    total_rows,
+                    "CTAS committed successfully (streaming)"
+                );
+            } else {
+                info!(
+                    table = %table_ident,
+                    "CTAS created empty table (no data to write)"
+                );
+            }
+            Ok(())
         }
+        .await;
+
+        if let Err(ref err) = post_create {
+            warn!(
+                table = %table_ident,
+                error = %err,
+                "CTAS (streaming) failed after create_table; rolling back to prevent orphan"
+            );
+            rollback_ctas_partial_create(&catalog, &table, &table_ident).await;
+        }
+        post_create?;
 
         Ok(vec![])
     }
