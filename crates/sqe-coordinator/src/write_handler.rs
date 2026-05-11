@@ -15,9 +15,10 @@ use iceberg::spec::{
 };
 use iceberg::table::Table as IcebergTable;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::{Catalog, TableCreation, TableIdent};
+use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 use sqlparser::ast::Statement;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use sqe_catalog::puffin_stats::{
     puffin_stats_enabled, write_puffin_sidecar,
@@ -164,6 +165,34 @@ async fn rollback_ctas_partial_create(
             "CTAS rollback: failed to drop catalog entry — orphan registration may remain"
         ),
     }
+}
+
+/// Build a unique table location under the namespace base by appending a UUID
+/// suffix to the table name.
+///
+/// Why: Polaris (and the Iceberg REST spec generally) refuse to create a table
+/// at a location that already belongs to another registered table or namespace.
+/// Without a UUID, every CTAS of `foo__dbt_tmp` lands at the deterministic
+/// `<warehouse>/<ns>/foo__dbt_tmp/`. dbt-trino's swap pattern then renames
+/// `foo__dbt_tmp` to `foo` — Iceberg renames are metadata-only, so the data
+/// stays at the `__dbt_tmp/` prefix and the slot is permanently claimed. The
+/// next `dbt run` hits 403. With a UUID, each CTAS gets its own slot
+/// (`foo__dbt_tmp-<uuid>/`) and the collision can't happen.
+///
+/// Returns `None` (so the catalog falls back to its default location) when:
+///   - the namespace lookup fails, or
+///   - the namespace has no `location` property set (e.g. in-memory catalogs
+///     used by unit tests). The collision-on-rename problem only bites against
+///     Polaris and other REST catalogs that enforce location-uniqueness; the
+///     in-memory paths don't care.
+async fn unique_table_location(
+    catalog: &dyn Catalog,
+    namespace: &NamespaceIdent,
+    table_name: &str,
+) -> Option<String> {
+    let ns = catalog.get_namespace(namespace).await.ok()?;
+    let base = ns.properties().get("location")?.trim_end_matches('/');
+    Some(format!("{base}/{table_name}-{}", Uuid::new_v4()))
 }
 
 /// Handles write operations: CTAS (CREATE TABLE AS SELECT) and INSERT INTO SELECT.
@@ -395,9 +424,11 @@ impl WriteHandler {
 
         // Create the table in the catalog
         let create_format_version = self.format_version();
+        let location = unique_table_location(catalog.as_ref(), &namespace, &name).await;
         let table_creation = TableCreation::builder()
             .name(name.clone())
             .schema(iceberg_schema)
+            .location_opt(location)
             .format_version(create_format_version)
             .properties(format_version_properties(create_format_version))
             .build();
@@ -540,9 +571,11 @@ impl WriteHandler {
         let catalog = self.create_catalog_bridge(session).await?;
 
         let create_format_version = self.format_version();
+        let location = unique_table_location(catalog.as_ref(), &namespace, &name).await;
         let table_creation = TableCreation::builder()
             .name(name.clone())
             .schema(iceberg_schema)
+            .location_opt(location)
             .format_version(create_format_version)
             .properties(format_version_properties(create_format_version))
             .build();
@@ -821,9 +854,11 @@ impl WriteHandler {
             &iceberg_schema,
         )?;
 
+        let location = unique_table_location(catalog.as_ref(), &namespace, &name).await;
         let table_creation = TableCreation::builder()
             .name(name.clone())
             .schema(iceberg_schema)
+            .location_opt(location)
             .format_version(format_version)
             .properties(props)
             .partition_spec_opt(partition_spec)
