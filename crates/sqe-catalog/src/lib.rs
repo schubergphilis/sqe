@@ -46,7 +46,7 @@ pub use circuit_breaker::CircuitBreaker;
 pub use footer_cache::FooterCache;
 pub use iceberg_scan::IcebergScanExec;
 pub use mount::build_catalog;
-pub use rest_catalog::{SessionCatalog, TableMetadataCache};
+pub use rest_catalog::{invalidate_rest_catalog_cache_all, SessionCatalog, TableMetadataCache};
 pub use iceberg_scan::coalesce_file_entries;
 pub use s3_io::{
     ByteRange, PrefetchHandle, coalesce_ranges, fetch_byte_ranges, fetch_column_chunks,

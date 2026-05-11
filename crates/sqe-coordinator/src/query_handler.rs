@@ -875,6 +875,29 @@ impl QueryHandler {
             }
         };
 
+        // Auth-failure recovery (issue #20). When the catalog rejected our
+        // bearer mid-query — typically Polaris-side expiry crossing the
+        // REST_CATALOG_CACHE TTL boundary on a long-running dbt run — the
+        // cached `RestCatalog` and `SessionContext` both still carry the
+        // stale token. Drop them now so the very next query rebuilds with
+        // whatever fresh bearer the session has (background refresh or
+        // re-auth from the client).
+        if let Err(ref err) = result {
+            if matches!(
+                err.error_code(),
+                sqe_core::SqeErrorCode::AuthenticationFailed
+                    | sqe_core::SqeErrorCode::AccessDenied
+            ) {
+                warn!(
+                    username = %session.user.username,
+                    error_code = ?err.error_code(),
+                    "Auth failure on catalog; evicting REST_CATALOG_CACHE and SESSION_CONTEXT_CACHE for the user"
+                );
+                sqe_catalog::invalidate_rest_catalog_cache_all().await;
+                crate::session_context::invalidate_session_cache(&session.user.username).await;
+            }
+        }
+
         // Record metrics and audit
         let duration = start.elapsed();
         let status = if result.is_ok() { "success" } else { "error" };
