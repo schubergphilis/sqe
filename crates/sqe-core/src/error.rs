@@ -22,25 +22,38 @@ pub enum SqeError {
 }
 
 impl SqeError {
-    /// Return a short, sanitised message safe for sending to clients.
+    /// Return a sanitised message safe for sending to clients.
     ///
-    /// For user errors (syntax, planning, auth, not-supported), the actual
-    /// detail is returned (cleaned of DataFusion wrapper noise).
-    /// For system/internal errors, a generic message is returned so that
-    /// internal details (stack traces, file paths, connection strings) are
-    /// never leaked.
+    /// Routing by the error *variant*, not the error-code classification:
+    ///
+    /// - `Config` / `Internal`: variants that originate inside the engine
+    ///   and may carry stack traces, file paths, connection strings, or
+    ///   panic context. Return only the generic message for the
+    ///   classified code, hiding the inner detail.
+    /// - `Auth` / `Catalog` / `Execution` / `NotImplemented`: variants
+    ///   whose payload describes something the user attempted — a bad
+    ///   SQL statement, a missing object, a denied permission, a catalog
+    ///   reply (Polaris 403 with details about the conflicting S3
+    ///   location, etc.). Return the cleaned message so the client can
+    ///   actually diagnose their query.
+    ///
+    /// The old behaviour routed by `error_code().is_user_error()`. That
+    /// hid every `ExecutionFailed` / `CatalogError` behind the generic
+    /// "Query execution failed" / "Catalog error occurred", which made
+    /// dbt failures look like "Database Error: Query execution failed"
+    /// with no actionable detail even though the underlying message
+    /// (e.g. "Unable to create table at location s3://... because it
+    /// conflicts with existing table or namespace") was sitting in the
+    /// coordinator log.
     pub fn client_message(&self) -> String {
-        let code = self.error_code();
-        if code.is_user_error() {
-            match self {
-                SqeError::Auth(msg) => clean_error_message(msg),
-                SqeError::NotImplemented(msg) => clean_error_message(msg),
-                SqeError::Execution(msg) => clean_error_message(msg),
-                SqeError::Catalog(msg) => clean_error_message(msg),
-                _ => code.generic_message().to_string(),
+        match self {
+            SqeError::Auth(msg)
+            | SqeError::Catalog(msg)
+            | SqeError::Execution(msg)
+            | SqeError::NotImplemented(msg) => clean_error_message(msg),
+            SqeError::Config(_) | SqeError::Internal(_) => {
+                self.error_code().generic_message().to_string()
             }
-        } else {
-            code.generic_message().to_string()
         }
     }
 
@@ -425,25 +438,36 @@ mod tests {
     }
 
     #[test]
-    fn client_message_hides_catalog_details() {
-        // Catalog errors with "connection refused" classify as CatalogError
-        // (system error) → generic message, no internal detail.
-        let err = SqeError::Catalog("connection refused: polaris:8181".into());
-        assert_eq!(err.client_message(), "Catalog operation failed");
-        assert!(!err.client_message().contains("polaris"));
+    fn client_message_surfaces_catalog_detail() {
+        // Catalog errors now route by variant, not error-code classification.
+        // The Polaris-returned text (object names, HTTP status, conflict
+        // descriptions) is what the client needs to diagnose the failure
+        // — surface it, don't hide it behind "Catalog operation failed".
+        let err = SqeError::Catalog(
+            "Failed to create table: status: 403 Forbidden, ... Unable to \
+             create table at location 's3://iceberg-warehouse/main_warehouse/\
+             dev_silver/stg_customers__dbt_tmp' because it conflicts with \
+             existing table or namespace".into(),
+        );
+        let msg = err.client_message();
+        assert!(msg.contains("conflicts with existing table"));
+        assert!(msg.contains("stg_customers__dbt_tmp"));
+        assert!(msg.contains("403 Forbidden"));
     }
 
     #[test]
-    fn client_message_hides_execution_details() {
-        // "column … not found" is a user error → detail shown, but the s3://
-        // path would be visible. The test checks the generic path scenario
-        // where ExecutionFailed (system) is returned for s3:// messages.
-        // Actually "column 'secret_col' not found" classifies as ColumnNotFound
-        // (user error) — detail IS shown. We update the assertion.
-        let err = SqeError::Execution("column 'secret_col' not found in s3://bucket/path".into());
+    fn client_message_surfaces_execution_detail() {
+        // ExecutionFailed used to fall back to the generic "Query execution
+        // failed" because the error code is in the system-error bucket. After
+        // the variant-based routing change, the underlying message is shown
+        // — that includes column / table names from the query the user
+        // actually submitted.
+        let err = SqeError::Execution(
+            "Failed to bind variable: 'p_threshold' not provided".into(),
+        );
         let msg = err.client_message();
-        // User error → detail shown; the test must now accept that.
-        assert!(msg.contains("column") || msg.contains("not found") || msg.contains("ColumnNotFound") || msg.contains("secret_col"));
+        assert!(msg.contains("p_threshold"));
+        assert!(msg.contains("not provided"));
     }
 
     #[test]
