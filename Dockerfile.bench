@@ -29,15 +29,25 @@ ENV SCCACHE_CACHE_SIZE=2G
 WORKDIR /build
 
 # ── Stage 2: Compute recipe ──────────────────────────────────
+# `cargo chef prepare` runs `cargo metadata` which walks every workspace
+# member listed in Cargo.toml. `xtask/` is one of those members; the
+# vendored iceberg-rust path-deps live under `vendor/`. Both must be
+# present in the build context for metadata to resolve.
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
+COPY vendor/ vendor/
+COPY xtask/ xtask/
 RUN cargo chef prepare --recipe-path recipe.json
 
 # ── Stage 3: Build dependencies ──────────────────────────────
 FROM chef AS deps
 ARG TARGETARCH
 COPY --from=planner /build/recipe.json recipe.json
+# Vendor crates are path-dependencies of the workspace; their sources
+# must be visible while `cargo chef cook` rebuilds the dependency
+# graph. The recipe alone does not carry the source tree.
+COPY vendor/ vendor/
 RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
     --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},target=/usr/local/cargo/git \
     --mount=type=cache,id=sqe-sccache-${TARGETARCH},target=/sccache \
@@ -49,6 +59,8 @@ FROM deps AS builder
 ARG TARGETARCH
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
+COPY vendor/ vendor/
+COPY xtask/ xtask/
 RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
     --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},target=/usr/local/cargo/git \
     --mount=type=cache,id=sqe-sccache-${TARGETARCH},target=/sccache \
