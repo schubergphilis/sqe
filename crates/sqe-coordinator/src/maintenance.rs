@@ -24,8 +24,9 @@ use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use sqe_catalog::{SessionCatalog, TableMetadataCache};
 use sqe_core::{Session, SqeConfig, SqeError};
-use sqe_sql::{ProcedureCall, TableRef};
+use sqe_sql::{NamespaceRef, ProcedureCall, TableRef};
 use tracing::{info, warn};
+use futures::TryStreamExt;
 
 use crate::writer::{parse_parquet_compression, write_data_files};
 
@@ -85,19 +86,18 @@ impl MaintenanceHandler {
         session: &Session,
         call: &ProcedureCall,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let table_ref = call.table().clone();
-        self.authorize_or_deny(session, call, &table_ref).await?;
+        self.authorize_or_deny(session, call).await?;
 
         match call {
             ProcedureCall::RewriteDataFiles {
-                table: _,
+                table,
                 target_file_size_bytes,
                 min_input_files,
                 max_concurrent_file_group_rewrites,
             } => {
                 self.rewrite_data_files(
                     session,
-                    &table_ref,
+                    table,
                     *target_file_size_bytes,
                     *min_input_files,
                     *max_concurrent_file_group_rewrites,
@@ -105,29 +105,32 @@ impl MaintenanceHandler {
                 .await
             }
             ProcedureCall::ExpireSnapshots {
-                table: _,
+                table,
                 older_than,
                 retain_last,
             } => {
                 let older_than_ms = older_than.map(|t| t.timestamp_millis());
-                self.expire_snapshots(session, &table_ref, older_than_ms, *retain_last)
+                self.expire_snapshots(session, table, older_than_ms, *retain_last)
                     .await
             }
             ProcedureCall::RemoveOrphanFiles {
-                table: _,
+                table,
                 older_than,
             } => {
                 let older_than_ms = older_than.map(|t| t.timestamp_millis());
-                self.remove_orphan_files(session, &table_ref, older_than_ms)
-                    .await
+                self.remove_orphan_files(session, table, older_than_ms).await
             }
-            ProcedureCall::RewriteManifests { table: _ } => {
-                self.rewrite_manifests(session, &table_ref).await
+            ProcedureCall::RewriteManifests { table } => {
+                self.rewrite_manifests(session, table).await
             }
             ProcedureCall::SuggestBloomFilterColumns {
-                table: _,
+                table,
                 history_limit,
-            } => self.suggest_bloom_filter_columns(&table_ref, *history_limit),
+            } => self.suggest_bloom_filter_columns(table, *history_limit),
+            ProcedureCall::PurgeOrphanLocations {
+                namespace,
+                dry_run,
+            } => self.purge_orphan_locations(session, namespace, *dry_run).await,
         }
     }
 
@@ -168,10 +171,13 @@ impl MaintenanceHandler {
         &self,
         session: &Session,
         call: &ProcedureCall,
-        table_ref: &TableRef,
     ) -> sqe_core::Result<()> {
         // Read-only procedures bypass the write-privilege gate.
         if matches!(call, ProcedureCall::SuggestBloomFilterColumns { .. }) {
+            return Ok(());
+        }
+        // `purge_orphan_locations` in dry_run mode is also read-only.
+        if let ProcedureCall::PurgeOrphanLocations { dry_run: true, .. } = call {
             return Ok(());
         }
 
@@ -179,6 +185,7 @@ impl MaintenanceHandler {
             return Ok(());
         }
 
+        let target = call.target_label();
         let audit_status = "denied";
         if let Some(ref audit) = self.audit {
             audit.log(&sqe_metrics::audit::AuditEntry {
@@ -186,14 +193,12 @@ impl MaintenanceHandler {
                 username: session.user.username.clone(),
                 session_id: Some(session.id.clone()),
                 query_hash: sqe_metrics::audit::query_hash(&format!(
-                    "CALL system.{}({})",
+                    "CALL system.{}({target})",
                     call.name(),
-                    table_ref.as_string()
                 )),
                 query_text: Some(format!(
-                    "CALL system.{}(table => '{}')",
+                    "CALL system.{}('{target}')",
                     call.name(),
-                    table_ref.as_string()
                 )),
                 statement_type: "procedure".to_string(),
                 duration_ms: 0,
@@ -205,14 +210,13 @@ impl MaintenanceHandler {
         warn!(
             username = %session.user.username,
             procedure = %call.name(),
-            table = %table_ref.as_string(),
+            target = %target,
             "Maintenance procedure denied: user lacks write privilege"
         );
         Err(SqeError::Execution(format!(
-            "Access denied: user '{}' does not have write privilege on '{}' required by \
+            "Access denied: user '{}' does not have write privilege on '{target}' required by \
              CALL system.{}",
             session.user.username,
-            table_ref.as_string(),
             call.name()
         )))
     }
@@ -588,6 +592,165 @@ impl MaintenanceHandler {
         )?])
     }
 
+    /// Sweep a namespace's warehouse prefix for S3 subdirectories that are
+    /// not registered as tables in the catalog. Returns a result set with
+    /// one row per orphan: `(path, kind, action)`.
+    ///
+    /// `dry_run = true` (default) reports without deleting. `dry_run = false`
+    /// deletes via `FileIO::delete_prefix`.
+    ///
+    /// Limitations:
+    /// - Requires at least one registered table in the namespace so we can
+    ///   derive a `FileIO` to enumerate / delete with. Empty namespaces
+    ///   error out; operators must `rm -rf` manually or add a sentinel
+    ///   table first.
+    /// - The namespace base location is derived from the first table's
+    ///   `metadata().location()` by stripping the trailing path segment.
+    ///   This matches the conventional `<warehouse>/<namespace>/<table>/`
+    ///   layout Polaris emits. Custom per-table locations outside the
+    ///   namespace prefix are not detected as orphans.
+    async fn purge_orphan_locations(
+        &self,
+        session: &Session,
+        namespace: &NamespaceRef,
+        dry_run: bool,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let catalog = self.create_catalog_bridge(session).await?;
+        let ns_ident = NamespaceIdent::new(namespace.namespace.clone());
+
+        let table_idents = catalog.list_tables(&ns_ident).await.map_err(|e| {
+            SqeError::Catalog(format!(
+                "Failed to list tables in namespace '{}': {e}",
+                namespace.as_string()
+            ))
+        })?;
+
+        if table_idents.is_empty() {
+            return Err(SqeError::Execution(format!(
+                "Cannot purge orphans in empty namespace '{}': at least one registered \
+                 table is required to derive the FileIO + namespace base. Add a \
+                 placeholder table or clean the prefix manually.",
+                namespace.as_string()
+            )));
+        }
+
+        // Load every table to collect its location + a usable FileIO.
+        let mut registered_locations: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut probe_table: Option<IcebergTable> = None;
+        for ident in &table_idents {
+            match catalog.load_table(ident).await {
+                Ok(t) => {
+                    registered_locations.insert(strip_trailing_slash(t.metadata().location()));
+                    if probe_table.is_none() {
+                        probe_table = Some(t);
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        table = %ident,
+                        error = %e,
+                        "purge_orphan_locations: failed to load registered table; \
+                         treating its location as unknown (might over-report orphans)"
+                    );
+                }
+            }
+        }
+
+        let probe = probe_table.ok_or_else(|| {
+            SqeError::Execution(format!(
+                "Cannot purge orphans in namespace '{}': failed to load any registered table",
+                namespace.as_string()
+            ))
+        })?;
+
+        // Derive the namespace base: parent of the probe table's location.
+        let probe_loc = strip_trailing_slash(probe.metadata().location());
+        let ns_base = probe_loc
+            .rsplit_once('/')
+            .map(|(parent, _)| parent.to_string())
+            .ok_or_else(|| {
+                SqeError::Execution(format!(
+                    "Could not derive namespace base from probe location '{probe_loc}'"
+                ))
+            })?;
+
+        info!(
+            namespace = %namespace.as_string(),
+            ns_base = %ns_base,
+            table_count = registered_locations.len(),
+            dry_run,
+            "purge_orphan_locations: enumerating prefixes"
+        );
+
+        // Enumerate one level under ns_base.
+        let file_io = probe.file_io();
+        let listing = file_io
+            .list(format!("{ns_base}/"), false)
+            .await
+            .map_err(|e| {
+                SqeError::Execution(format!(
+                    "Failed to list prefix '{ns_base}/': {e}"
+                ))
+            })?;
+        let entries: Vec<_> = listing.try_collect().await.map_err(|e| {
+            SqeError::Execution(format!("Failed to collect listing for '{ns_base}/': {e}"))
+        })?;
+
+        let mut paths: Vec<String> = Vec::new();
+        let mut kinds: Vec<&'static str> = Vec::new();
+        let mut actions: Vec<String> = Vec::new();
+        for entry in &entries {
+            let path = strip_trailing_slash(&entry.path);
+            if registered_locations.contains(&path) {
+                continue;
+            }
+            paths.push(path.clone());
+            kinds.push("orphan");
+            if dry_run {
+                actions.push("would_delete".to_string());
+            } else {
+                match file_io.delete_prefix(&path).await {
+                    Ok(()) => {
+                        info!(path = %path, "purge_orphan_locations: deleted orphan prefix");
+                        actions.push("deleted".to_string());
+                    }
+                    Err(e) => {
+                        warn!(
+                            path = %path,
+                            error = %e,
+                            "purge_orphan_locations: failed to delete orphan prefix"
+                        );
+                        actions.push(format!("delete_failed: {e}"));
+                    }
+                }
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("path", DataType::Utf8, false),
+            Field::new("kind", DataType::Utf8, false),
+            Field::new("action", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(paths)),
+                Arc::new(StringArray::from(kinds)),
+                Arc::new(StringArray::from(actions)),
+            ],
+        )
+        .map_err(|e| SqeError::Execution(format!("Failed to build result batch: {e}")))?;
+
+        info!(
+            namespace = %namespace.as_string(),
+            orphan_count = batch.num_rows(),
+            dry_run,
+            "purge_orphan_locations: complete"
+        );
+        Ok(vec![batch])
+    }
+
     async fn create_catalog_bridge(
         &self,
         session: &Session,
@@ -607,6 +770,12 @@ impl MaintenanceHandler {
 
 fn call_name_rewrite() -> &'static str {
     "rewrite_data_files"
+}
+
+/// Strip a single trailing `/` if present so two locations that differ only
+/// by trailing slash compare equal.
+fn strip_trailing_slash(s: &str) -> String {
+    s.strip_suffix('/').unwrap_or(s).to_string()
 }
 
 /// Translate an iceberg commit error into an SQE error, preserving retryable
