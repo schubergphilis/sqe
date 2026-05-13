@@ -131,6 +131,14 @@ pub enum SqeErrorCode {
     ResourceExhausted,
     // Catalog / storage infrastructure
     CatalogError,
+    /// Catalog is reachable but returned a 5xx, or the network call timed
+    /// out / connection-refused. Distinct from `CatalogError` so retryable
+    /// transients map to gRPC `Unavailable` (issue #12).
+    CatalogUnavailable,
+    /// Circuit breaker is open. Distinct from `CatalogUnavailable` because
+    /// the cause is local (recent failure threshold tripped) and the right
+    /// gRPC mapping is `FailedPrecondition` rather than `Unavailable`.
+    CircuitBreakerOpen,
     StorageError,
     CommitConflict,
     // Feature support
@@ -197,6 +205,8 @@ impl SqeErrorCode {
             SqeErrorCode::QueryCancelled => "QUERY_CANCELLED",
             SqeErrorCode::ResourceExhausted => "RESOURCE_EXHAUSTED",
             SqeErrorCode::CatalogError => "CATALOG_ERROR",
+            SqeErrorCode::CatalogUnavailable => "CATALOG_UNAVAILABLE",
+            SqeErrorCode::CircuitBreakerOpen => "CIRCUIT_BREAKER_OPEN",
             SqeErrorCode::StorageError => "STORAGE_ERROR",
             SqeErrorCode::CommitConflict => "COMMIT_CONFLICT",
             SqeErrorCode::NotSupported => "NOT_SUPPORTED",
@@ -230,6 +240,8 @@ impl SqeErrorCode {
             SqeErrorCode::QueryCancelled => 65542,
             SqeErrorCode::ResourceExhausted => 65537,
             SqeErrorCode::CatalogError => 65600,
+            SqeErrorCode::CatalogUnavailable => 65603,
+            SqeErrorCode::CircuitBreakerOpen => 65604,
             SqeErrorCode::StorageError => 65601,
             SqeErrorCode::CommitConflict => 65602,
             SqeErrorCode::NotSupported => 100,
@@ -243,7 +255,10 @@ impl SqeErrorCode {
             "USER_ERROR"
         } else {
             match self {
-                SqeErrorCode::CatalogError | SqeErrorCode::StorageError => "EXTERNAL",
+                SqeErrorCode::CatalogError
+                | SqeErrorCode::CatalogUnavailable
+                | SqeErrorCode::CircuitBreakerOpen
+                | SqeErrorCode::StorageError => "EXTERNAL",
                 _ => "INTERNAL_ERROR",
             }
         }
@@ -254,6 +269,10 @@ impl SqeErrorCode {
         match self {
             SqeErrorCode::ExecutionFailed => "Query execution failed",
             SqeErrorCode::CatalogError => "Catalog operation failed",
+            SqeErrorCode::CatalogUnavailable => "Catalog is unavailable (retry shortly)",
+            SqeErrorCode::CircuitBreakerOpen => {
+                "Catalog circuit breaker is open (recent failures)"
+            }
             SqeErrorCode::StorageError => "Storage operation failed",
             SqeErrorCode::CommitConflict => "Commit conflict",
             SqeErrorCode::ResourceExhausted => "Resource exhausted",
@@ -293,6 +312,37 @@ fn classify_catalog_error(msg: &str) -> SqeErrorCode {
     }
     if lower.contains("403") || lower.contains("forbidden") {
         return SqeErrorCode::AccessDenied;
+    }
+    // Transient catalog failures: surface as `Unavailable` so retry logic
+    // (in the client) and operators can distinguish "Polaris is down" from
+    // a real catalog bug. Without this the message fell through to
+    // `CatalogError` and ultimately `tonic::Code::Internal`, which gives
+    // no retry hint. Issue #12.
+    if lower.contains("circuit breaker") || lower.contains("circuit open") {
+        return SqeErrorCode::CircuitBreakerOpen;
+    }
+    if lower.contains("502")
+        || lower.contains("bad gateway")
+        || lower.contains("503")
+        || lower.contains("service unavailable")
+        || lower.contains("504")
+        || lower.contains("gateway timeout")
+        || lower.contains("500 internal server error")
+    {
+        return SqeErrorCode::CatalogUnavailable;
+    }
+    if lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("connection closed")
+        || lower.contains("dns")
+        || lower.contains("no route to host")
+        || lower.contains("network is unreachable")
+        || lower.contains("network error")
+    {
+        return SqeErrorCode::CatalogUnavailable;
+    }
+    if lower.contains("timeout") || lower.contains("timed out") {
+        return SqeErrorCode::QueryTimeout;
     }
     if (lower.contains("not found") || lower.contains("http 404")) && lower.contains("view") {
         SqeErrorCode::ViewNotFound
@@ -697,6 +747,68 @@ mod tests {
         let err = SqeError::Execution("file already referenced in snapshot".into());
         let code = err.error_code();
         assert_eq!(code, SqeErrorCode::CommitConflict);
+    }
+
+    // --- Issue #12: transient catalog failures (5xx, network, circuit) ---
+
+    #[test]
+    fn classify_catalog_503_is_unavailable_not_internal() {
+        let err = SqeError::Catalog("Polaris returned 503 Service Unavailable".into());
+        assert_eq!(err.error_code(), SqeErrorCode::CatalogUnavailable);
+    }
+
+    #[test]
+    fn classify_catalog_502_bad_gateway_is_unavailable() {
+        let err = SqeError::Catalog("HTTP 502 Bad Gateway from upstream".into());
+        assert_eq!(err.error_code(), SqeErrorCode::CatalogUnavailable);
+    }
+
+    #[test]
+    fn classify_catalog_504_gateway_timeout_is_unavailable() {
+        let err = SqeError::Catalog("HTTP 504 Gateway Timeout".into());
+        assert_eq!(err.error_code(), SqeErrorCode::CatalogUnavailable);
+    }
+
+    #[test]
+    fn classify_catalog_connection_refused_is_unavailable() {
+        let err = SqeError::Catalog(
+            "Failed to send request: connection refused (os error 61)".into(),
+        );
+        assert_eq!(err.error_code(), SqeErrorCode::CatalogUnavailable);
+    }
+
+    #[test]
+    fn classify_catalog_dns_failure_is_unavailable() {
+        let err = SqeError::Catalog("dns lookup failed: NXDOMAIN".into());
+        assert_eq!(err.error_code(), SqeErrorCode::CatalogUnavailable);
+    }
+
+    #[test]
+    fn classify_catalog_circuit_breaker_open() {
+        let err = SqeError::Catalog("circuit breaker open for polaris-rest".into());
+        assert_eq!(err.error_code(), SqeErrorCode::CircuitBreakerOpen);
+    }
+
+    #[test]
+    fn classify_catalog_genuine_404_still_not_found() {
+        // The new transient checks must not steal genuine 404s.
+        let err = SqeError::Catalog("Failed to load: HTTP 404 Not Found".into());
+        assert_eq!(err.error_code(), SqeErrorCode::TableNotFound);
+    }
+
+    #[test]
+    fn classify_catalog_genuine_401_still_auth_failed() {
+        // 401 wins over 5xx detection — auth comes first in the classifier.
+        let err = SqeError::Catalog("HTTP 401 Unauthorized: token expired".into());
+        assert_eq!(err.error_code(), SqeErrorCode::AuthenticationFailed);
+    }
+
+    #[test]
+    fn catalog_unavailable_name_and_trino_code() {
+        assert_eq!(SqeErrorCode::CatalogUnavailable.name(), "CATALOG_UNAVAILABLE");
+        assert_eq!(SqeErrorCode::CircuitBreakerOpen.name(), "CIRCUIT_BREAKER_OPEN");
+        assert_eq!(SqeErrorCode::CatalogUnavailable.trino_error_type(), "EXTERNAL");
+        assert_eq!(SqeErrorCode::CircuitBreakerOpen.trino_error_type(), "EXTERNAL");
     }
 
     #[test]
