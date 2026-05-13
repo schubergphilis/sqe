@@ -421,6 +421,7 @@ mod tests {
             providers: Vec::new(),
             role_mappings: std::collections::HashMap::new(),
             external: None,
+            admin_roles: Vec::new(),
         }
     }
 
@@ -439,6 +440,7 @@ mod tests {
             providers: Vec::new(),
             role_mappings: std::collections::HashMap::new(),
             external: None,
+            admin_roles: Vec::new(),
         }
     }
 
