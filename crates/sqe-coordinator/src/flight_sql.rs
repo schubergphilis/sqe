@@ -750,70 +750,32 @@ impl FlightSqlService for SqeFlightSqlService {
             self.config.catalog.warehouse.clone()
         };
 
-        // SQE doesn't have information_schema — use SHOW SCHEMAS + SHOW TABLES
-        // to enumerate all schemas and their tables.
-        let schema_batches = self
+        // Walk the catalog directly. The previous path ran `SHOW SCHEMAS`
+        // followed by `SHOW TABLES IN "<ns>"` once per namespace through
+        // the SQL planner — N+1 planner invocations plus N Polaris round
+        // trips per `DatabaseMetaData.getTables()`. It also concatenated
+        // catalog-returned namespace names into SQL with only
+        // backslash-quote escaping, so a federated catalog could pivot to
+        // SQL execution as the browsing user. `list_metadata_tables`
+        // closes both holes (issues #7, #9, #15).
+        let pairs = self
             .query_handler
-            .execute(&session, "SHOW SCHEMAS")
+            .list_metadata_tables(&session)
             .await
             .map_err(|e| sqe_error_to_status(&e, None))?;
-
-        // Collect schema names
-        let mut schema_names: Vec<String> = Vec::new();
-        for batch in &schema_batches {
-            let col = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow_array::StringArray>()
-                .ok_or_else(|| Status::internal("Expected string column for schema names"))?;
-            for i in 0..col.len() {
-                if !col.is_null(i) {
-                    schema_names.push(col.value(i).to_string());
-                }
-            }
-        }
 
         let mut builder = query.into_builder();
         let empty_schema = arrow_schema::Schema::empty();
 
-        // For each schema, list its tables
-        for ns in &schema_names {
-            let sql = format!("SHOW TABLES IN \"{}\"", ns.replace('"', "\"\""));
-            match self.query_handler.execute(&session, &sql).await {
-                Ok(table_batches) => {
-                    for batch in &table_batches {
-                        // SHOW TABLES returns (namespace, table_name) — column 1 is the table name
-                        let col = batch
-                            .column(1)
-                            .as_any()
-                            .downcast_ref::<arrow_array::StringArray>()
-                            .ok_or_else(|| {
-                                Status::internal("Expected string column for table names")
-                            })?;
-                        for i in 0..col.len() {
-                            if !col.is_null(i) {
-                                builder
-                                    .append(
-                                        &catalog_name,
-                                        ns,
-                                        col.value(i),
-                                        "TABLE",
-                                        &empty_schema,
-                                    )
-                                    .map_err(|e| {
-                                        Status::internal(format!("Failed to append table: {e}"))
-                                    })?;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(schema = %ns, error = %e, "Failed to list tables in schema");
-                }
-            }
+        for (ns, table_name) in &pairs {
+            builder
+                .append(&catalog_name, ns, table_name, "TABLE", &empty_schema)
+                .map_err(|e| Status::internal(format!("Failed to append table: {e}")))?;
         }
 
-        let batch = builder.build().map_err(|e| Status::internal(format!("Failed to build batch: {e}")))?;
+        let batch = builder
+            .build()
+            .map_err(|e| Status::internal(format!("Failed to build batch: {e}")))?;
         self.batches_to_stream(vec![batch])
     }
 
