@@ -8,6 +8,9 @@ spill_to_disk = true
 spill_dir = "/tmp/sqe-bench-spill"
 spill_compression = "lz4"
 worker_urls = ["http://worker-1:50052", "http://worker-2:50052", "http://worker-3:50052", "http://worker-4:50052"]
+# Benchmark harness runs in a private docker network; production
+# deployments must set worker_secret instead.
+allow_unauthenticated_workers = true
 
 [metrics]
 prometheus_port = 9090

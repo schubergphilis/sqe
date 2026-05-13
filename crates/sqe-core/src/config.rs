@@ -238,10 +238,21 @@ pub struct CoordinatorConfig {
     #[serde(default)]
     pub tls: TlsConfig,
     /// Shared secret that workers must supply in the `x-sqe-worker-secret`
-    /// metadata header when sending heartbeats. An empty value disables the
-    /// check (backwards compatible default).
+    /// metadata header when sending heartbeats. Must be non-empty whenever
+    /// `worker_urls` is non-empty unless `allow_unauthenticated_workers` is
+    /// explicitly set. Validation rejects the empty case at startup —
+    /// configuring distributed mode without a secret used to be a logged
+    /// warning, but that let any client on the cluster network register as
+    /// a worker and exfiltrate user bearers along with query plans.
     #[serde(default)]
     pub worker_secret: String,
+    /// Opt-in escape hatch for the `worker_secret` requirement. Leaving this
+    /// `false` (the default) makes the coordinator refuse to start when
+    /// distributed mode is configured without a secret. Setting it `true`
+    /// is visible in config diffs and acknowledges that any TCP-reachable
+    /// client may register as a worker.
+    #[serde(default)]
+    pub allow_unauthenticated_workers: bool,
     /// Memory limit for the coordinator's DataFusion runtime.
     /// Accepts human-readable sizes: "8GB", "512MB", "4096MB".
     /// Default: "8GB". Applies to all query operator memory (sorts, joins, aggregates).
@@ -1394,6 +1405,20 @@ impl SqeConfig {
             ));
         }
 
+        // Distributed-mode worker secret is required unless explicitly waived.
+        if !self.coordinator.worker_urls.is_empty()
+            && self.coordinator.worker_secret.is_empty()
+            && !self.coordinator.allow_unauthenticated_workers
+        {
+            errors.push(
+                "coordinator.worker_urls is set but coordinator.worker_secret is empty. \
+                 Any TCP-reachable client could register as a worker and receive query \
+                 fragments with user bearer tokens. Set worker_secret (recommended), or \
+                 explicitly set coordinator.allow_unauthenticated_workers = true to opt out."
+                    .to_string(),
+            );
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -1429,6 +1454,10 @@ impl SqeConfig {
         env_override_str("SQE_COORDINATOR__MODE", &mut self.coordinator.mode);
         env_override_bool("SQE_COORDINATOR__DEBUG", &mut self.coordinator.debug);
         env_override_str("SQE_COORDINATOR__WORKER_SECRET", &mut self.coordinator.worker_secret);
+        env_override_bool(
+            "SQE_COORDINATOR__ALLOW_UNAUTHENTICATED_WORKERS",
+            &mut self.coordinator.allow_unauthenticated_workers,
+        );
         env_override_str("SQE_TLS__CERT_FILE", &mut self.coordinator.tls.cert_file);
         env_override_str("SQE_TLS__KEY_FILE", &mut self.coordinator.tls.key_file);
         env_override_str("SQE_TLS__CA_FILE", &mut self.coordinator.tls.ca_file);
@@ -1713,6 +1742,7 @@ mod tests {
                 debug: false,
                 tls: TlsConfig::default(),
                 worker_secret: String::new(),
+                allow_unauthenticated_workers: false,
                 memory_limit: default_coordinator_memory(),
                 spill_to_disk: true,
                 spill_dir: default_coordinator_spill_dir(),
@@ -1842,6 +1872,49 @@ mod tests {
             err.contains("auth.client_id") && err.contains("catalog.catalog_url"),
             "Expected multiple errors, got: {err}"
         );
+    }
+
+    /// Regression for issue #6: distributed mode with no worker_secret used
+    /// to log a SECURITY error and continue booting, leaving the heartbeat
+    /// handler open to any reachable client. validate() must now refuse.
+    #[test]
+    fn validate_rejects_distributed_without_worker_secret() {
+        let mut config = valid_config();
+        config.coordinator.worker_urls = vec!["http://worker-1:50051".to_string()];
+        config.coordinator.worker_secret = String::new();
+        config.coordinator.allow_unauthenticated_workers = false;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("worker_urls") && err.contains("worker_secret"),
+            "Expected worker_secret guard error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_distributed_when_explicitly_unauthenticated() {
+        let mut config = valid_config();
+        config.coordinator.worker_urls = vec!["http://worker-1:50051".to_string()];
+        config.coordinator.worker_secret = String::new();
+        config.coordinator.allow_unauthenticated_workers = true;
+        // The explicit opt-in is allowed, visible in config diffs.
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_distributed_with_worker_secret() {
+        let mut config = valid_config();
+        config.coordinator.worker_urls = vec!["http://worker-1:50051".to_string()];
+        config.coordinator.worker_secret = "shared-secret-value".to_string();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_single_node_without_worker_secret() {
+        // No workers configured -> secret irrelevant, no error.
+        let mut config = valid_config();
+        config.coordinator.worker_urls.clear();
+        config.coordinator.worker_secret = String::new();
+        assert!(config.validate().is_ok());
     }
 
     /// Old configs that used `polaris_url` continue to deserialize via the
