@@ -63,14 +63,13 @@ pub async fn resolve_bearer(
             client_secret,
             scope,
         } => {
-            let client =
-                OAuthClient::new(token_endpoint, client_id, client_secret, false)?;
-            // Scope not yet plumbed through OAuthClient — defaults
-            // to PRINCIPAL_ROLE:ALL inside `get_token`. Once the
-            // Polaris / Auth0 split deployments need different
-            // scopes, OAuthClient grows a `with_scope` setter; for
-            // now the variant captures it for forward compat.
-            let _ = scope;
+            // Forward `scope` to OAuthClient. The previous `let _ = scope;`
+            // dropped the field silently — a deployment that mounted
+            // Polaris with `PRINCIPAL_ROLE:READ_ONLY` actually attached
+            // with `PRINCIPAL_ROLE:ALL`, broadening rights without any
+            // warning. Issue #17.
+            let client = OAuthClient::new(token_endpoint, client_id, client_secret, false)?
+                .with_scope(scope.clone());
             let resp = client.get_token().await?;
             Ok(resp.access_token)
         }
