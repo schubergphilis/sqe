@@ -228,6 +228,14 @@ impl ReadParquetFunction {
 impl TableFunctionImpl for ReadParquetFunction {
     fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
         let args = parse_args(exprs)?;
+        // Issue #10: reject local-path and arbitrary HTTP-host arguments
+        // BEFORE constructing the object store. Without this guard,
+        // `read_parquet('/etc/shadow')` or
+        // `read_parquet('http://169.254.169.254/...')` reached the
+        // filesystem / IMDS endpoint.
+        self.storage.tvf.check(&args.path).map_err(|e| {
+            datafusion::error::DataFusionError::Plan(format!("read_parquet: {e}"))
+        })?;
         let storage = self.storage.clone();
 
         // `TableFunctionImpl::call` is sync; schema inference is async.
