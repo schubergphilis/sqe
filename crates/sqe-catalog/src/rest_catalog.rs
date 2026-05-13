@@ -6,7 +6,6 @@ use iceberg::table::Table;
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent, TableRequirement, TableUpdate};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogBuilder};
 use moka::future::Cache as MokaCache;
-use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
@@ -48,15 +47,20 @@ struct CachedTableEntry {
 ///
 /// Process-global cache of `RestCatalog` instances, keyed by
 /// `format!("{catalog_url}-{token_fingerprint}")`. Each entry holds an
-/// `Arc<RwLock<RestCatalog>>` that bakes in the bearer token at construction
+/// `Arc<RestCatalog>` that bakes in the bearer token at construction
 /// time, so when Polaris-side token expiry crosses the 5-minute TTL boundary
 /// the cached entry returns 401 on every subsequent call. Issue #20 covers
 /// the symptom (dbt models 401'ing partway through a run) and the matching
 /// `invalidate_rest_catalog_cache_all` below is the error-driven escape
 /// hatch called from the query handler whenever a catalog op surfaces an
 /// `AuthenticationFailed`.
+///
+/// The cached value used to be `Arc<RwLock<RestCatalog>>` but every caller
+/// only ever took the lock for read — `RestCatalog` is `Send + Sync` and
+/// stateless per call. The lock plus its yield point were pure overhead
+/// (~100-500 ns per dispatch, compounding on metadata fan-out). Issue #18.
 pub(crate) static REST_CATALOG_CACHE: std::sync::LazyLock<
-    moka::future::Cache<String, Arc<RwLock<RestCatalog>>>,
+    moka::future::Cache<String, Arc<RestCatalog>>,
 > = std::sync::LazyLock::new(|| {
     moka::future::Cache::builder()
         .max_capacity(100)
@@ -179,16 +183,21 @@ impl TableMetadataCache {
 
 /// Backend handle inside `SessionCatalog`.
 ///
-/// REST keeps its `Arc<RwLock<RestCatalog>>` because the per-session
+/// REST keeps an `Arc<RestCatalog>` because the per-session
 /// `REST_CATALOG_CACHE` (keyed by URL + token fingerprint) hands out
 /// the same Arc to every session that authenticates with the same
-/// token, and the existing code accesses it through `read().await`.
+/// token. The earlier `Arc<RwLock<RestCatalog>>` shape had zero
+/// `.write()` callers anywhere in the codebase — every dispatch
+/// took `read().await`, which is purely a futex acquisition plus an
+/// extra scheduler yield point. `RestCatalog` is `Send + Sync` and
+/// stateless per call, so the lock was overhead.
+///
 /// Non-REST backends construct their iceberg::Catalog implementation
 /// once during `for_session` and store it directly as a trait
 /// object; there is no equivalent shared cache today (HMS / Glue /
 /// JDBC catalog construction is cheap and idempotent).
 pub(crate) enum CatalogHandle {
-    Rest(Arc<RwLock<RestCatalog>>),
+    Rest(Arc<RestCatalog>),
     Other(Arc<dyn iceberg::Catalog>),
 }
 
@@ -207,7 +216,7 @@ impl CatalogHandle {
     /// fast paths). `None` for non-REST backends; callers fall back
     /// to the trait-only path.
     #[allow(dead_code)] // wired up incrementally; keep accessor for future REST-only fast paths
-    pub(crate) fn rest(&self) -> Option<&Arc<RwLock<RestCatalog>>> {
+    pub(crate) fn rest(&self) -> Option<&Arc<RestCatalog>> {
         match self {
             Self::Rest(r) => Some(r),
             Self::Other(_) => None,
@@ -231,8 +240,10 @@ macro_rules! dispatch_catalog {
     ($handle:expr, $method:ident($($args:expr),* $(,)?)) => {
         match &$handle {
             $crate::rest_catalog::CatalogHandle::Rest(rest) => {
-                let catalog = rest.read().await;
-                catalog.$method($($args),*).await
+                // No `.read().await` here: `RestCatalog` is `Send + Sync`
+                // and stateless per call, so the previous `RwLock` was
+                // pure overhead. Issue #18.
+                rest.$method($($args),*).await
             }
             $crate::rest_catalog::CatalogHandle::Other(catalog) => {
                 catalog.$method($($args),*).await
@@ -258,13 +269,13 @@ pub(crate) use dispatch_catalog;
 /// * **Fault isolation**: when Polaris is unavailable the circuit opens and
 ///   subsequent requests fail fast without wasting threads / connections.
 pub struct SessionCatalog {
-    /// Backend handle. The REST variant keeps the existing cached
-    /// `Arc<RwLock<RestCatalog>>` so the per-session catalog cache
-    /// keeps working unchanged. Non-REST variants hold the iceberg
-    /// trait object directly. REST-specific methods on
-    /// `SessionCatalog` (view DDL, raw `commit_schema_update`, ETag
-    /// revalidation in `load_table`) match on this and error out
-    /// when the backend isn't REST.
+    /// Backend handle. The REST variant holds an `Arc<RestCatalog>`
+    /// (previously `Arc<RwLock<RestCatalog>>`; the lock was removed
+    /// in issue #18 because every dispatch only ever did a read).
+    /// Non-REST variants hold the iceberg trait object directly.
+    /// REST-specific methods on `SessionCatalog` (view DDL, raw
+    /// `commit_schema_update`, ETag revalidation in `load_table`)
+    /// match on this and error out when the backend isn't REST.
     inner: CatalogHandle,
     catalog_url: String,
     warehouse: String,
@@ -603,7 +614,7 @@ impl SessionCatalog {
                 )
                 .await
                 .map_err(|e| SqeError::Catalog(format!("Failed to create REST catalog: {e}")))?;
-            let arc_catalog = Arc::new(RwLock::new(catalog));
+            let arc_catalog = Arc::new(catalog);
             REST_CATALOG_CACHE.insert(catalog_key, arc_catalog.clone()).await;
             arc_catalog
         };
@@ -1289,8 +1300,10 @@ impl SessionCatalog {
 
 /// Bridge type that implements iceberg's `Catalog` trait by delegating
 /// to our `SessionCatalog`. This is needed because `SessionCatalog` wraps
-/// `RestCatalog` behind an `RwLock` and we need the `Catalog` trait for
-/// the iceberg-datafusion providers.
+/// the inner `RestCatalog` in `CatalogHandle::Rest(Arc<RestCatalog>)`
+/// (previously `Arc<RwLock<RestCatalog>>`, removed in issue #18) and we
+/// need a plain `Catalog` trait object for the iceberg-datafusion
+/// providers.
 #[derive(Debug)]
 pub struct SessionCatalogBridge {
     session: Arc<SessionCatalog>,

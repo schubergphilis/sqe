@@ -13,7 +13,8 @@
 //! What we want to surface:
 //!   * The race between `tokio::sync::OnceCell::get_or_try_init` and
 //!     concurrent `RestCatalog` calls that share the same
-//!     `Arc<RwLock<RestCatalog>>` from SQE's `REST_CATALOG_CACHE`.
+//!     `Arc<RestCatalog>` from SQE's `REST_CATALOG_CACHE` (formerly
+//!     `Arc<RwLock<RestCatalog>>`; lock removed in issue #18).
 //!   * Whether `HttpClient::update_with` (called once at OnceCell
 //!     init) drops the user's `token` prop when the server-supplied
 //!     `/v1/config` overrides do not include it.
@@ -223,9 +224,9 @@ async fn format_request_log(server: &MockServer) -> String {
 /// outbound calls interleave.
 ///
 /// We build one Arc<SessionCatalog> and clone it across all tasks so
-/// every task hits the *same* `Arc<RwLock<RestCatalog>>` — that's the
-/// shared state the bug report blames. If we constructed N catalogs
-/// in parallel we would be testing the moka cache double-build path
+/// every task hits the *same* `Arc<RestCatalog>` — that's the shared
+/// state the bug report blames. If we constructed N catalogs in
+/// parallel we would be testing the moka cache double-build path
 /// instead, which is a different (also worth-covering) concern.
 async fn drive_concurrent_calls(
     server_uri: &str,
