@@ -21,6 +21,9 @@ pub struct OAuthClient {
     token_endpoint: String,
     client_id: String,
     client_secret: String,
+    /// Optional OAuth `scope` parameter. When `None`, defaults to
+    /// `PRINCIPAL_ROLE:ALL` (legacy Polaris compatibility).
+    scope: Option<String>,
 }
 
 impl OAuthClient {
@@ -42,23 +45,36 @@ impl OAuthClient {
             token_endpoint: token_endpoint.to_string(),
             client_id: client_id.to_string(),
             client_secret: client_secret.to_string(),
+            scope: None,
         })
+    }
+
+    /// Override the OAuth `scope` parameter. Use this when a catalog needs
+    /// a reduced or alternative scope (e.g. `PRINCIPAL_ROLE:READ_ONLY`)
+    /// rather than the default `PRINCIPAL_ROLE:ALL`. Silently dropping a
+    /// caller-supplied scope used to broaden every catalog's effective
+    /// rights to ALL — see issue #17.
+    pub fn with_scope(mut self, scope: Option<String>) -> Self {
+        self.scope = scope.filter(|s| !s.is_empty());
+        self
     }
 
     /// Obtain an access token via the OAuth2 `client_credentials` grant.
     ///
-    /// The returned token is a bearer token scoped to `PRINCIPAL_ROLE:ALL`.
+    /// The returned token is a bearer token scoped to whatever `scope` was
+    /// configured (default `PRINCIPAL_ROLE:ALL`).
     pub async fn get_token(&self) -> sqe_core::Result<TokenResponse> {
         debug!(
             endpoint = self.token_endpoint,
             "Requesting token via client_credentials grant"
         );
 
+        let scope = self.scope.as_deref().unwrap_or("PRINCIPAL_ROLE:ALL");
         let params = [
             ("grant_type", "client_credentials"),
             ("client_id", &self.client_id),
             ("client_secret", &self.client_secret),
-            ("scope", "PRINCIPAL_ROLE:ALL"),
+            ("scope", scope),
         ];
 
         let response = self
