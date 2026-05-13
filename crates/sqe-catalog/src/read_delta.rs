@@ -89,6 +89,11 @@ impl TableFunctionImpl for ReadDeltaFunction {
             )));
         }
 
+        // Issue #10: TVF path / host policy check.
+        self.storage.tvf.check(&args.path).map_err(|e| {
+            DataFusionError::Plan(format!("{FN_NAME}: {e}"))
+        })?;
+
         let storage = self.storage.clone();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {

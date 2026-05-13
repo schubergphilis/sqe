@@ -899,6 +899,120 @@ pub struct StorageConfig {
     /// Inline GCP service-account JSON key contents.
     #[serde(default)]
     pub gcs_service_account_key: String,
+
+    // ── Table-valued function security (issue #10) ──────────────────────
+    /// File TVF (`read_parquet`, `read_csv`, `read_json`) policy. Defaults
+    /// deny local-fs and arbitrary HTTP hosts so an authenticated user
+    /// cannot exfiltrate `/etc/shadow`, `/proc/self/environ`, or the
+    /// coordinator's service-account token, nor pivot to cloud-metadata
+    /// endpoints (IMDS / GCP / Azure IMDS) on `http://169.254.169.254`.
+    #[serde(default)]
+    pub tvf: TvfPolicy,
+}
+
+/// Security policy for table-valued-function path arguments.
+///
+/// All defaults are fail-closed: cloud object stores (`s3://`, `abfss://`,
+/// `gs://`, `hf://`) keep working out of the box; local paths and arbitrary
+/// `http(s)://` hosts are rejected unless explicitly enabled.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct TvfPolicy {
+    /// When `true`, file TVFs may read absolute paths on the coordinator /
+    /// worker filesystem (e.g. `/var/data/foo.parquet`). Default: `false`
+    /// because an authenticated user could read `/etc/shadow`, a mounted
+    /// secret, or `/var/run/secrets/kubernetes.io/serviceaccount/token`.
+    /// Enable on single-tenant deployments where every user is trusted to
+    /// read the local filesystem (rare; production deployments should
+    /// stage files in an object store instead).
+    #[serde(default)]
+    pub allow_local_paths: bool,
+    /// When `true`, file TVFs may fetch from arbitrary `http(s)://` hosts.
+    /// Default: `false` because IMDS lives at `http://169.254.169.254`
+    /// and worker pods often run with cloud-side privileges higher than
+    /// the user's. When `false`, only `allowed_http_hosts` are reachable
+    /// (empty list = no HTTP at all).
+    #[serde(default)]
+    pub allow_http: bool,
+    /// When `allow_http` is `false`, this allowlist names the hosts that
+    /// file TVFs may reach. Compared case-insensitively against the URL's
+    /// host (no port, no path). Examples: `["data.example.com",
+    /// "huggingface.co"]`. Wildcards are not supported; add each fully-
+    /// qualified host explicitly.
+    #[serde(default)]
+    pub allowed_http_hosts: Vec<String>,
+}
+
+impl TvfPolicy {
+    /// Return `Ok(())` if a TVF may legitimately reference `path`, or an
+    /// error describing why it cannot. Object-store schemes (`s3://`,
+    /// `s3a://`, `abfss://`, `abfs://`, `azure://`, `az://`, `gs://`,
+    /// `gcs://`, `hf://`) are always allowed because they go through
+    /// SQE's credential-managed stores. Local paths (`/...`, `file://`,
+    /// no scheme) need `allow_local_paths = true`. `http(s)://` needs
+    /// either `allow_http = true` or an exact match in
+    /// `allowed_http_hosts`.
+    pub fn check(&self, path: &str) -> Result<(), String> {
+        let lower = path.to_lowercase();
+        // Object-store schemes — always allowed; credentials come from
+        // `[storage.*]`, not the TVF user's filesystem.
+        if lower.starts_with("s3://")
+            || lower.starts_with("s3a://")
+            || lower.starts_with("abfss://")
+            || lower.starts_with("abfs://")
+            || lower.starts_with("azure://")
+            || lower.starts_with("az://")
+            || lower.starts_with("gs://")
+            || lower.starts_with("gcs://")
+            || lower.starts_with("hf://")
+        {
+            return Ok(());
+        }
+
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            if self.allow_http {
+                return Ok(());
+            }
+            // Parse out the host (lowercased) and check the allowlist.
+            // Keeping this local + total avoids panicking on malformed input.
+            let after_scheme = lower
+                .split_once("://")
+                .map(|x| x.1)
+                .unwrap_or("");
+            let host_with_port = after_scheme.split('/').next().unwrap_or("");
+            let host = host_with_port
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .trim();
+            if host.is_empty() {
+                return Err(format!(
+                    "TVF: malformed URL '{path}' (missing host)"
+                ));
+            }
+            if self
+                .allowed_http_hosts
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(host))
+            {
+                return Ok(());
+            }
+            return Err(format!(
+                "TVF: HTTP host '{host}' is not in `[storage.tvf] allowed_http_hosts`. \
+                 Add the host or set `allow_http = true` to permit arbitrary hosts."
+            ));
+        }
+
+        // Everything else — bare path, `file://`, `/...` — is a local path.
+        if self.allow_local_paths {
+            return Ok(());
+        }
+        Err(format!(
+            "TVF: local filesystem paths are disabled. \
+             Path '{path}' is not an object-store URL (s3://, abfss://, gs://, hf://, ...). \
+             Set `[storage.tvf] allow_local_paths = true` to permit local reads, \
+             or stage the file in an object store."
+        ))
+    }
 }
 
 impl Default for StorageConfig {
@@ -922,6 +1036,7 @@ impl Default for StorageConfig {
             azure_use_emulator: false,
             gcs_service_account_path: String::new(),
             gcs_service_account_key: String::new(),
+            tvf: TvfPolicy::default(),
         }
     }
 }
@@ -2834,5 +2949,97 @@ otlp_endpoint = ""
         }
 
         std::env::remove_var("SQE_AUTH__PROVIDERS__0__CLIENT_SECRET");
+    }
+
+    // --- TvfPolicy (issue #10 regression tests) ---
+
+    #[test]
+    fn tvf_default_allows_object_store_schemes() {
+        let policy = TvfPolicy::default();
+        assert!(policy.check("s3://my-bucket/data.parquet").is_ok());
+        assert!(policy.check("s3a://my-bucket/data.parquet").is_ok());
+        assert!(policy.check("abfss://c@a.dfs.core.windows.net/x").is_ok());
+        assert!(policy.check("abfs://c@a.dfs.core.windows.net/x").is_ok());
+        assert!(policy.check("azure://container/x").is_ok());
+        assert!(policy.check("az://container/x").is_ok());
+        assert!(policy.check("gs://bucket/x").is_ok());
+        assert!(policy.check("gcs://bucket/x").is_ok());
+        assert!(policy.check("hf://datasets/foo/bar/x").is_ok());
+    }
+
+    #[test]
+    fn tvf_default_rejects_local_absolute_paths() {
+        let policy = TvfPolicy::default();
+        let err = policy.check("/etc/shadow").unwrap_err();
+        assert!(err.contains("local filesystem paths are disabled"));
+        let err = policy.check("/proc/self/environ").unwrap_err();
+        assert!(err.contains("local filesystem"));
+        let err = policy.check("file:///root/.aws/credentials").unwrap_err();
+        assert!(err.contains("local filesystem"));
+    }
+
+    #[test]
+    fn tvf_default_rejects_arbitrary_http_hosts() {
+        let policy = TvfPolicy::default();
+        // The IMDS scenario from the issue.
+        let err = policy
+            .check("http://169.254.169.254/latest/meta-data/iam/security-credentials/")
+            .unwrap_err();
+        assert!(err.contains("not in `[storage.tvf] allowed_http_hosts`"));
+        assert!(err.contains("169.254.169.254"));
+    }
+
+    #[test]
+    fn tvf_allowed_http_host_is_accepted_exact_match() {
+        let policy = TvfPolicy {
+            allow_local_paths: false,
+            allow_http: false,
+            allowed_http_hosts: vec![
+                "data.example.com".to_string(),
+                "huggingface.co".to_string(),
+            ],
+        };
+        assert!(policy.check("https://data.example.com/file.parquet").is_ok());
+        // Case-insensitive host comparison.
+        assert!(policy.check("https://DATA.EXAMPLE.COM/file.parquet").is_ok());
+        // Different port is still allowed (host match only).
+        assert!(policy.check("https://data.example.com:8080/file.parquet").is_ok());
+        // Subdomain that isn't allowlisted is rejected (no wildcards).
+        assert!(policy
+            .check("https://api.data.example.com/file.parquet")
+            .is_err());
+    }
+
+    #[test]
+    fn tvf_allow_http_true_bypasses_allowlist() {
+        let policy = TvfPolicy {
+            allow_local_paths: false,
+            allow_http: true,
+            allowed_http_hosts: Vec::new(),
+        };
+        assert!(policy.check("http://169.254.169.254/").is_ok());
+        assert!(policy.check("https://anything.example/x").is_ok());
+    }
+
+    #[test]
+    fn tvf_allow_local_paths_true_permits_filesystem() {
+        let policy = TvfPolicy {
+            allow_local_paths: true,
+            allow_http: false,
+            allowed_http_hosts: Vec::new(),
+        };
+        assert!(policy.check("/var/data/foo.parquet").is_ok());
+        assert!(policy.check("file:///var/data/foo.parquet").is_ok());
+    }
+
+    #[test]
+    fn tvf_malformed_http_url_returns_error() {
+        let policy = TvfPolicy {
+            allow_local_paths: false,
+            allow_http: false,
+            allowed_http_hosts: vec!["example.com".to_string()],
+        };
+        let err = policy.check("http:///just-a-path").unwrap_err();
+        assert!(err.contains("malformed URL") || err.contains("missing host"));
     }
 }
