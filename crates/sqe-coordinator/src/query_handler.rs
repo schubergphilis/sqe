@@ -523,36 +523,47 @@ impl QueryHandler {
                 StatementKind::ShowEffectiveGrants(ref user) => self.handle_show_effective_grants(session, user).await,
                 StatementKind::CheckAccess(ref params) => self.handle_check_access(session, params).await,
 
+                // DDL/DML invalidation scope (issue #11): a 50 ms SessionContext
+                // rebuild on cache miss multiplied by every active user's next
+                // query is a real cost on multi-tenant deployments running dbt.
+                // Most table mutations only need the writer's cache flushed;
+                // other users will refresh on their normal 5-minute TTL. Cross-
+                // user invalidation is reserved for changes that affect the
+                // schema/catalog name list (RENAME, CREATE/DROP SCHEMA,
+                // ATTACH/DETACH).
                 StatementKind::Drop(stmt) => {
                     self.catalog_ops.drop_table(session, stmt).await?;
-                    crate::session_context::invalidate_all_session_caches();
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
                 StatementKind::Rename(stmt) => {
+                    // Cross-user: the table name itself changes; other users'
+                    // SessionContexts hold the old name in their catalog
+                    // provider's cached namespace listings.
                     self.catalog_ops.rename_table(session, stmt).await?;
                     crate::session_context::invalidate_all_session_caches();
                     Ok(vec![])
                 }
                 StatementKind::AlterSchema(stmt) => {
                     self.catalog_ops.alter_table_schema(session, stmt).await?;
-                    crate::session_context::invalidate_all_session_caches();
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
                 StatementKind::AlterTableProps(stmt) => {
                     self.catalog_ops.set_table_properties(session, stmt).await?;
-                    crate::session_context::invalidate_all_session_caches();
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
                 StatementKind::RefDdl(ddl) => {
                     self.catalog_ops.apply_ref_ddl(session, ddl).await?;
-                    crate::session_context::invalidate_all_session_caches();
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
                 StatementKind::PartitionEvolution(evolution) => {
                     self.catalog_ops
                         .apply_partition_evolution(session, evolution)
                         .await?;
-                    crate::session_context::invalidate_all_session_caches();
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
                 StatementKind::SetWriteBranch(ref branch) => {
@@ -578,20 +589,23 @@ impl QueryHandler {
                 }
                 StatementKind::CreateView(stmt) => {
                     self.handle_create_view(session, stmt).await?;
-                    crate::session_context::invalidate_all_session_caches();
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
                 StatementKind::DropView(stmt) => {
                     self.catalog_ops.drop_view(session, stmt).await?;
-                    crate::session_context::invalidate_all_session_caches();
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
                 StatementKind::CreateSchema(stmt) => {
+                    // Cross-user: a new namespace appears in the catalog
+                    // listing, which other users' SessionContexts cache.
                     self.catalog_ops.create_schema(session, stmt).await?;
                     crate::session_context::invalidate_all_session_caches();
                     Ok(vec![])
                 }
                 StatementKind::DropSchema(stmt) => {
+                    // Cross-user: the namespace disappears for everyone.
                     self.catalog_ops.drop_schema(session, stmt).await?;
                     crate::session_context::invalidate_all_session_caches();
                     Ok(vec![])
@@ -599,7 +613,7 @@ impl QueryHandler {
 
                 StatementKind::CreateTable(stmt) => {
                     let result = self.write_handler.handle_create_table(session, stmt).await;
-                    crate::session_context::invalidate_all_session_caches();
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
                     result
                 }
 
@@ -622,7 +636,7 @@ impl QueryHandler {
                                     &mut captured_plan,
                                 )
                                 .await;
-                            crate::session_context::invalidate_all_session_caches();
+                            crate::session_context::invalidate_session_cache(&session.user.username).await;
                             result
                         } else {
                             Err(SqeError::Execution("CTAS without SELECT query".into()))
