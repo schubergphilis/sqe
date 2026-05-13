@@ -1,17 +1,34 @@
 //! Table-valued functions for querying Iceberg table metadata.
 //!
-//! Registers two TVFs on the [`SessionContext`]:
+//! Registers six TVFs on the [`SessionContext`]:
 //!
 //! ```sql
-//! -- List all snapshots for a table
 //! SELECT * FROM table_snapshots('namespace', 'table_name');
-//!
-//! -- List all manifest files from the current snapshot
 //! SELECT * FROM table_manifests('namespace', 'table_name');
+//! SELECT * FROM table_history('namespace', 'table_name');
+//! SELECT * FROM table_files('namespace', 'table_name');
+//! SELECT * FROM table_partitions('namespace', 'table_name');
+//! SELECT * FROM table_refs('namespace', 'table_name');
 //! ```
 //!
-//! Both functions are implemented as [`TableFunctionImpl`] — the same pattern
+//! Each function is implemented as [`TableFunctionImpl`] — the same pattern
 //! as [`crate::read_parquet::ReadParquetFunction`].
+//!
+//! ## Removing block_in_place (issue #19)
+//!
+//! Earlier versions bridged DataFusion's sync `TableFunctionImpl::call` into
+//! the async `catalog.load_table()` via `tokio::task::block_in_place` +
+//! `Handle::current().block_on(...)`. `block_in_place` requires the multi-
+//! threaded runtime and forces the worker thread off the scheduler. Under
+//! concurrent metadata-heavy workloads (dbt macros probing `table_files`
+//! across many models) each TVF call took a scheduler worker out of rotation
+//! for the duration of the Polaris load.
+//!
+//! This version defers the load and the RecordBatch construction to
+//! [`TableProvider::scan`], which is already async. The TVF dispatch path is
+//! purely sync: `call()` constructs an [`IcebergMetadataProvider`] capturing
+//! `(catalog, ident, kind)` and returns immediately. The async work happens
+//! later, on the executor's natural async surface.
 //!
 //! ## Time travel
 //!
@@ -20,20 +37,115 @@
 //! not implemented here and is documented as blocked on the upstream fork.
 //! Track progress at: <https://github.com/risingwavelabs/iceberg-rust>
 
+use std::any::Any;
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow_array::builder::{Int64Builder, StringBuilder};
 use arrow_array::{ArrayRef, RecordBatch};
-use datafusion::catalog::TableFunctionImpl;
-use datafusion::common::{ScalarValue, plan_err};
-use datafusion::datasource::{MemTable, TableProvider};
-use datafusion::error::Result as DFResult;
+use async_trait::async_trait;
+use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
+use datafusion::common::{plan_err, ScalarValue};
+use datafusion::datasource::MemTable;
+use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::logical_expr::TableType;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion_expr::Expr;
+use iceberg::table::Table;
 use iceberg::{NamespaceIdent, TableIdent};
 use tracing::warn;
 
 use crate::rest_catalog::SessionCatalog;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lazy provider — async load deferred to scan() so the TVF dispatch is sync.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy)]
+enum MetadataKind {
+    Snapshots,
+    Manifests,
+    History,
+    Files,
+    Partitions,
+    Refs,
+}
+
+impl MetadataKind {
+    fn fn_name(self) -> &'static str {
+        match self {
+            Self::Snapshots => "table_snapshots",
+            Self::Manifests => "table_manifests",
+            Self::History => "table_history",
+            Self::Files => "table_files",
+            Self::Partitions => "table_partitions",
+            Self::Refs => "table_refs",
+        }
+    }
+}
+
+/// TableProvider that defers the Iceberg catalog load + metadata RecordBatch
+/// construction to `scan()` — which is already async — so the TVF
+/// `call()` site never has to bridge sync-to-async with `block_in_place`.
+/// Issue #19.
+#[derive(Debug)]
+struct IcebergMetadataProvider {
+    schema: SchemaRef,
+    catalog: Arc<SessionCatalog>,
+    ident: TableIdent,
+    kind: MetadataKind,
+}
+
+#[async_trait]
+impl TableProvider for IcebergMetadataProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let fn_name = self.kind.fn_name();
+        let table = self.catalog.load_table(&self.ident).await.map_err(|e| {
+            DataFusionError::Plan(format!(
+                "{fn_name}: failed to load table '{}.{}': {e}",
+                self.ident.namespace().as_ref().join("."),
+                self.ident.name()
+            ))
+        })?;
+
+        let batch = match self.kind {
+            MetadataKind::Snapshots => build_snapshots_batch(&table, &self.schema)?,
+            MetadataKind::Manifests => build_manifests_batch(&table, &self.schema).await?,
+            MetadataKind::History => build_history_batch(&table, &self.schema)?,
+            MetadataKind::Files => build_files_batch(&table, &self.schema).await?,
+            MetadataKind::Partitions => build_partitions_batch(&table, &self.schema).await?,
+            MetadataKind::Refs => build_refs_batch(&table, &self.schema)?,
+        };
+
+        let mem = MemTable::try_new(self.schema.clone(), vec![vec![batch]])?;
+        mem.scan(state, projection, filters, limit).await
+    }
+}
+
+fn ident_for(namespace: &str, table_name: &str) -> TableIdent {
+    TableIdent::new(
+        NamespaceIdent::new(namespace.to_string()),
+        table_name.to_string(),
+    )
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared argument parsing
@@ -93,32 +205,16 @@ impl TableSnapshotsFunction {
 impl TableFunctionImpl for TableSnapshotsFunction {
     fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
         let (namespace, table_name) = parse_two_string_args("table_snapshots", exprs)?;
-        let catalog = Arc::clone(&self.session_catalog);
-
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                build_snapshots_table(&catalog, &namespace, &table_name).await
-            })
-        })
+        Ok(Arc::new(IcebergMetadataProvider {
+            schema: snapshots_schema(),
+            catalog: Arc::clone(&self.session_catalog),
+            ident: ident_for(&namespace, &table_name),
+            kind: MetadataKind::Snapshots,
+        }))
     }
 }
 
-async fn build_snapshots_table(
-    catalog: &SessionCatalog,
-    namespace: &str,
-    table_name: &str,
-) -> DFResult<Arc<dyn TableProvider>> {
-    let schema = snapshots_schema();
-
-    let ns = NamespaceIdent::new(namespace.to_string());
-    let ident = TableIdent::new(ns, table_name.to_string());
-
-    let table = catalog.load_table(&ident).await.map_err(|e| {
-        datafusion::error::DataFusionError::Plan(format!(
-            "table_snapshots: failed to load table '{namespace}.{table_name}': {e}"
-        ))
-    })?;
-
+fn build_snapshots_batch(table: &Table, schema: &SchemaRef) -> DFResult<RecordBatch> {
     let metadata = table.metadata();
     let current_snapshot_id = metadata.current_snapshot_id();
 
@@ -176,7 +272,7 @@ async fn build_snapshots_table(
         ],
     )?;
 
-    Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    Ok(batch)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -217,32 +313,16 @@ impl TableManifestsFunction {
 impl TableFunctionImpl for TableManifestsFunction {
     fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
         let (namespace, table_name) = parse_two_string_args("table_manifests", exprs)?;
-        let catalog = Arc::clone(&self.session_catalog);
-
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                build_manifests_table(&catalog, &namespace, &table_name).await
-            })
-        })
+        Ok(Arc::new(IcebergMetadataProvider {
+            schema: manifests_schema(),
+            catalog: Arc::clone(&self.session_catalog),
+            ident: ident_for(&namespace, &table_name),
+            kind: MetadataKind::Manifests,
+        }))
     }
 }
 
-async fn build_manifests_table(
-    catalog: &SessionCatalog,
-    namespace: &str,
-    table_name: &str,
-) -> DFResult<Arc<dyn TableProvider>> {
-    let schema = manifests_schema();
-
-    let ns = NamespaceIdent::new(namespace.to_string());
-    let ident = TableIdent::new(ns, table_name.to_string());
-
-    let table = catalog.load_table(&ident).await.map_err(|e| {
-        datafusion::error::DataFusionError::Plan(format!(
-            "table_manifests: failed to load table '{namespace}.{table_name}': {e}"
-        ))
-    })?;
-
+async fn build_manifests_batch(table: &Table, schema: &SchemaRef) -> DFResult<RecordBatch> {
     let metadata = table.metadata();
 
     let mut manifest_path_b = StringBuilder::new();
@@ -293,8 +373,7 @@ async fn build_manifests_table(
             }
             Err(e) => {
                 warn!(
-                    namespace = namespace,
-                    table = table_name,
+                    table = %table.identifier(),
                     error = %e,
                     "table_manifests: failed to load manifest list; returning empty result"
                 );
@@ -320,7 +399,7 @@ async fn build_manifests_table(
         ],
     )?;
 
-    Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    Ok(batch)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -356,32 +435,16 @@ impl TableHistoryFunction {
 impl TableFunctionImpl for TableHistoryFunction {
     fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
         let (namespace, table_name) = parse_two_string_args("table_history", exprs)?;
-        let catalog = Arc::clone(&self.session_catalog);
-
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                build_history_table(&catalog, &namespace, &table_name).await
-            })
-        })
+        Ok(Arc::new(IcebergMetadataProvider {
+            schema: history_schema(),
+            catalog: Arc::clone(&self.session_catalog),
+            ident: ident_for(&namespace, &table_name),
+            kind: MetadataKind::History,
+        }))
     }
 }
 
-async fn build_history_table(
-    catalog: &SessionCatalog,
-    namespace: &str,
-    table_name: &str,
-) -> DFResult<Arc<dyn TableProvider>> {
-    let schema = history_schema();
-
-    let ns = NamespaceIdent::new(namespace.to_string());
-    let ident = TableIdent::new(ns, table_name.to_string());
-
-    let table = catalog.load_table(&ident).await.map_err(|e| {
-        datafusion::error::DataFusionError::Plan(format!(
-            "table_history: failed to load table '{namespace}.{table_name}': {e}"
-        ))
-    })?;
-
+fn build_history_batch(table: &Table, schema: &SchemaRef) -> DFResult<RecordBatch> {
     let metadata = table.metadata();
 
     // Build a set of snapshot IDs that are ancestors of the current snapshot.
@@ -430,7 +493,7 @@ async fn build_history_table(
         ],
     )?;
 
-    Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    Ok(batch)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -469,13 +532,12 @@ impl TableFilesFunction {
 impl TableFunctionImpl for TableFilesFunction {
     fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
         let (namespace, table_name) = parse_two_string_args("table_files", exprs)?;
-        let catalog = Arc::clone(&self.session_catalog);
-
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                build_files_table(&catalog, &namespace, &table_name).await
-            })
-        })
+        Ok(Arc::new(IcebergMetadataProvider {
+            schema: files_schema(),
+            catalog: Arc::clone(&self.session_catalog),
+            ident: ident_for(&namespace, &table_name),
+            kind: MetadataKind::Files,
+        }))
     }
 }
 
@@ -488,23 +550,8 @@ fn int_map_to_json(map: &std::collections::HashMap<i32, u64>) -> String {
     format!("{{{}}}", pairs.join(","))
 }
 
-async fn build_files_table(
-    catalog: &SessionCatalog,
-    namespace: &str,
-    table_name: &str,
-) -> DFResult<Arc<dyn TableProvider>> {
+async fn build_files_batch(table: &Table, schema: &SchemaRef) -> DFResult<RecordBatch> {
     use iceberg::spec::{DataContentType, ManifestStatus};
-
-    let schema = files_schema();
-
-    let ns = NamespaceIdent::new(namespace.to_string());
-    let ident = TableIdent::new(ns, table_name.to_string());
-
-    let table = catalog.load_table(&ident).await.map_err(|e| {
-        datafusion::error::DataFusionError::Plan(format!(
-            "table_files: failed to load table '{namespace}.{table_name}': {e}"
-        ))
-    })?;
 
     let metadata = table.metadata();
 
@@ -553,8 +600,7 @@ async fn build_files_table(
                         }
                         Err(e) => {
                             warn!(
-                                namespace = namespace,
-                                table = table_name,
+                                table = %table.identifier(),
                                 error = %e,
                                 "table_files: failed to load manifest; skipping"
                             );
@@ -564,8 +610,7 @@ async fn build_files_table(
             }
             Err(e) => {
                 warn!(
-                    namespace = namespace,
-                    table = table_name,
+                    table = %table.identifier(),
                     error = %e,
                     "table_files: failed to load manifest list; returning empty result"
                 );
@@ -587,7 +632,7 @@ async fn build_files_table(
         ],
     )?;
 
-    Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    Ok(batch)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -622,33 +667,17 @@ impl TablePartitionsFunction {
 impl TableFunctionImpl for TablePartitionsFunction {
     fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
         let (namespace, table_name) = parse_two_string_args("table_partitions", exprs)?;
-        let catalog = Arc::clone(&self.session_catalog);
-
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                build_partitions_table(&catalog, &namespace, &table_name).await
-            })
-        })
+        Ok(Arc::new(IcebergMetadataProvider {
+            schema: partitions_schema(),
+            catalog: Arc::clone(&self.session_catalog),
+            ident: ident_for(&namespace, &table_name),
+            kind: MetadataKind::Partitions,
+        }))
     }
 }
 
-async fn build_partitions_table(
-    catalog: &SessionCatalog,
-    namespace: &str,
-    table_name: &str,
-) -> DFResult<Arc<dyn TableProvider>> {
+async fn build_partitions_batch(table: &Table, schema: &SchemaRef) -> DFResult<RecordBatch> {
     use iceberg::spec::{DataContentType, ManifestStatus};
-
-    let schema = partitions_schema();
-
-    let ns = NamespaceIdent::new(namespace.to_string());
-    let ident = TableIdent::new(ns, table_name.to_string());
-
-    let table = catalog.load_table(&ident).await.map_err(|e| {
-        datafusion::error::DataFusionError::Plan(format!(
-            "table_partitions: failed to load table '{namespace}.{table_name}': {e}"
-        ))
-    })?;
 
     let metadata = table.metadata();
 
@@ -689,8 +718,7 @@ async fn build_partitions_table(
                         }
                         Err(e) => {
                             warn!(
-                                namespace = namespace,
-                                table = table_name,
+                                table = %table.identifier(),
                                 error = %e,
                                 "table_partitions: failed to load manifest; skipping"
                             );
@@ -700,8 +728,7 @@ async fn build_partitions_table(
             }
             Err(e) => {
                 warn!(
-                    namespace = namespace,
-                    table = table_name,
+                    table = %table.identifier(),
                     error = %e,
                     "table_partitions: failed to load manifest list; returning empty result"
                 );
@@ -731,7 +758,7 @@ async fn build_partitions_table(
         ],
     )?;
 
-    Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    Ok(batch)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -768,32 +795,16 @@ impl TableRefsFunction {
 impl TableFunctionImpl for TableRefsFunction {
     fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
         let (namespace, table_name) = parse_two_string_args("table_refs", exprs)?;
-        let catalog = Arc::clone(&self.session_catalog);
-
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                build_refs_table(&catalog, &namespace, &table_name).await
-            })
-        })
+        Ok(Arc::new(IcebergMetadataProvider {
+            schema: refs_schema(),
+            catalog: Arc::clone(&self.session_catalog),
+            ident: ident_for(&namespace, &table_name),
+            kind: MetadataKind::Refs,
+        }))
     }
 }
 
-async fn build_refs_table(
-    catalog: &SessionCatalog,
-    namespace: &str,
-    table_name: &str,
-) -> DFResult<Arc<dyn TableProvider>> {
-    let schema = refs_schema();
-
-    let ns = NamespaceIdent::new(namespace.to_string());
-    let ident = TableIdent::new(ns, table_name.to_string());
-
-    let table = catalog.load_table(&ident).await.map_err(|e| {
-        datafusion::error::DataFusionError::Plan(format!(
-            "table_refs: failed to load table '{namespace}.{table_name}': {e}"
-        ))
-    })?;
-
+fn build_refs_batch(table: &Table, schema: &SchemaRef) -> DFResult<RecordBatch> {
     let metadata = table.metadata();
 
     let mut name_b = StringBuilder::new();
@@ -839,7 +850,7 @@ async fn build_refs_table(
         ],
     )?;
 
-    Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    Ok(batch)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
