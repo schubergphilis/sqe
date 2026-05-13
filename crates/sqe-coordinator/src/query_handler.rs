@@ -317,6 +317,38 @@ impl QueryHandler {
         Ok(pairs)
     }
 
+    /// Reject a coordinator-wide DDL statement when the session does not
+    /// hold an admin role. `statement` is the SQL verb (e.g. "ATTACH",
+    /// "CREATE SECRET") and lands in the audit log + the error message
+    /// returned to the client so operators can see which statement was
+    /// denied without dumping the full SQL text.
+    ///
+    /// The role allowlist comes from `[auth] admin_roles` (default:
+    /// `["service_admin", "catalog_admin"]`). An empty allowlist
+    /// fails closed for every caller — operators must populate it
+    /// before any admin statement succeeds. Issue #3.
+    fn require_admin(&self, session: &Session, statement: &str) -> sqe_core::Result<()> {
+        if self.config.auth.has_admin_role(&session.user.roles) {
+            return Ok(());
+        }
+        warn!(
+            username = %session.user.username,
+            roles = ?session.user.roles,
+            statement = statement,
+            "denied: caller lacks admin role required for coordinator-wide DDL"
+        );
+        // Build the message so `classify_catalog_error` maps it to
+        // `SqeErrorCode::AccessDenied` (and thus gRPC PermissionDenied)
+        // rather than AuthenticationFailed — the caller is authenticated,
+        // just not authorised. The "403 Forbidden" prefix is what the
+        // substring classifier looks for.
+        Err(SqeError::Catalog(format!(
+            "403 Forbidden: {statement} requires one of admin roles {:?}; \
+             caller has roles {:?}",
+            self.config.auth.admin_roles, session.user.roles
+        )))
+    }
+
     /// Compute the set of catalog names that the coordinator will
     /// register on every session context. The pre-flight unknown-
     /// qualifier check compares the leading component of any 3-part
@@ -950,15 +982,33 @@ impl QueryHandler {
                         .await
                 }
 
-                StatementKind::Attach(stmt) => self.handle_attach(stmt).await,
-
-                StatementKind::Detach(stmt) => self.handle_detach(stmt),
-
-                StatementKind::CreateSecret(stmt) => self.handle_create_secret(stmt),
-
-                StatementKind::DropSecret(stmt) => self.handle_drop_secret(stmt),
-
-                StatementKind::ShowSecrets => self.handle_show_secrets(),
+                // Coordinator-wide DDL — ATTACH / DETACH mount and unmount
+                // catalog backends, CREATE / DROP SECRET mutate the in-memory
+                // credential store, SHOW SECRETS exposes the inventory.
+                // Every authenticated session could run these before #3.
+                // Now gated behind the `[auth] admin_roles` allowlist; the
+                // helper returns PermissionDenied early when the caller is
+                // not an admin.
+                StatementKind::Attach(stmt) => {
+                    self.require_admin(session, "ATTACH")?;
+                    self.handle_attach(stmt).await
+                }
+                StatementKind::Detach(stmt) => {
+                    self.require_admin(session, "DETACH")?;
+                    self.handle_detach(stmt)
+                }
+                StatementKind::CreateSecret(stmt) => {
+                    self.require_admin(session, "CREATE SECRET")?;
+                    self.handle_create_secret(stmt)
+                }
+                StatementKind::DropSecret(stmt) => {
+                    self.require_admin(session, "DROP SECRET")?;
+                    self.handle_drop_secret(stmt)
+                }
+                StatementKind::ShowSecrets => {
+                    self.require_admin(session, "SHOW SECRETS")?;
+                    self.handle_show_secrets()
+                }
             }
         };
 
