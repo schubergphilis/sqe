@@ -34,7 +34,12 @@ pub struct BearerTokenProviderConfig {
     pub jwks_url: String,
     /// Optional: expected JWT `iss` (issuer) claim. Skipped if empty.
     pub issuer: Option<String>,
-    /// Optional: expected JWT `aud` (audience) claim. Skipped if empty.
+    /// Expected JWT `aud` (audience) claim. Required by default — without
+    /// audience binding, any JWT signed by the configured JWKS issuer would
+    /// be accepted, including tokens minted for unrelated SaaS apps that
+    /// share the IdP (confused-deputy). Operators who genuinely want
+    /// token-soup mode must set `allow_unbounded_audience = true` (visible
+    /// in config diffs). See issue #8.
     pub audience: Option<String>,
     /// JWT claim to use as the user ID. Default: `"sub"`.
     pub user_claim: String,
@@ -44,6 +49,11 @@ pub struct BearerTokenProviderConfig {
     /// Accept invalid TLS certificates (self-signed, expired, wrong hostname).
     /// Set `true` for development/Docker environments with self-signed certs.
     pub accept_invalid_certs: bool,
+    /// Explicit opt-in to accept tokens with any audience. Defaults to
+    /// `false`: an empty/missing `audience` then yields a config error at
+    /// construction. Setting this `true` acknowledges that tokens issued
+    /// for any service sharing the IdP will be accepted.
+    pub allow_unbounded_audience: bool,
 }
 
 impl Default for BearerTokenProviderConfig {
@@ -55,6 +65,7 @@ impl Default for BearerTokenProviderConfig {
             user_claim: "sub".to_string(),
             roles_claim: "realm_access.roles".to_string(),
             accept_invalid_certs: false,
+            allow_unbounded_audience: false,
         }
     }
 }
@@ -101,15 +112,28 @@ pub struct BearerTokenProvider {
 impl BearerTokenProvider {
     /// Create a new bearer token provider with the given configuration.
     pub fn new(config: BearerTokenProviderConfig) -> Result<Self, AuthError> {
-        // Warn if audience validation is disabled — tokens from any service will be accepted
-        match &config.audience {
-            Some(aud) if !aud.is_empty() => {}
-            _ => {
+        // Audience binding is required by default. Without it, any JWT
+        // signed by the configured JWKS issuer would be accepted —
+        // including tokens minted for other SaaS apps that share the IdP.
+        // Operators who genuinely want token-soup mode must set
+        // `allow_unbounded_audience = true` (visible in config diffs).
+        // See issue #8.
+        let has_audience = config
+            .audience
+            .as_deref()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+        if !has_audience {
+            if config.allow_unbounded_audience {
                 tracing::warn!(
-                    "⚠ JWT audience validation is DISABLED (no 'audience' configured). \
-                     Tokens issued for other services will be accepted. \
-                     Set 'audience' in the bearer_token provider config to restrict access."
+                    "JWT audience validation is DISABLED via allow_unbounded_audience = true. \
+                     Tokens issued for any service sharing the IdP will be accepted."
                 );
+            } else {
+                return Err(AuthError::Internal(anyhow::anyhow!(
+                    "bearer_token provider requires a non-empty `audience` (set audience, \
+                     or set allow_unbounded_audience = true to opt in to token-soup mode)"
+                )));
             }
         }
 
@@ -526,6 +550,11 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
     }
 
     /// Default config for tests.
+    ///
+    /// Tests opt in to `allow_unbounded_audience` because they cover JWKS,
+    /// signature, and claim-handling behaviour rather than the audience
+    /// guard itself. The audience-required default is exercised by
+    /// [`requires_audience_unless_explicitly_unbounded`].
     fn test_config(jwks_url: &str) -> BearerTokenProviderConfig {
         BearerTokenProviderConfig {
             jwks_url: jwks_url.to_string(),
@@ -534,6 +563,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             user_claim: "sub".to_string(),
             roles_claim: "realm_access.roles".to_string(),
             accept_invalid_certs: false,
+            allow_unbounded_audience: true,
         }
     }
 
@@ -864,6 +894,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
     async fn no_bearer_token_returns_not_my_credentials() {
         let config = BearerTokenProviderConfig {
             jwks_url: "http://localhost:0/jwks".to_string(),
+            allow_unbounded_audience: true,
             ..Default::default()
         };
         let provider = BearerTokenProvider::new(config).unwrap();
@@ -886,6 +917,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
     async fn empty_credentials_returns_not_my_credentials() {
         let config = BearerTokenProviderConfig {
             jwks_url: "http://localhost:0/jwks".to_string(),
+            allow_unbounded_audience: true,
             ..Default::default()
         };
         let provider = BearerTokenProvider::new(config).unwrap();
@@ -1039,6 +1071,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         let config = BearerTokenProviderConfig {
             jwks_url: jwks_url.clone(),
             issuer: Some("https://expected.example.com".to_string()),
+            allow_unbounded_audience: true,
             ..Default::default()
         };
         let provider = BearerTokenProvider::new(config).unwrap();
@@ -1117,6 +1150,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             jwks_url: jwks_url.clone(),
             user_claim: "email".to_string(),
             roles_claim: "groups".to_string(),
+            allow_unbounded_audience: true,
             ..Default::default()
         };
         let provider = BearerTokenProvider::new(config).unwrap();
@@ -1156,6 +1190,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         let config = BearerTokenProviderConfig {
             jwks_url: jwks_url.clone(),
             user_claim: "email".to_string(),
+            allow_unbounded_audience: true,
             ..Default::default()
         };
         let provider = BearerTokenProvider::new(config).unwrap();
@@ -1191,6 +1226,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
     async fn refresh_returns_same_token() {
         let config = BearerTokenProviderConfig {
             jwks_url: "http://localhost:0/jwks".to_string(),
+            allow_unbounded_audience: true,
             ..Default::default()
         };
         let provider = BearerTokenProvider::new(config).unwrap();
@@ -1214,6 +1250,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
     async fn refresh_returns_none_when_no_catalog_token() {
         let config = BearerTokenProviderConfig {
             jwks_url: "http://localhost:0/jwks".to_string(),
+            allow_unbounded_audience: true,
             ..Default::default()
         };
         let provider = BearerTokenProvider::new(config).unwrap();
@@ -1246,6 +1283,69 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             user_claim: "sub".to_string(),
             roles_claim: "realm_access.roles".to_string(),
             accept_invalid_certs: false,
+            allow_unbounded_audience: false,
+        };
+        assert!(BearerTokenProvider::new(config).is_ok());
+    }
+
+    // --- Issue #8: JWT audience required by default ---
+
+    #[test]
+    fn new_rejects_missing_audience_by_default() {
+        let config = BearerTokenProviderConfig {
+            jwks_url: "http://localhost:0/jwks".to_string(),
+            audience: None,
+            allow_unbounded_audience: false,
+            ..Default::default()
+        };
+        match BearerTokenProvider::new(config) {
+            Err(AuthError::Internal(e)) => {
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("audience") || msg.contains("allow_unbounded_audience"),
+                    "error must mention audience guard: {msg}"
+                );
+            }
+            Err(other) => panic!("expected Internal config error, got: {other:?}"),
+            Ok(_) => panic!("must reject empty audience"),
+        }
+    }
+
+    #[test]
+    fn new_rejects_empty_string_audience() {
+        let config = BearerTokenProviderConfig {
+            jwks_url: "http://localhost:0/jwks".to_string(),
+            audience: Some(String::new()),
+            allow_unbounded_audience: false,
+            ..Default::default()
+        };
+        match BearerTokenProvider::new(config) {
+            Err(AuthError::Internal(e)) => {
+                assert!(format!("{e}").to_lowercase().contains("audience"));
+            }
+            Err(other) => panic!("expected Internal config error, got: {other:?}"),
+            Ok(_) => panic!("must reject empty audience"),
+        }
+    }
+
+    #[test]
+    fn new_accepts_missing_audience_when_explicit_opt_in() {
+        let config = BearerTokenProviderConfig {
+            jwks_url: "http://localhost:0/jwks".to_string(),
+            audience: None,
+            allow_unbounded_audience: true,
+            ..Default::default()
+        };
+        assert!(BearerTokenProvider::new(config).is_ok());
+    }
+
+    #[test]
+    fn new_accepts_non_empty_audience_without_opt_in() {
+        let config = BearerTokenProviderConfig {
+            jwks_url: "http://localhost:0/jwks".to_string(),
+            audience: Some("sqe".to_string()),
+            allow_unbounded_audience: false,
+            ..Default::default()
         };
         assert!(BearerTokenProvider::new(config).is_ok());
     }

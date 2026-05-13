@@ -6,7 +6,11 @@ use zeroize::Zeroize;
 ///
 /// Stored in [`SecretStore`] keyed by name. Memory only; not persisted.
 /// Sensitive bytes are zeroized on drop.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-implemented so a stray `{:?}` in a panic handler or
+/// `anyhow!` chain prints only the variant name and field presence — never
+/// the raw token, access key, or password (issue #16).
+#[derive(Clone)]
 pub enum Secret {
     /// AWS credentials. Any subset can be `None` to defer to the AWS
     /// credential chain (env, shared credentials, IMDS, ECS, EKS Pod
@@ -22,6 +26,45 @@ pub enum Secret {
     Bearer { token: String },
     /// Basic auth (HMS over SASL/PLAIN, JDBC, etc.).
     Basic { username: String, password: String },
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // For Aws, identifying metadata (region, profile) is safe to log;
+            // anything that smells like a credential becomes a presence flag.
+            Self::Aws {
+                access_key,
+                secret_key,
+                session_token,
+                region,
+                profile,
+            } => f
+                .debug_struct("Secret::Aws")
+                .field("access_key", &presence(access_key))
+                .field("secret_key", &presence(secret_key))
+                .field("session_token", &presence(session_token))
+                .field("region", region)
+                .field("profile", profile)
+                .finish(),
+            Self::Bearer { token } => f
+                .debug_struct("Secret::Bearer")
+                .field("token", &if token.is_empty() { "None" } else { "<set>" })
+                .finish(),
+            Self::Basic { username, password } => f
+                .debug_struct("Secret::Basic")
+                .field("username", username)
+                .field("password", &if password.is_empty() { "None" } else { "<set>" })
+                .finish(),
+        }
+    }
+}
+
+fn presence(value: &Option<String>) -> &'static str {
+    match value {
+        Some(s) if !s.is_empty() => "<set>",
+        _ => "None",
+    }
 }
 
 impl Secret {
@@ -159,8 +202,51 @@ mod tests {
                 assert_eq!(region.as_deref(), Some("us-east-1"));
                 assert_eq!(profile.as_deref(), Some("prod"));
             }
-            other => panic!("expected Aws, got {:?}", other),
+            other => panic!("expected Aws, got {}", other.type_name()),
         }
+    }
+
+    // --- Issue #16: Debug never leaks secret material ---
+
+    #[test]
+    fn bearer_debug_does_not_leak_token() {
+        let s = Secret::Bearer {
+            token: "ey-very-secret-jwt".to_string(),
+        };
+        let d = format!("{:?}", s);
+        assert!(!d.contains("ey-very-secret-jwt"), "leaked: {d}");
+        assert!(d.contains("<set>"), "presence sentinel missing: {d}");
+        assert!(d.contains("Bearer"), "variant tag missing: {d}");
+    }
+
+    #[test]
+    fn aws_debug_redacts_credentials_but_keeps_region() {
+        let s = Secret::Aws {
+            access_key: Some("AKIAEXAMPLEXXXXXXXXX".to_string()),
+            secret_key: Some("supersecret-key-value".to_string()),
+            session_token: Some("session-token-payload".to_string()),
+            region: Some("eu-central-1".to_string()),
+            profile: Some("prod".to_string()),
+        };
+        let d = format!("{:?}", s);
+        assert!(!d.contains("AKIAEXAMPLEXXXXXXXXX"), "access_key leaked: {d}");
+        assert!(!d.contains("supersecret-key-value"), "secret_key leaked: {d}");
+        assert!(!d.contains("session-token-payload"), "session_token leaked: {d}");
+        // Non-credential fields are still useful for diagnostics.
+        assert!(d.contains("eu-central-1"), "region missing: {d}");
+        assert!(d.contains("prod"), "profile missing: {d}");
+    }
+
+    #[test]
+    fn basic_debug_does_not_leak_password() {
+        let s = Secret::Basic {
+            username: "alice".to_string(),
+            password: "hunter2-very-private".to_string(),
+        };
+        let d = format!("{:?}", s);
+        assert!(!d.contains("hunter2-very-private"), "password leaked: {d}");
+        // Username appears (not a secret).
+        assert!(d.contains("alice"), "username missing: {d}");
     }
 
     #[test]
