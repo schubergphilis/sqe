@@ -127,6 +127,7 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                     audience,
                     user_claim,
                     roles_claim,
+                    allow_unbounded_audience,
                 } => {
                     info!(
                         index = i,
@@ -140,6 +141,7 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                         user_claim: user_claim.clone(),
                         roles_claim: roles_claim.clone(),
                         accept_invalid_certs: config.should_skip_tls_verify(),
+                        allow_unbounded_audience: *allow_unbounded_audience,
                     };
                     let provider = BearerTokenProvider::new(bt_config).map_err(|e| {
                         sqe_core::SqeError::Config(format!(

@@ -10,7 +10,12 @@ use async_trait::async_trait;
 /// - `ApiKeyProvider` uses `password` (if it matches the key prefix)
 /// - `MtlsProvider` uses `client_cert_cn`
 /// - `AnonymousProvider` accepts anything
-#[derive(Debug, Clone, Default)]
+///
+/// `Debug` is hand-implemented to print only field presence for the secret
+/// fields (`password`, `bearer_token`) — see issue #16. A panic handler or
+/// `anyhow!` chain printing this struct with `{:?}` must never leak the
+/// caller's password or bearer token.
+#[derive(Clone, Default)]
 pub struct FlightCredentials {
     pub username: Option<String>,
     pub password: Option<String>,
@@ -18,12 +23,26 @@ pub struct FlightCredentials {
     pub client_cert_cn: Option<String>,
 }
 
+impl fmt::Debug for FlightCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FlightCredentials")
+            .field("username", &self.username)
+            .field("password", &redacted_presence(&self.password))
+            .field("bearer_token", &redacted_presence(&self.bearer_token))
+            .field("client_cert_cn", &self.client_cert_cn)
+            .finish()
+    }
+}
+
 /// The authenticated identity produced by a successful `AuthProvider::authenticate` call.
 ///
 /// Carried in the `Session` for the lifetime of the connection. The `catalog_token`
 /// is forwarded to the Polaris REST catalog (and S3) so every request runs as the
 /// authenticated user.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-implemented so `catalog_token` and `refresh_token` print as
+/// presence sentinels (`<set>` / `None`) rather than the raw value (issue #16).
+#[derive(Clone)]
 pub struct Identity {
     pub user_id: String,
     pub display_name: String,
@@ -32,6 +51,28 @@ pub struct Identity {
     /// Refresh token for obtaining new access tokens without re-authentication.
     /// Only populated by providers that support token refresh (e.g. OIDC password grant).
     pub refresh_token: Option<String>,
+}
+
+impl fmt::Debug for Identity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Identity")
+            .field("user_id", &self.user_id)
+            .field("display_name", &self.display_name)
+            .field("roles", &self.roles)
+            .field("catalog_token", &redacted_presence(&self.catalog_token))
+            .field("refresh_token", &redacted_presence(&self.refresh_token))
+            .finish()
+    }
+}
+
+/// Render an `Option<String>` as either `"<set>"` (any non-empty value) or
+/// `"None"`. Used by hand-written `Debug` impls on secret-bearing structs so
+/// that printing the struct via `{:?}` never reveals the underlying bytes.
+fn redacted_presence(value: &Option<String>) -> &'static str {
+    match value {
+        Some(s) if !s.is_empty() => "<set>",
+        _ => "None",
+    }
 }
 
 /// Errors returned by `AuthProvider::authenticate`.
@@ -138,12 +179,67 @@ mod tests {
             user_id: "alice".to_string(),
             display_name: "Alice".to_string(),
             roles: vec!["analyst".to_string()],
-            catalog_token: Some("secret-token".to_string()),
-            refresh_token: None,
+            catalog_token: Some("ey-very-secret-jwt-value".to_string()),
+            refresh_token: Some("very-secret-refresh-token".to_string()),
         };
-        // Debug should include the fields (it's derived Debug, which is fine
-        // for development; production logging should use Display or redact).
         let debug = format!("{:?}", identity);
-        assert!(debug.contains("alice"));
+
+        // Identifiers and roles are fine to log.
+        assert!(debug.contains("alice"), "user_id should appear: {debug}");
+        assert!(debug.contains("Alice"), "display_name should appear: {debug}");
+        assert!(debug.contains("analyst"), "role should appear: {debug}");
+
+        // Secrets must NOT appear in any form.
+        assert!(
+            !debug.contains("ey-very-secret-jwt-value"),
+            "catalog_token leaked to Debug output: {debug}"
+        );
+        assert!(
+            !debug.contains("very-secret-refresh-token"),
+            "refresh_token leaked to Debug output: {debug}"
+        );
+        // Presence sentinel is shown so operators can tell the field was set.
+        assert!(debug.contains("<set>"), "presence sentinel missing: {debug}");
+    }
+
+    #[test]
+    fn flight_credentials_debug_does_not_leak_password_or_bearer() {
+        let creds = FlightCredentials {
+            username: Some("alice".to_string()),
+            password: Some("hunter2-very-private".to_string()),
+            bearer_token: Some("ey-bearer-private".to_string()),
+            client_cert_cn: Some("cn=alice".to_string()),
+        };
+        let debug = format!("{:?}", creds);
+
+        assert!(debug.contains("alice"), "username should appear: {debug}");
+        assert!(debug.contains("cn=alice"), "cert CN should appear: {debug}");
+
+        assert!(
+            !debug.contains("hunter2-very-private"),
+            "password leaked to Debug output: {debug}"
+        );
+        assert!(
+            !debug.contains("ey-bearer-private"),
+            "bearer_token leaked to Debug output: {debug}"
+        );
+        assert!(debug.contains("<set>"), "presence sentinel missing: {debug}");
+    }
+
+    #[test]
+    fn flight_credentials_debug_distinguishes_none_from_set() {
+        // None should render as the string "None", not "<set>".
+        let creds = FlightCredentials {
+            username: Some("alice".to_string()),
+            ..Default::default()
+        };
+        let debug = format!("{:?}", creds);
+        // password and bearer_token are None — must NOT show "<set>" for them
+        // (but the username is some, so the test guards against missing <set>
+        // entirely is not appropriate here).
+        // We instead check that the rendering contains "None" for the empty
+        // fields. debug_struct prints "field: None" for &"None" values.
+        assert!(debug.contains("password: \"None\""), "expected 'password: \"None\"': {debug}");
+        assert!(debug.contains("bearer_token: \"None\""), "expected 'bearer_token: \"None\"': {debug}");
     }
 }

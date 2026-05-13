@@ -453,7 +453,11 @@ pub enum AuthProviderConfig {
         /// Expected issuer (`iss` claim). Optional.
         #[serde(default)]
         issuer: Option<String>,
-        /// Expected audience (`aud` claim). Optional.
+        /// Expected audience (`aud` claim). Required by default — see
+        /// `allow_unbounded_audience` for the explicit opt-out. Without
+        /// audience binding, any JWT signed by the configured JWKS issuer
+        /// would be accepted (confused-deputy across SaaS apps sharing
+        /// the IdP). Issue #8.
         #[serde(default)]
         audience: Option<String>,
         /// JWT claim for user identity. Default: `"sub"`.
@@ -462,6 +466,12 @@ pub enum AuthProviderConfig {
         /// Dot-separated JSON path to roles. Default: `"realm_access.roles"`.
         #[serde(default = "default_roles_claim")]
         roles_claim: String,
+        /// Explicit opt-in to accept tokens with any audience. Default
+        /// `false`: a missing/empty `audience` then errors at startup.
+        /// Setting `true` acknowledges that tokens issued for any service
+        /// sharing the IdP will be accepted.
+        #[serde(default)]
+        allow_unbounded_audience: bool,
     },
     /// AWS IAM authentication via STS GetCallerIdentity.
     AwsIam {
