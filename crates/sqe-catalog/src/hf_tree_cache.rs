@@ -330,11 +330,14 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    /// `(url, body_bytes, headers)` for a mock HTTP response.
+    type MockResponse = (String, Vec<u8>, Vec<(String, String)>);
+
     /// Simple in-memory mock keyed by URL. Records every call so tests
     /// can assert cache behaviour.
     #[derive(Debug, Default)]
     struct MockHttp {
-        responses: Mutex<Vec<(String, Vec<u8>, Vec<(String, String)>)>>,
+        responses: Mutex<Vec<MockResponse>>,
         calls: Mutex<Vec<String>>,
     }
 
