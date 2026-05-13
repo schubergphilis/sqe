@@ -4,14 +4,22 @@ use std::sync::Mutex;
 use serde::Serialize;
 use tracing::info;
 
-/// Redact common PII patterns from SQL text for audit log safety.
+/// Redact common PII patterns and secret literals from SQL text for audit
+/// log safety.
 ///
 /// Replaces:
 /// - Email addresses → [EMAIL]
 /// - Phone numbers (US/intl) → [PHONE]
 /// - SSN patterns (XXX-XX-XXXX) → [SSN]
 /// - Credit card-like numbers (13-19 digits) → [CARD]
-/// - Quoted string literals that look like identifiers → preserved
+/// - Quoted secret literals (`TOKEN '...'`, `PASSWORD '...'`,
+///   `ACCESS_KEY_ID '...'`, `SECRET_ACCESS_KEY '...'`, `SESSION_TOKEN '...'`,
+///   `SECRET '...'`) → [REDACTED]
+///
+/// The secret-literal pass is the belt-and-suspenders guard for issue #4:
+/// without it, `CREATE SECRET … TOKEN '<jwt>'` lands verbatim in the audit
+/// JSONL, OTel/Loki sinks, and any debug-level trace, exfiltrating every
+/// long-lived bearer ever created in the cluster.
 pub fn redact_pii(sql: &str) -> String {
     use std::sync::OnceLock;
 
@@ -19,6 +27,7 @@ pub fn redact_pii(sql: &str) -> String {
     static SSN_RE: OnceLock<regex_lite::Regex> = OnceLock::new();
     static PHONE_RE: OnceLock<regex_lite::Regex> = OnceLock::new();
     static CARD_RE: OnceLock<regex_lite::Regex> = OnceLock::new();
+    static SECRET_RE: OnceLock<regex_lite::Regex> = OnceLock::new();
 
     let email_re = EMAIL_RE.get_or_init(|| {
         regex_lite::Regex::new(
@@ -38,12 +47,23 @@ pub fn redact_pii(sql: &str) -> String {
     let card_re = CARD_RE.get_or_init(|| {
         regex_lite::Regex::new(r"'\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{1,7}'").unwrap()
     });
+    // Case-insensitive match for known secret-bearing keywords followed by
+    // an `=` (e.g. `key = 'val'`), space (e.g. `TOKEN 'val'`), or `(`
+    // (e.g. `TOKEN('val')`). Captures the keyword so the replacement
+    // preserves it while erasing the literal.
+    let secret_re = SECRET_RE.get_or_init(|| {
+        regex_lite::Regex::new(
+            r"(?i)\b(TOKEN|PASSWORD|PASSWD|SECRET|ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN|API_KEY|CLIENT_SECRET|BEARER)\b(\s*=\s*|\s+|\s*\(\s*)'[^']*'",
+        )
+        .unwrap()
+    });
 
     let mut result = sql.to_string();
     result = email_re.replace_all(&result, "'[EMAIL]'").to_string();
     result = ssn_re.replace_all(&result, "'[SSN]'").to_string();
     result = phone_re.replace_all(&result, "'[PHONE]'").to_string();
     result = card_re.replace_all(&result, "'[CARD]'").to_string();
+    result = secret_re.replace_all(&result, "$1$2'[REDACTED]'").to_string();
     result
 }
 
@@ -264,6 +284,98 @@ mod tests {
         assert!(redacted.contains("[EMAIL]"));
         assert!(redacted.contains("[SSN]"));
         assert!(!redacted.contains("bob@test.com"));
+    }
+
+    // --- Secret-literal redaction (issue #4 regression tests) ---
+
+    #[test]
+    fn redact_create_secret_bearer_token() {
+        let sql = "CREATE SECRET my_token (TYPE bearer, TOKEN 'eyJhbGciOiJSUzI1NiJ9.payload.sig')";
+        let redacted = redact_pii(sql);
+        assert!(
+            !redacted.contains("eyJhbGciOiJSUzI1NiJ9.payload.sig"),
+            "bearer token literal must not survive: {redacted}"
+        );
+        assert!(redacted.contains("[REDACTED]"));
+        // The keyword must be preserved so audit consumers still see the
+        // shape of the statement.
+        assert!(redacted.to_uppercase().contains("TOKEN"));
+    }
+
+    #[test]
+    fn redact_create_secret_password() {
+        let sql = "CREATE SECRET my_pw (TYPE password, PASSWORD 'hunter2!correct horse')";
+        let redacted = redact_pii(sql);
+        assert!(!redacted.contains("hunter2!correct horse"));
+        assert!(redacted.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn redact_create_secret_aws_keys() {
+        let sql = "CREATE SECRET aws (\
+            TYPE aws, \
+            ACCESS_KEY_ID 'AKIAIOSFODNN7EXAMPLE', \
+            SECRET_ACCESS_KEY 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', \
+            SESSION_TOKEN 'FQoDYXdzEPv...EXAMPLE')";
+        let redacted = redact_pii(sql);
+        assert!(!redacted.contains("AKIAIOSFODNN7EXAMPLE"), "{redacted}");
+        assert!(!redacted.contains("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"), "{redacted}");
+        assert!(!redacted.contains("FQoDYXdzEPv...EXAMPLE"), "{redacted}");
+        // All three literals turn into [REDACTED].
+        assert!(redacted.matches("[REDACTED]").count() >= 3);
+    }
+
+    #[test]
+    fn redact_secret_kv_equals_style() {
+        // SQL dialects that use `KEY = 'val'` rather than `KEY 'val'`.
+        let sql = "CREATE SECRET s WITH (token = 'abc.def.ghi', password = 'hunter2')";
+        let redacted = redact_pii(sql);
+        assert!(!redacted.contains("abc.def.ghi"));
+        assert!(!redacted.contains("hunter2"));
+    }
+
+    #[test]
+    fn redact_secret_case_insensitive() {
+        let sql = "CREATE SECRET x (token 'abc', Password 'def', api_key 'ghi')";
+        let redacted = redact_pii(sql);
+        assert!(!redacted.contains("'abc'"));
+        assert!(!redacted.contains("'def'"));
+        assert!(!redacted.contains("'ghi'"));
+    }
+
+    #[test]
+    fn redact_does_not_touch_column_named_token() {
+        // A column literally named `token` in a SELECT must NOT have the
+        // selected expression rewritten — only quoted-string literals next
+        // to the keyword get scrubbed. (Conservative regression for false
+        // positives.)
+        let sql = "SELECT token FROM creds WHERE id = 1";
+        let redacted = redact_pii(sql);
+        assert_eq!(redacted, sql);
+    }
+
+    #[test]
+    fn test_audit_log_does_not_contain_create_secret_literal() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("sqe-audit-secret-test.jsonl");
+        let path_str = path.to_str().unwrap();
+
+        let logger = AuditLogger::new(path_str).unwrap();
+        let mut entry = test_entry();
+        entry.statement_type = "create_secret".to_string();
+        entry.query_text = Some(
+            "CREATE SECRET prod_token (TYPE bearer, TOKEN 'eyJSECRETJWTPAYLOAD')".to_string(),
+        );
+        logger.log(&entry);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !content.contains("eyJSECRETJWTPAYLOAD"),
+            "secret literal leaked to audit log: {content}"
+        );
+        assert!(content.contains("[REDACTED]"));
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

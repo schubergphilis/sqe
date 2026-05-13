@@ -103,7 +103,7 @@ struct OpaResponse {
 
 #[derive(Deserialize, Default)]
 struct OpaResult {
-    #[serde(default = "default_true")]
+    #[serde(default)]
     allow: bool,
     #[serde(default)]
     row_filters: Vec<String>,
@@ -111,10 +111,6 @@ struct OpaResult {
     column_masks: HashMap<String, String>,
     #[serde(default)]
     restricted_columns: Vec<String>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[async_trait]
@@ -168,7 +164,16 @@ impl PolicyStore for OpaStore {
             sqe_core::error::SqeError::Execution(format!("Failed to parse OPA response: {e}"))
         })?;
 
-        let result = opa_response.result.unwrap_or_default();
+        // Fail-closed when OPA returns `{ "result": null }` — typical when the
+        // queried policy package or rule does not exist (typo in path, mis-
+        // deployed bundle, partial reload). Without this guard a degraded OPA
+        // silently lifts every row filter and column mask.
+        let result = opa_response.result.ok_or_else(|| {
+            sqe_core::error::SqeError::Execution(format!(
+                "OPA policy package missing for query path: {}",
+                self.policy_path
+            ))
+        })?;
 
         if !result.allow {
             // Denied — inject FALSE filter (returns zero rows, no error)
@@ -367,4 +372,31 @@ mod tests {
             panic!("Expected Redact variant");
         }
     }
+
+    // --- Fail-closed regression tests (issue #5) ---
+
+    #[test]
+    fn opa_result_allow_defaults_to_false_when_field_missing() {
+        // Regression: prior `default_true` made a missing `allow` field
+        // silently permit. Default must be false (deny) so a degraded OPA
+        // cannot lift restrictions by omission.
+        let result: OpaResult = serde_json::from_str("{}").unwrap();
+        assert!(!result.allow, "allow must default to false (fail-closed)");
+    }
+
+    #[test]
+    fn opa_response_with_null_result_yields_none() {
+        // OPA returns `{ "result": null }` when the queried policy package or
+        // rule does not exist. The resolver must NOT treat this as
+        // "permit everything" — it must surface an error so operators notice
+        // a missing bundle / typo in policy_path.
+        let response: OpaResponse =
+            serde_json::from_str(r#"{"result": null}"#).unwrap();
+        assert!(response.result.is_none());
+
+        // And the absent-field form behaves the same way.
+        let response: OpaResponse = serde_json::from_str("{}").unwrap();
+        assert!(response.result.is_none());
+    }
+
 }

@@ -3,6 +3,9 @@
 flight_sql_port = 50051
 trino_http_port = 8080
 worker_urls = ["http://worker-1:50052", "http://worker-2:50052"]
+# Test stack runs inside a private docker network; opt-in to skip the
+# worker_secret requirement that production deployments must satisfy.
+allow_unauthenticated_workers = true
 
 [metrics]
 prometheus_port = 9090

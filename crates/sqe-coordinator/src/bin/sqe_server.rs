@@ -311,8 +311,10 @@ async fn async_main() -> anyhow::Result<()> {
     if config.auth.should_skip_tls_verify() {
         tracing::warn!("WARNING: TLS certificate verification is DISABLED for auth endpoints -- vulnerable to MITM. Set auth.tls_skip_verify = false (or auth.ssl_verification = true) for production.");
     }
-    if !config.coordinator.worker_urls.is_empty() && config.coordinator.worker_secret.is_empty() {
-        tracing::error!("SECURITY: worker_urls configured but worker_secret is empty -- any client can register as a worker. Set worker_secret for distributed mode.");
+    if !config.coordinator.worker_urls.is_empty()
+        && config.coordinator.allow_unauthenticated_workers
+    {
+        tracing::warn!("WARNING: coordinator.allow_unauthenticated_workers = true -- any client reachable on the cluster network can register as a worker and receive user bearer tokens. Set worker_secret for production.");
     }
 
     // Priority: --mode flag > SQE_MODE env > config file mode
