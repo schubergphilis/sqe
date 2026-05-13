@@ -586,6 +586,18 @@ pub struct AuthConfig {
     /// Maps to `[auth.external]` in TOML.
     #[serde(default)]
     pub external: Option<ExternalAuthConfig>,
+    /// Roles that may execute coordinator-wide DDL: ATTACH, DETACH,
+    /// CREATE SECRET, DROP SECRET, SHOW SECRETS. Every authenticated
+    /// session used to be able to mount arbitrary catalog backends or
+    /// stash arbitrary credentials in process memory; that surface is
+    /// now gated behind the roles listed here (issue #3). Default:
+    /// `["service_admin", "catalog_admin"]`.
+    #[serde(default = "default_admin_roles")]
+    pub admin_roles: Vec<String>,
+}
+
+fn default_admin_roles() -> Vec<String> {
+    vec!["service_admin".to_string(), "catalog_admin".to_string()]
 }
 
 impl AuthConfig {
@@ -594,6 +606,18 @@ impl AuthConfig {
     /// Either `tls_skip_verify = true` OR `ssl_verification = false` triggers skip.
     pub fn should_skip_tls_verify(&self) -> bool {
         self.tls_skip_verify || !self.ssl_verification
+    }
+
+    /// Returns `true` if any of the given role names is in `admin_roles`.
+    /// Empty `admin_roles` (an operator who explicitly disabled the gate)
+    /// returns `false` — admin-only statements then fail closed.
+    pub fn has_admin_role(&self, roles: &[String]) -> bool {
+        if self.admin_roles.is_empty() {
+            return false;
+        }
+        roles
+            .iter()
+            .any(|r| self.admin_roles.iter().any(|admin| admin == r))
     }
 }
 
@@ -1932,6 +1956,7 @@ mod tests {
                 providers: Vec::new(),
                 role_mappings: std::collections::HashMap::new(),
                 external: None,
+                admin_roles: default_admin_roles(),
             },
             catalog: CatalogConfig {
                 catalog_url: "https://polaris.example.com".to_string(),
@@ -3041,5 +3066,51 @@ otlp_endpoint = ""
         };
         let err = policy.check("http:///just-a-path").unwrap_err();
         assert!(err.contains("malformed URL") || err.contains("missing host"));
+    }
+
+    // --- AuthConfig::has_admin_role (issue #3 regression tests) ---
+
+    fn auth_with_admin_roles(roles: Vec<&str>) -> AuthConfig {
+        let mut cfg = valid_config().auth;
+        cfg.admin_roles = roles.into_iter().map(String::from).collect();
+        cfg
+    }
+
+    #[test]
+    fn admin_role_matches_when_caller_in_allowlist() {
+        let auth = auth_with_admin_roles(vec!["service_admin", "catalog_admin"]);
+        let caller_roles = vec!["analyst".to_string(), "catalog_admin".to_string()];
+        assert!(auth.has_admin_role(&caller_roles));
+    }
+
+    #[test]
+    fn admin_role_misses_when_caller_lacks_admin() {
+        let auth = auth_with_admin_roles(vec!["service_admin", "catalog_admin"]);
+        let caller_roles = vec!["analyst".to_string(), "viewer".to_string()];
+        assert!(!auth.has_admin_role(&caller_roles));
+    }
+
+    #[test]
+    fn admin_role_misses_when_caller_has_no_roles() {
+        let auth = auth_with_admin_roles(vec!["service_admin"]);
+        assert!(!auth.has_admin_role(&[]));
+    }
+
+    #[test]
+    fn admin_role_fails_closed_when_allowlist_empty() {
+        // Operator explicitly cleared the allowlist - every admin
+        // statement is rejected, even for users who happen to hold
+        // a role named "service_admin".
+        let auth = auth_with_admin_roles(vec![]);
+        let caller_roles = vec!["service_admin".to_string()];
+        assert!(!auth.has_admin_role(&caller_roles));
+    }
+
+    #[test]
+    fn admin_role_match_is_case_sensitive() {
+        // Role names are exact-match. SERVICE_ADMIN != service_admin.
+        let auth = auth_with_admin_roles(vec!["service_admin"]);
+        let caller_roles = vec!["SERVICE_ADMIN".to_string()];
+        assert!(!auth.has_admin_role(&caller_roles));
     }
 }
