@@ -351,6 +351,7 @@ mod tests {
             token_refresh_buffer_secs: 60,
             ssl_verification: false,
             tls_skip_verify: false,
+            roles_claim: "realm_access.roles".to_string(),
             providers: Vec::new(),
             role_mappings: std::collections::HashMap::new(),
             external: None,

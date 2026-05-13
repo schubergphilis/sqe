@@ -16,6 +16,13 @@ pub struct OidcPasswordClient {
     token_url: String,
     client_id: String,
     client_secret: String,
+    /// Dot-separated JSON path to the roles array in the JWT payload. The
+    /// legacy default `realm_access.roles` is the Keycloak shape; Auth0,
+    /// Okta, and AzureAD typically use `groups`, a `cognito:groups`-style
+    /// path, or a custom claim. Without this plumbing those users
+    /// authenticated successfully but got `roles = []` and every
+    /// role-gated policy denied them (issue #13).
+    roles_claim: String,
 }
 
 impl OidcPasswordClient {
@@ -36,6 +43,7 @@ impl OidcPasswordClient {
             token_url,
             client_id: config.client_id.clone(),
             client_secret: config.client_secret.clone(),
+            roles_claim: config.roles_claim.clone(),
         })
     }
 
@@ -131,10 +139,14 @@ impl OidcPasswordClient {
             })
     }
 
-    /// Decode JWT payload without signature verification (OIDC provider already validated).
-    /// Extracts `realm_access.roles` from the claims.
+    /// Decode JWT payload without signature verification (OIDC provider
+    /// already validated) and extract role names from the configured
+    /// `roles_claim` path. Default path is `realm_access.roles` (Keycloak
+    /// shape); Auth0/Okta/AzureAD callers can point at `groups` or another
+    /// custom claim.
     ///
-    /// Returns an empty `Vec` for malformed tokens.
+    /// Returns an empty `Vec` for malformed tokens, missing claims, or
+    /// non-array role values.
     pub fn extract_roles(&self, access_token: &str) -> Vec<String> {
         let parts: Vec<&str> = access_token.split('.').collect();
         if parts.len() != 3 {
@@ -158,10 +170,22 @@ impl OidcPasswordClient {
             }
         };
 
-        claims
-            .get("realm_access")
-            .and_then(|ra| ra.get("roles"))
-            .and_then(|roles| roles.as_array())
+        Self::extract_roles_at_path(&claims, &self.roles_claim)
+    }
+
+    /// Walk a dot-separated path through the claim tree and collect role
+    /// strings. `realm_access.roles`, `groups`, or
+    /// `resource_access.sqe.roles` all work.
+    fn extract_roles_at_path(claims: &serde_json::Value, path: &str) -> Vec<String> {
+        let mut current = claims;
+        for segment in path.split('.') {
+            match current.get(segment) {
+                Some(v) => current = v,
+                None => return Vec::new(),
+            }
+        }
+        current
+            .as_array()
             .map(|arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str().map(String::from))
@@ -197,6 +221,7 @@ mod tests {
             token_refresh_buffer_secs: 60,
             ssl_verification: false,
             tls_skip_verify: false,
+            roles_claim: "realm_access.roles".to_string(),
             providers: Vec::new(),
             role_mappings: std::collections::HashMap::new(),
             external: None,
@@ -275,6 +300,48 @@ mod tests {
 
         let roles = client.extract_roles(&fake_jwt(&claims));
         assert_eq!(roles, vec!["admin", "user"]);
+    }
+
+    // --- roles_claim plumbing (issue #13 regression tests) ---
+
+    #[test]
+    fn extract_roles_honours_flat_groups_path() {
+        // Auth0 / Okta / AzureAD shape: roles live at top-level `groups`.
+        // Before the roles_claim plumbing landed, this returned [] because
+        // the legacy path hardcoded `realm_access.roles`.
+        let mut cfg = test_config();
+        cfg.roles_claim = "groups".to_string();
+        let client = OidcPasswordClient::new(&cfg).unwrap();
+        let claims = serde_json::json!({ "groups": ["dba", "analyst"] });
+        let roles = client.extract_roles(&fake_jwt(&claims));
+        assert_eq!(roles, vec!["dba", "analyst"]);
+    }
+
+    #[test]
+    fn extract_roles_honours_nested_resource_access_path() {
+        // Keycloak resource_access.<client>.roles shape.
+        let mut cfg = test_config();
+        cfg.roles_claim = "resource_access.sqe.roles".to_string();
+        let client = OidcPasswordClient::new(&cfg).unwrap();
+        let claims = serde_json::json!({
+            "resource_access": {
+                "sqe": { "roles": ["viewer"] }
+            }
+        });
+        let roles = client.extract_roles(&fake_jwt(&claims));
+        assert_eq!(roles, vec!["viewer"]);
+    }
+
+    #[test]
+    fn extract_roles_default_claim_still_matches_keycloak() {
+        // Existing Keycloak deployments must keep working with the legacy
+        // default path.
+        let client = make_client();
+        let claims = serde_json::json!({
+            "realm_access": { "roles": ["admin"] }
+        });
+        let roles = client.extract_roles(&fake_jwt(&claims));
+        assert_eq!(roles, vec!["admin"]);
     }
 
     #[test]

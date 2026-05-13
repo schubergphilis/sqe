@@ -85,6 +85,7 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                         token_refresh_buffer_secs: config.token_refresh_buffer_secs,
                         ssl_verification: config.ssl_verification,
                         tls_skip_verify: config.tls_skip_verify,
+                        roles_claim: config.roles_claim.clone(),
                         providers: Vec::new(),
                         role_mappings: HashMap::new(),
                         external: None,
@@ -250,6 +251,7 @@ mod tests {
             token_refresh_buffer_secs: 60,
             ssl_verification: true,
             tls_skip_verify: false,
+            roles_claim: "realm_access.roles".to_string(),
             providers: vec![AuthProviderConfig::Anonymous {
                 user: "dev-user".to_string(),
                 roles: vec!["admin".to_string()],
@@ -284,6 +286,7 @@ mod tests {
             token_refresh_buffer_secs: 60,
             ssl_verification: true,
             tls_skip_verify: false,
+            roles_claim: "realm_access.roles".to_string(),
             providers: vec![AuthProviderConfig::OidcPassword {
                 token_url: "http://localhost:8080/token".to_string(),
                 client_id: "sqe".to_string(),
@@ -313,6 +316,7 @@ mod tests {
             token_refresh_buffer_secs: 60,
             ssl_verification: true,
             tls_skip_verify: false,
+            roles_claim: "realm_access.roles".to_string(),
             providers: vec![
                 AuthProviderConfig::OidcPassword {
                     token_url: "http://localhost:8080/token".to_string(),
@@ -356,6 +360,7 @@ mod tests {
             token_refresh_buffer_secs: 60,
             ssl_verification: false,
             tls_skip_verify: false,
+            roles_claim: "realm_access.roles".to_string(),
             providers: Vec::new(),
             role_mappings: HashMap::new(),
             external: None,

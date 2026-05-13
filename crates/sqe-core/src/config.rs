@@ -545,6 +545,14 @@ pub struct AuthConfig {
     /// Clearer naming: `true` means "skip verification" (insecure).
     #[serde(default)]
     pub tls_skip_verify: bool,
+    /// Dot-separated JSON path to the roles claim in the legacy OIDC password
+    /// grant JWT payload. Default: `"realm_access.roles"` (Keycloak shape).
+    /// Set to e.g. `"groups"` for Auth0/Okta/AzureAD whose tokens carry roles
+    /// at the top level rather than under `realm_access`. Mirrors the
+    /// per-provider `roles_claim` on `[[auth.providers]]` so the legacy
+    /// authenticator path also reads custom claim paths (issue #13).
+    #[serde(default = "default_roles_claim")]
+    pub roles_claim: String,
     /// Explicit provider chain. When non-empty, takes precedence over the
     /// legacy `keycloak_url` / `token_endpoint` fields.
     #[serde(default)]
@@ -1450,6 +1458,41 @@ impl SqeConfig {
         env_override_str("SQE_AUTH__TOKEN_ENDPOINT", &mut self.auth.token_endpoint);
         env_override_u64("SQE_AUTH__TOKEN_REFRESH_BUFFER_SECS", &mut self.auth.token_refresh_buffer_secs);
         env_override_bool("SQE_AUTH__SSL_VERIFICATION", &mut self.auth.ssl_verification);
+        env_override_str("SQE_AUTH__ROLES_CLAIM", &mut self.auth.roles_claim);
+
+        // Auth providers: secrets must be injectable via env so Kubernetes
+        // Secret mounts, Vault Agent, and External Secrets Operator can rotate
+        // without rewriting TOML. Convention: `SQE_AUTH__PROVIDERS__<N>__<FIELD>`
+        // where `<N>` is the zero-based index in the `[[auth.providers]]`
+        // array. Today only `client_secret` is wired through, matching the
+        // fields where the bug bit (issue #14). Token endpoints and
+        // discovery URLs stay in TOML.
+        for (idx, provider) in self.auth.providers.iter_mut().enumerate() {
+            let env_name = format!("SQE_AUTH__PROVIDERS__{idx}__CLIENT_SECRET");
+            match provider {
+                AuthProviderConfig::OidcPassword { client_secret, .. } => {
+                    env_override_str(&env_name, client_secret);
+                }
+                AuthProviderConfig::ClientCredentials { client_secret, .. } => {
+                    env_override_str(&env_name, client_secret);
+                }
+                AuthProviderConfig::TokenExchange { client_secret, .. } => {
+                    if let Some(secret) = client_secret.as_mut() {
+                        env_override_str(&env_name, secret);
+                    } else if let Ok(v) = std::env::var(&env_name) {
+                        if !v.is_empty() {
+                            *client_secret = Some(v);
+                        }
+                    }
+                }
+                // Variants without a client_secret field: nothing to override.
+                AuthProviderConfig::BearerToken { .. }
+                | AuthProviderConfig::AwsIam { .. }
+                | AuthProviderConfig::ApiKey { .. }
+                | AuthProviderConfig::Mtls { .. }
+                | AuthProviderConfig::Anonymous { .. } => {}
+            }
+        }
 
         // Catalog
         // SQE_CATALOG__CATALOG_URL is the canonical env var; the legacy
@@ -1730,6 +1773,7 @@ mod tests {
                 token_refresh_buffer_secs: 60,
                 ssl_verification: true,
                 tls_skip_verify: false,
+                roles_claim: default_roles_claim(),
                 providers: Vec::new(),
                 role_mappings: std::collections::HashMap::new(),
                 external: None,
@@ -2623,5 +2667,89 @@ otlp_endpoint = ""
             ..OpenLineageConfig::default()
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    // --- Provider env-var override (issue #14 regression test) ---
+
+    /// Lock used to serialise env-var test mutation since std::env::set_var
+    /// has process-wide effect.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn provider_client_secret_env_override_beats_toml() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let mut cfg = valid_config();
+        cfg.auth.providers = vec![
+            AuthProviderConfig::OidcPassword {
+                token_url: "http://idp.example.com/token".to_string(),
+                client_id: "sqe".to_string(),
+                client_secret: "toml-secret".to_string(),
+                roles_claim: "realm_access.roles".to_string(),
+            },
+            AuthProviderConfig::ClientCredentials {
+                token_endpoint: "http://polaris:8181/oauth/tokens".to_string(),
+                client_id: "polaris-sa".to_string(),
+                client_secret: "toml-polaris".to_string(),
+            },
+        ];
+
+        std::env::set_var(
+            "SQE_AUTH__PROVIDERS__0__CLIENT_SECRET",
+            "from-env-oidc",
+        );
+        std::env::set_var(
+            "SQE_AUTH__PROVIDERS__1__CLIENT_SECRET",
+            "from-env-ccg",
+        );
+
+        cfg.apply_env_overrides();
+
+        match &cfg.auth.providers[0] {
+            AuthProviderConfig::OidcPassword { client_secret, .. } => {
+                assert_eq!(client_secret, "from-env-oidc");
+            }
+            other => panic!("expected OidcPassword, got {other:?}"),
+        }
+        match &cfg.auth.providers[1] {
+            AuthProviderConfig::ClientCredentials { client_secret, .. } => {
+                assert_eq!(client_secret, "from-env-ccg");
+            }
+            other => panic!("expected ClientCredentials, got {other:?}"),
+        }
+
+        std::env::remove_var("SQE_AUTH__PROVIDERS__0__CLIENT_SECRET");
+        std::env::remove_var("SQE_AUTH__PROVIDERS__1__CLIENT_SECRET");
+    }
+
+    #[test]
+    fn provider_client_secret_env_override_token_exchange_optional() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let mut cfg = valid_config();
+        cfg.auth.providers = vec![AuthProviderConfig::TokenExchange {
+            token_url: "http://idp.example.com/token".to_string(),
+            client_id: "sqe".to_string(),
+            client_secret: None,
+            audience: Some("polaris".to_string()),
+            user_claim: "sub".to_string(),
+            roles_claim: "realm_access.roles".to_string(),
+        }];
+
+        std::env::set_var(
+            "SQE_AUTH__PROVIDERS__0__CLIENT_SECRET",
+            "exchange-secret",
+        );
+
+        cfg.apply_env_overrides();
+
+        match &cfg.auth.providers[0] {
+            AuthProviderConfig::TokenExchange { client_secret, .. } => {
+                assert_eq!(client_secret.as_deref(), Some("exchange-secret"));
+            }
+            other => panic!("expected TokenExchange, got {other:?}"),
+        }
+
+        std::env::remove_var("SQE_AUTH__PROVIDERS__0__CLIENT_SECRET");
     }
 }
