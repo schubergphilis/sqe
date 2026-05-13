@@ -228,6 +228,95 @@ impl QueryHandler {
         &self.write_handler
     }
 
+    /// Return the cached per-session [`SessionCatalog`] for the given session.
+    ///
+    /// This is the same catalog instance that backs the user's queries —
+    /// it's built once on a SessionContext cache miss and reused thereafter.
+    /// Metadata paths (Flight `do_get_tables`, `SHOW SCHEMAS`, `SHOW TABLES`)
+    /// use this to avoid rebuilding the catalog wrapping (token hash, prop
+    /// map, HTTP client) every call.
+    pub async fn session_catalog(
+        &self,
+        session: &Session,
+    ) -> sqe_core::Result<Arc<SessionCatalog>> {
+        let (_ctx, catalog) = self.create_session_context(session).await?;
+        Ok(catalog)
+    }
+
+    /// List `(namespace, table_name)` pairs reachable by `session` across the
+    /// default Iceberg catalog. Used by Flight SQL `do_get_tables` and the
+    /// JDBC `DatabaseMetaData.getTables` path; bypasses the SQL planner so
+    /// 500-table warehouses no longer trigger 500 planner invocations
+    /// (issue #7), removes the catalog-name → SQL-string concatenation that
+    /// enabled SQL injection by federated catalogs returning crafted names
+    /// (issue #9), and reuses the cached `SessionCatalog` instead of
+    /// rebuilding it (issue #15).
+    ///
+    /// Namespaces are listed sequentially (one Polaris call) and the per-
+    /// namespace `list_tables` fans out with bounded concurrency. Views are
+    /// included when the catalog backend supports them; unsupported backends
+    /// (non-REST) are skipped silently per the existing schema-provider
+    /// contract.
+    pub async fn list_metadata_tables(
+        &self,
+        session: &Session,
+    ) -> sqe_core::Result<Vec<(String, String)>> {
+        use futures::StreamExt;
+
+        let catalog = self.session_catalog(session).await?;
+        let namespaces = catalog.list_namespaces().await?;
+
+        // Bounded concurrency keeps load on Polaris predictable while
+        // shaving wall-clock for warehouses with many schemas.
+        const MAX_INFLIGHT: usize = 16;
+
+        let entries: Vec<(String, Vec<String>)> = futures::stream::iter(namespaces.into_iter())
+            .map(|ns| {
+                let catalog = Arc::clone(&catalog);
+                async move {
+                    let ns_label: String = ns
+                        .as_ref()
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
+
+                    let mut names: Vec<String> = match catalog.list_tables(&ns).await {
+                        Ok(tables) => tables.into_iter().map(|t| t.name().to_string()).collect(),
+                        Err(e) => {
+                            warn!(
+                                namespace = %ns_label,
+                                error = %e,
+                                "list_metadata_tables: failed to list tables, skipping"
+                            );
+                            Vec::new()
+                        }
+                    };
+
+                    // Views: REST-only. Non-REST backends return an error
+                    // which we swallow — same shape as schema_provider.
+                    if let Ok(views) = catalog.list_views(&ns).await {
+                        names.extend(views);
+                    }
+
+                    (ns_label, names)
+                }
+            })
+            .buffer_unordered(MAX_INFLIGHT)
+            .collect()
+            .await;
+
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for (ns_label, names) in entries {
+            for name in names {
+                pairs.push((ns_label.clone(), name));
+            }
+        }
+        // Sorted output for stable JDBC client display.
+        pairs.sort();
+        Ok(pairs)
+    }
+
     /// Compute the set of catalog names that the coordinator will
     /// register on every session context. The pre-flight unknown-
     /// qualifier check compares the leading component of any 3-part
@@ -2125,16 +2214,14 @@ impl QueryHandler {
     }
 
     /// Handle SHOW SCHEMAS by listing namespaces from the Polaris catalog.
+    ///
+    /// Reuses the cached `Arc<SessionCatalog>` from `create_session_context`
+    /// instead of rebuilding the wrapping on every call (issue #15).
     async fn handle_show_schemas(
         &self,
         session: &Session,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let session_catalog = SessionCatalog::for_session(
-            &self.config,
-            self.table_cache.clone(),
-            &session.access_token,
-        )
-        .await?;
+        let session_catalog = self.session_catalog(session).await?;
 
         let namespaces = session_catalog.list_namespaces().await?;
 
@@ -2209,17 +2296,16 @@ impl QueryHandler {
     }
 
     /// Handle SHOW TABLES by listing tables in a namespace from the Polaris catalog.
+    ///
+    /// Reuses the cached `Arc<SessionCatalog>` from `create_session_context`
+    /// instead of re-running `SessionCatalog::for_session` (which re-hashes
+    /// the bearer and rebuilds the props map on every call — issue #15).
     async fn handle_show_tables(
         &self,
         session: &Session,
         filter: &str,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let session_catalog = SessionCatalog::for_session(
-            &self.config,
-            self.table_cache.clone(),
-            &session.access_token,
-        )
-        .await?;
+        let session_catalog = self.session_catalog(session).await?;
 
         // If a filter is provided, use it as the namespace; otherwise list all namespaces
         let ns_name = parse_show_tables_namespace(filter);
