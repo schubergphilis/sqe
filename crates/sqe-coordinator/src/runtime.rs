@@ -91,6 +91,7 @@ mod tests {
             debug: false,
             tls: TlsConfig::default(),
             worker_secret: String::new(),
+            allow_unauthenticated_workers: false,
             memory_limit: memory_limit.to_string(),
             spill_to_disk: false,
             spill_dir: "/tmp/sqe-test-coordinator-spill".to_string(),

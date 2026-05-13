@@ -1505,6 +1505,10 @@ impl FlightSqlService for SqeFlightSqlService {
         match action.r#type.as_str() {
             "heartbeat" => {
                 // Validate the worker secret when one is configured.
+                // An empty secret reaches this code path only when the
+                // operator explicitly set
+                // `coordinator.allow_unauthenticated_workers = true`;
+                // SqeConfig::validate refuses to boot otherwise.
                 if !self.worker_secret.is_empty() {
                     use subtle::ConstantTimeEq;
                     let provided = metadata
