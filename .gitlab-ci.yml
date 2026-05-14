@@ -82,6 +82,47 @@ cargo-test:
       - target/
       - .cargo/registry/
 
+# ── Feature subset check ───────────────────────────────────────
+# Default CI runs --all-features only. A #[cfg(feature = "hms")] block
+# can rot for months while CI stays green because the default-features
+# build keeps it hot. Issue #113. Each axis below is the documented
+# slim build path users actually take.
+cargo-check-features:
+  stage: check
+  image: rust:bookworm
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq cmake protobuf-compiler libssl-dev pkg-config > /dev/null
+  script:
+    # Slimmest REST-only build. The documented minimum.
+    - cargo check -p sqe-catalog --no-default-features --features rest
+    # AWS-heavy axis kept hot so glue + s3tables share aws-config.
+    - cargo check -p sqe-catalog --no-default-features --features rest,glue,s3tables
+    # HMS-only axis (Thrift weight without the AWS SDK).
+    - cargo check -p sqe-catalog --no-default-features --features rest,hms
+    # SQL catalog axes (PostgreSQL and SQLite split for tls-rustls reasons).
+    - cargo check -p sqe-catalog --no-default-features --features rest,sql-postgres
+    - cargo check -p sqe-catalog --no-default-features --features rest,sql-sqlite
+    # Delta read add-on. Slim REST + delta is the embedded mode build.
+    - cargo check -p sqe-catalog --no-default-features --features rest,delta
+    # No-features sanity check. Compiles, even if no backend is wired.
+    - cargo check -p sqe-catalog --no-default-features
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - crates/sqe-catalog/**/*
+        - Cargo.toml
+        - Cargo.lock
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
+      changes:
+        - crates/sqe-catalog/**/*
+        - Cargo.toml
+        - Cargo.lock
+  cache:
+    key: cargo-features-${CI_COMMIT_REF_SLUG}
+    paths:
+      - target/
+      - .cargo/registry/
+
 # ── Integration tests (Docker stack required) ─────────────────
 # Runs the 118 #[ignore] tests gated on docker-compose.test.yml. These
 # cover Iceberg V3 types, partition evolution, MoR delete, CTAS round-
