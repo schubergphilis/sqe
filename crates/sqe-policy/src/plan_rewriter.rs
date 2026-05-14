@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::{col, lit, Cast, Expr, Filter, LogicalPlan, Projection};
 use datafusion::scalar::ScalarValue;
 use tracing::{debug, warn};
@@ -182,7 +182,10 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                             }
                         }
 
-                        return Ok(Transformed::yes(current));
+                        // Jump: skip descending into the wrappers we just
+                        // injected. Continue would re-enter the inner
+                        // TableScan and rewrap forever.
+                        return Ok(Transformed::new(current, true, TreeNodeRecursion::Jump));
                     }
                 }
                 Ok(Transformed::no(node))
