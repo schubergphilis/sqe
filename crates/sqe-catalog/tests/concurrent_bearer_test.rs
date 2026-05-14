@@ -631,3 +631,90 @@ async fn concurrent_list_namespaces_current_thread_baseline() {
          === full captured log ===\n{log}",
     );
 }
+
+/// Issue #2 root-cause hypothesis: the server's `/v1/config` `overrides`
+/// map can clobber the user-supplied token with an empty string. Pre-
+/// fix the merge silently propagated that empty value all the way to
+/// the `token` mutex; downstream `authenticate()` errored at request
+/// time with a defensive guard, but the error pointed at the request
+/// site rather than the actual misconfiguration at the merge boundary.
+///
+/// This test mounts a wiremock `/v1/config` that returns
+/// `{"overrides":{"token":""}, "defaults":{}}` — exactly the shape a
+/// misconfigured Polaris (or a federated catalog that wants to opt the
+/// user into anonymous access without saying so) would emit. With the
+/// fix in `HttpClient::update_with`, SessionCatalog construction errors
+/// loudly at the merge boundary with operator-actionable text. Without
+/// the fix, construction succeeded and the first outbound call 401'd.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_catalog_rejects_server_overriding_token_to_empty() {
+    let server = MockServer::start().await;
+
+    // /v1/config with an empty-string token override. The mock only
+    // matches when Authorization is present — we want to confirm the
+    // first call carries the user's bearer, then verify the merge
+    // boundary rejects the response.
+    Mock::given(method("GET"))
+        .and(path("/v1/config"))
+        .and(header_exists("Authorization"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"overrides":{"token":""},"defaults":{}}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    // Catch-all 401 mock so a request slipping through without auth
+    // shows up clearly in the wiremock log.
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .insert_header("www-authenticate", "Bearer realm=\"polaris\""),
+        )
+        .mount(&server)
+        .await;
+
+    let token = format!("repro-clobber-{}", uuid::Uuid::new_v4());
+    let session = SessionCatalog::new(
+        &server.uri(),
+        "test-warehouse",
+        &token,
+        &StorageConfig::default(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("SessionCatalog::new returns Ok; the merge guard fires on first use");
+
+    // Driving the first actual catalog call triggers the OnceCell init
+    // which calls /v1/config and then update_with. The merge guard
+    // surfaces as a Catalog error.
+    let result = session.list_namespaces().await;
+    let request_log = format_request_log(&server).await;
+    let err = result.expect_err(
+        &format!(
+            "Expected a loud merge-boundary error when /v1/config clobbers \
+             the token with empty.\n{request_log}"
+        ),
+    );
+
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("token") && (msg.contains("misconfiguration") || msg.contains("empty")),
+        "Error must point at the token clobber: {msg}\n{request_log}"
+    );
+
+    // Confirm wiremock saw the /v1/config call WITH the user bearer
+    // (so we know the failure is the merge guard, not auth on the
+    // initial call).
+    let received = server.received_requests().await.unwrap_or_default();
+    let config_call = received
+        .iter()
+        .find(|r| r.url.path() == "/v1/config")
+        .expect("at least one /v1/config call");
+    assert!(
+        config_call.headers.get("authorization").is_some(),
+        "the /v1/config call must carry Authorization; otherwise the \
+         test isn't exercising the merge boundary at all"
+    );
+}
