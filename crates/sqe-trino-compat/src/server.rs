@@ -526,6 +526,21 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     headers: HeaderMap,
     Path((id, token)): Path<(String, String)>,
 ) -> Response {
+    // Authenticate the caller before exposing any result data.
+    let session = if let Some(token) = extract_bearer_token(&headers) {
+        match state.authenticator.authenticate_bearer(&token).await {
+            Ok(s) => s,
+            Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+        }
+    } else if let Some((user, pass)) = extract_basic_auth(&headers) {
+        match state.authenticator.authenticate(&user, &pass).await {
+            Ok(s) => s,
+            Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+        }
+    } else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
     // Parse the token as a page index.
     let page_token: usize = match token.parse() {
         Ok(t) => t,
@@ -538,6 +553,15 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 
     match state.results.get(&id) {
         Some(paginated) => {
+            if paginated.owner_username != session.user.username {
+                warn!(
+                    query_id = %id,
+                    caller = %session.user.username,
+                    owner = %paginated.owner_username,
+                    "get_results denied: caller does not own query"
+                );
+                return StatusCode::FORBIDDEN.into_response();
+            }
             if page_token >= paginated.total_pages {
                 let response = TrinoResponse {
                     id: id.clone(),
