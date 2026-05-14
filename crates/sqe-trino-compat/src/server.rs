@@ -64,6 +64,7 @@ pub trait TrinoAuthRateLimiter: Send + Sync + 'static {
 }
 
 /// Stores the full result set split into pages for pagination.
+#[derive(Debug)]
 pub struct PaginatedResult {
     /// Column metadata (shared across all pages).
     pub columns: Vec<TrinoColumn>,
@@ -71,10 +72,17 @@ pub struct PaginatedResult {
     pub pages: Vec<Vec<Vec<serde_json::Value>>>,
     /// Total number of pages.
     pub total_pages: usize,
+    /// Total rows across every page; reported as `processedRows`.
+    pub total_rows: usize,
     /// Wall-clock time at which this result was stored; used for TTL eviction.
     pub created_at: std::time::Instant,
     /// Username of the session that created this result; used for cancel authorization.
     pub owner_username: String,
+    /// `INSERT`/`UPDATE`/`DELETE` for write paths; `None` for reads.
+    pub update_type: Option<String>,
+    /// Affected rows for write statements; mirrored on every page so dbt-trino
+    /// can populate `rows_affected` from any response.
+    pub update_count: Option<i64>,
 }
 
 /// Trino client headers extracted from the request.
@@ -342,22 +350,73 @@ async fn server_state<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 }
 
 fn error_response(status: StatusCode, msg: impl Into<String>) -> Response {
+    let msg = msg.into();
     let body = TrinoResponse {
         id: String::new(),
         info_uri: None,
-        next_uri: None,
-        columns: None,
-        data: None,
         stats: TrinoStats::failed(),
         error: Some(TrinoError {
-            message: msg.into(),
+            message: msg.clone(),
             error_code: 1,
             error_name: "USER_ERROR".to_string(),
             error_type: "USER_ERROR".to_string(),
             query_id: None,
+            failure_info: Some(crate::protocol::TrinoFailureInfo {
+                r#type: "io.trino.spi.USER_ERROR".to_string(),
+                message: msg,
+                suppressed: Vec::new(),
+                cause: None,
+                stack: Vec::new(),
+            }),
+            error_location: None,
         }),
+        ..Default::default()
     };
     (status, Json(body)).into_response()
+}
+
+/// Classify a SQL statement against the leading keyword.
+///
+/// dbt-trino sets `rows_affected` from `updateType` + `updateCount`. Trino
+/// itself emits `INSERT`, `UPDATE`, `DELETE`, `MERGE`, plus the schema-DDL
+/// variants. We map them by the verb the user typed.
+fn classify_update_type(sql: &str) -> Option<&'static str> {
+    let token = sql
+        .trim_start()
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .find(|s| !s.is_empty())?
+        .to_ascii_uppercase();
+    match token.as_str() {
+        "INSERT" => Some("INSERT"),
+        "UPDATE" => Some("UPDATE"),
+        "DELETE" => Some("DELETE"),
+        "MERGE" => Some("MERGE"),
+        "CREATE" => Some("CREATE TABLE"),
+        "DROP" => Some("DROP TABLE"),
+        "ALTER" => Some("ALTER TABLE"),
+        "TRUNCATE" => Some("TRUNCATE TABLE"),
+        _ => None,
+    }
+}
+
+/// Extract the affected-row count from a write-path response.
+///
+/// DataFusion returns a single 1x1 batch with a `count` column for
+/// INSERT/UPDATE/DELETE/MERGE. We grovel through that shape and fall back
+/// to 0 if the engine returned nothing.
+fn extract_update_count(batches: &[arrow_array::RecordBatch]) -> Option<i64> {
+    let batch = batches.first()?;
+    if batch.num_rows() != 1 || batch.num_columns() != 1 {
+        return None;
+    }
+    let arr = batch.column(0);
+    if let Some(a) = arr.as_any().downcast_ref::<arrow_array::Int64Array>() {
+        return Some(a.value(0));
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<arrow_array::UInt64Array>() {
+        return Some(a.value(0) as i64);
+    }
+    None
 }
 
 // ── Header extraction ─────────────────────────────────────────
@@ -443,18 +502,26 @@ fn build_page_response(
         .unwrap_or_default();
     let is_last = page_token + 1 >= paginated.total_pages;
 
+    let metrics = protocol::ExecutionMetrics {
+        elapsed_millis: paginated.created_at.elapsed().as_millis() as u64,
+        processed_rows: paginated.total_rows as u64,
+        ..protocol::ExecutionMetrics::default()
+    };
+    let stats = if is_last {
+        TrinoStats::finished_with_metrics(&metrics)
+    } else {
+        TrinoStats::running_with_metrics(page_token + 1, paginated.total_pages, &metrics)
+    };
     TrinoResponse {
         id: query_id.to_string(),
         info_uri: Some(info_uri(base_url, query_id)),
         next_uri: next_uri(base_url, query_id, page_token, paginated.total_pages),
         columns: Some(paginated.columns.clone()),
         data: Some(page_data),
-        stats: if is_last {
-            TrinoStats::finished()
-        } else {
-            TrinoStats::running(page_token + 1, paginated.total_pages)
-        },
-        error: None,
+        stats,
+        update_type: paginated.update_type.clone(),
+        update_count: paginated.update_count,
+        ..Default::default()
     }
 }
 
@@ -578,6 +645,13 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 
     match state.query_handler.execute(&session, sql).await {
         Ok(batches) => {
+            let update_type = classify_update_type(sql).map(str::to_string);
+            let update_count = if update_type.is_some() {
+                extract_update_count(&batches).or(Some(0))
+            } else {
+                None
+            };
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             let (columns, data) = protocol::batches_to_trino(&batches);
             let pages = paginate_rows(data, state.page_size);
             let total_pages = pages.len();
@@ -586,8 +660,11 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 columns,
                 pages,
                 total_pages,
+                total_rows,
                 created_at: std::time::Instant::now(),
                 owner_username: session.user.username.clone(),
+                update_type,
+                update_count,
             };
 
             // Build the first page response (token = 0).
@@ -614,11 +691,9 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             let response = TrinoResponse {
                 id: query_id.clone(),
                 info_uri: Some(info_uri(&base_url, &query_id)),
-                next_uri: None,
-                columns: None,
-                data: None,
                 stats: TrinoStats::failed(),
                 error: Some(trino_error),
+                ..Default::default()
             };
             let mut resp = (StatusCode::OK, Json(response)).into_response();
             if is_rate_limited {
@@ -679,9 +754,6 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 let response = TrinoResponse {
                     id: id.clone(),
                     info_uri: Some(info_uri(&base_url, &id)),
-                    next_uri: None,
-                    columns: None,
-                    data: None,
                     stats: TrinoStats::failed(),
                     error: Some(TrinoError {
                         message: "Page token out of range".to_string(),
@@ -689,7 +761,10 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                         error_name: "USER_ERROR".to_string(),
                         error_type: "USER_ERROR".to_string(),
                         query_id: None,
+                        failure_info: None,
+                        error_location: None,
                     }),
+                    ..Default::default()
                 };
                 return (StatusCode::NOT_FOUND, Json(response)).into_response();
             }
@@ -711,9 +786,6 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             let response = TrinoResponse {
                 id: id.clone(),
                 info_uri: Some(info_uri(&base_url, &id)),
-                next_uri: None,
-                columns: None,
-                data: None,
                 stats: TrinoStats::failed(),
                 error: Some(TrinoError {
                     message: "Query not found".to_string(),
@@ -721,7 +793,10 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                     error_name: "USER_ERROR".to_string(),
                     error_type: "USER_ERROR".to_string(),
                     query_id: None,
+                    failure_info: None,
+                    error_location: None,
                 }),
+                ..Default::default()
             };
             (StatusCode::NOT_FOUND, Json(response)).into_response()
         }
@@ -1110,6 +1185,9 @@ mod tests {
             total_pages: 2,
             created_at: Instant::now(),
             owner_username: "test".to_string(),
+            total_rows: 0,
+            update_type: None,
+            update_count: None,
         };
 
         let resp = build_page_response("http://localhost:8080", "q-abc", &paginated, 0);
@@ -1141,6 +1219,9 @@ mod tests {
             total_pages: 2,
             created_at: Instant::now(),
             owner_username: "test".to_string(),
+            total_rows: 0,
+            update_type: None,
+            update_count: None,
         };
 
         let resp = build_page_response("http://localhost:8080", "q-abc", &paginated, 1);
@@ -1157,6 +1238,9 @@ mod tests {
             total_pages: 1,
             created_at: Instant::now(),
             owner_username: "test".to_string(),
+            total_rows: 0,
+            update_type: None,
+            update_count: None,
         };
 
         let resp = build_page_response("http://localhost:8080", "q-single", &paginated, 0);
@@ -1268,6 +1352,9 @@ mod tests {
                 total_pages: 2,
                 created_at: Instant::now(),
                 owner_username: "test".to_string(),
+                total_rows: 0,
+                update_type: None,
+                update_count: None,
             },
         );
 
@@ -1338,6 +1425,9 @@ mod tests {
                 total_pages: 1,
                 created_at: Instant::now(),
                 owner_username: "test".to_string(),
+                total_rows: 0,
+                update_type: None,
+                update_count: None,
             },
         );
 
@@ -1389,6 +1479,9 @@ mod tests {
                 total_pages: 3,
                 created_at: Instant::now(),
                 owner_username: "test".to_string(),
+                total_rows: 0,
+                update_type: None,
+                update_count: None,
             },
         );
 
@@ -1452,6 +1545,9 @@ mod tests {
                 total_pages: 2,
                 created_at: Instant::now(),
                 owner_username: "test".to_string(),
+                total_rows: 0,
+                update_type: None,
+                update_count: None,
             },
         );
 
@@ -1535,6 +1631,9 @@ mod tests {
                 total_pages: 2,
                 created_at: Instant::now(),
                 owner_username: "test-user".to_string(),
+                total_rows: 0,
+                update_type: None,
+                update_count: None,
             },
         );
 
