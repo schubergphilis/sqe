@@ -2,7 +2,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::{Path, State};
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
@@ -12,6 +14,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use sqe_core::Session;
+use sqe_core::config::SecurityConfig;
 
 use crate::protocol::{
     self, NodeVersion, ServerInfo, TrinoColumn, TrinoError, TrinoResponse, TrinoStats,
@@ -41,6 +44,23 @@ pub struct TrinoState<A, Q> {
     pub port: u16,
     /// OAuth2 external auth state. None if [auth.external] is not configured.
     pub oauth2: Option<Arc<crate::oauth2::OAuth2State>>,
+    /// Trusted-proxy allowlist used to decide whether to honour
+    /// `x-forwarded-for`. Empty = ignore it. Issue #74.
+    pub security: SecurityConfig,
+    /// Optional pre-auth rate limit on credentials. Issue #57.
+    pub auth_rate_limiter: Option<Arc<dyn TrinoAuthRateLimiter>>,
+    /// When true, /v1/info omits the build version so unauthenticated
+    /// callers cannot fingerprint the engine. Issue #40.
+    pub expose_version: bool,
+}
+
+/// Trait the coordinator implements to plug an
+/// `AuthRateLimiter` into the Trino path without coupling this crate
+/// to the coordinator's concrete rate-limit module.
+#[async_trait::async_trait]
+pub trait TrinoAuthRateLimiter: Send + Sync + 'static {
+    /// Returns `Err(())` when the (peer_ip, username) tuple is over budget.
+    fn check(&self, peer_ip: &str, username: &str) -> Result<(), ()>;
 }
 
 /// Stores the full result set split into pages for pagination.
@@ -88,12 +108,52 @@ pub trait TrinoQueryExecutor: Send + Sync + 'static {
     ) -> Result<Vec<arrow_array::RecordBatch>, String>;
 }
 
+pub struct TrinoServerOptions {
+    pub security: SecurityConfig,
+    pub auth_rate_limiter: Option<Arc<dyn TrinoAuthRateLimiter>>,
+    /// Whether `/v1/info` may return the exact build version. Default
+    /// `false` for production deployments. Issue #40.
+    pub expose_version: bool,
+}
+
+impl Default for TrinoServerOptions {
+    fn default() -> Self {
+        Self {
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: false,
+        }
+    }
+}
+
 pub fn start_trino_server<A, Q>(
     authenticator: Arc<A>,
     query_handler: Arc<Q>,
     port: u16,
     node: NodeContext,
     oauth2: Option<Arc<crate::oauth2::OAuth2State>>,
+) -> tokio::task::JoinHandle<()>
+where
+    A: TrinoAuthenticator,
+    Q: TrinoQueryExecutor,
+{
+    start_trino_server_with_options(
+        authenticator,
+        query_handler,
+        port,
+        node,
+        oauth2,
+        TrinoServerOptions::default(),
+    )
+}
+
+pub fn start_trino_server_with_options<A, Q>(
+    authenticator: Arc<A>,
+    query_handler: Arc<Q>,
+    port: u16,
+    node: NodeContext,
+    oauth2: Option<Arc<crate::oauth2::OAuth2State>>,
+    options: TrinoServerOptions,
 ) -> tokio::task::JoinHandle<()>
 where
     A: TrinoAuthenticator,
@@ -107,6 +167,9 @@ where
         page_size: DEFAULT_PAGE_SIZE,
         port,
         oauth2: oauth2.clone(),
+        security: options.security,
+        auth_rate_limiter: options.auth_rate_limiter,
+        expose_version: options.expose_version,
     });
 
     let state_sweep = state.clone();
@@ -187,10 +250,30 @@ where
 
         info!("Trino-compat HTTP server listening on {addr}");
 
-        if let Err(e) = axum::serve(listener, app).await {
+        if let Err(e) = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        {
             error!(error = %e, "Trino-compat HTTP server exited with error");
         }
     })
+}
+
+/// Compute the trusted client IP for a Trino request: honour
+/// `x-forwarded-for` only when the peer is in `[security] trusted_proxies`.
+fn trino_client_ip<A, Q>(
+    state: &Arc<TrinoState<A, Q>>,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+) -> String {
+    let xff = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok());
+    state
+        .security
+        .resolve_client_ip(Some(&peer.to_string()), xff)
 }
 
 // ── Trino /v1/info ────────────────────────────────────────────
@@ -212,15 +295,39 @@ async fn server_info<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     State(state): State<Arc<TrinoState<A, Q>>>,
 ) -> Json<ServerInfo> {
     let ready = state.node.ready.load(Ordering::Relaxed);
+    // Issue #40: unauthenticated callers used to receive the exact
+    // build version, which makes targeted-CVE matching trivial. The
+    // Trino spec says /v1/info needs no auth, so the right fix is to
+    // scrub the version unless the operator opts in. Clients that
+    // need exact-version handshake (rare) can set `expose_version`.
+    let version = if state.expose_version {
+        state.node.version.clone()
+    } else {
+        coarse_version(&state.node.version)
+    };
     Json(ServerInfo {
-        node_version: NodeVersion {
-            version: state.node.version.clone(),
-        },
+        node_version: NodeVersion { version },
         environment: "production".to_string(),
         coordinator: true,
         starting: !ready,
         uptime: format_uptime(state.node.started_at),
     })
+}
+
+/// Return `"<major>.<minor>"` from a semver-like input, or `"unknown"`
+/// when the input cannot be parsed. The major.minor pair is enough for
+/// JDBC drivers that branch on Trino protocol generation but does not
+/// pin the exact build for CVE matching.
+fn coarse_version(full: &str) -> String {
+    let trimmed = full.trim();
+    if trimmed.is_empty() {
+        return "unknown".to_string();
+    }
+    let mut parts = trimmed.split('.');
+    match (parts.next(), parts.next()) {
+        (Some(major), Some(minor)) => format!("{major}.{minor}"),
+        _ => "unknown".to_string(),
+    }
 }
 
 async fn server_state<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
@@ -364,6 +471,7 @@ fn build_page_response(
 )]
 async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     State(state): State<Arc<TrinoState<A, Q>>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: String,
 ) -> Response {
@@ -372,41 +480,45 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         return error_response(StatusCode::BAD_REQUEST, "Empty query");
     }
 
-    // Extract client IP for logging on every request
-    let client_ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+    let client_ip = trino_client_ip(&state, &headers, peer);
+    let peer_host = client_ip
+        .rsplit_once(':')
+        .filter(|(_, p)| p.chars().all(|c| c.is_ascii_digit()))
+        .map(|(host, _)| host)
+        .unwrap_or(&client_ip)
+        .to_string();
 
     let trino_headers = extract_trino_headers(&headers);
 
     let session = if let Some(token) = extract_bearer_token(&headers) {
-        // Bearer token auth: validate JWT through the auth provider chain.
         match state.authenticator.authenticate_bearer(&token).await {
             Ok(s) => s,
             Err(e) => {
                 warn!(error = %e, client_ip = %client_ip, "Trino bearer token validation failed");
-                return error_response(StatusCode::UNAUTHORIZED, "Invalid bearer token");
+                return error_response(StatusCode::UNAUTHORIZED, "authentication failed");
             }
         }
     } else if let Some((user, pass)) = extract_basic_auth(&headers) {
-        // Basic auth: authenticate via OIDC password grant
-        let client_ip = extract_header(&headers, "x-forwarded-for")
-            .map(|s| {
-                s.split(',')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .to_string()
-            })
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "unknown".to_string());
+        if let Some(ref limiter) = state.auth_rate_limiter {
+            if limiter.check(&peer_host, &user).is_err() {
+                warn!(
+                    user = %user,
+                    client_ip = %client_ip,
+                    "Trino auth rejected by rate limiter"
+                );
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(axum::http::header::RETRY_AFTER, "1")],
+                    "authentication rate limit",
+                )
+                    .into_response();
+            }
+        }
         match state.authenticator.authenticate(&user, &pass).await {
             Ok(s) => s,
             Err(e) => {
                 warn!(error = %e, user = %user, client_ip = %client_ip, "Trino authentication failed");
-                return error_response(StatusCode::UNAUTHORIZED, "Authentication failed");
+                return error_response(StatusCode::UNAUTHORIZED, "authentication failed");
             }
         }
     } else if let Some(ref oauth2_state) = state.oauth2 {
@@ -523,6 +635,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 #[tracing::instrument(skip_all, name = "trino.get_results")]
 async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     State(state): State<Arc<TrinoState<A, Q>>>,
+    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path((id, token)): Path<(String, String)>,
 ) -> Response {
@@ -617,6 +730,7 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 
 async fn cancel_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     State(state): State<Arc<TrinoState<A, Q>>>,
+    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
