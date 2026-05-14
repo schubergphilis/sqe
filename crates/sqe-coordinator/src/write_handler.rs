@@ -36,6 +36,86 @@ use crate::writer::{
     write_data_files_with_metrics, write_equality_delete_files, write_position_delete_files,
 };
 
+/// Rewrap the source SELECT of an `INSERT INTO t (c1, c2, ...) SELECT ...` so
+/// the resulting projection matches the target table's column order.
+///
+/// The user-supplied column list maps SELECT-output position `i` to target
+/// column `columns[i]`. Without this rewrite the writer stamps Iceberg field
+/// IDs positionally over the source's Arrow schema, silently swapping
+/// matching-type columns. We wrap the SELECT in a subquery, alias each
+/// projected column by the explicit target name, then re-project in the
+/// target schema's declared order. Columns absent from `columns` are written
+/// as NULL.
+fn reorder_insert_select(
+    select_sql: &str,
+    columns: &[sqlparser::ast::Ident],
+    target_schema: &IcebergSchema,
+) -> sqe_core::Result<String> {
+    use std::collections::HashSet;
+
+    let target_fields = target_schema.as_struct().fields();
+    let target_names: Vec<&str> = target_fields.iter().map(|f| f.name.as_str()).collect();
+
+    if columns.len() > target_names.len() {
+        return Err(SqeError::Execution(format!(
+            "INSERT column list has {} entries but target table has {} columns",
+            columns.len(),
+            target_names.len(),
+        )));
+    }
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let provided_lower: Vec<String> = columns
+        .iter()
+        .map(|c| c.value.to_ascii_lowercase())
+        .collect();
+    for name in &provided_lower {
+        if !seen.insert(name.clone()) {
+            return Err(SqeError::Execution(format!(
+                "INSERT column list contains duplicate column '{name}'"
+            )));
+        }
+        if !target_names
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(name))
+        {
+            return Err(SqeError::Execution(format!(
+                "INSERT column '{name}' does not exist in target table"
+            )));
+        }
+    }
+
+    // The source SELECT yields N columns. Position i in that result is
+    // the value destined for `columns[i]`. Alias each output by that target
+    // name in a CTE, then project the full target schema with NULLs for
+    // unprovided columns.
+    let alias_list: Vec<String> = columns.iter().map(|c| quote_ident(&c.value)).collect();
+    let alias_csv = alias_list.join(", ");
+
+    let projection: Vec<String> = target_names
+        .iter()
+        .map(|target| {
+            let lower = target.to_ascii_lowercase();
+            if provided_lower.iter().any(|p| p == &lower) {
+                quote_ident(target)
+            } else {
+                format!("NULL AS {}", quote_ident(target))
+            }
+        })
+        .collect();
+
+    Ok(format!(
+        "SELECT {} FROM ({}) AS __sqe_insert_src({})",
+        projection.join(", "),
+        select_sql,
+        alias_csv,
+    ))
+}
+
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 /// Build a single-row RecordBatch reporting affected row count.
 /// Matches Trino's DML response which returns the update count.
 fn affected_rows_batch(count: usize) -> Vec<RecordBatch> {
@@ -673,9 +753,9 @@ impl WriteHandler {
         select_sql: &str,
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let table_name = match stmt {
+        let (table_name, explicit_columns) = match stmt {
             Statement::Insert(ins) => match &ins.table {
-                sqlparser::ast::TableObject::TableName(name) => name,
+                sqlparser::ast::TableObject::TableName(name) => (name, &ins.columns),
                 other => {
                     return Err(SqeError::Execution(format!(
                         "INSERT INTO table functions not supported: {other}"
@@ -704,8 +784,18 @@ impl WriteHandler {
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
 
+        let effective_sql = if explicit_columns.is_empty() {
+            select_sql.to_string()
+        } else {
+            reorder_insert_select(
+                select_sql,
+                explicit_columns,
+                table.metadata().current_schema().as_ref(),
+            )?
+        };
+
         let df = ctx
-            .sql(select_sql)
+            .sql(&effective_sql)
             .await
             .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
 
@@ -5662,5 +5752,91 @@ SET c = ( \
         let assignments = parse_update(sql);
         let (_, joins) = decorrelate_scalar_subqueries(&assignments, "t");
         assert!(joins.is_empty(), "non-eq correlation should be left alone");
+    }
+
+    // -------------------------------------------------------------------------
+    // reorder_insert_select: INSERT INTO t (b, a) SELECT ... must not swap
+    // columns by position. The writer stamps Iceberg field IDs positionally,
+    // so reordering at SQL planning time is the only safe fix.
+    // -------------------------------------------------------------------------
+
+    fn make_target_schema() -> IcebergSchema {
+        use iceberg::spec::{PrimitiveType, Type};
+        IcebergSchema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                Arc::new(NestedField::optional(1, "a", Type::Primitive(PrimitiveType::Int))),
+                Arc::new(NestedField::optional(2, "b", Type::Primitive(PrimitiveType::Int))),
+                Arc::new(NestedField::optional(3, "c", Type::Primitive(PrimitiveType::Int))),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    fn ident(name: &str) -> sqlparser::ast::Ident {
+        sqlparser::ast::Ident::new(name.to_string())
+    }
+
+    #[test]
+    fn reorder_insert_swaps_columns_when_explicit_list_reverses_order() {
+        let schema = make_target_schema();
+        let columns = vec![ident("b"), ident("a"), ident("c")];
+        let sql = reorder_insert_select("SELECT 1, 2, 3", &columns, &schema).unwrap();
+        assert!(
+            sql.contains("\"a\", \"b\", \"c\""),
+            "outer projection must be in target order: {sql}"
+        );
+        assert!(
+            sql.contains("__sqe_insert_src(\"b\", \"a\", \"c\")"),
+            "inner CTE alias list must match user-provided order: {sql}"
+        );
+    }
+
+    #[test]
+    fn reorder_insert_fills_missing_columns_with_null() {
+        let schema = make_target_schema();
+        let columns = vec![ident("a")];
+        let sql = reorder_insert_select("SELECT 99", &columns, &schema).unwrap();
+        assert!(
+            sql.contains("NULL AS \"b\""),
+            "unmentioned columns must be NULL: {sql}"
+        );
+        assert!(sql.contains("NULL AS \"c\""), "{sql}");
+        assert!(sql.contains("\"a\","), "{sql}");
+    }
+
+    #[test]
+    fn reorder_insert_rejects_unknown_column() {
+        let schema = make_target_schema();
+        let columns = vec![ident("does_not_exist")];
+        let err = reorder_insert_select("SELECT 1", &columns, &schema).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("does not exist"), "msg: {msg}");
+    }
+
+    #[test]
+    fn reorder_insert_rejects_duplicate_column() {
+        let schema = make_target_schema();
+        let columns = vec![ident("a"), ident("a")];
+        let err = reorder_insert_select("SELECT 1, 2", &columns, &schema).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("duplicate"), "msg: {msg}");
+    }
+
+    #[test]
+    fn reorder_insert_rejects_more_columns_than_target() {
+        let schema = make_target_schema();
+        let columns = vec![ident("a"), ident("b"), ident("c"), ident("d")];
+        let err = reorder_insert_select("SELECT 1, 2, 3, 4", &columns, &schema).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("has 4 entries"), "msg: {msg}");
+    }
+
+    #[test]
+    fn reorder_insert_is_case_insensitive() {
+        let schema = make_target_schema();
+        let columns = vec![ident("A"), ident("B")];
+        // Should not error; both "A" and "B" map to lowercase target names.
+        reorder_insert_select("SELECT 1, 2", &columns, &schema).unwrap();
     }
 }
