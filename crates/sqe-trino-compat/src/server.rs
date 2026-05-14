@@ -419,6 +419,59 @@ fn extract_update_count(batches: &[arrow_array::RecordBatch]) -> Option<i64> {
     None
 }
 
+/// Emit `X-Trino-Set-*` / `X-Trino-Clear-*` response headers describing
+/// the session-state mutation the executor just performed. Clients
+/// observe these and resend the resulting state on the next request.
+fn apply_session_headers(
+    headers: &mut axum::http::HeaderMap,
+    update: &protocol::UpdatedSessionState,
+) {
+    use axum::http::{HeaderName, HeaderValue};
+
+    fn insert(headers: &mut axum::http::HeaderMap, name: HeaderName, value: &str) {
+        if let Ok(v) = HeaderValue::from_str(value) {
+            headers.insert(name, v);
+        }
+    }
+
+    fn append(headers: &mut axum::http::HeaderMap, name: HeaderName, value: &str) {
+        if let Ok(v) = HeaderValue::from_str(value) {
+            headers.append(name, v);
+        }
+    }
+
+    if let Some(catalog) = &update.set_catalog {
+        insert(headers, HeaderName::from_static("x-trino-set-catalog"), catalog);
+    }
+    if let Some(schema) = &update.set_schema {
+        insert(headers, HeaderName::from_static("x-trino-set-schema"), schema);
+    }
+    for (name, value) in &update.set_session {
+        append(
+            headers,
+            HeaderName::from_static("x-trino-set-session"),
+            &format!("{name}={value}"),
+        );
+    }
+    for name in &update.clear_session {
+        append(headers, HeaderName::from_static("x-trino-clear-session"), name);
+    }
+    for (name, sql) in &update.added_prepare {
+        append(
+            headers,
+            HeaderName::from_static("x-trino-added-prepare"),
+            &format!("{name}={sql}"),
+        );
+    }
+    for name in &update.deallocated_prepare {
+        append(
+            headers,
+            HeaderName::from_static("x-trino-deallocated-prepare"),
+            name,
+        );
+    }
+}
+
 // ── Header extraction ─────────────────────────────────────────
 
 /// Extract Trino client headers from the HTTP request.
@@ -643,6 +696,8 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     let query_id = Uuid::new_v4().to_string();
     let base_url = extract_base_url(&headers, state.port);
 
+    let session_update = protocol::parse_session_statement(sql);
+
     match state.query_handler.execute(&session, sql).await {
         Ok(batches) => {
             let update_type = classify_update_type(sql).map(str::to_string);
@@ -673,7 +728,11 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             // Store for subsequent GET requests (if there are more pages).
             state.results.insert(query_id, paginated);
 
-            (StatusCode::OK, Json(response)).into_response()
+            let mut resp = (StatusCode::OK, Json(response)).into_response();
+            if let Some(ref update) = session_update {
+                apply_session_headers(resp.headers_mut(), update);
+            }
+            resp
         }
         Err(e) => {
             let sqe_err = sqe_core::SqeError::Execution(e);

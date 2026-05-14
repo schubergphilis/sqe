@@ -283,6 +283,124 @@ pub fn batches_to_trino(
     (columns, rows)
 }
 
+/// Session-state mutations the server must echo back to the client.
+///
+/// Trino's wire protocol drives `USE` and `SET SESSION` by emitting
+/// `X-Trino-Set-*` / `X-Trino-Clear-*` headers on the response. Clients
+/// observe the headers and replay them on the next request to retain
+/// the new session state.
+#[derive(Debug, Clone, Default)]
+pub struct UpdatedSessionState {
+    pub set_catalog: Option<String>,
+    pub set_schema: Option<String>,
+    pub set_session: Vec<(String, String)>,
+    pub clear_session: Vec<String>,
+    pub added_prepare: Vec<(String, String)>,
+    pub deallocated_prepare: Vec<String>,
+}
+
+impl UpdatedSessionState {
+    pub fn is_empty(&self) -> bool {
+        self.set_catalog.is_none()
+            && self.set_schema.is_none()
+            && self.set_session.is_empty()
+            && self.clear_session.is_empty()
+            && self.added_prepare.is_empty()
+            && self.deallocated_prepare.is_empty()
+    }
+}
+
+/// Parse a Trino session-control statement from the leading verb.
+///
+/// Returns `None` for non-session statements; the server emits headers
+/// only when this returns `Some`. The Trino client REST API spec defines
+/// the supported verbs as USE, SET SESSION/CATALOG, RESET SESSION,
+/// PREPARE, DEALLOCATE PREPARE.
+pub fn parse_session_statement(sql: &str) -> Option<UpdatedSessionState> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let upper = trimmed.to_uppercase();
+    let mut state = UpdatedSessionState::default();
+
+    // Strip a known prefix in a case-insensitive way and return the
+    // remainder of the original (case-preserved) string.
+    fn strip_prefix_ci<'a>(s: &'a str, upper: &str, prefix: &str) -> Option<&'a str> {
+        if upper.starts_with(prefix) {
+            Some(&s[prefix.len()..])
+        } else {
+            None
+        }
+    }
+
+    if let Some(rest) = strip_prefix_ci(trimmed, &upper, "USE ") {
+        let target = rest.trim();
+        if let Some((catalog, schema)) = target.split_once('.') {
+            state.set_catalog = Some(unquote_identifier(catalog.trim()));
+            state.set_schema = Some(unquote_identifier(schema.trim()));
+        } else {
+            state.set_schema = Some(unquote_identifier(target));
+        }
+        return Some(state);
+    }
+
+    if let Some(rest) = strip_prefix_ci(trimmed, &upper, "SET CATALOG ") {
+        state.set_catalog = Some(unquote_identifier(rest.trim()));
+        return Some(state);
+    }
+
+    if let Some(rest) = strip_prefix_ci(trimmed, &upper, "SET SESSION ") {
+        if let Some((name, value)) = rest.split_once('=') {
+            state.set_session.push((
+                unquote_identifier(name.trim()),
+                value.trim().to_string(),
+            ));
+            return Some(state);
+        }
+        return None;
+    }
+
+    if let Some(rest) = strip_prefix_ci(trimmed, &upper, "RESET SESSION ") {
+        state.clear_session.push(unquote_identifier(rest.trim()));
+        return Some(state);
+    }
+
+    if let Some(rest) = strip_prefix_ci(trimmed, &upper, "DEALLOCATE PREPARE ") {
+        state.deallocated_prepare.push(unquote_identifier(rest.trim()));
+        return Some(state);
+    }
+
+    if let Some(rest) = strip_prefix_ci(trimmed, &upper, "PREPARE ") {
+        if let Some((name_part, sql_part)) = split_prepare_body(rest.trim()) {
+            state
+                .added_prepare
+                .push((unquote_identifier(name_part), sql_part.to_string()));
+            return Some(state);
+        }
+        return None;
+    }
+
+    None
+}
+
+fn unquote_identifier(s: &str) -> String {
+    let s = s.trim();
+    if let Some(stripped) = s.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+        return stripped.replace("\"\"", "\"");
+    }
+    if let Some(stripped) = s.strip_prefix('`').and_then(|v| v.strip_suffix('`')) {
+        return stripped.to_string();
+    }
+    s.to_string()
+}
+
+fn split_prepare_body(s: &str) -> Option<(&str, &str)> {
+    // PREPARE <name> FROM <statement>
+    let upper = s.to_uppercase();
+    let from = upper.find(" FROM ")?;
+    let name = s[..from].trim();
+    let sql = s[from + 6..].trim();
+    Some((name, sql))
+}
+
 /// Metrics collected from one execution that feed into a `TrinoStats` row.
 ///
 /// Populated best-effort from DataFusion / QueryHandler counters. Zero
@@ -518,6 +636,51 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"updateType\":\"INSERT\""));
         assert!(json.contains("\"updateCount\":42"));
+    }
+
+    #[test]
+    fn test_parse_session_use_catalog_schema() {
+        let s = parse_session_statement("USE iceberg.analytics").unwrap();
+        assert_eq!(s.set_catalog.as_deref(), Some("iceberg"));
+        assert_eq!(s.set_schema.as_deref(), Some("analytics"));
+    }
+
+    #[test]
+    fn test_parse_session_use_schema_only() {
+        let s = parse_session_statement("USE analytics").unwrap();
+        assert_eq!(s.set_catalog, None);
+        assert_eq!(s.set_schema.as_deref(), Some("analytics"));
+    }
+
+    #[test]
+    fn test_parse_session_set_session_kv() {
+        let s = parse_session_statement("SET SESSION optimize_hash_generation = true").unwrap();
+        assert_eq!(s.set_session.len(), 1);
+        assert_eq!(s.set_session[0].0, "optimize_hash_generation");
+        assert_eq!(s.set_session[0].1, "true");
+    }
+
+    #[test]
+    fn test_parse_session_reset_session() {
+        let s = parse_session_statement("RESET SESSION foo").unwrap();
+        assert_eq!(s.clear_session, vec!["foo".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_session_prepare_and_deallocate() {
+        let s = parse_session_statement("PREPARE p1 FROM SELECT 1").unwrap();
+        assert_eq!(s.added_prepare.len(), 1);
+        assert_eq!(s.added_prepare[0].0, "p1");
+        assert_eq!(s.added_prepare[0].1, "SELECT 1");
+
+        let s = parse_session_statement("DEALLOCATE PREPARE p1").unwrap();
+        assert_eq!(s.deallocated_prepare, vec!["p1".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_session_unrelated_returns_none() {
+        assert!(parse_session_statement("SELECT 1").is_none());
+        assert!(parse_session_statement("INSERT INTO t VALUES (1)").is_none());
     }
 
     #[test]
