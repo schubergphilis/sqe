@@ -419,6 +419,17 @@ pub fn build_s3_store(
         .filter(|s| !s.is_empty())
         .unwrap_or(storage.s3_endpoint.as_str());
 
+    // Issue #46: reject inline `endpoint =>` overrides that point at
+    // metadata services (IMDS at http://169.254.169.254) or other
+    // out-of-allowlist HTTP hosts. The path-based check from #10 did not
+    // cover this argument, so a benign s3:// path could still be paired
+    // with a hostile endpoint to pivot the S3 client at IMDS.
+    if args.endpoint.as_deref().is_some_and(|s| !s.is_empty()) {
+        storage.tvf.check_endpoint(endpoint).map_err(|e| {
+            datafusion::error::DataFusionError::Plan(format!("{fn_name}: {e}"))
+        })?;
+    }
+
     let region = args
         .region
         .as_deref()
@@ -1072,9 +1083,28 @@ mod tests {
         };
         let storage = StorageConfig {
             s3_allow_http: true,
+            tvf: sqe_core::config::TvfPolicy {
+                allowed_http_hosts: vec!["localhost".to_string()],
+                ..Default::default()
+            },
             ..StorageConfig::default()
         };
         assert!(build_s3_store("read_csv", &args, &storage).is_ok());
+    }
+
+    #[test]
+    fn build_s3_store_rejects_imds_endpoint() {
+        // Issue #46: defense-in-depth against SSRF via inline endpoint.
+        let args = FileTvfArgs {
+            path: "s3://bucket/data".to_string(),
+            endpoint: Some(
+                "http://169.254.169.254/latest/meta-data/iam/".to_string(),
+            ),
+            ..FileTvfArgs::default()
+        };
+        let storage = StorageConfig::default();
+        let err = build_s3_store("read_csv", &args, &storage).unwrap_err();
+        assert!(err.to_string().contains("169.254.169.254"));
     }
 
     // -----------------------------------------------------------------------

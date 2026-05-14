@@ -90,6 +90,22 @@ pub fn encode_batches_to_stream(
 }
 
 
+/// Strip the `:port` suffix from a peer-address string so the auth
+/// rate-limit key is stable across the ephemeral source ports a single
+/// IP cycles through.
+fn strip_port_for_key(s: &str) -> &str {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return &rest[..end];
+        }
+    }
+    match s.rfind(':') {
+        Some(idx) if !s[..idx].contains(':') => &s[..idx],
+        _ => s,
+    }
+}
+
 /// Flight SQL service implementation for SQE.
 ///
 /// Wires together session management (OIDC auth) and query execution
@@ -105,6 +121,8 @@ pub struct SqeFlightSqlService {
     worker_secret: String,
     metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
     rate_limiter: Option<Arc<crate::rate_limiter::QueryRateLimiter>>,
+    auth_rate_limiter: Option<Arc<crate::rate_limiter::AuthRateLimiter>>,
+    metadata_rate_limiter: Option<Arc<crate::rate_limiter::MetadataRateLimiter>>,
 }
 
 impl SqeFlightSqlService {
@@ -124,6 +142,8 @@ impl SqeFlightSqlService {
             worker_secret,
             metrics: None,
             rate_limiter: None,
+            auth_rate_limiter: None,
+            metadata_rate_limiter: None,
         }
     }
 
@@ -148,19 +168,38 @@ impl SqeFlightSqlService {
         self
     }
 
-    /// Extract client IP from request metadata (x-forwarded-for or peer addr).
-    fn extract_client_ip<T>(request: &Request<T>) -> String {
-        request
+    pub fn with_auth_rate_limiter(
+        mut self,
+        limiter: Arc<crate::rate_limiter::AuthRateLimiter>,
+    ) -> Self {
+        self.auth_rate_limiter = Some(limiter);
+        self
+    }
+
+    pub fn with_metadata_rate_limiter(
+        mut self,
+        limiter: Arc<crate::rate_limiter::MetadataRateLimiter>,
+    ) -> Self {
+        self.metadata_rate_limiter = Some(limiter);
+        self
+    }
+
+    /// Resolve the source IP for audit and rate-limit purposes.
+    ///
+    /// Issue #74: `x-forwarded-for` is honoured only when the request's
+    /// peer address appears in `[security] trusted_proxies`. Otherwise
+    /// the peer address is used directly. Empty allowlist (default)
+    /// means audit IPs always reflect the actual TCP peer.
+    fn extract_client_ip<T>(&self, request: &Request<T>) -> String {
+        let peer = request.remote_addr().map(|a| a.to_string());
+        let xff = request
             .metadata()
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
-            .unwrap_or_else(|| {
-                request
-                    .remote_addr()
-                    .map(|a| a.to_string())
-                    .unwrap_or_else(|| "unknown".to_string())
-            })
+            .map(|s| s.to_string());
+        self.config
+            .security
+            .resolve_client_ip(peer.as_deref(), xff.as_deref())
     }
 
     /// Extract and validate a bearer token from the request metadata,
@@ -175,7 +214,7 @@ impl SqeFlightSqlService {
         request: &Request<T>,
     ) -> Result<Arc<sqe_core::Session>, Status> {
         let metadata = request.metadata();
-        let client_ip = Self::extract_client_ip(request);
+        let client_ip = self.extract_client_ip(request);
 
         let auth = metadata
             .get("authorization")
@@ -439,7 +478,31 @@ impl FlightSqlService for SqeFlightSqlService {
             }
         };
 
-        let client_ip = Self::extract_client_ip(&request);
+        let client_ip = self.extract_client_ip(&request);
+
+        // Pre-auth rate limit, keyed by (peer-ip, username). Without
+        // this, do_handshake forwards every attempt to the upstream
+        // IdP -- unbounded credential stuffing plus a DoS vector
+        // against the IdP itself. Issue #57.
+        if let Some(ref limiter) = self.auth_rate_limiter {
+            if limiter
+                .check(strip_port_for_key(&client_ip), username)
+                .is_err()
+            {
+                if let Some(ref metrics) = self.metrics {
+                    metrics
+                        .auth_attempts_total
+                        .with_label_values(&["oidc", "rate_limited"])
+                        .inc();
+                }
+                warn!(
+                    username = username,
+                    client_ip = %client_ip,
+                    "Handshake rejected by auth rate limiter"
+                );
+                return Err(Status::resource_exhausted("authentication rate limit"));
+            }
+        }
 
         info!(username = username, "Handshake authentication attempt");
 
@@ -475,8 +538,13 @@ impl FlightSqlService for SqeFlightSqlService {
                 if let Some(ref metrics) = self.metrics {
                     metrics.auth_attempts_total.with_label_values(&["oidc", "failed"]).inc();
                 }
+                // Server-side detail stays in the warn log. The
+                // unauthenticated peer receives an opaque message so
+                // we don't leak audience / issuer / kid hints that
+                // turn the handler into a JWT enumeration oracle.
+                // Issue #38.
                 warn!(username = username, client_ip = %client_ip, error = %e, "Authentication failed");
-                return Err(Status::unauthenticated(format!("Authentication failed: {e}")));
+                return Err(Status::unauthenticated("authentication failed"));
             }
             Err(_) => {
                 if let Some(ref metrics) = self.metrics {
@@ -645,7 +713,12 @@ impl FlightSqlService for SqeFlightSqlService {
         query: CommandGetCatalogs,
         request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let _session = self.get_session_from_request(&request).await?;
+        let session = self.get_session_from_request(&request).await?;
+        if let Some(ref limiter) = self.metadata_rate_limiter {
+            limiter
+                .check(&session.user.username)
+                .map_err(|e| Status::resource_exhausted(e.to_string()))?;
+        }
         info!("Flight SQL: do_get_catalogs called");
         let catalog_name = if self.config.catalog.warehouse.is_empty() {
             "default".to_string()
@@ -684,6 +757,11 @@ impl FlightSqlService for SqeFlightSqlService {
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         info!("Flight SQL: do_get_schemas called");
         let session = self.get_session_from_request(&request).await?;
+        if let Some(ref limiter) = self.metadata_rate_limiter {
+            limiter
+                .check(&session.user.username)
+                .map_err(|e| Status::resource_exhausted(e.to_string()))?;
+        }
 
         let catalog_name = if self.config.catalog.warehouse.is_empty() {
             "default".to_string()
@@ -743,6 +821,11 @@ impl FlightSqlService for SqeFlightSqlService {
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         info!("Flight SQL: do_get_tables called");
         let session = self.get_session_from_request(&request).await?;
+        if let Some(ref limiter) = self.metadata_rate_limiter {
+            limiter
+                .check(&session.user.username)
+                .map_err(|e| Status::resource_exhausted(e.to_string()))?;
+        }
 
         let catalog_name = if self.config.catalog.warehouse.is_empty() {
             "default".to_string()
@@ -1317,6 +1400,11 @@ impl FlightSqlService for SqeFlightSqlService {
         request: Request<Action>,
     ) -> Result<ActionCreatePreparedStatementResult, Status> {
         let session = self.get_session_from_request(&request).await?;
+        if let Some(ref limiter) = self.metadata_rate_limiter {
+            limiter
+                .check(&session.user.username)
+                .map_err(|e| Status::resource_exhausted(e.to_string()))?;
+        }
         let sql = &query.query;
 
         debug!(username = %session.user.username, sql_len = sql.len(), "Creating prepared statement");
@@ -1398,8 +1486,10 @@ impl FlightSqlService for SqeFlightSqlService {
     async fn do_action_cancel_query(
         &self,
         query: ActionCancelQueryRequest,
-        _request: Request<Action>,
+        request: Request<Action>,
     ) -> Result<ActionCancelQueryResult, Status> {
+        let session = self.get_session_from_request(&request).await?;
+
         // ActionCancelQueryRequest.info contains the serialized FlightInfo
         // from get_flight_info_statement. Decode it to extract the query
         // handle from the first endpoint ticket.
@@ -1415,7 +1505,6 @@ impl FlightSqlService for SqeFlightSqlService {
             .first()
             .and_then(|ep| ep.ticket.as_ref())
             .map(|t| {
-                // Try to decode as our FetchResults protobuf to get the handle
                 if let Ok(fetch) = <FetchResults as Message>::decode(&*t.ticket) {
                     fetch.handle
                 } else {
@@ -1430,9 +1519,32 @@ impl FlightSqlService for SqeFlightSqlService {
 
         // QueryTracker uses Uuid keys. Try to parse the handle as a UUID;
         // if it's a SQL string (legacy ticket format) we cannot map it to a
-        // tracked query yet — full query-ID propagation via tickets is planned.
+        // tracked query yet.
         let cancelled = if let Ok(uuid) = uuid::Uuid::parse_str(&query_id) {
-            self.query_tracker.cancel(&uuid)
+            let is_admin = self.config.auth.has_admin_role(&session.user.roles);
+            match self.query_tracker.owner_of(&uuid) {
+                Some(owner) if owner == session.user.username || is_admin => {
+                    self.query_tracker.cancel(&uuid)
+                }
+                Some(owner) => {
+                    warn!(
+                        query_id = %query_id,
+                        caller = %session.user.username,
+                        owner = %owner,
+                        "CancelQuery denied: caller does not own query"
+                    );
+                    return Err(Status::permission_denied(
+                        "Cancel denied: caller does not own this query",
+                    ));
+                }
+                None => {
+                    debug!(
+                        query_id = %query_id,
+                        "CancelQuery: query not found in tracker (already completed or unknown)"
+                    );
+                    false
+                }
+            }
         } else {
             debug!(
                 query_id = %query_id,
@@ -1442,11 +1554,10 @@ impl FlightSqlService for SqeFlightSqlService {
         };
 
         if cancelled {
-            info!(query_id = %query_id, "Query cancelled via Flight CancelQuery action");
-        } else {
-            debug!(
+            info!(
                 query_id = %query_id,
-                "CancelQuery: query not found in tracker (already completed or unknown)"
+                user = %session.user.username,
+                "Query cancelled via Flight CancelQuery action"
             );
         }
 

@@ -316,8 +316,14 @@ async fn async_main() -> anyhow::Result<()> {
             None
         };
 
-    // Rate limiter — shared between Flight SQL and Trino paths
+    // Rate limiters — shared between Flight SQL and Trino paths
     let rate_limiter = Arc::new(sqe_coordinator::rate_limiter::QueryRateLimiter::new(
+        &config.rate_limit,
+    ));
+    let auth_rate_limiter = Arc::new(sqe_coordinator::rate_limiter::AuthRateLimiter::new(
+        &config.rate_limit,
+    ));
+    let metadata_rate_limiter = Arc::new(sqe_coordinator::rate_limiter::MetadataRateLimiter::new(
         &config.rate_limit,
     ));
 
@@ -331,7 +337,14 @@ async fn async_main() -> anyhow::Result<()> {
             handler: query_handler.clone(),
             rate_limiter: Arc::clone(&rate_limiter),
         });
-        sqe_trino_compat::server::start_trino_server(
+        let trino_auth_limiter: Arc<dyn sqe_trino_compat::server::TrinoAuthRateLimiter> =
+            Arc::clone(&auth_rate_limiter) as _;
+        let trino_opts = sqe_trino_compat::server::TrinoServerOptions {
+            security: config.security.clone(),
+            auth_rate_limiter: Some(trino_auth_limiter),
+            expose_version: false,
+        };
+        sqe_trino_compat::server::start_trino_server_with_options(
             auth_adapter,
             handler_adapter,
             config.coordinator.trino_http_port,
@@ -341,6 +354,7 @@ async fn async_main() -> anyhow::Result<()> {
                 started_at,
             },
             oauth2_state,
+            trino_opts,
         );
         tracing::info!(
             "Trino-compat HTTP server on port {}",
@@ -350,7 +364,10 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Start Flight SQL server
     let mut flight_service =
-        SqeFlightSqlService::new(session_manager, query_handler, config.clone());
+        SqeFlightSqlService::new(session_manager, query_handler, config.clone())
+            .with_rate_limiter(Arc::clone(&rate_limiter))
+            .with_auth_rate_limiter(Arc::clone(&auth_rate_limiter))
+            .with_metadata_rate_limiter(Arc::clone(&metadata_rate_limiter));
     if !config.coordinator.worker_urls.is_empty() {
         flight_service = flight_service.with_worker_registry(worker_registry.clone());
     }

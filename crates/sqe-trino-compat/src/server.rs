@@ -2,7 +2,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::{Path, State};
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
@@ -12,6 +14,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use sqe_core::Session;
+use sqe_core::config::SecurityConfig;
 
 use crate::protocol::{
     self, NodeVersion, ServerInfo, TrinoColumn, TrinoError, TrinoResponse, TrinoStats,
@@ -41,6 +44,23 @@ pub struct TrinoState<A, Q> {
     pub port: u16,
     /// OAuth2 external auth state. None if [auth.external] is not configured.
     pub oauth2: Option<Arc<crate::oauth2::OAuth2State>>,
+    /// Trusted-proxy allowlist used to decide whether to honour
+    /// `x-forwarded-for`. Empty = ignore it. Issue #74.
+    pub security: SecurityConfig,
+    /// Optional pre-auth rate limit on credentials. Issue #57.
+    pub auth_rate_limiter: Option<Arc<dyn TrinoAuthRateLimiter>>,
+    /// When true, /v1/info omits the build version so unauthenticated
+    /// callers cannot fingerprint the engine. Issue #40.
+    pub expose_version: bool,
+}
+
+/// Trait the coordinator implements to plug an
+/// `AuthRateLimiter` into the Trino path without coupling this crate
+/// to the coordinator's concrete rate-limit module.
+#[async_trait::async_trait]
+pub trait TrinoAuthRateLimiter: Send + Sync + 'static {
+    /// Returns `Err(())` when the (peer_ip, username) tuple is over budget.
+    fn check(&self, peer_ip: &str, username: &str) -> Result<(), ()>;
 }
 
 /// Stores the full result set split into pages for pagination.
@@ -88,12 +108,52 @@ pub trait TrinoQueryExecutor: Send + Sync + 'static {
     ) -> Result<Vec<arrow_array::RecordBatch>, String>;
 }
 
+pub struct TrinoServerOptions {
+    pub security: SecurityConfig,
+    pub auth_rate_limiter: Option<Arc<dyn TrinoAuthRateLimiter>>,
+    /// Whether `/v1/info` may return the exact build version. Default
+    /// `false` for production deployments. Issue #40.
+    pub expose_version: bool,
+}
+
+impl Default for TrinoServerOptions {
+    fn default() -> Self {
+        Self {
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: false,
+        }
+    }
+}
+
 pub fn start_trino_server<A, Q>(
     authenticator: Arc<A>,
     query_handler: Arc<Q>,
     port: u16,
     node: NodeContext,
     oauth2: Option<Arc<crate::oauth2::OAuth2State>>,
+) -> tokio::task::JoinHandle<()>
+where
+    A: TrinoAuthenticator,
+    Q: TrinoQueryExecutor,
+{
+    start_trino_server_with_options(
+        authenticator,
+        query_handler,
+        port,
+        node,
+        oauth2,
+        TrinoServerOptions::default(),
+    )
+}
+
+pub fn start_trino_server_with_options<A, Q>(
+    authenticator: Arc<A>,
+    query_handler: Arc<Q>,
+    port: u16,
+    node: NodeContext,
+    oauth2: Option<Arc<crate::oauth2::OAuth2State>>,
+    options: TrinoServerOptions,
 ) -> tokio::task::JoinHandle<()>
 where
     A: TrinoAuthenticator,
@@ -107,6 +167,9 @@ where
         page_size: DEFAULT_PAGE_SIZE,
         port,
         oauth2: oauth2.clone(),
+        security: options.security,
+        auth_rate_limiter: options.auth_rate_limiter,
+        expose_version: options.expose_version,
     });
 
     let state_sweep = state.clone();
@@ -187,10 +250,30 @@ where
 
         info!("Trino-compat HTTP server listening on {addr}");
 
-        if let Err(e) = axum::serve(listener, app).await {
+        if let Err(e) = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        {
             error!(error = %e, "Trino-compat HTTP server exited with error");
         }
     })
+}
+
+/// Compute the trusted client IP for a Trino request: honour
+/// `x-forwarded-for` only when the peer is in `[security] trusted_proxies`.
+fn trino_client_ip<A, Q>(
+    state: &Arc<TrinoState<A, Q>>,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+) -> String {
+    let xff = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok());
+    state
+        .security
+        .resolve_client_ip(Some(&peer.to_string()), xff)
 }
 
 // ── Trino /v1/info ────────────────────────────────────────────
@@ -212,15 +295,39 @@ async fn server_info<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     State(state): State<Arc<TrinoState<A, Q>>>,
 ) -> Json<ServerInfo> {
     let ready = state.node.ready.load(Ordering::Relaxed);
+    // Issue #40: unauthenticated callers used to receive the exact
+    // build version, which makes targeted-CVE matching trivial. The
+    // Trino spec says /v1/info needs no auth, so the right fix is to
+    // scrub the version unless the operator opts in. Clients that
+    // need exact-version handshake (rare) can set `expose_version`.
+    let version = if state.expose_version {
+        state.node.version.clone()
+    } else {
+        coarse_version(&state.node.version)
+    };
     Json(ServerInfo {
-        node_version: NodeVersion {
-            version: state.node.version.clone(),
-        },
+        node_version: NodeVersion { version },
         environment: "production".to_string(),
         coordinator: true,
         starting: !ready,
         uptime: format_uptime(state.node.started_at),
     })
+}
+
+/// Return `"<major>.<minor>"` from a semver-like input, or `"unknown"`
+/// when the input cannot be parsed. The major.minor pair is enough for
+/// JDBC drivers that branch on Trino protocol generation but does not
+/// pin the exact build for CVE matching.
+fn coarse_version(full: &str) -> String {
+    let trimmed = full.trim();
+    if trimmed.is_empty() {
+        return "unknown".to_string();
+    }
+    let mut parts = trimmed.split('.');
+    match (parts.next(), parts.next()) {
+        (Some(major), Some(minor)) => format!("{major}.{minor}"),
+        _ => "unknown".to_string(),
+    }
 }
 
 async fn server_state<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
@@ -364,6 +471,7 @@ fn build_page_response(
 )]
 async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     State(state): State<Arc<TrinoState<A, Q>>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: String,
 ) -> Response {
@@ -372,41 +480,45 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         return error_response(StatusCode::BAD_REQUEST, "Empty query");
     }
 
-    // Extract client IP for logging on every request
-    let client_ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+    let client_ip = trino_client_ip(&state, &headers, peer);
+    let peer_host = client_ip
+        .rsplit_once(':')
+        .filter(|(_, p)| p.chars().all(|c| c.is_ascii_digit()))
+        .map(|(host, _)| host)
+        .unwrap_or(&client_ip)
+        .to_string();
 
     let trino_headers = extract_trino_headers(&headers);
 
     let session = if let Some(token) = extract_bearer_token(&headers) {
-        // Bearer token auth: validate JWT through the auth provider chain.
         match state.authenticator.authenticate_bearer(&token).await {
             Ok(s) => s,
             Err(e) => {
                 warn!(error = %e, client_ip = %client_ip, "Trino bearer token validation failed");
-                return error_response(StatusCode::UNAUTHORIZED, "Invalid bearer token");
+                return error_response(StatusCode::UNAUTHORIZED, "authentication failed");
             }
         }
     } else if let Some((user, pass)) = extract_basic_auth(&headers) {
-        // Basic auth: authenticate via OIDC password grant
-        let client_ip = extract_header(&headers, "x-forwarded-for")
-            .map(|s| {
-                s.split(',')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .to_string()
-            })
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "unknown".to_string());
+        if let Some(ref limiter) = state.auth_rate_limiter {
+            if limiter.check(&peer_host, &user).is_err() {
+                warn!(
+                    user = %user,
+                    client_ip = %client_ip,
+                    "Trino auth rejected by rate limiter"
+                );
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(axum::http::header::RETRY_AFTER, "1")],
+                    "authentication rate limit",
+                )
+                    .into_response();
+            }
+        }
         match state.authenticator.authenticate(&user, &pass).await {
             Ok(s) => s,
             Err(e) => {
                 warn!(error = %e, user = %user, client_ip = %client_ip, "Trino authentication failed");
-                return error_response(StatusCode::UNAUTHORIZED, "Authentication failed");
+                return error_response(StatusCode::UNAUTHORIZED, "authentication failed");
             }
         }
     } else if let Some(ref oauth2_state) = state.oauth2 {
@@ -523,9 +635,25 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 #[tracing::instrument(skip_all, name = "trino.get_results")]
 async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     State(state): State<Arc<TrinoState<A, Q>>>,
+    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path((id, token)): Path<(String, String)>,
 ) -> Response {
+    // Authenticate the caller before exposing any result data.
+    let session = if let Some(token) = extract_bearer_token(&headers) {
+        match state.authenticator.authenticate_bearer(&token).await {
+            Ok(s) => s,
+            Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+        }
+    } else if let Some((user, pass)) = extract_basic_auth(&headers) {
+        match state.authenticator.authenticate(&user, &pass).await {
+            Ok(s) => s,
+            Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+        }
+    } else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
     // Parse the token as a page index.
     let page_token: usize = match token.parse() {
         Ok(t) => t,
@@ -538,6 +666,15 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 
     match state.results.get(&id) {
         Some(paginated) => {
+            if paginated.owner_username != session.user.username {
+                warn!(
+                    query_id = %id,
+                    caller = %session.user.username,
+                    owner = %paginated.owner_username,
+                    "get_results denied: caller does not own query"
+                );
+                return StatusCode::FORBIDDEN.into_response();
+            }
             if page_token >= paginated.total_pages {
                 let response = TrinoResponse {
                     id: id.clone(),
@@ -593,6 +730,7 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 
 async fn cancel_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     State(state): State<Arc<TrinoState<A, Q>>>,
+    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
@@ -653,6 +791,10 @@ mod tests {
     use super::*;
     use crate::protocol::TrinoColumn;
 
+    fn test_peer() -> ConnectInfo<SocketAddr> {
+        ConnectInfo("127.0.0.1:12345".parse().unwrap())
+    }
+
     #[test]
     fn test_format_uptime_seconds() {
         let started = Instant::now();
@@ -680,6 +822,9 @@ mod tests {
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
             oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
         });
 
         let Json(info) = server_info(State(state)).await;
@@ -706,6 +851,9 @@ mod tests {
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
             oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
         });
 
         let Json(info) = server_info(State(state)).await;
@@ -727,6 +875,9 @@ mod tests {
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
             oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
         });
 
         let result = server_state(State(state)).await;
@@ -748,6 +899,9 @@ mod tests {
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
             oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
         });
 
         let result = server_state(State(state)).await;
@@ -762,6 +916,45 @@ mod tests {
             Err("mock".to_string())
         }
     }
+
+    /// Mock auth that returns a session for whatever username the
+    /// caller passes. Used by ownership tests that need auth to succeed
+    /// so the post-auth branch is the one under test.
+    struct MockAuthOk;
+    #[async_trait::async_trait]
+    impl TrinoAuthenticator for MockAuthOk {
+        async fn authenticate(&self, user: &str, _: &str) -> Result<Session, String> {
+            Ok(Session::new(
+                user.to_string(),
+                "mock-token".to_string(),
+                None,
+                chrono::Utc::now() + chrono::Duration::hours(1),
+                vec![],
+            ))
+        }
+        async fn authenticate_bearer(&self, _: &str) -> Result<Session, String> {
+            Ok(Session::new(
+                "bearer-user".to_string(),
+                "mock-token".to_string(),
+                None,
+                chrono::Utc::now() + chrono::Duration::hours(1),
+                vec![],
+            ))
+        }
+    }
+
+    fn basic_auth_header(user: &str, pass: &str) -> HeaderMap {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(format!("{user}:{pass}"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Basic {encoded}").parse().unwrap(),
+        );
+        headers
+    }
+
     struct MockQuery;
     #[async_trait::async_trait]
     impl TrinoQueryExecutor for MockQuery {
@@ -1088,8 +1281,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_results_invalid_token() {
-        let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
-            authenticator: Arc::new(MockAuth),
+        let state = Arc::new(TrinoState::<MockAuthOk, MockQuery> {
+            authenticator: Arc::new(MockAuthOk),
             query_handler: Arc::new(MockQuery),
             results: DashMap::new(),
             node: NodeContext {
@@ -1100,16 +1293,20 @@ mod tests {
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
             oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
         });
 
-        let response = get_results::<MockAuth, MockQuery>(
+        // Authenticate so we exercise the page-token parse branch.
+        let response = get_results::<MockAuthOk, MockQuery>(
             State(state),
-            HeaderMap::new(),
+            test_peer(),
+            basic_auth_header("test", "pw"),
             Path(("q-123".to_string(), "not-a-number".to_string())),
         )
         .await;
 
-        // Should return 400 for invalid token
         assert_eq!(response.into_response().status(), StatusCode::BAD_REQUEST);
     }
 
@@ -1127,6 +1324,9 @@ mod tests {
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
             oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
         });
 
         // Insert a result with 1 page
@@ -1143,18 +1343,21 @@ mod tests {
 
         let response = get_results::<MockAuth, MockQuery>(
             State(state),
+            test_peer(),
             HeaderMap::new(),
             Path(("q-456".to_string(), "5".to_string())),
         )
         .await;
 
-        assert_eq!(response.into_response().status(), StatusCode::NOT_FOUND);
+        // Missing Authorization header now rejects with 401 before the
+        // out-of-range branch runs. The 401 covers issue #34.
+        assert_eq!(response.into_response().status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn test_get_results_returns_correct_page() {
-        let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
-            authenticator: Arc::new(MockAuth),
+        let state = Arc::new(TrinoState::<MockAuthOk, MockQuery> {
+            authenticator: Arc::new(MockAuthOk),
             query_handler: Arc::new(MockQuery),
             results: DashMap::new(),
             node: NodeContext {
@@ -1165,6 +1368,9 @@ mod tests {
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
             oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
         });
 
         state.results.insert(
@@ -1186,10 +1392,11 @@ mod tests {
             },
         );
 
-        // Fetch page 1 (middle)
-        let response = get_results::<MockAuth, MockQuery>(
+        // Fetch page 1 (middle); authenticate as the result owner.
+        let response = get_results::<MockAuthOk, MockQuery>(
             State(state.clone()),
-            HeaderMap::new(),
+            test_peer(),
+            basic_auth_header("test", "pw"),
             Path(("q-paged".to_string(), "1".to_string())),
         )
         .await;
@@ -1217,8 +1424,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_results_last_page_cleans_up() {
-        let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
-            authenticator: Arc::new(MockAuth),
+        let state = Arc::new(TrinoState::<MockAuthOk, MockQuery> {
+            authenticator: Arc::new(MockAuthOk),
             query_handler: Arc::new(MockQuery),
             results: DashMap::new(),
             node: NodeContext {
@@ -1229,6 +1436,9 @@ mod tests {
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
             oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
         });
 
         state.results.insert(
@@ -1245,16 +1455,57 @@ mod tests {
             },
         );
 
-        // Fetch the last page (token = 1)
-        let _response = get_results::<MockAuth, MockQuery>(
+        // Fetch the last page (token = 1); authenticate as owner.
+        let _response = get_results::<MockAuthOk, MockQuery>(
             State(state.clone()),
-            HeaderMap::new(),
+            test_peer(),
+            basic_auth_header("test", "pw"),
             Path(("q-cleanup".to_string(), "1".to_string())),
         )
         .await;
 
         // Result should be cleaned up
         assert!(state.results.get("q-cleanup").is_none());
+    }
+
+    /// Regression for #34: an authenticated caller who is not the
+    /// owner cannot pull the result set.
+    #[tokio::test]
+    async fn test_get_results_rejects_non_owner() {
+        let state = Arc::new(TrinoState::<MockAuthOk, MockQuery> {
+            authenticator: Arc::new(MockAuthOk),
+            query_handler: Arc::new(MockQuery),
+            results: DashMap::new(),
+            node: NodeContext {
+                version: "0.1.0".to_string(),
+                ready: Arc::new(AtomicBool::new(true)),
+                started_at: Instant::now(),
+            },
+            page_size: DEFAULT_PAGE_SIZE,
+            port: 8080,
+            oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
+        });
+        state.results.insert(
+            "q-secret".to_string(),
+            PaginatedResult {
+                columns: vec![],
+                pages: vec![vec![]],
+                total_pages: 1,
+                created_at: Instant::now(),
+                owner_username: "alice".to_string(),
+            },
+        );
+        let response = get_results::<MockAuthOk, MockQuery>(
+            State(state),
+            test_peer(),
+            basic_auth_header("mallory", "pw"),
+            Path(("q-secret".to_string(), "0".to_string())),
+        )
+        .await;
+        assert_eq!(response.into_response().status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -1271,6 +1522,9 @@ mod tests {
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
             oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
         });
 
         state.results.insert(
@@ -1294,6 +1548,7 @@ mod tests {
 
         let response = cancel_query::<MockAuth, MockQuery>(
             State(state.clone()),
+            test_peer(),
             headers,
             Path("q-cancel".to_string()),
         )
@@ -1345,6 +1600,9 @@ mod tests {
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
             oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
         });
 
         let mut headers = HeaderMap::new();
@@ -1357,13 +1615,14 @@ mod tests {
 
         let response = submit_query::<MockAuth, MockQuery>(
             State(state),
+            test_peer(),
             headers,
             "SELECT 1".to_string(),
         )
         .await;
 
         let resp = response.into_response();
-        // No bearer provider configured → token validation fails → 401
+        // No bearer provider configured -> token validation fails -> 401
         assert_eq!(
             resp.status(),
             StatusCode::UNAUTHORIZED,
@@ -1387,6 +1646,9 @@ mod tests {
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
             oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
         });
 
         let mut headers = HeaderMap::new();
@@ -1398,6 +1660,7 @@ mod tests {
 
         let response = submit_query::<MockAuth, MockQuery>(
             State(state),
+            test_peer(),
             headers,
             "SELECT 1".to_string(),
         )
@@ -1409,5 +1672,63 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "Opaque bearer tokens must be rejected when no provider is configured"
         );
+    }
+
+    // ── Trusted-proxy and coarse-version regression tests ─────────
+
+    #[tokio::test]
+    async fn test_server_info_scrubs_version_by_default() {
+        let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
+            authenticator: Arc::new(MockAuth),
+            query_handler: Arc::new(MockQuery),
+            results: DashMap::new(),
+            node: NodeContext {
+                version: "1.2.3-4567".to_string(),
+                ready: Arc::new(AtomicBool::new(true)),
+                started_at: Instant::now(),
+            },
+            page_size: DEFAULT_PAGE_SIZE,
+            port: 8080,
+            oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: false,
+        });
+        let Json(info) = server_info(State(state)).await;
+        // Exact build is hidden; coarse major.minor is fine.
+        assert_eq!(info.node_version.version, "1.2");
+    }
+
+    #[test]
+    fn coarse_version_handles_short_input() {
+        assert_eq!(coarse_version(""), "unknown");
+        assert_eq!(coarse_version("dev"), "unknown");
+        assert_eq!(coarse_version("0.1.0"), "0.1");
+        assert_eq!(coarse_version("0.31.4-build123"), "0.31");
+    }
+
+    #[tokio::test]
+    async fn test_trino_client_ip_ignores_xff_by_default() {
+        let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
+            authenticator: Arc::new(MockAuth),
+            query_handler: Arc::new(MockQuery),
+            results: DashMap::new(),
+            node: NodeContext {
+                version: "0.1.0".to_string(),
+                ready: Arc::new(AtomicBool::new(true)),
+                started_at: Instant::now(),
+            },
+            page_size: DEFAULT_PAGE_SIZE,
+            port: 8080,
+            oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: false,
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        let resolved =
+            trino_client_ip(&state, &headers, "10.0.0.1:33333".parse().unwrap());
+        assert_eq!(resolved, "10.0.0.1:33333");
     }
 }
