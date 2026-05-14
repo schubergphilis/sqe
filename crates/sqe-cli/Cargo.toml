@@ -12,6 +12,7 @@ sqe-core = { path = "../sqe-core" }
 sqe-catalog = { path = "../sqe-catalog", default-features = false, features = ["rest", "sql-sqlite", "hadoop", "delta"] }
 sqe-sql = { path = "../sqe-sql" }
 sqe-trino-functions = { path = "../sqe-trino-functions" }
+sqe-trino-compat = { path = "../sqe-trino-compat" }
 sqe-policy = { path = "../sqe-policy" }
 arrow = { workspace = true }
 arrow-flight = { workspace = true }

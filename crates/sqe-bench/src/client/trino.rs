@@ -4,7 +4,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use reqwest::Client;
-use serde::Deserialize;
+use sqe_trino_compat::{TrinoColumn, TrinoResponse};
 use std::sync::Arc;
 
 /// Trino HTTP v1 statement protocol benchmark client.
@@ -14,35 +14,6 @@ pub struct TrinoBenchClient {
     username: Option<String>,
     password: Option<String>,
     catalog: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct TrinoResponse {
-    #[allow(dead_code)]
-    id: String,
-    #[serde(rename = "nextUri")]
-    next_uri: Option<String>,
-    columns: Option<Vec<TrinoColumn>>,
-    data: Option<Vec<Vec<serde_json::Value>>>,
-    stats: TrinoStats,
-    error: Option<TrinoError>,
-}
-
-#[derive(Deserialize)]
-struct TrinoColumn {
-    name: String,
-    #[serde(rename = "type")]
-    type_name: String,
-}
-
-#[derive(Deserialize)]
-struct TrinoStats {
-    state: String,
-}
-
-#[derive(Deserialize)]
-struct TrinoError {
-    message: String,
 }
 
 impl TrinoBenchClient {
@@ -303,7 +274,7 @@ fn build_record_batches(
         // Return an empty RecordBatch that still carries the correct schema.
         let fields: Vec<Field> = columns
             .iter()
-            .map(|c| Field::new(&c.name, trino_type_to_arrow(&c.type_name), true))
+            .map(|c| Field::new(&c.name, trino_type_to_arrow(&c.r#type), true))
             .collect();
         let schema = Arc::new(Schema::new(fields));
         let empty_arrays: Vec<ArrayRef> = schema
@@ -318,7 +289,7 @@ fn build_record_batches(
 
     let fields: Vec<Field> = columns
         .iter()
-        .map(|c| Field::new(&c.name, trino_type_to_arrow(&c.type_name), true))
+        .map(|c| Field::new(&c.name, trino_type_to_arrow(&c.r#type), true))
         .collect();
     let schema = Arc::new(Schema::new(fields));
 
@@ -326,7 +297,7 @@ fn build_record_batches(
         .iter()
         .enumerate()
         .map(|(i, col)| {
-            let dt = trino_type_to_arrow(&col.type_name);
+            let dt = trino_type_to_arrow(&col.r#type);
             build_array(i, &dt, &rows)
         })
         .collect::<anyhow::Result<_>>()?;
