@@ -2433,13 +2433,21 @@ impl WriteHandler {
             .map(|f| f.name().clone())
             .collect();
 
-        // Use the target alias (or a default) for the merge MemTable names
+        // Use the target alias (or a default) for the merge MemTable names.
+        // The scratch table names embed a per-invocation uuid so concurrent
+        // MERGEs running in the same session do not clobber each other's
+        // MemTable registrations.
         let t_alias = target_alias.clone().unwrap_or_else(|| "t".to_string());
         let s_alias = source_alias.clone().unwrap_or_else(|| "s".to_string());
-        let target_table_ref = "__merge_target".to_string();
-        let source_table_ref = "__merge_source".to_string();
+        let merge_id = Uuid::now_v7().simple().to_string();
+        let target_table_ref = format!("__merge_target_{merge_id}");
+        let source_table_ref = format!("__merge_source_{merge_id}");
         let qualified_target_ref = format!("datafusion.public.{target_table_ref}");
         let qualified_source_ref = format!("datafusion.public.{source_table_ref}");
+        let _merge_scratch_guard = MergeScratchCleanup::new(
+            ctx,
+            vec![qualified_target_ref.clone(), qualified_source_ref.clone()],
+        );
 
         // Register target data as a MemTable in the full session context
         // (which has all catalog tables registered for cross-table subqueries)
@@ -2632,9 +2640,10 @@ impl WriteHandler {
             .await
             .map_err(|e| SqeError::Execution(format!("Failed to execute MERGE query: {e}")))?;
 
-        // Deregister temp tables to avoid polluting the shared session context
-        let _ = ctx.deregister_table(&qualified_target_ref);
-        let _ = ctx.deregister_table(&qualified_source_ref);
+        // Deregistration of the scratch MemTables is handled by the
+        // `MergeScratchCleanup` drop guard declared above. Keeping the
+        // guard alive for the rest of the function lets early-returns
+        // and `?` short-circuits still clean up.
 
         // For WHEN MATCHED THEN DELETE: filter out the rows where all columns are NULL
         // (these are the matched rows we set to NULL above)
@@ -2926,10 +2935,13 @@ impl WriteHandler {
 
         let t_alias = target_alias.clone().unwrap_or_else(|| "t".to_string());
         let s_alias = source_alias.clone().unwrap_or_else(|| "s".to_string());
-        let target_ref = "__merge_mor_target".to_string();
-        let source_ref = "__merge_mor_source".to_string();
+        let merge_id = Uuid::now_v7().simple().to_string();
+        let target_ref = format!("__merge_mor_target_{merge_id}");
+        let source_ref = format!("__merge_mor_source_{merge_id}");
         let q_target = format!("datafusion.public.{target_ref}");
         let q_source = format!("datafusion.public.{source_ref}");
+        let _merge_scratch_guard =
+            MergeScratchCleanup::new(ctx, vec![q_target.clone(), q_source.clone()]);
 
         let target_mem = if target_batches.is_empty() {
             datafusion::datasource::MemTable::try_new(target_schema.clone(), vec![])
@@ -2945,7 +2957,6 @@ impl WriteHandler {
 
         if source_batches.is_empty() {
             info!(table = %table_ident, "MoR MERGE: source returned no data, nothing to merge");
-            let _ = ctx.deregister_table(&q_target);
             return Ok(vec![]);
         }
         let source_schema = source_batches[0].schema();
@@ -3137,8 +3148,8 @@ impl WriteHandler {
             }
         }
 
-        let _ = ctx.deregister_table(&q_target);
-        let _ = ctx.deregister_table(&q_source);
+        // Scratch MemTables are deregistered by the `MergeScratchCleanup`
+        // drop guard declared above.
 
         let total_touched = updated_rows + deleted_rows + inserted_rows;
         if total_touched == 0 {
@@ -4147,6 +4158,42 @@ impl Drop for InSubqueryCleanup {
                     table = %name,
                     error = %e,
                     "in-subquery scratch deregister failed"
+                );
+            }
+        }
+    }
+}
+
+/// RAII guard that deregisters MERGE scratch MemTables on drop.
+///
+/// MERGE writes register target and source RecordBatches as MemTables in
+/// the shared session context. Two concurrent MERGEs in the same session
+/// would clobber each other's registrations if the names were not unique
+/// per invocation. The handler embeds a `Uuid::now_v7().simple()` suffix
+/// into the scratch names; this guard ensures the registrations are
+/// removed even if a `?` short-circuits the happy path.
+struct MergeScratchCleanup {
+    ctx: DFSessionContext,
+    scratch_tables: Vec<String>,
+}
+
+impl MergeScratchCleanup {
+    fn new(ctx: &DFSessionContext, scratch_tables: Vec<String>) -> Self {
+        Self {
+            ctx: ctx.clone(),
+            scratch_tables,
+        }
+    }
+}
+
+impl Drop for MergeScratchCleanup {
+    fn drop(&mut self) {
+        for name in &self.scratch_tables {
+            if let Err(e) = self.ctx.deregister_table(name.as_str()) {
+                tracing::warn!(
+                    table = %name,
+                    error = %e,
+                    "merge scratch deregister failed"
                 );
             }
         }
