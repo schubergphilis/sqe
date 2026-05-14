@@ -47,6 +47,237 @@ use crate::worker_registry::WorkerRegistry;
 pub use crate::flight_sql_helpers::FetchResults;
 use crate::flight_sql_helpers::{FlightStream, sqe_error_to_status};
 
+/// Populate the full Flight SQL `SqlInfo` table.
+///
+/// Apache ADBC, Tableau's Flight SQL connector, and dbt-sqe read these
+/// keys to decide which catalog APIs to call and which SQL grammar to
+/// emit. Absent keys silently degrade clients (Tableau falls back to no
+/// identifier quoting; JDBC `DatabaseMetaData.getIdentifierQuoteString`
+/// returns `""`). Apache Arrow Flight SQL spec section
+/// `CommandGetSqlInfo` enumerates the standard set.
+pub fn build_sql_info_data() -> Result<arrow_flight::sql::metadata::SqlInfoData, Status> {
+    use arrow_flight::sql::SqlInfo as I;
+
+    let mut b = SqlInfoDataBuilder::new();
+
+    // Server identity.
+    b.append(I::FlightSqlServerName, "SQE Coordinator");
+    b.append(I::FlightSqlServerVersion, env!("CARGO_PKG_VERSION"));
+    b.append(I::FlightSqlServerArrowVersion, "1.3");
+
+    // Server capabilities. SQE accepts writes (CTAS/INSERT/UPDATE/DELETE).
+    b.append(I::FlightSqlServerReadOnly, false);
+    b.append(I::FlightSqlServerSql, true);
+    b.append(I::FlightSqlServerSubstrait, false);
+    // SqlSupportedTransactions.SQL_TRANSACTIONS_UNSPECIFIED = 0.
+    b.append(I::FlightSqlServerTransaction, 0i32);
+    b.append(I::FlightSqlServerCancel, true);
+    b.append(I::FlightSqlServerBulkIngestion, false);
+    b.append(I::FlightSqlServerIngestTransactionsSupported, false);
+
+    // DDL support.
+    b.append(I::SqlDdlCatalog, false);
+    b.append(I::SqlDdlSchema, true);
+    b.append(I::SqlDdlTable, true);
+
+    // Identifier handling. Iceberg / SQE preserve identifier case when
+    // double-quoted; bare identifiers fold to lower-case (CaseSensitivityLowerCase = 2).
+    b.append(I::SqlIdentifierCase, 2i32);
+    b.append(I::SqlIdentifierQuoteChar, "\"");
+    b.append(I::SqlQuotedIdentifierCase, 3i32); // CaseSensitive = 3
+
+    // Catalog and schema semantics.
+    b.append(I::SqlAllTablesAreSelectable, true);
+    b.append(I::SqlCatalogTerm, "catalog");
+    b.append(I::SqlSchemaTerm, "schema");
+    b.append(I::SqlProcedureTerm, "procedure");
+    b.append(I::SqlCatalogAtStart, true);
+    // SqlNullOrdering.SQL_NULLS_SORTED_HIGH = 0.
+    b.append(I::SqlNullOrdering, 0i32);
+
+    // Function lists. The values are kept in sync with the trino-compat
+    // function registry (`sqe-trino-functions`) and the DataFusion stock
+    // function set.
+    b.append(
+        I::SqlNumericFunctions,
+        vec![
+            "ABS".into(),
+            "CEIL".into(),
+            "FLOOR".into(),
+            "ROUND".into(),
+            "SQRT".into(),
+            "POWER".into(),
+            "MOD".into(),
+            "EXP".into(),
+            "LN".into(),
+            "LOG10".into(),
+            "SIGN".into(),
+            "RAND".into(),
+        ],
+    );
+    b.append(
+        I::SqlStringFunctions,
+        vec![
+            "CONCAT".into(),
+            "LENGTH".into(),
+            "LOWER".into(),
+            "UPPER".into(),
+            "SUBSTRING".into(),
+            "TRIM".into(),
+            "LTRIM".into(),
+            "RTRIM".into(),
+            "REPLACE".into(),
+            "POSITION".into(),
+            "REGEXP_LIKE".into(),
+            "REGEXP_REPLACE".into(),
+        ],
+    );
+    b.append(
+        I::SqlDatetimeFunctions,
+        vec![
+            "CURRENT_DATE".into(),
+            "CURRENT_TIME".into(),
+            "CURRENT_TIMESTAMP".into(),
+            "DATE_TRUNC".into(),
+            "DATE_DIFF".into(),
+            "DATE_ADD".into(),
+            "EXTRACT".into(),
+            "FROM_UNIXTIME".into(),
+            "TO_TIMESTAMP".into(),
+            "YEAR".into(),
+            "MONTH".into(),
+            "DAY".into(),
+        ],
+    );
+    b.append(
+        I::SqlSystemFunctions,
+        vec![
+            "CURRENT_USER".into(),
+            "CURRENT_CATALOG".into(),
+            "CURRENT_SCHEMA".into(),
+            "VERSION".into(),
+        ],
+    );
+
+    // Reserved-word list (subset relevant to the engine's parser).
+    b.append(
+        I::SqlKeywords,
+        vec![
+            "ALTER".into(), "AND".into(), "AS".into(), "ASC".into(),
+            "BETWEEN".into(), "BIGINT".into(), "BY".into(),
+            "CASE".into(), "CAST".into(), "COLUMN".into(), "CREATE".into(),
+            "DELETE".into(), "DESC".into(), "DISTINCT".into(), "DROP".into(),
+            "ELSE".into(), "END".into(), "EXISTS".into(),
+            "FALSE".into(), "FOR".into(), "FROM".into(), "FULL".into(),
+            "GROUP".into(), "HAVING".into(),
+            "IN".into(), "INNER".into(), "INSERT".into(), "INTO".into(), "IS".into(),
+            "JOIN".into(),
+            "LEFT".into(), "LIKE".into(), "LIMIT".into(),
+            "MERGE".into(),
+            "NOT".into(), "NULL".into(),
+            "ON".into(), "OR".into(), "ORDER".into(), "OUTER".into(),
+            "PARTITION".into(), "PREPARE".into(),
+            "RIGHT".into(),
+            "SELECT".into(), "SET".into(),
+            "TABLE".into(), "THEN".into(), "TRUE".into(),
+            "UNION".into(), "UPDATE".into(), "USING".into(),
+            "VALUES".into(), "VIEW".into(),
+            "WHEN".into(), "WHERE".into(), "WITH".into(),
+        ],
+    );
+    b.append(I::SqlSearchStringEscape, "\\");
+    b.append(I::SqlExtraNameCharacters, "");
+
+    // Grammar level. SqlSupportedGrammar.SQL_MINIMUM_GRAMMAR = 0.
+    b.append(I::SqlSupportedGrammar, 0i32);
+    // SqlAnsi92SupportedLevel.ANSI92_INTERMEDIATE_SQL = 1.
+    b.append(I::SqlAnsi92SupportedLevel, 1i32);
+
+    // Common capability booleans.
+    b.append(I::SqlSupportsColumnAliasing, true);
+    b.append(I::SqlNullPlusNullIsNull, true);
+    b.append(I::SqlSupportsTableCorrelationNames, true);
+    b.append(I::SqlSupportsDifferentTableCorrelationNames, false);
+    b.append(I::SqlSupportsExpressionsInOrderBy, true);
+    b.append(I::SqlSupportsOrderByUnrelated, true);
+    b.append(I::SqlSupportsLikeEscapeClause, true);
+    b.append(I::SqlSupportsNonNullableColumns, true);
+    b.append(I::SqlSupportsIntegrityEnhancementFacility, false);
+    b.append(I::SqlSelectForUpdateSupported, false);
+    b.append(I::SqlStoredProceduresSupported, false);
+    b.append(I::SqlCorrelatedSubqueriesSupported, true);
+    // SqlSupportedPositionedCommands.SQL_POSITIONED_DELETE = 0 / UPDATE = 1.
+    // SQE doesn't support cursors; emit empty bitmask.
+    b.append(I::SqlSupportedPositionedCommands, 0i32);
+
+    // Limits. Iceberg + SQE have no fixed hard limits, but JDBC expects
+    // a value. `0` means "unknown / no limit" per the spec.
+    b.append(I::SqlMaxColumnNameLength, 1024i64);
+    b.append(I::SqlMaxColumnsInGroupBy, 0i64);
+    b.append(I::SqlMaxColumnsInIndex, 0i64);
+    b.append(I::SqlMaxColumnsInOrderBy, 0i64);
+    b.append(I::SqlMaxColumnsInSelect, 0i64);
+    b.append(I::SqlMaxColumnsInTable, 0i64);
+    b.append(I::SqlMaxConnections, 0i64);
+    b.append(I::SqlMaxCursorNameLength, 0i64);
+    b.append(I::SqlMaxIndexLength, 0i64);
+    b.append(I::SqlDbSchemaNameLength, 1024i64);
+    b.append(I::SqlMaxProcedureNameLength, 0i64);
+    b.append(I::SqlMaxCatalogNameLength, 1024i64);
+    b.append(I::SqlMaxRowSize, 0i64);
+    b.append(I::SqlMaxRowSizeIncludesBlobs, true);
+    b.append(I::SqlMaxStatementLength, 0i64);
+    b.append(I::SqlMaxStatements, 0i64);
+    b.append(I::SqlMaxTableNameLength, 1024i64);
+    b.append(I::SqlMaxTablesInSelect, 0i64);
+    b.append(I::SqlMaxUsernameLength, 1024i64);
+    b.append(I::SqlMaxBinaryLiteralLength, 0i64);
+    b.append(I::SqlMaxCharLiteralLength, 0i64);
+
+    // Transactions. SQE runs in autocommit; no isolation levels supported.
+    b.append(I::SqlDefaultTransactionIsolation, 0i64);
+    b.append(I::SqlTransactionsSupported, false);
+    b.append(I::SqlDataDefinitionCausesTransactionCommit, true);
+
+    b.build()
+        .map_err(|e| Status::internal(format!("Failed to build SQL info: {e}")))
+}
+
+/// SQL LIKE matching used for Flight SQL filter patterns.
+///
+/// `%` matches zero or more characters; `_` matches a single character.
+/// All other characters match literally. Comparison is case-sensitive
+/// because the Flight SQL spec keeps the identifier case the catalog
+/// reports it as. Catalogs that fold to lower-case at the source still
+/// match a lower-case pattern.
+pub fn like_match(pattern: &str, value: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let v: Vec<char> = value.chars().collect();
+    like_match_inner(&p, &v)
+}
+
+fn like_match_inner(pattern: &[char], value: &[char]) -> bool {
+    match (pattern.first(), value.first()) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        (Some('%'), _) => {
+            // % matches zero characters
+            if like_match_inner(&pattern[1..], value) {
+                return true;
+            }
+            // or any non-empty prefix
+            if !value.is_empty() {
+                return like_match_inner(pattern, &value[1..]);
+            }
+            false
+        }
+        (Some('_'), Some(_)) => like_match_inner(&pattern[1..], &value[1..]),
+        (Some('_'), None) => false,
+        (Some(p), Some(v)) if p == v => like_match_inner(&pattern[1..], &value[1..]),
+        _ => false,
+    }
+}
+
 /// Build [`IpcWriteOptions`] for a given compression setting.
 ///
 /// Used by both the coordinator (client-facing DoGet) and shared with workers
@@ -123,6 +354,13 @@ pub struct SqeFlightSqlService {
     rate_limiter: Option<Arc<crate::rate_limiter::QueryRateLimiter>>,
     auth_rate_limiter: Option<Arc<crate::rate_limiter::AuthRateLimiter>>,
     metadata_rate_limiter: Option<Arc<crate::rate_limiter::MetadataRateLimiter>>,
+    /// Parameter bindings for outstanding prepared statements.
+    ///
+    /// Keyed by the encoded statement handle (bytes). Each entry holds the
+    /// inbound `RecordBatch` of bound parameter values, decoded into a
+    /// list of SQL literals. `do_get_prepared_statement` substitutes `?`
+    /// placeholders in left-to-right order before executing.
+    prepared_params: Arc<dashmap::DashMap<Vec<u8>, Vec<String>>>,
 }
 
 impl SqeFlightSqlService {
@@ -144,6 +382,7 @@ impl SqeFlightSqlService {
             rate_limiter: None,
             auth_rate_limiter: None,
             metadata_rate_limiter: None,
+            prepared_params: Arc::new(dashmap::DashMap::new()),
         }
     }
 
@@ -833,9 +1072,48 @@ impl FlightSqlService for SqeFlightSqlService {
             self.config.catalog.warehouse.clone()
         };
 
+        let schema_pattern = query.db_schema_filter_pattern.clone();
+        let table_pattern = query.table_name_filter_pattern.clone();
+        let include_schema = query.include_schema;
+        let type_filter = if query.table_types.is_empty() {
+            None
+        } else {
+            Some(
+                query
+                    .table_types
+                    .iter()
+                    .map(|s| s.to_ascii_uppercase())
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        // Catalog filter: drop everything when the request asks for a
+        // different catalog than the one this coordinator hosts.
+        if let Some(ref c) = query.catalog {
+            if !c.is_empty() && !c.eq_ignore_ascii_case(&catalog_name) {
+                let builder = query.into_builder();
+                let batch = builder
+                    .build()
+                    .map_err(|e| Status::internal(format!("Failed to build batch: {e}")))?;
+                return self.batches_to_stream(vec![batch]);
+            }
+        }
+
+        // Table-type filter: short-circuit when the requested set excludes
+        // TABLE (the only kind `list_metadata_tables` returns today).
+        if let Some(ref types) = type_filter {
+            if !types.iter().any(|t| t == "TABLE") {
+                let builder = query.into_builder();
+                let batch = builder
+                    .build()
+                    .map_err(|e| Status::internal(format!("Failed to build batch: {e}")))?;
+                return self.batches_to_stream(vec![batch]);
+            }
+        }
+
         // Walk the catalog directly. The previous path ran `SHOW SCHEMAS`
         // followed by `SHOW TABLES IN "<ns>"` once per namespace through
-        // the SQL planner — N+1 planner invocations plus N Polaris round
+        // the SQL planner -- N+1 planner invocations plus N Polaris round
         // trips per `DatabaseMetaData.getTables()`. It also concatenated
         // catalog-returned namespace names into SQL with only
         // backslash-quote escaping, so a federated catalog could pivot to
@@ -851,6 +1129,38 @@ impl FlightSqlService for SqeFlightSqlService {
         let empty_schema = arrow_schema::Schema::empty();
 
         for (ns, table_name) in &pairs {
+            if let Some(ref pat) = schema_pattern {
+                if !like_match(pat, ns) {
+                    continue;
+                }
+            }
+            if let Some(ref pat) = table_pattern {
+                if !like_match(pat, table_name) {
+                    continue;
+                }
+            }
+
+            // include_schema=true asks for the table's Arrow schema in the
+            // output column. The previous handler always passed
+            // `Schema::empty()`; load the real schema best-effort when the
+            // client asked for it. Failure (e.g. the table dropped between
+            // listing and load) falls back to empty rather than failing
+            // the whole `getTables()` call.
+            if include_schema {
+                let qualified = format!("{ns}.{table_name}");
+                match self.query_handler.get_schema(&session, &qualified).await {
+                    Ok(schema) => {
+                        builder
+                            .append(&catalog_name, ns, table_name, "TABLE", &schema)
+                            .map_err(|e| Status::internal(format!("Failed to append table: {e}")))?;
+                        continue;
+                    }
+                    Err(_) => {
+                        // Fall through to the empty-schema append below.
+                    }
+                }
+            }
+
             builder
                 .append(&catalog_name, ns, table_name, "TABLE", &empty_schema)
                 .map_err(|e| Status::internal(format!("Failed to append table: {e}")))?;
@@ -931,13 +1241,7 @@ impl FlightSqlService for SqeFlightSqlService {
         query: CommandGetSqlInfo,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        let mut sql_info_builder = SqlInfoDataBuilder::new();
-        sql_info_builder.append(SqlInfo::FlightSqlServerName, "SQE Coordinator");
-        sql_info_builder.append(SqlInfo::FlightSqlServerVersion, "0.1.0");
-        sql_info_builder.append(SqlInfo::FlightSqlServerArrowVersion, "1.3");
-        let sql_info_data = sql_info_builder.build().map_err(|e| {
-            Status::internal(format!("Failed to build SQL info: {e}"))
-        })?;
+        let sql_info_data = build_sql_info_data()?;
 
         let flight_descriptor = request.into_inner();
         let ticket = Ticket::new(query.as_any().encode_to_vec());
@@ -1034,13 +1338,23 @@ impl FlightSqlService for SqeFlightSqlService {
             Message::decode(&*query.prepared_statement_handle)
                 .map_err(|e| Status::internal(format!("Failed to decode prepared statement handle: {e}")))?;
 
+        // Substitute any bound parameters before execution. Without this
+        // the SQL still contains `?` placeholders and DataFusion rejects
+        // the plan; previous behaviour silently returned wrong results.
+        let key: Vec<u8> = query.prepared_statement_handle.to_vec();
+        let sql = match self.prepared_params.remove(&key) {
+            Some((_, params)) => substitute_placeholders(&fetch.handle, &params)
+                .map_err(|e| Status::invalid_argument(e))?,
+            None => fetch.handle.clone(),
+        };
+
         debug!(
             username = %session.user.username,
-            sql = %fetch.handle,
+            sql = %sql,
             "Executing prepared statement"
         );
 
-        self.run_sql_into_flight_response(&session, &fetch.handle).await
+        self.run_sql_into_flight_response(&session, &sql).await
     }
 
     async fn do_get_table_types(
@@ -1049,9 +1363,13 @@ impl FlightSqlService for SqeFlightSqlService {
         request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let _session = self.get_session_from_request(&request).await?;
+        // SQE backs every metadata row from `list_metadata_tables` as a
+        // physical Iceberg table; VIEW is not yet implemented. Returning
+        // both TABLE and VIEW caused JDBC tools to issue follow-up
+        // `getTables(types=["VIEW"])` calls that always came back empty
+        // and confused schema browsers.
         let mut builder = arrow_array::builder::StringBuilder::new();
         builder.append_value("TABLE");
-        builder.append_value("VIEW");
         let arr = builder.finish();
         let schema = Arc::new(arrow_schema::Schema::new(vec![
             arrow_schema::Field::new("table_type", arrow_schema::DataType::Utf8, false),
@@ -1067,13 +1385,7 @@ impl FlightSqlService for SqeFlightSqlService {
         request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let _session = self.get_session_from_request(&request).await?;
-        let mut sql_info_builder = SqlInfoDataBuilder::new();
-        sql_info_builder.append(SqlInfo::FlightSqlServerName, "SQE Coordinator");
-        sql_info_builder.append(SqlInfo::FlightSqlServerVersion, "0.1.0");
-        sql_info_builder.append(SqlInfo::FlightSqlServerArrowVersion, "1.3");
-        let sql_info_data = sql_info_builder.build().map_err(|e| {
-            Status::internal(format!("Failed to build SQL info: {e}"))
-        })?;
+        let sql_info_data = build_sql_info_data()?;
 
         let builder = query.into_builder(&sql_info_data);
         let schema = builder.schema();
@@ -1362,11 +1674,30 @@ impl FlightSqlService for SqeFlightSqlService {
     async fn do_put_prepared_statement_query(
         &self,
         query: CommandPreparedStatementQuery,
-        _request: Request<PeekableFlightDataStream>,
+        request: Request<PeekableFlightDataStream>,
     ) -> Result<DoPutPreparedStatementResult, Status> {
-        // Parameter binding not yet supported — return the existing handle unchanged.
-        // This allows JDBC drivers to complete the prepared statement flow even without
-        // actual parameter substitution.
+        // The inbound stream carries a parameter `RecordBatch` produced by
+        // the JDBC driver. Decode it into a flat list of SQL literals and
+        // park the list on the handle; `do_get_prepared_statement` then
+        // substitutes `?` placeholders in left-to-right order before
+        // executing.
+        let handle_bytes: Vec<u8> = query.prepared_statement_handle.to_vec();
+        let stream = request.into_inner();
+        match decode_parameter_stream(stream).await {
+            Ok(params) if !params.is_empty() => {
+                self.prepared_params.insert(handle_bytes.clone(), params);
+            }
+            Ok(_) => {
+                // Empty parameter batch (driver issued bind with zero params).
+                self.prepared_params.remove(&handle_bytes);
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to decode prepared statement parameter stream; ignoring bind",
+                );
+            }
+        }
         Ok(DoPutPreparedStatementResult {
             prepared_statement_handle: Some(query.prepared_statement_handle),
         })
@@ -1437,9 +1768,11 @@ impl FlightSqlService for SqeFlightSqlService {
 
     async fn do_action_close_prepared_statement(
         &self,
-        _query: ActionClosePreparedStatementRequest,
+        query: ActionClosePreparedStatementRequest,
         _request: Request<Action>,
     ) -> Result<(), Status> {
+        let key: Vec<u8> = query.prepared_statement_handle.to_vec();
+        self.prepared_params.remove(&key);
         Ok(())
     }
 
@@ -1635,6 +1968,141 @@ impl FlightSqlService for SqeFlightSqlService {
 }
 
 // ---------------------------------------------------------------------------
+/// Decode a Flight inbound parameter stream into a flat list of SQL literals.
+///
+/// The Flight SQL spec ships parameter values as a single-row `RecordBatch`
+/// where each column corresponds to one `?` placeholder. JDBC drivers stay
+/// within this row-count contract; we still walk every row in case a future
+/// driver issues batched binds.
+async fn decode_parameter_stream<S>(stream: S) -> Result<Vec<String>, String>
+where
+    S: futures::Stream<Item = Result<arrow_flight::FlightData, Status>> + Send + Unpin + 'static,
+{
+    use arrow_flight::decode::FlightRecordBatchStream;
+    use futures::StreamExt;
+
+    let mapped = stream.map(|item| item.map_err(arrow_flight::error::FlightError::from));
+    let mut batches = FlightRecordBatchStream::new_from_flight_data(mapped);
+    let mut literals: Vec<String> = Vec::new();
+    while let Some(item) = batches.next().await {
+        let batch = item.map_err(|e| format!("Failed to read parameter batch: {e}"))?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        for col_idx in 0..batch.num_columns() {
+            let array = batch.column(col_idx).as_ref();
+            literals.push(arrow_value_to_sql_literal(array, 0));
+        }
+        // Subsequent rows would replay against the same SQL; one bind row
+        // is the JDBC contract. Stop here.
+        break;
+    }
+    Ok(literals)
+}
+
+/// Render one Arrow scalar as a SQL literal usable in textual substitution.
+///
+/// Strings are single-quoted with embedded quotes escaped. Binary is
+/// rendered as `X'<hex>'`. Numerics and booleans are formatted literally.
+/// Unsupported / structured types fall back to a quoted display string;
+/// the caller is expected to reject those before relying on the result.
+fn arrow_value_to_sql_literal(array: &dyn arrow_array::Array, row: usize) -> String {
+    use arrow_array::*;
+    use arrow_schema::DataType;
+
+    if array.is_null(row) {
+        return "NULL".to_string();
+    }
+    match array.data_type() {
+        DataType::Boolean => {
+            let a = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+            if a.value(row) { "TRUE" } else { "FALSE" }.to_string()
+        }
+        DataType::Int8 => array.as_any().downcast_ref::<Int8Array>().unwrap().value(row).to_string(),
+        DataType::Int16 => array.as_any().downcast_ref::<Int16Array>().unwrap().value(row).to_string(),
+        DataType::Int32 => array.as_any().downcast_ref::<Int32Array>().unwrap().value(row).to_string(),
+        DataType::Int64 => array.as_any().downcast_ref::<Int64Array>().unwrap().value(row).to_string(),
+        DataType::UInt8 => array.as_any().downcast_ref::<UInt8Array>().unwrap().value(row).to_string(),
+        DataType::UInt16 => array.as_any().downcast_ref::<UInt16Array>().unwrap().value(row).to_string(),
+        DataType::UInt32 => array.as_any().downcast_ref::<UInt32Array>().unwrap().value(row).to_string(),
+        DataType::UInt64 => array.as_any().downcast_ref::<UInt64Array>().unwrap().value(row).to_string(),
+        DataType::Float32 => array.as_any().downcast_ref::<Float32Array>().unwrap().value(row).to_string(),
+        DataType::Float64 => array.as_any().downcast_ref::<Float64Array>().unwrap().value(row).to_string(),
+        DataType::Utf8 => {
+            let a = array.as_any().downcast_ref::<StringArray>().unwrap();
+            sql_quote_string(a.value(row))
+        }
+        DataType::LargeUtf8 => {
+            let a = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
+            sql_quote_string(a.value(row))
+        }
+        DataType::Binary => {
+            let a = array.as_any().downcast_ref::<BinaryArray>().unwrap();
+            format!("X'{}'", hex::encode(a.value(row)))
+        }
+        DataType::LargeBinary => {
+            let a = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+            format!("X'{}'", hex::encode(a.value(row)))
+        }
+        _ => {
+            // Fall back to display rendering wrapped in single quotes so the
+            // result is still syntactically valid SQL. Callers that need
+            // exact type fidelity should round-trip through DataFusion's
+            // ParamValues path (deferred follow-up).
+            let s = arrow::util::display::array_value_to_string(array, row).unwrap_or_default();
+            sql_quote_string(&s)
+        }
+    }
+}
+
+fn sql_quote_string(s: &str) -> String {
+    let escaped = s.replace('\'', "''");
+    format!("'{escaped}'")
+}
+
+/// Replace `?` placeholders in the SQL string with the bound literals,
+/// in order. Returns an error if the placeholder count differs from the
+/// number of bound values, mirroring the JDBC behaviour of a
+/// `SQLException` rather than executing with a partial bind.
+fn substitute_placeholders(sql: &str, params: &[String]) -> Result<String, String> {
+    let mut out = String::with_capacity(sql.len() + params.iter().map(|s| s.len()).sum::<usize>());
+    let mut next: usize = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let bytes = sql.as_bytes();
+    let mut i: usize = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if !in_single && !in_double && c == '?' {
+            if next >= params.len() {
+                return Err(format!(
+                    "prepared statement expected {} parameters but bind supplied {}",
+                    next + 1,
+                    params.len()
+                ));
+            }
+            out.push_str(&params[next]);
+            next += 1;
+            i += 1;
+            continue;
+        }
+        if !in_double && c == '\'' {
+            in_single = !in_single;
+        } else if !in_single && c == '"' {
+            in_double = !in_double;
+        }
+        out.push(c);
+        i += 1;
+    }
+    if next != params.len() {
+        return Err(format!(
+            "prepared statement consumed {next} parameters but bind supplied {}",
+            params.len()
+        ));
+    }
+    Ok(out)
+}
+
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -1680,12 +2148,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn table_types_batch_contains_table_and_view() {
+    fn table_types_batch_contains_only_table() {
         // Replicate the exact logic from do_get_table_types so we can test it
-        // without gRPC overhead.
+        // without gRPC overhead. SQE does not yet implement VIEW, so the
+        // table_type result set is `TABLE` only (issue #98).
         let mut builder = StringBuilder::new();
         builder.append_value("TABLE");
-        builder.append_value("VIEW");
         let arr = builder.finish();
 
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -1696,17 +2164,15 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(arr)]).expect("batch should be valid");
 
-        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_rows(), 1);
         let col = batch.column(0).as_string::<i32>();
         assert_eq!(col.value(0), "TABLE");
-        assert_eq!(col.value(1), "VIEW");
     }
 
     #[test]
     fn table_types_batch_schema_has_expected_field() {
         let mut builder = StringBuilder::new();
         builder.append_value("TABLE");
-        builder.append_value("VIEW");
         let arr = builder.finish();
 
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -1722,6 +2188,53 @@ mod tests {
         assert_eq!(field.name(), "table_type");
         assert_eq!(field.data_type(), &DataType::Utf8);
         assert!(!field.is_nullable());
+    }
+
+    #[test]
+    fn like_match_basic() {
+        assert!(super::like_match("orders", "orders"));
+        assert!(!super::like_match("orders", "other"));
+    }
+
+    #[test]
+    fn like_match_percent() {
+        assert!(super::like_match("dimension_%", "dimension_users"));
+        assert!(super::like_match("%users%", "fact_users_2024"));
+        assert!(super::like_match("%", "anything"));
+        assert!(!super::like_match("dimension_%", "fact_users"));
+    }
+
+    #[test]
+    fn like_match_underscore() {
+        assert!(super::like_match("a_c", "abc"));
+        assert!(!super::like_match("a_c", "abbc"));
+        assert!(!super::like_match("a_c", "ac"));
+    }
+
+    #[test]
+    fn substitute_placeholders_basic() {
+        let sql = "SELECT * FROM t WHERE a = ? AND b = ?";
+        let out = super::substitute_placeholders(sql, &["1".into(), "'foo'".into()]).unwrap();
+        assert_eq!(out, "SELECT * FROM t WHERE a = 1 AND b = 'foo'");
+    }
+
+    #[test]
+    fn substitute_placeholders_skips_inside_quotes() {
+        // The `?` inside a string literal must be preserved as-is.
+        let sql = "SELECT '? not bound' FROM t WHERE a = ?";
+        let out = super::substitute_placeholders(sql, &["42".into()]).unwrap();
+        assert_eq!(out, "SELECT '? not bound' FROM t WHERE a = 42");
+    }
+
+    #[test]
+    fn substitute_placeholders_mismatch_errors() {
+        assert!(super::substitute_placeholders("?", &[]).is_err());
+        assert!(super::substitute_placeholders("?", &["a".into(), "b".into()]).is_err());
+    }
+
+    #[test]
+    fn sql_quote_string_escapes_quotes() {
+        assert_eq!(super::sql_quote_string("o'malley"), "'o''malley'");
     }
 
     // -----------------------------------------------------------------------
