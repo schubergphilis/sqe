@@ -6640,6 +6640,7 @@ dependencies = [
  "datafusion-proto",
  "futures",
  "governor",
+ "hex",
  "iceberg",
  "moka",
  "opentelemetry",
