@@ -791,6 +791,10 @@ mod tests {
     use super::*;
     use crate::protocol::TrinoColumn;
 
+    fn test_peer() -> ConnectInfo<SocketAddr> {
+        ConnectInfo("127.0.0.1:12345".parse().unwrap())
+    }
+
     #[test]
     fn test_format_uptime_seconds() {
         let started = Instant::now();
@@ -818,6 +822,9 @@ mod tests {
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
             oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
         });
 
         let Json(info) = server_info(State(state)).await;
@@ -844,6 +851,9 @@ mod tests {
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
             oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
         });
 
         let Json(info) = server_info(State(state)).await;
@@ -865,6 +875,9 @@ mod tests {
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
             oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
         });
 
         let result = server_state(State(state)).await;
@@ -886,6 +899,9 @@ mod tests {
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
             oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
         });
 
         let result = server_state(State(state)).await;
@@ -900,6 +916,45 @@ mod tests {
             Err("mock".to_string())
         }
     }
+
+    /// Mock auth that returns a session for whatever username the
+    /// caller passes. Used by ownership tests that need auth to succeed
+    /// so the post-auth branch is the one under test.
+    struct MockAuthOk;
+    #[async_trait::async_trait]
+    impl TrinoAuthenticator for MockAuthOk {
+        async fn authenticate(&self, user: &str, _: &str) -> Result<Session, String> {
+            Ok(Session::new(
+                user.to_string(),
+                "mock-token".to_string(),
+                None,
+                chrono::Utc::now() + chrono::Duration::hours(1),
+                vec![],
+            ))
+        }
+        async fn authenticate_bearer(&self, _: &str) -> Result<Session, String> {
+            Ok(Session::new(
+                "bearer-user".to_string(),
+                "mock-token".to_string(),
+                None,
+                chrono::Utc::now() + chrono::Duration::hours(1),
+                vec![],
+            ))
+        }
+    }
+
+    fn basic_auth_header(user: &str, pass: &str) -> HeaderMap {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(format!("{user}:{pass}"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Basic {encoded}").parse().unwrap(),
+        );
+        headers
+    }
+
     struct MockQuery;
     #[async_trait::async_trait]
     impl TrinoQueryExecutor for MockQuery {
@@ -1226,8 +1281,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_results_invalid_token() {
-        let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
-            authenticator: Arc::new(MockAuth),
+        let state = Arc::new(TrinoState::<MockAuthOk, MockQuery> {
+            authenticator: Arc::new(MockAuthOk),
             query_handler: Arc::new(MockQuery),
             results: DashMap::new(),
             node: NodeContext {
@@ -1238,16 +1293,20 @@ mod tests {
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
             oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
         });
 
-        let response = get_results::<MockAuth, MockQuery>(
+        // Authenticate so we exercise the page-token parse branch.
+        let response = get_results::<MockAuthOk, MockQuery>(
             State(state),
-            HeaderMap::new(),
+            test_peer(),
+            basic_auth_header("test", "pw"),
             Path(("q-123".to_string(), "not-a-number".to_string())),
         )
         .await;
 
-        // Should return 400 for invalid token
         assert_eq!(response.into_response().status(), StatusCode::BAD_REQUEST);
     }
 
@@ -1265,6 +1324,9 @@ mod tests {
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
             oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
         });
 
         // Insert a result with 1 page
@@ -1281,18 +1343,21 @@ mod tests {
 
         let response = get_results::<MockAuth, MockQuery>(
             State(state),
+            test_peer(),
             HeaderMap::new(),
             Path(("q-456".to_string(), "5".to_string())),
         )
         .await;
 
-        assert_eq!(response.into_response().status(), StatusCode::NOT_FOUND);
+        // Missing Authorization header now rejects with 401 before the
+        // out-of-range branch runs. The 401 covers issue #34.
+        assert_eq!(response.into_response().status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn test_get_results_returns_correct_page() {
-        let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
-            authenticator: Arc::new(MockAuth),
+        let state = Arc::new(TrinoState::<MockAuthOk, MockQuery> {
+            authenticator: Arc::new(MockAuthOk),
             query_handler: Arc::new(MockQuery),
             results: DashMap::new(),
             node: NodeContext {
@@ -1303,6 +1368,9 @@ mod tests {
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
             oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
         });
 
         state.results.insert(
@@ -1324,10 +1392,11 @@ mod tests {
             },
         );
 
-        // Fetch page 1 (middle)
-        let response = get_results::<MockAuth, MockQuery>(
+        // Fetch page 1 (middle); authenticate as the result owner.
+        let response = get_results::<MockAuthOk, MockQuery>(
             State(state.clone()),
-            HeaderMap::new(),
+            test_peer(),
+            basic_auth_header("test", "pw"),
             Path(("q-paged".to_string(), "1".to_string())),
         )
         .await;
@@ -1355,8 +1424,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_results_last_page_cleans_up() {
-        let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
-            authenticator: Arc::new(MockAuth),
+        let state = Arc::new(TrinoState::<MockAuthOk, MockQuery> {
+            authenticator: Arc::new(MockAuthOk),
             query_handler: Arc::new(MockQuery),
             results: DashMap::new(),
             node: NodeContext {
@@ -1367,6 +1436,9 @@ mod tests {
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
             oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
         });
 
         state.results.insert(
@@ -1383,16 +1455,57 @@ mod tests {
             },
         );
 
-        // Fetch the last page (token = 1)
-        let _response = get_results::<MockAuth, MockQuery>(
+        // Fetch the last page (token = 1); authenticate as owner.
+        let _response = get_results::<MockAuthOk, MockQuery>(
             State(state.clone()),
-            HeaderMap::new(),
+            test_peer(),
+            basic_auth_header("test", "pw"),
             Path(("q-cleanup".to_string(), "1".to_string())),
         )
         .await;
 
         // Result should be cleaned up
         assert!(state.results.get("q-cleanup").is_none());
+    }
+
+    /// Regression for #34: an authenticated caller who is not the
+    /// owner cannot pull the result set.
+    #[tokio::test]
+    async fn test_get_results_rejects_non_owner() {
+        let state = Arc::new(TrinoState::<MockAuthOk, MockQuery> {
+            authenticator: Arc::new(MockAuthOk),
+            query_handler: Arc::new(MockQuery),
+            results: DashMap::new(),
+            node: NodeContext {
+                version: "0.1.0".to_string(),
+                ready: Arc::new(AtomicBool::new(true)),
+                started_at: Instant::now(),
+            },
+            page_size: DEFAULT_PAGE_SIZE,
+            port: 8080,
+            oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
+        });
+        state.results.insert(
+            "q-secret".to_string(),
+            PaginatedResult {
+                columns: vec![],
+                pages: vec![vec![]],
+                total_pages: 1,
+                created_at: Instant::now(),
+                owner_username: "alice".to_string(),
+            },
+        );
+        let response = get_results::<MockAuthOk, MockQuery>(
+            State(state),
+            test_peer(),
+            basic_auth_header("mallory", "pw"),
+            Path(("q-secret".to_string(), "0".to_string())),
+        )
+        .await;
+        assert_eq!(response.into_response().status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -1409,6 +1522,9 @@ mod tests {
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
             oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
         });
 
         state.results.insert(
@@ -1432,6 +1548,7 @@ mod tests {
 
         let response = cancel_query::<MockAuth, MockQuery>(
             State(state.clone()),
+            test_peer(),
             headers,
             Path("q-cancel".to_string()),
         )
@@ -1483,6 +1600,9 @@ mod tests {
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
             oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
         });
 
         let mut headers = HeaderMap::new();
@@ -1495,13 +1615,14 @@ mod tests {
 
         let response = submit_query::<MockAuth, MockQuery>(
             State(state),
+            test_peer(),
             headers,
             "SELECT 1".to_string(),
         )
         .await;
 
         let resp = response.into_response();
-        // No bearer provider configured → token validation fails → 401
+        // No bearer provider configured -> token validation fails -> 401
         assert_eq!(
             resp.status(),
             StatusCode::UNAUTHORIZED,
@@ -1525,6 +1646,9 @@ mod tests {
             page_size: DEFAULT_PAGE_SIZE,
             port: 8080,
             oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
         });
 
         let mut headers = HeaderMap::new();
@@ -1536,6 +1660,7 @@ mod tests {
 
         let response = submit_query::<MockAuth, MockQuery>(
             State(state),
+            test_peer(),
             headers,
             "SELECT 1".to_string(),
         )
@@ -1547,5 +1672,63 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "Opaque bearer tokens must be rejected when no provider is configured"
         );
+    }
+
+    // ── Trusted-proxy and coarse-version regression tests ─────────
+
+    #[tokio::test]
+    async fn test_server_info_scrubs_version_by_default() {
+        let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
+            authenticator: Arc::new(MockAuth),
+            query_handler: Arc::new(MockQuery),
+            results: DashMap::new(),
+            node: NodeContext {
+                version: "1.2.3-4567".to_string(),
+                ready: Arc::new(AtomicBool::new(true)),
+                started_at: Instant::now(),
+            },
+            page_size: DEFAULT_PAGE_SIZE,
+            port: 8080,
+            oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: false,
+        });
+        let Json(info) = server_info(State(state)).await;
+        // Exact build is hidden; coarse major.minor is fine.
+        assert_eq!(info.node_version.version, "1.2");
+    }
+
+    #[test]
+    fn coarse_version_handles_short_input() {
+        assert_eq!(coarse_version(""), "unknown");
+        assert_eq!(coarse_version("dev"), "unknown");
+        assert_eq!(coarse_version("0.1.0"), "0.1");
+        assert_eq!(coarse_version("0.31.4-build123"), "0.31");
+    }
+
+    #[tokio::test]
+    async fn test_trino_client_ip_ignores_xff_by_default() {
+        let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
+            authenticator: Arc::new(MockAuth),
+            query_handler: Arc::new(MockQuery),
+            results: DashMap::new(),
+            node: NodeContext {
+                version: "0.1.0".to_string(),
+                ready: Arc::new(AtomicBool::new(true)),
+                started_at: Instant::now(),
+            },
+            page_size: DEFAULT_PAGE_SIZE,
+            port: 8080,
+            oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: false,
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        let resolved =
+            trino_client_ip(&state, &headers, "10.0.0.1:33333".parse().unwrap());
+        assert_eq!(resolved, "10.0.0.1:33333");
     }
 }
