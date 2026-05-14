@@ -351,18 +351,16 @@ fn test_scan_task_roundtrip() {
     assert_eq!(decoded.data_file_paths.len(), 1);
 }
 
-// Test: Distributed SELECT with coordinator + worker (requires both running)
+// Test: Local fallback when no worker is registered.
+//
+// Issue #122: the previous single test silently returned when the worker
+// port was closed, then asserted total_rows == 1 -- which the coordinator
+// would also satisfy when the planner fell back to local execution. The
+// fall-back path must be a deliberate, named test that asserts the result
+// shape WITHOUT a worker registry.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh + running worker
-async fn test_distributed_select() {
-    // This test requires:
-    // 1. Test stack (Polaris in-memory, RustFS)
-    // 2. A worker running on localhost:50052
-    // 3. A table with data in Polaris
-    //
-    // Run the worker: cargo run -p sqe-worker -- tests/sqe-test.toml
-    // Then run: cargo test -p sqe-coordinator --test integration_test test_distributed_select -- --ignored
-
+#[ignore = "needs docker-compose.test.yml + bootstrap-test.sh"]
+async fn test_local_fallback_select() {
     let config = sqe_core::SqeConfig::load(&common::test_config_path())
         .expect("Failed to load test config");
 
@@ -376,23 +374,78 @@ async fn test_distributed_select() {
 
     let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(sqe_policy::PassthroughEnforcer);
 
-    // Check if worker is reachable before running the test.
+    let query_tracker = Arc::new(
+        sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history),
+    );
+    let handler = sqe_coordinator::QueryHandler::new(
+        policy, None, config, None, None, None, None, query_tracker, None,
+        None,
+        None,
+        sqe_coordinator::RuntimeCatalogRegistry::default(),
+        sqe_core::SecretStore::default(),
+    ).expect("Failed to create QueryHandler");
+
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.local_fallback")
+        .await;
+    handler
+        .execute(
+            &session,
+            "CREATE TABLE test_ns.local_fallback AS SELECT 1 as id, 'local' as name",
+        )
+        .await
+        .expect("CTAS should succeed");
+
+    let batches = handler
+        .execute(&session, "SELECT * FROM test_ns.local_fallback")
+        .await
+        .expect("local SELECT must succeed without a worker");
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+
+    let _ = handler
+        .execute(&session, "DROP TABLE test_ns.local_fallback")
+        .await;
+}
+
+// Test: Distributed SELECT MUST dispatch to a registered worker.
+//
+// Issue #122: this test used to skip silently when the worker port was
+// closed, then assert total_rows == 1. A regression that breaks worker
+// dispatch (refused connection, wrong wire format, empty registry) would
+// fall through to local execution and still pass. We now fail loudly
+// when the worker is unreachable and check system.runtime.tasks to
+// confirm at least one task ran on a worker node.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs docker-compose.distributed.yml + a worker on :50052"]
+async fn test_distributed_select() {
+    let config = sqe_core::SqeConfig::load(&common::test_config_path())
+        .expect("Failed to load test config");
+
+    let authenticator = sqe_auth::Authenticator::new(&config.auth)
+        .await
+        .expect("Failed to create authenticator");
+    let session = authenticator
+        .authenticate("root", "")
+        .await
+        .expect("Auth failed");
+
+    let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(sqe_policy::PassthroughEnforcer);
+
     let worker_url = "http://localhost:50052";
-    if std::net::TcpStream::connect_timeout(
+    let socket = std::net::TcpStream::connect_timeout(
         &"127.0.0.1:50052".parse().unwrap(),
         std::time::Duration::from_secs(2),
-    )
-    .is_err()
-    {
-        eprintln!("Skipping test_distributed_select: worker not reachable at {worker_url}");
-        return;
-    }
+    );
+    assert!(
+        socket.is_ok(),
+        "worker unreachable at {worker_url}: distributed test must fail loudly, \
+         not fall back to local. Start the worker (cargo run -p sqe-worker -- \
+         tests/sqe-test.toml) or use --ignored to skip."
+    );
 
     let registry = Arc::new(sqe_coordinator::worker_registry::WorkerRegistry::new(
         vec![worker_url.to_string()],
     ));
-
-    // Mark worker as healthy for the test
     registry.mark_healthy(worker_url).await;
 
     let query_tracker = Arc::new(
@@ -400,31 +453,57 @@ async fn test_distributed_select() {
     );
     let handler = sqe_coordinator::QueryHandler::new(
         policy, None, config, Some(registry), None, None, None, query_tracker, None,
-        None, // grant_backend
-        None, // lineage observer
+        None,
+        None,
         sqe_coordinator::RuntimeCatalogRegistry::default(),
         sqe_core::SecretStore::default(),
     ).expect("Failed to create QueryHandler");
 
-    // First create a test table
     let _ = handler
         .execute(&session, "DROP TABLE IF EXISTS test_ns.dist_test")
         .await;
     handler
-        .execute(&session, "CREATE TABLE test_ns.dist_test AS SELECT 1 as id, 'distributed' as name")
+        .execute(
+            &session,
+            "CREATE TABLE test_ns.dist_test AS SELECT 1 as id, 'distributed' as name",
+        )
         .await
         .expect("CTAS should succeed");
 
-    // Query should work (may use local or distributed path)
     let batches = handler
         .execute(&session, "SELECT * FROM test_ns.dist_test")
         .await
         .expect("Distributed SELECT should succeed");
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
 
-    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total_rows, 1);
+    let tasks = handler
+        .execute(
+            &session,
+            "SELECT node_id FROM system.runtime.tasks ORDER BY query_id DESC LIMIT 20",
+        )
+        .await
+        .expect("system.runtime.tasks must be queryable");
+    let mut worker_seen = false;
+    for batch in &tasks {
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .expect("node_id should be string");
+        for i in 0..batch.num_rows() {
+            if col.value(i).contains("worker") {
+                worker_seen = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        worker_seen,
+        "expected at least one task to run on a worker node; \
+         system.runtime.tasks returned only coordinator entries -- \
+         the planner fell back to local execution"
+    );
 
-    // Cleanup
     let _ = handler
         .execute(&session, "DROP TABLE test_ns.dist_test")
         .await;
