@@ -34,6 +34,8 @@ pub struct SqeConfig {
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
     #[serde(default)]
+    pub security: SecurityConfig,
+    #[serde(default)]
     pub session: SessionConfig,
     #[serde(default)]
     pub query: QueryConfig,
@@ -1363,6 +1365,18 @@ pub struct RateLimitConfig {
     pub per_user_queries_per_minute: u32,
     #[serde(default = "default_global_rpm")]
     pub global_queries_per_minute: u32,
+    /// Pre-auth rate limit on handshake attempts, keyed by (peer-ip,
+    /// username). Defaults to 10 attempts per minute, enough for a
+    /// human to fat-finger a password a few times, low enough to make
+    /// credential stuffing impractical against the upstream IdP.
+    #[serde(default = "default_auth_rpm")]
+    pub auth_attempts_per_minute: u32,
+    /// Pre-auth rate limit on metadata browse paths (Flight catalog,
+    /// schemas, tables, prepared-statement schema lookup). Each call
+    /// triggers a Polaris fan-out and was previously uncapped.
+    /// Defaults to 120 per minute per user.
+    #[serde(default = "default_metadata_rpm")]
+    pub metadata_per_user_per_minute: u32,
 }
 
 impl Default for RateLimitConfig {
@@ -1371,7 +1385,93 @@ impl Default for RateLimitConfig {
             enabled: false,
             per_user_queries_per_minute: default_per_user_rpm(),
             global_queries_per_minute: default_global_rpm(),
+            auth_attempts_per_minute: default_auth_rpm(),
+            metadata_per_user_per_minute: default_metadata_rpm(),
         }
+    }
+}
+
+/// Security policy applied to wire-protocol surfaces.
+///
+/// Currently covers the trusted-proxy allowlist used when extracting
+/// the client IP for audit logs and pre-auth rate limiting. Issue #74.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct SecurityConfig {
+    /// IP literals of upstream proxies that are allowed to set
+    /// `x-forwarded-for`. When the request's peer address is in this
+    /// list, the rightmost untrusted hop from `x-forwarded-for` is
+    /// recorded as the client IP. Otherwise the peer address is used
+    /// directly and `x-forwarded-for` is ignored. Empty (the default)
+    /// means no proxy is trusted, audit IPs always come from the peer.
+    ///
+    /// IPv4 and IPv6 literals are supported. CIDR ranges are not (yet);
+    /// list each proxy IP explicitly. Hostnames are not resolved.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+}
+
+impl SecurityConfig {
+    /// Choose the client IP given the directly-observed peer address
+    /// and the `x-forwarded-for` header value (if any). When `peer` is
+    /// in `trusted_proxies`, the rightmost untrusted hop from the
+    /// header chain is returned; otherwise `peer` itself is returned.
+    ///
+    /// The "rightmost untrusted hop" rule walks the chain right-to-left
+    /// and skips IPs that are themselves in the trusted_proxies list,
+    /// stopping at the first untrusted address. This survives chains of
+    /// known proxies that prepend to one another.
+    pub fn resolve_client_ip(
+        &self,
+        peer: Option<&str>,
+        forwarded_for: Option<&str>,
+    ) -> String {
+        let peer = peer.unwrap_or("unknown");
+        let peer_host = strip_port(peer);
+        let trusted = !self.trusted_proxies.is_empty()
+            && self
+                .trusted_proxies
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(peer_host));
+        if !trusted {
+            return peer.to_string();
+        }
+        let chain = match forwarded_for {
+            Some(v) if !v.trim().is_empty() => v,
+            _ => return peer.to_string(),
+        };
+        // Walk right to left, skipping known trusted proxies.
+        let hops: Vec<&str> = chain.split(',').map(str::trim).collect();
+        for hop in hops.iter().rev() {
+            let hop_host = strip_port(hop);
+            if hop_host.is_empty() {
+                continue;
+            }
+            let is_trusted = self
+                .trusted_proxies
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(hop_host));
+            if !is_trusted {
+                return hop.to_string();
+            }
+        }
+        peer.to_string()
+    }
+}
+
+/// Strip the `:port` suffix from a peer-address-like string for
+/// allowlist comparison. IPv4 is `host:port`; IPv6 is `[host]:port`.
+fn strip_port(s: &str) -> &str {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return &rest[..end];
+        }
+    }
+    match s.rfind(':') {
+        // IPv6 without brackets contains multiple colons; treat the
+        // whole thing as the host.
+        Some(idx) if !s[..idx].contains(':') => &s[..idx],
+        _ => s,
     }
 }
 
@@ -1450,6 +1550,8 @@ fn default_passthrough() -> String { "passthrough".to_string() }
 fn default_prometheus_port() -> u16 { 9090 }
 fn default_per_user_rpm() -> u32 { 60 }
 fn default_global_rpm() -> u32 { 1000 }
+fn default_auth_rpm() -> u32 { 10 }
+fn default_metadata_rpm() -> u32 { 120 }
 
 impl SqeConfig {
     /// Default name for the legacy `[catalog]` block when the new
@@ -2029,6 +2131,7 @@ mod tests {
             access_control: AccessControlConfig::default(),
             metrics: MetricsConfig::default(),
             rate_limit: RateLimitConfig::default(),
+            security: SecurityConfig::default(),
             session: SessionConfig::default(),
             query: QueryConfig::default(),
             query_cache: QueryCacheConfig::default(),
@@ -3172,6 +3275,60 @@ otlp_endpoint = ""
         };
         // Defense-in-depth surrenders when allow_http = true.
         assert!(policy.check_endpoint("http://169.254.169.254").is_ok());
+    }
+
+    // --- SecurityConfig::resolve_client_ip (issue #74 regression tests) ---
+
+    #[test]
+    fn security_default_ignores_x_forwarded_for() {
+        let security = SecurityConfig::default();
+        let resolved = security
+            .resolve_client_ip(Some("10.0.0.1:55555"), Some("1.2.3.4"));
+        assert_eq!(resolved, "10.0.0.1:55555");
+    }
+
+    #[test]
+    fn security_trusted_proxy_returns_forwarded_for() {
+        let security = SecurityConfig {
+            trusted_proxies: vec!["10.0.0.1".to_string()],
+        };
+        let resolved = security
+            .resolve_client_ip(Some("10.0.0.1:33333"), Some("203.0.113.7"));
+        assert_eq!(resolved, "203.0.113.7");
+    }
+
+    #[test]
+    fn security_chain_walks_right_to_left_skipping_trusted() {
+        let security = SecurityConfig {
+            trusted_proxies: vec![
+                "10.0.0.1".to_string(),
+                "10.0.0.2".to_string(),
+            ],
+        };
+        let resolved = security.resolve_client_ip(
+            Some("10.0.0.1"),
+            Some("203.0.113.7, 10.0.0.2, 10.0.0.1"),
+        );
+        assert_eq!(resolved, "203.0.113.7");
+    }
+
+    #[test]
+    fn security_untrusted_peer_keeps_peer_addr() {
+        let security = SecurityConfig {
+            trusted_proxies: vec!["10.0.0.99".to_string()],
+        };
+        let resolved = security
+            .resolve_client_ip(Some("198.51.100.5"), Some("1.2.3.4"));
+        assert_eq!(resolved, "198.51.100.5");
+    }
+
+    #[test]
+    fn security_handles_missing_forwarded_for() {
+        let security = SecurityConfig {
+            trusted_proxies: vec!["10.0.0.1".to_string()],
+        };
+        let resolved = security.resolve_client_ip(Some("10.0.0.1"), None);
+        assert_eq!(resolved, "10.0.0.1");
     }
 
     // --- AuthConfig::has_admin_role (issue #3 regression tests) ---
