@@ -510,7 +510,7 @@ impl QueryHandler {
             sql_length = sql.len(),
             "Executing query"
         );
-        self.query_tracker.start(
+        let cancel_token = self.query_tracker.start(
             query_id,
             &session.user.username,
             session.source.as_deref(),
@@ -1013,19 +1013,37 @@ impl QueryHandler {
             }
         };
 
-        let result = match tokio::time::timeout(timeout_duration, execution_future).await {
-            Ok(inner_result) => inner_result,
-            Err(_elapsed) => {
+        // Race the execution against:
+        //   - the configured query timeout
+        //   - the per-query cancellation token (admin CancelQuery action)
+        // The first one to fire wins. Cancellation skips the failed() write
+        // because the tracker's cancel() already transitioned to Canceled.
+        let result = tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => {
                 warn!(
+                    query_id = %query_id,
                     username = %session.user.username,
-                    timeout_secs = timeout_secs,
-                    "Query timed out"
+                    "Query cancelled by admin or client"
                 );
-                let timeout_error = SqeError::Execution(format!(
-                    "Query timed out after {timeout_secs}s"
-                ));
-                self.query_tracker.failed(&query_id, &timeout_error);
-                Err(timeout_error)
+                Err(SqeError::Execution("Query cancelled".to_string()))
+            }
+            inner = tokio::time::timeout(timeout_duration, execution_future) => {
+                match inner {
+                    Ok(inner_result) => inner_result,
+                    Err(_elapsed) => {
+                        warn!(
+                            username = %session.user.username,
+                            timeout_secs = timeout_secs,
+                            "Query timed out"
+                        );
+                        let timeout_error = SqeError::Execution(format!(
+                            "Query timed out after {timeout_secs}s"
+                        ));
+                        self.query_tracker.failed(&query_id, &timeout_error);
+                        Err(timeout_error)
+                    }
+                }
             }
         };
 
@@ -1372,7 +1390,7 @@ impl QueryHandler {
             sql_length = sql.len(),
             "Starting streaming query"
         );
-        self.query_tracker.start(
+        let cancel_token = self.query_tracker.start(
             query_id,
             &session.user.username,
             session.source.as_deref(),
@@ -1401,10 +1419,11 @@ impl QueryHandler {
                     sql_length: sql.len(),
                 };
 
-                let tracked = crate::streaming::TrackedRecordBatchStream::new(
+                let tracked = crate::streaming::TrackedRecordBatchStream::with_cancel_token(
                     inner_stream,
                     finalizer,
                     permit,
+                    cancel_token,
                 )
                 .with_teardown(tt_cleanup);
                 let boxed: SendableRecordBatchStream = Box::pin(tracked);
