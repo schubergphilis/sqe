@@ -82,6 +82,38 @@ cargo-test:
       - target/
       - .cargo/registry/
 
+# ── Integration tests (Docker stack required) ─────────────────
+# Runs the 118 #[ignore] tests gated on docker-compose.test.yml. These
+# cover Iceberg V3 types, partition evolution, MoR delete, CTAS round-
+# trip, Trino HTTP, and distributed dispatch. CI used to never run them
+# (issue #93), so a regression in the hardest-to-test paths shipped
+# without being challenged. Default trigger: scheduled pipelines and
+# the merge-to-main push. Manual trigger available on MR pipelines.
+integration-test:
+  stage: test
+  image: docker:24
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - apk add --no-cache bash curl docker-compose rust cargo cmake protobuf-dev openssl-dev pkgconfig
+  script:
+    - ./scripts/integration-test.sh
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: manual
+      allow_failure: true
+  cache:
+    key: cargo-integration-${CI_COMMIT_REF_SLUG}
+    paths:
+      - target/
+      - .cargo/registry/
+  timeout: 1h
+
 # ── Iceberg matrix score regression guard ─────────────────────
 # Runs `cargo xtask matrix-report --min-percent N` where N is the current
 # baseline. If the committed docs/iceberg-matrix-state.json drops below the
