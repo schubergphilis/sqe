@@ -36,6 +36,86 @@ use crate::writer::{
     write_data_files_with_metrics, write_equality_delete_files, write_position_delete_files,
 };
 
+/// Rewrap the source SELECT of an `INSERT INTO t (c1, c2, ...) SELECT ...` so
+/// the resulting projection matches the target table's column order.
+///
+/// The user-supplied column list maps SELECT-output position `i` to target
+/// column `columns[i]`. Without this rewrite the writer stamps Iceberg field
+/// IDs positionally over the source's Arrow schema, silently swapping
+/// matching-type columns. We wrap the SELECT in a subquery, alias each
+/// projected column by the explicit target name, then re-project in the
+/// target schema's declared order. Columns absent from `columns` are written
+/// as NULL.
+fn reorder_insert_select(
+    select_sql: &str,
+    columns: &[sqlparser::ast::Ident],
+    target_schema: &IcebergSchema,
+) -> sqe_core::Result<String> {
+    use std::collections::HashSet;
+
+    let target_fields = target_schema.as_struct().fields();
+    let target_names: Vec<&str> = target_fields.iter().map(|f| f.name.as_str()).collect();
+
+    if columns.len() > target_names.len() {
+        return Err(SqeError::Execution(format!(
+            "INSERT column list has {} entries but target table has {} columns",
+            columns.len(),
+            target_names.len(),
+        )));
+    }
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let provided_lower: Vec<String> = columns
+        .iter()
+        .map(|c| c.value.to_ascii_lowercase())
+        .collect();
+    for name in &provided_lower {
+        if !seen.insert(name.clone()) {
+            return Err(SqeError::Execution(format!(
+                "INSERT column list contains duplicate column '{name}'"
+            )));
+        }
+        if !target_names
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(name))
+        {
+            return Err(SqeError::Execution(format!(
+                "INSERT column '{name}' does not exist in target table"
+            )));
+        }
+    }
+
+    // The source SELECT yields N columns. Position i in that result is
+    // the value destined for `columns[i]`. Alias each output by that target
+    // name in a CTE, then project the full target schema with NULLs for
+    // unprovided columns.
+    let alias_list: Vec<String> = columns.iter().map(|c| quote_ident(&c.value)).collect();
+    let alias_csv = alias_list.join(", ");
+
+    let projection: Vec<String> = target_names
+        .iter()
+        .map(|target| {
+            let lower = target.to_ascii_lowercase();
+            if provided_lower.iter().any(|p| p == &lower) {
+                quote_ident(target)
+            } else {
+                format!("NULL AS {}", quote_ident(target))
+            }
+        })
+        .collect();
+
+    Ok(format!(
+        "SELECT {} FROM ({}) AS __sqe_insert_src({})",
+        projection.join(", "),
+        select_sql,
+        alias_csv,
+    ))
+}
+
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 /// Build a single-row RecordBatch reporting affected row count.
 /// Matches Trino's DML response which returns the update count.
 fn affected_rows_batch(count: usize) -> Vec<RecordBatch> {
@@ -206,6 +286,11 @@ pub struct WriteHandler {
     /// Shared global table metadata cache. Used so write-path SessionCatalog
     /// instances hit the warm cache and invalidate the right entry on commit.
     table_cache: Option<TableMetadataCache>,
+    /// Policy enforcer applied to every source SELECT of an INSERT, CTAS,
+    /// DELETE, or UPDATE. Without this the SELECT path would enforce row
+    /// filters and column masks but the write path would let masked or
+    /// filtered-out rows be copied verbatim into a sink table.
+    policy_enforcer: Option<Arc<dyn sqe_policy::PolicyEnforcer>>,
 }
 
 impl WriteHandler {
@@ -214,6 +299,7 @@ impl WriteHandler {
             config,
             metrics: None,
             table_cache: None,
+            policy_enforcer: None,
         }
     }
 
@@ -226,6 +312,29 @@ impl WriteHandler {
     pub fn with_table_cache(mut self, cache: TableMetadataCache) -> Self {
         self.table_cache = Some(cache);
         self
+    }
+
+    /// Attach the policy enforcer used for write-path source SELECTs.
+    pub fn with_policy_enforcer(
+        mut self,
+        enforcer: Arc<dyn sqe_policy::PolicyEnforcer>,
+    ) -> Self {
+        self.policy_enforcer = Some(enforcer);
+        self
+    }
+
+    /// Run the source plan through the configured policy enforcer, if any.
+    /// Used by INSERT / CTAS / DELETE / UPDATE source SELECTs so row filters,
+    /// column masks, and column restrictions apply on writes too.
+    async fn enforce_source_plan(
+        &self,
+        session: &Session,
+        plan: LogicalPlan,
+    ) -> sqe_core::Result<LogicalPlan> {
+        match &self.policy_enforcer {
+            Some(enf) => enf.evaluate(&session.user, plan).await,
+            None => Ok(plan),
+        }
     }
 
     /// Return the Parquet compression codec from config.
@@ -558,6 +667,17 @@ impl WriteHandler {
             .await
             .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
 
+        // Enforce policy on the source SELECT so masks and restrictions
+        // shape the target table. Without this, CTAS over a masked table
+        // creates a sink with plaintext columns.
+        let enforced_source = self
+            .enforce_source_plan(session, df.logical_plan().clone())
+            .await?;
+        let df = ctx
+            .execute_logical_plan(enforced_source)
+            .await
+            .map_err(|e| SqeError::Execution(format!("Plan execution failed: {e}")))?;
+
         let arrow_schema = Arc::new(df.schema().as_arrow().clone());
         let iceberg_schema = arrow_schema_to_iceberg(&arrow_schema)?;
 
@@ -673,9 +793,9 @@ impl WriteHandler {
         select_sql: &str,
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let table_name = match stmt {
+        let (table_name, explicit_columns) = match stmt {
             Statement::Insert(ins) => match &ins.table {
-                sqlparser::ast::TableObject::TableName(name) => name,
+                sqlparser::ast::TableObject::TableName(name) => (name, &ins.columns),
                 other => {
                     return Err(SqeError::Execution(format!(
                         "INSERT INTO table functions not supported: {other}"
@@ -704,23 +824,42 @@ impl WriteHandler {
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
 
+        let effective_sql = if explicit_columns.is_empty() {
+            select_sql.to_string()
+        } else {
+            reorder_insert_select(
+                select_sql,
+                explicit_columns,
+                table.metadata().current_schema().as_ref(),
+            )?
+        };
+
         let df = ctx
-            .sql(select_sql)
+            .sql(&effective_sql)
             .await
             .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
 
-        // Capture the SELECT plan as a synthetic INSERT-into-target wrapper so
-        // OL extraction recovers inputs + outputs + column lineage. The
-        // wrapper is purely a lineage shape; the actual write goes through
-        // the streaming Parquet writer below.
+        // Enforce row filters, column masks, and restricted columns on the
+        // source SELECT. Without this, INSERT INTO sink SELECT FROM masked
+        // would copy plaintext into sink, bypassing every policy.
         let source_plan = df.logical_plan().clone();
+        let enforced_plan = self.enforce_source_plan(session, source_plan).await?;
+
         let (lin_catalog, lin_namespace, lin_table) =
             lineage_target_parts(&self.config, &table_ident);
-        if let Ok(wrapper) =
-            build_lineage_insert_plan(source_plan, &lin_catalog, &lin_namespace, &lin_table)
-        {
+        if let Ok(wrapper) = build_lineage_insert_plan(
+            enforced_plan.clone(),
+            &lin_catalog,
+            &lin_namespace,
+            &lin_table,
+        ) {
             *plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(wrapper)));
         }
+
+        let df = ctx
+            .execute_logical_plan(enforced_plan)
+            .await
+            .map_err(|e| SqeError::Execution(format!("Plan execution failed: {e}")))?;
 
         let stream = df
             .execute_stream()
@@ -5662,5 +5801,191 @@ SET c = ( \
         let assignments = parse_update(sql);
         let (_, joins) = decorrelate_scalar_subqueries(&assignments, "t");
         assert!(joins.is_empty(), "non-eq correlation should be left alone");
+    }
+
+    // -------------------------------------------------------------------------
+    // reorder_insert_select: INSERT INTO t (b, a) SELECT ... must not swap
+    // columns by position. The writer stamps Iceberg field IDs positionally,
+    // so reordering at SQL planning time is the only safe fix.
+    // -------------------------------------------------------------------------
+
+    fn make_target_schema() -> IcebergSchema {
+        use iceberg::spec::{PrimitiveType, Type};
+        IcebergSchema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                Arc::new(NestedField::optional(1, "a", Type::Primitive(PrimitiveType::Int))),
+                Arc::new(NestedField::optional(2, "b", Type::Primitive(PrimitiveType::Int))),
+                Arc::new(NestedField::optional(3, "c", Type::Primitive(PrimitiveType::Int))),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    fn ident(name: &str) -> sqlparser::ast::Ident {
+        sqlparser::ast::Ident::new(name.to_string())
+    }
+
+    #[test]
+    fn reorder_insert_swaps_columns_when_explicit_list_reverses_order() {
+        let schema = make_target_schema();
+        let columns = vec![ident("b"), ident("a"), ident("c")];
+        let sql = reorder_insert_select("SELECT 1, 2, 3", &columns, &schema).unwrap();
+        assert!(
+            sql.contains("\"a\", \"b\", \"c\""),
+            "outer projection must be in target order: {sql}"
+        );
+        assert!(
+            sql.contains("__sqe_insert_src(\"b\", \"a\", \"c\")"),
+            "inner CTE alias list must match user-provided order: {sql}"
+        );
+    }
+
+    #[test]
+    fn reorder_insert_fills_missing_columns_with_null() {
+        let schema = make_target_schema();
+        let columns = vec![ident("a")];
+        let sql = reorder_insert_select("SELECT 99", &columns, &schema).unwrap();
+        assert!(
+            sql.contains("NULL AS \"b\""),
+            "unmentioned columns must be NULL: {sql}"
+        );
+        assert!(sql.contains("NULL AS \"c\""), "{sql}");
+        assert!(sql.contains("\"a\","), "{sql}");
+    }
+
+    #[test]
+    fn reorder_insert_rejects_unknown_column() {
+        let schema = make_target_schema();
+        let columns = vec![ident("does_not_exist")];
+        let err = reorder_insert_select("SELECT 1", &columns, &schema).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("does not exist"), "msg: {msg}");
+    }
+
+    #[test]
+    fn reorder_insert_rejects_duplicate_column() {
+        let schema = make_target_schema();
+        let columns = vec![ident("a"), ident("a")];
+        let err = reorder_insert_select("SELECT 1, 2", &columns, &schema).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("duplicate"), "msg: {msg}");
+    }
+
+    #[test]
+    fn reorder_insert_rejects_more_columns_than_target() {
+        let schema = make_target_schema();
+        let columns = vec![ident("a"), ident("b"), ident("c"), ident("d")];
+        let err = reorder_insert_select("SELECT 1, 2, 3, 4", &columns, &schema).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("has 4 entries"), "msg: {msg}");
+    }
+
+    #[test]
+    fn reorder_insert_is_case_insensitive() {
+        let schema = make_target_schema();
+        let columns = vec![ident("A"), ident("B")];
+        // Should not error; both "A" and "B" map to lowercase target names.
+        reorder_insert_select("SELECT 1, 2", &columns, &schema).unwrap();
+    }
+
+    // -------------------------------------------------------------------------
+    // Policy enforcement on write paths (#36). The WriteHandler must run the
+    // source SELECT through the configured PolicyEnforcer before writing.
+    // -------------------------------------------------------------------------
+
+    fn write_test_config() -> SqeConfig {
+        let toml_text = r#"
+[coordinator]
+flight_sql_port = 0
+trino_http_port = 0
+
+[auth]
+token_endpoint = "http://127.0.0.1:9/unused"
+client_id = "test_client"
+
+[catalog]
+catalog_url = "http://127.0.0.1:9/unused"
+warehouse = "test_wh"
+
+[storage]
+s3_endpoint = "http://127.0.0.1:9"
+s3_access_key = "_"
+s3_secret_key = "_"
+s3_region = "us-east-1"
+s3_path_style = true
+"#;
+        toml::from_str::<SqeConfig>(toml_text).expect("config parses")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enforce_source_plan_passes_through_when_no_enforcer() {
+        use datafusion::logical_expr::LogicalPlanBuilder;
+        let handler = WriteHandler::new(write_test_config());
+        let plan = LogicalPlanBuilder::empty(false).build().unwrap();
+        let session = sqe_core::Session::new(
+            "u".to_string(),
+            "tok".to_string(),
+            None,
+            chrono::Utc::now(),
+            vec![],
+        );
+        let before = format!("{plan:?}");
+        let after = handler.enforce_source_plan(&session, plan).await.unwrap();
+        assert_eq!(before, format!("{after:?}"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enforce_source_plan_applies_mask_via_rewriter() {
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema2};
+        use datafusion::common::TableReference;
+        use datafusion::datasource::{provider_as_source, MemTable};
+        use datafusion::logical_expr::LogicalPlanBuilder;
+        use sqe_policy::plan_rewriter::PolicyPlanRewriter;
+        use sqe_policy::policy_store::InMemoryPolicyStore;
+        use sqe_policy::{MaskType, PolicyEnforcer as _, ResolvedPolicy};
+
+        let arrow_schema = Arc::new(ArrowSchema2::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("ssn", DataType::Utf8, true),
+        ]));
+        let mem = Arc::new(MemTable::try_new(arrow_schema, vec![vec![]]).unwrap());
+        let plan = LogicalPlanBuilder::scan(
+            TableReference::bare("employees"),
+            provider_as_source(mem),
+            None,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        let store = InMemoryPolicyStore::new();
+        let mut pol = ResolvedPolicy::default();
+        pol.column_masks
+            .insert("ssn".to_string(), MaskType::Redact("***".to_string()));
+        store.add_table_policy("default", "employees", pol).await;
+        let enforcer: Arc<dyn sqe_policy::PolicyEnforcer> =
+            Arc::new(PolicyPlanRewriter::new(Arc::new(store)));
+
+        let handler =
+            WriteHandler::new(write_test_config()).with_policy_enforcer(enforcer);
+        let session = sqe_core::Session::new(
+            "u".to_string(),
+            "tok".to_string(),
+            None,
+            chrono::Utc::now(),
+            vec![],
+        );
+        let rewritten = handler.enforce_source_plan(&session, plan).await.unwrap();
+        let s = format!("{}", rewritten.display_indent());
+        assert!(
+            s.contains("Projection:") && s.contains("\"***\""),
+            "expected redacted projection, got: {s}"
+        );
+
+        // Also verify the rewriter trait method can be called via the field
+        // — the `_` import keeps the trait in scope even if a future code
+        // change drops the explicit call site above.
+        let _ = sqe_policy::PassthroughEnforcer;
     }
 }

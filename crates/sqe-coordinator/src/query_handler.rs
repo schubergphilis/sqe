@@ -131,6 +131,7 @@ impl QueryHandler {
         if let Some(ref m) = metrics {
             write_handler = write_handler.with_metrics(Arc::clone(m));
         }
+        write_handler = write_handler.with_policy_enforcer(Arc::clone(&policy_enforcer));
         let mut maintenance_handler = MaintenanceHandler::new(config.clone());
         if let Some(ref a) = audit {
             maintenance_handler = maintenance_handler.with_audit(Arc::clone(a));

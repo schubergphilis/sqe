@@ -30,7 +30,7 @@ use datafusion::physical_plan::{
 use datafusion_expr::ColumnarValue;
 use futures::{Stream, StreamExt, TryStreamExt};
 use iceberg::expr::Predicate;
-use iceberg::spec::{DataContentType, DataFile, ManifestStatus};
+use iceberg::spec::{DataContentType, DataFile, ManifestContentType, ManifestStatus};
 use iceberg::table::Table;
 use parquet::arrow::arrow_reader::{
     ArrowPredicate, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowFilter,
@@ -751,7 +751,21 @@ impl ExecutionPlan for IcebergScanExec {
             // each file entirely in one S3 GET and parse Parquet from memory. This
             // eliminates the extra HEAD, footer, and manifest-re-read requests that
             // iceberg-rust's `scan.to_arrow()` pipeline issues per file.
-            let use_direct = small_file_threshold > 0
+            //
+            // The fast path opens parquet directly via FileIO and cannot apply
+            // Iceberg position or equality deletes. Any snapshot referencing
+            // delete manifests must fall back to iceberg-rust's reader pipeline
+            // (`scan.to_arrow`) which routes through CachingDeleteFileLoader.
+            // Without this gate, every MoR table whose data files are all under
+            // the threshold returns previously-deleted rows.
+            let has_deletes = snapshot_has_delete_files(&table, snapshot_id).await?;
+            if has_deletes {
+                debug!(
+                    "IcebergScanExec: snapshot has delete manifests, skipping direct-read fast path"
+                );
+            }
+            let use_direct = !has_deletes
+                && small_file_threshold > 0
                 && file_entries.iter().all(|(_, size)| *size <= small_file_threshold);
 
             if use_direct {
@@ -1075,6 +1089,35 @@ impl ExecutionPlan for IcebergScanExec {
 /// Partition / predicate pruning from `predicates` is also applied here by
 /// the planner, so files that cannot match the query are filtered before
 /// they reach the scan node.
+/// Returns true if the snapshot's manifest list references any delete
+/// manifests (position-delete or equality-delete files). Used to gate
+/// the direct-read fast path: that path bypasses iceberg-rust's reader
+/// pipeline, so it cannot apply DeleteVectors or equality-delete
+/// predicates. Falling back to `scan.to_arrow()` is the correct choice
+/// any time a delete file exists.
+async fn snapshot_has_delete_files(
+    table: &Table,
+    snapshot_id: Option<i64>,
+) -> DFResult<bool> {
+    let metadata_ref = table.metadata_ref();
+    let snapshot = match snapshot_id {
+        Some(sid) => metadata_ref.snapshot_by_id(sid),
+        None => metadata_ref.current_snapshot(),
+    };
+    let Some(snapshot) = snapshot else {
+        return Ok(false);
+    };
+    let manifest_list = table
+        .object_cache()
+        .get_manifest_list(snapshot, &metadata_ref)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    Ok(manifest_list
+        .entries()
+        .iter()
+        .any(|mf| mf.content == ManifestContentType::Deletes))
+}
+
 async fn collect_data_files_via_plan(
     table: &Table,
     snapshot_id: Option<i64>,
