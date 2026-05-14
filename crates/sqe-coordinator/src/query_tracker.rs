@@ -220,6 +220,12 @@ impl QueryTracker {
         }
     }
 
+    /// Look up the submitting username for a query, if known.
+    /// Returned for ownership checks on cancel/inspect operations.
+    pub fn owner_of(&self, query_id: &Uuid) -> Option<String> {
+        self.history.get(query_id).map(|r| r.user.clone())
+    }
+
     pub fn set_fragments(&self, query_id: &Uuid, fragments: Vec<FragmentInfo>) {
         if let Some(old) = self.history.get(query_id) {
             let mut record = (*old).clone();

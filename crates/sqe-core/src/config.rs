@@ -34,6 +34,8 @@ pub struct SqeConfig {
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
     #[serde(default)]
+    pub security: SecurityConfig,
+    #[serde(default)]
     pub session: SessionConfig,
     #[serde(default)]
     pub query: QueryConfig,
@@ -1037,6 +1039,58 @@ impl TvfPolicy {
              or stage the file in an object store."
         ))
     }
+
+    /// Validate an S3-style endpoint override (the `endpoint =>` argument
+    /// on `read_parquet` / `read_csv` / `read_json`). Issue #46 closed
+    /// the SSRF gap left by issue #10: the path argument was checked but
+    /// the endpoint override flowed straight into `AmazonS3Builder`, so
+    /// `read_parquet('s3://x/y', endpoint => 'http://169.254.169.254/...')`
+    /// still pivoted to IMDS.
+    ///
+    /// Empty endpoints are allowed (the operator's storage config kicks
+    /// in). HTTP/HTTPS endpoints are validated against the same allowlist
+    /// as path arguments. Bare-host endpoints (e.g. `minio.local:9000`)
+    /// are allowed since they cannot reach IMDS over its expected scheme.
+    pub fn check_endpoint(&self, endpoint: &str) -> Result<(), String> {
+        if endpoint.is_empty() {
+            return Ok(());
+        }
+        let lower = endpoint.to_lowercase();
+        if !lower.starts_with("http://") && !lower.starts_with("https://") {
+            return Ok(());
+        }
+        if self.allow_http {
+            return Ok(());
+        }
+        let after_scheme = lower
+            .split_once("://")
+            .map(|x| x.1)
+            .unwrap_or("");
+        let host_with_port = after_scheme.split('/').next().unwrap_or("");
+        let host = host_with_port
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if host.is_empty() {
+            return Err(format!(
+                "TVF: malformed endpoint '{endpoint}' (missing host)"
+            ));
+        }
+        if self
+            .allowed_http_hosts
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(host))
+        {
+            return Ok(());
+        }
+        Err(format!(
+            "TVF: endpoint host '{host}' is not in `[storage.tvf] allowed_http_hosts`. \
+             Inline `endpoint => '{endpoint}'` was rejected to prevent SSRF \
+             to metadata services. Add the host or set `allow_http = true` \
+             to permit arbitrary hosts."
+        ))
+    }
 }
 
 impl Default for StorageConfig {
@@ -1311,6 +1365,18 @@ pub struct RateLimitConfig {
     pub per_user_queries_per_minute: u32,
     #[serde(default = "default_global_rpm")]
     pub global_queries_per_minute: u32,
+    /// Pre-auth rate limit on handshake attempts, keyed by (peer-ip,
+    /// username). Defaults to 10 attempts per minute, enough for a
+    /// human to fat-finger a password a few times, low enough to make
+    /// credential stuffing impractical against the upstream IdP.
+    #[serde(default = "default_auth_rpm")]
+    pub auth_attempts_per_minute: u32,
+    /// Pre-auth rate limit on metadata browse paths (Flight catalog,
+    /// schemas, tables, prepared-statement schema lookup). Each call
+    /// triggers a Polaris fan-out and was previously uncapped.
+    /// Defaults to 120 per minute per user.
+    #[serde(default = "default_metadata_rpm")]
+    pub metadata_per_user_per_minute: u32,
 }
 
 impl Default for RateLimitConfig {
@@ -1319,7 +1385,93 @@ impl Default for RateLimitConfig {
             enabled: false,
             per_user_queries_per_minute: default_per_user_rpm(),
             global_queries_per_minute: default_global_rpm(),
+            auth_attempts_per_minute: default_auth_rpm(),
+            metadata_per_user_per_minute: default_metadata_rpm(),
         }
+    }
+}
+
+/// Security policy applied to wire-protocol surfaces.
+///
+/// Currently covers the trusted-proxy allowlist used when extracting
+/// the client IP for audit logs and pre-auth rate limiting. Issue #74.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct SecurityConfig {
+    /// IP literals of upstream proxies that are allowed to set
+    /// `x-forwarded-for`. When the request's peer address is in this
+    /// list, the rightmost untrusted hop from `x-forwarded-for` is
+    /// recorded as the client IP. Otherwise the peer address is used
+    /// directly and `x-forwarded-for` is ignored. Empty (the default)
+    /// means no proxy is trusted, audit IPs always come from the peer.
+    ///
+    /// IPv4 and IPv6 literals are supported. CIDR ranges are not (yet);
+    /// list each proxy IP explicitly. Hostnames are not resolved.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+}
+
+impl SecurityConfig {
+    /// Choose the client IP given the directly-observed peer address
+    /// and the `x-forwarded-for` header value (if any). When `peer` is
+    /// in `trusted_proxies`, the rightmost untrusted hop from the
+    /// header chain is returned; otherwise `peer` itself is returned.
+    ///
+    /// The "rightmost untrusted hop" rule walks the chain right-to-left
+    /// and skips IPs that are themselves in the trusted_proxies list,
+    /// stopping at the first untrusted address. This survives chains of
+    /// known proxies that prepend to one another.
+    pub fn resolve_client_ip(
+        &self,
+        peer: Option<&str>,
+        forwarded_for: Option<&str>,
+    ) -> String {
+        let peer = peer.unwrap_or("unknown");
+        let peer_host = strip_port(peer);
+        let trusted = !self.trusted_proxies.is_empty()
+            && self
+                .trusted_proxies
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(peer_host));
+        if !trusted {
+            return peer.to_string();
+        }
+        let chain = match forwarded_for {
+            Some(v) if !v.trim().is_empty() => v,
+            _ => return peer.to_string(),
+        };
+        // Walk right to left, skipping known trusted proxies.
+        let hops: Vec<&str> = chain.split(',').map(str::trim).collect();
+        for hop in hops.iter().rev() {
+            let hop_host = strip_port(hop);
+            if hop_host.is_empty() {
+                continue;
+            }
+            let is_trusted = self
+                .trusted_proxies
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(hop_host));
+            if !is_trusted {
+                return hop.to_string();
+            }
+        }
+        peer.to_string()
+    }
+}
+
+/// Strip the `:port` suffix from a peer-address-like string for
+/// allowlist comparison. IPv4 is `host:port`; IPv6 is `[host]:port`.
+fn strip_port(s: &str) -> &str {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return &rest[..end];
+        }
+    }
+    match s.rfind(':') {
+        // IPv6 without brackets contains multiple colons; treat the
+        // whole thing as the host.
+        Some(idx) if !s[..idx].contains(':') => &s[..idx],
+        _ => s,
     }
 }
 
@@ -1398,6 +1550,8 @@ fn default_passthrough() -> String { "passthrough".to_string() }
 fn default_prometheus_port() -> u16 { 9090 }
 fn default_per_user_rpm() -> u32 { 60 }
 fn default_global_rpm() -> u32 { 1000 }
+fn default_auth_rpm() -> u32 { 10 }
+fn default_metadata_rpm() -> u32 { 120 }
 
 impl SqeConfig {
     /// Default name for the legacy `[catalog]` block when the new
@@ -1977,6 +2131,7 @@ mod tests {
             access_control: AccessControlConfig::default(),
             metrics: MetricsConfig::default(),
             rate_limit: RateLimitConfig::default(),
+            security: SecurityConfig::default(),
             session: SessionConfig::default(),
             query: QueryConfig::default(),
             query_cache: QueryCacheConfig::default(),
@@ -3066,6 +3221,114 @@ otlp_endpoint = ""
         };
         let err = policy.check("http:///just-a-path").unwrap_err();
         assert!(err.contains("malformed URL") || err.contains("missing host"));
+    }
+
+    // --- TvfPolicy::check_endpoint (issue #46 regression tests) ---
+
+    #[test]
+    fn tvf_endpoint_empty_is_allowed() {
+        let policy = TvfPolicy::default();
+        assert!(policy.check_endpoint("").is_ok());
+    }
+
+    #[test]
+    fn tvf_endpoint_imds_url_is_rejected_by_default() {
+        let policy = TvfPolicy::default();
+        let err = policy
+            .check_endpoint("http://169.254.169.254/latest/meta-data/")
+            .unwrap_err();
+        assert!(err.contains("not in `[storage.tvf] allowed_http_hosts`"));
+        assert!(err.contains("169.254.169.254"));
+    }
+
+    #[test]
+    fn tvf_endpoint_bare_host_is_allowed() {
+        // MinIO / Ceph deployments use bare host:port endpoints. Allowed
+        // because they cannot be the IMDS http://169.254.169.254 URL.
+        let policy = TvfPolicy::default();
+        assert!(policy.check_endpoint("minio.local:9000").is_ok());
+        assert!(policy.check_endpoint("s3.example:9000").is_ok());
+    }
+
+    #[test]
+    fn tvf_endpoint_allowed_http_host_passes() {
+        let policy = TvfPolicy {
+            allow_local_paths: false,
+            allow_http: false,
+            allowed_http_hosts: vec!["s3.us-east-1.amazonaws.com".to_string()],
+        };
+        assert!(policy
+            .check_endpoint("https://s3.us-east-1.amazonaws.com")
+            .is_ok());
+        let err = policy
+            .check_endpoint("https://other-region.amazonaws.com")
+            .unwrap_err();
+        assert!(err.contains("not in `[storage.tvf] allowed_http_hosts`"));
+    }
+
+    #[test]
+    fn tvf_endpoint_allow_http_true_bypasses_allowlist() {
+        let policy = TvfPolicy {
+            allow_local_paths: false,
+            allow_http: true,
+            allowed_http_hosts: Vec::new(),
+        };
+        // Defense-in-depth surrenders when allow_http = true.
+        assert!(policy.check_endpoint("http://169.254.169.254").is_ok());
+    }
+
+    // --- SecurityConfig::resolve_client_ip (issue #74 regression tests) ---
+
+    #[test]
+    fn security_default_ignores_x_forwarded_for() {
+        let security = SecurityConfig::default();
+        let resolved = security
+            .resolve_client_ip(Some("10.0.0.1:55555"), Some("1.2.3.4"));
+        assert_eq!(resolved, "10.0.0.1:55555");
+    }
+
+    #[test]
+    fn security_trusted_proxy_returns_forwarded_for() {
+        let security = SecurityConfig {
+            trusted_proxies: vec!["10.0.0.1".to_string()],
+        };
+        let resolved = security
+            .resolve_client_ip(Some("10.0.0.1:33333"), Some("203.0.113.7"));
+        assert_eq!(resolved, "203.0.113.7");
+    }
+
+    #[test]
+    fn security_chain_walks_right_to_left_skipping_trusted() {
+        let security = SecurityConfig {
+            trusted_proxies: vec![
+                "10.0.0.1".to_string(),
+                "10.0.0.2".to_string(),
+            ],
+        };
+        let resolved = security.resolve_client_ip(
+            Some("10.0.0.1"),
+            Some("203.0.113.7, 10.0.0.2, 10.0.0.1"),
+        );
+        assert_eq!(resolved, "203.0.113.7");
+    }
+
+    #[test]
+    fn security_untrusted_peer_keeps_peer_addr() {
+        let security = SecurityConfig {
+            trusted_proxies: vec!["10.0.0.99".to_string()],
+        };
+        let resolved = security
+            .resolve_client_ip(Some("198.51.100.5"), Some("1.2.3.4"));
+        assert_eq!(resolved, "198.51.100.5");
+    }
+
+    #[test]
+    fn security_handles_missing_forwarded_for() {
+        let security = SecurityConfig {
+            trusted_proxies: vec!["10.0.0.1".to_string()],
+        };
+        let resolved = security.resolve_client_ip(Some("10.0.0.1"), None);
+        assert_eq!(resolved, "10.0.0.1");
     }
 
     // --- AuthConfig::has_admin_role (issue #3 regression tests) ---

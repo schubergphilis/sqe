@@ -632,8 +632,14 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             None
         };
 
-    // Rate limiter — shared between Flight SQL and Trino paths
+    // Rate limiters — shared between Flight SQL and Trino paths
     let rate_limiter = Arc::new(sqe_coordinator::rate_limiter::QueryRateLimiter::new(
+        &config.rate_limit,
+    ));
+    let auth_rate_limiter = Arc::new(sqe_coordinator::rate_limiter::AuthRateLimiter::new(
+        &config.rate_limit,
+    ));
+    let metadata_rate_limiter = Arc::new(sqe_coordinator::rate_limiter::MetadataRateLimiter::new(
         &config.rate_limit,
     ));
 
@@ -647,7 +653,14 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             handler: query_handler.clone(),
             rate_limiter: Arc::clone(&rate_limiter),
         });
-        sqe_trino_compat::server::start_trino_server(
+        let trino_auth_limiter: Arc<dyn sqe_trino_compat::server::TrinoAuthRateLimiter> =
+            Arc::clone(&auth_rate_limiter) as _;
+        let trino_opts = sqe_trino_compat::server::TrinoServerOptions {
+            security: config.security.clone(),
+            auth_rate_limiter: Some(trino_auth_limiter),
+            expose_version: false,
+        };
+        sqe_trino_compat::server::start_trino_server_with_options(
             auth_adapter,
             handler_adapter,
             config.coordinator.trino_http_port,
@@ -657,6 +670,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
                 started_at,
             },
             oauth2_state,
+            trino_opts,
         );
         tracing::info!("Trino-compat HTTP on port {}", config.coordinator.trino_http_port);
     }
@@ -667,7 +681,9 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     // Flight SQL server with graceful shutdown
     let flight_service =
         SqeFlightSqlService::new(session_manager, query_handler, config.clone())
-            .with_rate_limiter(rate_limiter);
+            .with_rate_limiter(rate_limiter)
+            .with_auth_rate_limiter(Arc::clone(&auth_rate_limiter))
+            .with_metadata_rate_limiter(metadata_rate_limiter);
     let addr = format!("0.0.0.0:{}", config.coordinator.flight_sql_port).parse()?;
 
     // Optional TLS
