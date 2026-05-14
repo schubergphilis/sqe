@@ -370,6 +370,16 @@ fn build_s3_store(
         .filter(|s| !s.is_empty())
         .unwrap_or(storage.s3_endpoint.as_str());
 
+    // Issue #46: reject inline `endpoint =>` overrides that bypass the
+    // path allowlist. Without this, the `s3://...` path passes the #10
+    // check but the endpoint flows straight into AmazonS3Builder and
+    // pivots the request to IMDS.
+    if args.endpoint.as_deref().is_some_and(|s| !s.is_empty()) {
+        storage.tvf.check_endpoint(endpoint).map_err(|e| {
+            datafusion::error::DataFusionError::Plan(format!("read_parquet: {e}"))
+        })?;
+    }
+
     let region = args
         .region
         .as_deref()

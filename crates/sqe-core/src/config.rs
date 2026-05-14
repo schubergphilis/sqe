@@ -1037,6 +1037,58 @@ impl TvfPolicy {
              or stage the file in an object store."
         ))
     }
+
+    /// Validate an S3-style endpoint override (the `endpoint =>` argument
+    /// on `read_parquet` / `read_csv` / `read_json`). Issue #46 closed
+    /// the SSRF gap left by issue #10: the path argument was checked but
+    /// the endpoint override flowed straight into `AmazonS3Builder`, so
+    /// `read_parquet('s3://x/y', endpoint => 'http://169.254.169.254/...')`
+    /// still pivoted to IMDS.
+    ///
+    /// Empty endpoints are allowed (the operator's storage config kicks
+    /// in). HTTP/HTTPS endpoints are validated against the same allowlist
+    /// as path arguments. Bare-host endpoints (e.g. `minio.local:9000`)
+    /// are allowed since they cannot reach IMDS over its expected scheme.
+    pub fn check_endpoint(&self, endpoint: &str) -> Result<(), String> {
+        if endpoint.is_empty() {
+            return Ok(());
+        }
+        let lower = endpoint.to_lowercase();
+        if !lower.starts_with("http://") && !lower.starts_with("https://") {
+            return Ok(());
+        }
+        if self.allow_http {
+            return Ok(());
+        }
+        let after_scheme = lower
+            .split_once("://")
+            .map(|x| x.1)
+            .unwrap_or("");
+        let host_with_port = after_scheme.split('/').next().unwrap_or("");
+        let host = host_with_port
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if host.is_empty() {
+            return Err(format!(
+                "TVF: malformed endpoint '{endpoint}' (missing host)"
+            ));
+        }
+        if self
+            .allowed_http_hosts
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(host))
+        {
+            return Ok(());
+        }
+        Err(format!(
+            "TVF: endpoint host '{host}' is not in `[storage.tvf] allowed_http_hosts`. \
+             Inline `endpoint => '{endpoint}'` was rejected to prevent SSRF \
+             to metadata services. Add the host or set `allow_http = true` \
+             to permit arbitrary hosts."
+        ))
+    }
 }
 
 impl Default for StorageConfig {
@@ -3066,6 +3118,60 @@ otlp_endpoint = ""
         };
         let err = policy.check("http:///just-a-path").unwrap_err();
         assert!(err.contains("malformed URL") || err.contains("missing host"));
+    }
+
+    // --- TvfPolicy::check_endpoint (issue #46 regression tests) ---
+
+    #[test]
+    fn tvf_endpoint_empty_is_allowed() {
+        let policy = TvfPolicy::default();
+        assert!(policy.check_endpoint("").is_ok());
+    }
+
+    #[test]
+    fn tvf_endpoint_imds_url_is_rejected_by_default() {
+        let policy = TvfPolicy::default();
+        let err = policy
+            .check_endpoint("http://169.254.169.254/latest/meta-data/")
+            .unwrap_err();
+        assert!(err.contains("not in `[storage.tvf] allowed_http_hosts`"));
+        assert!(err.contains("169.254.169.254"));
+    }
+
+    #[test]
+    fn tvf_endpoint_bare_host_is_allowed() {
+        // MinIO / Ceph deployments use bare host:port endpoints. Allowed
+        // because they cannot be the IMDS http://169.254.169.254 URL.
+        let policy = TvfPolicy::default();
+        assert!(policy.check_endpoint("minio.local:9000").is_ok());
+        assert!(policy.check_endpoint("s3.example:9000").is_ok());
+    }
+
+    #[test]
+    fn tvf_endpoint_allowed_http_host_passes() {
+        let policy = TvfPolicy {
+            allow_local_paths: false,
+            allow_http: false,
+            allowed_http_hosts: vec!["s3.us-east-1.amazonaws.com".to_string()],
+        };
+        assert!(policy
+            .check_endpoint("https://s3.us-east-1.amazonaws.com")
+            .is_ok());
+        let err = policy
+            .check_endpoint("https://other-region.amazonaws.com")
+            .unwrap_err();
+        assert!(err.contains("not in `[storage.tvf] allowed_http_hosts`"));
+    }
+
+    #[test]
+    fn tvf_endpoint_allow_http_true_bypasses_allowlist() {
+        let policy = TvfPolicy {
+            allow_local_paths: false,
+            allow_http: true,
+            allowed_http_hosts: Vec::new(),
+        };
+        // Defense-in-depth surrenders when allow_http = true.
+        assert!(policy.check_endpoint("http://169.254.169.254").is_ok());
     }
 
     // --- AuthConfig::has_admin_role (issue #3 regression tests) ---
