@@ -1,4 +1,5 @@
 use arrow_schema::DataType;
+use base64::Engine;
 
 pub fn arrow_to_trino_type(dt: &DataType) -> String {
     match dt {
@@ -7,7 +8,9 @@ pub fn arrow_to_trino_type(dt: &DataType) -> String {
         DataType::Int8 | DataType::UInt8 => "tinyint".to_string(),
         DataType::Int16 | DataType::UInt16 => "smallint".to_string(),
         DataType::Int32 => "integer".to_string(),
-        DataType::UInt32 | DataType::Int64 | DataType::UInt64 => "bigint".to_string(),
+        DataType::UInt32 | DataType::Int64 => "bigint".to_string(),
+        // u64 exceeds i64::MAX; decimal(20,0) covers the full unsigned range.
+        DataType::UInt64 => "decimal(20,0)".to_string(),
         DataType::Float16 | DataType::Float32 => "real".to_string(),
         DataType::Float64 => "double".to_string(),
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "varchar".to_string(),
@@ -88,13 +91,9 @@ pub fn arrow_value_to_json(
             serde_json::json!(arr.value(row))
         }
         DataType::UInt64 => {
+            // Mapped to decimal(20,0); Trino renders decimals as JSON strings.
             let arr = array.as_any().downcast_ref::<UInt64Array>().unwrap();
-            let v = arr.value(row);
-            if v > i64::MAX as u64 {
-                serde_json::json!(v.to_string())  // Serialize as string to avoid precision loss
-            } else {
-                serde_json::json!(v)
-            }
+            serde_json::Value::String(arr.value(row).to_string())
         }
         DataType::Float32 => {
             let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
@@ -183,10 +182,28 @@ pub fn arrow_value_to_json(
                 arrow::util::display::array_value_to_string(array, row).unwrap_or_default(),
             )
         }
-        DataType::Binary | DataType::LargeBinary | DataType::BinaryView
-        | DataType::FixedSizeBinary(_) => {
+        DataType::Binary => {
+            let arr = array.as_any().downcast_ref::<BinaryArray>().unwrap();
             serde_json::Value::String(
-                arrow::util::display::array_value_to_string(array, row).unwrap_or_default(),
+                base64::engine::general_purpose::STANDARD.encode(arr.value(row)),
+            )
+        }
+        DataType::LargeBinary => {
+            let arr = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+            serde_json::Value::String(
+                base64::engine::general_purpose::STANDARD.encode(arr.value(row)),
+            )
+        }
+        DataType::BinaryView => {
+            let arr = array.as_any().downcast_ref::<BinaryViewArray>().unwrap();
+            serde_json::Value::String(
+                base64::engine::general_purpose::STANDARD.encode(arr.value(row)),
+            )
+        }
+        DataType::FixedSizeBinary(_) => {
+            let arr = array.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
+            serde_json::Value::String(
+                base64::engine::general_purpose::STANDARD.encode(arr.value(row)),
             )
         }
         _ => {
@@ -270,6 +287,33 @@ mod tests {
         let arr = arrow_array::PrimitiveArray::<Time64MicrosecondType>::from(vec![micros]);
         let val = arrow_value_to_json(&arr, 0);
         assert!(val.as_str().unwrap().starts_with("10:30:00"));
+    }
+
+    #[test]
+    fn test_uint64_maps_to_decimal_20_0() {
+        assert_eq!(arrow_to_trino_type(&DataType::UInt64), "decimal(20,0)");
+    }
+
+    #[test]
+    fn test_uint64_value_rendered_as_decimal_string() {
+        let arr = arrow_array::UInt64Array::from(vec![u64::MAX]);
+        let val = arrow_value_to_json(&arr, 0);
+        assert_eq!(val, serde_json::Value::String(u64::MAX.to_string()));
+    }
+
+    #[test]
+    fn test_binary_rendered_as_base64() {
+        let arr = arrow_array::BinaryArray::from_iter_values([b"Hello".as_slice()]);
+        let val = arrow_value_to_json(&arr, 0);
+        assert_eq!(val, serde_json::Value::String("SGVsbG8=".to_string()));
+    }
+
+    #[test]
+    fn test_fixed_size_binary_rendered_as_base64() {
+        let vec_data: Vec<&[u8]> = vec![&[0u8, 1, 2, 3]];
+        let arr = arrow_array::FixedSizeBinaryArray::try_from_iter(vec_data.into_iter()).unwrap();
+        let val = arrow_value_to_json(&arr, 0);
+        assert_eq!(val, serde_json::Value::String("AAECAw==".to_string()));
     }
 
     #[test]
