@@ -1398,8 +1398,10 @@ impl FlightSqlService for SqeFlightSqlService {
     async fn do_action_cancel_query(
         &self,
         query: ActionCancelQueryRequest,
-        _request: Request<Action>,
+        request: Request<Action>,
     ) -> Result<ActionCancelQueryResult, Status> {
+        let session = self.get_session_from_request(&request).await?;
+
         // ActionCancelQueryRequest.info contains the serialized FlightInfo
         // from get_flight_info_statement. Decode it to extract the query
         // handle from the first endpoint ticket.
@@ -1415,7 +1417,6 @@ impl FlightSqlService for SqeFlightSqlService {
             .first()
             .and_then(|ep| ep.ticket.as_ref())
             .map(|t| {
-                // Try to decode as our FetchResults protobuf to get the handle
                 if let Ok(fetch) = <FetchResults as Message>::decode(&*t.ticket) {
                     fetch.handle
                 } else {
@@ -1430,9 +1431,32 @@ impl FlightSqlService for SqeFlightSqlService {
 
         // QueryTracker uses Uuid keys. Try to parse the handle as a UUID;
         // if it's a SQL string (legacy ticket format) we cannot map it to a
-        // tracked query yet — full query-ID propagation via tickets is planned.
+        // tracked query yet.
         let cancelled = if let Ok(uuid) = uuid::Uuid::parse_str(&query_id) {
-            self.query_tracker.cancel(&uuid)
+            let is_admin = self.config.auth.has_admin_role(&session.user.roles);
+            match self.query_tracker.owner_of(&uuid) {
+                Some(owner) if owner == session.user.username || is_admin => {
+                    self.query_tracker.cancel(&uuid)
+                }
+                Some(owner) => {
+                    warn!(
+                        query_id = %query_id,
+                        caller = %session.user.username,
+                        owner = %owner,
+                        "CancelQuery denied: caller does not own query"
+                    );
+                    return Err(Status::permission_denied(
+                        "Cancel denied: caller does not own this query",
+                    ));
+                }
+                None => {
+                    debug!(
+                        query_id = %query_id,
+                        "CancelQuery: query not found in tracker (already completed or unknown)"
+                    );
+                    false
+                }
+            }
         } else {
             debug!(
                 query_id = %query_id,
@@ -1442,11 +1466,10 @@ impl FlightSqlService for SqeFlightSqlService {
         };
 
         if cancelled {
-            info!(query_id = %query_id, "Query cancelled via Flight CancelQuery action");
-        } else {
-            debug!(
+            info!(
                 query_id = %query_id,
-                "CancelQuery: query not found in tracker (already completed or unknown)"
+                user = %session.user.username,
+                "Query cancelled via Flight CancelQuery action"
             );
         }
 
