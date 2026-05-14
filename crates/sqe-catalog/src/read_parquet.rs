@@ -583,11 +583,31 @@ mod tests {
         };
         let storage = StorageConfig {
             s3_allow_http: true,
+            tvf: sqe_core::config::TvfPolicy {
+                allowed_http_hosts: vec!["localhost".to_string()],
+                ..Default::default()
+            },
             ..StorageConfig::default()
         };
         // Should succeed (no network call at build time).
         let result = build_s3_store(&args, &storage);
         assert!(result.is_ok(), "build_s3_store failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_build_s3_store_rejects_imds_endpoint() {
+        // Issue #46: inline endpoint override must not be able to
+        // pivot the S3 client at IMDS.
+        let args = ReadParquetArgs {
+            path: "s3://my-bucket/innocent.parquet".to_string(),
+            endpoint: Some("http://169.254.169.254/latest/meta-data/".to_string()),
+            ..ReadParquetArgs::default()
+        };
+        let storage = StorageConfig::default();
+        let result = build_s3_store(&args, &storage);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("169.254.169.254"));
     }
 
     #[test]
