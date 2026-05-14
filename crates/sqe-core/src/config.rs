@@ -220,7 +220,7 @@ impl Default for QueryHistoryConfig {
 fn default_history_max_entries() -> u64 { 10000 }
 fn default_history_ttl_secs() -> u64 { 1800 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct CoordinatorConfig {
     #[serde(default = "default_flight_port")]
     pub flight_sql_port: u16,
@@ -278,6 +278,33 @@ pub struct CoordinatorConfig {
     /// Supported values: `"zstd"` (default), `"lz4"`, `"none"`.
     #[serde(default = "default_shuffle_compression")]
     pub shuffle_compression: String,
+}
+
+impl std::fmt::Debug for CoordinatorConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoordinatorConfig")
+            .field("flight_sql_port", &self.flight_sql_port)
+            .field("trino_http_port", &self.trino_http_port)
+            .field("mode", &self.mode)
+            .field("worker_urls", &self.worker_urls)
+            .field("debug", &self.debug)
+            .field("tls", &self.tls)
+            .field(
+                "worker_secret",
+                &if self.worker_secret.is_empty() { "None" } else { "<set>" },
+            )
+            .field(
+                "allow_unauthenticated_workers",
+                &self.allow_unauthenticated_workers,
+            )
+            .field("memory_limit", &self.memory_limit)
+            .field("spill_to_disk", &self.spill_to_disk)
+            .field("spill_dir", &self.spill_dir)
+            .field("spill_compression", &self.spill_compression)
+            .field("flight_compression", &self.flight_compression)
+            .field("shuffle_compression", &self.shuffle_compression)
+            .finish()
+    }
 }
 
 /// IPC body compression codec for Arrow Flight transfers.
@@ -3477,5 +3504,37 @@ otlp_endpoint = ""
         let auth = auth_with_admin_roles(vec!["service_admin"]);
         let caller_roles = vec!["SERVICE_ADMIN".to_string()];
         assert!(!auth.has_admin_role(&caller_roles));
+    }
+
+    fn coord_with_secret(secret: &str) -> CoordinatorConfig {
+        let toml_src = format!(
+            r#"
+            mode = "single"
+            worker_secret = "{secret}"
+            "#
+        );
+        toml::from_str(&toml_src).expect("valid coordinator config")
+    }
+
+    #[test]
+    fn coordinator_debug_does_not_leak_worker_secret() {
+        let cfg = coord_with_secret("super-secret-cluster-root-AAA");
+        let dbg = format!("{:?}", cfg);
+        assert!(
+            !dbg.contains("super-secret-cluster-root-AAA"),
+            "worker_secret leaked to Debug output: {dbg}"
+        );
+        assert!(dbg.contains("<set>"), "presence sentinel missing: {dbg}");
+        assert!(dbg.contains("CoordinatorConfig"), "struct tag missing: {dbg}");
+    }
+
+    #[test]
+    fn coordinator_debug_distinguishes_unset_worker_secret() {
+        let cfg = coord_with_secret("");
+        let dbg = format!("{:?}", cfg);
+        assert!(
+            dbg.contains("worker_secret: \"None\""),
+            "expected unset sentinel: {dbg}"
+        );
     }
 }
