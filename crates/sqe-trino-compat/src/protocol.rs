@@ -21,7 +21,7 @@ pub struct NodeVersion {
     pub version: String,
 }
 
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrinoResponse {
     pub id: String,
@@ -35,6 +35,34 @@ pub struct TrinoResponse {
     pub stats: TrinoStats,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<TrinoError>,
+    /// `INSERT`, `UPDATE`, `DELETE`, etc. Read by dbt-trino to mark write
+    /// statements; absent for read queries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_type: Option<String>,
+    /// Row count for write statements. dbt-trino's `adapter.execute` reads
+    /// this to populate `rows_affected`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_count: Option<i64>,
+    /// Optional URI clients can call to abort the query partway through.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partial_cancel_uri: Option<String>,
+    /// Always emitted (Trino spec mandates an empty array when no warnings).
+    #[serde(default)]
+    pub warnings: Vec<TrinoWarning>,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrinoWarning {
+    pub warning_code: TrinoWarningCode,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrinoWarningCode {
+    pub code: i32,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -65,7 +93,12 @@ pub struct TrinoTypeArgument {
     pub value: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+/// Statistics emitted on every page of a Trino query response.
+///
+/// dbt-trino, the Trino UI, Datadog's Trino integration, and the JDBC
+/// driver's `QueryStatusInfo` read these. Missing fields render as 0
+/// or blank for the user.
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrinoStats {
     pub state: String,
@@ -73,7 +106,21 @@ pub struct TrinoStats {
     pub scheduled: bool,
     pub nodes: u32,
     pub total_splits: u32,
+    pub queued_splits: u32,
+    pub running_splits: u32,
     pub completed_splits: u32,
+    pub cpu_time_millis: u64,
+    pub wall_time_millis: u64,
+    pub queued_time_millis: u64,
+    pub elapsed_time_millis: u64,
+    pub processed_rows: u64,
+    pub processed_bytes: u64,
+    pub physical_input_bytes: u64,
+    pub peak_memory_bytes: u64,
+    pub spilled_bytes: u64,
+    /// `rootStage` is always present but `null` until distributed staging
+    /// is exposed via this layer.
+    pub root_stage: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -85,17 +132,56 @@ pub struct TrinoError {
     pub error_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query_id: Option<String>,
+    /// Java exception chain. The Trino CLI and JDBC `QueryError.deserialize`
+    /// read `failureInfo` to render stack traces and the original cause.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_info: Option<TrinoFailureInfo>,
+    /// Line and column for IDE highlighting on syntax errors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_location: Option<TrinoErrorLocation>,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrinoFailureInfo {
+    pub r#type: String,
+    pub message: String,
+    #[serde(default)]
+    pub suppressed: Vec<TrinoFailureInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<Box<TrinoFailureInfo>>,
+    /// Frames are formatted as `package.Class.method(File:line)`. Empty
+    /// when the source did not produce a stack.
+    #[serde(default)]
+    pub stack: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrinoErrorLocation {
+    pub line_number: i32,
+    pub column_number: i32,
 }
 
 impl TrinoError {
     pub fn from_sqe_error(e: &sqe_core::SqeError, query_id: Option<&str>) -> Self {
         let code = e.error_code();
+        let message = e.client_message();
+        let error_type = code.trino_error_type().to_string();
         Self {
-            message: e.client_message(),
+            message: message.clone(),
             error_code: code.trino_error_code(),
             error_name: code.name().to_string(),
-            error_type: code.trino_error_type().to_string(),
+            error_type: error_type.clone(),
             query_id: query_id.map(|s| s.to_string()),
+            failure_info: Some(TrinoFailureInfo {
+                r#type: format!("io.trino.spi.{error_type}"),
+                message,
+                suppressed: Vec::new(),
+                cause: None,
+                stack: Vec::new(),
+            }),
+            error_location: None,
         }
     }
 }
@@ -197,15 +283,48 @@ pub fn batches_to_trino(
     (columns, rows)
 }
 
+/// Metrics collected from one execution that feed into a `TrinoStats` row.
+///
+/// Populated best-effort from DataFusion / QueryHandler counters. Zero
+/// values are valid and render as `0` on the wire, which is correct for
+/// queries that never reach the data path (e.g. `USE` statements).
+#[derive(Debug, Clone, Default)]
+pub struct ExecutionMetrics {
+    pub elapsed_millis: u64,
+    pub queued_millis: u64,
+    pub cpu_time_millis: u64,
+    pub processed_rows: u64,
+    pub processed_bytes: u64,
+    pub physical_input_bytes: u64,
+    pub peak_memory_bytes: u64,
+    pub spilled_bytes: u64,
+}
+
 impl TrinoStats {
     pub fn finished() -> Self {
+        Self::finished_with_metrics(&ExecutionMetrics::default())
+    }
+
+    pub fn finished_with_metrics(m: &ExecutionMetrics) -> Self {
         Self {
             state: "FINISHED".to_string(),
             queued: false,
             scheduled: true,
             nodes: 1,
             total_splits: 1,
+            queued_splits: 0,
+            running_splits: 0,
             completed_splits: 1,
+            cpu_time_millis: m.cpu_time_millis,
+            wall_time_millis: m.elapsed_millis,
+            queued_time_millis: m.queued_millis,
+            elapsed_time_millis: m.elapsed_millis,
+            processed_rows: m.processed_rows,
+            processed_bytes: m.processed_bytes,
+            physical_input_bytes: m.physical_input_bytes,
+            peak_memory_bytes: m.peak_memory_bytes,
+            spilled_bytes: m.spilled_bytes,
+            root_stage: None,
         }
     }
 
@@ -216,19 +335,52 @@ impl TrinoStats {
             scheduled: true,
             nodes: 1,
             total_splits: 1,
+            queued_splits: 0,
+            running_splits: 0,
             completed_splits: 0,
+            cpu_time_millis: 0,
+            wall_time_millis: 0,
+            queued_time_millis: 0,
+            elapsed_time_millis: 0,
+            processed_rows: 0,
+            processed_bytes: 0,
+            physical_input_bytes: 0,
+            peak_memory_bytes: 0,
+            spilled_bytes: 0,
+            root_stage: None,
         }
     }
 
     /// Stats for an in-progress paginated result.
     pub fn running(completed_pages: usize, total_pages: usize) -> Self {
+        Self::running_with_metrics(completed_pages, total_pages, &ExecutionMetrics::default())
+    }
+
+    pub fn running_with_metrics(
+        completed_pages: usize,
+        total_pages: usize,
+        m: &ExecutionMetrics,
+    ) -> Self {
+        let remaining = total_pages.saturating_sub(completed_pages);
         Self {
             state: "RUNNING".to_string(),
             queued: false,
             scheduled: true,
             nodes: 1,
             total_splits: total_pages as u32,
+            queued_splits: 0,
+            running_splits: remaining.min(1) as u32,
             completed_splits: completed_pages as u32,
+            cpu_time_millis: m.cpu_time_millis,
+            wall_time_millis: m.elapsed_millis,
+            queued_time_millis: m.queued_millis,
+            elapsed_time_millis: m.elapsed_millis,
+            processed_rows: m.processed_rows,
+            processed_bytes: m.processed_bytes,
+            physical_input_bytes: m.physical_input_bytes,
+            peak_memory_bytes: m.peak_memory_bytes,
+            spilled_bytes: m.spilled_bytes,
+            root_stage: None,
         }
     }
 }
@@ -320,7 +472,6 @@ mod tests {
         let resp = TrinoResponse {
             id: "q-001".to_string(),
             info_uri: None,
-            next_uri: None,
             columns: Some(vec![TrinoColumn {
                 name: "x".to_string(),
                 r#type: "bigint".to_string(),
@@ -328,7 +479,7 @@ mod tests {
             }]),
             data: Some(vec![vec![serde_json::json!(1)]]),
             stats: TrinoStats::finished(),
-            error: None,
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&resp).unwrap();
@@ -337,6 +488,9 @@ mod tests {
         assert!(!json.contains("nextUri")); // Skipped because None
         assert!(json.contains("\"typeSignature\""), "typeSignature must be present, got: {json}");
         assert!(json.contains("\"rawType\":\"bigint\""), "rawType must be present, got: {json}");
+        assert!(json.contains("\"warnings\":[]"), "warnings array must always be present");
+        assert!(json.contains("\"cpuTimeMillis\""), "stats must include cpuTimeMillis");
+        assert!(json.contains("\"processedRows\""), "stats must include processedRows");
     }
 
     #[test]
@@ -344,13 +498,51 @@ mod tests {
         let resp = TrinoResponse {
             id: "q-001".to_string(),
             info_uri: None,
-            next_uri: None,
-            columns: None,
-            data: None,
             stats: TrinoStats::finished(),
-            error: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"infoUri\":null"), "infoUri must always be present, got: {json}");
+    }
+
+    #[test]
+    fn test_trino_response_includes_update_type_count_for_writes() {
+        let resp = TrinoResponse {
+            id: "q-002".to_string(),
+            info_uri: None,
+            stats: TrinoStats::finished(),
+            update_type: Some("INSERT".to_string()),
+            update_count: Some(42),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"updateType\":\"INSERT\""));
+        assert!(json.contains("\"updateCount\":42"));
+    }
+
+    #[test]
+    fn test_trino_error_includes_failure_info() {
+        let err = TrinoError {
+            message: "broken".to_string(),
+            error_code: 1,
+            error_name: "USER_ERROR".to_string(),
+            error_type: "USER_ERROR".to_string(),
+            query_id: None,
+            failure_info: Some(TrinoFailureInfo {
+                r#type: "io.trino.spi.USER_ERROR".to_string(),
+                message: "broken".to_string(),
+                suppressed: Vec::new(),
+                cause: None,
+                stack: Vec::new(),
+            }),
+            error_location: Some(TrinoErrorLocation {
+                line_number: 1,
+                column_number: 8,
+            }),
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        assert!(json.contains("\"failureInfo\""));
+        assert!(json.contains("\"errorLocation\""));
+        assert!(json.contains("\"lineNumber\":1"));
     }
 }
