@@ -1,5 +1,5 @@
 use base64::Engine;
-use serde::Deserialize;
+use sqe_trino_compat::TrinoResponse;
 use url::Url;
 
 use crate::client::{QueryResult, SqlClient};
@@ -8,33 +8,6 @@ pub struct HttpClient {
     base_url: String,
     auth_header: String,
     client: reqwest::Client,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TrinoResponse {
-    #[allow(dead_code)]
-    id: String,
-    #[serde(default)]
-    next_uri: Option<String>,
-    #[serde(default)]
-    columns: Option<Vec<TrinoColumn>>,
-    #[serde(default)]
-    data: Option<Vec<Vec<serde_json::Value>>>,
-    #[serde(default)]
-    error: Option<TrinoError>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TrinoColumn {
-    name: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TrinoError {
-    message: String,
 }
 
 impl HttpClient {

@@ -12,6 +12,7 @@ name = "sqe-bench"
 path = "src/main.rs"
 
 [dependencies]
+sqe-trino-compat = { path = "../sqe-trino-compat" }
 clap = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }
