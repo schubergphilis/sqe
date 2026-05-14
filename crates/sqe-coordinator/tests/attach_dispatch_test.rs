@@ -33,12 +33,16 @@ fn minimal_config() -> SqeConfig {
 }
 
 fn dummy_session() -> Session {
+    session_with_roles(vec!["service_admin".to_string()])
+}
+
+fn session_with_roles(roles: Vec<String>) -> Session {
     let now = chrono::Utc::now();
     Session {
         id: "test".to_string(),
         user: sqe_core::session::SessionUser {
             username: "tester".to_string(),
-            roles: vec![],
+            roles,
         },
         access_token: "tok".to_string(),
         refresh_token: None,
@@ -290,4 +294,41 @@ async fn drop_secret_in_use_by_attached_catalog_errors() {
     let msg = err.to_string();
     assert!(msg.contains("mytoken"), "error should name the secret: {msg}");
     assert!(msg.contains("blocked"), "error should name the catalog: {msg}");
+}
+
+// ---------------------------------------------------------------------------
+// Admin gate regression (issue #3)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_secret_rejected_without_admin_role() {
+    let handler = make_handler(SecretStore::new(), RuntimeCatalogRegistry::new());
+    let session = session_with_roles(vec!["analyst".to_string()]);
+
+    let err = handler
+        .execute(&session, "CREATE SECRET denied_tok (TYPE bearer, TOKEN 'tok')")
+        .await
+        .expect_err("non-admin must not create secrets");
+
+    let msg = err.to_string();
+    assert!(msg.contains("403"), "expected 403, got: {msg}");
+    assert!(msg.contains("admin"), "expected admin role mention: {msg}");
+}
+
+#[tokio::test]
+async fn drop_secret_rejected_without_admin_role() {
+    let handler = make_handler(SecretStore::new(), RuntimeCatalogRegistry::new());
+    let admin = dummy_session();
+    handler
+        .execute(&admin, "CREATE SECRET to_drop (TYPE bearer, TOKEN 'tok')")
+        .await
+        .expect("admin creates secret");
+
+    let non_admin = session_with_roles(vec![]);
+    let err = handler
+        .execute(&non_admin, "DROP SECRET to_drop")
+        .await
+        .expect_err("non-admin must not drop secrets");
+
+    assert!(err.to_string().contains("403"), "expected 403: {err}");
 }
