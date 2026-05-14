@@ -113,15 +113,49 @@ impl HttpClient {
             .transpose()?
             .unwrap_or(self.extra_headers);
 
+        // Detect token-clobber at the merge boundary. Issue #2.
+        //
+        // The merge in [`RestCatalogConfig::merge_with_config`] folds the
+        // server's `/v1/config` response into the user-supplied props.
+        // The `overrides` map wins over the user's props. If a server
+        // operator (or a misconfigured server) emits
+        //   "overrides": { "token": "" }
+        // the merge silently overwrites the caller's real bearer with
+        // the empty string. With `or_else` semantics on `cfg.token()`,
+        // `Some("")` short-circuits the fallback to the saved token —
+        // we would otherwise pick up the saved value.
+        //
+        // The downstream `authenticate` already refuses to send an
+        // empty bearer (loud error per the second guard in this file).
+        // Surface it here so the failure points at the merge boundary,
+        // not the request site, and includes operator-actionable text.
+        let saved_user_token = self.token.into_inner();
+        let user_had_token = saved_user_token
+            .as_deref()
+            .is_some_and(|t| !t.is_empty());
+        let cfg_token = cfg.token();
+        let server_clobbered_with_empty =
+            user_had_token && matches!(cfg_token.as_deref(), Some(""));
+        if server_clobbered_with_empty {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "REST catalog `/v1/config` response cleared the user-supplied \
+                 token (empty-string override). This is a server-side \
+                 misconfiguration; the client would otherwise quietly send \
+                 every outbound request without an Authorization header and \
+                 401 at the server. Remove or correct the `token` field in \
+                 the catalog's /v1/config overrides.",
+            ));
+        }
+
         // Preserve the original auth-required flag across updates.
-        // The merge in [`RestCatalogConfig::merge_with_config`] folds
-        // in the server's `/v1/config` response; if a server-side
-        // override silently clobbers the user-supplied token (e.g.
-        // overrides "token" -> "" or omits it entirely while the user
-        // had one), the live `cfg` would resolve to no auth. Without
-        // this flag we'd construct a client that quietly drops the
-        // bearer on every outbound request and 401s downstream.
-        let merged_token = cfg.token().or_else(|| self.token.into_inner());
+        // The merge folds in the server's `/v1/config` response; if a
+        // server-side override silently clobbers the user-supplied token
+        // (e.g. overrides "token" -> "" or omits it entirely while the
+        // user had one), the live `cfg` would resolve to no auth.
+        // Without this flag we'd construct a client that quietly drops
+        // the bearer on every outbound request and 401s downstream.
+        let merged_token = cfg_token.or(saved_user_token);
         let merged_credential = cfg.credential().or(self.credential);
         let merged_gcp = cfg.gcp_credential().or(self.gcp_credential);
         let auth_required = self.auth_required
@@ -650,5 +684,80 @@ mod tests {
         assert!(result.contains("application/json"));
         // [REDACTED] should NOT be present when redaction is disabled
         assert!(!result.contains("[REDACTED]"));
+    }
+
+    // ─── Issue #2 token-clobber guard ────────────────────────────────────
+    //
+    // update_with() is the merge point between user props and the server's
+    // /v1/config response. If the server emits `overrides.token = ""`, the
+    // merge silently overwrites the user-supplied bearer with empty. The
+    // previous `or_else` semantics on `cfg.token()` would propagate that
+    // empty value to the live token mutex; downstream `authenticate()`
+    // refused the request, but the failure pointed at the request site
+    // rather than the actual misconfiguration (the merge boundary).
+
+    fn config_with_token(token: Option<&str>) -> RestCatalogConfig {
+        let mut props = HashMap::new();
+        if let Some(t) = token {
+            props.insert("token".to_string(), t.to_string());
+        }
+        RestCatalogConfig::builder()
+            .uri("http://localhost:8181".to_string())
+            .props(props)
+            .build()
+    }
+
+    #[test]
+    fn update_with_rejects_server_overriding_token_to_empty() {
+        // Set up: user supplied a real bearer.
+        let initial = HttpClient::new(&config_with_token(Some("user-real-bearer")))
+            .expect("client construction with real token must succeed");
+
+        // Server's /v1/config response carries an empty-string token
+        // override. The merged config therefore has Some("") for token.
+        let merged = config_with_token(Some(""));
+
+        let err = initial
+            .update_with(&merged)
+            .expect_err("update_with must reject empty-string token override");
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("token") && msg.contains("misconfiguration"),
+            "error must point at the merge boundary: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_with_preserves_user_token_when_server_omits_it() {
+        // Common case: server's /v1/config has no `token` override at all.
+        // The user-supplied token must survive the merge.
+        let initial = HttpClient::new(&config_with_token(Some("user-real-bearer")))
+            .expect("client construction must succeed");
+
+        let merged = config_with_token(None);
+        let updated = initial
+            .update_with(&merged)
+            .expect("merge with no server-side token override must succeed");
+
+        // Confirm the live token mutex retains the user's bearer.
+        let live = updated.token.lock().await;
+        assert_eq!(live.as_deref(), Some("user-real-bearer"));
+    }
+
+    #[tokio::test]
+    async fn update_with_lets_server_token_win_when_user_had_none() {
+        // Edge case: anonymous user, server starts handing out tokens.
+        // The merge picks up the server token.
+        let initial = HttpClient::new(&config_with_token(None))
+            .expect("anonymous client construction must succeed");
+
+        let merged = config_with_token(Some("server-issued-token"));
+        let updated = initial
+            .update_with(&merged)
+            .expect("server-supplied token on an anonymous client must merge");
+
+        let live = updated.token.lock().await;
+        assert_eq!(live.as_deref(), Some("server-issued-token"));
     }
 }
