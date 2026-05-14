@@ -15,9 +15,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::logical_expr::{col, lit, Expr, Filter, LogicalPlan, Projection};
+use datafusion::logical_expr::{col, lit, Cast, Expr, Filter, LogicalPlan, Projection};
+use datafusion::scalar::ScalarValue;
 use tracing::{debug, warn};
 
 use sqe_core::SessionUser;
@@ -133,7 +135,8 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                                 .filter(|f| !policy.restricted_columns.contains(f.name()))
                                 .map(|f| {
                                     if let Some(mask) = policy.column_masks.get(f.name()) {
-                                        apply_mask(f.name(), mask).alias(f.name())
+                                        apply_mask(f.name(), f.data_type(), mask)
+                                            .alias(f.name())
                                     } else {
                                         col(f.name())
                                     }
@@ -193,19 +196,49 @@ impl PolicyEnforcer for PolicyPlanRewriter {
 }
 
 /// Apply a mask type to a column, returning the masking expression.
-fn apply_mask(column_name: &str, mask: &MaskType) -> Expr {
+///
+/// `data_type` is the Arrow type of the original column. The returned
+/// expression has the same type so downstream operators (Filter, Join,
+/// GroupBy) see the column shape they expect. A Utf8 NULL substituted for
+/// a BIGINT column would either fail optimization or, worse, coerce both
+/// sides of a predicate to Utf8 and leak masked rows.
+fn apply_mask(column_name: &str, data_type: &DataType, mask: &MaskType) -> Expr {
     match mask {
-        MaskType::Nullify => lit(datafusion::scalar::ScalarValue::Utf8(None)),
-        MaskType::Redact(value) => lit(value.clone()),
+        MaskType::Nullify => match ScalarValue::try_from(data_type) {
+            Ok(scalar) => lit(scalar),
+            // Unsupported Arrow type for typed NULL: cast a Utf8 NULL into
+            // the target type so the optimizer still sees the right shape.
+            Err(_) => Expr::Cast(Cast::new(
+                Box::new(lit(ScalarValue::Utf8(None))),
+                data_type.clone(),
+            )),
+        },
+        MaskType::Redact(value) => {
+            if matches!(data_type, DataType::Utf8 | DataType::LargeUtf8) {
+                lit(value.clone())
+            } else {
+                Expr::Cast(Cast::new(
+                    Box::new(lit(value.clone())),
+                    data_type.clone(),
+                ))
+            }
+        }
         MaskType::Hash => {
-            // Uses the registered sha256 UDF. The UDF must be registered on the
-            // SessionContext before queries are executed.
-            datafusion::logical_expr::Expr::ScalarFunction(
+            // sha256 UDF returns Utf8; cast back to the column type so the
+            // projection schema matches. Non-string columns will fail the
+            // cast at runtime, which is the correct signal: hashing a
+            // BIGINT into itself is meaningless.
+            let hash = Expr::ScalarFunction(
                 datafusion::logical_expr::expr::ScalarFunction::new_udf(
                     Arc::new(crate::sha256_udf::sha256_udf()),
                     vec![col(column_name)],
                 ),
-            )
+            );
+            if matches!(data_type, DataType::Utf8 | DataType::LargeUtf8) {
+                hash
+            } else {
+                Expr::Cast(Cast::new(Box::new(hash), data_type.clone()))
+            }
         }
         MaskType::Custom(expr) => expr.clone(),
     }
@@ -216,21 +249,65 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_apply_mask_nullify() {
-        let expr = apply_mask("ssn", &MaskType::Nullify);
-        assert!(matches!(expr, Expr::Literal(..)));
+    fn test_apply_mask_nullify_utf8() {
+        let expr = apply_mask("ssn", &DataType::Utf8, &MaskType::Nullify);
+        match expr {
+            Expr::Literal(ScalarValue::Utf8(None), _) => {}
+            other => panic!("Expected Utf8 NULL literal, got: {other:?}"),
+        }
     }
 
     #[test]
-    fn test_apply_mask_redact() {
-        let expr = apply_mask("ssn", &MaskType::Redact("***".to_string()));
-        assert!(matches!(expr, Expr::Literal(..)));
+    fn test_apply_mask_nullify_int64_produces_typed_null() {
+        let expr = apply_mask("customer_id", &DataType::Int64, &MaskType::Nullify);
+        match expr {
+            Expr::Literal(ScalarValue::Int64(None), _) => {}
+            other => panic!("Expected Int64 NULL literal, got: {other:?}"),
+        }
     }
 
     #[test]
-    fn test_apply_mask_hash_produces_scalar_function() {
-        let expr = apply_mask("email", &MaskType::Hash);
-        // Hash mask must produce a ScalarFunction (the registered sha256 UDF)
+    fn test_apply_mask_nullify_decimal_produces_typed_null() {
+        let dt = DataType::Decimal128(18, 2);
+        let expr = apply_mask("salary", &dt, &MaskType::Nullify);
+        match expr {
+            Expr::Literal(ScalarValue::Decimal128(None, 18, 2), _) => {}
+            other => panic!("Expected Decimal128(None,18,2), got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_apply_mask_nullify_timestamp_produces_typed_null() {
+        let dt = DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None);
+        let expr = apply_mask("ts", &dt, &MaskType::Nullify);
+        match expr {
+            Expr::Literal(ScalarValue::TimestampMicrosecond(None, None), _) => {}
+            other => panic!("Expected TimestampMicrosecond NULL, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_apply_mask_redact_utf8_returns_literal() {
+        let expr = apply_mask("ssn", &DataType::Utf8, &MaskType::Redact("***".to_string()));
+        assert!(matches!(expr, Expr::Literal(ScalarValue::Utf8(Some(_)), _)));
+    }
+
+    #[test]
+    fn test_apply_mask_redact_int_wraps_in_cast() {
+        let expr = apply_mask(
+            "id",
+            &DataType::Int64,
+            &MaskType::Redact("0".to_string()),
+        );
+        assert!(
+            matches!(expr, Expr::Cast(_)),
+            "Expected Cast for Redact on Int64, got: {expr:?}"
+        );
+    }
+
+    #[test]
+    fn test_apply_mask_hash_utf8_produces_scalar_function() {
+        let expr = apply_mask("email", &DataType::Utf8, &MaskType::Hash);
         assert!(
             matches!(expr, Expr::ScalarFunction(_)),
             "Expected ScalarFunction for Hash mask, got: {expr:?}"
@@ -240,8 +317,11 @@ mod tests {
     #[test]
     fn test_apply_mask_custom_returns_provided_expr() {
         let custom_expr = datafusion::logical_expr::lit("REDACTED");
-        let result = apply_mask("secret", &MaskType::Custom(custom_expr.clone()));
-        // The returned expression must be equal to the custom expression we supplied.
+        let result = apply_mask(
+            "secret",
+            &DataType::Utf8,
+            &MaskType::Custom(custom_expr.clone()),
+        );
         assert_eq!(
             format!("{result:?}"),
             format!("{custom_expr:?}"),
