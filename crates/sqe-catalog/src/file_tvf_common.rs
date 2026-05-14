@@ -1083,9 +1083,28 @@ mod tests {
         };
         let storage = StorageConfig {
             s3_allow_http: true,
+            tvf: sqe_core::config::TvfPolicy {
+                allowed_http_hosts: vec!["localhost".to_string()],
+                ..Default::default()
+            },
             ..StorageConfig::default()
         };
         assert!(build_s3_store("read_csv", &args, &storage).is_ok());
+    }
+
+    #[test]
+    fn build_s3_store_rejects_imds_endpoint() {
+        // Issue #46: defense-in-depth against SSRF via inline endpoint.
+        let args = FileTvfArgs {
+            path: "s3://bucket/data".to_string(),
+            endpoint: Some(
+                "http://169.254.169.254/latest/meta-data/iam/".to_string(),
+            ),
+            ..FileTvfArgs::default()
+        };
+        let storage = StorageConfig::default();
+        let err = build_s3_store("read_csv", &args, &storage).unwrap_err();
+        assert!(err.to_string().contains("169.254.169.254"));
     }
 
     // -----------------------------------------------------------------------
