@@ -408,7 +408,7 @@ impl QueryHandler {
     ///
     /// Returned in stable sorted order so the error message reads the
     /// same across runs.
-    fn known_catalog_names(&self) -> Vec<String> {
+    fn known_catalog_names(&self) -> Result<Vec<String>, SqeError> {
         let mut names: Vec<String> = self
             .config
             .flattened_catalogs()
@@ -417,10 +417,10 @@ impl QueryHandler {
             .collect();
         names.push("system".to_string());
         names.push("datafusion".to_string());
-        names.extend(self.runtime_catalogs.list());
+        names.extend(self.runtime_catalogs.list().map_err(SqeError::Catalog)?);
         names.sort();
         names.dedup();
-        names
+        Ok(names)
     }
 
     /// Execute a SQL statement for the given session and return collected RecordBatches.
@@ -567,7 +567,7 @@ impl QueryHandler {
         if let Some(stmt) = kind.statement() {
             let qualifiers = sqe_sql::extract_catalog_qualifiers(stmt);
             if !qualifiers.is_empty() {
-                let known = self.known_catalog_names();
+                let known = self.known_catalog_names()?;
                 if let Some(unknown) =
                     qualifiers.iter().find(|q| !known.iter().any(|k| k == *q))
                 {
@@ -1521,7 +1521,7 @@ impl QueryHandler {
         if let Some(stmt) = kind.statement() {
             let qualifiers = sqe_sql::extract_catalog_qualifiers(stmt);
             if !qualifiers.is_empty() {
-                let known = self.known_catalog_names();
+                let known = self.known_catalog_names()?;
                 if let Some(unknown) =
                     qualifiers.iter().find(|q| !known.iter().any(|k| k == *q))
                 {
@@ -3571,14 +3571,17 @@ impl QueryHandler {
         &self,
         stmt: &sqe_sql::DropSecretStatement,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let in_use = self.runtime_catalogs.referenced_secrets(&stmt.name);
+        let in_use = self
+            .runtime_catalogs
+            .referenced_secrets(&stmt.name)
+            .map_err(SqeError::Catalog)?;
         self.secrets.drop_secret(&stmt.name, &in_use)?;
         info!(name = %stmt.name, "DROP SECRET complete");
         Ok(vec![])
     }
 
     fn handle_show_secrets(&self) -> sqe_core::Result<Vec<RecordBatch>> {
-        let listed = self.secrets.list();
+        let listed = self.secrets.list()?;
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("name", DataType::Utf8, false),

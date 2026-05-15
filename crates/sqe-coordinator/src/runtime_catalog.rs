@@ -158,34 +158,43 @@ impl RuntimeCatalogRegistry {
     }
 
     /// Names of all currently-attached catalogs, sorted.
-    pub fn list(&self) -> Vec<String> {
-        let r = self.inner.read().expect("registry poisoned");
+    pub fn list(&self) -> Result<Vec<String>, String> {
+        let r = self
+            .inner
+            .read()
+            .map_err(|_| "registry poisoned".to_string())?;
         let mut names: Vec<_> = r.keys().cloned().collect();
         names.sort();
-        names
+        Ok(names)
     }
 
     /// All attached `(name, provider)` pairs, sorted by name.
     ///
     /// Called by `create_session_context` to inject every attached
     /// catalog into a freshly built `SessionContext`.
-    pub fn providers(&self) -> ProviderList {
-        let r = self.inner.read().expect("registry poisoned");
+    pub fn providers(&self) -> Result<ProviderList, String> {
+        let r = self
+            .inner
+            .read()
+            .map_err(|_| "registry poisoned".to_string())?;
         let mut pairs: ProviderList = r
             .values()
             .map(|c| (c.name.clone(), Arc::clone(&c.provider)))
             .collect();
         pairs.sort_by(|a, b| a.0.cmp(&b.0));
-        pairs
+        Ok(pairs)
     }
 
     /// Names of attached catalogs that reference the given secret.
     /// Used by `DROP SECRET` to enforce the in-use guard.
-    pub fn referenced_secrets(&self, secret_name: &str) -> Vec<String> {
-        let r = self.inner.read().expect("registry poisoned");
-        r.values()
+    pub fn referenced_secrets(&self, secret_name: &str) -> Result<Vec<String>, String> {
+        let r = self
+            .inner
+            .read()
+            .map_err(|_| "registry poisoned".to_string())?;
+        Ok(r.values()
             .filter(|c| c.secret_ref.as_deref() == Some(secret_name))
             .map(|c| c.name.clone())
-            .collect()
+            .collect())
     }
 }
