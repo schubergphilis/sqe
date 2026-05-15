@@ -274,12 +274,16 @@ impl AuthProvider for OidcPasswordProvider {
         let roles =
             Self::extract_roles_from_claim(&token_response.access_token, &self.config.roles_claim);
 
+        let expires_at = chrono::Utc::now()
+            .checked_add_signed(chrono::Duration::seconds(token_response.expires_in as i64));
+
         Ok(Identity {
             user_id: user_id.clone(),
             display_name: user_id,
             roles,
             catalog_token: Some(sqe_core::SecretString::new(token_response.access_token)),
             refresh_token: token_response.refresh_token.map(sqe_core::SecretString::new),
+            expires_at,
         })
     }
 

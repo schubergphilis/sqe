@@ -1,6 +1,7 @@
 use std::fmt;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use sqe_core::SecretString;
 
 /// Raw credentials extracted from a Flight SQL handshake request.
@@ -52,6 +53,11 @@ pub struct Identity {
     /// Refresh token for obtaining new access tokens without re-authentication.
     /// Only populated by providers that support token refresh (e.g. OIDC password grant).
     pub refresh_token: Option<SecretString>,
+    /// Absolute expiry of the underlying access token (JWT `exp`, OIDC
+    /// `expires_in`). `None` for providers without a token lifetime concept
+    /// (anonymous, mTLS), in which case the `SessionManager` falls back to a
+    /// default. Issue #26.
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// Errors returned by `AuthProvider::authenticate`.
@@ -160,6 +166,7 @@ mod tests {
             roles: vec!["analyst".to_string()],
             catalog_token: Some(SecretString::new("ey-very-secret-jwt-value".to_string())),
             refresh_token: Some(SecretString::new("very-secret-refresh-token".to_string())),
+            expires_at: None,
         };
         let debug = format!("{:?}", identity);
 

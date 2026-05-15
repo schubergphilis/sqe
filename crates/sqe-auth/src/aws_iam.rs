@@ -324,6 +324,7 @@ impl AuthProvider for AwsIamProvider {
                 roles,
                 catalog_token: None,
                 refresh_token: None,
+                expires_at: None,
             })
         } else {
             // --- Config-only path ---
@@ -341,6 +342,7 @@ impl AuthProvider for AwsIamProvider {
                     roles: mapping.roles.clone(),
                     catalog_token: None,
                     refresh_token: None,
+                    expires_at: None,
                 })
             } else {
                 warn!(
@@ -896,6 +898,7 @@ mod tests {
             roles: vec![],
             catalog_token: None,
             refresh_token: None,
+            expires_at: None,
         };
 
         let result = provider.refresh_catalog_token(&identity).await;
