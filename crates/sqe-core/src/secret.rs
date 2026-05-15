@@ -392,7 +392,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let listed = store.list();
+        let listed = store.list().expect("list should succeed");
         assert_eq!(
             listed,
             vec![
