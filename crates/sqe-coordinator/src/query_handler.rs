@@ -1384,7 +1384,7 @@ impl QueryHandler {
 
         // --- Plan + open DataFusion stream -----------------------------------
         match self.open_stream(session, sql, &query_id, start).await {
-            Ok((schema, inner_stream, final_plan)) => {
+            Ok((schema, inner_stream, final_plan, tt_cleanup)) => {
                 let finalizer = crate::streaming::StreamFinalizer {
                     tracker: Arc::clone(&self.query_tracker),
                     metrics: self.metrics.clone(),
@@ -1405,7 +1405,8 @@ impl QueryHandler {
                     inner_stream,
                     finalizer,
                     permit,
-                );
+                )
+                .with_teardown(tt_cleanup);
                 let boxed: SendableRecordBatchStream = Box::pin(tracked);
                 Ok((schema, boxed))
             }
@@ -1446,11 +1447,13 @@ impl QueryHandler {
         SchemaRef,
         SendableRecordBatchStream,
         Arc<dyn ExecutionPlan>,
+        TimeTravelCleanup,
     )> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
 
         let sql = self.handle_incremental(sql, &ctx, &session_catalog).await?;
-        let sql = self.handle_time_travel(&sql, &ctx, &session_catalog).await?;
+        let (sql, tt_cleanup) =
+            self.handle_time_travel(&sql, &ctx, &session_catalog).await?;
         let sql = sql.as_str();
 
         let df = ctx
@@ -1513,7 +1516,7 @@ impl QueryHandler {
         let stream = execute_stream(Arc::clone(&final_plan), ctx.task_ctx())
             .map_err(|e| SqeError::Execution(format!("Query execution failed: {e}")))?;
 
-        Ok((schema, stream, final_plan))
+        Ok((schema, stream, final_plan, tt_cleanup))
     }
 
     /// Return the schema for a SQL statement without executing it.
@@ -1552,13 +1555,16 @@ impl QueryHandler {
             let sql_for_plan = self
                 .handle_incremental(sql, &ctx, &session_catalog)
                 .await?;
-            let sql_for_plan = self
+            let (sql_for_plan, _tt_cleanup) = self
                 .handle_time_travel(&sql_for_plan, &ctx, &session_catalog)
                 .await?;
             let df = ctx
                 .sql(&sql_for_plan)
                 .await
                 .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
+            // `_tt_cleanup` drops here, deregistering any pinned providers
+            // that schema-resolution required. Schema-only paths never read
+            // batches, so dropping right after `df.schema()` is fine.
             Ok(Arc::new(df.schema().as_arrow().clone()))
         } else {
             // Non-query statements: return empty schema. The actual execution
@@ -1598,8 +1604,12 @@ impl QueryHandler {
         let sql = self.handle_incremental(sql, &ctx, &session_catalog).await?;
         // Pre-process time travel: detect FOR SYSTEM_TIME AS OF, resolve
         // snapshot IDs, register snapshot-specific table providers, and
-        // strip the temporal clause.
-        let sql = self.handle_time_travel(&sql, &ctx, &session_catalog).await?;
+        // strip the temporal clause. `_tt_cleanup` deregisters the pinned
+        // providers when this function returns, so the bare table name
+        // resolves to HEAD on the next query in the same session (#44).
+        let (sql, _tt_cleanup) = self
+            .handle_time_travel(&sql, &ctx, &session_catalog)
+            .await?;
         // Pre-process Trino-compat AST patterns DataFusion does not natively
         // recognize. Today this only rewrites `CAST(v AS JSON)` to
         // `to_json(v)`; the rewriter is a no-op when the input does not
@@ -1910,11 +1920,33 @@ impl QueryHandler {
             "Distributing scan across workers"
         );
 
-        // 6. Get projected columns from the scan
+        // 6. Get projected columns + Iceberg field IDs from the scan. Field
+        // IDs (#43) let the worker project by the parquet PARQUET:field_id
+        // metadata key, so RENAME COLUMN / ADD COLUMN against post-evolution
+        // schema still resolves to the right parquet column in pre-evolution
+        // files. Names stay as a fallback for old workers and files without
+        // field IDs.
         let projected_cols: Vec<String> = iceberg_scan
             .projection()
             .map(|cols| cols.to_vec())
             .unwrap_or_default();
+        let iceberg_schema = iceberg_scan.table().metadata().current_schema().clone();
+        let projected_field_ids: Vec<i32> = if projected_cols.is_empty() {
+            Vec::new()
+        } else {
+            projected_cols
+                .iter()
+                .filter_map(|name| {
+                    iceberg_schema
+                        .as_struct()
+                        .fields()
+                        .iter()
+                        .find(|f| f.name == *name)
+                        .map(|f| f.id)
+                })
+                .collect()
+        };
+        let field_ids_complete = projected_field_ids.len() == projected_cols.len();
 
         // 7. Split (path, size) pairs into size-balanced bins using bin-packing.
         // target_size_bytes: read from config or fall back to 256 MiB.
@@ -1939,6 +1971,11 @@ impl QueryHandler {
                     data_file_paths,
                     file_sizes_bytes,
                     projected_columns: projected_cols.clone(),
+                    projected_field_ids: if field_ids_complete {
+                        projected_field_ids.clone()
+                    } else {
+                        Vec::new()
+                    },
                     s3_endpoint: storage.s3_endpoint.clone(),
                     s3_region: storage.s3_region.clone(),
                     s3_access_key: storage.s3_access_key.clone(),
@@ -2453,16 +2490,24 @@ impl QueryHandler {
     /// Also handles `FOR VERSION AS OF <snapshot_id_or_ref>` via a pre-scan
     /// because sqlparser-rs 0.53 does not model that variant.
     ///
-    /// When no time travel is found the original SQL is returned unchanged.
+    /// Returns the rewritten SQL plus a [`TimeTravelCleanup`] guard whose
+    /// Drop deregisters every alias that was registered for this query. The
+    /// caller must hold the guard across query execution so the pinned
+    /// provider doesn't leak into subsequent SQL in the same session (#44).
+    ///
+    /// When no time travel is found the original SQL is returned unchanged
+    /// and the guard is empty.
     async fn handle_time_travel(
         &self,
         sql: &str,
         ctx: &SessionContext,
         session_catalog: &Arc<SessionCatalog>,
-    ) -> sqe_core::Result<String> {
+    ) -> sqe_core::Result<(String, TimeTravelCleanup)> {
         use sqlparser::ast::SetExpr;
         use sqlparser::dialect::GenericDialect;
         use sqlparser::parser::Parser;
+
+        let mut cleanup_aliases: Vec<String> = Vec::new();
 
         // First, pre-scan and resolve FOR VERSION AS OF. This path hides the
         // clause from sqlparser and registers snapshot-pinned providers
@@ -2476,6 +2521,7 @@ impl QueryHandler {
         if version_resolved {
             for spec in &version_specs {
                 let alias = Self::apply_version_spec(spec, ctx, session_catalog).await?;
+                cleanup_aliases.push(alias.clone());
                 rewritten_for_version =
                     replace_table_reference(&rewritten_for_version, &spec.table, &alias);
             }
@@ -2491,11 +2537,12 @@ impl QueryHandler {
             .map_err(|e| SqeError::Execution(format!("Parse error in time travel detection: {e}")))?;
 
         if statements.is_empty() {
-            return Ok(sql_for_ast);
+            return Ok((sql_for_ast, TimeTravelCleanup::new(ctx, cleanup_aliases)));
         }
 
         let stmt = &mut statements[0];
         let mut found_time_travel = false;
+        let cleanup = &mut cleanup_aliases;
 
         if let sqlparser::ast::Statement::Query(ref mut query) = stmt {
             if let SetExpr::Select(ref mut select) = *query.body {
@@ -2504,6 +2551,7 @@ impl QueryHandler {
                         &mut twj.relation,
                         ctx,
                         session_catalog,
+                        cleanup,
                     ).await? {
                         found_time_travel = true;
                     }
@@ -2512,6 +2560,7 @@ impl QueryHandler {
                             &mut join.relation,
                             ctx,
                             session_catalog,
+                            cleanup,
                         ).await? {
                             found_time_travel = true;
                         }
@@ -2520,14 +2569,15 @@ impl QueryHandler {
             }
         }
 
+        let guard = TimeTravelCleanup::new(ctx, cleanup_aliases);
         if found_time_travel {
-            Ok(statements[0].to_string())
+            Ok((statements[0].to_string(), guard))
         } else if version_resolved {
-            Ok(sql_for_ast)
+            Ok((sql_for_ast, guard))
         } else {
             version_resolved = false;
             let _ = version_resolved; // silence unused warning if flow changes
-            Ok(sql.to_string())
+            Ok((sql.to_string(), guard))
         }
     }
 
@@ -2642,18 +2692,28 @@ impl QueryHandler {
     /// When a time travel clause is found:
     /// 1. Resolves the timestamp to a snapshot ID
     /// 2. Loads the Iceberg table and creates a snapshot-pinned provider
-    /// 3. Registers it in the DataFusion context
-    /// 4. Strips the `version` field so DataFusion doesn't see it
+    /// 3. Registers it under a unique alias `datafusion.public.__sqe_tt_<table>_<uuid>`
+    /// 4. Rewrites the `TableFactor` name to point at the alias and strips
+    ///    the `version` field so DataFusion doesn't see it
     ///
-    /// Returns `true` if a time travel clause was processed.
+    /// Returning the qualified alias under `datafusion.public` (#44):
+    /// - Earlier versions registered under the bare table name, leaking the
+    ///   pinned provider into the session for subsequent queries (silent
+    ///   stale reads).
+    /// - Qualified names also avoid collisions between two namespaces that
+    ///   happen to share a bare table name (`ns_a.t` vs `ns_b.t`).
+    ///
+    /// The alias is pushed into `cleanup` so the caller can deregister it
+    /// once query execution completes.
     async fn process_time_travel_table_factor(
         relation: &mut TableFactor,
         ctx: &SessionContext,
         session_catalog: &Arc<SessionCatalog>,
+        cleanup: &mut Vec<String>,
     ) -> sqe_core::Result<bool> {
         use sqlparser::ast::TableVersion;
 
-        if let TableFactor::Table { ref name, ref mut version, .. } = relation {
+        if let TableFactor::Table { ref mut name, ref mut version, .. } = relation {
             if let Some(TableVersion::ForSystemTimeAsOf(ref expr)) = version {
                 let table_name = name.to_string();
                 let timestamp_ms = resolve_timestamp_expr(expr)?;
@@ -2683,14 +2743,33 @@ impl QueryHandler {
                 );
 
                 // Build a snapshot-pinned SqeTableProvider and register it
+                // under a unique alias under datafusion.public.
                 let provider = sqe_catalog::table_provider::SqeTableProvider::try_new(iceberg_table)
                     .await?
                     .with_snapshot_id(snapshot_id);
 
-                ctx.register_table(bare_table, Arc::new(provider))
+                let alias = format!(
+                    "__sqe_tt_{}_{}",
+                    bare_table,
+                    uuid::Uuid::now_v7().simple()
+                );
+                let qualified = format!("datafusion.public.{alias}");
+                ctx.register_table(qualified.as_str(), Arc::new(provider))
                     .map_err(|e| SqeError::Execution(format!(
                         "Failed to register time-travel provider for {bare_table}: {e}"
                     )))?;
+                cleanup.push(qualified.clone());
+
+                // Rewrite the AST to point at the qualified alias so the
+                // planner resolves it under the writable `datafusion.public`
+                // schema. Splitting on `.` reconstructs the ObjectName as
+                // three Idents (catalog / schema / table).
+                *name = sqlparser::ast::ObjectName(
+                    qualified
+                        .split('.')
+                        .map(|part| sqlparser::ast::Ident::new(part.to_string()))
+                        .collect(),
+                );
 
                 // Strip the temporal clause so DataFusion doesn't reject it
                 *version = None;
@@ -3427,6 +3506,42 @@ impl QueryHandler {
         Ok(())
     }
 
+}
+
+/// RAII guard that deregisters time-travel pinned providers when the query
+/// completes (#44). The pinned provider must not survive the query that
+/// asked for it; otherwise later SQL in the same session that references
+/// the bare table name resolves to the pinned snapshot instead of HEAD,
+/// silently serving stale data.
+///
+/// Each entry is the fully-qualified `datafusion.public.<alias>` path used
+/// at registration, matching what `ctx.deregister_table` expects.
+pub struct TimeTravelCleanup {
+    ctx: SessionContext,
+    qualified_aliases: Vec<String>,
+}
+
+impl TimeTravelCleanup {
+    fn new(ctx: &SessionContext, qualified_aliases: Vec<String>) -> Self {
+        Self {
+            ctx: ctx.clone(),
+            qualified_aliases,
+        }
+    }
+}
+
+impl Drop for TimeTravelCleanup {
+    fn drop(&mut self) {
+        for name in &self.qualified_aliases {
+            if let Err(e) = self.ctx.deregister_table(name.as_str()) {
+                tracing::warn!(
+                    table = %name,
+                    error = %e,
+                    "time-travel pinned provider deregister failed"
+                );
+            }
+        }
+    }
 }
 
 /// Replace whole-token occurrences of `needle` (case insensitive) in `sql` with `replacement`.

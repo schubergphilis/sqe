@@ -227,6 +227,11 @@ pub struct TrackedRecordBatchStream {
     finalizer: Option<StreamFinalizer>,
     rows_so_far: usize,
     _permit: Option<OwnedSemaphorePermit>,
+    /// Opaque teardown handle whose Drop runs when the stream completes
+    /// (clean EOF, error, or client cancel). Used by time-travel pinned
+    /// providers (#44) to deregister the session-context alias once the
+    /// query finishes, so subsequent SQL in the same session sees HEAD.
+    _teardown: Option<Box<dyn std::any::Any + Send>>,
 }
 
 impl TrackedRecordBatchStream {
@@ -244,7 +249,17 @@ impl TrackedRecordBatchStream {
             finalizer: Some(finalizer),
             rows_so_far: 0,
             _permit: permit,
+            _teardown: None,
         }
+    }
+
+    /// Attach an opaque teardown handle. The handle's Drop runs when this
+    /// stream is dropped (after EOF, error, or cancel). The handle type is
+    /// erased so this module stays free of dependencies on individual
+    /// cleanup guards.
+    pub fn with_teardown<T: std::any::Any + Send + 'static>(mut self, t: T) -> Self {
+        self._teardown = Some(Box::new(t));
+        self
     }
 }
 

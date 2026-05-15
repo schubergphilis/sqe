@@ -336,6 +336,7 @@ fn test_scan_task_roundtrip() {
         ],
         file_sizes_bytes: vec![],
         projected_columns: vec!["id".to_string()],
+        projected_field_ids: vec![],
         s3_endpoint: "http://localhost:9000".to_string(),
         s3_region: "us-east-1".to_string(),
         s3_access_key: "key".to_string(),
