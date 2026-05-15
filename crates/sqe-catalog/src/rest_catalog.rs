@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use dashmap::DashMap;
 use iceberg::table::Table;
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent, TableRequirement, TableUpdate};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogBuilder};
@@ -14,6 +15,31 @@ use sqe_core::SqeError;
 use sqe_metrics::propagation::trace_context_http_headers;
 
 use crate::circuit_breaker::CircuitBreaker;
+
+/// Per-user circuit breakers keyed by token fingerprint.
+///
+/// A single global breaker blast-radiused one user's bad token (rapid
+/// retries on an expired bearer count as failures) into "no user can
+/// talk to Polaris until the recovery timeout". Keying the breaker by
+/// token fingerprint isolates each user's failure budget without
+/// changing the rest of the wiring.
+static USER_CIRCUIT_BREAKERS: std::sync::LazyLock<DashMap<String, Arc<CircuitBreaker>>> =
+    std::sync::LazyLock::new(DashMap::new);
+
+fn user_circuit_breaker(token_fingerprint: &str) -> Arc<CircuitBreaker> {
+    if let Some(existing) = USER_CIRCUIT_BREAKERS.get(token_fingerprint) {
+        return Arc::clone(existing.value());
+    }
+    let cb = Arc::new(CircuitBreaker::new(
+        format!("polaris-user-{token_fingerprint}"),
+        5,
+        std::time::Duration::from_secs(30),
+    ));
+    USER_CIRCUIT_BREAKERS
+        .entry(token_fingerprint.to_string())
+        .or_insert_with(|| Arc::clone(&cb))
+        .clone()
+}
 
 /// A cached table entry holding metadata, an optional ETag, and the time it was
 /// last validated against Polaris.
@@ -522,6 +548,7 @@ impl SessionCatalog {
             "Creating SessionCatalog over non-REST backend"
         );
 
+        let circuit_breaker = user_circuit_breaker(&token_fingerprint);
         Ok(Self {
             inner: CatalogHandle::Other(inner),
             catalog_url: String::new(),
@@ -530,11 +557,7 @@ impl SessionCatalog {
             token_fingerprint,
             storage_config: storage.clone(),
             http_client: reqwest::Client::new(),
-            circuit_breaker: Arc::new(CircuitBreaker::new(
-                "non-rest-catalog",
-                5,
-                std::time::Duration::from_secs(30),
-            )),
+            circuit_breaker,
             table_cache,
         })
     }
@@ -631,13 +654,7 @@ impl SessionCatalog {
         };
 
         let http_client = http_client.unwrap_or_default();
-        let circuit_breaker = circuit_breaker.unwrap_or_else(|| {
-            Arc::new(CircuitBreaker::new(
-                "polaris-rest",
-                5,
-                std::time::Duration::from_secs(30),
-            ))
-        });
+        let circuit_breaker = circuit_breaker.unwrap_or_else(|| user_circuit_breaker(&token_fingerprint));
 
         // Use the shared global cache when provided; fall back to a private
         // per-session cache (disabled — max_capacity 0) so that call sites that
