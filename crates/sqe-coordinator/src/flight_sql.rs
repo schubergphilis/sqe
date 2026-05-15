@@ -754,7 +754,7 @@ impl FlightSqlService for SqeFlightSqlService {
         let auth_start = std::time::Instant::now();
 
         let auth_result = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(self.config.coordinator.auth_handshake_timeout_secs),
             self.session_manager.authenticate_credentials(&credentials),
         )
         .await;

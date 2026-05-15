@@ -124,6 +124,11 @@ pub struct QueryHandler {
     /// rationale as `runtime_catalogs`: a default-constructed store is
     /// empty and acts as a no-op until SQL populates it.
     secrets: SecretStore,
+    /// Cross-query in-flight fragment counter per worker URL. Read by the
+    /// scheduler as initial load so concurrent queries don't both pick the
+    /// same idle worker; incremented on assignment, decremented on fragment
+    /// completion via [`ReservationGuard`].
+    worker_load: Arc<crate::worker_registry::WorkerLoadTracker>,
 }
 
 impl QueryHandler {
@@ -225,6 +230,7 @@ impl QueryHandler {
             session_manager: None,
             runtime_catalogs,
             secrets,
+            worker_load: Arc::new(crate::worker_registry::WorkerLoadTracker::new()),
         })
     }
 
@@ -1177,22 +1183,26 @@ impl QueryHandler {
             .map(|b| b.iter().map(|r| r.num_rows()).sum())
             .unwrap_or(0);
 
-        // Update query tracker with final state
         let execution_ms = duration.as_millis() as u64;
+        let tt_for_complete: Vec<String> = match captured_plan.as_ref() {
+            Some(sqe_lineage::PlanOrHint::Plan(p)) => {
+                sqe_lineage::extract::extract_table_names(p.as_ref())
+            }
+            _ => Vec::new(),
+        };
         if result.is_ok() {
             let pm = plan_metrics.lock().unwrap_or_else(|e| e.into_inner()).clone();
             self.query_tracker.complete(
                 &query_id,
                 rows,
                 execution_ms,
-                vec![],
+                tt_for_complete.clone(),
                 pm.bytes_scanned,
                 pm.rows_scanned,
                 pm.spill_bytes,
                 pm.peak_memory_bytes,
             );
 
-            // Store successful read query results in cache
             if let Some(ref cache) = self.query_cache {
                 if matches!(&kind, StatementKind::Query(_)) {
                     if let Ok(ref batches) = result {
@@ -1201,7 +1211,7 @@ impl QueryHandler {
                             sql,
                             query_id,
                             batches.clone(),
-                            vec![], // tables_touched — filled when we add plan extraction
+                            tt_for_complete.clone(),
                         );
                     }
                 }
@@ -1281,10 +1291,13 @@ impl QueryHandler {
             }
         }
 
-        // OpenLineage: emit COMPLETE on success or FAIL on error. The
-        // captured plan (Some when execute_query ran; None for DDL/DML branches
-        // that did not populate it) flows into the observer so the lineage
-        // extractor can build inputs/outputs/columnLineage facets.
+        let tables_touched: Vec<String> = match captured_plan.as_ref() {
+            Some(sqe_lineage::PlanOrHint::Plan(p)) => {
+                sqe_lineage::extract::extract_table_names(p.as_ref())
+            }
+            _ => Vec::new(),
+        };
+
         if ol_emit {
             if let Some(ref obs) = self.lineage {
                 let ol_ended_at = chrono::Utc::now();
@@ -1345,6 +1358,7 @@ impl QueryHandler {
                 rows_returned: rows,
                 status: status.to_string(),
                 client_ip: None,
+                tables_touched: tables_touched.clone(),
             });
         }
 
@@ -1554,9 +1568,8 @@ impl QueryHandler {
             session.user.roles.clone(),
         );
 
-        // --- Plan + open DataFusion stream -----------------------------------
         match self.open_stream(session, sql, &query_id, start).await {
-            Ok((schema, inner_stream, final_plan, tt_cleanup)) => {
+            Ok((schema, inner_stream, final_plan, tt_cleanup, tables_touched)) => {
                 let finalizer = crate::streaming::StreamFinalizer {
                     tracker: Arc::clone(&self.query_tracker),
                     metrics: self.metrics.clone(),
@@ -1571,6 +1584,7 @@ impl QueryHandler {
                     start,
                     slow_query_threshold_secs: self.config.query.slow_query_threshold_secs,
                     sql_length: sql.len(),
+                    tables_touched,
                 };
 
                 let tracked = crate::streaming::TrackedRecordBatchStream::with_permits_reservation_and_cancel_token(
@@ -1625,6 +1639,7 @@ impl QueryHandler {
         SendableRecordBatchStream,
         Arc<dyn ExecutionPlan>,
         TimeTravelCleanup,
+        Vec<String>,
     )> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
 
@@ -1640,6 +1655,7 @@ impl QueryHandler {
         let plan = df.logical_plan().clone();
         let enforced_plan = self.policy_enforcer.evaluate(&session.user, plan).await?;
         debug!("Policy-enforced plan (streaming): {:?}", enforced_plan);
+        let tables_touched = sqe_lineage::extract::extract_table_names(&enforced_plan);
 
         let enforced_df = ctx
             .execute_logical_plan(enforced_plan)
@@ -1693,7 +1709,7 @@ impl QueryHandler {
         let stream = execute_stream(Arc::clone(&final_plan), ctx.task_ctx())
             .map_err(|e| SqeError::Execution(format!("Query execution failed: {e}")))?;
 
-        Ok((schema, stream, final_plan, tt_cleanup))
+        Ok((schema, stream, final_plan, tt_cleanup, tables_touched))
     }
 
     /// Return the schema for a SQL statement without executing it.
@@ -2181,13 +2197,12 @@ impl QueryHandler {
             }
         }
 
-        // 9. Schedule tasks to workers using weighted scheduler
         let worker_infos: Vec<crate::scheduler::WorkerInfo> = healthy
             .iter()
             .map(|url| crate::scheduler::WorkerInfo {
                 url: url.clone(),
                 healthy: true,
-                active_fragments: 0, // First version: no active fragment tracking
+                active_fragments: self.worker_load.in_flight(url),
             })
             .collect();
 
@@ -2204,10 +2219,14 @@ impl QueryHandler {
             }
         };
 
-        // Build ordered worker URLs matching the scan_tasks order
         let worker_urls: Vec<String> = assignments.iter().map(|a| a.worker_url.clone()).collect();
 
-        // 10. Record fragments in query tracker
+        let reservations: Arc<dashmap::DashMap<String, crate::worker_registry::ReservationGuard>> =
+            Arc::new(dashmap::DashMap::new());
+        for (task, url) in scan_tasks.iter().zip(worker_urls.iter()) {
+            reservations.insert(task.fragment_id.clone(), self.worker_load.reserve(url));
+        }
+
         let fragment_infos: Vec<crate::query_tracker::FragmentInfo> = scan_tasks
             .iter()
             .zip(worker_urls.iter())
@@ -2222,12 +2241,13 @@ impl QueryHandler {
             .collect();
         self.query_tracker.set_fragments(query_id, fragment_infos);
 
-        // 11. Build fragment callback for progress tracking and straggler detection
         let tracker = self.query_tracker.clone();
         let qid = *query_id;
         let callback_metrics = self.metrics.clone();
+        let reservations_cb = reservations.clone();
         let callback: crate::distributed_scan::FragmentCallback =
             Arc::new(move |task_id, success, elapsed_ms, rows| {
+                let _ = reservations_cb.remove(task_id);
                 let state = if success {
                     FragmentState::Finished
                 } else {
@@ -2689,6 +2709,7 @@ impl QueryHandler {
         use sqlparser::parser::Parser;
 
         let mut cleanup_aliases: Vec<String> = Vec::new();
+        let prefetch_concurrency = self.config.storage.prefetch_concurrency;
 
         // First, pre-scan and resolve FOR VERSION AS OF. This path hides the
         // clause from sqlparser and registers snapshot-pinned providers
@@ -2701,7 +2722,9 @@ impl QueryHandler {
         let mut version_resolved = !version_specs.is_empty();
         if version_resolved {
             for spec in &version_specs {
-                let alias = Self::apply_version_spec(spec, ctx, session_catalog).await?;
+                let alias =
+                    Self::apply_version_spec(spec, ctx, session_catalog, prefetch_concurrency)
+                        .await?;
                 cleanup_aliases.push(alias.clone());
                 rewritten_for_version =
                     replace_table_reference(&rewritten_for_version, &spec.table, &alias);
@@ -2733,6 +2756,7 @@ impl QueryHandler {
                         ctx,
                         session_catalog,
                         cleanup,
+                        prefetch_concurrency,
                     ).await? {
                         found_time_travel = true;
                     }
@@ -2742,6 +2766,7 @@ impl QueryHandler {
                             ctx,
                             session_catalog,
                             cleanup,
+                            prefetch_concurrency,
                         ).await? {
                             found_time_travel = true;
                         }
@@ -2773,6 +2798,7 @@ impl QueryHandler {
         spec: &sqe_sql::TimeTravelSpec,
         ctx: &SessionContext,
         session_catalog: &Arc<SessionCatalog>,
+        prefetch_concurrency: usize,
     ) -> sqe_core::Result<String> {
         use iceberg::spec::SnapshotRetention;
         use sqe_sql::VersionRef;
@@ -2848,12 +2874,9 @@ impl QueryHandler {
 
         let provider = sqe_catalog::table_provider::SqeTableProvider::try_new(iceberg_table)
             .await?
-            .with_snapshot_id(snapshot_id);
+            .with_snapshot_id(snapshot_id)
+            .with_prefetch_concurrency(prefetch_concurrency);
 
-        // Register under a unique alias in `datafusion.public` (a
-        // MemoryCatalog schema that supports dynamic registration).
-        // The Iceberg schema provider that owns the original table name
-        // is read-only.
         let alias = format!(
             "__sqe_ver_{}_{}",
             bare_table,
@@ -2891,6 +2914,7 @@ impl QueryHandler {
         ctx: &SessionContext,
         session_catalog: &Arc<SessionCatalog>,
         cleanup: &mut Vec<String>,
+        prefetch_concurrency: usize,
     ) -> sqe_core::Result<bool> {
         use sqlparser::ast::TableVersion;
 
@@ -2927,7 +2951,8 @@ impl QueryHandler {
                 // under a unique alias under datafusion.public.
                 let provider = sqe_catalog::table_provider::SqeTableProvider::try_new(iceberg_table)
                     .await?
-                    .with_snapshot_id(snapshot_id);
+                    .with_snapshot_id(snapshot_id)
+                    .with_prefetch_concurrency(prefetch_concurrency);
 
                 let alias = format!(
                     "__sqe_tt_{}_{}",

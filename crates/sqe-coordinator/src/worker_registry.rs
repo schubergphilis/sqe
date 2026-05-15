@@ -1,11 +1,82 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::channel_pool::ChannelPool;
+
+/// Tracks in-flight fragment counts per worker URL across all concurrent
+/// queries. The scheduler consults this counter as the initial load so two
+/// queries planning at the same time do not both pick the same idle worker.
+///
+/// Increment via [`WorkerLoadTracker::reserve`] right after assignment;
+/// decrement via [`ReservationGuard::drop`] when the fragment completes
+/// (success, error, or cancel). The guard makes the decrement automatic
+/// and panic-safe.
+#[derive(Debug, Default, Clone)]
+pub struct WorkerLoadTracker {
+    counts: Arc<DashMap<String, AtomicU32>>,
+}
+
+impl WorkerLoadTracker {
+    pub fn new() -> Self {
+        Self {
+            counts: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Return the current in-flight fragment count for `url`.
+    pub fn in_flight(&self, url: &str) -> u32 {
+        self.counts
+            .get(url)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Snapshot `(url, count)` pairs without holding the map locked.
+    pub fn snapshot(&self) -> Vec<(String, u32)> {
+        self.counts
+            .iter()
+            .map(|kv| (kv.key().clone(), kv.value().load(Ordering::Relaxed)))
+            .collect()
+    }
+
+    /// Reserve a fragment slot on `url`. The returned guard decrements the
+    /// counter on drop.
+    pub fn reserve(&self, url: &str) -> ReservationGuard {
+        self.counts
+            .entry(url.to_string())
+            .or_insert_with(|| AtomicU32::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+        ReservationGuard {
+            tracker: self.counts.clone(),
+            url: url.to_string(),
+        }
+    }
+}
+
+/// RAII guard returned by [`WorkerLoadTracker::reserve`]. Decrements the
+/// in-flight count for the reserved worker URL when dropped.
+pub struct ReservationGuard {
+    tracker: Arc<DashMap<String, AtomicU32>>,
+    url: String,
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        if let Some(c) = self.tracker.get(&self.url) {
+            let prev = c.fetch_sub(1, Ordering::Relaxed);
+            if prev == 0 {
+                c.fetch_add(1, Ordering::Relaxed);
+                debug!(worker = %self.url, "reservation underflow guarded");
+            }
+        }
+    }
+}
 
 /// Tracks available workers and their health status.
 ///
@@ -17,6 +88,7 @@ pub struct WorkerRegistry {
     inner: Arc<RwLock<RegistryInner>>,
     channel_pool: Arc<ChannelPool>,
     max_workers: usize,
+    max_consecutive_failures: u32,
 }
 
 #[derive(Debug)]
@@ -32,7 +104,7 @@ struct WorkerState {
     last_healthy: Option<Instant>,
 }
 
-const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+const DEFAULT_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 const DEFAULT_MAX_WORKERS: usize = 1024;
 
 /// Reason a [`WorkerRegistry::register_heartbeat`] call was refused.
@@ -69,6 +141,20 @@ impl WorkerRegistry {
         channel_pool: Arc<ChannelPool>,
         max_workers: usize,
     ) -> Self {
+        Self::with_options_and_failures(
+            worker_urls,
+            channel_pool,
+            max_workers,
+            DEFAULT_MAX_CONSECUTIVE_FAILURES,
+        )
+    }
+
+    pub fn with_options_and_failures(
+        worker_urls: Vec<String>,
+        channel_pool: Arc<ChannelPool>,
+        max_workers: usize,
+        max_consecutive_failures: u32,
+    ) -> Self {
         let workers: HashMap<String, WorkerState> = worker_urls
             .into_iter()
             .map(|url| {
@@ -95,6 +181,7 @@ impl WorkerRegistry {
             inner: Arc::new(RwLock::new(RegistryInner { workers })),
             channel_pool,
             max_workers: effective_cap,
+            max_consecutive_failures,
         }
     }
 
@@ -184,21 +271,22 @@ impl WorkerRegistry {
                 );
             }
             state.healthy = false;
-            state.consecutive_failures = MAX_CONSECUTIVE_FAILURES;
+            state.consecutive_failures = self.max_consecutive_failures;
         }
     }
 
     pub async fn mark_failed(&self, url: &str) {
         let mut inner = self.inner.write().await;
+        let threshold = self.max_consecutive_failures;
         if let Some(state) = inner.workers.get_mut(url) {
             state.consecutive_failures += 1;
-            if state.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+            if state.consecutive_failures >= threshold {
                 if state.healthy {
                     warn!(
                         worker = url,
                         failures = state.consecutive_failures,
                         "Worker marked unhealthy after {} consecutive failures",
-                        MAX_CONSECUTIVE_FAILURES
+                        threshold
                     );
                 }
                 state.healthy = false;
@@ -208,7 +296,7 @@ impl WorkerRegistry {
                     failures = state.consecutive_failures,
                     "Worker health check failed ({}/{})",
                     state.consecutive_failures,
-                    MAX_CONSECUTIVE_FAILURES
+                    threshold
                 );
             }
         }
@@ -448,7 +536,7 @@ mod tests {
         registry.mark_healthy("http://worker1:50052").await;
 
         // Fail to the threshold (3 consecutive failures)
-        for _ in 0..MAX_CONSECUTIVE_FAILURES {
+        for _ in 0..DEFAULT_MAX_CONSECUTIVE_FAILURES {
             registry.mark_failed("http://worker1:50052").await;
         }
         assert!(
@@ -500,7 +588,7 @@ mod tests {
 
         // Mark some of them failed past the threshold
         for url in expected_healthy.iter().take(5) {
-            for _ in 0..MAX_CONSECUTIVE_FAILURES {
+            for _ in 0..DEFAULT_MAX_CONSECUTIVE_FAILURES {
                 registry.mark_failed(url).await;
             }
         }

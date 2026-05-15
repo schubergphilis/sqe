@@ -546,6 +546,7 @@ fn test_audit_logger_noop() {
         rows_returned: 1,
         status: "success".to_string(),
         client_ip: None,
+        tables_touched: Vec::new(),
     };
     logger.log(&entry); // Should not panic
 }
