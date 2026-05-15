@@ -1,6 +1,55 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+
+use thiserror::Error;
 use zeroize::Zeroize;
+
+/// Structured error type for [`SecretStore`] operations (issue #107).
+///
+/// The previous `Result<_, String>` shape flattened every failure into a
+/// freeform message, so callers that wanted to distinguish "already exists"
+/// from "in use by attached catalogs" had to substring-match. Worse, the
+/// internal `RwLock` poisoning case turned into the same opaque string as
+/// any other error, hiding a panic-recovery boundary that should never be
+/// silently swallowed.
+#[derive(Error, Debug)]
+pub enum SecretStoreError {
+    /// `CREATE SECRET` on a name that is already registered. Maps to a
+    /// `DuplicateTable`-style classification at the SQL layer so the
+    /// client receives the right gRPC code.
+    #[error("secret already exists: {0}")]
+    AlreadyExists(String),
+    /// `DROP SECRET` on a name that one or more attached catalogs still
+    /// reference. The carried tuple is `(secret_name, catalogs)` so the
+    /// rendered error message tells the user which secret was rejected and
+    /// which catalogs need to be detached first.
+    #[error("secret '{0}' is in use by catalogs: {1:?}")]
+    InUseBy(String, Vec<String>),
+    /// Lookup or drop on a name that was never registered.
+    #[error("secret not found: {0}")]
+    NotFound(String),
+    /// The backing `RwLock` was poisoned by a panic in another thread. This
+    /// is a separate variant rather than a flattened string so process-wide
+    /// recovery code can react to it explicitly.
+    #[error("secret store poisoned")]
+    Poisoned,
+}
+
+impl From<SecretStoreError> for crate::error::SqeError {
+    fn from(err: SecretStoreError) -> Self {
+        match err {
+            SecretStoreError::AlreadyExists(_) => {
+                // Routing through `Catalog` keeps the existing
+                // `error_code() == DuplicateTable` classifier working.
+                crate::error::SqeError::Catalog(err.to_string())
+            }
+            SecretStoreError::InUseBy(..) | SecretStoreError::NotFound(_) => {
+                crate::error::SqeError::Execution(err.to_string())
+            }
+            SecretStoreError::Poisoned => crate::error::SqeError::Internal(anyhow::anyhow!(err)),
+        }
+    }
+}
 
 /// Credential material, scoped to the running process.
 ///
@@ -118,13 +167,10 @@ impl SecretStore {
     }
 
     /// Create a new secret. Errors if the name already exists.
-    pub fn create(&self, name: &str, secret: Secret) -> Result<(), String> {
-        let mut w = self
-            .inner
-            .write()
-            .map_err(|_| "secret store poisoned".to_string())?;
+    pub fn create(&self, name: &str, secret: Secret) -> Result<(), SecretStoreError> {
+        let mut w = self.inner.write().map_err(|_| SecretStoreError::Poisoned)?;
         if w.contains_key(name) {
-            return Err(format!("secret '{name}' already exists"));
+            return Err(SecretStoreError::AlreadyExists(name.to_string()));
         }
         w.insert(name.to_string(), secret);
         Ok(())
@@ -132,32 +178,30 @@ impl SecretStore {
 
     /// Drop a secret. Errors if the secret does not exist or if any
     /// catalog in `in_use_by` references it.
-    pub fn drop_secret(&self, name: &str, in_use_by: &[String]) -> Result<(), String> {
+    pub fn drop_secret(
+        &self,
+        name: &str,
+        in_use_by: &[String],
+    ) -> Result<(), SecretStoreError> {
         if !in_use_by.is_empty() {
-            return Err(format!(
-                "secret '{name}' is referenced by attached catalogs: {}",
-                in_use_by.join(", ")
+            return Err(SecretStoreError::InUseBy(
+                name.to_string(),
+                in_use_by.to_vec(),
             ));
         }
-        let mut w = self
-            .inner
-            .write()
-            .map_err(|_| "secret store poisoned".to_string())?;
+        let mut w = self.inner.write().map_err(|_| SecretStoreError::Poisoned)?;
         w.remove(name)
-            .ok_or_else(|| format!("secret '{name}' not found"))?;
+            .ok_or_else(|| SecretStoreError::NotFound(name.to_string()))?;
         Ok(())
     }
 
     /// Fetch a secret by name. The returned value is a clone; the store
     /// retains its own copy. Errors if the name is not registered.
-    pub fn get(&self, name: &str) -> Result<Secret, String> {
-        let r = self
-            .inner
-            .read()
-            .map_err(|_| "secret store poisoned".to_string())?;
+    pub fn get(&self, name: &str) -> Result<Secret, SecretStoreError> {
+        let r = self.inner.read().map_err(|_| SecretStoreError::Poisoned)?;
         r.get(name)
             .cloned()
-            .ok_or_else(|| format!("secret '{name}' not found"))
+            .ok_or_else(|| SecretStoreError::NotFound(name.to_string()))
     }
 
     /// List all secrets as `(name, type_name)`. Never returns values.
@@ -256,8 +300,12 @@ mod tests {
         let err = store
             .create("dup", aws_full())
             .expect_err("second create should fail");
-        assert!(err.contains("dup"));
-        assert!(err.contains("already exists"));
+        match err {
+            SecretStoreError::AlreadyExists(ref name) => assert_eq!(name, "dup"),
+            other => panic!("expected AlreadyExists(\"dup\"), got: {other:?}"),
+        }
+        assert!(err.to_string().contains("dup"));
+        assert!(err.to_string().contains("already exists"));
     }
 
     #[test]
@@ -266,7 +314,10 @@ mod tests {
         store.create("ephemeral", aws_full()).unwrap();
         store.drop_secret("ephemeral", &[]).expect("drop succeeds");
         let err = store.get("ephemeral").expect_err("should be gone");
-        assert!(err.contains("not found"));
+        match err {
+            SecretStoreError::NotFound(ref name) => assert_eq!(name, "ephemeral"),
+            other => panic!("expected NotFound(\"ephemeral\"), got: {other:?}"),
+        }
     }
 
     #[test]
@@ -276,8 +327,13 @@ mod tests {
         let err = store
             .drop_secret("locked", &["mycat".to_string()])
             .expect_err("in-use drop should fail");
-        assert!(err.contains("locked"));
-        assert!(err.contains("mycat"));
+        match err {
+            SecretStoreError::InUseBy(ref name, ref cats) => {
+                assert_eq!(name, "locked");
+                assert_eq!(cats, &vec!["mycat".to_string()]);
+            }
+            other => panic!("expected InUseBy(\"locked\", [\"mycat\"]), got: {other:?}"),
+        }
         // Secret should still exist.
         store.get("locked").expect("still present");
     }
@@ -288,8 +344,31 @@ mod tests {
         let err = store
             .drop_secret("nope", &[])
             .expect_err("dropping missing should fail");
-        assert!(err.contains("nope"));
-        assert!(err.contains("not found"));
+        match err {
+            SecretStoreError::NotFound(ref name) => assert_eq!(name, "nope"),
+            other => panic!("expected NotFound(\"nope\"), got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_conversion_preserves_classifier_for_already_exists() {
+        // AlreadyExists must convert into a `SqeError::Catalog` whose
+        // string contains the right phrase so `error_code()` still classifies
+        // it as DuplicateTable (issue #12 alignment).
+        let err: crate::error::SqeError =
+            SecretStoreError::AlreadyExists("x".to_string()).into();
+        match err {
+            crate::error::SqeError::Catalog(ref m) => {
+                assert!(m.contains("already exists"), "got: {m}");
+            }
+            other => panic!("expected SqeError::Catalog, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_conversion_routes_poisoned_to_internal() {
+        let err: crate::error::SqeError = SecretStoreError::Poisoned.into();
+        assert!(matches!(err, crate::error::SqeError::Internal(_)));
     }
 
     #[test]

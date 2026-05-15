@@ -3344,9 +3344,7 @@ impl QueryHandler {
             },
         };
 
-        self.secrets
-            .create(&stmt.name, secret)
-            .map_err(SqeError::Execution)?;
+        self.secrets.create(&stmt.name, secret)?;
         info!(name = %stmt.name, kind = %stmt.kind.name(), "CREATE SECRET complete");
         Ok(vec![])
     }
@@ -3356,9 +3354,7 @@ impl QueryHandler {
         stmt: &sqe_sql::DropSecretStatement,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let in_use = self.runtime_catalogs.referenced_secrets(&stmt.name);
-        self.secrets
-            .drop_secret(&stmt.name, &in_use)
-            .map_err(SqeError::Execution)?;
+        self.secrets.drop_secret(&stmt.name, &in_use)?;
         info!(name = %stmt.name, "DROP SECRET complete");
         Ok(vec![])
     }

@@ -7,7 +7,7 @@ pub mod table_properties;
 
 pub use config::{AuthProviderConfig, DeviceAuthConfig, ExternalAuthConfig, FlightCompression, QueryCacheConfig, QueryConfig, QueryHistoryConfig, SortMode, SqeConfig, parse_memory_limit};
 pub use error::{Result, SqeError, SqeErrorCode};
-pub use secret::{Secret, SecretStore};
+pub use secret::{Secret, SecretStore, SecretStoreError};
 pub use secret_string::SecretString;
 pub use session::{Credentials, Session, SessionUser};
 pub use table_properties::{
