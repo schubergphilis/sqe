@@ -759,7 +759,7 @@ impl QueryHandler {
                     // SessionContexts hold the old name in their catalog
                     // provider's cached namespace listings.
                     self.catalog_ops.rename_table(session, stmt).await?;
-                    crate::session_context::invalidate_all_session_caches();
+                    crate::session_context::invalidate_all_session_caches().await;
                     Ok(vec![])
                 }
                 StatementKind::AlterSchema(stmt) => {
@@ -819,13 +819,13 @@ impl QueryHandler {
                     // Cross-user: a new namespace appears in the catalog
                     // listing, which other users' SessionContexts cache.
                     self.catalog_ops.create_schema(session, stmt).await?;
-                    crate::session_context::invalidate_all_session_caches();
+                    crate::session_context::invalidate_all_session_caches().await;
                     Ok(vec![])
                 }
                 StatementKind::DropSchema(stmt) => {
                     // Cross-user: the namespace disappears for everyone.
                     self.catalog_ops.drop_schema(session, stmt).await?;
-                    crate::session_context::invalidate_all_session_caches();
+                    crate::session_context::invalidate_all_session_caches().await;
                     Ok(vec![])
                 }
 
@@ -1092,7 +1092,7 @@ impl QueryHandler {
                 }
                 StatementKind::Detach(stmt) => {
                     self.require_admin(session, "DETACH")?;
-                    self.handle_detach(stmt)
+                    self.handle_detach(stmt).await
                 }
                 StatementKind::CreateSecret(stmt) => {
                     self.require_admin(session, "CREATE SECRET")?;
@@ -2281,7 +2281,7 @@ impl QueryHandler {
             schema,
         )
         .with_fragment_callback(callback)
-        .with_worker_secret(self.config.coordinator.worker_secret.clone());
+        .with_worker_secret(self.config.coordinator.worker_secret.expose().to_string());
 
         // Attach worker registry for health tracking / failover
         exec = exec.with_worker_registry(Arc::clone(registry));
@@ -3533,19 +3533,19 @@ impl QueryHandler {
             .attach(stmt, &self.secrets)
             .await
             .map_err(SqeError::Execution)?;
-        crate::session_context::invalidate_all_session_caches();
+        crate::session_context::invalidate_all_session_caches().await;
         info!(catalog = %stmt.name, kind = %stmt.kind.name(), "ATTACH complete");
         Ok(vec![])
     }
 
-    fn handle_detach(
+    async fn handle_detach(
         &self,
         stmt: &sqe_sql::DetachStatement,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         self.runtime_catalogs
             .detach(&stmt.name)
             .map_err(SqeError::Execution)?;
-        crate::session_context::invalidate_all_session_caches();
+        crate::session_context::invalidate_all_session_caches().await;
         info!(catalog = %stmt.name, "DETACH complete");
         Ok(vec![])
     }

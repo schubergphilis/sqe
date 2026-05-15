@@ -185,19 +185,28 @@ impl PolicyStore for OpaStore {
             return Ok(policy);
         }
 
-        // Parse row filters from string expressions
-        let row_filters: Vec<datafusion::logical_expr::Expr> = result
-            .row_filters
-            .iter()
-            .filter_map(|filter_str| {
-                // Parse SQL expression string into a DataFusion Expr
-                // For now, we use simple column comparison parsing
-                parse_filter_expr(filter_str).or_else(|| {
-                    warn!(filter = %filter_str, "Failed to parse OPA row filter expression");
-                    None
-                })
-            })
-            .collect();
+        // Parse row filters from string expressions.
+        // Fail closed: if any filter the policy returned cannot be parsed the resolve
+        // errors out, so the planner does not silently run with weaker policy than OPA
+        // intended. The supported shape is documented at the parse_filter_expr docstring.
+        let mut row_filters: Vec<datafusion::logical_expr::Expr> =
+            Vec::with_capacity(result.row_filters.len());
+        for filter_str in &result.row_filters {
+            match parse_filter_expr(filter_str) {
+                Some(expr) => row_filters.push(expr),
+                None => {
+                    warn!(
+                        filter = %filter_str,
+                        "Unparseable OPA row filter; rejecting policy (fail-closed)"
+                    );
+                    return Err(sqe_core::error::SqeError::Execution(format!(
+                        "OPA returned an unsupported row filter expression: '{}'. \
+                         Only single comparisons (col <op> literal) with =, !=, >, <, >=, <= are accepted.",
+                        filter_str
+                    )));
+                }
+            }
+        }
 
         // Parse column masks
         let column_masks: HashMap<String, MaskType> = result

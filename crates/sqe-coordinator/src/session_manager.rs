@@ -139,8 +139,15 @@ impl SessionManager {
     }
 
     /// Convert an `Identity` into a `Session`.
+    ///
+    /// Prefer the provider-supplied `expires_at` so the session evicts when the
+    /// underlying access token actually expires. Fall back to a 1-hour default
+    /// only when the provider has no lifetime concept (anonymous, mTLS).
+    /// Issue #26.
     fn identity_to_session(&self, identity: &Identity) -> Session {
-        let token_expiry = Utc::now() + chrono::Duration::hours(1);
+        let token_expiry = identity
+            .expires_at
+            .unwrap_or_else(|| Utc::now() + chrono::Duration::hours(1));
         Session::new(
             identity.user_id.clone(),
             identity.catalog_token.clone().unwrap_or_default(),
@@ -765,6 +772,7 @@ mod tests {
                     roles: vec!["analyst".to_string()],
                     catalog_token: Some(t.clone()),
                     refresh_token: None,
+                    expires_at: None,
                 }),
                 _ => Err(sqe_auth::AuthError::NotMyCredentials),
             }

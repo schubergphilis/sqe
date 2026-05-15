@@ -281,12 +281,18 @@ impl TokenExchangeProvider {
             "Token exchange authentication successful"
         );
 
+        let expires_at = claims
+            .get("exp")
+            .and_then(|v| v.as_i64())
+            .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0));
+
         Ok(Identity {
             user_id: user_id.clone(),
             display_name: user_id,
             roles,
             catalog_token: Some(sqe_core::SecretString::new(access_token.to_string())),
             refresh_token: Some(sqe_core::SecretString::new(subject_token.to_string())),
+            expires_at,
         })
     }
 

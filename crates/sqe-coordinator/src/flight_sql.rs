@@ -1942,7 +1942,11 @@ impl FlightSqlService for SqeFlightSqlService {
 
                 if let Some(ref registry) = self.worker_registry {
                     debug!(worker = %worker_url, "Received heartbeat from worker");
-                    registry.register_heartbeat(worker_url).await;
+                    if let Err(err) = registry.register_heartbeat(worker_url).await {
+                        return Err(Status::resource_exhausted(format!(
+                            "worker heartbeat rejected: {err}"
+                        )));
+                    }
                 } else {
                     debug!(
                         worker = %worker_url,

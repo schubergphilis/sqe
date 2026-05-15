@@ -127,6 +127,7 @@ mod tests {
                 roles: vec!["test-role".to_string()],
                 catalog_token: Some(sqe_core::SecretString::new("test-token".to_string())),
                 refresh_token: None,
+                expires_at: None,
             })
         }
     }
@@ -278,6 +279,7 @@ mod tests {
             roles: vec![],
             catalog_token: None,
             refresh_token: None,
+            expires_at: None,
         };
 
         let result = chain.refresh_catalog_token(&identity).await;
@@ -298,6 +300,7 @@ mod tests {
             roles: vec![],
             catalog_token: None,
             refresh_token: None,
+            expires_at: None,
         };
 
         let result = chain.refresh_catalog_token(&identity).await;
@@ -349,6 +352,7 @@ mod tests {
                     roles: vec!["user".to_string()],
                     catalog_token: Some(p.clone()),
                     refresh_token: None,
+                    expires_at: None,
                 }),
                 _ => Err(AuthError::NotMyCredentials),
             }
@@ -373,6 +377,7 @@ mod tests {
                     roles: vec!["api".to_string()],
                     catalog_token: Some(t.clone()),
                     refresh_token: None,
+                    expires_at: None,
                 }),
                 _ => Err(AuthError::NotMyCredentials),
             }

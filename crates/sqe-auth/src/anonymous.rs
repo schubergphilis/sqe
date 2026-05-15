@@ -57,6 +57,7 @@ impl AuthProvider for AnonymousProvider {
             roles: self.config.roles.clone(),
             catalog_token: None,
             refresh_token: None,
+            expires_at: None,
         })
     }
 
@@ -153,6 +154,7 @@ mod tests {
             roles: Vec::new(),
             catalog_token: None,
             refresh_token: None,
+            expires_at: None,
         };
 
         let result = provider.refresh_catalog_token(&identity).await;
