@@ -220,12 +220,14 @@ impl IcebergScanExec {
     /// Call from an async planning context (e.g. `TableProvider::scan`) before
     /// returning the scan node so DataFusion's `partition_statistics` query
     /// returns full per-column bounds rather than the row-count-only fallback.
+    #[must_use = "with_cached_statistics consumes self; bind the returned scan"]
     pub fn with_cached_statistics(mut self, stats: datafusion::common::Statistics) -> Self {
         self.cached_statistics = Some(stats);
         self
     }
 
     /// Set the snapshot ID for time travel queries.
+    #[must_use = "with_snapshot_id consumes self; bind the returned scan"]
     pub fn with_snapshot_id(mut self, snapshot_id: i64) -> Self {
         self.snapshot_id = Some(snapshot_id);
         self
@@ -239,6 +241,7 @@ impl IcebergScanExec {
     /// footer, and manifest-list requests.
     ///
     /// Pass `0` to disable the fast path for all files.
+    #[must_use = "with_small_file_threshold consumes self; bind the returned scan"]
     pub fn with_small_file_threshold(mut self, threshold_bytes: u64) -> Self {
         self.small_file_threshold_bytes = threshold_bytes;
         self
@@ -248,6 +251,7 @@ impl IcebergScanExec {
     ///
     /// A value of `0` is treated as `1` (sequential fallback) to avoid a
     /// zero-width `buffer_unordered` which would stall.
+    #[must_use = "with_manifest_concurrency consumes self; bind the returned scan"]
     pub fn with_manifest_concurrency(mut self, concurrency: usize) -> Self {
         self.manifest_concurrency = concurrency.max(1);
         self
@@ -256,6 +260,7 @@ impl IcebergScanExec {
     /// Set the concurrency for the direct-read small-file fast path.
     ///
     /// A value of `0` is treated as `1` (sequential fallback).
+    #[must_use = "with_direct_read_concurrency consumes self; bind the returned scan"]
     pub fn with_direct_read_concurrency(mut self, concurrency: usize) -> Self {
         self.direct_read_concurrency = concurrency.max(1);
         self
@@ -265,6 +270,7 @@ impl IcebergScanExec {
     /// When true, DataFusion may skip redundant sorts based on Iceberg metadata.
     /// WARNING: only enable when you know all data files are physically sorted
     /// (e.g., written by a sort-on-write engine). Incorrect for mixed-writer tables.
+    #[must_use = "with_trust_sort_order consumes self; bind the returned scan"]
     pub fn with_trust_sort_order(mut self, trust: bool) -> Self {
         if trust {
             // Rebuild equivalence properties with full sort order
@@ -289,6 +295,7 @@ impl IcebergScanExec {
     /// emits an independent `SendableRecordBatchStream`. The DataFusion planner
     /// typically passes `execution.target_partitions` here so the scan fan-out
     /// matches the configured CPU parallelism.
+    #[must_use = "with_target_partitions consumes self; bind the returned scan"]
     pub fn with_target_partitions(mut self, target_partitions: usize) -> Self {
         let n = target_partitions.max(1);
         self.target_partitions = n;

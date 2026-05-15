@@ -485,11 +485,6 @@ fn parse_suggest_bloom_filter_columns(
     })
 }
 
-// The `_` bindings below exist to silence "unused" lints if we later restrict
-// which sqlparser types we import. Keeping this hook avoids churn.
-#[allow(dead_code)]
-fn _sanity(_: &Function) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;

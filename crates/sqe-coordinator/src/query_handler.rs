@@ -21,7 +21,7 @@ use sqe_policy::{PolicyEnforcer, PolicyStore};
 use sqe_policy::grants::{
     AccessCheck, GrantBackend, GrantFilter, GrantStatement, Grantee, RevokeStatement,
 };
-use sqe_sql::{parse_and_classify, StatementKind};
+use sqe_sql::StatementKind;
 
 use crate::catalog_ops::CatalogOps;
 use crate::credential_refresh::CredentialRefreshTracker;
@@ -252,6 +252,7 @@ impl QueryHandler {
     ///
     /// Propagates the cache into the sub-handlers (`CatalogOps`, `WriteHandler`)
     /// so that DDL and write paths also share the same global cache.
+    #[must_use = "with_table_cache consumes self; bind the returned QueryHandler"]
     pub fn with_table_cache(mut self, cache: sqe_catalog::TableMetadataCache) -> Self {
         self.catalog_ops = self.catalog_ops.with_table_cache(cache.clone());
         self.write_handler = self.write_handler.with_table_cache(cache.clone());
@@ -543,25 +544,14 @@ impl QueryHandler {
         };
 
         let start = std::time::Instant::now();
-        // Pre-strip `FOR INCREMENTAL BETWEEN SNAPSHOT` before classification.
-        // sqlparser does not model the clause, so the classifier's
-        // `Parser::parse_sql` would reject it. The downstream
-        // `handle_incremental` call re-extracts the specs from the original
-        // SQL and registers the providers against the same session context.
-        let (classify_sql, _incremental_specs) = sqe_sql::extract_incremental_spec(sql)?;
-        // Also strip `FOR VERSION AS OF`. sqlparser-rs models
-        // `FOR SYSTEM_TIME AS OF` natively but not VERSION; the time-travel
-        // pre-parser handles VERSION later, but the classifier runs first
-        // and would otherwise reject the query.
-        let (classify_sql, _version_specs) =
-            sqe_sql::extract_time_travel_spec(&classify_sql)?;
-        // Rewrite Hive/Spark/Trino-style `PARTITIONED BY (...)` into
-        // sqlparser-friendly `PARTITION BY (...)`. sqlparser's native
-        // PARTITIONED BY expects column definitions; we want Iceberg
-        // transforms (year/month/day/hour/bucket/truncate/identity)
-        // which fit the BigQuery-style `PARTITION BY <expr>` shape.
-        let classify_sql = sqe_sql::normalize_partitioned_by(&classify_sql);
-        let kind = parse_and_classify(&classify_sql)?;
+        // Run the pre-parse pipeline: strip FOR INCREMENTAL / FOR VERSION AS OF
+        // (sqlparser does not model them) and rewrite Hive-style
+        // PARTITIONED BY into sqlparser-friendly PARTITION BY. The returned
+        // ClassifiableSql proves at the type level that the input is safe
+        // to hand to the classifier (issue #117).
+        let kind = sqe_sql::parse_and_classify_typed(
+            &sqe_sql::pre_parse_pipeline(&sqe_sql::UserSql::from(sql))?,
+        )?;
         let kind_name = kind.name().to_string();
 
         // Pre-flight: when a 3-part identifier names a catalog that the
@@ -1505,22 +1495,12 @@ impl QueryHandler {
         };
 
         // --- Classify ---------------------------------------------------------
-        // See execute() for why we pre-strip `FOR INCREMENTAL BETWEEN` before
-        // handing SQL to sqlparser-rs.
-        let (classify_sql, _incremental_specs) = sqe_sql::extract_incremental_spec(sql)?;
-        // Also strip `FOR VERSION AS OF`. sqlparser-rs models
-        // `FOR SYSTEM_TIME AS OF` natively but not VERSION; the time-travel
-        // pre-parser handles VERSION later, but the classifier runs first
-        // and would otherwise reject the query.
-        let (classify_sql, _version_specs) =
-            sqe_sql::extract_time_travel_spec(&classify_sql)?;
-        // Rewrite Hive/Spark/Trino-style `PARTITIONED BY (...)` into
-        // sqlparser-friendly `PARTITION BY (...)`. sqlparser's native
-        // PARTITIONED BY expects column definitions; we want Iceberg
-        // transforms (year/month/day/hour/bucket/truncate/identity)
-        // which fit the BigQuery-style `PARTITION BY <expr>` shape.
-        let classify_sql = sqe_sql::normalize_partitioned_by(&classify_sql);
-        let kind = parse_and_classify(&classify_sql)?;
+        // See execute() for the pipeline rationale. The typed wrapper proves
+        // at compile time that the classifier sees normalized SQL only
+        // (issue #117).
+        let kind = sqe_sql::parse_and_classify_typed(
+            &sqe_sql::pre_parse_pipeline(&sqe_sql::UserSql::from(sql))?,
+        )?;
         let kind_name = kind.name().to_string();
         if !matches!(kind, StatementKind::Query(_)) {
             return Err(SqeError::NotImplemented(
@@ -1723,21 +1703,11 @@ impl QueryHandler {
         session: &Session,
         sql: &str,
     ) -> sqe_core::Result<SchemaRef> {
-        // Pre-strip FOR INCREMENTAL so sqlparser can tokenise the statement.
-        let (classify_sql, _incremental_specs) = sqe_sql::extract_incremental_spec(sql)?;
-        // Also strip `FOR VERSION AS OF`. sqlparser-rs models
-        // `FOR SYSTEM_TIME AS OF` natively but not VERSION; the time-travel
-        // pre-parser handles VERSION later, but the classifier runs first
-        // and would otherwise reject the query.
-        let (classify_sql, _version_specs) =
-            sqe_sql::extract_time_travel_spec(&classify_sql)?;
-        // Rewrite Hive/Spark/Trino-style `PARTITIONED BY (...)` into
-        // sqlparser-friendly `PARTITION BY (...)`. sqlparser's native
-        // PARTITIONED BY expects column definitions; we want Iceberg
-        // transforms (year/month/day/hour/bucket/truncate/identity)
-        // which fit the BigQuery-style `PARTITION BY <expr>` shape.
-        let classify_sql = sqe_sql::normalize_partitioned_by(&classify_sql);
-        let kind = parse_and_classify(&classify_sql)?;
+        // Run the pre-parse pipeline before handing to the classifier;
+        // see `pipeline_types.rs` for the trust-boundary contract (issue #117).
+        let kind = sqe_sql::parse_and_classify_typed(
+            &sqe_sql::pre_parse_pipeline(&sqe_sql::UserSql::from(sql))?,
+        )?;
 
         if matches!(kind, StatementKind::Query(_)) {
             let (ctx, session_catalog) = self.create_session_context(session).await?;
@@ -4581,7 +4551,7 @@ mod tests {
 
     #[test]
     fn should_emit_select_respects_emit_selects_flag() {
-        let kind = parse_and_classify("SELECT 1").expect("parse SELECT");
+        let kind = sqe_sql::parse_and_classify("SELECT 1").expect("parse SELECT");
         assert!(matches!(kind, StatementKind::Query(_)));
         assert!(!should_emit(&kind, &ol_cfg(false)));
         assert!(should_emit(&kind, &ol_cfg(true)));
@@ -4592,7 +4562,7 @@ mod tests {
         // CALL system.rewrite_data_files is classified as Procedure, the
         // maintenance variant. Lineage events for snapshot rewrites add
         // noise without a meaningful input/output set.
-        let kind = parse_and_classify("CALL system.rewrite_data_files(table => 'ns.t')")
+        let kind = sqe_sql::parse_and_classify("CALL system.rewrite_data_files(table => 'ns.t')")
             .expect("parse CALL");
         assert!(matches!(kind, StatementKind::Procedure(_)));
         assert!(!should_emit(&kind, &ol_cfg(false)));
@@ -4601,7 +4571,7 @@ mod tests {
 
     #[test]
     fn should_emit_dml_always_emits_regardless_of_emit_selects() {
-        let kind = parse_and_classify("INSERT INTO t VALUES (1)").expect("parse INSERT");
+        let kind = sqe_sql::parse_and_classify("INSERT INTO t VALUES (1)").expect("parse INSERT");
         assert!(matches!(kind, StatementKind::Insert(_)));
         assert!(should_emit(&kind, &ol_cfg(false)));
         assert!(should_emit(&kind, &ol_cfg(true)));
@@ -4609,7 +4579,7 @@ mod tests {
 
     #[test]
     fn should_emit_ddl_always_emits() {
-        let kind = parse_and_classify("CREATE TABLE t (id INT)").expect("parse CREATE TABLE");
+        let kind = sqe_sql::parse_and_classify("CREATE TABLE t (id INT)").expect("parse CREATE TABLE");
         assert!(matches!(kind, StatementKind::CreateTable(_)));
         assert!(should_emit(&kind, &ol_cfg(false)));
     }

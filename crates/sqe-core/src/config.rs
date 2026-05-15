@@ -1353,11 +1353,43 @@ impl std::fmt::Debug for StorageConfig {
 /// backend = "chameleon"
 /// url = "http://backend:8080/api/platform/v1/access"
 /// ```
+/// Access control backend selected for GRANT/REVOKE/SHOW GRANTS dispatch.
+///
+/// Deserialized from TOML strings. Unknown values fail at config-load
+/// rather than silently disabling access control at the dispatch site.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AccessControlBackend {
+    /// No access control. GRANT/REVOKE statements are accepted by the
+    /// parser but rejected at execution. Default.
+    #[default]
+    None,
+    /// Chameleon platform API (`GROUP` / `USER` grantees).
+    Chameleon,
+    /// Apache Polaris 1.3 native (`PRINCIPAL` / `PRINCIPAL_ROLE` / `CATALOG_ROLE`).
+    Polaris,
+}
+
+impl std::str::FromStr for AccessControlBackend {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "none" | "" => Ok(Self::None),
+            "chameleon" => Ok(Self::Chameleon),
+            "polaris" => Ok(Self::Polaris),
+            other => Err(format!(
+                "unknown access_control.backend {other:?}; expected one of none, chameleon, polaris"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct AccessControlConfig {
-    /// Backend type: "chameleon", "polaris", or "none" (disabled).
-    #[serde(default = "default_access_control_backend")]
-    pub backend: String,
+    /// Backend type: `chameleon`, `polaris`, or `none` (disabled).
+    #[serde(default)]
+    pub backend: AccessControlBackend,
     /// Backend API URL.
     /// Chameleon: http://backend:port/api/platform/v1/access
     /// Polaris: http://polaris:8181/api/management/v1 (Polaris management API)
@@ -1379,7 +1411,7 @@ pub struct AccessControlConfig {
 impl Default for AccessControlConfig {
     fn default() -> Self {
         Self {
-            backend: "none".to_string(),
+            backend: AccessControlBackend::default(),
             url: String::new(),
             timeout_secs: 30,
             client_id: None,
@@ -1388,13 +1420,46 @@ impl Default for AccessControlConfig {
     }
 }
 
-fn default_access_control_backend() -> String { "none".to_string() }
 fn default_access_control_timeout() -> u64 { 30 }
+
+/// Policy engine backend used to compute row filters and column masks.
+///
+/// Deserialized from TOML strings. Unknown values fail at config-load.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PolicyEngine {
+    /// No policy enforcement: every plan passes through unmodified.
+    /// Default for the open-source distribution.
+    #[default]
+    Passthrough,
+    /// In-memory `PolicyStore` for tests and local dev.
+    InMemory,
+    /// Open Policy Agent over HTTP. Requires `[policy.opa]`.
+    Opa,
+    /// Cedar policy engine (experimental).
+    Cedar,
+}
+
+impl std::str::FromStr for PolicyEngine {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "passthrough" | "" => Ok(Self::Passthrough),
+            "in-memory" | "inmemory" | "in_memory" => Ok(Self::InMemory),
+            "opa" => Ok(Self::Opa),
+            "cedar" => Ok(Self::Cedar),
+            other => Err(format!(
+                "unknown policy.engine {other:?}; expected one of passthrough, in-memory, opa, cedar"
+            )),
+        }
+    }
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct PolicyConfig {
-    #[serde(default = "default_passthrough")]
-    pub engine: String,
+    #[serde(default)]
+    pub engine: PolicyEngine,
     /// Per-deployment secret keyed into the SHA-256 column mask UDF.
     ///
     /// When set, the `sha256(col)` mask runs as HMAC-SHA256 with this key,
@@ -1417,7 +1482,7 @@ pub struct PolicyConfig {
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
-            engine: "passthrough".to_string(),
+            engine: PolicyEngine::default(),
             mask_key: String::new(),
             opa: OpaConfig::default(),
         }
@@ -1821,7 +1886,6 @@ fn default_table_format_version() -> u8 { 2 }
 fn default_small_file_threshold_mb() -> u64 { 3 }
 fn default_parquet_compression() -> String { "zstd".to_string() }
 fn default_manifest_concurrency() -> usize { 64 }
-fn default_passthrough() -> String { "passthrough".to_string() }
 fn default_prometheus_port() -> u16 { 9090 }
 fn default_per_user_rpm() -> u32 { 60 }
 fn default_global_rpm() -> u32 { 1000 }
@@ -2042,6 +2106,9 @@ impl SqeConfig {
             );
         }
 
+        validate_urls(self, &mut errors);
+        validate_byte_sizes(self, &mut errors);
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -2194,8 +2261,12 @@ impl SqeConfig {
         env_override_str("SQE_STORAGE__GCS_SERVICE_ACCOUNT_KEY", &mut self.storage.gcs_service_account_key);
 
         // Policy
-        env_override_str("SQE_POLICY__ENGINE", &mut self.policy.engine);
+        env_override_parse("SQE_POLICY__ENGINE", &mut self.policy.engine);
         env_override_str("SQE_POLICY__MASK_KEY", &mut self.policy.mask_key);
+
+        // Access control
+        env_override_parse("SQE_ACCESS_CONTROL__BACKEND", &mut self.access_control.backend);
+        env_override_str("SQE_ACCESS_CONTROL__URL", &mut self.access_control.url);
 
         // Metrics
         env_override_u16("SQE_METRICS__PROMETHEUS_PORT", &mut self.metrics.prometheus_port);
@@ -2278,9 +2349,93 @@ impl SqeConfig {
     }
 }
 
+/// Validate every byte-size string in the config. Moves the parse-error
+/// surface for memory-limit / cache-size strings from query time to
+/// startup so `coordinator.memory_limit = "8X"` fails at config-load
+/// instead of two seconds into the first query (issue #116).
+fn validate_byte_sizes(config: &SqeConfig, errors: &mut Vec<String>) {
+    let mut check = |field: &str, value: &str| {
+        if value.is_empty() {
+            return;
+        }
+        if let Err(e) = parse_memory_limit(value) {
+            errors.push(format!("{field} = {value:?}: {e}"));
+        }
+    };
+
+    check("coordinator.memory_limit", &config.coordinator.memory_limit);
+    check("worker.memory_limit", &config.worker.memory_limit);
+    check("storage.coalesce_threshold", &config.storage.coalesce_threshold);
+    check("storage.footer_cache_size", &config.storage.footer_cache_size);
+    check("storage.prefetch_buffer", &config.storage.prefetch_buffer);
+}
+
+/// Validate every URL-shaped string in the config. Empty values are
+/// skipped (they're either optional or caught by required-field checks
+/// elsewhere). Each failure produces a precise field-name error so the
+/// operator does not have to chase a parse error two seconds into the
+/// first query (issue #108).
+fn validate_urls(config: &SqeConfig, errors: &mut Vec<String>) {
+    let mut check = |field: &str, value: &str| {
+        if value.is_empty() {
+            return;
+        }
+        if let Err(e) = url::Url::parse(value) {
+            errors.push(format!("{field} = {value:?} is not a valid URL: {e}"));
+        }
+    };
+
+    check("catalog.catalog_url", &config.catalog.catalog_url);
+    for (name, cat) in &config.catalogs {
+        let label = format!("catalogs.{name}.catalog_url");
+        check(&label, &cat.catalog_url);
+    }
+
+    check("worker.coordinator_url", &config.worker.coordinator_url);
+    for (i, url) in config.coordinator.worker_urls.iter().enumerate() {
+        let label = format!("coordinator.worker_urls[{i}]");
+        check(&label, url);
+    }
+
+    check("storage.s3_endpoint", &config.storage.s3_endpoint);
+    check("metrics.otlp_endpoint", &config.metrics.otlp_endpoint);
+    check("metrics.openlineage.http_endpoint", &config.metrics.openlineage.http_endpoint);
+
+    check("auth.keycloak_url", &config.auth.keycloak_url);
+    check("auth.token_endpoint", &config.auth.token_endpoint);
+
+    if let Some(ext) = &config.auth.external {
+        check("auth.external.issuer", &ext.issuer);
+        if let Some(v) = ext.authorization_endpoint.as_deref() {
+            check("auth.external.authorization_endpoint", v);
+        }
+        if let Some(v) = ext.token_endpoint.as_deref() {
+            check("auth.external.token_endpoint", v);
+        }
+        if let Some(v) = ext.device_authorization_endpoint.as_deref() {
+            check("auth.external.device_authorization_endpoint", v);
+        }
+    }
+
+    check("access_control.url", &config.access_control.url);
+}
+
 fn env_override_str(key: &str, target: &mut String) {
     if let Ok(val) = std::env::var(key) {
         *target = val;
+    }
+}
+
+fn env_override_parse<T>(key: &str, target: &mut T)
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    if let Ok(val) = std::env::var(key) {
+        match val.parse::<T>() {
+            Ok(parsed) => *target = parsed,
+            Err(e) => tracing::warn!("{key}={val:?} rejected: {e}; keeping previous value"),
+        }
     }
 }
 
@@ -2547,6 +2702,40 @@ mod tests {
         config.auth.keycloak_url = String::new();
         config.auth.token_endpoint = "https://token.example.com/token".to_string();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_malformed_catalog_url() {
+        let mut config = valid_config();
+        config.catalog.catalog_url = "not a url".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("catalog.catalog_url") && err.contains("not a valid URL"),
+            "Expected URL parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_malformed_memory_limit() {
+        let mut config = valid_config();
+        config.coordinator.memory_limit = "12XYZ".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("coordinator.memory_limit"),
+            "Expected memory_limit parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_malformed_worker_url() {
+        let mut config = valid_config();
+        config.coordinator.worker_urls = vec!["http://good.example".to_string(), "://broken".to_string()];
+        config.coordinator.worker_secret = SecretString::new("s".to_string());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("coordinator.worker_urls[1]") && err.contains("not a valid URL"),
+            "Expected URL parse error, got: {err}"
+        );
     }
 
     #[test]

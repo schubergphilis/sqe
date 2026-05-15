@@ -81,6 +81,7 @@ impl SqeSchemaProvider {
     }
 
     /// Set the small-file threshold (bytes) for the direct-read fast path.
+    #[must_use = "with_small_file_threshold consumes self; bind the returned provider"]
     pub fn with_small_file_threshold(mut self, threshold_bytes: u64) -> Self {
         self.small_file_threshold_bytes = threshold_bytes;
         self
@@ -88,6 +89,7 @@ impl SqeSchemaProvider {
 
     /// Set the per-scan concurrency used when walking manifests for
     /// column-statistics pruning.
+    #[must_use = "with_manifest_concurrency consumes self; bind the returned provider"]
     pub fn with_manifest_concurrency(mut self, concurrency: usize) -> Self {
         self.manifest_concurrency = concurrency.max(1);
         self
@@ -101,6 +103,7 @@ impl SqeSchemaProvider {
     }
 
     /// Attach Prometheus metrics to propagate to table providers.
+    #[must_use = "with_metrics consumes self; bind the returned provider"]
     pub fn with_metrics(mut self, metrics: Arc<sqe_metrics::MetricsRegistry>) -> Self {
         self.prom_metrics = Some(metrics);
         self

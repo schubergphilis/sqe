@@ -158,9 +158,7 @@ impl TableProvider for IncrementalTableProvider {
         //   - indices into the BASE schema, for the Parquet reader
         //   - flags telling us which meta columns to emit in the output
         let mut base_indices: Vec<usize> = Vec::new();
-        let mut wants_change_type = false;
-        let mut wants_change_ordinal = false;
-        let mut wants_commit_snapshot = false;
+        let mut meta = MetaCols::default();
         let base_cols = self.base_schema.fields().len();
         let requested: Vec<usize> = match projection {
             Some(p) => p.clone(),
@@ -177,15 +175,15 @@ impl TableProvider for IncrementalTableProvider {
             let name = self.augmented_schema.field(idx).name().as_str();
             match name {
                 CHANGE_TYPE_COLUMN => {
-                    wants_change_type = true;
+                    meta.change_type = true;
                     output_order.push(OutputCol::ChangeType);
                 }
                 CHANGE_ORDINAL_COLUMN => {
-                    wants_change_ordinal = true;
+                    meta.change_ordinal = true;
                     output_order.push(OutputCol::ChangeOrdinal);
                 }
                 COMMIT_SNAPSHOT_ID_COLUMN => {
-                    wants_commit_snapshot = true;
+                    meta.commit_snapshot = true;
                     output_order.push(OutputCol::CommitSnapshot);
                 }
                 other => {
@@ -202,9 +200,7 @@ impl TableProvider for IncrementalTableProvider {
             output_schema,
             base_indices,
             output_order,
-            wants_change_type,
-            wants_change_ordinal,
-            wants_commit_snapshot,
+            meta,
             self.file_io.clone(),
         );
         Ok(Arc::new(exec))
@@ -221,6 +217,29 @@ enum OutputCol {
     CommitSnapshot,
 }
 
+/// Which CDC meta columns the caller asked for. Replaces three
+/// correlated `bool` arguments where a caller could silently swap
+/// `wants_change_type` and `wants_change_ordinal` (same type, no
+/// warning) and emit values into the wrong column (issue #130).
+#[derive(Debug, Clone, Copy, Default)]
+struct MetaCols {
+    change_type: bool,
+    change_ordinal: bool,
+    commit_snapshot: bool,
+}
+
+impl MetaCols {
+    fn count(self) -> usize {
+        self.change_type as usize
+            + self.change_ordinal as usize
+            + self.commit_snapshot as usize
+    }
+
+    fn all(self) -> bool {
+        self.change_type && self.change_ordinal && self.commit_snapshot
+    }
+}
+
 /// Physical execution node for an incremental scan.
 ///
 /// Reads the listed data files one at a time using the table's `FileIO`,
@@ -233,9 +252,7 @@ struct IncrementalScanExec {
     output_schema: ArrowSchemaRef,
     base_indices: Vec<usize>,
     output_order: Vec<OutputCol>,
-    wants_change_type: bool,
-    wants_change_ordinal: bool,
-    wants_commit_snapshot: bool,
+    meta: MetaCols,
     file_io: Option<FileIO>,
     target_partitions: usize,
     properties: Arc<PlanProperties>,
@@ -243,16 +260,13 @@ struct IncrementalScanExec {
 }
 
 impl IncrementalScanExec {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         plan: Arc<IncrementalPlan>,
         base_schema: ArrowSchemaRef,
         output_schema: ArrowSchemaRef,
         base_indices: Vec<usize>,
         output_order: Vec<OutputCol>,
-        wants_change_type: bool,
-        wants_change_ordinal: bool,
-        wants_commit_snapshot: bool,
+        meta: MetaCols,
         file_io: Option<FileIO>,
     ) -> Self {
         let eq_props = EquivalenceProperties::new(output_schema.clone());
@@ -269,9 +283,7 @@ impl IncrementalScanExec {
             output_schema,
             base_indices,
             output_order,
-            wants_change_type,
-            wants_change_ordinal,
-            wants_commit_snapshot,
+            meta,
             file_io,
             target_partitions,
             properties,
@@ -356,9 +368,7 @@ impl ExecutionPlan for IncrementalScanExec {
         let base_schema = self.base_schema.clone();
         let base_indices = self.base_indices.clone();
         let output_order = self.output_order.clone();
-        let wants_change_type = self.wants_change_type;
-        let wants_change_ordinal = self.wants_change_ordinal;
-        let wants_commit_snapshot = self.wants_commit_snapshot;
+        let meta = self.meta;
         let file_io = self.file_io.clone();
         let plan = self.plan.clone();
 
@@ -403,9 +413,7 @@ impl ExecutionPlan for IncrementalScanExec {
                         file,
                         &output_schema_inner,
                         &output_order,
-                        wants_change_type,
-                        wants_change_ordinal,
-                        wants_commit_snapshot,
+                        meta,
                     )
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
                     all.push(out);
@@ -460,9 +468,7 @@ fn project_with_meta(
     file: &IncrementalFile,
     output_schema: &ArrowSchemaRef,
     output_order: &[OutputCol],
-    wants_change_type: bool,
-    wants_change_ordinal: bool,
-    wants_commit_snapshot: bool,
+    meta: MetaCols,
 ) -> Result<RecordBatch, ArrowError> {
     // Build meta columns for this batch by attaching to a zero-column base.
     let n = base_batch.num_rows();
@@ -473,16 +479,14 @@ fn project_with_meta(
     // column list by hand using `output_order`.
     let expects_canonical = {
         let base_cols = base_batch.num_columns();
-        let meta_cols =
-            (wants_change_type as usize) + (wants_change_ordinal as usize) + (wants_commit_snapshot as usize);
-        output_order.len() == base_cols + meta_cols
+        output_order.len() == base_cols + meta.count()
             && output_order
                 .iter()
                 .take(base_cols)
                 .enumerate()
                 .all(|(i, c)| matches!(c, OutputCol::Base(k) if *k == i))
     };
-    if expects_canonical && wants_change_type && wants_change_ordinal && wants_commit_snapshot {
+    if expects_canonical && meta.all() {
         return attach_meta_columns(base_batch, file);
     }
 

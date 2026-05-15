@@ -61,11 +61,13 @@ impl MaintenanceHandler {
         }
     }
 
+    #[must_use = "with_audit consumes self; bind the returned handler"]
     pub fn with_audit(mut self, audit: Arc<sqe_metrics::audit::AuditLogger>) -> Self {
         self.audit = Some(audit);
         self
     }
 
+    #[must_use = "with_table_cache consumes self; bind the returned handler"]
     pub fn with_table_cache(mut self, cache: TableMetadataCache) -> Self {
         self.table_cache = Some(cache);
         self
@@ -75,6 +77,7 @@ impl MaintenanceHandler {
     ///
     /// Required for `suggest_bloom_filter_columns`; without it the procedure
     /// returns an empty suggestion set (still a well-formed response).
+    #[must_use = "with_query_history consumes self; bind the returned handler"]
     pub fn with_query_history(mut self, f: QueryHistoryFn) -> Self {
         self.query_history = Some(f);
         self

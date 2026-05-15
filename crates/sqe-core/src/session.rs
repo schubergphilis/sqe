@@ -122,18 +122,21 @@ impl Session {
     }
 
     /// Returns a new session with the given default catalog.
+    #[must_use = "with_catalog consumes self; bind the returned Session"]
     pub fn with_catalog(mut self, catalog: Option<String>) -> Self {
         self.default_catalog = catalog;
         self
     }
 
     /// Returns a new session with the given default schema.
+    #[must_use = "with_schema consumes self; bind the returned Session"]
     pub fn with_schema(mut self, schema: Option<String>) -> Self {
         self.default_schema = schema;
         self
     }
 
     /// Returns a new session with the given source.
+    #[must_use = "with_source consumes self; bind the returned Session"]
     pub fn with_source(mut self, source: Option<String>) -> Self {
         self.source = source;
         self
@@ -145,9 +148,13 @@ impl Session {
         format!("{}-{}", self.user.username, &hash[..16])
     }
 
-    pub fn is_token_expiring(&self, buffer_secs: u64) -> bool {
-        let buffer = chrono::Duration::seconds(buffer_secs as i64);
-        Utc::now() + buffer >= self.token_expiry
+    /// Returns `true` if the access token will expire within `buffer`.
+    ///
+    /// Use `std::time::Duration::from_secs(n)` at the call site so the
+    /// unit can't be misread (issue #116).
+    pub fn is_token_expiring(&self, buffer: std::time::Duration) -> bool {
+        let buf = chrono::Duration::from_std(buffer).unwrap_or(chrono::Duration::zero());
+        Utc::now() + buf >= self.token_expiry
     }
 
     /// Update the last activity timestamp to the current time.
@@ -155,16 +162,16 @@ impl Session {
         self.last_activity = Utc::now();
     }
 
-    /// Returns `true` if the session has been idle for longer than `idle_timeout_secs`.
-    pub fn is_idle(&self, idle_timeout_secs: u64) -> bool {
-        let timeout = chrono::Duration::seconds(idle_timeout_secs as i64);
-        Utc::now() - self.last_activity > timeout
+    /// Returns `true` if the session has been idle for longer than `timeout`.
+    pub fn is_idle(&self, timeout: std::time::Duration) -> bool {
+        let tmo = chrono::Duration::from_std(timeout).unwrap_or(chrono::Duration::zero());
+        Utc::now() - self.last_activity > tmo
     }
 
     /// Returns `true` if the session has exceeded its absolute lifetime.
-    pub fn is_absolute_expired(&self, absolute_timeout_secs: u64) -> bool {
-        let timeout = chrono::Duration::seconds(absolute_timeout_secs as i64);
-        Utc::now() - self.created_at > timeout
+    pub fn is_absolute_expired(&self, timeout: std::time::Duration) -> bool {
+        let tmo = chrono::Duration::from_std(timeout).unwrap_or(chrono::Duration::zero());
+        Utc::now() - self.created_at > tmo
     }
 }
 
@@ -198,7 +205,7 @@ mod tests {
     fn test_is_idle_returns_false_immediately() {
         let session = make_session();
         // 15-minute idle timeout: a fresh session should not be idle
-        assert!(!session.is_idle(900));
+        assert!(!session.is_idle(std::time::Duration::from_secs(900)));
     }
 
     #[test]
@@ -207,14 +214,14 @@ mod tests {
         // Simulate last activity 20 minutes ago
         session.last_activity = Utc::now() - Duration::seconds(1200);
         // 15-minute (900s) idle timeout - session should be idle
-        assert!(session.is_idle(900));
+        assert!(session.is_idle(std::time::Duration::from_secs(900)));
     }
 
     #[test]
     fn test_is_absolute_expired_returns_false_immediately() {
         let session = make_session();
         // 8-hour absolute timeout: a fresh session should not be expired
-        assert!(!session.is_absolute_expired(28800));
+        assert!(!session.is_absolute_expired(std::time::Duration::from_secs(28800)));
     }
 
     #[test]
@@ -223,7 +230,7 @@ mod tests {
         // Simulate session created 9 hours ago
         session.created_at = Utc::now() - Duration::hours(9);
         // 8-hour (28800s) absolute timeout: session should be expired
-        assert!(session.is_absolute_expired(28800));
+        assert!(session.is_absolute_expired(std::time::Duration::from_secs(28800)));
     }
 
     #[test]
@@ -231,11 +238,11 @@ mod tests {
         let mut session = make_session();
         // Simulate last activity 20 minutes ago, idle
         session.last_activity = Utc::now() - Duration::seconds(1200);
-        assert!(session.is_idle(900));
+        assert!(session.is_idle(std::time::Duration::from_secs(900)));
 
         // Touch should reset last_activity to now
         session.touch();
-        assert!(!session.is_idle(900));
+        assert!(!session.is_idle(std::time::Duration::from_secs(900)));
     }
 
     #[test]
@@ -243,11 +250,11 @@ mod tests {
         let mut session = make_session();
         // Simulate session created 9 hours ago
         session.created_at = Utc::now() - Duration::hours(9);
-        assert!(session.is_absolute_expired(28800));
+        assert!(session.is_absolute_expired(std::time::Duration::from_secs(28800)));
 
         // Touch should not reset created_at
         session.touch();
-        assert!(session.is_absolute_expired(28800));
+        assert!(session.is_absolute_expired(std::time::Duration::from_secs(28800)));
     }
 
     #[test]
@@ -256,7 +263,7 @@ mod tests {
         // Simulate last activity 10 minutes ago
         session.last_activity = Utc::now() - Duration::seconds(600);
         // 15-minute (900s) idle timeout: session is still active
-        assert!(!session.is_idle(900));
+        assert!(!session.is_idle(std::time::Duration::from_secs(900)));
     }
 
     #[test]

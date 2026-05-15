@@ -523,18 +523,21 @@ impl WriteHandler {
         }
     }
 
+    #[must_use = "with_metrics consumes self; bind the returned handler"]
     pub fn with_metrics(mut self, metrics: Arc<sqe_metrics::MetricsRegistry>) -> Self {
         self.metrics = Some(metrics);
         self
     }
 
     /// Attach a global table metadata cache shared across all sessions.
+    #[must_use = "with_table_cache consumes self; bind the returned handler"]
     pub fn with_table_cache(mut self, cache: TableMetadataCache) -> Self {
         self.table_cache = Some(cache);
         self
     }
 
     /// Attach the policy enforcer used for write-path source SELECTs.
+    #[must_use = "with_policy_enforcer consumes self; bind the returned handler"]
     pub fn with_policy_enforcer(
         mut self,
         enforcer: Arc<dyn sqe_policy::PolicyEnforcer>,

@@ -31,6 +31,7 @@ impl TrinoBenchClient {
     }
 
     /// Set the default Trino catalog for queries.
+    #[must_use = "with_catalog consumes self; bind the returned client"]
     pub fn with_catalog(mut self, catalog: &str) -> Self {
         self.catalog = Some(catalog.to_string());
         self
