@@ -1353,11 +1353,43 @@ impl std::fmt::Debug for StorageConfig {
 /// backend = "chameleon"
 /// url = "http://backend:8080/api/platform/v1/access"
 /// ```
+/// Access control backend selected for GRANT/REVOKE/SHOW GRANTS dispatch.
+///
+/// Deserialized from TOML strings. Unknown values fail at config-load
+/// rather than silently disabling access control at the dispatch site.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AccessControlBackend {
+    /// No access control. GRANT/REVOKE statements are accepted by the
+    /// parser but rejected at execution. Default.
+    #[default]
+    None,
+    /// Chameleon platform API (`GROUP` / `USER` grantees).
+    Chameleon,
+    /// Apache Polaris 1.3 native (`PRINCIPAL` / `PRINCIPAL_ROLE` / `CATALOG_ROLE`).
+    Polaris,
+}
+
+impl std::str::FromStr for AccessControlBackend {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "none" | "" => Ok(Self::None),
+            "chameleon" => Ok(Self::Chameleon),
+            "polaris" => Ok(Self::Polaris),
+            other => Err(format!(
+                "unknown access_control.backend {other:?}; expected one of none, chameleon, polaris"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct AccessControlConfig {
-    /// Backend type: "chameleon", "polaris", or "none" (disabled).
-    #[serde(default = "default_access_control_backend")]
-    pub backend: String,
+    /// Backend type: `chameleon`, `polaris`, or `none` (disabled).
+    #[serde(default)]
+    pub backend: AccessControlBackend,
     /// Backend API URL.
     /// Chameleon: http://backend:port/api/platform/v1/access
     /// Polaris: http://polaris:8181/api/management/v1 (Polaris management API)
@@ -1379,7 +1411,7 @@ pub struct AccessControlConfig {
 impl Default for AccessControlConfig {
     fn default() -> Self {
         Self {
-            backend: "none".to_string(),
+            backend: AccessControlBackend::default(),
             url: String::new(),
             timeout_secs: 30,
             client_id: None,
@@ -1388,13 +1420,46 @@ impl Default for AccessControlConfig {
     }
 }
 
-fn default_access_control_backend() -> String { "none".to_string() }
 fn default_access_control_timeout() -> u64 { 30 }
+
+/// Policy engine backend used to compute row filters and column masks.
+///
+/// Deserialized from TOML strings. Unknown values fail at config-load.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PolicyEngine {
+    /// No policy enforcement: every plan passes through unmodified.
+    /// Default for the open-source distribution.
+    #[default]
+    Passthrough,
+    /// In-memory `PolicyStore` for tests and local dev.
+    InMemory,
+    /// Open Policy Agent over HTTP. Requires `[policy.opa]`.
+    Opa,
+    /// Cedar policy engine (experimental).
+    Cedar,
+}
+
+impl std::str::FromStr for PolicyEngine {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "passthrough" | "" => Ok(Self::Passthrough),
+            "in-memory" | "inmemory" | "in_memory" => Ok(Self::InMemory),
+            "opa" => Ok(Self::Opa),
+            "cedar" => Ok(Self::Cedar),
+            other => Err(format!(
+                "unknown policy.engine {other:?}; expected one of passthrough, in-memory, opa, cedar"
+            )),
+        }
+    }
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct PolicyConfig {
-    #[serde(default = "default_passthrough")]
-    pub engine: String,
+    #[serde(default)]
+    pub engine: PolicyEngine,
     /// Per-deployment secret keyed into the SHA-256 column mask UDF.
     ///
     /// When set, the `sha256(col)` mask runs as HMAC-SHA256 with this key,
@@ -1417,7 +1482,7 @@ pub struct PolicyConfig {
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
-            engine: "passthrough".to_string(),
+            engine: PolicyEngine::default(),
             mask_key: String::new(),
             opa: OpaConfig::default(),
         }
@@ -1821,7 +1886,6 @@ fn default_table_format_version() -> u8 { 2 }
 fn default_small_file_threshold_mb() -> u64 { 3 }
 fn default_parquet_compression() -> String { "zstd".to_string() }
 fn default_manifest_concurrency() -> usize { 64 }
-fn default_passthrough() -> String { "passthrough".to_string() }
 fn default_prometheus_port() -> u16 { 9090 }
 fn default_per_user_rpm() -> u32 { 60 }
 fn default_global_rpm() -> u32 { 1000 }
@@ -2194,8 +2258,12 @@ impl SqeConfig {
         env_override_str("SQE_STORAGE__GCS_SERVICE_ACCOUNT_KEY", &mut self.storage.gcs_service_account_key);
 
         // Policy
-        env_override_str("SQE_POLICY__ENGINE", &mut self.policy.engine);
+        env_override_parse("SQE_POLICY__ENGINE", &mut self.policy.engine);
         env_override_str("SQE_POLICY__MASK_KEY", &mut self.policy.mask_key);
+
+        // Access control
+        env_override_parse("SQE_ACCESS_CONTROL__BACKEND", &mut self.access_control.backend);
+        env_override_str("SQE_ACCESS_CONTROL__URL", &mut self.access_control.url);
 
         // Metrics
         env_override_u16("SQE_METRICS__PROMETHEUS_PORT", &mut self.metrics.prometheus_port);
@@ -2281,6 +2349,19 @@ impl SqeConfig {
 fn env_override_str(key: &str, target: &mut String) {
     if let Ok(val) = std::env::var(key) {
         *target = val;
+    }
+}
+
+fn env_override_parse<T>(key: &str, target: &mut T)
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    if let Ok(val) = std::env::var(key) {
+        match val.parse::<T>() {
+            Ok(parsed) => *target = parsed,
+            Err(e) => tracing::warn!("{key}={val:?} rejected: {e}; keeping previous value"),
+        }
     }
 }
 
