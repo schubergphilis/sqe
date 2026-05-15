@@ -280,20 +280,6 @@ impl std::fmt::Debug for CatalogHandle {
     }
 }
 
-impl CatalogHandle {
-    /// REST-only handle for methods that need direct access to
-    /// `RestCatalog` (cache invalidation, ETag-based revalidation
-    /// fast paths). `None` for non-REST backends; callers fall back
-    /// to the trait-only path.
-    #[allow(dead_code)] // wired up incrementally; keep accessor for future REST-only fast paths
-    pub(crate) fn rest(&self) -> Option<&Arc<RestCatalog>> {
-        match self {
-            Self::Rest(r) => Some(r),
-            Self::Other(_) => None,
-        }
-    }
-}
-
 /// Match on a `CatalogHandle` and run the same iceberg::Catalog
 /// trait method against either variant. Macro because each method
 /// signature is different and async closures aren't stable.

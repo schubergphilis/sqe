@@ -353,18 +353,6 @@ impl Accumulator for HistogramAccumulator {
     }
 }
 
-#[allow(dead_code)]
-fn _build_map_field_names() -> MapFieldNames {
-    // Trino uses "key" / "value" as the standard field names for histogram
-    // output. Kept as a dead helper for now; the inline construction in
-    // `evaluate` builds the fields directly to match Trino exactly.
-    MapFieldNames {
-        entry: "entries".into(),
-        key: "key".into(),
-        value: "value".into(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

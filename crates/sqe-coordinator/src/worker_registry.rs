@@ -98,7 +98,6 @@ struct RegistryInner {
 
 #[derive(Debug)]
 struct WorkerState {
-    url: String,
     healthy: bool,
     consecutive_failures: u32,
     last_healthy: Option<Instant>,
@@ -159,7 +158,6 @@ impl WorkerRegistry {
             .into_iter()
             .map(|url| {
                 let state = WorkerState {
-                    url: url.clone(),
                     healthy: false,
                     consecutive_failures: 0,
                     last_healthy: None,
@@ -193,9 +191,9 @@ impl WorkerRegistry {
         let inner = self.inner.read().await;
         inner
             .workers
-            .values()
-            .filter(|w| w.healthy)
-            .map(|w| w.url.clone())
+            .iter()
+            .filter(|(_, w)| w.healthy)
+            .map(|(url, _)| url.clone())
             .collect()
     }
 
@@ -239,7 +237,6 @@ impl WorkerRegistry {
         let state = inner.workers.entry(url.to_string()).or_insert_with(|| {
             info!(worker = url, "Discovered new worker via heartbeat");
             WorkerState {
-                url: url.to_string(),
                 healthy: false,
                 consecutive_failures: 0,
                 last_healthy: None,
