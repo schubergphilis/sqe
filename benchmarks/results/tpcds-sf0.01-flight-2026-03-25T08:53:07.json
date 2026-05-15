@@ -1,0 +1,23 @@
+{
+  "benchmark": "tpcds",
+  "scale_factor": 0.01,
+  "protocol": "flight",
+  "timestamp": "2026-03-25T08:53:07",
+  "summary": {
+    "total": 1,
+    "pass": 1,
+    "fail": 0,
+    "diff": 0,
+    "skip": 0,
+    "error": 0,
+    "total_duration_ms": 571
+  },
+  "queries": [
+    {
+      "id": "q49",
+      "status": "pass",
+      "duration_ms": 571,
+      "rows": 0
+    }
+  ]
+}

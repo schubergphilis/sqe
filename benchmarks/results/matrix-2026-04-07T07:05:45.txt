@@ -1,0 +1,46 @@
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Benchmark Matrix Results — Tue Apr  7 09:05:45 CEST 2026
+  Scale factor: SF1
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+── Config: single-512mb ──────────────────────────────────────
+  Memory: 512MB, PID: 79357
+  tpch SF1: 21/22 pass, 1 error, 29.0s
+    sqe_cache_misses_total 22
+  tpcds SF1: 93/99 pass, 6 error, 94.9s
+    sqe_cache_misses_total 99
+    sqe_sort_spill_bytes_total 1.76617e+09
+    sqe_sort_spill_count_total 44
+  ssb SF1: 4/13 pass, 9 error, 14.9s
+    sqe_cache_misses_total 13
+  tpcc SF1: 17/17 pass, 0 error, 24.4s
+    sqe_cache_misses_total 8
+  tpce SF1: 12/18 pass, 1 error, 9.7s
+    sqe_cache_misses_total 11
+
+── Config: single-8gb ──────────────────────────────────────
+  Memory: 8GB, PID: 82454
+  tpch SF1: 22/22 pass, 0 error, 27.9s
+    sqe_cache_misses_total 22
+  tpcds SF1: 99/99 pass, 0 error, 103.0s
+    sqe_cache_misses_total 99
+    sqe_sort_spill_bytes_total 2.11935e+07
+    sqe_sort_spill_count_total 1
+  ssb SF1: 13/13 pass, 0 error, 15.5s
+    sqe_cache_misses_total 13
+  tpcc SF1: 17/17 pass, 0 error, 21.4s
+    sqe_cache_misses_total 8
+  tpce SF1: 13/18 pass, 0 error, 142.2s
+    sqe_cache_misses_total 11
+    sqe_sort_spill_bytes_total 2.76864e+10
+    sqe_sort_spill_count_total 125
+
+── Config: distributed-2w (2 workers) ──────────────
+  tpch SF1: 0/0 pass, 0 error, 0s
+  tpcds SF1: 0/0 pass, 0 error, 0s
+  ssb SF1: 0/0 pass, 0 error, 0s
+  tpcc SF1: 0/0 pass, 0 error, 0s
+  tpce SF1: 0/0 pass, 0 error, 0s
+
+── Config: distributed-4w (4 workers) ──────────────

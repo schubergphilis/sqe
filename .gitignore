@@ -6,7 +6,6 @@ tests/.test-env
 .worktrees/
 .claude/worktrees/
 .claude/scheduled_tasks.lock
-benchmarks/results/
 
 # Vendored iceberg-rust has its own resolver; its Cargo.lock is not checked in.
 vendor/iceberg-rust/Cargo.lock
