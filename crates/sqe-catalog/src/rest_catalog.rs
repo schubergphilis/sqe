@@ -171,6 +171,17 @@ impl TableMetadataCache {
             .await;
     }
 
+    /// Attach an ETag to an existing cache entry without changing the cached
+    /// table or refreshing the soft-TTL clock. Used by the background HEAD
+    /// path so the ETag becomes available for future conditional revalidation
+    /// without blocking the cold load_table().
+    pub async fn update_etag(&self, key: &str, etag: Option<String>) {
+        if let Some(mut entry) = self.inner.get(key).await {
+            entry.etag = etag;
+            self.inner.insert(key.to_string(), entry).await;
+        }
+    }
+
     pub async fn invalidate(&self, key: &str) {
         self.inner.invalidate(key).await;
     }
@@ -839,26 +850,29 @@ impl SessionCatalog {
         match &result {
             Ok(table) => {
                 self.circuit_breaker.record_success();
-                // After loading via iceberg-rust, we don't have the ETag from
-                // that request (iceberg-rust doesn't expose response headers).
-                // Do a lightweight HEAD to capture the ETag for future
-                // conditional revalidation.
-                let etag = self.fetch_table_etag(table_ident).await;
                 self.table_cache
-                    .insert_with_etag(cache_key, table.clone(), etag)
+                    .insert_with_etag(cache_key.clone(), table.clone(), None)
                     .await;
+
+                let http_client = self.http_client.clone();
+                let bearer_token = self.bearer_token.clone();
+                let url = self.table_url(table_ident);
+                let table_cache = self.table_cache.clone();
+                let table_ident_log = table_ident.clone();
+                tokio::spawn(async move {
+                    let etag = fetch_table_etag_inner(&http_client, &bearer_token, &url).await;
+                    if let Some(e) = etag.as_deref() {
+                        debug!(table = %table_ident_log, etag = %e, "Captured ETag for table");
+                    }
+                    table_cache.update_etag(&cache_key, etag).await;
+                });
             }
             Err(_) => self.circuit_breaker.record_failure(),
         }
         result
     }
 
-    /// Fetch the ETag for a table from Polaris via a HEAD request.
-    ///
-    /// Returns `None` if the request fails or Polaris doesn't return an ETag.
-    /// This is a best-effort operation — the table metadata is already loaded,
-    /// we just want the ETag for future conditional requests.
-    async fn fetch_table_etag(&self, table_ident: &TableIdent) -> Option<String> {
+    fn table_url(&self, table_ident: &TableIdent) -> String {
         let ns_str = table_ident
             .namespace()
             .as_ref()
@@ -866,44 +880,43 @@ impl SessionCatalog {
             .map(|s| s.as_str())
             .collect::<Vec<_>>()
             .join("\u{1F}");
-        let url = format!(
+        format!(
             "{}/namespaces/{}/tables/{}",
             self.rest_prefix(),
             ns_str,
             table_ident.name()
-        );
+        )
+    }
 
-        let mut req = self
-            .http_client
-            .head(&url)
-            .bearer_auth(&self.bearer_token)
-            .header("X-Request-ID", Uuid::new_v4().to_string());
-        for (k, v) in trace_context_http_headers() {
-            req = req.header(k, v);
-        }
+}
 
-        match req.send().await {
-            Ok(resp) => {
-                let etag = resp
-                    .headers()
-                    .get("etag")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string());
-                if let Some(ref e) = etag {
-                    debug!(table = %table_ident, etag = %e, "Captured ETag for table");
-                }
-                etag
-            }
-            Err(e) => {
-                debug!(
-                    table = %table_ident,
-                    error = %e,
-                    "Failed to fetch ETag (non-fatal)"
-                );
-                None
-            }
+/// HEAD-based ETag fetch usable from a background `tokio::spawn`.
+async fn fetch_table_etag_inner(
+    http_client: &reqwest::Client,
+    bearer_token: &str,
+    url: &str,
+) -> Option<String> {
+    let mut req = http_client
+        .head(url)
+        .bearer_auth(bearer_token)
+        .header("X-Request-ID", Uuid::new_v4().to_string());
+    for (k, v) in trace_context_http_headers() {
+        req = req.header(k, v);
+    }
+    match req.send().await {
+        Ok(resp) => resp
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
+        Err(e) => {
+            debug!(url = %url, error = %e, "Failed to fetch ETag (non-fatal)");
+            None
         }
     }
+}
+
+impl SessionCatalog {
 
     /// Evict a table from the metadata cache.
     ///
