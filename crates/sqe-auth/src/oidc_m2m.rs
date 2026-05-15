@@ -54,6 +54,8 @@ pub struct OidcM2mConfig {
     pub refresh_skew: Duration,
     /// Accept invalid TLS certificates (dev/self-signed environments).
     pub accept_invalid_certs: bool,
+    /// Per-request timeout for the token endpoint. Default 5s.
+    pub request_timeout: Duration,
 }
 
 impl OidcM2mConfig {
@@ -71,6 +73,7 @@ impl OidcM2mConfig {
             roles: vec!["service".to_string()],
             refresh_skew: Duration::from_secs(60),
             accept_invalid_certs: false,
+            request_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -87,6 +90,10 @@ pub struct OidcM2mProvider {
     client: reqwest::Client,
     config: OidcM2mConfig,
     cache: Arc<RwLock<Option<CachedToken>>>,
+    // Serialises concurrent refreshes so only one task hits the IdP per
+    // expiry window. The HTTP call happens under this lock, but the cache
+    // RwLock is released first so readers never block on the network.
+    refresh: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl OidcM2mProvider {
@@ -101,12 +108,14 @@ impl OidcM2mProvider {
         }
         let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(config.accept_invalid_certs)
+            .timeout(config.request_timeout)
             .build()
             .map_err(|e| format!("build http client: {e}"))?;
         Ok(Self {
             client,
             config,
             cache: Arc::new(RwLock::new(None)),
+            refresh: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -114,43 +123,50 @@ impl OidcM2mProvider {
     /// `refresh_skew` of expiry.
     pub async fn get_token(&self) -> Result<String, AuthError> {
         // Fast path under read lock.
-        {
-            let guard = self.cache.read().await;
-            if let Some(cached) = guard.as_ref() {
-                if cached.expires_at.saturating_duration_since(Instant::now())
-                    > self.config.refresh_skew
-                {
-                    debug!("OIDC M2M cache hit");
-                    return Ok(cached.access_token.clone());
-                }
-            }
+        if let Some(token) = self.cached_if_fresh().await {
+            debug!("OIDC M2M cache hit");
+            return Ok(token);
         }
 
-        // Slow path: request and populate under write lock.
-        let mut guard = self.cache.write().await;
-        // Double-check under the write lock: another caller may have refreshed.
-        if let Some(cached) = guard.as_ref() {
-            if cached.expires_at.saturating_duration_since(Instant::now())
-                > self.config.refresh_skew
-            {
-                return Ok(cached.access_token.clone());
-            }
+        // Single-flight refresh. The cache RwLock is NOT held across the
+        // HTTP call: a hung IdP only blocks tasks waiting on `refresh`, not
+        // readers checking the cache.
+        let _refresh_guard = self.refresh.lock().await;
+
+        // Another task may have refreshed while we waited on `refresh`.
+        if let Some(token) = self.cached_if_fresh().await {
+            return Ok(token);
         }
 
         let resp = self.fetch_token().await?;
-        // Compute expiry from `expires_in`. Guard against unreasonable values.
         let lifetime = Duration::from_secs(resp.expires_in.clamp(1, 24 * 60 * 60));
         let expires_at = Instant::now() + lifetime;
         let access = resp.access_token.clone();
-        *guard = Some(CachedToken {
-            access_token: access.clone(),
-            expires_at,
-        });
+        {
+            let mut guard = self.cache.write().await;
+            *guard = Some(CachedToken {
+                access_token: access.clone(),
+                expires_at,
+            });
+        }
         info!(
             lifetime_secs = lifetime.as_secs(),
             "OIDC M2M token refreshed"
         );
         Ok(access)
+    }
+
+    async fn cached_if_fresh(&self) -> Option<String> {
+        let guard = self.cache.read().await;
+        guard.as_ref().and_then(|cached| {
+            if cached.expires_at.saturating_duration_since(Instant::now())
+                > self.config.refresh_skew
+            {
+                Some(cached.access_token.clone())
+            } else {
+                None
+            }
+        })
     }
 
     async fn fetch_token(&self) -> Result<TokenResponse, AuthError> {
@@ -243,6 +259,12 @@ mod tests {
     fn config_defaults_refresh_skew_to_60s() {
         let cfg = OidcM2mConfig::new("https://idp.test/token", "c", "s");
         assert_eq!(cfg.refresh_skew, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn config_defaults_request_timeout_to_5s() {
+        let cfg = OidcM2mConfig::new("https://idp.test/token", "c", "s");
+        assert_eq!(cfg.request_timeout, Duration::from_secs(5));
     }
 
     #[tokio::test]

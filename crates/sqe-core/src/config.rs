@@ -1826,6 +1826,24 @@ impl SqeConfig {
             );
         }
 
+        // tokio::time::interval panics if the period is zero. Reject the
+        // misconfig at load time with a message that names the field.
+        if self.session.snapshot_interval_secs == 0 {
+            errors.push(
+                "session.snapshot_interval_secs must be > 0 (tokio::time::interval rejects zero periods)".to_string(),
+            );
+        }
+        if self.worker.heartbeat_interval_secs == 0 {
+            errors.push(
+                "worker.heartbeat_interval_secs must be > 0 (tokio::time::interval rejects zero periods)".to_string(),
+            );
+        }
+        if self.metrics.openlineage.replay_interval_secs == 0 {
+            errors.push(
+                "metrics.openlineage.replay_interval_secs must be > 0 (tokio::time::interval rejects zero periods)".to_string(),
+            );
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -2293,6 +2311,39 @@ mod tests {
         config.auth.keycloak_url = String::new();
         config.auth.token_endpoint = "https://token.example.com/token".to_string();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_snapshot_interval() {
+        let mut config = valid_config();
+        config.session.snapshot_interval_secs = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("session.snapshot_interval_secs must be > 0"),
+            "Expected zero snapshot interval error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_heartbeat_interval() {
+        let mut config = valid_config();
+        config.worker.heartbeat_interval_secs = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("worker.heartbeat_interval_secs must be > 0"),
+            "Expected zero heartbeat interval error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_replay_interval() {
+        let mut config = valid_config();
+        config.metrics.openlineage.replay_interval_secs = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("metrics.openlineage.replay_interval_secs must be > 0"),
+            "Expected zero replay interval error, got: {err}"
+        );
     }
 
     #[test]

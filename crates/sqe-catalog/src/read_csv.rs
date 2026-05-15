@@ -34,7 +34,9 @@
 //! ## Implementation
 //!
 //! The TVF wraps DataFusion 53's [`CsvFormat`] in a [`ListingTable`], using
-//! the same `block_in_place`-driven async-from-sync bridge as `read_parquet`.
+//! the runtime-flavor-aware `block_on_compat` bridge from
+//! `crate::runtime_bridge` (issue #83) so the call works on both multi-thread
+//! and current-thread tokio runtimes.
 //! Hf:// URLs are resolved to HTTPS upstream; S3 stores get registered on
 //! demand from inline credentials or [`StorageConfig`] defaults.
 
@@ -228,10 +230,12 @@ impl TableFunctionImpl for ReadCsvFunction {
         })?;
 
         let storage = self.storage.clone();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async move { build_csv_listing_table(&args, &csv_opts, &storage).await })
+        crate::runtime_bridge::block_on_compat(async move {
+            build_csv_listing_table(&args, &csv_opts, &storage).await
         })
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!("{FN_NAME}: no tokio runtime available"))
+        })?
     }
 }
 
