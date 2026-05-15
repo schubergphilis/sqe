@@ -1,0 +1,153 @@
+{
+  "benchmark": "tpce",
+  "scale": 1.0,
+  "timestamp": "2026-05-07T07:12:13.440662+00:00",
+  "sqe_endpoint": "http://localhost:60051",
+  "trino_endpoint": "http://localhost:38080",
+  "queries": [
+    {
+      "query_name": "broker_volume",
+      "sqe_time_ms": 27,
+      "trino_time_ms": 306,
+      "speedup": 11.333333333333334,
+      "sqe_rows": 25,
+      "trino_rows": 25,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "customer_position",
+      "sqe_time_ms": 129,
+      "trino_time_ms": 2641,
+      "speedup": 20.472868217054263,
+      "sqe_rows": 857125,
+      "trino_rows": 857125,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "data_maintenance",
+      "sqe_time_ms": 58,
+      "trino_time_ms": 206,
+      "speedup": 3.5517241379310347,
+      "sqe_rows": 2,
+      "trino_rows": 2,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "market_feed",
+      "sqe_time_ms": 22,
+      "trino_time_ms": 178,
+      "speedup": 8.090909090909092,
+      "sqe_rows": 100,
+      "trino_rows": 100,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "market_watch",
+      "sqe_time_ms": 30,
+      "trino_time_ms": 517,
+      "speedup": 17.233333333333334,
+      "sqe_rows": 50000,
+      "trino_rows": 50000,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "security_detail",
+      "sqe_time_ms": 32,
+      "trino_time_ms": 219,
+      "speedup": 6.84375,
+      "sqe_rows": 104,
+      "trino_rows": 104,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "trade_lookup",
+      "sqe_time_ms": 64,
+      "trino_time_ms": 202,
+      "speedup": 3.15625,
+      "sqe_rows": 4361,
+      "trino_rows": 4361,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "trade_order",
+      "sqe_time_ms": 27,
+      "trino_time_ms": 229,
+      "speedup": 8.481481481481481,
+      "sqe_rows": 300,
+      "trino_rows": 300,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "trade_result",
+      "sqe_time_ms": 7461,
+      "trino_time_ms": 119178,
+      "speedup": 15.973462002412544,
+      "sqe_rows": 21343862,
+      "trino_rows": 21343862,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "trade_status",
+      "sqe_time_ms": 304,
+      "trino_time_ms": 1583,
+      "speedup": 5.207236842105263,
+      "sqe_rows": 31479,
+      "trino_rows": 31479,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "trade_update",
+      "sqe_time_ms": 63,
+      "trino_time_ms": 310,
+      "speedup": 4.920634920634921,
+      "sqe_rows": 4361,
+      "trino_rows": 4361,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    }
+  ],
+  "summary": {
+    "total": 11,
+    "matched": 11,
+    "row_diff": 0,
+    "sqe_failed": 0,
+    "trino_failed": 0,
+    "both_failed": 0,
+    "avg_speedup": 9.569543941745025,
+    "median_speedup": 8.090909090909092,
+    "sqe_total_ms": 8217,
+    "trino_total_ms": 125569
+  }
+}

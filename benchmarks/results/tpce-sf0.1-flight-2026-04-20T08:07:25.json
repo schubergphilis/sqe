@@ -1,0 +1,125 @@
+{
+  "benchmark": "tpce",
+  "scale_factor": 0.1,
+  "protocol": "flight",
+  "timestamp": "2026-04-20T08:07:25",
+  "summary": {
+    "total": 18,
+    "pass": 18,
+    "fail": 0,
+    "diff": 0,
+    "skip": 0,
+    "error": 0,
+    "total_duration_ms": 3788
+  },
+  "queries": [
+    {
+      "id": "broker_volume",
+      "status": "pass",
+      "duration_ms": 3,
+      "rows": 25
+    },
+    {
+      "id": "customer_position",
+      "status": "pass",
+      "duration_ms": 17,
+      "rows": 9092
+    },
+    {
+      "id": "data_maintenance",
+      "status": "pass",
+      "duration_ms": 23,
+      "rows": 1
+    },
+    {
+      "id": "data_maintenance_delete",
+      "status": "pass",
+      "duration_ms": 397,
+      "rows": 1
+    },
+    {
+      "id": "data_maintenance_update",
+      "status": "pass",
+      "duration_ms": 474,
+      "rows": 1
+    },
+    {
+      "id": "market_feed",
+      "status": "pass",
+      "duration_ms": 4,
+      "rows": 10
+    },
+    {
+      "id": "market_feed_update",
+      "status": "pass",
+      "duration_ms": 422,
+      "rows": 1
+    },
+    {
+      "id": "market_watch",
+      "status": "pass",
+      "duration_ms": 17,
+      "rows": 5000
+    },
+    {
+      "id": "security_detail",
+      "status": "pass",
+      "duration_ms": 14,
+      "rows": 3
+    },
+    {
+      "id": "trade_lookup",
+      "status": "pass",
+      "duration_ms": 19,
+      "rows": 468
+    },
+    {
+      "id": "trade_order",
+      "status": "pass",
+      "duration_ms": 3,
+      "rows": 0
+    },
+    {
+      "id": "trade_result",
+      "status": "pass",
+      "duration_ms": 6,
+      "rows": 19418
+    },
+    {
+      "id": "trade_result_update_holding",
+      "status": "pass",
+      "duration_ms": 499,
+      "rows": 1
+    },
+    {
+      "id": "trade_result_update_status",
+      "status": "pass",
+      "duration_ms": 612,
+      "rows": 1
+    },
+    {
+      "id": "trade_status",
+      "status": "pass",
+      "duration_ms": 29,
+      "rows": 2932
+    },
+    {
+      "id": "trade_update",
+      "status": "pass",
+      "duration_ms": 2,
+      "rows": 547
+    },
+    {
+      "id": "trade_update_executor",
+      "status": "pass",
+      "duration_ms": 793,
+      "rows": 1
+    },
+    {
+      "id": "trade_update_settlement",
+      "status": "pass",
+      "duration_ms": 454,
+      "rows": 1
+    }
+  ]
+}
