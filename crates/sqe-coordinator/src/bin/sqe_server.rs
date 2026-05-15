@@ -704,7 +704,10 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     let tls_config = sqe_coordinator::tls::build_server_tls_config(&config.coordinator.tls)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let mut server_builder = tonic::transport::Server::builder();
+    let mut server_builder = sqe_coordinator::transport::apply_grpc_transport(
+        tonic::transport::Server::builder(),
+        &config.coordinator.transport,
+    );
     if let Some(tls) = tls_config {
         server_builder = server_builder.tls_config(tls)?;
         tracing::info!("SQE coordinator listening on {addr} (TLS)");
@@ -765,7 +768,10 @@ async fn run_worker(config: SqeConfig) -> anyhow::Result<()> {
     let tls_config = sqe_coordinator::tls::build_server_tls_config(&config.coordinator.tls)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let mut server_builder = tonic::transport::Server::builder();
+    let mut server_builder = sqe_coordinator::transport::apply_grpc_transport(
+        tonic::transport::Server::builder(),
+        &config.coordinator.transport,
+    );
     if let Some(tls) = tls_config {
         server_builder = server_builder.tls_config(tls)?;
         tracing::info!("SQE worker listening on {addr} (TLS)");

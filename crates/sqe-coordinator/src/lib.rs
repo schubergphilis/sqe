@@ -3,6 +3,7 @@ pub mod catalog_ops;
 pub mod channel_pool;
 pub mod maintenance;
 pub mod tls;
+pub mod transport;
 pub mod codec;
 pub mod credential_refresh;
 pub mod distributed_scan;

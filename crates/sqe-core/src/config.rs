@@ -303,6 +303,72 @@ pub struct CoordinatorConfig {
     /// IPs in Kubernetes or report unstable URLs.
     #[serde(default = "default_max_workers")]
     pub max_workers: usize,
+    /// HTTP/2 / gRPC transport tuning. Lifts the receiver windows off
+    /// tonic's 64 KB default so Flight SQL DoGet streams are not forced
+    /// to send a WINDOW_UPDATE every ~64 KB on a multi-GB result set.
+    #[serde(default)]
+    pub transport: GrpcTransportConfig,
+}
+
+/// HTTP/2 + TCP knobs applied to every tonic Server / Client this
+/// binary opens.
+///
+/// Defaults: 8 MB stream window, 16 MB connection window, 1 MB frame,
+/// 30 s HTTP/2 keepalive interval (10 s timeout), 60 s TCP keepalive.
+/// They lift Flight throughput on SF10+ workloads and keep long-running
+/// connections alive across NAT / load-balancer idle timeouts.
+#[derive(Debug, Deserialize, Clone)]
+pub struct GrpcTransportConfig {
+    /// Per-stream receive window in bytes.
+    #[serde(default = "default_initial_stream_window_size")]
+    pub initial_stream_window_size: u32,
+    /// Connection-level receive window in bytes.
+    #[serde(default = "default_initial_connection_window_size")]
+    pub initial_connection_window_size: u32,
+    /// Maximum HTTP/2 frame size in bytes.
+    #[serde(default = "default_max_frame_size")]
+    pub max_frame_size: u32,
+    /// HTTP/2 keepalive ping interval in seconds.
+    #[serde(default = "default_http2_keepalive_interval_secs")]
+    pub http2_keepalive_interval_secs: u64,
+    /// HTTP/2 keepalive ping timeout in seconds.
+    #[serde(default = "default_http2_keepalive_timeout_secs")]
+    pub http2_keepalive_timeout_secs: u64,
+    /// TCP keepalive in seconds. 0 disables.
+    #[serde(default = "default_tcp_keepalive_secs")]
+    pub tcp_keepalive_secs: u64,
+}
+
+impl Default for GrpcTransportConfig {
+    fn default() -> Self {
+        Self {
+            initial_stream_window_size: default_initial_stream_window_size(),
+            initial_connection_window_size: default_initial_connection_window_size(),
+            max_frame_size: default_max_frame_size(),
+            http2_keepalive_interval_secs: default_http2_keepalive_interval_secs(),
+            http2_keepalive_timeout_secs: default_http2_keepalive_timeout_secs(),
+            tcp_keepalive_secs: default_tcp_keepalive_secs(),
+        }
+    }
+}
+
+fn default_initial_stream_window_size() -> u32 {
+    8 * 1024 * 1024
+}
+fn default_initial_connection_window_size() -> u32 {
+    16 * 1024 * 1024
+}
+fn default_max_frame_size() -> u32 {
+    1024 * 1024
+}
+fn default_http2_keepalive_interval_secs() -> u64 {
+    30
+}
+fn default_http2_keepalive_timeout_secs() -> u64 {
+    10
+}
+fn default_tcp_keepalive_secs() -> u64 {
+    60
 }
 
 impl std::fmt::Debug for CoordinatorConfig {
@@ -326,6 +392,7 @@ impl std::fmt::Debug for CoordinatorConfig {
             .field("flight_compression", &self.flight_compression)
             .field("shuffle_compression", &self.shuffle_compression)
             .field("max_workers", &self.max_workers)
+            .field("transport", &self.transport)
             .finish()
     }
 }

@@ -389,7 +389,10 @@ async fn async_main() -> anyhow::Result<()> {
     // Optional TLS
     let tls_config = sqe_coordinator::tls::build_server_tls_config(&config.coordinator.tls)?;
 
-    let mut server_builder = tonic::transport::Server::builder();
+    let mut server_builder = sqe_coordinator::transport::apply_grpc_transport(
+        tonic::transport::Server::builder(),
+        &config.coordinator.transport,
+    );
     if let Some(tls) = tls_config {
         server_builder = server_builder.tls_config(tls)?;
         tracing::info!("SQE coordinator listening on {} (TLS)", addr);
