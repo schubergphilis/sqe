@@ -368,17 +368,25 @@ impl ExecutionPlan for DistributedScanExec {
                                         }
                                     }),
                             );
+                        // Terminate the fragment stream on the first mid-stream
+                        // error so downstream operators do not see Ok batches
+                        // arriving after an Err from this fragment.
+                        let terminated: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
+                            Box::pin(TerminateOnErrorStream::new(
+                                inner,
+                                task.fragment_id.clone(),
+                            ));
                         // Wrap the stream so the callback fires when it completes
                         let wrapped: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
                             if let Some(cb) = fragment_callback.clone() {
                                 Box::pin(CallbackStream::new(
-                                    inner,
+                                    terminated,
                                     task.fragment_id.clone(),
                                     cb,
                                     start,
                                 ))
                             } else {
-                                inner
+                                terminated
                             };
                         return Ok(wrapped);
                     }
@@ -447,17 +455,22 @@ impl ExecutionPlan for DistributedScanExec {
                 let local_stream = executor.execute_local(&task, schema)?;
                 let inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
                     Box::pin(local_stream);
+                let terminated: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
+                    Box::pin(TerminateOnErrorStream::new(
+                        inner,
+                        task.fragment_id.clone(),
+                    ));
                 // Wrap the fallback stream so the callback fires on completion
                 let wrapped: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
                     if let Some(cb) = fragment_callback {
                         Box::pin(CallbackStream::new(
-                            inner,
+                            terminated,
                             task.fragment_id.clone(),
                             cb,
                             start,
                         ))
                     } else {
-                        inner
+                        terminated
                     };
                 return Ok(wrapped);
             }
@@ -620,6 +633,66 @@ impl CallbackStream {
             start,
             output_rows: 0,
             fired: false,
+        }
+    }
+}
+
+/// Stream adapter that terminates after surfacing a single error.
+///
+/// Wraps a `Stream<Item = DFResult<RecordBatch>>` so that:
+/// - Every `Ok` value passes through unchanged until an error occurs.
+/// - The first `Err` is yielded, then the stream returns `Poll::Ready(None)`
+///   on every subsequent poll.
+///
+/// This protects downstream operators (`HashJoinExec`, `AggregateExec`)
+/// from seeing `Ok` batches arriving after an `Err` from the same source,
+/// which was the silent-non-determinism gap called out in #50: the
+/// consumer would receive partial rows, the join would build state
+/// against them, and then a tail error would abort the query. Different
+/// retries returned different result sets. With this wrapper the
+/// consumer sees a clean prefix of `Ok` values followed by exactly one
+/// terminal event (error or normal EOF).
+struct TerminateOnErrorStream {
+    inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>,
+    fragment_id: String,
+    terminated: bool,
+}
+
+impl TerminateOnErrorStream {
+    fn new(
+        inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>,
+        fragment_id: String,
+    ) -> Self {
+        Self {
+            inner,
+            fragment_id,
+            terminated: false,
+        }
+    }
+}
+
+impl Stream for TerminateOnErrorStream {
+    type Item = DFResult<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.terminated {
+            return Poll::Ready(None);
+        }
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Err(e))) => {
+                error!(
+                    fragment_id = %self.fragment_id,
+                    error = %e,
+                    "Mid-stream worker failure; terminating fragment stream after one error"
+                );
+                self.terminated = true;
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(None) => {
+                self.terminated = true;
+                Poll::Ready(None)
+            }
+            other => other,
         }
     }
 }
@@ -1179,5 +1252,65 @@ mod tests {
                 || registry.healthy_workers().await.len() < 3,
             "At least the attempted workers should be marked unhealthy"
         );
+    }
+
+    #[tokio::test]
+    async fn terminate_on_error_drops_trailing_oks() {
+        // Construct a stream Ok, Ok, Err, Ok, Ok and assert the wrapper
+        // surfaces Ok, Ok, Err only.
+        use arrow_array::Int64Array;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let s = schema.clone();
+        let b1 = RecordBatch::try_new(s.clone(), vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
+        let b2 = RecordBatch::try_new(s.clone(), vec![Arc::new(Int64Array::from(vec![2]))]).unwrap();
+        let b3 = RecordBatch::try_new(s.clone(), vec![Arc::new(Int64Array::from(vec![3]))]).unwrap();
+        let b4 = RecordBatch::try_new(s.clone(), vec![Arc::new(Int64Array::from(vec![4]))]).unwrap();
+        let items: Vec<DFResult<RecordBatch>> = vec![
+            Ok(b1),
+            Ok(b2),
+            Err(DataFusionError::Execution("worker died".to_string())),
+            Ok(b3),
+            Ok(b4),
+        ];
+        let inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
+            Box::pin(futures::stream::iter(items));
+        let mut wrapped = TerminateOnErrorStream::new(inner, "frag-test".to_string());
+
+        use futures::StreamExt;
+        let collected: Vec<_> = (&mut wrapped).collect().await;
+        assert_eq!(
+            collected.len(),
+            3,
+            "Should see exactly Ok, Ok, Err - subsequent Oks must be dropped"
+        );
+        assert!(collected[0].is_ok());
+        assert!(collected[1].is_ok());
+        assert!(collected[2].is_err());
+
+        // After termination, further polls must yield None forever.
+        assert!(wrapped.next().await.is_none());
+        assert!(wrapped.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn terminate_on_error_passthrough_when_no_error() {
+        // A clean stream must pass through all batches without truncation.
+        use arrow_array::Int64Array;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let s = schema.clone();
+        let batches: Vec<DFResult<RecordBatch>> = (0..5)
+            .map(|i| {
+                RecordBatch::try_new(s.clone(), vec![Arc::new(Int64Array::from(vec![i as i64]))])
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+            })
+            .collect();
+        let inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
+            Box::pin(futures::stream::iter(batches));
+        let wrapped = TerminateOnErrorStream::new(inner, "frag-clean".to_string());
+
+        use futures::StreamExt;
+        let collected: Vec<_> = wrapped.collect().await;
+        assert_eq!(collected.len(), 5);
+        assert!(collected.iter().all(|r| r.is_ok()));
     }
 }
