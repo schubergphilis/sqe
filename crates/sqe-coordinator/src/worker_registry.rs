@@ -161,16 +161,20 @@ impl WorkerRegistry {
         }
     }
 
-    pub fn start_health_check_task(self: &Arc<Self>, interval: Duration) {
+    pub fn start_health_check_task(
+        self: &Arc<Self>,
+        interval: Duration,
+    ) -> sqe_core::TaskGuard {
         let registry = self.clone();
-        // TODO(security-hardening): store JoinHandle and add CancellationToken
-        tokio::spawn(async move {
+        sqe_core::spawn_supervised("worker-health-check", move |token| async move {
             let mut ticker = tokio::time::interval(interval);
             loop {
-                ticker.tick().await;
-                registry.check_all_workers().await;
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = ticker.tick() => registry.check_all_workers().await,
+                }
             }
-        });
+        })
     }
 
     async fn check_all_workers(&self) {

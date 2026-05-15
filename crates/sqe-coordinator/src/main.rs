@@ -140,9 +140,12 @@ async fn async_main() -> anyhow::Result<()> {
         config.coordinator.flight_sql_port
     );
 
+    // Track supervised background tasks for the lifetime of the binary.
+    let mut _task_guards: Vec<sqe_core::TaskGuard> = Vec::new();
+
     // Initialize auth
     let authenticator = Arc::new(sqe_auth::Authenticator::new(&config.auth).await?);
-    authenticator.start_refresh_task();
+    _task_guards.push(authenticator.start_refresh_task());
 
     // Build the auth provider chain from `[[auth.providers]]`. The chain
     // dispatches to `oidc_password`, `bearer_token`, `client_credentials`,
@@ -176,9 +179,12 @@ async fn async_main() -> anyhow::Result<()> {
         ),
     );
 
-    // Start background health checks (every 5 seconds)
+    // Start background health checks (every 5 seconds). Keep the TaskGuard
+    // for the lifetime of the binary so cancellation fires at shutdown.
     if !config.coordinator.worker_urls.is_empty() {
-        worker_registry.start_health_check_task(std::time::Duration::from_secs(5));
+        _task_guards.push(
+            worker_registry.start_health_check_task(std::time::Duration::from_secs(5)),
+        );
         tracing::info!(
             workers = ?config.coordinator.worker_urls,
             "Started worker health check task"

@@ -266,15 +266,18 @@ impl Authenticator {
 
     /// Spawns a background task that periodically checks the cache for expiring
     /// sessions and refreshes them. Errors are logged but do not crash the task.
-    pub fn start_refresh_task(self: &Arc<Self>) {
+    ///
+    /// Returns a [`sqe_core::TaskGuard`]; dropping it aborts the loop.
+    pub fn start_refresh_task(self: &Arc<Self>) -> sqe_core::TaskGuard {
         let this = Arc::clone(self);
-
-        // TODO(security-hardening): store JoinHandle and add CancellationToken
-        tokio::spawn(async move {
+        sqe_core::spawn_supervised("auth-refresh", move |token| async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
 
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = interval.tick() => {}
+                }
 
                 let expiring = this.cache.expiring_sessions(this.refresh_buffer_secs);
                 if expiring.is_empty() {
@@ -365,7 +368,7 @@ impl Authenticator {
                     }
                 }
             }
-        });
+        })
     }
 }
 

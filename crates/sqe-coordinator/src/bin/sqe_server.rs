@@ -353,9 +353,14 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     // Health endpoints on metrics port + 1 (or 9091 default)
     let health_port = config.metrics.prometheus_port + 1;
 
+    // Track supervised background tasks for the lifetime of the binary;
+    // dropping each TaskGuard signals cooperative cancellation and aborts
+    // the underlying tokio task.
+    let mut _task_guards: Vec<sqe_core::TaskGuard> = Vec::new();
+
     // Auth
     let authenticator = Arc::new(sqe_auth::Authenticator::new(&config.auth).await?);
-    authenticator.start_refresh_task();
+    _task_guards.push(authenticator.start_refresh_task());
 
     // Build the auth provider chain from `[[auth.providers]]`. Both Flight
     // SQL (via SessionManager) and the Trino-compat HTTP path use the
@@ -385,7 +390,9 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     );
 
     if !config.coordinator.worker_urls.is_empty() {
-        worker_registry.start_health_check_task(std::time::Duration::from_secs(5));
+        _task_guards.push(
+            worker_registry.start_health_check_task(std::time::Duration::from_secs(5)),
+        );
         tracing::info!(workers = ?config.coordinator.worker_urls, "Started worker health checks");
     }
 
@@ -420,19 +427,22 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
 
     // Start background credential refresh loop (checks every 60s)
     if !config.coordinator.worker_urls.is_empty() {
-        sqe_coordinator::credential_refresh::start_credential_refresh_task(
-            credential_tracker.clone(),
-            std::time::Duration::from_secs(60),
-            config.coordinator.worker_secret.clone(),
-            |_fragment| async {
-                // Credential vending is deferred to Step 5 (Pluggable Catalogs):
-                // the CatalogBackend trait will expose a `vend_credentials(table)`
-                // method that reloads the table from Polaris to obtain fresh STS
-                // tokens scoped to the fragment's data files.
-                // Until then, workers use the original session credentials.
-                // Tracking: nextsteps.md Step 5, openspec/changes/pluggable-catalogs/
-                None
-            },
+        _task_guards.push(
+            sqe_coordinator::credential_refresh::start_credential_refresh_task(
+                credential_tracker.clone(),
+                std::time::Duration::from_secs(60),
+                config.coordinator.worker_secret.clone(),
+                |_fragment| async {
+                    // Credential vending is deferred to Step 5 (Pluggable
+                    // Catalogs): the CatalogBackend trait will expose a
+                    // `vend_credentials(table)` method that reloads the
+                    // table from Polaris to obtain fresh STS tokens scoped
+                    // to the fragment's data files. Until then, workers use
+                    // the original session credentials. Tracking:
+                    // nextsteps.md Step 5, openspec/changes/pluggable-catalogs/
+                    None
+                },
+            ),
         );
         tracing::info!("Started credential refresh background task (60s interval)");
     }
