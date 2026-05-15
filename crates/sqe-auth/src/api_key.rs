@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -184,34 +185,42 @@ impl AuthProvider for ApiKeyProvider {
 
         let keys = self.keys.read().await;
 
-        // Find a matching key using constant-time comparison.
-        for entry in keys.iter() {
-            let input_bytes = password.as_bytes();
-            let key_bytes = entry.key.as_bytes();
+        // Hash the candidate once to a fixed-length digest. All subsequent
+        // comparisons are over 32-byte buffers, so length is never an input
+        // to the timing of the comparison.
+        let input_digest = sha256_digest(password.as_bytes());
 
-            // Constant-time comparison requires equal lengths; pad shorter with
-            // a length check first to avoid leaking length via timing.
-            if input_bytes.len() != key_bytes.len() {
-                continue;
-            }
+        // Walk every entry. ct_eq returns a Choice; we accumulate matches in
+        // a single byte and capture the first matching index without ever
+        // breaking out of the loop, so iteration order is not observable.
+        let mut matched: u8 = 0;
+        let mut match_index: usize = 0;
+        for (idx, entry) in keys.iter().enumerate() {
+            let entry_digest = sha256_digest(entry.key.as_bytes());
+            let eq: u8 = input_digest.ct_eq(&entry_digest).unwrap_u8();
+            // Latch the first index where eq == 1 without branching on it.
+            let take = eq & (1 - matched);
+            match_index = (take as usize) * idx + (1 - take as usize) * match_index;
+            matched |= eq;
+        }
 
-            if input_bytes.ct_eq(key_bytes).into() {
-                let roles = self.resolve_roles(&entry.groups);
-                debug!(
-                    user = %entry.user,
-                    description = %entry.description,
-                    roles = ?roles,
-                    "API key authentication succeeded"
-                );
-                return Ok(Identity {
-                    user_id: entry.user.clone(),
-                    display_name: entry.user.clone(),
-                    roles,
-                    catalog_token: None,
-                    refresh_token: None,
-                    expires_at: None,
-                });
-            }
+        if matched == 1 {
+            let entry = &keys[match_index];
+            let roles = self.resolve_roles(&entry.groups);
+            debug!(
+                user = %entry.user,
+                description = %entry.description,
+                roles = ?roles,
+                "API key authentication succeeded"
+            );
+            return Ok(Identity {
+                user_id: entry.user.clone(),
+                display_name: entry.user.clone(),
+                roles,
+                catalog_token: None,
+                refresh_token: None,
+                expires_at: None,
+            });
         }
 
         Err(AuthError::AuthFailed(
@@ -246,6 +255,12 @@ fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path)
         .ok()
         .and_then(|m| m.modified().ok())
+}
+
+fn sha256_digest(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
 }
 
 #[cfg(test)]
