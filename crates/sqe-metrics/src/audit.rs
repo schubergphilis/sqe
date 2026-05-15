@@ -80,6 +80,8 @@ pub struct AuditEntry {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tables_touched: Vec<String>,
 }
 
 /// Compute SHA-256 hash of normalised SQL (whitespace-collapsed, uppercase keywords).
@@ -202,6 +204,7 @@ impl AuditLogger {
                 rows_returned: entry.rows_returned,
                 status: entry.status.clone(),
                 client_ip: entry.client_ip.clone(),
+                tables_touched: entry.tables_touched.clone(),
             }
         } else {
             AuditEntry {
@@ -215,6 +218,7 @@ impl AuditLogger {
                 rows_returned: entry.rows_returned,
                 status: entry.status.clone(),
                 client_ip: entry.client_ip.clone(),
+                tables_touched: entry.tables_touched.clone(),
             }
         };
 
@@ -282,6 +286,7 @@ mod tests {
             rows_returned: 1,
             status: "success".to_string(),
             client_ip: Some("127.0.0.1".to_string()),
+            tables_touched: Vec::new(),
         }
     }
 
