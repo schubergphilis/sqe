@@ -11,3 +11,6 @@ sqe-core = { path = "../sqe-core" }
 sqlparser = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"

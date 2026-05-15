@@ -50,4 +50,6 @@ async-trait = { workspace = true }
 anyhow = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+tempfile = "3"
+assert_cmd = "2"
+predicates = "3"
