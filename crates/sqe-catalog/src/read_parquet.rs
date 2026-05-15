@@ -18,9 +18,10 @@
 //! ```
 //!
 //! The function implements [`TableFunctionImpl`] which DataFusion's planner
-//! calls during query planning.  Because `call` is synchronous but schema
-//! inference is async we use `tokio::task::block_in_place` + the current
-//! `Handle` to drive the async work without spawning a new runtime.
+//! calls during query planning. Because `call` is synchronous but schema
+//! inference is async we use `crate::runtime_bridge::block_on_compat` to
+//! drive the async work, which works on both multi-thread and
+//! current-thread tokio runtimes (issue #83).
 
 use std::sync::Arc;
 
@@ -239,13 +240,16 @@ impl TableFunctionImpl for ReadParquetFunction {
         let storage = self.storage.clone();
 
         // `TableFunctionImpl::call` is sync; schema inference is async.
-        // Use block_in_place so we can drive the async work on the current
-        // tokio multi-thread runtime without blocking the executor thread.
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                build_listing_table(&args, &storage).await
-            })
+        // block_on_compat drives the future on multi-thread (block_in_place)
+        // or current-thread (off-thread) runtimes (issue #83).
+        crate::runtime_bridge::block_on_compat(async move {
+            build_listing_table(&args, &storage).await
         })
+        .ok_or_else(|| {
+            datafusion::error::DataFusionError::Plan(
+                "read_parquet: no tokio runtime available".to_string(),
+            )
+        })?
     }
 }
 

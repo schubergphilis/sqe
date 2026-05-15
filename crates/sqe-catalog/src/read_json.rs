@@ -95,10 +95,12 @@ impl TableFunctionImpl for ReadJsonFunction {
         })?;
 
         let storage = self.storage.clone();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async move { build_json_listing_table(&args, &json_opts, &storage).await })
+        crate::runtime_bridge::block_on_compat(async move {
+            build_json_listing_table(&args, &json_opts, &storage).await
         })
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!("{FN_NAME}: no tokio runtime available"))
+        })?
     }
 }
 

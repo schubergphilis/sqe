@@ -95,11 +95,12 @@ impl TableFunctionImpl for ReadDeltaFunction {
         })?;
 
         let storage = self.storage.clone();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                build_delta_provider(args, delta_opts, storage).await
-            })
+        crate::runtime_bridge::block_on_compat(async move {
+            build_delta_provider(args, delta_opts, storage).await
         })
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!("{FN_NAME}: no tokio runtime available"))
+        })?
     }
 }
 
