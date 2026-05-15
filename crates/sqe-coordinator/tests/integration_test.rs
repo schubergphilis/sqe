@@ -21,7 +21,7 @@ async fn test_authentication() {
         .await
         .expect("Authentication failed");
     assert!(
-        !session.access_token.is_empty(),
+        !session.access_token().is_empty(),
         "Access token should not be empty"
     );
     assert_eq!(session.user.username, "root");
@@ -1674,7 +1674,7 @@ fn keycloak_config() -> Option<sqe_core::SqeConfig> {
     config.auth.realm = "iceberg".to_string();
     config.auth.client_id = "sqe-client".to_string();
     config.auth.client_secret =
-        std::env::var("SQE_TEST_CLIENT_SECRET").unwrap_or_else(|_| "sqe-secret-change-me".to_string());
+        std::env::var("SQE_TEST_CLIENT_SECRET").unwrap_or_else(|_| "sqe-secret-change-me".to_string()).into();
     config.auth.token_endpoint.clear(); // Force Keycloak ROPC mode
     Some(config)
 }
@@ -1702,7 +1702,7 @@ async fn test_keycloak_auth_with_test_users() {
         .await
         .expect("adminuser auth should succeed");
     assert_eq!(admin_session.user.username, "adminuser");
-    assert!(!admin_session.access_token.is_empty());
+    assert!(!admin_session.access_token().is_empty());
     assert!(
         admin_session.user.roles.contains(&"catalog_admin".to_string()),
         "adminuser should have catalog_admin role, got: {:?}",
@@ -1754,7 +1754,7 @@ async fn test_keycloak_token_refresh() {
         .await
         .expect("Auth failed");
 
-    let original_token = session.access_token.clone();
+    let original_token = session.access_token().clone();
 
     // Refresh the session
     authenticator
@@ -1763,10 +1763,11 @@ async fn test_keycloak_token_refresh() {
         .expect("Token refresh should succeed");
 
     assert_ne!(
-        session.access_token, original_token,
+        session.access_token().expose(),
+        original_token.expose(),
         "Refreshed token should differ from original"
     );
-    assert!(!session.access_token.is_empty());
+    assert!(!session.access_token().is_empty());
 }
 
 // Test: Different users see different catalog visibility (task 7.13)
@@ -1855,11 +1856,8 @@ impl sqe_trino_compat::server::TrinoAuthenticator for TestTrinoAuth {
         &self,
         username: &str,
         password: &str,
-    ) -> Result<sqe_core::Session, String> {
-        self.0
-            .authenticate(username, password)
-            .await
-            .map_err(|e| e.to_string())
+    ) -> Result<sqe_core::Session, sqe_core::SqeError> {
+        self.0.authenticate(username, password).await
     }
 }
 
@@ -1871,11 +1869,8 @@ impl sqe_trino_compat::server::TrinoQueryExecutor for TestTrinoQuery {
         &self,
         session: &sqe_core::Session,
         sql: &str,
-    ) -> Result<Vec<arrow_array::RecordBatch>, String> {
-        self.0
-            .execute(session, sql)
-            .await
-            .map_err(|e| e.to_string())
+    ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
+        self.0.execute(session, sql).await
     }
 }
 

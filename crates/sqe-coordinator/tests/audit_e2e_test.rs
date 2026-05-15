@@ -46,23 +46,13 @@ fn admin_session() -> Session {
 }
 
 fn session_with_roles(roles: Vec<String>) -> Session {
-    let now = chrono::Utc::now();
-    Session {
-        id: "audit-session".to_string(),
-        user: sqe_core::session::SessionUser {
-            username: "auditor".to_string(),
-            roles,
-        },
-        access_token: "tok".to_string(),
-        refresh_token: None,
-        token_expiry: now + chrono::Duration::hours(1),
-        created_at: now,
-        last_activity: now,
-        default_catalog: None,
-        default_schema: None,
-        source: None,
-        write_branch: None,
-    }
+    Session::new(
+        "auditor".to_string(),
+        sqe_core::SecretString::new("tok".to_string()),
+        None,
+        chrono::Utc::now() + chrono::Duration::hours(1),
+        roles,
+    )
 }
 
 struct AuditFixture {
