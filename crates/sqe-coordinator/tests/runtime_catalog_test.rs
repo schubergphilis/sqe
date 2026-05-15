@@ -4,10 +4,14 @@
 //! tempdir warehouse. Using `CatalogKind::Sqlite` keeps the wiring
 //! end to end (parser AST -> mount::build_catalog -> sqlx ->
 //! WritableIcebergCatalog) without standing up a REST endpoint or AWS
-//! fixture. The registry itself no longer touches DataFusion — every
+//! fixture. The registry itself no longer touches DataFusion. Every
 //! attached catalog's `CatalogProvider` is exposed via `providers()`
 //! and re-registered into each new `SessionContext` by
 //! `create_session_context`.
+//!
+//! Run with `cargo test -p sqe-coordinator --features test-sqlite`.
+
+#![cfg(feature = "test-sqlite")]
 
 use std::collections::BTreeMap;
 
