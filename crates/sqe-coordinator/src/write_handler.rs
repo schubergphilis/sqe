@@ -692,7 +692,9 @@ impl WriteHandler {
             }
         };
 
-        let (namespace, name) = parse_table_ref(table_name)?;
+        let table_ident = parse_table_ref(table_name)?;
+        let namespace = table_ident.namespace().clone();
+        let name = table_ident.name().to_string();
 
         info!(
             username = %session.user.username,
@@ -726,7 +728,6 @@ impl WriteHandler {
 
         // Load the table back (needed for the writer infrastructure which reads
         // table metadata for location generation, file IO, etc.)
-        let table_ident = TableIdent::new(namespace, name);
         let table = catalog
             .load_table(&table_ident)
             .await
@@ -857,9 +858,11 @@ impl WriteHandler {
             }
         };
 
-        let (namespace, name) = parse_table_ref(table_name)?;
+        let table_ident = parse_table_ref(table_name)?;
+        let namespace = table_ident.namespace().clone();
+        let name = table_ident.name().to_string();
 
-        // Plan the SELECT without executing it — gives us the output schema cheaply.
+        // Plan the SELECT without executing it; gives us the output schema cheaply.
         let df = ctx
             .sql(select_sql)
             .await
@@ -903,7 +906,6 @@ impl WriteHandler {
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to create table: {e}")))?;
 
-        let table_ident = TableIdent::new(namespace, name);
         let table = catalog
             .load_table(&table_ident)
             .await
@@ -1026,8 +1028,7 @@ impl WriteHandler {
             }
         };
 
-        let (namespace, name) = parse_table_ref(table_name)?;
-        let table_ident = TableIdent::new(namespace, name);
+        let table_ident = parse_table_ref(table_name)?;
 
         info!(
             username = %session.user.username,
@@ -1158,7 +1159,9 @@ impl WriteHandler {
             }
         };
 
-        let (namespace, name) = parse_table_ref(&ct.name)?;
+        let table_ident = parse_table_ref(&ct.name)?;
+        let namespace = table_ident.namespace().clone();
+        let name = table_ident.name().to_string();
 
         if ct.columns.is_empty() {
             return Err(SqeError::Execution(
@@ -1207,12 +1210,9 @@ impl WriteHandler {
 
         let catalog = self.create_catalog_bridge(session).await?;
 
-        if ct.if_not_exists {
-            let table_ident = TableIdent::new(namespace.clone(), name.clone());
-            if catalog.load_table(&table_ident).await.is_ok() {
-                info!(table = %table_ident, "Table already exists, skipping (IF NOT EXISTS)");
-                return Ok(vec![]);
-            }
+        if ct.if_not_exists && catalog.load_table(&table_ident).await.is_ok() {
+            info!(table = %table_ident, "Table already exists, skipping (IF NOT EXISTS)");
+            return Ok(vec![]);
         }
 
         // Merge in user-specified TBLPROPERTIES / WITH options so Polaris
@@ -1286,8 +1286,7 @@ impl WriteHandler {
             }
         };
 
-        let (namespace, name) = parse_table_ref(table_name)?;
-        let table_ident = TableIdent::new(namespace, name);
+        let table_ident = parse_table_ref(table_name)?;
 
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
@@ -1495,8 +1494,7 @@ impl WriteHandler {
             }
         };
 
-        let (namespace, name) = parse_table_ref(table_factor_name)?;
-        let table_ident = TableIdent::new(namespace, name);
+        let table_ident = parse_table_ref(table_factor_name)?;
 
         let table = catalog.load_table(&table_ident).await?;
 
@@ -1668,8 +1666,7 @@ impl WriteHandler {
             }
         };
 
-        let (namespace, name) = parse_table_ref(table_factor_name)?;
-        let table_ident = TableIdent::new(namespace, name);
+        let table_ident = parse_table_ref(table_factor_name)?;
 
         let table = catalog.load_table(&table_ident).await?;
 
@@ -1848,8 +1845,7 @@ impl WriteHandler {
             }
         };
 
-        let (namespace, name) = parse_table_ref(table_factor_name)?;
-        let table_ident = TableIdent::new(namespace, name);
+        let table_ident = parse_table_ref(table_factor_name)?;
         let table = catalog.load_table(&table_ident).await?;
 
         // Equality deletes require declared identifier-field-ids (primary key).
@@ -2036,10 +2032,9 @@ impl WriteHandler {
             _ => return self.handle_delete(session, stmt, catalog, ctx).await,
         };
 
-        let Ok((namespace, name)) = parse_table_ref(table_factor_name) else {
+        let Ok(table_ident) = parse_table_ref(table_factor_name) else {
             return self.handle_delete(session, stmt, catalog, ctx).await;
         };
-        let table_ident = TableIdent::new(namespace, name);
         let Ok(table) = catalog.load_table(&table_ident).await else {
             return self.handle_delete(session, stmt, catalog, ctx).await;
         };
@@ -2119,8 +2114,7 @@ impl WriteHandler {
             }
         };
 
-        let (namespace, name) = parse_table_ref(table_name)?;
-        let table_ident = TableIdent::new(namespace, name);
+        let table_ident = parse_table_ref(table_name)?;
 
         let table = catalog.load_table(&table_ident).await?;
 
@@ -2271,10 +2265,9 @@ impl WriteHandler {
             sqlparser::ast::TableFactor::Table { name, .. } => name,
             _ => return self.handle_update(session, stmt, catalog, ctx).await,
         };
-        let Ok((namespace, name)) = parse_table_ref(table_factor_name) else {
+        let Ok(table_ident) = parse_table_ref(table_factor_name) else {
             return self.handle_update(session, stmt, catalog, ctx).await;
         };
-        let table_ident = TableIdent::new(namespace, name);
         let Ok(table) = catalog.load_table(&table_ident).await else {
             return self.handle_update(session, stmt, catalog, ctx).await;
         };
@@ -2360,8 +2353,7 @@ impl WriteHandler {
             }
         };
 
-        let (namespace, name) = parse_table_ref(table_name)?;
-        let table_ident = TableIdent::new(namespace, name);
+        let table_ident = parse_table_ref(table_name)?;
         let table = catalog.load_table(&table_ident).await?;
 
         // MoR UPDATE requires declared identifier-field-ids (primary key)
@@ -2608,8 +2600,7 @@ impl WriteHandler {
             }
         };
 
-        let (namespace, name) = parse_table_ref(target_table_name)?;
-        let table_ident = TableIdent::new(namespace, name);
+        let table_ident = parse_table_ref(target_table_name)?;
 
         // Extract source alias (needed for column references in the JOIN)
         let source_alias = match source_factor {
@@ -2992,12 +2983,11 @@ impl WriteHandler {
                     .await;
             }
         };
-        let Ok((namespace, name)) = parse_table_ref(target_name) else {
+        let Ok(table_ident) = parse_table_ref(target_name) else {
             return self
                 .handle_merge(session, stmt, source_batches, catalog, ctx)
                 .await;
         };
-        let table_ident = TableIdent::new(namespace, name);
         let Ok(table) = catalog.load_table(&table_ident).await else {
             return self
                 .handle_merge(session, stmt, source_batches, catalog, ctx)
@@ -3117,8 +3107,7 @@ impl WriteHandler {
                 )));
             }
         };
-        let (namespace, name) = parse_table_ref(target_table_name)?;
-        let table_ident = TableIdent::new(namespace, name);
+        let table_ident = parse_table_ref(target_table_name)?;
 
         let source_alias = match source_factor {
             TableFactor::Table { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()),

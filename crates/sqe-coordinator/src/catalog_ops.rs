@@ -67,8 +67,7 @@ impl CatalogOps {
             SqeError::Execution("DROP TABLE requires at least one table name".to_string())
         })?;
 
-        let (namespace, name) = parse_table_ref(table_name)?;
-        let table_ident = TableIdent::new(namespace, name);
+        let table_ident = parse_table_ref(table_name)?;
 
         info!(
             username = %session.user.username,
@@ -243,18 +242,17 @@ impl CatalogOps {
                 )
             })?;
 
-        let (src_namespace, src_name) = parse_table_ref(source_name)?;
-        let src_ident = TableIdent::new(src_namespace, src_name);
+        let src_ident = parse_table_ref(source_name)?;
 
         // For the destination, if only a bare name is given (1 part), inherit
         // the source namespace so that a simple `RENAME TO new_name` stays in
         // the same namespace.
-        let (dest_namespace, dest_table) = parse_table_ref(dest_obj_name)?;
+        let parsed_dest = parse_table_ref(dest_obj_name)?;
         let dest_ident = if dest_obj_name.0.len() == 1 {
             // Inherit source namespace
-            TableIdent::new(src_ident.namespace().clone(), dest_table)
+            TableIdent::new(src_ident.namespace().clone(), parsed_dest.name().to_string())
         } else {
-            TableIdent::new(dest_namespace, dest_table)
+            parsed_dest
         };
 
         info!(
@@ -299,7 +297,9 @@ impl CatalogOps {
             }
         };
 
-        let (namespace, name) = parse_table_ref(view_name)?;
+        let view_ident = parse_table_ref(view_name)?;
+        let namespace = view_ident.namespace();
+        let name = view_ident.name();
         let select_sql = format!("{query}");
 
         info!(
@@ -319,7 +319,7 @@ impl CatalogOps {
 
         // For CREATE OR REPLACE VIEW: drop the existing view first (if it exists).
         if or_replace {
-            match session_catalog.drop_view(&namespace, &name).await {
+            match session_catalog.drop_view(namespace, name).await {
                 Ok(()) => {
                     info!(view = %name, "Dropped existing view for CREATE OR REPLACE VIEW");
                 }
@@ -331,7 +331,7 @@ impl CatalogOps {
         }
 
         session_catalog
-            .create_view(&namespace, &name, &select_sql, schema_json)
+            .create_view(namespace, name, &select_sql, schema_json)
             .await
     }
 
@@ -364,7 +364,9 @@ impl CatalogOps {
             SqeError::Execution("DROP VIEW requires at least one view name".to_string())
         })?;
 
-        let (namespace, name) = parse_table_ref(view_name)?;
+        let view_ident = parse_table_ref(view_name)?;
+        let namespace = view_ident.namespace();
+        let name = view_ident.name();
 
         info!(
             username = %session.user.username,
@@ -381,7 +383,7 @@ impl CatalogOps {
         )
         .await?;
 
-        match session_catalog.drop_view(&namespace, &name).await {
+        match session_catalog.drop_view(namespace, name).await {
             Ok(()) => Ok(()),
             Err(e) if if_exists && e.is_not_found() => {
                 info!(
@@ -416,8 +418,7 @@ impl CatalogOps {
             }
         };
 
-        let (namespace, name) = parse_table_ref(table_name)?;
-        let table_ident = TableIdent::new(namespace, name);
+        let table_ident = parse_table_ref(table_name)?;
 
         info!(
             username = %session.user.username,
@@ -653,8 +654,7 @@ impl CatalogOps {
             }
         };
 
-        let (namespace, name) = parse_table_ref(table_name)?;
-        let table_ident = TableIdent::new(namespace, name);
+        let table_ident = parse_table_ref(table_name)?;
 
         // Extract SET TBLPROPERTIES key-value pairs
         let mut updates: HashMap<String, String> = HashMap::new();
@@ -733,8 +733,7 @@ impl CatalogOps {
         }
 
         let object_name = parse_object_name(table_ref)?;
-        let (namespace, name) = parse_table_ref(&object_name)?;
-        let table_ident = TableIdent::new(namespace, name);
+        let table_ident = parse_table_ref(&object_name)?;
 
         let session_catalog = Arc::new(
             SessionCatalog::for_session(
@@ -871,8 +870,7 @@ impl CatalogOps {
         };
 
         let object_name = parse_object_name(table_ref)?;
-        let (namespace, name) = parse_table_ref(&object_name)?;
-        let table_ident = TableIdent::new(namespace, name);
+        let table_ident = parse_table_ref(&object_name)?;
 
         let session_catalog = Arc::new(
             SessionCatalog::for_session(
@@ -1055,12 +1053,15 @@ fn sql_expr_to_string(expr: &Expr) -> String {
     }
 }
 
-/// Parse a sqlparser `ObjectName` into an iceberg `(NamespaceIdent, table_name)`.
+/// Parse a sqlparser `ObjectName` into an iceberg `TableIdent`.
 ///
-/// - 1 part  → namespace = "default", table = name
-/// - 2 parts → namespace = parts[0], table = parts[1]
-/// - 3 parts → ignore catalog prefix, namespace = parts[1], table = parts[2]
-pub(crate) fn parse_table_ref(name: &ObjectName) -> sqe_core::Result<(NamespaceIdent, String)> {
+/// Returning a `TableIdent` end-to-end removes the chance of an
+/// argument-order swap at the `TableIdent::new(namespace, name)` call sites.
+///
+/// - 1 part  -> namespace = "default", table = name
+/// - 2 parts -> namespace = parts[0], table = parts[1]
+/// - 3 parts -> ignore catalog prefix, namespace = parts[1], table = parts[2]
+pub(crate) fn parse_table_ref(name: &ObjectName) -> sqe_core::Result<TableIdent> {
     let parts: Vec<String> = name
         .0
         .iter()
@@ -1068,15 +1069,15 @@ pub(crate) fn parse_table_ref(name: &ObjectName) -> sqe_core::Result<(NamespaceI
         .collect();
 
     match parts.len() {
-        1 => Ok((
+        1 => Ok(TableIdent::new(
             NamespaceIdent::new("default".to_string()),
             parts[0].clone(),
         )),
-        2 => Ok((
+        2 => Ok(TableIdent::new(
             NamespaceIdent::new(parts[0].clone()),
             parts[1].clone(),
         )),
-        3 => Ok((
+        3 => Ok(TableIdent::new(
             NamespaceIdent::new(parts[1].clone()),
             parts[2].clone(),
         )),
@@ -1233,17 +1234,17 @@ mod tests {
     #[test]
     fn test_parse_table_ref_one_part() {
         let name = ObjectName(vec![Ident::new("my_table")]);
-        let (ns, table) = parse_table_ref(&name).unwrap();
-        assert_eq!(ns, NamespaceIdent::new("default".to_string()));
-        assert_eq!(table, "my_table");
+        let ident = parse_table_ref(&name).unwrap();
+        assert_eq!(ident.namespace(), &NamespaceIdent::new("default".to_string()));
+        assert_eq!(ident.name(), "my_table");
     }
 
     #[test]
     fn test_parse_table_ref_two_parts() {
         let name = ObjectName(vec![Ident::new("my_schema"), Ident::new("my_table")]);
-        let (ns, table) = parse_table_ref(&name).unwrap();
-        assert_eq!(ns, NamespaceIdent::new("my_schema".to_string()));
-        assert_eq!(table, "my_table");
+        let ident = parse_table_ref(&name).unwrap();
+        assert_eq!(ident.namespace(), &NamespaceIdent::new("my_schema".to_string()));
+        assert_eq!(ident.name(), "my_table");
     }
 
     #[test]
@@ -1253,9 +1254,9 @@ mod tests {
             Ident::new("my_schema"),
             Ident::new("my_table"),
         ]);
-        let (ns, table) = parse_table_ref(&name).unwrap();
-        assert_eq!(ns, NamespaceIdent::new("my_schema".to_string()));
-        assert_eq!(table, "my_table");
+        let ident = parse_table_ref(&name).unwrap();
+        assert_eq!(ident.namespace(), &NamespaceIdent::new("my_schema".to_string()));
+        assert_eq!(ident.name(), "my_table");
     }
 
     #[test]
