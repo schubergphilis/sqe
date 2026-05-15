@@ -646,13 +646,15 @@ impl MaintenanceHandler {
         }
 
         // Load every table to collect its location + a usable FileIO.
+        // We index by canonical URI so case- and slash-only differences match
+        // the listing returned by the storage backend.
         let mut registered_locations: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         let mut probe_table: Option<IcebergTable> = None;
         for ident in &table_idents {
             match catalog.load_table(ident).await {
                 Ok(t) => {
-                    registered_locations.insert(strip_trailing_slash(t.metadata().location()));
+                    registered_locations.insert(canonicalize_uri(t.metadata().location()));
                     if probe_table.is_none() {
                         probe_table = Some(t);
                     }
@@ -662,8 +664,14 @@ impl MaintenanceHandler {
                         table = %ident,
                         error = %e,
                         "purge_orphan_locations: failed to load registered table; \
-                         treating its location as unknown (might over-report orphans)"
+                         refusing to proceed because an unknown registered location \
+                         would be misclassified as orphan"
                     );
+                    return Err(SqeError::Execution(format!(
+                        "purge_orphan_locations: refusing to run; could not load \
+                         registered table '{ident}': {e}. Fix the catalog before \
+                         retrying so live tables are not deleted."
+                    )));
                 }
             }
         }
@@ -685,6 +693,7 @@ impl MaintenanceHandler {
                     "Could not derive namespace base from probe location '{probe_loc}'"
                 ))
             })?;
+        let ns_base_canonical = canonicalize_uri(&ns_base);
 
         info!(
             namespace = %namespace.as_string(),
@@ -713,7 +722,23 @@ impl MaintenanceHandler {
         let mut actions: Vec<String> = Vec::new();
         for entry in &entries {
             let path = strip_trailing_slash(&entry.path);
-            if registered_locations.contains(&path) {
+            let canonical = canonicalize_uri(&path);
+            // Belt-and-suspenders: refuse to act on any candidate that does
+            // not live strictly under the namespace base. A buggy backend
+            // returning an absolute path outside ns_base would otherwise be
+            // honoured by delete_prefix and reach arbitrary keys.
+            if !is_strictly_under(&path, &ns_base_canonical) {
+                warn!(
+                    path = %path,
+                    ns_base = %ns_base_canonical,
+                    "purge_orphan_locations: skipping candidate outside namespace base"
+                );
+                paths.push(path);
+                kinds.push("out_of_scope");
+                actions.push("skipped_outside_ns".to_string());
+                continue;
+            }
+            if registered_locations.contains(&canonical) {
                 continue;
             }
             paths.push(path.clone());
@@ -787,6 +812,66 @@ fn call_name_rewrite() -> &'static str {
 /// by trailing slash compare equal.
 fn strip_trailing_slash(s: &str) -> String {
     s.strip_suffix('/').unwrap_or(s).to_string()
+}
+
+/// Canonical form for a URI used in orphan-location comparisons (#48).
+///
+/// - Scheme + host (authority) get lowercased so `S3://MyBucket/wh` matches
+///   `s3://mybucket/wh` (Polaris normalises lowercase, some S3-compatible
+///   stores preserve case).
+/// - The path keeps its case (S3 keys are case-sensitive).
+/// - Trailing slashes are stripped.
+/// - Consecutive slashes inside the path are collapsed so `s3://b/wh/ns/t//`
+///   compares equal to `s3://b/wh/ns/t/`.
+///
+/// Returns the input unchanged if it does not contain `://` (treats it as an
+/// opaque path).
+fn canonicalize_uri(s: &str) -> String {
+    let trimmed = s.trim_end_matches('/');
+    let (scheme, rest) = match trimmed.split_once("://") {
+        Some(parts) => parts,
+        None => return collapse_slashes(trimmed),
+    };
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let path_collapsed = collapse_slashes(path);
+    if path_collapsed.is_empty() {
+        format!("{}://{}", scheme.to_ascii_lowercase(), authority.to_ascii_lowercase())
+    } else {
+        format!(
+            "{}://{}/{}",
+            scheme.to_ascii_lowercase(),
+            authority.to_ascii_lowercase(),
+            path_collapsed
+        )
+    }
+}
+
+fn collapse_slashes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_slash = false;
+    for c in s.chars() {
+        if c == '/' {
+            if !prev_slash {
+                out.push('/');
+            }
+            prev_slash = true;
+        } else {
+            out.push(c);
+            prev_slash = false;
+        }
+    }
+    out.trim_end_matches('/').to_string()
+}
+
+/// Return true when `candidate` lives strictly under `base` after both have
+/// been canonicalised. Equal paths are not "under" the base; a path with a
+/// component that only shares a prefix as a string is rejected (e.g.
+/// `s3://b/wh/ns/table_2` is not under `s3://b/wh/ns/table`).
+fn is_strictly_under(candidate: &str, base: &str) -> bool {
+    let cand = canonicalize_uri(candidate);
+    let b = canonicalize_uri(base);
+    let prefix = format!("{b}/");
+    cand.starts_with(&prefix) && cand.len() > prefix.len()
 }
 
 /// Translate an iceberg commit error into an SQE error, preserving retryable
@@ -1196,5 +1281,64 @@ mod tests {
             .map(|g| g.iter().map(|f| f.file_size_in_bytes()).sum())
             .collect();
         assert!(sizes.contains(&850) && sizes.contains(&300));
+    }
+
+    // ---------------------------------------------------------------------
+    // URI canonicalization + prefix safety (#48 purge_orphan_locations)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn canonicalize_lowercases_scheme_and_host() {
+        assert_eq!(
+            canonicalize_uri("S3://MyBucket/wh/ns/t"),
+            "s3://mybucket/wh/ns/t"
+        );
+    }
+
+    #[test]
+    fn canonicalize_strips_trailing_slash() {
+        assert_eq!(canonicalize_uri("s3://b/wh/t/"), "s3://b/wh/t");
+    }
+
+    #[test]
+    fn canonicalize_collapses_double_slashes() {
+        assert_eq!(canonicalize_uri("s3://b/wh//ns//t//"), "s3://b/wh/ns/t");
+    }
+
+    #[test]
+    fn canonicalize_preserves_path_case() {
+        assert_eq!(canonicalize_uri("s3://b/Wh/Ns/T"), "s3://b/Wh/Ns/T");
+    }
+
+    #[test]
+    fn is_strictly_under_rejects_self() {
+        assert!(!is_strictly_under("s3://b/wh/ns/t", "s3://b/wh/ns/t"));
+    }
+
+    #[test]
+    fn is_strictly_under_rejects_string_prefix_match() {
+        // table_2 is not under table even though one is a string prefix of
+        // the other.
+        assert!(!is_strictly_under(
+            "s3://b/wh/ns/table_2",
+            "s3://b/wh/ns/table"
+        ));
+    }
+
+    #[test]
+    fn is_strictly_under_accepts_child() {
+        assert!(is_strictly_under("s3://b/wh/ns/t", "s3://b/wh/ns"));
+        assert!(is_strictly_under(
+            "s3://b/wh/ns/t/sub",
+            "s3://b/wh/ns"
+        ));
+    }
+
+    #[test]
+    fn is_strictly_under_handles_case_and_slash_variants() {
+        assert!(is_strictly_under(
+            "S3://MyBucket/wh/ns/t/",
+            "s3://mybucket/wh/ns"
+        ));
     }
 }
