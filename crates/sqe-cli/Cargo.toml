@@ -1,7 +1,10 @@
 [package]
 name = "sqe-cli"
-version = "0.31.4"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "sqe-cli"
@@ -37,8 +40,8 @@ bytes = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-base64 = "0.22"
-clap = { version = "4", features = ["derive"] }
+base64 = { workspace = true }
+clap = { workspace = true }
 rustyline = "15"
 rpassword = "7"
 reqwest = { workspace = true }
@@ -47,4 +50,4 @@ async-trait = { workspace = true }
 anyhow = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }

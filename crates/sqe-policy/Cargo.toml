@@ -1,7 +1,10 @@
 [package]
 name = "sqe-policy"
-version = "0.31.4"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 sqe-core = { path = "../sqe-core" }

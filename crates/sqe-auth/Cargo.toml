@@ -1,7 +1,10 @@
 [package]
 name = "sqe-auth"
-version = "0.31.4"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 sqe-core = { path = "../sqe-core" }
@@ -17,13 +20,13 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 jsonwebtoken = { workspace = true }
 moka = { workspace = true }
-base64 = "0.22"
+base64 = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 hex = { workspace = true }
 url = { workspace = true }
 toml = { workspace = true }
-subtle = "2"
+subtle = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]

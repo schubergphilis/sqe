@@ -1,7 +1,10 @@
 [package]
 name = "sqe-lineage"
-version = "0.31.4"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 sqe-core = { path = "../sqe-core" }
@@ -23,5 +26,5 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
-tempfile = "3"
-wiremock = "0.6"
+tempfile = { workspace = true }
+wiremock = { workspace = true }
