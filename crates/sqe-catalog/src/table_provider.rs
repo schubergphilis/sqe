@@ -210,12 +210,28 @@ impl TableProvider for SqeTableProvider {
         if self.trust_sort_order {
             exec = exec.with_trust_sort_order(true);
         }
-        let target_partitions = state.config_options().execution.target_partitions.max(1);
+        // NOTE: Do NOT auto-wire `target_partitions` here. Setting it to
+        // `state.config_options().execution.target_partitions` causes
+        // `IcebergScanExec` to advertise `Partitioning::UnknownPartitioning(N)`,
+        // which is the worst possible signal for DataFusion's EnforceDistribution
+        // rule -- it cannot promote the downstream HashJoin to `Partitioned`
+        // mode (which needs `HashPartitioning` on the join key), so the planner
+        // falls back to `CollectLeft` and inserts `CoalescePartitionsExec`
+        // immediately above the scan to gather the N streams back into 1. Net
+        // effect: parallel I/O, then immediate serialisation, then a
+        // single-threaded hash build that is also fragmented into many tiny
+        // round-robin batches. tpcds q72 SF1 regressed 5-6x (~17s -> ~100s)
+        // until the wiring was removed; see issue #131.
+        //
+        // The `with_target_partitions` setter on IcebergScanExec is kept so a
+        // follow-up can re-introduce parallel scan once a proper hash-aware
+        // exchange (Doris-style Local Shuffle, or a planner rule that injects
+        // `RepartitionExec(Hash, ...)` ahead of the join) is in place.
+        let _ = state; // intentionally unused now; see note above
         exec = exec
             .with_small_file_threshold(self.small_file_threshold_bytes)
             .with_manifest_concurrency(self.manifest_concurrency)
-            .with_direct_read_concurrency(self.prefetch_concurrency)
-            .with_target_partitions(target_partitions);
+            .with_direct_read_concurrency(self.prefetch_concurrency);
 
         // Pre-compute per-column min/max/null_count from manifest entries so
         // DataFusion's join-order optimizer sees real selectivity and picks
