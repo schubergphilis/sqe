@@ -166,6 +166,14 @@ pub struct QueryConfig {
     /// Default: 10 (fact table must be at least 10x larger than the smallest dimension).
     #[serde(default = "default_star_schema_min_ratio")]
     pub star_schema_min_ratio: usize,
+    /// Idle-timeout (seconds) for an active result stream. When the gRPC
+    /// client has not pulled a batch within this window the coordinator
+    /// aborts the stream and releases its concurrency permit. Bounds the
+    /// damage from slow or malicious clients holding open Flight streams
+    /// to pin every slot in `max_concurrent_queries`. Set to 0 to disable.
+    /// Default: 300 (5 minutes). Issue #75.
+    #[serde(default = "default_stream_idle_timeout")]
+    pub stream_idle_timeout_secs: u64,
 }
 
 impl Default for QueryConfig {
@@ -187,6 +195,7 @@ impl Default for QueryConfig {
             late_materialization_min_projection_cols: default_late_mat_min_projection_cols(),
             star_schema_reorder: default_true(),
             star_schema_min_ratio: default_star_schema_min_ratio(),
+            stream_idle_timeout_secs: default_stream_idle_timeout(),
         }
     }
 }
@@ -308,6 +317,17 @@ pub struct CoordinatorConfig {
     /// to send a WINDOW_UPDATE every ~64 KB on a multi-GB result set.
     #[serde(default)]
     pub transport: GrpcTransportConfig,
+    /// gRPC connect timeout (seconds) used when dispatching scan tasks to
+    /// workers. Caps the time the coordinator will wait for TCP+TLS+HTTP/2
+    /// handshake before failing the worker over. Issue #29.
+    #[serde(default = "default_worker_connect_timeout")]
+    pub worker_connect_timeout_secs: u64,
+    /// gRPC request timeout (seconds) applied to each `do_get` from coordinator
+    /// to worker. Must exceed `worker.scan_timeout_secs` (default 600s) so the
+    /// worker's own abort path fires first and the coordinator sees a clean
+    /// `DeadlineExceeded` instead of an unbounded await. Issue #29.
+    #[serde(default = "default_worker_rpc_timeout")]
+    pub worker_rpc_timeout_secs: u64,
 }
 
 /// HTTP/2 + TCP knobs applied to every tonic Server / Client this
@@ -393,6 +413,8 @@ impl std::fmt::Debug for CoordinatorConfig {
             .field("shuffle_compression", &self.shuffle_compression)
             .field("max_workers", &self.max_workers)
             .field("transport", &self.transport)
+            .field("worker_connect_timeout_secs", &self.worker_connect_timeout_secs)
+            .field("worker_rpc_timeout_secs", &self.worker_rpc_timeout_secs)
             .finish()
     }
 }
@@ -1721,6 +1743,7 @@ fn default_max_concurrent_queries() -> usize { 100 }
 fn default_max_concurrent_per_user() -> usize { 20 }
 fn default_per_user_memory_budget() -> String { "1GB".to_string() }
 fn default_slow_query_threshold() -> u64 { 30 }
+fn default_stream_idle_timeout() -> u64 { 300 }
 fn default_max_query_memory() -> String { "256MB".to_string() }
 fn default_distribution_threshold() -> String { "128MB".to_string() }
 fn default_distribution_file_threshold() -> usize { 4 }
@@ -1735,6 +1758,8 @@ fn default_spill_compression() -> String { "lz4".to_string() }
 fn default_flight_compression() -> String { "lz4".to_string() }
 fn default_shuffle_compression() -> String { "zstd".to_string() }
 fn default_max_workers() -> usize { 1024 }
+fn default_worker_connect_timeout() -> u64 { 5 }
+fn default_worker_rpc_timeout() -> u64 { 630 }
 
 fn default_flight_port() -> u16 { 50051 }
 fn default_trino_port() -> u16 { 8080 }
@@ -2350,6 +2375,8 @@ mod tests {
                 flight_compression: default_flight_compression(),
                 shuffle_compression: default_shuffle_compression(),
                 max_workers: default_max_workers(),
+                worker_connect_timeout_secs: default_worker_connect_timeout(),
+                worker_rpc_timeout_secs: default_worker_rpc_timeout(),
             },
             worker: WorkerConfig::default(),
             auth: AuthConfig {
