@@ -6764,6 +6764,7 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "datafusion",
+ "hmac 0.12.1",
  "moka",
  "reqwest 0.12.28",
  "serde",
