@@ -205,6 +205,15 @@ impl StatementKind {
     }
 }
 
+/// Parse a `ClassifiableSql` and classify the first statement. Prefer
+/// this over `parse_and_classify` at the trust boundary: the type bound
+/// proves the input ran through the pre-parse pipeline (issue #117).
+pub fn parse_and_classify_typed(
+    sql: &crate::pipeline_types::ClassifiableSql,
+) -> sqe_core::Result<StatementKind> {
+    parse_and_classify(sql.as_str())
+}
+
 /// Parse a SQL string and classify the first statement.
 pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
     // Before parsing with sqlparser, check for SHOW CATALOGS which sqlparser
