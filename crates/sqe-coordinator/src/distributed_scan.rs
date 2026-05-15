@@ -75,6 +75,11 @@ pub struct DistributedScanExec {
     /// can authenticate the coordinator. Empty when distributed mode is
     /// running with `allow_unauthenticated_workers = true`.
     worker_secret: String,
+    /// gRPC connect timeout for the per-call (`pool = None`) dispatch path.
+    /// Issue #29.
+    worker_connect_timeout: std::time::Duration,
+    /// gRPC request timeout for `do_get`. Issue #29.
+    worker_rpc_timeout: std::time::Duration,
 }
 
 /// Trait for local execution fallback.
@@ -147,6 +152,8 @@ impl DistributedScanExec {
             local_executor: None,
             fragment_callback: FragmentCallbackOpt(None),
             worker_secret: String::new(),
+            worker_connect_timeout: std::time::Duration::from_secs(5),
+            worker_rpc_timeout: std::time::Duration::from_secs(630),
         }
     }
 
@@ -196,6 +203,21 @@ impl DistributedScanExec {
     /// Set an optional callback that fires when each fragment stream completes or fails.
     pub fn with_fragment_callback(mut self, cb: FragmentCallback) -> Self {
         self.fragment_callback = FragmentCallbackOpt(Some(cb));
+        self
+    }
+
+    /// Set the gRPC connect and request timeouts used when dispatching scan
+    /// fragments to workers. Connect timeout caps TCP+TLS+HTTP/2 handshake;
+    /// rpc timeout caps the `do_get` round-trip so a kernel-paused worker
+    /// surfaces as `DeadlineExceeded` instead of an unbounded await that
+    /// starves the coordinator's query-permit pool. Issue #29.
+    pub fn with_timeouts(
+        mut self,
+        connect_timeout: std::time::Duration,
+        rpc_timeout: std::time::Duration,
+    ) -> Self {
+        self.worker_connect_timeout = connect_timeout;
+        self.worker_rpc_timeout = rpc_timeout;
         self
     }
 }
@@ -270,6 +292,8 @@ impl ExecutionPlan for DistributedScanExec {
         let local_executor = self.local_executor.clone();
         let fragment_callback = self.fragment_callback.0.clone();
         let worker_secret = self.worker_secret.clone();
+        let worker_connect_timeout = self.worker_connect_timeout;
+        let worker_rpc_timeout = self.worker_rpc_timeout;
 
         let dispatch_span = info_span!(
             "dispatch_to_worker",
@@ -330,6 +354,8 @@ impl ExecutionPlan for DistributedScanExec {
                     channel_pool.as_deref(),
                     &parent_cx,
                     &worker_secret,
+                    worker_connect_timeout,
+                    worker_rpc_timeout,
                 )
                 .await
                 {
@@ -506,13 +532,20 @@ impl ExecutionPlan for DistributedScanExec {
 /// Returns the `FlightRecordBatchStream` on success, or a `DataFusionError`
 /// on connection/transport failure. When `pool` is provided, the channel
 /// is fetched (or built once and cached) from it; otherwise a fresh
-/// connect runs per call.
+/// connect runs per call bounded by `connect_timeout`.
+///
+/// The `rpc_timeout` bounds the `do_get` round-trip itself. A kernel-paused
+/// worker that accepts the TCP connection but never replies on the gRPC
+/// stream surfaces as `DeadlineExceeded` instead of stalling the coordinator's
+/// query-semaphore permit indefinitely (issue #29).
 async fn dispatch_to_worker(
     task: &ScanTask,
     worker_url: &str,
     pool: Option<&ChannelPool>,
     parent_cx: &opentelemetry::Context,
     worker_secret: &str,
+    connect_timeout: std::time::Duration,
+    rpc_timeout: std::time::Duration,
 ) -> Result<FlightRecordBatchStream, DataFusionError> {
     let ticket_bytes = task
         .to_bytes()
@@ -531,6 +564,8 @@ async fn dispatch_to_worker(
                     "Failed to create endpoint for worker {worker_url}: {e}"
                 ))
             })?
+            .connect_timeout(connect_timeout)
+            .timeout(rpc_timeout)
             .connect()
             .await
             .map_err(|e| {
@@ -556,9 +591,20 @@ async fn dispatch_to_worker(
     // Inject W3C TraceContext (traceparent/tracestate) into gRPC metadata
     inject_trace_context(parent_cx, request.metadata_mut());
 
-    let response = client
-        .do_get(request)
+    // Wrap `do_get` with `tokio::time::timeout` so pooled channels (which
+    // don't carry an Endpoint-level timeout) still surface stalled workers
+    // as failures within `rpc_timeout`. Without this the await is unbounded.
+    let response = tokio::time::timeout(rpc_timeout, client.do_get(request))
         .await
+        .map_err(|_| {
+            if let Some(pool) = pool {
+                pool.invalidate(worker_url);
+            }
+            DataFusionError::Execution(format!(
+                "Worker {worker_url} do_get exceeded {}s rpc timeout",
+                rpc_timeout.as_secs()
+            ))
+        })?
         .map_err(|e| {
             if let Some(pool) = pool {
                 if matches!(
