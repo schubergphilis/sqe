@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use arrow::compute::cast;
 use arrow_array::RecordBatch;
@@ -6,6 +7,7 @@ use arrow_schema::Schema as ArrowSchema;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::StreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
+use iceberg::io::FileIO;
 use iceberg::spec::{DataFile, PartitionKey, Schema as IcebergSchema, Struct};
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -16,7 +18,7 @@ use iceberg::writer::base_writer::position_delete_file_writer::{
     PositionDeleteFileWriterBuilder, PositionDeleteInput, POSITION_DELETE_SCHEMA,
 };
 use iceberg::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, DefaultLocationGenerator,
+    DefaultFileNameGenerator, DefaultLocationGenerator, LocationGenerator,
 };
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
@@ -25,8 +27,126 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use sqe_catalog::parquet_writer_config::{self, writer_props_for_table as shared_writer_props_for_table};
 use sqe_core::SqeError;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 use uuid::Uuid;
+
+/// Shared list of every parquet file location the rolling writer has handed out
+/// during a write. Used by [`WriteCleanupGuard`] to delete orphans when the
+/// outer query future is cancelled mid-write before the Iceberg commit.
+///
+/// The vector is wrapped in `Arc<Mutex<>>` because the wrapping location
+/// generator must be `Clone + Send + Sync + 'static` (the iceberg-rust trait
+/// bound) and is cloned into multiple per-partition rolling writers. Each
+/// `generate_location` call appends one entry; the guard drains the vector on
+/// commit success or on drop without success.
+pub type UploadedPaths = Arc<Mutex<Vec<String>>>;
+
+/// Wraps [`DefaultLocationGenerator`] so every generated parquet path is
+/// recorded in a shared [`UploadedPaths`] tracker. The rolling writer asks the
+/// generator for a path before each file opens, so the tracker captures every
+/// file that could possibly exist on S3 after a mid-write cancellation.
+///
+/// See [`WriteCleanupGuard`] for the orphan-cleanup semantics this enables.
+#[derive(Clone, Debug)]
+pub struct TrackingLocationGenerator {
+    inner: DefaultLocationGenerator,
+    tracker: UploadedPaths,
+}
+
+impl TrackingLocationGenerator {
+    pub fn new(inner: DefaultLocationGenerator, tracker: UploadedPaths) -> Self {
+        Self { inner, tracker }
+    }
+}
+
+impl LocationGenerator for TrackingLocationGenerator {
+    fn generate_location(
+        &self,
+        partition_key: Option<&PartitionKey>,
+        file_name: &str,
+    ) -> String {
+        let path = self.inner.generate_location(partition_key, file_name);
+        if let Ok(mut paths) = self.tracker.lock() {
+            paths.push(path.clone());
+        }
+        path
+    }
+}
+
+/// Drop guard that deletes any parquet file the writer pushed to S3 if the
+/// surrounding write future never reaches commit. Closes the gap left by
+/// `tokio::time::timeout(write_future).await` and any other `Drop` of the
+/// outer write task.
+///
+/// Usage: the caller creates the guard with the table's `FileIO` and the
+/// shared `UploadedPaths` tracker, runs the streaming writer, and calls
+/// [`Self::mark_committed`] once the Iceberg commit succeeds. Drop without
+/// `mark_committed` spawns a best-effort tokio task that deletes every
+/// recorded path so S3 is not littered with orphan parquet files. The cleanup
+/// is best-effort because Drop cannot be async; we log when files cannot be
+/// removed.
+pub struct WriteCleanupGuard {
+    file_io: FileIO,
+    tracker: UploadedPaths,
+    committed: AtomicBool,
+    op: &'static str,
+}
+
+impl WriteCleanupGuard {
+    pub fn new(file_io: FileIO, tracker: UploadedPaths, op: &'static str) -> Self {
+        Self {
+            file_io,
+            tracker,
+            committed: AtomicBool::new(false),
+            op,
+        }
+    }
+
+    /// Signal that the Iceberg commit has succeeded; the guard's Drop becomes
+    /// a no-op. Must be called once the catalog commit lands; otherwise the
+    /// guard treats the write as cancelled and removes the parquet files.
+    pub fn mark_committed(&self) {
+        self.committed.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for WriteCleanupGuard {
+    fn drop(&mut self) {
+        if self.committed.load(Ordering::Acquire) {
+            return;
+        }
+        let paths: Vec<String> = match self.tracker.lock() {
+            Ok(mut g) => std::mem::take(&mut *g),
+            Err(_) => return,
+        };
+        if paths.is_empty() {
+            return;
+        }
+        let file_io = self.file_io.clone();
+        let op = self.op;
+        let count = paths.len();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                warn!(
+                    op,
+                    orphan_count = count,
+                    "write cancelled before commit; deleting orphan parquet files"
+                );
+                for p in paths {
+                    if let Err(e) = file_io.delete(&p).await {
+                        warn!(op, path = %p, error = %e, "orphan cleanup: delete failed");
+                    }
+                }
+            });
+        } else {
+            warn!(
+                op,
+                orphan_count = paths.len(),
+                "write cancelled outside tokio runtime; orphan parquet files left on S3"
+            );
+        }
+    }
+}
 
 /// When a table is logically unpartitioned (no fields, or all-Void) but its
 /// default partition spec is not the original `spec_id == 0`, the data files
@@ -120,12 +240,17 @@ pub fn writer_props_for_table(
 /// to convert a config string (e.g. `"zstd"`) into a [`Compression`] value.
 ///
 /// Returns the DataFile descriptors needed for Iceberg transaction commits.
-#[instrument(skip(table, batches, compression), fields(table = %table.identifier(), file_prefix, total_rows))]
+///
+/// `tracker` collects parquet paths the rolling writer creates so the caller's
+/// [`WriteCleanupGuard`] can remove them on cancellation before the Iceberg
+/// commit (#58).
+#[instrument(skip(table, batches, compression, tracker), fields(table = %table.identifier(), file_prefix, total_rows))]
 pub async fn write_data_files(
     table: &Table,
     batches: Vec<RecordBatch>,
     file_prefix: &str,
     compression: Compression,
+    tracker: UploadedPaths,
 ) -> sqe_core::Result<Vec<DataFile>> {
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     if total_rows == 0 {
@@ -140,8 +265,9 @@ pub async fn write_data_files(
     // current schema onto the batch schema before writing.
     let batches = stamp_field_ids(batches, table.metadata().current_schema())?;
 
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
+    let inner_loc = DefaultLocationGenerator::new(table.metadata().clone())
         .map_err(|e| SqeError::Execution(format!("Location generator error: {e}")))?;
+    let location_generator = TrackingLocationGenerator::new(inner_loc, tracker);
 
     // Generate a unique write ID for this operation. File names follow the
     // Iceberg convention: {write_uuid}-{counter}.parquet — no operation label.
@@ -270,8 +396,9 @@ pub async fn write_data_files_with_metrics(
     file_prefix: &str,
     metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
     compression: Compression,
+    tracker: UploadedPaths,
 ) -> sqe_core::Result<Vec<DataFile>> {
-    let data_files = write_data_files(table, batches, file_prefix, compression).await?;
+    let data_files = write_data_files(table, batches, file_prefix, compression, tracker).await?;
 
     if let Some(m) = metrics {
         let total_bytes: u64 = data_files.iter().map(|df| df.file_size_in_bytes()).sum();
@@ -299,15 +426,20 @@ pub async fn write_data_files_with_metrics(
 /// table can be created and the Parquet writer initialised before the first batch
 /// arrives. Field IDs and type casts are applied per-batch.
 ///
-/// Returns `(data_files, total_rows)` on success.
+/// Returns `(data_files, total_rows, uploaded_paths)` on success. The
+/// `uploaded_paths` tracker is registered with a [`WriteCleanupGuard`] by the
+/// caller so a cancellation between the last batch and the Iceberg commit
+/// deletes the parquet files instead of orphaning them on S3 (#58).
 pub async fn write_data_files_streaming(
     table: &Table,
     mut stream: SendableRecordBatchStream,
     file_prefix: &str,
     compression: Compression,
+    tracker: UploadedPaths,
 ) -> sqe_core::Result<(Vec<DataFile>, usize)> {
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
+    let inner_loc = DefaultLocationGenerator::new(table.metadata().clone())
         .map_err(|e| SqeError::Execution(format!("Location generator error: {e}")))?;
+    let location_generator = TrackingLocationGenerator::new(inner_loc, tracker);
 
     let _ = file_prefix; // kept for parity with non-streaming API; not used in file names
     let write_id = Uuid::now_v7();
@@ -442,15 +574,20 @@ pub async fn write_data_files_streaming(
 ///
 /// Delegates to [`write_data_files_streaming`] and, when `metrics` is provided,
 /// increments `sqe_s3_bytes_written_total` and `sqe_s3_requests_total{operation="put"}`.
+///
+/// `tracker` collects every parquet file location handed out by the rolling
+/// writer so the caller's [`WriteCleanupGuard`] can delete those files if the
+/// surrounding future is cancelled before commit.
 pub async fn write_data_files_streaming_with_metrics(
     table: &Table,
     stream: SendableRecordBatchStream,
     file_prefix: &str,
     metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
     compression: Compression,
+    tracker: UploadedPaths,
 ) -> sqe_core::Result<(Vec<DataFile>, usize)> {
     let (data_files, total_rows) =
-        write_data_files_streaming(table, stream, file_prefix, compression).await?;
+        write_data_files_streaming(table, stream, file_prefix, compression, tracker).await?;
 
     if let Some(m) = metrics {
         let total_bytes: u64 = data_files.iter().map(|df| df.file_size_in_bytes()).sum();
@@ -466,6 +603,12 @@ pub async fn write_data_files_streaming_with_metrics(
     }
 
     Ok((data_files, total_rows))
+}
+
+/// Allocate a fresh tracker for a streaming write. Bundled here so callers
+/// don't need to know the inner representation.
+pub fn new_upload_tracker() -> UploadedPaths {
+    Arc::new(Mutex::new(Vec::new()))
 }
 
 /// Write position delete files for an Iceberg table.
