@@ -1,0 +1,68 @@
+{
+  "benchmark": "tpcc",
+  "scale_factor": 1.0,
+  "protocol": "flight",
+  "timestamp": "2026-03-24T18:17:26",
+  "summary": {
+    "total": 8,
+    "pass": 5,
+    "fail": 0,
+    "diff": 0,
+    "skip": 3,
+    "error": 0,
+    "total_duration_ms": 2703
+  },
+  "queries": [
+    {
+      "id": "customer_balance",
+      "status": "pass",
+      "duration_ms": 536,
+      "rows": 100
+    },
+    {
+      "id": "delivery",
+      "status": "skip",
+      "duration_ms": 0,
+      "rows": 0,
+      "message": "requires: delete, update"
+    },
+    {
+      "id": "district_orders",
+      "status": "pass",
+      "duration_ms": 538,
+      "rows": 10
+    },
+    {
+      "id": "new_order",
+      "status": "skip",
+      "duration_ms": 0,
+      "rows": 0,
+      "message": "requires: insert, update"
+    },
+    {
+      "id": "order_status",
+      "status": "pass",
+      "duration_ms": 565,
+      "rows": 20
+    },
+    {
+      "id": "payment",
+      "status": "skip",
+      "duration_ms": 0,
+      "rows": 0,
+      "message": "requires: update"
+    },
+    {
+      "id": "stock_level",
+      "status": "pass",
+      "duration_ms": 529,
+      "rows": 1
+    },
+    {
+      "id": "warehouse_summary",
+      "status": "pass",
+      "duration_ms": 535,
+      "rows": 1
+    }
+  ]
+}

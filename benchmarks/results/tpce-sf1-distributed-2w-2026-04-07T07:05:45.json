@@ -1,0 +1,130 @@
+{
+  "benchmark": "tpce",
+  "scale_factor": 1.0,
+  "protocol": "flight",
+  "timestamp": "2026-04-07T07:14:01",
+  "summary": {
+    "total": 18,
+    "pass": 13,
+    "fail": 0,
+    "diff": 0,
+    "skip": 5,
+    "error": 0,
+    "total_duration_ms": 142272
+  },
+  "queries": [
+    {
+      "id": "broker_volume",
+      "status": "pass",
+      "duration_ms": 561,
+      "rows": 15
+    },
+    {
+      "id": "customer_position",
+      "status": "pass",
+      "duration_ms": 830,
+      "rows": 1397074
+    },
+    {
+      "id": "data_maintenance",
+      "status": "pass",
+      "duration_ms": 535,
+      "rows": 2
+    },
+    {
+      "id": "data_maintenance_delete",
+      "status": "pass",
+      "duration_ms": 345,
+      "rows": 0
+    },
+    {
+      "id": "data_maintenance_update",
+      "status": "pass",
+      "duration_ms": 333,
+      "rows": 0
+    },
+    {
+      "id": "market_feed",
+      "status": "pass",
+      "duration_ms": 603,
+      "rows": 100
+    },
+    {
+      "id": "market_feed_update",
+      "status": "skip",
+      "duration_ms": 0,
+      "rows": 0,
+      "message": "requires: in_subquery_memtable"
+    },
+    {
+      "id": "market_watch",
+      "status": "pass",
+      "duration_ms": 650,
+      "rows": 50000
+    },
+    {
+      "id": "security_detail",
+      "status": "pass",
+      "duration_ms": 616,
+      "rows": 125
+    },
+    {
+      "id": "trade_lookup",
+      "status": "pass",
+      "duration_ms": 615,
+      "rows": 4299
+    },
+    {
+      "id": "trade_order",
+      "status": "pass",
+      "duration_ms": 630,
+      "rows": 90
+    },
+    {
+      "id": "trade_result",
+      "status": "pass",
+      "duration_ms": 134713,
+      "rows": 238582068
+    },
+    {
+      "id": "trade_result_update_holding",
+      "status": "skip",
+      "duration_ms": 0,
+      "rows": 0,
+      "message": "requires: in_subquery_memtable"
+    },
+    {
+      "id": "trade_result_update_status",
+      "status": "skip",
+      "duration_ms": 0,
+      "rows": 0,
+      "message": "requires: in_subquery_memtable"
+    },
+    {
+      "id": "trade_status",
+      "status": "pass",
+      "duration_ms": 1026,
+      "rows": 31155
+    },
+    {
+      "id": "trade_update",
+      "status": "pass",
+      "duration_ms": 815,
+      "rows": 4299
+    },
+    {
+      "id": "trade_update_executor",
+      "status": "skip",
+      "duration_ms": 0,
+      "rows": 0,
+      "message": "requires: in_subquery_memtable"
+    },
+    {
+      "id": "trade_update_settlement",
+      "status": "skip",
+      "duration_ms": 0,
+      "rows": 0,
+      "message": "requires: in_subquery_memtable"
+    }
+  ]
+}

@@ -1,0 +1,117 @@
+{
+  "benchmark": "tpcc",
+  "scale": 1.0,
+  "timestamp": "2026-05-07T08:22:20.579445+00:00",
+  "sqe_endpoint": "http://localhost:60051",
+  "trino_endpoint": "http://localhost:38080",
+  "queries": [
+    {
+      "query_name": "customer_balance",
+      "sqe_time_ms": 51,
+      "trino_time_ms": 363,
+      "speedup": 7.117647058823529,
+      "sqe_rows": 0,
+      "trino_rows": 0,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "delivery",
+      "sqe_time_ms": 57,
+      "trino_time_ms": 861,
+      "speedup": 15.105263157894736,
+      "sqe_rows": 10,
+      "trino_rows": 10,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "district_orders",
+      "sqe_time_ms": 310,
+      "trino_time_ms": 1258,
+      "speedup": 4.058064516129032,
+      "sqe_rows": 10,
+      "trino_rows": 10,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "new_order",
+      "sqe_time_ms": 158,
+      "trino_time_ms": 521,
+      "speedup": 3.2974683544303796,
+      "sqe_rows": 100,
+      "trino_rows": 100,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "order_status",
+      "sqe_time_ms": 78,
+      "trino_time_ms": 281,
+      "speedup": 3.6025641025641026,
+      "sqe_rows": 0,
+      "trino_rows": 0,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "payment",
+      "sqe_time_ms": 28,
+      "trino_time_ms": 157,
+      "speedup": 5.607142857142857,
+      "sqe_rows": 0,
+      "trino_rows": 0,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "stock_level",
+      "sqe_time_ms": 63,
+      "trino_time_ms": 236,
+      "speedup": 3.746031746031746,
+      "sqe_rows": 1,
+      "trino_rows": 1,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "warehouse_summary",
+      "sqe_time_ms": 52,
+      "trino_time_ms": 645,
+      "speedup": 12.403846153846153,
+      "sqe_rows": 1,
+      "trino_rows": 1,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    }
+  ],
+  "summary": {
+    "total": 8,
+    "matched": 8,
+    "row_diff": 0,
+    "sqe_failed": 0,
+    "trino_failed": 0,
+    "both_failed": 0,
+    "avg_speedup": 6.867253493357817,
+    "median_speedup": 5.607142857142857,
+    "sqe_total_ms": 797,
+    "trino_total_ms": 4322
+  }
+}
