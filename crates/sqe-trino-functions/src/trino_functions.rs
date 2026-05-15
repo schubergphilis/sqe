@@ -1867,67 +1867,7 @@ impl ScalarUDFImpl for LocalTimestamp {
 // Shared string-transform helpers
 // ---------------------------------------------------------------------------
 
-fn string_transform(arg: &ColumnarValue, f: impl Fn(&str) -> String) -> DFResult<ColumnarValue> {
-    use datafusion::common::ScalarValue;
-    match arg {
-        ColumnarValue::Scalar(v) => {
-            let s = match v {
-                ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => s.as_str().to_owned(),
-                ScalarValue::Utf8(None) | ScalarValue::LargeUtf8(None) => {
-                    return Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None)));
-                }
-                other => other.to_string(),
-            };
-            Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(f(&s)))))
-        }
-        ColumnarValue::Array(arr) => {
-            let str_arr = arr
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| DataFusionError::Internal("Expected string array".into()))?;
-            let results: StringArray = str_arr.iter().map(|opt| opt.map(&f)).collect();
-            Ok(ColumnarValue::Array(Arc::new(results)))
-        }
-    }
-}
-
-fn string_transform_2(
-    args: &[ColumnarValue],
-    f: impl Fn(&str, &str) -> Option<String>,
-) -> DFResult<ColumnarValue> {
-    use datafusion::common::ScalarValue;
-    match (&args[0], &args[1]) {
-        (ColumnarValue::Scalar(v1), ColumnarValue::Scalar(v2)) => {
-            let s1 = match v1 {
-                ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => s.clone(),
-                _ => return Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None))),
-            };
-            let s2 = match v2 {
-                ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => s.clone(),
-                _ => return Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None))),
-            };
-            Ok(ColumnarValue::Scalar(ScalarValue::Utf8(f(&s1, &s2))))
-        }
-        (ColumnarValue::Array(arr1), ColumnarValue::Scalar(v2)) => {
-            let str_arr = arr1
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| DataFusionError::Internal("Expected string array".into()))?;
-            let s2 = match v2 {
-                ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => s.clone(),
-                _ => {
-                    let nulls: StringArray = str_arr.iter().map(|_| None::<&str>).collect();
-                    return Ok(ColumnarValue::Array(Arc::new(nulls)));
-                }
-            };
-            let results: StringArray = str_arr.iter().map(|opt| opt.and_then(|s| f(s, &s2))).collect();
-            Ok(ColumnarValue::Array(Arc::new(results)))
-        }
-        _ => Err(DataFusionError::Internal(
-            "Unsupported arg combination for 2-arg string transform".into(),
-        )),
-    }
-}
+use crate::helpers::{str_transform, str_transform_2};
 
 // ---------------------------------------------------------------------------
 // URL extraction functions
@@ -2070,7 +2010,7 @@ impl ScalarUDFImpl for UrlEncode {
         Ok(DataType::Utf8)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        string_transform(&args.args[0], |s| {
+        str_transform(&args.args[0], |s| {
             use std::fmt::Write;
             let mut result = String::new();
             for b in s.bytes() {
@@ -2080,7 +2020,7 @@ impl ScalarUDFImpl for UrlEncode {
                     write!(result, "%{:02X}", b).unwrap();
                 }
             }
-            result
+            Some(result)
         })
     }
 }
@@ -2105,7 +2045,7 @@ impl ScalarUDFImpl for UrlDecode {
         Ok(DataType::Utf8)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        string_transform(&args.args[0], |s| percent_decode(s.as_bytes()))
+        str_transform(&args.args[0], |s| Some(percent_decode(s.as_bytes())))
     }
 }
 
@@ -2137,7 +2077,8 @@ macro_rules! encoding_udf {
                 Ok(DataType::Utf8)
             }
             fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-                string_transform(&args.args[0], $transform)
+                let transform = $transform;
+                str_transform(&args.args[0], |s| Some(transform(s)))
             }
         }
     };
@@ -2259,7 +2200,7 @@ impl ScalarUDFImpl for JsonExtract {
         Ok(DataType::Utf8)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        string_transform_2(&args.args, |json, path| {
+        str_transform_2(&args.args, |json, path| {
             let key = path.trim_start_matches("$.");
             let key = if key == "$" { "" } else { key };
             extract_json_value(json, key)
@@ -2290,7 +2231,7 @@ impl ScalarUDFImpl for JsonExtractScalar {
         Ok(DataType::Utf8)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        string_transform_2(&args.args, |json, path| {
+        str_transform_2(&args.args, |json, path| {
             let key = path.trim_start_matches("$.");
             let key = if key == "$" { "" } else { key };
             extract_json_scalar(json, key)
@@ -2372,10 +2313,12 @@ impl ScalarUDFImpl for JsonParse {
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         // json_parse validates and normalises the JSON string (compact form).
-        string_transform(&args.args[0], |s| {
-            serde_json::from_str::<serde_json::Value>(s)
-                .map(|v| v.to_string())
-                .unwrap_or_else(|_| "null".to_string())
+        str_transform(&args.args[0], |s| {
+            Some(
+                serde_json::from_str::<serde_json::Value>(s)
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|_| "null".to_string()),
+            )
         })
     }
 }

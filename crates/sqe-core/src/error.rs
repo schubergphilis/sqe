@@ -1,5 +1,44 @@
 use thiserror::Error;
 
+/// Catalog operation that failed; carried by the structured `CatalogHttp`
+/// variant so logs and metrics can attribute errors without parsing English.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CatalogOp {
+    LoadTable,
+    CreateTable,
+    DropTable,
+    RenameTable,
+    ListTables,
+    ListNamespaces,
+    CreateNamespace,
+    DropNamespace,
+    LoadView,
+    CreateView,
+    DropView,
+    Commit,
+    Other,
+}
+
+impl CatalogOp {
+    pub fn name(self) -> &'static str {
+        match self {
+            CatalogOp::LoadTable => "load_table",
+            CatalogOp::CreateTable => "create_table",
+            CatalogOp::DropTable => "drop_table",
+            CatalogOp::RenameTable => "rename_table",
+            CatalogOp::ListTables => "list_tables",
+            CatalogOp::ListNamespaces => "list_namespaces",
+            CatalogOp::CreateNamespace => "create_namespace",
+            CatalogOp::DropNamespace => "drop_namespace",
+            CatalogOp::LoadView => "load_view",
+            CatalogOp::CreateView => "create_view",
+            CatalogOp::DropView => "drop_view",
+            CatalogOp::Commit => "commit",
+            CatalogOp::Other => "other",
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum SqeError {
     #[error("Authentication failed: {0}")]
@@ -17,8 +56,45 @@ pub enum SqeError {
     #[error("Not implemented: {0}")]
     NotImplemented(String),
 
+    /// Structured catalog HTTP failure. Carrying the status code in a real
+    /// field removes the need to grep English in `classify_catalog_error`
+    /// every time iceberg-rust reshapes its error text.
+    #[error("Catalog HTTP {status} ({op_name}): {body}", op_name = op.name())]
+    CatalogHttp {
+        status: u16,
+        op: CatalogOp,
+        body: String,
+    },
+
+    /// Structured auth failure on the execution path. Used when a 401/403
+    /// reply comes back during commit / write paths; the dispatcher gets
+    /// a direct variant match instead of a substring guess on the body.
+    #[error("Auth failure on execution: HTTP {status}{}", body_for_display(body))]
+    ExecutionAuth {
+        status: u16,
+        body: String,
+    },
+
+    /// Iceberg commit conflict surfaced as a typed variant so retry logic
+    /// does not need to grep for "already referenced" or "commit conflict".
+    #[error("Iceberg commit conflict: {0}")]
+    IcebergCommitConflict(String),
+
+    /// S3 throttle/rate-limit surfaced as a typed variant. Maps cleanly to
+    /// `ResourceExhausted` without keyword matching on regional 503 wording.
+    #[error("S3 throttled: {0}")]
+    S3Throttled(String),
+
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
+}
+
+fn body_for_display(body: &str) -> String {
+    if body.is_empty() {
+        String::new()
+    } else {
+        format!(": {body}")
+    }
 }
 
 impl SqeError {
@@ -50,7 +126,15 @@ impl SqeError {
             SqeError::Auth(msg)
             | SqeError::Catalog(msg)
             | SqeError::Execution(msg)
-            | SqeError::NotImplemented(msg) => clean_error_message(msg),
+            | SqeError::NotImplemented(msg)
+            | SqeError::IcebergCommitConflict(msg)
+            | SqeError::S3Throttled(msg) => clean_error_message(msg),
+            SqeError::CatalogHttp { status, op, body } => {
+                clean_error_message(&format!("HTTP {status} during {} ({body})", op.name()))
+            }
+            SqeError::ExecutionAuth { status, body } => {
+                clean_error_message(&format!("HTTP {status}: {body}"))
+            }
             SqeError::Config(_) | SqeError::Internal(_) => {
                 self.error_code().generic_message().to_string()
             }
@@ -62,6 +146,7 @@ impl SqeError {
     pub fn is_not_found(&self) -> bool {
         match self {
             SqeError::Catalog(msg) => msg.contains("HTTP 404"),
+            SqeError::CatalogHttp { status, .. } => *status == 404,
             _ => false,
         }
     }
@@ -81,12 +166,26 @@ impl SqeError {
     }
 
     /// Classify this error into a structured [`SqeErrorCode`].
+    ///
+    /// Structured variants dispatch by field, not by English-substring on the
+    /// inner string. The legacy `Catalog(String)` / `Execution(String)`
+    /// fallbacks remain for un-migrated call sites.
     pub fn error_code(&self) -> SqeErrorCode {
         match self {
             SqeError::Auth(_) => SqeErrorCode::AuthenticationFailed,
             SqeError::Config(_) => SqeErrorCode::InternalError,
             SqeError::NotImplemented(_) => SqeErrorCode::NotSupported,
             SqeError::Internal(_) => SqeErrorCode::InternalError,
+            SqeError::CatalogHttp { status, .. } => classify_catalog_status(*status),
+            SqeError::ExecutionAuth { status, .. } => {
+                if *status == 403 {
+                    SqeErrorCode::AccessDenied
+                } else {
+                    SqeErrorCode::AuthenticationFailed
+                }
+            }
+            SqeError::IcebergCommitConflict(_) => SqeErrorCode::CommitConflict,
+            SqeError::S3Throttled(_) => SqeErrorCode::ResourceExhausted,
             SqeError::Catalog(msg) => classify_catalog_error(msg),
             SqeError::Execution(msg) => classify_execution_error(msg),
         }
@@ -292,6 +391,21 @@ impl std::fmt::Display for SqeErrorCode {
 // ---------------------------------------------------------------------------
 // Classifier helpers
 // ---------------------------------------------------------------------------
+
+/// Classify a structured catalog HTTP status code. Replaces the brittle
+/// substring search for "401 unauthorized" / "404 not found" etc. when the
+/// caller has a real status code in hand.
+fn classify_catalog_status(status: u16) -> SqeErrorCode {
+    match status {
+        401 => SqeErrorCode::AuthenticationFailed,
+        403 => SqeErrorCode::AccessDenied,
+        404 => SqeErrorCode::TableNotFound,
+        409 => SqeErrorCode::DuplicateTable,
+        429 => SqeErrorCode::ResourceExhausted,
+        500 | 502 | 503 | 504 => SqeErrorCode::CatalogUnavailable,
+        _ => SqeErrorCode::CatalogError,
+    }
+}
 
 /// Classify a [`SqeError::Catalog`] message into a specific error code.
 fn classify_catalog_error(msg: &str) -> SqeErrorCode {
@@ -844,6 +958,95 @@ mod tests {
         let msg = err.client_message();
         assert_eq!(msg, "Internal error");
         assert!(!msg.contains("pool"), "should not contain internal detail");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Structured-variant classification (issue #101)
+    //
+    // These tests assert dispatch by variant field rather than English-substring
+    // matching, so iceberg-rust / DataFusion message wording changes cannot
+    // silently regress the error code.
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn catalog_http_401_is_authentication_failed() {
+        let err = SqeError::CatalogHttp {
+            status: 401,
+            op: CatalogOp::LoadTable,
+            body: String::new(),
+        };
+        assert_eq!(err.error_code(), SqeErrorCode::AuthenticationFailed);
+    }
+
+    #[test]
+    fn catalog_http_403_is_access_denied() {
+        let err = SqeError::CatalogHttp {
+            status: 403,
+            op: CatalogOp::CreateTable,
+            body: String::new(),
+        };
+        assert_eq!(err.error_code(), SqeErrorCode::AccessDenied);
+    }
+
+    #[test]
+    fn catalog_http_404_is_not_found() {
+        let err = SqeError::CatalogHttp {
+            status: 404,
+            op: CatalogOp::LoadTable,
+            body: String::new(),
+        };
+        assert!(err.is_not_found());
+        assert_eq!(err.error_code(), SqeErrorCode::TableNotFound);
+    }
+
+    #[test]
+    fn catalog_http_409_is_duplicate() {
+        let err = SqeError::CatalogHttp {
+            status: 409,
+            op: CatalogOp::CreateTable,
+            body: String::new(),
+        };
+        assert_eq!(err.error_code(), SqeErrorCode::DuplicateTable);
+    }
+
+    #[test]
+    fn catalog_http_503_is_unavailable() {
+        let err = SqeError::CatalogHttp {
+            status: 503,
+            op: CatalogOp::ListTables,
+            body: String::new(),
+        };
+        assert_eq!(err.error_code(), SqeErrorCode::CatalogUnavailable);
+    }
+
+    #[test]
+    fn execution_auth_401_is_authentication_failed() {
+        let err = SqeError::ExecutionAuth {
+            status: 401,
+            body: "token expired".into(),
+        };
+        assert_eq!(err.error_code(), SqeErrorCode::AuthenticationFailed);
+    }
+
+    #[test]
+    fn execution_auth_403_is_access_denied() {
+        let err = SqeError::ExecutionAuth {
+            status: 403,
+            body: String::new(),
+        };
+        assert_eq!(err.error_code(), SqeErrorCode::AccessDenied);
+    }
+
+    #[test]
+    fn iceberg_commit_conflict_variant_is_commit_conflict() {
+        let err = SqeError::IcebergCommitConflict("snapshot N has already been added".into());
+        assert_eq!(err.error_code(), SqeErrorCode::CommitConflict);
+    }
+
+    #[test]
+    fn s3_throttled_variant_is_resource_exhausted() {
+        let err = SqeError::S3Throttled("SlowDown".into());
+        assert_eq!(err.error_code(), SqeErrorCode::ResourceExhausted);
     }
 
     #[test]

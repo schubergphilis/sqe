@@ -96,24 +96,34 @@ pub struct TrinoClientHeaders {
 
 #[async_trait::async_trait]
 pub trait TrinoAuthenticator: Send + Sync + 'static {
-    async fn authenticate(&self, username: &str, password: &str) -> Result<Session, String>;
+    async fn authenticate(&self, username: &str, password: &str) -> Result<Session, sqe_core::SqeError>;
 
     /// Validate a raw bearer token (JWT) and return an authenticated session.
     ///
     /// The default implementation rejects all bearer tokens. Override this in
     /// the coordinator adapter to route through the JWKS-validating auth chain.
-    async fn authenticate_bearer(&self, _token: &str) -> Result<Session, String> {
-        Err("Bearer token authentication not configured".to_string())
+    async fn authenticate_bearer(&self, _token: &str) -> Result<Session, sqe_core::SqeError> {
+        Err(sqe_core::SqeError::Auth(
+            "Bearer token authentication not configured".to_string(),
+        ))
     }
 }
 
 #[async_trait::async_trait]
 pub trait TrinoQueryExecutor: Send + Sync + 'static {
+    /// Execute a SQL statement and return record batches.
+    ///
+    /// Returns the full `SqeError` so the Trino mapping in
+    /// `TrinoError::from_sqe_error` dispatches on the original variant. The
+    /// previous `Result<_, String>` shape lost the variant, forcing the
+    /// caller to substring-classify the `Display` output and produced
+    /// inconsistent error codes across Flight SQL and Trino HTTP for the
+    /// same fault (issue #102).
     async fn execute(
         &self,
         session: &Session,
         sql: &str,
-    ) -> Result<Vec<arrow_array::RecordBatch>, String>;
+    ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError>;
 }
 
 pub struct TrinoServerOptions {
@@ -734,18 +744,15 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             }
             resp
         }
-        Err(e) => {
-            let sqe_err = sqe_core::SqeError::Execution(e);
+        Err(sqe_err) => {
             tracing::warn!(
                 error_code = %sqe_err.error_code(),
                 query_id = %query_id,
                 error = %sqe_err,
                 "Trino query execution failed"
             );
-            let is_rate_limited = sqe_err
-                .to_string()
-                .to_ascii_lowercase()
-                .contains("rate limit");
+            let is_rate_limited =
+                sqe_err.error_code() == sqe_core::SqeErrorCode::ResourceExhausted;
             let trino_error = TrinoError::from_sqe_error(&sqe_err, Some(&query_id));
             let response = TrinoResponse {
                 id: query_id.clone(),
@@ -1046,8 +1053,8 @@ mod tests {
     struct MockAuth;
     #[async_trait::async_trait]
     impl TrinoAuthenticator for MockAuth {
-        async fn authenticate(&self, _: &str, _: &str) -> Result<Session, String> {
-            Err("mock".to_string())
+        async fn authenticate(&self, _: &str, _: &str) -> Result<Session, sqe_core::SqeError> {
+            Err(sqe_core::SqeError::Auth("mock".to_string()))
         }
     }
 
@@ -1057,7 +1064,7 @@ mod tests {
     struct MockAuthOk;
     #[async_trait::async_trait]
     impl TrinoAuthenticator for MockAuthOk {
-        async fn authenticate(&self, user: &str, _: &str) -> Result<Session, String> {
+        async fn authenticate(&self, user: &str, _: &str) -> Result<Session, sqe_core::SqeError> {
             Ok(Session::new(
                 user.to_string(),
                 sqe_core::SecretString::new("mock-token".to_string()),
@@ -1066,7 +1073,7 @@ mod tests {
                 vec![],
             ))
         }
-        async fn authenticate_bearer(&self, _: &str) -> Result<Session, String> {
+        async fn authenticate_bearer(&self, _: &str) -> Result<Session, sqe_core::SqeError> {
             Ok(Session::new(
                 "bearer-user".to_string(),
                 sqe_core::SecretString::new("mock-token".to_string()),
@@ -1096,8 +1103,8 @@ mod tests {
             &self,
             _: &Session,
             _: &str,
-        ) -> Result<Vec<arrow_array::RecordBatch>, String> {
-            Err("mock".to_string())
+        ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
+            Err(sqe_core::SqeError::Execution("mock".to_string()))
         }
     }
 

@@ -84,54 +84,7 @@ pub fn register_extended_trino_functions(ctx: &datafusion::prelude::SessionConte
 // Helpers
 // ═══════════════════════════════════════════════════════════════════
 
-/// Apply a scalar string→string transform to a ColumnarValue.
-fn str_transform(
-    arg: &ColumnarValue,
-    f: impl Fn(&str) -> Option<String>,
-) -> DFResult<ColumnarValue> {
-    match arg {
-        ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => {
-            Ok(ColumnarValue::Scalar(ScalarValue::Utf8(f(s))))
-        }
-        ColumnarValue::Scalar(ScalarValue::Utf8(None)) => {
-            Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None)))
-        }
-        ColumnarValue::Array(arr) => {
-            let str_arr = arr
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| DataFusionError::Internal("Expected StringArray".into()))?;
-            let result: StringArray = str_arr.iter().map(|opt| opt.and_then(&f)).collect();
-            Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
-        }
-        _ => Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None))),
-    }
-}
-
-/// Apply a transform over two string ColumnarValues (scalar/scalar or array/scalar).
-fn str_transform_2(
-    args: &[ColumnarValue],
-    f: impl Fn(&str, &str) -> Option<String>,
-) -> DFResult<ColumnarValue> {
-    match (&args[0], &args[1]) {
-        (
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some(s1))),
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some(s2))),
-        ) => Ok(ColumnarValue::Scalar(ScalarValue::Utf8(f(s1, s2)))),
-        (ColumnarValue::Array(arr), ColumnarValue::Scalar(ScalarValue::Utf8(Some(s2)))) => {
-            let str_arr = arr
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| DataFusionError::Internal("Expected StringArray".into()))?;
-            let result: StringArray = str_arr
-                .iter()
-                .map(|opt| opt.and_then(|s| f(s, s2)))
-                .collect();
-            Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
-        }
-        _ => Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None))),
-    }
-}
+use crate::helpers::{str_transform, str_transform_2};
 
 // ═══════════════════════════════════════════════════════════════════
 // TRIVIAL ALIASES

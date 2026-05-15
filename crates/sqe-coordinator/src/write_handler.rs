@@ -16,7 +16,7 @@ use iceberg::spec::{
 use iceberg::table::Table as IcebergTable;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
-use sqlparser::ast::Statement;
+use sqlparser::ast::{ObjectName, Statement};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -173,6 +173,80 @@ fn build_lineage_insert_plan(
     .map_err(|e| SqeError::Execution(format!("Failed to build lineage INSERT wrapper: {e}")))?
     .build()
     .map_err(|e| SqeError::Execution(format!("Failed to build lineage plan: {e}")))
+}
+
+/// Extract the target table `ObjectName` from a `Statement::Delete`. Centralises
+/// the FromTable + TableFactor matching so a future sqlparser variant change only
+/// needs to be patched once.
+fn delete_target_object_name(stmt: &Statement) -> sqe_core::Result<&ObjectName> {
+    let delete = match stmt {
+        Statement::Delete(d) => d,
+        other => {
+            return Err(SqeError::Execution(format!(
+                "Expected DELETE statement, got: {other}"
+            )));
+        }
+    };
+    let tables = match &delete.from {
+        sqlparser::ast::FromTable::WithFromKeyword(tables) => tables,
+        sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
+    };
+    let first = tables.first().ok_or_else(|| {
+        SqeError::Execution("DELETE statement has no target table".to_string())
+    })?;
+    match &first.relation {
+        sqlparser::ast::TableFactor::Table { name, .. } => Ok(name),
+        other => Err(SqeError::Execution(format!(
+            "Expected table name in DELETE, got: {other}"
+        ))),
+    }
+}
+
+/// Resolve the target `TableIdent` for a `Statement::Delete`. Combines the
+/// `ObjectName` extraction with `parse_table_ref`; five DELETE handlers used
+/// to inline this prologue.
+fn resolve_delete_target_ident(stmt: &Statement) -> sqe_core::Result<TableIdent> {
+    parse_table_ref(delete_target_object_name(stmt)?)
+}
+
+/// Best-effort variant for the dispatcher: returns `None` instead of an error
+/// so the dispatcher can fall through to a slower path that surfaces the same
+/// error in context.
+fn try_resolve_delete_target_ident(stmt: &Statement) -> Option<TableIdent> {
+    delete_target_object_name(stmt)
+        .ok()
+        .and_then(|name| parse_table_ref(name).ok())
+}
+
+/// Extract the target table `ObjectName` from a `Statement::Update`.
+fn update_target_object_name(stmt: &Statement) -> sqe_core::Result<&ObjectName> {
+    let table_factor = match stmt {
+        Statement::Update { table, .. } => table,
+        other => {
+            return Err(SqeError::Execution(format!(
+                "Expected UPDATE statement, got: {other}"
+            )));
+        }
+    };
+    match &table_factor.relation {
+        sqlparser::ast::TableFactor::Table { name, .. } => Ok(name),
+        other => Err(SqeError::Execution(format!(
+            "Expected table name in UPDATE, got: {other}"
+        ))),
+    }
+}
+
+/// Resolve the target `TableIdent` for a `Statement::Update`. Mirrors
+/// `resolve_delete_target_ident` so callers stay symmetric.
+fn resolve_update_target_ident(stmt: &Statement) -> sqe_core::Result<TableIdent> {
+    parse_table_ref(update_target_object_name(stmt)?)
+}
+
+/// Best-effort variant for the dispatcher.
+fn try_resolve_update_target_ident(stmt: &Statement) -> Option<TableIdent> {
+    update_target_object_name(stmt)
+        .ok()
+        .and_then(|name| parse_table_ref(name).ok())
 }
 
 /// Resolve the (catalog, namespace, table) tuple used to label a write target
@@ -692,7 +766,9 @@ impl WriteHandler {
             }
         };
 
-        let (namespace, name) = parse_table_ref(table_name)?;
+        let table_ident = parse_table_ref(table_name)?;
+        let namespace = table_ident.namespace().clone();
+        let name = table_ident.name().to_string();
 
         info!(
             username = %session.user.username,
@@ -726,7 +802,6 @@ impl WriteHandler {
 
         // Load the table back (needed for the writer infrastructure which reads
         // table metadata for location generation, file IO, etc.)
-        let table_ident = TableIdent::new(namespace, name);
         let table = catalog
             .load_table(&table_ident)
             .await
@@ -857,9 +932,11 @@ impl WriteHandler {
             }
         };
 
-        let (namespace, name) = parse_table_ref(table_name)?;
+        let table_ident = parse_table_ref(table_name)?;
+        let namespace = table_ident.namespace().clone();
+        let name = table_ident.name().to_string();
 
-        // Plan the SELECT without executing it — gives us the output schema cheaply.
+        // Plan the SELECT without executing it; gives us the output schema cheaply.
         let df = ctx
             .sql(select_sql)
             .await
@@ -903,7 +980,6 @@ impl WriteHandler {
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to create table: {e}")))?;
 
-        let table_ident = TableIdent::new(namespace, name);
         let table = catalog
             .load_table(&table_ident)
             .await
@@ -1026,8 +1102,7 @@ impl WriteHandler {
             }
         };
 
-        let (namespace, name) = parse_table_ref(table_name)?;
-        let table_ident = TableIdent::new(namespace, name);
+        let table_ident = parse_table_ref(table_name)?;
 
         info!(
             username = %session.user.username,
@@ -1158,7 +1233,9 @@ impl WriteHandler {
             }
         };
 
-        let (namespace, name) = parse_table_ref(&ct.name)?;
+        let table_ident = parse_table_ref(&ct.name)?;
+        let namespace = table_ident.namespace().clone();
+        let name = table_ident.name().to_string();
 
         if ct.columns.is_empty() {
             return Err(SqeError::Execution(
@@ -1207,12 +1284,9 @@ impl WriteHandler {
 
         let catalog = self.create_catalog_bridge(session).await?;
 
-        if ct.if_not_exists {
-            let table_ident = TableIdent::new(namespace.clone(), name.clone());
-            if catalog.load_table(&table_ident).await.is_ok() {
-                info!(table = %table_ident, "Table already exists, skipping (IF NOT EXISTS)");
-                return Ok(vec![]);
-            }
+        if ct.if_not_exists && catalog.load_table(&table_ident).await.is_ok() {
+            info!(table = %table_ident, "Table already exists, skipping (IF NOT EXISTS)");
+            return Ok(vec![]);
         }
 
         // Merge in user-specified TBLPROPERTIES / WITH options so Polaris
@@ -1286,8 +1360,7 @@ impl WriteHandler {
             }
         };
 
-        let (namespace, name) = parse_table_ref(table_name)?;
-        let table_ident = TableIdent::new(namespace, name);
+        let table_ident = parse_table_ref(table_name)?;
 
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
@@ -1473,30 +1546,14 @@ impl WriteHandler {
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let table_ident = resolve_delete_target_ident(stmt)?;
         let delete = match stmt {
             Statement::Delete(d) => d,
-            other => {
-                return Err(SqeError::Execution(format!(
-                    "Expected DELETE statement, got: {other}"
-                )));
-            }
+            // unreachable: resolve_delete_target_ident above already filtered.
+            other => return Err(SqeError::Execution(format!(
+                "Expected DELETE statement, got: {other}"
+            ))),
         };
-
-        let tables = match &delete.from {
-            sqlparser::ast::FromTable::WithFromKeyword(tables) => tables,
-            sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
-        };
-        let table_factor_name = match &tables[0].relation {
-            sqlparser::ast::TableFactor::Table { name, .. } => name,
-            other => {
-                return Err(SqeError::Execution(format!(
-                    "Expected table name in DELETE, got: {other}"
-                )));
-            }
-        };
-
-        let (namespace, name) = parse_table_ref(table_factor_name)?;
-        let table_ident = TableIdent::new(namespace, name);
 
         let table = catalog.load_table(&table_ident).await?;
 
@@ -1646,30 +1703,13 @@ impl WriteHandler {
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let table_ident = resolve_delete_target_ident(stmt)?;
         let delete = match stmt {
             Statement::Delete(d) => d,
-            other => {
-                return Err(SqeError::Execution(format!(
-                    "Expected DELETE statement, got: {other}"
-                )));
-            }
+            other => return Err(SqeError::Execution(format!(
+                "Expected DELETE statement, got: {other}"
+            ))),
         };
-
-        let tables = match &delete.from {
-            sqlparser::ast::FromTable::WithFromKeyword(tables) => tables,
-            sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
-        };
-        let table_factor_name = match &tables[0].relation {
-            sqlparser::ast::TableFactor::Table { name, .. } => name,
-            other => {
-                return Err(SqeError::Execution(format!(
-                    "Expected table name in DELETE, got: {other}"
-                )));
-            }
-        };
-
-        let (namespace, name) = parse_table_ref(table_factor_name)?;
-        let table_ident = TableIdent::new(namespace, name);
 
         let table = catalog.load_table(&table_ident).await?;
 
@@ -1826,30 +1866,13 @@ impl WriteHandler {
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let table_ident = resolve_delete_target_ident(stmt)?;
         let delete = match stmt {
             Statement::Delete(d) => d,
-            other => {
-                return Err(SqeError::Execution(format!(
-                    "Expected DELETE statement, got: {other}"
-                )));
-            }
+            other => return Err(SqeError::Execution(format!(
+                "Expected DELETE statement, got: {other}"
+            ))),
         };
-
-        let tables = match &delete.from {
-            sqlparser::ast::FromTable::WithFromKeyword(tables) => tables,
-            sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
-        };
-        let table_factor_name = match &tables[0].relation {
-            sqlparser::ast::TableFactor::Table { name, .. } => name,
-            other => {
-                return Err(SqeError::Execution(format!(
-                    "Expected table name in DELETE, got: {other}"
-                )));
-            }
-        };
-
-        let (namespace, name) = parse_table_ref(table_factor_name)?;
-        let table_ident = TableIdent::new(namespace, name);
         let table = catalog.load_table(&table_ident).await?;
 
         // Equality deletes require declared identifier-field-ids (primary key).
@@ -2023,23 +2046,12 @@ impl WriteHandler {
         // Peek at the target table to read its properties. Any parse or
         // load error falls through to the default CoW path, which surfaces
         // the error at that point.
-        let delete = match stmt {
-            Statement::Delete(d) => d,
-            _ => return self.handle_delete(session, stmt, catalog, ctx).await,
-        };
-        let tables = match &delete.from {
-            sqlparser::ast::FromTable::WithFromKeyword(t) => t,
-            sqlparser::ast::FromTable::WithoutKeyword(t) => t,
-        };
-        let table_factor_name = match tables.first().map(|t| &t.relation) {
-            Some(sqlparser::ast::TableFactor::Table { name, .. }) => name,
-            _ => return self.handle_delete(session, stmt, catalog, ctx).await,
-        };
-
-        let Ok((namespace, name)) = parse_table_ref(table_factor_name) else {
+        let Ok(table_factor_name) = delete_target_object_name(stmt) else {
             return self.handle_delete(session, stmt, catalog, ctx).await;
         };
-        let table_ident = TableIdent::new(namespace, name);
+        let Some(table_ident) = try_resolve_delete_target_ident(stmt) else {
+            return self.handle_delete(session, stmt, catalog, ctx).await;
+        };
         let Ok(table) = catalog.load_table(&table_ident).await else {
             return self.handle_delete(session, stmt, catalog, ctx).await;
         };
@@ -2096,31 +2108,17 @@ impl WriteHandler {
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let (table_factor, assignments, selection) = match stmt {
+        let table_ident = resolve_update_target_ident(stmt)?;
+        let (assignments, selection) = match stmt {
             Statement::Update {
-                table,
                 assignments,
                 selection,
                 ..
-            } => (table, assignments, selection),
-            other => {
-                return Err(SqeError::Execution(format!(
-                    "Expected UPDATE statement, got: {other}"
-                )));
-            }
+            } => (assignments, selection),
+            other => return Err(SqeError::Execution(format!(
+                "Expected UPDATE statement, got: {other}"
+            ))),
         };
-
-        let table_name = match &table_factor.relation {
-            sqlparser::ast::TableFactor::Table { name, .. } => name,
-            other => {
-                return Err(SqeError::Execution(format!(
-                    "Expected table name in UPDATE, got: {other}"
-                )));
-            }
-        };
-
-        let (namespace, name) = parse_table_ref(table_name)?;
-        let table_ident = TableIdent::new(namespace, name);
 
         let table = catalog.load_table(&table_ident).await?;
 
@@ -2263,18 +2261,12 @@ impl WriteHandler {
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         // Peek at the target table to read its properties.
-        let update_table = match stmt {
-            Statement::Update { table, .. } => table,
-            _ => return self.handle_update(session, stmt, catalog, ctx).await,
-        };
-        let table_factor_name = match &update_table.relation {
-            sqlparser::ast::TableFactor::Table { name, .. } => name,
-            _ => return self.handle_update(session, stmt, catalog, ctx).await,
-        };
-        let Ok((namespace, name)) = parse_table_ref(table_factor_name) else {
+        let Ok(table_factor_name) = update_target_object_name(stmt) else {
             return self.handle_update(session, stmt, catalog, ctx).await;
         };
-        let table_ident = TableIdent::new(namespace, name);
+        let Some(table_ident) = try_resolve_update_target_ident(stmt) else {
+            return self.handle_update(session, stmt, catalog, ctx).await;
+        };
         let Ok(table) = catalog.load_table(&table_ident).await else {
             return self.handle_update(session, stmt, catalog, ctx).await;
         };
@@ -2337,31 +2329,17 @@ impl WriteHandler {
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let (table_factor, assignments, selection) = match stmt {
+        let table_ident = resolve_update_target_ident(stmt)?;
+        let (assignments, selection) = match stmt {
             Statement::Update {
-                table,
                 assignments,
                 selection,
                 ..
-            } => (table, assignments, selection),
-            other => {
-                return Err(SqeError::Execution(format!(
-                    "Expected UPDATE statement, got: {other}"
-                )));
-            }
+            } => (assignments, selection),
+            other => return Err(SqeError::Execution(format!(
+                "Expected UPDATE statement, got: {other}"
+            ))),
         };
-
-        let table_name = match &table_factor.relation {
-            sqlparser::ast::TableFactor::Table { name, .. } => name,
-            other => {
-                return Err(SqeError::Execution(format!(
-                    "Expected table name in UPDATE, got: {other}"
-                )));
-            }
-        };
-
-        let (namespace, name) = parse_table_ref(table_name)?;
-        let table_ident = TableIdent::new(namespace, name);
         let table = catalog.load_table(&table_ident).await?;
 
         // MoR UPDATE requires declared identifier-field-ids (primary key)
@@ -2608,8 +2586,7 @@ impl WriteHandler {
             }
         };
 
-        let (namespace, name) = parse_table_ref(target_table_name)?;
-        let table_ident = TableIdent::new(namespace, name);
+        let table_ident = parse_table_ref(target_table_name)?;
 
         // Extract source alias (needed for column references in the JOIN)
         let source_alias = match source_factor {
@@ -2992,12 +2969,11 @@ impl WriteHandler {
                     .await;
             }
         };
-        let Ok((namespace, name)) = parse_table_ref(target_name) else {
+        let Ok(table_ident) = parse_table_ref(target_name) else {
             return self
                 .handle_merge(session, stmt, source_batches, catalog, ctx)
                 .await;
         };
-        let table_ident = TableIdent::new(namespace, name);
         let Ok(table) = catalog.load_table(&table_ident).await else {
             return self
                 .handle_merge(session, stmt, source_batches, catalog, ctx)
@@ -3117,8 +3093,7 @@ impl WriteHandler {
                 )));
             }
         };
-        let (namespace, name) = parse_table_ref(target_table_name)?;
-        let table_ident = TableIdent::new(namespace, name);
+        let table_ident = parse_table_ref(target_table_name)?;
 
         let source_alias = match source_factor {
             TableFactor::Table { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()),
