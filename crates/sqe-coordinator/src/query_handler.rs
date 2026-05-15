@@ -1580,7 +1580,10 @@ impl QueryHandler {
                     per_user_mem_reservation,
                     cancel_token,
                 )
-                .with_teardown(tt_cleanup);
+                .with_teardown(tt_cleanup)
+                .with_idle_timeout(std::time::Duration::from_secs(
+                    self.config.query.stream_idle_timeout_secs,
+                ));
                 let boxed: SendableRecordBatchStream = Box::pin(tracked);
                 Ok((schema, boxed))
             }

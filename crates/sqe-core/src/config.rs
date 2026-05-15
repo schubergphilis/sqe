@@ -166,6 +166,14 @@ pub struct QueryConfig {
     /// Default: 10 (fact table must be at least 10x larger than the smallest dimension).
     #[serde(default = "default_star_schema_min_ratio")]
     pub star_schema_min_ratio: usize,
+    /// Idle-timeout (seconds) for an active result stream. When the gRPC
+    /// client has not pulled a batch within this window the coordinator
+    /// aborts the stream and releases its concurrency permit. Bounds the
+    /// damage from slow or malicious clients holding open Flight streams
+    /// to pin every slot in `max_concurrent_queries`. Set to 0 to disable.
+    /// Default: 300 (5 minutes). Issue #75.
+    #[serde(default = "default_stream_idle_timeout")]
+    pub stream_idle_timeout_secs: u64,
 }
 
 impl Default for QueryConfig {
@@ -187,6 +195,7 @@ impl Default for QueryConfig {
             late_materialization_min_projection_cols: default_late_mat_min_projection_cols(),
             star_schema_reorder: default_true(),
             star_schema_min_ratio: default_star_schema_min_ratio(),
+            stream_idle_timeout_secs: default_stream_idle_timeout(),
         }
     }
 }
@@ -1734,6 +1743,7 @@ fn default_max_concurrent_queries() -> usize { 100 }
 fn default_max_concurrent_per_user() -> usize { 20 }
 fn default_per_user_memory_budget() -> String { "1GB".to_string() }
 fn default_slow_query_threshold() -> u64 { 30 }
+fn default_stream_idle_timeout() -> u64 { 300 }
 fn default_max_query_memory() -> String { "256MB".to_string() }
 fn default_distribution_threshold() -> String { "128MB".to_string() }
 fn default_distribution_file_threshold() -> usize { 4 }
