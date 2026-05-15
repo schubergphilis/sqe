@@ -39,6 +39,9 @@ pub struct SqeSchemaProvider {
     small_file_threshold_bytes: u64,
     /// Concurrency for direct manifest walks during pruning.
     manifest_concurrency: usize,
+    /// Prefetch concurrency for the direct-read fast path, propagated to
+    /// each `SqeTableProvider`.
+    prefetch_concurrency: usize,
     /// Short-TTL cache of table_names() results so repeated planning
     /// lookups during a single dbt run do not pay two REST round trips
     /// per call.
@@ -65,6 +68,7 @@ impl SqeSchemaProvider {
             prom_metrics: None,
             small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
             manifest_concurrency: crate::iceberg_scan::DEFAULT_MANIFEST_CONCURRENCY,
+            prefetch_concurrency: crate::iceberg_scan::DEFAULT_DIRECT_READ_CONCURRENCY,
             table_names_cache,
         }
     }
@@ -86,6 +90,13 @@ impl SqeSchemaProvider {
     /// column-statistics pruning.
     pub fn with_manifest_concurrency(mut self, concurrency: usize) -> Self {
         self.manifest_concurrency = concurrency.max(1);
+        self
+    }
+
+    /// Set the prefetch concurrency propagated to every table provider's
+    /// direct-read fast path. Sourced from `[storage] prefetch_concurrency`.
+    pub fn with_prefetch_concurrency(mut self, concurrency: usize) -> Self {
+        self.prefetch_concurrency = concurrency.max(1);
         self
     }
 
@@ -234,7 +245,8 @@ impl SchemaProvider for SqeSchemaProvider {
                         };
                         let provider = provider
                             .with_small_file_threshold(self.small_file_threshold_bytes)
-                            .with_manifest_concurrency(self.manifest_concurrency);
+                            .with_manifest_concurrency(self.manifest_concurrency)
+                            .with_prefetch_concurrency(self.prefetch_concurrency);
                         return Ok(Some(Arc::new(provider)));
                     }
                     Err(e) => {

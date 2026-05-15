@@ -252,6 +252,8 @@ pub async fn create_session_context(
                     catalog_provider.with_small_file_threshold(small_file_threshold_bytes);
                 catalog_provider =
                     catalog_provider.with_manifest_concurrency(cat_cfg.manifest_concurrency);
+                catalog_provider = catalog_provider
+                    .with_prefetch_concurrency(config.storage.prefetch_concurrency);
 
                 ctx.register_catalog(cat_name, Arc::new(catalog_provider));
 

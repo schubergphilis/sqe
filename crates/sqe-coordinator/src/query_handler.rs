@@ -2709,6 +2709,7 @@ impl QueryHandler {
         use sqlparser::parser::Parser;
 
         let mut cleanup_aliases: Vec<String> = Vec::new();
+        let prefetch_concurrency = self.config.storage.prefetch_concurrency;
 
         // First, pre-scan and resolve FOR VERSION AS OF. This path hides the
         // clause from sqlparser and registers snapshot-pinned providers
@@ -2721,7 +2722,9 @@ impl QueryHandler {
         let mut version_resolved = !version_specs.is_empty();
         if version_resolved {
             for spec in &version_specs {
-                let alias = Self::apply_version_spec(spec, ctx, session_catalog).await?;
+                let alias =
+                    Self::apply_version_spec(spec, ctx, session_catalog, prefetch_concurrency)
+                        .await?;
                 cleanup_aliases.push(alias.clone());
                 rewritten_for_version =
                     replace_table_reference(&rewritten_for_version, &spec.table, &alias);
@@ -2753,6 +2756,7 @@ impl QueryHandler {
                         ctx,
                         session_catalog,
                         cleanup,
+                        prefetch_concurrency,
                     ).await? {
                         found_time_travel = true;
                     }
@@ -2762,6 +2766,7 @@ impl QueryHandler {
                             ctx,
                             session_catalog,
                             cleanup,
+                            prefetch_concurrency,
                         ).await? {
                             found_time_travel = true;
                         }
@@ -2793,6 +2798,7 @@ impl QueryHandler {
         spec: &sqe_sql::TimeTravelSpec,
         ctx: &SessionContext,
         session_catalog: &Arc<SessionCatalog>,
+        prefetch_concurrency: usize,
     ) -> sqe_core::Result<String> {
         use iceberg::spec::SnapshotRetention;
         use sqe_sql::VersionRef;
@@ -2868,12 +2874,9 @@ impl QueryHandler {
 
         let provider = sqe_catalog::table_provider::SqeTableProvider::try_new(iceberg_table)
             .await?
-            .with_snapshot_id(snapshot_id);
+            .with_snapshot_id(snapshot_id)
+            .with_prefetch_concurrency(prefetch_concurrency);
 
-        // Register under a unique alias in `datafusion.public` (a
-        // MemoryCatalog schema that supports dynamic registration).
-        // The Iceberg schema provider that owns the original table name
-        // is read-only.
         let alias = format!(
             "__sqe_ver_{}_{}",
             bare_table,
@@ -2911,6 +2914,7 @@ impl QueryHandler {
         ctx: &SessionContext,
         session_catalog: &Arc<SessionCatalog>,
         cleanup: &mut Vec<String>,
+        prefetch_concurrency: usize,
     ) -> sqe_core::Result<bool> {
         use sqlparser::ast::TableVersion;
 
@@ -2947,7 +2951,8 @@ impl QueryHandler {
                 // under a unique alias under datafusion.public.
                 let provider = sqe_catalog::table_provider::SqeTableProvider::try_new(iceberg_table)
                     .await?
-                    .with_snapshot_id(snapshot_id);
+                    .with_snapshot_id(snapshot_id)
+                    .with_prefetch_concurrency(prefetch_concurrency);
 
                 let alias = format!(
                     "__sqe_tt_{}_{}",

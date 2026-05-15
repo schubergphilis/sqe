@@ -41,6 +41,9 @@ pub struct SqeTableProvider {
     small_file_threshold_bytes: u64,
     /// Concurrency for direct manifest walks during pruning.
     manifest_concurrency: usize,
+    /// In-flight prefetch concurrency for the direct-read small-file fast path.
+    /// Wired through to `IcebergScanExec::direct_read_concurrency`.
+    prefetch_concurrency: usize,
 }
 
 impl SqeTableProvider {
@@ -66,6 +69,7 @@ impl SqeTableProvider {
             snapshot_id: None,
             small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
             manifest_concurrency: crate::iceberg_scan::DEFAULT_MANIFEST_CONCURRENCY,
+            prefetch_concurrency: crate::iceberg_scan::DEFAULT_DIRECT_READ_CONCURRENCY,
         })
     }
 
@@ -88,6 +92,14 @@ impl SqeTableProvider {
     /// column-statistics pruning.
     pub fn with_manifest_concurrency(mut self, concurrency: usize) -> Self {
         self.manifest_concurrency = concurrency.max(1);
+        self
+    }
+
+    /// Set the in-flight prefetch concurrency for the direct-read small-file
+    /// fast path. Maps to `IcebergScanExec::direct_read_concurrency` and is
+    /// fed from `[storage] prefetch_concurrency`.
+    pub fn with_prefetch_concurrency(mut self, concurrency: usize) -> Self {
+        self.prefetch_concurrency = concurrency.max(1);
         self
     }
 
@@ -197,6 +209,7 @@ impl TableProvider for SqeTableProvider {
         exec = exec
             .with_small_file_threshold(self.small_file_threshold_bytes)
             .with_manifest_concurrency(self.manifest_concurrency)
+            .with_direct_read_concurrency(self.prefetch_concurrency)
             .with_target_partitions(target_partitions);
 
         // Pre-compute per-column min/max/null_count from manifest entries so
