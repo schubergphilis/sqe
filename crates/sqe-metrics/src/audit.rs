@@ -1,5 +1,6 @@
 use std::io::Write;
-use std::sync::Mutex;
+use std::sync::mpsc::{self, Sender};
+use std::thread::JoinHandle;
 
 use serde::Serialize;
 use tracing::info;
@@ -8,16 +9,16 @@ use tracing::info;
 /// log safety.
 ///
 /// Replaces:
-/// - Email addresses → [EMAIL]
-/// - Phone numbers (US/intl) → [PHONE]
-/// - SSN patterns (XXX-XX-XXXX) → [SSN]
-/// - Credit card-like numbers (13-19 digits) → [CARD]
+/// - Email addresses -> [EMAIL]
+/// - Phone numbers (US/intl) -> [PHONE]
+/// - SSN patterns (XXX-XX-XXXX) -> [SSN]
+/// - Credit card-like numbers (13-19 digits) -> [CARD]
 /// - Quoted secret literals (`TOKEN '...'`, `PASSWORD '...'`,
 ///   `ACCESS_KEY_ID '...'`, `SECRET_ACCESS_KEY '...'`, `SESSION_TOKEN '...'`,
-///   `SECRET '...'`) → [REDACTED]
+///   `SECRET '...'`) -> [REDACTED]
 ///
 /// The secret-literal pass is the belt-and-suspenders guard for issue #4:
-/// without it, `CREATE SECRET … TOKEN '<jwt>'` lands verbatim in the audit
+/// without it, `CREATE SECRET ... TOKEN '<jwt>'` lands verbatim in the audit
 /// JSONL, OTel/Loki sinks, and any debug-level trace, exfiltrating every
 /// long-lived bearer ever created in the cluster.
 pub fn redact_pii(sql: &str) -> String {
@@ -47,10 +48,6 @@ pub fn redact_pii(sql: &str) -> String {
     let card_re = CARD_RE.get_or_init(|| {
         regex_lite::Regex::new(r"'\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{1,7}'").unwrap()
     });
-    // Case-insensitive match for known secret-bearing keywords followed by
-    // an `=` (e.g. `key = 'val'`), space (e.g. `TOKEN 'val'`), or `(`
-    // (e.g. `TOKEN('val')`). Captures the keyword so the replacement
-    // preserves it while erasing the literal.
     let secret_re = SECRET_RE.get_or_init(|| {
         regex_lite::Regex::new(
             r"(?i)\b(TOKEN|PASSWORD|PASSWD|SECRET|ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN|API_KEY|CLIENT_SECRET|BEARER)\b(\s*=\s*|\s+|\s*\(\s*)'[^']*'",
@@ -93,14 +90,23 @@ pub fn query_hash(sql: &str) -> String {
     format!("{hash:x}")
 }
 
+enum AuditMsg {
+    Entry(Box<AuditEntry>),
+    Flush(Sender<()>),
+}
+
 pub struct AuditLogger {
-    writer: Option<Mutex<std::io::BufWriter<std::fs::File>>>,
+    tx: Option<Sender<AuditMsg>>,
+    worker: std::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
 impl AuditLogger {
     pub fn new(path: &str) -> Result<Self, String> {
         if path.is_empty() {
-            return Ok(Self { writer: None });
+            return Ok(Self {
+                tx: None,
+                worker: std::sync::Mutex::new(None),
+            });
         }
 
         let file = std::fs::OpenOptions::new()
@@ -109,52 +115,136 @@ impl AuditLogger {
             .open(path)
             .map_err(|e| format!("Failed to open audit log file '{path}': {e}"))?;
 
+        let path_owned = path.to_string();
+        let (tx, rx) = mpsc::channel::<AuditMsg>();
+        let worker = std::thread::Builder::new()
+            .name("sqe-audit-writer".to_string())
+            .spawn(move || {
+                let mut writer = std::io::BufWriter::new(file);
+                while let Ok(msg) = rx.recv() {
+                    match msg {
+                        AuditMsg::Entry(entry) => {
+                            // Drain whatever else has piled up so we batch
+                            // multiple entries between flushes.
+                            let mut batch = vec![*entry];
+                            while let Ok(more) = rx.try_recv() {
+                                match more {
+                                    AuditMsg::Entry(e) => batch.push(*e),
+                                    AuditMsg::Flush(ack) => {
+                                        Self::write_batch(&mut writer, &batch, &path_owned);
+                                        batch.clear();
+                                        if let Err(e) = writer.flush() {
+                                            tracing::error!("AUDIT: flush failed for '{path_owned}': {e}");
+                                        }
+                                        let _ = ack.send(());
+                                    }
+                                }
+                            }
+                            if !batch.is_empty() {
+                                Self::write_batch(&mut writer, &batch, &path_owned);
+                                if let Err(e) = writer.flush() {
+                                    tracing::error!("AUDIT: flush failed for '{path_owned}': {e}");
+                                }
+                            }
+                        }
+                        AuditMsg::Flush(ack) => {
+                            if let Err(e) = writer.flush() {
+                                tracing::error!("AUDIT: flush failed for '{path_owned}': {e}");
+                            }
+                            let _ = ack.send(());
+                        }
+                    }
+                }
+                let _ = writer.flush();
+            })
+            .map_err(|e| format!("Failed to start audit writer thread: {e}"))?;
+
         info!(path = path, "Audit log initialized");
         Ok(Self {
-            writer: Some(Mutex::new(std::io::BufWriter::new(file))),
+            tx: Some(tx),
+            worker: std::sync::Mutex::new(Some(worker)),
         })
     }
 
-    pub fn log(&self, entry: &AuditEntry) {
-        if let Some(ref writer) = self.writer {
-            // Recover from poison: a prior panic should not prevent future audit writes.
-            // Audit log integrity is more important than the panic's side effects.
-            let mut w = writer.lock().unwrap_or_else(|poisoned| {
-                tracing::error!("AUDIT: mutex was poisoned — recovering writer");
-                poisoned.into_inner()
-            });
-            // Redact PII from query_text before writing to the audit log.
-            // query_hash is a non-reversible hash and is left untouched.
-            let redacted_entry;
-            let entry = if entry.query_text.is_some() {
-                redacted_entry = AuditEntry {
-                    query_text: entry.query_text.as_deref().map(redact_pii),
-                    timestamp: entry.timestamp.clone(),
-                    username: entry.username.clone(),
-                    session_id: entry.session_id.clone(),
-                    query_hash: entry.query_hash.clone(),
-                    statement_type: entry.statement_type.clone(),
-                    duration_ms: entry.duration_ms,
-                    rows_returned: entry.rows_returned,
-                    status: entry.status.clone(),
-                    client_ip: entry.client_ip.clone(),
-                };
-                &redacted_entry
-            } else {
-                entry
-            };
+    fn write_batch(
+        writer: &mut std::io::BufWriter<std::fs::File>,
+        batch: &[AuditEntry],
+        path: &str,
+    ) {
+        for entry in batch {
             let json = match serde_json::to_string(entry) {
                 Ok(j) => j,
                 Err(e) => {
                     tracing::error!("AUDIT: serialization failed: {e}");
-                    return;
+                    continue;
                 }
             };
-            if let Err(e) = writeln!(w, "{json}") {
-                tracing::error!("AUDIT: write failed: {e}");
+            if let Err(e) = writeln!(writer, "{json}") {
+                tracing::error!("AUDIT: write failed for '{path}': {e}");
             }
-            if let Err(e) = w.flush() {
-                tracing::error!("AUDIT: flush failed: {e}");
+        }
+    }
+
+    pub fn log(&self, entry: &AuditEntry) {
+        let Some(ref tx) = self.tx else {
+            return;
+        };
+
+        let redacted = if entry.query_text.is_some() {
+            AuditEntry {
+                query_text: entry.query_text.as_deref().map(redact_pii),
+                timestamp: entry.timestamp.clone(),
+                username: entry.username.clone(),
+                session_id: entry.session_id.clone(),
+                query_hash: entry.query_hash.clone(),
+                statement_type: entry.statement_type.clone(),
+                duration_ms: entry.duration_ms,
+                rows_returned: entry.rows_returned,
+                status: entry.status.clone(),
+                client_ip: entry.client_ip.clone(),
+            }
+        } else {
+            AuditEntry {
+                timestamp: entry.timestamp.clone(),
+                username: entry.username.clone(),
+                session_id: entry.session_id.clone(),
+                query_hash: entry.query_hash.clone(),
+                query_text: None,
+                statement_type: entry.statement_type.clone(),
+                duration_ms: entry.duration_ms,
+                rows_returned: entry.rows_returned,
+                status: entry.status.clone(),
+                client_ip: entry.client_ip.clone(),
+            }
+        };
+
+        if let Err(e) = tx.send(AuditMsg::Entry(Box::new(redacted))) {
+            tracing::error!("AUDIT: writer dropped, entry not recorded: {e}");
+        }
+    }
+
+    /// Block until every entry sent before this call has been flushed to disk.
+    /// Intended for shutdown paths and tests that read the file synchronously.
+    pub fn flush(&self) {
+        let Some(ref tx) = self.tx else {
+            return;
+        };
+        let (ack_tx, ack_rx) = mpsc::channel();
+        if tx.send(AuditMsg::Flush(ack_tx)).is_err() {
+            return;
+        }
+        let _ = ack_rx.recv();
+    }
+}
+
+impl Drop for AuditLogger {
+    fn drop(&mut self) {
+        self.flush();
+        // Drop the sender so the writer thread exits, then join.
+        self.tx.take();
+        if let Ok(mut guard) = self.worker.lock() {
+            if let Some(handle) = guard.take() {
+                let _ = handle.join();
             }
         }
     }
@@ -163,7 +253,7 @@ impl AuditLogger {
 impl std::fmt::Debug for AuditLogger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuditLogger")
-            .field("active", &self.writer.is_some())
+            .field("active", &self.tx.is_some())
             .finish()
     }
 }
@@ -237,10 +327,31 @@ mod tests {
 
         let logger = AuditLogger::new(path_str).unwrap();
         logger.log(&test_entry());
+        logger.flush();
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("\"username\":\"test\""));
         assert!(content.contains("query_hash"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_flush_blocks_until_written() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("sqe-audit-flush-test.jsonl");
+        let path_str = path.to_str().unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let logger = AuditLogger::new(path_str).unwrap();
+        for _ in 0..50 {
+            logger.log(&test_entry());
+        }
+        logger.flush();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines = content.lines().count();
+        assert_eq!(lines, 50, "all entries visible after flush");
 
         let _ = std::fs::remove_file(&path);
     }
@@ -297,8 +408,6 @@ mod tests {
             "bearer token literal must not survive: {redacted}"
         );
         assert!(redacted.contains("[REDACTED]"));
-        // The keyword must be preserved so audit consumers still see the
-        // shape of the statement.
         assert!(redacted.to_uppercase().contains("TOKEN"));
     }
 
@@ -321,13 +430,11 @@ mod tests {
         assert!(!redacted.contains("AKIAIOSFODNN7EXAMPLE"), "{redacted}");
         assert!(!redacted.contains("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"), "{redacted}");
         assert!(!redacted.contains("FQoDYXdzEPv...EXAMPLE"), "{redacted}");
-        // All three literals turn into [REDACTED].
         assert!(redacted.matches("[REDACTED]").count() >= 3);
     }
 
     #[test]
     fn redact_secret_kv_equals_style() {
-        // SQL dialects that use `KEY = 'val'` rather than `KEY 'val'`.
         let sql = "CREATE SECRET s WITH (token = 'abc.def.ghi', password = 'hunter2')";
         let redacted = redact_pii(sql);
         assert!(!redacted.contains("abc.def.ghi"));
@@ -345,10 +452,6 @@ mod tests {
 
     #[test]
     fn redact_does_not_touch_column_named_token() {
-        // A column literally named `token` in a SELECT must NOT have the
-        // selected expression rewritten — only quoted-string literals next
-        // to the keyword get scrubbed. (Conservative regression for false
-        // positives.)
         let sql = "SELECT token FROM creds WHERE id = 1";
         let redacted = redact_pii(sql);
         assert_eq!(redacted, sql);
@@ -359,6 +462,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join("sqe-audit-secret-test.jsonl");
         let path_str = path.to_str().unwrap();
+        let _ = std::fs::remove_file(&path);
 
         let logger = AuditLogger::new(path_str).unwrap();
         let mut entry = test_entry();
@@ -367,6 +471,7 @@ mod tests {
             "CREATE SECRET prod_token (TYPE bearer, TOKEN 'eyJSECRETJWTPAYLOAD')".to_string(),
         );
         logger.log(&entry);
+        logger.flush();
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(
@@ -383,6 +488,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join("sqe-audit-pii-test.jsonl");
         let path_str = path.to_str().unwrap();
+        let _ = std::fs::remove_file(&path);
 
         let logger = AuditLogger::new(path_str).unwrap();
         let mut entry = test_entry();
@@ -390,6 +496,7 @@ mod tests {
             "SELECT * FROM users WHERE email = 'carol@example.com'".to_string(),
         );
         logger.log(&entry);
+        logger.flush();
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(!content.contains("carol@example.com"), "PII must not appear in audit log");

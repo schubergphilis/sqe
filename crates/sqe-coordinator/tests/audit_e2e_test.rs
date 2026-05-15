@@ -67,8 +67,16 @@ fn session_with_roles(roles: Vec<String>) -> Session {
 
 struct AuditFixture {
     handler: QueryHandler,
+    audit: Arc<AuditLogger>,
     log_path: PathBuf,
     _dir: TempDir,
+}
+
+impl AuditFixture {
+    fn read_lines(&self) -> Vec<Value> {
+        self.audit.flush();
+        read_audit_lines(&self.log_path)
+    }
 }
 
 fn make_fixture() -> AuditFixture {
@@ -86,7 +94,7 @@ fn make_fixture() -> AuditFixture {
         None,
         None,
         None,
-        Some(audit),
+        Some(audit.clone()),
         tracker,
         None,
         None,
@@ -97,6 +105,7 @@ fn make_fixture() -> AuditFixture {
     .expect("QueryHandler::new");
     AuditFixture {
         handler,
+        audit,
         log_path,
         _dir: dir,
     }
@@ -124,7 +133,7 @@ async fn audit_logs_create_secret_with_redacted_token() {
         .await
         .expect("create secret");
 
-    let lines = read_audit_lines(&fx.log_path);
+    let lines = fx.read_lines();
     assert_eq!(lines.len(), 1, "exactly one audit line written");
     let entry = &lines[0];
     assert_eq!(entry["statement_type"], "create_secret");
@@ -159,7 +168,7 @@ async fn audit_logs_show_and_drop_secret_each_emit_one_line() {
         .await
         .expect("drop");
 
-    let lines = read_audit_lines(&fx.log_path);
+    let lines = fx.read_lines();
     assert_eq!(lines.len(), 3, "one audit line per execute call");
     assert_eq!(lines[0]["statement_type"], "create_secret");
     assert_eq!(lines[1]["statement_type"], "show_secrets");
@@ -181,7 +190,7 @@ async fn audit_logs_failed_create_with_error_status() {
         .await
         .expect_err("missing TOKEN should fail");
 
-    let lines = read_audit_lines(&fx.log_path);
+    let lines = fx.read_lines();
     assert_eq!(lines.len(), 1, "failed calls still emit audit lines");
     assert_eq!(lines[0]["status"], "error");
 }
@@ -213,7 +222,7 @@ async fn audit_logs_attach_and_detach_against_mock_rest() {
         .await
         .expect("detach");
 
-    let lines = read_audit_lines(&fx.log_path);
+    let lines = fx.read_lines();
     assert_eq!(lines.len(), 2);
     assert_eq!(lines[0]["statement_type"], "attach");
     assert_eq!(lines[1]["statement_type"], "detach");
@@ -233,7 +242,7 @@ async fn audit_logs_denied_admin_call_as_error() {
         .await
         .expect_err("non-admin must be denied");
 
-    let lines = read_audit_lines(&fx.log_path);
+    let lines = fx.read_lines();
     assert_eq!(lines.len(), 1, "denied calls still produce an audit line");
     let entry = &lines[0];
     assert_eq!(entry["status"], "error");
