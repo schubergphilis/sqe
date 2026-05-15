@@ -226,9 +226,10 @@ async fn async_main() -> anyhow::Result<()> {
     // across queries and sessions.
 
     // Build the global table metadata cache (shared across all sessions and queries).
-    // Table metadata is user-independent — schema, partitions, and snapshots are the
+    // Table metadata is user-independent. Schema, partitions, and snapshots are the
     // same regardless of who queries. The cache is invalidated on DDL/DML operations.
-    let table_cache = sqe_catalog::TableMetadataCache::new(config.catalog.metadata_cache_ttl_secs);
+    let table_cache = sqe_catalog::TableMetadataCache::new(config.catalog.metadata_cache_ttl_secs)
+        .with_metrics(Arc::clone(&metrics));
     tracing::info!(
         metadata_cache_ttl_secs = config.catalog.metadata_cache_ttl_secs,
         "Initialized global table metadata cache (shared across all sessions)"
