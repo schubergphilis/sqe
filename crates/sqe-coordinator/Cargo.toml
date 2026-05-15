@@ -1,7 +1,10 @@
 [package]
 name = "sqe-coordinator"
-version = "0.31.4"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lib]
 name = "sqe_coordinator"
@@ -46,7 +49,7 @@ bytes = { workspace = true }
 uuid = { workspace = true }
 prost = { workspace = true }
 anyhow = { workspace = true }
-base64 = "0.22"
+base64 = { workspace = true }
 hex = { workspace = true }
 datafusion-functions-json = { workspace = true }
 datafusion-expr = { workspace = true }
@@ -60,9 +63,9 @@ prometheus = { workspace = true }
 chrono = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }
-clap = { version = "4", features = ["derive"] }
-sha2 = "0.10"
-subtle = "2"
+clap = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
 sqe-worker = { path = "../sqe-worker" }
 opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }
@@ -90,8 +93,8 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 reqwest = { workspace = true }
-base64 = "0.22"
-tempfile = "3"
-wiremock = "0.6"
+base64 = { workspace = true }
+tempfile = { workspace = true }
+wiremock = { workspace = true }
 datafusion-functions-json = { workspace = true }
 datafusion = { workspace = true }

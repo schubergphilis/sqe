@@ -1,7 +1,10 @@
 [package]
 name = "sqe-trino-functions"
-version = "0.31.4"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 # Trino-compatible scalar UDFs for DataFusion.
 #
@@ -17,8 +20,8 @@ chrono = { workspace = true }
 datafusion = { workspace = true }
 serde_json = { workspace = true }
 url = { workspace = true }
-base64 = "0.22"
-sha2 = "0.10"
+base64 = { workspace = true }
+sha2 = { workspace = true }
 
 # These four deps move here with the code — nothing else in the workspace
 # uses them, so pulling them out of sqe-coordinator's dep graph is the main

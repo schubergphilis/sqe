@@ -1,7 +1,10 @@
 [package]
 name = "sqe-catalog"
-version = "0.31.4"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [features]
 # Default ships every supported catalog backend compiled in. Picking a
@@ -135,13 +138,13 @@ aws-config = { version = "1.8", optional = true }
 aws-credential-types = { version = "1.2", optional = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 tracing-subscriber = { workspace = true }
-wiremock = "0.6"
+wiremock = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 sqe-auth = { path = "../sqe-auth" }
 # Used in the Phase O+ integration test to deserialise an inline
 # `[catalog.backend]` block into `SqeConfig` rather than constructing
 # all 14 SqeConfig fields by hand.
-toml = "0.8"
+toml = { workspace = true }
