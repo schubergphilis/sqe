@@ -2107,6 +2107,7 @@ impl SqeConfig {
         }
 
         validate_urls(self, &mut errors);
+        validate_byte_sizes(self, &mut errors);
 
         if errors.is_empty() {
             Ok(())
@@ -2346,6 +2347,27 @@ impl SqeConfig {
         // Query
         env_override_u64("SQE_QUERY__TIMEOUT_SECS", &mut self.query.timeout_secs);
     }
+}
+
+/// Validate every byte-size string in the config. Moves the parse-error
+/// surface for memory-limit / cache-size strings from query time to
+/// startup so `coordinator.memory_limit = "8X"` fails at config-load
+/// instead of two seconds into the first query (issue #116).
+fn validate_byte_sizes(config: &SqeConfig, errors: &mut Vec<String>) {
+    let mut check = |field: &str, value: &str| {
+        if value.is_empty() {
+            return;
+        }
+        if let Err(e) = parse_memory_limit(value) {
+            errors.push(format!("{field} = {value:?}: {e}"));
+        }
+    };
+
+    check("coordinator.memory_limit", &config.coordinator.memory_limit);
+    check("worker.memory_limit", &config.worker.memory_limit);
+    check("storage.coalesce_threshold", &config.storage.coalesce_threshold);
+    check("storage.footer_cache_size", &config.storage.footer_cache_size);
+    check("storage.prefetch_buffer", &config.storage.prefetch_buffer);
 }
 
 /// Validate every URL-shaped string in the config. Empty values are
@@ -2690,6 +2712,17 @@ mod tests {
         assert!(
             err.contains("catalog.catalog_url") && err.contains("not a valid URL"),
             "Expected URL parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_malformed_memory_limit() {
+        let mut config = valid_config();
+        config.coordinator.memory_limit = "12XYZ".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("coordinator.memory_limit"),
+            "Expected memory_limit parse error, got: {err}"
         );
     }
 
