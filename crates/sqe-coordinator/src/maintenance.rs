@@ -759,7 +759,7 @@ impl MaintenanceHandler {
             SessionCatalog::for_session(
                 &self.config,
                 self.table_cache.clone(),
-                session.access_token.expose(),
+                session.access_token().expose(),
             )
             .await?,
         );

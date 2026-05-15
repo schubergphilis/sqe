@@ -63,7 +63,7 @@ pub async fn create_session_context(
     // --- Cache key: username + token fingerprint ---
     // Different tokens from the same user must not share a stale SessionCatalog.
     // We key by username + first 16 hex chars of the SHA-256 of the access token.
-    let token_hash = format!("{:x}", Sha256::digest(session.access_token.expose_bytes()));
+    let token_hash = format!("{:x}", Sha256::digest(session.access_token().expose_bytes()));
     let cache_key = format!("{}:{}", session.user.username, &token_hash[..16]);
 
     // --- Atomic cache lookup / build via try_get_with ---
@@ -212,7 +212,7 @@ pub async fn create_session_context(
                 let auth = cat_cfg.auth.clone().unwrap_or_default();
                 let bearer = sqe_auth::per_catalog::resolve_bearer(
                     &auth,
-                    session.access_token.expose(),
+                    session.access_token().expose(),
                 )
                 .await
                 .map_err(Arc::new)?;

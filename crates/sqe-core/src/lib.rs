@@ -9,7 +9,7 @@ pub use config::{AuthProviderConfig, DeviceAuthConfig, ExternalAuthConfig, Fligh
 pub use error::{Result, SqeError, SqeErrorCode};
 pub use secret::{Secret, SecretStore};
 pub use secret_string::SecretString;
-pub use session::{Session, SessionUser};
+pub use session::{Credentials, Session, SessionUser};
 pub use table_properties::{
     WriteMode, WRITE_DELETE_MODE, WRITE_MERGE_MODE, WRITE_UPDATE_MODE, resolve_delete_mode,
     resolve_merge_mode, resolve_mode, resolve_update_mode,

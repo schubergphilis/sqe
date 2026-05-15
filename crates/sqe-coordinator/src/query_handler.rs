@@ -533,7 +533,7 @@ impl QueryHandler {
                     sql: sql.to_string(),
                     user: sqe_lineage::UserCtx {
                         username: session.user.username.clone(),
-                        bearer: Some(session.access_token.clone()),
+                        bearer: Some(session.access_token().clone()),
                     },
                     session_id: session.id.clone(),
                     started_at: ol_started_at,
@@ -565,7 +565,7 @@ impl QueryHandler {
                                 sql: sql.to_string(),
                                 user: sqe_lineage::UserCtx {
                                     username: session.user.username.clone(),
-                                    bearer: Some(session.access_token.clone()),
+                                    bearer: Some(session.access_token().clone()),
                                 },
                                 session_id: session.id.clone(),
                                 started_at: ol_started_at,
@@ -1179,7 +1179,7 @@ impl QueryHandler {
                             sql: sql.to_string(),
                             user: sqe_lineage::UserCtx {
                                 username: session.user.username.clone(),
-                                bearer: Some(session.access_token.clone()),
+                                bearer: Some(session.access_token().clone()),
                             },
                             session_id: session.id.clone(),
                             started_at: ol_started_at,
@@ -1197,7 +1197,7 @@ impl QueryHandler {
                             sql: sql.to_string(),
                             user: sqe_lineage::UserCtx {
                                 username: session.user.username.clone(),
-                                bearer: Some(session.access_token.clone()),
+                                bearer: Some(session.access_token().clone()),
                             },
                             session_id: session.id.clone(),
                             started_at: ol_started_at,
@@ -2958,7 +2958,7 @@ impl QueryHandler {
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let backend = self.require_grant_backend()?;
         let grant_stmt = Self::extract_grant_statement(stmt)?;
-        backend.grant(session.access_token.expose(), &grant_stmt).await?;
+        backend.grant(session.access_token().expose(), &grant_stmt).await?;
         Ok(vec![])
     }
 
@@ -2977,7 +2977,7 @@ impl QueryHandler {
             table: grant_stmt.table,
             grantee: grant_stmt.grantee,
         };
-        backend.revoke(session.access_token.expose(), &revoke_stmt).await?;
+        backend.revoke(session.access_token().expose(), &revoke_stmt).await?;
         Ok(vec![])
     }
 
@@ -3012,7 +3012,7 @@ impl QueryHandler {
             }
         };
 
-        let entries = backend.show_grants(session.access_token.expose(), &filter).await?;
+        let entries = backend.show_grants(session.access_token().expose(), &filter).await?;
         Self::grants_to_record_batch(&entries)
     }
 
@@ -3023,7 +3023,7 @@ impl QueryHandler {
         user: &str,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let backend = self.require_grant_backend()?;
-        let entries = backend.show_effective(session.access_token.expose(), user).await?;
+        let entries = backend.show_effective(session.access_token().expose(), user).await?;
         Self::grants_to_record_batch(&entries)
     }
 
@@ -3043,7 +3043,7 @@ impl QueryHandler {
             table: params.table.clone(),
         };
 
-        let resp = backend.check_access(session.access_token.expose(), &check).await?;
+        let resp = backend.check_access(session.access_token().expose(), &check).await?;
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("allowed", DataType::Boolean, false),
@@ -3402,7 +3402,7 @@ impl QueryHandler {
             SessionCatalog::for_session(
                 &self.config,
                 self.table_cache.clone(),
-                session.access_token.expose(),
+                session.access_token().expose(),
             )
             .await?,
         );
@@ -3983,27 +3983,18 @@ fn parse_show_tables_namespace(filter: &str) -> Option<String> {
 mod tests {
     use super::*;
     use sqe_core::config::QueryConfig;
-    use sqe_core::session::{Session, SessionUser};
+    use sqe_core::session::Session;
 
     /// Build a minimal session for timeout tests.
     fn test_session(roles: Vec<&str>) -> Session {
         let now = chrono::Utc::now();
-        Session {
-            id: "test-session".to_string(),
-            user: SessionUser {
-                username: "alice".to_string(),
-                roles: roles.into_iter().map(String::from).collect(),
-            },
-            access_token: sqe_core::SecretString::new("tok".to_string()),
-            refresh_token: None,
-            token_expiry: now + chrono::Duration::hours(1),
-            created_at: now,
-            last_activity: now,
-            default_catalog: None,
-            default_schema: None,
-            source: None,
-            write_branch: None,
-        }
+        Session::new(
+            "alice".to_string(),
+            sqe_core::SecretString::new("tok".to_string()),
+            None,
+            now + chrono::Duration::hours(1),
+            roles.into_iter().map(String::from).collect(),
+        )
     }
 
     #[test]

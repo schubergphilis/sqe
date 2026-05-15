@@ -165,12 +165,13 @@ impl SessionManager {
         // Check if the legacy background task refreshed this token
         if let Some(ref authenticator) = self.legacy_authenticator {
             if let Some(cached) = authenticator.get_cached_token(session_id) {
-                if cached.access_token != session.access_token.expose() {
+                if cached.access_token != session.access_token().expose() {
                     let mut updated = (*session).clone();
-                    updated.access_token = sqe_core::SecretString::new(cached.access_token);
-                    updated.refresh_token =
-                        cached.refresh_token.map(sqe_core::SecretString::new);
-                    updated.token_expiry = cached.expiry;
+                    updated.rotate_credentials(sqe_core::Credentials::new(
+                        sqe_core::SecretString::new(cached.access_token),
+                        cached.refresh_token.map(sqe_core::SecretString::new),
+                        cached.expiry,
+                    ));
                     updated.touch();
                     let updated = Arc::new(updated);
                     self.sessions.insert(session_id.to_string(), updated.clone());
@@ -190,7 +191,7 @@ impl SessionManager {
         }
 
         // Token is no longer in cache (or no legacy authenticator) — check if expired
-        if session.token_expiry <= Utc::now() {
+        if session.token_expiry() <= Utc::now() {
             warn!(session_id = %session_id, "Session token expired, evicting");
             self.sessions.remove(session_id);
             return None;
@@ -236,7 +237,7 @@ impl SessionManager {
                 serde_json::json!({
                     "id": session.id,
                     "username": session.user.username,
-                    "expires_at": session.token_expiry.to_rfc3339(),
+                    "expires_at": session.token_expiry().to_rfc3339(),
                 })
             })
             .collect();
@@ -808,7 +809,7 @@ mod tests {
             .expect("chain wiring must let bearer-only credentials through");
 
         assert_eq!(session.user.username, "alice");
-        assert_eq!(session.access_token.expose(), "eyJtest.payload.sig");
+        assert_eq!(session.access_token().expose(), "eyJtest.payload.sig");
     }
 
     /// Negative control: the legacy single-Authenticator wiring (the
