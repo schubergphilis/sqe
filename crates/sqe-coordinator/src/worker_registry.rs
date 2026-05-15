@@ -1,11 +1,82 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::channel_pool::ChannelPool;
+
+/// Tracks in-flight fragment counts per worker URL across all concurrent
+/// queries. The scheduler consults this counter as the initial load so two
+/// queries planning at the same time do not both pick the same idle worker.
+///
+/// Increment via [`WorkerLoadTracker::reserve`] right after assignment;
+/// decrement via [`ReservationGuard::drop`] when the fragment completes
+/// (success, error, or cancel). The guard makes the decrement automatic
+/// and panic-safe.
+#[derive(Debug, Default, Clone)]
+pub struct WorkerLoadTracker {
+    counts: Arc<DashMap<String, AtomicU32>>,
+}
+
+impl WorkerLoadTracker {
+    pub fn new() -> Self {
+        Self {
+            counts: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Return the current in-flight fragment count for `url`.
+    pub fn in_flight(&self, url: &str) -> u32 {
+        self.counts
+            .get(url)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Snapshot `(url, count)` pairs without holding the map locked.
+    pub fn snapshot(&self) -> Vec<(String, u32)> {
+        self.counts
+            .iter()
+            .map(|kv| (kv.key().clone(), kv.value().load(Ordering::Relaxed)))
+            .collect()
+    }
+
+    /// Reserve a fragment slot on `url`. The returned guard decrements the
+    /// counter on drop.
+    pub fn reserve(&self, url: &str) -> ReservationGuard {
+        self.counts
+            .entry(url.to_string())
+            .or_insert_with(|| AtomicU32::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+        ReservationGuard {
+            tracker: self.counts.clone(),
+            url: url.to_string(),
+        }
+    }
+}
+
+/// RAII guard returned by [`WorkerLoadTracker::reserve`]. Decrements the
+/// in-flight count for the reserved worker URL when dropped.
+pub struct ReservationGuard {
+    tracker: Arc<DashMap<String, AtomicU32>>,
+    url: String,
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        if let Some(c) = self.tracker.get(&self.url) {
+            let prev = c.fetch_sub(1, Ordering::Relaxed);
+            if prev == 0 {
+                c.fetch_add(1, Ordering::Relaxed);
+                debug!(worker = %self.url, "reservation underflow guarded");
+            }
+        }
+    }
+}
 
 /// Tracks available workers and their health status.
 ///

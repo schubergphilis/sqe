@@ -124,6 +124,11 @@ pub struct QueryHandler {
     /// rationale as `runtime_catalogs`: a default-constructed store is
     /// empty and acts as a no-op until SQL populates it.
     secrets: SecretStore,
+    /// Cross-query in-flight fragment counter per worker URL. Read by the
+    /// scheduler as initial load so concurrent queries don't both pick the
+    /// same idle worker; incremented on assignment, decremented on fragment
+    /// completion via [`ReservationGuard`].
+    worker_load: Arc<crate::worker_registry::WorkerLoadTracker>,
 }
 
 impl QueryHandler {
@@ -225,6 +230,7 @@ impl QueryHandler {
             session_manager: None,
             runtime_catalogs,
             secrets,
+            worker_load: Arc::new(crate::worker_registry::WorkerLoadTracker::new()),
         })
     }
 
@@ -2191,13 +2197,12 @@ impl QueryHandler {
             }
         }
 
-        // 9. Schedule tasks to workers using weighted scheduler
         let worker_infos: Vec<crate::scheduler::WorkerInfo> = healthy
             .iter()
             .map(|url| crate::scheduler::WorkerInfo {
                 url: url.clone(),
                 healthy: true,
-                active_fragments: 0, // First version: no active fragment tracking
+                active_fragments: self.worker_load.in_flight(url),
             })
             .collect();
 
@@ -2214,10 +2219,14 @@ impl QueryHandler {
             }
         };
 
-        // Build ordered worker URLs matching the scan_tasks order
         let worker_urls: Vec<String> = assignments.iter().map(|a| a.worker_url.clone()).collect();
 
-        // 10. Record fragments in query tracker
+        let reservations: Arc<dashmap::DashMap<String, crate::worker_registry::ReservationGuard>> =
+            Arc::new(dashmap::DashMap::new());
+        for (task, url) in scan_tasks.iter().zip(worker_urls.iter()) {
+            reservations.insert(task.fragment_id.clone(), self.worker_load.reserve(url));
+        }
+
         let fragment_infos: Vec<crate::query_tracker::FragmentInfo> = scan_tasks
             .iter()
             .zip(worker_urls.iter())
@@ -2232,12 +2241,13 @@ impl QueryHandler {
             .collect();
         self.query_tracker.set_fragments(query_id, fragment_infos);
 
-        // 11. Build fragment callback for progress tracking and straggler detection
         let tracker = self.query_tracker.clone();
         let qid = *query_id;
         let callback_metrics = self.metrics.clone();
+        let reservations_cb = reservations.clone();
         let callback: crate::distributed_scan::FragmentCallback =
             Arc::new(move |task_id, success, elapsed_ms, rows| {
+                let _ = reservations_cb.remove(task_id);
                 let state = if success {
                     FragmentState::Finished
                 } else {
