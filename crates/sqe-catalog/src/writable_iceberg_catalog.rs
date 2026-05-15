@@ -12,8 +12,10 @@
 //! behaviour is preserved bit-for-bit. Write paths
 //! (`register_schema`, `deregister_schema`) delegate to
 //! `iceberg::Catalog::create_namespace` / `drop_namespace` via the
-//! same `spawn_blocking` + `block_on` pattern upstream uses for
-//! `register_table`.
+//! runtime-flavor-aware `crate::runtime_bridge::block_on_compat`
+//! helper (issue #81 / #83). The earlier
+//! `spawn_blocking + futures::executor::block_on(join)` pattern could
+//! stall a worker waiting on the join future under busy schema DDL.
 //!
 //! `CREATE TABLE <cat>.<ns>.<table> (col TYPE, ...)` already works
 //! because `IcebergSchemaProvider` from upstream implements
@@ -125,40 +127,33 @@ impl CatalogProvider for WritableIcebergCatalog {
 
         let catalog = self.catalog.clone();
         let ns_name = name.to_string();
-        // The trait method is synchronous but the iceberg::Catalog is
-        // async. Bridge via `spawn_blocking` (moves the work to a
-        // dedicated blocking pool so we don't stall the async worker)
-        // followed by `futures::executor::block_on` to recover the
-        // result. Same pattern the upstream
-        // `IcebergSchemaProvider::register_table` uses, and the only
-        // option that works on both single-threaded and
-        // multi-threaded tokio runtimes (`block_in_place` requires
-        // multi-thread).
-        let join: tokio::task::JoinHandle<anyhow::Result<Arc<dyn SchemaProvider>>> =
-            tokio::task::spawn_blocking(move || {
-                let rt = tokio::runtime::Handle::current();
-                rt.block_on(async move {
-                    let ns = NamespaceIdent::new(ns_name.clone());
-                    catalog
-                        .create_namespace(&ns, std::collections::HashMap::new())
-                        .await
-                        .map_err(|e| anyhow::anyhow!("create_namespace({ns_name}): {e}"))?;
-                    let upstream_catalog =
-                        iceberg_datafusion::IcebergCatalogProvider::try_new(catalog.clone())
-                            .await
-                            .map_err(|e| {
-                                anyhow::anyhow!("rebuild after create_namespace: {e}")
-                            })?;
-                    let provider = upstream_catalog.schema(&ns_name).ok_or_else(|| {
-                        anyhow::anyhow!("schema {ns_name} disappeared between create and read")
-                    })?;
-                    Ok::<Arc<dyn SchemaProvider>, anyhow::Error>(provider)
-                })
-            });
-
-        let provider = futures::executor::block_on(join)
-            .map_err(|e| DataFusionError::Execution(format!("spawn_blocking join failed: {e}")))?
-            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        // The CatalogProvider trait method is sync; iceberg::Catalog is
+        // async. crate::runtime_bridge::block_on_compat picks
+        // block_in_place on multi-thread runtimes and an off-thread
+        // block_on on current-thread. The earlier
+        // spawn_blocking + futures::executor::block_on(join) pattern
+        // could stall a worker waiting on the join future (issue #81).
+        let ns_name_for_err = ns_name.clone();
+        let provider = crate::runtime_bridge::block_on_compat(async move {
+            let ns = NamespaceIdent::new(ns_name.clone());
+            catalog
+                .create_namespace(&ns, std::collections::HashMap::new())
+                .await
+                .map_err(|e| anyhow::anyhow!("create_namespace({ns_name}): {e}"))?;
+            let upstream_catalog =
+                iceberg_datafusion::IcebergCatalogProvider::try_new(catalog.clone())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("rebuild after create_namespace: {e}"))?;
+            upstream_catalog.schema(&ns_name).ok_or_else(|| {
+                anyhow::anyhow!("schema {ns_name} disappeared between create and read")
+            })
+        })
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "register_schema({ns_name_for_err}): no tokio runtime available"
+            ))
+        })?
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
         self.schemas.insert(name.to_string(), provider);
         Ok(None)
     }
@@ -181,21 +176,20 @@ impl CatalogProvider for WritableIcebergCatalog {
 
         let catalog = self.catalog.clone();
         let ns_name = name.to_string();
-        let join: tokio::task::JoinHandle<anyhow::Result<()>> =
-            tokio::task::spawn_blocking(move || {
-                let rt = tokio::runtime::Handle::current();
-                rt.block_on(async move {
-                    let ns = NamespaceIdent::new(ns_name.clone());
-                    catalog
-                        .drop_namespace(&ns)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("drop_namespace({ns_name}): {e}"))?;
-                    Ok(())
-                })
-            });
-        futures::executor::block_on(join)
-            .map_err(|e| DataFusionError::Execution(format!("spawn_blocking join failed: {e}")))?
-            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        let ns_name_for_err = ns_name.clone();
+        crate::runtime_bridge::block_on_compat(async move {
+            let ns = NamespaceIdent::new(ns_name.clone());
+            catalog
+                .drop_namespace(&ns)
+                .await
+                .map_err(|e| anyhow::anyhow!("drop_namespace({ns_name}): {e}"))
+        })
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "deregister_schema({ns_name_for_err}): no tokio runtime available"
+            ))
+        })?
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
 
         Ok(self.schemas.remove(name).map(|(_, v)| v))
     }
