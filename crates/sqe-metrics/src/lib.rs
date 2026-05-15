@@ -90,7 +90,7 @@ impl MetricsRegistry {
 
         let query_count = CounterVec::new(
             Opts::new("sqe_query_count_total", "Total queries executed"),
-            &["status", "statement_type"],
+            &["status", "statement_type", "error_code"],
         )
         .unwrap();
         registry.register(Box::new(query_count.clone())).unwrap();
@@ -559,7 +559,7 @@ mod tests {
     fn test_metrics_registry_creation() {
         let metrics = MetricsRegistry::new();
         // Touch each metric so Prometheus includes it in gather()
-        metrics.query_count.with_label_values(&["success", "query"]).inc_by(0.0);
+        metrics.query_count.with_label_values(&["success", "query", ""]).inc_by(0.0);
         metrics.query_duration.with_label_values(&["query"]).observe(0.0);
         metrics.rows_returned.inc_by(0.0);
         metrics.active_sessions.set(0);
@@ -609,8 +609,8 @@ mod tests {
     #[test]
     fn test_query_count_increment() {
         let metrics = MetricsRegistry::new();
-        metrics.query_count.with_label_values(&["success", "query"]).inc();
-        let count = metrics.query_count.with_label_values(&["success", "query"]).get();
+        metrics.query_count.with_label_values(&["success", "query", ""]).inc();
+        let count = metrics.query_count.with_label_values(&["success", "query", ""]).get();
         assert_eq!(count, 1.0);
     }
 
