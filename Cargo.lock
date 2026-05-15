@@ -6854,6 +6854,7 @@ dependencies = [
  "sqe-planner",
  "subtle",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
  "tracing-opentelemetry",

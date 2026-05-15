@@ -1,3 +1,4 @@
+use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -12,9 +13,9 @@ use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::ParquetMetaData;
-use futures::TryStreamExt;
+use futures::{Stream, StreamExt, TryStreamExt};
 use sqe_catalog::late_materialize;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 use url::Url;
 
@@ -23,6 +24,10 @@ use sqe_metrics::{MetricsRegistry, WorkerMetricsRegistry};
 use sqe_planner::ScanTask;
 
 use crate::credential_channel::RefreshableCredentials;
+
+/// Stream of `RecordBatch`es produced by [`execute_scan_streaming`].
+pub type ScanBatchStream =
+    Pin<Box<dyn Stream<Item = anyhow::Result<RecordBatch>> + Send + 'static>>;
 
 /// Execute a scan task by reading Parquet files from S3 and returning Arrow RecordBatches.
 ///
@@ -52,6 +57,311 @@ use crate::credential_channel::RefreshableCredentials;
 /// predicate columns and evaluates the filter; Phase 2 reads remaining
 /// projection columns only for surviving rows. This can reduce S3 I/O by
 /// 10-50x for selective queries on wide tables.
+/// Streaming variant of [`execute_scan`]: returns the schema synchronously
+/// and yields `RecordBatch`es from the in-flight Parquet streams without
+/// materialising the full scan in memory.
+///
+/// The first Parquet file is opened in this call so the caller can return
+/// the schema before the result stream is polled. A background task chains
+/// the per-file streams into an mpsc channel; if the consumer drops the
+/// returned stream, the channel closes and the task exits.
+pub async fn execute_scan_streaming(
+    task: ScanTask,
+    metrics: Option<Arc<WorkerMetricsRegistry>>,
+    session_ctx: SessionContext,
+    credential_rx: Option<watch::Receiver<Option<RefreshableCredentials>>>,
+    footer_cache: Option<Arc<FooterCache>>,
+    filter_expr: Option<Arc<dyn PhysicalExpr>>,
+    coordinator_metrics: Option<Arc<MetricsRegistry>>,
+) -> anyhow::Result<(SchemaRef, ScanBatchStream)> {
+    if task.data_file_paths.is_empty() {
+        anyhow::bail!("ScanTask has no data files");
+    }
+
+    let start = std::time::Instant::now();
+    let pool = session_ctx.runtime_env().memory_pool.clone();
+    let consumer = MemoryConsumer::new(format!("scan:{}", task.fragment_id));
+    let reservation = consumer.register(&pool);
+
+    // Open the first file synchronously so we know the schema before
+    // returning the stream.
+    let first_path = task.data_file_paths[0].clone();
+    let initial_store: Arc<dyn ObjectStore> = Arc::new(build_object_store_with_creds(
+        &task,
+        &task.s3_access_key,
+        &task.s3_secret_key,
+        &task.s3_session_token,
+    )?);
+
+    let (mut first_stream, first_schema, first_bytes) = open_parquet_stream(
+        &task,
+        &first_path,
+        initial_store.clone(),
+        footer_cache.as_deref(),
+        filter_expr.as_ref(),
+        coordinator_metrics.as_deref(),
+    )
+    .await?;
+
+    let (tx, rx) =
+        mpsc::channel::<anyhow::Result<RecordBatch>>(16);
+
+    let task_for_producer = task.clone();
+    let metrics_clone = metrics.clone();
+    let coord_metrics_clone = coordinator_metrics.clone();
+    let footer_cache_clone = footer_cache.clone();
+    let filter_expr_clone = filter_expr.clone();
+    let session_ctx_clone = session_ctx.clone();
+    let credential_rx_clone = credential_rx.clone();
+
+    tokio::spawn(async move {
+        let task = task_for_producer;
+        let metrics = metrics_clone;
+        let coordinator_metrics = coord_metrics_clone;
+        let footer_cache = footer_cache_clone;
+        let filter_expr = filter_expr_clone;
+        let _session_ctx = session_ctx_clone;
+        let mut credential_rx = credential_rx_clone;
+
+        let mut store: Arc<dyn ObjectStore> = initial_store;
+        let mut total_rows: usize = 0;
+        let mut total_bytes: u64 = first_bytes;
+
+        // Drain the first file's batches.
+        let mut first_file_bytes: usize = 0;
+        while let Some(batch_res) = first_stream.next().await {
+            match batch_res {
+                Ok(batch) => {
+                    total_rows += batch.num_rows();
+                    first_file_bytes += batch.get_array_memory_size();
+                    if let Err(e) = reservation.try_grow(batch.get_array_memory_size()) {
+                        let _ = tx.send(Err(anyhow::Error::new(e))).await;
+                        return;
+                    }
+                    if tx.send(Ok(batch)).await.is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(anyhow::Error::new(e))).await;
+                    return;
+                }
+            }
+        }
+        debug!(file = %first_path, rows = first_file_bytes, "first-file batches drained");
+
+        // Stream subsequent files.
+        for file_path in task.data_file_paths.iter().skip(1) {
+            // Apply any refreshed credentials before opening the next file.
+            if let Some(ref mut rx) = credential_rx {
+                if rx.has_changed().unwrap_or(false) {
+                    let new_creds = rx.borrow_and_update().clone();
+                    if let Some(creds) = new_creds {
+                        info!(
+                            fragment_id = %task.fragment_id,
+                            expiry = %creds.expiry,
+                            "Applying refreshed credentials for next file read"
+                        );
+                        match build_object_store_with_creds(
+                            &task,
+                            &creds.access_key_id,
+                            &creds.secret_access_key,
+                            &creds.session_token,
+                        ) {
+                            Ok(s) => store = Arc::new(s),
+                            Err(e) => warn!(
+                                fragment_id = %task.fragment_id,
+                                error = %e,
+                                "Failed to rebuild object store with refreshed credentials"
+                            ),
+                        }
+                    }
+                }
+            }
+
+            let opened = open_parquet_stream(
+                &task,
+                file_path,
+                store.clone(),
+                footer_cache.as_deref(),
+                filter_expr.as_ref(),
+                coordinator_metrics.as_deref(),
+            )
+            .await;
+            let (mut file_stream, _schema, bytes) = match opened {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            };
+            total_bytes += bytes;
+
+            while let Some(batch_res) = file_stream.next().await {
+                match batch_res {
+                    Ok(batch) => {
+                        total_rows += batch.num_rows();
+                        if let Err(e) = reservation.try_grow(batch.get_array_memory_size()) {
+                            let _ = tx.send(Err(anyhow::Error::new(e))).await;
+                            return;
+                        }
+                        if tx.send(Ok(batch)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(anyhow::Error::new(e))).await;
+                        return;
+                    }
+                }
+            }
+        }
+
+        let elapsed = start.elapsed();
+        info!(
+            fragment_id = %task.fragment_id,
+            total_rows = total_rows,
+            total_bytes = total_bytes,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "Streaming scan complete"
+        );
+        if let Some(ref m) = metrics {
+            m.fragments_executed.inc();
+            m.rows_scanned.inc_by(total_rows as f64);
+            m.bytes_read.inc_by(total_bytes as f64);
+            m.fragment_duration.observe(elapsed.as_secs_f64());
+        }
+    });
+
+    let out_stream: ScanBatchStream =
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
+    Ok((first_schema, out_stream))
+}
+
+/// Open a single Parquet file and return its batch stream plus the recorded
+/// byte size (from `head()`). Shared helper for [`execute_scan_streaming`]
+/// and the buffered [`execute_scan`] wrapper.
+#[allow(clippy::type_complexity)]
+async fn open_parquet_stream(
+    task: &ScanTask,
+    file_path: &str,
+    store: Arc<dyn ObjectStore>,
+    footer_cache: Option<&FooterCache>,
+    filter_expr: Option<&Arc<dyn PhysicalExpr>>,
+    coordinator_metrics: Option<&MetricsRegistry>,
+) -> anyhow::Result<(
+    Pin<Box<dyn Stream<Item = Result<RecordBatch, parquet::errors::ParquetError>> + Send>>,
+    SchemaRef,
+    u64,
+)> {
+    debug!(file = %file_path, "Reading Parquet file");
+    let object_key = s3_url_to_key(file_path)?;
+    let path = ObjectPath::from(object_key.as_str());
+
+    let s3_start = std::time::Instant::now();
+    let meta = store.head(&path).await?;
+    if let Some(cm) = coordinator_metrics {
+        cm.s3_requests_total
+            .with_label_values(&["head", "success"])
+            .inc();
+    }
+    let bytes_total = meta.size as u64;
+    let reader = ParquetObjectReader::new(store.clone(), meta.location).with_file_size(meta.size);
+
+    let mut builder: ParquetRecordBatchStreamBuilder<ParquetObjectReader> = if let Some(cache) =
+        footer_cache
+    {
+        let cache_key = file_path.to_string();
+        let store_for_fetch = store.clone();
+        let path_for_fetch = path.clone();
+        let file_size = meta.size;
+        let cached_meta = cache
+            .get_or_fetch(&cache_key, || {
+                let s = store_for_fetch;
+                let p = path_for_fetch;
+                async move {
+                    let fetch_reader = ParquetObjectReader::new(s, p).with_file_size(file_size);
+                    let tmp_builder =
+                        ParquetRecordBatchStreamBuilder::new(fetch_reader).await?;
+                    Ok::<ParquetMetaData, parquet::errors::ParquetError>(
+                        tmp_builder.metadata().as_ref().clone(),
+                    )
+                }
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Footer cache error: {e}"))?;
+        let reader_opts = ArrowReaderOptions::new()
+            .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required);
+        let arrow_meta = ArrowReaderMetadata::try_new(cached_meta, reader_opts)?;
+        ParquetRecordBatchStreamBuilder::new_with_metadata(reader, arrow_meta)
+    } else {
+        let reader_opts = ArrowReaderOptions::new()
+            .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required);
+        ParquetRecordBatchStreamBuilder::new_with_options(reader, reader_opts).await?
+    };
+
+    if !task.projected_columns.is_empty() {
+        let parquet_schema = builder.schema().clone();
+        let indices: Vec<usize> = task
+            .projected_columns
+            .iter()
+            .filter_map(|name| {
+                parquet_schema
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == name)
+            })
+            .collect();
+        if !indices.is_empty() {
+            let mask = parquet::arrow::ProjectionMask::roots(builder.parquet_schema(), indices);
+            builder = builder.with_projection(mask);
+        }
+    }
+
+    if let Some(filter) = filter_expr {
+        if late_materialize::is_late_materialization_beneficial(
+            Some(filter.as_ref()),
+            &task.projected_columns,
+        ) {
+            let classification =
+                late_materialize::classify_columns(filter.as_ref(), &task.projected_columns);
+            let file_schema = builder.schema().clone();
+            let predicate_schema =
+                late_materialize::build_predicate_schema(&classification, &file_schema);
+            match late_materialize::remap_predicate_columns(filter, &predicate_schema) {
+                Ok(remapped_predicate) => {
+                    let row_filter = late_materialize::build_row_filter(
+                        remapped_predicate,
+                        &predicate_schema,
+                        builder.parquet_schema(),
+                    );
+                    builder = builder.with_row_filter(row_filter);
+                }
+                Err(e) => warn!(
+                    fragment_id = %task.fragment_id,
+                    error = %e,
+                    "Failed to remap predicate columns for late materialization"
+                ),
+            }
+        }
+    }
+
+    let schema = builder.schema().clone();
+    let stream = builder.build()?;
+
+    if let Some(cm) = coordinator_metrics {
+        let s3_elapsed = s3_start.elapsed();
+        cm.s3_requests_total
+            .with_label_values(&["get", "success"])
+            .inc();
+        cm.s3_bytes_read_total.inc_by(bytes_total);
+        cm.s3_request_duration_seconds
+            .observe(s3_elapsed.as_secs_f64());
+    }
+
+    Ok((Box::pin(stream), schema, bytes_total))
+}
+
 #[tracing::instrument(skip(task, metrics, session_ctx, credential_rx, footer_cache, filter_expr, coordinator_metrics), fields(fragment_id = %task.fragment_id, file_count = task.data_file_paths.len()))]
 pub async fn execute_scan(
     task: &ScanTask,
