@@ -148,7 +148,9 @@ mod tests {
     #[test]
     fn new_can_be_created() {
         let f = ReadJsonFunction::new(StorageConfig::default());
-        assert!(matches!(f.storage, StorageConfig { .. }));
+        assert!(f.storage.s3_endpoint.is_empty());
+        assert!(!f.storage.s3_path_style);
+        assert!(!f.storage.s3_allow_http);
     }
 
     #[test]
