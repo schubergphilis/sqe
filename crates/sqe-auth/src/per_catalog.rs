@@ -18,20 +18,59 @@
 //!   `Authorization` header entirely; the session catalog code
 //!   already does this when the token is empty.
 //! - `ClientCredentials`: OAuth2 client_credentials grant against
-//!   the catalog's own token endpoint. Token is fetched at session
-//!   build time and reused for the session lifetime. Refresh on
-//!   expiry is a future change; for now the assumption is that
-//!   `expires_in` from the token endpoint exceeds the session TTL,
-//!   which holds for typical Polaris and Auth0 setups (1 hour
-//!   tokens, 5-minute sessions).
+//!   the catalog's own token endpoint. Tokens are cached globally
+//!   per `(token_endpoint, client_id, scope)` and reused across
+//!   session-context rebuilds. Cache TTL derives from the IdP's
+//!   `expires_in` minus a 60-second safety margin, so callers never
+//!   serve a soon-to-expire token. Issue #31.
 //! - `Aws`: returns an empty string and lets the AWS SDK provider
 //!   chain handle the actual signing path. Used by REST catalogs
 //!   pointed at AWS Glue / S3 Tables, where the catalog's
 //!   `/v1/config` flips on SigV4 mode.
 
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+use moka::future::Cache;
+
 use sqe_core::config::CatalogAuthConfig;
 
 use crate::oauth::OAuthClient;
+
+/// Safety margin subtracted from the IdP-reported `expires_in` before the
+/// cached token is considered stale. 60 seconds covers clock skew plus the
+/// round-trip needed to refresh on the next request.
+const TOKEN_EXPIRY_SAFETY_MARGIN: Duration = Duration::from_secs(60);
+
+/// Smallest TTL the cache will hold a token for, in case the IdP returns
+/// pathologically small `expires_in` values. Below this we just bypass the
+/// cache rather than serve a near-expired bearer.
+const MIN_CACHED_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+struct CachedToken {
+    access_token: String,
+    expires_at: Instant,
+}
+
+fn token_cache() -> &'static Cache<String, CachedToken> {
+    static CACHE: OnceLock<Cache<String, CachedToken>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Cache::builder()
+            .max_capacity(1024)
+            .time_to_live(Duration::from_secs(3600))
+            .build()
+    })
+}
+
+fn cache_key(token_endpoint: &str, client_id: &str, scope: &Option<String>) -> String {
+    format!(
+        "{}|{}|{}",
+        token_endpoint,
+        client_id,
+        scope.as_deref().unwrap_or("")
+    )
+}
 
 /// Resolve the bearer token for one catalog.
 ///
@@ -64,13 +103,38 @@ pub async fn resolve_bearer(
             scope,
         } => {
             // Forward `scope` to OAuthClient. The previous `let _ = scope;`
-            // dropped the field silently — a deployment that mounted
-            // Polaris with `PRINCIPAL_ROLE:READ_ONLY` actually attached
-            // with `PRINCIPAL_ROLE:ALL`, broadening rights without any
-            // warning. Issue #17.
+            // dropped the field silently. Issue #17.
+            // Cache the resulting bearer per (endpoint, client_id, scope) so
+            // session-context rebuilds and concurrent users do not hammer the
+            // IdP. Issue #31.
+            let key = cache_key(token_endpoint, client_id, scope);
+            let cache = token_cache();
+            let now = Instant::now();
+            if let Some(cached) = cache.get(&key).await {
+                if cached.expires_at > now {
+                    return Ok(cached.access_token);
+                }
+            }
+
             let client = OAuthClient::new(token_endpoint, client_id, client_secret, false)?
                 .with_scope(scope.clone());
             let resp = client.get_token().await?;
+
+            let lifetime = Duration::from_secs(resp.expires_in);
+            let cacheable = lifetime
+                .checked_sub(TOKEN_EXPIRY_SAFETY_MARGIN)
+                .unwrap_or_default();
+            if cacheable >= MIN_CACHED_TTL {
+                cache
+                    .insert(
+                        key,
+                        CachedToken {
+                            access_token: resp.access_token.clone(),
+                            expires_at: now + cacheable,
+                        },
+                    )
+                    .await;
+            }
             Ok(resp.access_token)
         }
     }
@@ -115,6 +179,22 @@ mod tests {
         let auth = CatalogAuthConfig::Aws;
         let resolved = resolve_bearer(&auth, "session").await.unwrap();
         assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn cache_key_separates_scope_and_client() {
+        let scope_a = Some("PRINCIPAL_ROLE:READ".to_string());
+        let scope_b = Some("PRINCIPAL_ROLE:ALL".to_string());
+        let none_scope = None;
+        let a = cache_key("https://idp/token", "client", &scope_a);
+        let b = cache_key("https://idp/token", "client", &scope_b);
+        let c = cache_key("https://idp/token", "other", &scope_a);
+        let d = cache_key("https://idp/token", "client", &none_scope);
+        assert_ne!(a, b, "scope must split the cache");
+        assert_ne!(a, c, "client_id must split the cache");
+        assert_ne!(a, d, "None vs Some scope must split the cache");
+        // Same triple yields same key.
+        assert_eq!(a, cache_key("https://idp/token", "client", &scope_a));
     }
 
     /// Live `ClientCredentials` against a real token endpoint is
