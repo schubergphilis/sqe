@@ -61,10 +61,12 @@ struct CachedTableEntry {
 
 /// Global table metadata cache shared across all sessions.
 ///
-/// Table metadata (schema, partitions, snapshots) is user-independent — the same
-/// table has the same structure regardless of which user queries it. User-level
-/// authorization is enforced by Polaris at load time; we cache the result here
-/// so subsequent queries within the TTL window skip the REST round-trip entirely.
+/// Cache keys are scoped per user via the session's token fingerprint
+/// (`"{token_fingerprint}|{namespace}.{table}"`). The cached `Table` carries a
+/// `FileIO` configured with vended S3 credentials returned by Polaris in the
+/// `LoadTableResponse.config` block; those credentials are per-user STS, so
+/// sharing a cache slot across users would silently hand User A's STS creds to
+/// User B on every cache hit. Issue #49.
 ///
 /// When a cached entry's soft TTL expires, the cache performs an ETag-based
 /// conditional request (`If-None-Match`) to Polaris. If Polaris returns
@@ -358,8 +360,10 @@ pub struct SessionCatalog {
     /// used directly (shared across all sessions). Otherwise a private per-session
     /// cache is created as a fallback (used in tests / when the caller passes `None`).
     ///
-    /// Cache is keyed by `"namespace.table_name"`. TTL and capacity are configured
-    /// when the global cache is created (see `TableMetadataCache::new`).
+    /// Cache is keyed by `"{token_fingerprint}|{namespace}.{table_name}"` so vended
+    /// per-user S3 credentials baked into the cached `Table` never cross sessions
+    /// (issue #49). TTL and capacity are configured when the global cache is created
+    /// (see `TableMetadataCache::new`).
     table_cache: TableMetadataCache,
 }
 
@@ -783,6 +787,20 @@ impl SessionCatalog {
         result
     }
 
+    /// Cache key for the table metadata cache.
+    ///
+    /// Scoped to the session's token fingerprint so vended S3 credentials baked
+    /// into the cached `Table` (per-user STS creds returned by Polaris) never
+    /// leak across users. Issue #49.
+    fn table_cache_key(&self, table_ident: &TableIdent) -> String {
+        format!(
+            "{}|{}.{}",
+            self.token_fingerprint,
+            table_ident.namespace(),
+            table_ident.name()
+        )
+    }
+
     /// Load a table by its identifier.
     ///
     /// The returned `Table` includes metadata and a FileIO configured with
@@ -796,7 +814,7 @@ impl SessionCatalog {
     /// Use [`invalidate_table`] to evict an entry after DDL/DML.
     #[instrument(skip(self), fields(table = %table_ident, warehouse = %self.warehouse))]
     pub async fn load_table(&self, table_ident: &TableIdent) -> sqe_core::Result<Table> {
-        let cache_key = format!("{}.{}", table_ident.namespace(), table_ident.name());
+        let cache_key = self.table_cache_key(table_ident);
 
         // Fast path: return cached table that is still within the soft TTL.
         if let Some(cached) = self.table_cache.get_fresh(&cache_key).await {
@@ -995,7 +1013,7 @@ impl SessionCatalog {
     /// (DROP TABLE, CREATE TABLE, ALTER TABLE, INSERT, MERGE, DELETE) so that
     /// the next `load_table()` fetches fresh metadata from Polaris.
     pub async fn invalidate_table(&self, table_ident: &TableIdent) {
-        let key = format!("{}.{}", table_ident.namespace(), table_ident.name());
+        let key = self.table_cache_key(table_ident);
         self.table_cache.invalidate(&key).await;
         debug!(table = %table_ident, "Table cache invalidated");
     }
@@ -1449,7 +1467,7 @@ impl Catalog for SessionCatalogBridge {
         let result = dispatch_catalog!(self.session.inner, create_table(namespace, creation))?;
         // Invalidate any stale cache entry for this table name.
         let ident = TableIdent::new(namespace.clone(), table_name);
-        self.session.table_cache.invalidate(&format!("{}.{}", ident.namespace(), ident.name())).await;
+        self.session.table_cache.invalidate(&self.session.table_cache_key(&ident)).await;
         Ok(result)
     }
 
@@ -1466,7 +1484,7 @@ impl Catalog for SessionCatalogBridge {
         // Invalidate on success or failure: stale data is worse than a miss.
         self.session
             .table_cache
-            .invalidate(&format!("{}.{}", table.namespace(), table.name()))
+            .invalidate(&self.session.table_cache_key(table))
             .await;
         result
     }
@@ -1497,7 +1515,7 @@ impl Catalog for SessionCatalogBridge {
         // Invalidate cache so any subsequent load_table sees updated metadata.
         self.session
             .table_cache
-            .invalidate(&format!("{}.{}", ident.namespace(), ident.name()))
+            .invalidate(&self.session.table_cache_key(&ident))
             .await;
         result
     }
