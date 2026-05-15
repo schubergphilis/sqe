@@ -356,8 +356,16 @@ pub async fn create_session_context(
             }
 
             // Register the sha256() scalar function for column masking.
-            // DataFusion does not ship a built-in sha256 — we provide one via sqe-policy.
-            ctx.register_udf(sqe_policy::sha256_udf::sha256_udf());
+            // DataFusion does not ship a built-in sha256, we provide one via sqe-policy.
+            // When `coordinator.policy.mask_key` is set the UDF runs as
+            // HMAC-SHA256 with that key, blocking offline rainbow-table
+            // attacks against low-entropy masked columns (issue #37).
+            let mask_key = if config.policy.mask_key.is_empty() {
+                None
+            } else {
+                Some(std::sync::Arc::new(config.policy.mask_key.as_bytes().to_vec()))
+            };
+            ctx.register_udf(sqe_policy::sha256_udf::sha256_udf(mask_key));
 
             // Register Trino-compatible function aliases (year(), month(), day_of_week(), etc.)
             // so Trino SQL and dbt models work without modification.
