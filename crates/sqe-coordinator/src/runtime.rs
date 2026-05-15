@@ -99,6 +99,8 @@ mod tests {
             flight_compression: "lz4".to_string(),
             shuffle_compression: "zstd".to_string(),
             max_workers: 1024,
+            worker_connect_timeout_secs: 5,
+            worker_rpc_timeout_secs: 630,
         }
     }
 

@@ -308,6 +308,17 @@ pub struct CoordinatorConfig {
     /// to send a WINDOW_UPDATE every ~64 KB on a multi-GB result set.
     #[serde(default)]
     pub transport: GrpcTransportConfig,
+    /// gRPC connect timeout (seconds) used when dispatching scan tasks to
+    /// workers. Caps the time the coordinator will wait for TCP+TLS+HTTP/2
+    /// handshake before failing the worker over. Issue #29.
+    #[serde(default = "default_worker_connect_timeout")]
+    pub worker_connect_timeout_secs: u64,
+    /// gRPC request timeout (seconds) applied to each `do_get` from coordinator
+    /// to worker. Must exceed `worker.scan_timeout_secs` (default 600s) so the
+    /// worker's own abort path fires first and the coordinator sees a clean
+    /// `DeadlineExceeded` instead of an unbounded await. Issue #29.
+    #[serde(default = "default_worker_rpc_timeout")]
+    pub worker_rpc_timeout_secs: u64,
 }
 
 /// HTTP/2 + TCP knobs applied to every tonic Server / Client this
@@ -393,6 +404,8 @@ impl std::fmt::Debug for CoordinatorConfig {
             .field("shuffle_compression", &self.shuffle_compression)
             .field("max_workers", &self.max_workers)
             .field("transport", &self.transport)
+            .field("worker_connect_timeout_secs", &self.worker_connect_timeout_secs)
+            .field("worker_rpc_timeout_secs", &self.worker_rpc_timeout_secs)
             .finish()
     }
 }
@@ -1735,6 +1748,8 @@ fn default_spill_compression() -> String { "lz4".to_string() }
 fn default_flight_compression() -> String { "lz4".to_string() }
 fn default_shuffle_compression() -> String { "zstd".to_string() }
 fn default_max_workers() -> usize { 1024 }
+fn default_worker_connect_timeout() -> u64 { 5 }
+fn default_worker_rpc_timeout() -> u64 { 630 }
 
 fn default_flight_port() -> u16 { 50051 }
 fn default_trino_port() -> u16 { 8080 }
@@ -2350,6 +2365,8 @@ mod tests {
                 flight_compression: default_flight_compression(),
                 shuffle_compression: default_shuffle_compression(),
                 max_workers: default_max_workers(),
+                worker_connect_timeout_secs: default_worker_connect_timeout(),
+                worker_rpc_timeout_secs: default_worker_rpc_timeout(),
             },
             worker: WorkerConfig::default(),
             auth: AuthConfig {
