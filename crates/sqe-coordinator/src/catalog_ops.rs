@@ -500,12 +500,19 @@ impl CatalogOps {
                                 column_def.name.value
                             ))
                         })?;
-                        if let Some(lit) =
-                            alter_default_to_iceberg_literal(&sql_literal, &iceberg_type)
-                        {
-                            new_field = new_field
-                                .with_initial_default(lit.clone())
-                                .with_write_default(lit);
+                        match alter_default_to_iceberg_literal(&sql_literal, &iceberg_type) {
+                            Ok(Some(lit)) => {
+                                new_field = new_field
+                                    .with_initial_default(lit.clone())
+                                    .with_write_default(lit);
+                            }
+                            Ok(None) => {}
+                            Err(msg) => {
+                                return Err(SqeError::Execution(format!(
+                                    "DEFAULT literal for column '{}': {msg}",
+                                    column_def.name.value
+                                )));
+                            }
                         }
                     }
 

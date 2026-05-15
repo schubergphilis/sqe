@@ -5032,18 +5032,28 @@ pub(crate) fn arrow_schema_to_iceberg_with_defaults(
                 ))
             })?;
 
-            if let Some(iceberg_literal) = default_to_iceberg_literal(&sql_literal, &iceberg_type)
-            {
-                field = field
-                    .with_initial_default(iceberg_literal.clone())
-                    .with_write_default(iceberg_literal);
-            } else if !matches!(sql_literal, DefaultLiteral::Null) {
-                return Err(SqeError::Execution(format!(
-                    "DEFAULT literal for column '{}' is not compatible with type {:?}",
-                    col_def.name.value, iceberg_type
-                )));
+            match default_to_iceberg_literal(&sql_literal, &iceberg_type) {
+                Ok(Some(iceberg_literal)) => {
+                    field = field
+                        .with_initial_default(iceberg_literal.clone())
+                        .with_write_default(iceberg_literal);
+                }
+                Ok(None) if matches!(sql_literal, DefaultLiteral::Null) => {
+                    // DefaultLiteral::Null is a no-op: NULL is already the absent default.
+                }
+                Ok(None) => {
+                    return Err(SqeError::Execution(format!(
+                        "DEFAULT literal for column '{}' is not compatible with type {:?}",
+                        col_def.name.value, iceberg_type
+                    )));
+                }
+                Err(msg) => {
+                    return Err(SqeError::Execution(format!(
+                        "DEFAULT literal for column '{}': {msg}",
+                        col_def.name.value
+                    )));
+                }
             }
-            // DefaultLiteral::Null is a no-op: NULL is already the absent default.
         }
 
         fields.push(Arc::new(field));
@@ -5057,28 +5067,54 @@ pub(crate) fn arrow_schema_to_iceberg_with_defaults(
 
 /// Convert a SQL-surface default literal into an Iceberg `Literal`.
 ///
-/// Returns `None` if the combination of SQL literal and target Iceberg
-/// type is not representable. The caller decides whether that is a
-/// hard error or a silent NULL.
+/// Returns `Ok(None)` if the combination of SQL literal and target Iceberg
+/// type is not representable but is not an error (the caller decides whether
+/// that is a hard error or a silent NULL). Returns `Err` when the literal
+/// is structurally compatible but out of range for the target type, so the
+/// user sees the failure instead of a silently wrapped value. Issue #77.
 pub(crate) fn default_to_iceberg_literal(
     sql_literal: &sqe_sql::DefaultLiteral,
     target: &iceberg::spec::Type,
-) -> Option<iceberg::spec::Literal> {
+) -> Result<Option<iceberg::spec::Literal>, String> {
     use iceberg::spec::{Literal, PrimitiveLiteral, PrimitiveType, Type};
     use sqe_sql::DefaultLiteral;
 
     let prim = match target {
         Type::Primitive(p) => p,
         // Struct/list/map defaults are not in scope.
-        _ => return None,
+        _ => return Ok(None),
     };
 
-    match (sql_literal, prim) {
+    let lit = match (sql_literal, prim) {
         (DefaultLiteral::Null, _) => None,
-        (DefaultLiteral::Int(i), PrimitiveType::Int) => Some(Literal::int(*i as i32)),
+        (DefaultLiteral::Int(i), PrimitiveType::Int) => {
+            let narrowed = i32::try_from(*i).map_err(|_| {
+                format!(
+                    "DEFAULT literal {i} does not fit in INT (range -2147483648 to 2147483647)"
+                )
+            })?;
+            Some(Literal::int(narrowed))
+        }
         (DefaultLiteral::Int(i), PrimitiveType::Long) => Some(Literal::long(*i)),
-        (DefaultLiteral::Int(i), PrimitiveType::Float) => Some(Literal::float(*i as f32)),
-        (DefaultLiteral::Int(i), PrimitiveType::Double) => Some(Literal::double(*i as f64)),
+        (DefaultLiteral::Int(i), PrimitiveType::Float) => {
+            // f32 has ~24 bits of mantissa; reject literals that lose precision
+            // so the on-disk value matches what the user wrote.
+            if (*i as f32 as i64) != *i {
+                return Err(format!(
+                    "DEFAULT literal {i} cannot be represented exactly as FLOAT (24-bit mantissa)"
+                ));
+            }
+            Some(Literal::float(*i as f32))
+        }
+        (DefaultLiteral::Int(i), PrimitiveType::Double) => {
+            // f64 has 53 bits of mantissa; outside that range integer precision is lost.
+            if (*i as f64 as i64) != *i {
+                return Err(format!(
+                    "DEFAULT literal {i} cannot be represented exactly as DOUBLE (53-bit mantissa)"
+                ));
+            }
+            Some(Literal::double(*i as f64))
+        }
         (DefaultLiteral::Float(f), PrimitiveType::Float) => Some(Literal::float(*f as f32)),
         (DefaultLiteral::Float(f), PrimitiveType::Double) => Some(Literal::double(*f)),
         (DefaultLiteral::Bool(b), PrimitiveType::Boolean) => Some(Literal::bool(*b)),
@@ -5088,7 +5124,8 @@ pub(crate) fn default_to_iceberg_literal(
             Some(Literal::Primitive(PrimitiveLiteral::String(s.clone())))
         }
         _ => None,
-    }
+    };
+    Ok(lit)
 }
 
 /// Decide whether a CREATE TABLE definition requires Iceberg format-version 3.
