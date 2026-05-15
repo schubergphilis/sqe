@@ -1060,7 +1060,7 @@ mod tests {
         async fn authenticate(&self, user: &str, _: &str) -> Result<Session, String> {
             Ok(Session::new(
                 user.to_string(),
-                "mock-token".to_string(),
+                sqe_core::SecretString::new("mock-token".to_string()),
                 None,
                 chrono::Utc::now() + chrono::Duration::hours(1),
                 vec![],
@@ -1069,7 +1069,7 @@ mod tests {
         async fn authenticate_bearer(&self, _: &str) -> Result<Session, String> {
             Ok(Session::new(
                 "bearer-user".to_string(),
-                "mock-token".to_string(),
+                sqe_core::SecretString::new("mock-token".to_string()),
                 None,
                 chrono::Utc::now() + chrono::Duration::hours(1),
                 vec![],
@@ -1361,7 +1361,7 @@ mod tests {
     fn test_apply_trino_headers_to_session() {
         let session = Session::new(
             "testuser".to_string(),
-            "token".to_string(),
+            sqe_core::SecretString::new("token".to_string()),
             None,
             chrono::Utc::now() + chrono::Duration::hours(1),
             vec![],
@@ -1384,7 +1384,7 @@ mod tests {
     fn test_apply_trino_headers_none_values() {
         let session = Session::new(
             "testuser".to_string(),
-            "token".to_string(),
+            sqe_core::SecretString::new("token".to_string()),
             None,
             chrono::Utc::now() + chrono::Duration::hours(1),
             vec![],

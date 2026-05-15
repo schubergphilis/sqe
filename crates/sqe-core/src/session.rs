@@ -1,13 +1,48 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-#[derive(Clone)]
+use crate::SecretString;
+
+/// Atomic credential bundle. The three fields rotate together: the access
+/// token, its matching refresh token (when the IdP issued one), and the
+/// expiry timestamp that pairs with the access token. Constructing a
+/// `Credentials` value forces the caller to set all three at the same call
+/// site, which is the bug class issue #89 closes: three independent
+/// `session.access_token = ...; session.refresh_token = ...; session.token_expiry = ...`
+/// assignment sequences let a fourth call site forget one of the three and
+/// leave a stale expiry attached to a fresh token.
+#[derive(Debug, Clone)]
+pub struct Credentials {
+    pub access_token: SecretString,
+    pub refresh_token: Option<SecretString>,
+    pub expiry: DateTime<Utc>,
+}
+
+impl Credentials {
+    pub fn new(
+        access_token: SecretString,
+        refresh_token: Option<SecretString>,
+        expiry: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            access_token,
+            refresh_token,
+            expiry,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Session {
     pub id: String,
     pub user: SessionUser,
-    pub access_token: String,
-    pub refresh_token: Option<String>,
-    pub token_expiry: DateTime<Utc>,
+    // The credential trio is private (issue #89). Mutate via
+    // `rotate_credentials`; read via `access_token()`, `refresh_token()`,
+    // `token_expiry()`. Direct field access would let any caller leave
+    // `token_expiry` stale relative to `access_token`.
+    access_token: SecretString,
+    refresh_token: Option<SecretString>,
+    token_expiry: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     /// Timestamp of last activity (query execution). Used for idle session expiry.
     pub last_activity: DateTime<Utc>,
@@ -23,23 +58,6 @@ pub struct Session {
     pub write_branch: Option<String>,
 }
 
-impl std::fmt::Debug for Session {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Session")
-            .field("id", &self.id)
-            .field("user", &self.user)
-            .field("access_token", &"[REDACTED]")
-            .field("refresh_token", &"[REDACTED]")
-            .field("token_expiry", &self.token_expiry)
-            .field("created_at", &self.created_at)
-            .field("last_activity", &self.last_activity)
-            .field("default_catalog", &self.default_catalog)
-            .field("default_schema", &self.default_schema)
-            .field("source", &self.source)
-            .finish()
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct SessionUser {
     pub username: String,
@@ -47,7 +65,13 @@ pub struct SessionUser {
 }
 
 impl Session {
-    pub fn new(username: String, access_token: String, refresh_token: Option<String>, token_expiry: DateTime<Utc>, roles: Vec<String>) -> Self {
+    pub fn new(
+        username: String,
+        access_token: SecretString,
+        refresh_token: Option<SecretString>,
+        token_expiry: DateTime<Utc>,
+        roles: Vec<String>,
+    ) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4().to_string(),
@@ -62,6 +86,33 @@ impl Session {
             source: None,
             write_branch: None,
         }
+    }
+
+    /// Borrow the current access token. Returns `&SecretString` so the
+    /// caller has to go through `.expose()` to read the raw value.
+    pub fn access_token(&self) -> &SecretString {
+        &self.access_token
+    }
+
+    /// Borrow the current refresh token, if the IdP issued one.
+    pub fn refresh_token(&self) -> Option<&SecretString> {
+        self.refresh_token.as_ref()
+    }
+
+    /// Return the expiry instant of the current access token.
+    pub fn token_expiry(&self) -> DateTime<Utc> {
+        self.token_expiry
+    }
+
+    /// Atomically replace the credential trio. The three fields move
+    /// together so a `Credentials` value always represents a consistent
+    /// (token, refresh, expiry) tuple. No external caller can leave
+    /// `token_expiry` mismatched against `access_token` because no
+    /// individual setter exists.
+    pub fn rotate_credentials(&mut self, creds: Credentials) {
+        self.access_token = creds.access_token;
+        self.refresh_token = creds.refresh_token;
+        self.token_expiry = creds.expiry;
     }
 
     /// Set the write branch for this session. Passing `None` clears the value
@@ -90,7 +141,7 @@ impl Session {
 
     pub fn token_fingerprint(&self) -> String {
         use sha2::{Digest, Sha256};
-        let hash = format!("{:x}", Sha256::digest(self.access_token.as_bytes()));
+        let hash = format!("{:x}", Sha256::digest(self.access_token.expose_bytes()));
         format!("{}-{}", self.user.username, &hash[..16])
     }
 
@@ -125,7 +176,7 @@ mod tests {
     fn make_session() -> Session {
         Session::new(
             "alice".to_string(),
-            "tok_abc".to_string(),
+            SecretString::new("tok_abc".to_string()),
             None,
             Utc::now() + Duration::hours(1),
             vec!["analyst".to_string()],
@@ -146,7 +197,7 @@ mod tests {
     #[test]
     fn test_is_idle_returns_false_immediately() {
         let session = make_session();
-        // 15-minute idle timeout — a fresh session should not be idle
+        // 15-minute idle timeout: a fresh session should not be idle
         assert!(!session.is_idle(900));
     }
 
@@ -155,14 +206,14 @@ mod tests {
         let mut session = make_session();
         // Simulate last activity 20 minutes ago
         session.last_activity = Utc::now() - Duration::seconds(1200);
-        // 15-minute (900s) idle timeout — session should be idle
+        // 15-minute (900s) idle timeout - session should be idle
         assert!(session.is_idle(900));
     }
 
     #[test]
     fn test_is_absolute_expired_returns_false_immediately() {
         let session = make_session();
-        // 8-hour absolute timeout — a fresh session should not be expired
+        // 8-hour absolute timeout: a fresh session should not be expired
         assert!(!session.is_absolute_expired(28800));
     }
 
@@ -171,14 +222,14 @@ mod tests {
         let mut session = make_session();
         // Simulate session created 9 hours ago
         session.created_at = Utc::now() - Duration::hours(9);
-        // 8-hour (28800s) absolute timeout — session should be expired
+        // 8-hour (28800s) absolute timeout: session should be expired
         assert!(session.is_absolute_expired(28800));
     }
 
     #[test]
     fn test_touch_resets_idle_timer() {
         let mut session = make_session();
-        // Simulate last activity 20 minutes ago — idle
+        // Simulate last activity 20 minutes ago, idle
         session.last_activity = Utc::now() - Duration::seconds(1200);
         assert!(session.is_idle(900));
 
@@ -204,7 +255,7 @@ mod tests {
         let mut session = make_session();
         // Simulate last activity 10 minutes ago
         session.last_activity = Utc::now() - Duration::seconds(600);
-        // 15-minute (900s) idle timeout — session is still active
+        // 15-minute (900s) idle timeout: session is still active
         assert!(!session.is_idle(900));
     }
 
@@ -216,5 +267,39 @@ mod tests {
             debug_str.contains("last_activity"),
             "Debug output should include last_activity, got: {debug_str}"
         );
+    }
+
+    #[test]
+    fn rotate_credentials_replaces_all_three_fields_atomically() {
+        let mut session = make_session();
+        let original_expiry = session.token_expiry();
+        let new_expiry = Utc::now() + Duration::hours(2);
+
+        session.rotate_credentials(Credentials::new(
+            SecretString::new("new-tok".to_string()),
+            Some(SecretString::new("new-refresh".to_string())),
+            new_expiry,
+        ));
+
+        assert_eq!(session.access_token().expose(), "new-tok");
+        assert_eq!(
+            session.refresh_token().map(|t| t.expose()),
+            Some("new-refresh"),
+        );
+        assert_eq!(session.token_expiry(), new_expiry);
+        assert_ne!(session.token_expiry(), original_expiry);
+    }
+
+    #[test]
+    fn debug_does_not_leak_access_or_refresh_token() {
+        let mut session = make_session();
+        session.rotate_credentials(Credentials::new(
+            SecretString::new("a-very-secret-token".to_string()),
+            Some(SecretString::new("a-very-secret-refresh".to_string())),
+            Utc::now() + Duration::hours(1),
+        ));
+        let d = format!("{:?}", session);
+        assert!(!d.contains("a-very-secret-token"), "leaked access: {d}");
+        assert!(!d.contains("a-very-secret-refresh"), "leaked refresh: {d}");
     }
 }

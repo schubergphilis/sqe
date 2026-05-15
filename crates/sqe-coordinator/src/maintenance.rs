@@ -795,7 +795,7 @@ impl MaintenanceHandler {
             SessionCatalog::for_session(
                 &self.config,
                 self.table_cache.clone(),
-                &session.access_token,
+                session.access_token().expose(),
             )
             .await?,
         );
@@ -1149,7 +1149,7 @@ mod tests {
     fn session_with_roles(roles: Vec<&str>) -> Session {
         Session::new(
             "alice".to_string(),
-            "test-token".to_string(),
+            sqe_core::SecretString::new("test-token".to_string()),
             None,
             chrono::Utc::now() + Duration::hours(1),
             roles.into_iter().map(String::from).collect(),

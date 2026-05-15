@@ -4344,7 +4344,7 @@ impl WriteHandler {
             SessionCatalog::for_session(
                 &self.config,
                 self.table_cache.clone(),
-                &session.access_token,
+                session.access_token().expose(),
             )
             .await?,
         );
@@ -6480,7 +6480,7 @@ s3_path_style = true
         let plan = LogicalPlanBuilder::empty(false).build().unwrap();
         let session = sqe_core::Session::new(
             "u".to_string(),
-            "tok".to_string(),
+            sqe_core::SecretString::new("tok".to_string()),
             None,
             chrono::Utc::now(),
             vec![],
@@ -6526,7 +6526,7 @@ s3_path_style = true
             WriteHandler::new(write_test_config()).with_policy_enforcer(enforcer);
         let session = sqe_core::Session::new(
             "u".to_string(),
-            "tok".to_string(),
+            sqe_core::SecretString::new("tok".to_string()),
             None,
             chrono::Utc::now(),
             vec![],

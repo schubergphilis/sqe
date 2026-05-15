@@ -4,14 +4,15 @@
 
 use chrono::{DateTime, Utc};
 use datafusion::logical_expr::LogicalPlan;
+use sqe_core::SecretString;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct UserCtx {
     pub username: String,
-    pub bearer: Option<String>,
+    pub bearer: Option<SecretString>,
 }
 
 pub enum LineageHint {

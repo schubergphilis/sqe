@@ -178,7 +178,7 @@ impl AuthProvider for ApiKeyProvider {
     async fn authenticate(&self, credentials: &FlightCredentials) -> Result<Identity, AuthError> {
         // Detect: password must be present and start with the configured prefix.
         let password = match &credentials.password {
-            Some(p) if p.starts_with(&self.config.key_prefix) => p,
+            Some(p) if p.expose().starts_with(&self.config.key_prefix) => p.expose(),
             _ => return Err(AuthError::NotMyCredentials),
         };
 
@@ -294,7 +294,7 @@ mod tests {
     async fn correct_key_returns_identity() {
         let provider = ApiKeyProvider::with_keys(test_config(), test_keys());
         let creds = FlightCredentials {
-            password: Some("sqe_key_alpha".to_string()),
+            password: Some(sqe_core::SecretString::new("sqe_key_alpha".to_string())),
             ..Default::default()
         };
 
@@ -312,7 +312,7 @@ mod tests {
     async fn wrong_key_returns_auth_failed() {
         let provider = ApiKeyProvider::with_keys(test_config(), test_keys());
         let creds = FlightCredentials {
-            password: Some("sqe_wrong_key".to_string()),
+            password: Some(sqe_core::SecretString::new("sqe_wrong_key".to_string())),
             ..Default::default()
         };
 
@@ -330,7 +330,7 @@ mod tests {
     async fn no_prefix_returns_not_my_credentials() {
         let provider = ApiKeyProvider::with_keys(test_config(), test_keys());
         let creds = FlightCredentials {
-            password: Some("regular_password".to_string()),
+            password: Some(sqe_core::SecretString::new("regular_password".to_string())),
             ..Default::default()
         };
 
@@ -366,7 +366,7 @@ mod tests {
     async fn jwt_password_returns_not_my_credentials() {
         let provider = ApiKeyProvider::with_keys(test_config(), test_keys());
         let creds = FlightCredentials {
-            password: Some("eyJhbGciOiJSUzI1NiJ9.payload.sig".to_string()),
+            password: Some(sqe_core::SecretString::new("eyJhbGciOiJSUzI1NiJ9.payload.sig".to_string())),
             ..Default::default()
         };
 
@@ -384,7 +384,7 @@ mod tests {
     async fn admin_key_maps_groups_to_roles() {
         let provider = ApiKeyProvider::with_keys(test_config(), test_keys());
         let creds = FlightCredentials {
-            password: Some("sqe_key_bravo".to_string()),
+            password: Some(sqe_core::SecretString::new("sqe_key_bravo".to_string())),
             ..Default::default()
         };
 
@@ -408,7 +408,7 @@ mod tests {
         }];
         let provider = ApiKeyProvider::with_keys(test_config(), keys);
         let creds = FlightCredentials {
-            password: Some("sqe_unmapped".to_string()),
+            password: Some(sqe_core::SecretString::new("sqe_unmapped".to_string())),
             ..Default::default()
         };
 
@@ -431,7 +431,7 @@ mod tests {
             refresh_token: None,
         };
 
-        assert_eq!(provider.refresh_catalog_token(&identity).await.unwrap(), None);
+        assert!(provider.refresh_catalog_token(&identity).await.unwrap().is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -493,7 +493,7 @@ user = "original-user"
 
         // Original key works.
         let creds = FlightCredentials {
-            password: Some("sqe_original".to_string()),
+            password: Some(sqe_core::SecretString::new("sqe_original".to_string())),
             ..Default::default()
         };
         let id = provider.authenticate(&creds).await.unwrap();
@@ -520,7 +520,7 @@ user = "new-user"
 
         // New key should work now.
         let creds2 = FlightCredentials {
-            password: Some("sqe_newkey".to_string()),
+            password: Some(sqe_core::SecretString::new("sqe_newkey".to_string())),
             ..Default::default()
         };
         let id2 = provider.authenticate(&creds2).await.unwrap();
@@ -545,7 +545,7 @@ user = "new-user"
         let provider = ApiKeyProvider::with_keys(test_config(), keys);
 
         let creds = FlightCredentials {
-            password: Some("sqe_short_but_longer".to_string()),
+            password: Some(sqe_core::SecretString::new("sqe_short_but_longer".to_string())),
             ..Default::default()
         };
         match provider.authenticate(&creds).await {

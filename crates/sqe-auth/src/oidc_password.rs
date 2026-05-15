@@ -1,5 +1,6 @@
 use base64::Engine;
 use serde::Deserialize;
+use sqe_core::SecretString;
 use sqe_core::config::AuthConfig;
 use tracing::{debug, warn};
 
@@ -15,7 +16,7 @@ pub struct OidcPasswordClient {
     client: reqwest::Client,
     token_url: String,
     client_id: String,
-    client_secret: String,
+    client_secret: SecretString,
     /// Dot-separated JSON path to the roles array in the JWT payload. The
     /// legacy default `realm_access.roles` is the Keycloak shape; Auth0,
     /// Okta, and AzureAD typically use `groups`, a `cognito:groups`-style
@@ -56,8 +57,8 @@ impl OidcPasswordClient {
 
         let params = [
             ("grant_type", "password"),
-            ("client_id", &self.client_id),
-            ("client_secret", &self.client_secret),
+            ("client_id", self.client_id.as_str()),
+            ("client_secret", self.client_secret.expose()),
             ("username", username),
             ("password", password),
         ];
@@ -101,8 +102,8 @@ impl OidcPasswordClient {
 
         let params = [
             ("grant_type", "refresh_token"),
-            ("client_id", &self.client_id),
-            ("client_secret", &self.client_secret),
+            ("client_id", self.client_id.as_str()),
+            ("client_secret", self.client_secret.expose()),
             ("refresh_token", refresh_token),
         ];
 
@@ -216,7 +217,7 @@ mod tests {
             keycloak_url: "http://localhost:8080".to_string(),
             realm: "test".to_string(),
             client_id: "test-client".to_string(),
-            client_secret: "secret".to_string(),
+            client_secret: SecretString::new("secret".to_string()),
             token_endpoint: String::new(),
             token_refresh_buffer_secs: 60,
             ssl_verification: false,

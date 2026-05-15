@@ -280,18 +280,19 @@ impl AuthProvider for AwsIamProvider {
 
         let secret_key = credentials
             .password
-            .as_deref()
+            .as_ref()
             .ok_or_else(|| {
                 AuthError::AuthFailed(
                     "AWS access key ID provided but secret access key (password) is missing"
                         .to_string(),
                 )
-            })?;
+            })?
+            .expose();
 
         // Session token for temporary credentials (ASIA* keys).
         // Passed via bearer_token field since Flight credentials don't have
         // a dedicated session token field.
-        let session_token = credentials.bearer_token.as_deref();
+        let session_token = credentials.bearer_token.as_ref().map(|t| t.expose());
 
         debug!(
             access_key_id = %username,
@@ -522,7 +523,7 @@ mod tests {
 
         let creds = FlightCredentials {
             username: Some("alice@example.com".to_string()),
-            password: Some("password123".to_string()),
+            password: Some(sqe_core::SecretString::new("password123".to_string())),
             ..Default::default()
         };
 
@@ -538,7 +539,7 @@ mod tests {
 
         let creds = FlightCredentials {
             username: None,
-            password: Some("password123".to_string()),
+            password: Some(sqe_core::SecretString::new("password123".to_string())),
             ..Default::default()
         };
 
@@ -593,7 +594,7 @@ mod tests {
 
         let creds = FlightCredentials {
             username: Some("AKIAIOSFODNN7EXAMPLE".to_string()),
-            password: Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            password: Some(sqe_core::SecretString::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string())),
             ..Default::default()
         };
 
@@ -618,7 +619,7 @@ mod tests {
 
         let creds = FlightCredentials {
             username: Some("AKIAIOSFODNN7EXAMPLE".to_string()),
-            password: Some("secret".to_string()),
+            password: Some(sqe_core::SecretString::new("secret".to_string())),
             ..Default::default()
         };
 
@@ -898,6 +899,6 @@ mod tests {
         };
 
         let result = provider.refresh_catalog_token(&identity).await;
-        assert_eq!(result.unwrap(), None);
+        assert!(result.unwrap().is_none());
     }
 }

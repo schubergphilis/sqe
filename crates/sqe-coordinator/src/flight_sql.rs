@@ -349,7 +349,7 @@ pub struct SqeFlightSqlService {
     config: SqeConfig,
     worker_registry: Option<Arc<WorkerRegistry>>,
     query_tracker: Arc<QueryTracker>,
-    worker_secret: String,
+    worker_secret: sqe_core::SecretString,
     metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
     rate_limiter: Option<Arc<crate::rate_limiter::QueryRateLimiter>>,
     auth_rate_limiter: Option<Arc<crate::rate_limiter::AuthRateLimiter>>,
@@ -490,7 +490,7 @@ impl SqeFlightSqlService {
         // not from a client-supplied header.
         if token.contains('.') {
             let credentials = sqe_auth::FlightCredentials {
-                bearer_token: Some(token.to_string()),
+                bearer_token: Some(sqe_core::SecretString::new(token.to_string())),
                 ..Default::default()
             };
             let session = self
@@ -747,7 +747,7 @@ impl FlightSqlService for SqeFlightSqlService {
 
         let credentials = sqe_auth::FlightCredentials {
             username: Some(username.to_string()),
-            password: Some(password.to_string()),
+            password: Some(sqe_core::SecretString::new(password.to_string())),
             ..Default::default()
         };
 
@@ -1922,7 +1922,7 @@ impl FlightSqlService for SqeFlightSqlService {
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("");
                     let provided_bytes = provided.as_bytes();
-                    let secret_bytes = self.worker_secret.as_bytes();
+                    let secret_bytes = self.worker_secret.expose_bytes();
                     if provided_bytes.len() != secret_bytes.len()
                         || !bool::from(provided_bytes.ct_eq(secret_bytes))
                     {

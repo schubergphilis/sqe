@@ -90,7 +90,7 @@ mod tests {
             worker_urls: vec![],
             debug: false,
             tls: TlsConfig::default(),
-            worker_secret: String::new(),
+            worker_secret: sqe_core::SecretString::default(),
             allow_unauthenticated_workers: false,
             memory_limit: memory_limit.to_string(),
             spill_to_disk: false,

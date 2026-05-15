@@ -307,7 +307,7 @@ mod tests {
             refresh_token: None,
         };
 
-        assert_eq!(provider.refresh_catalog_token(&identity).await.unwrap(), None);
+        assert!(provider.refresh_catalog_token(&identity).await.unwrap().is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -319,8 +319,8 @@ mod tests {
         let provider = MtlsProvider::new(test_config());
         let creds = FlightCredentials {
             username: Some("alice".to_string()),
-            password: Some("secret".to_string()),
-            bearer_token: Some("eyJ...".to_string()),
+            password: Some(sqe_core::SecretString::new("secret".to_string())),
+            bearer_token: Some(sqe_core::SecretString::new("eyJ...".to_string())),
             client_cert_cn: Some("service-x".to_string()),
         };
 

@@ -257,7 +257,7 @@ impl AuthProvider for OidcPasswordProvider {
         };
 
         let password = match &credentials.password {
-            Some(p) if !p.is_empty() => p,
+            Some(p) if !p.is_empty() => p.expose(),
             _ => return Err(AuthError::NotMyCredentials),
         };
 
@@ -278,22 +278,22 @@ impl AuthProvider for OidcPasswordProvider {
             user_id: user_id.clone(),
             display_name: user_id,
             roles,
-            catalog_token: Some(token_response.access_token),
-            refresh_token: token_response.refresh_token,
+            catalog_token: Some(sqe_core::SecretString::new(token_response.access_token)),
+            refresh_token: token_response.refresh_token.map(sqe_core::SecretString::new),
         })
     }
 
     async fn refresh_catalog_token(
         &self,
         identity: &Identity,
-    ) -> Result<Option<String>, AuthError> {
+    ) -> Result<Option<sqe_core::SecretString>, AuthError> {
         let refresh_token = match &identity.refresh_token {
-            Some(rt) if !rt.is_empty() => rt,
+            Some(rt) if !rt.is_empty() => rt.expose(),
             _ => return Ok(None),
         };
 
         let token_response = self.do_refresh_token(refresh_token).await?;
-        Ok(Some(token_response.access_token))
+        Ok(Some(sqe_core::SecretString::new(token_response.access_token)))
     }
 }
 
@@ -479,7 +479,7 @@ mod tests {
 
         let creds = FlightCredentials {
             username: None,
-            password: Some("pass".to_string()),
+            password: Some(sqe_core::SecretString::new("pass".to_string())),
             ..Default::default()
         };
 
@@ -517,7 +517,7 @@ mod tests {
 
         let creds = FlightCredentials {
             username: Some("alice".to_string()),
-            password: Some("eyJhbGciOiJSUzI1NiJ9.payload.sig".to_string()),
+            password: Some(sqe_core::SecretString::new("eyJhbGciOiJSUzI1NiJ9.payload.sig".to_string())),
             ..Default::default()
         };
 
@@ -536,7 +536,7 @@ mod tests {
 
         let creds = FlightCredentials {
             username: Some(String::new()),
-            password: Some("pass".to_string()),
+            password: Some(sqe_core::SecretString::new("pass".to_string())),
             ..Default::default()
         };
 
