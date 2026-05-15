@@ -221,6 +221,7 @@ impl AuthProvider for OidcM2mProvider {
             roles: self.config.roles.clone(),
             catalog_token: Some(sqe_core::SecretString::new(token)),
             refresh_token: None,
+            expires_at: None,
         })
     }
 

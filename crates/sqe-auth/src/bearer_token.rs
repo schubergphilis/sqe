@@ -436,6 +436,13 @@ impl AuthProvider for BearerTokenProvider {
 
         let roles = Self::extract_roles(claims, &self.config.roles_claim);
 
+        // Read JWT `exp` (Unix seconds) so the session expires when the bearer
+        // actually expires, not on a hard-coded 1h. Issue #26.
+        let expires_at = claims
+            .get("exp")
+            .and_then(|v| v.as_i64())
+            .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0));
+
         debug!(
             user_id = %user_id,
             roles = ?roles,
@@ -448,6 +455,7 @@ impl AuthProvider for BearerTokenProvider {
             roles,
             catalog_token: Some(sqe_core::SecretString::new(token)),
             refresh_token: None,
+            expires_at,
         })
     }
 
@@ -851,6 +859,12 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             Some(token.as_str()),
         );
         assert!(identity.refresh_token.is_none());
+        // Issue #26: JWT `exp` must propagate into the Identity so SessionManager
+        // can evict the cached session when the underlying bearer actually
+        // expires, not on a hard-coded 1h.
+        let expected_exp = chrono::DateTime::from_timestamp((now + 3600) as i64, 0)
+            .expect("valid timestamp");
+        assert_eq!(identity.expires_at, Some(expected_exp));
     }
 
     // -----------------------------------------------------------------------
@@ -1242,6 +1256,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             roles: vec!["admin".to_string()],
             catalog_token: Some(sqe_core::SecretString::new("the-jwt-token".to_string())),
             refresh_token: None,
+            expires_at: None,
         };
 
         let result = provider
@@ -1266,6 +1281,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             roles: vec![],
             catalog_token: None,
             refresh_token: None,
+            expires_at: None,
         };
 
         let result = provider
