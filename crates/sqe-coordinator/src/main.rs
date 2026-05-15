@@ -235,39 +235,7 @@ async fn async_main() -> anyhow::Result<()> {
         "Initialized global table metadata cache (shared across all sessions)"
     );
 
-    // Select the grant backend based on access_control.backend config.
-    // "chameleon" (default for existing deployments), "polaris" (3-step
-    // Management API), or "none" (access control disabled).
-    let grant_backend: Option<Arc<dyn GrantBackend>> = match config
-        .access_control
-        .backend
-        .as_str()
-    {
-        "chameleon" if !config.access_control.url.is_empty() => {
-            tracing::info!(
-                backend = "chameleon",
-                url = %config.access_control.url,
-                "Access control backend configured"
-            );
-            let client = Arc::new(sqe_catalog::AccessControlClient::new(
-                &config.access_control.url,
-            )?);
-            Some(Arc::new(ChameleonGrantBackend::new(client)))
-        }
-        "polaris" if !config.access_control.url.is_empty() => {
-            tracing::info!(
-                backend = "polaris",
-                url = %config.access_control.url,
-                "Access control backend configured"
-            );
-            Some(Arc::new(PolarisGrantBackend::new(
-                &config.access_control.url,
-                config.access_control.client_id.clone(),
-                config.access_control.client_secret.clone(),
-            )?))
-        }
-        _ => None,
-    };
+    let grant_backend: Option<Arc<dyn GrantBackend>> = build_grant_backend(&config)?;
 
     // Initialize query handler
     let query_handler = Arc::new(
@@ -462,4 +430,38 @@ fn build_oauth2_state(
         pending_store,
         base_url,
     })
+}
+
+fn build_grant_backend(
+    config: &SqeConfig,
+) -> anyhow::Result<Option<Arc<dyn GrantBackend>>> {
+    use sqe_core::config::AccessControlBackend;
+    match config.access_control.backend {
+        AccessControlBackend::Chameleon if !config.access_control.url.is_empty() => {
+            tracing::info!(
+                backend = "chameleon",
+                url = %config.access_control.url,
+                "Access control backend configured"
+            );
+            let client = Arc::new(sqe_catalog::AccessControlClient::new(
+                &config.access_control.url,
+            )?);
+            Ok(Some(Arc::new(ChameleonGrantBackend::new(client))))
+        }
+        AccessControlBackend::Polaris if !config.access_control.url.is_empty() => {
+            tracing::info!(
+                backend = "polaris",
+                url = %config.access_control.url,
+                "Access control backend configured"
+            );
+            Ok(Some(Arc::new(PolarisGrantBackend::new(
+                &config.access_control.url,
+                config.access_control.client_id.clone(),
+                config.access_control.client_secret.clone(),
+            )?)))
+        }
+        AccessControlBackend::None
+        | AccessControlBackend::Chameleon
+        | AccessControlBackend::Polaris => Ok(None),
+    }
 }
