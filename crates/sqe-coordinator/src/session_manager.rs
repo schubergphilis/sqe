@@ -331,6 +331,7 @@ impl SessionManager {
     ) -> usize {
         let mut removed = 0;
         let idle_timeout = chrono::Duration::seconds(idle_timeout_secs as i64);
+        let absolute_timeout = std::time::Duration::from_secs(absolute_timeout_secs);
         let now = Utc::now();
         let expired_ids: Vec<String> = self
             .sessions
@@ -339,7 +340,7 @@ impl SessionManager {
                 let session = entry.value();
                 let last = self.last_activity_at(entry.key(), session.last_activity);
                 let idle = now - last > idle_timeout;
-                idle || session.is_absolute_expired(absolute_timeout_secs)
+                idle || session.is_absolute_expired(absolute_timeout)
             })
             .map(|entry| entry.key().clone())
             .collect();
@@ -347,7 +348,7 @@ impl SessionManager {
         for id in expired_ids {
             if let Some((_, session)) = self.sessions.remove(&id) {
                 self.last_activity.remove(&id);
-                let reason = if session.is_absolute_expired(absolute_timeout_secs) {
+                let reason = if session.is_absolute_expired(absolute_timeout) {
                     "absolute timeout"
                 } else {
                     "idle timeout"
