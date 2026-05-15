@@ -1,9 +1,11 @@
 # SQE Security Audit
 
 **Date:** 2026-03-19 (audit); 2026-04-01 (fixes applied)
-**Scope:** `crates/` — all non-test Rust source code
+**Scope:** `crates/` -- all non-test Rust source code
 **Auditor:** Static analysis via Claude Code
 **Status:** 12 findings remediated (see OSS security hardening, Step 3 in nextsteps.md)
+
+> **Follow-up audits.** A second pass (`docs/issues.md`, 2026-04-13) found 43 issues, all fixed in MR !61. A third pass (2026-05-15) filed 130 issues against the full workspace; ~110 were closed across 19 themed MRs (!195 -> !213). See the campaign write-up at `docs/blog/2026-05-15-nineteen-mrs-four-waves.md` and the wave-by-wave summary in `nextsteps.md`.
 
 ---
 
