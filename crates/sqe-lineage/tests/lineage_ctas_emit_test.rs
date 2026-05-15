@@ -28,6 +28,20 @@ fn lookup() -> extract::CatalogLookup {
     })
 }
 
+async fn wait_for_requests(server: &MockServer, expected: usize) -> Vec<wiremock::Request> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let got = server.received_requests().await.unwrap_or_default();
+        if got.len() >= expected {
+            return got;
+        }
+        if std::time::Instant::now() > deadline {
+            return got;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 fn cfg() -> Arc<EmitterConfig> {
     Arc::new(EmitterConfig {
         job_namespace: "sqe-test".into(),
@@ -104,9 +118,7 @@ async fn ctas_complete_event_with_captured_plan_carries_column_lineage() {
 
     obs.on_query_complete(ctx);
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let received = collector.received_requests().await.unwrap();
+    let received = wait_for_requests(&collector, 1).await;
     assert_eq!(received.len(), 1, "expected one COMPLETE event");
 
     let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
@@ -196,9 +208,7 @@ async fn ctas_complete_event_without_plan_has_empty_lineage() {
 
     obs.on_query_complete(ctx);
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let received = collector.received_requests().await.unwrap();
+    let received = wait_for_requests(&collector, 1).await;
     assert_eq!(received.len(), 1);
 
     let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();

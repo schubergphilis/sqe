@@ -28,10 +28,19 @@ async fn emitter_drains_channel_and_writes_events_to_file_sink() {
     obs.on_query_start(QueryStartCtx::dummy());
     obs.on_query_complete(QueryCompleteCtx::dummy());
 
-    // Wait briefly for the emitter to drain.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let content = std::fs::read_to_string(&path).unwrap();
+    // Poll for the file to contain both events. Deadline is generous; inner
+    // sleep is tight so the happy path is fast.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let content = loop {
+        let body = std::fs::read_to_string(&path).unwrap_or_default();
+        if body.lines().count() >= 2 {
+            break body;
+        }
+        if std::time::Instant::now() > deadline {
+            break body;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
     assert_eq!(content.lines().count(), 2, "two events written");
 
     // Both events parse as RunEvents.
