@@ -4,6 +4,7 @@ pub mod classifier;
 pub mod ddl;
 pub mod partition;
 pub mod partition_evolution;
+pub mod pipeline_types;
 pub mod procedures;
 pub mod time_travel;
 pub mod trino_compat;
@@ -14,9 +15,13 @@ pub use attach::{
     DropSecretStatement, OptionValue, SecretKind,
 };
 pub use catalog_qualifiers::extract_catalog_qualifiers;
-pub use classifier::{parse_and_classify, CheckAccessParams, ShowGrantsTarget, StatementKind};
+pub use classifier::{
+    parse_and_classify, parse_and_classify_typed, CheckAccessParams, ShowGrantsTarget,
+    StatementKind,
+};
 pub use ddl::{try_parse_ref_ddl, BranchRetention, RefDdl};
 pub use partition::normalize_partitioned_by;
+pub use pipeline_types::{pre_parse_pipeline, ClassifiableSql, UserSql};
 pub use partition_evolution::{try_parse_partition_evolution, PartitionEvolution};
 pub use procedures::{try_parse_call, NamespaceRef, ProcedureCall, TableRef};
 pub use time_travel::{

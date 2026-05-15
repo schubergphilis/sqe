@@ -170,6 +170,7 @@ impl TableMetadataCache {
     /// Attach a metrics registry. Every `SessionCatalog` clone of this
     /// cache will see the same handle and report catalog roundtrip
     /// latency + circuit breaker state into it.
+    #[must_use = "with_metrics consumes self; bind the returned cache"]
     pub fn with_metrics(mut self, metrics: std::sync::Arc<sqe_metrics::MetricsRegistry>) -> Self {
         self.metrics = Some(metrics);
         self
@@ -275,20 +276,6 @@ impl std::fmt::Debug for CatalogHandle {
         match self {
             Self::Rest(_) => f.debug_tuple("Rest").field(&"<RestCatalog>").finish(),
             Self::Other(c) => f.debug_tuple("Other").field(c).finish(),
-        }
-    }
-}
-
-impl CatalogHandle {
-    /// REST-only handle for methods that need direct access to
-    /// `RestCatalog` (cache invalidation, ETag-based revalidation
-    /// fast paths). `None` for non-REST backends; callers fall back
-    /// to the trait-only path.
-    #[allow(dead_code)] // wired up incrementally; keep accessor for future REST-only fast paths
-    pub(crate) fn rest(&self) -> Option<&Arc<RestCatalog>> {
-        match self {
-            Self::Rest(r) => Some(r),
-            Self::Other(_) => None,
         }
     }
 }

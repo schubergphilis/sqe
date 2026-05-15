@@ -30,7 +30,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, Int64Array, Int64Builder, MapArray, MapFieldNames, StructArray,
+    Array, ArrayRef, Int64Array, Int64Builder, MapArray, StructArray,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, FieldRef, Fields};
@@ -350,18 +350,6 @@ impl Accumulator for HistogramAccumulator {
             }
         }
         Ok(())
-    }
-}
-
-#[allow(dead_code)]
-fn _build_map_field_names() -> MapFieldNames {
-    // Trino uses "key" / "value" as the standard field names for histogram
-    // output. Kept as a dead helper for now; the inline construction in
-    // `evaluate` builds the fields directly to match Trino exactly.
-    MapFieldNames {
-        entry: "entries".into(),
-        key: "key".into(),
-        value: "value".into(),
     }
 }
 

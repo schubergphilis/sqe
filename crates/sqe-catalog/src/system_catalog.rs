@@ -35,6 +35,7 @@ impl SystemCatalogProvider {
     }
 
     /// Set the runtime schema provider for `system.runtime.*` virtual tables.
+    #[must_use = "with_runtime consumes self; bind the returned provider"]
     pub fn with_runtime(mut self, runtime: Arc<RuntimeSchemaProvider>) -> Self {
         self.runtime_schema = Some(runtime);
         self

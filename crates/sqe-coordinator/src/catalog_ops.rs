@@ -35,6 +35,7 @@ impl CatalogOps {
     }
 
     /// Attach a global table metadata cache so DDL operations invalidate the right entry.
+    #[must_use = "with_table_cache consumes self; bind the returned ops"]
     pub fn with_table_cache(mut self, cache: TableMetadataCache) -> Self {
         self.table_cache = Some(cache);
         self

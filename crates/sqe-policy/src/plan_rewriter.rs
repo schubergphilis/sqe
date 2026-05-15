@@ -43,6 +43,7 @@ impl PolicyPlanRewriter {
 
     /// Set the HMAC key used by Hash-type column masks. Pass `None` to
     /// keep the legacy unsalted SHA-256 behavior.
+    #[must_use = "with_mask_key consumes self; bind the returned rewriter"]
     pub fn with_mask_key(mut self, mask_key: Option<Arc<Vec<u8>>>) -> Self {
         self.mask_key = mask_key;
         self

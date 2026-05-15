@@ -408,16 +408,31 @@ trino_extract_fn!(Week, "week",
     |_us: i64| None
 );
 
-// ─── Helper: parse time-unit string ─────────────────────────────────────────
+// ─── Helper: time-unit enum + parser ────────────────────────────────────────
 
-fn parse_unit(unit: &str) -> DFResult<&'static str> {
+/// Time-unit selector for `date_add` / `date_diff` / `date_trunc`.
+///
+/// Replaces the previous stringly-typed `&'static str` dispatch where a
+/// typo in one of three match arms compiled silently and reached
+/// `unreachable!()` only at runtime (issue #130).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeUnit {
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+}
+
+fn parse_unit(unit: &str) -> DFResult<TimeUnit> {
     match unit.to_lowercase().as_str() {
-        "year" | "years" => Ok("year"),
-        "month" | "months" => Ok("month"),
-        "day" | "days" => Ok("day"),
-        "hour" | "hours" => Ok("hour"),
-        "minute" | "minutes" => Ok("minute"),
-        "second" | "seconds" => Ok("second"),
+        "year" | "years" => Ok(TimeUnit::Year),
+        "month" | "months" => Ok(TimeUnit::Month),
+        "day" | "days" => Ok(TimeUnit::Day),
+        "hour" | "hours" => Ok(TimeUnit::Hour),
+        "minute" | "minutes" => Ok(TimeUnit::Minute),
+        "second" | "seconds" => Ok(TimeUnit::Second),
         other => Err(DataFusionError::Internal(format!(
             "Unsupported date unit: {other}"
         ))),
@@ -425,9 +440,9 @@ fn parse_unit(unit: &str) -> DFResult<&'static str> {
 }
 
 /// Add `amount` of `unit` to a NaiveDate, returning the new NaiveDate.
-fn date_add_date(d: NaiveDate, unit: &str, amount: i64) -> DFResult<NaiveDate> {
+fn date_add_date(d: NaiveDate, unit: TimeUnit, amount: i64) -> DFResult<NaiveDate> {
     let result = match unit {
-        "year" => {
+        TimeUnit::Year => {
             let months = amount * 12;
             if months >= 0 {
                 d.checked_add_months(Months::new(months as u32))
@@ -435,29 +450,28 @@ fn date_add_date(d: NaiveDate, unit: &str, amount: i64) -> DFResult<NaiveDate> {
                 d.checked_sub_months(Months::new((-months) as u32))
             }
         }
-        "month" => {
+        TimeUnit::Month => {
             if amount >= 0 {
                 d.checked_add_months(Months::new(amount as u32))
             } else {
                 d.checked_sub_months(Months::new((-amount) as u32))
             }
         }
-        "day" => d.checked_add_signed(Duration::days(amount)),
-        "hour" => d.checked_add_signed(Duration::hours(amount)),
-        "minute" => d.checked_add_signed(Duration::minutes(amount)),
-        "second" => d.checked_add_signed(Duration::seconds(amount)),
-        _ => unreachable!(),
+        TimeUnit::Day => d.checked_add_signed(Duration::days(amount)),
+        TimeUnit::Hour => d.checked_add_signed(Duration::hours(amount)),
+        TimeUnit::Minute => d.checked_add_signed(Duration::minutes(amount)),
+        TimeUnit::Second => d.checked_add_signed(Duration::seconds(amount)),
     };
     result.ok_or_else(|| DataFusionError::Internal("date_add overflow".to_string()))
 }
 
 /// Add `amount` of `unit` to a microsecond timestamp, returning updated micros.
-fn ts_add_us(us: i64, unit: &str, amount: i64) -> DFResult<i64> {
+fn ts_add_us(us: i64, unit: TimeUnit, amount: i64) -> DFResult<i64> {
     let dt = chrono::DateTime::from_timestamp_micros(us)
         .unwrap_or_default()
         .naive_utc();
     let result = match unit {
-        "year" => {
+        TimeUnit::Year => {
             let months = amount * 12;
             let date = if months >= 0 {
                 dt.date().checked_add_months(Months::new(months as u32))
@@ -466,7 +480,7 @@ fn ts_add_us(us: i64, unit: &str, amount: i64) -> DFResult<i64> {
             };
             date.map(|d| d.and_time(dt.time()))
         }
-        "month" => {
+        TimeUnit::Month => {
             let date = if amount >= 0 {
                 dt.date().checked_add_months(Months::new(amount as u32))
             } else {
@@ -474,11 +488,10 @@ fn ts_add_us(us: i64, unit: &str, amount: i64) -> DFResult<i64> {
             };
             date.map(|d| d.and_time(dt.time()))
         }
-        "day" => dt.checked_add_signed(Duration::days(amount)),
-        "hour" => dt.checked_add_signed(Duration::hours(amount)),
-        "minute" => dt.checked_add_signed(Duration::minutes(amount)),
-        "second" => dt.checked_add_signed(Duration::seconds(amount)),
-        _ => unreachable!(),
+        TimeUnit::Day => dt.checked_add_signed(Duration::days(amount)),
+        TimeUnit::Hour => dt.checked_add_signed(Duration::hours(amount)),
+        TimeUnit::Minute => dt.checked_add_signed(Duration::minutes(amount)),
+        TimeUnit::Second => dt.checked_add_signed(Duration::seconds(amount)),
     };
     let new_dt = result.ok_or_else(|| DataFusionError::Internal("date_add overflow".to_string()))?;
     new_dt
@@ -683,17 +696,16 @@ impl ScalarUDFImpl for DateDiff {
             }
         }
 
-        fn compute_diff(unit: &str, d1: NaiveDate, d2: NaiveDate) -> i64 {
+        fn compute_diff(unit: TimeUnit, d1: NaiveDate, d2: NaiveDate) -> i64 {
             match unit {
-                "year" => (d2.year() - d1.year()) as i64,
-                "month" => {
+                TimeUnit::Year => (d2.year() - d1.year()) as i64,
+                TimeUnit::Month => {
                     (d2.year() - d1.year()) as i64 * 12 + (d2.month() as i64 - d1.month() as i64)
                 }
-                "day" => d2.signed_duration_since(d1).num_days(),
-                "hour" => d2.signed_duration_since(d1).num_hours(),
-                "minute" => d2.signed_duration_since(d1).num_minutes(),
-                "second" => d2.signed_duration_since(d1).num_seconds(),
-                _ => unreachable!(),
+                TimeUnit::Day => d2.signed_duration_since(d1).num_days(),
+                TimeUnit::Hour => d2.signed_duration_since(d1).num_hours(),
+                TimeUnit::Minute => d2.signed_duration_since(d1).num_minutes(),
+                TimeUnit::Second => d2.signed_duration_since(d1).num_seconds(),
             }
         }
 
