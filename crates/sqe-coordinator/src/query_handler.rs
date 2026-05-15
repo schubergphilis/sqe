@@ -1942,7 +1942,7 @@ impl QueryHandler {
                     s3_endpoint: storage.s3_endpoint.clone(),
                     s3_region: storage.s3_region.clone(),
                     s3_access_key: storage.s3_access_key.clone(),
-                    s3_secret_key: storage.s3_secret_key.clone(),
+                    s3_secret_key: storage.s3_secret_key.expose().to_string(),
                     s3_session_token: String::new(),
                     s3_path_style: storage.s3_path_style,
                     s3_allow_http: storage.s3_endpoint.starts_with("http://"),
@@ -2958,7 +2958,7 @@ impl QueryHandler {
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let backend = self.require_grant_backend()?;
         let grant_stmt = Self::extract_grant_statement(stmt)?;
-        backend.grant(&session.access_token, &grant_stmt).await?;
+        backend.grant(session.access_token.expose(), &grant_stmt).await?;
         Ok(vec![])
     }
 
@@ -2977,7 +2977,7 @@ impl QueryHandler {
             table: grant_stmt.table,
             grantee: grant_stmt.grantee,
         };
-        backend.revoke(&session.access_token, &revoke_stmt).await?;
+        backend.revoke(session.access_token.expose(), &revoke_stmt).await?;
         Ok(vec![])
     }
 
@@ -3012,7 +3012,7 @@ impl QueryHandler {
             }
         };
 
-        let entries = backend.show_grants(&session.access_token, &filter).await?;
+        let entries = backend.show_grants(session.access_token.expose(), &filter).await?;
         Self::grants_to_record_batch(&entries)
     }
 
@@ -3023,7 +3023,7 @@ impl QueryHandler {
         user: &str,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let backend = self.require_grant_backend()?;
-        let entries = backend.show_effective(&session.access_token, user).await?;
+        let entries = backend.show_effective(session.access_token.expose(), user).await?;
         Self::grants_to_record_batch(&entries)
     }
 
@@ -3043,7 +3043,7 @@ impl QueryHandler {
             table: params.table.clone(),
         };
 
-        let resp = backend.check_access(&session.access_token, &check).await?;
+        let resp = backend.check_access(session.access_token.expose(), &check).await?;
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("allowed", DataType::Boolean, false),
@@ -3402,7 +3402,7 @@ impl QueryHandler {
             SessionCatalog::for_session(
                 &self.config,
                 self.table_cache.clone(),
-                &session.access_token,
+                session.access_token.expose(),
             )
             .await?,
         );
@@ -3994,7 +3994,7 @@ mod tests {
                 username: "alice".to_string(),
                 roles: roles.into_iter().map(String::from).collect(),
             },
-            access_token: "tok".to_string(),
+            access_token: sqe_core::SecretString::new("tok".to_string()),
             refresh_token: None,
             token_expiry: now + chrono::Duration::hours(1),
             created_at: now,

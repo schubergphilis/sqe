@@ -81,7 +81,7 @@ impl AuthProvider for AuthChain {
     async fn refresh_catalog_token(
         &self,
         identity: &Identity,
-    ) -> Result<Option<String>, AuthError> {
+    ) -> Result<Option<sqe_core::SecretString>, AuthError> {
         for provider in &self.providers {
             match provider.refresh_catalog_token(identity).await {
                 Ok(Some(token)) => return Ok(Some(token)),
@@ -125,7 +125,7 @@ mod tests {
                 user_id: self.user_id.clone(),
                 display_name: self.user_id.clone(),
                 roles: vec!["test-role".to_string()],
-                catalog_token: Some("test-token".to_string()),
+                catalog_token: Some(sqe_core::SecretString::new("test-token".to_string())),
                 refresh_token: None,
             })
         }
@@ -163,8 +163,8 @@ mod tests {
         async fn refresh_catalog_token(
             &self,
             _identity: &Identity,
-        ) -> Result<Option<String>, AuthError> {
-            Ok(Some(self.token.clone()))
+        ) -> Result<Option<sqe_core::SecretString>, AuthError> {
+            Ok(Some(sqe_core::SecretString::new(self.token.clone())))
         }
     }
 
@@ -281,7 +281,8 @@ mod tests {
         };
 
         let result = chain.refresh_catalog_token(&identity).await;
-        assert_eq!(result.unwrap(), Some("refreshed-token".to_string()));
+        let got = result.unwrap().expect("provider returned a token");
+        assert_eq!(got.expose(), "refreshed-token");
     }
 
     // -----------------------------------------------------------------------
@@ -300,7 +301,7 @@ mod tests {
         };
 
         let result = chain.refresh_catalog_token(&identity).await;
-        assert_eq!(result.unwrap(), None);
+        assert!(result.unwrap().is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -378,6 +379,7 @@ mod tests {
         }
     }
 
+
     /// The user's reported scenario: Flight SQL hands the chain a JWT in
     /// `bearer_token` only (no username, no password). The chain must skip
     /// the OIDC password provider that sits first and let the bearer
@@ -390,7 +392,7 @@ mod tests {
         ]);
 
         let creds = FlightCredentials {
-            bearer_token: Some("eyJtest.payload.sig".to_string()),
+            bearer_token: Some(sqe_core::SecretString::new("eyJtest.payload.sig".to_string())),
             ..Default::default()
         };
 
@@ -399,7 +401,10 @@ mod tests {
             .await
             .expect("chain must fall through to bearer provider");
         assert_eq!(identity.user_id, "bearer-user");
-        assert_eq!(identity.catalog_token.as_deref(), Some("eyJtest.payload.sig"));
+        assert_eq!(
+            identity.catalog_token.as_ref().map(|t| t.expose()),
+            Some("eyJtest.payload.sig"),
+        );
     }
 
     /// Documented workaround: putting `bearer_token` before `oidc_password`
@@ -415,7 +420,7 @@ mod tests {
         ]);
 
         let creds = FlightCredentials {
-            bearer_token: Some("eyJtest.payload.sig".to_string()),
+            bearer_token: Some(sqe_core::SecretString::new("eyJtest.payload.sig".to_string())),
             ..Default::default()
         };
 
@@ -437,7 +442,7 @@ mod tests {
 
         let creds = FlightCredentials {
             username: Some("alice".to_string()),
-            password: Some("secret".to_string()),
+            password: Some(sqe_core::SecretString::new("secret".to_string())),
             ..Default::default()
         };
 

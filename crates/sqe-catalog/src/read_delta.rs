@@ -190,7 +190,7 @@ fn build_storage_options(
         .secret_key
         .as_deref()
         .filter(|s| !s.is_empty())
-        .unwrap_or(storage.s3_secret_key.as_str());
+        .unwrap_or(storage.s3_secret_key.expose());
     let endpoint = args
         .endpoint
         .as_deref()
@@ -357,7 +357,7 @@ mod tests {
         };
         let storage = StorageConfig {
             s3_access_key: "config-akid".to_string(),
-            s3_secret_key: "config-secret".to_string(),
+            s3_secret_key: sqe_core::SecretString::new("config-secret".to_string()),
             s3_endpoint: "http://minio".to_string(),
             s3_region: "us-east-1".to_string(),
             ..StorageConfig::default()

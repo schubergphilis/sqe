@@ -1,6 +1,7 @@
 use std::fmt;
 
 use async_trait::async_trait;
+use sqe_core::SecretString;
 
 /// Raw credentials extracted from a Flight SQL handshake request.
 ///
@@ -11,15 +12,15 @@ use async_trait::async_trait;
 /// - `MtlsProvider` uses `client_cert_cn`
 /// - `AnonymousProvider` accepts anything
 ///
-/// `Debug` is hand-implemented to print only field presence for the secret
-/// fields (`password`, `bearer_token`) — see issue #16. A panic handler or
-/// `anyhow!` chain printing this struct with `{:?}` must never leak the
-/// caller's password or bearer token.
+/// `password` and `bearer_token` are wrapped in `SecretString` so the
+/// derived `Debug` cannot leak the raw bytes (issue #100). Callers that
+/// need to inspect the credential material must go through
+/// `SecretString::expose` at the point of use.
 #[derive(Clone, Default)]
 pub struct FlightCredentials {
     pub username: Option<String>,
-    pub password: Option<String>,
-    pub bearer_token: Option<String>,
+    pub password: Option<SecretString>,
+    pub bearer_token: Option<SecretString>,
     pub client_cert_cn: Option<String>,
 }
 
@@ -27,8 +28,8 @@ impl fmt::Debug for FlightCredentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FlightCredentials")
             .field("username", &self.username)
-            .field("password", &redacted_presence(&self.password))
-            .field("bearer_token", &redacted_presence(&self.bearer_token))
+            .field("password", &self.password)
+            .field("bearer_token", &self.bearer_token)
             .field("client_cert_cn", &self.client_cert_cn)
             .finish()
     }
@@ -40,39 +41,17 @@ impl fmt::Debug for FlightCredentials {
 /// is forwarded to the Polaris REST catalog (and S3) so every request runs as the
 /// authenticated user.
 ///
-/// `Debug` is hand-implemented so `catalog_token` and `refresh_token` print as
-/// presence sentinels (`<set>` / `None`) rather than the raw value (issue #16).
-#[derive(Clone)]
+/// `catalog_token` and `refresh_token` use `SecretString` so the derived `Debug`
+/// renders presence sentinels rather than the raw token bytes (issue #100).
+#[derive(Clone, Debug)]
 pub struct Identity {
     pub user_id: String,
     pub display_name: String,
     pub roles: Vec<String>,
-    pub catalog_token: Option<String>,
+    pub catalog_token: Option<SecretString>,
     /// Refresh token for obtaining new access tokens without re-authentication.
     /// Only populated by providers that support token refresh (e.g. OIDC password grant).
-    pub refresh_token: Option<String>,
-}
-
-impl fmt::Debug for Identity {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Identity")
-            .field("user_id", &self.user_id)
-            .field("display_name", &self.display_name)
-            .field("roles", &self.roles)
-            .field("catalog_token", &redacted_presence(&self.catalog_token))
-            .field("refresh_token", &redacted_presence(&self.refresh_token))
-            .finish()
-    }
-}
-
-/// Render an `Option<String>` as either `"<set>"` (any non-empty value) or
-/// `"None"`. Used by hand-written `Debug` impls on secret-bearing structs so
-/// that printing the struct via `{:?}` never reveals the underlying bytes.
-fn redacted_presence(value: &Option<String>) -> &'static str {
-    match value {
-        Some(s) if !s.is_empty() => "<set>",
-        _ => "None",
-    }
+    pub refresh_token: Option<SecretString>,
 }
 
 /// Errors returned by `AuthProvider::authenticate`.
@@ -137,7 +116,7 @@ pub trait AuthProvider: Send + Sync {
     async fn refresh_catalog_token(
         &self,
         _identity: &Identity,
-    ) -> Result<Option<String>, AuthError> {
+    ) -> Result<Option<SecretString>, AuthError> {
         Ok(None)
     }
 }
@@ -179,8 +158,8 @@ mod tests {
             user_id: "alice".to_string(),
             display_name: "Alice".to_string(),
             roles: vec!["analyst".to_string()],
-            catalog_token: Some("ey-very-secret-jwt-value".to_string()),
-            refresh_token: Some("very-secret-refresh-token".to_string()),
+            catalog_token: Some(SecretString::new("ey-very-secret-jwt-value".to_string())),
+            refresh_token: Some(SecretString::new("very-secret-refresh-token".to_string())),
         };
         let debug = format!("{:?}", identity);
 
@@ -206,8 +185,8 @@ mod tests {
     fn flight_credentials_debug_does_not_leak_password_or_bearer() {
         let creds = FlightCredentials {
             username: Some("alice".to_string()),
-            password: Some("hunter2-very-private".to_string()),
-            bearer_token: Some("ey-bearer-private".to_string()),
+            password: Some(SecretString::new("hunter2-very-private".to_string())),
+            bearer_token: Some(SecretString::new("ey-bearer-private".to_string())),
             client_cert_cn: Some("cn=alice".to_string()),
         };
         let debug = format!("{:?}", creds);
@@ -228,18 +207,21 @@ mod tests {
 
     #[test]
     fn flight_credentials_debug_distinguishes_none_from_set() {
-        // None should render as the string "None", not "<set>".
+        // None password / bearer must render distinctly from a set value, so
+        // operators looking at logs can tell whether the field arrived.
         let creds = FlightCredentials {
             username: Some("alice".to_string()),
             ..Default::default()
         };
         let debug = format!("{:?}", creds);
-        // password and bearer_token are None — must NOT show "<set>" for them
-        // (but the username is some, so the test guards against missing <set>
-        // entirely is not appropriate here).
-        // We instead check that the rendering contains "None" for the empty
-        // fields. debug_struct prints "field: None" for &"None" values.
-        assert!(debug.contains("password: \"None\""), "expected 'password: \"None\"': {debug}");
-        assert!(debug.contains("bearer_token: \"None\""), "expected 'bearer_token: \"None\"': {debug}");
+        // `Option<SecretString>` derives Debug as `None` (or `Some(<set>)`).
+        // The presence sentinel `<set>` must not appear, and the literal
+        // `None` must, when the underlying option is empty.
+        assert!(debug.contains("password: None"), "expected 'password: None': {debug}");
+        assert!(debug.contains("bearer_token: None"), "expected 'bearer_token: None': {debug}");
+        assert!(
+            !debug.contains("<set>"),
+            "no fields should render as set in this fixture: {debug}"
+        );
     }
 }

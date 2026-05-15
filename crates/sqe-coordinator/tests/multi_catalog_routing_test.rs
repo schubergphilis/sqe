@@ -82,7 +82,7 @@ fn handler(config: SqeConfig) -> sqe_coordinator::QueryHandler {
 fn fake_session() -> Session {
     Session::new(
         "alice".to_string(),
-        "tok_unused".to_string(),
+        sqe_core::SecretString::new("tok_unused".to_string()),
         None,
         Utc::now() + Duration::hours(1),
         vec![],

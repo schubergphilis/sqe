@@ -133,14 +133,14 @@ impl TokenExchangeProvider {
         // Prefer an explicit bearer token.
         if let Some(ref token) = credentials.bearer_token {
             if !token.is_empty() {
-                return Some(token.clone());
+                return Some(token.expose().to_string());
             }
         }
 
         // Fall back to password (the credential being exchanged).
         if let Some(ref password) = credentials.password {
             if !password.is_empty() {
-                return Some(password.clone());
+                return Some(password.expose().to_string());
             }
         }
 
@@ -285,8 +285,8 @@ impl TokenExchangeProvider {
             user_id: user_id.clone(),
             display_name: user_id,
             roles,
-            catalog_token: Some(access_token.to_string()),
-            refresh_token: Some(subject_token.to_string()),
+            catalog_token: Some(sqe_core::SecretString::new(access_token.to_string())),
+            refresh_token: Some(sqe_core::SecretString::new(subject_token.to_string())),
         })
     }
 
@@ -343,17 +343,17 @@ impl AuthProvider for TokenExchangeProvider {
     async fn refresh_catalog_token(
         &self,
         identity: &Identity,
-    ) -> Result<Option<String>, AuthError> {
+    ) -> Result<Option<sqe_core::SecretString>, AuthError> {
         // Re-exchange using the stored subject token (saved in refresh_token field).
         let subject_token = match &identity.refresh_token {
-            Some(t) if !t.is_empty() => t,
+            Some(t) if !t.is_empty() => t.expose(),
             _ => return Ok(None),
         };
 
         // TODO: check if the current catalog token is still valid (not expired)
         // before re-exchanging. For now, always re-exchange.
         let response = self.exchange(subject_token).await?;
-        Ok(Some(response.access_token))
+        Ok(Some(sqe_core::SecretString::new(response.access_token)))
     }
 }
 
@@ -607,8 +607,8 @@ mod tests {
     #[test]
     fn subject_token_from_bearer() {
         let creds = FlightCredentials {
-            bearer_token: Some("my-bearer-token".to_string()),
-            password: Some("my-password".to_string()),
+            bearer_token: Some(sqe_core::SecretString::new("my-bearer-token".to_string())),
+            password: Some(sqe_core::SecretString::new("my-password".to_string())),
             ..Default::default()
         };
         // bearer_token takes priority.
@@ -622,7 +622,7 @@ mod tests {
     fn subject_token_from_password() {
         let creds = FlightCredentials {
             bearer_token: None,
-            password: Some("my-password-token".to_string()),
+            password: Some(sqe_core::SecretString::new("my-password-token".to_string())),
             ..Default::default()
         };
         assert_eq!(
@@ -634,8 +634,8 @@ mod tests {
     #[test]
     fn subject_token_empty_bearer_falls_back_to_password() {
         let creds = FlightCredentials {
-            bearer_token: Some(String::new()),
-            password: Some("fallback-password".to_string()),
+            bearer_token: Some(sqe_core::SecretString::default()),
+            password: Some(sqe_core::SecretString::new("fallback-password".to_string())),
             ..Default::default()
         };
         assert_eq!(
@@ -653,8 +653,8 @@ mod tests {
     #[test]
     fn subject_token_none_when_both_empty() {
         let creds = FlightCredentials {
-            bearer_token: Some(String::new()),
-            password: Some(String::new()),
+            bearer_token: Some(sqe_core::SecretString::default()),
+            password: Some(sqe_core::SecretString::default()),
             ..Default::default()
         };
         assert!(TokenExchangeProvider::extract_subject_token(&creds).is_none());
