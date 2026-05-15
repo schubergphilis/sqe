@@ -160,8 +160,14 @@ pub fn build_embedded_context(memory_limit_bytes: usize) -> anyhow::Result<Sessi
     let ctx = ctx.enable_url_table();
     let mut ctx = ctx;
 
-    // Scalar UDFs.
-    ctx.register_udf(sqe_policy::sha256_udf::sha256_udf());
+    // Scalar UDFs. SQE_POLICY__MASK_KEY enables HMAC-SHA256 in embedded
+    // mode (issue #37). Without it the UDF stays plain SHA-256 and prints
+    // a one-shot warning on registration.
+    let mask_key = std::env::var("SQE_POLICY__MASK_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| Arc::new(s.into_bytes()));
+    ctx.register_udf(sqe_policy::sha256_udf::sha256_udf(mask_key));
 
     // Trino dialect compatibility — year(), month(), day_of_week(),
     // url_extract_*, etc. plus the extended set (regexp_extract,

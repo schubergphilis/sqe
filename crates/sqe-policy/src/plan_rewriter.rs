@@ -30,11 +30,22 @@ use crate::{MaskType, PolicyEnforcer, PolicyStore, ResolvedPolicy};
 /// and rewrites the LogicalPlan accordingly.
 pub struct PolicyPlanRewriter {
     store: Arc<dyn PolicyStore>,
+    /// HMAC key used by `MaskType::Hash`. When `None` the rewriter falls
+    /// back to plain SHA-256, which is vulnerable to offline brute force
+    /// against low-entropy columns (issue #37).
+    mask_key: Option<Arc<Vec<u8>>>,
 }
 
 impl PolicyPlanRewriter {
     pub fn new(store: Arc<dyn PolicyStore>) -> Self {
-        Self { store }
+        Self { store, mask_key: None }
+    }
+
+    /// Set the HMAC key used by Hash-type column masks. Pass `None` to
+    /// keep the legacy unsalted SHA-256 behavior.
+    pub fn with_mask_key(mut self, mask_key: Option<Arc<Vec<u8>>>) -> Self {
+        self.mask_key = mask_key;
+        self
     }
 }
 
@@ -46,6 +57,7 @@ impl PolicyEnforcer for PolicyPlanRewriter {
         plan: LogicalPlan,
     ) -> sqe_core::Result<LogicalPlan> {
         let store = self.store.clone();
+        let mask_key = self.mask_key.clone();
         let username = user.username.clone();
         let _roles = user.roles.clone();
         let user_clone = user.clone();
@@ -135,7 +147,7 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                                 .filter(|f| !policy.restricted_columns.contains(f.name()))
                                 .map(|f| {
                                     if let Some(mask) = policy.column_masks.get(f.name()) {
-                                        apply_mask(f.name(), f.data_type(), mask)
+                                        apply_mask(f.name(), f.data_type(), mask, mask_key.clone())
                                             .alias(f.name())
                                     } else {
                                         col(f.name())
@@ -205,7 +217,12 @@ impl PolicyEnforcer for PolicyPlanRewriter {
 /// GroupBy) see the column shape they expect. A Utf8 NULL substituted for
 /// a BIGINT column would either fail optimization or, worse, coerce both
 /// sides of a predicate to Utf8 and leak masked rows.
-fn apply_mask(column_name: &str, data_type: &DataType, mask: &MaskType) -> Expr {
+fn apply_mask(
+    column_name: &str,
+    data_type: &DataType,
+    mask: &MaskType,
+    mask_key: Option<Arc<Vec<u8>>>,
+) -> Expr {
     match mask {
         MaskType::Nullify => match ScalarValue::try_from(data_type) {
             Ok(scalar) => lit(scalar),
@@ -230,10 +247,13 @@ fn apply_mask(column_name: &str, data_type: &DataType, mask: &MaskType) -> Expr 
             // sha256 UDF returns Utf8; cast back to the column type so the
             // projection schema matches. Non-string columns will fail the
             // cast at runtime, which is the correct signal: hashing a
-            // BIGINT into itself is meaningless.
+            // BIGINT into itself is meaningless. The UDF runs HMAC-SHA256
+            // when `mask_key` is `Some`, plain SHA-256 otherwise. Plain
+            // mode is vulnerable to offline brute force on low-entropy
+            // values (issue #37).
             let hash = Expr::ScalarFunction(
                 datafusion::logical_expr::expr::ScalarFunction::new_udf(
-                    Arc::new(crate::sha256_udf::sha256_udf()),
+                    Arc::new(crate::sha256_udf::sha256_udf(mask_key)),
                     vec![col(column_name)],
                 ),
             );
@@ -253,7 +273,7 @@ mod tests {
 
     #[test]
     fn test_apply_mask_nullify_utf8() {
-        let expr = apply_mask("ssn", &DataType::Utf8, &MaskType::Nullify);
+        let expr = apply_mask("ssn", &DataType::Utf8, &MaskType::Nullify, None);
         match expr {
             Expr::Literal(ScalarValue::Utf8(None), _) => {}
             other => panic!("Expected Utf8 NULL literal, got: {other:?}"),
@@ -262,7 +282,7 @@ mod tests {
 
     #[test]
     fn test_apply_mask_nullify_int64_produces_typed_null() {
-        let expr = apply_mask("customer_id", &DataType::Int64, &MaskType::Nullify);
+        let expr = apply_mask("customer_id", &DataType::Int64, &MaskType::Nullify, None);
         match expr {
             Expr::Literal(ScalarValue::Int64(None), _) => {}
             other => panic!("Expected Int64 NULL literal, got: {other:?}"),
@@ -272,7 +292,7 @@ mod tests {
     #[test]
     fn test_apply_mask_nullify_decimal_produces_typed_null() {
         let dt = DataType::Decimal128(18, 2);
-        let expr = apply_mask("salary", &dt, &MaskType::Nullify);
+        let expr = apply_mask("salary", &dt, &MaskType::Nullify, None);
         match expr {
             Expr::Literal(ScalarValue::Decimal128(None, 18, 2), _) => {}
             other => panic!("Expected Decimal128(None,18,2), got: {other:?}"),
@@ -282,7 +302,7 @@ mod tests {
     #[test]
     fn test_apply_mask_nullify_timestamp_produces_typed_null() {
         let dt = DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None);
-        let expr = apply_mask("ts", &dt, &MaskType::Nullify);
+        let expr = apply_mask("ts", &dt, &MaskType::Nullify, None);
         match expr {
             Expr::Literal(ScalarValue::TimestampMicrosecond(None, None), _) => {}
             other => panic!("Expected TimestampMicrosecond NULL, got: {other:?}"),
@@ -291,7 +311,12 @@ mod tests {
 
     #[test]
     fn test_apply_mask_redact_utf8_returns_literal() {
-        let expr = apply_mask("ssn", &DataType::Utf8, &MaskType::Redact("***".to_string()));
+        let expr = apply_mask(
+            "ssn",
+            &DataType::Utf8,
+            &MaskType::Redact("***".to_string()),
+            None,
+        );
         assert!(matches!(expr, Expr::Literal(ScalarValue::Utf8(Some(_)), _)));
     }
 
@@ -301,6 +326,7 @@ mod tests {
             "id",
             &DataType::Int64,
             &MaskType::Redact("0".to_string()),
+            None,
         );
         assert!(
             matches!(expr, Expr::Cast(_)),
@@ -310,11 +336,29 @@ mod tests {
 
     #[test]
     fn test_apply_mask_hash_utf8_produces_scalar_function() {
-        let expr = apply_mask("email", &DataType::Utf8, &MaskType::Hash);
+        let expr = apply_mask("email", &DataType::Utf8, &MaskType::Hash, None);
         assert!(
             matches!(expr, Expr::ScalarFunction(_)),
             "Expected ScalarFunction for Hash mask, got: {expr:?}"
         );
+    }
+
+    /// Regression for #37: when a mask key is configured the Hash branch
+    /// must still produce a scalar function, but the registered UDF
+    /// carries the key so it runs HMAC-SHA256 at execution time. We can't
+    /// reach into the boxed ScalarFunction from the LogicalPlan layer, so
+    /// the assertion focuses on the structural invariant (still a
+    /// function call wrapped in a Cast for non-string types) plus the
+    /// keyed-vs-unkeyed branch in the underlying UDF (covered in
+    /// `sha256_udf::tests`).
+    #[test]
+    fn test_apply_mask_hash_with_key_still_produces_scalar_function() {
+        let key = Some(Arc::new(b"deployment-key".to_vec()));
+        let utf8_expr = apply_mask("email", &DataType::Utf8, &MaskType::Hash, key.clone());
+        assert!(matches!(utf8_expr, Expr::ScalarFunction(_)));
+
+        let int_expr = apply_mask("id", &DataType::Int64, &MaskType::Hash, key);
+        assert!(matches!(int_expr, Expr::Cast(_)));
     }
 
     #[test]
@@ -324,6 +368,7 @@ mod tests {
             "secret",
             &DataType::Utf8,
             &MaskType::Custom(custom_expr.clone()),
+            None,
         );
         assert_eq!(
             format!("{result:?}"),

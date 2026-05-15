@@ -1222,11 +1222,26 @@ fn default_access_control_timeout() -> u64 { 30 }
 pub struct PolicyConfig {
     #[serde(default = "default_passthrough")]
     pub engine: String,
+    /// Per-deployment secret keyed into the SHA-256 column mask UDF.
+    ///
+    /// When set, the `sha256(col)` mask runs as HMAC-SHA256 with this key,
+    /// blocking the offline rainbow-table attack against low-entropy
+    /// columns (SSN, phone, employee ID). When empty, the UDF falls back
+    /// to plain SHA-256 and emits a startup warning. Rotating the key
+    /// changes every masked digest, so the same key must persist across
+    /// coordinator restarts and across all coordinators in an HA setup.
+    ///
+    /// Can be set via the `SQE_POLICY__MASK_KEY` environment variable.
+    #[serde(default)]
+    pub mask_key: String,
 }
 
 impl Default for PolicyConfig {
     fn default() -> Self {
-        Self { engine: "passthrough".to_string() }
+        Self {
+            engine: "passthrough".to_string(),
+            mask_key: String::new(),
+        }
     }
 }
 
@@ -1895,6 +1910,7 @@ impl SqeConfig {
 
         // Policy
         env_override_str("SQE_POLICY__ENGINE", &mut self.policy.engine);
+        env_override_str("SQE_POLICY__MASK_KEY", &mut self.policy.mask_key);
 
         // Metrics
         env_override_u16("SQE_METRICS__PROMETHEUS_PORT", &mut self.metrics.prometheus_port);
