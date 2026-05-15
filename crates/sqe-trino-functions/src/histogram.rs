@@ -30,7 +30,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, Int64Array, Int64Builder, MapArray, MapFieldNames, StructArray,
+    Array, ArrayRef, Int64Array, Int64Builder, MapArray, StructArray,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, FieldRef, Fields};
