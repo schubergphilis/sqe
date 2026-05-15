@@ -22,10 +22,11 @@
 //! plan must contain a `SortPreservingMergeExec` (or an `OrderBy`). This
 //! module does not re-order batches.
 
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -35,6 +36,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::{ExecutionPlan, RecordBatchStream};
 use futures::Stream;
 use tokio::sync::OwnedSemaphorePermit;
+use tokio::time::Sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -243,6 +245,14 @@ pub struct TrackedRecordBatchStream {
     /// Set once the cancel token has fired so subsequent polls short-circuit
     /// without re-running the finalizer.
     cancelled: bool,
+    /// Maximum time the stream may sit without producing a batch before it
+    /// is aborted and its concurrency permit is released. None disables the
+    /// guard. Without this an idle gRPC client can pin every slot in
+    /// `max_concurrent_queries` by holding open Flight streams without
+    /// draining them. Issue #75.
+    idle_timeout: Option<Duration>,
+    /// Pending idle deadline. Pinned so it can be polled in place each call.
+    idle_sleep: Option<Pin<Box<Sleep>>>,
 }
 
 impl TrackedRecordBatchStream {
@@ -264,6 +274,8 @@ impl TrackedRecordBatchStream {
             _per_user_reservation: None,
             cancel_token: None,
             cancelled: false,
+            idle_timeout: None,
+            idle_sleep: None,
         }
     }
 
@@ -287,6 +299,8 @@ impl TrackedRecordBatchStream {
             _per_user_reservation: None,
             cancel_token: Some(cancel_token),
             cancelled: false,
+            idle_timeout: None,
+            idle_sleep: None,
         }
     }
 
@@ -309,6 +323,8 @@ impl TrackedRecordBatchStream {
             _per_user_reservation: None,
             cancel_token: Some(cancel_token),
             cancelled: false,
+            idle_timeout: None,
+            idle_sleep: None,
         }
     }
 
@@ -333,6 +349,8 @@ impl TrackedRecordBatchStream {
             _per_user_reservation: reservation,
             cancel_token: Some(cancel_token),
             cancelled: false,
+            idle_timeout: None,
+            idle_sleep: None,
         }
     }
 
@@ -343,6 +361,24 @@ impl TrackedRecordBatchStream {
     pub fn with_teardown<T: std::any::Any + Send + 'static>(mut self, t: T) -> Self {
         self._teardown = Some(Box::new(t));
         self
+    }
+
+    /// Enable the idle-timeout guard. The stream aborts (releasing its
+    /// concurrency permit) when no batch is produced for `timeout`. Skips
+    /// installation when `timeout` is zero. Issue #75.
+    pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
+        if !timeout.is_zero() {
+            self.idle_timeout = Some(timeout);
+            self.idle_sleep = Some(Box::pin(tokio::time::sleep(timeout)));
+        }
+        self
+    }
+
+    fn reset_idle_timer(&mut self) {
+        if let (Some(timeout), Some(ref mut sleep)) = (self.idle_timeout, self.idle_sleep.as_mut())
+        {
+            sleep.as_mut().reset(tokio::time::Instant::now() + timeout);
+        }
     }
 }
 
@@ -365,6 +401,7 @@ impl Stream for TrackedRecordBatchStream {
         match self.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(batch))) => {
                 self.rows_so_far = self.rows_so_far.saturating_add(batch.num_rows());
+                self.reset_idle_timer();
                 Poll::Ready(Some(Ok(batch)))
             }
             Poll::Ready(Some(Err(e))) => {
@@ -382,7 +419,26 @@ impl Stream for TrackedRecordBatchStream {
                 }
                 Poll::Ready(None)
             }
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                // Idle-timeout guard. When the downstream Flight encoder has
+                // not pulled a batch within `idle_timeout`, abort the stream
+                // so the held semaphore permit cannot be pinned by a stalled
+                // or malicious client. Issue #75.
+                if let Some(ref mut sleep) = self.idle_sleep {
+                    if sleep.as_mut().poll(cx).is_ready() {
+                        warn!(
+                            rows_so_far = self.rows_so_far,
+                            "Stream idle-timeout reached, cancelling and releasing permits"
+                        );
+                        self.cancelled = true;
+                        if let Some(f) = self.finalizer.take() {
+                            f.on_cancel(self.rows_so_far);
+                        }
+                        return Poll::Ready(None);
+                    }
+                }
+                Poll::Pending
+            }
         }
     }
 }

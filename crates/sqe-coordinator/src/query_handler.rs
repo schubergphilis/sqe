@@ -1580,7 +1580,10 @@ impl QueryHandler {
                     per_user_mem_reservation,
                     cancel_token,
                 )
-                .with_teardown(tt_cleanup);
+                .with_teardown(tt_cleanup)
+                .with_idle_timeout(std::time::Duration::from_secs(
+                    self.config.query.stream_idle_timeout_secs,
+                ));
                 let boxed: SendableRecordBatchStream = Box::pin(tracked);
                 Ok((schema, boxed))
             }
@@ -2288,7 +2291,11 @@ impl QueryHandler {
             schema,
         )
         .with_fragment_callback(callback)
-        .with_worker_secret(self.config.coordinator.worker_secret.expose().to_string());
+        .with_worker_secret(self.config.coordinator.worker_secret.expose().to_string())
+        .with_timeouts(
+            std::time::Duration::from_secs(self.config.coordinator.worker_connect_timeout_secs),
+            std::time::Duration::from_secs(self.config.coordinator.worker_rpc_timeout_secs),
+        );
 
         // Attach worker registry for health tracking / failover
         exec = exec.with_worker_registry(Arc::clone(registry));

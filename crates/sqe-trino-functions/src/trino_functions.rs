@@ -546,30 +546,45 @@ impl ScalarUDFImpl for DateAdd {
             }
         };
 
+        // Compute the epoch baseline once. `from_ymd_opt(1970, 1, 1)` is
+        // guaranteed to be `Some`; treat any failure as a hard error rather
+        // than panicking via .unwrap(). Issue #78.
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)
+            .ok_or_else(|| DataFusionError::Internal("epoch literal invalid".into()))?;
+
         match &args.args[2] {
             ColumnarValue::Array(array) => {
                 if let Some(date_arr) = array.as_any().downcast_ref::<Date32Array>() {
-                    let result: Date32Array = date_arr
-                        .iter()
-                        .map(|opt| {
-                            opt.map(|days| {
+                    let mut out: Vec<Option<i32>> = Vec::with_capacity(date_arr.len());
+                    for opt in date_arr.iter() {
+                        match opt {
+                            None => out.push(None),
+                            Some(days) => {
                                 let d = temporal_conversions::date32_to_datetime(days)
-                                    .unwrap()
+                                    .ok_or_else(|| {
+                                        DataFusionError::Execution(format!(
+                                            "date_add: Date32 value {days} out of supported range"
+                                        ))
+                                    })?
                                     .date();
-                                let new_d = date_add_date(d, unit_str, amount).unwrap();
-                                // days since epoch
-                                new_d
-                                    .signed_duration_since(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
-                                    .num_days() as i32
-                            })
-                        })
-                        .collect();
+                                let new_d = date_add_date(d, unit_str, amount)?;
+                                out.push(Some(
+                                    new_d.signed_duration_since(epoch).num_days() as i32,
+                                ));
+                            }
+                        }
+                    }
+                    let result: Date32Array = out.into_iter().collect();
                     Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
                 } else if let Some(ts_arr) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-                    let result: TimestampMicrosecondArray = ts_arr
-                        .iter()
-                        .map(|opt| opt.map(|us| ts_add_us(us, unit_str, amount).unwrap()))
-                        .collect();
+                    let mut out: Vec<Option<i64>> = Vec::with_capacity(ts_arr.len());
+                    for opt in ts_arr.iter() {
+                        match opt {
+                            None => out.push(None),
+                            Some(us) => out.push(Some(ts_add_us(us, unit_str, amount)?)),
+                        }
+                    }
+                    let result: TimestampMicrosecondArray = out.into_iter().collect();
                     Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
                 } else {
                     Err(DataFusionError::Internal(format!(
@@ -580,11 +595,15 @@ impl ScalarUDFImpl for DateAdd {
             }
             ColumnarValue::Scalar(scalar) => match scalar {
                 ScalarValue::Date32(Some(days)) => {
-                    let d = temporal_conversions::date32_to_datetime(*days).unwrap().date();
+                    let d = temporal_conversions::date32_to_datetime(*days)
+                        .ok_or_else(|| {
+                            DataFusionError::Execution(format!(
+                                "date_add: Date32 value {days} out of supported range"
+                            ))
+                        })?
+                        .date();
                     let new_d = date_add_date(d, unit_str, amount)?;
-                    let new_days = new_d
-                        .signed_duration_since(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
-                        .num_days() as i32;
+                    let new_days = new_d.signed_duration_since(epoch).num_days() as i32;
                     Ok(ColumnarValue::Scalar(ScalarValue::Date32(Some(new_days))))
                 }
                 ScalarValue::Date32(None) => Ok(ColumnarValue::Scalar(ScalarValue::Date32(None))),
