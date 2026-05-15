@@ -95,6 +95,12 @@ pub struct QueryConfig {
     /// Maximum concurrent queries. Default: 100. Set to 0 for unlimited.
     #[serde(default = "default_max_concurrent_queries")]
     pub max_concurrent_queries: usize,
+    /// Maximum concurrent queries from a single authenticated user. Defaults to
+    /// the global `max_concurrent_queries` value (no per-user differentiation).
+    /// Set to a smaller positive number to prevent one tenant from holding
+    /// every global permit; set to 0 to disable per-user accounting entirely.
+    #[serde(default = "default_max_concurrent_per_user")]
+    pub max_concurrent_per_user: usize,
     /// Queries taking longer than this are logged at WARN level. Default: 30. Set to 0 to disable.
     #[serde(default = "default_slow_query_threshold")]
     pub slow_query_threshold_secs: u64,
@@ -159,6 +165,7 @@ impl Default for QueryConfig {
             role_overrides: std::collections::HashMap::new(),
             max_result_rows: default_max_result_rows(),
             max_concurrent_queries: default_max_concurrent_queries(),
+            max_concurrent_per_user: default_max_concurrent_per_user(),
             slow_query_threshold_secs: default_slow_query_threshold(),
             max_query_memory: default_max_query_memory(),
             distribution_threshold: default_distribution_threshold(),
@@ -1548,6 +1555,7 @@ fn default_session_snapshot_interval() -> u64 { 60 }
 fn default_query_timeout() -> u64 { 300 }       // 5 minutes
 fn default_max_result_rows() -> usize { 1_000_000 }
 fn default_max_concurrent_queries() -> usize { 100 }
+fn default_max_concurrent_per_user() -> usize { 20 }
 fn default_slow_query_threshold() -> u64 { 30 }
 fn default_max_query_memory() -> String { "256MB".to_string() }
 fn default_distribution_threshold() -> String { "128MB".to_string() }

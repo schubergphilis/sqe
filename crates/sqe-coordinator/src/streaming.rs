@@ -227,7 +227,11 @@ pub struct TrackedRecordBatchStream {
     schema: SchemaRef,
     finalizer: Option<StreamFinalizer>,
     rows_so_far: usize,
-    _permit: Option<OwnedSemaphorePermit>,
+    /// Concurrency permits held for the lifetime of the stream. Stored as a
+    /// vec so the streaming path can carry both a per-user permit and a
+    /// global permit without duplicating fields; both drop when the stream
+    /// drops, releasing the slots back to their respective semaphores.
+    _permits: Vec<OwnedSemaphorePermit>,
     /// Opaque teardown handle whose Drop runs when the stream completes
     /// (clean EOF, error, or client cancel). Used by time-travel pinned
     /// providers (#44) to deregister the session-context alias once the
@@ -253,7 +257,7 @@ impl TrackedRecordBatchStream {
             schema,
             finalizer: Some(finalizer),
             rows_so_far: 0,
-            _permit: permit,
+            _permits: permit.into_iter().collect(),
             _teardown: None,
             cancel_token: None,
             cancelled: false,
@@ -275,7 +279,28 @@ impl TrackedRecordBatchStream {
             schema,
             finalizer: Some(finalizer),
             rows_so_far: 0,
-            _permit: permit,
+            _permits: permit.into_iter().collect(),
+            _teardown: None,
+            cancel_token: Some(cancel_token),
+            cancelled: false,
+        }
+    }
+
+    /// Construct a tracked stream carrying multiple permits (per-user and
+    /// global). Useful when admission control involves layered semaphores.
+    pub fn with_permits_and_cancel_token(
+        inner: SendableRecordBatchStream,
+        finalizer: StreamFinalizer,
+        permits: Vec<OwnedSemaphorePermit>,
+        cancel_token: CancellationToken,
+    ) -> Self {
+        let schema = inner.schema();
+        Self {
+            inner,
+            schema,
+            finalizer: Some(finalizer),
+            rows_so_far: 0,
+            _permits: permits,
             _teardown: None,
             cancel_token: Some(cancel_token),
             cancelled: false,
