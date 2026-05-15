@@ -220,7 +220,7 @@ async fn build_iceberg_rest(
         props.insert("token".to_string(), token.to_string());
     }
     if let Some(secret_ref) = options.get("SECRET").and_then(OptionValue::as_secret_ref) {
-        let secret = secrets.get(secret_ref)?;
+        let secret = secrets.get(secret_ref).map_err(|e| e.to_string())?;
         match &secret {
             Secret::Bearer { token } => {
                 props.insert("token".to_string(), token.clone());
@@ -273,7 +273,7 @@ fn aws_secret_to_props(
     let Some(secret_ref) = options.get("SECRET").and_then(OptionValue::as_secret_ref) else {
         return Ok(None);
     };
-    let secret = secrets.get(secret_ref)?;
+    let secret = secrets.get(secret_ref).map_err(|e| e.to_string())?;
     match &secret {
         Secret::Aws {
             access_key,
@@ -550,7 +550,7 @@ async fn build_hms(
                     "option `SECRET <name>` is required when `AUTH_MODE = plain` for TYPE hms"
                         .to_string()
                 })?;
-            let secret = secrets.get(secret_ref)?;
+            let secret = secrets.get(secret_ref).map_err(|e| e.to_string())?;
             match &secret {
                 Secret::Basic { .. } => {
                     // Fields will be threaded through once the
