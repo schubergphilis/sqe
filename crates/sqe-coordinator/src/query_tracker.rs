@@ -91,6 +91,17 @@ pub struct QueryTracker {
 }
 
 impl QueryTracker {
+    /// Return a clone of the [`CancellationToken`] for an in-flight query.
+    ///
+    /// Callers that hold this token can race a `select!` against it so a
+    /// later [`Self::cancel`] aborts the work cleanly. Returns `None` once
+    /// the query is no longer active (complete, failed, or already cancelled).
+    pub fn token_for(&self, query_id: &Uuid) -> Option<CancellationToken> {
+        self.active.get(query_id).map(|t| t.clone())
+    }
+}
+
+impl QueryTracker {
     pub fn new(config: &QueryHistoryConfig) -> Self {
         let history = Cache::builder()
             .max_capacity(config.max_entries)

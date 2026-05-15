@@ -236,50 +236,77 @@ impl FlightService for WorkerFlightService {
             // Subscribe to credential updates for this fragment
             let cred_rx = credential_store.subscribe(&scan_task.fragment_id).await;
 
-            let scan_future = executor::execute_scan(
-                &scan_task,
-                Some(&metrics),
-                &session_ctx,
+            let fragment_id = scan_task.fragment_id.clone();
+            let prepare = executor::execute_scan_streaming(
+                scan_task,
+                Some(metrics.clone()),
+                session_ctx.clone(),
                 Some(cred_rx),
-                footer_cache.as_ref(),
+                footer_cache.clone(),
                 None, // Late materialization filter (not yet wired from coordinator)
                 None, // Coordinator metrics (workers don't have coordinator registry)
             );
 
-            let (schema, batches) = if scan_timeout.is_zero() {
-                // No timeout configured
-                scan_future.await
+            let (schema, batch_stream) = if scan_timeout.is_zero() {
+                prepare.await
             } else {
-                tokio::time::timeout(scan_timeout, scan_future)
+                tokio::time::timeout(scan_timeout, prepare)
                     .await
                     .map_err(|_| {
                         warn!(
-                            fragment_id = %scan_task.fragment_id,
+                            fragment_id = %fragment_id,
                             timeout_secs = scan_timeout.as_secs(),
-                            "Scan task timed out"
+                            "Scan task setup timed out"
                         );
                         Status::deadline_exceeded(format!(
-                            "Scan task {} timed out after {}s",
-                            scan_task.fragment_id,
+                            "Scan task {} setup timed out after {}s",
+                            fragment_id,
                             scan_timeout.as_secs()
                         ))
                     })?
             }
             .map_err(|e| {
-                warn!(error = %e, "Scan task execution failed");
+                warn!(error = %e, "Scan task setup failed");
                 Status::internal(format!("Scan execution failed: {e}"))
             })?;
 
-            // Clean up the credential channel now that the scan is complete
-            credential_store.remove(&scan_task.fragment_id).await;
+            // Map the streaming batches through to FlightDataEncoder. On stream
+            // completion (Ok or Err), unsubscribe the fragment from the
+            // credential store so its watcher can be reclaimed.
+            let credential_store_for_cleanup = credential_store.clone();
+            let fragment_id_for_cleanup = fragment_id.clone();
+            let mapped_stream = batch_stream
+                .map(|item| match item {
+                    Ok(batch) => Ok(batch),
+                    Err(e) => Err(arrow_flight::error::FlightError::from_external_error(
+                        Box::new(std::io::Error::other(e.to_string())),
+                    )),
+                })
+                .chain(stream::once(async move {
+                    credential_store_for_cleanup
+                        .remove(&fragment_id_for_cleanup)
+                        .await;
+                    // Trailing sentinel; filtered out below.
+                    Err::<arrow_array::RecordBatch, arrow_flight::error::FlightError>(
+                        arrow_flight::error::FlightError::from_external_error(
+                            Box::new(std::io::Error::other("__SQE_CLEANUP_SENTINEL__")),
+                        ),
+                    )
+                }))
+                .filter_map(|item| async move {
+                    match item {
+                        Ok(b) => Some(Ok(b)),
+                        Err(e) if e.to_string().contains("__SQE_CLEANUP_SENTINEL__") => None,
+                        Err(e) => Some(Err(e)),
+                    }
+                });
 
-            let schema = Arc::new((*schema).clone());
+            let schema_arc = Arc::new((*schema).clone());
             let ipc_opts = ipc_options_for(flight_compression)?;
-            let batch_stream = stream::iter(batches.into_iter().map(Ok));
             let flight_stream = FlightDataEncoderBuilder::new()
-                .with_schema(schema)
+                .with_schema(schema_arc)
                 .with_options(ipc_opts)
-                .build(batch_stream)
+                .build(mapped_stream)
                 .map_err(Status::from);
 
             Ok(Response::new(

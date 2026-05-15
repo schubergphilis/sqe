@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::Action;
-use tonic::transport::Endpoint;
+use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, warn};
 
 /// Metadata header name shared with the coordinator's heartbeat handler.
@@ -15,6 +15,10 @@ const WORKER_SECRET_HEADER: &str = "x-sqe-worker-secret";
 /// which worker sent the heartbeat. When `worker_secret` is non-empty it is
 /// attached as the `x-sqe-worker-secret` metadata header so the coordinator
 /// can authenticate the heartbeat.
+///
+/// The `tonic::Channel` is built once at task start and reused across ticks.
+/// On connection-level failure it is dropped and rebuilt on the next tick;
+/// HTTP/2 multiplexing keeps the connection alive across heartbeats.
 ///
 /// On failure the error is logged and the next heartbeat is attempted after the
 /// normal interval. There is no exponential back-off because the coordinator's
@@ -33,16 +37,20 @@ pub fn start_heartbeat_task(
         // to start.
         ticker.tick().await;
 
+        let mut cached: Option<Channel> = None;
+
         loop {
             ticker.tick().await;
-            if let Err(e) = send_heartbeat(&coordinator_url, &worker_url, &worker_secret).await {
-                warn!(
-                    coordinator = %coordinator_url,
-                    error = %e,
-                    "Heartbeat to coordinator failed, will retry next interval"
-                );
-            } else {
-                debug!(coordinator = %coordinator_url, "Heartbeat sent");
+            match send_heartbeat(&coordinator_url, &worker_url, &worker_secret, &mut cached).await {
+                Ok(()) => debug!(coordinator = %coordinator_url, "Heartbeat sent"),
+                Err(e) => {
+                    cached = None;
+                    warn!(
+                        coordinator = %coordinator_url,
+                        error = %e,
+                        "Heartbeat to coordinator failed, will retry next interval"
+                    );
+                }
             }
         }
     });
@@ -52,10 +60,20 @@ async fn send_heartbeat(
     coordinator_url: &str,
     worker_url: &str,
     worker_secret: &str,
+    cached: &mut Option<Channel>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let channel = Endpoint::new(coordinator_url.to_string())?
-        .connect()
-        .await?;
+    let channel = match cached.as_ref() {
+        Some(ch) => ch.clone(),
+        None => {
+            let ch = Endpoint::new(coordinator_url.to_string())?
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(10))
+                .connect()
+                .await?;
+            *cached = Some(ch.clone());
+            ch
+        }
+    };
     let mut client = FlightServiceClient::new(channel);
 
     let action = Action {
@@ -83,9 +101,16 @@ mod tests {
     async fn heartbeat_to_unreachable_coordinator_returns_error() {
         // Attempting to heartbeat a non-existent coordinator should return an
         // error (connection refused), not panic.
-        let result =
-            send_heartbeat("http://127.0.0.1:19999", "http://127.0.0.1:50052", "").await;
+        let mut cached: Option<Channel> = None;
+        let result = send_heartbeat(
+            "http://127.0.0.1:19999",
+            "http://127.0.0.1:50052",
+            "",
+            &mut cached,
+        )
+        .await;
         assert!(result.is_err());
+        assert!(cached.is_none(), "failed connect should leave cache empty");
     }
 
     #[tokio::test]
