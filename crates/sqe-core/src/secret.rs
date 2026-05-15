@@ -205,11 +205,11 @@ impl SecretStore {
     }
 
     /// List all secrets as `(name, type_name)`. Never returns values.
-    pub fn list(&self) -> Vec<(String, &'static str)> {
-        let r = self.inner.read().expect("secret store poisoned");
+    pub fn list(&self) -> Result<Vec<(String, &'static str)>, SecretStoreError> {
+        let r = self.inner.read().map_err(|_| SecretStoreError::Poisoned)?;
         let mut out: Vec<_> = r.iter().map(|(n, s)| (n.clone(), s.type_name())).collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
-        out
+        Ok(out)
     }
 }
 
