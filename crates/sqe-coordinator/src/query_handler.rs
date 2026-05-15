@@ -1177,22 +1177,26 @@ impl QueryHandler {
             .map(|b| b.iter().map(|r| r.num_rows()).sum())
             .unwrap_or(0);
 
-        // Update query tracker with final state
         let execution_ms = duration.as_millis() as u64;
+        let tt_for_complete: Vec<String> = match captured_plan.as_ref() {
+            Some(sqe_lineage::PlanOrHint::Plan(p)) => {
+                sqe_lineage::extract::extract_table_names(p.as_ref())
+            }
+            _ => Vec::new(),
+        };
         if result.is_ok() {
             let pm = plan_metrics.lock().unwrap_or_else(|e| e.into_inner()).clone();
             self.query_tracker.complete(
                 &query_id,
                 rows,
                 execution_ms,
-                vec![],
+                tt_for_complete.clone(),
                 pm.bytes_scanned,
                 pm.rows_scanned,
                 pm.spill_bytes,
                 pm.peak_memory_bytes,
             );
 
-            // Store successful read query results in cache
             if let Some(ref cache) = self.query_cache {
                 if matches!(&kind, StatementKind::Query(_)) {
                     if let Ok(ref batches) = result {
@@ -1201,7 +1205,7 @@ impl QueryHandler {
                             sql,
                             query_id,
                             batches.clone(),
-                            vec![], // tables_touched — filled when we add plan extraction
+                            tt_for_complete.clone(),
                         );
                     }
                 }
@@ -1281,10 +1285,13 @@ impl QueryHandler {
             }
         }
 
-        // OpenLineage: emit COMPLETE on success or FAIL on error. The
-        // captured plan (Some when execute_query ran; None for DDL/DML branches
-        // that did not populate it) flows into the observer so the lineage
-        // extractor can build inputs/outputs/columnLineage facets.
+        let tables_touched: Vec<String> = match captured_plan.as_ref() {
+            Some(sqe_lineage::PlanOrHint::Plan(p)) => {
+                sqe_lineage::extract::extract_table_names(p.as_ref())
+            }
+            _ => Vec::new(),
+        };
+
         if ol_emit {
             if let Some(ref obs) = self.lineage {
                 let ol_ended_at = chrono::Utc::now();
@@ -1345,6 +1352,7 @@ impl QueryHandler {
                 rows_returned: rows,
                 status: status.to_string(),
                 client_ip: None,
+                tables_touched: tables_touched.clone(),
             });
         }
 
@@ -1554,9 +1562,8 @@ impl QueryHandler {
             session.user.roles.clone(),
         );
 
-        // --- Plan + open DataFusion stream -----------------------------------
         match self.open_stream(session, sql, &query_id, start).await {
-            Ok((schema, inner_stream, final_plan, tt_cleanup)) => {
+            Ok((schema, inner_stream, final_plan, tt_cleanup, tables_touched)) => {
                 let finalizer = crate::streaming::StreamFinalizer {
                     tracker: Arc::clone(&self.query_tracker),
                     metrics: self.metrics.clone(),
@@ -1571,6 +1578,7 @@ impl QueryHandler {
                     start,
                     slow_query_threshold_secs: self.config.query.slow_query_threshold_secs,
                     sql_length: sql.len(),
+                    tables_touched,
                 };
 
                 let tracked = crate::streaming::TrackedRecordBatchStream::with_permits_reservation_and_cancel_token(
@@ -1625,6 +1633,7 @@ impl QueryHandler {
         SendableRecordBatchStream,
         Arc<dyn ExecutionPlan>,
         TimeTravelCleanup,
+        Vec<String>,
     )> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
 
@@ -1640,6 +1649,7 @@ impl QueryHandler {
         let plan = df.logical_plan().clone();
         let enforced_plan = self.policy_enforcer.evaluate(&session.user, plan).await?;
         debug!("Policy-enforced plan (streaming): {:?}", enforced_plan);
+        let tables_touched = sqe_lineage::extract::extract_table_names(&enforced_plan);
 
         let enforced_df = ctx
             .execute_logical_plan(enforced_plan)
@@ -1693,7 +1703,7 @@ impl QueryHandler {
         let stream = execute_stream(Arc::clone(&final_plan), ctx.task_ctx())
             .map_err(|e| SqeError::Execution(format!("Query execution failed: {e}")))?;
 
-        Ok((schema, stream, final_plan, tt_cleanup))
+        Ok((schema, stream, final_plan, tt_cleanup, tables_touched))
     }
 
     /// Return the schema for a SQL statement without executing it.

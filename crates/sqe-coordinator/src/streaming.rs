@@ -64,6 +64,7 @@ pub struct StreamFinalizer {
     pub start: Instant,
     pub slow_query_threshold_secs: u64,
     pub sql_length: usize,
+    pub tables_touched: Vec<String>,
 }
 
 impl StreamFinalizer {
@@ -94,7 +95,7 @@ impl StreamFinalizer {
             &self.query_id,
             rows,
             execution_ms,
-            Vec::new(),
+            self.tables_touched.clone(),
             pm.bytes_scanned,
             pm.rows_scanned,
             pm.spill_bytes,
@@ -132,6 +133,7 @@ impl StreamFinalizer {
                 rows_returned: rows,
                 status: "success".to_string(),
                 client_ip: None,
+                tables_touched: self.tables_touched.clone(),
             });
         }
 
@@ -176,6 +178,7 @@ impl StreamFinalizer {
                 rows_returned: rows,
                 status: "error".to_string(),
                 client_ip: None,
+                tables_touched: self.tables_touched.clone(),
             });
         }
     }
@@ -207,6 +210,7 @@ impl StreamFinalizer {
                 rows_returned: rows,
                 status: "cancelled".to_string(),
                 client_ip: None,
+                tables_touched: self.tables_touched.clone(),
             });
         }
     }
@@ -505,6 +509,7 @@ mod tests {
             start: Instant::now(),
             slow_query_threshold_secs: 0,
             sql_length: 8,
+            tables_touched: Vec::new(),
         }
     }
 
