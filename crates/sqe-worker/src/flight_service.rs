@@ -233,10 +233,13 @@ impl FlightService for WorkerFlightService {
                 "Worker received scan task"
             );
 
-            // Subscribe to credential updates for this fragment
+            // Subscribe to credential updates for this fragment. The guard
+            // removes the entry on drop so timeouts, setup errors, and panics
+            // can't leak `watch::Sender`s into the store. Issue #76.
             let cred_rx = credential_store.subscribe(&scan_task.fragment_id).await;
-
             let fragment_id = scan_task.fragment_id.clone();
+            let cleanup_guard = credential_store.cleanup_guard(fragment_id.clone());
+
             let prepare = executor::execute_scan_streaming(
                 scan_task,
                 Some(metrics.clone()),
@@ -270,11 +273,9 @@ impl FlightService for WorkerFlightService {
                 Status::internal(format!("Scan execution failed: {e}"))
             })?;
 
-            // Map the streaming batches through to FlightDataEncoder. On stream
-            // completion (Ok or Err), unsubscribe the fragment from the
-            // credential store so its watcher can be reclaimed.
-            let credential_store_for_cleanup = credential_store.clone();
-            let fragment_id_for_cleanup = fragment_id.clone();
+            // Stream lifetime carries the guard; once the encoder finishes
+            // (or the client disconnects mid-stream) the guard drops and the
+            // credential entry is removed via `tokio::spawn`.
             let mapped_stream = batch_stream
                 .map(|item| match item {
                     Ok(batch) => Ok(batch),
@@ -283,10 +284,7 @@ impl FlightService for WorkerFlightService {
                     )),
                 })
                 .chain(stream::once(async move {
-                    credential_store_for_cleanup
-                        .remove(&fragment_id_for_cleanup)
-                        .await;
-                    // Trailing sentinel; filtered out below.
+                    drop(cleanup_guard);
                     Err::<arrow_array::RecordBatch, arrow_flight::error::FlightError>(
                         arrow_flight::error::FlightError::from_external_error(
                             Box::new(std::io::Error::other("__SQE_CLEANUP_SENTINEL__")),

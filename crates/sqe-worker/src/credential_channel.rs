@@ -118,6 +118,45 @@ impl CredentialStore {
             debug!(fragment_id = %fragment_id, "Removed credential channel");
         }
     }
+
+    /// Build a RAII guard that removes `fragment_id` from the store when
+    /// dropped, including on early returns from `?` and panics. Used by the
+    /// Flight `do_get` path so scan timeouts and setup errors stop leaking
+    /// one map entry plus one `watch::Sender` per failure. Issue #76.
+    pub fn cleanup_guard(&self, fragment_id: String) -> CredentialCleanupGuard {
+        CredentialCleanupGuard {
+            store: Some(self.clone()),
+            fragment_id,
+        }
+    }
+}
+
+/// RAII handle that removes a fragment's credential channel from the store
+/// when dropped. Cleanup runs via `tokio::spawn` because `Drop` is sync and
+/// the underlying map is behind an async `RwLock`.
+pub struct CredentialCleanupGuard {
+    store: Option<CredentialStore>,
+    fragment_id: String,
+}
+
+impl CredentialCleanupGuard {
+    /// Disarm the guard after explicit cleanup. Prevents a duplicate spawn
+    /// on the happy path where the stream's own chain already removed the
+    /// entry.
+    pub fn disarm(&mut self) {
+        self.store = None;
+    }
+}
+
+impl Drop for CredentialCleanupGuard {
+    fn drop(&mut self) {
+        if let Some(store) = self.store.take() {
+            let fragment_id = std::mem::take(&mut self.fragment_id);
+            tokio::spawn(async move {
+                store.remove(&fragment_id).await;
+            });
+        }
+    }
 }
 
 impl Default for CredentialStore {
