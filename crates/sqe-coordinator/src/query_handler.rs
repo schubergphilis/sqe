@@ -252,6 +252,7 @@ impl QueryHandler {
     ///
     /// Propagates the cache into the sub-handlers (`CatalogOps`, `WriteHandler`)
     /// so that DDL and write paths also share the same global cache.
+    #[must_use = "with_table_cache consumes self; bind the returned QueryHandler"]
     pub fn with_table_cache(mut self, cache: sqe_catalog::TableMetadataCache) -> Self {
         self.catalog_ops = self.catalog_ops.with_table_cache(cache.clone());
         self.write_handler = self.write_handler.with_table_cache(cache.clone());

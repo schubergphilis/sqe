@@ -170,6 +170,7 @@ impl TableMetadataCache {
     /// Attach a metrics registry. Every `SessionCatalog` clone of this
     /// cache will see the same handle and report catalog roundtrip
     /// latency + circuit breaker state into it.
+    #[must_use = "with_metrics consumes self; bind the returned cache"]
     pub fn with_metrics(mut self, metrics: std::sync::Arc<sqe_metrics::MetricsRegistry>) -> Self {
         self.metrics = Some(metrics);
         self

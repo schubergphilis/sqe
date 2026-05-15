@@ -111,24 +111,28 @@ impl WorkerFlightService {
     }
 
     /// Set the Parquet footer cache for this service.
+    #[must_use = "with_footer_cache consumes self; bind the returned service"]
     pub fn with_footer_cache(mut self, cache: Arc<FooterCache>) -> Self {
         self.footer_cache = Some(cache);
         self
     }
 
     /// Set the scan timeout from config.
+    #[must_use = "with_scan_timeout consumes self; bind the returned service"]
     pub fn with_scan_timeout(mut self, timeout_secs: u64) -> Self {
         self.scan_timeout = std::time::Duration::from_secs(timeout_secs);
         self
     }
 
     /// Set the IPC compression for DoGet responses.
+    #[must_use = "with_flight_compression consumes self; bind the returned service"]
     pub fn with_flight_compression(mut self, compression: FlightCompression) -> Self {
         self.flight_compression = compression;
         self
     }
 
     /// Set the IPC compression for DoExchange shuffle responses.
+    #[must_use = "with_shuffle_compression consumes self; bind the returned service"]
     pub fn with_shuffle_compression(mut self, compression: FlightCompression) -> Self {
         self.shuffle_compression = compression;
         self
@@ -138,6 +142,7 @@ impl WorkerFlightService {
     /// (`do_get` scan tickets and `do_action("refresh_credentials")`).
     /// An empty secret disables enforcement: callers must explicitly opt
     /// in via `worker.allow_unauthenticated = true` at config load time.
+    #[must_use = "with_worker_secret consumes self; bind the returned service"]
     pub fn with_worker_secret(mut self, secret: String) -> Self {
         self.worker_secret = secret;
         self

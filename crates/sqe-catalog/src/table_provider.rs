@@ -74,6 +74,7 @@ impl SqeTableProvider {
     }
 
     /// Attach Prometheus metrics for file pruning and S3 I/O.
+    #[must_use = "with_metrics consumes self; bind the returned provider"]
     pub fn with_metrics(mut self, metrics: Arc<sqe_metrics::MetricsRegistry>) -> Self {
         self.prom_metrics = Some(metrics);
         self
@@ -83,6 +84,7 @@ impl SqeTableProvider {
     ///
     /// Files below this size are read entirely in a single S3 GET and parsed
     /// from memory, bypassing iceberg-rust's `scan.to_arrow()` pipeline.
+    #[must_use = "with_small_file_threshold consumes self; bind the returned provider"]
     pub fn with_small_file_threshold(mut self, threshold_bytes: u64) -> Self {
         self.small_file_threshold_bytes = threshold_bytes;
         self
@@ -90,6 +92,7 @@ impl SqeTableProvider {
 
     /// Set the per-scan concurrency used when walking manifests for
     /// column-statistics pruning.
+    #[must_use = "with_manifest_concurrency consumes self; bind the returned provider"]
     pub fn with_manifest_concurrency(mut self, concurrency: usize) -> Self {
         self.manifest_concurrency = concurrency.max(1);
         self
@@ -104,6 +107,7 @@ impl SqeTableProvider {
     }
 
     /// Pin this provider to a specific Iceberg snapshot for time travel queries.
+    #[must_use = "with_snapshot_id consumes self; bind the returned provider"]
     pub fn with_snapshot_id(mut self, snapshot_id: i64) -> Self {
         self.snapshot_id = Some(snapshot_id);
         self
@@ -111,6 +115,7 @@ impl SqeTableProvider {
 
     /// Trust Iceberg sort order for all columns, not just partition keys.
     /// Only enable when data files are known to be physically sorted.
+    #[must_use = "with_trust_sort_order consumes self; bind the returned provider"]
     pub fn with_trust_sort_order(mut self, trust: bool) -> Self {
         self.trust_sort_order = trust;
         self

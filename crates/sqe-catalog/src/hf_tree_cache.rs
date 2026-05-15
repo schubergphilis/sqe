@@ -139,6 +139,7 @@ impl ReqwestClient {
         }
     }
 
+    #[must_use = "with_bearer consumes self; bind the returned client"]
     pub fn with_bearer(mut self, token: impl Into<String>) -> Self {
         self.bearer = Some(token.into());
         self
@@ -210,6 +211,7 @@ impl HfTreeCache {
     }
 
     /// Override the default 5-minute TTL.
+    #[must_use = "with_ttl consumes self; bind the returned cache"]
     pub fn with_ttl(mut self, ttl: Duration) -> Self {
         let http = self.http.clone();
         self.cache = Cache::builder()
