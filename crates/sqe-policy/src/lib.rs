@@ -3,6 +3,7 @@ pub mod plan_rewriter;
 pub mod policy_store;
 pub mod opa;
 pub mod sha256_udf;
+pub mod write_predicates;
 
 use async_trait::async_trait;
 use datafusion::logical_expr::LogicalPlan;

@@ -192,6 +192,74 @@ fn lineage_target_parts(
     (catalog, namespace, table)
 }
 
+/// Build an Arrow schema from the Iceberg table's current schema. Used
+/// to drive the policy probe that resolves row filters and column masks
+/// for the DELETE / UPDATE WHERE evaluator.
+fn build_arrow_schema_for_table(table: &IcebergTable) -> sqe_core::Result<Arc<ArrowSchema>> {
+    let iceberg_schema = table.metadata().current_schema();
+    let arrow_schema = iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
+        .map_err(|e| SqeError::Execution(format!("Iceberg -> Arrow schema: {e}")))?;
+    Ok(Arc::new(arrow_schema))
+}
+
+/// Alias used inside the policy subquery to expose the unmasked value of a
+/// masked column. UPDATE's CASE-ELSE branch must reference this so unchanged
+/// rows persist their pre-mask values instead of writing the masked value
+/// to disk.
+fn policy_raw_alias(col: &str) -> String {
+    format!("__pol_raw_{col}")
+}
+
+/// Combine the user's WHERE clause with the policy row filter. ANDing it
+/// here ensures DELETE and UPDATE only act on rows the policy admits,
+/// matching PostgreSQL RLS semantics on the SELECT path.
+fn augment_where_with_row_filter(
+    where_sql: &str,
+    predicates: &sqe_policy::write_predicates::WritePolicyPredicates,
+) -> String {
+    match &predicates.row_filter_sql {
+        Some(rf) => format!("({where_sql}) AND ({rf})"),
+        None => where_sql.to_string(),
+    }
+}
+
+/// Build the FROM clause for the per-batch evaluator. With no policy this
+/// is the scratch table aliased to the target name. With column masks it
+/// wraps the scratch table in a subquery that projects each column either
+/// raw or masked, plus a `__pol_raw_<col>` raw alias for masked columns
+/// when `expose_raw` is set (the UPDATE path needs this for the CASE-ELSE
+/// branch).
+fn build_policy_from_clause(
+    scratch_table: &str,
+    orig_alias: &str,
+    schema: &ArrowSchema,
+    predicates: &sqe_policy::write_predicates::WritePolicyPredicates,
+    expose_raw: bool,
+) -> String {
+    if predicates.column_mask_sqls.is_empty() {
+        return format!("{scratch_table} AS \"{orig_alias}\"");
+    }
+
+    let mut projections: Vec<String> = Vec::with_capacity(schema.fields().len() + 1);
+    for f in schema.fields() {
+        let name = f.name();
+        match predicates.column_mask_sqls.get(name) {
+            Some(mask_sql) => {
+                projections.push(format!("({mask_sql}) AS \"{name}\""));
+                if expose_raw {
+                    let raw = policy_raw_alias(name);
+                    projections.push(format!("\"{name}\" AS \"{raw}\""));
+                }
+            }
+            None => {
+                projections.push(format!("\"{name}\""));
+            }
+        }
+    }
+    let projection_sql = projections.join(", ");
+    format!("(SELECT {projection_sql} FROM {scratch_table}) AS \"{orig_alias}\"")
+}
+
 /// Best-effort cleanup of a partially-created CTAS table.
 ///
 /// Both CTAS paths (`handle_ctas`, `handle_ctas_streaming`) follow the same
@@ -335,6 +403,37 @@ impl WriteHandler {
             Some(enf) => enf.evaluate(&session.user, plan).await,
             None => Ok(plan),
         }
+    }
+
+    /// Resolve write-path policy predicates for the target of a DELETE / UPDATE.
+    /// Returns row-filter SQL and per-column mask SQL fragments derived from
+    /// the configured PolicyEnforcer. With no enforcer the result is empty
+    /// and the DML path is unchanged.
+    async fn compute_write_predicates(
+        &self,
+        session: &Session,
+        table_ident: &TableIdent,
+        schema: Arc<ArrowSchema>,
+    ) -> sqe_core::Result<sqe_policy::write_predicates::WritePolicyPredicates> {
+        let Some(enf) = &self.policy_enforcer else {
+            return Ok(sqe_policy::write_predicates::WritePolicyPredicates::default());
+        };
+        // The rewriter keys policy lookups by the last namespace component
+        // and the table name. Flatten the multi-level namespace to match.
+        let namespace_key = table_ident
+            .namespace()
+            .as_ref()
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "default".to_string());
+        sqe_policy::write_predicates::extract_write_predicates(
+            enf.as_ref(),
+            &session.user,
+            &namespace_key,
+            table_ident.name(),
+            schema,
+        )
+        .await
     }
 
     /// Return the Parquet compression codec from config.
@@ -1234,9 +1333,16 @@ impl WriteHandler {
         }
 
         let where_clause = &delete.selection;
+        let target_schema = build_arrow_schema_for_table(&table)?;
+        let predicates = self
+            .compute_write_predicates(session, &table_ident, target_schema)
+            .await?;
 
-        // No WHERE = truncate: remove all files, add none
-        if where_clause.is_none() {
+        // No WHERE = truncate. With no policy row filter we keep the fast
+        // path: drop every file. With a row filter we must preserve rows
+        // outside the user's view, so the truncate degrades into a CoW
+        // rewrite under the row filter.
+        if where_clause.is_none() && predicates.row_filter_sql.is_none() {
             info!(table = %table_ident, file_count = old_data_files.len(), "DELETE: truncating table (no WHERE clause)");
             let tx = Transaction::new(&table);
             let action = tx.rewrite_files().delete_files(old_data_files);
@@ -1250,8 +1356,10 @@ impl WriteHandler {
             return Ok(vec![]);
         }
 
-        // WHERE clause present: CoW rewrite
-        let raw_where = format!("{}", where_clause.as_ref().unwrap());
+        let raw_where = where_clause
+            .as_ref()
+            .map(|w| format!("{w}"))
+            .unwrap_or_else(|| "TRUE".to_string());
         // Lift any `IN (subquery)` expressions out of the WHERE into materialised
         // scratch MemTables joined via LEFT JOIN. The cleanup guard must outlive
         // every per-batch evaluator call below; `_in_subq_guard`'s Drop runs at
@@ -1262,6 +1370,8 @@ impl WriteHandler {
             table = %table_ident,
             file_count = old_data_files.len(),
             where_clause = %where_sql,
+            policy_row_filter = predicates.row_filter_sql.is_some(),
+            policy_masks = predicates.column_mask_sqls.len(),
             "DELETE: CoW rewrite"
         );
 
@@ -1280,7 +1390,14 @@ impl WriteHandler {
             let mut surviving_batches = Vec::new();
             for batch in &batches {
                 let filtered = self
-                    .filter_batch_negate(ctx, batch, &where_sql, &joins_sql, &table_ident)
+                    .filter_batch_negate(
+                        ctx,
+                        batch,
+                        &where_sql,
+                        &joins_sql,
+                        &table_ident,
+                        &predicates,
+                    )
                     .await?;
                 total_deleted += batch.num_rows() - filtered.num_rows();
                 if filtered.num_rows() > 0 {
@@ -1383,10 +1500,17 @@ impl WriteHandler {
         }
 
         let where_clause = &delete.selection;
+        let target_schema = build_arrow_schema_for_table(&table)?;
+        let predicates = self
+            .compute_write_predicates(session, &table_ident, target_schema)
+            .await?;
 
-        // No WHERE clause: fall back to CoW truncate (remove all files atomically).
-        // Writing a position delete for every row would be wasteful and serves no purpose.
-        if where_clause.is_none() {
+        // No WHERE clause and no policy row filter: keep the fast truncate
+        // path. With a row filter we cannot wipe every file because rows
+        // outside the user's view must survive; the position-delete loop
+        // below handles that case by emitting deletes only where the row
+        // filter admits a row.
+        if where_clause.is_none() && predicates.row_filter_sql.is_none() {
             info!(
                 table = %table_ident,
                 file_count = old_data_files.len(),
@@ -1404,7 +1528,10 @@ impl WriteHandler {
             return Ok(vec![]);
         }
 
-        let raw_where = format!("{}", where_clause.as_ref().unwrap());
+        let raw_where = where_clause
+            .as_ref()
+            .map(|w| format!("{w}"))
+            .unwrap_or_else(|| "TRUE".to_string());
         // Lift any `IN (subquery)` expressions; see `handle_delete` for details.
         // The guard must outlive the per-batch loop below.
         let (where_sql, joins_sql, _in_subq_guard) =
@@ -1413,6 +1540,8 @@ impl WriteHandler {
             table = %table_ident,
             file_count = old_data_files.len(),
             where_clause = %where_sql,
+            policy_row_filter = predicates.row_filter_sql.is_some(),
+            policy_masks = predicates.column_mask_sqls.len(),
             "MoR DELETE: collecting row positions to delete"
         );
 
@@ -1431,7 +1560,14 @@ impl WriteHandler {
             let mut row_offset: i64 = 0;
             for batch in &batches {
                 let match_mask = self
-                    .filter_batch_match(ctx, batch, &where_sql, &joins_sql, &table_ident)
+                    .filter_batch_match(
+                        ctx,
+                        batch,
+                        &where_sql,
+                        &joins_sql,
+                        &table_ident,
+                        &predicates,
+                    )
                     .await?;
 
                 for row_idx in 0..batch.num_rows() {
@@ -1543,9 +1679,16 @@ impl WriteHandler {
         }
 
         let where_clause = &delete.selection;
-        // DELETE without WHERE clause: falling back to CoW truncate as
-        // emitting an empty equality-delete file serves no purpose.
-        if where_clause.is_none() {
+        let target_schema = build_arrow_schema_for_table(&table)?;
+        let predicates = self
+            .compute_write_predicates(session, &table_ident, target_schema)
+            .await?;
+
+        // DELETE without WHERE and without a policy row filter: fall back
+        // to CoW truncate. Emitting an empty equality-delete file serves
+        // no purpose. With a policy row filter we scan instead so rows
+        // outside the user's view survive.
+        if where_clause.is_none() && predicates.row_filter_sql.is_none() {
             info!(
                 table = %table_ident,
                 file_count = old_data_files.len(),
@@ -1562,7 +1705,10 @@ impl WriteHandler {
             return Ok(vec![]);
         }
 
-        let raw_where = format!("{}", where_clause.as_ref().unwrap());
+        let raw_where = where_clause
+            .as_ref()
+            .map(|w| format!("{w}"))
+            .unwrap_or_else(|| "TRUE".to_string());
         let (where_sql, joins_sql, _in_subq_guard) =
             self.lift_in_subqueries(&raw_where, ctx).await?;
         info!(
@@ -1570,6 +1716,8 @@ impl WriteHandler {
             file_count = old_data_files.len(),
             where_clause = %where_sql,
             equality_ids = ?identifier_field_ids,
+            policy_row_filter = predicates.row_filter_sql.is_some(),
+            policy_masks = predicates.column_mask_sqls.len(),
             "equality DELETE: scanning for matching rows"
         );
 
@@ -1587,7 +1735,14 @@ impl WriteHandler {
             }
             for batch in batches {
                 let match_mask = self
-                    .filter_batch_match(ctx, &batch, &where_sql, &joins_sql, &table_ident)
+                    .filter_batch_match(
+                        ctx,
+                        &batch,
+                        &where_sql,
+                        &joins_sql,
+                        &table_ident,
+                        &predicates,
+                    )
                     .await?;
                 let filtered = filter_record_batch(&batch, &match_mask).map_err(|e| {
                     SqeError::Execution(format!("failed to filter match rows: {e}"))
@@ -1772,6 +1927,11 @@ impl WriteHandler {
             return Ok(vec![]);
         }
 
+        let target_schema = build_arrow_schema_for_table(&table)?;
+        let predicates = self
+            .compute_write_predicates(session, &table_ident, target_schema)
+            .await?;
+
         // Build the SET clause as SQL CASE expressions for a SELECT rewrite
         // UPDATE t SET col1 = expr1, col2 = expr2 WHERE cond
         // becomes:
@@ -1793,6 +1953,8 @@ impl WriteHandler {
             file_count = old_data_files.len(),
             assignments = assignments.len(),
             where_clause = %where_sql,
+            policy_row_filter = predicates.row_filter_sql.is_some(),
+            policy_masks = predicates.column_mask_sqls.len(),
             "UPDATE: CoW rewrite"
         );
 
@@ -1818,6 +1980,7 @@ impl WriteHandler {
                         &where_sql,
                         &joins_sql,
                         &table_ident,
+                        &predicates,
                     )
                     .await?;
                 rewritten_batches.push(rewritten);
@@ -1826,7 +1989,14 @@ impl WriteHandler {
             // Count updated rows by comparing before/after
             for batch in &batches {
                 let count = self
-                    .count_matching_rows(ctx, batch, &where_sql, &joins_sql, &table_ident)
+                    .count_matching_rows(
+                        ctx,
+                        batch,
+                        &where_sql,
+                        &joins_sql,
+                        &table_ident,
+                        &predicates,
+                    )
                     .await?;
                 total_updated += count;
             }
@@ -2005,6 +2175,11 @@ impl WriteHandler {
             return Ok(vec![]);
         }
 
+        let target_schema = build_arrow_schema_for_table(&table)?;
+        let predicates = self
+            .compute_write_predicates(session, &table_ident, target_schema)
+            .await?;
+
         let raw_where = selection
             .as_ref()
             .map(|w| format!("{w}"))
@@ -2018,6 +2193,8 @@ impl WriteHandler {
             assignments = assignments.len(),
             where_clause = %where_sql,
             equality_ids = ?identifier_field_ids,
+            policy_row_filter = predicates.row_filter_sql.is_some(),
+            policy_masks = predicates.column_mask_sqls.len(),
             "MoR UPDATE: scanning for matching rows"
         );
 
@@ -2041,7 +2218,14 @@ impl WriteHandler {
             }
             for batch in batches {
                 let match_mask = self
-                    .filter_batch_match(ctx, &batch, &where_sql, &joins_sql, &table_ident)
+                    .filter_batch_match(
+                        ctx,
+                        &batch,
+                        &where_sql,
+                        &joins_sql,
+                        &table_ident,
+                        &predicates,
+                    )
                     .await?;
                 // Skip files with zero matches: no new data rows, no
                 // equality deletes. Leaving them alone is the point of MoR.
@@ -2073,6 +2257,7 @@ impl WriteHandler {
                         &where_sql,
                         &joins_sql,
                         &table_ident,
+                        &predicates,
                     )
                     .await?;
                 let new_rows =
@@ -3236,6 +3421,13 @@ impl WriteHandler {
     /// [`Self::lift_in_subqueries`] and is spliced into the outer SELECT's
     /// FROM clause immediately after the aliased target. Pass an empty string
     /// when no lifted joins are needed.
+    ///
+    /// `predicates` carries the row-filter and column-mask SQL derived from
+    /// the configured PolicyEnforcer. The row filter is ANDed onto the user's
+    /// WHERE so DELETE only removes rows the policy admits, and masked
+    /// columns are exposed via a wrapping subquery so any WHERE reference
+    /// to a masked column sees the masked value.
+    #[allow(clippy::too_many_arguments)]
     async fn filter_batch_negate(
         &self,
         ctx: &DFSessionContext,
@@ -3243,6 +3435,7 @@ impl WriteHandler {
         where_sql: &str,
         joins_sql: &str,
         table_ident: &TableIdent,
+        predicates: &sqe_policy::write_predicates::WritePolicyPredicates,
     ) -> sqe_core::Result<RecordBatch> {
         use arrow::compute::not;
         use datafusion::arrow::array::BooleanArray;
@@ -3259,13 +3452,22 @@ impl WriteHandler {
         )
         .map_err(|e| SqeError::Execution(format!("Failed to register temp table: {e}")))?;
 
+        let augmented_where = augment_where_with_row_filter(where_sql, predicates);
+        let from_clause = build_policy_from_clause(
+            &format!("datafusion.public.{table_name}"),
+            orig_name,
+            &batch.schema(),
+            predicates,
+            false,
+        );
+
         // Execute: SELECT <where_clause> AS __match FROM __delete_<table>
         // Alias the scratch table to the original target name (see apply_update
         // for rationale) so correlated subqueries inside the WHERE clause can
         // reference `tablename.col`.
         let eval_sql = format!(
-            "SELECT CAST(({where_sql}) AS BOOLEAN) AS __match \
-             FROM datafusion.public.{table_name} AS \"{orig_name}\"{joins_sql}"
+            "SELECT CAST(({augmented_where}) AS BOOLEAN) AS __match \
+             FROM {from_clause}{joins_sql}"
         );
         let df = ctx
             .sql(&eval_sql)
@@ -3308,6 +3510,10 @@ impl WriteHandler {
     ///
     /// `joins_sql` carries the `LEFT JOIN ...` clauses produced by
     /// [`Self::lift_in_subqueries`]; see `filter_batch_negate` for details.
+    ///
+    /// `predicates` augments the user's WHERE with the policy row filter and
+    /// wraps masked columns so the predicate evaluates against masked values.
+    #[allow(clippy::too_many_arguments)]
     async fn filter_batch_match(
         &self,
         ctx: &DFSessionContext,
@@ -3315,6 +3521,7 @@ impl WriteHandler {
         where_sql: &str,
         joins_sql: &str,
         table_ident: &TableIdent,
+        predicates: &sqe_policy::write_predicates::WritePolicyPredicates,
     ) -> sqe_core::Result<arrow_array::BooleanArray> {
         use arrow_array::BooleanArray;
 
@@ -3329,11 +3536,20 @@ impl WriteHandler {
         )
         .map_err(|e| SqeError::Execution(format!("Failed to register temp table: {e}")))?;
 
+        let augmented_where = augment_where_with_row_filter(where_sql, predicates);
+        let from_clause = build_policy_from_clause(
+            &format!("datafusion.public.{table_name}"),
+            orig_name,
+            &batch.schema(),
+            predicates,
+            false,
+        );
+
         // Alias the scratch table to the original target name so correlated
         // subqueries inside WHERE can reference `tablename.col`.
         let eval_sql = format!(
-            "SELECT CAST(({where_sql}) AS BOOLEAN) AS __match \
-             FROM datafusion.public.{table_name} AS \"{orig_name}\"{joins_sql}"
+            "SELECT CAST(({augmented_where}) AS BOOLEAN) AS __match \
+             FROM {from_clause}{joins_sql}"
         );
         let df = ctx
             .sql(&eval_sql)
@@ -3373,6 +3589,7 @@ impl WriteHandler {
     /// [`Self::lift_in_subqueries`] and is appended to the outer SELECT's FROM
     /// clause after any decorrelator-generated joins. Pass an empty string when
     /// no lifted joins are needed.
+    #[allow(clippy::too_many_arguments)]
     async fn apply_update(
         &self,
         ctx: &DFSessionContext,
@@ -3381,6 +3598,7 @@ impl WriteHandler {
         where_sql: &str,
         in_subquery_joins: &str,
         table_ident: &TableIdent,
+        predicates: &sqe_policy::write_predicates::WritePolicyPredicates,
     ) -> sqe_core::Result<RecordBatch> {
         let table_name = format!("__update_{}", table_ident.name());
         let orig_name = table_ident.name();
@@ -3398,7 +3616,7 @@ impl WriteHandler {
         // subqueries that survive inside a CASE WHEN ... THEN (subquery) ELSE
         // col END projection, so we rewrite recognised correlated-equality
         // shapes into LEFT JOINs at the outer FROM. Shapes we don't recognise
-        // are left alone and will surface DataFusion's original error — no
+        // are left alone and will surface DataFusion's original error: no
         // change in behaviour for them.
         let (decorrelated, extra_joins) = decorrelate_scalar_subqueries(assignments, orig_name);
         let mut assignment_map = std::collections::HashMap::new();
@@ -3406,15 +3624,31 @@ impl WriteHandler {
             assignment_map.insert(d.col_name.clone(), d.expr_sql.clone());
         }
 
-        // Build SELECT with CASE expressions for assigned columns
+        let augmented_where = augment_where_with_row_filter(where_sql, predicates);
+
+        // Build SELECT with CASE expressions for assigned columns. Masked
+        // columns require special handling: the ELSE branch must reference
+        // the raw alias so unchanged rows keep their pre-mask values on
+        // disk. The aliased subquery exposes `__pol_raw_<col>` for every
+        // masked column in addition to the masked projection.
         let columns: Vec<String> = batch
             .schema()
             .fields()
             .iter()
             .map(|f| {
                 let col = f.name().clone();
+                let is_masked = predicates.column_mask_sqls.contains_key(&col);
+                let else_ref = if is_masked {
+                    format!("\"{}\"", policy_raw_alias(&col))
+                } else {
+                    format!("\"{col}\"")
+                };
                 if let Some(expr) = assignment_map.get(&col) {
-                    format!("CASE WHEN ({where_sql}) THEN ({expr}) ELSE \"{col}\" END AS \"{col}\"")
+                    format!(
+                        "CASE WHEN ({augmented_where}) THEN ({expr}) ELSE {else_ref} END AS \"{col}\""
+                    )
+                } else if is_masked {
+                    format!("{else_ref} AS \"{col}\"")
                 } else {
                     format!("\"{col}\"")
                 }
@@ -3428,9 +3662,9 @@ impl WriteHandler {
         // sees `__update_holding_summary` and fails to resolve the correlation.
         //
         // Two join sources get appended to the outer FROM clause:
-        //   1. `extra_joins` from the decorrelator above — these provide the
+        //   1. `extra_joins` from the decorrelator above: these provide the
         //      `__corrN.__val` columns substituted into the SET expressions.
-        //   2. `in_subquery_joins` from `lift_in_subqueries` — these provide the
+        //   2. `in_subquery_joins` from `lift_in_subqueries`: these provide the
         //      `__sqN.__matched` flags referenced from the rewritten WHERE.
         // Decorrelator joins come first so any columns they introduce are in
         // scope for the IN-subquery join ON clauses (not currently exercised,
@@ -3440,8 +3674,15 @@ impl WriteHandler {
         } else {
             format!(" {}{}", extra_joins.join(" "), in_subquery_joins)
         };
+        let from_clause = build_policy_from_clause(
+            &format!("datafusion.public.{table_name}"),
+            orig_name,
+            &batch.schema(),
+            predicates,
+            true,
+        );
         let select_sql = format!(
-            "SELECT {cols} FROM datafusion.public.{table_name} AS \"{orig_name}\"{joins}",
+            "SELECT {cols} FROM {from_clause}{joins}",
             cols = columns.join(", "),
             joins = joins_sql,
         );
@@ -3467,6 +3708,10 @@ impl WriteHandler {
     ///
     /// `joins_sql` carries the `LEFT JOIN ...` clauses produced by
     /// [`Self::lift_in_subqueries`]; see `filter_batch_negate` for details.
+    /// `predicates` augments the count with the policy row filter and
+    /// column masks so the affected-row count matches what was actually
+    /// modified.
+    #[allow(clippy::too_many_arguments)]
     async fn count_matching_rows(
         &self,
         ctx: &DFSessionContext,
@@ -3474,6 +3719,7 @@ impl WriteHandler {
         where_sql: &str,
         joins_sql: &str,
         table_ident: &TableIdent,
+        predicates: &sqe_policy::write_predicates::WritePolicyPredicates,
     ) -> sqe_core::Result<usize> {
         let table_name = format!("__count_{}", table_ident.name());
         let orig_name = table_ident.name();
@@ -3486,13 +3732,22 @@ impl WriteHandler {
         )
         .map_err(|e| SqeError::Execution(format!("Register error: {e}")))?;
 
+        let augmented_where = augment_where_with_row_filter(where_sql, predicates);
+        let from_clause = build_policy_from_clause(
+            &format!("datafusion.public.{table_name}"),
+            orig_name,
+            &batch.schema(),
+            predicates,
+            false,
+        );
+
         // Alias the scratch table to the original target name (see apply_update
-        // for rationale) — allows `tablename.col` references in WHERE subqueries
+        // for rationale): allows `tablename.col` references in WHERE subqueries
         // to resolve correctly.
         let sql = format!(
             "SELECT COUNT(*) AS cnt \
-             FROM datafusion.public.{table_name} AS \"{orig_name}\"{joins_sql} \
-             WHERE {where_sql}"
+             FROM {from_clause}{joins_sql} \
+             WHERE {augmented_where}"
         );
         let df = ctx
             .sql(&sql)
@@ -5984,8 +6239,340 @@ s3_path_style = true
         );
 
         // Also verify the rewriter trait method can be called via the field
-        // — the `_` import keeps the trait in scope even if a future code
-        // change drops the explicit call site above.
+        // (the `_` import keeps the trait in scope even if a future code
+        // change drops the explicit call site above).
         let _ = sqe_policy::PassthroughEnforcer;
+    }
+
+    // -------------------------------------------------------------------------
+    // Policy enforcement on DELETE / UPDATE WHERE-evaluator paths (#36 finish).
+    // Issue #36 documented an integrity bypass on INSERT and CTAS source SELECTs
+    // that MR !195 closed. The DELETE and UPDATE handlers read parquet files
+    // directly and evaluate WHERE per batch, which the rewriter never saw.
+    // These tests drive the per-batch helpers with policy-derived predicates
+    // and assert the WHERE actually gets the policy row filter ANDed onto it
+    // and any mask substitution gets applied before evaluation.
+    // -------------------------------------------------------------------------
+
+    fn make_employee_batch() -> arrow_array::RecordBatch {
+        use arrow_array::{Int64Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema2};
+        let schema = Arc::new(ArrowSchema2::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("ssn", DataType::Utf8, true),
+            Field::new("region", DataType::Utf8, true),
+        ]));
+        arrow_array::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4])),
+                Arc::new(StringArray::from(vec![
+                    "111-11", "222-22", "333-33", "444-44",
+                ])),
+                Arc::new(StringArray::from(vec!["EU", "US", "EU", "US"])),
+            ],
+        )
+        .unwrap()
+    }
+
+    async fn employees_handler_with_policy(
+        row_filter: Option<datafusion::logical_expr::Expr>,
+        masks: Vec<(&str, sqe_policy::MaskType)>,
+    ) -> (WriteHandler, sqe_core::Session, TableIdent, DFSessionContext) {
+        use sqe_policy::plan_rewriter::PolicyPlanRewriter;
+        use sqe_policy::policy_store::InMemoryPolicyStore;
+        use sqe_policy::ResolvedPolicy;
+
+        let store = InMemoryPolicyStore::new();
+        let mut pol = ResolvedPolicy::default();
+        if let Some(rf) = row_filter {
+            pol.row_filters.push(rf);
+        }
+        for (col, mask) in masks {
+            pol.column_masks.insert(col.to_string(), mask);
+        }
+        store.add_table_policy("default", "employees", pol).await;
+        let enforcer: Arc<dyn sqe_policy::PolicyEnforcer> =
+            Arc::new(PolicyPlanRewriter::new(Arc::new(store)));
+
+        let handler = WriteHandler::new(write_test_config()).with_policy_enforcer(enforcer);
+        let session = sqe_core::Session::new(
+            "alice".to_string(),
+            "tok".to_string(),
+            None,
+            chrono::Utc::now(),
+            vec![],
+        );
+        let table_ident = TableIdent::new(
+            NamespaceIdent::new("default".to_string()),
+            "employees".to_string(),
+        );
+        let ctx = DFSessionContext::new();
+        (handler, session, table_ident, ctx)
+    }
+
+    async fn compute_predicates_for_employees(
+        handler: &WriteHandler,
+        session: &sqe_core::Session,
+        table_ident: &TableIdent,
+    ) -> sqe_policy::write_predicates::WritePolicyPredicates {
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema2};
+        let schema = Arc::new(ArrowSchema2::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("ssn", DataType::Utf8, true),
+            Field::new("region", DataType::Utf8, true),
+        ]));
+        handler
+            .compute_write_predicates(session, table_ident, schema)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_with_row_filter_keeps_rows_outside_user_view() {
+        use arrow_array::Array as _;
+        use datafusion::logical_expr::{col, lit};
+        let (handler, session, table_ident, ctx) = employees_handler_with_policy(
+            Some(col("region").eq(lit("EU"))),
+            vec![],
+        )
+        .await;
+        let predicates =
+            compute_predicates_for_employees(&handler, &session, &table_ident).await;
+        assert!(predicates.row_filter_sql.is_some(), "row filter expected");
+
+        // User says DELETE everything (WHERE TRUE). With the EU row filter the
+        // effective predicate is "TRUE AND region = 'EU'", so only EU rows
+        // (ids 1 and 3) get filtered out, leaving the US rows (ids 2 and 4).
+        let batch = make_employee_batch();
+        let survivors = handler
+            .filter_batch_negate(&ctx, &batch, "TRUE", "", &table_ident, &predicates)
+            .await
+            .unwrap();
+        assert_eq!(survivors.num_rows(), 2, "US rows must survive");
+        let regions = survivors
+            .column_by_name("region")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap()
+            .clone();
+        for i in 0..regions.len() {
+            assert_eq!(regions.value(i), "US", "EU rows must not survive");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_count_with_row_filter_matches_admitted_rows() {
+        use datafusion::logical_expr::{col, lit};
+        let (handler, session, table_ident, ctx) = employees_handler_with_policy(
+            Some(col("region").eq(lit("EU"))),
+            vec![],
+        )
+        .await;
+        let predicates =
+            compute_predicates_for_employees(&handler, &session, &table_ident).await;
+
+        // User says DELETE WHERE TRUE. Policy restricts to EU rows. Match
+        // count must be the EU rows (2), not every row (4).
+        let batch = make_employee_batch();
+        let mask = handler
+            .filter_batch_match(&ctx, &batch, "TRUE", "", &table_ident, &predicates)
+            .await
+            .unwrap();
+        let matched: u32 = (0..mask.len()).map(|i| mask.value(i) as u32).sum();
+        assert_eq!(matched, 2, "only EU rows should be marked for deletion");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_match_with_column_mask_uses_masked_value_in_where() {
+        use sqe_policy::MaskType;
+        let (handler, session, table_ident, ctx) = employees_handler_with_policy(
+            None,
+            vec![("ssn", MaskType::Redact("***".to_string()))],
+        )
+        .await;
+        let predicates =
+            compute_predicates_for_employees(&handler, &session, &table_ident).await;
+        assert!(predicates.column_mask_sqls.contains_key("ssn"));
+
+        // User asks to delete rows where ssn = '111-11'. The mask redacts
+        // ssn to '***', so the WHERE evaluator must see '***' for every row
+        // and match zero rows.
+        let batch = make_employee_batch();
+        let mask = handler
+            .filter_batch_match(
+                &ctx,
+                &batch,
+                "ssn = '111-11'",
+                "",
+                &table_ident,
+                &predicates,
+            )
+            .await
+            .unwrap();
+        let matched: u32 = (0..mask.len()).map(|i| mask.value(i) as u32).sum();
+        assert_eq!(matched, 0, "masked ssn must not match the raw value");
+
+        // The complementary check: WHERE ssn = '***' matches every row when
+        // the mask is in effect. Confirms the policy substitution actually
+        // runs in the evaluator.
+        let mask2 = handler
+            .filter_batch_match(
+                &ctx,
+                &batch,
+                "ssn = '***'",
+                "",
+                &table_ident,
+                &predicates,
+            )
+            .await
+            .unwrap();
+        let matched2: u32 = (0..mask2.len()).map(|i| mask2.value(i) as u32).sum();
+        assert_eq!(matched2, 4, "every row matches the redacted ssn");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_with_row_filter_only_modifies_admitted_rows() {
+        use arrow_array::Array as _;
+        use datafusion::logical_expr::{col, lit};
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+        let (handler, session, table_ident, ctx) = employees_handler_with_policy(
+            Some(col("region").eq(lit("EU"))),
+            vec![],
+        )
+        .await;
+        let predicates =
+            compute_predicates_for_employees(&handler, &session, &table_ident).await;
+
+        // UPDATE employees SET ssn = 'X' WHERE TRUE. Policy restricts to EU.
+        let sql = "UPDATE employees SET ssn = 'X'";
+        let stmt = Parser::parse_sql(&GenericDialect {}, sql)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let assignments = match stmt {
+            sqlparser::ast::Statement::Update { assignments, .. } => assignments,
+            _ => panic!("expected UPDATE"),
+        };
+        let batch = make_employee_batch();
+        let rewritten = handler
+            .apply_update(
+                &ctx,
+                &batch,
+                &assignments,
+                "TRUE",
+                "",
+                &table_ident,
+                &predicates,
+            )
+            .await
+            .unwrap();
+        // EU rows (ids 1 and 3) should have ssn = 'X'; US rows (ids 2 and 4)
+        // should keep their original ssn.
+        let ssn = rewritten
+            .column_by_name("ssn")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap()
+            .clone();
+        let region = rewritten
+            .column_by_name("region")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap()
+            .clone();
+        for i in 0..rewritten.num_rows() {
+            if region.value(i) == "EU" {
+                assert_eq!(ssn.value(i), "X", "EU row must be updated at index {i}");
+            } else {
+                assert_ne!(
+                    ssn.value(i),
+                    "X",
+                    "US row must keep its original ssn at index {i}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_with_column_mask_writes_raw_value_for_unchanged_rows() {
+        use arrow_array::Array as _;
+        use sqe_policy::MaskType;
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+        let (handler, session, table_ident, ctx) = employees_handler_with_policy(
+            None,
+            vec![("ssn", MaskType::Redact("***".to_string()))],
+        )
+        .await;
+        let predicates =
+            compute_predicates_for_employees(&handler, &session, &table_ident).await;
+
+        // UPDATE employees SET region = 'XX' WHERE id = 1. The ssn column is
+        // masked but is NOT being assigned. The CASE-ELSE branch must write
+        // the raw ssn back to disk for every row, not the masked '***'.
+        let sql = "UPDATE employees SET region = 'XX' WHERE id = 1";
+        let stmt = Parser::parse_sql(&GenericDialect {}, sql)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let (assignments, where_sql) = match stmt {
+            sqlparser::ast::Statement::Update {
+                assignments,
+                selection,
+                ..
+            } => (assignments, format!("{}", selection.unwrap())),
+            _ => panic!("expected UPDATE"),
+        };
+
+        let batch = make_employee_batch();
+        let rewritten = handler
+            .apply_update(
+                &ctx,
+                &batch,
+                &assignments,
+                &where_sql,
+                "",
+                &table_ident,
+                &predicates,
+            )
+            .await
+            .unwrap();
+        let ssn = rewritten
+            .column_by_name("ssn")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap()
+            .clone();
+        for i in 0..ssn.len() {
+            assert_ne!(
+                ssn.value(i),
+                "***",
+                "raw ssn must persist for unchanged column at index {i}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_count_with_row_filter_matches_admitted_rows() {
+        use datafusion::logical_expr::{col, lit};
+        let (handler, session, table_ident, ctx) = employees_handler_with_policy(
+            Some(col("region").eq(lit("EU"))),
+            vec![],
+        )
+        .await;
+        let predicates =
+            compute_predicates_for_employees(&handler, &session, &table_ident).await;
+        let batch = make_employee_batch();
+        let count = handler
+            .count_matching_rows(&ctx, &batch, "TRUE", "", &table_ident, &predicates)
+            .await
+            .unwrap();
+        assert_eq!(count, 2, "row filter must shrink the affected count");
     }
 }
