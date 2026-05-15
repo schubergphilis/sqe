@@ -1920,11 +1920,33 @@ impl QueryHandler {
             "Distributing scan across workers"
         );
 
-        // 6. Get projected columns from the scan
+        // 6. Get projected columns + Iceberg field IDs from the scan. Field
+        // IDs (#43) let the worker project by the parquet PARQUET:field_id
+        // metadata key, so RENAME COLUMN / ADD COLUMN against post-evolution
+        // schema still resolves to the right parquet column in pre-evolution
+        // files. Names stay as a fallback for old workers and files without
+        // field IDs.
         let projected_cols: Vec<String> = iceberg_scan
             .projection()
             .map(|cols| cols.to_vec())
             .unwrap_or_default();
+        let iceberg_schema = iceberg_scan.table().metadata().current_schema().clone();
+        let projected_field_ids: Vec<i32> = if projected_cols.is_empty() {
+            Vec::new()
+        } else {
+            projected_cols
+                .iter()
+                .filter_map(|name| {
+                    iceberg_schema
+                        .as_struct()
+                        .fields()
+                        .iter()
+                        .find(|f| f.name == *name)
+                        .map(|f| f.id)
+                })
+                .collect()
+        };
+        let field_ids_complete = projected_field_ids.len() == projected_cols.len();
 
         // 7. Split (path, size) pairs into size-balanced bins using bin-packing.
         // target_size_bytes: read from config or fall back to 256 MiB.
@@ -1949,6 +1971,11 @@ impl QueryHandler {
                     data_file_paths,
                     file_sizes_bytes,
                     projected_columns: projected_cols.clone(),
+                    projected_field_ids: if field_ids_complete {
+                        projected_field_ids.clone()
+                    } else {
+                        Vec::new()
+                    },
                     s3_endpoint: storage.s3_endpoint.clone(),
                     s3_region: storage.s3_region.clone(),
                     s3_access_key: storage.s3_access_key.clone(),
