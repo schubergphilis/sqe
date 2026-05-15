@@ -10,8 +10,8 @@ pub mod trino_compat;
 pub mod v3_types;
 
 pub use attach::{
-    AttachStatement, CatalogKind, CreateSecretStatement, DetachStatement, DropSecretStatement,
-    OptionValue, SecretKind,
+    build_secret_from_stmt, AttachStatement, CatalogKind, CreateSecretStatement, DetachStatement,
+    DropSecretStatement, OptionValue, SecretKind,
 };
 pub use catalog_qualifiers::extract_catalog_qualifiers;
 pub use classifier::{parse_and_classify, CheckAccessParams, ShowGrantsTarget, StatementKind};

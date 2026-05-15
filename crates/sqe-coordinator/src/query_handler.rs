@@ -3554,40 +3554,7 @@ impl QueryHandler {
         &self,
         stmt: &sqe_sql::CreateSecretStatement,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        use sqe_core::Secret;
-        use sqe_sql::SecretKind;
-
-        let opts = &stmt.options;
-        let get_str = |key: &str| -> Result<String, SqeError> {
-            opts.get(key)
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .ok_or_else(|| SqeError::Execution(format!(
-                    "CREATE SECRET: missing required option {key} for {:?} secret",
-                    stmt.kind.name()
-                )))
-        };
-        let get_opt = |key: &str| -> Option<String> {
-            opts.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
-        };
-
-        let secret = match stmt.kind {
-            SecretKind::Aws => Secret::Aws {
-                access_key: get_opt("ACCESS_KEY_ID"),
-                secret_key: get_opt("SECRET_ACCESS_KEY"),
-                session_token: get_opt("SESSION_TOKEN"),
-                region: get_opt("REGION"),
-                profile: get_opt("PROFILE"),
-            },
-            SecretKind::Bearer => Secret::Bearer {
-                token: get_str("TOKEN")?,
-            },
-            SecretKind::Basic => Secret::Basic {
-                username: get_str("USERNAME")?,
-                password: get_str("PASSWORD")?,
-            },
-        };
-
+        let secret = sqe_sql::build_secret_from_stmt(stmt)?;
         self.secrets.create(&stmt.name, secret)?;
         info!(name = %stmt.name, kind = %stmt.kind.name(), "CREATE SECRET complete");
         Ok(vec![])
