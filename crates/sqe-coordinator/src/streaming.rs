@@ -237,6 +237,8 @@ pub struct TrackedRecordBatchStream {
     /// providers (#44) to deregister the session-context alias once the
     /// query finishes, so subsequent SQL in the same session sees HEAD.
     _teardown: Option<Box<dyn std::any::Any + Send>>,
+    /// Per-user memory reservation released when the stream drops.
+    _per_user_reservation: Option<crate::memory::PerUserReservation>,
     cancel_token: Option<CancellationToken>,
     /// Set once the cancel token has fired so subsequent polls short-circuit
     /// without re-running the finalizer.
@@ -259,6 +261,7 @@ impl TrackedRecordBatchStream {
             rows_so_far: 0,
             _permits: permit.into_iter().collect(),
             _teardown: None,
+            _per_user_reservation: None,
             cancel_token: None,
             cancelled: false,
         }
@@ -281,6 +284,7 @@ impl TrackedRecordBatchStream {
             rows_so_far: 0,
             _permits: permit.into_iter().collect(),
             _teardown: None,
+            _per_user_reservation: None,
             cancel_token: Some(cancel_token),
             cancelled: false,
         }
@@ -302,6 +306,31 @@ impl TrackedRecordBatchStream {
             rows_so_far: 0,
             _permits: permits,
             _teardown: None,
+            _per_user_reservation: None,
+            cancel_token: Some(cancel_token),
+            cancelled: false,
+        }
+    }
+
+    /// Variant that also carries a per-user memory reservation. The
+    /// reservation is released when the stream drops, freeing the user's
+    /// share of the per-user memory budget.
+    pub fn with_permits_reservation_and_cancel_token(
+        inner: SendableRecordBatchStream,
+        finalizer: StreamFinalizer,
+        permits: Vec<OwnedSemaphorePermit>,
+        reservation: Option<crate::memory::PerUserReservation>,
+        cancel_token: CancellationToken,
+    ) -> Self {
+        let schema = inner.schema();
+        Self {
+            inner,
+            schema,
+            finalizer: Some(finalizer),
+            rows_so_far: 0,
+            _permits: permits,
+            _teardown: None,
+            _per_user_reservation: reservation,
             cancel_token: Some(cancel_token),
             cancelled: false,
         }

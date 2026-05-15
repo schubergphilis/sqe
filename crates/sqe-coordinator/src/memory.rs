@@ -97,6 +97,76 @@ pub fn limit_bytes(pool: &Arc<dyn MemoryPool>) -> usize {
     }
 }
 
+/// Per-user memory account: tracks bytes reserved by in-flight queries
+/// keyed by username and enforces a per-user budget on admission.
+///
+/// Reservations are recorded via [`PerUserMemoryRegistry::try_reserve`]; the
+/// returned [`PerUserReservation`] guard releases the bytes when it drops
+/// (the streaming result wrapper carries it for the stream's lifetime).
+/// Setting `budget_bytes = 0` disables the cap entirely.
+#[derive(Debug, Default)]
+pub struct PerUserMemoryRegistry {
+    used: dashmap::DashMap<String, usize>,
+}
+
+#[derive(Debug)]
+pub struct PerUserReservation {
+    registry: Arc<PerUserMemoryRegistry>,
+    user: String,
+    bytes: usize,
+}
+
+impl PerUserMemoryRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Bytes currently reserved by the given user (0 if unknown).
+    pub fn used_bytes(&self, user: &str) -> usize {
+        self.used.get(user).map(|v| *v).unwrap_or(0)
+    }
+
+    /// Attempt to record a new reservation of `bytes` for `user`. Returns
+    /// `None` if the user is already at or above `budget_bytes`; the caller
+    /// should reject the query with a per-user pressure error in that case.
+    /// `budget_bytes == 0` disables the cap and always returns `Some`.
+    pub fn try_reserve(
+        self: &Arc<Self>,
+        user: &str,
+        bytes: usize,
+        budget_bytes: usize,
+    ) -> Option<PerUserReservation> {
+        if budget_bytes == 0 {
+            return Some(PerUserReservation {
+                registry: self.clone(),
+                user: user.to_string(),
+                bytes: 0,
+            });
+        }
+        let mut entry = self.used.entry(user.to_string()).or_insert(0);
+        if *entry + bytes > budget_bytes {
+            return None;
+        }
+        *entry += bytes;
+        Some(PerUserReservation {
+            registry: self.clone(),
+            user: user.to_string(),
+            bytes,
+        })
+    }
+}
+
+impl Drop for PerUserReservation {
+    fn drop(&mut self) {
+        if self.bytes == 0 {
+            return;
+        }
+        if let Some(mut entry) = self.registry.used.get_mut(&self.user) {
+            *entry = entry.saturating_sub(self.bytes);
+        }
+    }
+}
+
 /// Spawn a background task that updates memory metrics every second.
 ///
 /// This ensures Prometheus/Grafana always sees current memory usage,
@@ -244,5 +314,54 @@ mod tests {
         let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(1024 * 1024));
         assert_eq!(used_bytes(&pool), 0);
         assert_eq!(limit_bytes(&pool), 1024 * 1024);
+    }
+
+    #[test]
+    fn per_user_memory_admits_when_under_budget() {
+        let reg = Arc::new(PerUserMemoryRegistry::new());
+        let r1 = reg.try_reserve("alice", 100, 500);
+        assert!(r1.is_some());
+        assert_eq!(reg.used_bytes("alice"), 100);
+        let r2 = reg.try_reserve("alice", 200, 500);
+        assert!(r2.is_some());
+        assert_eq!(reg.used_bytes("alice"), 300);
+    }
+
+    #[test]
+    fn per_user_memory_rejects_when_budget_exceeded() {
+        let reg = Arc::new(PerUserMemoryRegistry::new());
+        let _r1 = reg.try_reserve("alice", 400, 500).unwrap();
+        let r2 = reg.try_reserve("alice", 200, 500);
+        assert!(r2.is_none(), "second reservation should exceed budget");
+        assert_eq!(reg.used_bytes("alice"), 400);
+    }
+
+    #[test]
+    fn per_user_memory_releases_on_drop() {
+        let reg = Arc::new(PerUserMemoryRegistry::new());
+        {
+            let _r = reg.try_reserve("alice", 400, 500).unwrap();
+            assert_eq!(reg.used_bytes("alice"), 400);
+        }
+        assert_eq!(reg.used_bytes("alice"), 0);
+    }
+
+    #[test]
+    fn per_user_memory_is_independent_per_user() {
+        let reg = Arc::new(PerUserMemoryRegistry::new());
+        let _a = reg.try_reserve("alice", 400, 500).unwrap();
+        let b = reg.try_reserve("bob", 400, 500);
+        assert!(b.is_some(), "bob's budget is independent from alice");
+        assert_eq!(reg.used_bytes("alice"), 400);
+        assert_eq!(reg.used_bytes("bob"), 400);
+    }
+
+    #[test]
+    fn per_user_memory_zero_budget_disables_cap() {
+        let reg = Arc::new(PerUserMemoryRegistry::new());
+        let r = reg.try_reserve("alice", usize::MAX / 2, 0);
+        assert!(r.is_some(), "budget = 0 should accept any reservation");
+        // Zero-byte tracking entry: used_bytes stays 0 because we never updated.
+        assert_eq!(reg.used_bytes("alice"), 0);
     }
 }
