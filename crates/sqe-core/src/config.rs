@@ -297,6 +297,12 @@ pub struct CoordinatorConfig {
     /// Supported values: `"zstd"` (default), `"lz4"`, `"none"`.
     #[serde(default = "default_shuffle_compression")]
     pub shuffle_compression: String,
+    /// Maximum number of workers the registry will track. Heartbeats from
+    /// previously-unknown URLs are rejected once this cap is reached. Bounds
+    /// the memory footprint of the registry when workers cycle through pod
+    /// IPs in Kubernetes or report unstable URLs.
+    #[serde(default = "default_max_workers")]
+    pub max_workers: usize,
 }
 
 impl std::fmt::Debug for CoordinatorConfig {
@@ -319,6 +325,7 @@ impl std::fmt::Debug for CoordinatorConfig {
             .field("spill_compression", &self.spill_compression)
             .field("flight_compression", &self.flight_compression)
             .field("shuffle_compression", &self.shuffle_compression)
+            .field("max_workers", &self.max_workers)
             .finish()
     }
 }
@@ -1607,6 +1614,7 @@ fn default_coordinator_spill_dir() -> String { "/tmp/sqe-coordinator-spill".to_s
 fn default_spill_compression() -> String { "lz4".to_string() }
 fn default_flight_compression() -> String { "lz4".to_string() }
 fn default_shuffle_compression() -> String { "zstd".to_string() }
+fn default_max_workers() -> usize { 1024 }
 
 fn default_flight_port() -> u16 { 50051 }
 fn default_trino_port() -> u16 { 8080 }
@@ -2221,6 +2229,7 @@ mod tests {
                 spill_compression: default_spill_compression(),
                 flight_compression: default_flight_compression(),
                 shuffle_compression: default_shuffle_compression(),
+                max_workers: default_max_workers(),
             },
             worker: WorkerConfig::default(),
             auth: AuthConfig {
