@@ -79,29 +79,17 @@ pub fn build_coordinator_runtime(config: &CoordinatorConfig) -> anyhow::Result<A
 mod tests {
     use super::*;
     use datafusion::execution::memory_pool::MemoryLimit;
-    use sqe_core::config::TlsConfig;
 
     /// Helper: create a CoordinatorConfig with spill disabled.
     fn config_no_spill(memory_limit: &str) -> CoordinatorConfig {
-        CoordinatorConfig {
-            flight_sql_port: 50051,
-            trino_http_port: 8080,
-            mode: "hybrid".to_string(),
-            worker_urls: vec![],
-            debug: false,
-            tls: TlsConfig::default(),
-            worker_secret: sqe_core::SecretString::default(),
-            allow_unauthenticated_workers: false,
-            memory_limit: memory_limit.to_string(),
-            spill_to_disk: false,
-            spill_dir: "/tmp/sqe-test-coordinator-spill".to_string(),
-            spill_compression: "lz4".to_string(),
-            flight_compression: "lz4".to_string(),
-            shuffle_compression: "zstd".to_string(),
-            max_workers: 1024,
-            worker_connect_timeout_secs: 5,
-            worker_rpc_timeout_secs: 630,
-        }
+        let toml_src = format!(
+            r#"
+            memory_limit = "{memory_limit}"
+            spill_to_disk = false
+            spill_dir = "/tmp/sqe-test-coordinator-spill"
+            "#
+        );
+        toml::from_str(&toml_src).expect("valid CoordinatorConfig toml")
     }
 
     #[test]
