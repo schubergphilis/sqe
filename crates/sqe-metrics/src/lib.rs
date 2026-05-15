@@ -4,8 +4,8 @@ pub mod otel;
 pub mod propagation;
 
 use prometheus::{
-    Counter, CounterVec, Gauge, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec,
-    IntGauge, Opts, Registry,
+    Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter,
+    IntCounterVec, IntGauge, Opts, Registry,
 };
 
 /// Trait for types that expose a Prometheus [`Registry`] for metrics serving.
@@ -82,6 +82,16 @@ pub struct MetricsRegistry {
 
     // Adaptive sort metrics
     pub sorts_stripped_total: IntCounterVec,
+
+    // Catalog (Polaris) roundtrip + circuit breaker state
+    pub catalog_request_duration_seconds: HistogramVec,
+    pub catalog_circuit_breaker_state: GaugeVec,
+
+    // Policy backend (OPA / Cedar) roundtrip + cache
+    pub policy_resolve_duration_seconds: HistogramVec,
+    pub policy_cache_hits_total: IntCounterVec,
+    pub policy_cache_misses_total: IntCounterVec,
+    pub policy_circuit_breaker_state: GaugeVec,
 }
 
 impl MetricsRegistry {
@@ -395,6 +405,84 @@ impl MetricsRegistry {
         .unwrap();
         registry.register(Box::new(sorts_stripped_total.clone())).unwrap();
 
+        let catalog_request_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "sqe_catalog_request_duration_seconds",
+                "Catalog (Polaris REST) roundtrip latency in seconds",
+            )
+            .buckets(vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            ]),
+            &["op", "status"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(catalog_request_duration_seconds.clone()))
+            .unwrap();
+
+        let catalog_circuit_breaker_state = GaugeVec::new(
+            Opts::new(
+                "sqe_catalog_circuit_breaker_state",
+                "Catalog circuit breaker state (0=closed, 1=half_open, 2=open)",
+            ),
+            &["circuit"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(catalog_circuit_breaker_state.clone()))
+            .unwrap();
+
+        let policy_resolve_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "sqe_policy_resolve_duration_seconds",
+                "Policy backend (OPA / Cedar) resolve latency in seconds",
+            )
+            .buckets(vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+            ]),
+            &["backend", "status"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(policy_resolve_duration_seconds.clone()))
+            .unwrap();
+
+        let policy_cache_hits_total = IntCounterVec::new(
+            Opts::new(
+                "sqe_policy_cache_hits_total",
+                "Policy backend cache hits by backend",
+            ),
+            &["backend"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(policy_cache_hits_total.clone()))
+            .unwrap();
+
+        let policy_cache_misses_total = IntCounterVec::new(
+            Opts::new(
+                "sqe_policy_cache_misses_total",
+                "Policy backend cache misses by backend",
+            ),
+            &["backend"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(policy_cache_misses_total.clone()))
+            .unwrap();
+
+        let policy_circuit_breaker_state = GaugeVec::new(
+            Opts::new(
+                "sqe_policy_circuit_breaker_state",
+                "Policy backend circuit breaker state (0=closed, 1=half_open, 2=open)",
+            ),
+            &["backend"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(policy_circuit_breaker_state.clone()))
+            .unwrap();
+
         Self {
             registry,
             query_count,
@@ -439,6 +527,12 @@ impl MetricsRegistry {
             auth_duration_seconds,
             token_refresh_total,
             sorts_stripped_total,
+            catalog_request_duration_seconds,
+            catalog_circuit_breaker_state,
+            policy_resolve_duration_seconds,
+            policy_cache_hits_total,
+            policy_cache_misses_total,
+            policy_circuit_breaker_state,
         }
     }
 }
