@@ -24,6 +24,43 @@ fn lookup() -> extract::CatalogLookup {
     Arc::new(|n: &str| format!("sqe://{n}"))
 }
 
+/// Poll the wiremock collector until it has received `expected` requests, or
+/// the deadline expires. Generous outer deadline keeps CI green under load;
+/// tight inner sleep keeps the happy path fast.
+async fn wait_for_requests(server: &MockServer, expected: usize) -> Vec<wiremock::Request> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let got = server.received_requests().await.unwrap_or_default();
+        if got.len() >= expected {
+            return got;
+        }
+        if std::time::Instant::now() > deadline {
+            return got;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Wait until the size of every file in `dir` totals `expected_total_bytes`,
+/// or the deadline expires. Used for the spool drain check.
+async fn wait_for_total_bytes(dir: &std::path::Path, expected: u64) -> u64 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let total: u64 = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| std::fs::metadata(e.path()).ok().map(|m| m.len()))
+            .sum();
+        if total == expected {
+            return total;
+        }
+        if std::time::Instant::now() > deadline {
+            return total;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 fn cfg() -> Arc<EmitterConfig> {
     Arc::new(EmitterConfig {
         job_namespace: "sqe-test".into(),
@@ -62,10 +99,7 @@ async fn end_to_end_pipeline_emits_start_and_complete() {
     obs.on_query_start(QueryStartCtx::dummy());
     obs.on_query_complete(QueryCompleteCtx::dummy());
 
-    // Wait for emitter to drain channel and post both events.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let received = collector.received_requests().await.unwrap();
+    let received = wait_for_requests(&collector, 2).await;
     assert_eq!(received.len(), 2, "expected START + COMPLETE");
 
     let start: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
@@ -105,9 +139,7 @@ async fn fail_event_carries_error_message_facet() {
 
     obs.on_query_fail(QueryFailCtx::dummy());
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let received = collector.received_requests().await.unwrap();
+    let received = wait_for_requests(&collector, 1).await;
     assert_eq!(received.len(), 1);
 
     let ev: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
@@ -126,7 +158,7 @@ async fn fail_event_carries_error_message_facet() {
 async fn emitter_with_no_sinks_drops_events_silently() {
     let multi = Arc::new(MultiSink::new(vec![]));
     let (tx, rx) = tokio::sync::mpsc::channel(8);
-    let _emitter = spawn_emitter(rx, multi, cfg());
+    let emitter = spawn_emitter(rx, multi, cfg());
 
     let counter = prometheus::IntCounter::new("emit_pipeline_test_3", "test").unwrap();
     let obs = ChannelObserver::new(tx, counter);
@@ -135,10 +167,14 @@ async fn emitter_with_no_sinks_drops_events_silently() {
     obs.on_query_complete(QueryCompleteCtx::dummy());
     obs.on_query_fail(QueryFailCtx::dummy());
 
-    // No assertion. We are verifying the emitter does not panic when the
-    // sink fan-out is empty. If the task crashed, subsequent sends would
-    // back up the channel and we would catch it via timing in CI.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Drop the observer so the emitter loop sees the channel close and exits
+    // cleanly. If the emitter panicked on any of the three events, awaiting
+    // the JoinHandle below would surface the panic instead of timing out.
+    drop(obs);
+    tokio::time::timeout(Duration::from_secs(10), emitter)
+        .await
+        .expect("emitter must finish promptly after channel closes")
+        .expect("emitter task must not panic");
 }
 
 /// I3: HTTP collector returns 500 -> spool buffers -> collector recovers ->
@@ -188,14 +224,8 @@ async fn spool_buffers_on_500_then_drains_on_recovery() {
 
     obs.on_query_start(QueryStartCtx::dummy());
 
-    // Wait for: emit -> 500 -> spool, then replay tick -> 200 -> drain.
-    tokio::time::sleep(Duration::from_millis(600)).await;
-
-    let total: u64 = std::fs::read_dir(dir.path())
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter_map(|e| std::fs::metadata(e.path()).ok().map(|m| m.len()))
-        .sum();
+    // Path: emit -> 500 -> spool, then replay tick -> 200 -> drain.
+    let total = wait_for_total_bytes(dir.path(), 0).await;
     assert_eq!(total, 0, "spool drained after collector recovery");
 }
 
@@ -236,9 +266,7 @@ async fn events_in_same_session_share_parent_run_id() {
     ctx_b.session_id = session_uuid.clone();
     obs.on_query_complete(ctx_b);
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let received = collector.received_requests().await.unwrap();
+    let received = wait_for_requests(&collector, 2).await;
     assert_eq!(received.len(), 2);
 
     let a: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
