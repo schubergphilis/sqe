@@ -1,12 +1,21 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use tracing::{debug, info, warn};
 
 use sqe_auth::{AuthProvider, FlightCredentials, Identity};
 use sqe_auth::Authenticator;
 use sqe_core::Session;
+
+fn now_micros() -> i64 {
+    Utc::now().timestamp_micros()
+}
+
+fn micros_to_datetime(micros: i64) -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp_micros(micros).unwrap_or_else(Utc::now)
+}
 
 /// Manages authenticated sessions for the coordinator.
 ///
@@ -28,6 +37,10 @@ pub struct SessionManager {
     /// Will be `None` when constructed via `with_provider`.
     legacy_authenticator: Option<Arc<Authenticator>>,
     sessions: DashMap<String, Arc<Session>>,
+    /// Per-session last activity timestamp (micros since epoch) kept outside
+    /// the Session Arc so touching it on every Flight RPC is a single atomic
+    /// store instead of a deep clone of the Session.
+    last_activity: DashMap<String, Arc<AtomicI64>>,
     /// Optional Prometheus metrics for tracking token refreshes.
     metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
 }
@@ -42,6 +55,7 @@ impl SessionManager {
             auth_provider: authenticator.clone() as Arc<dyn AuthProvider>,
             legacy_authenticator: Some(authenticator),
             sessions: DashMap::new(),
+            last_activity: DashMap::new(),
             metrics: None,
         }
     }
@@ -56,6 +70,7 @@ impl SessionManager {
             auth_provider: provider,
             legacy_authenticator: None,
             sessions: DashMap::new(),
+            last_activity: DashMap::new(),
             metrics: None,
         }
     }
@@ -85,6 +100,7 @@ impl SessionManager {
             auth_provider: provider,
             legacy_authenticator: Some(legacy_authenticator),
             sessions: DashMap::new(),
+            last_activity: DashMap::new(),
             metrics: None,
         }
     }
@@ -113,6 +129,8 @@ impl SessionManager {
         let session_id = session.id.clone();
         let session = Arc::new(session);
         self.sessions.insert(session_id.clone(), session.clone());
+        self.last_activity
+            .insert(session_id.clone(), Arc::new(AtomicI64::new(now_micros())));
 
         info!(user_id = %identity.user_id, "Session created");
         debug!(session_id = %session_id, user_id = %identity.user_id, "Session details");
@@ -169,7 +187,6 @@ impl SessionManager {
     pub fn get_session(&self, session_id: &str) -> Option<Arc<Session>> {
         let session = self.sessions.get(session_id)?.clone();
 
-        // Check if the legacy background task refreshed this token
         if let Some(ref authenticator) = self.legacy_authenticator {
             if let Some(cached) = authenticator.get_cached_token(session_id) {
                 if cached.access_token != session.access_token().expose() {
@@ -179,37 +196,45 @@ impl SessionManager {
                         cached.refresh_token.map(sqe_core::SecretString::new),
                         cached.expiry,
                     ));
-                    updated.touch();
                     let updated = Arc::new(updated);
                     self.sessions.insert(session_id.to_string(), updated.clone());
+                    self.record_activity(session_id);
                     debug!(session_id = %session_id, "Session updated with refreshed token");
                     if let Some(ref metrics) = self.metrics {
                         metrics.token_refresh_total.with_label_values(&["success"]).inc();
                     }
                     return Some(updated);
                 }
-                // Token unchanged — just touch the session for idle tracking
-                let mut touched = (*session).clone();
-                touched.touch();
-                let touched = Arc::new(touched);
-                self.sessions.insert(session_id.to_string(), touched.clone());
-                return Some(touched);
+                self.record_activity(session_id);
+                return Some(session);
             }
         }
 
-        // Token is no longer in cache (or no legacy authenticator) — check if expired
         if session.token_expiry() <= Utc::now() {
             warn!(session_id = %session_id, "Session token expired, evicting");
             self.sessions.remove(session_id);
+            self.last_activity.remove(session_id);
             return None;
         }
 
-        // Touch the session for idle tracking
-        let mut touched = (*session).clone();
-        touched.touch();
-        let touched = Arc::new(touched);
-        self.sessions.insert(session_id.to_string(), touched.clone());
-        Some(touched)
+        self.record_activity(session_id);
+        Some(session)
+    }
+
+    fn record_activity(&self, session_id: &str) {
+        if let Some(entry) = self.last_activity.get(session_id) {
+            entry.store(now_micros(), Ordering::Relaxed);
+        } else {
+            self.last_activity
+                .insert(session_id.to_string(), Arc::new(AtomicI64::new(now_micros())));
+        }
+    }
+
+    fn last_activity_at(&self, session_id: &str, fallback: DateTime<Utc>) -> DateTime<Utc> {
+        self.last_activity
+            .get(session_id)
+            .map(|entry| micros_to_datetime(entry.load(Ordering::Relaxed)))
+            .unwrap_or(fallback)
     }
 
     /// Update the session's `write_branch` so subsequent writes route to the
@@ -223,9 +248,9 @@ impl SessionManager {
         };
         let mut updated = (*session.value().clone()).clone();
         updated.set_write_branch(branch);
-        updated.touch();
         self.sessions
             .insert(session_id.to_string(), Arc::new(updated));
+        self.record_activity(session_id);
         true
     }
 
@@ -288,6 +313,7 @@ impl SessionManager {
     /// Remove a session from the manager.
     pub fn remove_session(&self, id: &str) {
         if self.sessions.remove(id).is_some() {
+            self.last_activity.remove(id);
             debug!(session_id = %id, "Session removed");
         }
     }
@@ -303,20 +329,23 @@ impl SessionManager {
         absolute_timeout_secs: u64,
     ) -> usize {
         let mut removed = 0;
-        // Collect IDs to remove (avoid holding DashMap shard locks during removal).
+        let idle_timeout = chrono::Duration::seconds(idle_timeout_secs as i64);
+        let now = Utc::now();
         let expired_ids: Vec<String> = self
             .sessions
             .iter()
             .filter(|entry| {
                 let session = entry.value();
-                session.is_idle(idle_timeout_secs)
-                    || session.is_absolute_expired(absolute_timeout_secs)
+                let last = self.last_activity_at(entry.key(), session.last_activity);
+                let idle = now - last > idle_timeout;
+                idle || session.is_absolute_expired(absolute_timeout_secs)
             })
             .map(|entry| entry.key().clone())
             .collect();
 
         for id in expired_ids {
             if let Some((_, session)) = self.sessions.remove(&id) {
+                self.last_activity.remove(&id);
                 let reason = if session.is_absolute_expired(absolute_timeout_secs) {
                     "absolute timeout"
                 } else {

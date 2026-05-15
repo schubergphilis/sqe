@@ -9,7 +9,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
-use dashmap::DashMap;
+use moka::sync::Cache as MokaCache;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -26,6 +26,22 @@ const DEFAULT_PAGE_SIZE: usize = 1000;
 /// Results older than this are evicted (5 minutes).
 const RESULT_TTL_SECS: u64 = 300;
 
+/// Upper bound on the bytes of cached Trino result JSON pages we keep
+/// resident at any one time. Bounding the cache by estimated payload
+/// size (not entry count) means a handful of large results cannot pin
+/// gigabytes outside DataFusion's memory pool.
+const RESULT_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+fn build_result_cache() -> MokaCache<String, Arc<PaginatedResult>> {
+    MokaCache::builder()
+        .max_capacity(RESULT_CACHE_MAX_BYTES)
+        .weigher(|_key: &String, value: &Arc<PaginatedResult>| {
+            value.estimated_bytes.max(1)
+        })
+        .time_to_live(std::time::Duration::from_secs(RESULT_TTL_SECS))
+        .build()
+}
+
 /// Shared context for Trino /v1/info endpoints.
 pub struct NodeContext {
     pub version: String,
@@ -36,7 +52,7 @@ pub struct NodeContext {
 pub struct TrinoState<A, Q> {
     pub authenticator: Arc<A>,
     pub query_handler: Arc<Q>,
-    pub results: DashMap<String, PaginatedResult>,
+    pub results: MokaCache<String, Arc<PaginatedResult>>,
     pub node: NodeContext,
     /// Number of rows per page. Configurable for testing; defaults to [`DEFAULT_PAGE_SIZE`].
     pub page_size: usize,
@@ -83,6 +99,40 @@ pub struct PaginatedResult {
     /// Affected rows for write statements; mirrored on every page so dbt-trino
     /// can populate `rows_affected` from any response.
     pub update_count: Option<i64>,
+    /// Pre-computed cache weight in bytes so the result-cache weigher
+    /// does not have to walk the JSON tree on every insert.
+    pub estimated_bytes: u32,
+}
+
+fn estimate_paginated_bytes(pages: &[Vec<Vec<serde_json::Value>>], columns: &[TrinoColumn]) -> u32 {
+    let mut total: usize = std::mem::size_of::<PaginatedResult>();
+    for col in columns {
+        total = total.saturating_add(col.name.len() + col.type_signature.raw_type.len() + 32);
+    }
+    for page in pages {
+        for row in page {
+            for value in row {
+                total = total.saturating_add(estimate_json_bytes(value));
+            }
+        }
+    }
+    total.try_into().unwrap_or(u32::MAX)
+}
+
+fn estimate_json_bytes(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Null => 4,
+        serde_json::Value::Bool(_) => 5,
+        serde_json::Value::Number(_) => 16,
+        serde_json::Value::String(s) => s.len() + 16,
+        serde_json::Value::Array(items) => items.iter().map(estimate_json_bytes).sum::<usize>() + 16,
+        serde_json::Value::Object(map) => {
+            map.iter()
+                .map(|(k, v)| k.len() + estimate_json_bytes(v) + 8)
+                .sum::<usize>()
+                + 16
+        }
+    }
 }
 
 /// Trino client headers extracted from the request.
@@ -180,7 +230,7 @@ where
     let state = Arc::new(TrinoState {
         authenticator,
         query_handler,
-        results: DashMap::new(),
+        results: build_result_cache(),
         node,
         page_size: DEFAULT_PAGE_SIZE,
         port,
@@ -188,26 +238,6 @@ where
         security: options.security,
         auth_rate_limiter: options.auth_rate_limiter,
         expose_version: options.expose_version,
-    });
-
-    let state_sweep = state.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-        loop {
-            interval.tick().await;
-            let expired: Vec<String> = state_sweep
-                .results
-                .iter()
-                .filter(|entry| entry.value().created_at.elapsed().as_secs() > RESULT_TTL_SECS)
-                .map(|entry| entry.key().clone())
-                .collect();
-            for id in &expired {
-                state_sweep.results.remove(id);
-            }
-            if !expired.is_empty() {
-                tracing::debug!(count = expired.len(), "Evicted stale Trino result sets");
-            }
-        }
     });
 
     tokio::spawn(async move {
@@ -720,6 +750,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             let (columns, data) = protocol::batches_to_trino(&batches);
             let pages = paginate_rows(data, state.page_size);
             let total_pages = pages.len();
+            let estimated_bytes = estimate_paginated_bytes(&pages, &columns);
 
             let paginated = PaginatedResult {
                 columns,
@@ -730,13 +761,12 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 owner_username: session.user.username.clone(),
                 update_type,
                 update_count,
+                estimated_bytes,
             };
 
-            // Build the first page response (token = 0).
             let response = build_page_response(&base_url, &query_id, &paginated, 0);
 
-            // Store for subsequent GET requests (if there are more pages).
-            state.results.insert(query_id, paginated);
+            state.results.insert(query_id, Arc::new(paginated));
 
             let mut resp = (StatusCode::OK, Json(response)).into_response();
             if let Some(ref update) = session_update {
@@ -835,15 +865,13 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 return (StatusCode::NOT_FOUND, Json(response)).into_response();
             }
 
-            let response = build_page_response(&base_url, &id, &paginated, page_token);
+            let response = build_page_response(&base_url, &id, paginated.as_ref(), page_token);
             let is_last = page_token + 1 >= paginated.total_pages;
 
-            // Drop the borrow before mutating.
             drop(paginated);
 
-            // Clean up after the last page has been served.
             if is_last {
-                state.results.remove(&id);
+                state.results.invalidate(&id);
             }
 
             (StatusCode::OK, Json(response)).into_response()
@@ -903,7 +931,7 @@ async fn cancel_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         }
     }
 
-    state.results.remove(&id);
+    state.results.invalidate(&id);
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -954,7 +982,7 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
-            results: DashMap::new(),
+            results: build_result_cache(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: ready.clone(),
@@ -983,7 +1011,7 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
-            results: DashMap::new(),
+            results: build_result_cache(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready,
@@ -1007,7 +1035,7 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
-            results: DashMap::new(),
+            results: build_result_cache(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready,
@@ -1031,7 +1059,7 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
-            results: DashMap::new(),
+            results: build_result_cache(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready,
@@ -1254,6 +1282,7 @@ mod tests {
             total_rows: 0,
             update_type: None,
             update_count: None,
+            estimated_bytes: 0,
         };
 
         let resp = build_page_response("http://localhost:8080", "q-abc", &paginated, 0);
@@ -1288,6 +1317,7 @@ mod tests {
             total_rows: 0,
             update_type: None,
             update_count: None,
+            estimated_bytes: 0,
         };
 
         let resp = build_page_response("http://localhost:8080", "q-abc", &paginated, 1);
@@ -1307,6 +1337,7 @@ mod tests {
             total_rows: 0,
             update_type: None,
             update_count: None,
+            estimated_bytes: 0,
         };
 
         let resp = build_page_response("http://localhost:8080", "q-single", &paginated, 0);
@@ -1409,10 +1440,10 @@ mod tests {
 
     #[test]
     fn test_paginated_result_cleanup_after_last_page() {
-        let results: DashMap<String, PaginatedResult> = DashMap::new();
+        let results: MokaCache<String, Arc<PaginatedResult>> = build_result_cache();
         results.insert(
             "q-test".to_string(),
-            PaginatedResult {
+            Arc::new(PaginatedResult {
                 columns: vec![],
                 pages: vec![vec![], vec![]],
                 total_pages: 2,
@@ -1421,14 +1452,13 @@ mod tests {
                 total_rows: 0,
                 update_type: None,
                 update_count: None,
-            },
+                estimated_bytes: 0,
+            }),
         );
 
-        // Simulate fetching page 0 (not last) -- should NOT remove
         assert!(results.get("q-test").is_some());
 
-        // Simulate fetching page 1 (last) -- should remove
-        results.remove("q-test");
+        results.invalidate("q-test");
         assert!(results.get("q-test").is_none());
     }
 
@@ -1437,7 +1467,7 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuthOk, MockQuery> {
             authenticator: Arc::new(MockAuthOk),
             query_handler: Arc::new(MockQuery),
-            results: DashMap::new(),
+            results: build_result_cache(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -1468,7 +1498,7 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
-            results: DashMap::new(),
+            results: build_result_cache(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -1482,10 +1512,9 @@ mod tests {
             expose_version: true,
         });
 
-        // Insert a result with 1 page
         state.results.insert(
             "q-456".to_string(),
-            PaginatedResult {
+            Arc::new(PaginatedResult {
                 columns: vec![],
                 pages: vec![vec![]],
                 total_pages: 1,
@@ -1494,7 +1523,8 @@ mod tests {
                 total_rows: 0,
                 update_type: None,
                 update_count: None,
-            },
+                estimated_bytes: 0,
+            }),
         );
 
         let response = get_results::<MockAuth, MockQuery>(
@@ -1515,7 +1545,7 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuthOk, MockQuery> {
             authenticator: Arc::new(MockAuthOk),
             query_handler: Arc::new(MockQuery),
-            results: DashMap::new(),
+            results: build_result_cache(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -1531,7 +1561,7 @@ mod tests {
 
         state.results.insert(
             "q-paged".to_string(),
-            PaginatedResult {
+            Arc::new(PaginatedResult {
                 columns: vec![TrinoColumn {
                     name: "val".to_string(),
                     r#type: "bigint".to_string(),
@@ -1548,7 +1578,8 @@ mod tests {
                 total_rows: 0,
                 update_type: None,
                 update_count: None,
-            },
+                estimated_bytes: 0,
+            }),
         );
 
         // Fetch page 1 (middle); authenticate as the result owner.
@@ -1586,7 +1617,7 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuthOk, MockQuery> {
             authenticator: Arc::new(MockAuthOk),
             query_handler: Arc::new(MockQuery),
-            results: DashMap::new(),
+            results: build_result_cache(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -1602,7 +1633,7 @@ mod tests {
 
         state.results.insert(
             "q-cleanup".to_string(),
-            PaginatedResult {
+            Arc::new(PaginatedResult {
                 columns: vec![],
                 pages: vec![
                     vec![vec![serde_json::json!(1)]],
@@ -1614,7 +1645,8 @@ mod tests {
                 total_rows: 0,
                 update_type: None,
                 update_count: None,
-            },
+                estimated_bytes: 0,
+            }),
         );
 
         // Fetch the last page (token = 1); authenticate as owner.
@@ -1637,7 +1669,7 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuthOk, MockQuery> {
             authenticator: Arc::new(MockAuthOk),
             query_handler: Arc::new(MockQuery),
-            results: DashMap::new(),
+            results: build_result_cache(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -1652,13 +1684,17 @@ mod tests {
         });
         state.results.insert(
             "q-secret".to_string(),
-            PaginatedResult {
+            Arc::new(PaginatedResult {
                 columns: vec![],
                 pages: vec![vec![]],
                 total_pages: 1,
                 created_at: Instant::now(),
                 owner_username: "alice".to_string(),
-            },
+                total_rows: 0,
+                update_type: None,
+                update_count: None,
+                estimated_bytes: 0,
+            }),
         );
         let response = get_results::<MockAuthOk, MockQuery>(
             State(state),
@@ -1675,7 +1711,7 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
-            results: DashMap::new(),
+            results: build_result_cache(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -1691,7 +1727,7 @@ mod tests {
 
         state.results.insert(
             "q-cancel".to_string(),
-            PaginatedResult {
+            Arc::new(PaginatedResult {
                 columns: vec![],
                 pages: vec![vec![], vec![]],
                 total_pages: 2,
@@ -1700,7 +1736,8 @@ mod tests {
                 total_rows: 0,
                 update_type: None,
                 update_count: None,
-            },
+                estimated_bytes: 0,
+            }),
         );
 
         // Build Basic auth header for "test-user:pass"
@@ -1756,7 +1793,7 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
-            results: DashMap::new(),
+            results: build_result_cache(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -1802,7 +1839,7 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
-            results: DashMap::new(),
+            results: build_result_cache(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -1846,7 +1883,7 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
-            results: DashMap::new(),
+            results: build_result_cache(),
             node: NodeContext {
                 version: "1.2.3-4567".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -1877,7 +1914,7 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
-            results: DashMap::new(),
+            results: build_result_cache(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),

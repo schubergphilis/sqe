@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use moka::sync::Cache;
@@ -82,7 +82,13 @@ pub struct QueryRecord {
     pub rows_scanned: u64,
     pub spill_bytes: u64,
     pub peak_memory_bytes: u64,
-    pub fragments: Vec<FragmentInfo>,
+    pub fragments: Arc<Mutex<Vec<FragmentInfo>>>,
+}
+
+impl QueryRecord {
+    pub fn fragments_snapshot(&self) -> Vec<FragmentInfo> {
+        self.fragments.lock().expect("fragments mutex poisoned").clone()
+    }
 }
 
 pub struct QueryTracker {
@@ -149,7 +155,7 @@ impl QueryTracker {
             rows_scanned: 0,
             spill_bytes: 0,
             peak_memory_bytes: 0,
-            fragments: Vec::new(),
+            fragments: Arc::new(Mutex::new(Vec::new())),
         };
         self.history.insert(query_id, Arc::new(record));
         self.active.insert(query_id, token.clone());
@@ -238,10 +244,9 @@ impl QueryTracker {
     }
 
     pub fn set_fragments(&self, query_id: &Uuid, fragments: Vec<FragmentInfo>) {
-        if let Some(old) = self.history.get(query_id) {
-            let mut record = (*old).clone();
-            record.fragments = fragments;
-            self.history.insert(*query_id, Arc::new(record));
+        if let Some(record) = self.history.get(query_id) {
+            let mut guard = record.fragments.lock().expect("fragments mutex poisoned");
+            *guard = fragments;
         }
     }
 
@@ -253,14 +258,13 @@ impl QueryTracker {
         elapsed_ms: u64,
         output_rows: usize,
     ) {
-        if let Some(old) = self.history.get(query_id) {
-            let mut record = (*old).clone();
-            if let Some(frag) = record.fragments.iter_mut().find(|f| f.task_id == task_id) {
+        if let Some(record) = self.history.get(query_id) {
+            let mut guard = record.fragments.lock().expect("fragments mutex poisoned");
+            if let Some(frag) = guard.iter_mut().find(|f| f.task_id == task_id) {
                 frag.state = state;
                 frag.elapsed_ms = elapsed_ms;
                 frag.output_rows = output_rows;
             }
-            self.history.insert(*query_id, Arc::new(record));
         }
     }
 
@@ -272,16 +276,16 @@ impl QueryTracker {
     /// fragment is still `Running` or `Retried`, or if the query is unknown.
     pub fn all_fragments_done(&self, query_id: &Uuid) -> Option<Vec<(String, String, u64)>> {
         let record = self.history.get(query_id)?;
-        if record.fragments.is_empty() {
+        let guard = record.fragments.lock().expect("fragments mutex poisoned");
+        if guard.is_empty() {
             return None;
         }
-        let all_done = record.fragments.iter().all(|f| {
+        let all_done = guard.iter().all(|f| {
             matches!(f.state, FragmentState::Finished | FragmentState::Failed)
         });
         if all_done {
             Some(
-                record
-                    .fragments
+                guard
                     .iter()
                     .map(|f| (f.task_id.clone(), f.worker_url.clone(), f.elapsed_ms))
                     .collect(),
@@ -501,13 +505,14 @@ mod tests {
         tracker.set_fragments(&id, frags);
 
         let rec = tracker.history.get(&id).unwrap();
-        assert_eq!(rec.fragments.len(), 2);
+        assert_eq!(rec.fragments_snapshot().len(), 2);
 
         tracker.update_fragment(&id, "frag-0", FragmentState::Finished, 42, 100);
         let rec = tracker.history.get(&id).unwrap();
-        assert_eq!(rec.fragments[0].state, FragmentState::Finished);
-        assert_eq!(rec.fragments[0].elapsed_ms, 42);
-        assert_eq!(rec.fragments[1].state, FragmentState::Running);
+        let snap = rec.fragments_snapshot();
+        assert_eq!(snap[0].state, FragmentState::Finished);
+        assert_eq!(snap[0].elapsed_ms, 42);
+        assert_eq!(snap[1].state, FragmentState::Running);
     }
 
     #[tokio::test]
