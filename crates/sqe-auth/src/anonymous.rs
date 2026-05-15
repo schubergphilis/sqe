@@ -80,7 +80,7 @@ mod tests {
 
         let creds = FlightCredentials {
             username: Some("alice".to_string()),
-            password: Some("secret".to_string()),
+            password: Some(sqe_core::SecretString::new("secret".to_string())),
             ..Default::default()
         };
 
@@ -156,7 +156,7 @@ mod tests {
         };
 
         let result = provider.refresh_catalog_token(&identity).await;
-        assert_eq!(result.unwrap(), None);
+        assert!(result.unwrap().is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -172,8 +172,8 @@ mod tests {
 
         let creds = FlightCredentials {
             username: Some("whoever".to_string()),
-            password: Some("anything".to_string()),
-            bearer_token: Some("eyJ...".to_string()),
+            password: Some(sqe_core::SecretString::new("anything".to_string())),
+            bearer_token: Some(sqe_core::SecretString::new("eyJ...".to_string())),
             client_cert_cn: Some("client.example.com".to_string()),
         };
 

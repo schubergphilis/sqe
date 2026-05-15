@@ -394,15 +394,17 @@ impl BearerTokenProvider {
     fn detect_jwt(credentials: &FlightCredentials) -> Option<String> {
         // Primary: explicit bearer_token field.
         if let Some(token) = &credentials.bearer_token {
-            if token.starts_with("eyJ") {
-                return Some(token.clone());
+            let raw = token.expose();
+            if raw.starts_with("eyJ") {
+                return Some(raw.to_string());
             }
         }
 
         // Fallback: password field that looks like a JWT (Flight Basic auth workaround).
         if let Some(password) = &credentials.password {
-            if password.starts_with("eyJ") {
-                return Some(password.clone());
+            let raw = password.expose();
+            if raw.starts_with("eyJ") {
+                return Some(raw.to_string());
             }
         }
 
@@ -444,7 +446,7 @@ impl AuthProvider for BearerTokenProvider {
             user_id: user_id.clone(),
             display_name: user_id,
             roles,
-            catalog_token: Some(token),
+            catalog_token: Some(sqe_core::SecretString::new(token)),
             refresh_token: None,
         })
     }
@@ -453,7 +455,7 @@ impl AuthProvider for BearerTokenProvider {
     async fn refresh_catalog_token(
         &self,
         identity: &Identity,
-    ) -> Result<Option<String>, AuthError> {
+    ) -> Result<Option<sqe_core::SecretString>, AuthError> {
         Ok(identity.catalog_token.clone())
     }
 }
@@ -574,7 +576,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
     #[test]
     fn detect_jwt_from_bearer_token() {
         let creds = FlightCredentials {
-            bearer_token: Some("eyJhbGciOiJSUzI1NiJ9.payload.sig".to_string()),
+            bearer_token: Some(sqe_core::SecretString::new("eyJhbGciOiJSUzI1NiJ9.payload.sig".to_string())),
             ..Default::default()
         };
         let token = BearerTokenProvider::detect_jwt(&creds);
@@ -585,7 +587,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
     #[test]
     fn detect_jwt_from_password_field() {
         let creds = FlightCredentials {
-            password: Some("eyJhbGciOiJSUzI1NiJ9.payload.sig".to_string()),
+            password: Some(sqe_core::SecretString::new("eyJhbGciOiJSUzI1NiJ9.payload.sig".to_string())),
             ..Default::default()
         };
         let token = BearerTokenProvider::detect_jwt(&creds);
@@ -595,8 +597,8 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
     #[test]
     fn detect_jwt_bearer_token_takes_precedence() {
         let creds = FlightCredentials {
-            bearer_token: Some("eyJbearer".to_string()),
-            password: Some("eyJpassword".to_string()),
+            bearer_token: Some(sqe_core::SecretString::new("eyJbearer".to_string())),
+            password: Some(sqe_core::SecretString::new("eyJpassword".to_string())),
             ..Default::default()
         };
         let token = BearerTokenProvider::detect_jwt(&creds);
@@ -606,7 +608,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
     #[test]
     fn detect_jwt_returns_none_for_non_jwt() {
         let creds = FlightCredentials {
-            password: Some("regular-password".to_string()),
+            password: Some(sqe_core::SecretString::new("regular-password".to_string())),
             ..Default::default()
         };
         assert!(BearerTokenProvider::detect_jwt(&creds).is_none());
@@ -832,7 +834,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         let token = build_signed_jwt(&claims);
 
         let creds = FlightCredentials {
-            bearer_token: Some(token.clone()),
+            bearer_token: Some(sqe_core::SecretString::new(token.clone())),
             ..Default::default()
         };
 
@@ -844,7 +846,10 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         assert_eq!(identity.user_id, "alice");
         assert_eq!(identity.display_name, "alice");
         assert_eq!(identity.roles, vec!["admin", "reader"]);
-        assert_eq!(identity.catalog_token, Some(token));
+        assert_eq!(
+            identity.catalog_token.as_ref().map(|t| t.expose()),
+            Some(token.as_str()),
+        );
         assert!(identity.refresh_token.is_none());
     }
 
@@ -870,7 +875,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         let token = build_signed_jwt(&claims);
 
         let creds = FlightCredentials {
-            bearer_token: Some(token),
+            bearer_token: Some(sqe_core::SecretString::new(token)),
             ..Default::default()
         };
 
@@ -902,7 +907,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         // No bearer_token, no password, nothing JWT-like.
         let creds = FlightCredentials {
             username: Some("alice".to_string()),
-            password: Some("regular-password".to_string()),
+            password: Some(sqe_core::SecretString::new("regular-password".to_string())),
             ..Default::default()
         };
 
@@ -961,7 +966,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         let token = build_signed_jwt(&claims);
 
         let creds = FlightCredentials {
-            bearer_token: Some(token),
+            bearer_token: Some(sqe_core::SecretString::new(token)),
             ..Default::default()
         };
 
@@ -1009,7 +1014,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
 
         let token = build_signed_jwt(&claims);
         let creds = FlightCredentials {
-            bearer_token: Some(token),
+            bearer_token: Some(sqe_core::SecretString::new(token)),
             ..Default::default()
         };
 
@@ -1048,7 +1053,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
 
         let token = build_signed_jwt(&claims);
         let creds = FlightCredentials {
-            bearer_token: Some(token),
+            bearer_token: Some(sqe_core::SecretString::new(token)),
             ..Default::default()
         };
 
@@ -1086,7 +1091,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
 
         let token = build_signed_jwt(&claims);
         let creds = FlightCredentials {
-            bearer_token: Some(token),
+            bearer_token: Some(sqe_core::SecretString::new(token)),
             ..Default::default()
         };
 
@@ -1125,7 +1130,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         let token = build_signed_jwt(&claims);
         let creds = FlightCredentials {
             username: Some("ignored".to_string()),
-            password: Some(token),
+            password: Some(sqe_core::SecretString::new(token)),
             ..Default::default()
         };
 
@@ -1166,7 +1171,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
 
         let token = build_signed_jwt(&claims);
         let creds = FlightCredentials {
-            bearer_token: Some(token),
+            bearer_token: Some(sqe_core::SecretString::new(token)),
             ..Default::default()
         };
 
@@ -1205,7 +1210,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
 
         let token = build_signed_jwt(&claims);
         let creds = FlightCredentials {
-            bearer_token: Some(token),
+            bearer_token: Some(sqe_core::SecretString::new(token)),
             ..Default::default()
         };
 
@@ -1235,7 +1240,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             user_id: "alice".to_string(),
             display_name: "Alice".to_string(),
             roles: vec!["admin".to_string()],
-            catalog_token: Some("the-jwt-token".to_string()),
+            catalog_token: Some(sqe_core::SecretString::new("the-jwt-token".to_string())),
             refresh_token: None,
         };
 
@@ -1243,7 +1248,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             .refresh_catalog_token(&identity)
             .await
             .expect("should succeed");
-        assert_eq!(result, Some("the-jwt-token".to_string()));
+        assert_eq!(result.as_ref().map(|t| t.expose()), Some("the-jwt-token"));
     }
 
     #[tokio::test]
@@ -1267,7 +1272,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             .refresh_catalog_token(&identity)
             .await
             .expect("should succeed");
-        assert_eq!(result, None);
+        assert!(result.is_none());
     }
 
     // -----------------------------------------------------------------------

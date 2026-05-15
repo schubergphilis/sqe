@@ -203,7 +203,7 @@ impl AuthProvider for OidcM2mProvider {
             user_id: self.config.user_id.clone(),
             display_name: self.config.user_id.clone(),
             roles: self.config.roles.clone(),
-            catalog_token: Some(token),
+            catalog_token: Some(sqe_core::SecretString::new(token)),
             refresh_token: None,
         })
     }
@@ -211,9 +211,9 @@ impl AuthProvider for OidcM2mProvider {
     async fn refresh_catalog_token(
         &self,
         _identity: &Identity,
-    ) -> Result<Option<String>, AuthError> {
+    ) -> Result<Option<sqe_core::SecretString>, AuthError> {
         let token = self.get_token().await?;
-        Ok(Some(token))
+        Ok(Some(sqe_core::SecretString::new(token)))
     }
 }
 
@@ -295,7 +295,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(identity.user_id, "sqe-m2m");
-        assert_eq!(identity.catalog_token.as_deref(), Some("cached-token"));
+        assert_eq!(
+            identity.catalog_token.as_ref().map(|t| t.expose()),
+            Some("cached-token"),
+        );
         assert!(identity.roles.contains(&"service".to_string()));
     }
 }

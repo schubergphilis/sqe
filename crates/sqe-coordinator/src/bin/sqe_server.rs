@@ -217,7 +217,7 @@ impl TrinoAuthenticator for AuthenticatorAdapter {
             .ok_or_else(|| "Bearer token authentication is not configured".to_string())?;
 
         let credentials = sqe_auth::FlightCredentials {
-            bearer_token: Some(token.to_string()),
+            bearer_token: Some(sqe_core::SecretString::new(token.to_string())),
             ..Default::default()
         };
 
@@ -231,7 +231,9 @@ impl TrinoAuthenticator for AuthenticatorAdapter {
         let token_expiry = chrono::Utc::now() + chrono::Duration::hours(1);
         Ok(sqe_core::Session::new(
             identity.user_id,
-            identity.catalog_token.unwrap_or_else(|| token.to_string()),
+            identity
+                .catalog_token
+                .unwrap_or_else(|| sqe_core::SecretString::new(token.to_string())),
             None,
             token_expiry,
             identity.roles,

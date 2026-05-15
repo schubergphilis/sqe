@@ -590,7 +590,7 @@ impl SessionCatalog {
         if !storage_config.s3_secret_key.is_empty() {
             props.insert(
                 "s3.secret-access-key".to_string(),
-                storage_config.s3_secret_key.clone(),
+                storage_config.s3_secret_key.expose().to_string(),
             );
         }
         if storage_config.s3_path_style {

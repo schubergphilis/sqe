@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::SecretString;
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct SqeConfig {
     pub coordinator: CoordinatorConfig,
@@ -247,7 +249,7 @@ pub struct CoordinatorConfig {
     /// warning, but that let any client on the cluster network register as
     /// a worker and exfiltrate user bearers along with query plans.
     #[serde(default)]
-    pub worker_secret: String,
+    pub worker_secret: SecretString,
     /// Opt-in escape hatch for the `worker_secret` requirement. Leaving this
     /// `false` (the default) makes the coordinator refuse to start when
     /// distributed mode is configured without a secret. Setting it `true`
@@ -289,10 +291,7 @@ impl std::fmt::Debug for CoordinatorConfig {
             .field("worker_urls", &self.worker_urls)
             .field("debug", &self.debug)
             .field("tls", &self.tls)
-            .field(
-                "worker_secret",
-                &if self.worker_secret.is_empty() { "None" } else { "<set>" },
-            )
+            .field("worker_secret", &self.worker_secret)
             .field(
                 "allow_unauthenticated_workers",
                 &self.allow_unauthenticated_workers,
@@ -596,7 +595,7 @@ pub struct AuthConfig {
     pub client_id: String,
     /// Legacy: OAuth2 client_secret.
     #[serde(default)]
-    pub client_secret: String,
+    pub client_secret: SecretString,
     /// Legacy: Generic OAuth2 token endpoint for client_credentials grant.
     /// When set (and keycloak_url is empty), the engine uses client_credentials mode.
     #[serde(default)]
@@ -673,7 +672,7 @@ impl std::fmt::Debug for AuthConfig {
             .field("keycloak_url", &self.keycloak_url)
             .field("realm", &self.realm)
             .field("client_id", &self.client_id)
-            .field("client_secret", &"[REDACTED]")
+            .field("client_secret", &self.client_secret)
             .field("token_endpoint", &self.token_endpoint)
             .field("token_refresh_buffer_secs", &self.token_refresh_buffer_secs)
             .field("ssl_verification", &self.ssl_verification)
@@ -920,7 +919,7 @@ pub struct StorageConfig {
     #[serde(default)]
     pub s3_access_key: String,
     #[serde(default)]
-    pub s3_secret_key: String,
+    pub s3_secret_key: SecretString,
     #[serde(default)]
     pub s3_path_style: bool,
     /// Allow plaintext HTTP for S3 endpoints. Only enable for dev/test (e.g., MinIO).
@@ -1143,7 +1142,7 @@ impl Default for StorageConfig {
             s3_endpoint: String::new(),
             s3_region: String::new(),
             s3_access_key: String::new(),
-            s3_secret_key: String::new(),
+            s3_secret_key: SecretString::default(),
             s3_path_style: false,
             s3_allow_http: false,
             coalesce_threshold: default_coalesce_threshold(),
@@ -1176,7 +1175,7 @@ impl std::fmt::Debug for StorageConfig {
             .field("s3_endpoint", &self.s3_endpoint)
             .field("s3_region", &self.s3_region)
             .field("s3_access_key", &"[REDACTED]")
-            .field("s3_secret_key", &"[REDACTED]")
+            .field("s3_secret_key", &self.s3_secret_key)
             .field("s3_path_style", &self.s3_path_style)
             .field("s3_allow_http", &self.s3_allow_http)
             .field("coalesce_threshold", &self.coalesce_threshold)
@@ -1842,7 +1841,7 @@ impl SqeConfig {
         env_override_u16("SQE_COORDINATOR__TRINO_HTTP_PORT", &mut self.coordinator.trino_http_port);
         env_override_str("SQE_COORDINATOR__MODE", &mut self.coordinator.mode);
         env_override_bool("SQE_COORDINATOR__DEBUG", &mut self.coordinator.debug);
-        env_override_str("SQE_COORDINATOR__WORKER_SECRET", &mut self.coordinator.worker_secret);
+        env_override_secret("SQE_COORDINATOR__WORKER_SECRET", &mut self.coordinator.worker_secret);
         env_override_bool(
             "SQE_COORDINATOR__ALLOW_UNAUTHENTICATED_WORKERS",
             &mut self.coordinator.allow_unauthenticated_workers,
@@ -1869,7 +1868,7 @@ impl SqeConfig {
         env_override_str("SQE_AUTH__KEYCLOAK_URL", &mut self.auth.keycloak_url);
         env_override_str("SQE_AUTH__REALM", &mut self.auth.realm);
         env_override_str("SQE_AUTH__CLIENT_ID", &mut self.auth.client_id);
-        env_override_str("SQE_AUTH__CLIENT_SECRET", &mut self.auth.client_secret);
+        env_override_secret("SQE_AUTH__CLIENT_SECRET", &mut self.auth.client_secret);
         env_override_str("SQE_AUTH__TOKEN_ENDPOINT", &mut self.auth.token_endpoint);
         env_override_u64("SQE_AUTH__TOKEN_REFRESH_BUFFER_SECS", &mut self.auth.token_refresh_buffer_secs);
         env_override_bool("SQE_AUTH__SSL_VERIFICATION", &mut self.auth.ssl_verification);
@@ -1924,7 +1923,7 @@ impl SqeConfig {
         env_override_str("SQE_STORAGE__S3_ENDPOINT", &mut self.storage.s3_endpoint);
         env_override_str("SQE_STORAGE__S3_REGION", &mut self.storage.s3_region);
         env_override_str("SQE_STORAGE__S3_ACCESS_KEY", &mut self.storage.s3_access_key);
-        env_override_str("SQE_STORAGE__S3_SECRET_KEY", &mut self.storage.s3_secret_key);
+        env_override_secret("SQE_STORAGE__S3_SECRET_KEY", &mut self.storage.s3_secret_key);
         env_override_bool("SQE_STORAGE__S3_PATH_STYLE", &mut self.storage.s3_path_style);
         env_override_bool("SQE_STORAGE__S3_ALLOW_HTTP", &mut self.storage.s3_allow_http);
         env_override_usize("SQE_STORAGE__PREFETCH_CONCURRENCY", &mut self.storage.prefetch_concurrency);
@@ -2019,6 +2018,12 @@ impl SqeConfig {
 fn env_override_str(key: &str, target: &mut String) {
     if let Ok(val) = std::env::var(key) {
         *target = val;
+    }
+}
+
+fn env_override_secret(key: &str, target: &mut SecretString) {
+    if let Ok(val) = std::env::var(key) {
+        *target = SecretString::new(val);
     }
 }
 
@@ -2171,7 +2176,7 @@ mod tests {
                 worker_urls: vec![],
                 debug: false,
                 tls: TlsConfig::default(),
-                worker_secret: String::new(),
+                worker_secret: SecretString::default(),
                 allow_unauthenticated_workers: false,
                 memory_limit: default_coordinator_memory(),
                 spill_to_disk: true,
@@ -2185,7 +2190,7 @@ mod tests {
                 keycloak_url: "https://keycloak.example.com".to_string(),
                 realm: "sqe".to_string(),
                 client_id: "sqe-client".to_string(),
-                client_secret: String::new(),
+                client_secret: SecretString::default(),
                 token_endpoint: String::new(),
                 token_refresh_buffer_secs: 60,
                 ssl_verification: true,
@@ -2314,7 +2319,7 @@ mod tests {
     fn validate_rejects_distributed_without_worker_secret() {
         let mut config = valid_config();
         config.coordinator.worker_urls = vec!["http://worker-1:50051".to_string()];
-        config.coordinator.worker_secret = String::new();
+        config.coordinator.worker_secret = SecretString::default();
         config.coordinator.allow_unauthenticated_workers = false;
         let err = config.validate().unwrap_err().to_string();
         assert!(
@@ -2327,7 +2332,7 @@ mod tests {
     fn validate_accepts_distributed_when_explicitly_unauthenticated() {
         let mut config = valid_config();
         config.coordinator.worker_urls = vec!["http://worker-1:50051".to_string()];
-        config.coordinator.worker_secret = String::new();
+        config.coordinator.worker_secret = SecretString::default();
         config.coordinator.allow_unauthenticated_workers = true;
         // The explicit opt-in is allowed, visible in config diffs.
         assert!(config.validate().is_ok());
@@ -2337,7 +2342,7 @@ mod tests {
     fn validate_accepts_distributed_with_worker_secret() {
         let mut config = valid_config();
         config.coordinator.worker_urls = vec!["http://worker-1:50051".to_string()];
-        config.coordinator.worker_secret = "shared-secret-value".to_string();
+        config.coordinator.worker_secret = SecretString::new("shared-secret-value".to_string());
         assert!(config.validate().is_ok());
     }
 
@@ -2346,7 +2351,7 @@ mod tests {
         // No workers configured -> secret irrelevant, no error.
         let mut config = valid_config();
         config.coordinator.worker_urls.clear();
-        config.coordinator.worker_secret = String::new();
+        config.coordinator.worker_secret = SecretString::default();
         assert!(config.validate().is_ok());
     }
 
@@ -3533,7 +3538,7 @@ otlp_endpoint = ""
         let cfg = coord_with_secret("");
         let dbg = format!("{:?}", cfg);
         assert!(
-            dbg.contains("worker_secret: \"None\""),
+            dbg.contains("worker_secret: <unset>"),
             "expected unset sentinel: {dbg}"
         );
     }

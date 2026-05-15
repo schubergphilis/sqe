@@ -5,8 +5,9 @@ use chrono::{DateTime, Duration, Utc};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
-use sqe_core::config::AuthConfig;
+use sqe_core::SecretString;
 use sqe_core::Session;
+use sqe_core::config::AuthConfig;
 
 use crate::oidc_password::OidcPasswordClient;
 use crate::oauth::OAuthClient;
@@ -52,7 +53,7 @@ impl Authenticator {
             let oauth = OAuthClient::new(
                 &config.token_endpoint,
                 &config.client_id,
-                &config.client_secret,
+                config.client_secret.expose(),
                 config.should_skip_tls_verify(),
             )?;
             AuthBackend::ClientCredentials(oauth)
@@ -93,8 +94,11 @@ impl Authenticator {
 
                 let session = Session::new(
                     username.to_string(),
-                    token_response.access_token.clone(),
-                    token_response.refresh_token.clone(),
+                    SecretString::new(token_response.access_token.clone()),
+                    token_response
+                        .refresh_token
+                        .clone()
+                        .map(SecretString::new),
                     token_expiry,
                     roles,
                 );
@@ -125,7 +129,7 @@ impl Authenticator {
                         if st.expiry > Utc::now() + buffer {
                             let session = Session::new(
                                 username.to_string(),
-                                st.access_token.clone(),
+                                SecretString::new(st.access_token.clone()),
                                 None,
                                 st.expiry,
                                 Vec::new(),
@@ -157,7 +161,7 @@ impl Authenticator {
                 // refresh_token (we re-fetch via client_credentials when needed).
                 let session = Session::new(
                     username.to_string(),
-                    token_response.access_token.clone(),
+                    SecretString::new(token_response.access_token.clone()),
                     None,
                     token_expiry,
                     Vec::new(),
@@ -195,17 +199,21 @@ impl Authenticator {
             AuthBackend::OidcPassword(kc) => {
                 let refresh_token = session
                     .refresh_token
-                    .as_deref()
+                    .as_ref()
+                    .map(|t| t.expose().to_string())
                     .ok_or_else(|| {
                         sqe_core::SqeError::Auth("No refresh token available".to_string())
                     })?;
 
-                let token_response = kc.refresh_token(refresh_token).await?;
+                let token_response = kc.refresh_token(&refresh_token).await?;
                 let token_expiry =
                     Utc::now() + Duration::seconds(token_response.expires_in as i64);
 
-                session.access_token = token_response.access_token.clone();
-                session.refresh_token = token_response.refresh_token.clone();
+                session.access_token = SecretString::new(token_response.access_token.clone());
+                session.refresh_token = token_response
+                    .refresh_token
+                    .clone()
+                    .map(SecretString::new);
                 session.token_expiry = token_expiry;
 
                 self.cache.insert(
@@ -225,7 +233,7 @@ impl Authenticator {
                 let token_expiry =
                     Utc::now() + Duration::seconds(token_response.expires_in as i64);
 
-                session.access_token = token_response.access_token.clone();
+                session.access_token = SecretString::new(token_response.access_token.clone());
                 session.refresh_token = None;
                 session.token_expiry = token_expiry;
 
@@ -379,8 +387,9 @@ impl AuthProvider for Authenticator {
             .ok_or(AuthError::NotMyCredentials)?;
         let password = credentials
             .password
-            .as_deref()
-            .ok_or(AuthError::NotMyCredentials)?;
+            .as_ref()
+            .ok_or(AuthError::NotMyCredentials)?
+            .expose();
 
         if username.is_empty() && password.is_empty() {
             return Err(AuthError::NotMyCredentials);
@@ -412,7 +421,7 @@ mod tests {
             keycloak_url: "http://localhost:8080".to_string(),
             realm: "test-realm".to_string(),
             client_id: "sqe-client".to_string(),
-            client_secret: "secret".to_string(),
+            client_secret: SecretString::new("secret".to_string()),
             token_endpoint: String::new(),
             token_refresh_buffer_secs: 60,
             ssl_verification: false,
@@ -431,7 +440,7 @@ mod tests {
             keycloak_url: String::new(),
             realm: String::new(),
             client_id: "polaris-client".to_string(),
-            client_secret: "polaris-secret".to_string(),
+            client_secret: SecretString::new("polaris-secret".to_string()),
             token_endpoint: "http://localhost:8181/api/catalog/v1/oauth/tokens".to_string(),
             token_refresh_buffer_secs: 120,
             ssl_verification: true,

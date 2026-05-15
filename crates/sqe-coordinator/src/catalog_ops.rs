@@ -313,7 +313,7 @@ impl CatalogOps {
         let session_catalog = SessionCatalog::for_session(
             &self.config,
             self.table_cache.clone(),
-            &session.access_token,
+            session.access_token.expose(),
         )
         .await?;
 
@@ -377,7 +377,7 @@ impl CatalogOps {
         let session_catalog = SessionCatalog::for_session(
             &self.config,
             self.table_cache.clone(),
-            &session.access_token,
+            session.access_token.expose(),
         )
         .await?;
 
@@ -431,7 +431,7 @@ impl CatalogOps {
             SessionCatalog::for_session(
                 &self.config,
                 self.table_cache.clone(),
-                &session.access_token,
+                session.access_token.expose(),
             )
             .await?,
         );
@@ -687,7 +687,7 @@ impl CatalogOps {
             SessionCatalog::for_session(
                 &self.config,
                 self.table_cache.clone(),
-                &session.access_token,
+                session.access_token.expose(),
             )
             .await?,
         );
@@ -740,7 +740,7 @@ impl CatalogOps {
             SessionCatalog::for_session(
                 &self.config,
                 self.table_cache.clone(),
-                &session.access_token,
+                session.access_token.expose(),
             )
             .await?,
         );
@@ -878,7 +878,7 @@ impl CatalogOps {
             SessionCatalog::for_session(
                 &self.config,
                 self.table_cache.clone(),
-                &session.access_token,
+                session.access_token.expose(),
             )
             .await?,
         );
@@ -1034,7 +1034,7 @@ impl CatalogOps {
             SessionCatalog::for_session(
                 &self.config,
                 self.table_cache.clone(),
-                &session.access_token,
+                session.access_token.expose(),
             )
             .await?,
         );

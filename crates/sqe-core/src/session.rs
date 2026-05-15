@@ -1,12 +1,14 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-#[derive(Clone)]
+use crate::SecretString;
+
+#[derive(Clone, Debug)]
 pub struct Session {
     pub id: String,
     pub user: SessionUser,
-    pub access_token: String,
-    pub refresh_token: Option<String>,
+    pub access_token: SecretString,
+    pub refresh_token: Option<SecretString>,
     pub token_expiry: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     /// Timestamp of last activity (query execution). Used for idle session expiry.
@@ -23,23 +25,6 @@ pub struct Session {
     pub write_branch: Option<String>,
 }
 
-impl std::fmt::Debug for Session {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Session")
-            .field("id", &self.id)
-            .field("user", &self.user)
-            .field("access_token", &"[REDACTED]")
-            .field("refresh_token", &"[REDACTED]")
-            .field("token_expiry", &self.token_expiry)
-            .field("created_at", &self.created_at)
-            .field("last_activity", &self.last_activity)
-            .field("default_catalog", &self.default_catalog)
-            .field("default_schema", &self.default_schema)
-            .field("source", &self.source)
-            .finish()
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct SessionUser {
     pub username: String,
@@ -47,7 +32,7 @@ pub struct SessionUser {
 }
 
 impl Session {
-    pub fn new(username: String, access_token: String, refresh_token: Option<String>, token_expiry: DateTime<Utc>, roles: Vec<String>) -> Self {
+    pub fn new(username: String, access_token: SecretString, refresh_token: Option<SecretString>, token_expiry: DateTime<Utc>, roles: Vec<String>) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4().to_string(),
@@ -90,7 +75,7 @@ impl Session {
 
     pub fn token_fingerprint(&self) -> String {
         use sha2::{Digest, Sha256};
-        let hash = format!("{:x}", Sha256::digest(self.access_token.as_bytes()));
+        let hash = format!("{:x}", Sha256::digest(self.access_token.expose_bytes()));
         format!("{}-{}", self.user.username, &hash[..16])
     }
 
@@ -125,7 +110,7 @@ mod tests {
     fn make_session() -> Session {
         Session::new(
             "alice".to_string(),
-            "tok_abc".to_string(),
+            SecretString::new("tok_abc".to_string()),
             None,
             Utc::now() + Duration::hours(1),
             vec!["analyst".to_string()],
