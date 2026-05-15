@@ -316,8 +316,8 @@ pub async fn create_session_context(
                         spill_bytes: r.spill_bytes,
                         peak_memory_bytes: r.peak_memory_bytes,
                         fragments: r
-                            .fragments
-                            .iter()
+                            .fragments_snapshot()
+                            .into_iter()
                             .map(|f| sqe_catalog::system_runtime::RuntimeFragmentInfo {
                                 task_id: f.task_id.clone(),
                                 worker_url: f.worker_url.clone(),
