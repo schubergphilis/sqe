@@ -2076,7 +2076,8 @@ impl QueryHandler {
             worker_urls,
             schema,
         )
-        .with_fragment_callback(callback);
+        .with_fragment_callback(callback)
+        .with_worker_secret(self.config.coordinator.worker_secret.clone());
 
         // Attach worker registry for health tracking / failover
         exec = exec.with_worker_registry(Arc::clone(registry));
