@@ -209,6 +209,7 @@ impl AuthProvider for ApiKeyProvider {
                     roles,
                     catalog_token: None,
                     refresh_token: None,
+                    expires_at: None,
                 });
             }
         }
@@ -429,6 +430,7 @@ mod tests {
             roles: vec![],
             catalog_token: None,
             refresh_token: None,
+            expires_at: None,
         };
 
         assert!(provider.refresh_catalog_token(&identity).await.unwrap().is_none());

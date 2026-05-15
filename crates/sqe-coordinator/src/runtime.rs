@@ -98,6 +98,7 @@ mod tests {
             spill_compression: "lz4".to_string(),
             flight_compression: "lz4".to_string(),
             shuffle_compression: "zstd".to_string(),
+            max_workers: 1024,
         }
     }
 

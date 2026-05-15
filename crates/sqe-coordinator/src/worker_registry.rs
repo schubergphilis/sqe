@@ -16,6 +16,7 @@ use crate::channel_pool::ChannelPool;
 pub struct WorkerRegistry {
     inner: Arc<RwLock<RegistryInner>>,
     channel_pool: Arc<ChannelPool>,
+    max_workers: usize,
 }
 
 #[derive(Debug)]
@@ -32,6 +33,27 @@ struct WorkerState {
 }
 
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+const DEFAULT_MAX_WORKERS: usize = 1024;
+
+/// Reason a [`WorkerRegistry::register_heartbeat`] call was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistrationError {
+    /// The registry already tracks `max_workers` URLs.
+    CapacityExceeded { cap: usize },
+}
+
+impl std::fmt::Display for RegistrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CapacityExceeded { cap } => write!(
+                f,
+                "worker registry at max_workers cap ({cap}); refusing to track additional workers"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RegistrationError {}
 
 impl WorkerRegistry {
     pub fn new(worker_urls: Vec<String>) -> Self {
@@ -39,6 +61,14 @@ impl WorkerRegistry {
     }
 
     pub fn with_channel_pool(worker_urls: Vec<String>, channel_pool: Arc<ChannelPool>) -> Self {
+        Self::with_options(worker_urls, channel_pool, DEFAULT_MAX_WORKERS)
+    }
+
+    pub fn with_options(
+        worker_urls: Vec<String>,
+        channel_pool: Arc<ChannelPool>,
+        max_workers: usize,
+    ) -> Self {
         let workers: HashMap<String, WorkerState> = worker_urls
             .into_iter()
             .map(|url| {
@@ -52,11 +82,19 @@ impl WorkerRegistry {
             })
             .collect();
 
-        info!(worker_count = workers.len(), "Initialized worker registry");
+        // Honour the configured cap but never refuse seed URLs already in config.
+        let effective_cap = max_workers.max(workers.len());
+
+        info!(
+            worker_count = workers.len(),
+            max_workers = effective_cap,
+            "Initialized worker registry"
+        );
 
         Self {
             inner: Arc::new(RwLock::new(RegistryInner { workers })),
             channel_pool,
+            max_workers: effective_cap,
         }
     }
 
@@ -94,9 +132,23 @@ impl WorkerRegistry {
     /// Register a worker (if not already known) and mark it healthy.
     ///
     /// Called when the coordinator receives a heartbeat from a worker.
-    /// Workers that were not in the initial config list are dynamically added.
-    pub async fn register_heartbeat(&self, url: &str) {
+    /// Workers that were not in the initial config list are dynamically added,
+    /// bounded by `max_workers`. Heartbeats from previously-unknown URLs are
+    /// rejected with `Err` once the cap is reached so a buggy or malicious
+    /// worker reporting rotating URLs cannot grow the registry without limit.
+    pub async fn register_heartbeat(&self, url: &str) -> Result<(), RegistrationError> {
         let mut inner = self.inner.write().await;
+        if !inner.workers.contains_key(url) && inner.workers.len() >= self.max_workers {
+            warn!(
+                worker = url,
+                registered = inner.workers.len(),
+                cap = self.max_workers,
+                "Rejected heartbeat: registry at max_workers cap"
+            );
+            return Err(RegistrationError::CapacityExceeded {
+                cap: self.max_workers,
+            });
+        }
         let state = inner.workers.entry(url.to_string()).or_insert_with(|| {
             info!(worker = url, "Discovered new worker via heartbeat");
             WorkerState {
@@ -112,6 +164,7 @@ impl WorkerRegistry {
         state.healthy = true;
         state.consecutive_failures = 0;
         state.last_healthy = Some(Instant::now());
+        Ok(())
     }
 
     /// Immediately mark a worker as unhealthy.
@@ -280,7 +333,8 @@ mod tests {
 
         registry
             .register_heartbeat("http://worker1:50052")
-            .await;
+            .await
+            .expect("first heartbeat fits under cap");
 
         assert_eq!(registry.total_workers().await, 1);
         assert_eq!(
@@ -298,7 +352,8 @@ mod tests {
         // Heartbeat marks it healthy
         registry
             .register_heartbeat("http://worker1:50052")
-            .await;
+            .await
+            .expect("known worker heartbeat accepted");
         assert_eq!(registry.healthy_workers().await.len(), 1);
         // Total count unchanged (was already registered)
         assert_eq!(registry.total_workers().await, 1);
@@ -318,7 +373,8 @@ mod tests {
         // Heartbeat recovers it
         registry
             .register_heartbeat("http://worker1:50052")
-            .await;
+            .await
+            .expect("known worker heartbeat accepted");
         assert_eq!(registry.healthy_workers().await.len(), 1);
     }
 
@@ -343,7 +399,8 @@ mod tests {
         // Heartbeat should still recover after immediate unhealthy
         registry
             .register_heartbeat("http://worker1:50052")
-            .await;
+            .await
+            .expect("known worker heartbeat accepted");
         assert_eq!(registry.healthy_workers().await.len(), 1);
     }
 
@@ -402,7 +459,8 @@ mod tests {
         // A single heartbeat should immediately recover it
         registry
             .register_heartbeat("http://worker1:50052")
-            .await;
+            .await
+            .expect("known worker heartbeat accepted");
         let healthy = registry.healthy_workers().await;
         assert_eq!(healthy.len(), 1);
         assert_eq!(healthy[0], "http://worker1:50052");
@@ -453,5 +511,57 @@ mod tests {
             20,
             "5 workers should have been removed from healthy pool"
         );
+    }
+
+    #[tokio::test]
+    async fn test_register_heartbeat_rejects_after_cap() {
+        // A worker with a rotating URL must not be able to grow the registry past
+        // the configured cap.
+        let registry = WorkerRegistry::with_options(vec![], ChannelPool::shared(), 2);
+
+        // Cap=2: two unique URLs accepted, the third is rejected.
+        registry
+            .register_heartbeat("http://w1:50052")
+            .await
+            .expect("first heartbeat fits under cap");
+        registry
+            .register_heartbeat("http://w2:50052")
+            .await
+            .expect("second heartbeat fits under cap");
+        let err = registry
+            .register_heartbeat("http://w3:50052")
+            .await
+            .expect_err("third heartbeat must be refused");
+        assert!(matches!(
+            err,
+            RegistrationError::CapacityExceeded { cap: 2 }
+        ));
+        assert_eq!(registry.total_workers().await, 2);
+
+        // Heartbeats for already-known URLs still work, even at the cap.
+        registry
+            .register_heartbeat("http://w1:50052")
+            .await
+            .expect("known worker heartbeat accepted at cap");
+    }
+
+    #[tokio::test]
+    async fn test_seed_urls_above_cap_are_preserved() {
+        // If the seed list exceeds max_workers, all seeds are kept (the cap only
+        // restricts dynamically-discovered workers).
+        let registry = WorkerRegistry::with_options(
+            vec!["http://w1:50052".to_string(), "http://w2:50052".to_string()],
+            ChannelPool::shared(),
+            1,
+        );
+        assert_eq!(registry.total_workers().await, 2);
+
+        // New dynamic discovery is still rejected: the effective cap is the seed
+        // size, not max_workers.
+        let err = registry
+            .register_heartbeat("http://w3:50052")
+            .await
+            .expect_err("dynamic discovery refused above effective cap");
+        assert!(matches!(err, RegistrationError::CapacityExceeded { .. }));
     }
 }

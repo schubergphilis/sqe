@@ -502,7 +502,16 @@ pub async fn invalidate_session_cache(username: &str) {
 ///
 /// Used when a DDL/DML operation modifies the catalog, ensuring all users
 /// (not just the current user) see the updated schema state.
-pub fn invalidate_all_session_caches() {
+///
+/// The flush after `invalidate_all` is required for the same reason the
+/// single-user version flushes: moka's eviction is queued as a pending task
+/// and the very next `try_get_with` in the same tokio tick would otherwise
+/// still hit the stale entry. Without this flush, `ATTACH`, `DETACH`,
+/// `RENAME TABLE`, `CREATE SCHEMA`, and `DROP SCHEMA` would have a race window
+/// where the issuing client's next query runs against the pre-mutation
+/// SessionContext. Issue #25.
+pub async fn invalidate_all_session_caches() {
     SESSION_CONTEXT_CACHE.invalidate_all();
+    SESSION_CONTEXT_CACHE.run_pending_tasks().await;
     debug!("All SessionContext caches invalidated");
 }
