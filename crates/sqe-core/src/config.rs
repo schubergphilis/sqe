@@ -3304,9 +3304,11 @@ otlp_endpoint = ""
 
     #[test]
     fn env_overrides_apply_to_openlineage() {
-        // Use unique env-var values per test scope to avoid cross-test leakage,
-        // and guard with the same lock pattern as other env-touching tests if
-        // any are added later. Set, override, assert, then clear.
+        // std::env::set_var is process-wide; serialise against every other
+        // env-touching test in this module so cargo's parallel thread-pool
+        // cannot interleave set_var / remove_var calls.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
         std::env::set_var("SQE_METRICS__OPENLINEAGE__ENABLED", "true");
         std::env::set_var("SQE_METRICS__OPENLINEAGE__SPOOL_MAX_BYTES", "999");
         std::env::set_var("SQE_METRICS__OPENLINEAGE__CHANNEL_CAPACITY", "42");
@@ -3383,7 +3385,10 @@ otlp_endpoint = ""
     // --- Provider env-var override (issue #14 regression test) ---
 
     /// Lock used to serialise env-var test mutation since std::env::set_var
-    /// has process-wide effect.
+    /// has process-wide effect. Every test in this module that calls
+    /// std::env::set_var or std::env::remove_var MUST acquire this lock
+    /// at its top with `let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());`
+    /// before touching the environment.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
