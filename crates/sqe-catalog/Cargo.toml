@@ -7,18 +7,23 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# Default ships every supported catalog backend compiled in. Picking a
-# backend is a runtime config concern, not a build-time one. Operators
-# who need a slim image (or want to drop the AWS SDK weight) build with
-# `--no-default-features --features rest` (or any subset).
+# Default ships only the REST backend (Polaris / Nessie). The kitchen-sink
+# build that included `sql-postgres`, `hms`, `glue`, `hadoop`, and
+# `s3tables` cost ~180-200 MB in binary size and dragged the full AWS SDK,
+# Thrift / pilota, and sqlx tls-rustls graph into every Polaris-only
+# deployment. Operators who need additional backends opt in by feature or
+# by the `full-backends` umbrella.
 #
-# Approximate binary cost on top of a `rest`-only build: nessie adds 0
-# (REST adapter, no new deps); hadoop adds ~0 (uses existing FileIO);
-# sql-postgres ~5-10 MB; hms ~10-15 MB; glue ~50-80 MB (the AWS SDK is
-# the heavyweight). Default release binary lands around 180-200 MB,
-# which is fine for our Kubernetes deployments and matches Java stacks
-# of similar scope.
-default = ["rest", "sql-postgres", "hms", "glue", "hadoop", "s3tables"]
+# Approximate binary cost on top of `rest`-only: hadoop adds ~0 (no new
+# deps); sql-postgres ~5-10 MB; hms ~10-15 MB; glue ~50-80 MB
+# (aws-sdk-glue is the heavyweight); s3tables adds ~5-10 MB on top of
+# glue's AWS SDK runtime.
+default = ["rest"]
+# Umbrella for the legacy default: every supported backend compiled in.
+# Use when packaging an image that needs to dispatch to Polaris, Glue,
+# S3 Tables, Hive Metastore, Hadoop warehouses, and Postgres-backed SQL
+# catalogs.
+full-backends = ["rest", "sql-postgres", "hms", "glue", "hadoop", "s3tables"]
 # REST catalog (the protocol Polaris and Nessie both speak). Activating
 # the feature pulls in `iceberg-catalog-rest`, compiles the
 # `rest_catalog` module, and registers the loader's REST builder.
