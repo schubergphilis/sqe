@@ -38,6 +38,10 @@ max_result_rows = 10_000_000
 # never approach this. Operators can tighten via config if running on
 # a smaller host.
 max_query_memory = "32GB"
+# Per-user memory budget (introduced in 382d8d0). Disabled here because
+# the test stack is single-tenant and max_query_memory (32GB) exceeds the
+# default 1GB cap on every query.
+per_user_memory_budget = "0"
 # Per-query timeout. SF100 lineitem CTAS + big hash joins can take
 # several minutes, and the new 30-minute client timeout (see
 # BENCH_CLIENT_TIMEOUT_SECS) gives us headroom to raise this.
@@ -53,3 +57,11 @@ s3_access_key = "s3admin"
 s3_secret_key = "s3admin"
 s3_region = "us-east-1"
 s3_path_style = true
+
+# TVF (read_parquet/read_csv) policy. The test stack is single-tenant
+# and tests like test_read_parquet_local_file write a tempdir parquet
+# and read it back. The PR #10 hardening denies local paths by default
+# (SSRF / path-traversal mitigation). Enable explicitly here so the
+# feature test runs; production deployments leave the default in place.
+[storage.tvf]
+allow_local_paths = true

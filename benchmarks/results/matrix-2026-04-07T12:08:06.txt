@@ -1,0 +1,12 @@
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Benchmark Matrix Results — Tue Apr  7 14:08:07 CEST 2026
+  Scale factor: SF1
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+── Config: single-512mb ──────────────────────────────────────
+  Memory: 512MB, PID: 28541
+  tpch SF1: 0/22 pass, 22 error, 5.7s
+  tpcds SF1: 0/99 pass, 99 error, 24.7s
+  ssb SF1: 0/13 pass, 13 error, 3.4s
+  tpcc SF1: 0/17 pass, 17 error, 4.3s

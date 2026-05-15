@@ -6628,7 +6628,7 @@ s3_path_style = true
         let handler = WriteHandler::new(write_test_config()).with_policy_enforcer(enforcer);
         let session = sqe_core::Session::new(
             "alice".to_string(),
-            "tok".to_string(),
+            "tok".to_string().into(),
             None,
             chrono::Utc::now(),
             vec![],

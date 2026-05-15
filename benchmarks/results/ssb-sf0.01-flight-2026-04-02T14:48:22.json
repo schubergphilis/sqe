@@ -1,0 +1,95 @@
+{
+  "benchmark": "ssb",
+  "scale_factor": 0.01,
+  "protocol": "flight",
+  "timestamp": "2026-04-02T14:48:22",
+  "summary": {
+    "total": 13,
+    "pass": 13,
+    "fail": 0,
+    "diff": 0,
+    "skip": 0,
+    "error": 0,
+    "total_duration_ms": 7408
+  },
+  "queries": [
+    {
+      "id": "q1.1",
+      "status": "pass",
+      "duration_ms": 535,
+      "rows": 1
+    },
+    {
+      "id": "q1.2",
+      "status": "pass",
+      "duration_ms": 551,
+      "rows": 1
+    },
+    {
+      "id": "q1.3",
+      "status": "pass",
+      "duration_ms": 557,
+      "rows": 1
+    },
+    {
+      "id": "q2.1",
+      "status": "pass",
+      "duration_ms": 595,
+      "rows": 56
+    },
+    {
+      "id": "q2.2",
+      "status": "pass",
+      "duration_ms": 585,
+      "rows": 0
+    },
+    {
+      "id": "q2.3",
+      "status": "pass",
+      "duration_ms": 559,
+      "rows": 0
+    },
+    {
+      "id": "q3.1",
+      "status": "pass",
+      "duration_ms": 565,
+      "rows": 60
+    },
+    {
+      "id": "q3.2",
+      "status": "pass",
+      "duration_ms": 565,
+      "rows": 34
+    },
+    {
+      "id": "q3.3",
+      "status": "pass",
+      "duration_ms": 575,
+      "rows": 0
+    },
+    {
+      "id": "q3.4",
+      "status": "pass",
+      "duration_ms": 568,
+      "rows": 0
+    },
+    {
+      "id": "q4.1",
+      "status": "pass",
+      "duration_ms": 584,
+      "rows": 35
+    },
+    {
+      "id": "q4.2",
+      "status": "pass",
+      "duration_ms": 581,
+      "rows": 76
+    },
+    {
+      "id": "q4.3",
+      "status": "pass",
+      "duration_ms": 588,
+      "rows": 1
+    }
+  ]
+}
