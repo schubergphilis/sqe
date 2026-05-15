@@ -28,7 +28,9 @@ use sqe_sql::{NamespaceRef, ProcedureCall, TableRef};
 use tracing::{info, warn};
 use futures::TryStreamExt;
 
-use crate::writer::{parse_parquet_compression, write_data_files};
+use crate::writer::{
+    new_upload_tracker, parse_parquet_compression, write_data_files, WriteCleanupGuard,
+};
 
 /// Callback that returns a snapshot of recent SQL query texts.
 ///
@@ -320,12 +322,20 @@ impl MaintenanceHandler {
         use futures::stream::{self, StreamExt, TryStreamExt};
 
         let table_arc = Arc::new(table.clone());
+        let tracker = new_upload_tracker();
+        let cleanup_guard = WriteCleanupGuard::new(
+            table.file_io().clone(),
+            tracker.clone(),
+            "rewrite-data-files",
+        );
         let results: Vec<(Vec<DataFile>, Vec<DataFile>, u64)> =
             stream::iter(eligible_groups.into_iter())
                 .map(|group| {
                     let table_for_group = table_arc.clone();
+                    let tracker_for_group = tracker.clone();
                     async move {
-                        rewrite_group(&table_for_group, group, compression).await
+                        rewrite_group(&table_for_group, group, compression, tracker_for_group)
+                            .await
                     }
                 })
                 .buffer_unordered(max_concurrent.max(1))
@@ -395,6 +405,7 @@ impl MaintenanceHandler {
             .commit(catalog.as_ref())
             .await
             .map_err(|e| classify_commit_error(e, "rewrite_data_files"))?;
+        cleanup_guard.mark_committed();
 
         // After the commit, invalidate the shared TableMetadataCache entry so
         // subsequent load_table calls (including the table_files TVF used by
@@ -899,6 +910,7 @@ async fn rewrite_group(
     table: &IcebergTable,
     group: Vec<DataFile>,
     compression: parquet::basic::Compression,
+    tracker: crate::writer::UploadedPaths,
 ) -> sqe_core::Result<(Vec<DataFile>, Vec<DataFile>, u64)> {
     let mut batches: Vec<RecordBatch> = Vec::new();
     let mut rows_read: u64 = 0;
@@ -928,7 +940,7 @@ async fn rewrite_group(
         return Ok((vec![], vec![], 0));
     }
 
-    let new_files = write_data_files(table, batches, "rewrite", compression).await?;
+    let new_files = write_data_files(table, batches, "rewrite", compression, tracker).await?;
 
     Ok((new_files, group, rows_read))
 }

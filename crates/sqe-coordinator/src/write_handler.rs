@@ -32,8 +32,9 @@ use tracing::instrument;
 
 use crate::catalog_ops::parse_table_ref;
 use crate::writer::{
-    parse_parquet_compression, write_data_files_streaming_with_metrics,
+    new_upload_tracker, parse_parquet_compression, write_data_files_streaming_with_metrics,
     write_data_files_with_metrics, write_equality_delete_files, write_position_delete_files,
+    WriteCleanupGuard,
 };
 
 /// Rewrap the source SELECT of an `INSERT INTO t (c1, c2, ...) SELECT ...` so
@@ -313,6 +314,83 @@ async fn rollback_ctas_partial_create(
             "CTAS rollback: failed to drop catalog entry — orphan registration may remain"
         ),
     }
+}
+
+/// Bounded retry around an Iceberg commit that may lose an optimistic-concurrency
+/// race against another writer.
+///
+/// iceberg-rust's vendored catalogs (SQL, in-memory, our REST bridge) tag conflict
+/// errors with `retryable = true`. Polaris and HMS surface the same condition as
+/// `CatalogCommitConflicts`. The fix for #47 wraps every commit site that builds
+/// a Transaction so a conflict reloads the table and rebuilds the action against
+/// the new base snapshot. Without the reload the next attempt commits over the
+/// same stale metadata-location and the conflict repeats.
+///
+/// `build_and_commit` runs once per attempt; it receives a freshly-loaded
+/// IcebergTable and is expected to build a `Transaction`, apply its action, and
+/// call `tx.commit(catalog).await`. The closure clones data files / delete files
+/// it captures so each attempt operates on its own action graph.
+///
+/// Backoff: exponential with jitter, capped at ~1s base. After `max_attempts`
+/// the last error propagates unchanged so the caller's error-mapping still runs.
+async fn commit_with_retry<F, Fut>(
+    catalog: &dyn Catalog,
+    table_ident: &TableIdent,
+    op: &str,
+    mut build_and_commit: F,
+) -> std::result::Result<IcebergTable, iceberg::Error>
+where
+    F: FnMut(IcebergTable) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<IcebergTable, iceberg::Error>>,
+{
+    const MAX_ATTEMPTS: u32 = 4;
+    let mut last_err: Option<iceberg::Error> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let table = catalog.load_table(table_ident).await?;
+        match build_and_commit(table).await {
+            Ok(t) => {
+                if attempt > 1 {
+                    info!(
+                        table = %table_ident,
+                        op,
+                        attempts = attempt,
+                        "commit succeeded after retry"
+                    );
+                }
+                return Ok(t);
+            }
+            Err(e) => {
+                let retryable = e.retryable() || is_conflict_message(&e.to_string());
+                if !retryable || attempt == MAX_ATTEMPTS {
+                    last_err = Some(e);
+                    break;
+                }
+                let base_ms: u64 = 50_u64.saturating_mul(1_u64 << (attempt - 1));
+                let jitter_ms: u64 = (Uuid::new_v4().as_u128() as u64) % 50;
+                let sleep_ms = base_ms.saturating_add(jitter_ms).min(1000);
+                warn!(
+                    table = %table_ident,
+                    op,
+                    attempt,
+                    backoff_ms = sleep_ms,
+                    error = %e,
+                    "commit conflict; reloading table and retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.expect("retry loop must have captured an error"))
+}
+
+fn is_conflict_message(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("commitconflict")
+        || lower.contains("commit conflict")
+        || lower.contains("stale snapshot")
+        || lower.contains("rowdelta conflict")
+        || lower.contains("retryable")
 }
 
 /// Build a unique table location under the namespace base by appending a UUID
@@ -660,6 +738,9 @@ impl WriteHandler {
         // next CTAS at the same target gets a 403 from Polaris's
         // location-uniqueness check.
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let tracker = new_upload_tracker();
+        let cleanup_guard =
+            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "ctas");
         let post_create: sqe_core::Result<()> = async {
             if total_rows > 0 {
                 // Clone batches cheaply for the Puffin sidecar when the table
@@ -675,23 +756,40 @@ impl WriteHandler {
                     "ctas",
                     self.metrics.as_ref(),
                     self.compression(),
+                    tracker,
                 )
                 .await?;
 
                 if !data_files.is_empty() {
-                    let tx = Transaction::new(&table);
-                    let action = tx.fast_append().add_data_files(data_files);
-                    let tx = action.apply(tx).map_err(|e| {
-                        SqeError::Execution(format!("Failed to apply fast append: {e}"))
-                    })?;
-                    tx.commit(catalog.as_ref()).await.map_err(|e| {
+                    let files_for_retry = data_files.clone();
+                    let catalog_for_commit = catalog.clone();
+                    commit_with_retry(
+                        catalog.as_ref(),
+                        &table_ident,
+                        "ctas",
+                        move |fresh_table| {
+                            let files = files_for_retry.clone();
+                            let cat = catalog_for_commit.clone();
+                            async move {
+                                let tx = Transaction::new(&fresh_table);
+                                let action = tx.fast_append().add_data_files(files);
+                                let tx = action.apply(tx)?;
+                                tx.commit(cat.as_ref()).await
+                            }
+                        },
+                    )
+                    .await
+                    .map_err(|e| {
                         SqeError::Execution(format!("Failed to commit CTAS transaction: {e}"))
                     })?;
+                    cleanup_guard.mark_committed();
 
                     if let Some(stats_batches) = stats_snapshot {
                         self.maybe_emit_puffin_sidecar(&catalog, &table_ident, &stats_batches)
                             .await;
                     }
+                } else {
+                    cleanup_guard.mark_committed();
                 }
 
                 info!(
@@ -700,6 +798,7 @@ impl WriteHandler {
                     "CTAS committed successfully"
                 );
             } else {
+                cleanup_guard.mark_committed();
                 info!(
                     table = %table_ident,
                     "CTAS created empty table (no data to write)"
@@ -828,6 +927,9 @@ impl WriteHandler {
         // non-streaming `handle_ctas` path: a failed write or commit leaves
         // the catalog entry plus S3 prefix in place, which Polaris's
         // location-uniqueness check rejects on every retry.
+        let tracker = new_upload_tracker();
+        let cleanup_guard =
+            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "ctas-streaming");
         let post_create: sqe_core::Result<()> = async {
             let stream = df.execute_stream().await.map_err(|e| {
                 SqeError::Execution(format!("Failed to start execution stream: {e}"))
@@ -839,24 +941,40 @@ impl WriteHandler {
                 "ctas",
                 self.metrics.as_ref(),
                 self.compression(),
+                tracker,
             )
             .await?;
 
             if !data_files.is_empty() {
-                let tx = Transaction::new(&table);
-                let action = tx.fast_append().add_data_files(data_files);
-                let tx = action.apply(tx).map_err(|e| {
-                    SqeError::Execution(format!("Failed to apply fast append: {e}"))
-                })?;
-                tx.commit(catalog.as_ref()).await.map_err(|e| {
+                let files_for_retry = data_files.clone();
+                let catalog_for_commit = catalog.clone();
+                commit_with_retry(
+                    catalog.as_ref(),
+                    &table_ident,
+                    "ctas-streaming",
+                    move |fresh_table| {
+                        let files = files_for_retry.clone();
+                        let cat = catalog_for_commit.clone();
+                        async move {
+                            let tx = Transaction::new(&fresh_table);
+                            let action = tx.fast_append().add_data_files(files);
+                            let tx = action.apply(tx)?;
+                            tx.commit(cat.as_ref()).await
+                        }
+                    },
+                )
+                .await
+                .map_err(|e| {
                     SqeError::Execution(format!("Failed to commit CTAS transaction: {e}"))
                 })?;
+                cleanup_guard.mark_committed();
                 info!(
                     table = %table_ident,
                     total_rows,
                     "CTAS committed successfully (streaming)"
                 );
             } else {
+                cleanup_guard.mark_committed();
                 info!(
                     table = %table_ident,
                     "CTAS created empty table (no data to write)"
@@ -965,35 +1083,56 @@ impl WriteHandler {
             .await
             .map_err(|e| SqeError::Execution(format!("Failed to start execution stream: {e}")))?;
 
+        let tracker = new_upload_tracker();
+        let cleanup_guard =
+            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "insert-streaming");
         let (data_files, total_rows) = write_data_files_streaming_with_metrics(
             &table,
             stream,
             "insert",
             self.metrics.as_ref(),
             self.compression(),
+            tracker,
         )
         .await?;
 
         if total_rows == 0 {
             info!(table = %table_ident, "INSERT SELECT returned no rows — nothing to write");
+            cleanup_guard.mark_committed();
             return Ok(vec![]);
         }
 
         if !data_files.is_empty() {
-            let tx = Transaction::new(&table);
-            let action = tx.fast_append().add_data_files(data_files);
-            let tx = action
-                .apply(tx)
-                .map_err(|e| SqeError::Execution(format!("Failed to apply fast append: {e}")))?;
-            tx.commit(catalog.as_ref()).await.map_err(|e| {
+            let files_for_retry = data_files.clone();
+            let catalog_for_commit = catalog.clone();
+            commit_with_retry(
+                catalog.as_ref(),
+                &table_ident,
+                "insert",
+                move |fresh_table| {
+                    let files = files_for_retry.clone();
+                    let cat = catalog_for_commit.clone();
+                    async move {
+                        let tx = Transaction::new(&fresh_table);
+                        let action = tx.fast_append().add_data_files(files);
+                        let tx = action.apply(tx)?;
+                        tx.commit(cat.as_ref()).await
+                    }
+                },
+            )
+            .await
+            .map_err(|e| {
                 SqeError::Execution(format!("Failed to commit INSERT transaction: {e}"))
             })?;
+            cleanup_guard.mark_committed();
 
             info!(
                 table = %table_ident,
                 total_rows,
                 "INSERT INTO committed successfully (streaming)"
             );
+        } else {
+            cleanup_guard.mark_committed();
         }
 
         Ok(vec![])
@@ -1177,27 +1316,42 @@ impl WriteHandler {
             puffin_stats_enabled(table.metadata().properties()).then(|| batches.clone());
 
         // Write data files
+        let tracker = new_upload_tracker();
+        let cleanup_guard =
+            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "insert");
         let data_files = write_data_files_with_metrics(
             &table,
             batches,
             "insert",
             self.metrics.as_ref(),
             self.compression(),
+            tracker,
         )
         .await?;
 
         if !data_files.is_empty() {
-            // Commit via fast-append
-            let tx = Transaction::new(&table);
-            let action = tx.fast_append().add_data_files(data_files);
-
-            let tx = action
-                .apply(tx)
-                .map_err(|e| SqeError::Execution(format!("Failed to apply fast append: {e}")))?;
-
-            tx.commit(catalog.as_ref()).await.map_err(|e| {
+            let files_for_retry = data_files.clone();
+            let catalog_for_commit = catalog.clone();
+            commit_with_retry(
+                catalog.as_ref(),
+                &table_ident,
+                "insert",
+                move |fresh_table| {
+                    let files = files_for_retry.clone();
+                    let cat = catalog_for_commit.clone();
+                    async move {
+                        let tx = Transaction::new(&fresh_table);
+                        let action = tx.fast_append().add_data_files(files);
+                        let tx = action.apply(tx)?;
+                        tx.commit(cat.as_ref()).await
+                    }
+                },
+            )
+            .await
+            .map_err(|e| {
                 SqeError::Execution(format!("Failed to commit INSERT transaction: {e}"))
             })?;
+            cleanup_guard.mark_committed();
 
             if let Some(stats_batches) = stats_snapshot {
                 self.maybe_emit_puffin_sidecar(&catalog, &table_ident, &stats_batches)
@@ -1209,6 +1363,8 @@ impl WriteHandler {
                 total_rows,
                 "INSERT INTO committed successfully"
             );
+        } else {
+            cleanup_guard.mark_committed();
         }
 
         Ok(affected_rows_batch(total_rows)) // DML success with affected row count
@@ -1256,26 +1412,46 @@ impl WriteHandler {
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
 
+        let tracker = new_upload_tracker();
+        let cleanup_guard =
+            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "ingest");
         let data_files = write_data_files_with_metrics(
             &table,
             batches,
             "ingest",
             self.metrics.as_ref(),
             self.compression(),
+            tracker,
         )
         .await?;
 
         if !data_files.is_empty() {
-            let tx = Transaction::new(&table);
-            let action = tx.fast_append().add_data_files(data_files);
-            let tx = action
-                .apply(tx)
-                .map_err(|e| SqeError::Execution(format!("Failed to apply fast append: {e}")))?;
-            tx.commit(catalog.as_ref()).await.map_err(|e| {
+            let files_for_retry = data_files.clone();
+            let catalog_for_commit = catalog.clone();
+            commit_with_retry(
+                catalog.as_ref(),
+                &table_ident,
+                "ingest",
+                move |fresh_table| {
+                    let files = files_for_retry.clone();
+                    let cat = catalog_for_commit.clone();
+                    async move {
+                        let tx = Transaction::new(&fresh_table);
+                        let action = tx.fast_append().add_data_files(files);
+                        let tx = action.apply(tx)?;
+                        tx.commit(cat.as_ref()).await
+                    }
+                },
+            )
+            .await
+            .map_err(|e| {
                 SqeError::Execution(format!("Failed to commit ingest transaction: {e}"))
             })?;
+            cleanup_guard.mark_committed();
 
             info!(table = %table_ident, total_rows, "DoPut ingest committed successfully");
+        } else {
+            cleanup_guard.mark_committed();
         }
 
         Ok(total_rows)
@@ -1377,6 +1553,9 @@ impl WriteHandler {
 
         let mut new_data_files = Vec::new();
         let mut total_deleted = 0usize;
+        let tracker = new_upload_tracker();
+        let cleanup_guard =
+            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "delete-cow");
 
         for data_file in &old_data_files {
             let file_path = data_file.file_path();
@@ -1413,6 +1592,7 @@ impl WriteHandler {
                     "delete",
                     self.metrics.as_ref(),
                     self.compression(),
+                    tracker.clone(),
                 )
                 .await?;
                 new_data_files.extend(new_files);
@@ -1439,6 +1619,7 @@ impl WriteHandler {
         tx.commit(catalog.as_catalog().as_ref())
             .await
             .map_err(|e| SqeError::Execution(format!("Failed to commit DELETE: {e}")))?;
+        cleanup_guard.mark_committed();
 
         info!(table = %table_ident, deleted_rows = total_deleted, "DELETE committed successfully");
         Ok(affected_rows_batch(total_deleted))
@@ -1597,14 +1778,25 @@ impl WriteHandler {
 
         // Commit: append position delete files. FastAppendAction auto-routes DataFiles
         // with content_type=PositionDeletes into the delete manifest entry.
-        let tx = Transaction::new(&table);
-        let action = tx.fast_append().add_data_files(delete_files);
-        let tx = action.apply(tx).map_err(|e| {
-            SqeError::Execution(format!("Failed to apply MoR DELETE fast-append: {e}"))
-        })?;
-        tx.commit(catalog.as_catalog().as_ref())
-            .await
-            .map_err(|e| SqeError::Execution(format!("Failed to commit MoR DELETE: {e}")))?;
+        let files_for_retry = delete_files.clone();
+        let catalog_for_commit = catalog.clone();
+        commit_with_retry(
+            catalog.as_catalog().as_ref(),
+            &table_ident,
+            "mor-delete",
+            move |fresh_table| {
+                let files = files_for_retry.clone();
+                let cat = catalog_for_commit.clone();
+                async move {
+                    let tx = Transaction::new(&fresh_table);
+                    let action = tx.fast_append().add_data_files(files);
+                    let tx = action.apply(tx)?;
+                    tx.commit(cat.as_catalog().as_ref()).await
+                }
+            },
+        )
+        .await
+        .map_err(|e| SqeError::Execution(format!("Failed to commit MoR DELETE: {e}")))?;
 
         info!(table = %table_ident, deleted_rows = deleted_count, "MoR DELETE committed successfully");
         Ok(affected_rows_batch(deleted_count))
@@ -1771,16 +1963,29 @@ impl WriteHandler {
         // Commit via RowDeltaAction: this emits Operation::Overwrite with
         // added-delete-files > 0 and no removed/added data files. The
         // SnapshotProducer's added-delete-files summary key mirrors Spark.
-        let tx = Transaction::new(&table);
-        let snapshot_id = table.metadata().current_snapshot_id();
-        let mut action = tx.row_delta().add_delete_files(delete_files);
-        if let Some(snap) = snapshot_id {
-            action = action.validate_from_snapshot(snap);
-        }
-        let tx = action.apply(tx).map_err(|e| {
-            SqeError::Execution(format!("Failed to apply RowDelta transaction: {e}"))
-        })?;
-        tx.commit(catalog.as_catalog().as_ref()).await.map_err(|e| {
+        let files_for_retry = delete_files.clone();
+        let catalog_for_commit = catalog.clone();
+        commit_with_retry(
+            catalog.as_catalog().as_ref(),
+            &table_ident,
+            "equality-delete",
+            move |fresh_table| {
+                let files = files_for_retry.clone();
+                let cat = catalog_for_commit.clone();
+                async move {
+                    let snapshot_id = fresh_table.metadata().current_snapshot_id();
+                    let tx = Transaction::new(&fresh_table);
+                    let mut action = tx.row_delta().add_delete_files(files);
+                    if let Some(snap) = snapshot_id {
+                        action = action.validate_from_snapshot(snap);
+                    }
+                    let tx = action.apply(tx)?;
+                    tx.commit(cat.as_catalog().as_ref()).await
+                }
+            },
+        )
+        .await
+        .map_err(|e| {
             let msg = e.to_string().to_lowercase();
             if msg.contains("stale snapshot") || msg.contains("rowdelta conflict") {
                 SqeError::Catalog(format!("commit conflict: {e}"))
@@ -1960,6 +2165,9 @@ impl WriteHandler {
 
         let mut new_data_files = Vec::new();
         let mut total_updated = 0usize;
+        let tracker = new_upload_tracker();
+        let cleanup_guard =
+            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "update-cow");
 
         for data_file in &old_data_files {
             let file_path = data_file.file_path();
@@ -2007,6 +2215,7 @@ impl WriteHandler {
                 "update",
                 self.metrics.as_ref(),
                 self.compression(),
+                tracker.clone(),
             )
             .await?;
             new_data_files.extend(new_files);
@@ -2031,6 +2240,7 @@ impl WriteHandler {
         tx.commit(catalog.as_catalog().as_ref())
             .await
             .map_err(|e| SqeError::Execution(format!("Failed to commit UPDATE: {e}")))?;
+        cleanup_guard.mark_committed();
 
         info!(table = %table_ident, updated_rows = total_updated, "UPDATE committed successfully");
         Ok(affected_rows_batch(total_updated))
@@ -2277,12 +2487,16 @@ impl WriteHandler {
 
         // Write the data file with the new values and the equality delete
         // file with the old keys. Both go into one RowDelta commit.
+        let tracker = new_upload_tracker();
+        let cleanup_guard =
+            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "update-mor");
         let new_data_files = write_data_files_with_metrics(
             &table,
             new_row_batches,
             "update-mor",
             self.metrics.as_ref(),
             self.compression(),
+            tracker,
         )
         .await?;
 
@@ -2302,19 +2516,31 @@ impl WriteHandler {
             "MoR UPDATE: committing row delta"
         );
 
-        let tx = Transaction::new(&table);
-        let snapshot_id = table.metadata().current_snapshot_id();
-        let mut action = tx
-            .row_delta()
-            .add_data_files(new_data_files)
-            .add_delete_files(delete_files);
-        if let Some(snap) = snapshot_id {
-            action = action.validate_from_snapshot(snap);
-        }
-        let tx = action.apply(tx).map_err(|e| {
-            SqeError::Execution(format!("Failed to apply MoR UPDATE row delta: {e}"))
-        })?;
-        tx.commit(catalog.as_catalog().as_ref()).await.map_err(|e| {
+        let data_files_for_retry = new_data_files.clone();
+        let delete_files_for_retry = delete_files.clone();
+        let catalog_for_commit = catalog.clone();
+        commit_with_retry(
+            catalog.as_catalog().as_ref(),
+            &table_ident,
+            "mor-update",
+            move |fresh_table| {
+                let dfs = data_files_for_retry.clone();
+                let dels = delete_files_for_retry.clone();
+                let cat = catalog_for_commit.clone();
+                async move {
+                    let snapshot_id = fresh_table.metadata().current_snapshot_id();
+                    let tx = Transaction::new(&fresh_table);
+                    let mut action = tx.row_delta().add_data_files(dfs).add_delete_files(dels);
+                    if let Some(snap) = snapshot_id {
+                        action = action.validate_from_snapshot(snap);
+                    }
+                    let tx = action.apply(tx)?;
+                    tx.commit(cat.as_catalog().as_ref()).await
+                }
+            },
+        )
+        .await
+        .map_err(|e| {
             let msg = e.to_string().to_lowercase();
             if msg.contains("stale snapshot") || msg.contains("rowdelta conflict") {
                 SqeError::Catalog(format!("commit conflict: {e}"))
@@ -2322,6 +2548,7 @@ impl WriteHandler {
                 SqeError::Execution(format!("Failed to commit MoR UPDATE: {e}"))
             }
         })?;
+        cleanup_guard.mark_committed();
 
         info!(
             table = %table_ident,
@@ -2677,6 +2904,9 @@ impl WriteHandler {
 
         // Write new data files from the merged results
         let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
+        let tracker = new_upload_tracker();
+        let cleanup_guard =
+            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "merge-cow");
         let new_data_files = if total_rows > 0 {
             write_data_files_with_metrics(
                 &table,
@@ -2684,6 +2914,7 @@ impl WriteHandler {
                 "merge",
                 self.metrics.as_ref(),
                 self.compression(),
+                tracker,
             )
             .await?
         } else {
@@ -2700,6 +2931,7 @@ impl WriteHandler {
 
         // Atomic commit: remove all old files, add new merged files
         if old_data_files.is_empty() && new_data_files.is_empty() {
+            cleanup_guard.mark_committed();
             info!(table = %table_ident, "MERGE: no changes to commit");
             return Ok(vec![]);
         }
@@ -2718,6 +2950,7 @@ impl WriteHandler {
         tx.commit(catalog.as_catalog().as_ref())
             .await
             .map_err(|e| SqeError::Execution(format!("Failed to commit MERGE: {e}")))?;
+        cleanup_guard.mark_committed();
 
         info!(table = %table_ident, total_rows, "MERGE committed successfully");
         Ok(affected_rows_batch(total_rows))
@@ -3157,6 +3390,9 @@ impl WriteHandler {
             return Ok(vec![]);
         }
 
+        let tracker = new_upload_tracker();
+        let cleanup_guard =
+            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "merge-mor");
         let new_data_files = if !new_data_batches.is_empty() {
             write_data_files_with_metrics(
                 &table,
@@ -3164,6 +3400,7 @@ impl WriteHandler {
                 "merge-mor",
                 self.metrics.as_ref(),
                 self.compression(),
+                tracker,
             )
             .await?
         } else {
@@ -3192,22 +3429,37 @@ impl WriteHandler {
             "MoR MERGE: committing row delta"
         );
 
-        let tx = Transaction::new(&table);
-        let snapshot_id = table.metadata().current_snapshot_id();
-        let mut action = tx.row_delta();
-        if !new_data_files.is_empty() {
-            action = action.add_data_files(new_data_files);
-        }
-        if !delete_files.is_empty() {
-            action = action.add_delete_files(delete_files);
-        }
-        if let Some(snap) = snapshot_id {
-            action = action.validate_from_snapshot(snap);
-        }
-        let tx = action.apply(tx).map_err(|e| {
-            SqeError::Execution(format!("Failed to apply MoR MERGE row delta: {e}"))
-        })?;
-        tx.commit(catalog.as_catalog().as_ref()).await.map_err(|e| {
+        let data_files_for_retry = new_data_files.clone();
+        let delete_files_for_retry = delete_files.clone();
+        let catalog_for_commit = catalog.clone();
+        commit_with_retry(
+            catalog.as_catalog().as_ref(),
+            &table_ident,
+            "mor-merge",
+            move |fresh_table| {
+                let dfs = data_files_for_retry.clone();
+                let dels = delete_files_for_retry.clone();
+                let cat = catalog_for_commit.clone();
+                async move {
+                    let snapshot_id = fresh_table.metadata().current_snapshot_id();
+                    let tx = Transaction::new(&fresh_table);
+                    let mut action = tx.row_delta();
+                    if !dfs.is_empty() {
+                        action = action.add_data_files(dfs);
+                    }
+                    if !dels.is_empty() {
+                        action = action.add_delete_files(dels);
+                    }
+                    if let Some(snap) = snapshot_id {
+                        action = action.validate_from_snapshot(snap);
+                    }
+                    let tx = action.apply(tx)?;
+                    tx.commit(cat.as_catalog().as_ref()).await
+                }
+            },
+        )
+        .await
+        .map_err(|e| {
             let msg = e.to_string().to_lowercase();
             if msg.contains("stale snapshot") || msg.contains("rowdelta conflict") {
                 SqeError::Catalog(format!("commit conflict: {e}"))
@@ -3215,6 +3467,7 @@ impl WriteHandler {
                 SqeError::Execution(format!("Failed to commit MoR MERGE: {e}"))
             }
         })?;
+        cleanup_guard.mark_committed();
 
         info!(
             table = %table_ident,
@@ -6621,5 +6874,26 @@ s3_path_style = true
             .await
             .unwrap();
         assert_eq!(count, 2, "row filter must shrink the affected count");
+    }
+
+    // -------------------------------------------------------------------------
+    // commit conflict retry classifier (#47)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn is_conflict_message_matches_vendor_conflicts() {
+        assert!(is_conflict_message("Commit conflicted for table: db.t"));
+        assert!(is_conflict_message(
+            "CatalogCommitConflicts: stale snapshot 12345"
+        ));
+        assert!(is_conflict_message("RowDelta conflict on partition"));
+        assert!(is_conflict_message("Operation marked retryable=true"));
+    }
+
+    #[test]
+    fn is_conflict_message_ignores_unrelated_errors() {
+        assert!(!is_conflict_message("table not found"));
+        assert!(!is_conflict_message("malformed parquet footer"));
+        assert!(!is_conflict_message("connection refused"));
     }
 }
