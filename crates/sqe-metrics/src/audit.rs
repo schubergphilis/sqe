@@ -262,6 +262,13 @@ impl std::fmt::Debug for AuditLogger {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use tempfile::TempDir;
+
+    fn fresh_audit_path(name: &str) -> (TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join(name);
+        (dir, path)
+    }
 
     fn test_entry() -> AuditEntry {
         AuditEntry {
@@ -321,8 +328,7 @@ mod tests {
 
     #[test]
     fn test_file_logger_writes() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("sqe-audit-test.jsonl");
+        let (_dir, path) = fresh_audit_path("sqe-audit-test.jsonl");
         let path_str = path.to_str().unwrap();
 
         let logger = AuditLogger::new(path_str).unwrap();
@@ -330,18 +336,16 @@ mod tests {
         logger.flush();
 
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("\"username\":\"test\""));
-        assert!(content.contains("query_hash"));
-
-        let _ = std::fs::remove_file(&path);
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1, "exactly one entry written, got: {content}");
+        assert!(lines[0].contains("\"username\":\"test\""));
+        assert!(lines[0].contains("query_hash"));
     }
 
     #[test]
     fn test_flush_blocks_until_written() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("sqe-audit-flush-test.jsonl");
+        let (_dir, path) = fresh_audit_path("sqe-audit-flush-test.jsonl");
         let path_str = path.to_str().unwrap();
-        let _ = std::fs::remove_file(&path);
 
         let logger = AuditLogger::new(path_str).unwrap();
         for _ in 0..50 {
@@ -352,8 +356,6 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let lines = content.lines().count();
         assert_eq!(lines, 50, "all entries visible after flush");
-
-        let _ = std::fs::remove_file(&path);
     }
 
     // --- PII redaction tests ---
@@ -459,10 +461,8 @@ mod tests {
 
     #[test]
     fn test_audit_log_does_not_contain_create_secret_literal() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("sqe-audit-secret-test.jsonl");
+        let (_dir, path) = fresh_audit_path("sqe-audit-secret-test.jsonl");
         let path_str = path.to_str().unwrap();
-        let _ = std::fs::remove_file(&path);
 
         let logger = AuditLogger::new(path_str).unwrap();
         let mut entry = test_entry();
@@ -474,21 +474,23 @@ mod tests {
         logger.flush();
 
         let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "exactly one entry must exist so the negative assertion below is meaningful, got: {content}"
+        );
         assert!(
             !content.contains("eyJSECRETJWTPAYLOAD"),
             "secret literal leaked to audit log: {content}"
         );
         assert!(content.contains("[REDACTED]"));
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn test_log_redacts_pii_in_written_file() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("sqe-audit-pii-test.jsonl");
+        let (_dir, path) = fresh_audit_path("sqe-audit-pii-test.jsonl");
         let path_str = path.to_str().unwrap();
-        let _ = std::fs::remove_file(&path);
 
         let logger = AuditLogger::new(path_str).unwrap();
         let mut entry = test_entry();
@@ -499,9 +501,13 @@ mod tests {
         logger.flush();
 
         let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "exactly one entry must exist so the negative assertion below is meaningful, got: {content}"
+        );
         assert!(!content.contains("carol@example.com"), "PII must not appear in audit log");
         assert!(content.contains("[EMAIL]"));
-
-        let _ = std::fs::remove_file(&path);
     }
 }
