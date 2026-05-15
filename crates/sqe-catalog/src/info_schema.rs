@@ -183,7 +183,9 @@ impl InformationSchemaProvider {
                     }
                 };
 
-                // Resolve restricted columns for this table when policy is active
+                // Resolve restricted columns for this table when policy is active.
+                // Fail closed on policy errors: skip the table entirely rather than leak
+                // the column list when the policy backend is degraded.
                 let restricted_columns = match (&self.policy_store, &self.session_user) {
                     (Some(store), Some(user)) => {
                         match store.resolve(user, table_ident.name(), ns).await {
@@ -193,9 +195,9 @@ impl InformationSchemaProvider {
                                     table = %table_ident.name(),
                                     namespace = %ns,
                                     error = %e,
-                                    "Failed to resolve policy for information_schema.columns; showing all columns"
+                                    "Policy resolution failed for information_schema.columns; omitting table (fail-closed)"
                                 );
-                                Vec::new()
+                                continue;
                             }
                         }
                     }
