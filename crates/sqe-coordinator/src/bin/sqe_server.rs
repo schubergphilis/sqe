@@ -203,18 +203,20 @@ impl TrinoAuthenticator for AuthenticatorAdapter {
         &self,
         username: &str,
         password: &str,
-    ) -> Result<sqe_core::Session, String> {
+    ) -> Result<sqe_core::Session, sqe_core::SqeError> {
         self.authenticator
             .authenticate(username, password)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| sqe_core::SqeError::Auth(e.to_string()))
     }
 
-    async fn authenticate_bearer(&self, token: &str) -> Result<sqe_core::Session, String> {
-        let provider = self
-            .bearer_provider
-            .as_ref()
-            .ok_or_else(|| "Bearer token authentication is not configured".to_string())?;
+    async fn authenticate_bearer(
+        &self,
+        token: &str,
+    ) -> Result<sqe_core::Session, sqe_core::SqeError> {
+        let provider = self.bearer_provider.as_ref().ok_or_else(|| {
+            sqe_core::SqeError::Auth("Bearer token authentication is not configured".to_string())
+        })?;
 
         let credentials = sqe_auth::FlightCredentials {
             bearer_token: Some(sqe_core::SecretString::new(token.to_string())),
@@ -224,7 +226,7 @@ impl TrinoAuthenticator for AuthenticatorAdapter {
         let identity = provider
             .authenticate(&credentials)
             .await
-            .map_err(|e| format!("Bearer token validation failed: {e}"))?;
+            .map_err(|e| sqe_core::SqeError::Auth(format!("Bearer token validation failed: {e}")))?;
 
         // Convert Identity to Session: use the JWT itself as the catalog token
         // (passthrough to Polaris), and the identity fields for user/roles.
@@ -252,14 +254,11 @@ impl TrinoQueryExecutor for QueryHandlerAdapter {
         &self,
         session: &sqe_core::Session,
         sql: &str,
-    ) -> Result<Vec<arrow_array::RecordBatch>, String> {
+    ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
         self.rate_limiter
             .check(&session.user.username)
-            .map_err(|e| e.to_string())?;
-        self.handler
-            .execute(session, sql)
-            .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| sqe_core::SqeError::Execution(format!("rate limit: {e}")))?;
+        self.handler.execute(session, sql).await
     }
 }
 
@@ -354,9 +353,14 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     // Health endpoints on metrics port + 1 (or 9091 default)
     let health_port = config.metrics.prometheus_port + 1;
 
+    // Track supervised background tasks for the lifetime of the binary;
+    // dropping each TaskGuard signals cooperative cancellation and aborts
+    // the underlying tokio task.
+    let mut _task_guards: Vec<sqe_core::TaskGuard> = Vec::new();
+
     // Auth
     let authenticator = Arc::new(sqe_auth::Authenticator::new(&config.auth).await?);
-    authenticator.start_refresh_task();
+    _task_guards.push(authenticator.start_refresh_task());
 
     // Build the auth provider chain from `[[auth.providers]]`. Both Flight
     // SQL (via SessionManager) and the Trino-compat HTTP path use the
@@ -386,7 +390,9 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     );
 
     if !config.coordinator.worker_urls.is_empty() {
-        worker_registry.start_health_check_task(std::time::Duration::from_secs(5));
+        _task_guards.push(
+            worker_registry.start_health_check_task(std::time::Duration::from_secs(5)),
+        );
         tracing::info!(workers = ?config.coordinator.worker_urls, "Started worker health checks");
     }
 
@@ -421,19 +427,22 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
 
     // Start background credential refresh loop (checks every 60s)
     if !config.coordinator.worker_urls.is_empty() {
-        sqe_coordinator::credential_refresh::start_credential_refresh_task(
-            credential_tracker.clone(),
-            std::time::Duration::from_secs(60),
-            config.coordinator.worker_secret.clone(),
-            |_fragment| async {
-                // Credential vending is deferred to Step 5 (Pluggable Catalogs):
-                // the CatalogBackend trait will expose a `vend_credentials(table)`
-                // method that reloads the table from Polaris to obtain fresh STS
-                // tokens scoped to the fragment's data files.
-                // Until then, workers use the original session credentials.
-                // Tracking: nextsteps.md Step 5, openspec/changes/pluggable-catalogs/
-                None
-            },
+        _task_guards.push(
+            sqe_coordinator::credential_refresh::start_credential_refresh_task(
+                credential_tracker.clone(),
+                std::time::Duration::from_secs(60),
+                config.coordinator.worker_secret.clone(),
+                |_fragment| async {
+                    // Credential vending is deferred to Step 5 (Pluggable
+                    // Catalogs): the CatalogBackend trait will expose a
+                    // `vend_credentials(table)` method that reloads the
+                    // table from Polaris to obtain fresh STS tokens scoped
+                    // to the fragment's data files. Until then, workers use
+                    // the original session credentials. Tracking:
+                    // nextsteps.md Step 5, openspec/changes/pluggable-catalogs/
+                    None
+                },
+            ),
         );
         tracing::info!("Started credential refresh background task (60s interval)");
     }

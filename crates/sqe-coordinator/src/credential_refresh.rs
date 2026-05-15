@@ -198,19 +198,22 @@ pub fn start_credential_refresh_task<F, Fut>(
     interval: std::time::Duration,
     worker_secret: String,
     get_fresh_credentials: F,
-) where
+) -> sqe_core::TaskGuard
+where
     F: Fn(ActiveFragment) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Option<RefreshableCredentials>> + Send,
 {
-    // TODO(security-hardening): store JoinHandle and add CancellationToken
-    tokio::spawn(async move {
+    sqe_core::spawn_supervised("credential-refresh", move |token| async move {
         let mut tick = tokio::time::interval(interval);
         // First tick fires immediately, skip it so we don't do a
         // pointless check at startup when no fragments are registered.
         tick.tick().await;
 
         loop {
-            tick.tick().await;
+            tokio::select! {
+                _ = token.cancelled() => break,
+                _ = tick.tick() => {}
+            }
 
             let active = tracker.active_count().await;
             if active == 0 {
@@ -225,7 +228,7 @@ pub fn start_credential_refresh_task<F, Fut>(
                 info!(count = refreshed, "Pushed refreshed credentials to workers");
             }
         }
-    });
+    })
 }
 
 /// Push refreshed credentials to a single worker via Arrow Flight `do_action`.
