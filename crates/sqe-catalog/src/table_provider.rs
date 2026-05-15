@@ -146,7 +146,7 @@ impl TableProvider for SqeTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         _limit: Option<usize>,
@@ -193,9 +193,11 @@ impl TableProvider for SqeTableProvider {
         if self.trust_sort_order {
             exec = exec.with_trust_sort_order(true);
         }
+        let target_partitions = state.config_options().execution.target_partitions.max(1);
         exec = exec
             .with_small_file_threshold(self.small_file_threshold_bytes)
-            .with_manifest_concurrency(self.manifest_concurrency);
+            .with_manifest_concurrency(self.manifest_concurrency)
+            .with_target_partitions(target_partitions);
 
         // Pre-compute per-column min/max/null_count from manifest entries so
         // DataFusion's join-order optimizer sees real selectivity and picks

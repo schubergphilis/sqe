@@ -237,6 +237,7 @@ struct IncrementalScanExec {
     wants_change_ordinal: bool,
     wants_commit_snapshot: bool,
     file_io: Option<FileIO>,
+    target_partitions: usize,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -255,9 +256,10 @@ impl IncrementalScanExec {
         file_io: Option<FileIO>,
     ) -> Self {
         let eq_props = EquivalenceProperties::new(output_schema.clone());
+        let target_partitions: usize = 1;
         let properties = Arc::new(PlanProperties::new(
             eq_props,
-            Partitioning::UnknownPartitioning(1),
+            Partitioning::UnknownPartitioning(target_partitions),
             EmissionType::Incremental,
             Boundedness::Bounded,
         ));
@@ -271,9 +273,28 @@ impl IncrementalScanExec {
             wants_change_ordinal,
             wants_commit_snapshot,
             file_io,
+            target_partitions,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// Override the number of output partitions.
+    ///
+    /// Each partition reads a round-robin slice of the planned `data_files`
+    /// list, allowing DataFusion to scan a wide change-log range in parallel.
+    #[allow(dead_code)]
+    fn with_target_partitions(mut self, target_partitions: usize) -> Self {
+        let n = target_partitions.max(1);
+        self.target_partitions = n;
+        let eq = self.properties.eq_properties.clone();
+        self.properties = Arc::new(PlanProperties::new(
+            eq,
+            Partitioning::UnknownPartitioning(n),
+            self.properties.emission_type,
+            self.properties.boundedness,
+        ));
+        self
     }
 }
 
@@ -323,11 +344,13 @@ impl ExecutionPlan for IncrementalScanExec {
         partition: usize,
         _context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        if partition != 0 {
+        if partition >= self.target_partitions {
             return Err(DataFusionError::Internal(format!(
-                "IncrementalScanExec only supports partition 0, got {partition}"
+                "IncrementalScanExec partition {partition} out of range (target_partitions = {})",
+                self.target_partitions
             )));
         }
+        let total_partitions = self.target_partitions;
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         let output_schema = self.output_schema.clone();
         let base_schema = self.base_schema.clone();
@@ -344,7 +367,17 @@ impl ExecutionPlan for IncrementalScanExec {
         // empty stream.
         let output_schema_inner = output_schema.clone();
         let file_io_opt = file_io.clone();
-        let data_files = plan.data_files.clone();
+        let data_files: Vec<_> = if total_partitions > 1 {
+            plan.data_files
+                .iter()
+                .cloned()
+                .enumerate()
+                .filter(|(idx, _)| idx % total_partitions == partition)
+                .map(|(_, f)| f)
+                .collect()
+        } else {
+            plan.data_files.clone()
+        };
         let gen_stream = futures::stream::once(async move {
             let Some(file_io) = file_io_opt else {
                 // Empty output batch once, then EOS.

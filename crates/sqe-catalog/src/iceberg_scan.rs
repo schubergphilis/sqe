@@ -64,6 +64,16 @@ pub const DEFAULT_MANIFEST_CONCURRENCY: usize = 64;
 /// in-flight bytes bounded (`concurrency × small_file_threshold`).
 pub const DEFAULT_DIRECT_READ_CONCURRENCY: usize = 8;
 
+/// Default number of output partitions for [`IcebergScanExec`].
+///
+/// One partition means the scan runs serially on a single thread regardless of
+/// how many cores the coordinator has. Callers that know the table file count
+/// should override this with [`IcebergScanExec::with_target_partitions`] (the
+/// DataFusion planner sets it from `execution.target_partitions`). Default `1`
+/// preserves the prior single-partition behaviour for code paths that have not
+/// been updated.
+pub const DEFAULT_TARGET_PARTITIONS: usize = 1;
+
 #[derive(Debug)]
 pub struct IcebergScanExec {
     table: Table,
@@ -114,6 +124,14 @@ pub struct IcebergScanExec {
     /// GET. This field sets how many of those GETs are in flight at once via
     /// `buffer_unordered`. Defaults to [`DEFAULT_DIRECT_READ_CONCURRENCY`].
     direct_read_concurrency: usize,
+    /// Number of output partitions (logical scan streams) this exec produces.
+    ///
+    /// DataFusion calls `execute(partition)` once per partition in [0, N).
+    /// Each partition reads a disjoint round-robin slice of the file list, so
+    /// the per-thread fan-out scales linearly with `target_partitions` until
+    /// the cluster runs out of useful concurrency. Defaults to
+    /// [`DEFAULT_TARGET_PARTITIONS`].
+    target_partitions: usize,
     /// Pre-computed table statistics aggregated from manifest entries.
     ///
     /// Populated at scan-planning time by `table_provider::scan` (which is
@@ -193,8 +211,8 @@ impl IcebergScanExec {
                 None => EquivalenceProperties::new(projected_schema.clone()),
             }
         };
-        let properties = Arc::new(PlanProperties::new(eq_props, Partitioning::UnknownPartitioning(1), EmissionType::Incremental, Boundedness::Bounded));
-        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![], manifest_concurrency: DEFAULT_MANIFEST_CONCURRENCY, direct_read_concurrency: DEFAULT_DIRECT_READ_CONCURRENCY, cached_statistics: None }
+        let properties = Arc::new(PlanProperties::new(eq_props, Partitioning::UnknownPartitioning(DEFAULT_TARGET_PARTITIONS), EmissionType::Incremental, Boundedness::Bounded));
+        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![], manifest_concurrency: DEFAULT_MANIFEST_CONCURRENCY, direct_read_concurrency: DEFAULT_DIRECT_READ_CONCURRENCY, target_partitions: DEFAULT_TARGET_PARTITIONS, cached_statistics: None }
     }
 
     /// Attach pre-computed statistics aggregated from Iceberg manifests.
@@ -255,13 +273,32 @@ impl IcebergScanExec {
             if let Some(sort_exprs) = crate::sort_order::iceberg_sort_to_physical(sort_order, iceberg_schema, &self.projected_schema) {
                 self.properties = Arc::new(PlanProperties::new(
                     crate::sort_order::equivalence_with_sort(self.projected_schema.clone(), sort_exprs),
-                    Partitioning::UnknownPartitioning(1),
+                    Partitioning::UnknownPartitioning(self.target_partitions),
                     EmissionType::Incremental,
                     Boundedness::Bounded,
                 ));
             }
         }
         self.trust_sort_order = trust;
+        self
+    }
+
+    /// Override the number of output partitions for this scan.
+    ///
+    /// Each partition reads a round-robin slice of the planned file list and
+    /// emits an independent `SendableRecordBatchStream`. The DataFusion planner
+    /// typically passes `execution.target_partitions` here so the scan fan-out
+    /// matches the configured CPU parallelism.
+    pub fn with_target_partitions(mut self, target_partitions: usize) -> Self {
+        let n = target_partitions.max(1);
+        self.target_partitions = n;
+        let eq = self.properties.eq_properties.clone();
+        self.properties = Arc::new(PlanProperties::new(
+            eq,
+            Partitioning::UnknownPartitioning(n),
+            self.properties.emission_type,
+            self.properties.boundedness,
+        ));
         self
     }
 
@@ -291,6 +328,7 @@ impl IcebergScanExec {
             pushed_down_filters: filters,
             manifest_concurrency: self.manifest_concurrency,
             direct_read_concurrency: self.direct_read_concurrency,
+            target_partitions: self.target_partitions,
             cached_statistics: self.cached_statistics.clone(),
         }
     }
@@ -674,7 +712,13 @@ impl ExecutionPlan for IcebergScanExec {
     fn execute(&self, partition: usize, _context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
         let span = info_span!("iceberg_scan", table=%self.table.identifier(), partition=partition, predicates=?self.predicates);
         let _guard = span.enter();
-        if partition != 0 { return Err(DataFusionError::Internal(format!("IcebergScanExec only supports partition 0, got {partition}"))); }
+        if partition >= self.target_partitions {
+            return Err(DataFusionError::Internal(format!(
+                "IcebergScanExec partition {partition} out of range (target_partitions = {})",
+                self.target_partitions
+            )));
+        }
+        let total_partitions = self.target_partitions;
         let table = self.table.clone();
         let schema = self.projected_schema.clone();
         let projection = self.projection.clone();
@@ -744,6 +788,26 @@ impl ExecutionPlan for IcebergScanExec {
                 smallest_file_bytes = file_entries.last().map(|(_, sz)| *sz).unwrap_or(0),
                 "IcebergScanExec: file entries collected and sorted by size descending"
             );
+
+            // Round-robin assignment after the size-descending sort spreads the
+            // largest files across partitions instead of clustering them at the
+            // top of partition 0. With one partition this is a no-op slice.
+            if total_partitions > 1 {
+                let before = file_entries.len();
+                file_entries = file_entries
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(idx, _)| idx % total_partitions == partition)
+                    .map(|(_, entry)| entry)
+                    .collect();
+                debug!(
+                    partition = partition,
+                    total_partitions = total_partitions,
+                    before = before,
+                    after = file_entries.len(),
+                    "IcebergScanExec: round-robin partition slice"
+                );
+            }
 
             // ── Direct-read fast path ────────────────────────────────────────
             //
