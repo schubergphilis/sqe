@@ -83,8 +83,25 @@ pub struct QueryHandler {
     lineage: Option<Arc<dyn sqe_lineage::LineageObserver>>,
     query_tracker: Arc<QueryTracker>,
     query_cache: Option<Arc<ResultCache>>,
-    /// Semaphore limiting concurrent query execution.
+    /// Semaphore limiting global concurrent query execution.
     query_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    /// Per-user concurrency semaphores. Lazily created on first query per
+    /// username. Each entry caps how many simultaneous queries one user can
+    /// hold against the global pool, preventing a single tenant from
+    /// monopolising `query_semaphore`.
+    per_user_semaphores: Arc<dashmap::DashMap<String, Arc<tokio::sync::Semaphore>>>,
+    /// Tracks per-user reserved memory bytes for admission. Reservations are
+    /// recorded at admit time and released when the streaming result wrapper
+    /// drops, so a single user submitting many memory-hungry queries gets
+    /// rejected with a per-user pressure error before they drag the global
+    /// FairSpillPool into the red-band.
+    per_user_memory: Arc<crate::memory::PerUserMemoryRegistry>,
+    /// Cached parse of `config.query.per_user_memory_budget`. `0` disables
+    /// the per-user cap.
+    per_user_memory_budget_bytes: usize,
+    /// Cached parse of `config.query.max_query_memory`. Used as the
+    /// per-query reservation increment against the per-user budget.
+    per_query_memory_bytes: usize,
     /// Shared DataFusion runtime with FairSpillPool memory management.
     /// Built once at startup and reused across all queries.
     runtime: Arc<RuntimeEnv>,
@@ -161,6 +178,27 @@ impl QueryHandler {
         let runtime = crate::runtime::build_coordinator_runtime(&config.coordinator)
             .map_err(|e| sqe_core::SqeError::Config(format!("Failed to build runtime: {e}")))?;
 
+        let per_user_memory_budget_bytes = if config.query.per_user_memory_budget == "0" {
+            0
+        } else {
+            sqe_core::parse_memory_limit(&config.query.per_user_memory_budget).map_err(|e| {
+                sqe_core::SqeError::Config(format!(
+                    "Invalid per_user_memory_budget '{}': {e}",
+                    config.query.per_user_memory_budget
+                ))
+            })? as usize
+        };
+        let per_query_memory_bytes = if config.query.max_query_memory == "0" {
+            0
+        } else {
+            sqe_core::parse_memory_limit(&config.query.max_query_memory).map_err(|e| {
+                sqe_core::SqeError::Config(format!(
+                    "Invalid max_query_memory '{}': {e}",
+                    config.query.max_query_memory
+                ))
+            })? as usize
+        };
+
         Ok(Self {
             policy_enforcer,
             policy_store,
@@ -177,6 +215,10 @@ impl QueryHandler {
             query_tracker,
             query_cache,
             query_semaphore,
+            per_user_semaphores: Arc::new(dashmap::DashMap::new()),
+            per_user_memory: Arc::new(crate::memory::PerUserMemoryRegistry::new()),
+            per_user_memory_budget_bytes,
+            per_query_memory_bytes,
             runtime,
             table_cache: None,
             grant_backend,
@@ -425,9 +467,63 @@ impl QueryHandler {
             ));
         }
 
-        // Backpressure: reject if too many concurrent queries
+        // Backpressure: per-user gate first, then global gate. The per-user
+        // gate prevents one tenant from holding every global permit while
+        // legitimately under their submission rate limit. We acquire owned
+        // permits because the streaming path holds them for the result-
+        // stream lifetime, not the synchronous execute() call.
+        let _per_user_permit = if self.config.query.max_concurrent_per_user > 0 {
+            let username = session.user.username.clone();
+            let sem = self
+                .per_user_semaphores
+                .entry(username.clone())
+                .or_insert_with(|| {
+                    Arc::new(tokio::sync::Semaphore::new(
+                        self.config.query.max_concurrent_per_user,
+                    ))
+                })
+                .clone();
+            match sem.try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    return Err(SqeError::Execution(format!(
+                        "Too many concurrent queries for user '{}' ({} active). Please retry later.",
+                        username, self.config.query.max_concurrent_per_user
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
+        // Per-user memory reservation. Reject when this user's in-flight
+        // queries would push past their share of the global pool, before
+        // the global red-band check fires for everyone else.
+        let _per_user_mem_reservation = if self.per_user_memory_budget_bytes > 0
+            && self.per_query_memory_bytes > 0
+        {
+            let username = session.user.username.clone();
+            match self.per_user_memory.try_reserve(
+                &username,
+                self.per_query_memory_bytes,
+                self.per_user_memory_budget_bytes,
+            ) {
+                Some(r) => Some(r),
+                None => {
+                    let used = self.per_user_memory.used_bytes(&username);
+                    return Err(SqeError::Execution(format!(
+                        "Per-user memory budget exceeded for '{}': {} bytes reserved, \
+                         limit {} bytes. Wait for in-flight queries to complete.",
+                        username, used, self.per_user_memory_budget_bytes
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
         let _permit = if let Some(ref sem) = self.query_semaphore {
-            match sem.try_acquire() {
+            match sem.clone().try_acquire_owned() {
                 Ok(permit) => Some(permit),
                 Err(_) => {
                     return Err(SqeError::Execution(format!(
@@ -510,7 +606,7 @@ impl QueryHandler {
             sql_length = sql.len(),
             "Executing query"
         );
-        self.query_tracker.start(
+        let cancel_token = self.query_tracker.start(
             query_id,
             &session.user.username,
             session.source.as_deref(),
@@ -1013,19 +1109,37 @@ impl QueryHandler {
             }
         };
 
-        let result = match tokio::time::timeout(timeout_duration, execution_future).await {
-            Ok(inner_result) => inner_result,
-            Err(_elapsed) => {
+        // Race the execution against:
+        //   - the configured query timeout
+        //   - the per-query cancellation token (admin CancelQuery action)
+        // The first one to fire wins. Cancellation skips the failed() write
+        // because the tracker's cancel() already transitioned to Canceled.
+        let result = tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => {
                 warn!(
+                    query_id = %query_id,
                     username = %session.user.username,
-                    timeout_secs = timeout_secs,
-                    "Query timed out"
+                    "Query cancelled by admin or client"
                 );
-                let timeout_error = SqeError::Execution(format!(
-                    "Query timed out after {timeout_secs}s"
-                ));
-                self.query_tracker.failed(&query_id, &timeout_error);
-                Err(timeout_error)
+                Err(SqeError::Execution("Query cancelled".to_string()))
+            }
+            inner = tokio::time::timeout(timeout_duration, execution_future) => {
+                match inner {
+                    Ok(inner_result) => inner_result,
+                    Err(_elapsed) => {
+                        warn!(
+                            username = %session.user.username,
+                            timeout_secs = timeout_secs,
+                            "Query timed out"
+                        );
+                        let timeout_error = SqeError::Execution(format!(
+                            "Query timed out after {timeout_secs}s"
+                        ));
+                        self.query_tracker.failed(&query_id, &timeout_error);
+                        Err(timeout_error)
+                    }
+                }
             }
         };
 
@@ -1302,15 +1416,66 @@ impl QueryHandler {
             ));
         }
 
-        // Acquire owned concurrency permit so it can be moved into the
+        // Acquire owned concurrency permits so they can be moved into the
         // stream wrapper and released when the client finishes draining.
-        let permit = if let Some(ref sem) = self.query_semaphore {
+        // The per-user permit is acquired first; if granted, the global
+        // permit is acquired second. A user that holds N per-user permits
+        // (each tied to an open stream) still counts N times against the
+        // global ceiling.
+        let mut permits: Vec<tokio::sync::OwnedSemaphorePermit> = Vec::new();
+        if self.config.query.max_concurrent_per_user > 0 {
+            let username = session.user.username.clone();
+            let sem = self
+                .per_user_semaphores
+                .entry(username.clone())
+                .or_insert_with(|| {
+                    Arc::new(tokio::sync::Semaphore::new(
+                        self.config.query.max_concurrent_per_user,
+                    ))
+                })
+                .clone();
+            match sem.try_acquire_owned() {
+                Ok(p) => permits.push(p),
+                Err(_) => {
+                    return Err(SqeError::Execution(format!(
+                        "Too many concurrent queries for user '{}' ({} active). Please retry later.",
+                        username, self.config.query.max_concurrent_per_user
+                    )));
+                }
+            }
+        }
+        if let Some(ref sem) = self.query_semaphore {
             match Arc::clone(sem).try_acquire_owned() {
-                Ok(p) => Some(p),
+                Ok(p) => permits.push(p),
                 Err(_) => {
                     return Err(SqeError::Execution(format!(
                         "Too many concurrent queries ({} active). Please retry later.",
                         self.config.query.max_concurrent_queries
+                    )));
+                }
+            }
+        }
+
+        // Per-user memory reservation. Carried by the streaming wrapper so
+        // it releases when the result stream drops, not when the planning
+        // call returns. Without this, large multi-second streams would
+        // appear to free their budget immediately on admission.
+        let per_user_mem_reservation = if self.per_user_memory_budget_bytes > 0
+            && self.per_query_memory_bytes > 0
+        {
+            let username = session.user.username.clone();
+            match self.per_user_memory.try_reserve(
+                &username,
+                self.per_query_memory_bytes,
+                self.per_user_memory_budget_bytes,
+            ) {
+                Some(r) => Some(r),
+                None => {
+                    let used = self.per_user_memory.used_bytes(&username);
+                    return Err(SqeError::Execution(format!(
+                        "Per-user memory budget exceeded for '{}': {} bytes reserved, \
+                         limit {} bytes. Wait for in-flight queries to complete.",
+                        username, used, self.per_user_memory_budget_bytes
                     )));
                 }
             }
@@ -1372,7 +1537,7 @@ impl QueryHandler {
             sql_length = sql.len(),
             "Starting streaming query"
         );
-        self.query_tracker.start(
+        let cancel_token = self.query_tracker.start(
             query_id,
             &session.user.username,
             session.source.as_deref(),
@@ -1401,10 +1566,12 @@ impl QueryHandler {
                     sql_length: sql.len(),
                 };
 
-                let tracked = crate::streaming::TrackedRecordBatchStream::new(
+                let tracked = crate::streaming::TrackedRecordBatchStream::with_permits_reservation_and_cancel_token(
                     inner_stream,
                     finalizer,
-                    permit,
+                    permits,
+                    per_user_mem_reservation,
+                    cancel_token,
                 )
                 .with_teardown(tt_cleanup);
                 let boxed: SendableRecordBatchStream = Box::pin(tracked);

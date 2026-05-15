@@ -35,6 +35,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::{ExecutionPlan, RecordBatchStream};
 use futures::Stream;
 use tokio::sync::OwnedSemaphorePermit;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::query_handler::{aggregate_spill_metrics, extract_plan_metrics};
@@ -226,12 +227,22 @@ pub struct TrackedRecordBatchStream {
     schema: SchemaRef,
     finalizer: Option<StreamFinalizer>,
     rows_so_far: usize,
-    _permit: Option<OwnedSemaphorePermit>,
+    /// Concurrency permits held for the lifetime of the stream. Stored as a
+    /// vec so the streaming path can carry both a per-user permit and a
+    /// global permit without duplicating fields; both drop when the stream
+    /// drops, releasing the slots back to their respective semaphores.
+    _permits: Vec<OwnedSemaphorePermit>,
     /// Opaque teardown handle whose Drop runs when the stream completes
     /// (clean EOF, error, or client cancel). Used by time-travel pinned
     /// providers (#44) to deregister the session-context alias once the
     /// query finishes, so subsequent SQL in the same session sees HEAD.
     _teardown: Option<Box<dyn std::any::Any + Send>>,
+    /// Per-user memory reservation released when the stream drops.
+    _per_user_reservation: Option<crate::memory::PerUserReservation>,
+    cancel_token: Option<CancellationToken>,
+    /// Set once the cancel token has fired so subsequent polls short-circuit
+    /// without re-running the finalizer.
+    cancelled: bool,
 }
 
 impl TrackedRecordBatchStream {
@@ -248,8 +259,80 @@ impl TrackedRecordBatchStream {
             schema,
             finalizer: Some(finalizer),
             rows_so_far: 0,
-            _permit: permit,
+            _permits: permit.into_iter().collect(),
             _teardown: None,
+            _per_user_reservation: None,
+            cancel_token: None,
+            cancelled: false,
+        }
+    }
+
+    /// Construct a tracked stream that also observes a cancellation token.
+    /// When the token fires, `poll_next` returns `None` after invoking the
+    /// finalizer's `on_cancel` path exactly once.
+    pub fn with_cancel_token(
+        inner: SendableRecordBatchStream,
+        finalizer: StreamFinalizer,
+        permit: Option<OwnedSemaphorePermit>,
+        cancel_token: CancellationToken,
+    ) -> Self {
+        let schema = inner.schema();
+        Self {
+            inner,
+            schema,
+            finalizer: Some(finalizer),
+            rows_so_far: 0,
+            _permits: permit.into_iter().collect(),
+            _teardown: None,
+            _per_user_reservation: None,
+            cancel_token: Some(cancel_token),
+            cancelled: false,
+        }
+    }
+
+    /// Construct a tracked stream carrying multiple permits (per-user and
+    /// global). Useful when admission control involves layered semaphores.
+    pub fn with_permits_and_cancel_token(
+        inner: SendableRecordBatchStream,
+        finalizer: StreamFinalizer,
+        permits: Vec<OwnedSemaphorePermit>,
+        cancel_token: CancellationToken,
+    ) -> Self {
+        let schema = inner.schema();
+        Self {
+            inner,
+            schema,
+            finalizer: Some(finalizer),
+            rows_so_far: 0,
+            _permits: permits,
+            _teardown: None,
+            _per_user_reservation: None,
+            cancel_token: Some(cancel_token),
+            cancelled: false,
+        }
+    }
+
+    /// Variant that also carries a per-user memory reservation. The
+    /// reservation is released when the stream drops, freeing the user's
+    /// share of the per-user memory budget.
+    pub fn with_permits_reservation_and_cancel_token(
+        inner: SendableRecordBatchStream,
+        finalizer: StreamFinalizer,
+        permits: Vec<OwnedSemaphorePermit>,
+        reservation: Option<crate::memory::PerUserReservation>,
+        cancel_token: CancellationToken,
+    ) -> Self {
+        let schema = inner.schema();
+        Self {
+            inner,
+            schema,
+            finalizer: Some(finalizer),
+            rows_so_far: 0,
+            _permits: permits,
+            _teardown: None,
+            _per_user_reservation: reservation,
+            cancel_token: Some(cancel_token),
+            cancelled: false,
         }
     }
 
@@ -267,6 +350,18 @@ impl Stream for TrackedRecordBatchStream {
     type Item = Result<RecordBatch, DataFusionError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.cancelled {
+            return Poll::Ready(None);
+        }
+        if let Some(ref token) = self.cancel_token {
+            if token.is_cancelled() {
+                self.cancelled = true;
+                if let Some(f) = self.finalizer.take() {
+                    f.on_cancel(self.rows_so_far);
+                }
+                return Poll::Ready(None);
+            }
+        }
         match self.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(batch))) => {
                 self.rows_so_far = self.rows_so_far.saturating_add(batch.num_rows());

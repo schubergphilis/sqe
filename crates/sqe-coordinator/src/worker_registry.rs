@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::channel_pool::ChannelPool;
+
 /// Tracks available workers and their health status.
 ///
 /// Workers are discovered from config and health-checked periodically.
@@ -13,6 +15,7 @@ use tracing::{debug, info, warn};
 #[derive(Debug, Clone)]
 pub struct WorkerRegistry {
     inner: Arc<RwLock<RegistryInner>>,
+    channel_pool: Arc<ChannelPool>,
 }
 
 #[derive(Debug)]
@@ -32,6 +35,10 @@ const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
 impl WorkerRegistry {
     pub fn new(worker_urls: Vec<String>) -> Self {
+        Self::with_channel_pool(worker_urls, ChannelPool::shared())
+    }
+
+    pub fn with_channel_pool(worker_urls: Vec<String>, channel_pool: Arc<ChannelPool>) -> Self {
         let workers: HashMap<String, WorkerState> = worker_urls
             .into_iter()
             .map(|url| {
@@ -49,7 +56,12 @@ impl WorkerRegistry {
 
         Self {
             inner: Arc::new(RwLock::new(RegistryInner { workers })),
+            channel_pool,
         }
+    }
+
+    pub fn channel_pool(&self) -> Arc<ChannelPool> {
+        self.channel_pool.clone()
     }
 
     pub async fn healthy_workers(&self) -> Vec<String> {
@@ -168,23 +180,26 @@ impl WorkerRegistry {
         };
 
         for url in urls {
-            let result = Self::health_check_worker(&url).await;
+            let result = self.health_check_worker(&url).await;
             match result {
                 Ok(()) => self.mark_healthy(&url).await,
                 Err(e) => {
                     debug!(worker = %url, error = %e, "Health check failed");
+                    self.channel_pool.invalidate(&url);
                     self.mark_failed(&url).await;
                 }
             }
         }
     }
 
-    async fn health_check_worker(url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn health_check_worker(
+        &self,
+        url: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use arrow_flight::flight_service_client::FlightServiceClient;
         use arrow_flight::Action;
-        use tonic::transport::Endpoint;
 
-        let channel = Endpoint::new(url.to_string())?.connect().await?;
+        let channel = self.channel_pool.get(url).await?;
         let mut client = FlightServiceClient::new(channel);
         let action = Action {
             r#type: "health_check".to_string(),

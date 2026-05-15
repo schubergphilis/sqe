@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::channel_pool::ChannelPool;
+
 /// Metadata header used by the worker to authenticate the coordinator's
 /// credential refresh push (issue #35). Matches the heartbeat path.
 const WORKER_SECRET_HEADER: &str = "x-sqe-worker-secret";
@@ -234,19 +236,51 @@ pub fn start_credential_refresh_task<F, Fut>(
 /// `allow_unauthenticated = true`.
 ///
 /// Returns `Ok(())` if the worker accepted the credentials, or an error if the
-/// Flight call failed.
+/// Flight call failed. Builds a fresh `Endpoint` per call; prefer
+/// [`push_credentials_to_worker_with_pool`] when a [`ChannelPool`] is available.
 pub async fn push_credentials_to_worker(
     worker_url: &str,
     credentials: &RefreshableCredentials,
     worker_secret: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    push_credentials_to_worker_inner(worker_url, credentials, worker_secret, None).await
+}
+
+/// Variant of [`push_credentials_to_worker`] that reuses a cached `Channel`
+/// from a shared [`ChannelPool`].
+pub async fn push_credentials_to_worker_with_pool(
+    pool: &ChannelPool,
+    worker_url: &str,
+    credentials: &RefreshableCredentials,
+    worker_secret: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    push_credentials_to_worker_inner(worker_url, credentials, worker_secret, Some(pool)).await
+}
+
+async fn push_credentials_to_worker_inner(
+    worker_url: &str,
+    credentials: &RefreshableCredentials,
+    worker_secret: &str,
+    pool: Option<&ChannelPool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let body = serde_json::to_vec(credentials)?;
 
-    let channel = tonic::transport::Endpoint::new(worker_url.to_string())?
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(10))
-        .connect()
-        .await?;
+    let channel = match pool {
+        Some(pool) => match pool.get(worker_url).await {
+            Ok(ch) => ch,
+            Err(e) => {
+                pool.invalidate(worker_url);
+                return Err(Box::new(e));
+            }
+        },
+        None => {
+            tonic::transport::Endpoint::new(worker_url.to_string())?
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(10))
+                .connect()
+                .await?
+        }
+    };
     let mut client = FlightServiceClient::new(channel);
 
     let action = Action {
@@ -262,7 +296,17 @@ pub async fn push_credentials_to_worker(
         request.metadata_mut().insert(WORKER_SECRET_HEADER, value);
     }
 
-    let response = client.do_action(request).await?;
+    let response = client.do_action(request).await.map_err(|e| {
+        if let Some(pool) = pool {
+            if matches!(
+                e.code(),
+                tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+            ) {
+                pool.invalidate(worker_url);
+            }
+        }
+        e
+    })?;
 
     // Consume the response stream to ensure the action completed
     let mut stream = response.into_inner();

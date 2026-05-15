@@ -26,6 +26,7 @@ parquet = { workspace = true }
 object_store = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = "0.1"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }
