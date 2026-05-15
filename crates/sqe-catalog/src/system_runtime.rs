@@ -200,6 +200,10 @@ fn queries_schema() -> Schema {
     ])
 }
 
+fn u64_to_i64_saturating(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
+}
+
 fn build_queries_table(records: &[RuntimeQueryRecord]) -> DFResult<Arc<dyn TableProvider>> {
     let schema = Arc::new(queries_schema());
 
@@ -237,10 +241,10 @@ fn build_queries_table(records: &[RuntimeQueryRecord]) -> DFResult<Arc<dyn Table
         }
         query_b.append_value(&rec.sql);
         resource_group_b.append_value("global");
-        queued_ms_b.append_value(rec.queued_ms as i64);
+        queued_ms_b.append_value(u64_to_i64_saturating(rec.queued_ms));
         analysis_ms_b.append_value(0); // no separate analysis phase
-        planning_ms_b.append_value(rec.planning_ms as i64);
-        execution_ms_b.append_value(rec.execution_ms as i64);
+        planning_ms_b.append_value(u64_to_i64_saturating(rec.planning_ms));
+        execution_ms_b.append_value(u64_to_i64_saturating(rec.execution_ms));
         created_b.append_value(rec.created.timestamp_millis());
         match rec.started {
             Some(ts) => started_b.append_value(ts.timestamp_millis()),
@@ -255,11 +259,11 @@ fn build_queries_table(records: &[RuntimeQueryRecord]) -> DFResult<Arc<dyn Table
             Some(ts) => end_b.append_value(ts.timestamp_millis()),
             None => end_b.append_null(),
         }
-        output_rows_b.append_value(rec.output_rows as i64);
-        bytes_scanned_b.append_value(rec.bytes_scanned as i64);
-        rows_scanned_b.append_value(rec.rows_scanned as i64);
-        spill_bytes_b.append_value(rec.spill_bytes as i64);
-        peak_memory_bytes_b.append_value(rec.peak_memory_bytes as i64);
+        output_rows_b.append_value(u64_to_i64_saturating(rec.output_rows as u64));
+        bytes_scanned_b.append_value(u64_to_i64_saturating(rec.bytes_scanned));
+        rows_scanned_b.append_value(u64_to_i64_saturating(rec.rows_scanned));
+        spill_bytes_b.append_value(u64_to_i64_saturating(rec.spill_bytes));
+        peak_memory_bytes_b.append_value(u64_to_i64_saturating(rec.peak_memory_bytes));
         match &rec.error_type {
             Some(s) => error_type_b.append_value(s),
             None => error_type_b.append_null(),
@@ -399,19 +403,19 @@ fn build_tasks_table(
             task_id_b.append_value(format!("{}-0", rec.query_id));
             node_id_b.append_value(coordinator_node_id);
             state_b.append_value("FINISHED");
-            elapsed_ms_b.append_value(rec.execution_ms as i64);
-            input_rows_b.append_value(rec.output_rows as i64); // single-node: input ≈ output
-            output_rows_b.append_value(rec.output_rows as i64);
+            elapsed_ms_b.append_value(u64_to_i64_saturating(rec.execution_ms));
+            input_rows_b.append_value(u64_to_i64_saturating(rec.output_rows as u64));
+            output_rows_b.append_value(u64_to_i64_saturating(rec.output_rows as u64));
         } else {
-            // Distributed execution — emit one row per fragment with real worker URLs.
+            // Distributed execution: one row per fragment with real worker URLs.
             for frag in &rec.fragments {
                 query_id_b.append_value(&rec.query_id);
                 task_id_b.append_value(&frag.task_id);
                 node_id_b.append_value(&frag.worker_url);
                 state_b.append_value(&frag.state);
-                elapsed_ms_b.append_value(frag.elapsed_ms as i64);
-                input_rows_b.append_value(frag.input_rows as i64);
-                output_rows_b.append_value(frag.output_rows as i64);
+                elapsed_ms_b.append_value(u64_to_i64_saturating(frag.elapsed_ms));
+                input_rows_b.append_value(u64_to_i64_saturating(frag.input_rows as u64));
+                output_rows_b.append_value(u64_to_i64_saturating(frag.output_rows as u64));
             }
         }
     }

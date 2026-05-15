@@ -541,6 +541,10 @@ impl TableFunctionImpl for TableFilesFunction {
     }
 }
 
+fn u64_to_i64_saturating(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
+}
+
 /// Serialize a `HashMap<i32, u64>` to a compact JSON string like `{"1":100,"2":200}`.
 fn int_map_to_json(map: &std::collections::HashMap<i32, u64>) -> String {
     if map.is_empty() {
@@ -581,8 +585,8 @@ async fn build_files_batch(table: &Table, schema: &SchemaRef) -> DFResult<Record
 
                                 file_path_b.append_value(df.file_path());
                                 file_format_b.append_value(format!("{:?}", df.file_format()));
-                                record_count_b.append_value(df.record_count() as i64);
-                                file_size_b.append_value(df.file_size_in_bytes() as i64);
+                                record_count_b.append_value(u64_to_i64_saturating(df.record_count()));
+                                file_size_b.append_value(u64_to_i64_saturating(df.file_size_in_bytes()));
 
                                 column_sizes_b.append_value(int_map_to_json(df.column_sizes()));
                                 value_counts_b.append_value(int_map_to_json(df.value_counts()));
@@ -711,9 +715,13 @@ async fn build_partitions_batch(table: &Table, schema: &SchemaRef) -> DFResult<R
                                 let entry_stats = partition_stats
                                     .entry(partition_key)
                                     .or_insert((0, 0, 0));
-                                entry_stats.0 += df.record_count() as i64;
+                                entry_stats.0 = entry_stats
+                                    .0
+                                    .saturating_add(u64_to_i64_saturating(df.record_count()));
                                 entry_stats.1 += 1;
-                                entry_stats.2 += df.file_size_in_bytes() as i64;
+                                entry_stats.2 = entry_stats
+                                    .2
+                                    .saturating_add(u64_to_i64_saturating(df.file_size_in_bytes()));
                             }
                         }
                         Err(e) => {
