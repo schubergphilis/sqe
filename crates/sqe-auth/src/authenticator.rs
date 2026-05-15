@@ -198,8 +198,7 @@ impl Authenticator {
         match &self.backend {
             AuthBackend::OidcPassword(kc) => {
                 let refresh_token = session
-                    .refresh_token
-                    .as_ref()
+                    .refresh_token()
                     .map(|t| t.expose().to_string())
                     .ok_or_else(|| {
                         sqe_core::SqeError::Auth("No refresh token available".to_string())
@@ -209,12 +208,11 @@ impl Authenticator {
                 let token_expiry =
                     Utc::now() + Duration::seconds(token_response.expires_in as i64);
 
-                session.access_token = SecretString::new(token_response.access_token.clone());
-                session.refresh_token = token_response
-                    .refresh_token
-                    .clone()
-                    .map(SecretString::new);
-                session.token_expiry = token_expiry;
+                session.rotate_credentials(sqe_core::Credentials::new(
+                    SecretString::new(token_response.access_token.clone()),
+                    token_response.refresh_token.clone().map(SecretString::new),
+                    token_expiry,
+                ));
 
                 self.cache.insert(
                     &session.id,
@@ -228,14 +226,16 @@ impl Authenticator {
                 debug!(session_id = session.id, "Session token refreshed (OIDC)");
             }
             AuthBackend::ClientCredentials(oauth) => {
-                // No refresh_token in client_credentials mode — simply re-fetch.
+                // No refresh_token in client_credentials mode, simply re-fetch.
                 let token_response = oauth.get_token().await?;
                 let token_expiry =
                     Utc::now() + Duration::seconds(token_response.expires_in as i64);
 
-                session.access_token = SecretString::new(token_response.access_token.clone());
-                session.refresh_token = None;
-                session.token_expiry = token_expiry;
+                session.rotate_credentials(sqe_core::Credentials::new(
+                    SecretString::new(token_response.access_token.clone()),
+                    None,
+                    token_expiry,
+                ));
 
                 self.cache.insert(
                     &session.id,
@@ -404,8 +404,8 @@ impl AuthProvider for Authenticator {
             user_id: session.user.username.clone(),
             display_name: session.user.username.clone(),
             roles: session.user.roles.clone(),
-            catalog_token: Some(session.access_token.clone()),
-            refresh_token: session.refresh_token.clone(),
+            catalog_token: Some(session.access_token().clone()),
+            refresh_token: session.refresh_token().cloned(),
         })
     }
 }
