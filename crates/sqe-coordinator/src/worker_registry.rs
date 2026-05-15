@@ -17,6 +17,7 @@ pub struct WorkerRegistry {
     inner: Arc<RwLock<RegistryInner>>,
     channel_pool: Arc<ChannelPool>,
     max_workers: usize,
+    max_consecutive_failures: u32,
 }
 
 #[derive(Debug)]
@@ -32,7 +33,7 @@ struct WorkerState {
     last_healthy: Option<Instant>,
 }
 
-const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+const DEFAULT_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 const DEFAULT_MAX_WORKERS: usize = 1024;
 
 /// Reason a [`WorkerRegistry::register_heartbeat`] call was refused.
@@ -69,6 +70,20 @@ impl WorkerRegistry {
         channel_pool: Arc<ChannelPool>,
         max_workers: usize,
     ) -> Self {
+        Self::with_options_and_failures(
+            worker_urls,
+            channel_pool,
+            max_workers,
+            DEFAULT_MAX_CONSECUTIVE_FAILURES,
+        )
+    }
+
+    pub fn with_options_and_failures(
+        worker_urls: Vec<String>,
+        channel_pool: Arc<ChannelPool>,
+        max_workers: usize,
+        max_consecutive_failures: u32,
+    ) -> Self {
         let workers: HashMap<String, WorkerState> = worker_urls
             .into_iter()
             .map(|url| {
@@ -95,6 +110,7 @@ impl WorkerRegistry {
             inner: Arc::new(RwLock::new(RegistryInner { workers })),
             channel_pool,
             max_workers: effective_cap,
+            max_consecutive_failures,
         }
     }
 
@@ -184,21 +200,22 @@ impl WorkerRegistry {
                 );
             }
             state.healthy = false;
-            state.consecutive_failures = MAX_CONSECUTIVE_FAILURES;
+            state.consecutive_failures = self.max_consecutive_failures;
         }
     }
 
     pub async fn mark_failed(&self, url: &str) {
         let mut inner = self.inner.write().await;
+        let threshold = self.max_consecutive_failures;
         if let Some(state) = inner.workers.get_mut(url) {
             state.consecutive_failures += 1;
-            if state.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+            if state.consecutive_failures >= threshold {
                 if state.healthy {
                     warn!(
                         worker = url,
                         failures = state.consecutive_failures,
                         "Worker marked unhealthy after {} consecutive failures",
-                        MAX_CONSECUTIVE_FAILURES
+                        threshold
                     );
                 }
                 state.healthy = false;
@@ -208,7 +225,7 @@ impl WorkerRegistry {
                     failures = state.consecutive_failures,
                     "Worker health check failed ({}/{})",
                     state.consecutive_failures,
-                    MAX_CONSECUTIVE_FAILURES
+                    threshold
                 );
             }
         }
@@ -448,7 +465,7 @@ mod tests {
         registry.mark_healthy("http://worker1:50052").await;
 
         // Fail to the threshold (3 consecutive failures)
-        for _ in 0..MAX_CONSECUTIVE_FAILURES {
+        for _ in 0..DEFAULT_MAX_CONSECUTIVE_FAILURES {
             registry.mark_failed("http://worker1:50052").await;
         }
         assert!(
@@ -500,7 +517,7 @@ mod tests {
 
         // Mark some of them failed past the threshold
         for url in expected_healthy.iter().take(5) {
-            for _ in 0..MAX_CONSECUTIVE_FAILURES {
+            for _ in 0..DEFAULT_MAX_CONSECUTIVE_FAILURES {
                 registry.mark_failed(url).await;
             }
         }

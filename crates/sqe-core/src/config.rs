@@ -328,6 +328,25 @@ pub struct CoordinatorConfig {
     /// `DeadlineExceeded` instead of an unbounded await. Issue #29.
     #[serde(default = "default_worker_rpc_timeout")]
     pub worker_rpc_timeout_secs: u64,
+    /// Maximum time the Flight SQL handshake will block waiting for the
+    /// auth provider. Default: 30 s. Increase for slow OIDC providers.
+    #[serde(default = "default_auth_handshake_timeout_secs")]
+    pub auth_handshake_timeout_secs: u64,
+    /// Interval between worker health checks. Default: 5 s.
+    #[serde(default = "default_health_check_interval_secs")]
+    pub health_check_interval_secs: u64,
+    /// Consecutive failed health checks before a worker is marked unhealthy. Default: 3.
+    #[serde(default = "default_health_check_max_failures")]
+    pub health_check_max_failures: u32,
+    /// How often the credential-refresh background loop runs. Default: 60 s.
+    #[serde(default = "default_credential_refresh_interval_secs")]
+    pub credential_refresh_interval_secs: u64,
+    /// Connect timeout used when pushing refreshed credentials to a worker. Default: 5 s.
+    #[serde(default = "default_credential_push_connect_timeout_secs")]
+    pub credential_push_connect_timeout_secs: u64,
+    /// Per-request timeout used when pushing refreshed credentials to a worker. Default: 10 s.
+    #[serde(default = "default_credential_push_request_timeout_secs")]
+    pub credential_push_request_timeout_secs: u64,
 }
 
 /// HTTP/2 + TCP knobs applied to every tonic Server / Client this
@@ -415,6 +434,21 @@ impl std::fmt::Debug for CoordinatorConfig {
             .field("transport", &self.transport)
             .field("worker_connect_timeout_secs", &self.worker_connect_timeout_secs)
             .field("worker_rpc_timeout_secs", &self.worker_rpc_timeout_secs)
+            .field("auth_handshake_timeout_secs", &self.auth_handshake_timeout_secs)
+            .field("health_check_interval_secs", &self.health_check_interval_secs)
+            .field("health_check_max_failures", &self.health_check_max_failures)
+            .field(
+                "credential_refresh_interval_secs",
+                &self.credential_refresh_interval_secs,
+            )
+            .field(
+                "credential_push_connect_timeout_secs",
+                &self.credential_push_connect_timeout_secs,
+            )
+            .field(
+                "credential_push_request_timeout_secs",
+                &self.credential_push_request_timeout_secs,
+            )
             .finish()
     }
 }
@@ -1718,6 +1752,9 @@ pub struct SessionConfig {
     /// How often to snapshot sessions to disk (seconds). Default: 60.
     #[serde(default = "default_session_snapshot_interval")]
     pub snapshot_interval_secs: u64,
+    /// How often the session-expiry sweeper runs (seconds). Default: 60.
+    #[serde(default = "default_session_expiry_sweep_interval")]
+    pub expiry_sweep_interval_secs: u64,
 }
 
 impl Default for SessionConfig {
@@ -1728,6 +1765,7 @@ impl Default for SessionConfig {
             persistence: default_session_persistence(),
             persistence_path: default_session_persistence_path(),
             snapshot_interval_secs: default_session_snapshot_interval(),
+            expiry_sweep_interval_secs: default_session_expiry_sweep_interval(),
         }
     }
 }
@@ -1737,6 +1775,13 @@ fn default_absolute_timeout() -> u64 { 28800 }  // 8 hours
 fn default_session_persistence() -> String { "memory".to_string() }
 fn default_session_persistence_path() -> String { "/tmp/sqe-sessions.json".to_string() }
 fn default_session_snapshot_interval() -> u64 { 60 }
+fn default_session_expiry_sweep_interval() -> u64 { 60 }
+fn default_auth_handshake_timeout_secs() -> u64 { 30 }
+fn default_health_check_interval_secs() -> u64 { 5 }
+fn default_health_check_max_failures() -> u32 { 3 }
+fn default_credential_refresh_interval_secs() -> u64 { 60 }
+fn default_credential_push_connect_timeout_secs() -> u64 { 5 }
+fn default_credential_push_request_timeout_secs() -> u64 { 10 }
 fn default_query_timeout() -> u64 { 300 }       // 5 minutes
 fn default_max_result_rows() -> usize { 1_000_000 }
 fn default_max_concurrent_queries() -> usize { 100 }
@@ -2039,6 +2084,30 @@ impl SqeConfig {
         env_override_str("SQE_TLS__CERT_FILE", &mut self.coordinator.tls.cert_file);
         env_override_str("SQE_TLS__KEY_FILE", &mut self.coordinator.tls.key_file);
         env_override_str("SQE_TLS__CA_FILE", &mut self.coordinator.tls.ca_file);
+        env_override_u64(
+            "SQE_COORDINATOR__AUTH_HANDSHAKE_TIMEOUT_SECS",
+            &mut self.coordinator.auth_handshake_timeout_secs,
+        );
+        env_override_u64(
+            "SQE_COORDINATOR__HEALTH_CHECK_INTERVAL_SECS",
+            &mut self.coordinator.health_check_interval_secs,
+        );
+        env_override_u32(
+            "SQE_COORDINATOR__HEALTH_CHECK_MAX_FAILURES",
+            &mut self.coordinator.health_check_max_failures,
+        );
+        env_override_u64(
+            "SQE_COORDINATOR__CREDENTIAL_REFRESH_INTERVAL_SECS",
+            &mut self.coordinator.credential_refresh_interval_secs,
+        );
+        env_override_u64(
+            "SQE_COORDINATOR__CREDENTIAL_PUSH_CONNECT_TIMEOUT_SECS",
+            &mut self.coordinator.credential_push_connect_timeout_secs,
+        );
+        env_override_u64(
+            "SQE_COORDINATOR__CREDENTIAL_PUSH_REQUEST_TIMEOUT_SECS",
+            &mut self.coordinator.credential_push_request_timeout_secs,
+        );
 
         // Worker
         env_override_str("SQE_WORKER__COORDINATOR_URL", &mut self.worker.coordinator_url);
@@ -2199,6 +2268,10 @@ impl SqeConfig {
         // Session
         env_override_u64("SQE_SESSION__IDLE_TIMEOUT_SECS", &mut self.session.idle_timeout_secs);
         env_override_u64("SQE_SESSION__ABSOLUTE_TIMEOUT_SECS", &mut self.session.absolute_timeout_secs);
+        env_override_u64(
+            "SQE_SESSION__EXPIRY_SWEEP_INTERVAL_SECS",
+            &mut self.session.expiry_sweep_interval_secs,
+        );
 
         // Query
         env_override_u64("SQE_QUERY__TIMEOUT_SECS", &mut self.query.timeout_secs);
@@ -2375,8 +2448,15 @@ mod tests {
                 flight_compression: default_flight_compression(),
                 shuffle_compression: default_shuffle_compression(),
                 max_workers: default_max_workers(),
+                transport: GrpcTransportConfig::default(),
                 worker_connect_timeout_secs: default_worker_connect_timeout(),
                 worker_rpc_timeout_secs: default_worker_rpc_timeout(),
+                auth_handshake_timeout_secs: default_auth_handshake_timeout_secs(),
+                health_check_interval_secs: default_health_check_interval_secs(),
+                health_check_max_failures: default_health_check_max_failures(),
+                credential_refresh_interval_secs: default_credential_refresh_interval_secs(),
+                credential_push_connect_timeout_secs: default_credential_push_connect_timeout_secs(),
+                credential_push_request_timeout_secs: default_credential_push_request_timeout_secs(),
             },
             worker: WorkerConfig::default(),
             auth: AuthConfig {
