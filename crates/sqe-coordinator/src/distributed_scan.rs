@@ -24,6 +24,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use sqe_metrics::propagation::inject_trace_context;
 use sqe_planner::ScanTask;
 
+use crate::channel_pool::ChannelPool;
 use crate::credential_refresh::CredentialRefreshTracker;
 use crate::worker_registry::WorkerRegistry;
 
@@ -262,6 +263,10 @@ impl ExecutionPlan for DistributedScanExec {
         let credential_tracker = self.credential_tracker.clone();
         let max_retries = self.max_retries;
         let worker_registry = self.worker_registry.clone();
+        let channel_pool = self
+            .worker_registry
+            .as_ref()
+            .map(|r| r.channel_pool());
         let local_executor = self.local_executor.clone();
         let fragment_callback = self.fragment_callback.0.clone();
         let worker_secret = self.worker_secret.clone();
@@ -319,7 +324,15 @@ impl ExecutionPlan for DistributedScanExec {
                     );
                 }
 
-                match dispatch_to_worker(&task, &current_worker_url, &parent_cx, &worker_secret).await {
+                match dispatch_to_worker(
+                    &task,
+                    &current_worker_url,
+                    channel_pool.as_deref(),
+                    &parent_cx,
+                    &worker_secret,
+                )
+                .await
+                {
                     Ok(flight_stream) => {
                         // Project received batches to match the expected schema.
                         // Workers return full table columns, but the plan may expect
@@ -478,10 +491,13 @@ impl ExecutionPlan for DistributedScanExec {
 /// Dispatch a scan task to a single worker via Arrow Flight `do_get`.
 ///
 /// Returns the `FlightRecordBatchStream` on success, or a `DataFusionError`
-/// on connection/transport failure.
+/// on connection/transport failure. When `pool` is provided, the channel
+/// is fetched (or built once and cached) from it; otherwise a fresh
+/// connect runs per call.
 async fn dispatch_to_worker(
     task: &ScanTask,
     worker_url: &str,
+    pool: Option<&ChannelPool>,
     parent_cx: &opentelemetry::Context,
     worker_secret: &str,
 ) -> Result<FlightRecordBatchStream, DataFusionError> {
@@ -489,19 +505,27 @@ async fn dispatch_to_worker(
         .to_bytes()
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-    let channel = tonic::transport::Endpoint::new(worker_url.to_string())
-        .map_err(|e| {
-            DataFusionError::Execution(format!(
-                "Failed to create endpoint for worker {worker_url}: {e}"
-            ))
-        })?
-        .connect()
-        .await
-        .map_err(|e| {
+    let channel = match pool {
+        Some(pool) => pool.get(worker_url).await.map_err(|e| {
+            pool.invalidate(worker_url);
             DataFusionError::Execution(format!(
                 "Failed to connect to worker {worker_url}: {e}"
             ))
-        })?;
+        })?,
+        None => tonic::transport::Endpoint::new(worker_url.to_string())
+            .map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "Failed to create endpoint for worker {worker_url}: {e}"
+                ))
+            })?
+            .connect()
+            .await
+            .map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "Failed to connect to worker {worker_url}: {e}"
+                ))
+            })?,
+    };
     let mut client = FlightServiceClient::new(channel);
 
     let ticket = Ticket::new(ticket_bytes);
@@ -523,6 +547,14 @@ async fn dispatch_to_worker(
         .do_get(request)
         .await
         .map_err(|e| {
+            if let Some(pool) = pool {
+                if matches!(
+                    e.code(),
+                    tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+                ) {
+                    pool.invalidate(worker_url);
+                }
+            }
             DataFusionError::Execution(format!(
                 "Worker {worker_url} do_get failed: {e}"
             ))
