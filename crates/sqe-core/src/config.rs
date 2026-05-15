@@ -303,6 +303,72 @@ pub struct CoordinatorConfig {
     /// IPs in Kubernetes or report unstable URLs.
     #[serde(default = "default_max_workers")]
     pub max_workers: usize,
+    /// HTTP/2 / gRPC transport tuning. Lifts the receiver windows off
+    /// tonic's 64 KB default so Flight SQL DoGet streams are not forced
+    /// to send a WINDOW_UPDATE every ~64 KB on a multi-GB result set.
+    #[serde(default)]
+    pub transport: GrpcTransportConfig,
+}
+
+/// HTTP/2 + TCP knobs applied to every tonic Server / Client this
+/// binary opens.
+///
+/// Defaults: 8 MB stream window, 16 MB connection window, 1 MB frame,
+/// 30 s HTTP/2 keepalive interval (10 s timeout), 60 s TCP keepalive.
+/// They lift Flight throughput on SF10+ workloads and keep long-running
+/// connections alive across NAT / load-balancer idle timeouts.
+#[derive(Debug, Deserialize, Clone)]
+pub struct GrpcTransportConfig {
+    /// Per-stream receive window in bytes.
+    #[serde(default = "default_initial_stream_window_size")]
+    pub initial_stream_window_size: u32,
+    /// Connection-level receive window in bytes.
+    #[serde(default = "default_initial_connection_window_size")]
+    pub initial_connection_window_size: u32,
+    /// Maximum HTTP/2 frame size in bytes.
+    #[serde(default = "default_max_frame_size")]
+    pub max_frame_size: u32,
+    /// HTTP/2 keepalive ping interval in seconds.
+    #[serde(default = "default_http2_keepalive_interval_secs")]
+    pub http2_keepalive_interval_secs: u64,
+    /// HTTP/2 keepalive ping timeout in seconds.
+    #[serde(default = "default_http2_keepalive_timeout_secs")]
+    pub http2_keepalive_timeout_secs: u64,
+    /// TCP keepalive in seconds. 0 disables.
+    #[serde(default = "default_tcp_keepalive_secs")]
+    pub tcp_keepalive_secs: u64,
+}
+
+impl Default for GrpcTransportConfig {
+    fn default() -> Self {
+        Self {
+            initial_stream_window_size: default_initial_stream_window_size(),
+            initial_connection_window_size: default_initial_connection_window_size(),
+            max_frame_size: default_max_frame_size(),
+            http2_keepalive_interval_secs: default_http2_keepalive_interval_secs(),
+            http2_keepalive_timeout_secs: default_http2_keepalive_timeout_secs(),
+            tcp_keepalive_secs: default_tcp_keepalive_secs(),
+        }
+    }
+}
+
+fn default_initial_stream_window_size() -> u32 {
+    8 * 1024 * 1024
+}
+fn default_initial_connection_window_size() -> u32 {
+    16 * 1024 * 1024
+}
+fn default_max_frame_size() -> u32 {
+    1024 * 1024
+}
+fn default_http2_keepalive_interval_secs() -> u64 {
+    30
+}
+fn default_http2_keepalive_timeout_secs() -> u64 {
+    10
+}
+fn default_tcp_keepalive_secs() -> u64 {
+    60
 }
 
 impl std::fmt::Debug for CoordinatorConfig {
@@ -326,6 +392,7 @@ impl std::fmt::Debug for CoordinatorConfig {
             .field("flight_compression", &self.flight_compression)
             .field("shuffle_compression", &self.shuffle_compression)
             .field("max_workers", &self.max_workers)
+            .field("transport", &self.transport)
             .finish()
     }
 }
@@ -1284,6 +1351,11 @@ pub struct PolicyConfig {
     /// Can be set via the `SQE_POLICY__MASK_KEY` environment variable.
     #[serde(default)]
     pub mask_key: String,
+    /// OPA backend tuning. Empty defaults are sensible for most deployments
+    /// (5 s timeout, 10 000 cache entries, 5 consecutive failures opens the
+    /// breaker, 30 s recovery window).
+    #[serde(default)]
+    pub opa: OpaConfig,
 }
 
 impl Default for PolicyConfig {
@@ -1291,8 +1363,56 @@ impl Default for PolicyConfig {
         Self {
             engine: "passthrough".to_string(),
             mask_key: String::new(),
+            opa: OpaConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct OpaConfig {
+    /// HTTP timeout for a single OPA evaluate call in seconds.
+    #[serde(default = "default_opa_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Maximum cached `ResolvedPolicy` entries.
+    #[serde(default = "default_opa_cache_max_entries")]
+    pub cache_max_entries: u64,
+    /// Cache TTL in seconds; entries older than this are revalidated.
+    #[serde(default = "default_opa_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+    /// Consecutive OPA failures before the circuit breaker opens.
+    #[serde(default = "default_opa_breaker_failure_threshold")]
+    pub breaker_failure_threshold: u32,
+    /// How long to keep the breaker open before probing again, in seconds.
+    #[serde(default = "default_opa_breaker_recovery_secs")]
+    pub breaker_recovery_secs: u64,
+}
+
+impl Default for OpaConfig {
+    fn default() -> Self {
+        Self {
+            timeout_secs: default_opa_timeout_secs(),
+            cache_max_entries: default_opa_cache_max_entries(),
+            cache_ttl_secs: default_opa_cache_ttl_secs(),
+            breaker_failure_threshold: default_opa_breaker_failure_threshold(),
+            breaker_recovery_secs: default_opa_breaker_recovery_secs(),
+        }
+    }
+}
+
+fn default_opa_timeout_secs() -> u64 {
+    5
+}
+fn default_opa_cache_max_entries() -> u64 {
+    10_000
+}
+fn default_opa_cache_ttl_secs() -> u64 {
+    60
+}
+fn default_opa_breaker_failure_threshold() -> u32 {
+    5
+}
+fn default_opa_breaker_recovery_secs() -> u64 {
+    30
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -3184,9 +3304,11 @@ otlp_endpoint = ""
 
     #[test]
     fn env_overrides_apply_to_openlineage() {
-        // Use unique env-var values per test scope to avoid cross-test leakage,
-        // and guard with the same lock pattern as other env-touching tests if
-        // any are added later. Set, override, assert, then clear.
+        // std::env::set_var is process-wide; serialise against every other
+        // env-touching test in this module so cargo's parallel thread-pool
+        // cannot interleave set_var / remove_var calls.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
         std::env::set_var("SQE_METRICS__OPENLINEAGE__ENABLED", "true");
         std::env::set_var("SQE_METRICS__OPENLINEAGE__SPOOL_MAX_BYTES", "999");
         std::env::set_var("SQE_METRICS__OPENLINEAGE__CHANNEL_CAPACITY", "42");
@@ -3263,7 +3385,10 @@ otlp_endpoint = ""
     // --- Provider env-var override (issue #14 regression test) ---
 
     /// Lock used to serialise env-var test mutation since std::env::set_var
-    /// has process-wide effect.
+    /// has process-wide effect. Every test in this module that calls
+    /// std::env::set_var or std::env::remove_var MUST acquire this lock
+    /// at its top with `let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());`
+    /// before touching the environment.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]

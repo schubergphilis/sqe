@@ -1,7 +1,10 @@
 [package]
 name = "sqe-trino-compat"
-version = "0.31.4"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 sqe-core = { path = "../sqe-core" }
@@ -20,7 +23,7 @@ dashmap = { workspace = true }
 moka = { workspace = true }
 uuid = { workspace = true }
 async-trait = { workspace = true }
-base64 = "0.22"
+base64 = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]

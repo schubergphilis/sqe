@@ -408,7 +408,7 @@ impl QueryHandler {
     ///
     /// Returned in stable sorted order so the error message reads the
     /// same across runs.
-    fn known_catalog_names(&self) -> Vec<String> {
+    fn known_catalog_names(&self) -> Result<Vec<String>, SqeError> {
         let mut names: Vec<String> = self
             .config
             .flattened_catalogs()
@@ -417,10 +417,10 @@ impl QueryHandler {
             .collect();
         names.push("system".to_string());
         names.push("datafusion".to_string());
-        names.extend(self.runtime_catalogs.list());
+        names.extend(self.runtime_catalogs.list().map_err(SqeError::Catalog)?);
         names.sort();
         names.dedup();
-        names
+        Ok(names)
     }
 
     /// Execute a SQL statement for the given session and return collected RecordBatches.
@@ -567,7 +567,7 @@ impl QueryHandler {
         if let Some(stmt) = kind.statement() {
             let qualifiers = sqe_sql::extract_catalog_qualifiers(stmt);
             if !qualifiers.is_empty() {
-                let known = self.known_catalog_names();
+                let known = self.known_catalog_names()?;
                 if let Some(unknown) =
                     qualifiers.iter().find(|q| !known.iter().any(|k| k == *q))
                 {
@@ -646,7 +646,10 @@ impl QueryHandler {
                     let rows: usize = cached.batches.iter().map(|b| b.num_rows()).sum();
                     self.query_tracker.complete(&query_id, rows, 0, cached.tables_touched.clone(), 0, 0, 0, 0);
                     if let Some(ref metrics) = self.metrics {
-                        metrics.query_count.with_label_values(&["success", &kind_name]).inc();
+                        metrics
+                            .query_count
+                            .with_label_values(&["success", &kind_name, ""])
+                            .inc();
                         metrics.rows_returned.inc_by(rows as f64);
                     }
                     // OpenLineage: cache hits still get a COMPLETE event so the
@@ -1256,9 +1259,13 @@ impl QueryHandler {
         }
 
         if let Some(ref metrics) = self.metrics {
+            let error_code = match &result {
+                Err(e) => e.error_code().name(),
+                Ok(_) => "",
+            };
             metrics
                 .query_count
-                .with_label_values(&[status, &kind_name])
+                .with_label_values(&[status, &kind_name, error_code])
                 .inc();
             metrics
                 .query_duration
@@ -1514,7 +1521,7 @@ impl QueryHandler {
         if let Some(stmt) = kind.statement() {
             let qualifiers = sqe_sql::extract_catalog_qualifiers(stmt);
             if !qualifiers.is_empty() {
-                let known = self.known_catalog_names();
+                let known = self.known_catalog_names()?;
                 if let Some(unknown) =
                     qualifiers.iter().find(|q| !known.iter().any(|k| k == *q))
                 {
@@ -1585,7 +1592,7 @@ impl QueryHandler {
                 if let Some(ref metrics) = self.metrics {
                     metrics
                         .query_count
-                        .with_label_values(&["error", &kind_name])
+                        .with_label_values(&["error", &kind_name, e.error_code().name()])
                         .inc();
                     metrics
                         .query_duration
@@ -3564,14 +3571,17 @@ impl QueryHandler {
         &self,
         stmt: &sqe_sql::DropSecretStatement,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let in_use = self.runtime_catalogs.referenced_secrets(&stmt.name);
+        let in_use = self
+            .runtime_catalogs
+            .referenced_secrets(&stmt.name)
+            .map_err(SqeError::Catalog)?;
         self.secrets.drop_secret(&stmt.name, &in_use)?;
         info!(name = %stmt.name, "DROP SECRET complete");
         Ok(vec![])
     }
 
     fn handle_show_secrets(&self) -> sqe_core::Result<Vec<RecordBatch>> {
-        let listed = self.secrets.list();
+        let listed = self.secrets.list()?;
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("name", DataType::Utf8, false),

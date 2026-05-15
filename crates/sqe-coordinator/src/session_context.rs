@@ -71,7 +71,9 @@ pub async fn create_session_context(
     // both miss the cache and build redundant SessionContexts. moka coalesces
     // concurrent callers into a single init future.
     let username = session.user.username.clone();
-    let attached_providers = runtime_catalogs.providers();
+    let attached_providers = runtime_catalogs
+        .providers()
+        .map_err(sqe_core::SqeError::Catalog)?;
     let result = SESSION_CONTEXT_CACHE
         .try_get_with(cache_key.clone(), async {
             debug!(
