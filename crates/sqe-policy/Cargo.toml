@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 sqe-core = { path = "../sqe-core" }
+sqe-metrics = { path = "../sqe-metrics" }
 datafusion = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }

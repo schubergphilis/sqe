@@ -1351,6 +1351,11 @@ pub struct PolicyConfig {
     /// Can be set via the `SQE_POLICY__MASK_KEY` environment variable.
     #[serde(default)]
     pub mask_key: String,
+    /// OPA backend tuning. Empty defaults are sensible for most deployments
+    /// (5 s timeout, 10 000 cache entries, 5 consecutive failures opens the
+    /// breaker, 30 s recovery window).
+    #[serde(default)]
+    pub opa: OpaConfig,
 }
 
 impl Default for PolicyConfig {
@@ -1358,8 +1363,56 @@ impl Default for PolicyConfig {
         Self {
             engine: "passthrough".to_string(),
             mask_key: String::new(),
+            opa: OpaConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct OpaConfig {
+    /// HTTP timeout for a single OPA evaluate call in seconds.
+    #[serde(default = "default_opa_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Maximum cached `ResolvedPolicy` entries.
+    #[serde(default = "default_opa_cache_max_entries")]
+    pub cache_max_entries: u64,
+    /// Cache TTL in seconds; entries older than this are revalidated.
+    #[serde(default = "default_opa_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+    /// Consecutive OPA failures before the circuit breaker opens.
+    #[serde(default = "default_opa_breaker_failure_threshold")]
+    pub breaker_failure_threshold: u32,
+    /// How long to keep the breaker open before probing again, in seconds.
+    #[serde(default = "default_opa_breaker_recovery_secs")]
+    pub breaker_recovery_secs: u64,
+}
+
+impl Default for OpaConfig {
+    fn default() -> Self {
+        Self {
+            timeout_secs: default_opa_timeout_secs(),
+            cache_max_entries: default_opa_cache_max_entries(),
+            cache_ttl_secs: default_opa_cache_ttl_secs(),
+            breaker_failure_threshold: default_opa_breaker_failure_threshold(),
+            breaker_recovery_secs: default_opa_breaker_recovery_secs(),
+        }
+    }
+}
+
+fn default_opa_timeout_secs() -> u64 {
+    5
+}
+fn default_opa_cache_max_entries() -> u64 {
+    10_000
+}
+fn default_opa_cache_ttl_secs() -> u64 {
+    60
+}
+fn default_opa_breaker_failure_threshold() -> u32 {
+    5
+}
+fn default_opa_breaker_recovery_secs() -> u64 {
+    30
 }
 
 #[derive(Debug, Deserialize, Clone)]
