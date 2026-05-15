@@ -384,8 +384,10 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
 
     // Workers
     let worker_registry = Arc::new(
-        sqe_coordinator::worker_registry::WorkerRegistry::new(
+        sqe_coordinator::worker_registry::WorkerRegistry::with_options(
             config.coordinator.worker_urls.clone(),
+            sqe_coordinator::channel_pool::ChannelPool::shared(),
+            config.coordinator.max_workers,
         ),
     );
 

@@ -174,8 +174,10 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Initialize worker registry
     let worker_registry = Arc::new(
-        sqe_coordinator::worker_registry::WorkerRegistry::new(
+        sqe_coordinator::worker_registry::WorkerRegistry::with_options(
             config.coordinator.worker_urls.clone(),
+            sqe_coordinator::channel_pool::ChannelPool::shared(),
+            config.coordinator.max_workers,
         ),
     );
 
