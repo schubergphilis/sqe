@@ -57,3 +57,11 @@ s3_access_key = "s3admin"
 s3_secret_key = "s3admin"
 s3_region = "us-east-1"
 s3_path_style = true
+
+# TVF (read_parquet/read_csv) policy. The test stack is single-tenant
+# and tests like test_read_parquet_local_file write a tempdir parquet
+# and read it back. The PR #10 hardening denies local paths by default
+# (SSRF / path-traversal mitigation). Enable explicitly here so the
+# feature test runs; production deployments leave the default in place.
+[storage.tvf]
+allow_local_paths = true
