@@ -88,36 +88,37 @@ impl SchemaProvider for SqeSchemaProvider {
     // DataFusion version may provide an async alternative.
     fn table_names(&self) -> Vec<String> {
         let catalog = self.session_catalog.clone();
+        let catalog_for_views = catalog.clone();
         let ns = self.namespace.clone();
+        let ns_for_views = ns.clone();
 
-        let handle = match tokio::runtime::Handle::try_current() {
-            Ok(h) => h,
-            Err(_) => {
+        let ns_ident = NamespaceIdent::new(ns.clone());
+        let ns_ident_views = ns_ident.clone();
+
+        let tables = crate::runtime_bridge::block_on_compat(async move {
+            catalog.list_tables(&ns_ident).await
+        });
+        let mut names: Vec<String> = match tables {
+            Some(Ok(t)) => t.iter().map(|t| t.name().to_string()).collect(),
+            Some(Err(e)) => {
+                error!(namespace = %ns, error = %e, "Failed to list tables");
+                Vec::new()
+            }
+            None => {
                 error!(namespace = %ns, "No tokio runtime available for table_names()");
                 return Vec::new();
             }
         };
 
-        let ns_ident = NamespaceIdent::new(ns.clone());
-
-        let tables =
-            tokio::task::block_in_place(|| handle.block_on(catalog.list_tables(&ns_ident)));
-        let mut names: Vec<String> = match tables {
-            Ok(t) => t.iter().map(|t| t.name().to_string()).collect(),
-            Err(e) => {
-                error!(namespace = %ns, error = %e, "Failed to list tables");
-                Vec::new()
-            }
-        };
-
-        // Also include views
-        let views =
-            tokio::task::block_in_place(|| handle.block_on(catalog.list_views(&ns_ident)));
+        let views = crate::runtime_bridge::block_on_compat(async move {
+            catalog_for_views.list_views(&ns_ident_views).await
+        });
         match views {
-            Ok(view_names) => names.extend(view_names),
-            Err(e) => {
-                error!(namespace = %ns, error = %e, "Failed to list views");
+            Some(Ok(view_names)) => names.extend(view_names),
+            Some(Err(e)) => {
+                error!(namespace = %ns_for_views, error = %e, "Failed to list views");
             }
+            None => {}
         }
 
         names
@@ -126,46 +127,45 @@ impl SchemaProvider for SqeSchemaProvider {
     fn table_exist(&self, name: &str) -> bool {
         // Optimized path: check existence directly via the catalog's table_exists()
         // API instead of listing ALL tables and searching client-side. This avoids
-        // fetching the entire table list just to check if one table exists —
-        // a significant improvement for namespaces with many tables.
+        // fetching the entire table list just to check if one table exists,
+        // a measurable improvement for namespaces with many tables.
         let catalog = self.session_catalog.clone();
+        let catalog_for_view = catalog.clone();
         let ns = self.namespace.clone();
         let table_name = name.to_string();
-
-        let handle = match tokio::runtime::Handle::try_current() {
-            Ok(h) => h,
-            Err(_) => {
-                error!(namespace = %ns, table = %table_name, "No tokio runtime available for table_exist()");
-                return false;
-            }
-        };
+        let table_name_for_view = table_name.clone();
 
         let ns_ident = NamespaceIdent::new(ns.clone());
+        let ns_ident_view = ns_ident.clone();
         let table_ident = iceberg::TableIdent::new(ns_ident.clone(), table_name.clone());
 
-        // Try table_exists() first (single REST call to Polaris HEAD endpoint)
-        let table_exists = tokio::task::block_in_place(|| {
-            handle.block_on(catalog.table_exists(&table_ident))
+        let table_exists = crate::runtime_bridge::block_on_compat(async move {
+            catalog.table_exists(&table_ident).await
         });
         match table_exists {
-            Ok(true) => {
+            Some(Ok(true)) => {
                 debug!(namespace = %ns, table = %table_name, "table_exist: found as table");
                 return true;
             }
-            Ok(false) => {
-                // Not a table — check if it is a view
+            Some(Ok(false)) => {
+                // Not a table, check if it is a view.
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 debug!(namespace = %ns, table = %table_name, error = %e,
                     "table_exist: table_exists() failed, falling back to list");
-                // Fall through to view check
+            }
+            None => {
+                error!(namespace = %ns, table = %table_name, "No tokio runtime available for table_exist()");
+                return false;
             }
         }
 
-        // Check views: load_view_sql is cheaper than listing all views
-        let view_result = tokio::task::block_in_place(|| {
-            handle.block_on(catalog.load_view_sql(&ns_ident, &table_name))
-        });
+        let view_result = match crate::runtime_bridge::block_on_compat(async move {
+            catalog_for_view.load_view_sql(&ns_ident_view, &table_name_for_view).await
+        }) {
+            Some(r) => r,
+            None => return false,
+        };
         match view_result {
             Ok(Some(_)) => {
                 debug!(namespace = %ns, table = %table_name, "table_exist: found as view");
