@@ -2106,6 +2106,8 @@ impl SqeConfig {
             );
         }
 
+        validate_urls(self, &mut errors);
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -2344,6 +2346,56 @@ impl SqeConfig {
         // Query
         env_override_u64("SQE_QUERY__TIMEOUT_SECS", &mut self.query.timeout_secs);
     }
+}
+
+/// Validate every URL-shaped string in the config. Empty values are
+/// skipped (they're either optional or caught by required-field checks
+/// elsewhere). Each failure produces a precise field-name error so the
+/// operator does not have to chase a parse error two seconds into the
+/// first query (issue #108).
+fn validate_urls(config: &SqeConfig, errors: &mut Vec<String>) {
+    let mut check = |field: &str, value: &str| {
+        if value.is_empty() {
+            return;
+        }
+        if let Err(e) = url::Url::parse(value) {
+            errors.push(format!("{field} = {value:?} is not a valid URL: {e}"));
+        }
+    };
+
+    check("catalog.catalog_url", &config.catalog.catalog_url);
+    for (name, cat) in &config.catalogs {
+        let label = format!("catalogs.{name}.catalog_url");
+        check(&label, &cat.catalog_url);
+    }
+
+    check("worker.coordinator_url", &config.worker.coordinator_url);
+    for (i, url) in config.coordinator.worker_urls.iter().enumerate() {
+        let label = format!("coordinator.worker_urls[{i}]");
+        check(&label, url);
+    }
+
+    check("storage.s3_endpoint", &config.storage.s3_endpoint);
+    check("metrics.otlp_endpoint", &config.metrics.otlp_endpoint);
+    check("metrics.openlineage.http_endpoint", &config.metrics.openlineage.http_endpoint);
+
+    check("auth.keycloak_url", &config.auth.keycloak_url);
+    check("auth.token_endpoint", &config.auth.token_endpoint);
+
+    if let Some(ext) = &config.auth.external {
+        check("auth.external.issuer", &ext.issuer);
+        if let Some(v) = ext.authorization_endpoint.as_deref() {
+            check("auth.external.authorization_endpoint", v);
+        }
+        if let Some(v) = ext.token_endpoint.as_deref() {
+            check("auth.external.token_endpoint", v);
+        }
+        if let Some(v) = ext.device_authorization_endpoint.as_deref() {
+            check("auth.external.device_authorization_endpoint", v);
+        }
+    }
+
+    check("access_control.url", &config.access_control.url);
 }
 
 fn env_override_str(key: &str, target: &mut String) {
@@ -2628,6 +2680,29 @@ mod tests {
         config.auth.keycloak_url = String::new();
         config.auth.token_endpoint = "https://token.example.com/token".to_string();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_malformed_catalog_url() {
+        let mut config = valid_config();
+        config.catalog.catalog_url = "not a url".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("catalog.catalog_url") && err.contains("not a valid URL"),
+            "Expected URL parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_malformed_worker_url() {
+        let mut config = valid_config();
+        config.coordinator.worker_urls = vec!["http://good.example".to_string(), "://broken".to_string()];
+        config.coordinator.worker_secret = SecretString::new("s".to_string());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("coordinator.worker_urls[1]") && err.contains("not a valid URL"),
+            "Expected URL parse error, got: {err}"
+        );
     }
 
     #[test]
