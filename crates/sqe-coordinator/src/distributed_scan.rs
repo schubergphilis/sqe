@@ -161,6 +161,7 @@ impl DistributedScanExec {
     /// When unset the dispatcher sends no auth header; the worker must
     /// also be running with `allow_unauthenticated = true` for the call
     /// to succeed.
+    #[must_use = "with_worker_secret consumes self; bind the returned scan"]
     pub fn with_worker_secret(mut self, secret: String) -> Self {
         self.worker_secret = secret;
         self
@@ -171,36 +172,42 @@ impl DistributedScanExec {
     /// When combined with a credential tracker, this enables the coordinator to
     /// detect when credentials are approaching expiry and push refreshed ones
     /// to workers.
+    #[must_use = "with_credential_expiry consumes self; bind the returned scan"]
     pub fn with_credential_expiry(mut self, expiry: DateTime<Utc>) -> Self {
         self.credential_expiry = Some(expiry);
         self
     }
 
     /// Set the credential refresh tracker for monitoring expiring credentials.
+    #[must_use = "with_credential_tracker consumes self; bind the returned scan"]
     pub fn with_credential_tracker(mut self, tracker: Arc<CredentialRefreshTracker>) -> Self {
         self.credential_tracker = Some(tracker);
         self
     }
 
     /// Set the worker registry for health tracking and failover.
+    #[must_use = "with_worker_registry consumes self; bind the returned scan"]
     pub fn with_worker_registry(mut self, registry: Arc<WorkerRegistry>) -> Self {
         self.worker_registry = Some(registry);
         self
     }
 
     /// Set the maximum number of retry attempts per fragment.
+    #[must_use = "with_max_retries consumes self; bind the returned scan"]
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = max_retries;
         self
     }
 
     /// Set the local executor for fallback when all workers are down.
+    #[must_use = "with_local_executor consumes self; bind the returned scan"]
     pub fn with_local_executor(mut self, executor: Arc<dyn LocalExecutor>) -> Self {
         self.local_executor = Some(executor);
         self
     }
 
     /// Set an optional callback that fires when each fragment stream completes or fails.
+    #[must_use = "with_fragment_callback consumes self; bind the returned scan"]
     pub fn with_fragment_callback(mut self, cb: FragmentCallback) -> Self {
         self.fragment_callback = FragmentCallbackOpt(Some(cb));
         self

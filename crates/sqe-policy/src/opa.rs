@@ -192,6 +192,7 @@ impl OpaStore {
 
     /// Attach a metrics registry. Resolve latency and breaker state are
     /// recorded under `sqe_policy_*` series.
+    #[must_use = "with_metrics consumes self; bind the returned store"]
     pub fn with_metrics(mut self, metrics: Arc<MetricsRegistry>) -> Self {
         self.metrics = Some(metrics);
         self

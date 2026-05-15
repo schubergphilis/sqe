@@ -54,6 +54,7 @@ impl OAuthClient {
     /// rather than the default `PRINCIPAL_ROLE:ALL`. Silently dropping a
     /// caller-supplied scope used to broaden every catalog's effective
     /// rights to ALL — see issue #17.
+    #[must_use = "with_scope consumes self; bind the returned client"]
     pub fn with_scope(mut self, scope: Option<String>) -> Self {
         self.scope = scope.filter(|s| !s.is_empty());
         self

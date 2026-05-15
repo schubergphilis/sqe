@@ -106,6 +106,7 @@ impl SessionManager {
     }
 
     /// Attach Prometheus metrics registry for tracking token refresh events.
+    #[must_use = "with_metrics consumes self; bind the returned SessionManager"]
     pub fn with_metrics(mut self, metrics: Arc<sqe_metrics::MetricsRegistry>) -> Self {
         self.metrics = Some(metrics);
         self

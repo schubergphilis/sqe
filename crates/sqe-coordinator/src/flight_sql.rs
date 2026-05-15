@@ -386,6 +386,7 @@ impl SqeFlightSqlService {
         }
     }
 
+    #[must_use = "with_metrics consumes self; bind the returned service"]
     pub fn with_metrics(mut self, metrics: Arc<sqe_metrics::MetricsRegistry>) -> Self {
         self.metrics = Some(metrics);
         self
@@ -397,16 +398,19 @@ impl SqeFlightSqlService {
         &self.query_tracker
     }
 
+    #[must_use = "with_worker_registry consumes self; bind the returned service"]
     pub fn with_worker_registry(mut self, registry: Arc<WorkerRegistry>) -> Self {
         self.worker_registry = Some(registry);
         self
     }
 
+    #[must_use = "with_rate_limiter consumes self; bind the returned service"]
     pub fn with_rate_limiter(mut self, limiter: Arc<crate::rate_limiter::QueryRateLimiter>) -> Self {
         self.rate_limiter = Some(limiter);
         self
     }
 
+    #[must_use = "with_auth_rate_limiter consumes self; bind the returned service"]
     pub fn with_auth_rate_limiter(
         mut self,
         limiter: Arc<crate::rate_limiter::AuthRateLimiter>,
@@ -415,6 +419,7 @@ impl SqeFlightSqlService {
         self
     }
 
+    #[must_use = "with_metadata_rate_limiter consumes self; bind the returned service"]
     pub fn with_metadata_rate_limiter(
         mut self,
         limiter: Arc<crate::rate_limiter::MetadataRateLimiter>,

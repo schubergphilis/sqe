@@ -122,18 +122,21 @@ impl Session {
     }
 
     /// Returns a new session with the given default catalog.
+    #[must_use = "with_catalog consumes self; bind the returned Session"]
     pub fn with_catalog(mut self, catalog: Option<String>) -> Self {
         self.default_catalog = catalog;
         self
     }
 
     /// Returns a new session with the given default schema.
+    #[must_use = "with_schema consumes self; bind the returned Session"]
     pub fn with_schema(mut self, schema: Option<String>) -> Self {
         self.default_schema = schema;
         self
     }
 
     /// Returns a new session with the given source.
+    #[must_use = "with_source consumes self; bind the returned Session"]
     pub fn with_source(mut self, source: Option<String>) -> Self {
         self.source = source;
         self
