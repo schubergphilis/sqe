@@ -83,8 +83,13 @@ pub struct QueryHandler {
     lineage: Option<Arc<dyn sqe_lineage::LineageObserver>>,
     query_tracker: Arc<QueryTracker>,
     query_cache: Option<Arc<ResultCache>>,
-    /// Semaphore limiting concurrent query execution.
+    /// Semaphore limiting global concurrent query execution.
     query_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    /// Per-user concurrency semaphores. Lazily created on first query per
+    /// username. Each entry caps how many simultaneous queries one user can
+    /// hold against the global pool, preventing a single tenant from
+    /// monopolising `query_semaphore`.
+    per_user_semaphores: Arc<dashmap::DashMap<String, Arc<tokio::sync::Semaphore>>>,
     /// Shared DataFusion runtime with FairSpillPool memory management.
     /// Built once at startup and reused across all queries.
     runtime: Arc<RuntimeEnv>,
@@ -177,6 +182,7 @@ impl QueryHandler {
             query_tracker,
             query_cache,
             query_semaphore,
+            per_user_semaphores: Arc::new(dashmap::DashMap::new()),
             runtime,
             table_cache: None,
             grant_backend,
@@ -425,9 +431,37 @@ impl QueryHandler {
             ));
         }
 
-        // Backpressure: reject if too many concurrent queries
+        // Backpressure: per-user gate first, then global gate. The per-user
+        // gate prevents one tenant from holding every global permit while
+        // legitimately under their submission rate limit. We acquire owned
+        // permits because the streaming path holds them for the result-
+        // stream lifetime, not the synchronous execute() call.
+        let _per_user_permit = if self.config.query.max_concurrent_per_user > 0 {
+            let username = session.user.username.clone();
+            let sem = self
+                .per_user_semaphores
+                .entry(username.clone())
+                .or_insert_with(|| {
+                    Arc::new(tokio::sync::Semaphore::new(
+                        self.config.query.max_concurrent_per_user,
+                    ))
+                })
+                .clone();
+            match sem.try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    return Err(SqeError::Execution(format!(
+                        "Too many concurrent queries for user '{}' ({} active). Please retry later.",
+                        username, self.config.query.max_concurrent_per_user
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
         let _permit = if let Some(ref sem) = self.query_semaphore {
-            match sem.try_acquire() {
+            match sem.clone().try_acquire_owned() {
                 Ok(permit) => Some(permit),
                 Err(_) => {
                     return Err(SqeError::Execution(format!(
@@ -1320,11 +1354,37 @@ impl QueryHandler {
             ));
         }
 
-        // Acquire owned concurrency permit so it can be moved into the
+        // Acquire owned concurrency permits so they can be moved into the
         // stream wrapper and released when the client finishes draining.
-        let permit = if let Some(ref sem) = self.query_semaphore {
+        // The per-user permit is acquired first; if granted, the global
+        // permit is acquired second. A user that holds N per-user permits
+        // (each tied to an open stream) still counts N times against the
+        // global ceiling.
+        let mut permits: Vec<tokio::sync::OwnedSemaphorePermit> = Vec::new();
+        if self.config.query.max_concurrent_per_user > 0 {
+            let username = session.user.username.clone();
+            let sem = self
+                .per_user_semaphores
+                .entry(username.clone())
+                .or_insert_with(|| {
+                    Arc::new(tokio::sync::Semaphore::new(
+                        self.config.query.max_concurrent_per_user,
+                    ))
+                })
+                .clone();
+            match sem.try_acquire_owned() {
+                Ok(p) => permits.push(p),
+                Err(_) => {
+                    return Err(SqeError::Execution(format!(
+                        "Too many concurrent queries for user '{}' ({} active). Please retry later.",
+                        username, self.config.query.max_concurrent_per_user
+                    )));
+                }
+            }
+        }
+        if let Some(ref sem) = self.query_semaphore {
             match Arc::clone(sem).try_acquire_owned() {
-                Ok(p) => Some(p),
+                Ok(p) => permits.push(p),
                 Err(_) => {
                     return Err(SqeError::Execution(format!(
                         "Too many concurrent queries ({} active). Please retry later.",
@@ -1332,9 +1392,7 @@ impl QueryHandler {
                     )));
                 }
             }
-        } else {
-            None
-        };
+        }
 
         // --- Classify ---------------------------------------------------------
         // See execute() for why we pre-strip `FOR INCREMENTAL BETWEEN` before
@@ -1419,13 +1477,14 @@ impl QueryHandler {
                     sql_length: sql.len(),
                 };
 
-                let tracked = crate::streaming::TrackedRecordBatchStream::with_cancel_token(
-                    inner_stream,
-                    finalizer,
-                    permit,
-                    cancel_token,
-                )
-                .with_teardown(tt_cleanup);
+                let tracked =
+                    crate::streaming::TrackedRecordBatchStream::with_permits_and_cancel_token(
+                        inner_stream,
+                        finalizer,
+                        permits,
+                        cancel_token,
+                    )
+                    .with_teardown(tt_cleanup);
                 let boxed: SendableRecordBatchStream = Box::pin(tracked);
                 Ok((schema, boxed))
             }
