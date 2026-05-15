@@ -6856,6 +6856,7 @@ dependencies = [
  "sqe-core",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
