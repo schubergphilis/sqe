@@ -412,7 +412,7 @@ async fn read_only_user_rejected_with_audit() {
     let (_root_session, handler) = common::setup_handler().await;
     let readonly = sqe_core::Session::new(
         "alice-readonly".to_string(),
-        "deadbeef".to_string(),
+        sqe_core::SecretString::new("deadbeef".to_string()),
         None,
         Utc::now() + Duration::hours(1),
         vec!["readonly".to_string()],

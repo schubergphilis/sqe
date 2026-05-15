@@ -132,7 +132,7 @@ impl SessionManager {
     ) -> sqe_core::Result<Arc<Session>> {
         let credentials = FlightCredentials {
             username: Some(username.to_string()),
-            password: Some(password.to_string()),
+            password: Some(sqe_core::SecretString::new(password.to_string())),
             ..Default::default()
         };
         self.authenticate_credentials(&credentials).await
@@ -165,11 +165,13 @@ impl SessionManager {
         // Check if the legacy background task refreshed this token
         if let Some(ref authenticator) = self.legacy_authenticator {
             if let Some(cached) = authenticator.get_cached_token(session_id) {
-                if cached.access_token != session.access_token {
+                if cached.access_token != session.access_token().expose() {
                     let mut updated = (*session).clone();
-                    updated.access_token = cached.access_token;
-                    updated.refresh_token = cached.refresh_token;
-                    updated.token_expiry = cached.expiry;
+                    updated.rotate_credentials(sqe_core::Credentials::new(
+                        sqe_core::SecretString::new(cached.access_token),
+                        cached.refresh_token.map(sqe_core::SecretString::new),
+                        cached.expiry,
+                    ));
                     updated.touch();
                     let updated = Arc::new(updated);
                     self.sessions.insert(session_id.to_string(), updated.clone());
@@ -189,7 +191,7 @@ impl SessionManager {
         }
 
         // Token is no longer in cache (or no legacy authenticator) — check if expired
-        if session.token_expiry <= Utc::now() {
+        if session.token_expiry() <= Utc::now() {
             warn!(session_id = %session_id, "Session token expired, evicting");
             self.sessions.remove(session_id);
             return None;
@@ -235,7 +237,7 @@ impl SessionManager {
                 serde_json::json!({
                     "id": session.id,
                     "username": session.user.username,
-                    "expires_at": session.token_expiry.to_rfc3339(),
+                    "expires_at": session.token_expiry().to_rfc3339(),
                 })
             })
             .collect();
@@ -346,7 +348,7 @@ mod tests {
             keycloak_url: "http://localhost:18080".to_string(),
             realm: "test".to_string(),
             client_id: "test-client".to_string(),
-            client_secret: "secret".to_string(),
+            client_secret: sqe_core::SecretString::new("secret".to_string()),
             token_endpoint: String::new(),
             token_refresh_buffer_secs: 60,
             ssl_verification: false,
@@ -373,8 +375,8 @@ mod tests {
     fn make_session(username: &str) -> Session {
         Session::new(
             username.to_string(),
-            "access_tok".to_string(),
-            Some("refresh_tok".to_string()),
+            sqe_core::SecretString::new("access_tok".to_string()),
+            Some(sqe_core::SecretString::new("refresh_tok".to_string())),
             Utc::now() + Duration::hours(1),
             vec!["analyst".to_string()],
         )
@@ -384,7 +386,7 @@ mod tests {
     fn make_expired_token_session(username: &str) -> Session {
         Session::new(
             username.to_string(),
-            "expired_tok".to_string(),
+            sqe_core::SecretString::new("expired_tok".to_string()),
             None,
             Utc::now() - Duration::minutes(5),
             vec![],
@@ -797,7 +799,7 @@ mod tests {
         );
 
         let creds = FlightCredentials {
-            bearer_token: Some("eyJtest.payload.sig".to_string()),
+            bearer_token: Some(sqe_core::SecretString::new("eyJtest.payload.sig".to_string())),
             ..Default::default()
         };
 
@@ -807,7 +809,7 @@ mod tests {
             .expect("chain wiring must let bearer-only credentials through");
 
         assert_eq!(session.user.username, "alice");
-        assert_eq!(session.access_token, "eyJtest.payload.sig");
+        assert_eq!(session.access_token().expose(), "eyJtest.payload.sig");
     }
 
     /// Negative control: the legacy single-Authenticator wiring (the
@@ -820,7 +822,7 @@ mod tests {
         let manager = SessionManager::new(legacy);
 
         let creds = FlightCredentials {
-            bearer_token: Some("eyJtest.payload.sig".to_string()),
+            bearer_token: Some(sqe_core::SecretString::new("eyJtest.payload.sig".to_string())),
             ..Default::default()
         };
 
@@ -854,7 +856,7 @@ mod tests {
         );
 
         let creds = FlightCredentials {
-            bearer_token: Some("eyJtest.payload.sig".to_string()),
+            bearer_token: Some(sqe_core::SecretString::new("eyJtest.payload.sig".to_string())),
             ..Default::default()
         };
 

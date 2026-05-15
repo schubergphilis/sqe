@@ -411,7 +411,7 @@ pub fn build_s3_store(
         .secret_key
         .as_deref()
         .filter(|s| !s.is_empty())
-        .unwrap_or(storage.s3_secret_key.as_str());
+        .unwrap_or(storage.s3_secret_key.expose());
 
     let endpoint = args
         .endpoint

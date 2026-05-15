@@ -58,7 +58,7 @@ pub async fn build_aws_config(
     // we need, and let the original drop normally — the clones go on to
     // the AWS credential provider untouched.
     if let Some(secret_ref) = options.get("SECRET").and_then(OptionValue::as_secret_ref) {
-        let secret = secrets.get(secret_ref)?;
+        let secret = secrets.get(secret_ref).map_err(|e| e.to_string())?;
         match &secret {
             Secret::Aws {
                 access_key,

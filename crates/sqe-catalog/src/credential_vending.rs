@@ -90,7 +90,7 @@ impl CredentialCache {
         debug!(table = table_key, "Using static S3 credentials from StorageConfig");
         VendedCredentials {
             access_key: self.storage_config.s3_access_key.clone(),
-            secret_key: self.storage_config.s3_secret_key.clone(),
+            secret_key: self.storage_config.s3_secret_key.expose().to_string(),
             session_token: None,
             expiry: None,
         }
