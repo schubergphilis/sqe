@@ -90,6 +90,18 @@ pub struct QueryHandler {
     /// hold against the global pool, preventing a single tenant from
     /// monopolising `query_semaphore`.
     per_user_semaphores: Arc<dashmap::DashMap<String, Arc<tokio::sync::Semaphore>>>,
+    /// Tracks per-user reserved memory bytes for admission. Reservations are
+    /// recorded at admit time and released when the streaming result wrapper
+    /// drops, so a single user submitting many memory-hungry queries gets
+    /// rejected with a per-user pressure error before they drag the global
+    /// FairSpillPool into the red-band.
+    per_user_memory: Arc<crate::memory::PerUserMemoryRegistry>,
+    /// Cached parse of `config.query.per_user_memory_budget`. `0` disables
+    /// the per-user cap.
+    per_user_memory_budget_bytes: usize,
+    /// Cached parse of `config.query.max_query_memory`. Used as the
+    /// per-query reservation increment against the per-user budget.
+    per_query_memory_bytes: usize,
     /// Shared DataFusion runtime with FairSpillPool memory management.
     /// Built once at startup and reused across all queries.
     runtime: Arc<RuntimeEnv>,
@@ -166,6 +178,27 @@ impl QueryHandler {
         let runtime = crate::runtime::build_coordinator_runtime(&config.coordinator)
             .map_err(|e| sqe_core::SqeError::Config(format!("Failed to build runtime: {e}")))?;
 
+        let per_user_memory_budget_bytes = if config.query.per_user_memory_budget == "0" {
+            0
+        } else {
+            sqe_core::parse_memory_limit(&config.query.per_user_memory_budget).map_err(|e| {
+                sqe_core::SqeError::Config(format!(
+                    "Invalid per_user_memory_budget '{}': {e}",
+                    config.query.per_user_memory_budget
+                ))
+            })? as usize
+        };
+        let per_query_memory_bytes = if config.query.max_query_memory == "0" {
+            0
+        } else {
+            sqe_core::parse_memory_limit(&config.query.max_query_memory).map_err(|e| {
+                sqe_core::SqeError::Config(format!(
+                    "Invalid max_query_memory '{}': {e}",
+                    config.query.max_query_memory
+                ))
+            })? as usize
+        };
+
         Ok(Self {
             policy_enforcer,
             policy_store,
@@ -183,6 +216,9 @@ impl QueryHandler {
             query_cache,
             query_semaphore,
             per_user_semaphores: Arc::new(dashmap::DashMap::new()),
+            per_user_memory: Arc::new(crate::memory::PerUserMemoryRegistry::new()),
+            per_user_memory_budget_bytes,
+            per_query_memory_bytes,
             runtime,
             table_cache: None,
             grant_backend,
@@ -453,6 +489,32 @@ impl QueryHandler {
                     return Err(SqeError::Execution(format!(
                         "Too many concurrent queries for user '{}' ({} active). Please retry later.",
                         username, self.config.query.max_concurrent_per_user
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
+        // Per-user memory reservation. Reject when this user's in-flight
+        // queries would push past their share of the global pool, before
+        // the global red-band check fires for everyone else.
+        let _per_user_mem_reservation = if self.per_user_memory_budget_bytes > 0
+            && self.per_query_memory_bytes > 0
+        {
+            let username = session.user.username.clone();
+            match self.per_user_memory.try_reserve(
+                &username,
+                self.per_query_memory_bytes,
+                self.per_user_memory_budget_bytes,
+            ) {
+                Some(r) => Some(r),
+                None => {
+                    let used = self.per_user_memory.used_bytes(&username);
+                    return Err(SqeError::Execution(format!(
+                        "Per-user memory budget exceeded for '{}': {} bytes reserved, \
+                         limit {} bytes. Wait for in-flight queries to complete.",
+                        username, used, self.per_user_memory_budget_bytes
                     )));
                 }
             }
@@ -1394,6 +1456,33 @@ impl QueryHandler {
             }
         }
 
+        // Per-user memory reservation. Carried by the streaming wrapper so
+        // it releases when the result stream drops, not when the planning
+        // call returns. Without this, large multi-second streams would
+        // appear to free their budget immediately on admission.
+        let per_user_mem_reservation = if self.per_user_memory_budget_bytes > 0
+            && self.per_query_memory_bytes > 0
+        {
+            let username = session.user.username.clone();
+            match self.per_user_memory.try_reserve(
+                &username,
+                self.per_query_memory_bytes,
+                self.per_user_memory_budget_bytes,
+            ) {
+                Some(r) => Some(r),
+                None => {
+                    let used = self.per_user_memory.used_bytes(&username);
+                    return Err(SqeError::Execution(format!(
+                        "Per-user memory budget exceeded for '{}': {} bytes reserved, \
+                         limit {} bytes. Wait for in-flight queries to complete.",
+                        username, used, self.per_user_memory_budget_bytes
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
         // --- Classify ---------------------------------------------------------
         // See execute() for why we pre-strip `FOR INCREMENTAL BETWEEN` before
         // handing SQL to sqlparser-rs.
@@ -1477,14 +1566,14 @@ impl QueryHandler {
                     sql_length: sql.len(),
                 };
 
-                let tracked =
-                    crate::streaming::TrackedRecordBatchStream::with_permits_and_cancel_token(
-                        inner_stream,
-                        finalizer,
-                        permits,
-                        cancel_token,
-                    )
-                    .with_teardown(tt_cleanup);
+                let tracked = crate::streaming::TrackedRecordBatchStream::with_permits_reservation_and_cancel_token(
+                    inner_stream,
+                    finalizer,
+                    permits,
+                    per_user_mem_reservation,
+                    cancel_token,
+                )
+                .with_teardown(tt_cleanup);
                 let boxed: SendableRecordBatchStream = Box::pin(tracked);
                 Ok((schema, boxed))
             }
