@@ -218,6 +218,21 @@ impl CircuitBreaker {
             _ => "closed",
         }
     }
+
+    /// Return the current state as a numeric code for gauges.
+    /// 0 = closed, 1 = half_open, 2 = open.
+    pub fn state_code(&self) -> u8 {
+        match self.state.load(Ordering::Relaxed) {
+            STATE_OPEN => 2,
+            STATE_HALF_OPEN => 1,
+            _ => 0,
+        }
+    }
+
+    /// Return the circuit's name (used as label value for metrics).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 #[cfg(test)]

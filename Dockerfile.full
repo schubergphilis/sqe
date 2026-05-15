@@ -1,0 +1,96 @@
+# syntax=docker/dockerfile:1
+# Kitchen-sink build that compiles every supported Iceberg catalog
+# backend into the SQE binary: REST (Polaris / Nessie), Hive Metastore,
+# AWS Glue, S3 Tables, Postgres-backed SQL, and Hadoop warehouses.
+#
+# Use this image when a single deployment needs to dispatch to multiple
+# catalogs by runtime config. For a slim Polaris-only image, use the
+# default `Dockerfile`, which now ships only the REST backend.
+#
+# Adds ~150 MB to the binary on top of the slim default (aws-sdk-glue,
+# aws-sdk-s3tables, volo-thrift, pilota, sqlx tls-rustls).
+FROM lukemathwalker/cargo-chef:latest-rust-bookworm AS chef
+
+ARG TARGETARCH
+ARG SCCACHE_VERSION=0.9.0
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake protobuf-compiler libssl-dev pkg-config clang lld curl && \
+    rm -rf /var/lib/apt/lists/* && \
+    case "$TARGETARCH" in \
+        amd64) SCCACHE_ARCH=x86_64 ;; \
+        arm64) SCCACHE_ARCH=aarch64 ;; \
+        *) echo "unsupported arch: $TARGETARCH" && exit 1 ;; \
+    esac && \
+    curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz" \
+    | tar xz --strip-components=1 -C /usr/local/bin \
+        "sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl/sccache"
+
+ENV RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=lld"
+ENV RUSTC_WRAPPER=sccache
+ENV SCCACHE_DIR=/sccache
+ENV SCCACHE_CACHE_SIZE=2G
+
+WORKDIR /build
+
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY vendor/ vendor/
+COPY xtask/ xtask/
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS deps
+ARG TARGETARCH
+COPY --from=planner /build/recipe.json recipe.json
+COPY vendor/ vendor/
+RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
+    --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},target=/usr/local/cargo/git \
+    --mount=type=cache,id=sqe-sccache-${TARGETARCH},target=/sccache \
+    cargo chef cook --release --recipe-path recipe.json \
+      --features sqe-catalog/full-backends && \
+    sccache --show-stats
+
+FROM deps AS builder
+ARG TARGETARCH
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY vendor/ vendor/
+COPY xtask/ xtask/
+RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
+    --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},target=/usr/local/cargo/git \
+    --mount=type=cache,id=sqe-sccache-${TARGETARCH},target=/sccache \
+    cargo build --release \
+      --features sqe-catalog/full-backends \
+      --bin sqe-server --bin sqe-worker --bin sqe-cli && \
+    sccache --show-stats
+
+FROM debian:bookworm-slim
+
+ARG VERSION=dev
+ARG BUILD_DATE
+ARG GIT_REVISION
+
+LABEL org.opencontainers.image.title="sqe-full" \
+      org.opencontainers.image.description="Sovereign Query Engine with all catalog backends compiled in" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.revision="${GIT_REVISION}" \
+      org.opencontainers.image.source="https://github.com/schuberg/sqe"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 curl && \
+    rm -rf /var/lib/apt/lists/* && \
+    groupadd -r sqe && useradd -r -g sqe -u 1000 sqe
+
+COPY --from=builder /build/target/release/sqe-server /usr/local/bin/
+COPY --from=builder /build/target/release/sqe-worker /usr/local/bin/
+COPY --from=builder /build/target/release/sqe-cli /usr/local/bin/
+
+USER sqe
+EXPOSE 50051 50052 8080 9090 9091
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:9091/healthz || exit 1
+
+ENTRYPOINT ["sqe-server"]

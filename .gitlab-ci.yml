@@ -65,6 +65,10 @@ cargo-test:
     - apt-get update -qq && apt-get install -y -qq cmake protobuf-compiler libssl-dev pkg-config > /dev/null
   script:
     - cargo test --release
+    # Run the SQLite-backed runtime catalog tests behind the explicit
+    # feature flag so unrelated workspace builds do not silently pick up
+    # the SQLite driver via feature unification.
+    - cargo test --release -p sqe-coordinator --features test-sqlite --test runtime_catalog_test
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes:

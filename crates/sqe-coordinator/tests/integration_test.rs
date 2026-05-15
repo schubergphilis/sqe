@@ -520,12 +520,12 @@ fn test_metrics_registry() {
     let metrics = sqe_metrics::MetricsRegistry::new();
     metrics
         .query_count
-        .with_label_values(&["success", "query"])
+        .with_label_values(&["success", "query", ""])
         .inc();
     assert_eq!(
         metrics
             .query_count
-            .with_label_values(&["success", "query"])
+            .with_label_values(&["success", "query", ""])
             .get(),
         1.0
     );

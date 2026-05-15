@@ -646,7 +646,10 @@ impl QueryHandler {
                     let rows: usize = cached.batches.iter().map(|b| b.num_rows()).sum();
                     self.query_tracker.complete(&query_id, rows, 0, cached.tables_touched.clone(), 0, 0, 0, 0);
                     if let Some(ref metrics) = self.metrics {
-                        metrics.query_count.with_label_values(&["success", &kind_name]).inc();
+                        metrics
+                            .query_count
+                            .with_label_values(&["success", &kind_name, ""])
+                            .inc();
                         metrics.rows_returned.inc_by(rows as f64);
                     }
                     // OpenLineage: cache hits still get a COMPLETE event so the
@@ -1256,9 +1259,13 @@ impl QueryHandler {
         }
 
         if let Some(ref metrics) = self.metrics {
+            let error_code = match &result {
+                Err(e) => e.error_code().name(),
+                Ok(_) => "",
+            };
             metrics
                 .query_count
-                .with_label_values(&[status, &kind_name])
+                .with_label_values(&[status, &kind_name, error_code])
                 .inc();
             metrics
                 .query_duration
@@ -1585,7 +1592,7 @@ impl QueryHandler {
                 if let Some(ref metrics) = self.metrics {
                     metrics
                         .query_count
-                        .with_label_values(&["error", &kind_name])
+                        .with_label_values(&["error", &kind_name, e.error_code().name()])
                         .inc();
                     metrics
                         .query_duration
