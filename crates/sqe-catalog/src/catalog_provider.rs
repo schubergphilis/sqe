@@ -37,6 +37,9 @@ pub struct SqeCatalogProvider {
     /// Concurrency for direct manifest walks during pruning.
     /// Propagated to schema and table providers.
     manifest_concurrency: usize,
+    /// Prefetch concurrency for the direct-read fast path. Sourced from
+    /// `[storage] prefetch_concurrency` and propagated downstream.
+    prefetch_concurrency: usize,
 }
 
 impl std::fmt::Debug for SqeCatalogProvider {
@@ -95,6 +98,7 @@ impl SqeCatalogProvider {
             prom_metrics: None,
             small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
             manifest_concurrency: crate::iceberg_scan::DEFAULT_MANIFEST_CONCURRENCY,
+            prefetch_concurrency: crate::iceberg_scan::DEFAULT_DIRECT_READ_CONCURRENCY,
         })
     }
 
@@ -118,6 +122,14 @@ impl SqeCatalogProvider {
         self
     }
 
+    /// Set the prefetch concurrency for the direct-read fast path.
+    /// Propagated to schema and table providers. Fed from
+    /// `[storage] prefetch_concurrency`.
+    pub fn with_prefetch_concurrency(mut self, concurrency: usize) -> Self {
+        self.prefetch_concurrency = concurrency.max(1);
+        self
+    }
+
     /// Create a catalog provider with pre-populated namespace names.
     /// Useful when the namespace list is already known.
     pub fn with_namespaces(
@@ -136,6 +148,7 @@ impl SqeCatalogProvider {
             prom_metrics: None,
             small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
             manifest_concurrency: crate::iceberg_scan::DEFAULT_MANIFEST_CONCURRENCY,
+            prefetch_concurrency: crate::iceberg_scan::DEFAULT_DIRECT_READ_CONCURRENCY,
         }
     }
 }
@@ -179,6 +192,7 @@ impl CatalogProvider for SqeCatalogProvider {
         }
         provider = provider.with_small_file_threshold(self.small_file_threshold_bytes);
         provider = provider.with_manifest_concurrency(self.manifest_concurrency);
+        provider = provider.with_prefetch_concurrency(self.prefetch_concurrency);
 
         Some(Arc::new(provider))
 

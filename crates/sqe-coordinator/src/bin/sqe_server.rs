@@ -382,20 +382,24 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     let policy_enforcer: Arc<dyn sqe_policy::PolicyEnforcer> =
         Arc::new(sqe_policy::PassthroughEnforcer);
 
-    // Workers
     let worker_registry = Arc::new(
-        sqe_coordinator::worker_registry::WorkerRegistry::with_options(
+        sqe_coordinator::worker_registry::WorkerRegistry::with_options_and_failures(
             config.coordinator.worker_urls.clone(),
             sqe_coordinator::channel_pool::ChannelPool::shared(),
             config.coordinator.max_workers,
+            config.coordinator.health_check_max_failures,
         ),
     );
 
     if !config.coordinator.worker_urls.is_empty() {
-        _task_guards.push(
-            worker_registry.start_health_check_task(std::time::Duration::from_secs(5)),
+        let interval =
+            std::time::Duration::from_secs(config.coordinator.health_check_interval_secs);
+        _task_guards.push(worker_registry.start_health_check_task(interval));
+        tracing::info!(
+            workers = ?config.coordinator.worker_urls,
+            interval_secs = config.coordinator.health_check_interval_secs,
+            "Started worker health checks"
         );
-        tracing::info!(workers = ?config.coordinator.worker_urls, "Started worker health checks");
     }
 
     // Health server (start early so probes work during init)
@@ -427,12 +431,13 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         sqe_coordinator::credential_refresh::CredentialRefreshTracker::new(),
     );
 
-    // Start background credential refresh loop (checks every 60s)
     if !config.coordinator.worker_urls.is_empty() {
+        let interval =
+            std::time::Duration::from_secs(config.coordinator.credential_refresh_interval_secs);
         _task_guards.push(
             sqe_coordinator::credential_refresh::start_credential_refresh_task(
                 credential_tracker.clone(),
-                std::time::Duration::from_secs(60),
+                interval,
                 config.coordinator.worker_secret.expose().to_string(),
                 |_fragment| async {
                     // Credential vending is deferred to Step 5 (Pluggable
@@ -440,23 +445,26 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
                     // `vend_credentials(table)` method that reloads the
                     // table from Polaris to obtain fresh STS tokens scoped
                     // to the fragment's data files. Until then, workers use
-                    // the original session credentials. Tracking:
-                    // nextsteps.md Step 5, openspec/changes/pluggable-catalogs/
+                    // the original session credentials.
                     None
                 },
             ),
         );
-        tracing::info!("Started credential refresh background task (60s interval)");
+        tracing::info!(
+            interval_secs = config.coordinator.credential_refresh_interval_secs,
+            "Started credential refresh background task"
+        );
     }
 
-    // Session expiry sweeper — runs every 60s to remove idle/absolute-expired sessions
     {
         let sm = session_manager.clone();
         let idle = config.session.idle_timeout_secs;
         let absolute = config.session.absolute_timeout_secs;
+        let sweep_interval =
+            std::time::Duration::from_secs(config.session.expiry_sweep_interval_secs);
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
-            tick.tick().await; // skip first immediate tick
+            let mut tick = tokio::time::interval(sweep_interval);
+            tick.tick().await;
             loop {
                 tick.tick().await;
                 sm.sweep_expired_sessions(idle, absolute);
@@ -465,7 +473,8 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         tracing::info!(
             idle_timeout_secs = config.session.idle_timeout_secs,
             absolute_timeout_secs = config.session.absolute_timeout_secs,
-            "Started session expiry sweeper (60s interval)"
+            sweep_interval_secs = config.session.expiry_sweep_interval_secs,
+            "Started session expiry sweeper"
         );
     }
 

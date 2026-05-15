@@ -9,6 +9,41 @@
 pub mod datasets;
 pub mod columns;
 
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::logical_expr::{DmlStatement, TableScan};
+
+/// Return the fully-qualified table names this plan reads or writes,
+/// deduplicated and sorted. Used for audit-log `tables_touched`.
+///
+/// Read sources come from `TableScan` nodes; write targets come from
+/// `Dml` / `CreateMemoryTable` / `CreateExternalTable` / `CreateView`
+/// statements.
+pub fn extract_table_names(plan: &LogicalPlan) -> Vec<String> {
+    let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let _ = plan.apply(|node| {
+        match node {
+            LogicalPlan::TableScan(TableScan { table_name, .. }) => {
+                names.insert(table_name.to_string());
+            }
+            LogicalPlan::Dml(DmlStatement { table_name, .. }) => {
+                names.insert(table_name.to_string());
+            }
+            LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(ct)) => {
+                names.insert(ct.name.to_string());
+            }
+            LogicalPlan::Ddl(DdlStatement::CreateExternalTable(ct)) => {
+                names.insert(ct.name.to_string());
+            }
+            LogicalPlan::Ddl(DdlStatement::CreateView(cv)) => {
+                names.insert(cv.name.to_string());
+            }
+            _ => {}
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    names.into_iter().collect()
+}
+
 use crate::event::{
     ColumnLineageEntry, ColumnLineageFacet, ColumnLineageInput, DataSourceFacet, DatasetFacets,
     InputDataset, OutputDataset, OutputDatasetFacets, SchemaFacet, SchemaField,

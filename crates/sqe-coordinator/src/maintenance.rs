@@ -207,6 +207,7 @@ impl MaintenanceHandler {
                 rows_returned: 0,
                 status: audit_status.to_string(),
                 client_ip: None,
+                tables_touched: vec![target.to_string()],
             });
         }
         warn!(

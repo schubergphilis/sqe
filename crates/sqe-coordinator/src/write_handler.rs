@@ -700,12 +700,27 @@ impl WriteHandler {
             }
         };
 
-        // Reload fresh for the stats transaction so our view of the metadata
-        // is current (avoid committing against stale base metadata).
+        let staged_path = stats_file.statistics_path.clone();
+        let file_io = table.file_io().clone();
+        let cleanup_staged = |reason: &str, err: &dyn std::fmt::Display| {
+            let path = staged_path.clone();
+            let io = file_io.clone();
+            tracing::warn!(error = %err, path = %path, reason = reason, "puffin: deleting orphan sidecar");
+            tokio::spawn(async move {
+                if let Err(del_err) = io.delete(&path).await {
+                    tracing::warn!(
+                        error = %del_err,
+                        path = %path,
+                        "puffin: orphan sidecar delete failed; will require manual cleanup"
+                    );
+                }
+            });
+        };
+
         let table = match catalog.load_table(table_ident).await {
             Ok(t) => t,
             Err(e) => {
-                tracing::warn!(error = %e, "puffin: reload for stats tx failed");
+                cleanup_staged("reload_for_stats_tx_failed", &e);
                 return;
             }
         };
@@ -714,12 +729,12 @@ impl WriteHandler {
         let tx = match action.apply(tx) {
             Ok(t) => t,
             Err(e) => {
-                tracing::warn!(error = %e, "puffin: apply update_statistics failed");
+                cleanup_staged("apply_update_statistics_failed", &e);
                 return;
             }
         };
         if let Err(e) = tx.commit(catalog.as_ref()).await {
-            tracing::warn!(error = %e, "puffin: commit update_statistics failed");
+            cleanup_staged("commit_update_statistics_failed", &e);
         }
     }
 
