@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use datafusion::catalog::SchemaProvider;
@@ -8,6 +9,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use iceberg::NamespaceIdent;
+use moka::sync::Cache as SyncCache;
 use tracing::{debug, error};
 
 use sqe_core::config::StorageConfig;
@@ -15,6 +17,11 @@ use sqe_core::config::StorageConfig;
 use crate::catalog_provider::SqeCatalogProvider;
 use crate::rest_catalog::SessionCatalog;
 use crate::table_provider::SqeTableProvider;
+
+/// TTL for the per-namespace table_names() cache. Short so DDL becomes
+/// visible within a few seconds without each planning lookup paying two
+/// REST round trips against Polaris.
+const TABLE_NAMES_TTL_SECS: u64 = 5;
 
 /// DataFusion `SchemaProvider` that maps an Iceberg namespace to a DataFusion schema.
 ///
@@ -32,6 +39,10 @@ pub struct SqeSchemaProvider {
     small_file_threshold_bytes: u64,
     /// Concurrency for direct manifest walks during pruning.
     manifest_concurrency: usize,
+    /// Short-TTL cache of table_names() results so repeated planning
+    /// lookups during a single dbt run do not pay two REST round trips
+    /// per call.
+    table_names_cache: SyncCache<String, Arc<Vec<String>>>,
 }
 
 impl SqeSchemaProvider {
@@ -42,6 +53,10 @@ impl SqeSchemaProvider {
         storage_config: StorageConfig,
         warehouse: String,
     ) -> Self {
+        let table_names_cache = SyncCache::builder()
+            .max_capacity(128)
+            .time_to_live(Duration::from_secs(TABLE_NAMES_TTL_SECS))
+            .build();
         Self {
             session_catalog,
             namespace,
@@ -50,7 +65,15 @@ impl SqeSchemaProvider {
             prom_metrics: None,
             small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
             manifest_concurrency: crate::iceberg_scan::DEFAULT_MANIFEST_CONCURRENCY,
+            table_names_cache,
         }
+    }
+
+    /// Drop any cached `table_names()` result for this namespace. Call after
+    /// DDL that creates or drops a table/view so the next planning lookup
+    /// sees the change without waiting for the TTL.
+    pub fn invalidate_table_names(&self) {
+        self.table_names_cache.invalidate(&self.namespace);
     }
 
     /// Set the small-file threshold (bytes) for the direct-read fast path.
@@ -87,6 +110,10 @@ impl SchemaProvider for SqeSchemaProvider {
     // the SchemaProvider trait predates DataFusion's async catalog work. A future
     // DataFusion version may provide an async alternative.
     fn table_names(&self) -> Vec<String> {
+        if let Some(cached) = self.table_names_cache.get(&self.namespace) {
+            return (*cached).clone();
+        }
+
         let catalog = self.session_catalog.clone();
         let catalog_for_views = catalog.clone();
         let ns = self.namespace.clone();
@@ -121,6 +148,8 @@ impl SchemaProvider for SqeSchemaProvider {
             None => {}
         }
 
+        self.table_names_cache
+            .insert(self.namespace.clone(), Arc::new(names.clone()));
         names
     }
 
