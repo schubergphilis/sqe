@@ -16,8 +16,19 @@ pub struct ScanTask {
     /// treat an empty vec as "unknown" and fall back to file-count cost.
     #[serde(default)]
     pub file_sizes_bytes: Vec<u64>,
-    /// Column names to project (empty = all columns).
+    /// Column names to project (empty = all columns). Used as a fallback when
+    /// the parquet file lacks PARQUET:field_id metadata or when the
+    /// coordinator did not supply field IDs.
     pub projected_columns: Vec<String>,
+    /// Iceberg field IDs to project, parallel to `projected_columns` (#43).
+    ///
+    /// When non-empty and the parquet file has PARQUET:field_id metadata on
+    /// each field, the worker projects by field ID so RENAME COLUMN and
+    /// ADD COLUMN survive schema evolution. Older coordinators may not send
+    /// this field; readers fall back to `projected_columns` matching in that
+    /// case.
+    #[serde(default)]
+    pub projected_field_ids: Vec<i32>,
     /// S3 endpoint URL.
     pub s3_endpoint: String,
     /// S3 region.
@@ -84,6 +95,7 @@ mod tests {
             ],
             file_sizes_bytes: vec![],
             projected_columns: vec!["id".to_string(), "name".to_string()],
+            projected_field_ids: vec![1, 2],
             s3_endpoint: "http://localhost:9000".to_string(),
             s3_region: "us-east-1".to_string(),
             s3_access_key: "testadmin".to_string(),
@@ -99,6 +111,7 @@ mod tests {
         assert_eq!(decoded.fragment_id, "frag-001");
         assert_eq!(decoded.data_file_paths.len(), 2);
         assert_eq!(decoded.projected_columns, vec!["id", "name"]);
+        assert_eq!(decoded.projected_field_ids, vec![1, 2]);
         assert!(decoded.s3_path_style);
         assert!(decoded.s3_allow_http);
     }
@@ -110,6 +123,7 @@ mod tests {
             data_file_paths: vec!["s3://bucket/data/file1.parquet".to_string()],
             file_sizes_bytes: vec![],
             projected_columns: vec![],
+            projected_field_ids: vec![],
             s3_endpoint: String::new(),
             s3_region: String::new(),
             s3_access_key: String::new(),
@@ -122,6 +136,31 @@ mod tests {
         let bytes = task.to_bytes().unwrap();
         let decoded = ScanTask::from_bytes(&bytes).unwrap();
         assert!(decoded.projected_columns.is_empty());
+        assert!(decoded.projected_field_ids.is_empty());
+    }
+
+    #[test]
+    fn test_scan_task_old_coordinator_omits_field_ids() {
+        // Old coordinators that predate #43 send ScanTask JSON without the
+        // projected_field_ids key. Serde's default makes the decode succeed
+        // with an empty vector; the worker falls back to name-based
+        // projection in that case.
+        let json = r#"{
+            "fragment_id": "frag-old",
+            "data_file_paths": ["s3://b/f.parquet"],
+            "file_sizes_bytes": [],
+            "projected_columns": ["id"],
+            "s3_endpoint": "",
+            "s3_region": "",
+            "s3_access_key": "",
+            "s3_secret_key": "",
+            "s3_session_token": "",
+            "s3_path_style": false,
+            "s3_allow_http": false
+        }"#;
+        let decoded: ScanTask = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded.projected_columns, vec!["id"]);
+        assert!(decoded.projected_field_ids.is_empty());
     }
 
     #[test]
@@ -131,6 +170,7 @@ mod tests {
             data_file_paths: vec![],
             file_sizes_bytes: vec![],
             projected_columns: vec![],
+            projected_field_ids: vec![],
             s3_endpoint: "http://localhost:9000".to_string(),
             s3_region: "us-east-1".to_string(),
             s3_access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),

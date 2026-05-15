@@ -197,19 +197,33 @@ pub async fn execute_scan(
                 ParquetRecordBatchStreamBuilder::new_with_options(reader, reader_opts).await?
             };
 
-        // Apply column projection if specified
+        // Apply column projection. Prefer field-ID-based projection (#43): the
+        // coordinator sends `projected_field_ids` parallel to `projected_columns`,
+        // and Iceberg writes a `PARQUET:field_id` metadata key on every parquet
+        // column. Resolving by ID survives RENAME COLUMN (storage name unchanged,
+        // catalog name updated) and ADD COLUMN (new field absent from old files).
+        // Fall back to name-based projection when the coordinator did not supply
+        // IDs (older sender, name-mapping path) or the parquet file has no IDs
+        // (Hive-written files predating Iceberg's metadata stamp).
         if !task.projected_columns.is_empty() {
             let parquet_schema = builder.schema().clone();
-            let indices: Vec<usize> = task
-                .projected_columns
-                .iter()
-                .filter_map(|name| {
-                    parquet_schema
-                        .fields()
-                        .iter()
-                        .position(|f| f.name() == name)
-                })
-                .collect();
+            let projected_by_id = project_by_field_id(
+                &parquet_schema,
+                &task.projected_field_ids,
+            );
+            let indices: Vec<usize> = match projected_by_id {
+                Some(ids) => ids,
+                None => task
+                    .projected_columns
+                    .iter()
+                    .filter_map(|name| {
+                        parquet_schema
+                            .fields()
+                            .iter()
+                            .position(|f| f.name() == name)
+                    })
+                    .collect(),
+            };
 
             if !indices.is_empty() {
                 let mask = parquet::arrow::ProjectionMask::roots(
@@ -406,6 +420,64 @@ fn s3_url_to_key(url: &str) -> anyhow::Result<String> {
     Ok(path.trim_start_matches('/').to_string())
 }
 
+/// Iceberg writes a `PARQUET:field_id` metadata entry on every parquet column.
+/// The reader resolves a projection by ID when the parquet file actually
+/// stamped IDs on every projected field and the coordinator supplied IDs.
+const PARQUET_FIELD_ID_META_KEY: &str = "PARQUET:field_id";
+
+/// Build a parquet-column-index list for `projected_field_ids` by reading the
+/// `PARQUET:field_id` metadata key on each parquet field (#43).
+///
+/// Returns `None` when the projection cannot be resolved entirely by ID
+/// (caller-supplied IDs missing, parquet file missing IDs, or one of the
+/// requested IDs is absent from this file). The caller falls back to the
+/// existing name-based projection in that case so old files and old
+/// coordinators continue to work.
+///
+/// Top-level only: matches the existing name-based projection's
+/// `parquet_schema.fields().position(...)` granularity. Nested field-id
+/// projection is iceberg-rust's job (see arrow/reader.rs).
+fn project_by_field_id(
+    parquet_schema: &arrow_schema::Schema,
+    projected_field_ids: &[i32],
+) -> Option<Vec<usize>> {
+    if projected_field_ids.is_empty() {
+        return None;
+    }
+
+    let mut id_to_index: std::collections::HashMap<i32, usize> =
+        std::collections::HashMap::with_capacity(parquet_schema.fields().len());
+    for (idx, field) in parquet_schema.fields().iter().enumerate() {
+        let Some(id_str) = field.metadata().get(PARQUET_FIELD_ID_META_KEY) else {
+            // At least one parquet field lacks an ID. Treat the file as
+            // pre-Iceberg-stamp and abandon field-ID projection.
+            return None;
+        };
+        let Ok(id) = id_str.parse::<i32>() else {
+            return None;
+        };
+        id_to_index.insert(id, idx);
+    }
+
+    let mut indices = Vec::with_capacity(projected_field_ids.len());
+    for fid in projected_field_ids {
+        match id_to_index.get(fid) {
+            Some(idx) => indices.push(*idx),
+            None => {
+                // The projected field id is absent from this file. This is
+                // expected for ADD COLUMN against pre-evolution files. The
+                // name-based fallback would also miss it, but returning None
+                // here lets the existing path log and continue. A future
+                // refinement can return the partial mask and tell the caller
+                // to fill the rest with NULL (see iceberg-rust's
+                // RecordBatchTransformer).
+                return None;
+            }
+        }
+    }
+    Some(indices)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,5 +504,64 @@ mod tests {
             s3_url_to_key("s3://bucket/warehouse/db/table/data/00001.parquet").unwrap(),
             "warehouse/db/table/data/00001.parquet"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Field-ID projection (#43) — covers the RENAME / ADD COLUMN survival paths.
+    // -------------------------------------------------------------------------
+
+    use std::collections::HashMap;
+    use arrow_schema::{DataType, Field, Schema};
+
+    fn stamped(name: &str, id: i32) -> Field {
+        let mut md = HashMap::new();
+        md.insert(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string());
+        Field::new(name, DataType::Int64, false).with_metadata(md)
+    }
+
+    #[test]
+    fn project_by_field_id_rename_survives() {
+        // Parquet was written when the column was called "b". The Iceberg
+        // catalog has since renamed it to "c". The worker is asked to project
+        // [field_id = 2] and must resolve to parquet position 1 even though
+        // the file's column name is "b".
+        let schema = Schema::new(vec![
+            stamped("id", 1),
+            stamped("b", 2),
+        ]);
+        let indices = project_by_field_id(&schema, &[1, 2]).unwrap();
+        assert_eq!(indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn project_by_field_id_returns_none_when_id_absent_in_file() {
+        // Post-rename file has no column with the old field id.
+        let schema = Schema::new(vec![stamped("id", 1), stamped("c", 2)]);
+        assert!(project_by_field_id(&schema, &[1, 99]).is_none());
+    }
+
+    #[test]
+    fn project_by_field_id_returns_none_when_file_lacks_field_ids() {
+        // Hive-written file with no PARQUET:field_id metadata.
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]);
+        assert!(project_by_field_id(&schema, &[1, 2]).is_none());
+    }
+
+    #[test]
+    fn project_by_field_id_empty_caller_returns_none() {
+        let schema = Schema::new(vec![stamped("id", 1)]);
+        assert!(project_by_field_id(&schema, &[]).is_none());
+    }
+
+    #[test]
+    fn project_by_field_id_reorders_to_match_caller_order() {
+        // Caller asks for [b, id] (ids [2, 1]). The mask must follow the
+        // caller's order, not the parquet schema's order.
+        let schema = Schema::new(vec![stamped("id", 1), stamped("b", 2)]);
+        let indices = project_by_field_id(&schema, &[2, 1]).unwrap();
+        assert_eq!(indices, vec![1, 0]);
     }
 }
