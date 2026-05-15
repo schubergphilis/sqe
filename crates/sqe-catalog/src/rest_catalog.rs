@@ -16,6 +16,14 @@ use sqe_metrics::propagation::trace_context_http_headers;
 
 use crate::circuit_breaker::CircuitBreaker;
 
+/// Process-wide reqwest client reused across every SessionCatalog so
+/// non-REST backends stop opening a fresh connection pool and a fresh
+/// TLS slow-start per authenticated session. The REST path already
+/// honoured the shared-client contract; this lets the non-REST path
+/// share the same default when callers pass `None`.
+static SHARED_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(reqwest::Client::new);
+
 /// Per-user circuit breakers keyed by token fingerprint.
 ///
 /// A single global breaker blast-radiused one user's bad token (rapid
@@ -556,7 +564,7 @@ impl SessionCatalog {
             bearer_token: bearer_token.to_string(),
             token_fingerprint,
             storage_config: storage.clone(),
-            http_client: reqwest::Client::new(),
+            http_client: SHARED_HTTP_CLIENT.clone(),
             circuit_breaker,
             table_cache,
         })
@@ -653,7 +661,7 @@ impl SessionCatalog {
             arc_catalog
         };
 
-        let http_client = http_client.unwrap_or_default();
+        let http_client = http_client.unwrap_or_else(|| SHARED_HTTP_CLIENT.clone());
         let circuit_breaker = circuit_breaker.unwrap_or_else(|| user_circuit_breaker(&token_fingerprint));
 
         // Use the shared global cache when provided; fall back to a private
