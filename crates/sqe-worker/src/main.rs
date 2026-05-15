@@ -37,6 +37,20 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting SQE worker on port {port}");
 
+    // Validate the worker config before binding any sockets. The check
+    // refuses to boot a coordinator-connected worker with an empty secret
+    // unless the operator explicitly waives via
+    // `worker.allow_unauthenticated = true`.
+    config.validate()?;
+
+    if config.worker.worker_secret.is_empty() && config.worker.allow_unauthenticated {
+        tracing::warn!(
+            "WARNING: worker.allow_unauthenticated = true -- any TCP-reachable \
+             client may send scan tickets or refresh S3 credentials on this \
+             worker. Set worker.worker_secret for production."
+        );
+    }
+
     // Start heartbeat to coordinator if a coordinator URL is configured.
     if !config.worker.coordinator_url.is_empty() {
         let worker_url = format!("http://0.0.0.0:{port}");
@@ -50,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
             config.worker.coordinator_url.clone(),
             worker_url,
             interval,
+            config.worker.worker_secret.clone(),
         );
     }
 
@@ -64,7 +79,8 @@ async fn main() -> anyhow::Result<()> {
     let flight_service = WorkerFlightService::new(worker_metrics, session_ctx)
         .with_scan_timeout(config.worker.scan_timeout_secs)
         .with_flight_compression(shuffle_compression)
-        .with_shuffle_compression(shuffle_compression);
+        .with_shuffle_compression(shuffle_compression)
+        .with_worker_secret(config.worker.worker_secret.clone());
 
     tonic::transport::Server::builder()
         .add_service(flight_service.into_server())

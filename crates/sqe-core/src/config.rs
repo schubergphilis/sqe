@@ -353,6 +353,21 @@ pub struct WorkerConfig {
     /// Set to 0 to disable the timeout.
     #[serde(default = "default_scan_timeout")]
     pub scan_timeout_secs: u64,
+    /// Shared secret that the coordinator must supply in the
+    /// `x-sqe-worker-secret` metadata header on every `do_get` and
+    /// `do_action("refresh_credentials")` call. Must match
+    /// `coordinator.worker_secret`. When empty the worker refuses to start
+    /// unless `allow_unauthenticated = true` is set: a worker that accepts
+    /// unauthenticated scan tickets leaks user S3 credentials to anyone with
+    /// network reach to the Flight port.
+    #[serde(default)]
+    pub worker_secret: String,
+    /// Opt-in escape hatch for the `worker_secret` requirement. Leaving
+    /// `false` (the default) makes the worker refuse to start with an empty
+    /// secret. Setting `true` accepts the documented risk: any TCP-reachable
+    /// client may push scan tasks or swap S3 credentials.
+    #[serde(default)]
+    pub allow_unauthenticated: bool,
 }
 
 impl Default for WorkerConfig {
@@ -365,6 +380,8 @@ impl Default for WorkerConfig {
             spill_to_disk: true,
             spill_dir: default_spill_dir(),
             scan_timeout_secs: default_scan_timeout(),
+            worker_secret: String::new(),
+            allow_unauthenticated: false,
         }
     }
 }
@@ -1205,11 +1222,26 @@ fn default_access_control_timeout() -> u64 { 30 }
 pub struct PolicyConfig {
     #[serde(default = "default_passthrough")]
     pub engine: String,
+    /// Per-deployment secret keyed into the SHA-256 column mask UDF.
+    ///
+    /// When set, the `sha256(col)` mask runs as HMAC-SHA256 with this key,
+    /// blocking the offline rainbow-table attack against low-entropy
+    /// columns (SSN, phone, employee ID). When empty, the UDF falls back
+    /// to plain SHA-256 and emits a startup warning. Rotating the key
+    /// changes every masked digest, so the same key must persist across
+    /// coordinator restarts and across all coordinators in an HA setup.
+    ///
+    /// Can be set via the `SQE_POLICY__MASK_KEY` environment variable.
+    #[serde(default)]
+    pub mask_key: String,
 }
 
 impl Default for PolicyConfig {
     fn default() -> Self {
-        Self { engine: "passthrough".to_string() }
+        Self {
+            engine: "passthrough".to_string(),
+            mask_key: String::new(),
+        }
     }
 }
 
@@ -1730,6 +1762,25 @@ impl SqeConfig {
             );
         }
 
+        // Worker-side mirror: refuse to boot a worker with an empty secret
+        // unless the operator explicitly opts in. A worker that accepts
+        // unauthenticated Flight calls hands out the user's S3 credentials
+        // and refreshed STS tokens to any TCP-reachable peer.
+        if !self.worker.coordinator_url.is_empty()
+            && self.worker.worker_secret.is_empty()
+            && !self.worker.allow_unauthenticated
+        {
+            errors.push(
+                "worker.coordinator_url is set but worker.worker_secret is empty. \
+                 Any TCP-reachable client could send scan tickets or refresh \
+                 credentials on this worker, leaking user S3 credentials. Set \
+                 worker.worker_secret to match coordinator.worker_secret \
+                 (recommended), or explicitly set worker.allow_unauthenticated \
+                 = true to opt out."
+                    .to_string(),
+            );
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -1781,6 +1832,11 @@ impl SqeConfig {
         env_override_bool("SQE_WORKER__SPILL_TO_DISK", &mut self.worker.spill_to_disk);
         env_override_str("SQE_WORKER__SPILL_DIR", &mut self.worker.spill_dir);
         env_override_u64("SQE_WORKER__SCAN_TIMEOUT_SECS", &mut self.worker.scan_timeout_secs);
+        env_override_str("SQE_WORKER__WORKER_SECRET", &mut self.worker.worker_secret);
+        env_override_bool(
+            "SQE_WORKER__ALLOW_UNAUTHENTICATED",
+            &mut self.worker.allow_unauthenticated,
+        );
 
         // Auth
         env_override_str("SQE_AUTH__KEYCLOAK_URL", &mut self.auth.keycloak_url);
@@ -1854,6 +1910,7 @@ impl SqeConfig {
 
         // Policy
         env_override_str("SQE_POLICY__ENGINE", &mut self.policy.engine);
+        env_override_str("SQE_POLICY__MASK_KEY", &mut self.policy.mask_key);
 
         // Metrics
         env_override_u16("SQE_METRICS__PROMETHEUS_PORT", &mut self.metrics.prometheus_port);
@@ -2263,6 +2320,51 @@ mod tests {
         let mut config = valid_config();
         config.coordinator.worker_urls.clear();
         config.coordinator.worker_secret = String::new();
+        assert!(config.validate().is_ok());
+    }
+
+    /// Regression for issues #22 + #35: a worker that registers with a
+    /// coordinator but has an empty `worker_secret` would accept
+    /// unauthenticated scan tickets and credential refresh actions from
+    /// anyone with network reach. validate() must refuse unless the
+    /// operator explicitly waives.
+    #[test]
+    fn validate_rejects_worker_without_secret() {
+        let mut config = valid_config();
+        config.worker.coordinator_url = "http://coordinator:50051".to_string();
+        config.worker.worker_secret = String::new();
+        config.worker.allow_unauthenticated = false;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("worker.coordinator_url") && err.contains("worker.worker_secret"),
+            "Expected worker-side secret guard error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_worker_when_explicitly_unauthenticated() {
+        let mut config = valid_config();
+        config.worker.coordinator_url = "http://coordinator:50051".to_string();
+        config.worker.worker_secret = String::new();
+        config.worker.allow_unauthenticated = true;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_worker_with_secret() {
+        let mut config = valid_config();
+        config.worker.coordinator_url = "http://coordinator:50051".to_string();
+        config.worker.worker_secret = "shared-secret-value".to_string();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_standalone_worker_without_secret() {
+        // A worker not pointed at any coordinator is not exposed to the
+        // distributed-mode threat model; no error.
+        let mut config = valid_config();
+        config.worker.coordinator_url = String::new();
+        config.worker.worker_secret = String::new();
         assert!(config.validate().is_ok());
     }
 
