@@ -523,7 +523,10 @@ impl EmbeddedClient {
     }
 
     fn embedded_handle_show_secrets(&self) -> Result<QueryResult, Box<dyn std::error::Error>> {
-        let listed = self.secrets.list();
+        let listed = self
+            .secrets
+            .list()
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         Ok(QueryResult {
             columns: vec!["name".to_string(), "type".to_string()],
             rows: listed
