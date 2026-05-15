@@ -1,30 +1,40 @@
 [package]
 name = "sqe-catalog"
-version = "0.31.4"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [features]
-# Default ships every supported catalog backend compiled in. Picking a
-# backend is a runtime config concern, not a build-time one. Operators
-# who need a slim image (or want to drop the AWS SDK weight) build with
-# `--no-default-features --features rest` (or any subset).
+# Default ships only the REST backend (Polaris / Nessie). The kitchen-sink
+# build that included `sql-postgres`, `hms`, `glue`, `hadoop`, and
+# `s3tables` cost ~180-200 MB in binary size and dragged the full AWS SDK,
+# Thrift / pilota, and sqlx tls-rustls graph into every Polaris-only
+# deployment. Operators who need additional backends opt in by feature or
+# by the `full-backends` umbrella.
 #
-# Approximate binary cost on top of a `rest`-only build: nessie adds 0
-# (REST adapter, no new deps); hadoop adds ~0 (uses existing FileIO);
-# sql-postgres ~5-10 MB; hms ~10-15 MB; glue ~50-80 MB (the AWS SDK is
-# the heavyweight). Default release binary lands around 180-200 MB,
-# which is fine for our Kubernetes deployments and matches Java stacks
-# of similar scope.
-default = ["rest", "sql-postgres", "hms", "glue", "hadoop", "s3tables"]
-# REST catalog (the protocol Polaris and Nessie both speak). Always on
-# in default; the flag exists so `--no-default-features --features rest`
-# is a valid slim build.
-# SQE forwards each backend feature into the loader so the loader's
-# registry only contains backends the SQE binary actually links.
-# Without forwarding, the loader's default-features pull every
-# backend (and its AWS SDK / Thrift / sqlx weight) regardless of
-# what SQE asked for.
-rest = ["iceberg-catalog-loader/rest"]
+# Approximate binary cost on top of `rest`-only: hadoop adds ~0 (no new
+# deps); sql-postgres ~5-10 MB; hms ~10-15 MB; glue ~50-80 MB
+# (aws-sdk-glue is the heavyweight); s3tables adds ~5-10 MB on top of
+# glue's AWS SDK runtime.
+default = ["rest"]
+# Umbrella for the legacy default: every supported backend compiled in.
+# Use when packaging an image that needs to dispatch to Polaris, Glue,
+# S3 Tables, Hive Metastore, Hadoop warehouses, and Postgres-backed SQL
+# catalogs.
+full-backends = ["rest", "sql-postgres", "hms", "glue", "hadoop", "s3tables"]
+# REST catalog (the protocol Polaris and Nessie both speak). Activating
+# the feature pulls in `iceberg-catalog-rest`, compiles the
+# `rest_catalog` module, and registers the loader's REST builder.
+# Without this feature, the slim build skips the full REST client and
+# the `SessionCatalog` / `TableMetadataCache` surface that lives on top
+# of it. Without `rest`, downstream consumers (sqe-coordinator,
+# sqe-worker) will not compile, which is the intent for the slim path.
+rest = [
+    "dep:iceberg-catalog-rest",
+    "iceberg-catalog-loader/rest",
+]
 # JDBC-style SQL catalog. SQLite via rusqlite (existing helper) plus the
 # upstream iceberg-catalog-sql crate which uses sqlx::any for runtime
 # dispatch to SQLite/PostgreSQL/MySQL.
@@ -86,7 +96,7 @@ arrow = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
 iceberg = { workspace = true }
-iceberg-catalog-rest = { workspace = true }
+iceberg-catalog-rest = { workspace = true, optional = true }
 # Catalog factory dispatch. Replaces SQE's per-backend match
 # dispatch and gives every backend a uniform `load(name, props)`
 # entry point. The workspace-level dep declares
@@ -135,13 +145,13 @@ aws-config = { version = "1.8", optional = true }
 aws-credential-types = { version = "1.2", optional = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 tracing-subscriber = { workspace = true }
-wiremock = "0.6"
+wiremock = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 sqe-auth = { path = "../sqe-auth" }
 # Used in the Phase O+ integration test to deserialise an inline
 # `[catalog.backend]` block into `SqeConfig` rather than constructing
 # all 14 SqeConfig fields by hand.
-toml = "0.8"
+toml = { workspace = true }

@@ -1,7 +1,17 @@
 [package]
 name = "sqe-coordinator"
-version = "0.31.4"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Opt-in for integration tests that spin up a SQLite-backed Iceberg
+# catalog. Activating this through a dev-dep used to leak `sql-sqlite`
+# into every workspace consumer via Cargo's feature unification. Tests
+# now run via `cargo test -p sqe-coordinator --features test-sqlite`.
+test-sqlite = ["sqe-catalog/sql-sqlite"]
 
 [lib]
 name = "sqe_coordinator"
@@ -46,7 +56,7 @@ bytes = { workspace = true }
 uuid = { workspace = true }
 prost = { workspace = true }
 anyhow = { workspace = true }
-base64 = "0.22"
+base64 = { workspace = true }
 hex = { workspace = true }
 datafusion-functions-json = { workspace = true }
 datafusion-expr = { workspace = true }
@@ -60,9 +70,9 @@ prometheus = { workspace = true }
 chrono = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }
-clap = { version = "4", features = ["derive"] }
-sha2 = "0.10"
-subtle = "2"
+clap = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
 sqe-worker = { path = "../sqe-worker" }
 opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }
@@ -71,11 +81,11 @@ tracing-opentelemetry = { workspace = true }
 toml = { workspace = true }
 sqe-core = { path = "../sqe-core" }
 sqe-auth = { path = "../sqe-auth" }
-# Tests for the runtime catalog registry build a real SQLite-backed
-# Iceberg catalog at a tempdir, so we need the `sql-sqlite` feature
-# on top of the default set (`sql-postgres`, `glue`, ...). Cargo
-# unifies dev + non-dev features so this stays additive.
-sqe-catalog = { path = "../sqe-catalog", features = ["sql-sqlite"] }
+# Tests for the runtime catalog registry need the `sql-sqlite` backend
+# on `sqe-catalog`. Enable through the `test-sqlite` feature instead of
+# a dev-dep override so feature unification does not leak the SQLite
+# driver into every workspace build.
+sqe-catalog = { path = "../sqe-catalog" }
 sqe-sql = { path = "../sqe-sql" }
 sqe-policy = { path = "../sqe-policy" }
 sqe-planner = { path = "../sqe-planner" }
@@ -90,8 +100,8 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 reqwest = { workspace = true }
-base64 = "0.22"
-tempfile = "3"
-wiremock = "0.6"
+base64 = { workspace = true }
+tempfile = { workspace = true }
+wiremock = { workspace = true }
 datafusion-functions-json = { workspace = true }
 datafusion = { workspace = true }

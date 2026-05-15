@@ -17,9 +17,18 @@ members = [
     "crates/sqe-bench",
     "xtask",
 ]
-# Exclude vendored iceberg-rust — it has its own workspace.
+# Exclude vendored iceberg-rust. It has its own workspace.
 # SQE references the crates via path deps, not workspace members.
 exclude = ["vendor/iceberg-rust"]
+
+[workspace.package]
+version = "0.31.4"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://gitlab.schubergphilis.com/data-ai/chameleon/sqlengine"
+homepage = "https://gitlab.schubergphilis.com/data-ai/chameleon/sqlengine"
+authors = ["Schuberg Philis"]
 
 [workspace.dependencies]
 # Query engine — DataFusion 53 with hash join dynamic filters, LIMIT-aware pruning,
@@ -127,6 +136,16 @@ rand = "0.8"
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
+base64 = "0.22"
+subtle = "2"
+zeroize = "1"
+
+# Hash maps
+ahash = "0.8"
+
+# Dev / test deps used by multiple crates
+tempfile = "3"
+wiremock = "0.6"
 
 # Misc
 async-trait = "0.1"

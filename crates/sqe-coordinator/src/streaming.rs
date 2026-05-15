@@ -102,7 +102,7 @@ impl StreamFinalizer {
         if let Some(ref metrics) = self.metrics {
             metrics
                 .query_count
-                .with_label_values(&["success", &self.kind_name])
+                .with_label_values(&["success", &self.kind_name, ""])
                 .inc();
             metrics
                 .query_duration
@@ -153,7 +153,7 @@ impl StreamFinalizer {
         if let Some(ref metrics) = self.metrics {
             metrics
                 .query_count
-                .with_label_values(&["error", &self.kind_name])
+                .with_label_values(&["error", &self.kind_name, err.error_code().name()])
                 .inc();
             metrics
                 .query_duration
@@ -185,7 +185,7 @@ impl StreamFinalizer {
         if let Some(ref metrics) = self.metrics {
             metrics
                 .query_count
-                .with_label_values(&["cancelled", &self.kind_name])
+                .with_label_values(&["cancelled", &self.kind_name, "QUERY_CANCELLED"])
                 .inc();
             metrics
                 .query_duration

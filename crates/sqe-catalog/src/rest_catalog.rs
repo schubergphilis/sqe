@@ -126,6 +126,11 @@ pub struct TableMetadataCache {
     inner: MokaCache<String, CachedTableEntry>,
     /// Soft TTL: entries older than this are revalidated via conditional GET.
     soft_ttl: std::time::Duration,
+    /// Optional Prometheus metrics for catalog roundtrip + circuit
+    /// breaker state. Threaded through the cache so every
+    /// `SessionCatalog` clone shares the same handle without changing
+    /// the constructor signature.
+    metrics: Option<std::sync::Arc<sqe_metrics::MetricsRegistry>>,
 }
 
 impl TableMetadataCache {
@@ -153,7 +158,24 @@ impl TableMetadataCache {
                 std::time::Duration::from_secs(ttl_secs),
             )
         };
-        Self { inner, soft_ttl }
+        Self {
+            inner,
+            soft_ttl,
+            metrics: None,
+        }
+    }
+
+    /// Attach a metrics registry. Every `SessionCatalog` clone of this
+    /// cache will see the same handle and report catalog roundtrip
+    /// latency + circuit breaker state into it.
+    pub fn with_metrics(mut self, metrics: std::sync::Arc<sqe_metrics::MetricsRegistry>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Returns the attached metrics registry, if any.
+    pub fn metrics(&self) -> Option<&std::sync::Arc<sqe_metrics::MetricsRegistry>> {
+        self.metrics.as_ref()
     }
 
     /// Get a cached entry if it exists and is still fresh (within soft TTL).
@@ -709,12 +731,14 @@ impl SessionCatalog {
         self.circuit_breaker
             .check()
             .map_err(sqe_core::SqeError::Catalog)?;
+        let started = Instant::now();
         let result = dispatch_catalog!(self.inner, list_namespaces(None))
             .map_err(|e| sqe_core::SqeError::Catalog(format!("Failed to list namespaces: {e}")));
         match &result {
             Ok(_) => self.circuit_breaker.record_success(),
             Err(_) => self.circuit_breaker.record_failure(),
         }
+        self.record_catalog_call("list_namespaces", started, result.is_ok());
         result
     }
 
@@ -748,12 +772,14 @@ impl SessionCatalog {
         self.circuit_breaker
             .check()
             .map_err(sqe_core::SqeError::Catalog)?;
+        let started = Instant::now();
         let result = dispatch_catalog!(self.inner, list_tables(namespace))
             .map_err(|e| sqe_core::SqeError::Catalog(format!("Failed to list tables: {e}")));
         match &result {
             Ok(_) => self.circuit_breaker.record_success(),
             Err(_) => self.circuit_breaker.record_failure(),
         }
+        self.record_catalog_call("list_tables", started, result.is_ok());
         result
     }
 
@@ -870,6 +896,7 @@ impl SessionCatalog {
         self.circuit_breaker
             .check()
             .map_err(sqe_core::SqeError::Catalog)?;
+        let started = Instant::now();
         let result = dispatch_catalog!(self.inner, load_table(table_ident))
             .map_err(|e| sqe_core::SqeError::Catalog(format!("Failed to load table: {e}")));
         match &result {
@@ -894,7 +921,26 @@ impl SessionCatalog {
             }
             Err(_) => self.circuit_breaker.record_failure(),
         }
+        self.record_catalog_call("load_table", started, result.is_ok());
         result
+    }
+
+    /// Record catalog roundtrip latency + circuit breaker state into
+    /// the optional MetricsRegistry attached to the table cache. The
+    /// helper is a no-op when no metrics handle is attached, so
+    /// test-only SessionCatalogs pay nothing.
+    fn record_catalog_call(&self, op: &'static str, started: Instant, ok: bool) {
+        if let Some(metrics) = self.table_cache.metrics() {
+            let status = if ok { "ok" } else { "err" };
+            metrics
+                .catalog_request_duration_seconds
+                .with_label_values(&[op, status])
+                .observe(started.elapsed().as_secs_f64());
+            metrics
+                .catalog_circuit_breaker_state
+                .with_label_values(&[self.circuit_breaker.name()])
+                .set(self.circuit_breaker.state_code() as f64);
+        }
     }
 
     fn table_url(&self, table_ident: &TableIdent) -> String {
