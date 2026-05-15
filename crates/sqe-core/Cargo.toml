@@ -1,7 +1,10 @@
 [package]
 name = "sqe-core"
-version = "0.31.4"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 serde = { workspace = true }
@@ -13,7 +16,7 @@ uuid = { workspace = true }
 url = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
-zeroize = "1"
+zeroize = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }

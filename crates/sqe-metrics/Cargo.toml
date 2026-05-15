@@ -1,7 +1,10 @@
 [package]
 name = "sqe-metrics"
-version = "0.31.4"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 prometheus = { workspace = true }
@@ -18,7 +21,7 @@ tonic = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
-sha2 = "0.10"
+sha2 = { workspace = true }
 regex-lite = "0.1"
 
 [dev-dependencies]

@@ -67,7 +67,7 @@ mod tests {
     #[tokio::test]
     async fn test_metrics_handler_returns_text() {
         let metrics = Arc::new(MetricsRegistry::new());
-        metrics.query_count.with_label_values(&["success", "query"]).inc();
+        metrics.query_count.with_label_values(&["success", "query", ""]).inc();
         // Observe a duration sample so the histogram family appears in gather()
         metrics.query_duration.with_label_values(&["query"]).observe(0.1);
 
