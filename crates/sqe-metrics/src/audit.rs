@@ -24,32 +24,32 @@ use tracing::info;
 pub fn redact_pii(sql: &str) -> String {
     use std::sync::OnceLock;
 
-    static EMAIL_RE: OnceLock<regex_lite::Regex> = OnceLock::new();
-    static SSN_RE: OnceLock<regex_lite::Regex> = OnceLock::new();
-    static PHONE_RE: OnceLock<regex_lite::Regex> = OnceLock::new();
-    static CARD_RE: OnceLock<regex_lite::Regex> = OnceLock::new();
-    static SECRET_RE: OnceLock<regex_lite::Regex> = OnceLock::new();
+    static EMAIL_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static SSN_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static PHONE_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static CARD_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static SECRET_RE: OnceLock<regex::Regex> = OnceLock::new();
 
     let email_re = EMAIL_RE.get_or_init(|| {
-        regex_lite::Regex::new(
+        regex::Regex::new(
             r"'[^']*[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[^']*'",
         )
         .unwrap()
     });
     let ssn_re = SSN_RE.get_or_init(|| {
-        regex_lite::Regex::new(r"'\d{3}-\d{2}-\d{4}'").unwrap()
+        regex::Regex::new(r"'\d{3}-\d{2}-\d{4}'").unwrap()
     });
     let phone_re = PHONE_RE.get_or_init(|| {
-        regex_lite::Regex::new(
+        regex::Regex::new(
             r"'(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}'",
         )
         .unwrap()
     });
     let card_re = CARD_RE.get_or_init(|| {
-        regex_lite::Regex::new(r"'\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{1,7}'").unwrap()
+        regex::Regex::new(r"'\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{1,7}'").unwrap()
     });
     let secret_re = SECRET_RE.get_or_init(|| {
-        regex_lite::Regex::new(
+        regex::Regex::new(
             r"(?i)\b(TOKEN|PASSWORD|PASSWD|SECRET|ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN|API_KEY|CLIENT_SECRET|BEARER)\b(\s*=\s*|\s+|\s*\(\s*)'[^']*'",
         )
         .unwrap()

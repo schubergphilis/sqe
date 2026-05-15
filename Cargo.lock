@@ -6871,7 +6871,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "prometheus",
- "regex-lite",
+ "regex",
  "serde",
  "serde_json",
  "sha2 0.10.9",
