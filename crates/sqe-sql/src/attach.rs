@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use sqe_core::SqeError;
+use sqe_core::{Secret, SqeError};
 
 /// `ATTACH '<location>' AS <name> (TYPE <kind>, <option> = <value>, ...)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +140,45 @@ impl OptionValue {
             _ => None,
         }
     }
+}
+
+/// Build a `Secret` payload from a parsed `CREATE SECRET` statement.
+///
+/// Both the coordinator and the embedded CLI need the same validation rules.
+/// Previously each duplicated the same kind-dispatch and option-extraction;
+/// the embedded path missed the admin gate added later for the coordinator.
+/// Keeping the body here means a new SecretKind variant gets a single fix.
+pub fn build_secret_from_stmt(stmt: &CreateSecretStatement) -> Result<Secret, SqeError> {
+    let opts = &stmt.options;
+    let get_str = |key: &str| -> Result<String, SqeError> {
+        opts.get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                SqeError::Execution(format!(
+                    "CREATE SECRET: missing required option {key} for {:?} secret",
+                    stmt.kind.name()
+                ))
+            })
+    };
+    let get_opt =
+        |key: &str| -> Option<String> { opts.get(key).and_then(|v| v.as_str()).map(|s| s.to_string()) };
+
+    let secret = match stmt.kind {
+        SecretKind::Aws => Secret::Aws {
+            access_key: get_opt("ACCESS_KEY_ID"),
+            secret_key: get_opt("SECRET_ACCESS_KEY"),
+            session_token: get_opt("SESSION_TOKEN"),
+            region: get_opt("REGION"),
+            profile: get_opt("PROFILE"),
+        },
+        SecretKind::Bearer => Secret::Bearer { token: get_str("TOKEN")? },
+        SecretKind::Basic => Secret::Basic {
+            username: get_str("USERNAME")?,
+            password: get_str("PASSWORD")?,
+        },
+    };
+    Ok(secret)
 }
 
 // ---------------------------------------------------------------------------

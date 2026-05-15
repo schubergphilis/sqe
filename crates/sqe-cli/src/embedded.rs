@@ -493,41 +493,12 @@ impl EmbeddedClient {
         &mut self,
         stmt: &sqe_sql::CreateSecretStatement,
     ) -> Result<QueryResult, Box<dyn std::error::Error>> {
-        use sqe_core::Secret;
-        use sqe_sql::SecretKind;
-
-        let opts = &stmt.options;
-        let get_str = |key: &str| -> Result<String, Box<dyn std::error::Error>> {
-            opts.get(key)
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .ok_or_else(|| {
-                    format!(
-                        "CREATE SECRET: missing required option {key} for {:?} secret",
-                        stmt.kind.name()
-                    )
-                    .into()
-                })
-        };
-        let get_opt = |key: &str| -> Option<String> {
-            opts.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
-        };
-
-        let secret = match stmt.kind {
-            SecretKind::Aws => Secret::Aws {
-                access_key: get_opt("ACCESS_KEY_ID"),
-                secret_key: get_opt("SECRET_ACCESS_KEY"),
-                session_token: get_opt("SESSION_TOKEN"),
-                region: get_opt("REGION"),
-                profile: get_opt("PROFILE"),
-            },
-            SecretKind::Bearer => Secret::Bearer { token: get_str("TOKEN")? },
-            SecretKind::Basic => Secret::Basic {
-                username: get_str("USERNAME")?,
-                password: get_str("PASSWORD")?,
-            },
-        };
-
+        // Embedded mode is a single-user binary, so there is no admin gate to
+        // apply here; see #106 for the rationale. The shared helper keeps the
+        // kind dispatch and option extraction symmetric with the coordinator
+        // path so a new SecretKind variant lands once.
+        let secret = sqe_sql::build_secret_from_stmt(stmt)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         self.secrets
             .create(&stmt.name, secret)
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
