@@ -27,6 +27,22 @@ use crate::channel_pool::ChannelPool;
 /// credential refresh push (issue #35). Matches the heartbeat path.
 const WORKER_SECRET_HEADER: &str = "x-sqe-worker-secret";
 
+fn push_connect_timeout() -> std::time::Duration {
+    std::env::var("SQE_COORDINATOR__CREDENTIAL_PUSH_CONNECT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(5))
+}
+
+fn push_request_timeout() -> std::time::Duration {
+    std::env::var("SQE_COORDINATOR__CREDENTIAL_PUSH_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(10))
+}
+
 /// Refreshed S3 credential payload pushed from coordinator to worker.
 ///
 /// This mirrors `sqe_worker::credential_channel::RefreshableCredentials` but is
@@ -278,8 +294,8 @@ async fn push_credentials_to_worker_inner(
         },
         None => {
             tonic::transport::Endpoint::new(worker_url.to_string())?
-                .connect_timeout(std::time::Duration::from_secs(5))
-                .timeout(std::time::Duration::from_secs(10))
+                .connect_timeout(push_connect_timeout())
+                .timeout(push_request_timeout())
                 .connect()
                 .await?
         }
