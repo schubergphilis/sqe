@@ -242,6 +242,54 @@ impl TokenExchangeProvider {
         navigate_claim(claims, user_claim).and_then(|v| v.as_str().map(String::from))
     }
 
+    /// Build an [`Identity`] from a freshly exchanged access token.
+    ///
+    /// On any of these conditions we refuse the request:
+    /// 1. The exchanged token does not decode as a JWT payload.
+    /// 2. The configured user claim is missing or not a string.
+    ///
+    /// Decode failure must not fall back to a client-supplied username: an
+    /// attacker who can mint a JWT the IdP will exchange, but shape the
+    /// response so our decoder fails, could otherwise claim any user_id
+    /// they want by stuffing it into `FlightCredentials.username` (#39).
+    fn identity_from_exchanged_token(
+        access_token: &str,
+        subject_token: &str,
+        user_claim: &str,
+        roles_claim: &str,
+    ) -> Result<Identity, AuthError> {
+        let claims = Self::decode_jwt_payload(access_token).ok_or_else(|| {
+            warn!("Failed to decode exchanged JWT payload; refusing to mint identity");
+            AuthError::Internal(anyhow::anyhow!(
+                "exchanged token from IdP could not be decoded as JWT"
+            ))
+        })?;
+
+        let user_id = Self::extract_user_claim(&claims, user_claim).ok_or_else(|| {
+            warn!(
+                user_claim = %user_claim,
+                "Exchanged JWT is missing the configured user claim; refusing to mint identity"
+            );
+            AuthError::AuthFailed(format!("exchanged token has no '{user_claim}' claim"))
+        })?;
+
+        let roles = Self::extract_roles(&claims, roles_claim);
+
+        debug!(
+            user_id = %user_id,
+            roles = ?roles,
+            "Token exchange authentication successful"
+        );
+
+        Ok(Identity {
+            user_id: user_id.clone(),
+            display_name: user_id,
+            roles,
+            catalog_token: Some(access_token.to_string()),
+            refresh_token: Some(subject_token.to_string()),
+        })
+    }
+
     /// Extract roles from a JWT payload using a dot-separated claim path.
     fn extract_roles(claims: &serde_json::Value, roles_claim: &str) -> Vec<String> {
         match navigate_claim(claims, roles_claim) {
@@ -282,37 +330,14 @@ impl AuthProvider for TokenExchangeProvider {
         // Perform the RFC 8693 token exchange.
         let response = self.exchange(&subject_token).await?;
 
-        // Decode the returned JWT to extract identity claims.
-        let claims = Self::decode_jwt_payload(&response.access_token);
-
-        let user_id = claims
-            .as_ref()
-            .and_then(|c| Self::extract_user_claim(c, &self.config.user_claim))
-            .or_else(|| {
-                // Fall back to username from credentials if JWT decoding fails.
-                credentials.username.clone()
-            })
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let roles = claims
-            .as_ref()
-            .map(|c| Self::extract_roles(c, &self.config.roles_claim))
-            .unwrap_or_default();
-
-        debug!(
-            user_id = %user_id,
-            roles = ?roles,
-            "Token exchange authentication successful"
-        );
-
-        Ok(Identity {
-            user_id: user_id.clone(),
-            display_name: user_id,
-            roles,
-            catalog_token: Some(response.access_token),
-            // Store the original subject token so we can re-exchange on refresh.
-            refresh_token: Some(subject_token),
-        })
+        // Refuse to mint an identity unless the exchanged token decodes
+        // and contains the configured user claim. See `identity_from_exchanged_token`.
+        Self::identity_from_exchanged_token(
+            &response.access_token,
+            &subject_token,
+            &self.config.user_claim,
+            &self.config.roles_claim,
+        )
     }
 
     async fn refresh_catalog_token(
@@ -673,6 +698,95 @@ mod tests {
     // -----------------------------------------------------------------------
     // Full claims extraction from mock JWT
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // identity_from_exchanged_token: never trusts client-supplied input (#39)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn identity_from_exchanged_token_rejects_undecodable_jwt() {
+        // The IdP's response was syntactically a JSON object with an
+        // `access_token` field but the token itself is malformed. Before
+        // the fix this would have fallen back to credentials.username;
+        // now it must refuse.
+        let result = TokenExchangeProvider::identity_from_exchanged_token(
+            "not-a-jwt",
+            "subject-token",
+            "sub",
+            "realm_access.roles",
+        );
+        assert!(
+            matches!(result, Err(AuthError::Internal(_))),
+            "decode failure must produce AuthError::Internal, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn identity_from_exchanged_token_rejects_missing_user_claim() {
+        // The token decodes, but the configured user claim is absent.
+        // We refuse rather than label the session "unknown" or fall back
+        // to the client-supplied username.
+        let claims = serde_json::json!({
+            "name": "Alice",
+            "realm_access": { "roles": ["analyst"] }
+        });
+        let token = fake_jwt(&claims);
+        let result = TokenExchangeProvider::identity_from_exchanged_token(
+            &token,
+            "subject-token",
+            "sub",
+            "realm_access.roles",
+        );
+        assert!(
+            matches!(result, Err(AuthError::AuthFailed(_))),
+            "missing user claim must produce AuthError::AuthFailed, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn identity_from_exchanged_token_accepts_valid_jwt() {
+        let claims = serde_json::json!({
+            "sub": "alice",
+            "realm_access": { "roles": ["analyst", "writer"] }
+        });
+        let token = fake_jwt(&claims);
+        let identity = TokenExchangeProvider::identity_from_exchanged_token(
+            &token,
+            "subject-token",
+            "sub",
+            "realm_access.roles",
+        )
+        .expect("valid JWT yields identity");
+        assert_eq!(identity.user_id, "alice");
+        assert_eq!(identity.display_name, "alice");
+        assert_eq!(identity.roles, vec!["analyst", "writer"]);
+        assert_eq!(identity.catalog_token.as_deref(), Some(token.as_str()));
+        assert_eq!(identity.refresh_token.as_deref(), Some("subject-token"));
+    }
+
+    #[test]
+    fn identity_from_exchanged_token_ignores_username_fallback() {
+        // Regression for #39: even when the exchanged JWT fails to
+        // decode, we must NOT take user_id from any caller-controlled
+        // source. The contract is that the helper does not even see the
+        // FlightCredentials struct.
+        let result = TokenExchangeProvider::identity_from_exchanged_token(
+            "garbage.garbage.garbage",
+            "subject-token",
+            "sub",
+            "realm_access.roles",
+        );
+        match result {
+            Err(AuthError::Internal(e)) => {
+                let msg = e.to_string();
+                assert!(
+                    !msg.to_lowercase().contains("alice"),
+                    "error must not leak any user identifier, got: {msg}"
+                );
+            }
+            other => panic!("expected Internal error, got {other:?}"),
+        }
+    }
 
     #[test]
     fn full_claims_extraction_from_mock_jwt() {
