@@ -31,6 +31,10 @@ use crate::worker_registry::WorkerRegistry;
 /// or falling back to local execution.
 const DEFAULT_MAX_RETRIES: u32 = 2;
 
+/// Metadata header carrying the coordinator/worker shared secret. The
+/// worker rejects `do_get` calls that don't carry it (issue #22).
+const WORKER_SECRET_HEADER: &str = "x-sqe-worker-secret";
+
 /// DataFusion `ExecutionPlan` that distributes scan work across workers.
 ///
 /// Each partition maps to one worker. When DataFusion calls `execute(i)`,
@@ -66,6 +70,10 @@ pub struct DistributedScanExec {
     local_executor: Option<Arc<dyn LocalExecutor>>,
     /// Optional callback fired when each fragment completes or fails.
     fragment_callback: FragmentCallbackOpt,
+    /// Shared secret attached to every outbound `do_get` so the worker
+    /// can authenticate the coordinator. Empty when distributed mode is
+    /// running with `allow_unauthenticated_workers = true`.
+    worker_secret: String,
 }
 
 /// Trait for local execution fallback.
@@ -137,7 +145,17 @@ impl DistributedScanExec {
             max_retries: DEFAULT_MAX_RETRIES,
             local_executor: None,
             fragment_callback: FragmentCallbackOpt(None),
+            worker_secret: String::new(),
         }
+    }
+
+    /// Set the shared secret attached to every outbound worker `do_get`.
+    /// When unset the dispatcher sends no auth header; the worker must
+    /// also be running with `allow_unauthenticated = true` for the call
+    /// to succeed.
+    pub fn with_worker_secret(mut self, secret: String) -> Self {
+        self.worker_secret = secret;
+        self
     }
 
     /// Set the credential expiry for the vended credentials in these scan tasks.
@@ -246,6 +264,7 @@ impl ExecutionPlan for DistributedScanExec {
         let worker_registry = self.worker_registry.clone();
         let local_executor = self.local_executor.clone();
         let fragment_callback = self.fragment_callback.0.clone();
+        let worker_secret = self.worker_secret.clone();
 
         let dispatch_span = info_span!(
             "dispatch_to_worker",
@@ -300,7 +319,7 @@ impl ExecutionPlan for DistributedScanExec {
                     );
                 }
 
-                match dispatch_to_worker(&task, &current_worker_url, &parent_cx).await {
+                match dispatch_to_worker(&task, &current_worker_url, &parent_cx, &worker_secret).await {
                     Ok(flight_stream) => {
                         // Project received batches to match the expected schema.
                         // Workers return full table columns, but the plan may expect
@@ -464,6 +483,7 @@ async fn dispatch_to_worker(
     task: &ScanTask,
     worker_url: &str,
     parent_cx: &opentelemetry::Context,
+    worker_secret: &str,
 ) -> Result<FlightRecordBatchStream, DataFusionError> {
     let ticket_bytes = task
         .to_bytes()
@@ -486,6 +506,15 @@ async fn dispatch_to_worker(
 
     let ticket = Ticket::new(ticket_bytes);
     let mut request = tonic::Request::new(ticket);
+
+    if !worker_secret.is_empty() {
+        let value = worker_secret.parse().map_err(|e| {
+            DataFusionError::Execution(format!(
+                "worker_secret cannot be encoded as a metadata header value: {e}"
+            ))
+        })?;
+        request.metadata_mut().insert(WORKER_SECRET_HEADER, value);
+    }
 
     // Inject W3C TraceContext (traceparent/tracestate) into gRPC metadata
     inject_trace_context(parent_cx, request.metadata_mut());

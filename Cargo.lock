@@ -6851,6 +6851,7 @@ dependencies = [
  "sqe-core",
  "sqe-metrics",
  "sqe-planner",
+ "subtle",
  "tokio",
  "tonic",
  "tracing",

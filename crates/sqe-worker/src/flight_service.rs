@@ -37,6 +37,11 @@ fn ipc_options_for(compression: FlightCompression) -> Result<IpcWriteOptions, St
         .map_err(|e| Status::internal(format!("Failed to set IPC compression: {e}")))
 }
 
+/// Metadata header carrying the shared coordinator/worker secret.
+/// Same name as the coordinator's heartbeat handler so a single rotation
+/// covers both directions.
+const WORKER_SECRET_HEADER: &str = "x-sqe-worker-secret";
+
 /// Worker's Arrow Flight service.
 ///
 /// Handles three operations:
@@ -62,6 +67,10 @@ pub struct WorkerFlightService {
     /// IPC compression for DoExchange shuffle responses.
     /// Default: ZSTD.
     shuffle_compression: FlightCompression,
+    /// Shared secret used to authenticate inbound Flight calls. When empty
+    /// the worker accepts unauthenticated traffic (operators must opt in
+    /// via `worker.allow_unauthenticated = true`, enforced at config load).
+    worker_secret: String,
 }
 
 impl WorkerFlightService {
@@ -75,6 +84,7 @@ impl WorkerFlightService {
             scan_timeout: std::time::Duration::from_secs(600),
             flight_compression: FlightCompression::Zstd,
             shuffle_compression: FlightCompression::Zstd,
+            worker_secret: String::new(),
         }
     }
 
@@ -96,6 +106,7 @@ impl WorkerFlightService {
             scan_timeout: std::time::Duration::from_secs(600),
             flight_compression: FlightCompression::Zstd,
             shuffle_compression: FlightCompression::Zstd,
+            worker_secret: String::new(),
         }
     }
 
@@ -121,6 +132,37 @@ impl WorkerFlightService {
     pub fn with_shuffle_compression(mut self, compression: FlightCompression) -> Self {
         self.shuffle_compression = compression;
         self
+    }
+
+    /// Set the shared secret used to authenticate inbound Flight calls
+    /// (`do_get` scan tickets and `do_action("refresh_credentials")`).
+    /// An empty secret disables enforcement: callers must explicitly opt
+    /// in via `worker.allow_unauthenticated = true` at config load time.
+    pub fn with_worker_secret(mut self, secret: String) -> Self {
+        self.worker_secret = secret;
+        self
+    }
+
+    /// Constant-time check of the `x-sqe-worker-secret` metadata header.
+    /// Returns `Ok(())` when the secret matches or when no secret is
+    /// configured. Returns `Status::unauthenticated` on mismatch.
+    fn verify_worker_secret(&self, metadata: &tonic::metadata::MetadataMap) -> Result<(), Status> {
+        if self.worker_secret.is_empty() {
+            return Ok(());
+        }
+        use subtle::ConstantTimeEq;
+        let provided = metadata
+            .get(WORKER_SECRET_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let provided_bytes = provided.as_bytes();
+        let secret_bytes = self.worker_secret.as_bytes();
+        if provided_bytes.len() != secret_bytes.len()
+            || !bool::from(provided_bytes.ct_eq(secret_bytes))
+        {
+            return Err(Status::unauthenticated("Invalid worker secret"));
+        }
+        Ok(())
     }
 
     /// Returns a reference to the credential store for use by executors.
@@ -154,6 +196,12 @@ impl FlightService for WorkerFlightService {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
+        // Reject anonymous callers before parsing the ticket: the ticket
+        // body carries the user's S3 credentials, so we must not log the
+        // scan task or even validate its shape until the coordinator has
+        // proven itself.
+        self.verify_worker_secret(request.metadata())?;
+
         // Extract W3C TraceContext from incoming gRPC metadata so this
         // worker span becomes a child of the coordinator's trace.
         let parent_cx = extract_trace_context(request.metadata());
@@ -246,7 +294,7 @@ impl FlightService for WorkerFlightService {
         &self,
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
-        let action = request.into_inner();
+        let (metadata, _, action) = request.into_parts();
 
         match action.r#type.as_str() {
             "health_check" => {
@@ -257,6 +305,12 @@ impl FlightService for WorkerFlightService {
                 Ok(Response::new(Box::pin(stream::once(async { Ok(result) }))))
             }
             "refresh_credentials" => {
+                // Credential refresh swaps the S3 keys that the executor
+                // will use for the next file read. An attacker who pushes
+                // their own bucket here either exfiltrates data or causes
+                // a table-swap. Require the worker secret on every call.
+                self.verify_worker_secret(&metadata)?;
+
                 let creds: RefreshableCredentials =
                     serde_json::from_slice(&action.body).map_err(|e| {
                         Status::invalid_argument(format!(
@@ -493,5 +547,163 @@ impl FlightService for WorkerFlightService {
         Ok(Response::new(Box::pin(stream::iter(
             actions.into_iter().map(Ok),
         ))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+    use datafusion::prelude::SessionContext;
+    use tonic::Request;
+
+    fn make_service(secret: &str) -> WorkerFlightService {
+        let metrics = Arc::new(WorkerMetricsRegistry::new());
+        WorkerFlightService::new(metrics, SessionContext::new())
+            .with_worker_secret(secret.to_string())
+    }
+
+    fn make_refresh_creds() -> RefreshableCredentials {
+        RefreshableCredentials {
+            fragment_id: "frag-test".to_string(),
+            access_key_id: "AKID".to_string(),
+            secret_access_key: "SECRET".to_string(),
+            session_token: "TOKEN".to_string(),
+            expiry: Utc::now() + Duration::hours(1),
+        }
+    }
+
+    fn unwrap_err<T>(r: Result<T, Status>) -> Status {
+        match r {
+            Ok(_) => panic!("expected Status error, got Ok"),
+            Err(s) => s,
+        }
+    }
+
+    fn unwrap_ok<T>(r: Result<T, Status>) -> T {
+        match r {
+            Ok(v) => v,
+            Err(s) => panic!("expected Ok, got Status: {s}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn do_get_rejects_missing_secret_header() {
+        let svc = make_service("expected-secret");
+        let ticket = Ticket {
+            ticket: bytes::Bytes::from_static(b"junk"),
+        };
+        let request = Request::new(ticket);
+        let err = unwrap_err(svc.do_get(request).await);
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn do_get_rejects_wrong_secret() {
+        let svc = make_service("expected-secret");
+        let ticket = Ticket {
+            ticket: bytes::Bytes::from_static(b"junk"),
+        };
+        let mut request = Request::new(ticket);
+        request
+            .metadata_mut()
+            .insert(WORKER_SECRET_HEADER, "wrong".parse().unwrap());
+        let err = unwrap_err(svc.do_get(request).await);
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn do_get_accepts_correct_secret_then_fails_on_bad_ticket() {
+        // With the right secret the auth gate passes; ticket decoding then
+        // fails because the body is junk. The error must NOT be
+        // Unauthenticated, proving the gate let the call through.
+        let svc = make_service("expected-secret");
+        let ticket = Ticket {
+            ticket: bytes::Bytes::from_static(b"junk"),
+        };
+        let mut request = Request::new(ticket);
+        request
+            .metadata_mut()
+            .insert(WORKER_SECRET_HEADER, "expected-secret".parse().unwrap());
+        let err = unwrap_err(svc.do_get(request).await);
+        assert_ne!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn do_get_empty_secret_accepts_anonymous() {
+        // Empty worker_secret means unauthenticated mode (opt-in via
+        // config). Auth gate disabled; failure comes from ticket decoding.
+        let svc = make_service("");
+        let ticket = Ticket {
+            ticket: bytes::Bytes::from_static(b"junk"),
+        };
+        let request = Request::new(ticket);
+        let err = unwrap_err(svc.do_get(request).await);
+        assert_ne!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn refresh_credentials_rejects_missing_secret() {
+        let svc = make_service("expected-secret");
+        let body = serde_json::to_vec(&make_refresh_creds()).unwrap();
+        let action = Action {
+            r#type: "refresh_credentials".to_string(),
+            body: bytes::Bytes::from(body),
+        };
+        let request = Request::new(action);
+        let err = unwrap_err(svc.do_action(request).await);
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn refresh_credentials_rejects_wrong_secret() {
+        let svc = make_service("expected-secret");
+        let body = serde_json::to_vec(&make_refresh_creds()).unwrap();
+        let action = Action {
+            r#type: "refresh_credentials".to_string(),
+            body: bytes::Bytes::from(body),
+        };
+        let mut request = Request::new(action);
+        request
+            .metadata_mut()
+            .insert(WORKER_SECRET_HEADER, "wrong".parse().unwrap());
+        let err = unwrap_err(svc.do_action(request).await);
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn refresh_credentials_accepts_correct_secret() {
+        let svc = make_service("expected-secret");
+        let _rx = svc.credential_store.subscribe("frag-test").await;
+        let body = serde_json::to_vec(&make_refresh_creds()).unwrap();
+        let action = Action {
+            r#type: "refresh_credentials".to_string(),
+            body: bytes::Bytes::from(body),
+        };
+        let mut request = Request::new(action);
+        request
+            .metadata_mut()
+            .insert(WORKER_SECRET_HEADER, "expected-secret".parse().unwrap());
+        let response = unwrap_ok(svc.do_action(request).await);
+        let mut stream = response.into_inner();
+        let first = stream.next().await.expect("body present").expect("ok");
+        assert_eq!(first.body.as_ref(), b"accepted");
+    }
+
+    #[tokio::test]
+    async fn health_check_remains_open_when_secret_configured() {
+        // Health probes from the coordinator worker_registry do not carry
+        // the secret today; keep them open so liveness still works. The
+        // call must not leak any credential state.
+        let svc = make_service("expected-secret");
+        let action = Action {
+            r#type: "health_check".to_string(),
+            body: bytes::Bytes::new(),
+        };
+        let request = Request::new(action);
+        let response = unwrap_ok(svc.do_action(request).await);
+        let mut stream = response.into_inner();
+        let first = stream.next().await.expect("body").expect("ok");
+        assert_eq!(first.body.as_ref(), b"ok");
     }
 }

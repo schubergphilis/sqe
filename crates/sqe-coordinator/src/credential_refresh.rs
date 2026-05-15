@@ -21,6 +21,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+/// Metadata header used by the worker to authenticate the coordinator's
+/// credential refresh push (issue #35). Matches the heartbeat path.
+const WORKER_SECRET_HEADER: &str = "x-sqe-worker-secret";
+
 /// Refreshed S3 credential payload pushed from coordinator to worker.
 ///
 /// This mirrors `sqe_worker::credential_channel::RefreshableCredentials` but is
@@ -190,6 +194,7 @@ impl Default for CredentialRefreshTracker {
 pub fn start_credential_refresh_task<F, Fut>(
     tracker: Arc<CredentialRefreshTracker>,
     interval: std::time::Duration,
+    worker_secret: String,
     get_fresh_credentials: F,
 ) where
     F: Fn(ActiveFragment) -> Fut + Send + Sync + 'static,
@@ -198,7 +203,7 @@ pub fn start_credential_refresh_task<F, Fut>(
     // TODO(security-hardening): store JoinHandle and add CancellationToken
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
-        // First tick fires immediately — skip it so we don't do a
+        // First tick fires immediately, skip it so we don't do a
         // pointless check at startup when no fragments are registered.
         tick.tick().await;
 
@@ -211,7 +216,9 @@ pub fn start_credential_refresh_task<F, Fut>(
             }
 
             debug!(active_fragments = active, "Credential refresh tick");
-            let refreshed = refresh_expiring_credentials(&tracker, &get_fresh_credentials).await;
+            let refreshed =
+                refresh_expiring_credentials(&tracker, &worker_secret, &get_fresh_credentials)
+                    .await;
             if refreshed > 0 {
                 info!(count = refreshed, "Pushed refreshed credentials to workers");
             }
@@ -221,11 +228,17 @@ pub fn start_credential_refresh_task<F, Fut>(
 
 /// Push refreshed credentials to a single worker via Arrow Flight `do_action`.
 ///
+/// The `worker_secret` is sent as the `x-sqe-worker-secret` metadata header
+/// so the worker can authenticate the push. An empty secret omits the header
+/// and only succeeds when the worker is running with
+/// `allow_unauthenticated = true`.
+///
 /// Returns `Ok(())` if the worker accepted the credentials, or an error if the
 /// Flight call failed.
 pub async fn push_credentials_to_worker(
     worker_url: &str,
     credentials: &RefreshableCredentials,
+    worker_secret: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let body = serde_json::to_vec(credentials)?;
 
@@ -241,9 +254,15 @@ pub async fn push_credentials_to_worker(
         body: bytes::Bytes::from(body),
     };
 
-    let response = client
-        .do_action(tonic::Request::new(action))
-        .await?;
+    let mut request = tonic::Request::new(action);
+    if !worker_secret.is_empty() {
+        let value: tonic::metadata::MetadataValue<_> = worker_secret.parse().map_err(|e| {
+            format!("worker_secret cannot be encoded as a metadata header value: {e}")
+        })?;
+        request.metadata_mut().insert(WORKER_SECRET_HEADER, value);
+    }
+
+    let response = client.do_action(request).await?;
 
     // Consume the response stream to ensure the action completed
     let mut stream = response.into_inner();
@@ -269,6 +288,7 @@ pub async fn push_credentials_to_worker(
 /// Returns the number of successful pushes.
 pub async fn refresh_expiring_credentials<F, Fut>(
     tracker: &CredentialRefreshTracker,
+    worker_secret: &str,
     get_fresh_credentials: F,
 ) -> usize
 where
@@ -295,7 +315,7 @@ where
         match get_fresh_credentials(fragment).await {
             Some(creds) => {
                 let new_expiry = creds.expiry;
-                match push_credentials_to_worker(&worker_url, &creds).await {
+                match push_credentials_to_worker(&worker_url, &creds, worker_secret).await {
                     Ok(()) => {
                         tracker.update_expiry(&fragment_id, new_expiry).await;
                         success_count += 1;
@@ -496,14 +516,32 @@ mod tests {
         };
 
         let result =
-            push_credentials_to_worker("http://127.0.0.1:19999", &creds).await;
+            push_credentials_to_worker("http://127.0.0.1:19999", &creds, "").await;
         assert!(result.is_err(), "push to unreachable worker should fail");
+    }
+
+    #[tokio::test]
+    async fn test_push_to_unreachable_worker_with_secret_returns_error() {
+        let creds = RefreshableCredentials {
+            fragment_id: "frag-001".to_string(),
+            access_key_id: "AKID".to_string(),
+            secret_access_key: "SECRET".to_string(),
+            session_token: "TOKEN".to_string(),
+            expiry: Utc::now() + Duration::hours(1),
+        };
+
+        let result =
+            push_credentials_to_worker("http://127.0.0.1:19999", &creds, "shared-secret").await;
+        assert!(
+            result.is_err(),
+            "push to unreachable worker should fail even with a secret set"
+        );
     }
 
     #[tokio::test]
     async fn test_refresh_expiring_credentials_with_no_fragments() {
         let tracker = CredentialRefreshTracker::new();
-        let count = refresh_expiring_credentials(&tracker, |_| async { None }).await;
+        let count = refresh_expiring_credentials(&tracker, "", |_| async { None }).await;
         assert_eq!(count, 0);
     }
 
@@ -520,7 +558,7 @@ mod tests {
             .await;
 
         // Callback cannot obtain fresh credentials
-        let count = refresh_expiring_credentials(&tracker, |_| async { None }).await;
+        let count = refresh_expiring_credentials(&tracker, "", |_| async { None }).await;
         assert_eq!(count, 0);
     }
 
