@@ -33,9 +33,19 @@ echo "Running integration tests..."
 # crates/sqe-coordinator/src/main.rs:96 WORKER_STACK_BYTES). The default
 # 2 MiB tokio stack overflows in debug builds on the CTAS + policy-rewriter
 # path that integration_test.rs::test_aggregation_basic + similar exercise.
+# test_distributed_select intentionally fails when no worker is listening on
+# :50052 (issue #122 — local-fallback masking distributed dispatch bugs).
+# This script targets docker-compose.test.yml, which doesn't include a worker;
+# distributed coverage is exercised by scripts/distributed-test.sh on
+# docker-compose.distributed.yml. Skip the test here unless the caller passes
+# their own filter args ($# > 0 implies an explicit test name was selected).
+SKIP_ARGS=()
+if [ "$#" -eq 0 ]; then
+    SKIP_ARGS=(--skip test_distributed_select)
+fi
 RUST_LOG="${RUST_LOG:-sqe_coordinator=info,sqe_catalog=info,sqe_auth=info,warn}" \
 RUST_MIN_STACK="${RUST_MIN_STACK:-8388608}" \
-    cargo test -p sqe-coordinator -- --ignored --test-threads=1 --nocapture "$@" 2>&1 \
+    cargo test -p sqe-coordinator -- --ignored --test-threads=1 --nocapture "${SKIP_ARGS[@]}" "$@" 2>&1 \
     | tee "$SQE_LOG_FILE"
 EXIT_CODE=${PIPESTATUS[0]}
 
