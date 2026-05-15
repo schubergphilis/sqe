@@ -24,18 +24,22 @@ impl TrinoAuthenticator for AuthenticatorAdapter {
         &self,
         username: &str,
         password: &str,
-    ) -> Result<sqe_core::Session, String> {
+    ) -> Result<sqe_core::Session, sqe_core::SqeError> {
         self.authenticator
             .authenticate(username, password)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| sqe_core::SqeError::Auth(e.to_string()))
     }
 
-    async fn authenticate_bearer(&self, token: &str) -> Result<sqe_core::Session, String> {
-        let provider = self
-            .bearer_provider
-            .as_ref()
-            .ok_or_else(|| "Bearer token authentication is not configured".to_string())?;
+    async fn authenticate_bearer(
+        &self,
+        token: &str,
+    ) -> Result<sqe_core::Session, sqe_core::SqeError> {
+        let provider = self.bearer_provider.as_ref().ok_or_else(|| {
+            sqe_core::SqeError::Auth(
+                "Bearer token authentication is not configured".to_string(),
+            )
+        })?;
 
         let credentials = sqe_auth::FlightCredentials {
             bearer_token: Some(sqe_core::SecretString::new(token.to_string())),
@@ -45,7 +49,9 @@ impl TrinoAuthenticator for AuthenticatorAdapter {
         let identity = provider
             .authenticate(&credentials)
             .await
-            .map_err(|e| format!("Bearer token validation failed: {e}"))?;
+            .map_err(|e| {
+                sqe_core::SqeError::Auth(format!("Bearer token validation failed: {e}"))
+            })?;
 
         // Convert Identity to Session: use the JWT itself as the catalog token
         // (passthrough to Polaris), and the identity fields for user/roles.
@@ -73,14 +79,11 @@ impl TrinoQueryExecutor for QueryHandlerAdapter {
         &self,
         session: &sqe_core::Session,
         sql: &str,
-    ) -> Result<Vec<arrow_array::RecordBatch>, String> {
+    ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
         self.rate_limiter
             .check(&session.user.username)
-            .map_err(|e| e.to_string())?;
-        self.handler
-            .execute(session, sql)
-            .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| sqe_core::SqeError::Execution(format!("rate limit: {e}")))?;
+        self.handler.execute(session, sql).await
     }
 }
 

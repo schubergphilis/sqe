@@ -433,7 +433,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             sqe_coordinator::credential_refresh::start_credential_refresh_task(
                 credential_tracker.clone(),
                 std::time::Duration::from_secs(60),
-                config.coordinator.worker_secret.clone(),
+                config.coordinator.worker_secret.expose().to_string(),
                 |_fragment| async {
                     // Credential vending is deferred to Step 5 (Pluggable
                     // Catalogs): the CatalogBackend trait will expose a
