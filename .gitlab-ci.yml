@@ -25,7 +25,11 @@ cargo-check:
   stage: check
   image: rust:bookworm
   before_script:
-    - apt-get update -qq && apt-get install -y -qq cmake protobuf-compiler libssl-dev pkg-config > /dev/null
+    # `clang` + `mold` are required because .cargo/config.toml pins them as
+    # the linker for x86_64-unknown-linux-gnu builds (faster link than GNU
+    # ld). The rust:bookworm image ships neither, so without this we fail
+    # at link time with `linker `clang` not found`.
+    - apt-get update -qq && apt-get install -y -qq cmake protobuf-compiler libssl-dev pkg-config clang mold > /dev/null
     # The `rust:bookworm` image ships without clippy or cargo-audit for the
     # 1.92 toolchain; install them explicitly so the script stage has the
     # binaries it expects. cargo-deny was already being installed this way;
@@ -62,7 +66,11 @@ cargo-test:
   stage: test
   image: rust:bookworm
   before_script:
-    - apt-get update -qq && apt-get install -y -qq cmake protobuf-compiler libssl-dev pkg-config > /dev/null
+    # `clang` + `mold` are required because .cargo/config.toml pins them as
+    # the linker for x86_64-unknown-linux-gnu builds (faster link than GNU
+    # ld). The rust:bookworm image ships neither, so without this we fail
+    # at link time with `linker `clang` not found`.
+    - apt-get update -qq && apt-get install -y -qq cmake protobuf-compiler libssl-dev pkg-config clang mold > /dev/null
   script:
     - cargo test --release
     # Run the SQLite-backed runtime catalog tests behind the explicit
@@ -95,7 +103,11 @@ cargo-check-features:
   stage: check
   image: rust:bookworm
   before_script:
-    - apt-get update -qq && apt-get install -y -qq cmake protobuf-compiler libssl-dev pkg-config > /dev/null
+    # `clang` + `mold` are required because .cargo/config.toml pins them as
+    # the linker for x86_64-unknown-linux-gnu builds (faster link than GNU
+    # ld). The rust:bookworm image ships neither, so without this we fail
+    # at link time with `linker `clang` not found`.
+    - apt-get update -qq && apt-get install -y -qq cmake protobuf-compiler libssl-dev pkg-config clang mold > /dev/null
   script:
     # Slimmest REST-only build. The documented minimum.
     - cargo check -p sqe-catalog --no-default-features --features rest
@@ -137,13 +149,29 @@ cargo-check-features:
 integration-test:
   stage: test
   image: docker:24
+  # docker-in-docker. The job's `docker compose up` against
+  # docker-compose.test.yml needs a real Docker daemon, which the sibling
+  # `docker:24-dind` service provides. Explicit `alias: docker` ensures the
+  # DNS name the job container connects to (`tcp://docker:2375`) lines up
+  # with the service hostname regardless of GitLab Runner version, and
+  # `--tls=false --host=tcp://0.0.0.0:2375` makes dind listen on the
+  # non-TLS port instead of the default TLS-only :2376. Without the
+  # explicit command the daemon binds to 2376 with self-signed certs and
+  # the job hits `Cannot connect to the Docker daemon at tcp://docker:2375`.
   services:
-    - docker:24-dind
+    - name: docker:24-dind
+      alias: docker
+      command: ["--tls=false", "--host=tcp://0.0.0.0:2375"]
   variables:
     DOCKER_HOST: tcp://docker:2375
     DOCKER_TLS_CERTDIR: ""
+    DOCKER_DRIVER: overlay2
   before_script:
-    - apk add --no-cache bash curl docker-compose rust cargo cmake protobuf-dev openssl-dev pkgconfig
+    # `clang` + `mold` mirror the rust:bookworm jobs above: .cargo/config.toml
+    # pins them as the Linux linker, so the Alpine-based integration job must
+    # install them as well. `mold` lives in the community repo (on by default
+    # in docker:24's apk index).
+    - apk add --no-cache bash curl docker-compose rust cargo cmake protobuf-dev openssl-dev pkgconfig clang mold
   script:
     - ./scripts/integration-test.sh
   rules:
@@ -167,7 +195,11 @@ matrix-score:
   stage: check
   image: rust:bookworm
   before_script:
-    - apt-get update -qq && apt-get install -y -qq cmake protobuf-compiler libssl-dev pkg-config > /dev/null
+    # `clang` + `mold` are required because .cargo/config.toml pins them as
+    # the linker for x86_64-unknown-linux-gnu builds (faster link than GNU
+    # ld). The rust:bookworm image ships neither, so without this we fail
+    # at link time with `linker `clang` not found`.
+    - apt-get update -qq && apt-get install -y -qq cmake protobuf-compiler libssl-dev pkg-config clang mold > /dev/null
   script:
     - cargo xtask matrix-report --min-percent $MATRIX_MIN_PERCENT
   variables:
