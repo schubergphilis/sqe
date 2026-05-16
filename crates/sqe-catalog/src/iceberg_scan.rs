@@ -1097,18 +1097,29 @@ impl ExecutionPlan for IcebergScanExec {
                                 // For DynamicFilterPhysicalExpr, get the current snapshot
                                 // (non-blocking — returns the latest filter or lit(true) if
                                 // the build side hasn't finished yet).
-                                let expr: Arc<dyn PhysicalExpr> = if let Some(dynamic) = filter.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
+                                let (expr, is_dynamic): (Arc<dyn PhysicalExpr>, bool) = if let Some(dynamic) = filter.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
                                     match dynamic.current() {
-                                        Ok(e) => e,
+                                        Ok(e) => (e, true),
                                         Err(_) => continue,
                                     }
                                 } else {
-                                    Arc::clone(filter)
+                                    (Arc::clone(filter), false)
                                 };
 
-                                // Widen narrow types before evaluation (Int32->Int64 etc.)
-                                let coerced = PhysicalExprPredicate::coerce_batch_types(&expr, &result)
-                                    .unwrap_or_else(|_| result.clone());
+                                // DynamicFilterPhysicalExpr carries runtime literals
+                                // typed to the build-side column (Iceberg Int32 for
+                                // integer joinkeys); widening the probe batch to Int64
+                                // would make the column-vs-literal comparison fail
+                                // ("Invalid comparison operation: Int64 >= Int32") and
+                                // the eval-Err arm below silently skips. Static
+                                // predicates already carry planner-inserted CASTs so
+                                // widening is still required for them.
+                                let coerced = if is_dynamic {
+                                    result.clone()
+                                } else {
+                                    PhysicalExprPredicate::coerce_batch_types(&expr, &result)
+                                        .unwrap_or_else(|_| result.clone())
+                                };
 
                                 // Evaluate the filter on the coerced batch
                                 let predicate = match expr.evaluate(&coerced) {
