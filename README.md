@@ -64,15 +64,15 @@ Two longer comparison docs trace the lineage of these positions:
 
 | Suite | SQE | Trino | Speedup | Pass |
 |---|---|---|---|---|
-| TPC-H (22) | 19.3s | 26.6s | **2.3x** | 22/22 |
-| SSB (13) | 7.6s | 8.3s | **1.1x** | 13/13 |
-| TPC-DS (99) | 57.1s | 39.7s | **1.4x slower** | 93/99 |
-| TPC-C (8 read) | 0.45s | 3.4s | **9.6x** | 8/8 |
-| TPC-E (11) | 10.4s | 138.8s | **7.8x** | 11/11 |
-| TPC-BB (10) | 36.9s | 323.6s | **5.5x** | 10/10 |
-| ClickBench (43) | 1.7s | 6.3s | **4.6x** | 43/43 |
+| TPC-H (22) | 17.5s | 26.7s | **2.2x** | 22/22 |
+| SSB (13) | 7.0s | 5.8s | **0.83x slower** | 13/13 |
+| TPC-DS (99) | 42.5s | 45.6s | **1.07x** | 93/99 |
+| TPC-C (8 read) | 0.41s | 2.65s | **6.5x** | 8/8 |
+| TPC-E (11) | 10.8s | 172.0s | **15.9x** | 11/11 |
+| TPC-BB (10) | 38.2s | 255.7s | **6.7x** | 10/10 |
+| ClickBench (43) | 1.56s | 4.46s | **2.9x** | 43/43 |
 
-SQE wins six of seven suites. The TPC-DS regression is concentrated in TPC-DS Q72, where DataFusion's lack of full CBO with NDV statistics costs SQE 13x against Trino. The story of that one query is [docs/blog/2026-04-16-our-nemesis-q72.md](docs/blog/2026-04-16-our-nemesis-q72.md). The May 2026 numbers reflect manifest-derived column statistics flowing into DataFusion's optimizer for the first time, plus Path B+B-2 runtime-filter pushdown ([docs/features/runtime-filter-pushdown.md](docs/features/runtime-filter-pushdown.md)).
+SQE wins six of seven suites. TPC-DS flipped from 1.4x slower to 1.07x faster after we fixed the dynamic-filter type-coercion bug that was suppressing pruning on every Iceberg integer joinkey ([docs/blog/2026-05-16-q72-the-nemesis.md](docs/blog/2026-05-16-q72-the-nemesis.md)). q72 alone went from 10.7s to 0.77s. SSB is the one suite where we still trail; the gap is structural in the lineitem-heavy scan pattern and tracked separately. The remaining 6/99 TPC-DS mismatches are upstream DataFusion ROLLUP / GROUPING() gaps (apache/datafusion#4763, #13993), not engine regressions. The earlier "Our Nemesis" investigation is preserved as [docs/blog/2026-04-16-our-nemesis-q72.md](docs/blog/2026-04-16-our-nemesis-q72.md).
 
 Run your own:
 
