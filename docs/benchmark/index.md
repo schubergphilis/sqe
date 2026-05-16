@@ -92,7 +92,7 @@ What they show:
 
 - **Day a fix landed**: a step-change in total duration usually corresponds to a single commit landing on `main`. Cross-reference with the [Performance Roadmap](../specs/performance-roadmap.md) and the dated blog posts.
 - **Regression caught fast**: a single-run spike that the next run reverses is the common shape after a bad change is rolled back.
-- **Consistently slow queries**: rows in the heatmap that stay orange / red across the whole period (q72 in TPC-DS, q01 in some TPC-H windows) are the queries the planner has not yet learned to handle well.
+- **Consistently slow queries**: rows in the heatmap that stay orange / red across the whole period are queries the planner has not yet learned to handle well. q72 in TPC-DS was the standout for a month before the 2026-05-16 dynamic-filter type-coercion fix collapsed it from 10.7s to 0.77s; the orange band on the heatmap stops there.
 - **New benchmark machine**: a step-change that affects every query the same way is usually environmental (different machine, different disk, different Trino version).
 
 What they do not show:
@@ -107,19 +107,20 @@ Numbers below are from the latest SF1 run on the same machine, against Trino 465
 
 | Suite | SQE | Trino | Avg speedup | Pass |
 |---|---|---|---|---|
-| TPC-H (22) | 19.3s | 26.6s | **2.3x** | 22/22 |
-| SSB (13) | 7.6s | 8.3s | **1.1x** | 13/13 |
-| TPC-DS (99) | 57.1s | 39.7s | **1.4x** | 93/99 |
-| TPC-C (8 read) | 0.45s | 3.4s | **9.6x** | 8/8 |
-| TPC-E (11) | 10.4s | 138.8s | **7.8x** | 11/11 |
-| TPC-BB (10) | 36.9s | 323.6s | **5.5x** | 10/10 |
-| ClickBench (43) | 1.7s | 6.3s | **4.6x** | 43/43 |
+| TPC-H (22) | 17.5s | 26.7s | **2.2x** | 22/22 |
+| SSB (13) | 7.0s | 5.8s | **0.83x slower** | 13/13 |
+| TPC-DS (99) | 42.5s | 45.6s | **1.07x** | 93/99 |
+| TPC-C (8 read) | 0.41s | 2.65s | **6.5x** | 8/8 |
+| TPC-E (11) | 10.8s | 172.0s | **15.9x** | 11/11 |
+| TPC-BB (10) | 38.2s | 255.7s | **6.7x** | 10/10 |
+| ClickBench (43) | 1.56s | 4.46s | **2.9x** | 43/43 |
 
-The numbers are approximate (run-to-run variance is real) but the rank order is stable across the last month of runs.
+The numbers are approximate (run-to-run variance is real) but the rank order is stable across the last month of runs. The May 16 dynamic-filter type-coercion fix flipped TPC-DS from 1.4x slower to 1.07x faster.
 
 ## Related
 
 - [Performance Roadmap](../specs/performance-roadmap.md): the optimisation backlog, in order.
 - [Runtime Filter Pushdown](../features/runtime-filter-pushdown.md): the Path B+B-2 work that drove most of the April-May TPC-H speedups.
-- [Our Nemesis: TPC-DS Q72](../blog/2026-04-16-our-nemesis-q72.md): the one query that stays expensive.
+- [Our Nemesis: TPC-DS Q72 (April)](../blog/2026-04-16-our-nemesis-q72.md): the original investigation, when the query was still 12x slower.
+- [q72, our nemesis, and the Int32 that hid for a month (May 16)](../blog/2026-05-16-q72-the-nemesis.md): the post-mortem on the fix that finally landed.
 - [Five Layers of Caching and an 8.8x Speedup](../blog/2026-04-12-caching-and-the-8x-speedup.md): the early-April caching work.
