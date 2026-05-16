@@ -187,13 +187,29 @@ pub async fn run_benchmark_test(
         //      including the `-- timeout: Ns` header in the .sql file.
         //      Use this for SF100+ runs where the committed headers
         //      (typically 60-120s, sized for SF1) are too tight.
-        //   2. `-- timeout: Ns` header in the .sql file, with a floor of
-        //      120s to prevent a typo from setting it to 0.
+        //   2. `-- timeout: Ns` header in the .sql file, when positive.
+        //      A `-- timeout: 0` (or a missing header) falls through to
+        //      the default rather than disabling the timeout entirely,
+        //      so a typo in one file does not let a runaway query stall
+        //      the suite.
         //   3. Default 300s (from `parse_query_file`).
+        //
+        // Previously a 120s floor was applied on top of the header value,
+        // which silently bumped all the SF1 sweeps' `-- timeout: 60s` and
+        // `-- timeout: 30s` headers up to 120s. tpcds q72 ran for 100s
+        // during the perf regression in #131 without ever tripping its
+        // own declared 60s ceiling because of that floor. Honouring the
+        // header value as-written restores the intent.
         let timeout_secs = std::env::var("BENCH_QUERY_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or_else(|| query.timeout_secs.max(120));
+            .unwrap_or_else(|| {
+                if query.timeout_secs > 0 {
+                    query.timeout_secs
+                } else {
+                    300
+                }
+            });
         let start = std::time::Instant::now();
 
         // Use tokio::select! so the timeout fires even if the gRPC stream

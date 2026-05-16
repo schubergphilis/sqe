@@ -2108,6 +2108,7 @@ impl SqeConfig {
 
         validate_urls(self, &mut errors);
         validate_byte_sizes(self, &mut errors);
+        validate_memory_budget_invariants(self, &mut errors);
 
         if errors.is_empty() {
             Ok(())
@@ -2346,6 +2347,55 @@ impl SqeConfig {
 
         // Query
         env_override_u64("SQE_QUERY__TIMEOUT_SECS", &mut self.query.timeout_secs);
+    }
+}
+
+/// Validate the relationship between `query.per_user_memory_budget` and
+/// `query.max_query_memory`.
+///
+/// When the per-user budget is enabled (non-zero) and is smaller than the
+/// per-query reservation, every single query is rejected on admission
+/// with `Per-user memory budget exceeded for '<user>': 0 bytes reserved,
+/// limit <N> bytes` — the message reads as if the user is over budget
+/// when in fact the *request* exceeds the budget on the very first
+/// query. We hit this with the SQE 1GB default + the 32GB
+/// `max_query_memory` shipped in `tests/sqe-test.toml` for SF100 sweeps
+/// (issue #131): integration tests fired the rejection on every
+/// statement until the per-user gate was disabled with
+/// `per_user_memory_budget = "0"`.
+///
+/// Fail loudly at config-load time so operators see the misconfiguration
+/// before the first query reaches the engine. `per_user_memory_budget =
+/// "0"` (gate disabled) is always accepted.
+fn validate_memory_budget_invariants(config: &SqeConfig, errors: &mut Vec<String>) {
+    let budget_str = config.query.per_user_memory_budget.trim();
+    let per_query_str = config.query.max_query_memory.trim();
+    if budget_str.is_empty() || per_query_str.is_empty() {
+        return;
+    }
+    if budget_str == "0" {
+        // Operator deliberately disabled the per-user gate.
+        return;
+    }
+    let budget = match parse_memory_limit(budget_str) {
+        Ok(v) => v,
+        Err(_) => return, // surfaced by validate_byte_sizes
+    };
+    let per_query = match parse_memory_limit(per_query_str) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    if per_query > 0 && budget < per_query {
+        errors.push(format!(
+            "query.per_user_memory_budget ({budget_str}) must be >= \
+             query.max_query_memory ({per_query_str}), or set \
+             per_user_memory_budget = \"0\" to disable the gate. With \
+             the current values every single query would be rejected on \
+             admission with `Per-user memory budget exceeded for \
+             '<user>': 0 bytes reserved, limit {budget} bytes` because \
+             the first reservation alone ({per_query} bytes) exceeds \
+             the per-user cap"
+        ));
     }
 }
 
@@ -4041,5 +4091,37 @@ otlp_endpoint = ""
             dbg.contains("worker_secret: <unset>"),
             "expected unset sentinel: {dbg}"
         );
+    }
+
+    /// Regression for #131: when `per_user_memory_budget` is smaller than
+    /// `max_query_memory`, every query is rejected on admission. Validate
+    /// at config-load instead.
+    #[test]
+    fn validate_rejects_per_user_budget_below_max_query_memory() {
+        let mut config = valid_config();
+        config.query.max_query_memory = "32GB".to_string();
+        config.query.per_user_memory_budget = "1GB".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("per_user_memory_budget") && err.contains("max_query_memory"),
+            "expected budget-vs-per-query guard, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_per_user_budget_equal_to_max_query_memory() {
+        let mut config = valid_config();
+        config.query.max_query_memory = "32GB".to_string();
+        config.query.per_user_memory_budget = "32GB".to_string();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_per_user_budget_disabled() {
+        let mut config = valid_config();
+        config.query.max_query_memory = "32GB".to_string();
+        config.query.per_user_memory_budget = "0".to_string();
+        // "0" disables the gate, so the size relationship is irrelevant.
+        assert!(config.validate().is_ok());
     }
 }
