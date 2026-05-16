@@ -149,11 +149,23 @@ cargo-check-features:
 integration-test:
   stage: test
   image: docker:24
+  # docker-in-docker. The job's `docker compose up` against
+  # docker-compose.test.yml needs a real Docker daemon, which the sibling
+  # `docker:24-dind` service provides. Explicit `alias: docker` ensures the
+  # DNS name the job container connects to (`tcp://docker:2375`) lines up
+  # with the service hostname regardless of GitLab Runner version, and
+  # `--tls=false --host=tcp://0.0.0.0:2375` makes dind listen on the
+  # non-TLS port instead of the default TLS-only :2376. Without the
+  # explicit command the daemon binds to 2376 with self-signed certs and
+  # the job hits `Cannot connect to the Docker daemon at tcp://docker:2375`.
   services:
-    - docker:24-dind
+    - name: docker:24-dind
+      alias: docker
+      command: ["--tls=false", "--host=tcp://0.0.0.0:2375"]
   variables:
     DOCKER_HOST: tcp://docker:2375
     DOCKER_TLS_CERTDIR: ""
+    DOCKER_DRIVER: overlay2
   before_script:
     # `clang` + `mold` mirror the rust:bookworm jobs above: .cargo/config.toml
     # pins them as the Linux linker, so the Alpine-based integration job must
