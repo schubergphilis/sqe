@@ -64,15 +64,15 @@ Two longer comparison docs trace the lineage of these positions:
 
 | Suite | SQE | Trino | Speedup | Pass |
 |---|---|---|---|---|
-| TPC-H (22) | 17.5s | 26.7s | **2.2x** | 22/22 |
-| SSB (13) | 7.0s | 5.8s | **0.83x slower** | 13/13 |
-| TPC-DS (99) | 42.5s | 45.6s | **1.07x** | 93/99 |
+| TPC-H (22) | 16.8s | 26.7s | **1.6x** | 22/22 |
+| SSB (13) | 8.3s | 5.8s | **0.70x slower** | 13/13 |
+| TPC-DS (99) | 13.4s | 45.6s | **3.4x** | 93/99 |
 | TPC-C (8 read) | 0.41s | 2.65s | **6.5x** | 8/8 |
-| TPC-E (11) | 10.8s | 172.0s | **15.9x** | 11/11 |
-| TPC-BB (10) | 38.2s | 255.7s | **6.7x** | 10/10 |
-| ClickBench (43) | 1.56s | 4.46s | **2.9x** | 43/43 |
+| TPC-E (11) | 9.3s | 172.0s | **18.5x** | 11/11 |
+| TPC-BB (10) | 28.0s | 255.7s | **9.1x** | 10/10 |
+| ClickBench (43) | 1.3s | 4.46s | **3.4x** | 43/43 |
 
-SQE wins six of seven suites. TPC-DS flipped from 1.4x slower to 1.07x faster after we fixed the dynamic-filter type-coercion bug that was suppressing pruning on every Iceberg integer joinkey ([docs/blog/2026-05-16-q72-the-nemesis.md](docs/blog/2026-05-16-q72-the-nemesis.md)). q72 alone went from 10.7s to 0.77s. SSB is the one suite where we still trail; the gap is structural in the lineitem-heavy scan pattern and tracked separately. The remaining 6/99 TPC-DS mismatches are upstream DataFusion ROLLUP / GROUPING() gaps (apache/datafusion#4763, #13993), not engine regressions. The earlier "Our Nemesis" investigation is preserved as [docs/blog/2026-04-16-our-nemesis-q72.md](docs/blog/2026-04-16-our-nemesis-q72.md).
+SQE wins six of seven suites. TPC-DS collapsed from 42.5s to 13.4s after we wired DataFusion's runtime filters into iceberg-rust's scan path through the vendor's `DynamicPredicate` bridge: q82 dropped 1787ms to 113ms (16x), q80 1398ms to 103ms (14x), q13 1317ms to 220ms (6x). The fix is a two-tier pushdown — iceberg-rust samples once per file scan task for row-group / page-index pruning, and a per-batch wrapper catches filters that resolve after the task opened. Earlier in the month we landed the dynamic-filter type-coercion fix that flipped q72 from 10.7s to 0.77s ([docs/blog/2026-05-16-q72-the-nemesis.md](docs/blog/2026-05-16-q72-the-nemesis.md)). SSB is the one suite we still trail; lineorder's uniform FK distribution defeats row-group pruning, so the runtime filter only helps at row level and Trino's vectorized decoder still wins. The remaining 6/99 TPC-DS mismatches are upstream DataFusion ROLLUP / GROUPING() gaps (apache/datafusion#4763, #13993), not engine regressions. The earlier "Our Nemesis" investigation is preserved as [docs/blog/2026-04-16-our-nemesis-q72.md](docs/blog/2026-04-16-our-nemesis-q72.md).
 
 Run your own:
 
