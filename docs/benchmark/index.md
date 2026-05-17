@@ -107,15 +107,15 @@ Numbers below are from the latest SF1 run on the same machine, against Trino 465
 
 | Suite | SQE | Trino | Avg speedup | Pass |
 |---|---|---|---|---|
-| TPC-H (22) | 17.5s | 26.7s | **2.2x** | 22/22 |
-| SSB (13) | 7.0s | 5.8s | **0.83x slower** | 13/13 |
-| TPC-DS (99) | 42.5s | 45.6s | **1.07x** | 93/99 |
+| TPC-H (22) | 16.8s | 26.7s | **1.6x** | 22/22 |
+| SSB (13) | 8.3s | 5.8s | **0.70x slower** | 13/13 |
+| TPC-DS (99) | 13.4s | 45.6s | **3.4x** | 93/99 |
 | TPC-C (8 read) | 0.41s | 2.65s | **6.5x** | 8/8 |
-| TPC-E (11) | 10.8s | 172.0s | **15.9x** | 11/11 |
-| TPC-BB (10) | 38.2s | 255.7s | **6.7x** | 10/10 |
-| ClickBench (43) | 1.56s | 4.46s | **2.9x** | 43/43 |
+| TPC-E (11) | 9.3s | 172.0s | **18.5x** | 11/11 |
+| TPC-BB (10) | 28.0s | 255.7s | **9.1x** | 10/10 |
+| ClickBench (43) | 1.3s | 4.46s | **3.4x** | 43/43 |
 
-The numbers are approximate (run-to-run variance is real) but the rank order is stable across the last month of runs. The May 16 dynamic-filter type-coercion fix flipped TPC-DS from 1.4x slower to 1.07x faster.
+The numbers are approximate (run-to-run variance is real) but the rank order is stable across the last month of runs. Two fixes landed in May moved the needle: the dynamic-filter type-coercion fix on May 16 collapsed q72 from 10.7s to 0.77s, and the runtime-filter pushdown into iceberg-rust's scan path on May 17 took TPC-DS from 42.5s to 13.4s, TPC-BB from 38.2s to 28.0s, and TPC-E from 10.8s to 9.3s. SSB regressed slightly (7.0s -> 8.3s) because lineorder's uniform FK distribution defeats row-group pruning.
 
 ## Related
 
