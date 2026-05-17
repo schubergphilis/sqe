@@ -136,7 +136,143 @@ impl MaintenanceHandler {
                 namespace,
                 dry_run,
             } => self.purge_orphan_locations(session, namespace, *dry_run).await,
+            ProcedureCall::RegisterTable {
+                table,
+                metadata_location,
+            } => self.register_table(session, table, metadata_location).await,
+            ProcedureCall::DropTable { table, purge } => {
+                self.drop_table(session, table, *purge).await
+            }
+            ProcedureCall::SetCurrentSnapshot { .. }
+            | ProcedureCall::RollbackToSnapshot { .. } => Err(SqeError::Execution(
+                format!(
+                    "CALL system.{}: snapshot pointer operations are not yet implemented; \
+                     track via the SQL extensions roadmap",
+                    call.name()
+                ),
+            )),
         }
+    }
+
+    /// Register an existing Iceberg table by pointing the catalog at its
+    /// `metadata.json`. No data movement; the catalog backend validates the
+    /// metadata file is readable and commits a pointer to it.
+    ///
+    /// Mirrors Spark's `CALL <catalog>.system.register_table(...)`. Useful
+    /// for the golden-dataset workflow (generate once, register into each
+    /// test catalog), catalog migration (drop on source + register on
+    /// destination = data-free move), and disaster recovery (rebuild the
+    /// catalog from intact S3 by re-registering every `metadata.json`).
+    async fn register_table(
+        &self,
+        session: &Session,
+        table_ref: &TableRef,
+        metadata_location: &str,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let catalog = self.create_catalog_bridge(session).await?;
+        let ident = to_table_ident(table_ref);
+
+        info!(
+            user = %session.user.username,
+            table = %ident,
+            metadata_location = metadata_location,
+            "register_table: requesting catalog registration"
+        );
+
+        let table = catalog
+            .register_table(&ident, metadata_location.to_string())
+            .await
+            .map_err(|e| classify_commit_error(e, "register_table"))?;
+
+        // Invalidate the table cache so subsequent SELECTs see the
+        // registration immediately. The cache key is the bearer token
+        // fingerprint plus the table identifier, so a stale "table not
+        // found" entry from an earlier load would otherwise mask the
+        // registered table for up to the cache TTL.
+        // Force every session to re-resolve the table on next access so the
+        // register / drop is visible without waiting for the soft TTL to
+        // expire. Cheap (one moka clear) and bounded to one catalog
+        // operation per CALL.
+        sqe_catalog::invalidate_rest_catalog_cache_all().await;
+
+        let snapshot_id = table
+            .metadata()
+            .current_snapshot()
+            .map(|s| s.snapshot_id())
+            .unwrap_or(0);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("table_identifier", DataType::Utf8, false),
+            Field::new("snapshot_id", DataType::Int64, false),
+            Field::new("metadata_location", DataType::Utf8, false),
+            Field::new("status", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![ident.to_string()])),
+                Arc::new(Int64Array::from(vec![snapshot_id])),
+                Arc::new(StringArray::from(vec![metadata_location.to_string()])),
+                Arc::new(StringArray::from(vec!["registered"])),
+            ],
+        )
+        .map_err(|e| SqeError::Execution(format!("register_table summary: {e}")))?;
+        Ok(vec![batch])
+    }
+
+    /// Drop a table from the catalog without deleting its data files. The
+    /// `purge => true` form is reserved for a follow-up change that wires
+    /// FileIO::delete_prefix into the drop path; today it returns an
+    /// explicit "not yet implemented" error so users do not accidentally
+    /// rely on it.
+    async fn drop_table(
+        &self,
+        session: &Session,
+        table_ref: &TableRef,
+        purge: bool,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        if purge {
+            return Err(SqeError::Execution(
+                "CALL system.drop_table(purge => true) is not yet implemented; \
+                 drop without purge then delete the table prefix manually"
+                    .into(),
+            ));
+        }
+
+        let catalog = self.create_catalog_bridge(session).await?;
+        let ident = to_table_ident(table_ref);
+
+        info!(
+            user = %session.user.username,
+            table = %ident,
+            "drop_table: requesting catalog drop (no purge)"
+        );
+
+        catalog
+            .drop_table(&ident)
+            .await
+            .map_err(|e| classify_commit_error(e, "drop_table"))?;
+
+        // Force every session to re-resolve the table on next access so the
+        // register / drop is visible without waiting for the soft TTL to
+        // expire. Cheap (one moka clear) and bounded to one catalog
+        // operation per CALL.
+        sqe_catalog::invalidate_rest_catalog_cache_all().await;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("table_identifier", DataType::Utf8, false),
+            Field::new("purge", DataType::Utf8, false),
+            Field::new("status", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![ident.to_string()])),
+                Arc::new(StringArray::from(vec!["false"])),
+                Arc::new(StringArray::from(vec!["dropped"])),
+            ],
+        )
+        .map_err(|e| SqeError::Execution(format!("drop_table summary: {e}")))?;
+        Ok(vec![batch])
     }
 
     /// Read-only probe: walk the in-memory query log and surface the top
