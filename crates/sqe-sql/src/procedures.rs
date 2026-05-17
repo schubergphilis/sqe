@@ -81,6 +81,47 @@ pub enum ProcedureCall {
         /// delete the orphan prefixes.
         dry_run: bool,
     },
+    /// Register an existing Iceberg table (data files + metadata already on
+    /// the object store) into the session's catalog by recording a pointer
+    /// to its current `metadata.json`. No data movement. Mirrors Spark's
+    /// `CALL <catalog>.system.register_table(...)`.
+    RegisterTable {
+        table: TableRef,
+        /// Absolute URI of the table's current `metadata.json`. The catalog
+        /// backend reads it to validate schema + partition spec + current
+        /// snapshot before committing the registration.
+        metadata_location: String,
+    },
+    /// Drop a table from the catalog. Default `purge => false` removes the
+    /// catalog entry only; data and metadata files on the object store are
+    /// preserved (the table can be re-registered with [`RegisterTable`]).
+    /// `purge => true` additionally deletes underlying files via the
+    /// backend's `purge_table` operation.
+    DropTable {
+        table: TableRef,
+        /// When true, delete data + metadata files in addition to the catalog
+        /// entry. Default false (catalog-only drop, safe for migration and
+        /// recovery workflows).
+        purge: bool,
+    },
+    /// Move a table's current snapshot pointer to a previous snapshot id.
+    /// Subsequent reads without an explicit `FOR VERSION AS OF` see the
+    /// chosen snapshot. Used for pinning to a known-good state for
+    /// reproducible testing. Does NOT append a new snapshot — the history
+    /// is rewritten to mark `snapshot_id` as current.
+    SetCurrentSnapshot {
+        table: TableRef,
+        /// Target snapshot id. Must exist in the table's snapshot log.
+        snapshot_id: i64,
+    },
+    /// Roll a table back to a previous snapshot by appending a new snapshot
+    /// whose state matches the target. Preserves the snapshot log (audit
+    /// trail) unlike [`SetCurrentSnapshot`].
+    RollbackToSnapshot {
+        table: TableRef,
+        /// Target snapshot id. Must exist in the table's snapshot log.
+        snapshot_id: i64,
+    },
 }
 
 impl ProcedureCall {
@@ -93,6 +134,10 @@ impl ProcedureCall {
             ProcedureCall::RewriteManifests { .. } => "rewrite_manifests",
             ProcedureCall::SuggestBloomFilterColumns { .. } => "suggest_bloom_filter_columns",
             ProcedureCall::PurgeOrphanLocations { .. } => "purge_orphan_locations",
+            ProcedureCall::RegisterTable { .. } => "register_table",
+            ProcedureCall::DropTable { .. } => "drop_table",
+            ProcedureCall::SetCurrentSnapshot { .. } => "set_current_snapshot",
+            ProcedureCall::RollbackToSnapshot { .. } => "rollback_to_snapshot",
         }
     }
 
@@ -104,7 +149,11 @@ impl ProcedureCall {
             | ProcedureCall::ExpireSnapshots { table, .. }
             | ProcedureCall::RemoveOrphanFiles { table, .. }
             | ProcedureCall::RewriteManifests { table }
-            | ProcedureCall::SuggestBloomFilterColumns { table, .. } => Some(table),
+            | ProcedureCall::SuggestBloomFilterColumns { table, .. }
+            | ProcedureCall::RegisterTable { table, .. }
+            | ProcedureCall::DropTable { table, .. }
+            | ProcedureCall::SetCurrentSnapshot { table, .. }
+            | ProcedureCall::RollbackToSnapshot { table, .. } => Some(table),
             ProcedureCall::PurgeOrphanLocations { .. } => None,
         }
     }
@@ -233,7 +282,91 @@ pub fn try_parse_call(stmt: &Statement) -> sqe_core::Result<Option<ProcedureCall
         "rewrite_manifests" => parse_rewrite_manifests(args).map(Some),
         "suggest_bloom_filter_columns" => parse_suggest_bloom_filter_columns(args).map(Some),
         "purge_orphan_locations" => parse_purge_orphan_locations(args).map(Some),
+        "register_table" => parse_register_table(args).map(Some),
+        "drop_table" => parse_drop_table(args).map(Some),
+        "set_current_snapshot" => parse_set_current_snapshot(args).map(Some),
+        "rollback_to_snapshot" => parse_rollback_to_snapshot(args).map(Some),
         _ => Ok(None),
+    }
+}
+
+/// Parse `CALL system.register_table(table => 'ns.t', metadata_location => 's3://...')`.
+fn parse_register_table(mut args: Vec<(String, Expr)>) -> sqe_core::Result<ProcedureCall> {
+    let table = take_table(&mut args)?;
+    let metadata_location = take_option(&mut args, "metadata_location", |e| {
+        expect_string(e, "metadata_location")
+    })?
+    .ok_or_else(|| {
+        SqeError::Execution(
+            "CALL system.register_table requires `metadata_location => 's3://...'`".into(),
+        )
+    })?;
+    expect_no_remaining(&args, "register_table")?;
+    Ok(ProcedureCall::RegisterTable {
+        table,
+        metadata_location,
+    })
+}
+
+/// Parse `CALL system.drop_table(table => 'ns.t'[, purge => true|false])`.
+///
+/// `purge` defaults to `false` so the safe operation (catalog-only drop,
+/// data files preserved) is the default. A typo cannot cause data loss.
+fn parse_drop_table(mut args: Vec<(String, Expr)>) -> sqe_core::Result<ProcedureCall> {
+    let table = take_table(&mut args)?;
+    let purge = take_option(&mut args, "purge", |e| expect_bool(e, "purge"))?.unwrap_or(false);
+    expect_no_remaining(&args, "drop_table")?;
+    Ok(ProcedureCall::DropTable { table, purge })
+}
+
+/// Parse `CALL system.set_current_snapshot(table => 'ns.t', snapshot_id => 1234567890)`.
+fn parse_set_current_snapshot(mut args: Vec<(String, Expr)>) -> sqe_core::Result<ProcedureCall> {
+    let table = take_table(&mut args)?;
+    let snapshot_id = take_option(&mut args, "snapshot_id", |e| expect_i64(e, "snapshot_id"))?
+        .ok_or_else(|| {
+            SqeError::Execution(
+                "CALL system.set_current_snapshot requires `snapshot_id => <id>`".into(),
+            )
+        })?;
+    expect_no_remaining(&args, "set_current_snapshot")?;
+    Ok(ProcedureCall::SetCurrentSnapshot { table, snapshot_id })
+}
+
+/// Parse `CALL system.rollback_to_snapshot(table => 'ns.t', snapshot_id => 1234567890)`.
+fn parse_rollback_to_snapshot(mut args: Vec<(String, Expr)>) -> sqe_core::Result<ProcedureCall> {
+    let table = take_table(&mut args)?;
+    let snapshot_id = take_option(&mut args, "snapshot_id", |e| expect_i64(e, "snapshot_id"))?
+        .ok_or_else(|| {
+            SqeError::Execution(
+                "CALL system.rollback_to_snapshot requires `snapshot_id => <id>`".into(),
+            )
+        })?;
+    expect_no_remaining(&args, "rollback_to_snapshot")?;
+    Ok(ProcedureCall::RollbackToSnapshot { table, snapshot_id })
+}
+
+/// Parse a signed integer literal. Iceberg snapshot ids are i64; sqlparser
+/// emits them through `Value::Number`. Negative literals show up as
+/// `UnaryOp(Minus, Number)` because sqlparser does not fold unary minus
+/// into the number itself.
+fn expect_i64(expr: &Expr, field: &str) -> sqe_core::Result<i64> {
+    use sqlparser::ast::UnaryOperator;
+    match expr {
+        Expr::Value(Value::Number(n, _)) => n.parse::<i64>().map_err(|e| {
+            SqeError::Execution(format!("Invalid integer for '{field}': {n} ({e})"))
+        }),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: inner,
+        } => {
+            let inner_val = expect_i64(inner, field)?;
+            inner_val
+                .checked_neg()
+                .ok_or_else(|| SqeError::Execution(format!("Value for '{field}' overflows i64")))
+        }
+        other => Err(SqeError::Execution(format!(
+            "Expected integer for '{field}', got: {other}"
+        ))),
     }
 }
 
@@ -745,6 +878,148 @@ mod tests {
                 history_limit, ..
             } => assert_eq!(history_limit, Some(500)),
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    // ── Catalog procedures: register_table / drop_table / snapshots ──────
+
+    #[test]
+    fn parses_register_table() {
+        let stmt = parse_first(
+            "CALL system.register_table(table => 'ns.t', metadata_location => 's3://bucket/ns/t/metadata/v1.metadata.json')",
+        );
+        let call = try_parse_call(&stmt).unwrap().expect("match");
+        match call {
+            ProcedureCall::RegisterTable {
+                table,
+                metadata_location,
+            } => {
+                assert_eq!(table.namespace, "ns");
+                assert_eq!(table.name, "t");
+                assert_eq!(
+                    metadata_location,
+                    "s3://bucket/ns/t/metadata/v1.metadata.json"
+                );
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_table_requires_metadata_location() {
+        let stmt = parse_first("CALL system.register_table(table => 'ns.t')");
+        let err = try_parse_call(&stmt).expect_err("missing metadata_location should reject");
+        assert!(
+            err.to_string().contains("metadata_location"),
+            "error must name the missing arg: {err}"
+        );
+    }
+
+    #[test]
+    fn register_table_rejects_unknown_arg() {
+        let stmt = parse_first(
+            "CALL system.register_table(table => 'ns.t', metadata_location => 's3://x', \
+             properties => 'foo')",
+        );
+        let err = try_parse_call(&stmt).expect_err("unknown arg should reject");
+        assert!(err.to_string().contains("properties"));
+    }
+
+    #[test]
+    fn parses_drop_table_defaults_purge_false() {
+        let stmt = parse_first("CALL system.drop_table(table => 'ns.t')");
+        let call = try_parse_call(&stmt).unwrap().expect("match");
+        match call {
+            ProcedureCall::DropTable { table, purge } => {
+                assert_eq!(table.as_string(), "ns.t");
+                assert!(!purge, "purge must default to false (safe)");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_drop_table_with_purge_true() {
+        let stmt = parse_first("CALL system.drop_table(table => 'ns.t', purge => true)");
+        let call = try_parse_call(&stmt).unwrap().expect("match");
+        match call {
+            ProcedureCall::DropTable { purge, .. } => assert!(purge),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_set_current_snapshot() {
+        let stmt = parse_first(
+            "CALL system.set_current_snapshot(table => 'ns.t', snapshot_id => 1234567890)",
+        );
+        let call = try_parse_call(&stmt).unwrap().expect("match");
+        match call {
+            ProcedureCall::SetCurrentSnapshot { table, snapshot_id } => {
+                assert_eq!(table.as_string(), "ns.t");
+                assert_eq!(snapshot_id, 1_234_567_890);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_current_snapshot_requires_snapshot_id() {
+        let stmt = parse_first("CALL system.set_current_snapshot(table => 'ns.t')");
+        let err = try_parse_call(&stmt).expect_err("missing snapshot_id should reject");
+        assert!(err.to_string().contains("snapshot_id"));
+    }
+
+    #[test]
+    fn parses_rollback_to_snapshot() {
+        let stmt = parse_first(
+            "CALL system.rollback_to_snapshot(table => 'ns.t', snapshot_id => 9876543210)",
+        );
+        let call = try_parse_call(&stmt).unwrap().expect("match");
+        match call {
+            ProcedureCall::RollbackToSnapshot { table, snapshot_id } => {
+                assert_eq!(table.as_string(), "ns.t");
+                assert_eq!(snapshot_id, 9_876_543_210);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_id_accepts_negative() {
+        // Iceberg snapshot ids are i64 and can be negative when generated
+        // by hashing. The parser must accept the unary-minus form.
+        let stmt = parse_first(
+            "CALL system.set_current_snapshot(table => 'ns.t', snapshot_id => -42)",
+        );
+        let call = try_parse_call(&stmt).unwrap().expect("match");
+        match call {
+            ProcedureCall::SetCurrentSnapshot { snapshot_id, .. } => assert_eq!(snapshot_id, -42),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_procedures_name_label_stable() {
+        for (sql, expected) in [
+            (
+                "CALL system.register_table(table => 'ns.t', metadata_location => 's3://x')",
+                "register_table",
+            ),
+            ("CALL system.drop_table(table => 'ns.t')", "drop_table"),
+            (
+                "CALL system.set_current_snapshot(table => 'ns.t', snapshot_id => 1)",
+                "set_current_snapshot",
+            ),
+            (
+                "CALL system.rollback_to_snapshot(table => 'ns.t', snapshot_id => 1)",
+                "rollback_to_snapshot",
+            ),
+        ] {
+            let stmt = parse_first(sql);
+            let call = try_parse_call(&stmt).unwrap().expect("match");
+            assert_eq!(call.name(), expected, "for {sql}");
+            assert_eq!(call.table().unwrap().as_string(), "ns.t");
         }
     }
 }
