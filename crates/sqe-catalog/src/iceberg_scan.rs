@@ -1069,21 +1069,43 @@ impl ExecutionPlan for IcebergScanExec {
             // is ready pass through unfiltered (same as no dynamic filter).
             debug!(
                 file_count = file_entries.len(),
+                pushed_filters = pushed_down_filters.len(),
                 "IcebergScanExec: using iceberg-rust scan.to_arrow() path"
             );
             let mut sb = table.scan();
             if let Some(sid) = snapshot_id { sb = sb.snapshot_id(sid); }
             if let Some(ref cols) = projection { sb = sb.select(cols.iter().map(|s| s.as_str())); }
             if let Some(pred) = predicates { sb = sb.with_filter(pred); }
+            // Two-tier dynamic-filter pushdown.
+            //
+            // Tier 1 (scan-time): the DynamicPredicate is sampled once
+            // per file scan task and feeds manifest, row-group min/max,
+            // page-index, and parquet RowFilter pruning. This is what
+            // collapsed TPC-DS q82 1787->113ms (and the whole TPC-DS
+            // sweep 40s -> 16s): selective dim filters prune row groups
+            // before any rows are decoded.
+            //
+            // Tier 2 (post-scan stream wrapper): re-evaluates the
+            // filters per batch. iceberg-rust only samples
+            // `current()` once at task open; for tables with a single
+            // file (SSB SF1 lineorder is a 6-row-group 151MB file = one
+            // task) that single sample lands BEFORE the dim build sides
+            // have finished, so the dynamic filter is still lit(true)
+            // and Tier 1 contributes nothing. The wrapper re-samples
+            // every 8192-row batch, so once the build sides seal a few
+            // ms in, every subsequent batch sees the real filter and
+            // pruning works. Skipping the wrapper regressed SSB by
+            // +21% (1.6s) without buying anything elsewhere; keeping it
+            // costs ~3ms when Tier 1 already pruned because every
+            // surviving batch passes the wrapper cheaply.
+            if !pushed_down_filters.is_empty() {
+                let dyn_pred = iceberg_datafusion::physical_plan::physical_to_predicate::RuntimeFiltersDynamicPredicate::new(pushed_down_filters.clone());
+                sb = sb.with_dynamic_predicate(dyn_pred);
+            }
             let scan = sb.build().map_err(|e| DataFusionError::External(Box::new(e)))?;
             let arrow_stream = scan.to_arrow().await.map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-            // Wrap the stream with dynamic filter evaluation if filters are present.
             let s: BatchStream = if !pushed_down_filters.is_empty() {
-                debug!(
-                    count = pushed_down_filters.len(),
-                    "Applying dynamic filters as post-scan filter on fallback path"
-                );
                 let filters = pushed_down_filters.clone();
                 let filtered_schema = schema.clone();
                 arrow_stream
@@ -1094,9 +1116,6 @@ impl ExecutionPlan for IcebergScanExec {
                         async move {
                             let mut result = batch;
                             for filter in &filters {
-                                // For DynamicFilterPhysicalExpr, get the current snapshot
-                                // (non-blocking — returns the latest filter or lit(true) if
-                                // the build side hasn't finished yet).
                                 let (expr, is_dynamic): (Arc<dyn PhysicalExpr>, bool) = if let Some(dynamic) = filter.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
                                     match dynamic.current() {
                                         Ok(e) => (e, true),
@@ -1105,23 +1124,17 @@ impl ExecutionPlan for IcebergScanExec {
                                 } else {
                                     (Arc::clone(filter), false)
                                 };
-
                                 // DynamicFilterPhysicalExpr carries runtime literals
                                 // typed to the build-side column (Iceberg Int32 for
-                                // integer joinkeys); widening the probe batch to Int64
-                                // would make the column-vs-literal comparison fail
-                                // ("Invalid comparison operation: Int64 >= Int32") and
-                                // the eval-Err arm below silently skips. Static
-                                // predicates already carry planner-inserted CASTs so
-                                // widening is still required for them.
+                                // integer joinkeys); widening the probe batch to
+                                // Int64 would make the column-vs-literal comparison
+                                // fail and the eval-Err arm silently skips.
                                 let coerced = if is_dynamic {
                                     result.clone()
                                 } else {
                                     PhysicalExprPredicate::coerce_batch_types(&expr, &result)
                                         .unwrap_or_else(|_| result.clone())
                                 };
-
-                                // Evaluate the filter on the coerced batch
                                 let predicate = match expr.evaluate(&coerced) {
                                     Ok(ColumnarValue::Array(arr)) => {
                                         match arr.as_any().downcast_ref::<BooleanArray>() {
@@ -1131,15 +1144,13 @@ impl ExecutionPlan for IcebergScanExec {
                                     }
                                     Ok(ColumnarValue::Scalar(s)) => {
                                         if s == datafusion::common::ScalarValue::Boolean(Some(true)) {
-                                            continue; // All rows pass
+                                            continue;
                                         } else {
                                             return Ok(RecordBatch::new_empty(filtered_schema));
                                         }
                                     }
-                                    Err(_) => continue, // Still failed after coercion, skip
+                                    Err(_) => continue,
                                 };
-
-                                // Apply the boolean mask
                                 result = arrow::compute::filter_record_batch(&result, &predicate)
                                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
                             }
