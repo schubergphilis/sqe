@@ -63,7 +63,7 @@ fn ctas_wrapper_yields_inputs_outputs_and_column_lineage() {
     assert_eq!(outputs[0].namespace, "https://polaris.example/api/catalog");
 
     let cl = outputs[0]
-        .outputFacets
+        .facets
         .columnLineage
         .as_ref()
         .expect("columnLineage facet must be present for CTAS write");
@@ -142,7 +142,7 @@ fn ctas_wrapper_with_aggregation_uses_correct_transformation() {
     assert_eq!(outputs.len(), 1);
 
     let cl = outputs[0]
-        .outputFacets
+        .facets
         .columnLineage
         .as_ref()
         .expect("columnLineage facet must be present");
