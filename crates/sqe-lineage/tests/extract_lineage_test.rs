@@ -50,7 +50,7 @@ fn insert_into_yields_inputs_outputs_and_column_lineage() {
     assert_eq!(outputs[0].name, "sales.archive");
 
     let cl = outputs[0]
-        .outputFacets
+        .facets
         .columnLineage
         .as_ref()
         .expect("columnLineage facet present");

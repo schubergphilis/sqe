@@ -124,16 +124,17 @@ async fn ctas_complete_event_with_captured_plan_carries_column_lineage() {
     let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
     assert_eq!(body["eventType"], "COMPLETE");
 
-    // The fix: outputs[0].outputFacets.columnLineage is populated because
-    // the write plan was captured. Without the fix, plan = None and this
-    // facet would be missing entirely.
+    // The fix: outputs[0].facets.columnLineage is populated because the
+    // write plan was captured. Without the fix, plan = None and this
+    // facet would be missing entirely. (Pre-spec-fix this lived under
+    // outputFacets; OL 2.0 places ColumnLineageDatasetFacet in facets.)
     let outputs = body["outputs"]
         .as_array()
         .expect("outputs array present");
     assert_eq!(outputs.len(), 1, "exactly one output dataset");
     assert_eq!(outputs[0]["name"], "sales.archive");
 
-    let cl = &outputs[0]["outputFacets"]["columnLineage"];
+    let cl = &outputs[0]["facets"]["columnLineage"];
     assert!(
         cl.is_object(),
         "columnLineage facet must be an object, got: {cl}"

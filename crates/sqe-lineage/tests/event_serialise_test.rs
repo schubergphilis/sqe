@@ -74,6 +74,7 @@ fn snapshot_select_complete() {
                     name: "polaris".into(),
                     uri: "https://polaris.example/api/catalog".into(),
                 }),
+                columnLineage: None,
             },
         }],
         outputs: vec![],
@@ -118,10 +119,11 @@ fn snapshot_ctas_complete_with_column_lineage() {
         outputs: vec![OutputDataset {
             namespace: "https://polaris.example/api/catalog".into(),
             name: "sales.archive".into(),
-            facets: DatasetFacets::default(),
-            outputFacets: OutputDatasetFacets {
+            facets: DatasetFacets {
                 columnLineage: Some(ColumnLineageFacet { fields: col_fields }),
+                ..DatasetFacets::default()
             },
+            outputFacets: OutputDatasetFacets::default(),
         }],
     };
     insta::assert_json_snapshot!(ev);

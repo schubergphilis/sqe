@@ -85,12 +85,20 @@ pub struct DatasetFacets {
     pub schema: Option<SchemaFacet>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dataSource: Option<DataSourceFacet>,
+    // OL 2.0 places ColumnLineageDatasetFacet in DatasetFacets, not
+    // OutputDatasetFacets. Marquez-style ingesters (including the
+    // data-platform backend) only walk ``facets`` when applying
+    // dataset-scoped facets, so emitting columnLineage from
+    // outputFacets caused it to be silently dropped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub columnLineage: Option<ColumnLineageFacet>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OutputDatasetFacets {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub columnLineage: Option<ColumnLineageFacet>,
+    // Reserved for facets that are genuinely write-only per the OL
+    // spec (outputStatistics, etc.). columnLineage moved to
+    // ``DatasetFacets`` above to match the spec and the consumer.
 }
 
 // Facet types. Full versions stay here; no partial fills.

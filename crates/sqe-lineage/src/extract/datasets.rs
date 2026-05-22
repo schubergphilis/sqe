@@ -62,6 +62,7 @@ pub fn extract_inputs(plan: &LogicalPlan, lookup: &CatalogLookup) -> Vec<InputDa
                         name: catalog.clone(),
                         uri: namespace,
                     }),
+                    columnLineage: None,
                 },
             });
         }
@@ -73,9 +74,11 @@ pub fn extract_inputs(plan: &LogicalPlan, lookup: &CatalogLookup) -> Vec<InputDa
 /// Walk the plan for write nodes (INSERT, CTAS via CreateMemoryTable, CREATE
 /// EXTERNAL TABLE, CREATE VIEW) and produce one OutputDataset per write target.
 ///
-/// Schema facet is left empty for now: target column types come from the DML
-/// statement's projected schema, not a TableSource. E14 fills it in alongside
-/// column lineage.
+/// The schema facet is populated by the caller (``extract::extract_lineage``)
+/// after this function runs — the projected output schema comes from the DML
+/// source plan, which this layer doesn't see. We leave ``facets.schema = None``
+/// here as a sentinel so the caller's "did this output already get a schema?"
+/// check is unambiguous.
 pub fn extract_outputs(plan: &LogicalPlan, lookup: &CatalogLookup) -> Vec<OutputDataset> {
     let mut out = Vec::new();
     let _ = plan.apply(|node| {
@@ -103,6 +106,7 @@ pub fn extract_outputs(plan: &LogicalPlan, lookup: &CatalogLookup) -> Vec<Output
                             name: catalog.clone(),
                             uri: namespace,
                         }),
+                        columnLineage: None,
                     },
                     outputFacets: OutputDatasetFacets::default(),
                 });
