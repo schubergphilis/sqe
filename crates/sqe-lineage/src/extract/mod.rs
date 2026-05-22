@@ -66,13 +66,27 @@ pub fn extract_lineage(
     let inputs = datasets::extract_inputs(plan, lookup);
     let mut outputs = datasets::extract_outputs(plan, lookup);
 
-    // For DML/DDL writes, attach column lineage by tracing the source plan
-    // and projecting it onto the target schema by ordinal.
+    // For DML/DDL writes, attach the projected target schema and column
+    // lineage by tracing the source plan. The source plan's output
+    // schema IS the target schema (the planner aligns columns by
+    // ordinal at plan-build time per spec §5.3), so we can lift fields
+    // and types directly from it without consulting the catalog.
     if let Some(out) = outputs.first_mut() {
         if let Some(source_plan) = source_of_write(plan) {
+            out.facets.schema = Some(SchemaFacet {
+                fields: source_plan
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| SchemaField {
+                        name: f.name().clone(),
+                        field_type: f.data_type().to_string(),
+                    })
+                    .collect(),
+            });
             let trace = columns::trace_plan(source_plan);
             let target_fields = output_field_names(source_plan);
-            out.outputFacets.columnLineage =
+            out.facets.columnLineage =
                 Some(build_column_lineage_facet(&target_fields, &trace, lookup));
         }
     }
@@ -161,6 +175,7 @@ pub fn extract_from_hint(
                         name: catalog.clone(),
                         uri: namespace,
                     }),
+                    columnLineage: None,
                 },
                 outputFacets: OutputDatasetFacets::default(),
             };
