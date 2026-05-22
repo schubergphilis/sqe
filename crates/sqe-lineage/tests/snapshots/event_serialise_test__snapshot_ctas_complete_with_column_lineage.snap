@@ -37,8 +37,7 @@ expression: ev
     {
       "namespace": "https://polaris.example/api/catalog",
       "name": "sales.archive",
-      "facets": {},
-      "outputFacets": {
+      "facets": {
         "columnLineage": {
           "fields": {
             "doubled": {
@@ -60,7 +59,8 @@ expression: ev
             }
           }
         }
-      }
+      },
+      "outputFacets": {}
     }
   ]
 }
