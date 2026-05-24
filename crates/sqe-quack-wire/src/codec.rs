@@ -128,6 +128,12 @@ impl BinarySerializer {
         varint::encode_unsigned(bytes.len() as u64, &mut self.out);
         self.out.extend_from_slice(bytes);
     }
+
+    /// DuckDB `WriteDataPtr(ptr, count)`: varint length followed by raw bytes.
+    pub fn write_data_ptr(&mut self, bytes: &[u8]) {
+        varint::encode_unsigned(bytes.len() as u64, &mut self.out);
+        self.out.extend_from_slice(bytes);
+    }
 }
 
 pub struct BinaryDeserializer<'a> {
@@ -284,6 +290,18 @@ impl<'a> BinaryDeserializer<'a> {
     pub fn read_list_count(&mut self) -> crate::Result<u64> {
         self.read_u64()
     }
+
+    /// DuckDB `ReadDataPtr`: varint length followed by raw bytes. Returns an
+    /// owned copy so the caller does not need to track buffer lifetimes.
+    pub fn read_data_ptr(&mut self) -> crate::Result<Vec<u8>> {
+        let len = self.read_u64()? as usize;
+        if self.buf.len() - self.pos < len {
+            return Err(crate::WireError::UnexpectedEof);
+        }
+        let bytes = self.buf[self.pos..self.pos + len].to_vec();
+        self.pos += len;
+        Ok(bytes)
+    }
 }
 
 #[cfg(test)]
@@ -434,6 +452,25 @@ mod tests {
         assert!(d.read_optional(7).unwrap());
         assert!(d.read_bool().unwrap());
         d.expect_object_end().unwrap();
+    }
+
+    #[test]
+    fn write_data_ptr_roundtrips_empty_and_nonempty() {
+        for payload in [&[][..], &[0xDE, 0xAD, 0xBE, 0xEF][..], &[0xAA; 4096][..]] {
+            let mut s = BinarySerializer::new();
+            s.begin_object();
+            s.begin_property(1);
+            s.write_data_ptr(payload);
+            s.end_property();
+            s.end_object();
+            let bytes = s.into_bytes();
+
+            let mut d = BinaryDeserializer::new(&bytes);
+            d.expect_field(1).unwrap();
+            let decoded = d.read_data_ptr().unwrap();
+            d.expect_object_end().unwrap();
+            assert_eq!(decoded, payload);
+        }
     }
 
     #[test]
