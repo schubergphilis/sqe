@@ -3,6 +3,7 @@
 //! Pinned to `quack_version = 1` and DuckDB extension `v1.5-variegata`.
 //! See `docs/quack-protocol.md` for the wire format reference.
 
+pub mod arrow_bridge;
 pub mod codec;
 pub mod data_chunk;
 pub mod message;
@@ -30,6 +31,8 @@ pub enum WireError {
     UnsupportedLogicalType(crate::data_chunk::LogicalTypeId),
     #[error("VectorType {0} (compressed format) not yet supported by sqe-quack-wire")]
     UnsupportedVectorType(u8),
+    #[error("Arrow data type {0} not yet supported by sqe-quack-wire::arrow_bridge")]
+    UnsupportedArrowType(String),
 }
 
 pub type Result<T> = std::result::Result<T, WireError>;
