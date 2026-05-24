@@ -14,6 +14,7 @@ members = [
     "crates/sqe-metrics",
     "crates/sqe-lineage",
     "crates/sqe-quack-wire",
+    "crates/sqe-quack-server",
     "crates/sqe-cli",
     "crates/sqe-bench",
     "xtask",
