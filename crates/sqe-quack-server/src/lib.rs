@@ -4,9 +4,11 @@
 //! See `docs/quack-protocol.md` for the wire reference.
 
 pub mod app;
+pub mod query_executor;
 pub mod session;
 
 pub use app::{router, QuackServerState};
+pub use query_executor::{QueryError, QueryExecutor};
 pub use session::{Session, SessionStore};
 
 #[derive(Debug, thiserror::Error)]

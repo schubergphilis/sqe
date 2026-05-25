@@ -13,13 +13,16 @@ use axum::{
 use bytes::Bytes;
 use sqe_auth::{AuthError, AuthProvider, FlightCredentials};
 use sqe_core::SecretString;
+use sqe_quack_wire::arrow_bridge::record_batch_to_data_chunk;
+use sqe_quack_wire::data_chunk::DataChunk;
 use sqe_quack_wire::message::{
     decode_message, encode_message, ConnectionResponse, ErrorResponse, MessageHeader, MessageType,
-    QuackMessage,
+    PrepareResponse, QuackMessage,
 };
 use uuid::Uuid;
 
-use crate::session::{Session, SessionStore};
+use crate::query_executor::{QueryError, QueryExecutor};
+use crate::session::{identity_to_core_session, Session, SessionStore};
 
 const QUACK_VERSION: u64 = 1;
 const APPLICATION_VND_DUCKDB: &str = "application/vnd.duckdb";
@@ -30,18 +33,23 @@ pub struct QuackServerState {
     pub server_duckdb_version: String,
     pub server_platform: String,
     pub auth_provider: Arc<dyn AuthProvider>,
+    pub query_executor: Arc<dyn QueryExecutor>,
 }
 
 impl QuackServerState {
-    /// Construct a server state with a pluggable auth provider. Use an
-    /// `AuthChain` from `sqe-auth` in production; tests typically supply a
-    /// stub that returns a fixed `Identity`.
-    pub fn with_provider(auth_provider: Arc<dyn AuthProvider>) -> Self {
+    /// Construct a server state with a pluggable auth provider and query
+    /// executor. Use the production `AuthChain` + a `QueryHandler` adapter in
+    /// production; tests typically supply a stub for both.
+    pub fn new(
+        auth_provider: Arc<dyn AuthProvider>,
+        query_executor: Arc<dyn QueryExecutor>,
+    ) -> Self {
         Self {
             sessions: SessionStore::new(Duration::from_secs(600)),
             server_duckdb_version: format!("sqe-{}", env!("CARGO_PKG_VERSION")),
             server_platform: std::env::consts::OS.to_string(),
             auth_provider,
+            query_executor,
         }
     }
 }
@@ -78,7 +86,7 @@ async fn handle_quack(
             handle_disconnect_message(&state, &request_header)
         }
         (MessageType::PrepareRequest, QuackMessage::PrepareRequest(req)) => {
-            handle_prepare_request(&state, &request_header, req)
+            handle_prepare_request(&state, &request_header, req).await
         }
         (msg_type, _) => error_response(
             &request_header.connection_id,
@@ -88,24 +96,127 @@ async fn handle_quack(
     }
 }
 
-fn handle_prepare_request(
+async fn handle_prepare_request(
     state: &QuackServerState,
     request_header: &MessageHeader,
-    _req: sqe_quack_wire::message::PrepareRequest,
+    req: sqe_quack_wire::message::PrepareRequest,
 ) -> (StatusCode, [(&'static str, &'static str); 1], Vec<u8>) {
-    if state.sessions.get(&request_header.connection_id).is_none() {
-        return error_response(
-            &request_header.connection_id,
-            request_header.client_query_id,
-            "SQE-AUTH: unknown connection_id".to_string(),
-        );
+    let session = match state.sessions.get(&request_header.connection_id) {
+        Some(s) => s,
+        None => {
+            return error_response(
+                &request_header.connection_id,
+                request_header.client_query_id,
+                "SQE-AUTH: unknown connection_id".to_string(),
+            );
+        }
+    };
+
+    let batches = match state
+        .query_executor
+        .execute(&session.core_session, &req.sql_query)
+        .await
+    {
+        Ok(b) => b,
+        Err(QueryError::Parse(msg)) => {
+            return error_response(
+                &request_header.connection_id,
+                request_header.client_query_id,
+                format!("SQE-PARSE: {msg}"),
+            );
+        }
+        Err(QueryError::Policy(msg)) => {
+            // Don't echo the policy decision detail — that's the row-filter
+            // / column-mask payload, and leaking it defeats the policy.
+            tracing::info!(reason = %msg, "policy denied query");
+            return error_response(
+                &request_header.connection_id,
+                request_header.client_query_id,
+                "SQE-POLICY: access denied".to_string(),
+            );
+        }
+        Err(QueryError::Execution(msg)) => {
+            return error_response(
+                &request_header.connection_id,
+                request_header.client_query_id,
+                format!("SQE-EXEC: {msg}"),
+            );
+        }
+        Err(QueryError::Internal(msg)) => {
+            tracing::warn!(error = %msg, "query executor internal error");
+            return error_response(
+                &request_header.connection_id,
+                request_header.client_query_id,
+                "SQE-EXEC: internal execution error".to_string(),
+            );
+        }
+    };
+
+    // Drain the batches into our DataChunk representation. Type/name schema
+    // is captured from the first batch; later batches must match (DataFusion
+    // guarantees this within a single result stream).
+    let (result_types, result_names) = match batches.first() {
+        Some(first) => {
+            let names: Vec<String> = first
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            // We materialise the first batch to read its column types into
+            // LogicalType; conversion happens once we collect all chunks.
+            let first_chunk = match record_batch_to_data_chunk(first) {
+                Ok(c) => c,
+                Err(e) => {
+                    return error_response(
+                        &request_header.connection_id,
+                        request_header.client_query_id,
+                        format!("SQE-EXEC: {e}"),
+                    );
+                }
+            };
+            let types: Vec<_> = first_chunk
+                .columns
+                .iter()
+                .map(|v| v.logical_type.clone())
+                .collect();
+            (types, names)
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+
+    let mut chunks: Vec<DataChunk> = Vec::with_capacity(batches.len());
+    for batch in &batches {
+        match record_batch_to_data_chunk(batch) {
+            Ok(c) => chunks.push(c),
+            Err(e) => {
+                return error_response(
+                    &request_header.connection_id,
+                    request_header.client_query_id,
+                    format!("SQE-EXEC: {e}"),
+                );
+            }
+        }
     }
-    error_response(
-        &request_header.connection_id,
-        request_header.client_query_id,
-        "SQE-EXEC: query execution is not yet wired to sqe-coordinator; result \
-         encoding is in place but no plan is built"
-            .to_string(),
+
+    let response_header = MessageHeader {
+        r#type: MessageType::PrepareResponse,
+        connection_id: request_header.connection_id.clone(),
+        client_query_id: request_header.client_query_id,
+    };
+    let body = QuackMessage::PrepareResponse(PrepareResponse {
+        result_types,
+        result_names,
+        // All batches inlined; FETCH loop lands once result streaming is needed.
+        needs_more_fetch: false,
+        results: chunks,
+        result_uuid: 0,
+    });
+    let bytes = encode_message(&response_header, &body);
+    (
+        StatusCode::OK,
+        [("content-type", APPLICATION_VND_DUCKDB)],
+        bytes,
     )
 }
 
@@ -181,10 +292,12 @@ async fn handle_connection_request(
     };
 
     let connection_id = Uuid::new_v4().to_string();
+    let core_session = identity_to_core_session(&identity);
     state.sessions.insert(Session {
         connection_id: connection_id.clone(),
         bearer_token: req.auth_string,
         identity,
+        core_session,
     });
 
     let response_header = MessageHeader {
