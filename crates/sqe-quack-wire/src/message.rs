@@ -82,9 +82,18 @@ impl MessageHeader {
         s.write_u8(self.r#type as u8);
         s.end_property();
 
-        s.begin_property(HEADER_FIELD_CONNECTION_ID);
-        s.write_string(&self.connection_id);
-        s.end_property();
+        // `connection_id` uses DuckDB's `WritePropertyWithDefault` pattern:
+        // the field is omitted on the wire when it's the empty string. A fresh
+        // ConnectionRequest from the DuckDB CLI has no connection_id assigned
+        // yet, so it skips field 2 entirely and jumps straight to field 3.
+        // Mirroring that here is the only thing that lets a real DuckDB
+        // client's handshake parse on the SQE side.
+        let present = !self.connection_id.is_empty();
+        s.begin_optional_property(HEADER_FIELD_CONNECTION_ID, present);
+        if present {
+            s.write_string(&self.connection_id);
+        }
+        s.end_optional_property(present);
 
         s.begin_property(HEADER_FIELD_CLIENT_QUERY_ID);
         s.write_u64(self.client_query_id.unwrap_or(OPTIONAL_IDX_INVALID));
@@ -96,8 +105,13 @@ impl MessageHeader {
         let type_tag = d.read_u8()?;
         let r#type = MessageType::from_u8(type_tag)?;
 
-        d.expect_field(HEADER_FIELD_CONNECTION_ID)?;
-        let connection_id = d.read_string()?;
+        // Optional per `WritePropertyWithDefault`: absent on the wire means
+        // empty string. Real DuckDB clients omit the field on first connect.
+        let connection_id = if d.read_optional(HEADER_FIELD_CONNECTION_ID)? {
+            d.read_string()?
+        } else {
+            String::new()
+        };
 
         d.expect_field(HEADER_FIELD_CLIENT_QUERY_ID)?;
         let raw = d.read_u64()?;
@@ -850,5 +864,60 @@ mod tests {
         assert_eq!(decoded.r#type, MessageType::ConnectionRequest);
         assert_eq!(decoded.connection_id, "");
         assert!(decoded.client_query_id.is_none());
+    }
+
+    /// Regression for the live DuckDB v1.5.3 interop: a fresh
+    /// `ConnectionRequest` header has an empty `connection_id`. The real
+    /// DuckDB client encodes that field via `WritePropertyWithDefault` and
+    /// omits it from the wire when it equals the default (empty string), so
+    /// the decoder must accept a header that jumps from field 1 (`type`)
+    /// straight to field 3 (`client_query_id`).
+    #[test]
+    fn header_decodes_when_empty_connection_id_field_is_absent_on_wire() {
+        // Hand-craft a header where field 2 is skipped, matching what DuckDB
+        // actually sends. Bytes: field_id 1 + varint(1=ConnectionRequest) +
+        // field_id 3 + varint(u64::MAX) + terminator.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // field 1 (type)
+        crate::varint::encode_unsigned(MessageType::ConnectionRequest as u64, &mut bytes);
+        bytes.extend_from_slice(&3u16.to_le_bytes()); // field 3 (client_query_id)
+        crate::varint::encode_unsigned(u64::MAX, &mut bytes); // INVALID_INDEX
+        bytes.extend_from_slice(&0xFFFFu16.to_le_bytes()); // object terminator
+
+        let mut d = BinaryDeserializer::new(&bytes);
+        let decoded = MessageHeader::decode(&mut d).expect("decode wire-form header");
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded.r#type, MessageType::ConnectionRequest);
+        assert_eq!(decoded.connection_id, "", "absent field 2 means empty string");
+        assert!(decoded.client_query_id.is_none());
+    }
+
+    #[test]
+    fn header_with_empty_connection_id_skips_field_on_wire() {
+        // Verifies the encode side mirrors DuckDB's behaviour: when
+        // connection_id is empty, field 2 must not appear on the wire.
+        let header = MessageHeader {
+            r#type: MessageType::ConnectionRequest,
+            connection_id: String::new(),
+            client_query_id: None,
+        };
+        let mut s = BinarySerializer::new();
+        s.begin_object();
+        header.encode(&mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+
+        // Expected layout: [01 00] (field 1) [01] (varint ConnectionRequest=1)
+        // [03 00] (field 3) [FF FF ... FF 01] (varint u64::MAX) [FF FF] (terminator)
+        // Field 2 (connection_id) must NOT appear.
+        // We check via decoding: after consuming field 1 we should next see field 3.
+        let mut d = BinaryDeserializer::new(&bytes);
+        d.expect_field(1).unwrap();
+        let _ty: u8 = d.read_u8().unwrap();
+        assert_eq!(
+            d.peek_field().unwrap(),
+            3,
+            "after field 1, wire must jump straight to field 3 (connection_id field 2 omitted)"
+        );
     }
 }
