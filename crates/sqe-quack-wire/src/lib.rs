@@ -4,6 +4,7 @@
 //! See `docs/quack-protocol.md` for the wire format reference.
 
 pub mod codec;
+pub mod data_chunk;
 pub mod message;
 pub mod varint;
 
@@ -21,6 +22,14 @@ pub enum WireError {
     UnknownMessageType(u8),
     #[error("message type {0:?} not yet supported by sqe-quack-wire (DataChunk-carrying messages deferred)")]
     UnsupportedMessageType(crate::message::MessageType),
+    #[error("unknown LogicalTypeId discriminant {0}")]
+    UnknownLogicalTypeId(u8),
+    #[error(
+        "LogicalType {0:?} is recognised but not yet supported (likely nested or parameterised)"
+    )]
+    UnsupportedLogicalType(crate::data_chunk::LogicalTypeId),
+    #[error("VectorType {0} (compressed format) not yet supported by sqe-quack-wire")]
+    UnsupportedVectorType(u8),
 }
 
 pub type Result<T> = std::result::Result<T, WireError>;
