@@ -221,6 +221,20 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                         roles: roles.clone(),
                     }))
                 }
+                AuthProviderConfig::BearerPassthrough { user, roles } => {
+                    crate::bearer_passthrough::warn_active();
+                    info!(
+                        index = i,
+                        user = %user,
+                        "Adding BearerPassthroughProvider to chain"
+                    );
+                    Arc::new(crate::bearer_passthrough::BearerPassthroughProvider::new(
+                        crate::bearer_passthrough::BearerPassthroughProviderConfig {
+                            user: user.clone(),
+                            roles: roles.clone(),
+                        },
+                    ))
+                }
             };
             providers.push(provider);
         }
