@@ -4,11 +4,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use moka::sync::Cache;
+use sqe_auth::Identity;
 
 #[derive(Debug, Clone)]
 pub struct Session {
     pub connection_id: String,
     pub bearer_token: String,
+    pub identity: Identity,
 }
 
 #[derive(Clone)]

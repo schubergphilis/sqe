@@ -1456,7 +1456,7 @@ impl std::str::FromStr for PolicyEngine {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct PolicyConfig {
     #[serde(default)]
     pub engine: PolicyEngine,
@@ -1477,16 +1477,6 @@ pub struct PolicyConfig {
     /// breaker, 30 s recovery window).
     #[serde(default)]
     pub opa: OpaConfig,
-}
-
-impl Default for PolicyConfig {
-    fn default() -> Self {
-        Self {
-            engine: PolicyEngine::default(),
-            mask_key: String::new(),
-            opa: OpaConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
