@@ -8,6 +8,8 @@ repository.workspace = true
 
 [dependencies]
 sqe-quack-wire = { path = "../sqe-quack-wire" }
+sqe-auth = { path = "../sqe-auth" }
+sqe-core = { path = "../sqe-core" }
 axum = { workspace = true }
 tokio = { workspace = true }
 moka = { workspace = true }
@@ -19,3 +21,4 @@ thiserror = { workspace = true }
 [dev-dependencies]
 reqwest = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+async-trait = { workspace = true }

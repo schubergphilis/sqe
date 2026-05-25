@@ -1,23 +1,13 @@
 //! Integration test for the PrepareRequest stub.
 
-use std::time::Duration;
+mod support;
 
-use sqe_quack_server::{router, QuackServerState};
 use sqe_quack_wire::message::{
     decode_message, encode_message, ConnectionRequest, MessageHeader, MessageType, PrepareRequest,
     QuackMessage,
 };
 
-async fn spawn_server() -> String {
-    let app = router(QuackServerState::new());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    format!("http://{addr}")
-}
+use support::{accept_provider, spawn_server_with};
 
 async fn connect(base: &str) -> String {
     let header = MessageHeader {
@@ -44,8 +34,8 @@ async fn connect(base: &str) -> String {
 }
 
 #[tokio::test]
-async fn prepare_request_returns_sqe_exec_error_until_datachunk_lands() {
-    let base = spawn_server().await;
+async fn prepare_request_returns_sqe_exec_error_until_coordinator_wires_up() {
+    let base = spawn_server_with(accept_provider()).await;
     let connection_id = connect(&base).await;
 
     let header = MessageHeader {
@@ -71,9 +61,9 @@ async fn prepare_request_returns_sqe_exec_error_until_datachunk_lands() {
         QuackMessage::ErrorResponse(e) => {
             assert!(e.message.starts_with("SQE-EXEC"));
             assert!(
-                e.message.to_lowercase().contains("datachunk")
+                e.message.to_lowercase().contains("coordinator")
                     || e.message.to_lowercase().contains("result"),
-                "error message should hint at the missing DataChunk codec: got {}",
+                "error message should reference the missing coordinator integration: {}",
                 e.message
             );
         }
@@ -83,7 +73,7 @@ async fn prepare_request_returns_sqe_exec_error_until_datachunk_lands() {
 
 #[tokio::test]
 async fn prepare_request_with_unknown_connection_id_is_rejected() {
-    let base = spawn_server().await;
+    let base = spawn_server_with(accept_provider()).await;
 
     let header = MessageHeader {
         r#type: MessageType::PrepareRequest,

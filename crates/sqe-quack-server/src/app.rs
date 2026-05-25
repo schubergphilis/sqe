@@ -11,6 +11,8 @@ use axum::{
     Router,
 };
 use bytes::Bytes;
+use sqe_auth::{AuthError, AuthProvider, FlightCredentials};
+use sqe_core::SecretString;
 use sqe_quack_wire::message::{
     decode_message, encode_message, ConnectionResponse, ErrorResponse, MessageHeader, MessageType,
     QuackMessage,
@@ -27,21 +29,20 @@ pub struct QuackServerState {
     pub sessions: SessionStore,
     pub server_duckdb_version: String,
     pub server_platform: String,
+    pub auth_provider: Arc<dyn AuthProvider>,
 }
 
 impl QuackServerState {
-    pub fn new() -> Self {
+    /// Construct a server state with a pluggable auth provider. Use an
+    /// `AuthChain` from `sqe-auth` in production; tests typically supply a
+    /// stub that returns a fixed `Identity`.
+    pub fn with_provider(auth_provider: Arc<dyn AuthProvider>) -> Self {
         Self {
             sessions: SessionStore::new(Duration::from_secs(600)),
             server_duckdb_version: format!("sqe-{}", env!("CARGO_PKG_VERSION")),
             server_platform: std::env::consts::OS.to_string(),
+            auth_provider,
         }
-    }
-}
-
-impl Default for QuackServerState {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -71,7 +72,7 @@ async fn handle_quack(
 
     match (request_header.r#type, request_body) {
         (MessageType::ConnectionRequest, QuackMessage::ConnectionRequest(req)) => {
-            handle_connection_request(&state, &request_header, req)
+            handle_connection_request(&state, &request_header, req).await
         }
         (MessageType::DisconnectMessage, QuackMessage::DisconnectMessage) => {
             handle_disconnect_message(&state, &request_header)
@@ -134,7 +135,7 @@ fn handle_disconnect_message(
     )
 }
 
-fn handle_connection_request(
+async fn handle_connection_request(
     state: &QuackServerState,
     request_header: &MessageHeader,
     req: sqe_quack_wire::message::ConnectionRequest,
@@ -146,10 +147,44 @@ fn handle_connection_request(
             "SQE-AUTH: bearer token is required".to_string(),
         );
     }
+
+    let credentials = FlightCredentials {
+        bearer_token: Some(SecretString::new(req.auth_string.clone())),
+        ..Default::default()
+    };
+
+    let identity = match state.auth_provider.authenticate(&credentials).await {
+        Ok(identity) => identity,
+        Err(AuthError::NotMyCredentials) => {
+            return error_response(
+                "",
+                request_header.client_query_id,
+                "SQE-AUTH: no provider accepted the bearer token".to_string(),
+            );
+        }
+        Err(AuthError::AuthFailed(msg)) => {
+            return error_response(
+                "",
+                request_header.client_query_id,
+                format!("SQE-AUTH: {msg}"),
+            );
+        }
+        Err(AuthError::Internal(e)) => {
+            tracing::warn!(error = %e, "auth provider internal error");
+            // Don't leak internals to the wire (issue #38 style).
+            return error_response(
+                "",
+                request_header.client_query_id,
+                "SQE-AUTH: internal authentication error".to_string(),
+            );
+        }
+    };
+
     let connection_id = Uuid::new_v4().to_string();
     state.sessions.insert(Session {
         connection_id: connection_id.clone(),
         bearer_token: req.auth_string,
+        identity,
     });
 
     let response_header = MessageHeader {
