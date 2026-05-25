@@ -1349,7 +1349,7 @@ impl FlightSqlService for SqeFlightSqlService {
         let key: Vec<u8> = query.prepared_statement_handle.to_vec();
         let sql = match self.prepared_params.remove(&key) {
             Some((_, params)) => substitute_placeholders(&fetch.handle, &params)
-                .map_err(|e| Status::invalid_argument(e))?,
+                .map_err(Status::invalid_argument)?,
             None => fetch.handle.clone(),
         };
 
