@@ -254,6 +254,12 @@ pub struct CoordinatorConfig {
     pub flight_sql_port: u16,
     #[serde(default = "default_trino_port")]
     pub trino_http_port: u16,
+    /// Port the DuckDB Quack RPC server listens on. Zero disables the Quack
+    /// endpoint entirely. DuckDB's documented default for `quack:host` URIs
+    /// is 9494, so enabling this with `quack_port = 9494` lets a DuckDB CLI
+    /// attach without specifying a port.
+    #[serde(default)]
+    pub quack_port: u16,
     #[serde(default = "default_mode")]
     pub mode: String,
     /// List of worker Flight server URLs for distributed execution.
@@ -415,6 +421,7 @@ impl std::fmt::Debug for CoordinatorConfig {
         f.debug_struct("CoordinatorConfig")
             .field("flight_sql_port", &self.flight_sql_port)
             .field("trino_http_port", &self.trino_http_port)
+            .field("quack_port", &self.quack_port)
             .field("mode", &self.mode)
             .field("worker_urls", &self.worker_urls)
             .field("debug", &self.debug)
@@ -2014,6 +2021,24 @@ impl SqeConfig {
                 self.coordinator.flight_sql_port
             ));
         }
+        if self.coordinator.quack_port > 0 {
+            let qp = self.coordinator.quack_port;
+            if qp == self.coordinator.flight_sql_port {
+                errors.push(format!(
+                    "port conflict: coordinator.quack_port and coordinator.flight_sql_port are both {qp}"
+                ));
+            }
+            if qp == self.coordinator.trino_http_port {
+                errors.push(format!(
+                    "port conflict: coordinator.quack_port and coordinator.trino_http_port are both {qp}"
+                ));
+            }
+            if qp == self.metrics.prometheus_port {
+                errors.push(format!(
+                    "port conflict: coordinator.quack_port and metrics.prometheus_port are both {qp}"
+                ));
+            }
+        }
 
         // TLS validation: if one of cert/key is set, both must be set
         let tls = &self.coordinator.tls;
@@ -2630,6 +2655,7 @@ mod tests {
             coordinator: CoordinatorConfig {
                 flight_sql_port: 50051,
                 trino_http_port: 8080,
+                quack_port: 0,
                 mode: "hybrid".to_string(),
                 worker_urls: vec![],
                 debug: false,
