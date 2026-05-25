@@ -6528,7 +6528,7 @@ s3_path_style = true
         use datafusion::logical_expr::LogicalPlanBuilder;
         use sqe_policy::plan_rewriter::PolicyPlanRewriter;
         use sqe_policy::policy_store::InMemoryPolicyStore;
-        use sqe_policy::{MaskType, PolicyEnforcer as _, ResolvedPolicy};
+        use sqe_policy::{MaskType, ResolvedPolicy};
 
         let arrow_schema = Arc::new(ArrowSchema2::new(vec![
             Field::new("id", DataType::Int64, true),
