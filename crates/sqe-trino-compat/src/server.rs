@@ -76,6 +76,10 @@ pub struct TrinoState<A, Q> {
 #[async_trait::async_trait]
 pub trait TrinoAuthRateLimiter: Send + Sync + 'static {
     /// Returns `Err(())` when the (peer_ip, username) tuple is over budget.
+    // Trait surface predates the `result_unit_err` lint; switching to a
+    // dedicated `RateLimitError` would touch every implementer for no
+    // wire-level benefit.
+    #[allow(clippy::result_unit_err)]
     fn check(&self, peer_ip: &str, username: &str) -> Result<(), ()>;
 }
 
@@ -176,22 +180,13 @@ pub trait TrinoQueryExecutor: Send + Sync + 'static {
     ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError>;
 }
 
+#[derive(Default)]
 pub struct TrinoServerOptions {
     pub security: SecurityConfig,
     pub auth_rate_limiter: Option<Arc<dyn TrinoAuthRateLimiter>>,
     /// Whether `/v1/info` may return the exact build version. Default
     /// `false` for production deployments. Issue #40.
     pub expose_version: bool,
-}
-
-impl Default for TrinoServerOptions {
-    fn default() -> Self {
-        Self {
-            security: SecurityConfig::default(),
-            auth_rate_limiter: None,
-            expose_version: false,
-        }
-    }
 }
 
 pub fn start_trino_server<A, Q>(

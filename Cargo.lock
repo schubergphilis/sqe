@@ -6922,6 +6922,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqe-quack-server"
+version = "0.31.4"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-schema",
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "moka",
+ "reqwest 0.12.28",
+ "sqe-auth",
+ "sqe-coordinator",
+ "sqe-core",
+ "sqe-quack-wire",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "sqe-quack-wire"
+version = "0.31.4"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "arrow-schema",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "sqe-sql"
 version = "0.31.4"
 dependencies = [

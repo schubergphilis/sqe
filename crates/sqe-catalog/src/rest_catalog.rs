@@ -450,6 +450,12 @@ impl SessionCatalog {
     /// Per-catalog variant. Same logic as `for_session_other_backend`
     /// but scoped to a single `CatalogConfig` so the multi-catalog
     /// path can iterate over `[catalogs.*]` entries.
+    ///
+    /// `catalog`, `storage`, `bearer_token`, and `table_cache` are consumed
+    /// only when one of the optional backend features (`hms`, `glue`,
+    /// `sql-postgres`, `s3tables`) is enabled; the default REST-only build
+    /// uses the early `unreachable!` arm for `Rest`.
+    #[allow(unused_variables, unreachable_code)]
     async fn for_session_other_backend_with(
         catalog: &sqe_core::config::CatalogConfig,
         storage: &sqe_core::config::StorageConfig,
