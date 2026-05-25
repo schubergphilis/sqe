@@ -33,6 +33,8 @@ pub enum WireError {
     UnsupportedVectorType(u8),
     #[error("Arrow data type {0} not yet supported by sqe-quack-wire::arrow_bridge")]
     UnsupportedArrowType(String),
+    #[error("DataChunkWrapper nullable byte was false (null), which the protocol does not emit in practice")]
+    NullDataChunkWrapper,
 }
 
 pub type Result<T> = std::result::Result<T, WireError>;

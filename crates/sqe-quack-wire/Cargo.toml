@@ -11,3 +11,6 @@ thiserror = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true, features = ["blocking"] }
