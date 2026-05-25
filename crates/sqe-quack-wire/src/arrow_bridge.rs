@@ -10,13 +10,15 @@
 //! `AppendRequest` write path; not implemented yet.
 
 use arrow_array::{
-    Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
-    LargeStringArray, RecordBatch, StringArray, StringViewArray, TimestampMicrosecondArray,
+    Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, FixedSizeBinaryArray,
+    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+    IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray, LargeBinaryArray,
+    LargeStringArray, RecordBatch, StringArray, StringViewArray, Time32MillisecondArray,
+    Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
     UInt32Array, UInt64Array, UInt8Array,
 };
-use arrow_schema::{DataType, TimeUnit};
+use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 
 use crate::data_chunk::{DataChunk, LogicalType, LogicalTypeId, Vector, VectorData};
 
@@ -111,6 +113,38 @@ fn column_to_vector(array: &dyn Array, row_count: usize) -> crate::Result<Vector
                 row_count,
             )?
         }
+        // Arrow `Time32` is i32 seconds- or millisecond-of-day; DuckDB's `TIME`
+        // is i64 microseconds-of-day. Widen + scale into 8-byte LE.
+        DataType::Time32(TimeUnit::Second) => {
+            time32_second_to_time(array, row_count)?
+        }
+        DataType::Time32(TimeUnit::Millisecond) => {
+            time32_millisecond_to_time(array, row_count)?
+        }
+        // Arrow `Time64(Microsecond)` already matches DuckDB `TIME` exactly.
+        DataType::Time64(TimeUnit::Microsecond) => {
+            fixed_from_array::<Time64MicrosecondArray>(array, LogicalTypeId::Time, row_count)?
+        }
+        // Arrow `Time64(Nanosecond)` maps to DuckDB `TIME_NS` (i64 ns of day).
+        DataType::Time64(TimeUnit::Nanosecond) => {
+            fixed_from_array::<Time64NanosecondArray>(array, LogicalTypeId::TimeNs, row_count)?
+        }
+        // FixedSizeBinary(16) is the canonical UUID encoding in Arrow. DuckDB's
+        // UUID is also 16 bytes (a `uhugeint` on disk, but byte-for-byte we
+        // copy the raw 16 bytes).
+        DataType::FixedSizeBinary(16) => fixed_size_binary_to_uuid(array, row_count)?,
+        DataType::FixedSizeBinary(n) => {
+            return Err(crate::WireError::UnsupportedArrowType(format!(
+                "FixedSizeBinary({n}) — only width 16 (UUID) is supported"
+            )))
+        }
+        // Arrow interval types all widen into DuckDB's 16-byte `interval_t`
+        // { months: i32, days: i32, micros: i64 }.
+        DataType::Interval(IntervalUnit::YearMonth) => interval_yearmonth_to_interval(array, row_count)?,
+        DataType::Interval(IntervalUnit::DayTime) => interval_daytime_to_interval(array, row_count)?,
+        DataType::Interval(IntervalUnit::MonthDayNano) => {
+            interval_monthdaynano_to_interval(array, row_count)?
+        }
         other => return Err(crate::WireError::UnsupportedArrowType(format!("{other:?}"))),
     };
     Ok(Vector {
@@ -165,6 +199,8 @@ fixed_width_impl!(TimestampSecondArray, i64);
 fixed_width_impl!(TimestampMillisecondArray, i64);
 fixed_width_impl!(TimestampMicrosecondArray, i64);
 fixed_width_impl!(TimestampNanosecondArray, i64);
+fixed_width_impl!(Time64MicrosecondArray, i64);
+fixed_width_impl!(Time64NanosecondArray, i64);
 
 /// Arrow's `Date64` is `i64` ms since UNIX epoch. DuckDB's `DATE` is a
 /// 4-byte day count, so we divide out 86_400_000 to convert.
@@ -187,6 +223,181 @@ fn date64_to_date(array: &dyn Array, row_count: usize) -> crate::Result<(Logical
     }
     Ok((
         LogicalType::new(LogicalTypeId::Date),
+        VectorData::Fixed(bytes),
+    ))
+}
+
+/// Arrow `Time32(Second)` is i32 seconds-of-day. DuckDB `TIME` is i64
+/// microseconds-of-day, so we widen and multiply by 1_000_000.
+fn time32_second_to_time(
+    array: &dyn Array,
+    row_count: usize,
+) -> crate::Result<(LogicalType, VectorData)> {
+    let typed = array
+        .as_any()
+        .downcast_ref::<Time32SecondArray>()
+        .ok_or_else(|| {
+            crate::WireError::UnsupportedArrowType("time32(second) downcast failed".to_string())
+        })?;
+    let mut bytes = Vec::with_capacity(row_count * 8);
+    for i in 0..row_count {
+        let v: i64 = if typed.is_valid(i) {
+            (typed.value(i) as i64) * 1_000_000
+        } else {
+            0
+        };
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    Ok((
+        LogicalType::new(LogicalTypeId::Time),
+        VectorData::Fixed(bytes),
+    ))
+}
+
+/// Arrow `Time32(Millisecond)` is i32 ms-of-day. Widen ×1_000 into i64
+/// microseconds-of-day.
+fn time32_millisecond_to_time(
+    array: &dyn Array,
+    row_count: usize,
+) -> crate::Result<(LogicalType, VectorData)> {
+    let typed = array
+        .as_any()
+        .downcast_ref::<Time32MillisecondArray>()
+        .ok_or_else(|| {
+            crate::WireError::UnsupportedArrowType(
+                "time32(millisecond) downcast failed".to_string(),
+            )
+        })?;
+    let mut bytes = Vec::with_capacity(row_count * 8);
+    for i in 0..row_count {
+        let v: i64 = if typed.is_valid(i) {
+            (typed.value(i) as i64) * 1_000
+        } else {
+            0
+        };
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    Ok((
+        LogicalType::new(LogicalTypeId::Time),
+        VectorData::Fixed(bytes),
+    ))
+}
+
+/// Arrow `FixedSizeBinary(16)` is the canonical UUID layout. DuckDB's UUID
+/// is also 16 bytes on the wire — copy raw.
+fn fixed_size_binary_to_uuid(
+    array: &dyn Array,
+    row_count: usize,
+) -> crate::Result<(LogicalType, VectorData)> {
+    let typed = array
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .ok_or_else(|| {
+            crate::WireError::UnsupportedArrowType("fixed-size-binary downcast failed".to_string())
+        })?;
+    let mut bytes = Vec::with_capacity(row_count * 16);
+    let zero = [0u8; 16];
+    for i in 0..row_count {
+        let src: &[u8] = if typed.is_valid(i) {
+            typed.value(i)
+        } else {
+            &zero
+        };
+        debug_assert_eq!(src.len(), 16, "FixedSizeBinary(16) row width");
+        bytes.extend_from_slice(src);
+    }
+    Ok((
+        LogicalType::new(LogicalTypeId::Uuid),
+        VectorData::Fixed(bytes),
+    ))
+}
+
+/// Write one row of DuckDB's `interval_t { months: i32, days: i32, micros: i64 }`
+/// into the buffer as 16 little-endian bytes.
+fn push_interval(out: &mut Vec<u8>, months: i32, days: i32, micros: i64) {
+    out.extend_from_slice(&months.to_le_bytes());
+    out.extend_from_slice(&days.to_le_bytes());
+    out.extend_from_slice(&micros.to_le_bytes());
+}
+
+/// Arrow `Interval(YearMonth)` is i32 months. days/micros default to 0.
+fn interval_yearmonth_to_interval(
+    array: &dyn Array,
+    row_count: usize,
+) -> crate::Result<(LogicalType, VectorData)> {
+    let typed = array
+        .as_any()
+        .downcast_ref::<IntervalYearMonthArray>()
+        .ok_or_else(|| {
+            crate::WireError::UnsupportedArrowType(
+                "interval-yearmonth downcast failed".to_string(),
+            )
+        })?;
+    let mut bytes = Vec::with_capacity(row_count * 16);
+    for i in 0..row_count {
+        let months = if typed.is_valid(i) { typed.value(i) } else { 0 };
+        push_interval(&mut bytes, months, 0, 0);
+    }
+    Ok((
+        LogicalType::new(LogicalTypeId::Interval),
+        VectorData::Fixed(bytes),
+    ))
+}
+
+/// Arrow `Interval(DayTime)` packs 32-bit days + 32-bit ms. Widen ms ->
+/// micros (×1000) for DuckDB.
+fn interval_daytime_to_interval(
+    array: &dyn Array,
+    row_count: usize,
+) -> crate::Result<(LogicalType, VectorData)> {
+    let typed = array
+        .as_any()
+        .downcast_ref::<IntervalDayTimeArray>()
+        .ok_or_else(|| {
+            crate::WireError::UnsupportedArrowType("interval-daytime downcast failed".to_string())
+        })?;
+    let mut bytes = Vec::with_capacity(row_count * 16);
+    for i in 0..row_count {
+        if typed.is_valid(i) {
+            let v = typed.value(i);
+            let micros = (v.milliseconds as i64) * 1_000;
+            push_interval(&mut bytes, 0, v.days, micros);
+        } else {
+            push_interval(&mut bytes, 0, 0, 0);
+        }
+    }
+    Ok((
+        LogicalType::new(LogicalTypeId::Interval),
+        VectorData::Fixed(bytes),
+    ))
+}
+
+/// Arrow `Interval(MonthDayNano)` carries 32-bit months + 32-bit days + 64-bit
+/// nanoseconds. DuckDB's micros field is i64; we floor-divide ns by 1000.
+fn interval_monthdaynano_to_interval(
+    array: &dyn Array,
+    row_count: usize,
+) -> crate::Result<(LogicalType, VectorData)> {
+    let typed = array
+        .as_any()
+        .downcast_ref::<IntervalMonthDayNanoArray>()
+        .ok_or_else(|| {
+            crate::WireError::UnsupportedArrowType(
+                "interval-monthdaynano downcast failed".to_string(),
+            )
+        })?;
+    let mut bytes = Vec::with_capacity(row_count * 16);
+    for i in 0..row_count {
+        if typed.is_valid(i) {
+            let v = typed.value(i);
+            let micros = v.nanoseconds / 1_000;
+            push_interval(&mut bytes, v.months, v.days, micros);
+        } else {
+            push_interval(&mut bytes, 0, 0, 0);
+        }
+    }
+    Ok((
+        LogicalType::new(LogicalTypeId::Interval),
         VectorData::Fixed(bytes),
     ))
 }
@@ -527,5 +738,178 @@ mod tests {
         let decoded = DataChunk::decode(&mut d).unwrap();
         d.expect_object_end().unwrap();
         assert_eq!(decoded, chunk);
+    }
+
+    #[test]
+    fn time32_second_widens_to_microseconds() {
+        // 1h = 3600 s -> 3_600_000_000 us
+        let arr: Arc<dyn Array> = Arc::new(Time32SecondArray::from(vec![0, 3600, 86_399]));
+        let batch = batch_with(vec![("t", DataType::Time32(TimeUnit::Second), arr)]);
+        let chunk = record_batch_to_data_chunk(&batch).unwrap();
+        assert_eq!(chunk.columns[0].logical_type.id, LogicalTypeId::Time);
+        match &chunk.columns[0].data {
+            VectorData::Fixed(bytes) => {
+                let expected: Vec<u8> = [0i64, 3_600_000_000, 86_399_000_000]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+                assert_eq!(bytes, &expected);
+            }
+            other => panic!("expected Fixed VectorData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn time32_millisecond_widens_to_microseconds() {
+        let arr: Arc<dyn Array> =
+            Arc::new(Time32MillisecondArray::from(vec![0, 1_000, 86_399_999]));
+        let batch = batch_with(vec![("t", DataType::Time32(TimeUnit::Millisecond), arr)]);
+        let chunk = record_batch_to_data_chunk(&batch).unwrap();
+        assert_eq!(chunk.columns[0].logical_type.id, LogicalTypeId::Time);
+        match &chunk.columns[0].data {
+            VectorData::Fixed(bytes) => {
+                let expected: Vec<u8> = [0i64, 1_000_000, 86_399_999_000]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+                assert_eq!(bytes, &expected);
+            }
+            other => panic!("expected Fixed VectorData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn time64_microsecond_passes_through() {
+        let arr: Arc<dyn Array> = Arc::new(Time64MicrosecondArray::from(vec![
+            0,
+            12 * 3_600_000_000,
+            86_399_999_999,
+        ]));
+        let batch = batch_with(vec![("t", DataType::Time64(TimeUnit::Microsecond), arr)]);
+        let chunk = record_batch_to_data_chunk(&batch).unwrap();
+        assert_eq!(chunk.columns[0].logical_type.id, LogicalTypeId::Time);
+        match &chunk.columns[0].data {
+            VectorData::Fixed(bytes) => assert_eq!(bytes.len(), 24),
+            other => panic!("expected Fixed VectorData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn time64_nanosecond_maps_to_timens() {
+        let arr: Arc<dyn Array> = Arc::new(Time64NanosecondArray::from(vec![Some(0), None, Some(1)]));
+        let batch = batch_with(vec![("t", DataType::Time64(TimeUnit::Nanosecond), arr)]);
+        let chunk = record_batch_to_data_chunk(&batch).unwrap();
+        assert_eq!(chunk.columns[0].logical_type.id, LogicalTypeId::TimeNs);
+        assert_eq!(chunk.columns[0].validity, Some(vec![true, false, true]));
+    }
+
+    #[test]
+    fn fixed_size_binary_16_maps_to_uuid() {
+        let uuid_a = [0x11u8; 16];
+        let uuid_b = [0x22u8; 16];
+        let arr =
+            FixedSizeBinaryArray::try_from_iter([uuid_a.to_vec(), uuid_b.to_vec()].into_iter())
+                .unwrap();
+        let arr: Arc<dyn Array> = Arc::new(arr);
+        let dt = arr.data_type().clone();
+        let batch = batch_with(vec![("u", dt, arr)]);
+        let chunk = record_batch_to_data_chunk(&batch).unwrap();
+        assert_eq!(chunk.columns[0].logical_type.id, LogicalTypeId::Uuid);
+        match &chunk.columns[0].data {
+            VectorData::Fixed(bytes) => {
+                assert_eq!(bytes.len(), 32);
+                assert_eq!(&bytes[..16], &uuid_a);
+                assert_eq!(&bytes[16..], &uuid_b);
+            }
+            other => panic!("expected Fixed VectorData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fixed_size_binary_non_16_is_rejected() {
+        // FixedSizeBinary(8) is a valid Arrow type but not a UUID; we surface
+        // a clear UnsupportedArrowType error rather than silently truncating.
+        let arr = FixedSizeBinaryArray::try_from_iter([[1u8; 8].to_vec()].into_iter()).unwrap();
+        let arr: Arc<dyn Array> = Arc::new(arr);
+        let dt = arr.data_type().clone();
+        let batch = batch_with(vec![("b", dt, arr)]);
+        let err = record_batch_to_data_chunk(&batch).unwrap_err();
+        match err {
+            crate::WireError::UnsupportedArrowType(msg) => {
+                assert!(msg.contains("FixedSizeBinary(8)"), "msg was {msg}");
+            }
+            other => panic!("expected UnsupportedArrowType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interval_yearmonth_widens_to_16_byte_struct() {
+        // 14 months = 1 year + 2 months
+        let arr: Arc<dyn Array> = Arc::new(IntervalYearMonthArray::from(vec![14]));
+        let batch = batch_with(vec![("i", DataType::Interval(IntervalUnit::YearMonth), arr)]);
+        let chunk = record_batch_to_data_chunk(&batch).unwrap();
+        assert_eq!(chunk.columns[0].logical_type.id, LogicalTypeId::Interval);
+        match &chunk.columns[0].data {
+            VectorData::Fixed(bytes) => {
+                assert_eq!(bytes.len(), 16);
+                let mut expected = Vec::new();
+                expected.extend_from_slice(&14i32.to_le_bytes());
+                expected.extend_from_slice(&0i32.to_le_bytes());
+                expected.extend_from_slice(&0i64.to_le_bytes());
+                assert_eq!(bytes, &expected);
+            }
+            other => panic!("expected Fixed VectorData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interval_daytime_scales_ms_to_micros() {
+        use arrow_array::types::IntervalDayTime;
+        // 3 days + 5_000 ms = 5_000_000 micros
+        let arr: Arc<dyn Array> = Arc::new(IntervalDayTimeArray::from(vec![IntervalDayTime {
+            days: 3,
+            milliseconds: 5_000,
+        }]));
+        let batch = batch_with(vec![("i", DataType::Interval(IntervalUnit::DayTime), arr)]);
+        let chunk = record_batch_to_data_chunk(&batch).unwrap();
+        match &chunk.columns[0].data {
+            VectorData::Fixed(bytes) => {
+                let mut expected = Vec::new();
+                expected.extend_from_slice(&0i32.to_le_bytes());
+                expected.extend_from_slice(&3i32.to_le_bytes());
+                expected.extend_from_slice(&5_000_000i64.to_le_bytes());
+                assert_eq!(bytes, &expected);
+            }
+            other => panic!("expected Fixed VectorData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interval_monthdaynano_floors_ns_to_micros() {
+        use arrow_array::types::IntervalMonthDayNano;
+        // 1 month + 2 days + 1_500 ns -> 1 us (floor)
+        let arr: Arc<dyn Array> = Arc::new(IntervalMonthDayNanoArray::from(vec![
+            IntervalMonthDayNano {
+                months: 1,
+                days: 2,
+                nanoseconds: 1_500,
+            },
+        ]));
+        let batch = batch_with(vec![(
+            "i",
+            DataType::Interval(IntervalUnit::MonthDayNano),
+            arr,
+        )]);
+        let chunk = record_batch_to_data_chunk(&batch).unwrap();
+        match &chunk.columns[0].data {
+            VectorData::Fixed(bytes) => {
+                let mut expected = Vec::new();
+                expected.extend_from_slice(&1i32.to_le_bytes());
+                expected.extend_from_slice(&2i32.to_le_bytes());
+                expected.extend_from_slice(&1i64.to_le_bytes());
+                assert_eq!(bytes, &expected);
+            }
+            other => panic!("expected Fixed VectorData, got {other:?}"),
+        }
     }
 }
