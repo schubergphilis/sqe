@@ -6799,6 +6799,7 @@ dependencies = [
  "sqe-planner",
  "sqe-policy",
  "sqe-quack-server",
+ "sqe-quack-wire",
  "sqe-sql",
  "sqe-trino-compat",
  "sqe-trino-functions",
@@ -6950,6 +6951,7 @@ dependencies = [
  "arrow",
  "arrow-array",
  "arrow-schema",
+ "reqwest 0.12.28",
  "thiserror 2.0.18",
 ]
 
