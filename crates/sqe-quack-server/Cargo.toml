@@ -17,6 +17,10 @@ uuid = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+async-trait = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 reqwest = { workspace = true }

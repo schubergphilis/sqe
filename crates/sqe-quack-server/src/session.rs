@@ -3,14 +3,36 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Utc;
 use moka::sync::Cache;
 use sqe_auth::Identity;
+use sqe_core::Session as CoreSession;
 
 #[derive(Debug, Clone)]
 pub struct Session {
     pub connection_id: String,
     pub bearer_token: String,
     pub identity: Identity,
+    /// `sqe_core::Session` built from the `Identity` at connect time. Held so
+    /// `PrepareRequest` can hand it directly to the `QueryExecutor` without
+    /// rebuilding per query.
+    pub core_session: CoreSession,
+}
+
+/// Mirror of `sqe-coordinator`'s `SessionManager::identity_to_session`. Lives
+/// here so `sqe-quack-server` does not have to depend on `sqe-coordinator`
+/// just for this conversion.
+pub fn identity_to_core_session(identity: &Identity) -> CoreSession {
+    let token_expiry = identity
+        .expires_at
+        .unwrap_or_else(|| Utc::now() + chrono::Duration::hours(1));
+    CoreSession::new(
+        identity.user_id.clone(),
+        identity.catalog_token.clone().unwrap_or_default(),
+        identity.refresh_token.clone(),
+        token_expiry,
+        identity.roles.clone(),
+    )
 }
 
 #[derive(Clone)]
