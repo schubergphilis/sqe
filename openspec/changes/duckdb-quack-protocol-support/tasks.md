@@ -2,13 +2,15 @@
 
 - [x] 1.1 Read `duckdb/duckdb-quack` source (MIT, v1.5-variegata) and document the wire protocol in `docs/quack-protocol.md`: endpoint, content type, message schema, version constants, auth flow
 - [x] 1.2 Confirm encoding: DuckDB `BinarySerializer` with `SerializationCompatibility::FromIndex(7)`, NOT bincode/msgpack. Result chunks use DuckDB native `DataChunk` (not Arrow IPC)
-- [x] 1.3 Decide serialisation strategy: link `duckdb-rs` (bundled feature) in `sqe-quack-wire` to reuse DuckDB's own serialiser. Rationale captured in design.md
-- [ ] 1.4 Create `crates/sqe-quack-wire/` with `Cargo.toml` (depends on `duckdb` with `bundled` feature), `lib.rs`, message enum mirroring `quack_message.json`
-- [ ] 1.5 Implement `encode(msg, header, &mut Vec<u8>)` + `decode(body, &duckdb::Connection)` using DuckDB's BinarySerializer/Deserializer bindings (or a thin FFI shim if `duckdb-rs` does not expose them directly)
-- [ ] 1.6 Implement `arrow_to_data_chunk(batch: &RecordBatch, conn: &Connection) -> DataChunk` and `data_chunk_to_arrow(chunk: &DataChunk) -> RecordBatch` helpers
-- [ ] 1.7 Round-trip test: encode every message variant, decode, assert equality
-- [ ] 1.8 Compatibility test: capture real `POST /quack` bodies from `duckdb` CLI talking to a `quack_serve()` instance, replay through our codec, assert byte-identical re-encoding
+- [x] 1.3 Decide serialisation strategy. ORIGINAL plan was to link `duckdb-rs` and reuse DuckDB's serialiser. REVISED (Phase 1.4 finding): `duckdb-rs` does not expose `BinarySerializer` and libduckdb's stable C API exposes only Arrow conversion. Pure-Rust port of `BinarySerializer` chosen. Rationale captured in design.md
+- [ ] 1.4 Create `crates/sqe-quack-wire/` with `Cargo.toml`, `lib.rs`, modules `varint`, `codec`, `message`, `data_chunk` (last one stubbed for now)
+- [ ] 1.5 Implement `VarIntEncode/Decode` (`varint.rs`) with round-trip tests against known DuckDB-emitted byte sequences
+- [ ] 1.6 Implement `BinarySerializer` + `BinaryDeserializer` (`codec.rs`) for primitives: bool, u8-u64, i8-i64, hugeint, f32/f64, string. Plus `Begin/End` block nesting and `MESSAGE_TERMINATOR_FIELD_ID` (0xFFFF). Round-trip tests per primitive
+- [ ] 1.7 Implement non-DataChunk message types (`message.rs`): `MessageHeader`, `ConnectionRequest/Response`, `PrepareRequest`, `FetchRequest`, `SuccessResponse`, `DisconnectMessage`, `ErrorResponse`. Round-trip test per variant
+- [ ] 1.8 Capture real wire fixtures: run `duckdb` CLI + `quack_serve()` locally, dump request bodies, save as `tests/fixtures/*.bin`. Assert our codec decodes them and re-encodes byte-identical output
 - [ ] 1.9 Pin supported DuckDB extension version in `docs/quack-protocol.md` and `sqe-quack-wire/README.md`: `v1.5-variegata`, `quack_version = 1`
+- [ ] 1.10 (deferred to Phase 1.6 sub-phase) Implement `DataChunk` codec covering `LogicalType` recursion, `Vector` data buffers, validity bitmaps. Add `arrow_to_data_chunk` and `data_chunk_to_arrow` converters
+- [ ] 1.11 (deferred to Phase 1.6 sub-phase) Implement `PrepareResponse`, `FetchResponse`, `AppendRequest` message types (they carry `DataChunk`)
 
 ## 2. sqe-quack-server crate (Option A)
 

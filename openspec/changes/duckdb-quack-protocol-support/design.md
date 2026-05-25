@@ -13,7 +13,22 @@ For SQE, this opens two integration points using the same protocol:
 - **Server side (Option A)**: SQE accepts incoming HTTP requests on the Quack endpoint and translates inbound DuckDB sessions to SQE's session/catalog/auth/policy stack. DuckDB clients see SQE as another DuckDB server.
 - **Client side (Option B)**: SQE runs DuckDB as an alternative execution backend behind a worker boundary. The coordinator sends SQL fragments to the DuckDB worker over Quack and reads back result chunks.
 
-Both paths share the wire codec (`sqe-quack-wire`), which links `duckdb-rs` to reuse DuckDB's `BinarySerializer` + `DataChunk` Serialize/Deserialize. Hand-rolling the codec was considered and rejected: the protocol is pre-release and the maintenance cost of tracking DuckDB's internal serialiser drift outweighs the ~25 MB binary cost of linking libduckdb.
+Both paths share the wire codec (`sqe-quack-wire`).
+
+**Codec strategy revised after Phase 1.3 research.** Original plan: link `duckdb-rs` to reuse DuckDB's `BinarySerializer`. Verified in Phase 1.4 that `duckdb-rs` does not expose `BinarySerializer` and libduckdb's stable C API exposes only Arrow conversion, not the binary serialiser. Reachable alternatives:
+
+1. Vendor DuckDB's `BinarySerializer` C++ code with a thin C shim, built via `build.rs`. Adds a C++ build dependency.
+2. Reimplement `BinarySerializer` and the message schema in pure Rust. The format is well documented (`field_id` + varint-encoded value, `Begin/End` nested blocks, `MESSAGE_TERMINATOR_FIELD_ID`).
+3. Submit `BinarySerializer` exposure upstream to `duckdb-rs` and wait.
+
+We pick **(2) pure Rust reimplementation** for `sqe-quack-wire`:
+
+- Format is simple: varint tagging, primitive writes, list/object/optional/nullable nesting. ~300 lines for the codec primitives plus ~400 lines for the ten message types.
+- No C++ build dependency in the workspace.
+- Tracks DuckDB releases by reading their `binary_serializer.cpp` and bumping the supported `SerializationCompatibility` index manually.
+- We accept the maintenance cost in exchange for keeping the codec sovereign.
+
+`DataChunk` serialisation is more involved (~600-900 lines covering `LogicalType` recursion, `Vector` data buffers, validity bitmaps). It is deferred to a Phase 1.6 sub-task; Phase 1.4-1.5 ships the handshake-and-error path, which covers all messages that do not carry `DataChunk`.
 
 Decisions from exploration:
 
@@ -52,8 +67,8 @@ Decisions from exploration:
                              ▼
                       ┌───────────────┐
                       │ sqe-quack-    │
-                      │ wire          │   decode using duckdb-rs
-                      │ codec         │   into QuackMessage variant
+                      │ wire          │   decode via pure-Rust
+                      │ codec         │   BinarySerializer port
                       └──────┬────────┘
                              │ QuackMessage + header
                              ▼
@@ -127,7 +142,8 @@ crates/
   sqe-quack-wire/            # protocol codec, message types
     src/
       messages.rs           # ten message variants + MessageHeader
-      codec.rs              # encode/decode against duckdb-rs BinarySerializer
+      codec.rs              # pure-Rust port of DuckDB BinarySerializer (varint-tagged)
+      varint.rs             # VarIntEncode/Decode
       data_chunk.rs         # RecordBatch <-> DataChunk conversion helpers
   sqe-quack-server/          # Option A
     src/
@@ -193,18 +209,18 @@ pub enum QuackMessage {
         result_types: Vec<DuckLogicalType>,
         result_names: Vec<String>,
         needs_more_fetch: bool,
-        results: Vec<duckdb::DataChunk>,
+        results: Vec<DataChunk>,
         result_uuid: i128,
     },
     FetchRequest { uuid: i128 },
     FetchResponse {
-        results: Vec<duckdb::DataChunk>,
+        results: Vec<DataChunk>,
         batch_index: Option<u64>,
     },
     AppendRequest {
         schema_name: String,
         table_name: String,
-        append_chunk: duckdb::DataChunk,
+        append_chunk: DataChunk,
     },
     SuccessResponse,
     DisconnectMessage,
@@ -212,12 +228,10 @@ pub enum QuackMessage {
 }
 
 pub fn encode(msg: &QuackMessage, header: &MessageHeader, out: &mut Vec<u8>) -> Result<()>;
-pub fn decode(body: &[u8], db: &duckdb::Connection) -> Result<(MessageHeader, QuackMessage)>;
+pub fn decode(body: &[u8]) -> Result<(MessageHeader, QuackMessage)>;
 ```
 
-The `encode`/`decode` functions bridge through `duckdb-rs`. We require a `duckdb::Connection` because `BinarySerializer` is tied to DuckDB's catalog/type resolution context. A tiny in-memory DuckDB instance per process is sufficient; we do not need a per-request connection.
-
-`DuckLogicalType` is `duckdb-rs`'s logical type wrapper. `DataChunk` is also from `duckdb-rs`.
+`DataChunk` and `DuckLogicalType` are pure-Rust types defined in `sqe-quack-wire::data_chunk`. They mirror the DuckDB types only for the surface we need over the wire (column count, per-column logical type with nested types, validity bitmap, vector data). Conversion to/from Arrow `RecordBatch` lives in the same module.
 
 ### RecordBatch <-> DataChunk conversion
 
@@ -238,7 +252,8 @@ pub struct QuackServer {
     auth: Arc<dyn AuthBackend>,
     sessions: Arc<moka::future::Cache<String, SqeQuackSession>>,
     bind_addr: SocketAddr,
-    duckdb_ctx: Arc<duckdb::Connection>,   // shared codec context, NOT for query exec
+    // No shared duckdb context needed for the codec — wire is pure Rust.
+    // duckdb-rs is still pulled in by `sqe-worker-duckdb` for Option B execution.
 }
 
 pub async fn serve(server: Arc<QuackServer>) -> Result<()> {
@@ -254,7 +269,7 @@ async fn handle_quack(
     Extension(server): Extension<Arc<QuackServer>>,
     body: Bytes,
 ) -> impl IntoResponse {
-    let (header, msg) = match quack_wire::decode(&body, &server.duckdb_ctx) {
+    let (header, msg) = match quack_wire::decode(&body) {
         Ok(v) => v,
         Err(e) => return error_response(&server, "", None, &e.to_string()),
     };
@@ -288,7 +303,7 @@ async fn handle_quack(
    - If the entire result fits in `quack_fetch_batch_bytes` (default 4 MiB), return `PrepareResponse { needs_more_fetch: false, results: vec![...] }`
    - Otherwise, return the first batch with `needs_more_fetch: true` and a fresh `result_uuid`; remaining batches stay in a per-connection result cache awaiting `FetchRequest`s
 
-The shared `duckdb_ctx` is a process-singleton `duckdb::Connection` used only for serialisation context, not for query execution. The actual query runs through `sqe-coordinator` against DataFusion or a remote DuckDB worker.
+The wire codec is pure Rust with no DuckDB process dependency. The actual query runs through `sqe-coordinator` against DataFusion (default) or a remote DuckDB worker (Option B). `sqe-quack-server` itself does not link `duckdb-rs`.
 
 #### Connection lifecycle
 
@@ -490,7 +505,8 @@ Plain DuckDB clients see this as a normal error string. SQE-aware clients can sp
 | Quack protocol churn between DuckDB releases | Pin to extension `v1.5-variegata` + `quack_version = 1`; gate behind cargo feature; documented support matrix; re-evaluate at DuckDB v2.0 |
 | SQL dialect coverage gap surprises users | Explicit `SQE-DIALECT` error with feature name; track gaps in `docs/duckdb-dialect-status.md` |
 | SQL-text policy rewriting introduces correctness bugs | Property-based test parity against LogicalPlan rewriter |
-| Binary size: linking duckdb-rs in coordinator (~25 MB) | Gate behind `quack-server` feature; coordinator binary without the feature stays slim; documented in build profiles |
+| Binary size: linking duckdb-rs in the worker (~25 MB) | Only `sqe-worker-duckdb` links duckdb-rs; `sqe-quack-server` is pure Rust. Coordinator binary unaffected unless the worker is co-located |
+| Pure-Rust codec drifts from upstream | Pinned to `quack_version = 1`, `SerializationCompatibility::FromIndex(7)`. Fixture-based tests compare against captured upstream frames. Re-evaluate when DuckDB v2.0 ships |
 | Two enforcement points in `sqe-policy` increase audit surface | Single internal `PolicyDecision` data structure; both rewriters call the same decision builder; audit log emits the same event regardless of enforcement path |
 | OIDC token expiry mid-session | If `sqe-auth` rejects mid-session, server returns `SQE-AUTH` error; client must re-`ATTACH` with fresh token |
 | Arrow -> DataChunk conversion overhead in Option A | Use DuckDB's `Appender::append_record_batch` (zero-copy where possible); benchmarked in task 9.x |
