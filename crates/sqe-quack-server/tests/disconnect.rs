@@ -6,7 +6,7 @@ use sqe_quack_wire::message::{
     decode_message, encode_message, ConnectionRequest, MessageHeader, MessageType, QuackMessage,
 };
 
-use support::{accept_provider, spawn_server_with_sessions};
+use support::{accept_provider, noop_executor, spawn_server_with_sessions};
 
 async fn connect(base: &str) -> String {
     let header = MessageHeader {
@@ -34,7 +34,7 @@ async fn connect(base: &str) -> String {
 
 #[tokio::test]
 async fn disconnect_removes_session_and_returns_success() {
-    let (base, sessions) = spawn_server_with_sessions(accept_provider()).await;
+    let (base, sessions) = spawn_server_with_sessions(accept_provider(), noop_executor()).await;
     let connection_id = connect(&base).await;
     sessions.run_pending_tasks();
     assert!(sessions.get(&connection_id).is_some());
@@ -62,7 +62,7 @@ async fn disconnect_removes_session_and_returns_success() {
 
 #[tokio::test]
 async fn disconnect_with_unknown_connection_id_returns_auth_error() {
-    let (base, _sessions) = spawn_server_with_sessions(accept_provider()).await;
+    let (base, _sessions) = spawn_server_with_sessions(accept_provider(), noop_executor()).await;
 
     let header = MessageHeader {
         r#type: MessageType::DisconnectMessage,
