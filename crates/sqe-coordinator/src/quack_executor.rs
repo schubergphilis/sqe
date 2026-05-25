@@ -1,18 +1,17 @@
-//! Production `QueryExecutor` implementation that delegates to
-//! `sqe_coordinator::QueryHandler`.
-//!
-//! Available only when this crate is built with the `coordinator-executor`
-//! feature so the default build does not pull in DataFusion, the catalog
-//! layer, or any of the other coordinator dependencies.
+//! `QueryExecutor` implementation that delegates to this crate's
+//! `QueryHandler`. Lives here (rather than in `sqe-quack-server`) because
+//! `sqe-quack-server` does not depend on `sqe-coordinator` — the trait is
+//! defined there but the production implementation has to live on this
+//! side of the dependency edge to avoid a cycle.
 
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
-use sqe_coordinator::QueryHandler;
 use sqe_core::{Session, SqeError};
+use sqe_quack_server::{QueryError, QueryExecutor};
 
-use crate::query_executor::{QueryError, QueryExecutor};
+use crate::QueryHandler;
 
 pub struct CoordinatorExecutor {
     query_handler: Arc<QueryHandler>,
