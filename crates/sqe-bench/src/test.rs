@@ -200,16 +200,15 @@ pub async fn run_benchmark_test(
         // during the perf regression in #131 without ever tripping its
         // own declared 60s ceiling because of that floor. Honouring the
         // header value as-written restores the intent.
+        let default_timeout = if query.timeout_secs > 0 {
+            query.timeout_secs
+        } else {
+            300
+        };
         let timeout_secs = std::env::var("BENCH_QUERY_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or_else(|| {
-                if query.timeout_secs > 0 {
-                    query.timeout_secs
-                } else {
-                    300
-                }
-            });
+            .unwrap_or(default_timeout);
         let start = std::time::Instant::now();
 
         // Use tokio::select! so the timeout fires even if the gRPC stream
@@ -254,7 +253,7 @@ pub async fn run_benchmark_test(
                 if std::env::var("BENCH_DEBUG").is_ok() && rows < 200 {
                     eprintln!("[bench] {} result ({} rows):", query.id, rows);
                     for batch in &batches {
-                        match arrow::util::pretty::pretty_format_batches(&[batch.clone()]) {
+                        match arrow::util::pretty::pretty_format_batches(std::slice::from_ref(batch)) {
                             Ok(s) => eprintln!("{}", s),
                             Err(e) => eprintln!("[bench] pretty-format error: {e}"),
                         }
@@ -458,8 +457,9 @@ pub(crate) fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> Stri
                     output.matches('\'').count() + remaining[..pos].matches('\'').count();
                 let double_quotes_before =
                     output.matches('"').count() + remaining[..pos].matches('"').count();
-                let inside_string = !single_quotes_before.is_multiple_of(2);
-                let inside_identifier = !double_quotes_before.is_multiple_of(2);
+                // `is_multiple_of` is stable only from 1.87; workspace MSRV is 1.85.
+                let inside_string = single_quotes_before % 2 != 0;
+                let inside_identifier = double_quotes_before % 2 != 0;
                 if !inside_string && !inside_identifier {
                     output.push_str(&remaining[..pos]);
                     output.push_str(&qualified);

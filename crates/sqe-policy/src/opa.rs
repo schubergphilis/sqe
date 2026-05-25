@@ -69,32 +69,30 @@ impl OpaCircuitBreaker {
     }
 
     fn check(&self) -> Result<(), String> {
-        loop {
-            let state = self.state.load(Ordering::Acquire);
-            match state {
-                STATE_CLOSED => return Ok(()),
-                STATE_OPEN => {
-                    let elapsed_ms = now_millis()
-                        .saturating_sub(self.last_failure_ms.load(Ordering::Relaxed));
-                    if elapsed_ms >= self.recovery_timeout.as_millis() as u64
-                        && self
-                            .state
-                            .compare_exchange(
-                                STATE_OPEN,
-                                STATE_HALF_OPEN,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            )
-                            .is_ok()
-                    {
-                        info!("OPA circuit breaker moving to half_open (probe allowed)");
-                        return Ok(());
-                    }
-                    return Err("OPA circuit breaker is open".to_string());
+        let state = self.state.load(Ordering::Acquire);
+        match state {
+            STATE_CLOSED => Ok(()),
+            STATE_OPEN => {
+                let elapsed_ms = now_millis()
+                    .saturating_sub(self.last_failure_ms.load(Ordering::Relaxed));
+                if elapsed_ms >= self.recovery_timeout.as_millis() as u64
+                    && self
+                        .state
+                        .compare_exchange(
+                            STATE_OPEN,
+                            STATE_HALF_OPEN,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                {
+                    info!("OPA circuit breaker moving to half_open (probe allowed)");
+                    return Ok(());
                 }
-                STATE_HALF_OPEN => return Ok(()),
-                _ => return Ok(()),
+                Err("OPA circuit breaker is open".to_string())
             }
+            STATE_HALF_OPEN => Ok(()),
+            _ => Ok(()),
         }
     }
 
@@ -160,8 +158,10 @@ pub struct OpaStore {
 
 impl OpaStore {
     pub fn new(opa_url: &str, policy_path: &str, cache_ttl_secs: u64) -> Result<Self, reqwest::Error> {
-        let mut cfg = OpaConfig::default();
-        cfg.cache_ttl_secs = cache_ttl_secs;
+        let cfg = OpaConfig {
+            cache_ttl_secs,
+            ..OpaConfig::default()
+        };
         Self::with_config(opa_url, policy_path, &cfg)
     }
 

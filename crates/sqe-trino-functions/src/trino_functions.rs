@@ -1399,7 +1399,9 @@ impl ScalarUDFImpl for JsonObject {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         use datafusion::common::ScalarValue;
 
-        if !args.args.len().is_multiple_of(2) {
+        // `is_multiple_of` would be clearer but is stable only from 1.87;
+        // workspace MSRV is 1.85.
+        if args.args.len() % 2 != 0 {
             return Err(DataFusionError::Internal(
                 "json_object: must have an even number of arguments (key-value pairs)".to_string(),
             ));

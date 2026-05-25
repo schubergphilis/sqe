@@ -766,8 +766,14 @@ mod tests {
         assert_eq!(identity.user_id, "alice");
         assert_eq!(identity.display_name, "alice");
         assert_eq!(identity.roles, vec!["analyst", "writer"]);
-        assert_eq!(identity.catalog_token.as_deref(), Some(token.as_str()));
-        assert_eq!(identity.refresh_token.as_deref(), Some("subject-token"));
+        assert_eq!(
+            identity.catalog_token.as_ref().map(|s| s.expose()),
+            Some(token.as_str())
+        );
+        assert_eq!(
+            identity.refresh_token.as_ref().map(|s| s.expose()),
+            Some("subject-token")
+        );
     }
 
     #[test]

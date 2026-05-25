@@ -41,7 +41,8 @@ fn employee_schema() -> Arc<Schema> {
 }
 
 fn employee_batch(schema: Arc<Schema>) -> RecordBatch {
-    let salary = Decimal128Array::from(vec![100_000_00_i128, 50_000_00_i128, 75_000_00_i128])
+    // Decimal128 cents-units: $100,000, $50,000, $75,000.
+    let salary = Decimal128Array::from(vec![10_000_000_i128, 5_000_000_i128, 7_500_000_i128])
         .with_precision_and_scale(18, 2)
         .unwrap();
     RecordBatch::try_new(

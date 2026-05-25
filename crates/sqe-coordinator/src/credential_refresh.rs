@@ -315,7 +315,7 @@ async fn push_credentials_to_worker_inner(
         request.metadata_mut().insert(WORKER_SECRET_HEADER, value);
     }
 
-    let response = client.do_action(request).await.map_err(|e| {
+    let response = client.do_action(request).await.inspect_err(|e| {
         if let Some(pool) = pool {
             if matches!(
                 e.code(),
@@ -324,7 +324,6 @@ async fn push_credentials_to_worker_inner(
                 pool.invalidate(worker_url);
             }
         }
-        e
     })?;
 
     // Consume the response stream to ensure the action completed

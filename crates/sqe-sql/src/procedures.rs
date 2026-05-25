@@ -26,7 +26,7 @@
 
 use chrono::{DateTime, Utc};
 use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Statement, Value,
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Statement, Value,
 };
 
 use sqe_core::SqeError;
