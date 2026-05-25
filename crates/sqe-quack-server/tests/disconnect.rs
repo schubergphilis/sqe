@@ -1,24 +1,12 @@
 //! Integration tests for the DisconnectMessage handler.
 
-use std::time::Duration;
+mod support;
 
-use sqe_quack_server::{router, QuackServerState};
 use sqe_quack_wire::message::{
     decode_message, encode_message, ConnectionRequest, MessageHeader, MessageType, QuackMessage,
 };
 
-async fn spawn_server() -> (String, sqe_quack_server::SessionStore) {
-    let state = QuackServerState::new();
-    let sessions = state.sessions.clone();
-    let app = router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    (format!("http://{addr}"), sessions)
-}
+use support::{accept_provider, spawn_server_with_sessions};
 
 async fn connect(base: &str) -> String {
     let header = MessageHeader {
@@ -33,11 +21,10 @@ async fn connect(base: &str) -> String {
         min_supported_quack_version: 1,
         max_supported_quack_version: 1,
     });
-    let request_bytes = encode_message(&header, &body);
     let resp = reqwest::Client::new()
         .post(format!("{base}/quack"))
         .header("content-type", "application/vnd.duckdb")
-        .body(request_bytes)
+        .body(encode_message(&header, &body))
         .send()
         .await
         .unwrap();
@@ -47,7 +34,7 @@ async fn connect(base: &str) -> String {
 
 #[tokio::test]
 async fn disconnect_removes_session_and_returns_success() {
-    let (base, sessions) = spawn_server().await;
+    let (base, sessions) = spawn_server_with_sessions(accept_provider()).await;
     let connection_id = connect(&base).await;
     sessions.run_pending_tasks();
     assert!(sessions.get(&connection_id).is_some());
@@ -69,14 +56,13 @@ async fn disconnect_removes_session_and_returns_success() {
     assert_eq!(resp_header.r#type, MessageType::SuccessResponse);
     assert!(matches!(resp_body, QuackMessage::SuccessResponse));
 
-    // moka's entry_count is a hint not a strict count; run a sync pass first.
     sessions.run_pending_tasks();
     assert!(sessions.get(&connection_id).is_none());
 }
 
 #[tokio::test]
 async fn disconnect_with_unknown_connection_id_returns_auth_error() {
-    let (base, _sessions) = spawn_server().await;
+    let (base, _sessions) = spawn_server_with_sessions(accept_provider()).await;
 
     let header = MessageHeader {
         r#type: MessageType::DisconnectMessage,
