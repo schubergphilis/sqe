@@ -6,10 +6,20 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Default build is the lightweight wire + handlers + trait abstraction.
+default = []
+# Bring in sqe-coordinator and expose CoordinatorExecutor — the production
+# adapter that implements `QueryExecutor` over `QueryHandler`. Off by default
+# so the server crate stays buildable on its own (e.g. for testing or for
+# binaries that wrap a different execution engine).
+coordinator-executor = ["dep:sqe-coordinator"]
+
 [dependencies]
 sqe-quack-wire = { path = "../sqe-quack-wire" }
 sqe-auth = { path = "../sqe-auth" }
 sqe-core = { path = "../sqe-core" }
+sqe-coordinator = { path = "../sqe-coordinator", optional = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 moka = { workspace = true }
@@ -26,3 +36,4 @@ chrono = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 async-trait = { workspace = true }
+anyhow = { workspace = true }
