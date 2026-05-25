@@ -70,6 +70,20 @@ impl BinarySerializer {
         // OnListEnd: no output.
     }
 
+    /// Write the leading "nullable present" byte that DuckDB's
+    /// `OnNullableBegin` emits before serialised `unique_ptr<T>` /
+    /// `Option<T>` values. The value is `1` when present, `0` when null.
+    /// Used by `unique_ptr<DataChunkWrapper>` and the list-of-unique_ptr
+    /// shape that `PrepareResponse.results` and `FetchResponse.results`
+    /// take on the wire.
+    pub fn begin_nullable(&mut self, present: bool) {
+        self.out.push(present as u8);
+    }
+
+    pub fn end_nullable(&mut self, _present: bool) {
+        // OnNullableEnd: no output.
+    }
+
     pub fn write_bool(&mut self, value: bool) {
         self.out.push(value as u8);
     }
@@ -201,6 +215,14 @@ impl<'a> BinaryDeserializer<'a> {
         } else {
             Ok(false)
         }
+    }
+
+    /// Consume DuckDB's "nullable present" byte that precedes a serialised
+    /// `unique_ptr<T>` value. Returns `true` when the value follows (most
+    /// common case in our message set), `false` when the upstream sent a
+    /// null pointer.
+    pub fn read_nullable_present(&mut self) -> crate::Result<bool> {
+        self.read_bool()
     }
 
     pub fn read_bool(&mut self) -> crate::Result<bool> {
