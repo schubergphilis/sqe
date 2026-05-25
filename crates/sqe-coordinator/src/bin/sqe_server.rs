@@ -701,6 +701,29 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         tracing::info!("Trino-compat HTTP on port {}", config.coordinator.trino_http_port);
     }
 
+    // DuckDB Quack RPC endpoint (off by default). Shares the same AuthChain
+    // as Flight SQL / Trino-compat, and dispatches every query through the
+    // same QueryHandler via a CoordinatorExecutor adapter.
+    if config.coordinator.quack_port > 0 {
+        let quack_port = config.coordinator.quack_port;
+        let executor: Arc<dyn sqe_quack_server::QueryExecutor> = Arc::new(
+            sqe_coordinator::CoordinatorExecutor::new(query_handler.clone()),
+        );
+        let quack_state =
+            sqe_quack_server::QuackServerState::new(Arc::clone(&auth_chain), executor);
+        let quack_app = sqe_quack_server::router(quack_state);
+        let bind = format!("0.0.0.0:{quack_port}");
+        let listener = tokio::net::TcpListener::bind(&bind)
+            .await
+            .map_err(|e| anyhow::anyhow!("Quack server bind to {bind}: {e}"))?;
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, quack_app).await {
+                tracing::error!(error = %e, "Quack RPC server terminated unexpectedly");
+            }
+        });
+        tracing::info!("DuckDB Quack RPC on port {quack_port}");
+    }
+
     // Mark ready
     ready.store(true, Ordering::Relaxed);
 

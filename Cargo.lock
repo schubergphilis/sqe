@@ -6798,6 +6798,7 @@ dependencies = [
  "sqe-metrics",
  "sqe-planner",
  "sqe-policy",
+ "sqe-quack-server",
  "sqe-sql",
  "sqe-trino-compat",
  "sqe-trino-functions",
@@ -6925,7 +6926,6 @@ dependencies = [
 name = "sqe-quack-server"
 version = "0.31.4"
 dependencies = [
- "anyhow",
  "arrow-array",
  "arrow-schema",
  "async-trait",
@@ -6935,7 +6935,6 @@ dependencies = [
  "moka",
  "reqwest 0.12.28",
  "sqe-auth",
- "sqe-coordinator",
  "sqe-core",
  "sqe-quack-wire",
  "thiserror 2.0.18",

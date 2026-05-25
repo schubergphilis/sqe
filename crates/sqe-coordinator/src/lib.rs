@@ -12,6 +12,7 @@ pub mod flight_sql;
 pub mod flight_sql_helpers;
 pub mod memory;
 pub mod mode;
+pub mod quack_executor;
 pub mod query_handler;
 pub mod runtime;
 pub mod runtime_catalog;
@@ -28,6 +29,7 @@ pub mod write_handler;
 pub mod writer;
 
 pub use mode::Mode;
+pub use quack_executor::CoordinatorExecutor;
 pub use query_handler::QueryHandler;
 pub use runtime_catalog::{AttachedCatalog, RuntimeCatalogRegistry};
 pub use session_manager::SessionManager;
