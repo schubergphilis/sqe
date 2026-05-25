@@ -82,6 +82,8 @@ tracing-opentelemetry = { workspace = true }
 toml = { workspace = true }
 sqe-core = { path = "../sqe-core" }
 sqe-auth = { path = "../sqe-auth" }
+sqe-quack-server = { path = "../sqe-quack-server" }
+sqe-quack-wire = { path = "../sqe-quack-wire" }
 # Tests for the runtime catalog registry need the `sql-sqlite` backend
 # on `sqe-catalog`. Enable through the `test-sqlite` feature instead of
 # a dev-dep override so feature unification does not leak the SQLite
