@@ -718,6 +718,22 @@ pub enum AuthProviderConfig {
         #[serde(default)]
         roles: Vec<String>,
     },
+    /// Accepts any non-empty bearer and forwards it to the catalog without
+    /// local validation. Intended for deployments where an upstream proxy
+    /// has already validated the JWT, or for dev environments where the
+    /// catalog itself is the source of truth.
+    BearerPassthrough {
+        /// User name to assign. Default: `"bearer-passthrough"`.
+        #[serde(default = "default_bearer_passthrough_user")]
+        user: String,
+        /// Roles to assign. Default: empty.
+        #[serde(default)]
+        roles: Vec<String>,
+    },
+}
+
+fn default_bearer_passthrough_user() -> String {
+    "bearer-passthrough".to_string()
 }
 
 fn default_roles_claim() -> String {
@@ -2246,7 +2262,8 @@ impl SqeConfig {
                 | AuthProviderConfig::AwsIam { .. }
                 | AuthProviderConfig::ApiKey { .. }
                 | AuthProviderConfig::Mtls { .. }
-                | AuthProviderConfig::Anonymous { .. } => {}
+                | AuthProviderConfig::Anonymous { .. }
+                | AuthProviderConfig::BearerPassthrough { .. } => {}
             }
         }
 

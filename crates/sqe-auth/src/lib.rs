@@ -6,6 +6,7 @@ pub mod oauth;
 pub mod anonymous;
 pub mod api_key;
 pub mod aws_iam;
+pub mod bearer_passthrough;
 pub mod bearer_token;
 pub mod mtls;
 pub mod token_exchange;
