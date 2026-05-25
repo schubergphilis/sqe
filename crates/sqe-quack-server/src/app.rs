@@ -102,8 +102,8 @@ fn handle_prepare_request(
     error_response(
         &request_header.connection_id,
         request_header.client_query_id,
-        "SQE-EXEC: result streaming requires the DataChunk codec, which is not \
-         yet implemented in this build (see Phase 1.6 in the openspec change)"
+        "SQE-EXEC: query execution is not yet wired to sqe-coordinator; result \
+         encoding is in place but no plan is built"
             .to_string(),
     )
 }
