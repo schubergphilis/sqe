@@ -91,15 +91,19 @@ impl LogicalTypeId {
 
     /// Constant byte width for fixed-size types. None for variable-length
     /// types (VARCHAR, BLOB) and unsupported types.
+    ///
+    /// Width matches DuckDB's internal C++ representation: `Time`/`TimeNs`/`TimeTz`
+    /// are i64 microseconds (or ns / packed micros+offset), and `Interval` is the
+    /// 16-byte `interval_t { months: i32, days: i32, micros: i64 }`.
     pub fn fixed_width(self) -> Option<usize> {
         use LogicalTypeId::*;
         Some(match self {
             Boolean | TinyInt | UTinyInt => 1,
             SmallInt | USmallInt => 2,
-            Integer | UInteger | Float | Date | Time | TimeNs | TimeTz => 4,
-            BigInt | UBigInt | Double | Timestamp | TimestampSec | TimestampMs | TimestampNs
-            | TimestampTz | TimestampTzNs => 8,
-            HugeInt | UHugeInt | Uuid => 16,
+            Integer | UInteger | Float | Date => 4,
+            BigInt | UBigInt | Double | Time | TimeNs | TimeTz | Timestamp | TimestampSec
+            | TimestampMs | TimestampNs | TimestampTz | TimestampTzNs => 8,
+            HugeInt | UHugeInt | Uuid | Interval => 16,
             _ => return None,
         })
     }

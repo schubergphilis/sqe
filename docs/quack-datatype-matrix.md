@@ -22,9 +22,10 @@ How DuckDB, Arrow/DataFusion, SQE's `LogicalTypeId`, and Iceberg primitive types
 | `DATE` from `Date64` | `Date64` | `Date` | `date` | ✅ | narrowed to `i32` days |
 | `TIMESTAMP_S` / `_MS` / `_US` (default `TIMESTAMP`) / `_NS` | `Timestamp(Second/Millisecond/Microsecond/Nanosecond, None)` | `TimestampSec` / `TimestampMs` / `Timestamp` / `TimestampNs` | `timestamp` | ✅ | timezone discarded; see follow-ups |
 | `TIMESTAMP WITH TIME ZONE` | `Timestamp(*, Some(tz))` | `TimestampTz` | `timestamptz` | ❌ | timezone stripped today |
-| `TIME` | `Time32(*)` / `Time64(*)` | `Time` / `TimeNs` | `time` | ❌ | not in `arrow_bridge` yet |
-| `UUID` | `FixedSizeBinary(16)` | `Uuid` | `uuid` | ❌ | not in `arrow_bridge` yet; DuckDB UUID literal syntax not handled by DataFusion either |
-| `INTERVAL` | `Interval(YearMonth/DayTime/MonthDayNano)` | `Interval` | (none) | ❌ | |
+| `TIME` | `Time32(Second/Millisecond)` / `Time64(Microsecond)` | `Time` | `time` | ✅ | Time32 variants widen ×1_000_000 / ×1_000 to i64 microseconds-of-day |
+| `TIME_NS` | `Time64(Nanosecond)` | `TimeNs` | (none, project as `time`) | ✅ | i64 nanoseconds-of-day passthrough |
+| `UUID` | `FixedSizeBinary(16)` | `Uuid` | `uuid` | ✅ | 16-byte raw passthrough; other widths rejected |
+| `INTERVAL` | `Interval(YearMonth/DayTime/MonthDayNano)` | `Interval` | (none) | ✅ | widens into DuckDB's 16-byte `interval_t { months, days, micros }`; ns floored to micros |
 | `BIT` | (no native Arrow) | `Bit` | (none) | ❌ | |
 
 ## Nested types
