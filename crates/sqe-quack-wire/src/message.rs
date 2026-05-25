@@ -333,16 +333,30 @@ impl PrepareResponse {
         s.end_list();
         s.end_property();
 
-        s.begin_property(3);
-        s.write_bool(self.needs_more_fetch);
-        s.end_property();
+        // `needs_more_fetch` uses DuckDB's `WritePropertyWithDefault` pattern:
+        // the field is omitted on the wire when its value equals the default
+        // (false). This matters because the real DuckDB client uses
+        // positional decoding, expecting field 4 immediately after field 2
+        // when `needs_more_fetch` is false.
+        let needs_more_fetch_present = self.needs_more_fetch;
+        s.begin_optional_property(3, needs_more_fetch_present);
+        if needs_more_fetch_present {
+            s.write_bool(self.needs_more_fetch);
+        }
+        s.end_optional_property(needs_more_fetch_present);
 
         s.begin_property(4);
         s.begin_list(self.results.len() as u64);
         for chunk in &self.results {
+            // `vector<unique_ptr<DataChunkWrapper>>` writes a nullable
+            // "present" byte before each element. Real DuckDB's decoder
+            // unconditionally consumes that byte; omitting it shifts the
+            // reader by one byte and trips a field_id mismatch on field 300.
+            s.begin_nullable(true);
             s.begin_object();
             encode_data_chunk_wrapper(s, chunk);
             s.end_object();
+            s.end_nullable(true);
         }
         s.end_list();
         s.end_property();
@@ -369,13 +383,24 @@ impl PrepareResponse {
             result_names.push(d.read_string()?);
         }
 
-        d.expect_field(3)?;
-        let needs_more_fetch = d.read_bool()?;
+        // Optional per `WritePropertyWithDefault`; absent on the wire means
+        // `false`.
+        let needs_more_fetch = if d.read_optional(3)? {
+            d.read_bool()?
+        } else {
+            false
+        };
 
         d.expect_field(4)?;
         let results_count = d.read_list_count()? as usize;
         let mut results = Vec::with_capacity(results_count);
         for _ in 0..results_count {
+            // Consume the leading nullable byte; a `false` value here would
+            // mean a null DataChunkWrapper, which the protocol doesn't
+            // emit in practice.
+            if !d.read_nullable_present()? {
+                return Err(crate::WireError::NullDataChunkWrapper);
+            }
             let chunk = decode_data_chunk_wrapper(d)?;
             d.expect_object_end()?;
             results.push(chunk);
@@ -405,9 +430,13 @@ impl FetchResponse {
         s.begin_property(1);
         s.begin_list(self.results.len() as u64);
         for chunk in &self.results {
+            // `vector<unique_ptr<DataChunkWrapper>>` — same nullable-byte
+            // prefix per element as in PrepareResponse.
+            s.begin_nullable(true);
             s.begin_object();
             encode_data_chunk_wrapper(s, chunk);
             s.end_object();
+            s.end_nullable(true);
         }
         s.end_list();
         s.end_property();
@@ -422,6 +451,9 @@ impl FetchResponse {
         let count = d.read_list_count()? as usize;
         let mut results = Vec::with_capacity(count);
         for _ in 0..count {
+            if !d.read_nullable_present()? {
+                return Err(crate::WireError::NullDataChunkWrapper);
+            }
             let chunk = decode_data_chunk_wrapper(d)?;
             d.expect_object_end()?;
             results.push(chunk);
@@ -457,7 +489,13 @@ impl AppendRequest {
         s.begin_property(2);
         s.write_string(&self.table_name);
         s.end_property();
+        // `append_chunk` is `unique_ptr<DataChunkWrapper>` — same
+        // nullable-present byte as the result lists.
+        s.begin_property(3);
+        s.begin_nullable(true);
         encode_data_chunk_wrapper(s, &self.append_chunk);
+        s.end_nullable(true);
+        s.end_property();
     }
 
     pub fn decode(d: &mut BinaryDeserializer<'_>) -> crate::Result<Self> {
@@ -465,6 +503,10 @@ impl AppendRequest {
         let schema_name = d.read_string()?;
         d.expect_field(2)?;
         let table_name = d.read_string()?;
+        d.expect_field(3)?;
+        if !d.read_nullable_present()? {
+            return Err(crate::WireError::NullDataChunkWrapper);
+        }
         let append_chunk = decode_data_chunk_wrapper(d)?;
         Ok(Self {
             schema_name,
@@ -888,7 +930,10 @@ mod tests {
         let decoded = MessageHeader::decode(&mut d).expect("decode wire-form header");
         d.expect_object_end().unwrap();
         assert_eq!(decoded.r#type, MessageType::ConnectionRequest);
-        assert_eq!(decoded.connection_id, "", "absent field 2 means empty string");
+        assert_eq!(
+            decoded.connection_id, "",
+            "absent field 2 means empty string"
+        );
         assert!(decoded.client_query_id.is_none());
     }
 
