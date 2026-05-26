@@ -747,20 +747,19 @@ impl Vector {
                     child: Box::new(child_vec),
                 }
             }
-            LogicalTypeId::Struct => {
-                // STRUCT: field 103 "children" — list of child vector objects,
-                // one per declared field.
+            // UNION reuses STRUCT's physical layout — DuckDB's
+            // `LogicalType::UNION` factory builds a StructTypeInfo with a
+            // UTINYINT "tag" prepended to the member list, so the wire is
+            // identical (field 103 + parallel child vectors). The only
+            // difference is the parent LogicalTypeId.
+            LogicalTypeId::Struct | LogicalTypeId::Union => {
                 d.expect_field(103)?;
                 let child_count = d.read_list_count()? as usize;
                 let field_types: Vec<LogicalType> = match &logical_type.extra {
                     Some(ExtraTypeInfo::Struct { fields }) => {
                         fields.iter().map(|(_, ty)| ty.clone()).collect()
                     }
-                    _ => {
-                        return Err(crate::WireError::UnsupportedLogicalType(
-                            LogicalTypeId::Struct,
-                        ))
-                    }
+                    _ => return Err(crate::WireError::UnsupportedLogicalType(logical_type.id)),
                 };
                 if child_count != field_types.len() {
                     return Err(crate::WireError::UnexpectedField {
@@ -1543,6 +1542,53 @@ mod tests {
 
         let mut d = BinaryDeserializer::new(&encoded);
         let decoded = Vector::decode(lt, 4, &mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, v);
+    }
+
+    #[test]
+    fn union_vector_reuses_struct_physical_layout() {
+        // DuckDB's `LogicalType::UNION(members)` factory builds a
+        // StructTypeInfo with a hidden UTINYINT "tag" prepended to the
+        // member list. The wire bytes are identical to a STRUCT — only the
+        // outer LogicalTypeId changes from Struct to Union.
+        // 3 rows: row 0 picks member "a" (tag=0), row 1 picks "b" (tag=1),
+        // row 2 picks "a" (tag=0).
+        let tag_col = Vector::new_fixed(LogicalTypeId::UTinyInt, vec![0u8, 1, 0]);
+        let a_bytes: Vec<u8> = [10i32, 0, 30].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let a_col = Vector {
+            logical_type: LogicalType::new(LogicalTypeId::Integer),
+            validity: Some(vec![true, false, true]),
+            data: VectorData::Fixed(a_bytes),
+        };
+        let b_col = Vector::new_strings(vec![None, Some("hi".to_string()), None]);
+
+        let union_lt = LogicalType::with_extra(
+            LogicalTypeId::Union,
+            ExtraTypeInfo::Struct {
+                fields: vec![
+                    ("".to_string(), LogicalType::new(LogicalTypeId::UTinyInt)),
+                    ("a".to_string(), LogicalType::new(LogicalTypeId::Integer)),
+                    ("b".to_string(), LogicalType::new(LogicalTypeId::Varchar)),
+                ],
+            },
+        );
+        let v = Vector {
+            logical_type: union_lt.clone(),
+            validity: None,
+            data: VectorData::Struct {
+                children: vec![tag_col, a_col, b_col],
+            },
+        };
+
+        let mut s = BinarySerializer::new();
+        s.begin_object();
+        v.encode(3, &mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+
+        let mut d = BinaryDeserializer::new(&bytes);
+        let decoded = Vector::decode(union_lt, 3, &mut d).unwrap();
         d.expect_object_end().unwrap();
         assert_eq!(decoded, v);
     }
