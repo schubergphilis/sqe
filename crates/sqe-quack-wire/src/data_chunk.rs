@@ -786,11 +786,19 @@ impl Vector {
                 let mut values = Vec::with_capacity(take);
                 let validity_ref = validity.as_deref();
                 for i in 0..actual {
-                    let s_value = d.read_string()?;
                     let valid = validity_ref
                         .map(|v| v.get(i).copied().unwrap_or(true))
                         .unwrap_or(true);
-                    values.push(if valid { Some(s_value) } else { None });
+                    // Real DuckDB writes uninitialised bytes (often non-UTF-8)
+                    // at NULL VARCHAR positions rather than an empty string.
+                    // Skip them by length without UTF-8 validation when the
+                    // row is known to be null.
+                    if valid {
+                        values.push(Some(d.read_string()?));
+                    } else {
+                        d.skip_string()?;
+                        values.push(None);
+                    }
                 }
                 VectorData::Strings(values)
             }
@@ -1001,6 +1009,42 @@ mod tests {
         let v = Vector::new_strings(values.clone());
         let decoded = roundtrip_vector(v.clone(), values.len());
         assert_eq!(decoded.data, VectorData::Strings(values));
+    }
+
+    #[test]
+    fn varchar_vector_decodes_null_rows_with_garbage_string_bytes() {
+        // Real DuckDB writes uninitialised bytes (often non-UTF-8) at NULL
+        // VARCHAR positions instead of an empty string. Forge that exact
+        // wire shape and verify decode succeeds with a None at the null
+        // position rather than tripping a UTF-8 validation error.
+        // Layout: 1 row, validity_mask says row 0 is NULL,
+        // field-102 data list = [1 string of length 1 = 0x80].
+        let mut s = BinarySerializer::new();
+        s.begin_object();
+        s.begin_property(100);
+        s.write_bool(true); // has_validity
+        s.end_property();
+        s.begin_property(101);
+        // 1 u64 mask byte sequence; bit 0 = 0 (invalid).
+        s.write_data_ptr(&[0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+        s.end_property();
+        s.begin_property(102);
+        s.begin_list(1);
+        // Write a single byte 0x80 — DuckDB's typical garbage at NULL slots.
+        s.write_string(unsafe { std::str::from_utf8_unchecked(&[0x80]) });
+        s.end_list();
+        s.end_property();
+        s.end_object();
+        let bytes = s.into_bytes();
+
+        let mut d = BinaryDeserializer::new(&bytes);
+        let decoded = Vector::decode(LogicalType::new(LogicalTypeId::Varchar), 1, &mut d).unwrap();
+        d.expect_object_end().unwrap();
+        match decoded.data {
+            VectorData::Strings(values) => assert_eq!(values, vec![None]),
+            other => panic!("expected Strings, got {other:?}"),
+        }
+        assert_eq!(decoded.validity, Some(vec![false]));
     }
 
     #[test]
