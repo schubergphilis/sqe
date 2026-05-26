@@ -445,19 +445,26 @@ pub struct FetchResponse {
 
 impl FetchResponse {
     pub fn encode(&self, s: &mut BinarySerializer) {
-        s.begin_property(1);
-        s.begin_list(self.results.len() as u64);
-        for chunk in &self.results {
-            // `vector<unique_ptr<DataChunkWrapper>>` — same nullable-byte
-            // prefix per element as in PrepareResponse.
-            s.begin_nullable(true);
-            s.begin_object();
-            encode_data_chunk_wrapper(s, chunk);
-            s.end_object();
-            s.end_nullable(true);
+        // Field 1 ("results") uses `WriteListWithDefault` — DuckDB omits
+        // the field entirely when the list is empty (which is exactly what
+        // the terminal fetch in a long stream does to signal "no more
+        // batches"). Match the elision for byte-level compat.
+        let results_present = !self.results.is_empty();
+        s.begin_optional_property(1, results_present);
+        if results_present {
+            s.begin_list(self.results.len() as u64);
+            for chunk in &self.results {
+                // `vector<unique_ptr<DataChunkWrapper>>` — same nullable-byte
+                // prefix per element as in PrepareResponse.
+                s.begin_nullable(true);
+                s.begin_object();
+                encode_data_chunk_wrapper(s, chunk);
+                s.end_object();
+                s.end_nullable(true);
+            }
+            s.end_list();
         }
-        s.end_list();
-        s.end_property();
+        s.end_optional_property(results_present);
 
         s.begin_property(2);
         s.write_u64(self.batch_index.unwrap_or(OPTIONAL_IDX_INVALID_BATCH));
@@ -465,17 +472,23 @@ impl FetchResponse {
     }
 
     pub fn decode(d: &mut BinaryDeserializer<'_>) -> crate::Result<Self> {
-        d.expect_field(1)?;
-        let count = d.read_list_count()? as usize;
-        let mut results = Vec::with_capacity(count);
-        for _ in 0..count {
-            if !d.read_nullable_present()? {
-                return Err(crate::WireError::NullDataChunkWrapper);
+        // Mirror the encode elision: when field 1 is absent the server is
+        // signalling an empty results list.
+        let results = if d.read_optional(1)? {
+            let count = d.read_list_count()? as usize;
+            let mut out = Vec::with_capacity(count);
+            for _ in 0..count {
+                if !d.read_nullable_present()? {
+                    return Err(crate::WireError::NullDataChunkWrapper);
+                }
+                let chunk = decode_data_chunk_wrapper(d)?;
+                d.expect_object_end()?;
+                out.push(chunk);
             }
-            let chunk = decode_data_chunk_wrapper(d)?;
-            d.expect_object_end()?;
-            results.push(chunk);
-        }
+            out
+        } else {
+            Vec::new()
+        };
 
         d.expect_field(2)?;
         let raw = d.read_u64()?;
