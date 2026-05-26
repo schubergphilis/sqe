@@ -109,3 +109,29 @@ In addition to serving Quack RPC, SQE can act as a Quack client and pull rows fr
   ```
 
 This is symmetric to DuckDB's own `quack_query` built-in. Composing the two lets a single DuckDB CLI session route queries through sqe-server, which itself fetches from a remote DuckDB — useful for federated reads or for treating DuckDB as an execution backend for specific workloads.
+
+### Federation: Iceberg + Quack in one query
+
+Because both `quack_query()` and Iceberg tables surface as DataFusion `TableProvider`s on the same session, a single SQL statement can freely mix the two:
+
+```sql
+-- JOIN an Iceberg table with rows pulled from a remote DuckDB
+SELECT p.id, p.name AS person, r.color
+FROM "default".quack_demo p                  -- Iceberg / Polaris
+JOIN quack_query(
+       'quack:remote-duckdb:9495',
+       'remote-secret',
+       'SELECT id, name AS color FROM colors'
+     ) r                                     -- remote DuckDB via Quack
+  ON p.id = r.id;
+```
+
+Live-verified shapes:
+
+- INNER JOIN (Iceberg ↔ Quack) on matching keys.
+- COUNT/SUM aggregation across the join.
+- UNION ALL of Iceberg rows with Quack rows (same projected schema).
+- CROSS JOIN with DECIMAL preserved end-to-end.
+- Filter/projection from either side.
+
+DataFusion plans each query end-to-end; the Iceberg scan reads Parquet from object storage and the Quack TVF round-trips Arrow batches over HTTP/Quack — both feed into the same execution plan.
