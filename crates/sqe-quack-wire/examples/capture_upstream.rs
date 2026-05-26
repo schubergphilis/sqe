@@ -111,6 +111,25 @@ fn main() -> Result<(), Box<dyn Error>> {
     hexdump("DuckDB response to PrepareRequest", &response_bytes);
     save("prepare_response_select_1.bin", &response_bytes)?;
 
+    // ── 3. PrepareRequest("SELECT CAST(... AS DECIMAL(10,2))") ─────────────
+    // Exercises the DECIMAL_TYPE_INFO path: LogicalType field 101 should
+    // emit a non-null ExtraTypeInfo carrying width=10 and scale=2. The
+    // physical width per row is 8 bytes (i64) per DuckDB's tier table.
+    let decimal_header = MessageHeader {
+        r#type: MessageType::PrepareRequest,
+        connection_id: connection_id.clone(),
+        client_query_id: Some(2),
+    };
+    let decimal_body = QuackMessage::PrepareRequest(PrepareRequest {
+        sql_query: "SELECT CAST(1.23 AS DECIMAL(10, 2)) AS price".to_string(),
+    });
+    let request_bytes = encode_message(&decimal_header, &decimal_body);
+    save("prepare_request_decimal_10_2.bin", &request_bytes)?;
+
+    let response_bytes = post_quack(&client, request_bytes)?;
+    hexdump("DuckDB response to DECIMAL(10,2) prepare", &response_bytes);
+    save("prepare_response_decimal_10_2.bin", &response_bytes)?;
+
     Ok(())
 }
 

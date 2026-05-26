@@ -35,6 +35,18 @@ pub enum WireError {
     UnsupportedArrowType(String),
     #[error("DataChunkWrapper nullable byte was false (null), which the protocol does not emit in practice")]
     NullDataChunkWrapper,
+    #[error("unknown ExtraTypeInfoType discriminant {0}")]
+    UnknownExtraTypeInfoType(u8),
+    #[error(
+        "ExtraTypeInfo variant {0:?} is not yet implemented; only DECIMAL is supported so far"
+    )]
+    UnsupportedExtraTypeInfo(crate::data_chunk::ExtraTypeInfoType),
+    #[error(
+        "LogicalType.type_info present but inner ExtraTypeInfo is null — this shape is not produced by DuckDB"
+    )]
+    NullExtraTypeInfo,
+    #[error("ExtraTypeInfo carries an ExtensionTypeInfo (field 103), which the codec does not yet support")]
+    UnsupportedExtensionTypeInfo,
 }
 
 pub type Result<T> = std::result::Result<T, WireError>;

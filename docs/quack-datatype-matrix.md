@@ -15,7 +15,7 @@ How DuckDB, Arrow/DataFusion, SQE's `LogicalTypeId`, and Iceberg primitive types
 | `HUGEINT` / `UHUGEINT` | (no native Arrow) | `HugeInt` / `UHugeInt` | `decimal(38, 0)` | ⚠️ | wire encoding works; DataFusion SQL planner rejects `HUGEINT` |
 | `FLOAT` | `Float32` | `Float` | `float` | ✅ | |
 | `DOUBLE` | `Float64` | `Double` | `double` | ✅ | |
-| `DECIMAL(p, s)` | `Decimal128` / `Decimal256` | `Decimal` | `decimal(p, s)` | ❌ | requires `LogicalType.type_info` (parameterised type); see "Parameterised types" below |
+| `DECIMAL(p, s)` | `Decimal128` | `Decimal` + `ExtraTypeInfo::Decimal { precision, scale }` | `decimal(p, s)` | ✅ | physical width tier-narrowed to i16/i32/i64/i128 per DuckDB; `Decimal256` not supported; negative scale rejected |
 | `VARCHAR` | `Utf8` / `LargeUtf8` / `Utf8View` | `Varchar` | `string` | ✅ | DataFusion 53 emits `Utf8View` by default |
 | `BLOB` | `Binary` / `LargeBinary` / `BinaryView` | `Blob` | `binary` | ✅ | nulls round-trip |
 | `DATE` | `Date32` | `Date` | `date` | ✅ | both sides use days-since-1970-01-01 |
@@ -40,22 +40,23 @@ How DuckDB, Arrow/DataFusion, SQE's `LogicalTypeId`, and Iceberg primitive types
 
 ## Parameterised types
 
-DuckDB's `LogicalType` carries optional `ExtraTypeInfo` on the wire (field 101 of the `LogicalType` object). Today our codec rejects any `LogicalType` that ships with `type_info` populated. The types blocked behind that rejection are:
+DuckDB's `LogicalType` carries optional `ExtraTypeInfo` on the wire (field 101 of the `LogicalType` object). Wave 2a added the framework plus the `DECIMAL` variant; the remaining variants still surface as `WireError::UnsupportedExtraTypeInfo`:
 
-- `DECIMAL(p, s)` — precision + scale live in `DecimalTypeInfo`
+- `DECIMAL(p, s)` — ✅ encoded via `ExtraTypeInfo::Decimal { precision, scale }`. Storage tier follows DuckDB: precision 1-4 -> i16, 5-9 -> i32, 10-18 -> i64, 19-38 -> i128.
 - `LIST<T>` / `ARRAY` — element type in `ListTypeInfo`
 - `STRUCT(...)` — field name + type pairs in `StructTypeInfo`
 - `MAP<K, V>` — key + value types in `MapTypeInfo`
 - `ENUM` — dictionary in `EnumTypeInfo`
 - User-defined types
 
-Implementing those means:
-1. Modeling `ExtraTypeInfo` as a Rust enum in `data_chunk.rs`.
-2. Encoding / decoding `ExtraTypeInfo` (each variant uses `WriteValue` with its own field layout).
-3. Plumbing the parameters through the `arrow_bridge` (e.g. `Decimal128` carries `(precision, scale)` in its Arrow `DataType`).
-4. Choosing what to do for types Iceberg doesn't have a direct mapping for (`ENUM`, nested `UNION`).
+Wave 2b will add the nested variants. They follow the same on-wire shape (object inside field 101, base discriminant at field 100, subclass fields after) but need recursive `LogicalType` encode/decode for child types and Arrow `ListArray` / `StructArray` handling on the bridge.
 
-That's a substantial follow-up MR on its own, tracked in `openspec/changes/duckdb-quack-protocol-support` as part of the deferred Phase 1.6 work.
+ExtraTypeInfo wire layout (verified against DuckDB v1.5.3 generated serializer):
+- Base field 100 (u8): `ExtraTypeInfoType` discriminant — `WriteProperty`, always written.
+- Base field 101 (string): `alias` — `WritePropertyWithDefault`, omitted when "".
+- Base field 102: deleted; readers tolerate but writers never emit.
+- Base field 103 (`unique_ptr<ExtensionTypeInfo>`): `WritePropertyWithDefault`, omitted when null. Unsupported in the codec.
+- Subclass fields per variant. For `DECIMAL`: field 200 (width, u8, `WritePropertyWithDefault` default 0) and field 201 (scale, u8, `WritePropertyWithDefault` default 0). Scale 0 is the common case and omits field 201 entirely.
 
 ## How to reproduce the matrix
 

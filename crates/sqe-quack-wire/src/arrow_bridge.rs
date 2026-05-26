@@ -10,17 +10,20 @@
 //! `AppendRequest` write path; not implemented yet.
 
 use arrow_array::{
-    Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, FixedSizeBinaryArray,
-    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
-    IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray, LargeBinaryArray,
-    LargeStringArray, RecordBatch, StringArray, StringViewArray, Time32MillisecondArray,
-    Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
-    UInt32Array, UInt64Array, UInt8Array,
+    Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
+    FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+    Int8Array, IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray,
+    LargeBinaryArray, LargeStringArray, RecordBatch, StringArray, StringViewArray,
+    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 
-use crate::data_chunk::{DataChunk, LogicalType, LogicalTypeId, Vector, VectorData};
+use crate::data_chunk::{
+    decimal_physical_width, DataChunk, ExtraTypeInfo, LogicalType, LogicalTypeId, Vector,
+    VectorData,
+};
 
 pub fn record_batch_to_data_chunk(batch: &RecordBatch) -> crate::Result<DataChunk> {
     let row_count = batch.num_rows();
@@ -137,6 +140,13 @@ fn column_to_vector(array: &dyn Array, row_count: usize) -> crate::Result<Vector
             return Err(crate::WireError::UnsupportedArrowType(format!(
                 "FixedSizeBinary({n}) — only width 16 (UUID) is supported"
             )))
+        }
+        // Arrow `Decimal128(p, s)` always stores i128 per row. DuckDB's
+        // physical width is precision-tiered (i16/i32/i64/i128), so we
+        // narrow on encode and attach `ExtraTypeInfo::Decimal { precision,
+        // scale }` so the wire carries the parameters.
+        DataType::Decimal128(precision, scale) => {
+            decimal128_to_decimal(array, row_count, *precision, *scale)?
         }
         // Arrow interval types all widen into DuckDB's 16-byte `interval_t`
         // { months: i32, days: i32, micros: i64 }.
@@ -398,6 +408,54 @@ fn interval_monthdaynano_to_interval(
     }
     Ok((
         LogicalType::new(LogicalTypeId::Interval),
+        VectorData::Fixed(bytes),
+    ))
+}
+
+/// Arrow `Decimal128(precision, scale)` -> DuckDB `DECIMAL(precision, scale)`.
+///
+/// DuckDB picks an integer width based on the precision tier
+/// ([`decimal_physical_width`]); we narrow each i128 row accordingly. The
+/// narrowing is value-preserving because `Decimal128` guarantees the digit
+/// count fits within precision. Negative scales would not fit `uint8_t` on the
+/// wire and are rejected up front.
+fn decimal128_to_decimal(
+    array: &dyn Array,
+    row_count: usize,
+    precision: u8,
+    scale: i8,
+) -> crate::Result<(LogicalType, VectorData)> {
+    let scale_u8 = u8::try_from(scale).map_err(|_| {
+        crate::WireError::UnsupportedArrowType(format!(
+            "Decimal128 with negative scale {scale} is not representable in DuckDB DecimalTypeInfo"
+        ))
+    })?;
+    let typed = array
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .ok_or_else(|| {
+            crate::WireError::UnsupportedArrowType("decimal128 downcast failed".to_string())
+        })?;
+    let width = decimal_physical_width(precision);
+    let mut bytes = Vec::with_capacity(row_count * width);
+    for i in 0..row_count {
+        let v: i128 = if typed.is_valid(i) { typed.value(i) } else { 0 };
+        match width {
+            2 => bytes.extend_from_slice(&(v as i16).to_le_bytes()),
+            4 => bytes.extend_from_slice(&(v as i32).to_le_bytes()),
+            8 => bytes.extend_from_slice(&(v as i64).to_le_bytes()),
+            16 => bytes.extend_from_slice(&v.to_le_bytes()),
+            _ => unreachable!("decimal_physical_width returned an unexpected width"),
+        }
+    }
+    Ok((
+        LogicalType::with_extra(
+            LogicalTypeId::Decimal,
+            ExtraTypeInfo::Decimal {
+                precision,
+                scale: scale_u8,
+            },
+        ),
         VectorData::Fixed(bytes),
     ))
 }
@@ -882,6 +940,135 @@ mod tests {
             }
             other => panic!("expected Fixed VectorData, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decimal128_p4s2_narrows_to_i16_le() {
+        // precision 4 -> 2-byte i16 storage. -123 with scale 2 == -1.23.
+        let arr: Arc<dyn Array> = Arc::new(
+            Decimal128Array::from(vec![123i128, -123, 0])
+                .with_precision_and_scale(4, 2)
+                .unwrap(),
+        );
+        let dt = arr.data_type().clone();
+        let batch = batch_with(vec![("d", dt, arr)]);
+        let chunk = record_batch_to_data_chunk(&batch).unwrap();
+        let lt = &chunk.columns[0].logical_type;
+        assert_eq!(lt.id, LogicalTypeId::Decimal);
+        assert_eq!(
+            lt.extra,
+            Some(ExtraTypeInfo::Decimal {
+                precision: 4,
+                scale: 2,
+            })
+        );
+        match &chunk.columns[0].data {
+            VectorData::Fixed(bytes) => {
+                let expected: Vec<u8> = [123i16, -123, 0]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+                assert_eq!(bytes, &expected);
+            }
+            other => panic!("expected Fixed VectorData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decimal128_p9s0_narrows_to_i32_le() {
+        let arr: Arc<dyn Array> = Arc::new(
+            Decimal128Array::from(vec![1i128, 2, 3])
+                .with_precision_and_scale(9, 0)
+                .unwrap(),
+        );
+        let dt = arr.data_type().clone();
+        let batch = batch_with(vec![("d", dt, arr)]);
+        let chunk = record_batch_to_data_chunk(&batch).unwrap();
+        match &chunk.columns[0].data {
+            VectorData::Fixed(bytes) => assert_eq!(bytes.len(), 12, "three i32 values"),
+            other => panic!("expected Fixed VectorData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decimal128_p18s6_narrows_to_i64_le() {
+        let arr: Arc<dyn Array> = Arc::new(
+            Decimal128Array::from(vec![1_000_000i128, -1_000_000])
+                .with_precision_and_scale(18, 6)
+                .unwrap(),
+        );
+        let dt = arr.data_type().clone();
+        let batch = batch_with(vec![("d", dt, arr)]);
+        let chunk = record_batch_to_data_chunk(&batch).unwrap();
+        match &chunk.columns[0].data {
+            VectorData::Fixed(bytes) => {
+                let expected: Vec<u8> = [1_000_000i64, -1_000_000]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+                assert_eq!(bytes, &expected);
+            }
+            other => panic!("expected Fixed VectorData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decimal128_p38_keeps_full_i128() {
+        let arr: Arc<dyn Array> = Arc::new(
+            Decimal128Array::from(vec![i128::MAX, i128::MIN])
+                .with_precision_and_scale(38, 0)
+                .unwrap(),
+        );
+        let dt = arr.data_type().clone();
+        let batch = batch_with(vec![("d", dt, arr)]);
+        let chunk = record_batch_to_data_chunk(&batch).unwrap();
+        match &chunk.columns[0].data {
+            VectorData::Fixed(bytes) => assert_eq!(bytes.len(), 32, "two i128 values"),
+            other => panic!("expected Fixed VectorData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decimal128_with_negative_scale_is_rejected() {
+        // DuckDB's DecimalTypeInfo.scale is uint8_t — negative scales can't
+        // round-trip through the wire.
+        let arr: Arc<dyn Array> = Arc::new(
+            Decimal128Array::from(vec![1i128])
+                .with_precision_and_scale(10, -2)
+                .unwrap(),
+        );
+        let dt = arr.data_type().clone();
+        let batch = batch_with(vec![("d", dt, arr)]);
+        let err = record_batch_to_data_chunk(&batch).unwrap_err();
+        match err {
+            crate::WireError::UnsupportedArrowType(msg) => {
+                assert!(msg.contains("negative scale"), "msg was {msg}");
+            }
+            other => panic!("expected UnsupportedArrowType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decimal128_round_trips_through_full_data_chunk_codec() {
+        let arr: Arc<dyn Array> = Arc::new(
+            Decimal128Array::from(vec![Some(150i128), None, Some(-150)])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        );
+        let dt = arr.data_type().clone();
+        let batch = batch_with(vec![("amount", dt, arr)]);
+        let chunk = record_batch_to_data_chunk(&batch).unwrap();
+
+        let mut s = crate::codec::BinarySerializer::new();
+        s.begin_object();
+        chunk.encode(&mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+
+        let mut d = crate::codec::BinaryDeserializer::new(&bytes);
+        let decoded = DataChunk::decode(&mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, chunk);
     }
 
     #[test]
