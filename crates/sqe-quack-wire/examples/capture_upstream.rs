@@ -130,6 +130,44 @@ fn main() -> Result<(), Box<dyn Error>> {
     hexdump("DuckDB response to DECIMAL(10,2) prepare", &response_bytes);
     save("prepare_response_decimal_10_2.bin", &response_bytes)?;
 
+    // ── 4. PrepareRequest("SELECT [1, 2, 3]") — LIST<INTEGER> ──────────────
+    // Exercises ListTypeInfo: LogicalType field 101 emits ExtraTypeInfo with
+    // discriminant=LIST_TYPE_INFO and subclass field 200 carrying a nested
+    // LogicalType object. Vector payload uses fields 104 (list_size),
+    // 105 (entries: u64 offset + u64 length per row), 106 (child vector).
+    let list_header = MessageHeader {
+        r#type: MessageType::PrepareRequest,
+        connection_id: connection_id.clone(),
+        client_query_id: Some(3),
+    };
+    let list_body = QuackMessage::PrepareRequest(PrepareRequest {
+        sql_query: "SELECT [10, 20, 30] AS xs".to_string(),
+    });
+    let request_bytes = encode_message(&list_header, &list_body);
+    save("prepare_request_list_int.bin", &request_bytes)?;
+    let response_bytes = post_quack(&client, request_bytes)?;
+    hexdump("DuckDB response to LIST<INTEGER>", &response_bytes);
+    save("prepare_response_list_int.bin", &response_bytes)?;
+
+    // ── 5. PrepareRequest("SELECT {a: 1, b: 'hi'}") — STRUCT(a INT, b VARCHAR)
+    // Exercises StructTypeInfo: ExtraTypeInfo subclass field 200 is a
+    // child_list_t<LogicalType> — each entry is a pair object with field 0
+    // (name) and field 1 (LogicalType). Vector payload uses field 103
+    // ("children": parallel child vectors).
+    let struct_header = MessageHeader {
+        r#type: MessageType::PrepareRequest,
+        connection_id,
+        client_query_id: Some(4),
+    };
+    let struct_body = QuackMessage::PrepareRequest(PrepareRequest {
+        sql_query: "SELECT {a: 1, b: 'hi'} AS s".to_string(),
+    });
+    let request_bytes = encode_message(&struct_header, &struct_body);
+    save("prepare_request_struct.bin", &request_bytes)?;
+    let response_bytes = post_quack(&client, request_bytes)?;
+    hexdump("DuckDB response to STRUCT(a INT, b VARCHAR)", &response_bytes);
+    save("prepare_response_struct.bin", &response_bytes)?;
+
     Ok(())
 }
 

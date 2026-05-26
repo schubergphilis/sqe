@@ -32,11 +32,12 @@ How DuckDB, Arrow/DataFusion, SQE's `LogicalTypeId`, and Iceberg primitive types
 
 | DuckDB | Arrow | `LogicalTypeId` | Iceberg | Quack |
 |---|---|---|---|---|
-| `LIST<T>` / `ARRAY` | `List` / `LargeList` | not implemented | `list<T>` | ❌ |
-| `STRUCT(...)` | `Struct` | not implemented | `struct<...>` | ❌ |
-| `MAP<K, V>` | `Map` | not implemented | `map<K, V>` | ❌ |
-| `UNION` | `Union` | not implemented | (none) | ❌ |
-| `ENUM` | `Dictionary(Int32, Utf8)` | not implemented | (none, project as `string`) | ❌ |
+| `LIST<T>` | `List` / `LargeList` | `List` + `ExtraTypeInfo::List { child }` | `list<T>` | ✅ recursive child type; child element vector reused under `field 106` |
+| `STRUCT(...)` | `Struct` | `Struct` + `ExtraTypeInfo::Struct { fields }` | `struct<...>` | ✅ pairs of (name, LogicalType) via `child_list_t` (pair fields 0/1) |
+| `MAP<K, V>` | `Map` | `Map` (id only) | `map<K, V>` | ❌ MAP is LIST<STRUCT<key,value>>; needs MapTypeInfo + arrow bridge |
+| `ARRAY<T, N>` (fixed) | `FixedSizeList` | `Array` (id only) | (none) | ❌ ArrayTypeInfo modelled; vector encode still TBD |
+| `UNION` | `Union` | `Union` (id only) | (none) | ❌ |
+| `ENUM` | `Dictionary(Int32, Utf8)` | `Enum` (id only) | (none, project as `string`) | ❌ |
 
 ## Parameterised types
 
