@@ -1,5 +1,5 @@
 [package]
-name = "sqe-quack-wire"
+name = "sqe-quack-client"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,11 +7,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-thiserror = { workspace = true }
+sqe-quack-wire = { path = "../sqe-quack-wire" }
 arrow = { workspace = true }
 arrow-array = { workspace = true }
-arrow-buffer = { workspace = true }
 arrow-schema = { workspace = true }
-
-[dev-dependencies]
 reqwest = { workspace = true, features = ["blocking"] }
+thiserror = { workspace = true }
+url = { workspace = true }

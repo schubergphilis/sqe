@@ -39,6 +39,42 @@ pub fn record_batch_to_data_chunk(batch: &RecordBatch) -> crate::Result<DataChun
     })
 }
 
+/// Reverse direction: take a decoded `DataChunk` plus the column names from
+/// `PrepareResponse.result_names` and rebuild an Arrow [`RecordBatch`]. Used by
+/// `sqe-quack-client` to surface server responses as Arrow.
+///
+/// Scope: covers the scalar/varchar/blob/decimal/temporal/uuid/interval paths
+/// needed for the bulk of DuckDB query results. Nested types (LIST, STRUCT,
+/// MAP, ARRAY) surface as `UnsupportedLogicalType` until the recursive
+/// vector_to_array logic is added in a follow-up.
+pub fn data_chunk_to_record_batch(
+    names: &[String],
+    chunk: &DataChunk,
+) -> crate::Result<RecordBatch> {
+    if names.len() != chunk.columns.len() {
+        return Err(crate::WireError::UnexpectedField {
+            expected: chunk.columns.len() as u16,
+            actual: names.len() as u16,
+        });
+    }
+    let row_count = chunk.row_count as usize;
+    let mut fields = Vec::with_capacity(chunk.columns.len());
+    let mut arrays: Vec<std::sync::Arc<dyn Array>> = Vec::with_capacity(chunk.columns.len());
+    for (name, column) in names.iter().zip(chunk.columns.iter()) {
+        let array = vector_to_array(column, row_count)?;
+        fields.push(arrow_schema::Field::new(
+            name.clone(),
+            array.data_type().clone(),
+            true,
+        ));
+        arrays.push(array);
+    }
+    let schema = std::sync::Arc::new(arrow_schema::Schema::new(fields));
+    RecordBatch::try_new(schema, arrays).map_err(|e| {
+        crate::WireError::UnsupportedArrowType(format!("RecordBatch::try_new failed: {e}"))
+    })
+}
+
 fn column_to_vector(array: &dyn Array, row_count: usize) -> crate::Result<Vector> {
     let validity = null_buffer_to_validity(array, row_count);
     let (logical_type, data) = match array.data_type() {
@@ -926,6 +962,269 @@ fn string_to_strings<A: StringLikeArray>(
         LogicalType::new(LogicalTypeId::Varchar),
         VectorData::Strings(values),
     ))
+}
+
+// -----------------------------------------------------------------------------
+// Reverse direction: Vector / DataChunk -> Arrow
+// -----------------------------------------------------------------------------
+
+/// Convert a single `Vector` back to an Arrow array. Inverse of
+/// `column_to_vector`.
+fn vector_to_array(vector: &Vector, row_count: usize) -> crate::Result<std::sync::Arc<dyn Array>> {
+    use std::sync::Arc;
+    let nulls = validity_to_null_buffer(vector.validity.as_deref(), row_count);
+    match (&vector.data, vector.logical_type.id) {
+        (VectorData::Strings(values), _) => {
+            // VARCHAR -> StringArray.
+            let mut builder = arrow_array::builder::StringBuilder::with_capacity(row_count, 0);
+            for v in values.iter().take(row_count) {
+                match v {
+                    Some(s) => builder.append_value(s),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        (VectorData::Blobs(values), _) => {
+            let mut builder = arrow_array::builder::BinaryBuilder::with_capacity(row_count, 0);
+            for v in values.iter().take(row_count) {
+                match v {
+                    Some(b) => builder.append_value(b),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        (VectorData::Fixed(_), _) => {
+            let VectorData::Fixed(bytes) = &vector.data else { unreachable!() };
+            fixed_to_array(vector.logical_type.id, bytes, row_count, nulls, &vector.logical_type)
+        }
+        (VectorData::List { .. } | VectorData::Struct { .. } | VectorData::Array { .. }, id) => {
+            // Nested types in the reverse direction are deferred — the
+            // recursive vector_to_array body needs careful sizing of child
+            // counts and field-name plumbing. Tracked as a follow-up.
+            Err(crate::WireError::UnsupportedLogicalType(id))
+        }
+    }
+}
+
+/// Build a typed Arrow array from a tightly-packed little-endian byte buffer.
+/// Mirrors the forward `fixed_from_array` path, monomorphised on `LogicalTypeId`.
+fn fixed_to_array(
+    id: LogicalTypeId,
+    bytes: &[u8],
+    row_count: usize,
+    nulls: Option<arrow_buffer::NullBuffer>,
+    logical_type: &LogicalType,
+) -> crate::Result<std::sync::Arc<dyn Array>> {
+    use arrow_buffer::ScalarBuffer;
+    use std::sync::Arc;
+    match id {
+        LogicalTypeId::Boolean => {
+            let mut builder = arrow_array::builder::BooleanBuilder::with_capacity(row_count);
+            for (i, byte) in bytes.iter().enumerate().take(row_count) {
+                let valid = nulls.as_ref().map(|n| n.is_valid(i)).unwrap_or(true);
+                if valid {
+                    builder.append_value(*byte != 0);
+                } else {
+                    builder.append_null();
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        LogicalTypeId::TinyInt => Ok(Arc::new(Int8Array::new(
+            scalar_buffer_le::<i8>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::SmallInt => Ok(Arc::new(Int16Array::new(
+            scalar_buffer_le::<i16>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::Integer => Ok(Arc::new(Int32Array::new(
+            scalar_buffer_le::<i32>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::BigInt => Ok(Arc::new(Int64Array::new(
+            scalar_buffer_le::<i64>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::UTinyInt => Ok(Arc::new(UInt8Array::new(
+            scalar_buffer_le::<u8>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::USmallInt => Ok(Arc::new(UInt16Array::new(
+            scalar_buffer_le::<u16>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::UInteger => Ok(Arc::new(UInt32Array::new(
+            scalar_buffer_le::<u32>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::UBigInt => Ok(Arc::new(UInt64Array::new(
+            scalar_buffer_le::<u64>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::Float => Ok(Arc::new(Float32Array::new(
+            scalar_buffer_le::<f32>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::Double => Ok(Arc::new(Float64Array::new(
+            scalar_buffer_le::<f64>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::Date => Ok(Arc::new(Date32Array::new(
+            ScalarBuffer::from(
+                bytes
+                    .chunks_exact(4)
+                    .take(row_count)
+                    .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                    .collect::<Vec<_>>(),
+            ),
+            nulls,
+        ))),
+        LogicalTypeId::Time => Ok(Arc::new(Time64MicrosecondArray::new(
+            scalar_buffer_le::<i64>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::TimeNs => Ok(Arc::new(Time64NanosecondArray::new(
+            scalar_buffer_le::<i64>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::Timestamp => Ok(Arc::new(TimestampMicrosecondArray::new(
+            scalar_buffer_le::<i64>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::TimestampSec => Ok(Arc::new(TimestampSecondArray::new(
+            scalar_buffer_le::<i64>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::TimestampMs => Ok(Arc::new(TimestampMillisecondArray::new(
+            scalar_buffer_le::<i64>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::TimestampNs => Ok(Arc::new(TimestampNanosecondArray::new(
+            scalar_buffer_le::<i64>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::Uuid => {
+            let mut builder =
+                arrow_array::builder::FixedSizeBinaryBuilder::with_capacity(row_count, 16);
+            for i in 0..row_count {
+                let valid = nulls.as_ref().map(|n| n.is_valid(i)).unwrap_or(true);
+                if valid {
+                    let off = i * 16;
+                    builder.append_value(&bytes[off..off + 16]).map_err(|e| {
+                        crate::WireError::UnsupportedArrowType(format!("uuid append: {e}"))
+                    })?;
+                } else {
+                    builder.append_null();
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        LogicalTypeId::Interval => {
+            // DuckDB interval_t = { months: i32, days: i32, micros: i64 }; Arrow's
+            // closest match is Interval(MonthDayNano) which stores months/days/ns.
+            // Widen micros -> nanoseconds on the way back.
+            use arrow_array::types::IntervalMonthDayNano;
+            let mut values: Vec<IntervalMonthDayNano> = Vec::with_capacity(row_count);
+            for i in 0..row_count {
+                let off = i * 16;
+                let months = i32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+                let days = i32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
+                let micros = i64::from_le_bytes(bytes[off + 8..off + 16].try_into().unwrap());
+                values.push(IntervalMonthDayNano {
+                    months,
+                    days,
+                    nanoseconds: micros.saturating_mul(1_000),
+                });
+            }
+            Ok(Arc::new(IntervalMonthDayNanoArray::new(
+                ScalarBuffer::from(values),
+                nulls,
+            )))
+        }
+        LogicalTypeId::Decimal => {
+            let (precision, scale) = match &logical_type.extra {
+                Some(crate::data_chunk::ExtraTypeInfo::Decimal { precision, scale }) => {
+                    (*precision, *scale)
+                }
+                _ => {
+                    return Err(crate::WireError::UnsupportedLogicalType(
+                        LogicalTypeId::Decimal,
+                    ))
+                }
+            };
+            let width = crate::data_chunk::decimal_physical_width(precision);
+            let mut values: Vec<i128> = Vec::with_capacity(row_count);
+            for i in 0..row_count {
+                let off = i * width;
+                let v: i128 = match width {
+                    2 => i16::from_le_bytes(bytes[off..off + 2].try_into().unwrap()) as i128,
+                    4 => i32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as i128,
+                    8 => i64::from_le_bytes(bytes[off..off + 8].try_into().unwrap()) as i128,
+                    16 => i128::from_le_bytes(bytes[off..off + 16].try_into().unwrap()),
+                    _ => unreachable!(),
+                };
+                values.push(v);
+            }
+            let arr = Decimal128Array::new(ScalarBuffer::from(values), nulls)
+                .with_precision_and_scale(precision, scale as i8)
+                .map_err(|e| {
+                    crate::WireError::UnsupportedArrowType(format!("decimal precision/scale: {e}"))
+                })?;
+            Ok(Arc::new(arr))
+        }
+        other => Err(crate::WireError::UnsupportedLogicalType(other)),
+    }
+}
+
+fn validity_to_null_buffer(
+    validity: Option<&[bool]>,
+    row_count: usize,
+) -> Option<arrow_buffer::NullBuffer> {
+    validity.map(|bits| {
+        let mut builder = arrow_buffer::BooleanBufferBuilder::new(row_count);
+        for &b in bits.iter().take(row_count) {
+            builder.append(b);
+        }
+        arrow_buffer::NullBuffer::new(builder.finish())
+    })
+}
+
+trait FromLeBytesScalar: Sized + arrow_array::ArrowNativeTypeOp {
+    fn from_le(bytes: &[u8]) -> Self;
+}
+
+macro_rules! impl_from_le {
+    ($t:ty, $n:expr) => {
+        impl FromLeBytesScalar for $t {
+            fn from_le(bytes: &[u8]) -> Self {
+                <$t>::from_le_bytes(bytes.try_into().unwrap())
+            }
+        }
+    };
+}
+impl_from_le!(i8, 1);
+impl_from_le!(i16, 2);
+impl_from_le!(i32, 4);
+impl_from_le!(i64, 8);
+impl_from_le!(u8, 1);
+impl_from_le!(u16, 2);
+impl_from_le!(u32, 4);
+impl_from_le!(u64, 8);
+impl_from_le!(f32, 4);
+impl_from_le!(f64, 8);
+
+fn scalar_buffer_le<T: FromLeBytesScalar>(
+    bytes: &[u8],
+    row_count: usize,
+) -> arrow_buffer::ScalarBuffer<T> {
+    let width = std::mem::size_of::<T>();
+    let values: Vec<T> = (0..row_count)
+        .map(|i| T::from_le(&bytes[i * width..(i + 1) * width]))
+        .collect();
+    arrow_buffer::ScalarBuffer::from(values)
 }
 
 #[cfg(test)]
