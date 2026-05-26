@@ -34,8 +34,8 @@ How DuckDB, Arrow/DataFusion, SQE's `LogicalTypeId`, and Iceberg primitive types
 |---|---|---|---|---|
 | `LIST<T>` | `List` / `LargeList` | `List` + `ExtraTypeInfo::List { child }` | `list<T>` | ✅ recursive child type; child element vector reused under `field 106` |
 | `STRUCT(...)` | `Struct` | `Struct` + `ExtraTypeInfo::Struct { fields }` | `struct<...>` | ✅ pairs of (name, LogicalType) via `child_list_t` (pair fields 0/1) |
-| `MAP<K, V>` | `Map` | `Map` (id only) | `map<K, V>` | ❌ MAP is LIST<STRUCT<key,value>>; needs MapTypeInfo + arrow bridge |
-| `ARRAY<T, N>` (fixed) | `FixedSizeList` | `Array` (id only) | (none) | ❌ ArrayTypeInfo modelled; vector encode still TBD |
+| `MAP<K, V>` | `Map` | `Map` + `ExtraTypeInfo::List { child: STRUCT(key, value) }` | `map<K, V>` | ✅ DuckDB stores MAP as LIST<STRUCT<key,value>>; we reuse the LIST vector layout and stamp the parent type id as Map |
+| `ARRAY<T, N>` (fixed) | `FixedSizeList` | `Array` + `ExtraTypeInfo::Array { child, size }` | (none) | ✅ fields 103 (array_size) + 104 (child vector with size*count elements); size=0 honors WritePropertyWithDefault elision |
 | `UNION` | `Union` | `Union` (id only) | (none) | ❌ |
 | `ENUM` | `Dictionary(Int32, Utf8)` | `Enum` (id only) | (none, project as `string`) | ❌ |
 
@@ -44,13 +44,15 @@ How DuckDB, Arrow/DataFusion, SQE's `LogicalTypeId`, and Iceberg primitive types
 DuckDB's `LogicalType` carries optional `ExtraTypeInfo` on the wire (field 101 of the `LogicalType` object). Wave 2a added the framework plus the `DECIMAL` variant; the remaining variants still surface as `WireError::UnsupportedExtraTypeInfo`:
 
 - `DECIMAL(p, s)` — ✅ encoded via `ExtraTypeInfo::Decimal { precision, scale }`. Storage tier follows DuckDB: precision 1-4 -> i16, 5-9 -> i32, 10-18 -> i64, 19-38 -> i128.
-- `LIST<T>` / `ARRAY` — element type in `ListTypeInfo`
-- `STRUCT(...)` — field name + type pairs in `StructTypeInfo`
-- `MAP<K, V>` — key + value types in `MapTypeInfo`
-- `ENUM` — dictionary in `EnumTypeInfo`
-- User-defined types
+- `LIST<T>` — ✅ encoded via `ExtraTypeInfo::List { child }`. Recursive child type, child element vector under field 106.
+- `STRUCT(...)` — ✅ encoded via `ExtraTypeInfo::Struct { fields }`. Pair entries with field 0 (name) + field 1 (LogicalType).
+- `MAP<K, V>` — ✅ reuses `ExtraTypeInfo::List { child: STRUCT(key, value) }` per DuckDB's internal `LogicalType::MAP` factory; no separate `MapTypeInfo`.
+- `ARRAY<T, N>` — ✅ encoded via `ExtraTypeInfo::Array { child, size }`. Field 200 (child_type, WriteProperty) + field 201 (size, WritePropertyWithDefault default 0).
+- `ENUM` — dictionary in `EnumTypeInfo` (custom serializer, not implemented).
+- `UNION` — distinct UnionTypeInfo, not implemented.
+- User-defined types — not implemented.
 
-Wave 2b will add the nested variants. They follow the same on-wire shape (object inside field 101, base discriminant at field 100, subclass fields after) but need recursive `LogicalType` encode/decode for child types and Arrow `ListArray` / `StructArray` handling on the bridge.
+Wave 2c completes the auto-generated subclass set (DECIMAL, LIST, STRUCT, MAP, ARRAY). ENUM and UNION require hand-written DuckDB serializers; they're future work.
 
 ExtraTypeInfo wire layout (verified against DuckDB v1.5.3 generated serializer):
 - Base field 100 (u8): `ExtraTypeInfoType` discriminant — `WriteProperty`, always written.
