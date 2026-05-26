@@ -10,10 +10,11 @@
 //! `AppendRequest` write path; not implemented yet.
 
 use arrow_array::{
-    Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
-    FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
-    Int8Array, IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray,
-    LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, RecordBatch, StringArray,
+    cast::AsArray, types as arrow_types, Array, BinaryArray, BinaryViewArray, BooleanArray,
+    Date32Array, Date64Array, Decimal128Array, DictionaryArray, FixedSizeBinaryArray,
+    FixedSizeListArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+    IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray, LargeBinaryArray,
+    LargeListArray, LargeStringArray, ListArray, MapArray, RecordBatch, StringArray,
     StringViewArray, StructArray, Time32MillisecondArray, Time32SecondArray,
     Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
@@ -22,8 +23,8 @@ use arrow_array::{
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 
 use crate::data_chunk::{
-    decimal_physical_width, DataChunk, ExtraTypeInfo, LogicalType, LogicalTypeId, Vector,
-    VectorData,
+    decimal_physical_width, enum_physical_width, DataChunk, ExtraTypeInfo, LogicalType,
+    LogicalTypeId, Vector, VectorData,
 };
 
 pub fn record_batch_to_data_chunk(batch: &RecordBatch) -> crate::Result<DataChunk> {
@@ -35,6 +36,42 @@ pub fn record_batch_to_data_chunk(batch: &RecordBatch) -> crate::Result<DataChun
     Ok(DataChunk {
         row_count: row_count as u32,
         columns,
+    })
+}
+
+/// Reverse direction: take a decoded `DataChunk` plus the column names from
+/// `PrepareResponse.result_names` and rebuild an Arrow [`RecordBatch`]. Used by
+/// `sqe-quack-client` to surface server responses as Arrow.
+///
+/// Scope: covers the scalar/varchar/blob/decimal/temporal/uuid/interval paths
+/// needed for the bulk of DuckDB query results. Nested types (LIST, STRUCT,
+/// MAP, ARRAY) surface as `UnsupportedLogicalType` until the recursive
+/// vector_to_array logic is added in a follow-up.
+pub fn data_chunk_to_record_batch(
+    names: &[String],
+    chunk: &DataChunk,
+) -> crate::Result<RecordBatch> {
+    if names.len() != chunk.columns.len() {
+        return Err(crate::WireError::UnexpectedField {
+            expected: chunk.columns.len() as u16,
+            actual: names.len() as u16,
+        });
+    }
+    let row_count = chunk.row_count as usize;
+    let mut fields = Vec::with_capacity(chunk.columns.len());
+    let mut arrays: Vec<std::sync::Arc<dyn Array>> = Vec::with_capacity(chunk.columns.len());
+    for (name, column) in names.iter().zip(chunk.columns.iter()) {
+        let array = vector_to_array(column, row_count)?;
+        fields.push(arrow_schema::Field::new(
+            name.clone(),
+            array.data_type().clone(),
+            true,
+        ));
+        arrays.push(array);
+    }
+    let schema = std::sync::Arc::new(arrow_schema::Schema::new(fields));
+    RecordBatch::try_new(schema, arrays).map_err(|e| {
+        crate::WireError::UnsupportedArrowType(format!("RecordBatch::try_new failed: {e}"))
     })
 }
 
@@ -156,6 +193,22 @@ fn column_to_vector(array: &dyn Array, row_count: usize) -> crate::Result<Vector
         // STRUCT(...): each field becomes a parallel child vector sharing
         // the parent row count.
         DataType::Struct(_) => struct_array_to_struct(array, row_count)?,
+        // Arrow `Map` is physically `List<Struct<keys, values>>`. DuckDB also
+        // stores MAP as LIST<STRUCT<key, value>>, so we reuse the LIST wire
+        // payload and just stamp the parent LogicalTypeId as `Map`.
+        DataType::Map(_, _) => map_array_to_map(array, row_count)?,
+        // FixedSizeList<T, N>: DuckDB ARRAY. Flat child vector with N elements
+        // per parent row, no per-row offsets needed.
+        DataType::FixedSizeList(_, _) => fixed_size_list_to_array(array, row_count)?,
+        // Arrow `Dictionary(Key, Utf8)` with a string value type maps cleanly
+        // to DuckDB ENUM. Keys narrow to u8/u16/u32 per the dict-size tier.
+        // Non-string value types (Binary, Int, etc.) aren't valid ENUM payloads
+        // and fall through to the unsupported branch below.
+        DataType::Dictionary(key_dt, value_dt)
+            if matches!(value_dt.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
+        {
+            dictionary_to_enum(array, row_count, key_dt.as_ref())?
+        }
         // Arrow interval types all widen into DuckDB's 16-byte `interval_t`
         // { months: i32, days: i32, micros: i64 }.
         DataType::Interval(IntervalUnit::YearMonth) => interval_yearmonth_to_interval(array, row_count)?,
@@ -507,6 +560,203 @@ fn struct_array_to_struct(
     ))
 }
 
+/// Arrow `Map` is physically `List<Struct<keys, values>>`. We reuse the LIST
+/// `VectorData` and stamp the parent `LogicalTypeId::Map` so the downstream
+/// codec emits the right type id (the inner `ExtraTypeInfo::List` is identical
+/// to what DuckDB itself stores for `LogicalType::MAP`).
+fn map_array_to_map(
+    array: &dyn Array,
+    row_count: usize,
+) -> crate::Result<(LogicalType, VectorData)> {
+    let typed = array
+        .as_any()
+        .downcast_ref::<MapArray>()
+        .ok_or_else(|| crate::WireError::UnsupportedArrowType("map downcast failed".to_string()))?;
+    let mut entries = Vec::with_capacity(row_count);
+    let offs = typed.value_offsets();
+    for i in 0..row_count {
+        let start = offs[i] as u64;
+        let end = offs[i + 1] as u64;
+        entries.push((start, end - start));
+    }
+    // Arrow stores Map.entries() as a StructArray with the keys + values children.
+    let entries_arr: &dyn Array = typed.entries();
+    let child_count = entries_arr.len();
+    let child_vector = column_to_vector(entries_arr, child_count)?;
+    let child_logical = child_vector.logical_type.clone();
+    Ok((
+        LogicalType::with_extra(
+            LogicalTypeId::Map,
+            ExtraTypeInfo::List {
+                child: Box::new(child_logical),
+            },
+        ),
+        VectorData::List {
+            entries,
+            child_count: child_count as u64,
+            child: Box::new(child_vector),
+        },
+    ))
+}
+
+/// Arrow `Dictionary(KeyType, Utf8|LargeUtf8)` -> DuckDB `ENUM`. The dictionary
+/// strings populate `ExtraTypeInfo::Enum.values`; per-row keys narrow to u8/u16/u32
+/// indices based on the dictionary size tier (see [`enum_physical_width`]).
+fn dictionary_to_enum(
+    array: &dyn Array,
+    row_count: usize,
+    key_dt: &DataType,
+) -> crate::Result<(LogicalType, VectorData)> {
+    // Each per-row key arrives as u64 (any int type fits, including u64).
+    // dictionary_keys_to_u64 monomorphizes on the Arrow key type and rejects
+    // negative signed indices (ENUM indices are unsigned in DuckDB).
+    let (values, keys) = match key_dt {
+        DataType::Int8 => dictionary_keys_to_u64::<arrow_types::Int8Type, _>(array, row_count, |v| {
+            check_unsigned_key(v as i64)
+        })?,
+        DataType::Int16 => {
+            dictionary_keys_to_u64::<arrow_types::Int16Type, _>(array, row_count, |v| {
+                check_unsigned_key(v as i64)
+            })?
+        }
+        DataType::Int32 => {
+            dictionary_keys_to_u64::<arrow_types::Int32Type, _>(array, row_count, |v| {
+                check_unsigned_key(v as i64)
+            })?
+        }
+        DataType::Int64 => {
+            dictionary_keys_to_u64::<arrow_types::Int64Type, _>(array, row_count, check_unsigned_key)?
+        }
+        DataType::UInt8 => {
+            dictionary_keys_to_u64::<arrow_types::UInt8Type, _>(array, row_count, |v| Ok(v as u64))?
+        }
+        DataType::UInt16 => {
+            dictionary_keys_to_u64::<arrow_types::UInt16Type, _>(array, row_count, |v| {
+                Ok(v as u64)
+            })?
+        }
+        DataType::UInt32 => {
+            dictionary_keys_to_u64::<arrow_types::UInt32Type, _>(array, row_count, |v| {
+                Ok(v as u64)
+            })?
+        }
+        DataType::UInt64 => {
+            dictionary_keys_to_u64::<arrow_types::UInt64Type, _>(array, row_count, Ok)?
+        }
+        other => {
+            return Err(crate::WireError::UnsupportedArrowType(format!(
+                "Dictionary key type {other:?} not supported for ENUM mapping"
+            )))
+        }
+    };
+
+    let width = enum_physical_width(values.len());
+    let mut bytes = Vec::with_capacity(row_count * width);
+    for k in keys {
+        match width {
+            1 => bytes.push(k as u8),
+            2 => bytes.extend_from_slice(&(k as u16).to_le_bytes()),
+            4 => bytes.extend_from_slice(&(k as u32).to_le_bytes()),
+            _ => unreachable!("enum_physical_width returned an unexpected width"),
+        }
+    }
+    Ok((
+        LogicalType::with_extra(LogicalTypeId::Enum, ExtraTypeInfo::Enum { values }),
+        VectorData::Fixed(bytes),
+    ))
+}
+
+fn check_unsigned_key(raw: i64) -> crate::Result<u64> {
+    if raw < 0 {
+        return Err(crate::WireError::UnsupportedArrowType(format!(
+            "Dictionary key {raw} is negative; ENUM indices must be unsigned"
+        )));
+    }
+    Ok(raw as u64)
+}
+
+/// Helper: downcast to `DictionaryArray<K>` and emit (dictionary strings,
+/// per-row keys widened to u64). The `key_to_u64` closure handles the
+/// signed-vs-unsigned native-type conversion.
+fn dictionary_keys_to_u64<K, F>(
+    array: &dyn Array,
+    row_count: usize,
+    key_to_u64: F,
+) -> crate::Result<(Vec<String>, Vec<u64>)>
+where
+    K: arrow_array::types::ArrowDictionaryKeyType,
+    F: Fn(K::Native) -> crate::Result<u64>,
+{
+    let typed = array
+        .as_any()
+        .downcast_ref::<DictionaryArray<K>>()
+        .ok_or_else(|| {
+            crate::WireError::UnsupportedArrowType("dictionary downcast failed".to_string())
+        })?;
+    let values_arr = typed.values();
+    let values: Vec<String> = if let Some(a) = values_arr.as_string_opt::<i32>() {
+        (0..a.len()).map(|i| a.value(i).to_string()).collect()
+    } else if let Some(a) = values_arr.as_string_opt::<i64>() {
+        (0..a.len()).map(|i| a.value(i).to_string()).collect()
+    } else {
+        return Err(crate::WireError::UnsupportedArrowType(
+            "Dictionary value type must be Utf8 or LargeUtf8 for ENUM".to_string(),
+        ));
+    };
+    let key_arr = typed.keys();
+    let mut keys = Vec::with_capacity(row_count);
+    for i in 0..row_count {
+        if key_arr.is_valid(i) {
+            keys.push(key_to_u64(key_arr.value(i))?);
+        } else {
+            keys.push(0);
+        }
+    }
+    Ok((values, keys))
+}
+
+/// Arrow `FixedSizeList<T, N>` -> DuckDB `ARRAY<T, N>`. Flat child vector with
+/// `N * row_count` elements; no per-row offsets.
+fn fixed_size_list_to_array(
+    array: &dyn Array,
+    row_count: usize,
+) -> crate::Result<(LogicalType, VectorData)> {
+    let typed = array
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .ok_or_else(|| {
+            crate::WireError::UnsupportedArrowType("fixed-size-list downcast failed".to_string())
+        })?;
+    let array_size = typed.value_length();
+    if array_size < 0 {
+        return Err(crate::WireError::UnsupportedArrowType(format!(
+            "FixedSizeList with negative element size {array_size}"
+        )));
+    }
+    let array_size_u32 = u32::try_from(array_size).map_err(|_| {
+        crate::WireError::UnsupportedArrowType(format!(
+            "FixedSizeList size {array_size} exceeds u32"
+        ))
+    })?;
+    let child_arr: &dyn Array = typed.values();
+    let child_count = (array_size as usize) * row_count;
+    let child_vector = column_to_vector(child_arr, child_count)?;
+    let child_logical = child_vector.logical_type.clone();
+    Ok((
+        LogicalType::with_extra(
+            LogicalTypeId::Array,
+            ExtraTypeInfo::Array {
+                child: Box::new(child_logical),
+                size: array_size_u32,
+            },
+        ),
+        VectorData::Array {
+            array_size: array_size as u64,
+            child: Box::new(child_vector),
+        },
+    ))
+}
+
 /// Arrow `Decimal128(precision, scale)` -> DuckDB `DECIMAL(precision, scale)`.
 ///
 /// DuckDB picks an integer width based on the precision tier
@@ -714,6 +964,269 @@ fn string_to_strings<A: StringLikeArray>(
     ))
 }
 
+// -----------------------------------------------------------------------------
+// Reverse direction: Vector / DataChunk -> Arrow
+// -----------------------------------------------------------------------------
+
+/// Convert a single `Vector` back to an Arrow array. Inverse of
+/// `column_to_vector`.
+fn vector_to_array(vector: &Vector, row_count: usize) -> crate::Result<std::sync::Arc<dyn Array>> {
+    use std::sync::Arc;
+    let nulls = validity_to_null_buffer(vector.validity.as_deref(), row_count);
+    match (&vector.data, vector.logical_type.id) {
+        (VectorData::Strings(values), _) => {
+            // VARCHAR -> StringArray.
+            let mut builder = arrow_array::builder::StringBuilder::with_capacity(row_count, 0);
+            for v in values.iter().take(row_count) {
+                match v {
+                    Some(s) => builder.append_value(s),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        (VectorData::Blobs(values), _) => {
+            let mut builder = arrow_array::builder::BinaryBuilder::with_capacity(row_count, 0);
+            for v in values.iter().take(row_count) {
+                match v {
+                    Some(b) => builder.append_value(b),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        (VectorData::Fixed(_), _) => {
+            let VectorData::Fixed(bytes) = &vector.data else { unreachable!() };
+            fixed_to_array(vector.logical_type.id, bytes, row_count, nulls, &vector.logical_type)
+        }
+        (VectorData::List { .. } | VectorData::Struct { .. } | VectorData::Array { .. }, id) => {
+            // Nested types in the reverse direction are deferred — the
+            // recursive vector_to_array body needs careful sizing of child
+            // counts and field-name plumbing. Tracked as a follow-up.
+            Err(crate::WireError::UnsupportedLogicalType(id))
+        }
+    }
+}
+
+/// Build a typed Arrow array from a tightly-packed little-endian byte buffer.
+/// Mirrors the forward `fixed_from_array` path, monomorphised on `LogicalTypeId`.
+fn fixed_to_array(
+    id: LogicalTypeId,
+    bytes: &[u8],
+    row_count: usize,
+    nulls: Option<arrow_buffer::NullBuffer>,
+    logical_type: &LogicalType,
+) -> crate::Result<std::sync::Arc<dyn Array>> {
+    use arrow_buffer::ScalarBuffer;
+    use std::sync::Arc;
+    match id {
+        LogicalTypeId::Boolean => {
+            let mut builder = arrow_array::builder::BooleanBuilder::with_capacity(row_count);
+            for (i, byte) in bytes.iter().enumerate().take(row_count) {
+                let valid = nulls.as_ref().map(|n| n.is_valid(i)).unwrap_or(true);
+                if valid {
+                    builder.append_value(*byte != 0);
+                } else {
+                    builder.append_null();
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        LogicalTypeId::TinyInt => Ok(Arc::new(Int8Array::new(
+            scalar_buffer_le::<i8>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::SmallInt => Ok(Arc::new(Int16Array::new(
+            scalar_buffer_le::<i16>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::Integer => Ok(Arc::new(Int32Array::new(
+            scalar_buffer_le::<i32>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::BigInt => Ok(Arc::new(Int64Array::new(
+            scalar_buffer_le::<i64>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::UTinyInt => Ok(Arc::new(UInt8Array::new(
+            scalar_buffer_le::<u8>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::USmallInt => Ok(Arc::new(UInt16Array::new(
+            scalar_buffer_le::<u16>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::UInteger => Ok(Arc::new(UInt32Array::new(
+            scalar_buffer_le::<u32>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::UBigInt => Ok(Arc::new(UInt64Array::new(
+            scalar_buffer_le::<u64>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::Float => Ok(Arc::new(Float32Array::new(
+            scalar_buffer_le::<f32>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::Double => Ok(Arc::new(Float64Array::new(
+            scalar_buffer_le::<f64>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::Date => Ok(Arc::new(Date32Array::new(
+            ScalarBuffer::from(
+                bytes
+                    .chunks_exact(4)
+                    .take(row_count)
+                    .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                    .collect::<Vec<_>>(),
+            ),
+            nulls,
+        ))),
+        LogicalTypeId::Time => Ok(Arc::new(Time64MicrosecondArray::new(
+            scalar_buffer_le::<i64>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::TimeNs => Ok(Arc::new(Time64NanosecondArray::new(
+            scalar_buffer_le::<i64>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::Timestamp => Ok(Arc::new(TimestampMicrosecondArray::new(
+            scalar_buffer_le::<i64>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::TimestampSec => Ok(Arc::new(TimestampSecondArray::new(
+            scalar_buffer_le::<i64>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::TimestampMs => Ok(Arc::new(TimestampMillisecondArray::new(
+            scalar_buffer_le::<i64>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::TimestampNs => Ok(Arc::new(TimestampNanosecondArray::new(
+            scalar_buffer_le::<i64>(bytes, row_count),
+            nulls,
+        ))),
+        LogicalTypeId::Uuid => {
+            let mut builder =
+                arrow_array::builder::FixedSizeBinaryBuilder::with_capacity(row_count, 16);
+            for i in 0..row_count {
+                let valid = nulls.as_ref().map(|n| n.is_valid(i)).unwrap_or(true);
+                if valid {
+                    let off = i * 16;
+                    builder.append_value(&bytes[off..off + 16]).map_err(|e| {
+                        crate::WireError::UnsupportedArrowType(format!("uuid append: {e}"))
+                    })?;
+                } else {
+                    builder.append_null();
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        LogicalTypeId::Interval => {
+            // DuckDB interval_t = { months: i32, days: i32, micros: i64 }; Arrow's
+            // closest match is Interval(MonthDayNano) which stores months/days/ns.
+            // Widen micros -> nanoseconds on the way back.
+            use arrow_array::types::IntervalMonthDayNano;
+            let mut values: Vec<IntervalMonthDayNano> = Vec::with_capacity(row_count);
+            for i in 0..row_count {
+                let off = i * 16;
+                let months = i32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+                let days = i32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
+                let micros = i64::from_le_bytes(bytes[off + 8..off + 16].try_into().unwrap());
+                values.push(IntervalMonthDayNano {
+                    months,
+                    days,
+                    nanoseconds: micros.saturating_mul(1_000),
+                });
+            }
+            Ok(Arc::new(IntervalMonthDayNanoArray::new(
+                ScalarBuffer::from(values),
+                nulls,
+            )))
+        }
+        LogicalTypeId::Decimal => {
+            let (precision, scale) = match &logical_type.extra {
+                Some(crate::data_chunk::ExtraTypeInfo::Decimal { precision, scale }) => {
+                    (*precision, *scale)
+                }
+                _ => {
+                    return Err(crate::WireError::UnsupportedLogicalType(
+                        LogicalTypeId::Decimal,
+                    ))
+                }
+            };
+            let width = crate::data_chunk::decimal_physical_width(precision);
+            let mut values: Vec<i128> = Vec::with_capacity(row_count);
+            for i in 0..row_count {
+                let off = i * width;
+                let v: i128 = match width {
+                    2 => i16::from_le_bytes(bytes[off..off + 2].try_into().unwrap()) as i128,
+                    4 => i32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as i128,
+                    8 => i64::from_le_bytes(bytes[off..off + 8].try_into().unwrap()) as i128,
+                    16 => i128::from_le_bytes(bytes[off..off + 16].try_into().unwrap()),
+                    _ => unreachable!(),
+                };
+                values.push(v);
+            }
+            let arr = Decimal128Array::new(ScalarBuffer::from(values), nulls)
+                .with_precision_and_scale(precision, scale as i8)
+                .map_err(|e| {
+                    crate::WireError::UnsupportedArrowType(format!("decimal precision/scale: {e}"))
+                })?;
+            Ok(Arc::new(arr))
+        }
+        other => Err(crate::WireError::UnsupportedLogicalType(other)),
+    }
+}
+
+fn validity_to_null_buffer(
+    validity: Option<&[bool]>,
+    row_count: usize,
+) -> Option<arrow_buffer::NullBuffer> {
+    validity.map(|bits| {
+        let mut builder = arrow_buffer::BooleanBufferBuilder::new(row_count);
+        for &b in bits.iter().take(row_count) {
+            builder.append(b);
+        }
+        arrow_buffer::NullBuffer::new(builder.finish())
+    })
+}
+
+trait FromLeBytesScalar: Sized + arrow_array::ArrowNativeTypeOp {
+    fn from_le(bytes: &[u8]) -> Self;
+}
+
+macro_rules! impl_from_le {
+    ($t:ty, $n:expr) => {
+        impl FromLeBytesScalar for $t {
+            fn from_le(bytes: &[u8]) -> Self {
+                <$t>::from_le_bytes(bytes.try_into().unwrap())
+            }
+        }
+    };
+}
+impl_from_le!(i8, 1);
+impl_from_le!(i16, 2);
+impl_from_le!(i32, 4);
+impl_from_le!(i64, 8);
+impl_from_le!(u8, 1);
+impl_from_le!(u16, 2);
+impl_from_le!(u32, 4);
+impl_from_le!(u64, 8);
+impl_from_le!(f32, 4);
+impl_from_le!(f64, 8);
+
+fn scalar_buffer_le<T: FromLeBytesScalar>(
+    bytes: &[u8],
+    row_count: usize,
+) -> arrow_buffer::ScalarBuffer<T> {
+    let width = std::mem::size_of::<T>();
+    let values: Vec<T> = (0..row_count)
+        .map(|i| T::from_le(&bytes[i * width..(i + 1) * width]))
+        .collect();
+    arrow_buffer::ScalarBuffer::from(values)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -812,25 +1325,21 @@ mod tests {
 
     #[test]
     fn unsupported_arrow_type_returns_clear_error() {
-        // FixedSizeList isn't on the supported scalar map; expect the
-        // dispatch table to surface UnsupportedArrowType.
-        use arrow_array::{FixedSizeListArray, Int32Array};
-        use arrow_schema::Field;
-        let values: Arc<dyn Array> = Arc::new(Int32Array::from(vec![1, 2, 3, 4]));
-        let arr: Arc<dyn Array> = Arc::new(
-            FixedSizeListArray::try_new(
-                Arc::new(Field::new("item", DataType::Int32, true)),
-                2,
-                values,
-                None,
-            )
-            .unwrap(),
-        );
+        // Dictionary(Int32, Binary) isn't a valid ENUM payload — DuckDB ENUM
+        // values are strings only. Expect the bridge to fall through to the
+        // unsupported branch so the server emits a clear SQE-EXEC error.
+        use arrow_array::{BinaryArray, DictionaryArray, Int32Array};
+        let keys = Int32Array::from(vec![0, 1, 0]);
+        let values: Arc<dyn Array> =
+            Arc::new(BinaryArray::from(vec![b"red".as_ref(), b"blue".as_ref()]));
+        let dict: DictionaryArray<arrow_array::types::Int32Type> =
+            DictionaryArray::try_new(keys, values).unwrap();
+        let arr: Arc<dyn Array> = Arc::new(dict);
         let dt = arr.data_type().clone();
-        let batch = batch_with(vec![("v", dt, arr)]);
+        let batch = batch_with(vec![("color", dt, arr)]);
         let err = record_batch_to_data_chunk(&batch).unwrap_err();
         match err {
-            crate::WireError::UnsupportedArrowType(msg) => assert!(msg.contains("FixedSizeList")),
+            crate::WireError::UnsupportedArrowType(msg) => assert!(msg.contains("Dictionary")),
             other => panic!("expected UnsupportedArrowType, got {other:?}"),
         }
     }
@@ -1281,6 +1790,153 @@ mod tests {
                 assert_eq!(children[1].logical_type.id, LogicalTypeId::Varchar);
             }
             other => panic!("expected VectorData::Struct, got {other:?}"),
+        }
+
+        // Round-trip through the codec.
+        let mut s = crate::codec::BinarySerializer::new();
+        s.begin_object();
+        chunk.encode(&mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+        let mut d = crate::codec::BinaryDeserializer::new(&bytes);
+        let decoded = DataChunk::decode(&mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, chunk);
+    }
+
+    #[test]
+    fn fixed_size_list_round_trips_as_array() {
+        use arrow_array::builder::{FixedSizeListBuilder, Int32Builder};
+        let mut b = FixedSizeListBuilder::new(Int32Builder::new(), 3);
+        for v in [10, 20, 30, 40, 50, 60] {
+            b.values().append_value(v);
+        }
+        b.append(true);
+        b.append(true);
+        let fixed_arr = b.finish();
+        let arr: Arc<dyn Array> = Arc::new(fixed_arr);
+        let dt = arr.data_type().clone();
+        let batch = batch_with(vec![("a", dt, arr)]);
+        let chunk = record_batch_to_data_chunk(&batch).unwrap();
+        assert_eq!(chunk.columns[0].logical_type.id, LogicalTypeId::Array);
+        match &chunk.columns[0].logical_type.extra {
+            Some(ExtraTypeInfo::Array { size, .. }) => assert_eq!(*size, 3),
+            other => panic!("expected ExtraTypeInfo::Array, got {other:?}"),
+        }
+        match &chunk.columns[0].data {
+            VectorData::Array { array_size, child } => {
+                assert_eq!(*array_size, 3);
+                assert_eq!(child.logical_type.id, LogicalTypeId::Integer);
+            }
+            other => panic!("expected VectorData::Array, got {other:?}"),
+        }
+
+        // Round-trip through the codec.
+        let mut s = crate::codec::BinarySerializer::new();
+        s.begin_object();
+        chunk.encode(&mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+        let mut d = crate::codec::BinaryDeserializer::new(&bytes);
+        let decoded = DataChunk::decode(&mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, chunk);
+    }
+
+    #[test]
+    fn dictionary_int8_utf8_maps_to_enum() {
+        use arrow_array::{Int8Array, StringArray};
+        // 3 unique values, 5 rows.
+        let keys = Int8Array::from(vec![0i8, 1, 2, 1, 0]);
+        let values: Arc<dyn Array> = Arc::new(StringArray::from(vec!["red", "green", "blue"]));
+        let dict: DictionaryArray<arrow_types::Int8Type> =
+            DictionaryArray::try_new(keys, values).unwrap();
+        let arr: Arc<dyn Array> = Arc::new(dict);
+        let dt = arr.data_type().clone();
+        let batch = batch_with(vec![("color", dt, arr)]);
+        let chunk = record_batch_to_data_chunk(&batch).unwrap();
+        assert_eq!(chunk.columns[0].logical_type.id, LogicalTypeId::Enum);
+        match &chunk.columns[0].logical_type.extra {
+            Some(ExtraTypeInfo::Enum { values }) => {
+                assert_eq!(values, &vec!["red", "green", "blue"]);
+            }
+            other => panic!("expected ExtraTypeInfo::Enum, got {other:?}"),
+        }
+        // 3 dict entries -> u8 tier -> 5 bytes for 5 rows.
+        match &chunk.columns[0].data {
+            VectorData::Fixed(bytes) => assert_eq!(bytes, &vec![0u8, 1, 2, 1, 0]),
+            other => panic!("expected Fixed, got {other:?}"),
+        }
+
+        // Full codec round-trip.
+        let mut s = crate::codec::BinarySerializer::new();
+        s.begin_object();
+        chunk.encode(&mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+        let mut d = crate::codec::BinaryDeserializer::new(&bytes);
+        let decoded = DataChunk::decode(&mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, chunk);
+    }
+
+    #[test]
+    fn dictionary_int32_utf8_widens_to_u16_tier() {
+        use arrow_array::{Int32Array, StringArray};
+        // 300 dictionary entries forces the u16 tier on the wire.
+        let value_strs: Vec<String> = (0..300).map(|i| format!("v{i}")).collect();
+        let values: Arc<dyn Array> = Arc::new(StringArray::from(
+            value_strs.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ));
+        let keys = Int32Array::from(vec![0i32, 299, 100, 50]);
+        let dict: DictionaryArray<arrow_types::Int32Type> =
+            DictionaryArray::try_new(keys, values).unwrap();
+        let arr: Arc<dyn Array> = Arc::new(dict);
+        let dt = arr.data_type().clone();
+        let batch = batch_with(vec![("x", dt, arr)]);
+        let chunk = record_batch_to_data_chunk(&batch).unwrap();
+        match &chunk.columns[0].data {
+            VectorData::Fixed(bytes) => {
+                let expected: Vec<u8> = [0u16, 299, 100, 50]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+                assert_eq!(bytes, &expected);
+            }
+            other => panic!("expected Fixed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_array_round_trips_via_list_layout() {
+        use arrow_array::builder::{Int32Builder, MapBuilder, StringBuilder};
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        // Row 0: {"a" -> 1, "b" -> 2}
+        builder.keys().append_value("a");
+        builder.values().append_value(1);
+        builder.keys().append_value("b");
+        builder.values().append_value(2);
+        builder.append(true).unwrap();
+        // Row 1: {} (empty map)
+        builder.append(true).unwrap();
+        let map_arr = builder.finish();
+        let arr: Arc<dyn Array> = Arc::new(map_arr);
+        let dt = arr.data_type().clone();
+        let batch = batch_with(vec![("m", dt, arr)]);
+        let chunk = record_batch_to_data_chunk(&batch).unwrap();
+        assert_eq!(chunk.columns[0].logical_type.id, LogicalTypeId::Map);
+        match &chunk.columns[0].logical_type.extra {
+            Some(ExtraTypeInfo::List { child }) => {
+                assert_eq!(child.id, LogicalTypeId::Struct);
+            }
+            other => panic!("expected ExtraTypeInfo::List wrapping STRUCT, got {other:?}"),
+        }
+        match &chunk.columns[0].data {
+            VectorData::List { entries, child_count, .. } => {
+                assert_eq!(entries, &vec![(0, 2), (2, 0)]);
+                assert_eq!(*child_count, 2);
+            }
+            other => panic!("expected VectorData::List, got {other:?}"),
         }
 
         // Round-trip through the codec.

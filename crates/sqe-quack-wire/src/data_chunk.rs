@@ -181,6 +181,20 @@ pub enum ExtraTypeInfo {
     Struct {
         fields: Vec<(String, LogicalType)>,
     },
+    /// ARRAY<T, N>. Fixed-size variant of LIST — every row carries exactly
+    /// `size` elements of `child`. Wire layout is `ArrayTypeInfo`: field 200
+    /// (child_type, WriteProperty) + field 201 (size, WritePropertyWithDefault
+    /// default 0).
+    Array {
+        child: Box<LogicalType>,
+        size: u32,
+    },
+    /// ENUM. `values` are the dictionary entries in insertion order; rows
+    /// carry an unsigned integer index whose width depends on `values.len()`
+    /// (see [`enum_physical_width`]). DuckDB writes this as a hand-rolled
+    /// `EnumTypeInfo` rather than via the auto-generated serializer:
+    /// field 200 (values_count, u64) + field 201 (list of strings).
+    Enum { values: Vec<String> },
 }
 
 impl ExtraTypeInfo {
@@ -189,6 +203,8 @@ impl ExtraTypeInfo {
             ExtraTypeInfo::Decimal { .. } => ExtraTypeInfoType::Decimal,
             ExtraTypeInfo::List { .. } => ExtraTypeInfoType::List,
             ExtraTypeInfo::Struct { .. } => ExtraTypeInfoType::Struct,
+            ExtraTypeInfo::Array { .. } => ExtraTypeInfoType::Array,
+            ExtraTypeInfo::Enum { .. } => ExtraTypeInfoType::Enum,
         }
     }
 
@@ -251,6 +267,35 @@ impl ExtraTypeInfo {
                     s.end_property();
                 }
             }
+            ExtraTypeInfo::Array { child, size } => {
+                // Field 200 (child_type) is WriteProperty<LogicalType> — always written.
+                s.begin_property(200);
+                s.begin_object();
+                child.encode(s);
+                s.end_object();
+                s.end_property();
+                // Field 201 (size) is WritePropertyWithDefault<uint32_t> default 0.
+                if *size != 0 {
+                    s.begin_property(201);
+                    s.write_u32(*size);
+                    s.end_property();
+                }
+            }
+            ExtraTypeInfo::Enum { values } => {
+                // Field 200 (values_count) is WriteProperty<idx_t> — always written.
+                s.begin_property(200);
+                s.write_u64(values.len() as u64);
+                s.end_property();
+                // Field 201 (values) is WriteList<string>. begin_list emits the
+                // count varint; each element is a string with its own length+bytes.
+                s.begin_property(201);
+                s.begin_list(values.len() as u64);
+                for v in values {
+                    s.write_string(v);
+                }
+                s.end_list();
+                s.end_property();
+            }
         }
     }
 
@@ -309,8 +354,49 @@ impl ExtraTypeInfo {
                 };
                 Ok(ExtraTypeInfo::Struct { fields })
             }
+            ExtraTypeInfoType::Array => {
+                d.expect_field(200)?;
+                let child = LogicalType::decode(d)?;
+                d.expect_object_end()?;
+                let size = if d.read_optional(201)? { d.read_u32()? } else { 0 };
+                Ok(ExtraTypeInfo::Array {
+                    child: Box::new(child),
+                    size,
+                })
+            }
+            ExtraTypeInfoType::Enum => {
+                d.expect_field(200)?;
+                let count = d.read_u64()? as usize;
+                d.expect_field(201)?;
+                let listed = d.read_list_count()? as usize;
+                if listed != count {
+                    return Err(crate::WireError::UnexpectedField {
+                        expected: count as u16,
+                        actual: listed as u16,
+                    });
+                }
+                let mut values = Vec::with_capacity(count);
+                for _ in 0..count {
+                    values.push(d.read_string()?);
+                }
+                Ok(ExtraTypeInfo::Enum { values })
+            }
             other => Err(crate::WireError::UnsupportedExtraTypeInfo(other)),
         }
+    }
+}
+
+/// Physical storage width for an ENUM index, given the dictionary cardinality.
+/// Matches `EnumTypeInfo::DictType`: <=256 entries fit in u8, <=65536 in u16,
+/// otherwise u32. The u64 cap exists in the wire schema but DuckDB never picks
+/// it (validation rejects enums beyond u32::MAX).
+pub fn enum_physical_width(dict_size: usize) -> usize {
+    if dict_size <= u8::MAX as usize + 1 {
+        1
+    } else if dict_size <= u16::MAX as usize + 1 {
+        2
+    } else {
+        4
     }
 }
 
@@ -355,6 +441,9 @@ impl LogicalType {
         match (self.id, &self.extra) {
             (LogicalTypeId::Decimal, Some(ExtraTypeInfo::Decimal { precision, .. })) => {
                 Some(decimal_physical_width(*precision))
+            }
+            (LogicalTypeId::Enum, Some(ExtraTypeInfo::Enum { values })) => {
+                Some(enum_physical_width(values.len()))
             }
             (id, _) => id.fixed_width(),
         }
@@ -424,6 +513,13 @@ pub enum VectorData {
     /// STRUCT(...). `children` are parallel vectors, one per field, each
     /// sharing the parent's row count.
     Struct { children: Vec<Vector> },
+    /// ARRAY<T, N>. Fixed-size flattened child vector — child row count is
+    /// `array_size * parent_row_count`. Distinct from `List` because the
+    /// wire layout omits per-row entries (sizes are constant).
+    Array {
+        array_size: u64,
+        child: Box<Vector>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -521,6 +617,18 @@ impl Vector {
                 s.end_list();
                 s.end_property();
             }
+            VectorData::Array { array_size, child } => {
+                // ARRAY: field 103 (array_size, u64), field 104 (child vector
+                // with array_size * count elements).
+                s.begin_property(103);
+                s.write_u64(*array_size);
+                s.end_property();
+                s.begin_property(104);
+                s.begin_object();
+                child.encode((*array_size as usize) * count, s);
+                s.end_object();
+                s.end_property();
+            }
             VectorData::List {
                 entries,
                 child_count,
@@ -585,7 +693,10 @@ impl Vector {
         };
 
         let data = match logical_type.id {
-            LogicalTypeId::List => {
+            // MAP shares LIST's physical layout: DuckDB models `MAP<K,V>` as
+            // a `LogicalTypeId::Map` whose `ExtraTypeInfo::List` carries a
+            // `STRUCT(key, value)` child. The Vector wire bytes are identical.
+            LogicalTypeId::List | LogicalTypeId::Map => {
                 // LIST: field 104 (list_size), 105 (entries), 106 (child).
                 d.expect_field(104)?;
                 let child_count = d.read_u64()?;
@@ -604,9 +715,7 @@ impl Vector {
                 let child_logical = match &logical_type.extra {
                     Some(ExtraTypeInfo::List { child }) => (**child).clone(),
                     _ => {
-                        return Err(crate::WireError::UnsupportedLogicalType(
-                            LogicalTypeId::List,
-                        ))
+                        return Err(crate::WireError::UnsupportedLogicalType(logical_type.id))
                     }
                 };
                 let child_vec = Vector::decode(child_logical, child_count as usize, d)?;
@@ -617,20 +726,40 @@ impl Vector {
                     child: Box::new(child_vec),
                 }
             }
-            LogicalTypeId::Struct => {
-                // STRUCT: field 103 "children" — list of child vector objects,
-                // one per declared field.
+            LogicalTypeId::Array => {
+                // ARRAY: field 103 (array_size, u64), field 104 (child vector).
+                d.expect_field(103)?;
+                let array_size = d.read_u64()?;
+                d.expect_field(104)?;
+                let child_logical = match &logical_type.extra {
+                    Some(ExtraTypeInfo::Array { child, .. }) => (**child).clone(),
+                    _ => {
+                        return Err(crate::WireError::UnsupportedLogicalType(
+                            LogicalTypeId::Array,
+                        ))
+                    }
+                };
+                let child_vec =
+                    Vector::decode(child_logical, (array_size as usize) * count, d)?;
+                d.expect_object_end()?;
+                VectorData::Array {
+                    array_size,
+                    child: Box::new(child_vec),
+                }
+            }
+            // UNION reuses STRUCT's physical layout — DuckDB's
+            // `LogicalType::UNION` factory builds a StructTypeInfo with a
+            // UTINYINT "tag" prepended to the member list, so the wire is
+            // identical (field 103 + parallel child vectors). The only
+            // difference is the parent LogicalTypeId.
+            LogicalTypeId::Struct | LogicalTypeId::Union => {
                 d.expect_field(103)?;
                 let child_count = d.read_list_count()? as usize;
                 let field_types: Vec<LogicalType> = match &logical_type.extra {
                     Some(ExtraTypeInfo::Struct { fields }) => {
                         fields.iter().map(|(_, ty)| ty.clone()).collect()
                     }
-                    _ => {
-                        return Err(crate::WireError::UnsupportedLogicalType(
-                            LogicalTypeId::Struct,
-                        ))
-                    }
+                    _ => return Err(crate::WireError::UnsupportedLogicalType(logical_type.id)),
                 };
                 if child_count != field_types.len() {
                     return Err(crate::WireError::UnexpectedField {
@@ -1013,12 +1142,13 @@ mod tests {
 
     #[test]
     fn extratypeinfo_unsupported_variant_returns_clear_error() {
-        // Forge a wire object with type discriminant = ENUM_TYPE_INFO (6) —
-        // recognised but not yet implemented in the codec.
+        // Forge a wire object with type discriminant = AGGREGATE_STATE_TYPE_INFO
+        // (8) — recognised in the discriminant enum but not implemented as a
+        // codec variant yet.
         let mut s = BinarySerializer::new();
         s.begin_object();
         s.begin_property(100);
-        s.write_u8(ExtraTypeInfoType::Enum as u8);
+        s.write_u8(ExtraTypeInfoType::AggregateState as u8);
         s.end_property();
         s.end_object();
         let bytes = s.into_bytes();
@@ -1027,7 +1157,7 @@ mod tests {
         let err = ExtraTypeInfo::decode_inner(&mut d).unwrap_err();
         assert!(matches!(
             err,
-            crate::WireError::UnsupportedExtraTypeInfo(ExtraTypeInfoType::Enum)
+            crate::WireError::UnsupportedExtraTypeInfo(ExtraTypeInfoType::AggregateState)
         ));
     }
 
@@ -1247,5 +1377,273 @@ mod tests {
         let decoded = Vector::decode(lt, raw.len(), &mut d).unwrap();
         d.expect_object_end().unwrap();
         assert_eq!(decoded.data, VectorData::Fixed(bytes));
+    }
+
+    #[test]
+    fn extratypeinfo_array_round_trips_with_size_field() {
+        let extra = ExtraTypeInfo::Array {
+            child: Box::new(LogicalType::new(LogicalTypeId::Integer)),
+            size: 4,
+        };
+        let mut s = BinarySerializer::new();
+        s.begin_object();
+        extra.encode_inner(&mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+
+        let mut d = BinaryDeserializer::new(&bytes);
+        let decoded = ExtraTypeInfo::decode_inner(&mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, extra);
+    }
+
+    #[test]
+    fn extratypeinfo_array_size_zero_is_field_default() {
+        // size = 0 is the WritePropertyWithDefault default — field 201 must
+        // not be emitted, and decode should reconstruct 0.
+        let extra = ExtraTypeInfo::Array {
+            child: Box::new(LogicalType::new(LogicalTypeId::Integer)),
+            size: 0,
+        };
+        let mut s = BinarySerializer::new();
+        s.begin_object();
+        extra.encode_inner(&mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+
+        let mut d = BinaryDeserializer::new(&bytes);
+        let decoded = ExtraTypeInfo::decode_inner(&mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, extra);
+        // Spot-check: field 201 must not appear in the serialized output.
+        // The first occurrence of byte 201 (0xC9) followed by 0x00 would
+        // indicate field 201 was emitted; absence is the easier check.
+        // We look for the pattern 0xC9, 0x00 (field 201 LE).
+        let leaked_field_201 = bytes.windows(2).any(|w| w == [0xC9, 0x00]);
+        assert!(!leaked_field_201, "field 201 must not be emitted when size=0");
+    }
+
+    #[test]
+    fn array_vector_round_trips_fixed_size_children() {
+        // ARRAY<INT, 3>: 2 rows, child holds 6 ints in row-major layout.
+        let int_bytes: Vec<u8> = [10i32, 20, 30, 40, 50, 60]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let child = Vector::new_fixed(LogicalTypeId::Integer, int_bytes);
+        let lt = LogicalType::with_extra(
+            LogicalTypeId::Array,
+            ExtraTypeInfo::Array {
+                child: Box::new(LogicalType::new(LogicalTypeId::Integer)),
+                size: 3,
+            },
+        );
+        let v = Vector {
+            logical_type: lt.clone(),
+            validity: None,
+            data: VectorData::Array {
+                array_size: 3,
+                child: Box::new(child),
+            },
+        };
+
+        let mut s = BinarySerializer::new();
+        s.begin_object();
+        v.encode(2, &mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+
+        let mut d = BinaryDeserializer::new(&bytes);
+        let decoded = Vector::decode(lt, 2, &mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, v);
+    }
+
+    #[test]
+    fn enum_physical_width_matches_duckdb_tiers() {
+        assert_eq!(enum_physical_width(1), 1);
+        assert_eq!(enum_physical_width(256), 1);
+        assert_eq!(enum_physical_width(257), 2);
+        assert_eq!(enum_physical_width(65_536), 2);
+        assert_eq!(enum_physical_width(65_537), 4);
+        assert_eq!(enum_physical_width(1_000_000), 4);
+    }
+
+    #[test]
+    fn extratypeinfo_enum_round_trips_three_values() {
+        let extra = ExtraTypeInfo::Enum {
+            values: vec!["red".to_string(), "green".to_string(), "blue".to_string()],
+        };
+        let mut s = BinarySerializer::new();
+        s.begin_object();
+        extra.encode_inner(&mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+
+        let mut d = BinaryDeserializer::new(&bytes);
+        let decoded = ExtraTypeInfo::decode_inner(&mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, extra);
+    }
+
+    #[test]
+    fn enum_vector_round_trips_with_u8_indices() {
+        // 3-value ENUM, physical width = 1 byte.
+        let lt = LogicalType::with_extra(
+            LogicalTypeId::Enum,
+            ExtraTypeInfo::Enum {
+                values: vec!["red".to_string(), "green".to_string(), "blue".to_string()],
+            },
+        );
+        // Rows: 0, 2, 1, 0 -> indices into the dict.
+        let v = Vector {
+            logical_type: lt.clone(),
+            validity: None,
+            data: VectorData::Fixed(vec![0u8, 2, 1, 0]),
+        };
+
+        let mut s = BinarySerializer::new();
+        s.begin_object();
+        v.encode(4, &mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+
+        let mut d = BinaryDeserializer::new(&bytes);
+        let decoded = Vector::decode(lt, 4, &mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, v);
+    }
+
+    #[test]
+    fn enum_vector_round_trips_with_u16_indices() {
+        // Force the u16 tier with a dictionary of 300 entries.
+        let values: Vec<String> = (0..300).map(|i| format!("v{i}")).collect();
+        let lt = LogicalType::with_extra(
+            LogicalTypeId::Enum,
+            ExtraTypeInfo::Enum {
+                values: values.clone(),
+            },
+        );
+        assert_eq!(lt.physical_width(), Some(2));
+
+        let raw_indices: [u16; 4] = [0, 299, 100, 50];
+        let bytes: Vec<u8> = raw_indices.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let v = Vector {
+            logical_type: lt.clone(),
+            validity: None,
+            data: VectorData::Fixed(bytes),
+        };
+
+        let mut s = BinarySerializer::new();
+        s.begin_object();
+        v.encode(4, &mut s);
+        s.end_object();
+        let encoded = s.into_bytes();
+
+        let mut d = BinaryDeserializer::new(&encoded);
+        let decoded = Vector::decode(lt, 4, &mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, v);
+    }
+
+    #[test]
+    fn union_vector_reuses_struct_physical_layout() {
+        // DuckDB's `LogicalType::UNION(members)` factory builds a
+        // StructTypeInfo with a hidden UTINYINT "tag" prepended to the
+        // member list. The wire bytes are identical to a STRUCT — only the
+        // outer LogicalTypeId changes from Struct to Union.
+        // 3 rows: row 0 picks member "a" (tag=0), row 1 picks "b" (tag=1),
+        // row 2 picks "a" (tag=0).
+        let tag_col = Vector::new_fixed(LogicalTypeId::UTinyInt, vec![0u8, 1, 0]);
+        let a_bytes: Vec<u8> = [10i32, 0, 30].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let a_col = Vector {
+            logical_type: LogicalType::new(LogicalTypeId::Integer),
+            validity: Some(vec![true, false, true]),
+            data: VectorData::Fixed(a_bytes),
+        };
+        let b_col = Vector::new_strings(vec![None, Some("hi".to_string()), None]);
+
+        let union_lt = LogicalType::with_extra(
+            LogicalTypeId::Union,
+            ExtraTypeInfo::Struct {
+                fields: vec![
+                    ("".to_string(), LogicalType::new(LogicalTypeId::UTinyInt)),
+                    ("a".to_string(), LogicalType::new(LogicalTypeId::Integer)),
+                    ("b".to_string(), LogicalType::new(LogicalTypeId::Varchar)),
+                ],
+            },
+        );
+        let v = Vector {
+            logical_type: union_lt.clone(),
+            validity: None,
+            data: VectorData::Struct {
+                children: vec![tag_col, a_col, b_col],
+            },
+        };
+
+        let mut s = BinarySerializer::new();
+        s.begin_object();
+        v.encode(3, &mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+
+        let mut d = BinaryDeserializer::new(&bytes);
+        let decoded = Vector::decode(union_lt, 3, &mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, v);
+    }
+
+    #[test]
+    fn map_vector_reuses_list_physical_layout() {
+        // MAP<VARCHAR, INTEGER> = LogicalTypeId::Map + ExtraTypeInfo::List
+        // { child: STRUCT(key VARCHAR, value INTEGER) }. Wire payload is
+        // identical to LIST<STRUCT<...>>.
+        let key_col = Vector::new_strings(vec![Some("a".to_string()), Some("b".to_string())]);
+        let val_bytes: Vec<u8> = [1i32, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let val_col = Vector::new_fixed(LogicalTypeId::Integer, val_bytes);
+        let struct_lt = LogicalType::with_extra(
+            LogicalTypeId::Struct,
+            ExtraTypeInfo::Struct {
+                fields: vec![
+                    ("key".to_string(), LogicalType::new(LogicalTypeId::Varchar)),
+                    ("value".to_string(), LogicalType::new(LogicalTypeId::Integer)),
+                ],
+            },
+        );
+        let entry_vec = Vector {
+            logical_type: struct_lt.clone(),
+            validity: None,
+            data: VectorData::Struct {
+                children: vec![key_col, val_col],
+            },
+        };
+
+        let map_lt = LogicalType::with_extra(
+            LogicalTypeId::Map,
+            ExtraTypeInfo::List {
+                child: Box::new(struct_lt),
+            },
+        );
+        // One row: {"a" -> 1, "b" -> 2}; two entries total.
+        let v = Vector {
+            logical_type: map_lt.clone(),
+            validity: None,
+            data: VectorData::List {
+                entries: vec![(0, 2)],
+                child_count: 2,
+                child: Box::new(entry_vec),
+            },
+        };
+
+        let mut s = BinarySerializer::new();
+        s.begin_object();
+        v.encode(1, &mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+
+        let mut d = BinaryDeserializer::new(&bytes);
+        let decoded = Vector::decode(map_lt, 1, &mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, v);
     }
 }
