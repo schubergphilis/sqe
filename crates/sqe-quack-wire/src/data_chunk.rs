@@ -189,6 +189,12 @@ pub enum ExtraTypeInfo {
         child: Box<LogicalType>,
         size: u32,
     },
+    /// ENUM. `values` are the dictionary entries in insertion order; rows
+    /// carry an unsigned integer index whose width depends on `values.len()`
+    /// (see [`enum_physical_width`]). DuckDB writes this as a hand-rolled
+    /// `EnumTypeInfo` rather than via the auto-generated serializer:
+    /// field 200 (values_count, u64) + field 201 (list of strings).
+    Enum { values: Vec<String> },
 }
 
 impl ExtraTypeInfo {
@@ -198,6 +204,7 @@ impl ExtraTypeInfo {
             ExtraTypeInfo::List { .. } => ExtraTypeInfoType::List,
             ExtraTypeInfo::Struct { .. } => ExtraTypeInfoType::Struct,
             ExtraTypeInfo::Array { .. } => ExtraTypeInfoType::Array,
+            ExtraTypeInfo::Enum { .. } => ExtraTypeInfoType::Enum,
         }
     }
 
@@ -274,6 +281,21 @@ impl ExtraTypeInfo {
                     s.end_property();
                 }
             }
+            ExtraTypeInfo::Enum { values } => {
+                // Field 200 (values_count) is WriteProperty<idx_t> — always written.
+                s.begin_property(200);
+                s.write_u64(values.len() as u64);
+                s.end_property();
+                // Field 201 (values) is WriteList<string>. begin_list emits the
+                // count varint; each element is a string with its own length+bytes.
+                s.begin_property(201);
+                s.begin_list(values.len() as u64);
+                for v in values {
+                    s.write_string(v);
+                }
+                s.end_list();
+                s.end_property();
+            }
         }
     }
 
@@ -342,8 +364,39 @@ impl ExtraTypeInfo {
                     size,
                 })
             }
+            ExtraTypeInfoType::Enum => {
+                d.expect_field(200)?;
+                let count = d.read_u64()? as usize;
+                d.expect_field(201)?;
+                let listed = d.read_list_count()? as usize;
+                if listed != count {
+                    return Err(crate::WireError::UnexpectedField {
+                        expected: count as u16,
+                        actual: listed as u16,
+                    });
+                }
+                let mut values = Vec::with_capacity(count);
+                for _ in 0..count {
+                    values.push(d.read_string()?);
+                }
+                Ok(ExtraTypeInfo::Enum { values })
+            }
             other => Err(crate::WireError::UnsupportedExtraTypeInfo(other)),
         }
+    }
+}
+
+/// Physical storage width for an ENUM index, given the dictionary cardinality.
+/// Matches `EnumTypeInfo::DictType`: <=256 entries fit in u8, <=65536 in u16,
+/// otherwise u32. The u64 cap exists in the wire schema but DuckDB never picks
+/// it (validation rejects enums beyond u32::MAX).
+pub fn enum_physical_width(dict_size: usize) -> usize {
+    if dict_size <= u8::MAX as usize + 1 {
+        1
+    } else if dict_size <= u16::MAX as usize + 1 {
+        2
+    } else {
+        4
     }
 }
 
@@ -388,6 +441,9 @@ impl LogicalType {
         match (self.id, &self.extra) {
             (LogicalTypeId::Decimal, Some(ExtraTypeInfo::Decimal { precision, .. })) => {
                 Some(decimal_physical_width(*precision))
+            }
+            (LogicalTypeId::Enum, Some(ExtraTypeInfo::Enum { values })) => {
+                Some(enum_physical_width(values.len()))
             }
             (id, _) => id.fixed_width(),
         }
@@ -1087,12 +1143,13 @@ mod tests {
 
     #[test]
     fn extratypeinfo_unsupported_variant_returns_clear_error() {
-        // Forge a wire object with type discriminant = ENUM_TYPE_INFO (6) —
-        // recognised but not yet implemented in the codec.
+        // Forge a wire object with type discriminant = AGGREGATE_STATE_TYPE_INFO
+        // (8) — recognised in the discriminant enum but not implemented as a
+        // codec variant yet.
         let mut s = BinarySerializer::new();
         s.begin_object();
         s.begin_property(100);
-        s.write_u8(ExtraTypeInfoType::Enum as u8);
+        s.write_u8(ExtraTypeInfoType::AggregateState as u8);
         s.end_property();
         s.end_object();
         let bytes = s.into_bytes();
@@ -1101,7 +1158,7 @@ mod tests {
         let err = ExtraTypeInfo::decode_inner(&mut d).unwrap_err();
         assert!(matches!(
             err,
-            crate::WireError::UnsupportedExtraTypeInfo(ExtraTypeInfoType::Enum)
+            crate::WireError::UnsupportedExtraTypeInfo(ExtraTypeInfoType::AggregateState)
         ));
     }
 
@@ -1399,6 +1456,93 @@ mod tests {
 
         let mut d = BinaryDeserializer::new(&bytes);
         let decoded = Vector::decode(lt, 2, &mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, v);
+    }
+
+    #[test]
+    fn enum_physical_width_matches_duckdb_tiers() {
+        assert_eq!(enum_physical_width(1), 1);
+        assert_eq!(enum_physical_width(256), 1);
+        assert_eq!(enum_physical_width(257), 2);
+        assert_eq!(enum_physical_width(65_536), 2);
+        assert_eq!(enum_physical_width(65_537), 4);
+        assert_eq!(enum_physical_width(1_000_000), 4);
+    }
+
+    #[test]
+    fn extratypeinfo_enum_round_trips_three_values() {
+        let extra = ExtraTypeInfo::Enum {
+            values: vec!["red".to_string(), "green".to_string(), "blue".to_string()],
+        };
+        let mut s = BinarySerializer::new();
+        s.begin_object();
+        extra.encode_inner(&mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+
+        let mut d = BinaryDeserializer::new(&bytes);
+        let decoded = ExtraTypeInfo::decode_inner(&mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, extra);
+    }
+
+    #[test]
+    fn enum_vector_round_trips_with_u8_indices() {
+        // 3-value ENUM, physical width = 1 byte.
+        let lt = LogicalType::with_extra(
+            LogicalTypeId::Enum,
+            ExtraTypeInfo::Enum {
+                values: vec!["red".to_string(), "green".to_string(), "blue".to_string()],
+            },
+        );
+        // Rows: 0, 2, 1, 0 -> indices into the dict.
+        let v = Vector {
+            logical_type: lt.clone(),
+            validity: None,
+            data: VectorData::Fixed(vec![0u8, 2, 1, 0]),
+        };
+
+        let mut s = BinarySerializer::new();
+        s.begin_object();
+        v.encode(4, &mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+
+        let mut d = BinaryDeserializer::new(&bytes);
+        let decoded = Vector::decode(lt, 4, &mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, v);
+    }
+
+    #[test]
+    fn enum_vector_round_trips_with_u16_indices() {
+        // Force the u16 tier with a dictionary of 300 entries.
+        let values: Vec<String> = (0..300).map(|i| format!("v{i}")).collect();
+        let lt = LogicalType::with_extra(
+            LogicalTypeId::Enum,
+            ExtraTypeInfo::Enum {
+                values: values.clone(),
+            },
+        );
+        assert_eq!(lt.physical_width(), Some(2));
+
+        let raw_indices: [u16; 4] = [0, 299, 100, 50];
+        let bytes: Vec<u8> = raw_indices.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let v = Vector {
+            logical_type: lt.clone(),
+            validity: None,
+            data: VectorData::Fixed(bytes),
+        };
+
+        let mut s = BinarySerializer::new();
+        s.begin_object();
+        v.encode(4, &mut s);
+        s.end_object();
+        let encoded = s.into_bytes();
+
+        let mut d = BinaryDeserializer::new(&encoded);
+        let decoded = Vector::decode(lt, 4, &mut d).unwrap();
         d.expect_object_end().unwrap();
         assert_eq!(decoded, v);
     }

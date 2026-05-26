@@ -37,7 +37,7 @@ How DuckDB, Arrow/DataFusion, SQE's `LogicalTypeId`, and Iceberg primitive types
 | `MAP<K, V>` | `Map` | `Map` + `ExtraTypeInfo::List { child: STRUCT(key, value) }` | `map<K, V>` | ✅ DuckDB stores MAP as LIST<STRUCT<key,value>>; we reuse the LIST vector layout and stamp the parent type id as Map |
 | `ARRAY<T, N>` (fixed) | `FixedSizeList` | `Array` + `ExtraTypeInfo::Array { child, size }` | (none) | ✅ fields 103 (array_size) + 104 (child vector with size*count elements); size=0 honors WritePropertyWithDefault elision |
 | `UNION` | `Union` | `Union` (id only) | (none) | ❌ |
-| `ENUM` | `Dictionary(Int32, Utf8)` | `Enum` (id only) | (none, project as `string`) | ❌ |
+| `ENUM` | `Dictionary(Int8/16/32/64 or UInt8/16/32/64, Utf8/LargeUtf8)` | `Enum` + `ExtraTypeInfo::Enum { values }` | (none, project as `string`) | ⚠️ wire codec verified by unit tests (hand-written EnumTypeInfo: fields 200=values_count u64, 201=string list; per-row indices narrow to u8/u16/u32 by dict-size tier). DataFusion's SQL planner rejects the `ENUM(...)` type literal and doesn't dictionary-encode repeated strings, so end-to-end SQL exercising it via DataFusion isn't currently possible — the path is ready for non-DataFusion engines or future DataFusion support |
 
 ## Parameterised types
 
@@ -48,11 +48,11 @@ DuckDB's `LogicalType` carries optional `ExtraTypeInfo` on the wire (field 101 o
 - `STRUCT(...)` — ✅ encoded via `ExtraTypeInfo::Struct { fields }`. Pair entries with field 0 (name) + field 1 (LogicalType).
 - `MAP<K, V>` — ✅ reuses `ExtraTypeInfo::List { child: STRUCT(key, value) }` per DuckDB's internal `LogicalType::MAP` factory; no separate `MapTypeInfo`.
 - `ARRAY<T, N>` — ✅ encoded via `ExtraTypeInfo::Array { child, size }`. Field 200 (child_type, WriteProperty) + field 201 (size, WritePropertyWithDefault default 0).
-- `ENUM` — dictionary in `EnumTypeInfo` (custom serializer, not implemented).
+- `ENUM` — ✅ encoded via `ExtraTypeInfo::Enum { values }`. Custom serializer: field 200 (values_count u64, `WriteProperty`) + field 201 (`WriteList<string>`). Per-row index width follows DuckDB's `EnumTypeInfo::DictType`: <=256 entries -> u8, <=65536 -> u16, otherwise u32.
 - `UNION` — distinct UnionTypeInfo, not implemented.
 - User-defined types — not implemented.
 
-Wave 2c completes the auto-generated subclass set (DECIMAL, LIST, STRUCT, MAP, ARRAY). ENUM and UNION require hand-written DuckDB serializers; they're future work.
+The auto-generated `ExtraTypeInfo` subclass set (DECIMAL, LIST, STRUCT, MAP, ARRAY) plus the hand-written `ENUM` are all wired end-to-end. Only `UNION` and user-defined types remain in the parameterised family.
 
 ExtraTypeInfo wire layout (verified against DuckDB v1.5.3 generated serializer):
 - Base field 100 (u8): `ExtraTypeInfoType` discriminant — `WriteProperty`, always written.
