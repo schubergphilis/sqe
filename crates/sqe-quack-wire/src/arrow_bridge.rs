@@ -39,6 +39,73 @@ pub fn record_batch_to_data_chunk(batch: &RecordBatch) -> crate::Result<DataChun
     })
 }
 
+/// Map a single `LogicalType` to an Arrow [`DataType`]. Mirrors the
+/// type-level choices made by `column_to_vector` so a server's
+/// `PrepareResponse.result_types` can be turned into an Arrow [`Schema`]
+/// even before the first `DataChunk` arrives.
+///
+/// Nested types (LIST/STRUCT/MAP/ARRAY) are not yet supported on the reverse
+/// schema path; they surface as `UnsupportedLogicalType` until the recursive
+/// `vector_to_array` body exists.
+pub fn logical_type_to_arrow(t: &LogicalType) -> crate::Result<arrow_schema::DataType> {
+    use arrow_schema::DataType as A;
+    Ok(match t.id {
+        LogicalTypeId::Boolean => A::Boolean,
+        LogicalTypeId::TinyInt => A::Int8,
+        LogicalTypeId::SmallInt => A::Int16,
+        LogicalTypeId::Integer => A::Int32,
+        LogicalTypeId::BigInt => A::Int64,
+        LogicalTypeId::UTinyInt => A::UInt8,
+        LogicalTypeId::USmallInt => A::UInt16,
+        LogicalTypeId::UInteger => A::UInt32,
+        LogicalTypeId::UBigInt => A::UInt64,
+        LogicalTypeId::Float => A::Float32,
+        LogicalTypeId::Double => A::Float64,
+        LogicalTypeId::Varchar => A::Utf8,
+        LogicalTypeId::Blob => A::Binary,
+        LogicalTypeId::Date => A::Date32,
+        LogicalTypeId::Time => A::Time64(TimeUnit::Microsecond),
+        LogicalTypeId::TimeNs => A::Time64(TimeUnit::Nanosecond),
+        LogicalTypeId::Timestamp => A::Timestamp(TimeUnit::Microsecond, None),
+        LogicalTypeId::TimestampSec => A::Timestamp(TimeUnit::Second, None),
+        LogicalTypeId::TimestampMs => A::Timestamp(TimeUnit::Millisecond, None),
+        LogicalTypeId::TimestampNs => A::Timestamp(TimeUnit::Nanosecond, None),
+        LogicalTypeId::Uuid => A::FixedSizeBinary(16),
+        LogicalTypeId::Interval => A::Interval(IntervalUnit::MonthDayNano),
+        LogicalTypeId::Decimal => {
+            let (precision, scale) = match &t.extra {
+                Some(crate::data_chunk::ExtraTypeInfo::Decimal { precision, scale }) => {
+                    (*precision, *scale)
+                }
+                _ => return Err(crate::WireError::UnsupportedLogicalType(LogicalTypeId::Decimal)),
+            };
+            A::Decimal128(precision, scale as i8)
+        }
+        other => return Err(crate::WireError::UnsupportedLogicalType(other)),
+    })
+}
+
+/// Build an Arrow [`Schema`] from a parallel `(names, types)` pair, suitable
+/// for `RecordBatch::schema()` and DataFusion's `TableProvider::schema()` even
+/// when no batches have been received yet.
+pub fn logical_schema_to_arrow(
+    names: &[String],
+    types: &[LogicalType],
+) -> crate::Result<arrow_schema::SchemaRef> {
+    if names.len() != types.len() {
+        return Err(crate::WireError::UnexpectedField {
+            expected: names.len() as u16,
+            actual: types.len() as u16,
+        });
+    }
+    let mut fields = Vec::with_capacity(names.len());
+    for (name, ty) in names.iter().zip(types.iter()) {
+        let dt = logical_type_to_arrow(ty)?;
+        fields.push(arrow_schema::Field::new(name.clone(), dt, true));
+    }
+    Ok(std::sync::Arc::new(arrow_schema::Schema::new(fields)))
+}
+
 /// Reverse direction: take a decoded `DataChunk` plus the column names from
 /// `PrepareResponse.result_names` and rebuild an Arrow [`RecordBatch`]. Used by
 /// `sqe-quack-client` to surface server responses as Arrow.
