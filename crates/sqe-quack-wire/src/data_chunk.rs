@@ -109,38 +109,207 @@ impl LogicalTypeId {
     }
 }
 
+/// Subset of DuckDB's `ExtraTypeInfoType` (uint8_t). Acts as the discriminant
+/// for the `ExtraTypeInfo` variant on the wire (field 100 inside the type_info
+/// object).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtraTypeInfoType {
+    Invalid = 0,
+    Generic = 1,
+    Decimal = 2,
+    String = 3,
+    List = 4,
+    Struct = 5,
+    Enum = 6,
+    Unbound = 7,
+    AggregateState = 8,
+    Array = 9,
+    Any = 10,
+    IntegerLiteral = 11,
+    Template = 12,
+    Geo = 13,
+}
+
+impl ExtraTypeInfoType {
+    pub fn from_u8(value: u8) -> crate::Result<Self> {
+        Ok(match value {
+            0 => Self::Invalid,
+            1 => Self::Generic,
+            2 => Self::Decimal,
+            3 => Self::String,
+            4 => Self::List,
+            5 => Self::Struct,
+            6 => Self::Enum,
+            7 => Self::Unbound,
+            8 => Self::AggregateState,
+            9 => Self::Array,
+            10 => Self::Any,
+            11 => Self::IntegerLiteral,
+            12 => Self::Template,
+            13 => Self::Geo,
+            _ => return Err(crate::WireError::UnknownExtraTypeInfoType(value)),
+        })
+    }
+}
+
+/// Parameterised type info attached to a `LogicalType` via field 101.
+/// Only the variants we encode/decode end-to-end are listed; everything else
+/// surfaces as `WireError::UnsupportedExtraTypeInfo`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtraTypeInfo {
+    Decimal { precision: u8, scale: u8 },
+}
+
+impl ExtraTypeInfo {
+    pub fn discriminant(&self) -> ExtraTypeInfoType {
+        match self {
+            ExtraTypeInfo::Decimal { .. } => ExtraTypeInfoType::Decimal,
+        }
+    }
+
+    /// Encode an `ExtraTypeInfo` *inside* a begin_object/end_object pair the
+    /// caller already opened. Mirrors `ExtraTypeInfo::Serialize` (base then
+    /// subclass). Alias and extension_info default-omit because we never set
+    /// them.
+    pub fn encode_inner(&self, s: &mut BinarySerializer) {
+        // Base field 100: type discriminant — WriteProperty<ExtraTypeInfoType>.
+        s.begin_property(100);
+        s.write_u8(self.discriminant() as u8);
+        s.end_property();
+        // Base field 101 (alias, default ""): omitted.
+        // Base field 102 (deleted modifiers): never emitted by current DuckDB.
+        // Base field 103 (extension_info, default null): omitted.
+        match self {
+            ExtraTypeInfo::Decimal { precision, scale } => {
+                // Field 200 (width) is WritePropertyWithDefault<uint8_t> with
+                // default 0. Real DECIMALs always have width >= 1, but we
+                // honour the default-elision rule for byte-level compat.
+                if *precision != 0 {
+                    s.begin_property(200);
+                    s.write_u8(*precision);
+                    s.end_property();
+                }
+                if *scale != 0 {
+                    s.begin_property(201);
+                    s.write_u8(*scale);
+                    s.end_property();
+                }
+            }
+        }
+    }
+
+    /// Decode an `ExtraTypeInfo` after the caller has confirmed an object is
+    /// open. Reads the base discriminant first, then dispatches to the
+    /// subclass; consumes the trailing 0xFFFF object terminator.
+    pub fn decode_inner(d: &mut BinaryDeserializer<'_>) -> crate::Result<Self> {
+        d.expect_field(100)?;
+        let kind = ExtraTypeInfoType::from_u8(d.read_u8()?)?;
+        // Base field 101 (alias, default ""): consume if present.
+        if d.read_optional(101)? {
+            let _alias = d.read_string()?;
+        }
+        // Field 102 was deleted in v1.5; refuse to silently skip if a legacy
+        // writer ever emits it because we can't determine the value's length.
+        if d.read_optional(102)? {
+            return Err(crate::WireError::UnexpectedField {
+                expected: 200,
+                actual: 102,
+            });
+        }
+        // Field 103 (extension_info) — not implemented.
+        if d.read_optional(103)? {
+            return Err(crate::WireError::UnsupportedExtensionTypeInfo);
+        }
+        match kind {
+            ExtraTypeInfoType::Decimal => {
+                let precision = if d.read_optional(200)? { d.read_u8()? } else { 0 };
+                let scale = if d.read_optional(201)? { d.read_u8()? } else { 0 };
+                Ok(ExtraTypeInfo::Decimal { precision, scale })
+            }
+            other => Err(crate::WireError::UnsupportedExtraTypeInfo(other)),
+        }
+    }
+}
+
+/// Physical storage width for a DECIMAL with the given precision.
+/// Matches `DecimalType::GetInternalType` in DuckDB: precision 1-4 -> i16,
+/// 5-9 -> i32, 10-18 -> i64, 19-38 -> i128.
+pub fn decimal_physical_width(precision: u8) -> usize {
+    match precision {
+        0..=4 => 2,
+        5..=9 => 4,
+        10..=18 => 8,
+        _ => 16,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogicalType {
     pub id: LogicalTypeId,
-    // ExtraTypeInfo is null for primitive types (covered in this MVP).
-    // Nested types (LIST<T>, STRUCT<...>) and parameterised types (DECIMAL(p,s))
-    // require type_info; not implemented yet.
+    /// `None` for primitive types whose `ExtraTypeInfo` field is the default
+    /// (null `shared_ptr`). `Some(...)` carries the parameters required to
+    /// reconstruct the type — today only `DECIMAL(precision, scale)`.
+    pub extra: Option<ExtraTypeInfo>,
 }
 
 impl LogicalType {
     pub fn new(id: LogicalTypeId) -> Self {
-        Self { id }
+        Self { id, extra: None }
+    }
+
+    pub fn with_extra(id: LogicalTypeId, extra: ExtraTypeInfo) -> Self {
+        Self {
+            id,
+            extra: Some(extra),
+        }
+    }
+
+    /// Per-row byte width for fixed-size types. None for variable-length
+    /// (`VARCHAR`/`BLOB`). For `DECIMAL` the width depends on the precision
+    /// stored in `extra`; for every other id we fall back to
+    /// `LogicalTypeId::fixed_width`.
+    pub fn physical_width(&self) -> Option<usize> {
+        match (self.id, &self.extra) {
+            (LogicalTypeId::Decimal, Some(ExtraTypeInfo::Decimal { precision, .. })) => {
+                Some(decimal_physical_width(*precision))
+            }
+            (id, _) => id.fixed_width(),
+        }
     }
 
     pub fn encode(&self, s: &mut BinarySerializer) {
         s.begin_property(100);
         s.write_u8(self.id as u8);
         s.end_property();
-        // field 101 "type_info" is WritePropertyWithDefault — for primitive
-        // types the default (null) is emitted by omitting the field entirely.
+        // Field 101 ("type_info") is WritePropertyWithDefault<shared_ptr<ExtraTypeInfo>>.
+        // When non-null the on-wire shape is: field_id, nullable present byte
+        // (1), object content, 0xFFFF terminator.
+        if let Some(extra) = &self.extra {
+            s.begin_optional_property(101, true);
+            s.begin_nullable(true);
+            s.begin_object();
+            extra.encode_inner(s);
+            s.end_object();
+            s.end_nullable(true);
+            s.end_optional_property(true);
+        }
     }
 
     pub fn decode(d: &mut BinaryDeserializer<'_>) -> crate::Result<Self> {
         d.expect_field(100)?;
         let id = LogicalTypeId::from_u8(d.read_u8()?)?;
-        // Optional type_info (field 101). If present we currently reject:
-        // parameterised and nested types are not in the MVP. The optional
-        // serialisation skips the field entirely when the value is null,
-        // so the wire is silent for primitive types.
-        if d.read_optional(101)? {
-            return Err(crate::WireError::UnsupportedLogicalType(id));
-        }
-        Ok(LogicalType { id })
+        let extra = if d.read_optional(101)? {
+            let present = d.read_nullable_present()?;
+            if !present {
+                return Err(crate::WireError::NullExtraTypeInfo);
+            }
+            let extra = ExtraTypeInfo::decode_inner(d)?;
+            d.expect_object_end()?;
+            Some(extra)
+        } else {
+            None
+        };
+        Ok(LogicalType { id, extra })
     }
 }
 
@@ -268,36 +437,39 @@ impl Vector {
         };
 
         d.expect_field(102)?;
-        let data = match logical_type.id {
-            id if id.fixed_width().is_some() => VectorData::Fixed(d.read_data_ptr()?),
-            LogicalTypeId::Varchar => {
-                let actual = d.read_list_count()? as usize;
-                let take = actual.min(count);
-                let mut values = Vec::with_capacity(take);
-                let validity_ref = validity.as_deref();
-                for i in 0..actual {
-                    let s_value = d.read_string()?;
-                    let valid = validity_ref
-                        .map(|v| v.get(i).copied().unwrap_or(true))
-                        .unwrap_or(true);
-                    values.push(if valid { Some(s_value) } else { None });
+        let data = if logical_type.physical_width().is_some() {
+            VectorData::Fixed(d.read_data_ptr()?)
+        } else {
+            match logical_type.id {
+                LogicalTypeId::Varchar => {
+                    let actual = d.read_list_count()? as usize;
+                    let take = actual.min(count);
+                    let mut values = Vec::with_capacity(take);
+                    let validity_ref = validity.as_deref();
+                    for i in 0..actual {
+                        let s_value = d.read_string()?;
+                        let valid = validity_ref
+                            .map(|v| v.get(i).copied().unwrap_or(true))
+                            .unwrap_or(true);
+                        values.push(if valid { Some(s_value) } else { None });
+                    }
+                    VectorData::Strings(values)
                 }
-                VectorData::Strings(values)
-            }
-            LogicalTypeId::Blob => {
-                let actual = d.read_list_count()? as usize;
-                let mut values = Vec::with_capacity(actual);
-                let validity_ref = validity.as_deref();
-                for i in 0..actual {
-                    let bytes = d.read_data_ptr()?;
-                    let valid = validity_ref
-                        .map(|v| v.get(i).copied().unwrap_or(true))
-                        .unwrap_or(true);
-                    values.push(if valid { Some(bytes) } else { None });
+                LogicalTypeId::Blob => {
+                    let actual = d.read_list_count()? as usize;
+                    let mut values = Vec::with_capacity(actual);
+                    let validity_ref = validity.as_deref();
+                    for i in 0..actual {
+                        let bytes = d.read_data_ptr()?;
+                        let valid = validity_ref
+                            .map(|v| v.get(i).copied().unwrap_or(true))
+                            .unwrap_or(true);
+                        values.push(if valid { Some(bytes) } else { None });
+                    }
+                    VectorData::Blobs(values)
                 }
-                VectorData::Blobs(values)
+                other => return Err(crate::WireError::UnsupportedLogicalType(other)),
             }
-            other => return Err(crate::WireError::UnsupportedLogicalType(other)),
         };
 
         Ok(Vector {
@@ -567,5 +739,147 @@ mod tests {
         let mut d = BinaryDeserializer::new(&bytes);
         let err = Vector::decode(LogicalType::new(LogicalTypeId::Integer), 1, &mut d).unwrap_err();
         assert!(matches!(err, crate::WireError::UnsupportedVectorType(2)));
+    }
+
+    #[test]
+    fn decimal_physical_width_matches_duckdb_tiers() {
+        // Boundary precisions per DecimalType::GetInternalType.
+        assert_eq!(decimal_physical_width(1), 2);
+        assert_eq!(decimal_physical_width(4), 2);
+        assert_eq!(decimal_physical_width(5), 4);
+        assert_eq!(decimal_physical_width(9), 4);
+        assert_eq!(decimal_physical_width(10), 8);
+        assert_eq!(decimal_physical_width(18), 8);
+        assert_eq!(decimal_physical_width(19), 16);
+        assert_eq!(decimal_physical_width(38), 16);
+    }
+
+    #[test]
+    fn extratypeinfo_decimal_round_trips_inside_object() {
+        let extra = ExtraTypeInfo::Decimal {
+            precision: 10,
+            scale: 2,
+        };
+        let mut s = BinarySerializer::new();
+        s.begin_object();
+        extra.encode_inner(&mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+
+        let mut d = BinaryDeserializer::new(&bytes);
+        let decoded = ExtraTypeInfo::decode_inner(&mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, extra);
+    }
+
+    #[test]
+    fn extratypeinfo_decimal_omits_zero_scale_field() {
+        // Scale 0 is the WritePropertyWithDefault default -> field 201 omitted.
+        let extra = ExtraTypeInfo::Decimal {
+            precision: 5,
+            scale: 0,
+        };
+        let mut s = BinarySerializer::new();
+        s.begin_object();
+        extra.encode_inner(&mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+
+        // Expected layout:
+        //   field 100 (type discriminant) = 0x64 0x00, varint 2 = 0x02
+        //   field 200 (width)             = 0xC8 0x00, varint 5 = 0x05
+        //   terminator                    = 0xFF 0xFF
+        assert_eq!(
+            bytes,
+            &[0x64, 0x00, 0x02, 0xC8, 0x00, 0x05, 0xFF, 0xFF],
+            "scale=0 must not emit field 201"
+        );
+
+        let mut d = BinaryDeserializer::new(&bytes);
+        let decoded = ExtraTypeInfo::decode_inner(&mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, extra);
+    }
+
+    #[test]
+    fn extratypeinfo_unsupported_variant_returns_clear_error() {
+        // Forge a wire object with type discriminant = LIST_TYPE_INFO (4).
+        let mut s = BinarySerializer::new();
+        s.begin_object();
+        s.begin_property(100);
+        s.write_u8(ExtraTypeInfoType::List as u8);
+        s.end_property();
+        s.end_object();
+        let bytes = s.into_bytes();
+
+        let mut d = BinaryDeserializer::new(&bytes);
+        let err = ExtraTypeInfo::decode_inner(&mut d).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::WireError::UnsupportedExtraTypeInfo(ExtraTypeInfoType::List)
+        ));
+    }
+
+    #[test]
+    fn logical_type_with_decimal_extra_round_trips() {
+        let lt = LogicalType::with_extra(
+            LogicalTypeId::Decimal,
+            ExtraTypeInfo::Decimal {
+                precision: 18,
+                scale: 6,
+            },
+        );
+        let mut s = BinarySerializer::new();
+        s.begin_object();
+        lt.encode(&mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+
+        let mut d = BinaryDeserializer::new(&bytes);
+        let decoded = LogicalType::decode(&mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, lt);
+    }
+
+    #[test]
+    fn logical_type_primitive_still_omits_field_101() {
+        // Pre-existing behaviour: primitive types never emit type_info.
+        let lt = LogicalType::new(LogicalTypeId::Integer);
+        let mut s = BinarySerializer::new();
+        s.begin_object();
+        lt.encode(&mut s);
+        s.end_object();
+        // field 100 = 0x64 0x00, varint 13 = 0x0D, terminator 0xFF 0xFF — no field 101.
+        assert_eq!(s.into_bytes(), &[0x64, 0x00, 0x0D, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn decimal_vector_uses_physical_width_for_fixed_path() {
+        // DECIMAL(10, 2) -> physical width 8 bytes (i64).
+        let lt = LogicalType::with_extra(
+            LogicalTypeId::Decimal,
+            ExtraTypeInfo::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+        );
+        let raw: [i64; 3] = [12345, -67890, 0];
+        let bytes: Vec<u8> = raw.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let v = Vector {
+            logical_type: lt.clone(),
+            validity: None,
+            data: VectorData::Fixed(bytes.clone()),
+        };
+
+        let mut s = BinarySerializer::new();
+        s.begin_object();
+        v.encode(raw.len(), &mut s);
+        s.end_object();
+        let encoded = s.into_bytes();
+
+        let mut d = BinaryDeserializer::new(&encoded);
+        let decoded = Vector::decode(lt, raw.len(), &mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded.data, VectorData::Fixed(bytes));
     }
 }
