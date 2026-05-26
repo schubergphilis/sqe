@@ -1015,27 +1015,21 @@ mod tests {
     fn varchar_vector_decodes_null_rows_with_garbage_string_bytes() {
         // Real DuckDB writes uninitialised bytes (often non-UTF-8) at NULL
         // VARCHAR positions instead of an empty string. Forge that exact
-        // wire shape and verify decode succeeds with a None at the null
-        // position rather than tripping a UTF-8 validation error.
-        // Layout: 1 row, validity_mask says row 0 is NULL,
-        // field-102 data list = [1 string of length 1 = 0x80].
-        let mut s = BinarySerializer::new();
-        s.begin_object();
-        s.begin_property(100);
-        s.write_bool(true); // has_validity
-        s.end_property();
-        s.begin_property(101);
-        // 1 u64 mask byte sequence; bit 0 = 0 (invalid).
-        s.write_data_ptr(&[0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
-        s.end_property();
-        s.begin_property(102);
-        s.begin_list(1);
-        // Write a single byte 0x80 — DuckDB's typical garbage at NULL slots.
-        s.write_string(unsafe { std::str::from_utf8_unchecked(&[0x80]) });
-        s.end_list();
-        s.end_property();
-        s.end_object();
-        let bytes = s.into_bytes();
+        // wire shape (1 row, NULL validity, 1-byte 0x80 payload) and verify
+        // decode succeeds with a None rather than tripping UTF-8 validation.
+        // Hand-rolled byte layout, since the safe BinarySerializer API
+        // can't write non-UTF-8 strings (and shouldn't be able to).
+        let bytes: Vec<u8> = [
+            // field 100 (has_validity) = true
+            0x64, 0x00, 0x01,
+            // field 101 (validity mask) — 8 bytes, bit 0 = 0 (invalid)
+            0x65, 0x00, 0x08, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            // field 102 (data list) — count=1, then a single 1-byte "string" = 0x80
+            0x66, 0x00, 0x01, 0x01, 0x80,
+            // object terminator
+            0xff, 0xff,
+        ]
+        .to_vec();
 
         let mut d = BinaryDeserializer::new(&bytes);
         let decoded = Vector::decode(LogicalType::new(LogicalTypeId::Varchar), 1, &mut d).unwrap();

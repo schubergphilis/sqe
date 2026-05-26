@@ -3,7 +3,8 @@
 use std::time::Duration;
 
 use arrow_array::RecordBatch;
-use sqe_quack_wire::arrow_bridge::data_chunk_to_record_batch;
+use arrow_schema::SchemaRef;
+use sqe_quack_wire::arrow_bridge::{data_chunk_to_record_batch, logical_schema_to_arrow};
 use sqe_quack_wire::message::{
     decode_message, encode_message, ConnectionRequest, FetchRequest, MessageHeader, MessageType,
     PrepareRequest, QuackMessage,
@@ -116,6 +117,7 @@ impl QuackClient {
         };
 
         let names = prepare.result_names.clone();
+        let schema = logical_schema_to_arrow(&names, &prepare.result_types)?;
         let mut batches: Vec<RecordBatch> = Vec::new();
         for chunk in &prepare.results {
             batches.push(data_chunk_to_record_batch(&names, chunk)?);
@@ -148,6 +150,7 @@ impl QuackClient {
 
         Ok(ExecuteResult {
             names: prepare.result_names,
+            schema,
             batches,
         })
     }
@@ -203,11 +206,15 @@ impl Drop for QuackClient {
     }
 }
 
-/// Result of [`QuackClient::execute`]: column names plus every batch the
-/// server streamed back.
+/// Result of [`QuackClient::execute`]: column names + the Arrow [`SchemaRef`]
+/// derived from `PrepareResponse.result_types` + every batch the server
+/// streamed back. The schema is set even when `batches` is empty — useful
+/// for downstream consumers (e.g. `QuackTableProvider`) that need to expose
+/// a schema before any rows arrive.
 #[derive(Debug, Clone)]
 pub struct ExecuteResult {
     pub names: Vec<String>,
+    pub schema: SchemaRef,
     pub batches: Vec<RecordBatch>,
 }
 
