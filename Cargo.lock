@@ -6798,6 +6798,7 @@ dependencies = [
  "sqe-metrics",
  "sqe-planner",
  "sqe-policy",
+ "sqe-quack-client",
  "sqe-quack-server",
  "sqe-quack-wire",
  "sqe-sql",
@@ -6930,9 +6931,13 @@ dependencies = [
  "arrow",
  "arrow-array",
  "arrow-schema",
+ "async-trait",
+ "datafusion",
+ "datafusion-expr",
  "reqwest 0.12.28",
  "sqe-quack-wire",
  "thiserror 2.0.18",
+ "tokio",
  "url",
 ]
 
