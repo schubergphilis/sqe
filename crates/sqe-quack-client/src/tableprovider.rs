@@ -41,18 +41,12 @@ impl QuackTableProvider {
     pub fn new(uri: &str, token: Option<&str>, sql: &str) -> Result<Self, ClientError> {
         let mut client = QuackClient::connect(uri, token)?;
         let result = client.execute(sql)?;
-        let schema = match result.batches.first() {
-            Some(batch) => batch.schema(),
-            None => {
-                return Err(ClientError::ServerError(
-                    "query returned no batches; schema cannot be inferred without data"
-                        .to_string(),
-                ));
-            }
-        };
         let _ = client.disconnect();
+        // Schema comes from `PrepareResponse.result_types`, not from the
+        // first batch — that lets zero-row results (e.g. WHERE 1=0) still
+        // expose a valid table to DataFusion.
         Ok(Self {
-            schema,
+            schema: result.schema,
             batches: result.batches,
         })
     }

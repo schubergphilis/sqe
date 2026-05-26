@@ -309,6 +309,20 @@ impl<'a> BinaryDeserializer<'a> {
         Ok(s)
     }
 
+    /// Consume a length-prefixed string slot without UTF-8 validation. Used
+    /// for NULL VARCHAR rows: real DuckDB writes uninitialised garbage
+    /// bytes (e.g. an `0x80` byte that fails UTF-8) instead of an empty
+    /// string at NULL positions. The decoder must skip those bytes by
+    /// position without trying to interpret them.
+    pub fn skip_string(&mut self) -> crate::Result<()> {
+        let len = self.read_u64()? as usize;
+        if self.buf.len() - self.pos < len {
+            return Err(crate::WireError::UnexpectedEof);
+        }
+        self.pos += len;
+        Ok(())
+    }
+
     pub fn read_list_count(&mut self) -> crate::Result<u64> {
         self.read_u64()
     }

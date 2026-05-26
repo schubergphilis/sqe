@@ -345,21 +345,31 @@ impl PrepareResponse {
         }
         s.end_optional_property(needs_more_fetch_present);
 
-        s.begin_property(4);
-        s.begin_list(self.results.len() as u64);
-        for chunk in &self.results {
-            // `vector<unique_ptr<DataChunkWrapper>>` writes a nullable
-            // "present" byte before each element. Real DuckDB's decoder
-            // unconditionally consumes that byte; omitting it shifts the
-            // reader by one byte and trips a field_id mismatch on field 300.
-            s.begin_nullable(true);
-            s.begin_object();
-            encode_data_chunk_wrapper(s, chunk);
-            s.end_object();
-            s.end_nullable(true);
+        // Field 4 ("results") uses `WriteListWithDefault`: when the list is
+        // empty, real DuckDB omits the field entirely. Our decode mirror in
+        // `read_optional(4)` consumes the property if present and otherwise
+        // synthesises an empty Vec — so we have to match that on the encode
+        // side for byte-for-byte compatibility (without this elision, a
+        // server emitting an empty result set would confuse real DuckDB
+        // clients, which positionally seek field 5 next).
+        let results_present = !self.results.is_empty();
+        s.begin_optional_property(4, results_present);
+        if results_present {
+            s.begin_list(self.results.len() as u64);
+            for chunk in &self.results {
+                // `vector<unique_ptr<DataChunkWrapper>>` writes a nullable
+                // "present" byte before each element. Real DuckDB's decoder
+                // unconditionally consumes that byte; omitting it shifts the
+                // reader by one byte and trips a field_id mismatch on field 300.
+                s.begin_nullable(true);
+                s.begin_object();
+                encode_data_chunk_wrapper(s, chunk);
+                s.end_object();
+                s.end_nullable(true);
+            }
+            s.end_list();
         }
-        s.end_list();
-        s.end_property();
+        s.end_optional_property(results_present);
 
         s.begin_property(5);
         s.write_hugeint(self.result_uuid);
@@ -391,20 +401,28 @@ impl PrepareResponse {
             false
         };
 
-        d.expect_field(4)?;
-        let results_count = d.read_list_count()? as usize;
-        let mut results = Vec::with_capacity(results_count);
-        for _ in 0..results_count {
-            // Consume the leading nullable byte; a `false` value here would
-            // mean a null DataChunkWrapper, which the protocol doesn't
-            // emit in practice.
-            if !d.read_nullable_present()? {
-                return Err(crate::WireError::NullDataChunkWrapper);
+        // Field 4 ("results") is a `vector<unique_ptr<DataChunkWrapper>>` that
+        // DuckDB writes with `WriteListWithDefault` — an empty list omits the
+        // field entirely (real `quack_serve` does this for queries that yield
+        // zero rows, e.g. `WHERE 1=0`).
+        let results = if d.read_optional(4)? {
+            let results_count = d.read_list_count()? as usize;
+            let mut out = Vec::with_capacity(results_count);
+            for _ in 0..results_count {
+                // Consume the leading nullable byte; a `false` value here
+                // would mean a null DataChunkWrapper, which the protocol
+                // doesn't emit in practice.
+                if !d.read_nullable_present()? {
+                    return Err(crate::WireError::NullDataChunkWrapper);
+                }
+                let chunk = decode_data_chunk_wrapper(d)?;
+                d.expect_object_end()?;
+                out.push(chunk);
             }
-            let chunk = decode_data_chunk_wrapper(d)?;
-            d.expect_object_end()?;
-            results.push(chunk);
-        }
+            out
+        } else {
+            Vec::new()
+        };
 
         d.expect_field(5)?;
         let result_uuid = d.read_hugeint()?;
@@ -427,19 +445,26 @@ pub struct FetchResponse {
 
 impl FetchResponse {
     pub fn encode(&self, s: &mut BinarySerializer) {
-        s.begin_property(1);
-        s.begin_list(self.results.len() as u64);
-        for chunk in &self.results {
-            // `vector<unique_ptr<DataChunkWrapper>>` — same nullable-byte
-            // prefix per element as in PrepareResponse.
-            s.begin_nullable(true);
-            s.begin_object();
-            encode_data_chunk_wrapper(s, chunk);
-            s.end_object();
-            s.end_nullable(true);
+        // Field 1 ("results") uses `WriteListWithDefault` — DuckDB omits
+        // the field entirely when the list is empty (which is exactly what
+        // the terminal fetch in a long stream does to signal "no more
+        // batches"). Match the elision for byte-level compat.
+        let results_present = !self.results.is_empty();
+        s.begin_optional_property(1, results_present);
+        if results_present {
+            s.begin_list(self.results.len() as u64);
+            for chunk in &self.results {
+                // `vector<unique_ptr<DataChunkWrapper>>` — same nullable-byte
+                // prefix per element as in PrepareResponse.
+                s.begin_nullable(true);
+                s.begin_object();
+                encode_data_chunk_wrapper(s, chunk);
+                s.end_object();
+                s.end_nullable(true);
+            }
+            s.end_list();
         }
-        s.end_list();
-        s.end_property();
+        s.end_optional_property(results_present);
 
         s.begin_property(2);
         s.write_u64(self.batch_index.unwrap_or(OPTIONAL_IDX_INVALID_BATCH));
@@ -447,17 +472,23 @@ impl FetchResponse {
     }
 
     pub fn decode(d: &mut BinaryDeserializer<'_>) -> crate::Result<Self> {
-        d.expect_field(1)?;
-        let count = d.read_list_count()? as usize;
-        let mut results = Vec::with_capacity(count);
-        for _ in 0..count {
-            if !d.read_nullable_present()? {
-                return Err(crate::WireError::NullDataChunkWrapper);
+        // Mirror the encode elision: when field 1 is absent the server is
+        // signalling an empty results list.
+        let results = if d.read_optional(1)? {
+            let count = d.read_list_count()? as usize;
+            let mut out = Vec::with_capacity(count);
+            for _ in 0..count {
+                if !d.read_nullable_present()? {
+                    return Err(crate::WireError::NullDataChunkWrapper);
+                }
+                let chunk = decode_data_chunk_wrapper(d)?;
+                d.expect_object_end()?;
+                out.push(chunk);
             }
-            let chunk = decode_data_chunk_wrapper(d)?;
-            d.expect_object_end()?;
-            results.push(chunk);
-        }
+            out
+        } else {
+            Vec::new()
+        };
 
         d.expect_field(2)?;
         let raw = d.read_u64()?;
@@ -792,6 +823,40 @@ mod tests {
         original.encode(&mut s);
         s.end_object();
         let bytes = s.into_bytes();
+        let mut d = BinaryDeserializer::new(&bytes);
+        let decoded = PrepareResponse::decode(&mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn prepare_response_with_empty_results_omits_field_4() {
+        // Real DuckDB writes `WriteListWithDefault` for the results list:
+        // an empty list omits field 4 entirely. Round-trip must reconstruct
+        // an empty Vec from the absence of the field.
+        let original = PrepareResponse {
+            result_types: vec![LogicalType::new(crate::data_chunk::LogicalTypeId::Integer)],
+            result_names: vec!["x".to_string()],
+            needs_more_fetch: false,
+            results: Vec::new(),
+            result_uuid: 0,
+        };
+        let mut s = BinarySerializer::new();
+        s.begin_object();
+        original.encode(&mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+        // Sanity: byte stream must not contain the field-4 sentinel (0x04, 0x00)
+        // anywhere before the trailing object terminator. Since field 4 is the
+        // only place that pair appears in our encode path for this fixture, a
+        // simple substring search is sufficient.
+        let field4 = [0x04u8, 0x00];
+        let trailing = &bytes[..bytes.len().saturating_sub(2)];
+        assert!(
+            !trailing.windows(2).any(|w| w == field4),
+            "field 4 must be omitted when results is empty"
+        );
+
         let mut d = BinaryDeserializer::new(&bytes);
         let decoded = PrepareResponse::decode(&mut d).unwrap();
         d.expect_object_end().unwrap();

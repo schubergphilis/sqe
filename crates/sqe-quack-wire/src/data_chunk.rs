@@ -786,11 +786,19 @@ impl Vector {
                 let mut values = Vec::with_capacity(take);
                 let validity_ref = validity.as_deref();
                 for i in 0..actual {
-                    let s_value = d.read_string()?;
                     let valid = validity_ref
                         .map(|v| v.get(i).copied().unwrap_or(true))
                         .unwrap_or(true);
-                    values.push(if valid { Some(s_value) } else { None });
+                    // Real DuckDB writes uninitialised bytes (often non-UTF-8)
+                    // at NULL VARCHAR positions rather than an empty string.
+                    // Skip them by length without UTF-8 validation when the
+                    // row is known to be null.
+                    if valid {
+                        values.push(Some(d.read_string()?));
+                    } else {
+                        d.skip_string()?;
+                        values.push(None);
+                    }
                 }
                 VectorData::Strings(values)
             }
@@ -1001,6 +1009,36 @@ mod tests {
         let v = Vector::new_strings(values.clone());
         let decoded = roundtrip_vector(v.clone(), values.len());
         assert_eq!(decoded.data, VectorData::Strings(values));
+    }
+
+    #[test]
+    fn varchar_vector_decodes_null_rows_with_garbage_string_bytes() {
+        // Real DuckDB writes uninitialised bytes (often non-UTF-8) at NULL
+        // VARCHAR positions instead of an empty string. Forge that exact
+        // wire shape (1 row, NULL validity, 1-byte 0x80 payload) and verify
+        // decode succeeds with a None rather than tripping UTF-8 validation.
+        // Hand-rolled byte layout, since the safe BinarySerializer API
+        // can't write non-UTF-8 strings (and shouldn't be able to).
+        let bytes: Vec<u8> = [
+            // field 100 (has_validity) = true
+            0x64, 0x00, 0x01,
+            // field 101 (validity mask) — 8 bytes, bit 0 = 0 (invalid)
+            0x65, 0x00, 0x08, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            // field 102 (data list) — count=1, then a single 1-byte "string" = 0x80
+            0x66, 0x00, 0x01, 0x01, 0x80,
+            // object terminator
+            0xff, 0xff,
+        ]
+        .to_vec();
+
+        let mut d = BinaryDeserializer::new(&bytes);
+        let decoded = Vector::decode(LogicalType::new(LogicalTypeId::Varchar), 1, &mut d).unwrap();
+        d.expect_object_end().unwrap();
+        match decoded.data {
+            VectorData::Strings(values) => assert_eq!(values, vec![None]),
+            other => panic!("expected Strings, got {other:?}"),
+        }
+        assert_eq!(decoded.validity, Some(vec![false]));
     }
 
     #[test]
