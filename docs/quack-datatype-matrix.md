@@ -91,3 +91,21 @@ duckdb -c "
 ## Status
 
 Every row marked ✅ has been verified end-to-end with a real `duckdb 1.5.3` CLI session. The verification command for each row is `SELECT <literal>::<type> ...` against `quack_query`, and the assertion is that DuckDB renders the value back without error.
+
+## Client mode (Option B)
+
+In addition to serving Quack RPC, SQE can act as a Quack client and pull rows from a remote DuckDB or another sqe-server:
+
+- `sqe-quack-client` crate exposes a synchronous `QuackClient` for programmatic use.
+- `QuackTableProvider` adapts a Quack query result to a DataFusion `TableProvider` (eager fetch, in-memory).
+- `quack_query(uri, [token,] sql)` is registered as a TVF on every coordinator session, so any SQL client can pull remote tables inline:
+
+  ```sql
+  -- 2-arg form (no auth)
+  SELECT * FROM quack_query('quack:remote-duckdb:9495', 'SELECT * FROM colors');
+
+  -- 3-arg form (bearer / static token)
+  SELECT * FROM quack_query('quack:remote-duckdb:9495', 'remote-secret', 'SELECT * FROM colors');
+  ```
+
+This is symmetric to DuckDB's own `quack_query` built-in. Composing the two lets a single DuckDB CLI session route queries through sqe-server, which itself fetches from a remote DuckDB — useful for federated reads or for treating DuckDB as an execution backend for specific workloads.

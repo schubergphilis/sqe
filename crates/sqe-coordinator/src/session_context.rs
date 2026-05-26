@@ -457,6 +457,18 @@ pub async fn create_session_context(
                 )),
             );
 
+            // Symmetric to DuckDB's quack_query(): pull rows from a remote
+            // Quack endpoint inline.
+            //   SELECT * FROM quack_query('quack:host:9495', 'SELECT 42');
+            //   SELECT * FROM quack_query('quack:host:9495', 'token', 'SELECT 42');
+            // The 2-arg form uses an empty auth string; the 3-arg form sends
+            // the supplied token. Returned columns are materialised eagerly
+            // at planning time and exposed as an in-memory table.
+            ctx.register_udtf(
+                "quack_query",
+                Arc::new(sqe_quack_client::QuackQueryTvf::new()),
+            );
+
             debug!(
                 catalog_name = %catalog_name,
                 "Registered session catalog in DataFusion context"
