@@ -19,5 +19,9 @@
 //! [`RecordBatch`]: arrow_array::RecordBatch
 
 mod client;
+mod tableprovider;
+mod tvf;
 
-pub use client::{ClientError, QuackClient};
+pub use client::{ClientError, ExecuteResult, QuackClient};
+pub use tableprovider::QuackTableProvider;
+pub use tvf::QuackQueryTvf;
