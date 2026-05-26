@@ -52,7 +52,7 @@ DuckDB's `LogicalType` carries optional `ExtraTypeInfo` on the wire (field 101 o
 - `UNION` — ✅ codec routes through STRUCT's wire layout. DuckDB models `UNION(members)` as a StructTypeInfo with a UTINYINT tag prepended to the members, so no new ExtraTypeInfo variant is needed. Arrow bridge mapping is deferred because DataFusion never emits `UnionArray`.
 - User-defined types — not implemented.
 
-The full parameterised-type family is wired in the codec. The remaining gaps are upstream (DataFusion's planner rejecting certain SQL syntax) or low-traffic enough to defer (Arrow bridge for ENUM/UNION when DataFusion doesn't emit those array types in practice).
+The full parameterised-type family is wired in the codec, **in both directions**. Forward (Arrow -> DataChunk) handles every type DataFusion emits; reverse (DataChunk -> Arrow) handles every type a remote DuckDB returns through the `quack_query()` TVF — LIST, STRUCT, MAP, ARRAY, ENUM (as `Dictionary(UIntX, Utf8)`), and arbitrarily deep compositions like `STRUCT(tags VARCHAR[], counts MAP(VARCHAR, INT))`. The remaining gaps are upstream (DataFusion's planner rejecting certain SQL syntax) or low-traffic enough to defer (Arrow bridge for UNION's `UnionArray`, which DataFusion does not emit in practice).
 
 ExtraTypeInfo wire layout (verified against DuckDB v1.5.3 generated serializer):
 - Base field 100 (u8): `ExtraTypeInfoType` discriminant — `WriteProperty`, always written.
