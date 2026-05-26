@@ -13,10 +13,11 @@ use arrow_array::{
     Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
     FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
     Int8Array, IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray,
-    LargeBinaryArray, LargeStringArray, RecordBatch, StringArray, StringViewArray,
-    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, RecordBatch, StringArray,
+    StringViewArray, StructArray, Time32MillisecondArray, Time32SecondArray,
+    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
+    UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 
@@ -148,6 +149,13 @@ fn column_to_vector(array: &dyn Array, row_count: usize) -> crate::Result<Vector
         DataType::Decimal128(precision, scale) => {
             decimal128_to_decimal(array, row_count, *precision, *scale)?
         }
+        // LIST<T> / LARGELIST<T>: build (offset, length) entries from the
+        // Arrow offsets array, then recurse into the values child.
+        DataType::List(_) => list_array_to_list::<ListArray>(array, row_count)?,
+        DataType::LargeList(_) => list_array_to_list::<LargeListArray>(array, row_count)?,
+        // STRUCT(...): each field becomes a parallel child vector sharing
+        // the parent row count.
+        DataType::Struct(_) => struct_array_to_struct(array, row_count)?,
         // Arrow interval types all widen into DuckDB's 16-byte `interval_t`
         // { months: i32, days: i32, micros: i64 }.
         DataType::Interval(IntervalUnit::YearMonth) => interval_yearmonth_to_interval(array, row_count)?,
@@ -409,6 +417,93 @@ fn interval_monthdaynano_to_interval(
     Ok((
         LogicalType::new(LogicalTypeId::Interval),
         VectorData::Fixed(bytes),
+    ))
+}
+
+/// Trait abstracting `ListArray` (i32 offsets) and `LargeListArray` (i64
+/// offsets). Both expose `value_offsets()` and `values()`; the offset type
+/// converts cleanly into `u64` for DuckDB's `list_entry_t.offset`/`length`.
+trait OffsetListArray: Array + 'static {
+    fn offsets_at(&self, idx: usize) -> (i64, i64);
+    fn values_ref(&self) -> &dyn Array;
+}
+
+impl OffsetListArray for ListArray {
+    fn offsets_at(&self, idx: usize) -> (i64, i64) {
+        let offs = self.value_offsets();
+        (offs[idx] as i64, offs[idx + 1] as i64)
+    }
+    fn values_ref(&self) -> &dyn Array {
+        ListArray::values(self).as_ref()
+    }
+}
+
+impl OffsetListArray for LargeListArray {
+    fn offsets_at(&self, idx: usize) -> (i64, i64) {
+        let offs = self.value_offsets();
+        (offs[idx], offs[idx + 1])
+    }
+    fn values_ref(&self) -> &dyn Array {
+        LargeListArray::values(self).as_ref()
+    }
+}
+
+fn list_array_to_list<A: OffsetListArray>(
+    array: &dyn Array,
+    row_count: usize,
+) -> crate::Result<(LogicalType, VectorData)> {
+    let typed = array
+        .as_any()
+        .downcast_ref::<A>()
+        .ok_or_else(|| crate::WireError::UnsupportedArrowType("list downcast failed".to_string()))?;
+    let mut entries = Vec::with_capacity(row_count);
+    for i in 0..row_count {
+        let (start, end) = typed.offsets_at(i);
+        entries.push((start as u64, (end - start) as u64));
+    }
+    let values_array = typed.values_ref();
+    let child_count = values_array.len();
+    let child_vector = column_to_vector(values_array, child_count)?;
+    let child_logical = child_vector.logical_type.clone();
+    Ok((
+        LogicalType::with_extra(
+            LogicalTypeId::List,
+            ExtraTypeInfo::List {
+                child: Box::new(child_logical),
+            },
+        ),
+        VectorData::List {
+            entries,
+            child_count: child_count as u64,
+            child: Box::new(child_vector),
+        },
+    ))
+}
+
+fn struct_array_to_struct(
+    array: &dyn Array,
+    row_count: usize,
+) -> crate::Result<(LogicalType, VectorData)> {
+    let typed = array.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
+        crate::WireError::UnsupportedArrowType("struct downcast failed".to_string())
+    })?;
+    let fields = typed.fields();
+    let mut children = Vec::with_capacity(fields.len());
+    let mut field_types = Vec::with_capacity(fields.len());
+    for (i, f) in fields.iter().enumerate() {
+        let child_arr = typed.column(i);
+        let child_vec = column_to_vector(child_arr.as_ref(), row_count)?;
+        field_types.push((f.name().clone(), child_vec.logical_type.clone()));
+        children.push(child_vec);
+    }
+    Ok((
+        LogicalType::with_extra(
+            LogicalTypeId::Struct,
+            ExtraTypeInfo::Struct {
+                fields: field_types,
+            },
+        ),
+        VectorData::Struct { children },
     ))
 }
 
@@ -1098,5 +1193,105 @@ mod tests {
             }
             other => panic!("expected Fixed VectorData, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn list_array_round_trips_through_data_chunk() {
+        use arrow_array::builder::{Int32Builder, ListBuilder};
+        let mut b = ListBuilder::new(Int32Builder::new());
+        b.values().append_value(10);
+        b.values().append_value(20);
+        b.append(true);
+        b.append(true); // empty list
+        b.values().append_value(30);
+        b.values().append_value(40);
+        b.values().append_value(50);
+        b.append(true);
+        let list_arr = b.finish();
+        let arr: Arc<dyn Array> = Arc::new(list_arr);
+        let dt = arr.data_type().clone();
+        let batch = batch_with(vec![("xs", dt, arr)]);
+        let chunk = record_batch_to_data_chunk(&batch).unwrap();
+        assert_eq!(chunk.columns[0].logical_type.id, LogicalTypeId::List);
+        match &chunk.columns[0].data {
+            VectorData::List {
+                entries,
+                child_count,
+                child,
+            } => {
+                assert_eq!(entries, &vec![(0, 2), (2, 0), (2, 3)]);
+                assert_eq!(*child_count, 5);
+                assert_eq!(child.logical_type.id, LogicalTypeId::Integer);
+            }
+            other => panic!("expected VectorData::List, got {other:?}"),
+        }
+
+        // Round-trip through the codec.
+        let mut s = crate::codec::BinarySerializer::new();
+        s.begin_object();
+        chunk.encode(&mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+        let mut d = crate::codec::BinaryDeserializer::new(&bytes);
+        let decoded = DataChunk::decode(&mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, chunk);
+    }
+
+    #[test]
+    fn struct_array_round_trips_through_data_chunk() {
+        use arrow_array::builder::{Int32Builder, StringBuilder, StructBuilder};
+        use arrow_schema::Field;
+        let fields = vec![
+            Arc::new(Field::new("id", DataType::Int32, true)),
+            Arc::new(Field::new("name", DataType::Utf8, true)),
+        ];
+        let mut builder = StructBuilder::new(
+            fields.clone(),
+            vec![Box::new(Int32Builder::new()), Box::new(StringBuilder::new())],
+        );
+        builder
+            .field_builder::<Int32Builder>(0)
+            .unwrap()
+            .append_value(1);
+        builder
+            .field_builder::<StringBuilder>(1)
+            .unwrap()
+            .append_value("alice");
+        builder.append(true);
+        builder
+            .field_builder::<Int32Builder>(0)
+            .unwrap()
+            .append_value(2);
+        builder
+            .field_builder::<StringBuilder>(1)
+            .unwrap()
+            .append_value("bob");
+        builder.append(true);
+        let struct_arr = builder.finish();
+        let arr: Arc<dyn Array> = Arc::new(struct_arr);
+        let dt = arr.data_type().clone();
+        let batch = batch_with(vec![("s", dt, arr)]);
+        let chunk = record_batch_to_data_chunk(&batch).unwrap();
+        assert_eq!(chunk.columns[0].logical_type.id, LogicalTypeId::Struct);
+        match &chunk.columns[0].data {
+            VectorData::Struct { children } => {
+                assert_eq!(children.len(), 2);
+                assert_eq!(children[0].logical_type.id, LogicalTypeId::Integer);
+                assert_eq!(children[1].logical_type.id, LogicalTypeId::Varchar);
+            }
+            other => panic!("expected VectorData::Struct, got {other:?}"),
+        }
+
+        // Round-trip through the codec.
+        let mut s = crate::codec::BinarySerializer::new();
+        s.begin_object();
+        chunk.encode(&mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+        let mut d = crate::codec::BinaryDeserializer::new(&bytes);
+        let decoded = DataChunk::decode(&mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, chunk);
     }
 }
