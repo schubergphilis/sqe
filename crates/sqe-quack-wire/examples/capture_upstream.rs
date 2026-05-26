@@ -156,7 +156,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // ("children": parallel child vectors).
     let struct_header = MessageHeader {
         r#type: MessageType::PrepareRequest,
-        connection_id,
+        connection_id: connection_id.clone(),
         client_query_id: Some(4),
     };
     let struct_body = QuackMessage::PrepareRequest(PrepareRequest {
@@ -167,6 +167,42 @@ fn main() -> Result<(), Box<dyn Error>> {
     let response_bytes = post_quack(&client, request_bytes)?;
     hexdump("DuckDB response to STRUCT(a INT, b VARCHAR)", &response_bytes);
     save("prepare_response_struct.bin", &response_bytes)?;
+
+    // ── 6. MAP<VARCHAR, INTEGER> ──────────────────────────────────────────
+    // DuckDB stores MAP as LIST<STRUCT<key,value>>; the LogicalType id is
+    // MAP (102) but the ExtraTypeInfo carries a ListTypeInfo with a STRUCT
+    // child. Same Vector wire as LIST.
+    let map_header = MessageHeader {
+        r#type: MessageType::PrepareRequest,
+        connection_id: connection_id.clone(),
+        client_query_id: Some(5),
+    };
+    let map_body = QuackMessage::PrepareRequest(PrepareRequest {
+        sql_query: "SELECT MAP {'a': 1, 'b': 2} AS m".to_string(),
+    });
+    let request_bytes = encode_message(&map_header, &map_body);
+    save("prepare_request_map.bin", &request_bytes)?;
+    let response_bytes = post_quack(&client, request_bytes)?;
+    hexdump("DuckDB response to MAP<VARCHAR,INTEGER>", &response_bytes);
+    save("prepare_response_map.bin", &response_bytes)?;
+
+    // ── 7. ARRAY<INTEGER, 3> ──────────────────────────────────────────────
+    // Fixed-size list. ArrayTypeInfo subclass fields are 200 (child_type)
+    // and 201 (size). Vector payload uses fields 103 (array_size, u64)
+    // and 104 (child vector with array_size * count elements).
+    let array_header = MessageHeader {
+        r#type: MessageType::PrepareRequest,
+        connection_id,
+        client_query_id: Some(6),
+    };
+    let array_body = QuackMessage::PrepareRequest(PrepareRequest {
+        sql_query: "SELECT CAST([10, 20, 30] AS INTEGER[3]) AS a".to_string(),
+    });
+    let request_bytes = encode_message(&array_header, &array_body);
+    save("prepare_request_array.bin", &request_bytes)?;
+    let response_bytes = post_quack(&client, request_bytes)?;
+    hexdump("DuckDB response to ARRAY<INTEGER,3>", &response_bytes);
+    save("prepare_response_array.bin", &response_bytes)?;
 
     Ok(())
 }

@@ -11,11 +11,11 @@
 
 use arrow_array::{
     Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
-    FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
-    Int8Array, IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray,
-    LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, RecordBatch, StringArray,
-    StringViewArray, StructArray, Time32MillisecondArray, Time32SecondArray,
-    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Float64Array, Int16Array, Int32Array,
+    Int64Array, Int8Array, IntervalDayTimeArray, IntervalMonthDayNanoArray,
+    IntervalYearMonthArray, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray,
+    MapArray, RecordBatch, StringArray, StringViewArray, StructArray, Time32MillisecondArray,
+    Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
     UInt32Array, UInt64Array, UInt8Array,
 };
@@ -156,6 +156,13 @@ fn column_to_vector(array: &dyn Array, row_count: usize) -> crate::Result<Vector
         // STRUCT(...): each field becomes a parallel child vector sharing
         // the parent row count.
         DataType::Struct(_) => struct_array_to_struct(array, row_count)?,
+        // Arrow `Map` is physically `List<Struct<keys, values>>`. DuckDB also
+        // stores MAP as LIST<STRUCT<key, value>>, so we reuse the LIST wire
+        // payload and just stamp the parent LogicalTypeId as `Map`.
+        DataType::Map(_, _) => map_array_to_map(array, row_count)?,
+        // FixedSizeList<T, N>: DuckDB ARRAY. Flat child vector with N elements
+        // per parent row, no per-row offsets needed.
+        DataType::FixedSizeList(_, _) => fixed_size_list_to_array(array, row_count)?,
         // Arrow interval types all widen into DuckDB's 16-byte `interval_t`
         // { months: i32, days: i32, micros: i64 }.
         DataType::Interval(IntervalUnit::YearMonth) => interval_yearmonth_to_interval(array, row_count)?,
@@ -507,6 +514,87 @@ fn struct_array_to_struct(
     ))
 }
 
+/// Arrow `Map` is physically `List<Struct<keys, values>>`. We reuse the LIST
+/// `VectorData` and stamp the parent `LogicalTypeId::Map` so the downstream
+/// codec emits the right type id (the inner `ExtraTypeInfo::List` is identical
+/// to what DuckDB itself stores for `LogicalType::MAP`).
+fn map_array_to_map(
+    array: &dyn Array,
+    row_count: usize,
+) -> crate::Result<(LogicalType, VectorData)> {
+    let typed = array
+        .as_any()
+        .downcast_ref::<MapArray>()
+        .ok_or_else(|| crate::WireError::UnsupportedArrowType("map downcast failed".to_string()))?;
+    let mut entries = Vec::with_capacity(row_count);
+    let offs = typed.value_offsets();
+    for i in 0..row_count {
+        let start = offs[i] as u64;
+        let end = offs[i + 1] as u64;
+        entries.push((start, end - start));
+    }
+    // Arrow stores Map.entries() as a StructArray with the keys + values children.
+    let entries_arr: &dyn Array = typed.entries();
+    let child_count = entries_arr.len();
+    let child_vector = column_to_vector(entries_arr, child_count)?;
+    let child_logical = child_vector.logical_type.clone();
+    Ok((
+        LogicalType::with_extra(
+            LogicalTypeId::Map,
+            ExtraTypeInfo::List {
+                child: Box::new(child_logical),
+            },
+        ),
+        VectorData::List {
+            entries,
+            child_count: child_count as u64,
+            child: Box::new(child_vector),
+        },
+    ))
+}
+
+/// Arrow `FixedSizeList<T, N>` -> DuckDB `ARRAY<T, N>`. Flat child vector with
+/// `N * row_count` elements; no per-row offsets.
+fn fixed_size_list_to_array(
+    array: &dyn Array,
+    row_count: usize,
+) -> crate::Result<(LogicalType, VectorData)> {
+    let typed = array
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .ok_or_else(|| {
+            crate::WireError::UnsupportedArrowType("fixed-size-list downcast failed".to_string())
+        })?;
+    let array_size = typed.value_length();
+    if array_size < 0 {
+        return Err(crate::WireError::UnsupportedArrowType(format!(
+            "FixedSizeList with negative element size {array_size}"
+        )));
+    }
+    let array_size_u32 = u32::try_from(array_size).map_err(|_| {
+        crate::WireError::UnsupportedArrowType(format!(
+            "FixedSizeList size {array_size} exceeds u32"
+        ))
+    })?;
+    let child_arr: &dyn Array = typed.values();
+    let child_count = (array_size as usize) * row_count;
+    let child_vector = column_to_vector(child_arr, child_count)?;
+    let child_logical = child_vector.logical_type.clone();
+    Ok((
+        LogicalType::with_extra(
+            LogicalTypeId::Array,
+            ExtraTypeInfo::Array {
+                child: Box::new(child_logical),
+                size: array_size_u32,
+            },
+        ),
+        VectorData::Array {
+            array_size: array_size as u64,
+            child: Box::new(child_vector),
+        },
+    ))
+}
+
 /// Arrow `Decimal128(precision, scale)` -> DuckDB `DECIMAL(precision, scale)`.
 ///
 /// DuckDB picks an integer width based on the precision tier
@@ -812,25 +900,20 @@ mod tests {
 
     #[test]
     fn unsupported_arrow_type_returns_clear_error() {
-        // FixedSizeList isn't on the supported scalar map; expect the
-        // dispatch table to surface UnsupportedArrowType.
-        use arrow_array::{FixedSizeListArray, Int32Array};
-        use arrow_schema::Field;
-        let values: Arc<dyn Array> = Arc::new(Int32Array::from(vec![1, 2, 3, 4]));
-        let arr: Arc<dyn Array> = Arc::new(
-            FixedSizeListArray::try_new(
-                Arc::new(Field::new("item", DataType::Int32, true)),
-                2,
-                values,
-                None,
-            )
-            .unwrap(),
-        );
+        // Dictionary(Int32, Utf8) isn't mapped yet — DuckDB ENUM needs custom
+        // EnumTypeInfo handling. Expect the dispatch table to surface
+        // UnsupportedArrowType so the server emits a clear SQE-EXEC error.
+        use arrow_array::{DictionaryArray, Int32Array, StringArray};
+        let keys = Int32Array::from(vec![0, 1, 0]);
+        let values: Arc<dyn Array> = Arc::new(StringArray::from(vec!["red", "blue"]));
+        let dict: DictionaryArray<arrow_array::types::Int32Type> =
+            DictionaryArray::try_new(keys, values).unwrap();
+        let arr: Arc<dyn Array> = Arc::new(dict);
         let dt = arr.data_type().clone();
-        let batch = batch_with(vec![("v", dt, arr)]);
+        let batch = batch_with(vec![("color", dt, arr)]);
         let err = record_batch_to_data_chunk(&batch).unwrap_err();
         match err {
-            crate::WireError::UnsupportedArrowType(msg) => assert!(msg.contains("FixedSizeList")),
+            crate::WireError::UnsupportedArrowType(msg) => assert!(msg.contains("Dictionary")),
             other => panic!("expected UnsupportedArrowType, got {other:?}"),
         }
     }
@@ -1281,6 +1364,89 @@ mod tests {
                 assert_eq!(children[1].logical_type.id, LogicalTypeId::Varchar);
             }
             other => panic!("expected VectorData::Struct, got {other:?}"),
+        }
+
+        // Round-trip through the codec.
+        let mut s = crate::codec::BinarySerializer::new();
+        s.begin_object();
+        chunk.encode(&mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+        let mut d = crate::codec::BinaryDeserializer::new(&bytes);
+        let decoded = DataChunk::decode(&mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, chunk);
+    }
+
+    #[test]
+    fn fixed_size_list_round_trips_as_array() {
+        use arrow_array::builder::{FixedSizeListBuilder, Int32Builder};
+        let mut b = FixedSizeListBuilder::new(Int32Builder::new(), 3);
+        for v in [10, 20, 30, 40, 50, 60] {
+            b.values().append_value(v);
+        }
+        b.append(true);
+        b.append(true);
+        let fixed_arr = b.finish();
+        let arr: Arc<dyn Array> = Arc::new(fixed_arr);
+        let dt = arr.data_type().clone();
+        let batch = batch_with(vec![("a", dt, arr)]);
+        let chunk = record_batch_to_data_chunk(&batch).unwrap();
+        assert_eq!(chunk.columns[0].logical_type.id, LogicalTypeId::Array);
+        match &chunk.columns[0].logical_type.extra {
+            Some(ExtraTypeInfo::Array { size, .. }) => assert_eq!(*size, 3),
+            other => panic!("expected ExtraTypeInfo::Array, got {other:?}"),
+        }
+        match &chunk.columns[0].data {
+            VectorData::Array { array_size, child } => {
+                assert_eq!(*array_size, 3);
+                assert_eq!(child.logical_type.id, LogicalTypeId::Integer);
+            }
+            other => panic!("expected VectorData::Array, got {other:?}"),
+        }
+
+        // Round-trip through the codec.
+        let mut s = crate::codec::BinarySerializer::new();
+        s.begin_object();
+        chunk.encode(&mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+        let mut d = crate::codec::BinaryDeserializer::new(&bytes);
+        let decoded = DataChunk::decode(&mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, chunk);
+    }
+
+    #[test]
+    fn map_array_round_trips_via_list_layout() {
+        use arrow_array::builder::{Int32Builder, MapBuilder, StringBuilder};
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        // Row 0: {"a" -> 1, "b" -> 2}
+        builder.keys().append_value("a");
+        builder.values().append_value(1);
+        builder.keys().append_value("b");
+        builder.values().append_value(2);
+        builder.append(true).unwrap();
+        // Row 1: {} (empty map)
+        builder.append(true).unwrap();
+        let map_arr = builder.finish();
+        let arr: Arc<dyn Array> = Arc::new(map_arr);
+        let dt = arr.data_type().clone();
+        let batch = batch_with(vec![("m", dt, arr)]);
+        let chunk = record_batch_to_data_chunk(&batch).unwrap();
+        assert_eq!(chunk.columns[0].logical_type.id, LogicalTypeId::Map);
+        match &chunk.columns[0].logical_type.extra {
+            Some(ExtraTypeInfo::List { child }) => {
+                assert_eq!(child.id, LogicalTypeId::Struct);
+            }
+            other => panic!("expected ExtraTypeInfo::List wrapping STRUCT, got {other:?}"),
+        }
+        match &chunk.columns[0].data {
+            VectorData::List { entries, child_count, .. } => {
+                assert_eq!(entries, &vec![(0, 2), (2, 0)]);
+                assert_eq!(*child_count, 2);
+            }
+            other => panic!("expected VectorData::List, got {other:?}"),
         }
 
         // Round-trip through the codec.
