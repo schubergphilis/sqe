@@ -15,6 +15,7 @@ members = [
     "crates/sqe-lineage",
     "crates/sqe-quack-wire",
     "crates/sqe-quack-server",
+    "crates/sqe-quack-client",
     "crates/sqe-cli",
     "crates/sqe-bench",
     "xtask",
@@ -45,6 +46,7 @@ arrow-flight = { version = "58", features = ["flight-sql-experimental"] }
 arrow-ipc = { version = "58", features = ["lz4", "zstd"] }
 arrow-schema = "58"
 arrow-array = "58"
+arrow-buffer = "58"
 parquet = { version = "58", features = ["async", "object_store"] }
 object_store = { version = "0.13", features = ["aws", "http", "azure", "gcp"] }
 

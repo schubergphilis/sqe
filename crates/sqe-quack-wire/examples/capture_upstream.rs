@@ -156,7 +156,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // ("children": parallel child vectors).
     let struct_header = MessageHeader {
         r#type: MessageType::PrepareRequest,
-        connection_id,
+        connection_id: connection_id.clone(),
         client_query_id: Some(4),
     };
     let struct_body = QuackMessage::PrepareRequest(PrepareRequest {
@@ -167,6 +167,79 @@ fn main() -> Result<(), Box<dyn Error>> {
     let response_bytes = post_quack(&client, request_bytes)?;
     hexdump("DuckDB response to STRUCT(a INT, b VARCHAR)", &response_bytes);
     save("prepare_response_struct.bin", &response_bytes)?;
+
+    // ── 6. MAP<VARCHAR, INTEGER> ──────────────────────────────────────────
+    // DuckDB stores MAP as LIST<STRUCT<key,value>>; the LogicalType id is
+    // MAP (102) but the ExtraTypeInfo carries a ListTypeInfo with a STRUCT
+    // child. Same Vector wire as LIST.
+    let map_header = MessageHeader {
+        r#type: MessageType::PrepareRequest,
+        connection_id: connection_id.clone(),
+        client_query_id: Some(5),
+    };
+    let map_body = QuackMessage::PrepareRequest(PrepareRequest {
+        sql_query: "SELECT MAP {'a': 1, 'b': 2} AS m".to_string(),
+    });
+    let request_bytes = encode_message(&map_header, &map_body);
+    save("prepare_request_map.bin", &request_bytes)?;
+    let response_bytes = post_quack(&client, request_bytes)?;
+    hexdump("DuckDB response to MAP<VARCHAR,INTEGER>", &response_bytes);
+    save("prepare_response_map.bin", &response_bytes)?;
+
+    // ── 7. ARRAY<INTEGER, 3> ──────────────────────────────────────────────
+    // Fixed-size list. ArrayTypeInfo subclass fields are 200 (child_type)
+    // and 201 (size). Vector payload uses fields 103 (array_size, u64)
+    // and 104 (child vector with array_size * count elements).
+    let array_header = MessageHeader {
+        r#type: MessageType::PrepareRequest,
+        connection_id: connection_id.clone(),
+        client_query_id: Some(6),
+    };
+    let array_body = QuackMessage::PrepareRequest(PrepareRequest {
+        sql_query: "SELECT CAST([10, 20, 30] AS INTEGER[3]) AS a".to_string(),
+    });
+    let request_bytes = encode_message(&array_header, &array_body);
+    save("prepare_request_array.bin", &request_bytes)?;
+    let response_bytes = post_quack(&client, request_bytes)?;
+    hexdump("DuckDB response to ARRAY<INTEGER,3>", &response_bytes);
+    save("prepare_response_array.bin", &response_bytes)?;
+
+    // ── 8. ENUM ────────────────────────────────────────────────────────────
+    // EnumTypeInfo is hand-written: field 200 = values_count (u64,
+    // WriteProperty), field 201 = WriteList<string>. Vector payload is
+    // a Fixed buffer of u8/u16/u32 indices per the dict-size tier
+    // (here three entries -> u8 / 1 byte per row).
+    let enum_header = MessageHeader {
+        r#type: MessageType::PrepareRequest,
+        connection_id: connection_id.clone(),
+        client_query_id: Some(7),
+    };
+    let enum_body = QuackMessage::PrepareRequest(PrepareRequest {
+        sql_query: "SELECT 'green'::ENUM('red', 'green', 'blue') AS color".to_string(),
+    });
+    let request_bytes = encode_message(&enum_header, &enum_body);
+    save("prepare_request_enum.bin", &request_bytes)?;
+    let response_bytes = post_quack(&client, request_bytes)?;
+    hexdump("DuckDB response to ENUM('red','green','blue')", &response_bytes);
+    save("prepare_response_enum.bin", &response_bytes)?;
+
+    // ── 9. UNION ───────────────────────────────────────────────────────────
+    // UnionType is StructTypeInfo with a UTINYINT "tag" field prepended. The
+    // Vector wire is identical to STRUCT (field 103 + parallel child vectors)
+    // and the LogicalType id is Union (107) instead of Struct (100).
+    let union_header = MessageHeader {
+        r#type: MessageType::PrepareRequest,
+        connection_id,
+        client_query_id: Some(8),
+    };
+    let union_body = QuackMessage::PrepareRequest(PrepareRequest {
+        sql_query: "SELECT union_value(num := 42) AS u".to_string(),
+    });
+    let request_bytes = encode_message(&union_header, &union_body);
+    save("prepare_request_union.bin", &request_bytes)?;
+    let response_bytes = post_quack(&client, request_bytes)?;
+    hexdump("DuckDB response to UNION(num INT)", &response_bytes);
+    save("prepare_response_union.bin", &response_bytes)?;
 
     Ok(())
 }
