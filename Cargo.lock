@@ -6924,6 +6924,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqe-quack-client"
+version = "0.31.4"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "arrow-schema",
+ "reqwest 0.12.28",
+ "sqe-quack-wire",
+ "thiserror 2.0.18",
+ "url",
+]
+
+[[package]]
 name = "sqe-quack-server"
 version = "0.31.4"
 dependencies = [
@@ -6950,6 +6963,7 @@ version = "0.31.4"
 dependencies = [
  "arrow",
  "arrow-array",
+ "arrow-buffer",
  "arrow-schema",
  "reqwest 0.12.28",
  "thiserror 2.0.18",

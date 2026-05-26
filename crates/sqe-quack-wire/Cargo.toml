@@ -10,6 +10,7 @@ repository.workspace = true
 thiserror = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
 arrow-schema = { workspace = true }
 
 [dev-dependencies]
