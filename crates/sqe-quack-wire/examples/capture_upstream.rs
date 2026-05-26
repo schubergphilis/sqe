@@ -192,7 +192,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // and 104 (child vector with array_size * count elements).
     let array_header = MessageHeader {
         r#type: MessageType::PrepareRequest,
-        connection_id,
+        connection_id: connection_id.clone(),
         client_query_id: Some(6),
     };
     let array_body = QuackMessage::PrepareRequest(PrepareRequest {
@@ -203,6 +203,25 @@ fn main() -> Result<(), Box<dyn Error>> {
     let response_bytes = post_quack(&client, request_bytes)?;
     hexdump("DuckDB response to ARRAY<INTEGER,3>", &response_bytes);
     save("prepare_response_array.bin", &response_bytes)?;
+
+    // ── 8. ENUM ────────────────────────────────────────────────────────────
+    // EnumTypeInfo is hand-written: field 200 = values_count (u64,
+    // WriteProperty), field 201 = WriteList<string>. Vector payload is
+    // a Fixed buffer of u8/u16/u32 indices per the dict-size tier
+    // (here three entries -> u8 / 1 byte per row).
+    let enum_header = MessageHeader {
+        r#type: MessageType::PrepareRequest,
+        connection_id,
+        client_query_id: Some(7),
+    };
+    let enum_body = QuackMessage::PrepareRequest(PrepareRequest {
+        sql_query: "SELECT 'green'::ENUM('red', 'green', 'blue') AS color".to_string(),
+    });
+    let request_bytes = encode_message(&enum_header, &enum_body);
+    save("prepare_request_enum.bin", &request_bytes)?;
+    let response_bytes = post_quack(&client, request_bytes)?;
+    hexdump("DuckDB response to ENUM('red','green','blue')", &response_bytes);
+    save("prepare_response_enum.bin", &response_bytes)?;
 
     Ok(())
 }

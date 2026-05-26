@@ -10,20 +10,21 @@
 //! `AppendRequest` write path; not implemented yet.
 
 use arrow_array::{
-    Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
-    FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Float64Array, Int16Array, Int32Array,
-    Int64Array, Int8Array, IntervalDayTimeArray, IntervalMonthDayNanoArray,
-    IntervalYearMonthArray, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray,
-    MapArray, RecordBatch, StringArray, StringViewArray, StructArray, Time32MillisecondArray,
-    Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    cast::AsArray, types as arrow_types, Array, BinaryArray, BinaryViewArray, BooleanArray,
+    Date32Array, Date64Array, Decimal128Array, DictionaryArray, FixedSizeBinaryArray,
+    FixedSizeListArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+    IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray, LargeBinaryArray,
+    LargeListArray, LargeStringArray, ListArray, MapArray, RecordBatch, StringArray,
+    StringViewArray, StructArray, Time32MillisecondArray, Time32SecondArray,
+    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
     UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 
 use crate::data_chunk::{
-    decimal_physical_width, DataChunk, ExtraTypeInfo, LogicalType, LogicalTypeId, Vector,
-    VectorData,
+    decimal_physical_width, enum_physical_width, DataChunk, ExtraTypeInfo, LogicalType,
+    LogicalTypeId, Vector, VectorData,
 };
 
 pub fn record_batch_to_data_chunk(batch: &RecordBatch) -> crate::Result<DataChunk> {
@@ -163,6 +164,15 @@ fn column_to_vector(array: &dyn Array, row_count: usize) -> crate::Result<Vector
         // FixedSizeList<T, N>: DuckDB ARRAY. Flat child vector with N elements
         // per parent row, no per-row offsets needed.
         DataType::FixedSizeList(_, _) => fixed_size_list_to_array(array, row_count)?,
+        // Arrow `Dictionary(Key, Utf8)` with a string value type maps cleanly
+        // to DuckDB ENUM. Keys narrow to u8/u16/u32 per the dict-size tier.
+        // Non-string value types (Binary, Int, etc.) aren't valid ENUM payloads
+        // and fall through to the unsupported branch below.
+        DataType::Dictionary(key_dt, value_dt)
+            if matches!(value_dt.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
+        {
+            dictionary_to_enum(array, row_count, key_dt.as_ref())?
+        }
         // Arrow interval types all widen into DuckDB's 16-byte `interval_t`
         // { months: i32, days: i32, micros: i64 }.
         DataType::Interval(IntervalUnit::YearMonth) => interval_yearmonth_to_interval(array, row_count)?,
@@ -553,6 +563,122 @@ fn map_array_to_map(
     ))
 }
 
+/// Arrow `Dictionary(KeyType, Utf8|LargeUtf8)` -> DuckDB `ENUM`. The dictionary
+/// strings populate `ExtraTypeInfo::Enum.values`; per-row keys narrow to u8/u16/u32
+/// indices based on the dictionary size tier (see [`enum_physical_width`]).
+fn dictionary_to_enum(
+    array: &dyn Array,
+    row_count: usize,
+    key_dt: &DataType,
+) -> crate::Result<(LogicalType, VectorData)> {
+    // Each per-row key arrives as u64 (any int type fits, including u64).
+    // dictionary_keys_to_u64 monomorphizes on the Arrow key type and rejects
+    // negative signed indices (ENUM indices are unsigned in DuckDB).
+    let (values, keys) = match key_dt {
+        DataType::Int8 => dictionary_keys_to_u64::<arrow_types::Int8Type, _>(array, row_count, |v| {
+            check_unsigned_key(v as i64)
+        })?,
+        DataType::Int16 => {
+            dictionary_keys_to_u64::<arrow_types::Int16Type, _>(array, row_count, |v| {
+                check_unsigned_key(v as i64)
+            })?
+        }
+        DataType::Int32 => {
+            dictionary_keys_to_u64::<arrow_types::Int32Type, _>(array, row_count, |v| {
+                check_unsigned_key(v as i64)
+            })?
+        }
+        DataType::Int64 => {
+            dictionary_keys_to_u64::<arrow_types::Int64Type, _>(array, row_count, check_unsigned_key)?
+        }
+        DataType::UInt8 => {
+            dictionary_keys_to_u64::<arrow_types::UInt8Type, _>(array, row_count, |v| Ok(v as u64))?
+        }
+        DataType::UInt16 => {
+            dictionary_keys_to_u64::<arrow_types::UInt16Type, _>(array, row_count, |v| {
+                Ok(v as u64)
+            })?
+        }
+        DataType::UInt32 => {
+            dictionary_keys_to_u64::<arrow_types::UInt32Type, _>(array, row_count, |v| {
+                Ok(v as u64)
+            })?
+        }
+        DataType::UInt64 => {
+            dictionary_keys_to_u64::<arrow_types::UInt64Type, _>(array, row_count, Ok)?
+        }
+        other => {
+            return Err(crate::WireError::UnsupportedArrowType(format!(
+                "Dictionary key type {other:?} not supported for ENUM mapping"
+            )))
+        }
+    };
+
+    let width = enum_physical_width(values.len());
+    let mut bytes = Vec::with_capacity(row_count * width);
+    for k in keys {
+        match width {
+            1 => bytes.push(k as u8),
+            2 => bytes.extend_from_slice(&(k as u16).to_le_bytes()),
+            4 => bytes.extend_from_slice(&(k as u32).to_le_bytes()),
+            _ => unreachable!("enum_physical_width returned an unexpected width"),
+        }
+    }
+    Ok((
+        LogicalType::with_extra(LogicalTypeId::Enum, ExtraTypeInfo::Enum { values }),
+        VectorData::Fixed(bytes),
+    ))
+}
+
+fn check_unsigned_key(raw: i64) -> crate::Result<u64> {
+    if raw < 0 {
+        return Err(crate::WireError::UnsupportedArrowType(format!(
+            "Dictionary key {raw} is negative; ENUM indices must be unsigned"
+        )));
+    }
+    Ok(raw as u64)
+}
+
+/// Helper: downcast to `DictionaryArray<K>` and emit (dictionary strings,
+/// per-row keys widened to u64). The `key_to_u64` closure handles the
+/// signed-vs-unsigned native-type conversion.
+fn dictionary_keys_to_u64<K, F>(
+    array: &dyn Array,
+    row_count: usize,
+    key_to_u64: F,
+) -> crate::Result<(Vec<String>, Vec<u64>)>
+where
+    K: arrow_array::types::ArrowDictionaryKeyType,
+    F: Fn(K::Native) -> crate::Result<u64>,
+{
+    let typed = array
+        .as_any()
+        .downcast_ref::<DictionaryArray<K>>()
+        .ok_or_else(|| {
+            crate::WireError::UnsupportedArrowType("dictionary downcast failed".to_string())
+        })?;
+    let values_arr = typed.values();
+    let values: Vec<String> = if let Some(a) = values_arr.as_string_opt::<i32>() {
+        (0..a.len()).map(|i| a.value(i).to_string()).collect()
+    } else if let Some(a) = values_arr.as_string_opt::<i64>() {
+        (0..a.len()).map(|i| a.value(i).to_string()).collect()
+    } else {
+        return Err(crate::WireError::UnsupportedArrowType(
+            "Dictionary value type must be Utf8 or LargeUtf8 for ENUM".to_string(),
+        ));
+    };
+    let key_arr = typed.keys();
+    let mut keys = Vec::with_capacity(row_count);
+    for i in 0..row_count {
+        if key_arr.is_valid(i) {
+            keys.push(key_to_u64(key_arr.value(i))?);
+        } else {
+            keys.push(0);
+        }
+    }
+    Ok((values, keys))
+}
+
 /// Arrow `FixedSizeList<T, N>` -> DuckDB `ARRAY<T, N>`. Flat child vector with
 /// `N * row_count` elements; no per-row offsets.
 fn fixed_size_list_to_array(
@@ -900,12 +1026,13 @@ mod tests {
 
     #[test]
     fn unsupported_arrow_type_returns_clear_error() {
-        // Dictionary(Int32, Utf8) isn't mapped yet — DuckDB ENUM needs custom
-        // EnumTypeInfo handling. Expect the dispatch table to surface
-        // UnsupportedArrowType so the server emits a clear SQE-EXEC error.
-        use arrow_array::{DictionaryArray, Int32Array, StringArray};
+        // Dictionary(Int32, Binary) isn't a valid ENUM payload — DuckDB ENUM
+        // values are strings only. Expect the bridge to fall through to the
+        // unsupported branch so the server emits a clear SQE-EXEC error.
+        use arrow_array::{BinaryArray, DictionaryArray, Int32Array};
         let keys = Int32Array::from(vec![0, 1, 0]);
-        let values: Arc<dyn Array> = Arc::new(StringArray::from(vec!["red", "blue"]));
+        let values: Arc<dyn Array> =
+            Arc::new(BinaryArray::from(vec![b"red".as_ref(), b"blue".as_ref()]));
         let dict: DictionaryArray<arrow_array::types::Int32Type> =
             DictionaryArray::try_new(keys, values).unwrap();
         let arr: Arc<dyn Array> = Arc::new(dict);
@@ -1415,6 +1542,70 @@ mod tests {
         let decoded = DataChunk::decode(&mut d).unwrap();
         d.expect_object_end().unwrap();
         assert_eq!(decoded, chunk);
+    }
+
+    #[test]
+    fn dictionary_int8_utf8_maps_to_enum() {
+        use arrow_array::{Int8Array, StringArray};
+        // 3 unique values, 5 rows.
+        let keys = Int8Array::from(vec![0i8, 1, 2, 1, 0]);
+        let values: Arc<dyn Array> = Arc::new(StringArray::from(vec!["red", "green", "blue"]));
+        let dict: DictionaryArray<arrow_types::Int8Type> =
+            DictionaryArray::try_new(keys, values).unwrap();
+        let arr: Arc<dyn Array> = Arc::new(dict);
+        let dt = arr.data_type().clone();
+        let batch = batch_with(vec![("color", dt, arr)]);
+        let chunk = record_batch_to_data_chunk(&batch).unwrap();
+        assert_eq!(chunk.columns[0].logical_type.id, LogicalTypeId::Enum);
+        match &chunk.columns[0].logical_type.extra {
+            Some(ExtraTypeInfo::Enum { values }) => {
+                assert_eq!(values, &vec!["red", "green", "blue"]);
+            }
+            other => panic!("expected ExtraTypeInfo::Enum, got {other:?}"),
+        }
+        // 3 dict entries -> u8 tier -> 5 bytes for 5 rows.
+        match &chunk.columns[0].data {
+            VectorData::Fixed(bytes) => assert_eq!(bytes, &vec![0u8, 1, 2, 1, 0]),
+            other => panic!("expected Fixed, got {other:?}"),
+        }
+
+        // Full codec round-trip.
+        let mut s = crate::codec::BinarySerializer::new();
+        s.begin_object();
+        chunk.encode(&mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+        let mut d = crate::codec::BinaryDeserializer::new(&bytes);
+        let decoded = DataChunk::decode(&mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, chunk);
+    }
+
+    #[test]
+    fn dictionary_int32_utf8_widens_to_u16_tier() {
+        use arrow_array::{Int32Array, StringArray};
+        // 300 dictionary entries forces the u16 tier on the wire.
+        let value_strs: Vec<String> = (0..300).map(|i| format!("v{i}")).collect();
+        let values: Arc<dyn Array> = Arc::new(StringArray::from(
+            value_strs.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ));
+        let keys = Int32Array::from(vec![0i32, 299, 100, 50]);
+        let dict: DictionaryArray<arrow_types::Int32Type> =
+            DictionaryArray::try_new(keys, values).unwrap();
+        let arr: Arc<dyn Array> = Arc::new(dict);
+        let dt = arr.data_type().clone();
+        let batch = batch_with(vec![("x", dt, arr)]);
+        let chunk = record_batch_to_data_chunk(&batch).unwrap();
+        match &chunk.columns[0].data {
+            VectorData::Fixed(bytes) => {
+                let expected: Vec<u8> = [0u16, 299, 100, 50]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+                assert_eq!(bytes, &expected);
+            }
+            other => panic!("expected Fixed, got {other:?}"),
+        }
     }
 
     #[test]
