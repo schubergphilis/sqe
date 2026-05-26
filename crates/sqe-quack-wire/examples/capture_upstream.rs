@@ -211,7 +211,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // (here three entries -> u8 / 1 byte per row).
     let enum_header = MessageHeader {
         r#type: MessageType::PrepareRequest,
-        connection_id,
+        connection_id: connection_id.clone(),
         client_query_id: Some(7),
     };
     let enum_body = QuackMessage::PrepareRequest(PrepareRequest {
@@ -222,6 +222,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     let response_bytes = post_quack(&client, request_bytes)?;
     hexdump("DuckDB response to ENUM('red','green','blue')", &response_bytes);
     save("prepare_response_enum.bin", &response_bytes)?;
+
+    // ── 9. UNION ───────────────────────────────────────────────────────────
+    // UnionType is StructTypeInfo with a UTINYINT "tag" field prepended. The
+    // Vector wire is identical to STRUCT (field 103 + parallel child vectors)
+    // and the LogicalType id is Union (107) instead of Struct (100).
+    let union_header = MessageHeader {
+        r#type: MessageType::PrepareRequest,
+        connection_id,
+        client_query_id: Some(8),
+    };
+    let union_body = QuackMessage::PrepareRequest(PrepareRequest {
+        sql_query: "SELECT union_value(num := 42) AS u".to_string(),
+    });
+    let request_bytes = encode_message(&union_header, &union_body);
+    save("prepare_request_union.bin", &request_bytes)?;
+    let response_bytes = post_quack(&client, request_bytes)?;
+    hexdump("DuckDB response to UNION(num INT)", &response_bytes);
+    save("prepare_response_union.bin", &response_bytes)?;
 
     Ok(())
 }
