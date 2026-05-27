@@ -81,9 +81,10 @@ iceberg-catalog-s3tables = { path = "vendor/iceberg-rust/crates/catalog/s3tables
 iceberg-catalog-loader = { path = "vendor/iceberg-rust/crates/catalog/loader", default-features = false }
 sqlx = { version = "0.8.1", default-features = false }
 
-# SQL parser — DataFusion 53 ships sqlparser 0.54. The `visitor` feature
-# enables the VisitMut derive used by sqe-sql for AST rewrites
-# (Trino-compat CAST(v AS JSON) -> to_json(v)).
+# SQL parser — SQE pins 0.54 directly for the `visitor` feature (VisitMut derive
+# used by sqe-sql for AST rewrites like Trino-compat CAST(v AS JSON) -> to_json(v)).
+# DataFusion 53 actually requires sqlparser ^0.61 transitively, so two sqlparser
+# versions ship in the tree. Bump SQE's pin to 0.61+ when porting the AST rewrites.
 sqlparser = { version = "0.54", features = ["visitor"] }
 
 # JSON functions for DataFusion (Trino json_extract compat)
