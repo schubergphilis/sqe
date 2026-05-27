@@ -81,6 +81,65 @@ pub fn logical_type_to_arrow(t: &LogicalType) -> crate::Result<arrow_schema::Dat
             };
             A::Decimal128(precision, scale as i8)
         }
+        LogicalTypeId::List => {
+            let child = match &t.extra {
+                Some(crate::data_chunk::ExtraTypeInfo::List { child }) => child,
+                _ => return Err(crate::WireError::UnsupportedLogicalType(LogicalTypeId::List)),
+            };
+            let item_dt = logical_type_to_arrow(child)?;
+            A::List(std::sync::Arc::new(arrow_schema::Field::new(
+                "item", item_dt, true,
+            )))
+        }
+        LogicalTypeId::Struct => {
+            let fields = match &t.extra {
+                Some(crate::data_chunk::ExtraTypeInfo::Struct { fields }) => fields,
+                _ => return Err(crate::WireError::UnsupportedLogicalType(LogicalTypeId::Struct)),
+            };
+            let mut arrow_fields = Vec::with_capacity(fields.len());
+            for (name, ty) in fields {
+                let dt = logical_type_to_arrow(ty)?;
+                arrow_fields.push(arrow_schema::Field::new(name.clone(), dt, true));
+            }
+            A::Struct(arrow_fields.into())
+        }
+        LogicalTypeId::Map => {
+            // DuckDB MAP is LogicalTypeId::Map + ExtraTypeInfo::List { child: STRUCT(key, value) }.
+            // Arrow's Map type is Map(Field { name: "entries", type: Struct(key, value) }, keys_sorted=false).
+            let entries_struct = match &t.extra {
+                Some(crate::data_chunk::ExtraTypeInfo::List { child }) => child,
+                _ => return Err(crate::WireError::UnsupportedLogicalType(LogicalTypeId::Map)),
+            };
+            let entries_dt = logical_type_to_arrow(entries_struct)?;
+            let entries_field = arrow_schema::Field::new("entries", entries_dt, false);
+            A::Map(std::sync::Arc::new(entries_field), false)
+        }
+        LogicalTypeId::Array => {
+            let (child, size) = match &t.extra {
+                Some(crate::data_chunk::ExtraTypeInfo::Array { child, size }) => (child, *size),
+                _ => return Err(crate::WireError::UnsupportedLogicalType(LogicalTypeId::Array)),
+            };
+            let item_dt = logical_type_to_arrow(child)?;
+            A::FixedSizeList(
+                std::sync::Arc::new(arrow_schema::Field::new("item", item_dt, true)),
+                size as i32,
+            )
+        }
+        LogicalTypeId::Enum => {
+            // ENUM round-trips as Arrow Dictionary(key, Utf8). Key width follows
+            // the same tier table as the wire payload (1/2/4 bytes).
+            let values = match &t.extra {
+                Some(crate::data_chunk::ExtraTypeInfo::Enum { values }) => values,
+                _ => return Err(crate::WireError::UnsupportedLogicalType(LogicalTypeId::Enum)),
+            };
+            let key_dt = match crate::data_chunk::enum_physical_width(values.len()) {
+                1 => A::UInt8,
+                2 => A::UInt16,
+                4 => A::UInt32,
+                _ => unreachable!(),
+            };
+            A::Dictionary(Box::new(key_dt), Box::new(A::Utf8))
+        }
         other => return Err(crate::WireError::UnsupportedLogicalType(other)),
     })
 }
@@ -1066,13 +1125,205 @@ fn vector_to_array(vector: &Vector, row_count: usize) -> crate::Result<std::sync
             let VectorData::Fixed(bytes) = &vector.data else { unreachable!() };
             fixed_to_array(vector.logical_type.id, bytes, row_count, nulls, &vector.logical_type)
         }
-        (VectorData::List { .. } | VectorData::Struct { .. } | VectorData::Array { .. }, id) => {
-            // Nested types in the reverse direction are deferred — the
-            // recursive vector_to_array body needs careful sizing of child
-            // counts and field-name plumbing. Tracked as a follow-up.
-            Err(crate::WireError::UnsupportedLogicalType(id))
+        (
+            VectorData::List {
+                entries,
+                child_count,
+                child,
+            },
+            id,
+        ) => list_or_map_to_array(
+            id,
+            &vector.logical_type,
+            entries,
+            *child_count,
+            child,
+            row_count,
+            nulls,
+        ),
+        (VectorData::Struct { children }, _) => {
+            struct_to_array(&vector.logical_type, children, row_count, nulls)
+        }
+        (VectorData::Array { array_size, child }, _) => {
+            fixed_size_list_to_array_arrow(&vector.logical_type, *array_size, child, row_count, nulls)
         }
     }
+}
+
+/// Convert a `VectorData::List` back to an Arrow `ListArray`. When the parent
+/// LogicalTypeId is `Map`, wraps the result in a `MapArray` — DuckDB stores
+/// MAP as a LIST<STRUCT<key, value>> physically, so the same VectorData shape
+/// produces both Arrow types based on which id the caller set.
+fn list_or_map_to_array(
+    id: LogicalTypeId,
+    parent_type: &LogicalType,
+    entries: &[(u64, u64)],
+    child_count: u64,
+    child: &Vector,
+    row_count: usize,
+    nulls: Option<arrow_buffer::NullBuffer>,
+) -> crate::Result<std::sync::Arc<dyn Array>> {
+    use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+    use std::sync::Arc;
+    let child_array = vector_to_array(child, child_count as usize)?;
+    // Build i32 offsets from the (offset, length) pairs. DuckDB sometimes
+    // stores list entries with gaps in the child buffer, so we cannot just
+    // accumulate lengths — we use the actual offsets.
+    let mut offsets: Vec<i32> = Vec::with_capacity(row_count + 1);
+    offsets.push(0);
+    for (off, len) in entries.iter().take(row_count) {
+        offsets.push((off + len) as i32);
+    }
+    // For Arrow ListArray the offsets must be monotonic starting at 0. When
+    // the source has gaps (a row's `offset` doesn't match the prior row's
+    // `offset + length`), we compact by copying the relevant child slice for
+    // each row. We use a fast path when offsets are already contiguous.
+    let contiguous = entries
+        .iter()
+        .scan(0u64, |acc, (off, len)| {
+            let ok = *off == *acc;
+            *acc = off + len;
+            Some(ok)
+        })
+        .all(|ok| ok);
+    let (final_offsets, final_child) = if contiguous {
+        (offsets, child_array)
+    } else {
+        // Compact: build new offsets [0, len0, len0+len1, ...] and a new child
+        // array that's a concatenation of each row's slice.
+        let mut new_offsets: Vec<i32> = Vec::with_capacity(row_count + 1);
+        new_offsets.push(0);
+        let mut accum: i32 = 0;
+        let mut slices: Vec<std::sync::Arc<dyn Array>> = Vec::with_capacity(row_count);
+        for (off, len) in entries.iter().take(row_count) {
+            accum += *len as i32;
+            new_offsets.push(accum);
+            slices.push(child_array.slice(*off as usize, *len as usize));
+        }
+        let refs: Vec<&dyn Array> = slices.iter().map(|a| a.as_ref()).collect();
+        let concatenated = arrow::compute::concat(&refs).map_err(|e| {
+            crate::WireError::UnsupportedArrowType(format!(
+                "list compact: arrow concat failed: {e}"
+            ))
+        })?;
+        (new_offsets, concatenated)
+    };
+    let offsets_buf = OffsetBuffer::new(ScalarBuffer::from(final_offsets));
+    let dt = logical_type_to_arrow(parent_type)?;
+    match id {
+        LogicalTypeId::List => {
+            let field = match &dt {
+                arrow_schema::DataType::List(f) => f.clone(),
+                _ => {
+                    return Err(crate::WireError::UnsupportedArrowType(format!(
+                        "expected DataType::List, got {dt:?}"
+                    )))
+                }
+            };
+            Ok(Arc::new(arrow_array::ListArray::new(
+                field,
+                offsets_buf,
+                final_child,
+                nulls,
+            )))
+        }
+        LogicalTypeId::Map => {
+            // The child of MAP is STRUCT(key, value). Arrow MapArray wraps it
+            // as a single field named "entries".
+            let entries_field = match &dt {
+                arrow_schema::DataType::Map(f, _) => f.clone(),
+                _ => {
+                    return Err(crate::WireError::UnsupportedArrowType(format!(
+                        "expected DataType::Map, got {dt:?}"
+                    )))
+                }
+            };
+            let struct_arr = final_child
+                .as_any()
+                .downcast_ref::<arrow_array::StructArray>()
+                .ok_or_else(|| {
+                    crate::WireError::UnsupportedArrowType(
+                        "MAP child must decode as StructArray".to_string(),
+                    )
+                })?
+                .clone();
+            Ok(Arc::new(arrow_array::MapArray::new(
+                entries_field,
+                offsets_buf,
+                struct_arr,
+                nulls,
+                false,
+            )))
+        }
+        other => Err(crate::WireError::UnsupportedLogicalType(other)),
+    }
+}
+
+fn struct_to_array(
+    parent_type: &LogicalType,
+    children: &[Vector],
+    row_count: usize,
+    nulls: Option<arrow_buffer::NullBuffer>,
+) -> crate::Result<std::sync::Arc<dyn Array>> {
+    use std::sync::Arc;
+    let fields = match &parent_type.extra {
+        Some(crate::data_chunk::ExtraTypeInfo::Struct { fields }) => fields,
+        _ => {
+            return Err(crate::WireError::UnsupportedLogicalType(
+                LogicalTypeId::Struct,
+            ))
+        }
+    };
+    if fields.len() != children.len() {
+        return Err(crate::WireError::UnexpectedField {
+            expected: fields.len() as u16,
+            actual: children.len() as u16,
+        });
+    }
+    let mut arrow_fields = Vec::with_capacity(fields.len());
+    let mut arrow_arrays: Vec<Arc<dyn Array>> = Vec::with_capacity(children.len());
+    for ((name, _ty), child) in fields.iter().zip(children.iter()) {
+        let arr = vector_to_array(child, row_count)?;
+        arrow_fields.push(arrow_schema::Field::new(
+            name.clone(),
+            arr.data_type().clone(),
+            true,
+        ));
+        arrow_arrays.push(arr);
+    }
+    let fields_ref: arrow_schema::Fields = arrow_fields.into();
+    Ok(Arc::new(arrow_array::StructArray::new(
+        fields_ref,
+        arrow_arrays,
+        nulls,
+    )))
+}
+
+fn fixed_size_list_to_array_arrow(
+    parent_type: &LogicalType,
+    array_size: u64,
+    child: &Vector,
+    row_count: usize,
+    nulls: Option<arrow_buffer::NullBuffer>,
+) -> crate::Result<std::sync::Arc<dyn Array>> {
+    use std::sync::Arc;
+    let dt = logical_type_to_arrow(parent_type)?;
+    let field = match &dt {
+        arrow_schema::DataType::FixedSizeList(f, _) => f.clone(),
+        _ => {
+            return Err(crate::WireError::UnsupportedArrowType(format!(
+                "expected DataType::FixedSizeList, got {dt:?}"
+            )))
+        }
+    };
+    let child_count = (array_size as usize) * row_count;
+    let child_arr = vector_to_array(child, child_count)?;
+    Ok(Arc::new(arrow_array::FixedSizeListArray::new(
+        field,
+        array_size as i32,
+        child_arr,
+        nulls,
+    )))
 }
 
 /// Build a typed Arrow array from a tightly-packed little-endian byte buffer.
@@ -1241,6 +1492,29 @@ fn fixed_to_array(
                     crate::WireError::UnsupportedArrowType(format!("decimal precision/scale: {e}"))
                 })?;
             Ok(Arc::new(arr))
+        }
+        LogicalTypeId::Enum => {
+            let values = match &logical_type.extra {
+                Some(crate::data_chunk::ExtraTypeInfo::Enum { values }) => values,
+                _ => return Err(crate::WireError::UnsupportedLogicalType(LogicalTypeId::Enum)),
+            };
+            let value_arr = StringArray::from_iter_values(values.iter().map(|s| s.as_str()));
+            let width = crate::data_chunk::enum_physical_width(values.len());
+            match width {
+                1 => Ok(Arc::new(arrow_array::DictionaryArray::<arrow_array::types::UInt8Type>::new(
+                    arrow_array::UInt8Array::new(scalar_buffer_le::<u8>(bytes, row_count), nulls),
+                    Arc::new(value_arr),
+                ))),
+                2 => Ok(Arc::new(arrow_array::DictionaryArray::<arrow_array::types::UInt16Type>::new(
+                    arrow_array::UInt16Array::new(scalar_buffer_le::<u16>(bytes, row_count), nulls),
+                    Arc::new(value_arr),
+                ))),
+                4 => Ok(Arc::new(arrow_array::DictionaryArray::<arrow_array::types::UInt32Type>::new(
+                    arrow_array::UInt32Array::new(scalar_buffer_le::<u32>(bytes, row_count), nulls),
+                    Arc::new(value_arr),
+                ))),
+                _ => unreachable!(),
+            }
         }
         other => Err(crate::WireError::UnsupportedLogicalType(other)),
     }
