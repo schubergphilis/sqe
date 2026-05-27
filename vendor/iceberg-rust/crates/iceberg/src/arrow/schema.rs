@@ -199,10 +199,7 @@ fn visit_struct<V: ArrowSchemaVisitor>(fields: &Fields, visitor: &mut V) -> Resu
 }
 
 /// Visit schema in post order.
-pub(crate) fn visit_schema<V: ArrowSchemaVisitor>(
-    schema: &ArrowSchema,
-    visitor: &mut V,
-) -> Result<V::U> {
+fn visit_schema<V: ArrowSchemaVisitor>(schema: &ArrowSchema, visitor: &mut V) -> Result<V::U> {
     let mut results = Vec::with_capacity(schema.fields().len());
     for field in schema.fields() {
         visitor.before_field(field)?;
