@@ -66,6 +66,43 @@ them quickly.
    `crates/catalog/loader/Cargo.toml`,
    `crates/catalog/loader/src/lib.rs`.
 
+## Cherry-picks from apache/iceberg-rust main
+
+Six fixes from apache main applied on top of the RW base. RisingWave
+has not backported these yet; they apply on the SQE vendor because
+the touched files diverge minimally from apache. The original PR
+authorship and commit messages are preserved.
+
+- **#2118** Make `convert_filters_to_predicate` public — visibility
+  change on the DataFusion integration so SQE can reuse the filter
+  conversion logic.
+- **#2348** support `fixedbinary(n)` — adds datum conversion for
+  `FixedSizedBinaryArray` (Arrow schema mapping).
+- **#2307** fix nested `build_fallback_field_id_map` — predicates on
+  columns after struct/list/map in migrated Parquet files no longer
+  crash with "Leaf column ... isn't a root column." Test addition
+  skipped (depends on the apache-only `serde_arrow` dev-dep).
+- **#2351** NaN pushdown correctness — float predicates now handle
+  NaN semantics correctly. Test addition skipped (apache-only test
+  helpers).
+- **#2301** INT96 Parquet timestamps — Iceberg v1 tables read INT96
+  timestamps correctly. Brings `crates/iceberg/src/arrow/int96.rs`
+  (578 lines, pure addition) plus the coercion hook in `reader.rs`.
+  Test addition skipped (apache-only structure).
+- **#2360** EXPLAIN pushed-down limit — `IcebergTableScan` EXPLAIN
+  output shows the pushed-down LIMIT.
+
+Two apache fixes were considered but skipped because they require
+upstream structural changes our base does not have:
+
+- **#2349** `read_with_metrics` — depends on apache #2358 (arrow
+  reader split into modules `pipeline.rs`, `positional_deletes.rs`,
+  `projection.rs`, `row_filter.rs`). Bring back when the next vendor
+  refresh includes #2358.
+- **#2285** snapshot ancestor utils — apache renamed `utils.rs` to
+  `util/mod.rs` and added `util/snapshot.rs`. Rename conflict makes
+  cherry-pick non-surgical.
+
 ## Alignment opportunity (deferred)
 
 RisingWave's `dev_rebase_main_20260303` branch landed its own
