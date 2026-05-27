@@ -68,33 +68,29 @@ them quickly.
 
 ## Alignment opportunity (deferred)
 
-Risingwavelabs's main branch landed its own DataFusion 53 + Arrow 58
-rebase on 2026-04-15 (commit `fb290e4c9`, PR #148). SQE's downstream
-DF 53 patches now overlap with upstream main; we are no longer the
-only fork carrying that work.
+RisingWave's `dev_rebase_main_20260303` branch landed its own
+DataFusion 53 + Arrow 58 rebase on 2026-04-15 (commit `fb290e4c9`,
+PR #148). RW `main` itself has not moved since 2026-03-03 and does
+not carry DF 53. SQE's downstream DF 53 patches now overlap with
+RW's rebase branch; we are no longer the only fork carrying that
+work.
 
-Aligning the vendor pin with risingwavelabs main would let us drop
-the DF 53 patch family. The remaining SQE-only patches above would
+Aligning the vendor pin with the RW rebase branch HEAD (currently
+`8f7c952f66de`, 11 commits past our pin) would let us drop the
+DF 53 patch family. The remaining SQE-only patches above would
 need to ride on top of the new base.
 
-Costs of doing the alignment now: roughly a day to redo the rebase
-and re-apply the five patch families. Benefit: smaller patch surface
-vs upstream, easier next vendor refresh.
+Cost: half a day to redo the rebase and re-apply the five patch
+families. Benefit: smaller patch surface vs upstream, easier next
+vendor refresh, picks up writer fixes (write_with_position,
+DeletionVectorWriter perf, schema-evolution column fill, REST 401
+token refresh).
 
-The natural moment to align is when one of these happens:
-
-- We upstream the SigV4 signer (item 2 above) into either
-  risingwavelabs or apache/iceberg-rust. That removes one patch
-  family from the rebase.
-- apache/iceberg-rust#2376 lands (item 1 above). That removes
-  another.
-- We need a feature from risingwavelabs main that we don't
-  currently have. Then we get the rebase as a side effect.
-- Next major version bump (DataFusion 54 / Arrow 59) ships and we
-  rebase anyway.
-
-Until one of those, the vendor stays pinned to `645f02a4b533` with
-SQE's DF 53 patches.
+Apache `main` carries fixes RW has not backported. Relevant ones to
+consider cherry-picking after the alignment: #2307 (nested field id
+map), #2301 (INT96 timestamps), #2351 (NaN pushdown correctness),
+#2360 (EXPLAIN pushed-down limit), #2349 (read_with_metrics), #2348
+(fixedbinary), #2118 (public convert_filters_to_predicate).
 
 ## Catalog config: URL and bucket conventions
 
