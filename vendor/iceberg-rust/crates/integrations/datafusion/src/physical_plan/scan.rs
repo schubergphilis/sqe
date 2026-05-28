@@ -143,6 +143,42 @@ impl IcebergTableScan {
         self.limit
     }
 
+    /// Reconstruct a scan from already-resolved parts.
+    ///
+    /// SQE-only patch (sqe-ballista-poc): a `PhysicalExtensionCodec` on the
+    /// ballista executor needs to rebuild an `IcebergTableScan` from the
+    /// wire — it has the post-planning `projection` (column names),
+    /// `predicates`, and `limit`, plus a freshly-loaded `Table`, but the
+    /// stock `new()` takes raw DataFusion `Expr` filters and projection
+    /// indices that aren't recoverable after planning.  This constructor
+    /// takes the resolved fields directly.  `output_schema` must already
+    /// reflect the projection.
+    ///
+    /// Upstream shape: iceberg-datafusion should own its
+    /// `PhysicalExtensionCodec` and this constructor (or an equivalent) so
+    /// the scan node round-trips for distributed engines (ballista,
+    /// datafusion-comet).  Filed-shape TODO in the spike report.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_codec_parts(
+        table: Table,
+        snapshot_id: Option<i64>,
+        output_schema: ArrowSchemaRef,
+        projection: Option<Vec<String>>,
+        predicates: Option<Predicate>,
+        limit: Option<usize>,
+    ) -> Self {
+        let plan_properties = Self::compute_properties(output_schema);
+        Self {
+            table,
+            snapshot_id,
+            plan_properties,
+            projection,
+            predicates,
+            limit,
+            runtime_filters: Vec::new(),
+        }
+    }
+
     /// Computes [`PlanProperties`] used in query optimization.
     fn compute_properties(schema: ArrowSchemaRef) -> Arc<PlanProperties> {
         // TODO:
