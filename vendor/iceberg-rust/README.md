@@ -1,7 +1,9 @@
 # iceberg-rust (SQE vendored fork)
 
 This is a vendored copy of the [RisingWave Labs iceberg-rust fork](https://github.com/risingwavelabs/iceberg-rust),
-branch `dev_rebase_main_20260303` at commit `645f02a4b533`, with DataFusion upgraded to 53.0 / Arrow 58 / Parquet 58.
+branch `dev_rebase_main_20260303` at commit `8f7c952f66de`. The branch carries
+DataFusion 53.0 / Arrow 58 / Parquet 58 (RW PR #148, 2026-04-15) plus 10 writer
+and transaction fixes on top.
 
 ## Vendored crates
 
@@ -31,12 +33,11 @@ Apache upstream iceberg-rust (v0.9.0) lacks:
 - `PositionDeleteFileWriter` (Merge-on-Read position deletes)
 - `DeletionVectorWriter` (Iceberg V3)
 
-The RisingWave fork provides all of these. SQE applied the DF 53 migration
-on top (same changes as upstream PR #2206).
+The RisingWave fork provides all of these.
 
 ## Upstream tracking
 
-- RisingWave fork: `dev_rebase_main_20260303` @ `645f02a4b533`
+- RisingWave fork: `dev_rebase_main_20260303` @ `8f7c952f66de`
 - Apache upstream: tracking PRs #2185 (OverwriteAction) and #2203 (RowDeltaAction)
 - When upstream merges these, SQE will migrate to official apache/iceberg-rust
 
@@ -85,16 +86,17 @@ authorship and commit messages are preserved.
 - **#2351** NaN pushdown correctness — float predicates now handle
   NaN semantics correctly. Test addition skipped (apache-only test
   helpers).
-- **#2301** INT96 Parquet timestamps — Iceberg v1 tables read INT96
-  timestamps correctly. Brings `crates/iceberg/src/arrow/int96.rs`
-  (578 lines, pure addition) plus the coercion hook in `reader.rs`.
-  Test addition skipped (apache-only structure).
 - **#2360** EXPLAIN pushed-down limit — `IcebergTableScan` EXPLAIN
   output shows the pushed-down LIMIT.
 
-Two apache fixes were considered but skipped because they require
-upstream structural changes our base does not have:
+Three apache fixes were considered but skipped:
 
+- **#2301** INT96 Parquet timestamps — depends on a `ParquetRecordBatchStreamBuilder`
+  flow that exposes `arrow_metadata` and `parquet_file_reader` as
+  separate locals. Our base uses an opaque `create_parquet_record_batch_stream_builder`
+  helper, so the coercion block does not compile against our shape.
+  Initially landed then reverted; revisit when the reader flow is
+  refactored or apache lands a port-friendlier patch.
 - **#2349** `read_with_metrics` — depends on apache #2358 (arrow
   reader split into modules `pipeline.rs`, `positional_deletes.rs`,
   `projection.rs`, `row_filter.rs`). Bring back when the next vendor
@@ -103,31 +105,25 @@ upstream structural changes our base does not have:
   `util/mod.rs` and added `util/snapshot.rs`. Rename conflict makes
   cherry-pick non-surgical.
 
-## Alignment opportunity (deferred)
+## What landed in this rebase
 
-RisingWave's `dev_rebase_main_20260303` branch landed its own
-DataFusion 53 + Arrow 58 rebase on 2026-04-15 (commit `fb290e4c9`,
-PR #148). RW `main` itself has not moved since 2026-03-03 and does
-not carry DF 53. SQE's downstream DF 53 patches now overlap with
-RW's rebase branch; we are no longer the only fork carrying that
-work.
+The bump from `645f02a4b533` to `8f7c952f66de` brings 11 upstream
+commits from the RW rebase branch:
 
-Aligning the vendor pin with the RW rebase branch HEAD (currently
-`8f7c952f66de`, 11 commits past our pin) would let us drop the
-DF 53 patch family. The remaining SQE-only patches above would
-need to ride on top of the new base.
-
-Cost: half a day to redo the rebase and re-apply the five patch
-families. Benefit: smaller patch surface vs upstream, easier next
-vendor refresh, picks up writer fixes (write_with_position,
-DeletionVectorWriter perf, schema-evolution column fill, REST 401
-token refresh).
-
-Apache `main` carries fixes RW has not backported. Relevant ones to
-consider cherry-picking after the alignment: #2307 (nested field id
-map), #2301 (INT96 timestamps), #2351 (NaN pushdown correctness),
-#2360 (EXPLAIN pushed-down limit), #2349 (read_with_metrics), #2348
-(fixedbinary), #2118 (public convert_filters_to_predicate).
+- DF 53 / Arrow 58 / Parquet 58 upgrade (PR #148) — replaces SQE's
+  hand-rebased DF 53 work; the deltas are now identical to upstream.
+- `IcebergWriter::write_with_position` (PR #149)
+- `DeletionVectorWriter::write` perf — avoid extra copy (PR #150)
+- Transaction snapshot summary rollup fixes (PR #151, #152) — fixes
+  the `previous_snapshot` lookup that resolved to None and zeroed
+  out the `total-*` rollup.
+- `object_cache` accurate memory sizing (PR #153)
+- `DataFile::set_partition` (PR #154)
+- `support dropping schema fields` (PR #155)
+- Schema-evolution: handle all Iceberg types when filling missing
+  columns after schema change (PR #156)
+- REST client: refresh token after 401 unauthorized (PR #157)
+- opendal: skip TimeoutLayer under madsim (PR #160)
 
 ## Catalog config: URL and bucket conventions
 
