@@ -501,8 +501,19 @@ impl TableScan {
         Ok(file_scan_task_rx.boxed())
     }
 
-    /// Returns an [`ArrowRecordBatchStream`].
+    /// Returns an [`ArrowRecordBatchStream`].  Discards scan I/O metrics;
+    /// callers that want them should use [`to_arrow_with_metrics`] which
+    /// returns a [`crate::arrow::ScanResult`].
     pub async fn to_arrow(&self) -> Result<ArrowRecordBatchStream> {
+        Ok(self.to_arrow_with_metrics().await?.stream())
+    }
+
+    /// Returns a [`crate::arrow::ScanResult`] containing both the record
+    /// batch stream and per-scan I/O metrics (apache iceberg-rust#2349).
+    /// Use this when consumers want to surface `bytes_read` to an
+    /// engine UI (e.g. DataFusion Comet's `bytes_scanned` ->
+    /// Spark's `TaskMetrics.inputMetrics.setBytesRead()`).
+    pub async fn to_arrow_with_metrics(&self) -> Result<crate::arrow::ScanResult> {
         let mut arrow_reader_builder = ArrowReaderBuilder::new(self.file_io.clone())
             .with_data_file_concurrency_limit(self.concurrency_limit_data_files)
             .with_row_group_filtering_enabled(self.row_group_filtering_enabled)

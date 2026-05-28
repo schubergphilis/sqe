@@ -47,6 +47,11 @@ pub(crate) struct CachingDeleteFileLoader {
     /// Shared filter state to allow caching loaded deletes across multiple
     /// calls to `load_deletes` (e.g., across multiple file scan tasks).
     delete_filter: DeleteFilter,
+    /// Shared bytes-read counter from a per-scan [`crate::arrow::ScanMetrics`].
+    /// When set, every delete file opened by this loader increments the
+    /// same counter as the data files of the parent scan
+    /// (apache iceberg-rust#2349).
+    bytes_read_counter: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 // Intermediate context during processing of a delete file task.
@@ -89,7 +94,19 @@ impl CachingDeleteFileLoader {
             basic_delete_file_loader: BasicDeleteFileLoader::new(file_io),
             concurrency_limit_data_files,
             delete_filter: DeleteFilter::default(),
+            bytes_read_counter: None,
         }
+    }
+
+    /// Share a per-scan I/O counter (typically the one inside
+    /// [`crate::arrow::ScanMetrics`]) so delete-file reads accumulate
+    /// into the same total as data-file reads.  Apache iceberg-rust#2349.
+    pub(crate) fn with_scan_metrics(
+        mut self,
+        scan_metrics: crate::arrow::ScanMetrics,
+    ) -> Self {
+        self.bytes_read_counter = Some(scan_metrics.bytes_read_counter().clone());
+        self
     }
 
     /// Initiates loading of all deletes for all the specified tasks
@@ -179,6 +196,7 @@ impl CachingDeleteFileLoader {
         let del_filter = self.delete_filter.clone();
         let concurrency_limit_data_files = self.concurrency_limit_data_files;
         let basic_delete_file_loader = self.basic_delete_file_loader.clone();
+        let bytes_read_counter = self.bytes_read_counter.clone();
         crate::runtime::spawn(async move {
             let result = async move {
                 let mut del_filter = del_filter;
@@ -187,12 +205,14 @@ impl CachingDeleteFileLoader {
                 let mut results_stream = task_stream
                     .map(move |(task, file_io, del_filter, schema)| {
                         let basic_delete_file_loader = basic_delete_file_loader.clone();
+                        let bytes_read_counter = bytes_read_counter.clone();
                         async move {
                             Self::load_file_for_task(
                                 &task,
                                 basic_delete_file_loader.clone(),
                                 del_filter,
                                 schema,
+                                bytes_read_counter,
                             )
                             .await
                         }
@@ -228,6 +248,7 @@ impl CachingDeleteFileLoader {
         basic_delete_file_loader: BasicDeleteFileLoader,
         del_filter: DeleteFilter,
         schema: SchemaRef,
+        bytes_read_counter: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     ) -> Result<DeleteFileContext> {
         match task.data_file_content {
             DataContentType::PositionDeletes => {
@@ -262,6 +283,7 @@ impl CachingDeleteFileLoader {
                                     .parquet_to_batch_stream(
                                         task.data_file_path(),
                                         task.file_size_in_bytes,
+                                        bytes_read_counter.clone(),
                                     )
                                     .await?,
                             })
@@ -283,7 +305,11 @@ impl CachingDeleteFileLoader {
                 let equality_ids_vec = task.equality_ids.clone().unwrap();
                 let evolved_stream = BasicDeleteFileLoader::evolve_schema(
                     basic_delete_file_loader
-                        .parquet_to_batch_stream(task.data_file_path(), task.file_size_in_bytes)
+                        .parquet_to_batch_stream(
+                            task.data_file_path(),
+                            task.file_size_in_bytes,
+                            bytes_read_counter.clone(),
+                        )
                         .await?,
                     schema,
                     &equality_ids_vec,
@@ -696,6 +722,7 @@ mod tests {
             .parquet_to_batch_stream(
                 &eq_delete_file_path,
                 std::fs::metadata(&eq_delete_file_path).unwrap().len(),
+                None,
             )
             .await
             .expect("could not get batch stream");
@@ -896,6 +923,7 @@ mod tests {
             .parquet_to_batch_stream(
                 &delete_file_path,
                 std::fs::metadata(&delete_file_path).unwrap().len(),
+                None,
             )
             .await
             .unwrap();
@@ -1124,7 +1152,7 @@ mod tests {
 
         let basic_delete_file_loader = BasicDeleteFileLoader::new(file_io.clone());
         let record_batch_stream = basic_delete_file_loader
-            .parquet_to_batch_stream(&path, std::fs::metadata(&path).unwrap().len())
+            .parquet_to_batch_stream(&path, std::fs::metadata(&path).unwrap().len(), None)
             .await
             .expect("could not get batch stream");
 
