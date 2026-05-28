@@ -15,7 +15,7 @@ pub struct Cli {
 pub enum Command {
     /// Generate Parquet data files for a benchmark suite
     Generate {
-        /// Benchmark suite to generate (tpch, ssb)
+        /// Benchmark suite to generate (tpch, ssb, tpcds, tpcc, tpce, tpcbb, clickbench)
         #[arg(value_name = "BENCHMARK")]
         benchmark: String,
 
@@ -66,7 +66,7 @@ pub enum Command {
 
     /// Load generated data into SQE via Iceberg REST catalog
     Load {
-        /// Benchmark suite to load (tpch, ssb)
+        /// Benchmark suite to load (tpch, ssb, tpcds, tpcc, tpce, tpcbb, clickbench)
         #[arg(value_name = "BENCHMARK")]
         benchmark: String,
 
@@ -146,7 +146,7 @@ pub enum Command {
 
     /// Run benchmark queries and report timing
     Test {
-        /// Benchmark suite to test (tpch, ssb)
+        /// Benchmark suite to test (tpch, ssb, tpcds, tpcc, tpce, tpcbb, clickbench)
         #[arg(value_name = "BENCHMARK")]
         benchmark: String,
 
@@ -224,6 +224,18 @@ pub enum Command {
         /// SQE auth password
         #[arg(long, env = "SQE_PASSWORD")]
         sqe_password: Option<String>,
+
+        /// OAuth2 token endpoint for client_credentials auth
+        #[arg(long, env = "SQE_TOKEN_ENDPOINT")]
+        token_endpoint: Option<String>,
+
+        /// OAuth2 client ID
+        #[arg(long, env = "SQE_CLIENT_ID")]
+        client_id: Option<String>,
+
+        /// OAuth2 client secret
+        #[arg(long, env = "SQE_CLIENT_SECRET")]
+        client_secret: Option<String>,
 
         /// Trino HTTP URL (e.g., http://localhost:8080)
         #[arg(long)]

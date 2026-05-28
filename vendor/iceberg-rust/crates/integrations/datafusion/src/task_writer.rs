@@ -221,7 +221,7 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
         let partitioned_batches = splitter.split(batch)?;
 
         // Write each partition
-        for (partition_key, partition_batch) in partitioned_batches {
+        for (partition_key, partition_batch, _) in partitioned_batches {
             writer.write(partition_key, partition_batch).await?;
         }
 
@@ -417,7 +417,7 @@ mod tests {
                 _ => panic!("Expected string partition value"),
             };
 
-            *partition_counts.entry(region.clone()).or_insert(0) += data_file.record_count();
+            *partition_counts.entry(region).or_insert(0) += data_file.record_count();
 
             // Verify file path contains partition information
             assert!(

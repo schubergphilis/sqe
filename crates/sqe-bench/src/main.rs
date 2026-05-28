@@ -131,6 +131,9 @@ async fn main() -> anyhow::Result<()> {
             sqe_port,
             sqe_username,
             sqe_password,
+            token_endpoint,
+            client_id,
+            client_secret,
             trino_url,
             trino_user,
             trino_catalog: _,
@@ -144,9 +147,9 @@ async fn main() -> anyhow::Result<()> {
                 &sqe_endpoint,
                 sqe_username.as_deref(),
                 sqe_password.as_deref(),
-                None,
-                None,
-                None,
+                token_endpoint.as_deref(),
+                client_id.as_deref(),
+                client_secret.as_deref(),
             )
             .await?;
 

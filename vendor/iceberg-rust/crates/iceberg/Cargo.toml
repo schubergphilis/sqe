@@ -93,6 +93,7 @@ typetag = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 zstd = { workspace = true }
+hashbrown = "0.17.0"
 
 [dev-dependencies]
 expect-test = { workspace = true }
@@ -107,3 +108,6 @@ minijinja = { workspace = true }
 [package.metadata.cargo-machete]
 # These dependencies are added to ensure minimal dependency version
 ignored = ["tap"]
+
+[lints]
+workspace = true
