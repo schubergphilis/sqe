@@ -73,6 +73,36 @@ impl SortMode {
     }
 }
 
+/// Distributed execution backend.
+///
+/// `Legacy` is SQE's bespoke distributed layer (DistributedScanExec +
+/// worker registry + shuffle). `Ballista` routes the policy-rewritten plan
+/// through an embedded Apache Ballista scheduler instead. The switch lets
+/// us A/B the two during the cutover; see
+/// `docs/superpowers/specs/2026-05-28-sqe-on-ballista-cutover-design.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryEngine {
+    /// SQE's bespoke distributed execution (the default during migration).
+    Legacy,
+    /// Apache Ballista as the distributed runtime.
+    Ballista,
+}
+
+impl QueryEngine {
+    /// Parse from config string. Returns `Legacy` for unknown values so a
+    /// typo never silently routes traffic onto the new path.
+    pub fn parse(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "ballista" => Self::Ballista,
+            "legacy" => Self::Legacy,
+            _ => {
+                tracing::warn!(engine = s, "Unknown query engine, defaulting to legacy");
+                Self::Legacy
+            }
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct QueryConfig {
     /// Default catalog for unqualified SQL identifiers. When unset
@@ -174,6 +204,14 @@ pub struct QueryConfig {
     /// Default: 300 (5 minutes). Issue #75.
     #[serde(default = "default_stream_idle_timeout")]
     pub stream_idle_timeout_secs: u64,
+    /// Distributed execution backend: `"legacy"` (SQE's bespoke layer) or
+    /// `"ballista"` (embedded Apache Ballista scheduler). Parsed via
+    /// [`QueryEngine::parse`]. Default: `"legacy"`. During the ballista
+    /// cutover this stays `legacy` until parity is proven; flip to
+    /// `ballista` to route through the new runtime, flip back for instant
+    /// rollback.
+    #[serde(default = "default_engine")]
+    pub engine: String,
 }
 
 impl Default for QueryConfig {
@@ -196,6 +234,7 @@ impl Default for QueryConfig {
             star_schema_reorder: default_true(),
             star_schema_min_ratio: default_star_schema_min_ratio(),
             stream_idle_timeout_secs: default_stream_idle_timeout(),
+            engine: default_engine(),
         }
     }
 }
@@ -1872,6 +1911,7 @@ fn default_distribution_threshold() -> String { "128MB".to_string() }
 fn default_distribution_file_threshold() -> usize { 4 }
 fn default_target_task_size() -> String { "256MB".to_string() }
 fn default_sort_mode() -> String { "adaptive".to_string() }
+fn default_engine() -> String { "legacy".to_string() }
 fn default_late_mat_min_projection_cols() -> usize { 1 }
 fn default_star_schema_min_ratio() -> usize { 10 }
 
@@ -2596,6 +2636,25 @@ mod tests {
         assert_eq!(parse_memory_limit("1024").unwrap(), 1024);
         assert_eq!(parse_memory_limit("1024B").unwrap(), 1024);
         assert_eq!(parse_memory_limit("1024b").unwrap(), 1024);
+    }
+
+    #[test]
+    fn test_query_engine_parse() {
+        assert_eq!(QueryEngine::parse("ballista"), QueryEngine::Ballista);
+        assert_eq!(QueryEngine::parse("Ballista"), QueryEngine::Ballista);
+        assert_eq!(QueryEngine::parse("legacy"), QueryEngine::Legacy);
+        // Unknown values must default to Legacy, never silently flip to the
+        // new path.
+        assert_eq!(QueryEngine::parse("typo"), QueryEngine::Legacy);
+        assert_eq!(QueryEngine::parse(""), QueryEngine::Legacy);
+    }
+
+    #[test]
+    fn test_query_config_default_engine_is_legacy() {
+        assert_eq!(
+            QueryEngine::parse(&QueryConfig::default().engine),
+            QueryEngine::Legacy
+        );
     }
 
     #[test]
