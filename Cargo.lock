@@ -7012,7 +7012,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sqe-ballista-poc"
+name = "sqe-ballista"
 version = "0.31.4"
 dependencies = [
  "anyhow",

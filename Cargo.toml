@@ -18,7 +18,7 @@ members = [
     "crates/sqe-quack-client",
     "crates/sqe-cli",
     "crates/sqe-bench",
-    "crates/sqe-ballista-poc",
+    "crates/sqe-ballista",
     "xtask",
 ]
 # Exclude vendored iceberg-rust. It has its own workspace.

@@ -1,0 +1,33 @@
+{
+  "benchmark": "tpch",
+  "scale": 0.1,
+  "timestamp": "2026-05-28T07:42:47.754784+00:00",
+  "sqe_endpoint": "http://localhost:60051",
+  "trino_endpoint": "http://localhost:38080",
+  "queries": [
+    {
+      "query_name": "q01",
+      "sqe_time_ms": 4,
+      "trino_time_ms": 165,
+      "speedup": 41.25,
+      "sqe_rows": 0,
+      "trino_rows": 6,
+      "rows_match": false,
+      "sqe_error": "Query failed: Tonic error: code: 'The request does not have valid authentication credentials', message: \"No authorization header\"",
+      "trino_error": null,
+      "status": "SqeFailed"
+    }
+  ],
+  "summary": {
+    "total": 1,
+    "matched": 0,
+    "row_diff": 0,
+    "sqe_failed": 1,
+    "trino_failed": 0,
+    "both_failed": 0,
+    "avg_speedup": 0.0,
+    "median_speedup": 0.0,
+    "sqe_total_ms": 4,
+    "trino_total_ms": 165
+  }
+}

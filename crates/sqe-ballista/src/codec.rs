@@ -321,3 +321,57 @@ impl PhysicalExtensionCodec for IcebergPhysicalCodec {
         Ok(Arc::new(scan))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `EncodedScan` wire format is what crosses the scheduler ->
+    /// executor boundary; a silent field drop would corrupt scans. Pin the
+    /// round-trip.
+    #[test]
+    fn encoded_scan_round_trips() {
+        let original = EncodedScan {
+            namespace: vec!["tpch_sf0_1".to_string()],
+            table: "lineitem".to_string(),
+            snapshot_id: Some(123456789),
+            projection: Some(vec!["l_orderkey".to_string(), "l_quantity".to_string()]),
+            limit: Some(100),
+            had_predicates: false,
+            schema_proto: vec![1, 2, 3, 4],
+        };
+
+        let bytes = serde_json::to_vec(&original).expect("encode");
+        let decoded: EncodedScan = serde_json::from_slice(&bytes).expect("decode");
+
+        assert_eq!(decoded.namespace, original.namespace);
+        assert_eq!(decoded.table, original.table);
+        assert_eq!(decoded.snapshot_id, original.snapshot_id);
+        assert_eq!(decoded.projection, original.projection);
+        assert_eq!(decoded.limit, original.limit);
+        assert_eq!(decoded.had_predicates, original.had_predicates);
+        assert_eq!(decoded.schema_proto, original.schema_proto);
+    }
+
+    /// `None` projection means "all columns" — distinct from an empty Vec.
+    /// Confirm the distinction survives the wire.
+    #[test]
+    fn encoded_scan_preserves_none_projection() {
+        let original = EncodedScan {
+            namespace: vec!["ns".to_string()],
+            table: "t".to_string(),
+            snapshot_id: None,
+            projection: None,
+            limit: None,
+            had_predicates: false,
+            schema_proto: vec![],
+        };
+
+        let bytes = serde_json::to_vec(&original).expect("encode");
+        let decoded: EncodedScan = serde_json::from_slice(&bytes).expect("decode");
+
+        assert!(decoded.projection.is_none());
+        assert!(decoded.snapshot_id.is_none());
+        assert!(decoded.limit.is_none());
+    }
+}

@@ -1,13 +1,15 @@
 [package]
-name = "sqe-ballista-poc"
+name = "sqe-ballista"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
 
-# 3-day vertical-slice PoC: validates ballista 53.0.0 can host SQE's
-# iceberg + OIDC bearer-passthrough workload.  See
-# `docs/superpowers/specs/2026-05-28-sqe-on-ballista-poc-plan.md`.
+# SQE-on-ballista integration crate. Hosts the iceberg logical+physical
+# extension codecs, the coordinator-side submission facade, and the
+# executor bootstrap that lets ballista 53 run SQE's iceberg + OIDC
+# bearer-passthrough workload. See
+# `docs/superpowers/specs/2026-05-28-sqe-on-ballista-cutover-design.md`.
 
 [dependencies]
 ballista = "53.0.0"
@@ -30,6 +32,12 @@ iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 iceberg-datafusion = { workspace = true }
 
+[lib]
+name = "sqe_ballista"
+path = "src/lib.rs"
+
+# The original PoC, kept as a runnable smoke test against the
+# Polaris + RustFS stack (`cargo run -p sqe-ballista --bin sqe-ballista-poc`).
 [[bin]]
 name = "sqe-ballista-poc"
-path = "src/main.rs"
+path = "src/bin/poc.rs"

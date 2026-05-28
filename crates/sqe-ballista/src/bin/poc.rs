@@ -23,8 +23,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-mod codec;
-
 use anyhow::{Context, Result};
 use ballista::datafusion::{
     execution::SessionStateBuilder,
@@ -35,7 +33,7 @@ use iceberg::CatalogBuilder;
 use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder};
 use iceberg_datafusion::IcebergCatalogProvider;
 
-use crate::codec::{IcebergLogicalCodec, IcebergPhysicalCodec};
+use sqe_ballista::codec::{IcebergLogicalCodec, IcebergPhysicalCodec};
 
 const POLARIS_URL: &str = "http://localhost:18181/api/catalog";
 const POLARIS_TOKEN_URL: &str = "http://localhost:18181/api/catalog/v1/oauth/tokens";
