@@ -152,8 +152,8 @@ impl IcebergTableScan {
             EquivalenceProperties::new(schema),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
-            Boundedness::Bounded,)
-        )
+            Boundedness::Bounded,
+        ))
     }
 }
 

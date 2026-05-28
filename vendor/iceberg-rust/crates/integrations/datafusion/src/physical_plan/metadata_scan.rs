@@ -38,8 +38,8 @@ impl IcebergMetadataScan {
             EquivalenceProperties::new(provider.schema()),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
-            Boundedness::Bounded,)
-        );
+            Boundedness::Bounded,
+        ));
         Self {
             provider,
             properties,

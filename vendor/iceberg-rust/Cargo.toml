@@ -43,7 +43,7 @@ version = "0.8.0"
 license = "Apache-2.0"
 repository = "https://github.com/apache/iceberg-rust"
 # Check the MSRV policy in README.md before changing this
-rust-version = "1.88"
+rust-version = "1.92"
 
 [workspace.dependencies]
 anyhow = "1.0.72"
@@ -69,8 +69,8 @@ bimap = "0.6"
 bytes = "1.11"
 chrono = "0.4.41"
 clap = { version = "4.5.48", features = ["derive", "cargo"] }
+crc32fast = "1.5"
 dashmap = "6"
-crc32fast = "1.5.0"
 datafusion = "53.0.0"
 datafusion-cli = "53.0.0"
 datafusion-sqllogictest = "53.0.0"
@@ -79,6 +79,10 @@ dirs = "6"
 enum-ordinalize = "4.3.0"
 env_logger = "0.11.8"
 expect-test = "1"
+fastnum = { version = "0.7", default-features = false, features = [
+  "std",
+  "serde",
+] }
 faststr = "0.2.31"
 flate2 = "1.1.5"
 fnv = "1.0.7"
@@ -116,14 +120,13 @@ rand = "0.8.5"
 regex = "1.11.3"
 reqwest = { version = "0.12.12", default-features = false, features = ["json"] }
 roaring = { version = "0.11" }
-fastnum = { version = "0.7", default-features = false, features = ["std", "serde"] }
 serde = { version = "1.0.219", features = ["rc"] }
 serde_bytes = "0.11.17"
 serde_derive = "1.0.219"
 serde_json = "1.0.142"
 serde_repr = "0.1.16"
 serde_with = "3.4"
-sqllogictest = "0.28.3"
+sqllogictest = "0.29"
 sqlx = { version = "0.8.1", default-features = false }
 stacker = "0.1.20"
 strum = "0.27.2"
@@ -140,3 +143,6 @@ uuid = { version = "1.18", features = ["v7"] }
 volo = "0.10.6"
 volo-thrift = "0.10.8"
 zstd = "0.13.3"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)'] }
