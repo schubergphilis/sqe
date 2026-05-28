@@ -56,10 +56,16 @@ impl BasicDeleteFileLoader {
         self.file_io.new_input(data_file_path)
     }
     /// Loads a RecordBatchStream for a given datafile.
+    ///
+    /// `bytes_read_counter` is shared with the per-scan [`ScanMetrics`] so
+    /// delete-file bytes count towards the same scan total as data-file
+    /// bytes (apache iceberg-rust#2349).  `None` skips counting — useful
+    /// for ad-hoc loads outside a scan.
     pub(crate) async fn parquet_to_batch_stream(
         &self,
         data_file_path: &str,
         file_size_in_bytes: u64,
+        bytes_read_counter: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     ) -> Result<ArrowRecordBatchStream> {
         /*
            Essentially a super-cut-down ArrowReader. We can't use ArrowReader directly
@@ -72,6 +78,7 @@ impl BasicDeleteFileLoader {
                 false,
                 None,
                 file_size_in_bytes,
+                bytes_read_counter,
             )
             .await?;
         let record_batch_stream =
@@ -112,7 +119,7 @@ impl DeleteFileLoader for BasicDeleteFileLoader {
         schema: SchemaRef,
     ) -> Result<ArrowRecordBatchStream> {
         let raw_batch_stream = self
-            .parquet_to_batch_stream(&task.file_path, task.file_size_in_bytes)
+            .parquet_to_batch_stream(&task.file_path, task.file_size_in_bytes, None)
             .await?;
 
         // For equality deletes, only evolve the equality_ids columns.
