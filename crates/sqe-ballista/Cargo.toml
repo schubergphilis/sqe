@@ -32,6 +32,11 @@ iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 iceberg-datafusion = { workspace = true }
 
+# SQE catalog — the production codecs target SQE's own SqeTableProvider /
+# IcebergScanExec (not iceberg-datafusion's nodes). See the cutover design.
+sqe-catalog = { path = "../sqe-catalog" }
+sqe-core = { path = "../sqe-core" }
+
 [lib]
 name = "sqe_ballista"
 path = "src/lib.rs"

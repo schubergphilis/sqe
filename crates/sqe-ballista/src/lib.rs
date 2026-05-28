@@ -14,3 +14,19 @@
 //! `docs/superpowers/specs/2026-05-28-sqe-on-ballista-cutover-design.md`.
 
 pub mod codec;
+pub mod sqe_codec;
+
+/// Drive an async future to completion from a sync context that is itself
+/// running on a tokio worker thread (codec decode happens inside the
+/// ballista executor's runtime).
+///
+/// `futures::executor::block_on` deadlocks here: it parks the worker thread
+/// without pumping the tokio reactor, so the iceberg REST client's HTTP
+/// future never makes progress. `block_in_place` hands the thread back to
+/// the runtime while we block, and the current `Handle` drives our future on
+/// the same multi-threaded runtime. Requires a multi-threaded runtime (the
+/// ballista executor has one).
+pub(crate) fn block_on_in_runtime<F: std::future::Future>(fut: F) -> F::Output {
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::block_in_place(move || handle.block_on(fut))
+}
