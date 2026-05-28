@@ -26,6 +26,8 @@ pub(crate) mod caching_delete_file_loader;
 /// Delete File loader
 pub mod delete_file_loader;
 pub(crate) mod int96;
+mod scan_metrics;
+pub use scan_metrics::{ScanMetrics, ScanResult};
 pub(crate) mod delete_filter;
 
 mod reader;

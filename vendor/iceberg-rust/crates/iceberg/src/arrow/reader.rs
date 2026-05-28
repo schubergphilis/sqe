@@ -48,8 +48,11 @@ use parquet::file::metadata::{
 };
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 
+use std::sync::atomic::AtomicU64;
+
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::int96::coerce_int96_timestamps;
+use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::{arrow_schema_to_schema, get_arrow_datum};
 use crate::delete_vector::DeleteVector;
@@ -176,9 +179,13 @@ pub struct ArrowReader {
 }
 
 impl ArrowReader {
-    /// Take a stream of FileScanTasks and reads all the files.
-    /// Returns a stream of Arrow RecordBatches containing the data from the files
-    pub fn read(self, tasks: FileScanTaskStream) -> Result<ArrowRecordBatchStream> {
+    /// Take a stream of FileScanTasks and read them. Returns a
+    /// [`ScanResult`] carrying both the record-batch stream and the
+    /// scan-level I/O metrics (per apache iceberg-rust#2349).  Metrics
+    /// are always collected; the counter is created fresh per `read()`
+    /// call so concurrent scans against the same `FileIO` track
+    /// independent byte totals.
+    pub fn read(self, tasks: FileScanTaskStream) -> Result<ScanResult> {
         let file_io = self.file_io.clone();
         let batch_size = self.batch_size;
         let concurrency_limit_data_files = self.concurrency_limit_data_files;
@@ -187,6 +194,16 @@ impl ArrowReader {
         let metadata_size_hint = self.metadata_size_hint;
         let dynamic_predicate = self.dynamic_predicate.clone();
 
+        // Per-scan I/O metrics.  Cloned into both the data-file path
+        // (`process_file_scan_task`) and the delete-file loader so the
+        // total reflects every Parquet open made for this scan.
+        let scan_metrics = ScanMetrics::new();
+        let delete_file_loader = self
+            .delete_file_loader
+            .clone()
+            .with_scan_metrics(scan_metrics.clone());
+        let bytes_read = scan_metrics.bytes_read_counter().clone();
+
         // Fast-path for single concurrency to avoid overhead of try_flatten_unordered
         let stream: ArrowRecordBatchStream = if concurrency_limit_data_files == 1 {
             Box::pin(
@@ -194,16 +211,18 @@ impl ArrowReader {
                     .and_then(move |task| {
                         let file_io = file_io.clone();
                         let dynamic_predicate = dynamic_predicate.clone();
+                        let bytes_read = bytes_read.clone();
 
                         Self::process_file_scan_task(
                             task,
                             batch_size,
                             file_io,
-                            self.delete_file_loader.clone(),
+                            delete_file_loader.clone(),
                             row_group_filtering_enabled,
                             row_selection_enabled,
                             metadata_size_hint,
                             dynamic_predicate,
+                            bytes_read,
                         )
                     })
                     .map_err(|err| {
@@ -218,16 +237,18 @@ impl ArrowReader {
                     .map_ok(move |task| {
                         let file_io = file_io.clone();
                         let dynamic_predicate = dynamic_predicate.clone();
+                        let bytes_read = bytes_read.clone();
 
                         Self::process_file_scan_task(
                             task,
                             batch_size,
                             file_io,
-                            self.delete_file_loader.clone(),
+                            delete_file_loader.clone(),
                             row_group_filtering_enabled,
                             row_selection_enabled,
                             metadata_size_hint,
                             dynamic_predicate,
+                            bytes_read,
                         )
                     })
                     .map_err(|err| {
@@ -239,7 +260,7 @@ impl ArrowReader {
             )
         };
 
-        Ok(stream)
+        Ok(ScanResult::new(stream, scan_metrics))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -252,6 +273,7 @@ impl ArrowReader {
         row_selection_enabled: bool,
         metadata_size_hint: Option<usize>,
         dynamic_predicate: Option<Arc<dyn DynamicPredicate>>,
+        bytes_read: Arc<AtomicU64>,
     ) -> Result<ArrowRecordBatchStream> {
         let should_load_page_index =
             (row_selection_enabled && task.predicate.is_some()) || !task.deletes.is_empty();
@@ -272,6 +294,7 @@ impl ArrowReader {
             should_load_page_index,
             metadata_size_hint,
             task.file_size_in_bytes,
+            Some(bytes_read),
         )
         .await?;
 
@@ -586,16 +609,26 @@ impl ArrowReader {
         should_load_page_index: bool,
         metadata_size_hint: Option<usize>,
         file_size_in_bytes: u64,
+        bytes_read_counter: Option<Arc<AtomicU64>>,
     ) -> Result<(ArrowFileReader, ArrowReaderMetadata)> {
         let parquet_file = file_io.new_input(data_file_path)?;
         let parquet_reader = parquet_file.reader().await?;
+        // Wrap with CountingFileRead when a counter is supplied so total
+        // scan I/O can be reported via `ScanMetrics::bytes_read()`
+        // (apache iceberg-rust#2349).  Both data files (this function's
+        // primary caller) and delete files share the same counter so the
+        // reported total reflects the whole scan, not just data bytes.
+        let inner_reader: Box<dyn FileRead> = match bytes_read_counter {
+            Some(counter) => Box::new(CountingFileRead::new(parquet_reader, counter)),
+            None => parquet_reader,
+        };
         let mut parquet_file_reader = ArrowFileReader::new(
             FileMetadata {
                 size: file_size_in_bytes,
                 last_modified_ms: None,
                 is_dir: false,
             },
-            parquet_reader,
+            inner_reader,
         )
         .with_preload_column_index(true)
         .with_preload_offset_index(true)
