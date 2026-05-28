@@ -1626,6 +1626,12 @@ impl QueryHandler {
         let sql = self.handle_incremental(sql, &ctx, &session_catalog).await?;
         let (sql, tt_cleanup) =
             self.handle_time_travel(&sql, &ctx, &session_catalog).await?;
+        // Apply Trino-compat AST rewrites before planning, matching the
+        // execute() path. Today this matters for the empty-input ROLLUP /
+        // CUBE / GROUPING SETS wrap that works around apache/datafusion#21570;
+        // CAST(v AS JSON) -> to_json(v) and the $-suffix metadata-table
+        // rewrite also apply here when present.
+        let sql = sqe_sql::rewrite_trino_compat(&sql);
         let sql = sql.as_str();
 
         let df = ctx

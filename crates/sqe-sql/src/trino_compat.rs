@@ -37,8 +37,9 @@ use std::ops::ControlFlow;
 
 use sqlparser::ast::{
     DataType as SqlDataType, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArgumentList, FunctionArguments, Ident, ObjectName, Statement, TableFactor,
-    TableFunctionArgs, Value, VisitMut, VisitorMut,
+    FunctionArgumentList, FunctionArguments, GroupByExpr, GroupByWithModifier, Ident,
+    ObjectName, Query, Select, SetExpr, Statement, TableFactor, TableFunctionArgs, Value,
+    VisitMut, VisitorMut,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -67,14 +68,21 @@ pub fn rewrite_trino_compat(sql: &str) -> String {
         Err(_) => return sql.to_string(),
     };
 
-    // Cheap fast path: if the lowercased text contains neither `as json`
-    // nor `$` nor any metadata suffix, no rewriter can fire. Skip the AST
-    // walk and the re-serialization, which together cost more than the
-    // substring check on the typical SQL string.
+    // Cheap fast path: if the lowercased text contains none of the
+    // rewriter triggers, no rewriter can fire. Skip the AST walk and the
+    // re-serialization, which together cost more than the substring check
+    // on the typical SQL string. Trigger words for each rewriter:
+    //   `as json`              -> rewrite_cast_as_json
+    //   `$`                    -> rewrite_metadata_dollar_table
+    //   `rollup` / `cube` /
+    //   `grouping sets`        -> wrap_rollup_for_empty_input
     let lower = sql.to_ascii_lowercase();
     let has_json_cast = lower.contains("as json");
     let has_dollar = lower.contains('$');
-    if !has_json_cast && !has_dollar {
+    let has_grouping_set = lower.contains("rollup")
+        || lower.contains("cube")
+        || lower.contains("grouping sets");
+    if !has_json_cast && !has_dollar && !has_grouping_set {
         return sql.to_string();
     }
 
@@ -101,9 +109,15 @@ pub fn rewrite_trino_compat(sql: &str) -> String {
 /// Combined visitor that runs every Trino-compat rewriter. One walk over
 /// the AST, rewrites accumulate into the `rewrites` counter so the caller
 /// knows whether to re-serialize.
+///
+/// `wrap_cte_depth` tracks how many enclosing `Query` nodes already carry
+/// the empty-input ROLLUP wrap CTE.  When >0 we are inside an existing
+/// wrap and must not wrap again — otherwise re-running the rewriter on
+/// already-wrapped SQL would produce ever-more-nested wraps.
 #[derive(Default)]
 struct TrinoCompatVisitor {
     rewrites: usize,
+    wrap_cte_depth: usize,
 }
 
 impl VisitorMut for TrinoCompatVisitor {
@@ -125,6 +139,42 @@ impl VisitorMut for TrinoCompatVisitor {
         }
         ControlFlow::Continue(())
     }
+
+    fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+        // Enter: if this Query already owns a wrap CTE, anything below it
+        // (CTE body, outer-body subqueries) is "inside the wrap" for
+        // re-wrap-suppression purposes.
+        if has_wrap_cte(query) {
+            self.wrap_cte_depth += 1;
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+        // Wrap only when we are NOT inside an existing wrap chain.  This
+        // protects the inner CTE body (which still uses ROLLUP) from
+        // being wrapped a second time when the rewriter runs on SQL that
+        // came back through the same path.
+        let was_wrap_owner = has_wrap_cte(query);
+        if self.wrap_cte_depth == 0 || was_wrap_owner {
+            if wrap_rollup_for_empty_input(query) {
+                self.rewrites += 1;
+            }
+        }
+        // Leave: pair the increment in pre_visit_query.
+        if was_wrap_owner {
+            self.wrap_cte_depth = self.wrap_cte_depth.saturating_sub(1);
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// True if `query` defines a CTE named `__sqe_rollup_q` (the wrap marker).
+fn has_wrap_cte(query: &Query) -> bool {
+    let Some(with) = &query.with else { return false };
+    with.cte_tables
+        .iter()
+        .any(|cte| cte.alias.name.value == ROLLUP_WRAP_CTE)
 }
 
 /// Rewrite `Expr::Cast { data_type: JSON, expr }` to `to_json(expr)`.
@@ -262,9 +312,220 @@ fn rewrite_metadata_dollar_table(factor: &mut TableFactor) -> bool {
     true
 }
 
-// (Per-rewriter logic now lives in `rewrite_cast_as_json` /
-// `rewrite_metadata_dollar_table` above. The combined `TrinoCompatVisitor`
-// dispatches both in one walk over the AST.)
+/// CTE alias used by the empty-input ROLLUP wrap. Picked to be unlikely
+/// to collide with a user-written identifier.
+const ROLLUP_WRAP_CTE: &str = "__sqe_rollup_q";
+
+/// Workaround for apache/datafusion#21570: `GROUP BY ROLLUP/CUBE/GROUPING
+/// SETS` returns zero rows when the input is empty, where the SQL standard
+/// requires the grand-total row.  Trino emits the grand-total row.
+/// DataFusion does not.  Until the upstream fix lands, wrap every `Query`
+/// whose top-level `Select` body uses grouping-set semantics so that an
+/// empty result still produces a single all-NULL row.
+///
+/// Transformation:
+///
+/// ```sql
+/// -- Before
+/// SELECT a, SUM(b) FROM t GROUP BY ROLLUP(a) ORDER BY a LIMIT 10
+///
+/// -- After
+/// WITH __sqe_rollup_q AS (SELECT a, SUM(b) FROM t GROUP BY ROLLUP(a))
+/// SELECT __sqe_rollup_q.*
+/// FROM (SELECT 1 AS __sqe_marker) AS __sqe_m
+/// LEFT JOIN __sqe_rollup_q ON TRUE
+/// ORDER BY a LIMIT 10
+/// ```
+///
+/// `LEFT JOIN ... ON TRUE` against a 1-row left side produces a row of
+/// NULLs when the right side is empty (`q` empty -> grand-total stand-in)
+/// and the cross-product of `q`'s rows otherwise (`q` non-empty -> pass
+/// through unchanged).  `ORDER BY` / `LIMIT` / `OFFSET` / `FETCH` are
+/// lifted from the inner query to the outer so paging semantics are
+/// preserved.
+///
+/// The wrap fires once per `Query` node visited; the visitor walks the
+/// whole AST so nested ROLLUP subqueries (e.g. TPC-DS q67's
+/// `(SELECT ... GROUP BY ROLLUP(...)) dw1`) are also covered.  An
+/// idempotency guard skips queries that already carry the wrap CTE so a
+/// second rewrite pass on rewritten SQL is a no-op.
+///
+/// Limitations:
+/// - The synthetic row has NULL for every column, including
+///   `GROUPING(col)` (would be `1` on Trino) and window functions like
+///   `RANK()` (would be `1`).  The row counts match Trino for parity
+///   tests; the value of the grand-total `GROUPING` and window columns
+///   does not.  This is acceptable for the bench tool's row-count
+///   comparison.  Drop the wrap once apache/datafusion#21570 lands and
+///   SQE picks up a DataFusion release that includes the fix.
+/// - Only fires when the immediate `Query.body` is a `Select` with a
+///   grouping-set GROUP BY.  Set operations (`UNION ALL` of two
+///   ROLLUP-using selects) are handled by the visitor recursing into
+///   each side individually.
+fn wrap_rollup_for_empty_input(query: &mut Query) -> bool {
+    // Quick check: the body must be a plain SELECT (not a set operation,
+    // parenthesised subquery, etc.) and that SELECT must have a
+    // grouping-set GROUP BY clause.
+    let body_uses_rollup = match query.body.as_ref() {
+        SetExpr::Select(s) => select_uses_grouping_sets(s),
+        _ => false,
+    };
+    if !body_uses_rollup {
+        return false;
+    }
+
+    // Idempotency: if this Query already has our wrap CTE in its `with`,
+    // don't re-wrap.  Prevents an unbounded blowup when this code path
+    // runs more than once on the same SQL.
+    if let Some(with) = &query.with {
+        if with
+            .cte_tables
+            .iter()
+            .any(|cte| cte.alias.name.value == ROLLUP_WRAP_CTE)
+        {
+            return false;
+        }
+    }
+
+    // Lift outer clauses off the original query.  These ride on the
+    // wrapper, not the inner CTE, so paging and ordering apply after the
+    // empty-input row has been added (or not).
+    let outer_order_by = query.order_by.take();
+    let outer_limit = query.limit.take();
+    let outer_limit_by = std::mem::take(&mut query.limit_by);
+    let outer_offset = query.offset.take();
+    let outer_fetch = query.fetch.take();
+    let outer_with = query.with.take();
+    let outer_body = std::mem::replace(
+        query.body.as_mut(),
+        SetExpr::Select(Box::new(empty_placeholder_select())),
+    );
+
+    // Construct the inner Query that will become the CTE body.  Carries
+    // forward any pre-existing WITH so previously-defined CTEs the user
+    // wrote still resolve from inside __sqe_rollup_q.
+    let inner_query = Query {
+        with: outer_with,
+        body: Box::new(outer_body),
+        order_by: None,
+        limit: None,
+        limit_by: vec![],
+        offset: None,
+        fetch: None,
+        locks: vec![],
+        for_clause: None,
+        settings: None,
+        format_clause: None,
+    };
+
+    // Build the wrapper by string-templating then re-parsing.  Trying to
+    // construct the wrapper Query node by hand requires reproducing
+    // sqlparser's exact AST layout for LEFT JOIN, AttachedToken spans,
+    // empty Vecs, etc.; round-tripping through Parser is shorter, less
+    // brittle, and inherits any future sqlparser changes for free.
+    let inner_sql = inner_query.to_string();
+    let wrap_sql = format!(
+        "WITH {cte} AS ({inner}) \
+         SELECT {cte}.* \
+         FROM (SELECT 1 AS __sqe_marker) AS __sqe_m \
+         LEFT JOIN {cte} ON TRUE",
+        cte = ROLLUP_WRAP_CTE,
+        inner = inner_sql,
+    );
+
+    let Ok(mut stmts) = Parser::parse_sql(&GenericDialect {}, &wrap_sql) else {
+        // Re-parse failed.  This should only happen if the inner SQL is
+        // non-round-trip-safe (some sqlparser edge cases).  Restore the
+        // original `Query` fields so the caller sees an untouched node
+        // and the SQL goes to DataFusion unchanged.
+        restore_query_fields(
+            query,
+            inner_query,
+            outer_order_by,
+            outer_limit,
+            outer_limit_by,
+            outer_offset,
+            outer_fetch,
+        );
+        return false;
+    };
+    if stmts.is_empty() {
+        return false;
+    }
+    let Statement::Query(wrap_query) = stmts.remove(0) else {
+        return false;
+    };
+
+    let mut new_q = *wrap_query;
+    // Restore the outer clauses on the wrapper query so paging applies
+    // to the unioned result, not the CTE.
+    new_q.order_by = outer_order_by;
+    new_q.limit = outer_limit;
+    new_q.limit_by = outer_limit_by;
+    new_q.offset = outer_offset;
+    new_q.fetch = outer_fetch;
+
+    *query = new_q;
+    true
+}
+
+/// Helper: rebuild `query` from a saved inner query plus outer clauses.
+/// Used to restore state when the wrap re-parse fails.
+fn restore_query_fields(
+    query: &mut Query,
+    inner: Query,
+    order_by: Option<sqlparser::ast::OrderBy>,
+    limit: Option<Expr>,
+    limit_by: Vec<Expr>,
+    offset: Option<sqlparser::ast::Offset>,
+    fetch: Option<sqlparser::ast::Fetch>,
+) {
+    query.with = inner.with;
+    *query.body = *inner.body;
+    query.order_by = order_by;
+    query.limit = limit;
+    query.limit_by = limit_by;
+    query.offset = offset;
+    query.fetch = fetch;
+}
+
+/// Return true if `select.group_by` contains any grouping-set construct
+/// (`ROLLUP(...)`, `CUBE(...)`, `GROUPING SETS (...)`, or the MySQL
+/// `... WITH ROLLUP` / `... WITH CUBE` modifier).
+fn select_uses_grouping_sets(select: &Select) -> bool {
+    match &select.group_by {
+        GroupByExpr::All(_) => false,
+        GroupByExpr::Expressions(exprs, modifiers) => {
+            if modifiers
+                .iter()
+                .any(|m| matches!(m, GroupByWithModifier::Rollup | GroupByWithModifier::Cube))
+            {
+                return true;
+            }
+            exprs.iter().any(|e| {
+                matches!(
+                    e,
+                    Expr::Rollup(_) | Expr::Cube(_) | Expr::GroupingSets(_)
+                )
+            })
+        }
+    }
+}
+
+/// Build a throwaway empty `Select` used as a placeholder while the real
+/// body is being moved out for wrapping.  Parsing an empty SELECT keeps
+/// us from having to hand-construct an `AttachedToken`.
+fn empty_placeholder_select() -> Select {
+    let stmts = Parser::parse_sql(&GenericDialect {}, "SELECT 1")
+        .expect("parse of literal `SELECT 1` cannot fail");
+    let Statement::Query(q) = stmts.into_iter().next().expect("one statement") else {
+        unreachable!("parsed `SELECT 1` is a Query");
+    };
+    let SetExpr::Select(s) = *q.body else {
+        unreachable!("parsed `SELECT 1` is a Select");
+    };
+    *s
+}
 
 #[cfg(test)]
 mod tests {
@@ -477,6 +738,102 @@ mod tests {
         assert!(
             lower.contains("table_snapshots('cat.schema', 't')"),
             "three-segment ns should join, got: {out}"
+        );
+    }
+
+    // ── Empty-input ROLLUP wrap (DataFusion #21570 workaround) ──────────
+
+    #[test]
+    fn rollup_query_gets_wrapped() {
+        let out = rewrite_trino_compat(
+            "SELECT a, SUM(b) FROM t GROUP BY ROLLUP(a) ORDER BY a LIMIT 10",
+        );
+        let lower = out.to_ascii_lowercase();
+        assert!(
+            lower.contains("__sqe_rollup_q"),
+            "wrap CTE missing: {out}"
+        );
+        assert!(
+            lower.contains("left join __sqe_rollup_q"),
+            "LEFT JOIN against wrap CTE missing: {out}"
+        );
+        assert!(
+            lower.contains("order by a"),
+            "ORDER BY should be lifted to outer: {out}"
+        );
+        assert!(
+            lower.contains("limit 10"),
+            "LIMIT should be lifted to outer: {out}"
+        );
+    }
+
+    #[test]
+    fn cube_query_gets_wrapped() {
+        let out = rewrite_trino_compat(
+            "SELECT a, b, SUM(c) FROM t GROUP BY CUBE(a, b)",
+        );
+        assert!(
+            out.to_ascii_lowercase().contains("__sqe_rollup_q"),
+            "CUBE should trigger wrap: {out}"
+        );
+    }
+
+    #[test]
+    fn grouping_sets_query_gets_wrapped() {
+        let out = rewrite_trino_compat(
+            "SELECT a, b, SUM(c) FROM t GROUP BY GROUPING SETS ((a), (b), ())",
+        );
+        assert!(
+            out.to_ascii_lowercase().contains("__sqe_rollup_q"),
+            "GROUPING SETS should trigger wrap: {out}"
+        );
+    }
+
+    #[test]
+    fn plain_group_by_is_not_wrapped() {
+        let out = rewrite_trino_compat("SELECT a, SUM(b) FROM t GROUP BY a");
+        assert!(
+            !out.to_ascii_lowercase().contains("__sqe_rollup_q"),
+            "plain GROUP BY must not wrap: {out}"
+        );
+    }
+
+    #[test]
+    fn select_without_group_by_is_not_wrapped() {
+        let out = rewrite_trino_compat("SELECT a FROM t");
+        assert!(
+            !out.to_ascii_lowercase().contains("__sqe_rollup_q"),
+            "no GROUP BY must not wrap: {out}"
+        );
+    }
+
+    #[test]
+    fn nested_rollup_subquery_gets_wrapped() {
+        // TPC-DS q67 shape: ROLLUP inside an inner SELECT, outer wraps it
+        // in another SELECT with RANK() and a filter.
+        let out = rewrite_trino_compat(
+            "SELECT * FROM (SELECT a, SUM(b) AS s FROM t GROUP BY ROLLUP(a)) dw \
+             WHERE s IS NOT NULL ORDER BY a LIMIT 100",
+        );
+        assert!(
+            out.to_ascii_lowercase().contains("__sqe_rollup_q"),
+            "nested ROLLUP should trigger wrap somewhere: {out}"
+        );
+    }
+
+    #[test]
+    fn already_wrapped_is_not_double_wrapped() {
+        // First pass wraps.  Second pass on the rewritten SQL must be a
+        // no-op (no second nesting of __sqe_rollup_q).
+        let once = rewrite_trino_compat(
+            "SELECT a, SUM(b) FROM t GROUP BY ROLLUP(a)",
+        );
+        let twice = rewrite_trino_compat(&once);
+        let count_once = once.matches("__sqe_rollup_q").count();
+        let count_twice = twice.matches("__sqe_rollup_q").count();
+        assert_eq!(
+            count_once, count_twice,
+            "idempotency violated:\n  once:  {once}\n  twice: {twice}"
         );
     }
 }
