@@ -40,6 +40,7 @@ use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, stream};
 use parquet::arrow::arrow_reader::{
     ArrowPredicateFn, ArrowReaderOptions, RowFilter, RowSelection, RowSelector,
 };
+use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::file::metadata::{
@@ -48,6 +49,7 @@ use parquet::file::metadata::{
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
+use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::{arrow_schema_to_schema, get_arrow_datum};
 use crate::delete_vector::DeleteVector;
@@ -257,13 +259,17 @@ impl ArrowReader {
         let delete_filter_rx =
             delete_file_loader.load_deletes(&task.deletes, Arc::clone(&task.schema));
 
-        // Migrated tables lack field IDs, requiring us to inspect the schema to choose
-        // between field-ID-based or position-based projection
-        let initial_stream_builder = Self::create_parquet_record_batch_stream_builder(
+        // Open the parquet file once and load its metadata.  All subsequent
+        // ArrowReaderOptions adjustments (name mapping, fallback IDs, INT96
+        // coercion) are applied by rebuilding the ArrowReaderMetadata via
+        // try_new without reopening the file.  This pattern matches apache
+        // upstream and is required to expose the metadata between load and
+        // stream-builder construction, which apache/iceberg-rust#2301
+        // (INT96 timestamp coercion) needs.
+        let (parquet_file_reader, arrow_metadata) = Self::open_parquet_and_load_metadata(
             &task.data_file_path,
             file_io.clone(),
             should_load_page_index,
-            None,
             metadata_size_hint,
             task.file_size_in_bytes,
         )
@@ -272,7 +278,7 @@ impl ArrowReader {
         // Check if Parquet file has embedded field IDs
         // Corresponds to Java's ParquetSchemaUtil.hasIds()
         // Reference: parquet/src/main/java/org/apache/iceberg/parquet/ParquetSchemaUtil.java:118
-        let missing_field_ids = initial_stream_builder
+        let missing_field_ids = arrow_metadata
             .schema()
             .fields()
             .iter()
@@ -294,7 +300,7 @@ impl ArrowReader {
         // - Branch 1: hasIds(fileSchema) → trust embedded field IDs, use pruneColumns()
         // - Branch 2: nameMapping present → applyNameMapping(), then pruneColumns()
         // - Branch 3: fallback → addFallbackIds(), then pruneColumnsFallback()
-        let mut record_batch_stream_builder = if missing_field_ids {
+        let arrow_metadata = if missing_field_ids {
             // Parquet file lacks field IDs - must assign them before reading
             let arrow_schema = if let Some(name_mapping) = &task.name_mapping {
                 // Branch 2: Apply name mapping to assign correct Iceberg field IDs
@@ -302,30 +308,58 @@ impl ArrowReader {
                 // to columns without field id"
                 // Corresponds to Java's ParquetSchemaUtil.applyNameMapping()
                 apply_name_mapping_to_arrow_schema(
-                    Arc::clone(initial_stream_builder.schema()),
+                    Arc::clone(arrow_metadata.schema()),
                     name_mapping,
                 )?
             } else {
                 // Branch 3: No name mapping - use position-based fallback IDs
                 // Corresponds to Java's ParquetSchemaUtil.addFallbackIds()
-                add_fallback_field_ids_to_arrow_schema(initial_stream_builder.schema())
+                add_fallback_field_ids_to_arrow_schema(arrow_metadata.schema())
             };
 
             let options = ArrowReaderOptions::new().with_schema(arrow_schema);
-
-            Self::create_parquet_record_batch_stream_builder(
-                &task.data_file_path,
-                file_io.clone(),
-                should_load_page_index,
-                Some(options),
-                metadata_size_hint,
-                task.file_size_in_bytes,
-            )
-            .await?
+            ArrowReaderMetadata::try_new(Arc::clone(arrow_metadata.metadata()), options).map_err(
+                |e| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "Failed to rebuild ArrowReaderMetadata with schema overrides",
+                    )
+                    .with_source(e)
+                },
+            )?
         } else {
             // Branch 1: File has embedded field IDs - trust them
-            initial_stream_builder
+            arrow_metadata
         };
+
+        // Coerce INT96 timestamp columns to the resolution specified by the
+        // Iceberg schema.  This must happen before building the stream
+        // reader to avoid i64 nanosecond overflow in arrow-rs for
+        // out-of-range timestamps.  Workaround for the silent INT96 ->
+        // i64-nanos truncation in arrow-rs; tracked as upstream apache
+        // iceberg-rust#2301.
+        let arrow_metadata = if let Some(coerced_schema) =
+            coerce_int96_timestamps(arrow_metadata.schema(), &task.schema)
+        {
+            let options = ArrowReaderOptions::new().with_schema(Arc::clone(&coerced_schema));
+            ArrowReaderMetadata::try_new(Arc::clone(arrow_metadata.metadata()), options).map_err(
+                |e| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!(
+                            "Failed to create ArrowReaderMetadata with INT96-coerced schema: {coerced_schema}"
+                        ),
+                    )
+                    .with_source(e)
+                },
+            )?
+        } else {
+            arrow_metadata
+        };
+
+        // Build the stream reader, reusing the already-opened file reader.
+        let mut record_batch_stream_builder =
+            ParquetRecordBatchStreamBuilder::new_with_metadata(parquet_file_reader, arrow_metadata);
 
         // Filter out metadata fields for Parquet projection (they don't exist in files)
         let project_field_ids_without_metadata: Vec<i32> = task
@@ -535,16 +569,24 @@ impl ArrowReader {
         Ok(Box::pin(record_batch_stream) as ArrowRecordBatchStream)
     }
 
-    pub(crate) async fn create_parquet_record_batch_stream_builder(
+    /// Open a Parquet file and load its ArrowReaderMetadata, without
+    /// constructing a stream builder.
+    ///
+    /// The returned `(reader, metadata)` pair lets the caller apply any
+    /// number of schema or option overrides to the metadata (via
+    /// `ArrowReaderMetadata::try_new`) before building the final stream
+    /// builder with `ParquetRecordBatchStreamBuilder::new_with_metadata`.
+    /// This is the pattern apache iceberg-rust uses in `process_file_scan_task`
+    /// to insert INT96 timestamp coercion (apache iceberg-rust#2301) and
+    /// the fallback / name-mapping schema overrides between metadata load
+    /// and stream construction, without reopening the file.
+    pub(crate) async fn open_parquet_and_load_metadata(
         data_file_path: &str,
         file_io: FileIO,
         should_load_page_index: bool,
-        arrow_reader_options: Option<ArrowReaderOptions>,
         metadata_size_hint: Option<usize>,
         file_size_in_bytes: u64,
-    ) -> Result<ParquetRecordBatchStreamBuilder<ArrowFileReader>> {
-        // Get the metadata for the Parquet file we need to read and build
-        // a reader for the data within
+    ) -> Result<(ArrowFileReader, ArrowReaderMetadata)> {
         let parquet_file = file_io.new_input(data_file_path)?;
         let parquet_reader = parquet_file.reader().await?;
         let mut parquet_file_reader = ArrowFileReader::new(
@@ -563,11 +605,23 @@ impl ArrowReader {
             parquet_file_reader = parquet_file_reader.with_metadata_size_hint(hint);
         }
 
-        // Create the record batch stream builder, which wraps the parquet file reader
-        let options = arrow_reader_options.unwrap_or_default();
-        let record_batch_stream_builder =
-            ParquetRecordBatchStreamBuilder::new_with_options(parquet_file_reader, options).await?;
-        Ok(record_batch_stream_builder)
+        // Load metadata only — no stream builder yet so the caller can
+        // adjust ArrowReaderOptions (schema overrides, INT96 coercion)
+        // against the loaded metadata.
+        let arrow_metadata = ArrowReaderMetadata::load_async(
+            &mut parquet_file_reader,
+            ArrowReaderOptions::default(),
+        )
+        .await
+        .map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "Failed to load Parquet ArrowReaderMetadata",
+            )
+            .with_source(e)
+        })?;
+
+        Ok((parquet_file_reader, arrow_metadata))
     }
 
     /// computes a `RowSelection` from positional delete indices.
