@@ -25,6 +25,7 @@ pub(crate) use nan_val_cnt_visitor::*;
 pub(crate) mod caching_delete_file_loader;
 /// Delete File loader
 pub mod delete_file_loader;
+pub(crate) mod int96;
 pub(crate) mod delete_filter;
 
 mod reader;
