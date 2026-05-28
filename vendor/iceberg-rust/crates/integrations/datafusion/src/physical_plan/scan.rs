@@ -145,7 +145,7 @@ impl IcebergTableScan {
 
     /// Reconstruct a scan from already-resolved parts.
     ///
-    /// SQE-only patch (sqe-ballista-poc): a `PhysicalExtensionCodec` on the
+    /// SQE-only patch (sqe-ballista): a `PhysicalExtensionCodec` on the
     /// ballista executor needs to rebuild an `IcebergTableScan` from the
     /// wire — it has the post-planning `projection` (column names),
     /// `predicates`, and `limit`, plus a freshly-loaded `Table`, but the
