@@ -87,11 +87,11 @@ The PoC physical codec bails when the scan carries pushed-down predicates.
 Two predicate kinds must cross the wire:
 
 1. **Iceberg `Predicate`** pushed into the scan at plan time (static
-   filters). Serialize as part of `EncodedScan`. Iceberg's `Predicate`
-   has a bound/unbound form; we encode the unbound predicate (column
-   names + literals + ops) and re-bind against the reloaded table schema
-   on the executor. If iceberg lacks a serde-friendly form, encode our own
-   minimal predicate IR covering the ops the iceberg scan supports.
+   filters). **DONE (Phase 1).** Iceberg's `Predicate` already derives
+   `Serialize`/`Deserialize`, so it rides the wire as a field of
+   `EncodedScan` directly; the executor re-binds it against the reloaded
+   table schema via `scan_builder.with_filter` when the scan runs. No
+   custom IR needed. Covered by `encoded_scan_round_trips_predicate`.
 
 2. **SQE `DynamicPredicate` runtime filters** (build-side join bloom/min-max
    pushed into the probe-side scan). These are produced *during* execution,
@@ -171,6 +171,17 @@ upstream improvement. Appended as we build.
   (20% tolerance). Ballista's scheduler is load/round-robin. *Decide in
   Phase 5:* measure the hit-rate loss; if material, upstream a pluggable
   task-placement hook to ballista. Otherwise drop the heuristic.
+- **D6 — dynamic / runtime-filter pushdown across stages.** SQE's
+  `IcebergTableScan` absorbs build-side join filters (`DynamicFilterPhysicalExpr`)
+  via `handle_child_pushdown_result` and feeds them into iceberg row-group
+  pruning mid-stream. These are produced *during* execution, so they can't
+  be serialized into the submitted plan. *v1 decision:* the physical codec
+  carries only static `Predicate`s; runtime filters stay local to whatever
+  ballista stage runs the join+scan together, and cross-stage dynamic
+  pushdown is disabled on the ballista path. *Why diverge:* ballista has no
+  dynamic-filter transport. *Upstream:* a ballista physical node + codec for
+  dynamic-filter propagation between stages. Measure the perf delta in
+  Phase 5; implement transport as a follow-up only if material.
 
 ## Rollback
 

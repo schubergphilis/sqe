@@ -44,6 +44,7 @@ use datafusion::sql::TableReference;
 use ballista_core::serde::{BallistaLogicalExtensionCodec, BallistaPhysicalExtensionCodec};
 use datafusion_proto::logical_plan::LogicalExtensionCodec;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
+use iceberg::expr::Predicate;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use iceberg_datafusion::IcebergCatalogProvider;
 use iceberg_datafusion::physical_plan::IcebergTableScan;
@@ -182,11 +183,14 @@ struct EncodedScan {
     /// Projected column names; `None` = all columns.
     projection: Option<Vec<String>>,
     limit: Option<usize>,
-    /// `true` if the original scan carried pushed-down predicates.  The
-    /// PoC bails in that case rather than silently dropping them (the
-    /// COUNT(*) test query has none).  A production codec would serialize
-    /// the iceberg `Predicate`.
-    had_predicates: bool,
+    /// Static filters pushed into the scan at plan time, as the iceberg
+    /// `Predicate` (unbound: column names + literals + ops).  `None` = no
+    /// pushdown.  Iceberg's `Predicate` derives serde, so it rides the wire
+    /// directly; the executor re-binds it against the reloaded table schema
+    /// when the scan runs.  Runtime/dynamic filters are NOT carried here —
+    /// they are produced during execution (divergence D-runtime-filters in
+    /// the cutover design); ballista handles join execution itself for v1.
+    predicate: Option<Predicate>,
     /// Output (already-projected) Arrow schema, datafusion-proto bytes.
     schema_proto: Vec<u8>,
 }
@@ -256,7 +260,7 @@ impl PhysicalExtensionCodec for IcebergPhysicalCodec {
             snapshot_id: scan.snapshot_id(),
             projection: scan.projection().map(|p| p.to_vec()),
             limit: scan.limit(),
-            had_predicates: scan.predicates().is_some(),
+            predicate: scan.predicates().cloned(),
             schema_proto: schema_proto.encode_to_vec(),
         };
 
@@ -283,13 +287,6 @@ impl PhysicalExtensionCodec for IcebergPhysicalCodec {
         let encoded: EncodedScan = serde_json::from_slice(rest)
             .map_err(|e| DataFusionError::Internal(format!("scan decode: {e}")))?;
 
-        if encoded.had_predicates {
-            return Err(DataFusionError::NotImplemented(
-                "IcebergPhysicalCodec PoC does not serialize pushed-down predicates yet"
-                    .into(),
-            ));
-        }
-
         // Decode output schema.
         let schema: SchemaRef = {
             let proto = datafusion_proto::protobuf::Schema::decode(&encoded.schema_proto[..])
@@ -315,7 +312,7 @@ impl PhysicalExtensionCodec for IcebergPhysicalCodec {
             encoded.snapshot_id,
             schema,
             encoded.projection,
-            None, // had_predicates == false guaranteed above
+            encoded.predicate,
             encoded.limit,
         );
         Ok(Arc::new(scan))
@@ -324,6 +321,9 @@ impl PhysicalExtensionCodec for IcebergPhysicalCodec {
 
 #[cfg(test)]
 mod tests {
+    use iceberg::expr::Reference;
+    use iceberg::spec::Datum;
+
     use super::*;
 
     /// The `EncodedScan` wire format is what crosses the scheduler ->
@@ -337,7 +337,7 @@ mod tests {
             snapshot_id: Some(123456789),
             projection: Some(vec!["l_orderkey".to_string(), "l_quantity".to_string()]),
             limit: Some(100),
-            had_predicates: false,
+            predicate: None,
             schema_proto: vec![1, 2, 3, 4],
         };
 
@@ -349,7 +349,7 @@ mod tests {
         assert_eq!(decoded.snapshot_id, original.snapshot_id);
         assert_eq!(decoded.projection, original.projection);
         assert_eq!(decoded.limit, original.limit);
-        assert_eq!(decoded.had_predicates, original.had_predicates);
+        assert!(decoded.predicate.is_none());
         assert_eq!(decoded.schema_proto, original.schema_proto);
     }
 
@@ -363,7 +363,7 @@ mod tests {
             snapshot_id: None,
             projection: None,
             limit: None,
-            had_predicates: false,
+            predicate: None,
             schema_proto: vec![],
         };
 
@@ -373,5 +373,35 @@ mod tests {
         assert!(decoded.projection.is_none());
         assert!(decoded.snapshot_id.is_none());
         assert!(decoded.limit.is_none());
+    }
+
+    /// Phase 1: a pushed-down static `Predicate` must survive the wire so
+    /// the executor can re-bind it and prune. This is the gap the PoC
+    /// codec bailed on (`had_predicates`).
+    #[test]
+    fn encoded_scan_round_trips_predicate() {
+        // l_quantity > 30 AND l_orderkey = 42
+        let predicate = Reference::new("l_quantity")
+            .greater_than(Datum::double(30.0))
+            .and(Reference::new("l_orderkey").equal_to(Datum::long(42)));
+
+        let original = EncodedScan {
+            namespace: vec!["tpch_sf0_1".to_string()],
+            table: "lineitem".to_string(),
+            snapshot_id: None,
+            projection: None,
+            limit: None,
+            predicate: Some(predicate.clone()),
+            schema_proto: vec![],
+        };
+
+        let bytes = serde_json::to_vec(&original).expect("encode");
+        let decoded: EncodedScan = serde_json::from_slice(&bytes).expect("decode");
+
+        assert_eq!(
+            decoded.predicate.expect("predicate present"),
+            predicate,
+            "round-tripped predicate must equal the original"
+        );
     }
 }
