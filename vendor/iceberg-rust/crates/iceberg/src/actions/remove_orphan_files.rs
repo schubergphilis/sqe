@@ -29,7 +29,7 @@ use futures::stream::{self, StreamExt};
 
 use crate::Result;
 use crate::table::Table;
-use crate::utils::{load_manifest_lists, load_manifests};
+use crate::util::{load_manifest_lists, load_manifests};
 
 /// Default time offset for orphan file deletion threshold (1 day in milliseconds).
 const DEFAULT_OLDER_THAN_MS: i64 = 7 * 24 * 60 * 60 * 1000; // 7 days

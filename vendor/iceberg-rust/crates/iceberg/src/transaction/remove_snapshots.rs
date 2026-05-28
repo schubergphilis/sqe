@@ -27,7 +27,8 @@ use crate::error::Result;
 use crate::spec::{MAIN_BRANCH, SnapshotReference, SnapshotRetention, TableMetadataRef};
 use crate::table::Table;
 use crate::transaction::{ActionCommit, TransactionAction};
-use crate::utils::{DEFAULT_LOAD_CONCURRENCY_LIMIT, ancestors_of, load_manifest_lists};
+use crate::util::snapshot::ancestors_of;
+use crate::util::{DEFAULT_LOAD_CONCURRENCY_LIMIT, load_manifest_lists};
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 /// Default value for max snapshot age in milliseconds.
