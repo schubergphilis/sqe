@@ -423,6 +423,17 @@ pub trait FileRead: Send + Sync + Unpin + 'static {
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes>;
 }
 
+/// Blanket impl: any wrapper that derefs to a `dyn FileRead` is itself a
+/// `FileRead`.  Lets generic wrappers like `CountingFileRead<F>` accept
+/// the boxed reader returned by `FileIO::reader()` without changing the
+/// `FileIO` trait signature.  Added for apache iceberg-rust#2349.
+#[async_trait::async_trait]
+impl<T: AsRef<dyn FileRead> + Send + Sync + Unpin + 'static> FileRead for T {
+    async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+        self.as_ref().read(range).await
+    }
+}
+
 /// Input file is used for reading from files.
 #[derive(Debug)]
 pub struct InputFile {
