@@ -33,7 +33,7 @@ use crate::spec::{
     DataContentType, ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList,
     ManifestStatus, Operation, SchemaRef, SnapshotRef, TableMetadataRef,
 };
-use crate::utils::ancestors_between;
+use crate::util::snapshot::ancestors_between;
 use crate::{Error, ErrorKind, Result};
 
 type ManifestEntryFilterFn = dyn Fn(&ManifestEntryRef) -> bool + Send + Sync;

@@ -94,7 +94,8 @@ pub mod actions;
 pub mod arrow;
 pub(crate) mod delete_file_index;
 pub mod test_utils;
-mod utils;
+/// Utility functions and modules.
+pub mod util;
 pub mod writer;
 
 pub mod delete_vector;

@@ -19,6 +19,11 @@ use std::num::NonZeroUsize;
 
 use crate::spec::{SnapshotRef, TableMetadataRef};
 
+/// Snapshot history traversal helpers (`Ancestors`, `ancestors_of`,
+/// `ancestors_between`).  Apache iceberg-rust#2285 put them in their
+/// own module; we matched the shape so future cherry-picks line up.
+pub mod snapshot;
+
 // Use a default value of 1 as the safest option.
 // See https://doc.rust-lang.org/std/thread/fn.available_parallelism.html#limitations
 // for more details.
@@ -43,6 +48,9 @@ pub(crate) fn available_parallelism() -> NonZeroUsize {
     })
 }
 
+/// Bin-packing helpers for grouping weighted items into fixed-capacity
+/// bins.  Used when partitioning manifest entries or scan tasks across
+/// workers without exceeding a per-bin target weight.
 pub mod bin {
     use std::iter::Iterator;
     use std::marker::PhantomData;
@@ -188,59 +196,7 @@ pub mod bin {
     }
 }
 
-pub struct Ancestors {
-    next: Option<SnapshotRef>,
-    get_snapshot: Box<dyn Fn(i64) -> Option<SnapshotRef> + Send>,
-}
-
-impl Iterator for Ancestors {
-    type Item = SnapshotRef;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let snapshot = self.next.take()?;
-        let result = snapshot.clone();
-        self.next = snapshot
-            .parent_snapshot_id()
-            .and_then(|id| (self.get_snapshot)(id));
-        Some(result)
-    }
-}
-
-/// Iterate starting from `snapshot` (inclusive) to the root snapshot.
-pub fn ancestors_of(
-    table_metadata: &TableMetadataRef,
-    snapshot: i64,
-) -> Box<dyn Iterator<Item = SnapshotRef> + Send> {
-    if let Some(snapshot) = table_metadata.snapshot_by_id(snapshot) {
-        let table_metadata = table_metadata.clone();
-        Box::new(Ancestors {
-            next: Some(snapshot.clone()),
-            get_snapshot: Box::new(move |id| table_metadata.snapshot_by_id(id).cloned()),
-        })
-    } else {
-        Box::new(std::iter::empty())
-    }
-}
-
-/// Iterate starting from `snapshot` (inclusive) to `oldest_snapshot_id` (exclusive).
-pub fn ancestors_between(
-    table_metadata: &TableMetadataRef,
-    latest_snapshot_id: i64,
-    oldest_snapshot_id: Option<i64>,
-) -> Box<dyn Iterator<Item = SnapshotRef> + Send> {
-    let Some(oldest_snapshot_id) = oldest_snapshot_id else {
-        return Box::new(ancestors_of(table_metadata, latest_snapshot_id));
-    };
-
-    if latest_snapshot_id == oldest_snapshot_id {
-        return Box::new(std::iter::empty());
-    }
-
-    Box::new(
-        ancestors_of(table_metadata, latest_snapshot_id)
-            .take_while(move |snapshot| snapshot.snapshot_id() != oldest_snapshot_id),
-    )
-}
+// `Ancestors`, `ancestors_of`, `ancestors_between` moved to `snapshot` (above).
 
 use std::collections::HashSet;
 use std::sync::Arc;
