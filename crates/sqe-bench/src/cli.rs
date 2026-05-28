@@ -225,6 +225,18 @@ pub enum Command {
         #[arg(long, env = "SQE_PASSWORD")]
         sqe_password: Option<String>,
 
+        /// OAuth2 token endpoint for client_credentials auth
+        #[arg(long, env = "SQE_TOKEN_ENDPOINT")]
+        token_endpoint: Option<String>,
+
+        /// OAuth2 client ID
+        #[arg(long, env = "SQE_CLIENT_ID")]
+        client_id: Option<String>,
+
+        /// OAuth2 client secret
+        #[arg(long, env = "SQE_CLIENT_SECRET")]
+        client_secret: Option<String>,
+
         /// Trino HTTP URL (e.g., http://localhost:8080)
         #[arg(long)]
         trino_url: String,
