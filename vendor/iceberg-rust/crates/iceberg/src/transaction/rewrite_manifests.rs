@@ -28,7 +28,7 @@ use crate::spec::{
 };
 use crate::table::Table;
 use crate::transaction::{ActionCommit, TransactionAction};
-use crate::utils::{DEFAULT_LOAD_CONCURRENCY_LIMIT, load_manifests};
+use crate::util::{DEFAULT_LOAD_CONCURRENCY_LIMIT, load_manifests};
 use crate::{Error, ErrorKind};
 
 const KEPT_MANIFESTS_COUNT: &str = "manifests-kept";
