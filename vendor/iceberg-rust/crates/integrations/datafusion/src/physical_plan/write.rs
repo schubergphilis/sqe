@@ -87,8 +87,8 @@ impl IcebergWriteExec {
             EquivalenceProperties::new(schema),
             Partitioning::UnknownPartitioning(input.output_partitioning().partition_count()),
             EmissionType::Final,
-            Boundedness::Bounded,)
-        )
+            Boundedness::Bounded,
+        ))
     }
 
     // Create a record batch with serialized data files
@@ -345,8 +345,8 @@ mod tests {
                 EquivalenceProperties::new(schema.clone()),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Final,
-                Boundedness::Bounded,)
-            );
+                Boundedness::Bounded,
+            ));
 
             Self {
                 schema,

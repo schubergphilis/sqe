@@ -77,8 +77,8 @@ impl IcebergCommitExec {
             EquivalenceProperties::new(schema),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
-            Boundedness::Bounded,)
-        )
+            Boundedness::Bounded,
+        ))
     }
 
     // Create a record batch with just the count of rows written
@@ -316,8 +316,8 @@ mod tests {
                 EquivalenceProperties::new(schema.clone()),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Final,
-                Boundedness::Bounded,)
-            );
+                Boundedness::Bounded,
+            ));
 
             Self {
                 schema,

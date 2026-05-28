@@ -51,11 +51,11 @@ parquet = { version = "58", features = ["async", "object_store"] }
 object_store = { version = "0.13", features = ["aws", "http", "azure", "gcp"] }
 
 # Iceberg — RisingWave fork for rewrite_files() / overwrite_files() transaction support.
-# RisingWave iceberg-rust fork with SQE's DF 53 / Arrow 58 rebase.
-# Base: risingwavelabs/iceberg-rust dev_rebase_main_20260303 @ 645f02a4
-# SQE delta: DataFusion 52->53, Arrow 57->58, Parquet 57->58
-# Retains all RW fork features: RewriteFilesAction, PositionDeleteFileWriter,
-# DeletionVectorWriter, OverwriteFilesAction, parallel manifest loading.
+# Pinned to risingwavelabs/iceberg-rust dev_rebase_main_20260303 @ 8f7c952f66de.
+# DF 53 / Arrow 58 / Parquet 58 land via RW PR #148. Retains RW fork features:
+# RewriteFilesAction, OverwriteFilesAction, PositionDeleteFileWriter,
+# DeletionVectorWriter, MergeAppend, parallel manifest loading.
+# Five apache main fixes cherry-picked on top: #2118, #2348, #2307, #2351, #2360.
 # Vendored in vendor/iceberg-rust/ — see vendor/iceberg-rust/README.md
 iceberg = { path = "vendor/iceberg-rust/crates/iceberg" }
 iceberg-catalog-rest = { path = "vendor/iceberg-rust/crates/catalog/rest", features = ["aws-sigv4"] }
@@ -81,9 +81,10 @@ iceberg-catalog-s3tables = { path = "vendor/iceberg-rust/crates/catalog/s3tables
 iceberg-catalog-loader = { path = "vendor/iceberg-rust/crates/catalog/loader", default-features = false }
 sqlx = { version = "0.8.1", default-features = false }
 
-# SQL parser — DataFusion 53 ships sqlparser 0.54. The `visitor` feature
-# enables the VisitMut derive used by sqe-sql for AST rewrites
-# (Trino-compat CAST(v AS JSON) -> to_json(v)).
+# SQL parser — SQE pins 0.54 directly for the `visitor` feature (VisitMut derive
+# used by sqe-sql for AST rewrites like Trino-compat CAST(v AS JSON) -> to_json(v)).
+# DataFusion 53 actually requires sqlparser ^0.61 transitively, so two sqlparser
+# versions ship in the tree. Bump SQE's pin to 0.61+ when porting the AST rewrites.
 sqlparser = { version = "0.54", features = ["visitor"] }
 
 # JSON functions for DataFusion (Trino json_extract compat)
