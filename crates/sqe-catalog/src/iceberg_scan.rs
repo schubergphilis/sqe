@@ -315,6 +315,65 @@ impl IcebergScanExec {
     pub fn projection(&self) -> Option<&[String]> { self.projection.as_deref() }
     pub fn pushed_down_filters(&self) -> &[Arc<dyn PhysicalExpr>] { &self.pushed_down_filters }
 
+    // --- Accessors for distributed-plan serialization (sqe-ballista) -------
+    // A ballista PhysicalExtensionCodec reads these to put the scan on the
+    // wire, then rebuilds the node on the executor via `from_codec_parts`.
+    // See the cutover design doc (codec-target correction).
+    pub fn projected_schema(&self) -> &SchemaRef { &self.projected_schema }
+    pub fn snapshot_id(&self) -> Option<i64> { self.snapshot_id }
+    pub fn small_file_threshold_bytes(&self) -> u64 { self.small_file_threshold_bytes }
+    pub fn manifest_concurrency(&self) -> usize { self.manifest_concurrency }
+    pub fn direct_read_concurrency(&self) -> usize { self.direct_read_concurrency }
+    pub fn target_partitions(&self) -> usize { self.target_partitions }
+    pub fn trust_sort_order(&self) -> bool { self.trust_sort_order }
+
+    /// Reconstruct a scan from already-resolved, wire-transported parts.
+    ///
+    /// A ballista `PhysicalExtensionCodec` on the executor has the
+    /// post-planning `projection` (column names), `predicates`, `snapshot_id`,
+    /// the output `projected_schema`, and the scan's config knobs, plus a
+    /// freshly-loaded `Table` (with the executor's own vended credentials).
+    /// The stock constructors take DataFusion `Expr` filters and recompute
+    /// the predicate; this one takes the resolved fields directly so the scan
+    /// round-trips across the scheduler -> executor boundary.
+    ///
+    /// `df_filters` is left empty (the resolved `predicates` already carry
+    /// the static pushdown) and `pushed_down_filters` is left empty (dynamic
+    /// runtime filters are not serialized — ledger D6). `cached_statistics`
+    /// is not restored; the scan falls back to the snapshot-summary path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_codec_parts(
+        table: Table,
+        projected_schema: SchemaRef,
+        projection: Option<Vec<String>>,
+        predicates: Option<Predicate>,
+        snapshot_id: Option<i64>,
+        small_file_threshold_bytes: u64,
+        manifest_concurrency: usize,
+        direct_read_concurrency: usize,
+        target_partitions: usize,
+        trust_sort_order: bool,
+    ) -> Self {
+        let mut scan = Self::new_with_filters_and_metrics(
+            table,
+            projected_schema,
+            projection,
+            predicates,
+            vec![],
+        )
+        .with_small_file_threshold(small_file_threshold_bytes)
+        .with_manifest_concurrency(manifest_concurrency)
+        .with_direct_read_concurrency(direct_read_concurrency)
+        .with_target_partitions(target_partitions);
+        if trust_sort_order {
+            scan = scan.with_trust_sort_order(true);
+        }
+        if let Some(sid) = snapshot_id {
+            scan = scan.with_snapshot_id(sid);
+        }
+        scan
+    }
+
     /// Create a copy of this scan with additional dynamic filters pushed down
     /// from parent operators (e.g., `HashJoinExec` build-side bounds).
     ///

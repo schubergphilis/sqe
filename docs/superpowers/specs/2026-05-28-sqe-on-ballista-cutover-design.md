@@ -64,6 +64,34 @@ SQE Worker process(es) = ballista Executor
   - codecs rehydrate IcebergTableScan from the catalog (executor-side creds)
 ```
 
+### Codec target correction (found in Phase 2)
+
+The PoC codecs target **iceberg-datafusion's** `IcebergTableProvider` /
+`IcebergTableScan`. The real coordinator plan does **not** contain those.
+SQE registers its own `SqeCatalogProvider` (`sqe-catalog`), whose tables are
+`SqeTableProvider`, and whose `scan()` returns SQE's own `IcebergScanExec`
+(`crates/sqe-catalog/src/iceberg_scan.rs`). That node carries features the
+upstream node lacks: pushed-down dynamic filters, late materialization,
+small-file handling, manifest/direct-read concurrency, cached statistics,
+policy integration. Converging SQE's scan onto the upstream node would
+forfeit those, so the production codecs **target SQE's own nodes**:
+
+- Logical codec rehydrates `SqeTableProvider` via the registered
+  `SqeCatalogProvider` (`schema(ns).table(name)`), same reference-encode /
+  catalog-reload pattern the PoC proved.
+- Physical codec encodes `(namespace, table, snapshot_id, projection,
+  predicate, output schema, config knobs)` and rebuilds `IcebergScanExec`
+  on the executor by reloading the `Table` from the `SessionCatalog`.
+  Needs a public reconstruct constructor on `IcebergScanExec`
+  (`from_codec_parts`-style), the sqe-catalog analogue of the
+  iceberg-datafusion D2 patch.
+
+`IcebergScanExec.table: iceberg::Table` is not serializable (holds
+`FileIO`, S3 creds), confirming the reload-from-catalog approach. Dynamic
+`pushed_down_filters` are runtime-only and are NOT serialized (ledger D6).
+The PoC's iceberg-datafusion codecs stay in the crate as the upstream-PR
+reference (D1) but are not on SQE's hot path.
+
 ### New crate: `sqe-ballista`
 
 Promote the PoC crate `sqe-ballista-poc` into a real integration crate
