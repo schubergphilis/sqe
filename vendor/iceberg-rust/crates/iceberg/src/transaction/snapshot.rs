@@ -35,8 +35,8 @@ use crate::spec::{
 };
 use crate::table::Table;
 use crate::transaction::{ActionCommit, ManifestFilterManager, ManifestWriterContext};
-use crate::utils::bin::ListPacker;
-use crate::utils::load_manifests;
+use crate::util::bin::ListPacker;
+use crate::util::load_manifests;
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 const META_ROOT_PATH: &str = "metadata";
@@ -957,7 +957,7 @@ partition_struct: {:?}, partition_type: {:?}",
             let loaded_manifests = load_manifests(
                 table.file_io(),
                 manifest_files,
-                crate::utils::DEFAULT_LOAD_CONCURRENCY_LIMIT,
+                crate::util::DEFAULT_LOAD_CONCURRENCY_LIMIT,
             )
             .await?;
 
@@ -1098,7 +1098,7 @@ impl MergeManifestManager {
         let loaded = load_manifests(
             &file_io,
             manifest_bin,
-            crate::utils::DEFAULT_LOAD_CONCURRENCY_LIMIT,
+            crate::util::DEFAULT_LOAD_CONCURRENCY_LIMIT,
         )
         .await?;
 

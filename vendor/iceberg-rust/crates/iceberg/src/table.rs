@@ -25,7 +25,7 @@ use crate::io::FileIO;
 use crate::io::object_cache::ObjectCache;
 use crate::scan::TableScanBuilder;
 use crate::spec::{SchemaRef, TableMetadata, TableMetadataRef};
-use crate::utils::{DEFAULT_DELETE_CONCURRENCY_LIMIT, ReachableFileCleanupStrategy};
+use crate::util::{DEFAULT_DELETE_CONCURRENCY_LIMIT, ReachableFileCleanupStrategy};
 use crate::{Error, ErrorKind, Result, TableIdent};
 
 /// Builder to create table scan.
