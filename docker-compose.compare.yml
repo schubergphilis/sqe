@@ -11,7 +11,6 @@ services:
   sqe:
     build:
       context: .
-      target: coordinator
     ports:
       - "60051:50051"   # Flight SQL
       - "28080:8080"    # Trino HTTP compat
