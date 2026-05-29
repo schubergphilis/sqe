@@ -516,6 +516,72 @@ pub async fn create_session_context(
     Ok(result)
 }
 
+/// Pick the `CatalogConfig` to clone as the template for a discovered
+/// warehouse: the configured default catalog (`query.default_catalog`) if it
+/// names a REST catalog, else the first flattened REST catalog. Returns
+/// `None` when no REST catalog is configured (discovery only targets Polaris/
+/// REST). Only `warehouse` differs on the clone; `catalog_url` + `auth` +
+/// backend are inherited.
+pub(crate) fn discovery_template(config: &SqeConfig) -> Option<sqe_core::config::CatalogConfig> {
+    let flattened = config.flattened_catalogs();
+    let pick = config
+        .query
+        .default_catalog
+        .as_deref()
+        .and_then(|name| flattened.iter().find(|(n, _)| n == name))
+        .or_else(|| {
+            flattened
+                .iter()
+                .find(|(_, c)| matches!(c.backend, sqe_core::config::CatalogBackend::Rest))
+        })
+        .or_else(|| flattened.first());
+    pick.map(|(_, c)| (*c).clone())
+        .filter(|c| matches!(c.backend, sqe_core::config::CatalogBackend::Rest))
+}
+
+/// Attempt to resolve `warehouse` as a Polaris catalog and build its
+/// `SqeCatalogProvider` using the discovery template + the caller's bearer.
+/// Returns `Ok(None)` (not an error) when discovery is off, no template
+/// exists, or Polaris rejects the warehouse (unauthorized / nonexistent) --
+/// the caller turns `None` into the existing "unknown catalog" error so an
+/// unauthorized warehouse is indistinguishable from a missing one.
+pub(crate) async fn discover_catalog_provider(
+    warehouse: &str,
+    config: &SqeConfig,
+    session: &Session,
+    table_cache: Option<&TableMetadataCache>,
+    policy_store: Option<&Arc<dyn PolicyStore>>,
+    prom_metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
+) -> Option<SqeCatalogProvider> {
+    if config.query.catalog_discovery != sqe_core::config::CatalogDiscovery::PolarisAuto {
+        return None;
+    }
+    let mut cfg = discovery_template(config)?;
+    cfg.warehouse = warehouse.to_string();
+
+    match build_catalog_provider(
+        &cfg,
+        session,
+        &config.storage,
+        config.storage.prefetch_concurrency,
+        table_cache,
+        policy_store,
+        prom_metrics,
+    )
+    .await
+    {
+        Ok((provider, _)) => Some(provider),
+        Err(e) => {
+            tracing::info!(
+                warehouse,
+                error = %e,
+                "catalog discovery: Polaris did not resolve warehouse (treated as unknown catalog)"
+            );
+            None
+        }
+    }
+}
+
 /// Invalidate the cached SessionContext for a specific user.
 ///
 /// Because cache keys are now `username:token_hash`, we iterate and remove all
@@ -564,4 +630,55 @@ pub async fn invalidate_all_session_caches() {
     SESSION_CONTEXT_CACHE.invalidate_all();
     SESSION_CONTEXT_CACHE.run_pending_tasks().await;
     debug!("All SessionContext caches invalidated");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config_rest() -> SqeConfig {
+        let toml_text = r#"
+[coordinator]
+flight_sql_port = 0
+trino_http_port = 0
+
+[auth]
+token_endpoint = "http://127.0.0.1:9/unused"
+client_id = "test_client"
+
+[catalog]
+catalog_url = "https://polaris.example.com"
+warehouse = "original_wh"
+
+[storage]
+s3_endpoint = "http://127.0.0.1:9"
+s3_access_key = "_"
+s3_secret_key = "_"
+s3_region = "us-east-1"
+s3_path_style = true
+"#;
+        toml::from_str::<SqeConfig>(toml_text).expect("test config parses")
+    }
+
+    #[test]
+    fn discovery_template_returns_rest_catalog_and_warehouse_override_works() {
+        let config = test_config_rest();
+
+        let tmpl = discovery_template(&config);
+        assert!(tmpl.is_some(), "expected Some for a REST catalog config");
+
+        let tmpl = tmpl.unwrap();
+        assert_eq!(tmpl.catalog_url, "https://polaris.example.com");
+        assert_eq!(tmpl.warehouse, "original_wh");
+
+        // Callers override only `warehouse`; everything else is inherited.
+        let mut cloned = tmpl.clone();
+        cloned.warehouse = "discovered_wh".to_string();
+        assert_eq!(cloned.warehouse, "discovered_wh");
+        assert_eq!(cloned.catalog_url, "https://polaris.example.com");
+        assert!(matches!(
+            cloned.backend,
+            sqe_core::config::CatalogBackend::Rest
+        ));
+    }
 }
