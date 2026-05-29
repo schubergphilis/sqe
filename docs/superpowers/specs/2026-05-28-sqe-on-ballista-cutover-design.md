@@ -387,16 +387,76 @@ upstream improvement. Appended as we build.
   config. Verified empirically: client `bearer_len=630`, executor
   `bearer_len=0`.
 
+## End goal + plumbing-reduction gates
+
+**North Star (user, 2026-05-29):** reduce SQE's bespoke plumbing by leaning
+on ballista where possible — **without losing functionality or speed.** Both
+halves are hard constraints, and they shape what the cutover is allowed to do.
+
+**What never moves (engine-agnostic, above the execution seam).** The product
+surface is coordinator-side and independent of the execution engine. It is
+*never* a candidate for "reduce plumbing via ballista":
+- Multi-protocol frontends: Flight SQL, Trino HTTP (`sqe-trino-compat`),
+  Quack/DuckDB (`sqe-quack-server`, HTTP `POST /quack`).
+- Security: OIDC auth (`sqe-auth`) + policy rewrite (OPA/Cedar, column masks,
+  row filters) applied to the LogicalPlan *before* the engine branch.
+- Pluggable catalog backends (`CatalogKind`: IcebergRest, Glue, S3Tables, HMS,
+  SQLite; JDBC/Hadoop stubbed) via `sqe-catalog/mount.rs`.
+
+The engine (bespoke or ballista) only ever receives an already-secured,
+already-planned fragment and reloads tables by identifier. It sees no protocol
+and makes no auth/policy decision.
+
+**The plumbing that *could* be reduced** is only the distributed-execution
+layer (~11.5K LOC): `distributed_scan`, `shuffle`, `stage_planner`,
+`distributed_join|sort|aggregate`, `worker_registry`, `heartbeat`,
+`channel_pool`, `credential_refresh`.
+
+**Why it can't be reduced today.** Ballista's scheduler and executor are one
+runtime — the scheduler drives executors over ballista's task-gRPC + shuffle
+protocol, bridged by the codec. There is no seam to borrow ballista's
+orchestration while keeping bespoke execution; adopting the cheap half
+requires the expensive half. And measured today (D9), the expensive half
+loses **both** constraints at once: speed (TPC-H ~2.2x slower, TPC-DS hangs)
+and functionality (per-user security does not reach distributed executors,
+D8). So "use ballista where possible" on the distributed hot path = nowhere,
+today, without breaking the North Star.
+
+**The reduction is therefore a gated destination, not a switch.** Each gate is
+an upstream contribution; the divergence ledger doubles as the backlog. The
+~11.5K bespoke LOC are deleted only after all gates pass on a fair benchmark:
+
+| Gate | Unlocks | Blocking work |
+|---|---|---|
+| **G1 robustness** | ballista completes complex queries (no hang) | **D4** non-blocking / async codec decode (overlaps Phase 4b) |
+| **G2 speed** | ballista within an agreed band of bespoke (e.g. ≤1.2x) on a RELEASE build across SEPARATE worker machines | shuffle/serialization + per-task overhead; fair bench (Phase 5b) |
+| **G3 functionality** | per-user identity (bearer + STS) reaches distributed executors, honoring the no-service-account model | **4b** plan-node bearer threading + **D3** per-task credential hook |
+| **G4 soak** | ballista default for a soak period, no regressions | flip default; observe |
+
+Only after G1-G4 do the bespoke distributed files get deleted — that is when
+the plumbing reduction is banked *without* losing speed or functionality.
+Until then: bespoke is the default engine, ballista is optional behind the
+`[query] engine` flag (cheap insurance, already built), nothing is deleted.
+Doing the contribution work (D4, D8, D1/D2, D3) is precisely how each gate is
+earned; it is the path to the end goal, not a detour from it.
+
 ## Rollback
 
 The `engine = "legacy"` config switch keeps the bespoke path runnable
 through Phase 5. If ballista mode fails parity or perf gates, flip back to
 legacy with zero code change. Phase 6 (deletion) only happens after the
-gate passes and ballista mode has been default for a soak period.
+gates above (G1-G4) pass and ballista mode has been default for a soak period.
 
 ## Success criteria
 
 1. TPC-H/DS/SSB correctness parity 100% in ballista mode (SF0.1 + SF1).
-2. Perf within agreed band of the distributed baseline (12.0s SF1 TPC-H).
-3. The 17 bespoke files deleted; net LOC down ~10K.
-4. Divergence ledger complete; upstream PRs filed for D1/D2 at minimum.
+   **Status:** TPC-H 22/22 (SF0.1+SF1); TPC-DS/SSB blocked on G1 (D4 hang).
+2. Perf within agreed band of bespoke on a fair release/multi-node bench
+   (gate G2). **Status:** not met — TPC-H ~2.2x slower on the shared-box
+   debug cluster; fair bench is Phase 5b.
+3. The bespoke distributed files deleted; net LOC down ~10K. **Gated on
+   G1-G4** (see "End goal + plumbing-reduction gates"); not done, not before
+   the gates pass. This is the *payoff* of the end goal, deferred until
+   earned.
+4. Divergence ledger complete; upstream PRs filed (D8 + D1/D2 are the
+   smallest; D4 is the keystone). On request.
