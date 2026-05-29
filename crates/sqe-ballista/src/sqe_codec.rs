@@ -42,6 +42,9 @@ use datafusion::sql::TableReference;
 use datafusion_proto::logical_plan::LogicalExtensionCodec;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use iceberg::expr::Predicate;
+use iceberg::io::{FileIO, FileIOBuilder};
+use iceberg::spec::TableMetadata;
+use iceberg::table::Table;
 use iceberg::{NamespaceIdent, TableIdent};
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -164,6 +167,18 @@ struct EncodedSqeScan {
     trust_sort_order: bool,
     /// Output (already-projected) Arrow schema, datafusion-proto bytes.
     schema_proto: Vec<u8>,
+    /// Serialized `iceberg::spec::TableMetadata` (JSON). Carrying it lets the
+    /// executor rebuild the `Table` synchronously at decode instead of an
+    /// async catalog round-trip per scan task (cutover design D4 — the per-task
+    /// `block_on` in decode starved the executor runtime under concurrent
+    /// multi-stage plans and hung TPC-DS). Empty = legacy/compat: fall back to
+    /// reloading from the catalog (the old blocking path).
+    #[serde(default)]
+    metadata_json: Vec<u8>,
+    /// Table metadata file location (e.g. `s3://.../metadata/v3.json`). Used to
+    /// infer the FileIO scheme on decode, and passed to the rebuilt `Table`.
+    #[serde(default)]
+    metadata_location: Option<String>,
 }
 
 /// Physical codec that rehydrates [`IcebergScanExec`] on the executor by
@@ -271,6 +286,12 @@ impl PhysicalExtensionCodec for SqePhysicalCodec {
             .try_into()
             .map_err(|e| DataFusionError::Internal(format!("schema encode: {e}")))?;
 
+        // Serialize the table metadata so the executor can rebuild the `Table`
+        // synchronously at decode (D4), avoiding a per-task catalog round-trip.
+        let metadata_json = serde_json::to_vec(scan.table().metadata())
+            .map_err(|e| DataFusionError::Internal(format!("table metadata encode: {e}")))?;
+        let metadata_location = scan.table().metadata_location().map(|s| s.to_string());
+
         let encoded = EncodedSqeScan {
             namespace: ident.namespace().clone().inner(),
             table: ident.name().to_string(),
@@ -283,6 +304,8 @@ impl PhysicalExtensionCodec for SqePhysicalCodec {
             target_partitions: scan.target_partitions(),
             trust_sort_order: scan.trust_sort_order(),
             schema_proto: schema_proto.encode_to_vec(),
+            metadata_json,
+            metadata_location,
         };
 
         let bytes = serde_json::to_vec(&encoded)
@@ -320,17 +343,38 @@ impl PhysicalExtensionCodec for SqePhysicalCodec {
             .map_err(|e| DataFusionError::Internal(format!("bad namespace: {e}")))?;
         let ident = TableIdent::new(namespace, encoded.table);
 
-        // Reload the table from the catalog on the executor — this is where
-        // the per-user (or fallback) vended credentials apply. block_in_place
-        // + current Handle so the tokio reactor keeps driving the REST calls
-        // (per-user catalog build + load_table).
-        let table = block_on_in_runtime(async move {
-            let catalog = self.resolve_catalog(ctx).await?;
-            catalog
-                .load_table(&ident)
-                .await
-                .map_err(|e| DataFusionError::Internal(format!("load_table on executor: {e}")))
-        })?;
+        // D4: rebuild the `Table` synchronously from the serialized metadata +
+        // a FileIO built from static storage config. No catalog round-trip, no
+        // `block_on` -> decode is pure CPU and cannot starve the executor's
+        // tokio runtime under concurrent multi-stage task decodes.
+        //
+        // Empty `metadata_json` is the legacy/compat path (plans from an older
+        // encoder, or the per-user seam Phase 4b extends): fall back to the
+        // catalog reload, which blocks. New encoders always populate it, so the
+        // blocking branch is not hit on the hot path.
+        let table = if encoded.metadata_json.is_empty() {
+            block_on_in_runtime(async move {
+                let catalog = self.resolve_catalog(ctx).await?;
+                catalog
+                    .load_table(&ident)
+                    .await
+                    .map_err(|e| DataFusionError::Internal(format!("load_table on executor: {e}")))
+            })?
+        } else {
+            let metadata: TableMetadata = serde_json::from_slice(&encoded.metadata_json)
+                .map_err(|e| DataFusionError::Internal(format!("table metadata decode: {e}")))?;
+            let file_io = build_file_io(&self.storage, encoded.metadata_location.as_deref())?;
+            let mut builder = Table::builder()
+                .identifier(ident)
+                .metadata(Arc::new(metadata))
+                .file_io(file_io);
+            if let Some(loc) = &encoded.metadata_location {
+                builder = builder.metadata_location(loc.clone());
+            }
+            builder
+                .build()
+                .map_err(|e| DataFusionError::Internal(format!("rebuild table on executor: {e}")))?
+        };
 
         let scan = IcebergScanExec::from_codec_parts(
             table,
@@ -346,6 +390,45 @@ impl PhysicalExtensionCodec for SqePhysicalCodec {
         );
         Ok(Arc::new(scan))
     }
+}
+
+/// Build a synchronous `FileIO` from static S3 storage config, mirroring the
+/// `s3.*` props the per-session REST catalog injects (see `rest_catalog.rs`).
+/// Used on the executor to rebuild a `Table` without a catalog round-trip (D4).
+/// Single-tenant / service-principal creds only; per-user vended creds are
+/// Phase 4b (threaded through the plan bytes, fed into these props).
+fn build_file_io(storage: &StorageConfig, metadata_location: Option<&str>) -> DFResult<FileIO> {
+    let mut props: HashMap<String, String> = HashMap::new();
+    if !storage.s3_endpoint.is_empty() {
+        props.insert("s3.endpoint".to_string(), storage.s3_endpoint.clone());
+    }
+    if !storage.s3_region.is_empty() {
+        props.insert("s3.region".to_string(), storage.s3_region.clone());
+    }
+    if !storage.s3_access_key.is_empty() {
+        props.insert("s3.access-key-id".to_string(), storage.s3_access_key.clone());
+    }
+    if !storage.s3_secret_key.is_empty() {
+        props.insert(
+            "s3.secret-access-key".to_string(),
+            storage.s3_secret_key.expose().to_string(),
+        );
+    }
+    if storage.s3_path_style {
+        props.insert("s3.path-style-access".to_string(), "true".to_string());
+    }
+
+    // Prefer inferring the scheme from the metadata location (matches the way
+    // iceberg-rust's RestCatalog builds FileIO); fall back to plain "s3".
+    let builder = match metadata_location {
+        Some(loc) => FileIO::from_path(loc)
+            .map_err(|e| DataFusionError::Internal(format!("file_io from_path: {e}")))?,
+        None => FileIOBuilder::new("s3"),
+    };
+    builder
+        .with_props(props)
+        .build()
+        .map_err(|e| DataFusionError::Internal(format!("build executor file_io: {e}")))
 }
 
 #[cfg(test)]
@@ -377,6 +460,10 @@ mod tests {
             target_partitions: 4,
             trust_sort_order: true,
             schema_proto: vec![9, 8, 7],
+            metadata_json: vec![123, 34, 102, 111, 114, 109, 97, 116, 34, 125],
+            metadata_location: Some(
+                "s3://warehouse/tpch_sf0_1/lineitem/metadata/00003.metadata.json".to_string(),
+            ),
         };
 
         let bytes = serde_json::to_vec(&original).expect("encode");
@@ -399,5 +486,7 @@ mod tests {
         assert_eq!(decoded.target_partitions, original.target_partitions);
         assert_eq!(decoded.trust_sort_order, original.trust_sort_order);
         assert_eq!(decoded.schema_proto, original.schema_proto);
+        assert_eq!(decoded.metadata_json, original.metadata_json);
+        assert_eq!(decoded.metadata_location, original.metadata_location);
     }
 }
