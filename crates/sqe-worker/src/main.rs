@@ -52,6 +52,18 @@ async fn main() -> anyhow::Result<()> {
             concurrent_tasks: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4),
+            // Bound the executor's DataFusion memory pool. Default 4 GiB;
+            // override via SQE_BALLISTA_EXECUTOR_MEM_GB. Unbounded executors
+            // co-located on one box OOM under sustained shuffle workloads.
+            memory_pool_bytes: Some(
+                std::env::var("SQE_BALLISTA_EXECUTOR_MEM_GB")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(4)
+                    * 1024
+                    * 1024
+                    * 1024,
+            ),
         };
         tracing::info!(
             flight_port,

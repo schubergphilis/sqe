@@ -39,6 +39,7 @@ iceberg-datafusion = { workspace = true }
 sqe-catalog = { path = "../sqe-catalog" }
 sqe-core = { path = "../sqe-core" }
 sqe-auth = { path = "../sqe-auth" }
+sqe-trino-functions = { path = "../sqe-trino-functions" }
 
 [lib]
 name = "sqe_ballista"
