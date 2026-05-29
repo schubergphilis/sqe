@@ -459,7 +459,51 @@ pub fn build_s3_store(
     if storage.s3_path_style {
         builder = builder.with_virtual_hosted_style_request(false);
     }
-    if storage.s3_allow_http {
+    // Allow plain HTTP when the operator opted in OR when the effective
+    // endpoint is itself an `http://` URL. The table-scan path
+    // (sqe-coordinator `query_handler`) already derives allow_http from the
+    // endpoint scheme; deriving it here too keeps the file-reader TVFs
+    // consistent — otherwise an `http://` endpoint without `s3_allow_http=true`
+    // fails at object_store construction with a bare "builder error".
+    if storage.s3_allow_http || endpoint.starts_with("http://") {
+        builder = builder.with_allow_http(true);
+    }
+    builder
+        .build()
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
+}
+
+/// Build an [`object_store::aws::AmazonS3`] for `bucket` from the
+/// coordinator-wide [`StorageConfig`] alone (no inline TVF arg overrides).
+///
+/// Used by the lazy object-store registry
+/// ([`crate::lazy_object_store::LazyHttpObjectStoreRegistry::with_s3_fallback`])
+/// to resolve `s3://` buckets that file-reader TVFs reference at execution time
+/// but that were never pre-registered as Iceberg catalogs. Mirrors the builder
+/// configuration of [`build_s3_store`], including the endpoint-derived
+/// `allow_http` behaviour.
+pub fn build_s3_store_for_bucket(
+    bucket: &str,
+    storage: &StorageConfig,
+) -> DFResult<object_store::aws::AmazonS3> {
+    let mut builder = AmazonS3Builder::new().with_bucket_name(bucket);
+    if !storage.s3_access_key.is_empty() {
+        builder = builder.with_access_key_id(storage.s3_access_key.as_str());
+    }
+    let secret = storage.s3_secret_key.expose();
+    if !secret.is_empty() {
+        builder = builder.with_secret_access_key(secret);
+    }
+    if !storage.s3_endpoint.is_empty() {
+        builder = builder.with_endpoint(storage.s3_endpoint.as_str());
+    }
+    if !storage.s3_region.is_empty() {
+        builder = builder.with_region(storage.s3_region.as_str());
+    }
+    if storage.s3_path_style {
+        builder = builder.with_virtual_hosted_style_request(false);
+    }
+    if storage.s3_allow_http || storage.s3_endpoint.starts_with("http://") {
         builder = builder.with_allow_http(true);
     }
     builder

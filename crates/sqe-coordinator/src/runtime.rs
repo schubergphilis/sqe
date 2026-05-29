@@ -12,7 +12,7 @@ use datafusion::execution::memory_pool::FairSpillPool;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use tracing::info;
 
-use sqe_core::config::CoordinatorConfig;
+use sqe_core::config::{CoordinatorConfig, StorageConfig};
 use sqe_core::parse_memory_limit;
 
 /// Build a DataFusion [`RuntimeEnv`] for the coordinator with memory limits
@@ -24,7 +24,15 @@ use sqe_core::parse_memory_limit;
 ///   `RuntimeEnvBuilder::with_temp_file_path`.
 /// - When `spill_to_disk` is `false`, the disk manager is disabled via
 ///   `DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled)`.
-pub fn build_coordinator_runtime(config: &CoordinatorConfig) -> anyhow::Result<Arc<RuntimeEnv>> {
+///
+/// `storage` is the coordinator-wide `[storage]` block; it is handed to the
+/// object-store registry so file-reader TVFs (`read_csv` / `read_parquet`) can
+/// lazily build `s3://` stores for ad-hoc buckets that were never
+/// pre-registered as Iceberg catalogs.
+pub fn build_coordinator_runtime(
+    config: &CoordinatorConfig,
+    storage: &StorageConfig,
+) -> anyhow::Result<Arc<RuntimeEnv>> {
     let memory_bytes = parse_memory_limit(&config.memory_limit).map_err(|e| {
         anyhow::anyhow!(
             "Invalid coordinator memory_limit '{}': {e}",
@@ -47,11 +55,16 @@ pub fn build_coordinator_runtime(config: &CoordinatorConfig) -> anyhow::Result<A
 
     // V10 httpfs: wrap the default ObjectStoreRegistry so http(s) URLs in
     // file-format TVFs (read_csv / read_json / read_parquet) get a backing
-    // HttpStore built lazily on first request. S3 / file paths use the
-    // default registry's existing path.
-    let registry = Arc::new(sqe_catalog::lazy_object_store::LazyHttpObjectStoreRegistry::new(
-        datafusion::execution::object_store::DefaultObjectStoreRegistry::new(),
-    ));
+    // HttpStore built lazily on first request. `with_s3_fallback` additionally
+    // builds `s3://` stores from the coordinator `[storage]` config on demand,
+    // so the same TVFs can read ad-hoc S3 buckets that were never
+    // pre-registered as Iceberg catalogs. `file` paths use the default
+    // registry's existing path.
+    let registry =
+        Arc::new(sqe_catalog::lazy_object_store::LazyHttpObjectStoreRegistry::with_s3_fallback(
+            datafusion::execution::object_store::DefaultObjectStoreRegistry::new(),
+            storage.clone(),
+        ));
     let mut builder = RuntimeEnvBuilder::new()
         .with_memory_pool(memory_pool)
         .with_object_store_registry(registry);
@@ -95,7 +108,7 @@ mod tests {
     #[test]
     fn test_default_memory_limit_applied() {
         let config = config_no_spill("8GB");
-        let runtime = build_coordinator_runtime(&config).expect("should build");
+        let runtime = build_coordinator_runtime(&config, &StorageConfig::default()).expect("should build");
 
         // 8GB = 8 * 1024^3 = 8_589_934_592 bytes
         let expected_bytes = 8 * 1024 * 1024 * 1024;
@@ -108,7 +121,7 @@ mod tests {
     #[test]
     fn test_custom_memory_limit_512mb() {
         let config = config_no_spill("512MB");
-        let runtime = build_coordinator_runtime(&config).expect("should build with 512MB limit");
+        let runtime = build_coordinator_runtime(&config, &StorageConfig::default()).expect("should build with 512MB limit");
 
         let expected_bytes = 512 * 1024 * 1024;
         match runtime.memory_pool.memory_limit() {
@@ -120,7 +133,7 @@ mod tests {
     #[test]
     fn test_spill_disabled() {
         let config = config_no_spill("1GB");
-        let runtime = build_coordinator_runtime(&config).expect("should build with spill disabled");
+        let runtime = build_coordinator_runtime(&config, &StorageConfig::default()).expect("should build with spill disabled");
 
         assert!(
             !runtime.disk_manager.tmp_files_enabled(),
@@ -141,7 +154,7 @@ mod tests {
             ..config_no_spill("1GB")
         };
         let runtime =
-            build_coordinator_runtime(&config).expect("should build with spill enabled");
+            build_coordinator_runtime(&config, &StorageConfig::default()).expect("should build with spill enabled");
 
         assert!(
             runtime.disk_manager.tmp_files_enabled(),
@@ -156,7 +169,7 @@ mod tests {
     #[test]
     fn test_invalid_memory_limit_errors() {
         let config = config_no_spill("not_a_number");
-        let result = build_coordinator_runtime(&config);
+        let result = build_coordinator_runtime(&config, &StorageConfig::default());
         assert!(result.is_err(), "Should error on invalid memory limit");
     }
 }
