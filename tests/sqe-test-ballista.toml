@@ -12,7 +12,7 @@ trino_http_port = 18080
 # back to the pool between queries, so we need extra headroom to absorb
 # cumulative retention across a benchmark sweep. Raising the cap buys time
 # until that's fixed.
-memory_limit = "64GB"
+memory_limit = "8GB"
 spill_to_disk = true
 spill_dir = "/tmp/sqe-bench-spill"
 spill_compression = "lz4"
@@ -37,7 +37,7 @@ max_result_rows = 10_000_000
 # Per-query memory cap. Sized for SF100 TPC-H hash joins; SF1 queries
 # never approach this. Operators can tighten via config if running on
 # a smaller host.
-max_query_memory = "32GB"
+max_query_memory = "4GB"
 # Per-user memory budget (introduced in 382d8d0). Disabled here because
 # the test stack is single-tenant and max_query_memory (32GB) exceeds the
 # default 1GB cap on every query.

@@ -7034,6 +7034,7 @@ dependencies = [
  "sqe-auth",
  "sqe-catalog",
  "sqe-core",
+ "sqe-trino-functions",
  "tokio",
  "tracing",
  "tracing-subscriber",
