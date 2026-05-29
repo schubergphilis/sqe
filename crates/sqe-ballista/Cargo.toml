@@ -14,6 +14,8 @@ publish = false
 [dependencies]
 ballista = "53.0.0"
 ballista-core = "53.0.0"
+ballista-executor = "53.0.0"
+ballista-scheduler = "53.0.0"
 datafusion = { workspace = true }
 arrow = { workspace = true }
 tokio = { workspace = true }
@@ -36,6 +38,7 @@ iceberg-datafusion = { workspace = true }
 # IcebergScanExec (not iceberg-datafusion's nodes). See the cutover design.
 sqe-catalog = { path = "../sqe-catalog" }
 sqe-core = { path = "../sqe-core" }
+sqe-auth = { path = "../sqe-auth" }
 
 [lib]
 name = "sqe_ballista"
