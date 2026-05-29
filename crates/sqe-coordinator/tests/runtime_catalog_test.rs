@@ -45,7 +45,7 @@ async fn attach_then_list_returns_name() {
         .await
         .expect("first attach succeeds");
 
-    assert_eq!(registry.list(), vec!["foo".to_string()]);
+    assert_eq!(registry.list().unwrap(), vec!["foo".to_string()]);
 }
 
 #[tokio::test]
@@ -68,7 +68,7 @@ async fn attach_duplicate_name_errors() {
         "expected duplicate-name error, got: {err}"
     );
     // Registry state must not have changed.
-    assert_eq!(registry.list(), vec!["foo".to_string()]);
+    assert_eq!(registry.list().unwrap(), vec!["foo".to_string()]);
 }
 
 #[tokio::test]
@@ -96,14 +96,14 @@ async fn detach_then_attach_again_works() {
         .expect("first attach succeeds");
 
     registry.detach("foo").expect("first detach succeeds");
-    assert!(registry.list().is_empty());
+    assert!(registry.list().unwrap().is_empty());
 
     registry
         .attach(&sqlite_attach("foo", &dir), &secrets)
         .await
         .expect("re-attach after detach should succeed");
 
-    assert_eq!(registry.list(), vec!["foo".to_string()]);
+    assert_eq!(registry.list().unwrap(), vec!["foo".to_string()]);
 }
 
 #[tokio::test]
@@ -137,7 +137,7 @@ async fn referenced_secrets_lists_consumers() {
         .await
         .expect("attach cat_b");
 
-    let mut consumers = registry.referenced_secrets("shared_creds");
+    let mut consumers = registry.referenced_secrets("shared_creds").unwrap();
     consumers.sort();
     assert_eq!(
         consumers,
@@ -158,8 +158,8 @@ async fn referenced_secrets_empty_when_no_consumers() {
         .await
         .expect("attach without secret");
 
-    assert!(registry.referenced_secrets("anything").is_empty());
-    assert!(registry.referenced_secrets("plain").is_empty());
+    assert!(registry.referenced_secrets("anything").unwrap().is_empty());
+    assert!(registry.referenced_secrets("plain").unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -169,7 +169,7 @@ async fn providers_returns_attached_catalogs() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     assert!(
-        registry.providers().is_empty(),
+        registry.providers().unwrap().is_empty(),
         "fresh registry should expose no providers"
     );
 
@@ -178,7 +178,7 @@ async fn providers_returns_attached_catalogs() {
         .await
         .expect("attach succeeds");
 
-    let providers = registry.providers();
+    let providers = registry.providers().unwrap();
     assert_eq!(providers.len(), 1, "one catalog attached");
     assert_eq!(providers[0].0, "foo");
     // The default fresh SQLite catalog has no namespaces, so
