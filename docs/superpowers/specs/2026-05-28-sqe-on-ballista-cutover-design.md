@@ -186,7 +186,29 @@ else is "wire ballista in, delete the old path".
   expected to show at SF1+ (Phase 5). Endpoints via env
   `SQE_BALLISTA_SCHEDULER_HOST/PORT`, `SQE_BALLISTA_EXECUTOR_HOST/GRPC_PORT`.
 - **Phase 4 — credential passthrough + refresh on the ballista path.**
-  Per-query bearer install (config producer) + STS refresh hook (D3).
+  **PARTIAL — infra in place, per-user passthrough blocked by ballista D8.**
+  Built: `auth_ext::SqeAuthOptions` config extension, executor-side
+  `SqePhysicalCodec::resolve_catalog` (mints + caches a per-user
+  `SessionCatalog` from the bearer, falls back to the single-tenant config
+  catalog when absent), config producers that register the extension on
+  scheduler + executor, and `submit_remote` stamping the user bearer.
+  **Found during validation:** the bearer does NOT reach the executor.
+  Ballista propagates session settings via `ConfigOptions::entries()` ->
+  `set()`, but DataFusion emits `ConfigExtension` entries *unprefixed*
+  ("bearer", not "sqe_auth.bearer") and the receiving `set()` can't route an
+  unprefixed key back to the extension, so it is silently dropped (ledger
+  D8). The executor falls back to single-tenant, which **equals legacy
+  parity** (the legacy distributed path also used static `[storage]` creds).
+  Per-user passthrough is an enhancement *beyond* legacy and is deferred to a
+  designed follow-up: thread the bearer through the plan node
+  (`SqeLogicalCodec` encodes it on the client -> scheduler stamps it on the
+  rehydrated `SqeTableProvider` -> `IcebergScanExec` -> `EncodedSqeScan`
+  physical bytes -> executor `resolve_catalog`), bypassing ballista session
+  propagation entirely. The single-principal test stack ("all users share a
+  single service token") cannot validate true multi-tenancy regardless. STS
+  refresh: largely obviated by reload-per-task (each task mints fresh vended
+  creds at load_table); true mid-task refresh for very long tasks remains a
+  deferred edge case (D3).
 - **Phase 5 — parity + perf.** Run TPC-H / TPC-DS / SSB at SF0.1 then SF1
   in ballista mode; compare against committed baselines
   (`tpch-sf1-flight-2026-04-06T20:57:10.json`, distributed 22/22 12.0s).
@@ -247,6 +269,21 @@ upstream improvement. Appended as we build.
   dynamic-filter transport. *Upstream:* a ballista physical node + codec for
   dynamic-filter propagation between stages. Measure the perf delta in
   Phase 5; implement transport as a follow-up only if material.
+- **D7 — bearer in session config (trace-log risk).** The per-query bearer
+  was to ride in a session-config value; ballista logs config keys at
+  `trace`. Mitigation: keep cluster traffic internal, no `trace` in prod.
+  Superseded in practice by D8 (the value doesn't propagate anyway).
+- **D8 — ballista does not round-trip DataFusion `ConfigExtension` values.**
+  `ConfigOptions::entries()` emits extension entries *unprefixed* (DataFusion:
+  "The prefix is not used for extensions"), so ballista ships key `bearer`,
+  and the peer's `ConfigOptions::set("bearer", ..)` can't route it back to the
+  `sqe_auth` extension -> silently dropped. *Why it matters:* blocks the
+  simplest per-query-secret passthrough. *Upstream:* ballista should prefix
+  extension keys in `to_key_value_pairs` (or DataFusion's extension
+  `entries()` should emit prefixed keys). *SQE workaround (designed, not yet
+  built):* thread the secret through the plan-node bytes instead of session
+  config. Verified empirically: client `bearer_len=630`, executor
+  `bearer_len=0`.
 
 ## Rollback
 

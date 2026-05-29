@@ -27,6 +27,7 @@
 //! Dynamic runtime filters are NOT serialized (cutover design D6); ballista
 //! runs joins itself for v1.
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -45,7 +46,9 @@ use iceberg::{NamespaceIdent, TableIdent};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use sqe_catalog::{IcebergScanExec, SessionCatalog};
+use sqe_core::config::{CatalogConfig, StorageConfig};
 
+use crate::auth_ext::SqeAuthOptions;
 use crate::block_on_in_runtime;
 
 /// Logical codec that resolves `SqeTableProvider`s against a
@@ -164,10 +167,23 @@ struct EncodedSqeScan {
 }
 
 /// Physical codec that rehydrates [`IcebergScanExec`] on the executor by
-/// reloading the table from the `SessionCatalog` and rebuilding the scan
-/// from the wire-encoded parts.
+/// reloading the table from a `SessionCatalog` and rebuilding the scan from
+/// the wire-encoded parts.
+///
+/// Per-query auth (Phase 4): if the task carries a `sqe_auth.bearer`
+/// (propagated via [`crate::auth_ext::SqeAuthOptions`]), the codec mints a
+/// per-user `SessionCatalog` from `cat_cfg` + `storage` with that bearer and
+/// reloads the table through it, so Polaris vends per-user S3 creds and
+/// enforces per-user access. Per-token catalogs are cached. With no bearer it
+/// falls back to the config-built `fallback` catalog (Phase 3 single-tenant).
 pub struct SqePhysicalCodec {
-    catalog: Arc<SessionCatalog>,
+    /// Config service-token catalog; used when no per-query bearer is present.
+    fallback: Arc<SessionCatalog>,
+    /// Catalog + storage config used to mint per-user `SessionCatalog`s.
+    cat_cfg: CatalogConfig,
+    storage: StorageConfig,
+    /// Per-user catalog cache keyed by a non-crypto hash of the bearer.
+    per_user: Arc<tokio::sync::Mutex<HashMap<u64, Arc<SessionCatalog>>>>,
     default: BallistaPhysicalExtensionCodec,
 }
 
@@ -178,11 +194,57 @@ impl Debug for SqePhysicalCodec {
 }
 
 impl SqePhysicalCodec {
-    pub fn new(catalog: Arc<SessionCatalog>) -> Self {
+    pub fn new(
+        fallback: Arc<SessionCatalog>,
+        cat_cfg: CatalogConfig,
+        storage: StorageConfig,
+    ) -> Self {
         Self {
-            catalog,
+            fallback,
+            cat_cfg,
+            storage,
+            per_user: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             default: BallistaPhysicalExtensionCodec::default(),
         }
+    }
+
+    /// Resolve the `SessionCatalog` to use for this task: a per-user one keyed
+    /// by the task's `sqe_auth.bearer`, or the fallback when none is present.
+    async fn resolve_catalog(&self, ctx: &TaskContext) -> DFResult<Arc<SessionCatalog>> {
+        let bearer = ctx
+            .session_config()
+            .options()
+            .extensions
+            .get::<SqeAuthOptions>()
+            .map(|o| o.bearer.clone())
+            .unwrap_or_default();
+
+        if bearer.is_empty() {
+            return Ok(self.fallback.clone());
+        }
+
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            bearer.hash(&mut h);
+            h.finish()
+        };
+
+        if let Some(existing) = self.per_user.lock().await.get(&key) {
+            return Ok(existing.clone());
+        }
+
+        let session_catalog = SessionCatalog::for_session_with(
+            &self.cat_cfg,
+            &self.storage,
+            None,
+            &bearer,
+        )
+        .await
+        .map_err(|e| DataFusionError::Internal(format!("per-user catalog on executor: {e}")))?;
+        let arc = Arc::new(session_catalog);
+        self.per_user.lock().await.insert(key, arc.clone());
+        Ok(arc)
     }
 }
 
@@ -254,11 +316,16 @@ impl PhysicalExtensionCodec for SqePhysicalCodec {
         let ident = TableIdent::new(namespace, encoded.table);
 
         // Reload the table from the catalog on the executor — this is where
-        // the executor's own vended credentials apply. block_in_place +
-        // current Handle so the tokio reactor keeps driving the REST call.
-        let catalog = self.catalog.clone();
-        let table = block_on_in_runtime(async move { catalog.load_table(&ident).await })
-            .map_err(|e| DataFusionError::Internal(format!("load_table on executor: {e}")))?;
+        // the per-user (or fallback) vended credentials apply. block_in_place
+        // + current Handle so the tokio reactor keeps driving the REST calls
+        // (per-user catalog build + load_table).
+        let table = block_on_in_runtime(async move {
+            let catalog = self.resolve_catalog(ctx).await?;
+            catalog
+                .load_table(&ident)
+                .await
+                .map_err(|e| DataFusionError::Internal(format!("load_table on executor: {e}")))
+        })?;
 
         let scan = IcebergScanExec::from_codec_parts(
             table,

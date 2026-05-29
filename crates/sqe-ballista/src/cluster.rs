@@ -42,10 +42,28 @@ use datafusion::catalog::CatalogProvider;
 use datafusion::execution::session_state::SessionState;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::SendableRecordBatchStream;
+use ballista_core::ConfigProducer;
 use sqe_catalog::{SessionCatalog, SqeCatalogProvider};
-use sqe_core::config::{CatalogAuthConfig, SqeConfig};
+use sqe_core::config::{CatalogAuthConfig, CatalogConfig, SqeConfig, StorageConfig};
 
+use crate::auth_ext::SqeAuthOptions;
 use crate::sqe_codec::{SqeLogicalCodec, SqePhysicalCodec};
+
+/// A ballista config producer that registers the [`SqeAuthOptions`] extension
+/// so the per-query `sqe_auth.bearer` key round-trips (set/get succeed) on the
+/// scheduler and executor. Without registration ballista silently drops the
+/// unknown key during `update_from_key_value_pair`.
+fn sqe_config_producer() -> ConfigProducer {
+    Arc::new(|| {
+        let config = SessionConfig::new_with_ballista();
+        let mut config = config;
+        config
+            .options_mut()
+            .extensions
+            .insert(SqeAuthOptions::default());
+        config
+    })
+}
 
 /// A single-tenant catalog built from config, plus the codecs over it.
 ///
@@ -55,6 +73,10 @@ pub struct ClusterCatalog {
     pub catalog_name: String,
     pub provider: Arc<dyn CatalogProvider>,
     pub session_catalog: Arc<SessionCatalog>,
+    /// Catalog + storage config retained so the physical codec can mint
+    /// per-user `SessionCatalog`s (Phase 4 bearer passthrough).
+    cat_cfg: CatalogConfig,
+    storage: StorageConfig,
 }
 
 impl ClusterCatalog {
@@ -63,7 +85,11 @@ impl ClusterCatalog {
     }
 
     fn physical_codec(&self) -> Arc<SqePhysicalCodec> {
-        Arc::new(SqePhysicalCodec::new(self.session_catalog.clone()))
+        Arc::new(SqePhysicalCodec::new(
+            self.session_catalog.clone(),
+            self.cat_cfg.clone(),
+            self.storage.clone(),
+        ))
     }
 }
 
@@ -104,7 +130,7 @@ pub async fn build_cluster_catalog(config: &SqeConfig) -> Result<ClusterCatalog>
 
     let provider = SqeCatalogProvider::try_new(
         session_catalog.clone(),
-        storage,
+        storage.clone(),
         cat_cfg.warehouse.clone(),
     )
     .await
@@ -114,6 +140,8 @@ pub async fn build_cluster_catalog(config: &SqeConfig) -> Result<ClusterCatalog>
         catalog_name,
         provider: Arc::new(provider),
         session_catalog,
+        cat_cfg: cat_cfg.clone(),
+        storage,
     })
 }
 
@@ -146,6 +174,7 @@ pub async fn run_executor(config: &SqeConfig, opts: ExecutorOptions) -> Result<(
         scheduler_host: opts.scheduler_host,
         scheduler_port: opts.scheduler_port,
         concurrent_tasks: opts.concurrent_tasks,
+        override_config_producer: Some(sqe_config_producer()),
         override_logical_codec: Some(cluster.logical_codec()),
         override_physical_codec: Some(cluster.physical_codec()),
         ..Default::default()
@@ -193,6 +222,9 @@ pub async fn start_scheduler(
         .with_port(bind_port);
     scheduler_config.bind_host = bind_host.to_string();
     scheduler_config.override_session_builder = Some(session_builder);
+    // Register the SqeAuthOptions extension so the per-query bearer survives
+    // the scheduler's config merge and is re-emitted into each task's props.
+    scheduler_config.override_config_producer = Some(sqe_config_producer());
     scheduler_config.override_logical_codec = Some(cluster_catalog.logical_codec());
     scheduler_config.override_physical_codec = Some(cluster_catalog.physical_codec());
 
@@ -266,11 +298,31 @@ pub async fn submit_remote(
     plan: LogicalPlan,
     cluster: &ClusterCatalog,
     target_partitions: usize,
+    user_bearer: &str,
 ) -> Result<(SchemaRef, SendableRecordBatchStream)> {
-    let config = SessionConfig::new_with_ballista()
+    let mut config = SessionConfig::new_with_ballista()
         .with_target_partitions(target_partitions)
         .with_ballista_logical_extension_codec(cluster.logical_codec())
         .with_ballista_physical_extension_codec(cluster.physical_codec());
+
+    // Carry the authenticated user's bearer to the executors so the physical
+    // codec can mint a per-user catalog (Polaris then vends per-user S3 creds).
+    //
+    // KNOWN LIMITATION (cutover design D8): this does NOT currently reach the
+    // executor. Ballista propagates session settings via
+    // `ConfigOptions::entries()` -> `set()`, but DataFusion emits
+    // `ConfigExtension` entries *unprefixed* ("bearer", not "sqe_auth.bearer"),
+    // and the receiving `set()` can't route an unprefixed key back to the
+    // extension, so it is silently dropped. The executor's `resolve_catalog`
+    // therefore falls back to its single-tenant config catalog today (which
+    // matches the legacy distributed path's static-creds model). True
+    // per-user passthrough needs the bearer threaded through the plan node
+    // (SqeTableProvider -> IcebergScanExec -> EncodedSqeScan) or an upstream
+    // ballista fix; tracked as a follow-up. We still set it here so the wiring
+    // is in place the moment that lands.
+    config.options_mut().extensions.insert(SqeAuthOptions {
+        bearer: user_bearer.to_string(),
+    });
 
     let state: SessionState = SessionStateBuilder::new()
         .with_config(config)

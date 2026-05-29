@@ -13,9 +13,9 @@
 //! bootstrap. See
 //! `docs/superpowers/specs/2026-05-28-sqe-on-ballista-cutover-design.md`.
 
+pub mod auth_ext;
 pub mod cluster;
 pub mod codec;
-pub mod facade;
 pub mod sqe_codec;
 
 /// Drive an async future to completion from a sync context that is itself
