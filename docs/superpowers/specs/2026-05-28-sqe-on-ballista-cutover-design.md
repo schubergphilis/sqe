@@ -329,28 +329,37 @@ upstream improvement. Appended as we build.
     `with_default_features` only, so SQE's Trino-compat UDFs were unknown at
     plan time — now registered in the scheduler `session_builder`.
 
-  *But the perf wall is real and persists after all three fixes.* On the
-  fully-fixed cluster (bounded mem + table cache + scheduler UDFs, SF0.1,
-  embedded scheduler + 2 executors, debug build):
+  *The perf gap persists after all three fixes — but only the TPC-H number
+  is a complete, measured result.* On the fully-fixed cluster (bounded mem +
+  table cache + scheduler UDFs, SF0.1, embedded scheduler + 2 executors,
+  debug build):
   - TPC-H: 22/22 parity, **24.3s vs legacy 10.8s (~2.2x slower)** —
     essentially unchanged from the pre-fix 22.9s, so the gap is *not* a
-    memory or cache artifact.
-  - TPC-DS: still **does not complete representatively** — 47 queries in
-    22.5 min (~29s/query) vs legacy's all-99-in-33s (~85x slower per query).
-    Simple queries finish; complex ones hit the 60s client timeout. The run
-    is alive and progressing (not a hard uniform wedge — spacing is not a
-    flat 60s), just far too slow to be usable.
+    memory or cache artifact. This is a clean full-run datapoint.
+  - TPC-DS: **does not complete in reasonable time on the ballista path.**
+    Run was killed at ~22.5 min after ~47 query *starts* (vs legacy's
+    all-99-in-33s). **Cause not yet isolated:** the run was stopped before a
+    pass/fail breakdown, so we cannot say whether queries are executing
+    slowly or hanging/erroring — "starts" is not "completions." Executor
+    logs showed **no task activity** (startup lines only), which fits a
+    dispatch-but-never-complete wedge as well as it fits raw shuffle
+    overhead. Live suspects, both unfixed: (a) the executor has no SQE
+    physical-optimizer rules and no UDF *execution* registry
+    (`override_function_registry`) — an integration gap, not yet built;
+    (b) the sync-codec-over-async-catalog blocking pattern (ledger **D4**)
+    per task decode, which under concurrent tasks can starve the executor
+    runtime.
 
   *Verdict (confirmed with the user):* the OOM crash was our integration
-  bug and is fixed. The execution perf gap is **inherent to running SQE's
-  iceberg workload through ballista's generic shuffle/serialization on this
-  topology**, not an integration oversight — it survives every fix we
-  applied. This is the strongest "we did it better" divergence: keep SQE's
-  bespoke execution as the default. Remaining suspects for any future
-  optimization attempt (not blockers for the decision): the sync-codec-
-  over-async-catalog blocking pattern (ledger **D4**) per task decode, and
-  the absence of SQE's physical optimizer rules + UDF *execution* registry
-  on the executor (`override_function_registry`).
+  bug and is fixed. Where ballista completes (TPC-H) it is ~2.2x slower than
+  bespoke; complex suites (TPC-DS) need integration work we have not
+  finished. Both justify keeping SQE's bespoke execution as the default —
+  without claiming the TPC-DS gap is "inherent," which the data does not
+  establish. *Wedge status (ledger D9 earlier text):* the original wedge was
+  about degradation across *repeated* runs on one cluster; that was **not
+  retested** after these fixes. A single fresh TPC-DS pass is consistent
+  with the wedge still present (SSB grinding on the already-used cluster
+  weakly supports that). Treat the wedge as untested post-fix, not resolved.
 - **D8 — ballista does not round-trip DataFusion `ConfigExtension` values.**
   `ConfigOptions::entries()` emits extension entries *unprefixed* (DataFusion:
   "The prefix is not used for extensions"), so ballista ships key `bearer`,
