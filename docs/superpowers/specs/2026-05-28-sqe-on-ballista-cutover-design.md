@@ -209,12 +209,22 @@ else is "wire ballista in, delete the old path".
   refresh: largely obviated by reload-per-task (each task mints fresh vended
   creds at load_table); true mid-task refresh for very long tasks remains a
   deferred edge case (D3).
-- **Phase 5 — parity + perf.** Run TPC-H / TPC-DS / SSB at SF0.1 then SF1
-  in ballista mode; compare against committed baselines
-  (`tpch-sf1-flight-2026-04-06T20:57:10.json`, distributed 22/22 12.0s).
-  Gate: correctness parity 100%, perf within agreed band.
-- **Phase 6 — delete the bespoke layer.** Remove the 17 files once ballista
-  mode is default and parity holds. Drop the `engine = "legacy"` switch.
+- **Phase 5 — parity + perf. CORRECTNESS GREEN; perf gate deferred to
+  real hardware.** TPC-H SF1 in ballista multi-process mode: **22/22, row
+  counts identical to legacy** (correctness parity confirmed at SF1, not
+  just SF0.1). Perf on a single dev machine (debug build, 2 co-located
+  executors): ballista 147s vs legacy 102s — ballista *slower*, as expected:
+  co-located executors share one machine's cores so there's no parallelism
+  to win, only serialization + shuffle-over-gRPC + per-task table-reload
+  overhead. **The perf question cannot be answered here.** A real evaluation
+  needs release builds on separate worker machines (the committed 12.0s
+  distributed baseline was exactly that). Until that runs, ballista mode is
+  correct but its production perf is unproven. TPC-DS/SSB parity in ballista
+  mode also still to run.
+- **Phase 6 — delete the bespoke layer. BLOCKED on the Phase 5 perf gate.**
+  Removing ~11.5K LOC is irreversible-ish and must not happen until ballista
+  mode is proven on real multi-node release hardware AND made default after a
+  soak. Correctness parity alone is not sufficient. Do NOT delete yet.
 
 ## Testing strategy
 
