@@ -171,6 +171,20 @@ else is "wire ballista in, delete the old path".
   having the executor codec build/caches a per-token catalog. Codecs must be
   installed in all three places (client SessionConfig, SchedulerConfig,
   ExecutorProcessConfig) and match.
+
+  **DONE / GREEN.** `sqe-ballista/src/cluster.rs` implements
+  `build_cluster_catalog`, `run_executor`, `start_scheduler`,
+  `submit_remote`, and a process-global `get_or_init_runtime`. The
+  coordinator starts the embedded scheduler eagerly at startup and submits
+  via `submit_remote`; `sqe-worker` runs as a ballista executor when
+  `engine=ballista`. **Validated live:** coordinator (embedded scheduler,
+  no local executor) + **two separate executor processes** ran full TPC-H
+  SF0.1 22/22, row counts identical to legacy. Since the coordinator hosts
+  no executor, the two worker processes provably executed every task.
+  Perf at SF0.1: ~27s multi-process vs ~31s standalone vs ~13s legacy — the
+  cluster overhead still dominates at tiny scale; the shared-cluster win is
+  expected to show at SF1+ (Phase 5). Endpoints via env
+  `SQE_BALLISTA_SCHEDULER_HOST/PORT`, `SQE_BALLISTA_EXECUTOR_HOST/GRPC_PORT`.
 - **Phase 4 — credential passthrough + refresh on the ballista path.**
   Per-query bearer install (config producer) + STS refresh hook (D3).
 - **Phase 5 — parity + perf.** Run TPC-H / TPC-DS / SSB at SF0.1 then SF1
