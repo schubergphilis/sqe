@@ -152,8 +152,25 @@ else is "wire ballista in, delete the old path".
   (a fresh scheduler+executor per statement); Phase 3's shared cluster +
   remote executors closes that gap. Benchmark JSON committed.
 - **Phase 3 — worker as ballista executor.** `sqe_ballista::run_executor`
-  with config/runtime producers installing per-query bearer + iceberg
-  catalog + object store. `sqe-worker` bin shrinks to a wrapper.
+  boots a real ballista executor process (`start_executor_process`) with the
+  SQE codecs + config/runtime producers. Coordinator embeds a shared ballista
+  **scheduler** (`start_server`) at startup and submits via
+  `SessionContext::remote_with_state(scheduler_url, state)` — replacing the
+  standalone-per-query facade, which closes the Phase 2 perf gap.
+  `sqe-worker` bin shrinks to call `run_executor`.
+
+  **Auth scope decision:** the *legacy* distributed path already uses static
+  storage creds from `[storage]` (try_distribute passes no per-session
+  bearer — confirmed in the code). So Phase 3 targets legacy parity: the
+  executor + scheduler build their `SessionCatalog` / `SqeCatalogProvider`
+  from their **own config** (catalog url + warehouse + static S3 creds),
+  single-tenant. The codecs on the cluster side therefore hold a
+  config-built catalog, not a per-session one. Per-user OIDC bearer
+  passthrough to executors is **Phase 4** (the multi-process auth question);
+  it requires propagating the bearer through the submitted SessionConfig and
+  having the executor codec build/caches a per-token catalog. Codecs must be
+  installed in all three places (client SessionConfig, SchedulerConfig,
+  ExecutorProcessConfig) and match.
 - **Phase 4 — credential passthrough + refresh on the ballista path.**
   Per-query bearer install (config producer) + STS refresh hook (D3).
 - **Phase 5 — parity + perf.** Run TPC-H / TPC-DS / SSB at SF0.1 then SF1
