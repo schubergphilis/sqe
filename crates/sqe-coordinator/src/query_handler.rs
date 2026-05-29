@@ -1725,6 +1725,7 @@ impl QueryHandler {
                 plan,
                 &runtime.cluster,
                 target_partitions,
+                session.access_token().expose(),
             )
             .await
             .map_err(|e| SqeError::Execution(format!("ballista execution failed: {e}")))?;
