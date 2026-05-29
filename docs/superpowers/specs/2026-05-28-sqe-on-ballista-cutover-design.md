@@ -343,12 +343,27 @@ upstream improvement. Appended as we build.
     slowly or hanging/erroring — "starts" is not "completions." Executor
     logs showed **no task activity** (startup lines only), which fits a
     dispatch-but-never-complete wedge as well as it fits raw shuffle
-    overhead. Live suspects, both unfixed: (a) the executor has no SQE
-    physical-optimizer rules and no UDF *execution* registry
-    (`override_function_registry`) — an integration gap, not yet built;
-    (b) the sync-codec-over-async-catalog blocking pattern (ledger **D4**)
-    per task decode, which under concurrent tasks can starve the executor
-    runtime.
+    overhead. Live suspects, both unfixed — **(b) is the leading one given
+    the signature:** (a) the executor has no SQE physical-optimizer rules
+    and no UDF *execution* registry (`override_function_registry`) — an
+    integration gap, but it would surface as *errors* ("function not found",
+    cf. the 2 pre-fix SSB errors), not the silent hang we saw, so it does
+    not fit TPC-DS; (b) the sync-codec-over-async-catalog blocking pattern
+    (ledger **D4**): physical `try_decode` calls
+    `block_in_place(|| Handle::block_on(resolve_catalog().load_table()))`
+    **per scan task**. On a multi-stage plan that dispatches many scan tasks
+    at once, if `concurrent_tasks` ≈ executor worker-thread count, every
+    worker thread enters `block_in_place` + `block_on` simultaneously and no
+    thread is left to drive the inner async Polaris round-trips → runtime
+    starvation → tasks hang, no output, no error, client times out at 60s.
+    This matches the observed signature exactly; TPC-H survives because its
+    shallower plans decode fewer concurrent scan tasks per stage.
+    *Cheap confirmation (one knob, not a full re-run):* set executor
+    `concurrent_tasks = 1`; if the hung TPC-DS queries then complete
+    (slowly), runtime starvation is confirmed. *Real fix:* make decode
+    non-blocking — serialize enough scan state into the encoded plan bytes
+    to rebuild the scan without a catalog round-trip (dovetails with the 4b
+    plan-node threading), or an async decode hook upstream (D4).
 
   *Verdict (confirmed with the user):* the OOM crash was our integration
   bug and is fixed. Where ballista completes (TPC-H) it is ~2.2x slower than
