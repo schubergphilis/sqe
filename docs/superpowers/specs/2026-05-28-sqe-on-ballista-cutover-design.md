@@ -10,6 +10,17 @@ Branch: `feat/sqe-ballista-poc-spike` -> cutover work continues here / new `feat
 Replace SQE's bespoke distributed execution layer (~11,560 LOC across 17
 files) with Apache Ballista 53.0.0 as the maintained distributed runtime.
 
+> **OUTCOME UPDATE (2026-05-29).** Benchmark testing reshaped the goal. Ballista
+> gives **correctness parity** for the common path (TPC-H 22/22 SF0.1 + SF1) and
+> its scheduling/orchestration is usable, **but SQE's bespoke execution is
+> materially faster and more robust on complex queries** (SSB 2 errors + ~18x
+> slower; TPC-DS hangs; see ledger D9). Decision (with the user): this is **not a
+> wholesale replacement**. Ballista becomes an **optional engine behind the
+> `[query] engine` flag** (the superset model); SQE's bespoke layer stays as the
+> performant default and is **NOT deleted**. Phase 6 (deletion) is cancelled
+> unless a future, optimized ballista path actually beats the bespoke layer on a
+> fair multi-node release benchmark.
+
 **Guiding rule (user directive):** use ballista's code wherever it covers
 the need. Diverge only where ballista is missing functionality, or where
 SQE's existing integration is demonstrably better. Every divergence gets
@@ -283,6 +294,31 @@ upstream improvement. Appended as we build.
   was to ride in a session-config value; ballista logs config keys at
   `trace`. Mitigation: keep cluster traffic internal, no `trace` in prod.
   Superseded in practice by D8 (the value doesn't propagate anyway).
+- **D9 — ballista distributed execution is materially slower than SQE's
+  bespoke layer, and errors/hangs on complex queries.** Measured (SF0.1,
+  same debug build + same single machine, ballista cluster = embedded
+  scheduler + 2 executors):
+  - TPC-H: 22/22 correctness parity, but ~2x slower (22.9s vs 10.8s).
+  - SSB: **11/13 pass, 2 error** (q4.2, q4.3), ~18x slower (135.9s vs 7.7s).
+  - TPC-DS: many queries hang past the 60s client timeout (legacy: all 99
+    in 33s). Effectively does not complete.
+
+  *Verdict (confirmed with the user):* **adopt ballista's scheduling /
+  orchestration where it helps, but SQE's bespoke execution is "way better"
+  — keep it.** This is the strongest "we did it better" divergence: do NOT
+  delete the bespoke distributed layer. The cutover becomes a **superset**
+  (ballista as an optional engine behind the flag; SQE execution remains the
+  performant default), not a wholesale replacement.
+
+  *Not yet root-caused — fix before any apples-to-apples claim:* (a) the
+  executor `SessionCatalog` is built with `table_cache = None`
+  (`cluster.rs` `build_cluster_catalog`) so every `load_table` re-hits
+  Polaris — a metadata-fetch storm on multi-stage plans; (b) the scheduler
+  session uses `with_default_features` only, so SQE's physical optimizer
+  rules (star-schema reorder, adaptive sort, late materialization) and
+  custom UDFs never run on the ballista path — complex plans are unoptimized
+  and may error; (c) co-located executors on one machine + debug build add
+  shuffle/serialization overhead. The 2 SSB errors point at (b).
 - **D8 — ballista does not round-trip DataFusion `ConfigExtension` values.**
   `ConfigOptions::entries()` emits extension entries *unprefixed* (DataFusion:
   "The prefix is not used for extensions"), so ballista ships key `bearer`,
