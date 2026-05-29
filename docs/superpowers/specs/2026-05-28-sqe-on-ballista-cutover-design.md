@@ -319,6 +319,18 @@ upstream improvement. Appended as we build.
   custom UDFs never run on the ballista path — complex plans are unoptimized
   and may error; (c) co-located executors on one machine + debug build add
   shuffle/serialization overhead. The 2 SSB errors point at (b).
+
+  *Sharper finding (re-run):* the cluster **wedges** — a fresh cluster ran
+  SSB 11/13, but a *second* SSB run on the same cluster had **every** query
+  time out at 60s. Complex/failed queries leave the cluster unresponsive.
+  Prime suspect: the codec's blocking-async pattern (`block_in_place` +
+  `Handle::block_on`, ledger **D4**) runs per task decode; under ballista's
+  concurrent task execution, many tasks blocking at once starve the
+  executor's tokio runtime. This is a robustness blocker under real load and
+  partly inherent to the sync-codec-over-async-catalog design — it
+  strengthens the "keep the bespoke layer as default" decision. A real fix
+  needs an async-capable codec path (D4 upstream) or non-blocking
+  table-resolution on the executor.
 - **D8 — ballista does not round-trip DataFusion `ConfigExtension` values.**
   `ConfigOptions::entries()` emits extension entries *unprefixed* (DataFusion:
   "The prefix is not used for extensions"), so ballista ships key `bearer`,
