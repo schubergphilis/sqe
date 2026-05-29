@@ -310,27 +310,47 @@ upstream improvement. Appended as we build.
   (ballista as an optional engine behind the flag; SQE execution remains the
   performant default), not a wholesale replacement.
 
-  *Not yet root-caused — fix before any apples-to-apples claim:* (a) the
-  executor `SessionCatalog` is built with `table_cache = None`
-  (`cluster.rs` `build_cluster_catalog`) so every `load_table` re-hits
-  Polaris — a metadata-fetch storm on multi-stage plans; (b) the scheduler
-  session uses `with_default_features` only, so SQE's physical optimizer
-  rules (star-schema reorder, adaptive sort, late materialization) and
-  custom UDFs never run on the ballista path — complex plans are unoptimized
-  and may error; (c) co-located executors on one machine + debug build add
-  shuffle/serialization overhead. The 2 SSB errors point at (b).
+  *Root cause of the "TPC-DS hang" — found and partly fixed (2026-05-29,
+  commit `fix(ballista): bound executor memory + ...`):* it was not one bug
+  but a crash stacked on a perf wall.
+  - **The crash was OOM-SIGKILL, not a logic wedge.** Ballista executors ran
+    with `memory_pool_size: None` (effectively unbounded), unlike the legacy
+    worker. Co-located on one 36 GB box under sustained shuffle load they
+    over-allocated and got OOM-killed — taking the coordinator down with
+    them (the "transport error" / "crash at ~8 queries" we first read as a
+    ballista perf wall). Fix: `ExecutorOptions.memory_pool_bytes` (default
+    4 GiB). After the fix the coordinator + both executors **survive the
+    full TPC-DS run** — no crash.
+  - **Two contributing perf bugs, now fixed:** (a) the executor
+    `SessionCatalog` and every per-user catalog were built with
+    `table_cache = None`, so `load_table` re-hit Polaris on every scan task
+    (a metadata-fetch storm on multi-stage plans) — now share a
+    `TableMetadataCache`; (b) the scheduler session used
+    `with_default_features` only, so SQE's Trino-compat UDFs were unknown at
+    plan time — now registered in the scheduler `session_builder`.
 
-  *Sharper finding (re-run):* the cluster **wedges** — a fresh cluster ran
-  SSB 11/13, but a *second* SSB run on the same cluster had **every** query
-  time out at 60s. Complex/failed queries leave the cluster unresponsive.
-  Prime suspect: the codec's blocking-async pattern (`block_in_place` +
-  `Handle::block_on`, ledger **D4**) runs per task decode; under ballista's
-  concurrent task execution, many tasks blocking at once starve the
-  executor's tokio runtime. This is a robustness blocker under real load and
-  partly inherent to the sync-codec-over-async-catalog design — it
-  strengthens the "keep the bespoke layer as default" decision. A real fix
-  needs an async-capable codec path (D4 upstream) or non-blocking
-  table-resolution on the executor.
+  *But the perf wall is real and persists after all three fixes.* On the
+  fully-fixed cluster (bounded mem + table cache + scheduler UDFs, SF0.1,
+  embedded scheduler + 2 executors, debug build):
+  - TPC-H: 22/22 parity, **24.3s vs legacy 10.8s (~2.2x slower)** —
+    essentially unchanged from the pre-fix 22.9s, so the gap is *not* a
+    memory or cache artifact.
+  - TPC-DS: still **does not complete representatively** — 47 queries in
+    22.5 min (~29s/query) vs legacy's all-99-in-33s (~85x slower per query).
+    Simple queries finish; complex ones hit the 60s client timeout. The run
+    is alive and progressing (not a hard uniform wedge — spacing is not a
+    flat 60s), just far too slow to be usable.
+
+  *Verdict (confirmed with the user):* the OOM crash was our integration
+  bug and is fixed. The execution perf gap is **inherent to running SQE's
+  iceberg workload through ballista's generic shuffle/serialization on this
+  topology**, not an integration oversight — it survives every fix we
+  applied. This is the strongest "we did it better" divergence: keep SQE's
+  bespoke execution as the default. Remaining suspects for any future
+  optimization attempt (not blockers for the decision): the sync-codec-
+  over-async-catalog blocking pattern (ledger **D4**) per task decode, and
+  the absence of SQE's physical optimizer rules + UDF *execution* registry
+  on the executor (`override_function_registry`).
 - **D8 — ballista does not round-trip DataFusion `ConfigExtension` values.**
   `ConfigOptions::entries()` emits extension entries *unprefixed* (DataFusion:
   "The prefix is not used for extensions"), so ballista ships key `bearer`,
