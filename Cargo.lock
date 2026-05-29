@@ -7193,6 +7193,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqe-auth",
+ "sqe-ballista",
  "sqe-catalog",
  "sqe-core",
  "sqe-lineage",

@@ -14,7 +14,7 @@ use tracing::{debug, info, warn, Span};
 
 use sqlparser::ast::{Statement, TableFactor};
 use sqe_catalog::{IcebergScanExec, SessionCatalog};
-use sqe_core::{QueryConfig, SecretStore, Session, SortMode, SqeConfig, SqeError};
+use sqe_core::{QueryConfig, QueryEngine, SecretStore, Session, SortMode, SqeConfig, SqeError};
 
 use crate::adaptive_sort;
 use sqe_policy::{PolicyEnforcer, PolicyStore};
@@ -1643,6 +1643,20 @@ impl QueryHandler {
         debug!("Policy-enforced plan (streaming): {:?}", enforced_plan);
         let tables_touched = sqe_lineage::extract::extract_table_names(&enforced_plan);
 
+        // Engine switch: route the policy-rewritten plan through an embedded
+        // ballista cluster instead of the bespoke distributed path. Default
+        // is legacy; flip [query] engine = "ballista" to opt in. See the
+        // cutover design doc. The ballista path keeps a locally-built
+        // physical plan only for finalizer introspection — execution happens
+        // on ballista.
+        let use_ballista =
+            QueryEngine::parse(&self.config.query.engine) == QueryEngine::Ballista;
+        let enforced_plan_for_ballista = if use_ballista {
+            Some(enforced_plan.clone())
+        } else {
+            None
+        };
+
         let enforced_df = ctx
             .execute_logical_plan(enforced_plan)
             .await
@@ -1684,7 +1698,38 @@ impl QueryHandler {
             debug!(warning = %warning, "Adaptive sort stripping applied (streaming)");
         }
 
-        // Distribute scan across workers if possible
+        // Ballista path: submit the policy-rewritten logical plan to an
+        // embedded ballista standalone cluster. The locally-built
+        // physical_plan is handed to the finalizer for introspection only;
+        // results stream from ballista. (Ballista-path plan metrics are not
+        // yet populated — Phase 2 limitation, tracked for later.)
+        if let Some(plan) = enforced_plan_for_ballista {
+            let final_plan = physical_plan; // introspection only
+            self.query_tracker
+                .running(query_id, start.elapsed().as_millis() as u64);
+
+            let cat_name = self.config.resolve_default_catalog();
+            let cat_provider = ctx.catalog(&cat_name).ok_or_else(|| {
+                SqeError::Execution(format!(
+                    "ballista engine: default catalog '{cat_name}' not registered on context"
+                ))
+            })?;
+            let target_partitions = ctx.state().config().target_partitions();
+
+            let (schema, stream) = sqe_ballista::facade::submit_standalone(
+                plan,
+                &cat_name,
+                cat_provider,
+                Arc::clone(&session_catalog),
+                target_partitions,
+            )
+            .await
+            .map_err(|e| SqeError::Execution(format!("ballista execution failed: {e}")))?;
+
+            return Ok((schema, stream, final_plan, tt_cleanup, tables_touched));
+        }
+
+        // Legacy path: distribute scan across workers if possible.
         let final_plan = self.try_distribute(physical_plan, session, query_id).await;
 
         // Planning complete — promote tracker to Running
