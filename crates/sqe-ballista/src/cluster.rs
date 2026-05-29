@@ -43,7 +43,7 @@ use datafusion::execution::session_state::SessionState;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use ballista_core::ConfigProducer;
-use sqe_catalog::{SessionCatalog, SqeCatalogProvider};
+use sqe_catalog::{SessionCatalog, SqeCatalogProvider, TableMetadataCache};
 use sqe_core::config::{CatalogAuthConfig, CatalogConfig, SqeConfig, StorageConfig};
 
 use crate::auth_ext::SqeAuthOptions;
@@ -77,6 +77,10 @@ pub struct ClusterCatalog {
     /// per-user `SessionCatalog`s (Phase 4 bearer passthrough).
     cat_cfg: CatalogConfig,
     storage: StorageConfig,
+    /// Shared table-metadata cache so executor-side `load_table` calls don't
+    /// re-fetch metadata from the catalog on every scan task (avoids a
+    /// metadata refetch storm on shuffle-heavy multi-stage queries).
+    table_cache: TableMetadataCache,
 }
 
 impl ClusterCatalog {
@@ -89,6 +93,7 @@ impl ClusterCatalog {
             self.session_catalog.clone(),
             self.cat_cfg.clone(),
             self.storage.clone(),
+            self.table_cache.clone(),
         ))
     }
 }
@@ -111,6 +116,10 @@ pub async fn build_cluster_catalog(config: &SqeConfig) -> Result<ClusterCatalog>
 
     let storage = cat_cfg.storage.clone().unwrap_or_else(|| config.storage.clone());
 
+    // Shared table-metadata cache (mirrors the coordinator's). Without it the
+    // executor re-fetches table metadata from Polaris on every scan task.
+    let table_cache = TableMetadataCache::new(cat_cfg.metadata_cache_ttl_secs);
+
     // Service token via client_credentials from the top-level [auth] block.
     let auth = CatalogAuthConfig::ClientCredentials {
         token_endpoint: config.auth.token_endpoint.clone(),
@@ -123,7 +132,7 @@ pub async fn build_cluster_catalog(config: &SqeConfig) -> Result<ClusterCatalog>
         .map_err(|e| anyhow::anyhow!("minting cluster service token: {e}"))?;
 
     let session_catalog = Arc::new(
-        SessionCatalog::for_session_with(cat_cfg, &storage, None, &bearer)
+        SessionCatalog::for_session_with(cat_cfg, &storage, Some(table_cache.clone()), &bearer)
             .await
             .map_err(|e| anyhow::anyhow!("building cluster SessionCatalog: {e}"))?,
     );
@@ -142,6 +151,7 @@ pub async fn build_cluster_catalog(config: &SqeConfig) -> Result<ClusterCatalog>
         session_catalog,
         cat_cfg: cat_cfg.clone(),
         storage,
+        table_cache,
     })
 }
 
@@ -154,6 +164,11 @@ pub struct ExecutorOptions {
     pub scheduler_host: String,
     pub scheduler_port: u16,
     pub concurrent_tasks: usize,
+    /// Hard memory ceiling for this executor's DataFusion pool, in bytes.
+    /// `None` = ballista default (effectively unbounded), which on a shared
+    /// box lets co-located executors over-allocate and get OOM-killed under
+    /// sustained shuffle-heavy workloads. Always set this in real deployments.
+    pub memory_pool_bytes: Option<usize>,
 }
 
 /// Run a ballista executor process to completion (blocks until shutdown).
@@ -174,6 +189,7 @@ pub async fn run_executor(config: &SqeConfig, opts: ExecutorOptions) -> Result<(
         scheduler_host: opts.scheduler_host,
         scheduler_port: opts.scheduler_port,
         concurrent_tasks: opts.concurrent_tasks,
+        memory_pool_size: opts.memory_pool_bytes.map(|b| b as u64),
         override_config_producer: Some(sqe_config_producer()),
         override_logical_codec: Some(cluster.logical_codec()),
         override_physical_codec: Some(cluster.physical_codec()),
@@ -214,6 +230,12 @@ pub async fn start_scheduler(
             .build();
         let ctx = SessionContext::new_with_state(state);
         ctx.register_catalog(catalog_name.clone(), provider.clone());
+        // Register SQE's Trino-compat functions so the scheduler can plan
+        // queries that use them (the coordinator registers the same set on
+        // its planning context). NOTE: executors also need these to *run*
+        // UDF-bearing physical tasks (override_function_registry) — follow-up.
+        sqe_trino_functions::register_trino_functions(&ctx);
+        sqe_trino_functions::register_extended_trino_functions(&ctx);
         Ok(ctx.state())
     });
 

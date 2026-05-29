@@ -45,7 +45,7 @@ use iceberg::expr::Predicate;
 use iceberg::{NamespaceIdent, TableIdent};
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use sqe_catalog::{IcebergScanExec, SessionCatalog};
+use sqe_catalog::{IcebergScanExec, SessionCatalog, TableMetadataCache};
 use sqe_core::config::{CatalogConfig, StorageConfig};
 
 use crate::auth_ext::SqeAuthOptions;
@@ -182,6 +182,9 @@ pub struct SqePhysicalCodec {
     /// Catalog + storage config used to mint per-user `SessionCatalog`s.
     cat_cfg: CatalogConfig,
     storage: StorageConfig,
+    /// Shared table-metadata cache passed to every minted `SessionCatalog`
+    /// so `load_table` doesn't refetch metadata per scan task.
+    table_cache: TableMetadataCache,
     /// Per-user catalog cache keyed by a non-crypto hash of the bearer.
     per_user: Arc<tokio::sync::Mutex<HashMap<u64, Arc<SessionCatalog>>>>,
     default: BallistaPhysicalExtensionCodec,
@@ -198,11 +201,13 @@ impl SqePhysicalCodec {
         fallback: Arc<SessionCatalog>,
         cat_cfg: CatalogConfig,
         storage: StorageConfig,
+        table_cache: TableMetadataCache,
     ) -> Self {
         Self {
             fallback,
             cat_cfg,
             storage,
+            table_cache,
             per_user: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             default: BallistaPhysicalExtensionCodec::default(),
         }
@@ -237,7 +242,7 @@ impl SqePhysicalCodec {
         let session_catalog = SessionCatalog::for_session_with(
             &self.cat_cfg,
             &self.storage,
-            None,
+            Some(self.table_cache.clone()),
             &bearer,
         )
         .await
