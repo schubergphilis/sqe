@@ -1708,19 +1708,22 @@ impl QueryHandler {
             self.query_tracker
                 .running(query_id, start.elapsed().as_millis() as u64);
 
-            let cat_name = self.config.resolve_default_catalog();
-            let cat_provider = ctx.catalog(&cat_name).ok_or_else(|| {
-                SqeError::Execution(format!(
-                    "ballista engine: default catalog '{cat_name}' not registered on context"
-                ))
-            })?;
             let target_partitions = ctx.state().config().target_partitions();
 
-            let (schema, stream) = sqe_ballista::facade::submit_standalone(
+            // Submit to the process-global embedded ballista scheduler +
+            // remote executors (started lazily on first ballista query).
+            // The cluster catalog is single-tenant (built from config); per-
+            // user bearer passthrough is Phase 4.
+            let runtime = sqe_ballista::cluster::get_or_init_runtime(&self.config)
+                .await
+                .map_err(|e| {
+                    SqeError::Execution(format!("ballista runtime init failed: {e}"))
+                })?;
+
+            let (schema, stream) = sqe_ballista::cluster::submit_remote(
+                &runtime.scheduler_url,
                 plan,
-                &cat_name,
-                cat_provider,
-                Arc::clone(&session_catalog),
+                &runtime.cluster,
                 target_partitions,
             )
             .await

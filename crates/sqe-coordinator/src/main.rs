@@ -262,6 +262,24 @@ async fn async_main() -> anyhow::Result<()> {
         .with_session_manager(session_manager.clone()),
     );
 
+    // When the ballista engine is selected, start the embedded ballista
+    // scheduler eagerly at startup (not lazily on first query) so executor
+    // processes can register before any query arrives. Idempotent: the
+    // first query reuses this same process-global runtime.
+    if sqe_core::QueryEngine::parse(&config.query.engine) == sqe_core::QueryEngine::Ballista {
+        match sqe_ballista::cluster::get_or_init_runtime(&config).await {
+            Ok(rt) => tracing::info!(
+                scheduler_url = %rt.scheduler_url,
+                "Embedded ballista scheduler started; waiting for executors to register"
+            ),
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "failed to start embedded ballista scheduler: {e}"
+                ))
+            }
+        }
+    }
+
     // Spawn background memory metrics reporter (updates gauges every 1s for Grafana)
     sqe_coordinator::memory::spawn_metrics_reporter(
         query_handler.runtime().clone(),
