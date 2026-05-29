@@ -375,6 +375,41 @@ upstream improvement. Appended as we build.
   retested** after these fixes. A single fresh TPC-DS pass is consistent
   with the wedge still present (SSB grinding on the already-used cluster
   weakly supports that). Treat the wedge as untested post-fix, not resolved.
+- **D4 OUTCOME (2026-05-29, built + tested, commit `feat(ballista): D4 ...`).**
+  Built the non-blocking decode: `EncodedSqeScan` now carries the iceberg
+  `TableMetadata` (serde JSON) + `metadata_location`, and the executor rebuilds
+  the `Table` synchronously (`FileIOBuilder::build` + `Table::builder().build`
+  are both sync) from static `[storage]` config — no catalog round-trip, no
+  `block_on` in decode. **Result: the decode-starvation hang is gone.** TPC-DS
+  q01-q13 run ~2s each (were ALL timing out at 60s pre-D4); TPC-H still 22/22,
+  22.7s (no regression). So D4 was *necessary* and is a confirmed win, but it
+  is **not sufficient** to complete TPC-DS — it peeled the top layer and
+  exposed D10/D11 below. The decode fast path is single-tenant (static creds);
+  per-user vended creds through the same plan bytes is Phase 4b (G3).
+- **D10 — `count(*)` aggregate physical-plan serialization assertion.** Once D4
+  let complex queries actually execute, multi-stage TPC-DS queries with
+  `count(*)` over joins fail on the executor with a DataFusion internal
+  assertion: `Input field name r_reason_sk does not match with the projection
+  expression count(*)`. The mismatch is in an `AggregateExec`/`ProjectionExec`
+  pair that crosses the stage boundary via **ballista's default physical
+  codec** (datafusion-proto), *not* SQE's scan codec — the aggregate
+  expression naming doesn't survive the proto round-trip. 48 occurrences in one
+  TPC-DS sweep. *Why it matters:* blocks the analytical core of TPC-DS on the
+  ballista path. *Upstream:* a datafusion-proto / ballista physical-plan
+  serialization bug for aggregate output naming; reproduce minimally and file.
+  Not caused by anything SQE diverged on.
+- **D11 — ballista evicts the executor on a task `InvalidArgument` error.** When
+  a task fails with the D10 assertion (a *query* error), ballista's scheduler
+  reports it as "Failed to connect to executor" and **removes the executor**
+  from its registry (`executor_manager`), rather than failing just that query.
+  48 D10 errors caused **24 executor removals**; executors re-register on the
+  next heartbeat, but the churn means complex queries cascade into timeouts and
+  the cluster appears to "wedge." *This is the precise mechanism behind the D9
+  "wedge"* — not `block_on` starvation (that was the *simple*-query hang, fixed
+  by D4), but executor eviction on task errors. *Why it matters:* one bad query
+  degrades the whole cluster. *Upstream:* ballista should distinguish a
+  task-level `InvalidArgument` (fail the query) from an executor transport
+  failure (evict the executor). Robustness blocker for shared clusters.
 - **D8 — ballista does not round-trip DataFusion `ConfigExtension` values.**
   `ConfigOptions::entries()` emits extension entries *unprefixed* (DataFusion:
   "The prefix is not used for extensions"), so ballista ships key `bearer`,
@@ -428,7 +463,7 @@ an upstream contribution; the divergence ledger doubles as the backlog. The
 
 | Gate | Unlocks | Blocking work |
 |---|---|---|
-| **G1 robustness** | ballista completes complex queries (no hang) | **D4** non-blocking / async codec decode (overlaps Phase 4b) |
+| **G1 robustness** | ballista completes complex queries (no hang) | **D4** non-blocking decode — DONE (simple-query hang fixed). Now blocked on **D10** (`count(*)` aggregate serialization assertion) + **D11** (executor eviction on task error). |
 | **G2 speed** | ballista within an agreed band of bespoke (e.g. ≤1.2x) on a RELEASE build across SEPARATE worker machines | shuffle/serialization + per-task overhead; fair bench (Phase 5b) |
 | **G3 functionality** | per-user identity (bearer + STS) reaches distributed executors, honoring the no-service-account model | **4b** plan-node bearer threading + **D3** per-task credential hook |
 | **G4 soak** | ballista default for a soak period, no regressions | flip default; observe |
