@@ -6,7 +6,7 @@ pub mod session;
 pub mod supervised_task;
 pub mod table_properties;
 
-pub use config::{AuthProviderConfig, DeviceAuthConfig, ExternalAuthConfig, FlightCompression, QueryCacheConfig, QueryConfig, QueryHistoryConfig, SortMode, SqeConfig, parse_memory_limit};
+pub use config::{AuthProviderConfig, DeviceAuthConfig, ExternalAuthConfig, FlightCompression, QueryCacheConfig, QueryConfig, QueryEngine, QueryHistoryConfig, SortMode, SqeConfig, parse_memory_limit};
 pub use error::{CatalogOp, Result, SqeError, SqeErrorCode};
 pub use secret::{Secret, SecretStore, SecretStoreError};
 pub use secret_string::SecretString;

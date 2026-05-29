@@ -1,0 +1,52 @@
+[package]
+name = "sqe-ballista"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# SQE-on-ballista integration crate. Hosts the iceberg logical+physical
+# extension codecs, the coordinator-side submission facade, and the
+# executor bootstrap that lets ballista 53 run SQE's iceberg + OIDC
+# bearer-passthrough workload. See
+# `docs/superpowers/specs/2026-05-28-sqe-on-ballista-cutover-design.md`.
+
+[dependencies]
+ballista = "53.0.0"
+ballista-core = "53.0.0"
+ballista-executor = "53.0.0"
+ballista-scheduler = "53.0.0"
+datafusion = { workspace = true }
+arrow = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+futures = { workspace = true }
+datafusion-proto = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Iceberg integration — same path-dep'd vendored set the rest of SQE uses.
+iceberg = { workspace = true }
+iceberg-catalog-rest = { workspace = true }
+iceberg-datafusion = { workspace = true }
+
+# SQE catalog — the production codecs target SQE's own SqeTableProvider /
+# IcebergScanExec (not iceberg-datafusion's nodes). See the cutover design.
+sqe-catalog = { path = "../sqe-catalog" }
+sqe-core = { path = "../sqe-core" }
+sqe-auth = { path = "../sqe-auth" }
+sqe-trino-functions = { path = "../sqe-trino-functions" }
+
+[lib]
+name = "sqe_ballista"
+path = "src/lib.rs"
+
+# The original PoC, kept as a runnable smoke test against the
+# Polaris + RustFS stack (`cargo run -p sqe-ballista --bin sqe-ballista-poc`).
+[[bin]]
+name = "sqe-ballista-poc"
+path = "src/bin/poc.rs"
