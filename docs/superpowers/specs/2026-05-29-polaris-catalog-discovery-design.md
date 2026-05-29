@@ -47,12 +47,15 @@ Rejected alternatives:
 
 ### 1. Config (`sqe-core/src/config.rs`)
 
-Add a discovery mode under `[catalogs]`:
+Add a discovery mode. It lives under `[query]` (next to `default_catalog`,
+which is the same concern — how queries resolve catalogs) because `[catalogs]`
+is a serde `HashMap<String, CatalogConfig>`; a scalar key under it would
+collide with the per-catalog subtables.
 
 ```toml
-[catalogs]
-discovery = "static"        # default; today's behavior
-# discovery = "polaris-auto"  # lazy probe on unknown 3-part reference
+[query]
+catalog_discovery = "static"        # default; today's behavior
+# catalog_discovery = "polaris-auto"  # lazy probe on unknown 3-part reference
 ```
 
 A `CatalogDiscovery` enum (`Static` | `PolarisAuto`), `#[serde(default)]` to
