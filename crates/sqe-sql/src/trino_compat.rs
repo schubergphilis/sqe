@@ -156,10 +156,10 @@ impl VisitorMut for TrinoCompatVisitor {
         // being wrapped a second time when the rewriter runs on SQL that
         // came back through the same path.
         let was_wrap_owner = has_wrap_cte(query);
-        if self.wrap_cte_depth == 0 || was_wrap_owner {
-            if wrap_rollup_for_empty_input(query) {
-                self.rewrites += 1;
-            }
+        if (self.wrap_cte_depth == 0 || was_wrap_owner)
+            && wrap_rollup_for_empty_input(query)
+        {
+            self.rewrites += 1;
         }
         // Leave: pair the increment in pre_visit_query.
         if was_wrap_owner {
