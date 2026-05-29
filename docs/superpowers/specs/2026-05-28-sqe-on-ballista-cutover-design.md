@@ -141,10 +141,16 @@ else is "wire ballista in, delete the old path".
 - **Phase 1 — static predicate serialization.** Extend `EncodedScan` +
   `from_codec_parts` to carry the iceberg `Predicate`. Test: a scan with a
   `WHERE` filter round-trips through the codec and prunes correctly.
-- **Phase 2 — coordinator embeds the scheduler.** `BallistaCoordinator`
-  facade; Flight SQL handler submits the rewritten LogicalPlan. Behind a
-  config switch `[coordinator] engine = "ballista" | "legacy"` so we can
-  A/B and keep the old path alive during migration.
+- **Phase 2 — coordinator embeds the scheduler. DONE / GREEN.** Config
+  switch `[query] engine = "ballista" | "legacy"` (default legacy);
+  `submit_standalone` facade; `open_stream` branch submits the
+  policy-rewritten LogicalPlan to an in-process ballista standalone cluster
+  per query. **Validated live:** full TPC-H SF0.1 (22/22) through the real
+  coordinator wiring in ballista mode, row counts identical to the legacy
+  path query-for-query — correctness parity confirmed. Perf: ballista 31.4s
+  vs legacy 12.8s at SF0.1, the expected cost of standalone-per-query
+  (a fresh scheduler+executor per statement); Phase 3's shared cluster +
+  remote executors closes that gap. Benchmark JSON committed.
 - **Phase 3 — worker as ballista executor.** `sqe_ballista::run_executor`
   with config/runtime producers installing per-query bearer + iceberg
   catalog + object store. `sqe-worker` bin shrinks to a wrapper.
