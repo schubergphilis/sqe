@@ -563,15 +563,44 @@ impl QueryHandler {
         if let Some(stmt) = kind.statement() {
             let qualifiers = sqe_sql::extract_catalog_qualifiers(stmt);
             if !qualifiers.is_empty() {
-                let known = self.known_catalog_names()?;
-                if let Some(unknown) =
-                    qualifiers.iter().find(|q| !known.iter().any(|k| k == *q))
-                {
+                // Authority for "known" is the caller's session ctx: it already
+                // has every static + attached catalog registered, plus any
+                // catalog discovered earlier in this session (so a second
+                // reference never re-probes Polaris).
+                let (ctx, _) = self.create_session_context(session).await?;
+                let mut known: std::collections::HashSet<String> =
+                    ctx.catalog_names().into_iter().collect();
+                known.insert("system".to_string());
+                known.insert("datafusion".to_string());
+
+                for q in &qualifiers {
+                    if known.contains(q) {
+                        continue;
+                    }
+                    if let Some(provider) = crate::session_context::discover_catalog_provider(
+                        q,
+                        &self.config,
+                        session,
+                        self.table_cache.as_ref(),
+                        self.policy_store.as_ref(),
+                        self.metrics.as_ref(),
+                    )
+                    .await
+                    {
+                        ctx.register_catalog(q.clone(), std::sync::Arc::new(provider));
+                        known.insert(q.clone());
+                        tracing::info!(catalog = %q, "catalog discovery: registered Polaris warehouse for session");
+                    }
+                }
+
+                if let Some(unknown) = qualifiers.iter().find(|q| !known.contains(*q)) {
+                    let mut names: Vec<String> = known.into_iter().collect();
+                    names.sort();
                     return Err(SqeError::Catalog(format!(
                         "unknown catalog '{}' in 3-part identifier; configured \
-                         catalogs are {:?}. Use TOML `[catalogs.<name>]` to declare \
-                         additional catalogs, or `ATTACH` at runtime once that lands.",
-                        unknown, known
+                         catalogs are {:?}. Declare it via TOML `[catalogs.<name>]`, \
+                         `ATTACH` it, or enable `[query] catalog_discovery = \"polaris-auto\"`.",
+                        unknown, names
                     )));
                 }
             }
