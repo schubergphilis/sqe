@@ -7,8 +7,13 @@ ARG TARGETARCH
 ARG SCCACHE_VERSION=0.9.0
 
 # Install build deps + download pre-compiled sccache binary (avoids ~10 min cargo install sccache)
+# libprotobuf-dev is required in addition to protobuf-compiler: the protoc
+# binary ships in protobuf-compiler, but the well-known type definitions
+# (google/protobuf/any.proto, empty.proto, ...) ship in libprotobuf-dev under
+# /usr/include. datafusion-substrait's build.rs imports them, so without it the
+# deps layer fails with "google/protobuf/any.proto: File not found".
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake protobuf-compiler libssl-dev pkg-config clang lld curl && \
+    cmake protobuf-compiler libprotobuf-dev libssl-dev pkg-config clang lld curl && \
     rm -rf /var/lib/apt/lists/* && \
     case "$TARGETARCH" in \
         amd64) SCCACHE_ARCH=x86_64 ;; \
