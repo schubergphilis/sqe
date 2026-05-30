@@ -1751,9 +1751,12 @@ impl QueryHandler {
             let target_partitions = ctx.state().config().target_partitions();
 
             // Submit to the process-global embedded ballista scheduler +
-            // remote executors (started lazily on first ballista query).
-            // The cluster catalog is single-tenant (built from config); per-
-            // user bearer passthrough is Phase 4.
+            // remote executors (started lazily on first ballista query). The
+            // cluster catalog is single-tenant (built from config) for the
+            // no-bearer fallback; the authenticated user bearer is threaded
+            // through the plan (Phase 4b) so executors mint per-user vended
+            // creds. On the single-principal stack the user bearer IS the
+            // service token, so this resolves to the same catalog.
             let runtime = sqe_ballista::cluster::get_or_init_runtime(&self.config)
                 .await
                 .map_err(|e| {
