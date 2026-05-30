@@ -179,6 +179,12 @@ struct EncodedSqeScan {
     /// infer the FileIO scheme on decode, and passed to the rebuilt `Table`.
     #[serde(default)]
     metadata_location: Option<String>,
+    /// The authenticated user's OIDC bearer, threaded through the plan so the
+    /// executor can mint per-user vended S3 creds (parity #1 / D8). `None` =
+    /// single-tenant fallback (Phase 3 behaviour). Only the bearer travels,
+    /// never S3 secrets (auth_ext.rs trust model).
+    #[serde(default)]
+    bearer: Option<String>,
 }
 
 /// Physical codec that rehydrates [`IcebergScanExec`] on the executor by
@@ -306,6 +312,8 @@ impl PhysicalExtensionCodec for SqePhysicalCodec {
             schema_proto: schema_proto.encode_to_vec(),
             metadata_json,
             metadata_location,
+            // Populated from the node's bearer in a later task (parity #1 / D8).
+            bearer: None,
         };
 
         let bytes = serde_json::to_vec(&encoded)
@@ -464,6 +472,7 @@ mod tests {
             metadata_location: Some(
                 "s3://warehouse/tpch_sf0_1/lineitem/metadata/00003.metadata.json".to_string(),
             ),
+            bearer: Some("eyJhbGciOiJ.user-bearer.sig".to_string()),
         };
 
         let bytes = serde_json::to_vec(&original).expect("encode");
@@ -488,5 +497,6 @@ mod tests {
         assert_eq!(decoded.schema_proto, original.schema_proto);
         assert_eq!(decoded.metadata_json, original.metadata_json);
         assert_eq!(decoded.metadata_location, original.metadata_location);
+        assert_eq!(decoded.bearer, original.bearer);
     }
 }
