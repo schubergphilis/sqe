@@ -220,7 +220,18 @@ mod hms {
 
 // -- JDBC / SQL (SQLite) ----------------------------------------------------
 
-#[cfg(feature = "sql")]
+// This module asserts the builder REJECTS `sqlite://` when no sqlite driver
+// is compiled in. The premise needs the sqlx tokio runtime present (so the
+// pool can be constructed and report a clean "no sqlite driver" error rather
+// than panicking on a missing runtime) but the sqlite driver absent -- i.e.
+// `sql-postgres` on, `sql-sqlite` off, which is exactly the "default SQE
+// build only enables sqlx/postgres" path. Bare `sql` pulls sqlx with no
+// runtime feature and panics; `sql-sqlite` makes the driver present and the
+// rejection impossible. Under `cargo test --all`, Cargo unifies features
+// workspace-wide and `sqe-cli` enables `sqe-catalog/sql-sqlite`, so the
+// module must gate off when sqlite is available (same `sql-sqlite`-leak
+// isolation `sqe-coordinator` already does via its `test-sqlite` feature).
+#[cfg(all(feature = "sql-postgres", not(feature = "sql-sqlite")))]
 mod sql {
     use std::collections::HashMap;
     use std::sync::Arc;
