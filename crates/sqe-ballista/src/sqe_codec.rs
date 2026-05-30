@@ -223,6 +223,12 @@ struct EncodedSqeScan {
     bearer: Option<String>,
 }
 
+/// Per-(user,table) FileIO cache: each key maps to a `OnceCell` so concurrent
+/// cold decodes for the same key single-flight the bearer to vended-creds
+/// exchange (D4 invariant) instead of stampeding. Key = (full bearer, ident).
+type FileIoCache =
+    Arc<tokio::sync::Mutex<HashMap<(String, String), Arc<tokio::sync::OnceCell<FileIO>>>>>;
+
 /// Physical codec that rehydrates [`IcebergScanExec`] on the executor by
 /// reloading the table from a `SessionCatalog` and rebuilding the scan from
 /// the wire-encoded parts.
@@ -244,6 +250,10 @@ pub struct SqePhysicalCodec {
     table_cache: TableMetadataCache,
     /// Per-user catalog cache keyed by a non-crypto hash of the bearer.
     per_user: Arc<tokio::sync::Mutex<HashMap<u64, Arc<SessionCatalog>>>>,
+    /// Per-(user,table) FileIO cache so the D4 sync-rebuild path pays the
+    /// bearer to vended-creds exchange at most once per (user,table) per
+    /// executor, not per task. Keyed by (full bearer, "ns.table").
+    file_io: FileIoCache,
     default: BallistaPhysicalExtensionCodec,
 }
 
@@ -266,6 +276,7 @@ impl SqePhysicalCodec {
             storage,
             table_cache,
             per_user: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            file_io: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             default: BallistaPhysicalExtensionCodec::default(),
         }
     }
@@ -308,6 +319,59 @@ impl SqePhysicalCodec {
         self.per_user.lock().await.insert(key, arc.clone());
         Ok(arc)
     }
+
+    /// Resolve the `FileIO` for the D4 sync-rebuild path.
+    ///
+    /// No bearer: static service creds via [`build_file_io`] (unchanged Phase 3
+    /// behaviour; no network). With a bearer: a per-(user,table) FileIO minted
+    /// from that bearer, cached so the bearer to vended-creds exchange happens
+    /// at most once per (user,table) per executor, not per task (preserves the
+    /// D4 "no per-task catalog round-trip" invariant). Single-flight: only the
+    /// first cold caller for a key runs the exchange; concurrent cold callers
+    /// await the same `OnceCell`.
+    async fn resolve_file_io(
+        &self,
+        bearer: Option<&str>,
+        ident: &TableIdent,
+        metadata_location: Option<&str>,
+    ) -> DFResult<FileIO> {
+        let Some(bearer) = bearer.filter(|b| !b.is_empty()) else {
+            // No bearer: static service creds (unchanged Phase 3 behaviour).
+            return build_file_io(&self.storage, metadata_location);
+        };
+        let key = bearer_table_key(bearer, ident);
+        let cell = {
+            let mut guard = self.file_io.lock().await;
+            guard
+                .entry(key)
+                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+                .clone()
+        };
+        // Single-flight: only the first caller for this key runs the exchange;
+        // concurrent cold callers await the same OnceCell.
+        cell.get_or_try_init(|| async {
+            let session_catalog = SessionCatalog::for_session_with(
+                &self.cat_cfg,
+                &self.storage,
+                Some(self.table_cache.clone()),
+                bearer,
+            )
+            .await
+            .map_err(|e| DataFusionError::Internal(format!("per-user catalog on executor: {e}")))?;
+            let table = session_catalog
+                .load_table(ident)
+                .await
+                .map_err(|e| DataFusionError::Internal(format!("per-user load_table: {e}")))?;
+            Ok::<_, DataFusionError>(table.file_io().clone())
+        })
+        .await
+        .cloned()
+    }
+
+    #[cfg(test)]
+    pub async fn file_io_cache_len(&self) -> usize {
+        self.file_io.lock().await.len()
+    }
 }
 
 impl PhysicalExtensionCodec for SqePhysicalCodec {
@@ -348,8 +412,8 @@ impl PhysicalExtensionCodec for SqePhysicalCodec {
             schema_proto: schema_proto.encode_to_vec(),
             metadata_json,
             metadata_location,
-            // Populated from the node's bearer in a later task (parity #1 / D8).
-            bearer: None,
+            // Ship the per-user bearer threaded onto the node (parity #1 / D8).
+            bearer: scan.bearer().map(|b| b.to_string()),
         };
 
         let bytes = serde_json::to_vec(&encoded)
@@ -407,7 +471,19 @@ impl PhysicalExtensionCodec for SqePhysicalCodec {
         } else {
             let metadata: TableMetadata = serde_json::from_slice(&encoded.metadata_json)
                 .map_err(|e| DataFusionError::Internal(format!("table metadata decode: {e}")))?;
-            let file_io = build_file_io(&self.storage, encoded.metadata_location.as_deref())?;
+            // Bearer-aware FileIO. No bearer: synchronous static creds (early
+            // return inside `resolve_file_io`). With a bearer: only the cold
+            // cache miss blocks on the one-time vended-creds exchange; warm
+            // hits return immediately, preserving the D4 invariant.
+            let file_io = block_on_in_runtime({
+                let bearer = encoded.bearer.clone();
+                let ident = ident.clone();
+                let loc = encoded.metadata_location.clone();
+                async move {
+                    self.resolve_file_io(bearer.as_deref(), &ident, loc.as_deref())
+                        .await
+                }
+            })?;
             let mut builder = Table::builder()
                 .identifier(ident)
                 .metadata(Arc::new(metadata))
@@ -434,6 +510,13 @@ impl PhysicalExtensionCodec for SqePhysicalCodec {
         );
         Ok(Arc::new(scan))
     }
+}
+
+/// Cache key for a per-user FileIO: (full bearer, table ident string).
+/// Keys on the full bearer (not a hash) so a hash collision can never vend
+/// one user's FileIO to another; correctness over the tiny memory cost.
+fn bearer_table_key(bearer: &str, ident: &TableIdent) -> (String, String) {
+    (bearer.to_string(), ident.to_string())
 }
 
 /// Build a synchronous `FileIO` from static S3 storage config, mirroring the
@@ -538,6 +621,121 @@ mod tests {
     /// A `TaskContext` for the decode call (which ignores it).
     fn task_ctx() -> Arc<TaskContext> {
         SessionContext::new().task_ctx()
+    }
+
+    /// Build a minimal `IcebergScanExec` from inline JSON metadata, mirroring
+    /// `iceberg_scan.rs`'s own test helper. No I/O; the table only satisfies the
+    /// constructor. Has no `metadata_location`, so the no-bearer decode path
+    /// builds a FileIO from empty props (offline).
+    fn make_iceberg_scan_exec() -> IcebergScanExec {
+        use datafusion::arrow::datatypes::{DataType, Field};
+        let metadata_json = r#"{
+            "format-version": 2,
+            "table-uuid": "fb072c92-a02b-11e9-ae9c-1bb7bc9eca94",
+            "location": "file:///tmp/test-table",
+            "last-sequence-number": 0,
+            "last-updated-ms": 1600000000000,
+            "last-column-id": 1,
+            "schemas": [{"schema-id":0,"type":"struct","fields":[{"id":1,"name":"id","required":false,"type":"long"}]}],
+            "current-schema-id": 0,
+            "partition-specs": [{"spec-id":0,"fields":[]}],
+            "default-spec-id": 0,
+            "last-partition-id": 999,
+            "properties": {},
+            "snapshots": [],
+            "snapshot-log": [],
+            "metadata-log": [],
+            "sort-orders": [{"order-id":0,"fields":[]}],
+            "default-sort-order-id": 0,
+            "refs": {}
+        }"#;
+        let metadata: TableMetadata =
+            serde_json::from_str(metadata_json).expect("test metadata must parse");
+        let file_io = FileIOBuilder::new_fs_io().build().expect("fs FileIO");
+        let ident = TableIdent::new(NamespaceIdent::new("ns".to_string()), "t".to_string());
+        let table = Table::builder()
+            .file_io(file_io)
+            .identifier(ident)
+            .metadata(Arc::new(metadata))
+            .build()
+            .expect("test Table");
+        let projected_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        IcebergScanExec::new(table, projected_schema, None, None)
+    }
+
+    /// Build a `SqePhysicalCodec` offline. `SessionCatalog::new` (via
+    /// `for_session_with`) builds a `RestCatalog` lazily (its `/v1/config`
+    /// probe is memoized on first table use), so construction touches no
+    /// network. The encode tests never use the catalog; the no-bearer decode
+    /// test takes the static `build_file_io` path, also offline.
+    async fn make_physical_codec() -> SqePhysicalCodec {
+        let cat_cfg: CatalogConfig = serde_json::from_value(serde_json::json!({
+            "catalog_url": "http://127.0.0.1:1/iceberg",
+            "warehouse": "test",
+        }))
+        .expect("minimal CatalogConfig must deserialize");
+        let storage = StorageConfig::default();
+        let table_cache = TableMetadataCache::new(0);
+        let fallback = Arc::new(
+            SessionCatalog::for_session_with(&cat_cfg, &storage, Some(table_cache.clone()), "svc")
+                .await
+                .expect("offline SessionCatalog build (lazy REST catalog)"),
+        );
+        SqePhysicalCodec::new(fallback, cat_cfg, storage, table_cache)
+    }
+
+    /// The physical encoder must lift the per-user bearer threaded onto the
+    /// `IcebergScanExec` node into the `EncodedSqeScan.bearer` wire field
+    /// (parity #1 / D8). Offline: `try_encode` is sync and never touches the
+    /// catalog.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn physical_encode_carries_node_bearer() {
+        let scan = make_iceberg_scan_exec().with_bearer(Some(Arc::from("ptok")));
+        let codec = make_physical_codec().await;
+        let mut buf = Vec::new();
+        codec.try_encode(Arc::new(scan), &mut buf).unwrap();
+        assert_eq!(buf[0], 1u8); // iceberg discriminator
+        let decoded: EncodedSqeScan = serde_json::from_slice(&buf[1..]).unwrap();
+        assert_eq!(decoded.bearer.as_deref(), Some("ptok"));
+    }
+
+    /// The cache key must separate distinct users (different bearer) and
+    /// distinct tables (different ident), and be stable for the same pair, so a
+    /// per-(user,table) FileIO is never shared across users or tables.
+    #[test]
+    fn bearer_table_key_distinguishes_users_and_tables() {
+        let t1 = TableIdent::new(NamespaceIdent::new("ns".into()), "t".into());
+        let t2 = TableIdent::new(NamespaceIdent::new("ns".into()), "u".into());
+        assert_ne!(bearer_table_key("a", &t1), bearer_table_key("b", &t1)); // diff user
+        assert_ne!(bearer_table_key("a", &t1), bearer_table_key("a", &t2)); // diff table
+        assert_eq!(bearer_table_key("a", &t1), bearer_table_key("a", &t1)); // stable
+    }
+
+    /// No bearer on the metadata-populated D4 path must take the static
+    /// `build_file_io` route and rebuild the `IcebergScanExec` offline, with no
+    /// per-user catalog round-trip. Round-trips through the real encoder so the
+    /// schema-proto and metadata-json bytes are valid.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn physical_decode_no_bearer_uses_static_file_io() {
+        let scan = make_iceberg_scan_exec(); // bearer defaults to None
+        assert_eq!(scan.bearer(), None);
+        let codec = make_physical_codec().await;
+
+        let mut buf = Vec::new();
+        codec.try_encode(Arc::new(scan), &mut buf).unwrap();
+
+        // The encoder must have left the bearer empty on the wire.
+        let encoded: EncodedSqeScan = serde_json::from_slice(&buf[1..]).unwrap();
+        assert_eq!(encoded.bearer, None);
+        assert!(!encoded.metadata_json.is_empty(), "D4 sync path");
+
+        let decoded = codec.try_decode(&buf, &[], &task_ctx()).unwrap();
+        decoded
+            .as_any()
+            .downcast_ref::<IcebergScanExec>()
+            .expect("decode must return an IcebergScanExec");
+        // No bearer => the per-(user,table) FileIO cache is never touched.
+        assert_eq!(codec.file_io_cache_len().await, 0);
     }
 
     /// Pin the wire format: bearer, a single newline, then the table ref.
