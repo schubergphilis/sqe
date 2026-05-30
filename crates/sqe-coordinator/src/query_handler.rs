@@ -399,35 +399,99 @@ impl QueryHandler {
         )))
     }
 
-    /// Compute the set of catalog names that the coordinator will
-    /// register on every session context. The pre-flight unknown-
-    /// qualifier check compares the leading component of any 3-part
-    /// identifier against this set.
-    ///
-    /// Sources:
-    /// 1. `config.flattened_catalogs()` - the legacy `[catalog]` block
-    ///    plus any `[catalogs.<name>]` map entries. This matches the
-    ///    list `session_context::create_session_context` registers.
-    /// 2. The two coordinator-registered system catalogs `system`
-    ///    (Trino JDBC metadata + `system.runtime.*`) and `datafusion`
-    ///    (in-memory scratch catalog used by the IN-subquery
-    ///    rewriter).
-    ///
-    /// Returned in stable sorted order so the error message reads the
-    /// same across runs.
-    fn known_catalog_names(&self) -> Result<Vec<String>, SqeError> {
-        let mut names: Vec<String> = self
+    /// Resolve any unknown 3-part catalog qualifiers in `stmt` against the
+    /// caller's session ctx, lazily discovering Polaris warehouses when
+    /// `[query] catalog_discovery = polaris-auto`. Errors with the standard
+    /// "unknown catalog" message if a qualifier still can't be resolved.
+    /// Shared by `execute()` and `execute_stream()`.
+    async fn preflight_resolve_catalogs(
+        &self,
+        stmt: &Statement,
+        session: &Session,
+    ) -> Result<(), SqeError> {
+        let qualifiers = sqe_sql::extract_catalog_qualifiers(stmt);
+        if qualifiers.is_empty() {
+            return Ok(());
+        }
+
+        // First pass: build the "known" set from config + attached catalogs
+        // WITHOUT contacting Polaris. This preserves static-mode behavior: an
+        // unknown qualifier under `catalog_discovery = static` fails fast with
+        // no network IO (the pre-flight check fires before any connection).
+        let mut known: std::collections::HashSet<String> = self
             .config
             .flattened_catalogs()
             .into_iter()
             .map(|(n, _)| n)
             .collect();
-        names.push("system".to_string());
-        names.push("datafusion".to_string());
-        names.extend(self.runtime_catalogs.list().map_err(SqeError::Catalog)?);
-        names.sort();
-        names.dedup();
-        Ok(names)
+        known.insert("system".to_string());
+        known.insert("datafusion".to_string());
+        known.extend(self.runtime_catalogs.list().map_err(SqeError::Catalog)?);
+
+        // Fast path: every qualifier is statically known — done, no Polaris.
+        if qualifiers.iter().all(|q| known.contains(q)) {
+            return Ok(());
+        }
+
+        // Static mode: an unknown qualifier is an error. Never probe Polaris.
+        if self.config.query.catalog_discovery
+            != sqe_core::config::CatalogDiscovery::PolarisAuto
+        {
+            let unknown = qualifiers
+                .iter()
+                .find(|q| !known.contains(*q))
+                .expect("at least one unknown qualifier (the all() check failed)");
+            let mut names: Vec<String> = known.into_iter().collect();
+            names.sort();
+            return Err(SqeError::Catalog(format!(
+                "unknown catalog '{}' in 3-part identifier; configured \
+                 catalogs are {:?}. Declare it via TOML `[catalogs.<name>]`, \
+                 `ATTACH` it, or enable `[query] catalog_discovery = \"polaris-auto\"`.",
+                unknown, names
+            )));
+        }
+
+        // PolarisAuto + at least one unknown qualifier: now build the session
+        // ctx (authoritative — it includes any catalog discovered earlier in
+        // this session, so a second reference never re-probes Polaris) and
+        // lazily discover the unknown warehouses.
+        let (ctx, _) = self.create_session_context(session).await?;
+        let mut known: std::collections::HashSet<String> =
+            ctx.catalog_names().into_iter().collect();
+        known.insert("system".to_string());
+        known.insert("datafusion".to_string());
+
+        for q in &qualifiers {
+            if known.contains(q) {
+                continue;
+            }
+            if let Some(provider) = crate::session_context::discover_catalog_provider(
+                q,
+                &self.config,
+                session,
+                self.table_cache.as_ref(),
+                self.policy_store.as_ref(),
+                self.metrics.as_ref(),
+            )
+            .await
+            {
+                ctx.register_catalog(q.clone(), std::sync::Arc::new(provider));
+                known.insert(q.clone());
+                tracing::info!(catalog = %q, "catalog discovery: registered Polaris warehouse for session");
+            }
+        }
+
+        if let Some(unknown) = qualifiers.iter().find(|q| !known.contains(*q)) {
+            let mut names: Vec<String> = known.into_iter().collect();
+            names.sort();
+            return Err(SqeError::Catalog(format!(
+                "unknown catalog '{}' in 3-part identifier; configured \
+                 catalogs are {:?}. Declare it via TOML `[catalogs.<name>]`, \
+                 `ATTACH` it, or enable `[query] catalog_discovery = \"polaris-auto\"`.",
+                unknown, names
+            )));
+        }
+        Ok(())
     }
 
     /// Execute a SQL statement for the given session and return collected RecordBatches.
@@ -560,21 +624,9 @@ impl QueryHandler {
         // session-default catalog. The silent fallback produces
         // confusing "namespace does not exist" errors against the
         // wrong warehouse and was the original symptom of issue #1.
+        // Lazily discovers Polaris warehouses when catalog_discovery = polaris-auto.
         if let Some(stmt) = kind.statement() {
-            let qualifiers = sqe_sql::extract_catalog_qualifiers(stmt);
-            if !qualifiers.is_empty() {
-                let known = self.known_catalog_names()?;
-                if let Some(unknown) =
-                    qualifiers.iter().find(|q| !known.iter().any(|k| k == *q))
-                {
-                    return Err(SqeError::Catalog(format!(
-                        "unknown catalog '{}' in 3-part identifier; configured \
-                         catalogs are {:?}. Use TOML `[catalogs.<name>]` to declare \
-                         additional catalogs, or `ATTACH` at runtime once that lands.",
-                        unknown, known
-                    )));
-                }
-            }
+            self.preflight_resolve_catalogs(stmt, session).await?;
         }
 
         let span = Span::current();
@@ -1510,23 +1562,11 @@ impl QueryHandler {
             ));
         }
 
-        // Pre-flight: same unknown-catalog-qualifier check as execute().
-        // See `execute()` for the rationale.
+        // Pre-flight: same unknown-catalog-qualifier check + lazy Polaris
+        // discovery as execute(). See `preflight_resolve_catalogs` for the
+        // rationale.
         if let Some(stmt) = kind.statement() {
-            let qualifiers = sqe_sql::extract_catalog_qualifiers(stmt);
-            if !qualifiers.is_empty() {
-                let known = self.known_catalog_names()?;
-                if let Some(unknown) =
-                    qualifiers.iter().find(|q| !known.iter().any(|k| k == *q))
-                {
-                    return Err(SqeError::Catalog(format!(
-                        "unknown catalog '{}' in 3-part identifier; configured \
-                         catalogs are {:?}. Use TOML `[catalogs.<name>]` to declare \
-                         additional catalogs, or `ATTACH` at runtime once that lands.",
-                        unknown, known
-                    )));
-                }
-            }
+            self.preflight_resolve_catalogs(stmt, session).await?;
         }
 
         // --- Start tracker ----------------------------------------------------

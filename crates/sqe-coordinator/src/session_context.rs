@@ -31,6 +31,74 @@ static SESSION_CONTEXT_CACHE: LazyLock<Cache<String, (SessionContext, Arc<Sessio
             .build()
     });
 
+/// Build one [`SqeCatalogProvider`] + [`Arc<SessionCatalog>`] for a single
+/// catalog entry.
+///
+/// Extracted from the `create_session_context` loop so that Task 4 (dynamic
+/// Polaris catalog discovery) can reuse identical construction logic without
+/// duplicating it. This is the only place that calls
+/// `SessionCatalog::for_session_with` and `SqeCatalogProvider::try_new_with_policy`.
+///
+/// Returns `(catalog_provider, session_catalog)` so the caller can register
+/// the provider under `cat_name` and optionally promote it to the primary
+/// `SessionCatalog`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_catalog_provider(
+    cat_cfg: &sqe_core::config::CatalogConfig,
+    session: &Session,
+    global_storage: &sqe_core::config::StorageConfig,
+    prefetch_concurrency: usize,
+    table_cache: Option<&TableMetadataCache>,
+    policy_store: Option<&Arc<dyn PolicyStore>>,
+    prom_metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
+) -> Result<(SqeCatalogProvider, Arc<SessionCatalog>), Arc<SqeError>> {
+    let auth = cat_cfg.auth.clone().unwrap_or_default();
+    let bearer = sqe_auth::per_catalog::resolve_bearer(
+        &auth,
+        session.access_token().expose(),
+    )
+    .await
+    .map_err(Arc::new)?;
+    let storage = cat_cfg
+        .storage
+        .clone()
+        .unwrap_or_else(|| global_storage.clone());
+
+    let session_catalog = Arc::new(
+        SessionCatalog::for_session_with(
+            cat_cfg,
+            &storage,
+            table_cache.cloned(),
+            &bearer,
+        )
+        .await
+        .map_err(Arc::new)?,
+    );
+
+    let mut catalog_provider = SqeCatalogProvider::try_new_with_policy(
+        session_catalog.clone(),
+        storage.clone(),
+        cat_cfg.warehouse.clone(),
+        policy_store.cloned(),
+        Some(session.user.clone()),
+    )
+    .await
+    .map_err(Arc::new)?;
+    if let Some(m) = prom_metrics {
+        catalog_provider = catalog_provider.with_metrics(Arc::clone(m));
+    }
+    let small_file_threshold_bytes =
+        cat_cfg.small_file_threshold_mb.saturating_mul(1024 * 1024);
+    catalog_provider =
+        catalog_provider.with_small_file_threshold(small_file_threshold_bytes);
+    catalog_provider =
+        catalog_provider.with_manifest_concurrency(cat_cfg.manifest_concurrency);
+    catalog_provider = catalog_provider
+        .with_prefetch_concurrency(prefetch_concurrency);
+
+    Ok((catalog_provider, session_catalog))
+}
+
 /// Build a DataFusion [`SessionContext`] for the given session.
 ///
 /// The context is wired up with:
@@ -211,50 +279,16 @@ pub async fn create_session_context(
             let mut primary_session_catalog: Option<Arc<SessionCatalog>> = None;
 
             for (cat_name, cat_cfg) in &flattened {
-                let auth = cat_cfg.auth.clone().unwrap_or_default();
-                let bearer = sqe_auth::per_catalog::resolve_bearer(
-                    &auth,
-                    session.access_token().expose(),
+                let (catalog_provider, session_catalog) = build_catalog_provider(
+                    cat_cfg,
+                    session,
+                    &global_storage,
+                    config.storage.prefetch_concurrency,
+                    table_cache,
+                    policy_store,
+                    prom_metrics,
                 )
-                .await
-                .map_err(Arc::new)?;
-                let storage = cat_cfg
-                    .storage
-                    .clone()
-                    .unwrap_or_else(|| global_storage.clone());
-
-                let session_catalog = Arc::new(
-                    SessionCatalog::for_session_with(
-                        cat_cfg,
-                        &storage,
-                        table_cache.cloned(),
-                        &bearer,
-                    )
-                    .await
-                    .map_err(Arc::new)?,
-                );
-
-                let mut catalog_provider = SqeCatalogProvider::try_new_with_policy(
-                    session_catalog.clone(),
-                    storage.clone(),
-                    cat_cfg.warehouse.clone(),
-                    policy_store.cloned(),
-                    Some(session.user.clone()),
-                )
-                .await
-                .map_err(Arc::new)?;
-                if let Some(m) = prom_metrics {
-                    catalog_provider = catalog_provider.with_metrics(Arc::clone(m));
-                }
-                let small_file_threshold_bytes =
-                    cat_cfg.small_file_threshold_mb.saturating_mul(1024 * 1024);
-                catalog_provider =
-                    catalog_provider.with_small_file_threshold(small_file_threshold_bytes);
-                catalog_provider =
-                    catalog_provider.with_manifest_concurrency(cat_cfg.manifest_concurrency);
-                catalog_provider = catalog_provider
-                    .with_prefetch_concurrency(config.storage.prefetch_concurrency);
-
+                .await?;
                 ctx.register_catalog(cat_name, Arc::new(catalog_provider));
 
                 if primary_session_catalog.is_none() {
@@ -482,6 +516,72 @@ pub async fn create_session_context(
     Ok(result)
 }
 
+/// Pick the `CatalogConfig` to clone as the template for a discovered
+/// warehouse: the configured default catalog (`query.default_catalog`) if it
+/// names a REST catalog, else the first flattened REST catalog. Returns
+/// `None` when no REST catalog is configured (discovery only targets Polaris/
+/// REST). Only `warehouse` differs on the clone; `catalog_url` + `auth` +
+/// backend are inherited.
+pub(crate) fn discovery_template(config: &SqeConfig) -> Option<sqe_core::config::CatalogConfig> {
+    let flattened = config.flattened_catalogs();
+    let pick = config
+        .query
+        .default_catalog
+        .as_deref()
+        .and_then(|name| flattened.iter().find(|(n, _)| n == name))
+        .or_else(|| {
+            flattened
+                .iter()
+                .find(|(_, c)| matches!(c.backend, sqe_core::config::CatalogBackend::Rest))
+        })
+        .or_else(|| flattened.first());
+    pick.map(|(_, c)| (*c).clone())
+        .filter(|c| matches!(c.backend, sqe_core::config::CatalogBackend::Rest))
+}
+
+/// Attempt to resolve `warehouse` as a Polaris catalog and build its
+/// `SqeCatalogProvider` using the discovery template + the caller's bearer.
+/// Returns `Ok(None)` (not an error) when discovery is off, no template
+/// exists, or Polaris rejects the warehouse (unauthorized / nonexistent) --
+/// the caller turns `None` into the existing "unknown catalog" error so an
+/// unauthorized warehouse is indistinguishable from a missing one.
+pub(crate) async fn discover_catalog_provider(
+    warehouse: &str,
+    config: &SqeConfig,
+    session: &Session,
+    table_cache: Option<&TableMetadataCache>,
+    policy_store: Option<&Arc<dyn PolicyStore>>,
+    prom_metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
+) -> Option<SqeCatalogProvider> {
+    if config.query.catalog_discovery != sqe_core::config::CatalogDiscovery::PolarisAuto {
+        return None;
+    }
+    let mut cfg = discovery_template(config)?;
+    cfg.warehouse = warehouse.to_string();
+
+    match build_catalog_provider(
+        &cfg,
+        session,
+        &config.storage,
+        config.storage.prefetch_concurrency,
+        table_cache,
+        policy_store,
+        prom_metrics,
+    )
+    .await
+    {
+        Ok((provider, _)) => Some(provider),
+        Err(e) => {
+            tracing::info!(
+                warehouse,
+                error = %e,
+                "catalog discovery: Polaris did not resolve warehouse (treated as unknown catalog)"
+            );
+            None
+        }
+    }
+}
+
 /// Invalidate the cached SessionContext for a specific user.
 ///
 /// Because cache keys are now `username:token_hash`, we iterate and remove all
@@ -530,4 +630,55 @@ pub async fn invalidate_all_session_caches() {
     SESSION_CONTEXT_CACHE.invalidate_all();
     SESSION_CONTEXT_CACHE.run_pending_tasks().await;
     debug!("All SessionContext caches invalidated");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config_rest() -> SqeConfig {
+        let toml_text = r#"
+[coordinator]
+flight_sql_port = 0
+trino_http_port = 0
+
+[auth]
+token_endpoint = "http://127.0.0.1:9/unused"
+client_id = "test_client"
+
+[catalog]
+catalog_url = "https://polaris.example.com"
+warehouse = "original_wh"
+
+[storage]
+s3_endpoint = "http://127.0.0.1:9"
+s3_access_key = "_"
+s3_secret_key = "_"
+s3_region = "us-east-1"
+s3_path_style = true
+"#;
+        toml::from_str::<SqeConfig>(toml_text).expect("test config parses")
+    }
+
+    #[test]
+    fn discovery_template_returns_rest_catalog_and_warehouse_override_works() {
+        let config = test_config_rest();
+
+        let tmpl = discovery_template(&config);
+        assert!(tmpl.is_some(), "expected Some for a REST catalog config");
+
+        let tmpl = tmpl.unwrap();
+        assert_eq!(tmpl.catalog_url, "https://polaris.example.com");
+        assert_eq!(tmpl.warehouse, "original_wh");
+
+        // Callers override only `warehouse`; everything else is inherited.
+        let mut cloned = tmpl.clone();
+        cloned.warehouse = "discovered_wh".to_string();
+        assert_eq!(cloned.warehouse, "discovered_wh");
+        assert_eq!(cloned.catalog_url, "https://polaris.example.com");
+        assert!(matches!(
+            cloned.backend,
+            sqe_core::config::CatalogBackend::Rest
+        ));
+    }
 }

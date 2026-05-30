@@ -103,6 +103,29 @@ impl QueryEngine {
     }
 }
 
+/// How the coordinator resolves a catalog name that is not statically
+/// declared in `[catalogs.*]`. `Static` (default) errors on an unknown
+/// 3-part identifier. `PolarisAuto` lazily probes Polaris for a warehouse
+/// of that name using the caller's bearer (see the catalog-discovery design).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CatalogDiscovery {
+    #[default]
+    Static,
+    PolarisAuto,
+}
+
+impl CatalogDiscovery {
+    /// Parse from a config string; unknown values fall back to `Static`
+    /// (fail-closed — discovery is opt-in).
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "polaris-auto" => Self::PolarisAuto,
+            _ => Self::Static,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct QueryConfig {
     /// Default catalog for unqualified SQL identifiers. When unset
@@ -114,6 +137,12 @@ pub struct QueryConfig {
     /// it to be the default rather than the alphabetic winner.
     #[serde(default)]
     pub default_catalog: Option<String>,
+    /// How catalogs not declared in `[catalogs.*]` resolve. `"static"`
+    /// (default) errors on an unknown 3-part identifier; `"polaris-auto"`
+    /// lazily probes Polaris for a warehouse of that name with the caller's
+    /// bearer. See `docs/superpowers/specs/2026-05-29-polaris-catalog-discovery-design.md`.
+    #[serde(default)]
+    pub catalog_discovery: CatalogDiscovery,
     /// Maximum query execution time in seconds. Default: 300 (5 minutes).
     #[serde(default = "default_query_timeout")]
     pub timeout_secs: u64,
@@ -218,6 +247,7 @@ impl Default for QueryConfig {
     fn default() -> Self {
         Self {
             default_catalog: None,
+            catalog_discovery: CatalogDiscovery::default(),
             timeout_secs: default_query_timeout(),
             role_overrides: std::collections::HashMap::new(),
             max_result_rows: default_max_result_rows(),
@@ -2636,6 +2666,15 @@ mod tests {
         assert_eq!(parse_memory_limit("1024").unwrap(), 1024);
         assert_eq!(parse_memory_limit("1024B").unwrap(), 1024);
         assert_eq!(parse_memory_limit("1024b").unwrap(), 1024);
+    }
+
+    #[test]
+    fn catalog_discovery_parses_and_defaults() {
+        assert_eq!(CatalogDiscovery::parse("polaris-auto"), CatalogDiscovery::PolarisAuto);
+        assert_eq!(CatalogDiscovery::parse("static"), CatalogDiscovery::Static);
+        assert_eq!(CatalogDiscovery::parse("PoLaRiS-AuTo"), CatalogDiscovery::PolarisAuto);
+        assert_eq!(CatalogDiscovery::parse("nonsense"), CatalogDiscovery::Static);
+        assert_eq!(CatalogDiscovery::default(), CatalogDiscovery::Static);
     }
 
     #[test]

@@ -192,6 +192,48 @@ that the token is valid against the catalog's expected issuer. Bearer
 tokens stored as secrets are forwarded as-is; SQE does not reissue
 or refresh them.
 
+## Dynamic Polaris catalog discovery
+
+`ATTACH` and `[catalogs.*]` both name catalogs explicitly. For
+dynamically-provisioned Polaris warehouses (IaC, per-tenant, random-suffixed),
+enable lazy discovery instead:
+
+```toml
+[query]
+catalog_discovery = "polaris-auto"   # default is "static"
+```
+
+With `polaris-auto`, a query referencing a 3-part identifier whose catalog is
+not statically declared triggers a one-time probe against Polaris for a
+warehouse of that name, using the caller's own bearer token. If Polaris
+resolves it (and the caller is authorized), SQE registers it into the session
+exactly like a static catalog -- same policy enforcement, dynamic-filter
+pushdown, and credential passthrough -- and the query proceeds. No `sqe.toml`
+change, no restart:
+
+```sql
+-- main_warehouse_9d679d was created in Polaris at runtime, never declared in TOML
+SELECT count(*) FROM "main_warehouse_9d679d".analytics.orders;
+```
+
+Properties:
+
+- **Authorization is unchanged.** The probe uses the caller's bearer; Polaris
+  rejects warehouses they are not authorized for. A denied or nonexistent
+  warehouse returns the same `unknown catalog` error -- existence is not
+  leaked.
+- **Per-session scoping.** The discovered catalog is registered into the
+  caller's session, not shared process-wide, so vended credentials and
+  visibility stay per-user. A second reference in the same session reuses it
+  without re-probing.
+- **Drop-out within the session TTL.** A renamed or dropped warehouse stops
+  resolving on the next session refresh.
+- **`static` (the default) is unchanged** -- an undeclared catalog errors with
+  no Polaris probe.
+- **REST/Polaris only.** Glue, S3 Tables, and HMS still require static
+  declaration or `ATTACH`. `SHOW CATALOGS` lists statically-configured and
+  already-discovered catalogs, not warehouses never yet referenced.
+
 ## v1 limitations
 
 - No on-disk persistence. ATTACH does not survive a restart.
