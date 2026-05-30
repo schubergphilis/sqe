@@ -88,6 +88,14 @@ impl ClusterCatalog {
         Arc::new(SqeLogicalCodec::new(self.provider.clone()))
     }
 
+    /// Bearer-aware variant of [`logical_codec`]. Used by [`submit_remote`] to
+    /// stamp the authenticated user's bearer onto the encoded plan so executors
+    /// can mint a per-user FileIO without relying on ballista session-config
+    /// propagation (which silently drops `ConfigExtension` keys).
+    fn logical_codec_with_bearer(&self, bearer: Option<Arc<str>>) -> Arc<SqeLogicalCodec> {
+        Arc::new(SqeLogicalCodec::new_with_bearer(self.provider.clone(), bearer))
+    }
+
     fn physical_codec(&self) -> Arc<SqePhysicalCodec> {
         Arc::new(SqePhysicalCodec::new(
             self.session_catalog.clone(),
@@ -322,26 +330,27 @@ pub async fn submit_remote(
     target_partitions: usize,
     user_bearer: &str,
 ) -> Result<(SchemaRef, SendableRecordBatchStream)> {
+    // The bearer is threaded through the plan: the logical codec stamps it onto
+    // the encoded SqeTableProvider node; the scheduler decodes it and attaches
+    // the bearer to the rehydrated provider; from there it flows to
+    // IcebergScanExec and the physical EncodedSqeScan, which uses it to mint a
+    // per-(user,table) FileIO. This is the primary bearer-passthrough path.
+    //
+    // The SqeAuthOptions session-config insert below is retained as harmless
+    // redundancy. Ballista currently drops ConfigExtension keys during
+    // `update_from_key_value_pair` (they are emitted unprefixed so the
+    // receiving `set()` cannot route them back), so the insert is a no-op at
+    // runtime. It is kept so the wiring is already in place should a future
+    // ballista version round-trip ConfigExtension keys correctly.
+    //
+    // Security: the bearer is a live OIDC token; do not log it at trace level.
     let mut config = SessionConfig::new_with_ballista()
         .with_target_partitions(target_partitions)
-        .with_ballista_logical_extension_codec(cluster.logical_codec())
+        .with_ballista_logical_extension_codec(cluster.logical_codec_with_bearer(
+            (!user_bearer.is_empty()).then(|| Arc::from(user_bearer)),
+        ))
         .with_ballista_physical_extension_codec(cluster.physical_codec());
 
-    // Carry the authenticated user's bearer to the executors so the physical
-    // codec can mint a per-user catalog (Polaris then vends per-user S3 creds).
-    //
-    // KNOWN LIMITATION (cutover design D8): this does NOT currently reach the
-    // executor. Ballista propagates session settings via
-    // `ConfigOptions::entries()` -> `set()`, but DataFusion emits
-    // `ConfigExtension` entries *unprefixed* ("bearer", not "sqe_auth.bearer"),
-    // and the receiving `set()` can't route an unprefixed key back to the
-    // extension, so it is silently dropped. The executor's `resolve_catalog`
-    // therefore falls back to its single-tenant config catalog today (which
-    // matches the legacy distributed path's static-creds model). True
-    // per-user passthrough needs the bearer threaded through the plan node
-    // (SqeTableProvider -> IcebergScanExec -> EncodedSqeScan) or an upstream
-    // ballista fix; tracked as a follow-up. We still set it here so the wiring
-    // is in place the moment that lands.
     config.options_mut().extensions.insert(SqeAuthOptions {
         bearer: user_bearer.to_string(),
     });
