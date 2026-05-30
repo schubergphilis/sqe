@@ -200,7 +200,10 @@ else is "wire ballista in, delete the old path".
   expected to show at SF1+ (Phase 5). Endpoints via env
   `SQE_BALLISTA_SCHEDULER_HOST/PORT`, `SQE_BALLISTA_EXECUTOR_HOST/GRPC_PORT`.
 - **Phase 4 — credential passthrough + refresh on the ballista path.**
-  **PARTIAL — infra in place, per-user passthrough blocked by ballista D8.**
+  **DONE (Phase 4b landed 2026-05-30): per-user bearer now threads through the
+  plan, not ballista session config.** The narrative below is the original
+  Phase 4 finding that motivated the plan-node design; the resolution is in
+  ledger D8 and the parity-gate table (criterion #1, code-complete).
   Built: `auth_ext::SqeAuthOptions` config extension, executor-side
   `SqePhysicalCodec::resolve_catalog` (mints + caches a per-user
   `SessionCatalog` from the bearer, falls back to the single-tenant config
@@ -420,10 +423,24 @@ upstream improvement. Appended as we build.
   `sqe_auth` extension -> silently dropped. *Why it matters:* blocks the
   simplest per-query-secret passthrough. *Upstream:* ballista should prefix
   extension keys in `to_key_value_pairs` (or DataFusion's extension
-  `entries()` should emit prefixed keys). *SQE workaround (designed, not yet
-  built):* thread the secret through the plan-node bytes instead of session
-  config. Verified empirically: client `bearer_len=630`, executor
-  `bearer_len=0`.
+  `entries()` should emit prefixed keys). Verified empirically: client
+  `bearer_len=630`, executor `bearer_len=0`.
+  *SQE resolution (BUILT 2026-05-30, plan `2026-05-30-ballista-bearer-passthrough.md`):*
+  thread the bearer through the plan instead of session config. The client
+  `SqeLogicalCodec` stamps the bearer onto the encoded table-provider bytes
+  (`"<bearer>\n<tableref>"`); the scheduler's `try_decode_table_provider`
+  attaches it to the rehydrated `SqeTableProvider`; `scan()` bakes it onto
+  `IcebergScanExec`; the physical codec writes it into `EncodedSqeScan.bearer`;
+  the executor mints a per-(user,table) `FileIO` from it, cached with a
+  per-key `OnceCell` single-flight so the D4 no-per-task-round-trip invariant
+  holds (one bearer->vended-creds exchange per (user,table) per executor, not
+  per task). Trust model preserved: only the bearer crosses the wire, never S3
+  secrets. The `SqeAuthOptions` session-config insert is retained as a no-op in
+  case a future ballista round-trips extension keys. Per-user isolation is NOT
+  end-to-end verifiable on the single-principal dev stack (all users share one
+  service token); unit-tested units are the wire round-trip, the cache keying
+  (keyed on the full bearer, no hash-collision crossover), and the no-bearer
+  static fallback.
 
 ## End goal + plumbing-reduction gates
 
@@ -456,7 +473,7 @@ scheduling is more mature than the bespoke `WeightedScheduler` + `stage_planner`
 
 | # | Criterion | Status (verified vs. assumed) | Maps to |
 |---|---|---|---|
-| 1 | **Bearer passthrough** — per-user OIDC bearer reaches executors; the query authenticates *as the user* to Polaris/S3 (no service account) | **VERIFIED BROKEN.** D8: ballista drops the unprefixed `ConfigExtension` key; the ballista path falls back to single-tenant = *legacy* parity, not per-user. Fix designed (plan-node threading), not implemented. | G3, task 4b |
+| 1 | **Bearer passthrough** — per-user OIDC bearer reaches executors; the query authenticates *as the user* to Polaris/S3 (no service account) | **CODE-COMPLETE (2026-05-30).** Bearer threaded through the plan (logical codec -> provider -> `IcebergScanExec` -> `EncodedSqeScan` -> executor per-(user,table) `FileIO`, D4-safe cache); see D8. Unit-tested: wire round-trip, full-bearer cache keying, no-bearer fallback. Per-user isolation NOT E2E-verifiable on the single-principal stack; needs a multi-principal env. | G3, task 4b |
 | 2 | **Policy plans survive the codec** — injected column-mask / row-filter nodes round-trip through `SqeLogicalCodec` and enforce on executors | **TO ASSESS WHEN REACHED.** TPC-H 22/22 proves *ordinary* plans serialize; no benchmark exercises injected security nodes yet. | new |
 | 3 | **All catalog backends decode** — Glue/S3Tables/Unity/Nessie/Hadoop rebuild executor-side, not just REST/Polaris | **TO ASSESS WHEN REACHED.** | new |
 | 4 | **Protocols route** — both Flight SQL and Trino HTTP drive the ballista path | **TO ASSESS WHEN REACHED.** | new |
