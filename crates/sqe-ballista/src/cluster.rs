@@ -8,15 +8,21 @@
 //!   and submits each query to it via [`submit_remote`].
 //! - Each `sqe-worker` process is a ballista **executor** ([`run_executor`]).
 //!
-//! ## Auth scope (Phase 3)
+//! ## Auth scope (Phase 3 fallback + Phase 4b per-user)
 //!
-//! The legacy distributed path already used static `[storage]` creds (no
-//! per-session bearer). Phase 3 matches that: the scheduler and every
-//! executor build a single-tenant [`SessionCatalog`] / `SqeCatalogProvider`
-//! from their **own config** (catalog url + warehouse + static S3 creds via a
-//! client_credentials service token), and the SQE codecs on the cluster side
-//! hold that config-built catalog. Per-user OIDC bearer passthrough to
-//! executors is Phase 4. See the cutover design doc.
+//! The scheduler and every executor build a single-tenant [`SessionCatalog`] /
+//! `SqeCatalogProvider` from their **own config** (catalog url + warehouse +
+//! static S3 creds via a client_credentials service token), and the SQE codecs
+//! on the cluster side hold that config-built catalog. This is the no-bearer
+//! fallback (matches the legacy distributed path's static `[storage]` creds).
+//!
+//! Phase 4b adds per-user passthrough: the authenticated user bearer is
+//! threaded through the plan (client logical codec stamps it; the scheduler
+//! attaches it to the rehydrated provider; it rides the physical
+//! `EncodedSqeScan` to the executor, which mints a per-(user,table) `FileIO`
+//! from it). Only the bearer travels, never S3 secrets. See the cutover design
+//! doc (ledger D8) for the full path and why it bypasses ballista's
+//! `ConfigExtension` propagation.
 //!
 //! ## Codec placement
 //!
