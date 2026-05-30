@@ -459,6 +459,18 @@ upstream improvement. Appended as we build.
   `schema()` live against the catalog instead of a startup snapshot, or
   (b) rebuild/invalidate the cluster catalog on DDL. Pre-existing; orthogonal to
   parity #1. The single-node (legacy) path is unaffected (per-session catalog).
+  *FIXED (2026-05-30, option a, surgical):* `SqeCatalogProvider` gains an opt-in
+  `with_live_schema_resolution()` that makes `schema(name)` resolve the requested
+  namespace directly instead of gating on the construction-time
+  `cached_namespaces` snapshot; table existence is then decided live by the
+  schema provider's `table()`. Set ONLY on the long-lived cluster catalog
+  (`build_cluster_catalog`); the per-statement coordinator catalog keeps the
+  snapshot guard (always fresh, preserves "schema not found" semantics) so its
+  hot path is byte-for-byte unchanged. `schema_names()` enumeration still uses
+  the snapshot (no async in the sync trait method). *Verified:* the exact
+  failing scenario (coordinator started, THEN TPC-H SF0.1 loaded, ballista mode)
+  now passes **22/22** (was 0/22); plus a unit regression test in
+  `catalog_provider.rs`.
 
 ## End goal + plumbing-reduction gates
 
@@ -491,7 +503,7 @@ scheduling is more mature than the bespoke `WeightedScheduler` + `stage_planner`
 
 | # | Criterion | Status (verified vs. assumed) | Maps to |
 |---|---|---|---|
-| 1 | **Bearer passthrough** — per-user OIDC bearer reaches executors; the query authenticates *as the user* to Polaris/S3 (no service account) | **CODE-COMPLETE + E2E-SMOKED (2026-05-30).** Bearer threaded through the plan (logical codec -> provider -> `IcebergScanExec` -> `EncodedSqeScan` -> executor per-(user,table) `FileIO`, D4-safe cache); see D8. Unit-tested: wire round-trip, full-bearer cache keying, no-bearer fallback. **Ballista-mode smoke: TPC-H SF0.1 22/22** (single-principal stack; exercises the full bearer path with a real token). Per-user *isolation* still NOT E2E-verifiable on the single-principal stack (needs a multi-principal env). NB: the smoke first hit 0/22 from a pre-existing cluster-catalog freshness bug (D12), not from bearer threading. | G3, task 4b |
+| 1 | **Bearer passthrough** — per-user OIDC bearer reaches executors; the query authenticates *as the user* to Polaris/S3 (no service account) | **CODE-COMPLETE + E2E-SMOKED (2026-05-30).** Bearer threaded through the plan (logical codec -> provider -> `IcebergScanExec` -> `EncodedSqeScan` -> executor per-(user,table) `FileIO`, D4-safe cache); see D8. Unit-tested: wire round-trip, full-bearer cache keying, no-bearer fallback. **Ballista-mode smoke: TPC-H SF0.1 22/22** (single-principal stack; exercises the full bearer path with a real token). Per-user *isolation* still NOT E2E-verifiable on the single-principal stack (needs a multi-principal env). NB: the smoke first hit 0/22 from a pre-existing cluster-catalog freshness bug (D12, now FIXED), not from bearer threading; ballista-mode TPC-H is 22/22 in the start-then-load order too. | G3, task 4b |
 | 2 | **Policy plans survive the codec** — injected column-mask / row-filter nodes round-trip through `SqeLogicalCodec` and enforce on executors | **TO ASSESS WHEN REACHED.** TPC-H 22/22 proves *ordinary* plans serialize; no benchmark exercises injected security nodes yet. | new |
 | 3 | **All catalog backends decode** — Glue/S3Tables/Unity/Nessie/Hadoop rebuild executor-side, not just REST/Polaris | **TO ASSESS WHEN REACHED.** | new |
 | 4 | **Protocols route** — both Flight SQL and Trino HTTP drive the ballista path | **TO ASSESS WHEN REACHED.** | new |

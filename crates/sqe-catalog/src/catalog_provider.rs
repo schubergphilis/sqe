@@ -40,6 +40,14 @@ pub struct SqeCatalogProvider {
     /// Prefetch concurrency for the direct-read fast path. Sourced from
     /// `[storage] prefetch_concurrency` and propagated downstream.
     prefetch_concurrency: usize,
+    /// When true, `schema(name)` resolves the requested namespace directly
+    /// instead of gating on `cached_namespaces`. Long-lived catalogs (the
+    /// ballista cluster catalog, built once and reused) set this so a namespace
+    /// created after construction still resolves; table existence is then
+    /// decided live by the schema provider's `table()`. The per-statement
+    /// coordinator catalog leaves it false: its snapshot is always fresh, and
+    /// the guard preserves "schema not found" semantics. See ledger D12.
+    live_schema_resolution: bool,
 }
 
 impl std::fmt::Debug for SqeCatalogProvider {
@@ -99,6 +107,7 @@ impl SqeCatalogProvider {
             small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
             manifest_concurrency: crate::iceberg_scan::DEFAULT_MANIFEST_CONCURRENCY,
             prefetch_concurrency: crate::iceberg_scan::DEFAULT_DIRECT_READ_CONCURRENCY,
+            live_schema_resolution: false,
         })
     }
 
@@ -152,7 +161,18 @@ impl SqeCatalogProvider {
             small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
             manifest_concurrency: crate::iceberg_scan::DEFAULT_MANIFEST_CONCURRENCY,
             prefetch_concurrency: crate::iceberg_scan::DEFAULT_DIRECT_READ_CONCURRENCY,
+            live_schema_resolution: false,
         }
+    }
+
+    /// Resolve `schema(name)` point lookups live (bypass the construction-time
+    /// `cached_namespaces` snapshot). Set for long-lived catalogs that outlive
+    /// DDL, such as the ballista cluster catalog. `schema_names()` enumeration
+    /// still uses the snapshot. See ledger D12.
+    #[must_use = "with_live_schema_resolution consumes self; bind the returned provider"]
+    pub fn with_live_schema_resolution(mut self) -> Self {
+        self.live_schema_resolution = true;
+        self
     }
 }
 
@@ -179,7 +199,11 @@ impl CatalogProvider for SqeCatalogProvider {
             ));
         }
 
-        if !self.cached_namespaces.contains(&name.to_string()) {
+        // Long-lived catalogs (cluster catalog) resolve the requested namespace
+        // directly so namespaces created after construction still resolve;
+        // table existence is decided live by the schema provider (ledger D12).
+        // Per-statement catalogs keep the snapshot guard ("schema not found").
+        if !self.live_schema_resolution && !self.cached_namespaces.contains(&name.to_string()) {
             debug!(schema = name, "Schema not found in cached namespaces");
             return None;
         }
@@ -199,5 +223,77 @@ impl CatalogProvider for SqeCatalogProvider {
 
         Some(Arc::new(provider))
 
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rest_catalog::SessionCatalog;
+    use sqe_core::config::CatalogConfig;
+
+    /// Build a `SessionCatalog` offline. `for_session_with` builds the REST
+    /// catalog lazily (the `/v1/config` probe is memoized on first table use),
+    /// so construction touches no network. `schema()` itself does no I/O (it
+    /// only constructs a `SqeSchemaProvider`), so these assertions are offline.
+    async fn offline_session_catalog() -> Arc<SessionCatalog> {
+        let cat_cfg: CatalogConfig = serde_json::from_value(serde_json::json!({
+            "catalog_url": "http://127.0.0.1:1/iceberg",
+            "warehouse": "test",
+        }))
+        .expect("minimal CatalogConfig must deserialize");
+        let storage = StorageConfig::default();
+        Arc::new(
+            SessionCatalog::for_session_with(&cat_cfg, &storage, None, "svc")
+                .await
+                .expect("offline SessionCatalog build (lazy REST catalog)"),
+        )
+    }
+
+    /// The long-lived cluster catalog (ballista) is built once and reused; a
+    /// namespace created afterward must still resolve. Snapshot mode (the
+    /// per-statement coordinator default) gates point lookups on the cached
+    /// list; live mode (the cluster catalog) resolves the requested namespace
+    /// directly and lets table resolution decide existence. Regression guard
+    /// for cutover ledger D12.
+    #[tokio::test]
+    async fn schema_point_lookup_respects_live_resolution_flag() {
+        let sc = offline_session_catalog().await;
+        let storage = StorageConfig::default();
+
+        // Snapshot mode: the cached list omits "newns" -> rejected (current,
+        // correct-for-per-statement behaviour, preserved).
+        let snapshot_only = SqeCatalogProvider::with_namespaces(
+            sc.clone(),
+            storage.clone(),
+            "test".to_string(),
+            vec!["oldns".to_string()],
+        );
+        assert!(
+            snapshot_only.schema("newns").is_none(),
+            "snapshot mode must gate point lookups on the cached namespace list"
+        );
+        assert!(
+            snapshot_only.schema("oldns").is_some(),
+            "snapshot mode resolves cached namespaces"
+        );
+
+        // Live mode: the cluster catalog resolves a namespace absent from the
+        // construction-time snapshot (the D12 fix).
+        let live = SqeCatalogProvider::with_namespaces(
+            sc,
+            storage,
+            "test".to_string(),
+            vec!["oldns".to_string()],
+        )
+        .with_live_schema_resolution();
+        assert!(
+            live.schema("newns").is_some(),
+            "live mode resolves namespaces created after the snapshot was taken"
+        );
+        assert!(
+            live.schema("information_schema").is_some(),
+            "live mode still serves information_schema"
+        );
     }
 }
