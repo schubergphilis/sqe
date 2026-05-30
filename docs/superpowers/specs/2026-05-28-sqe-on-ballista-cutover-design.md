@@ -1,7 +1,10 @@
 # SQE-on-ballista cutover design
 
-Date: 2026-05-28
-Status: approved-in-principle (user: "let's do the cutover", "keep on building")
+Date: 2026-05-28 (migration contract added 2026-05-30)
+Status: approved-in-principle (user: "let's do the cutover", "keep on building");
+migration contract = Option 3, parity-gated retirement (see "Migration contract
+& parity gate", 2026-05-30) — bespoke default, ballista opt-in, retire at
+functional+speed parity, functional blockers first
 PoC: `docs/superpowers/specs/2026-05-28-sqe-on-ballista-poc-report.md` (GREEN)
 Branch: `feat/sqe-ballista-poc-spike` -> cutover work continues here / new `feat/sqe-ballista-cutover`
 
@@ -427,6 +430,42 @@ upstream improvement. Appended as we build.
 **North Star (user, 2026-05-29):** reduce SQE's bespoke plumbing by leaning
 on ballista where possible — **without losing functionality or speed.** Both
 halves are hard constraints, and they shape what the cutover is allowed to do.
+
+### Migration contract & parity gate (user, 2026-05-30)
+
+The user reframed the relationship precisely: **SQE is the lakehouse SQL
+server** (like the Polaris / Iceberg-REST / Glue / S3Tables stack it fronts),
+and its identity is four pillars it owns — **protocols** (Flight SQL, Trino
+HTTP), **targets** (Polaris, Iceberg REST, Glue/S3Tables, Unity, Nessie,
+Hadoop), **speed** (our scan / IO / spill tuning), and **policy SQL**
+(GRANT/REVOKE, column masks, row filters). **Ballista's job is narrowed to one
+thing: the distributed scheduler / task-management brain** — chosen because its
+scheduling is more mature than the bespoke `WeightedScheduler` + `stage_planner`.
+
+**The contract (Option 3, parity-gated retirement):**
+
+- **Now:** bespoke is the **default**; ballista is **opt-in** behind
+  `[query] engine = "ballista"`. Nothing in the bespoke layer is touched.
+- **Retire trigger:** when ballista reaches **functional parity** *and* **speed
+  parity** (the gate below), the bespoke distributed layer retires and ballista
+  becomes the single path.
+- **Ordering (user directive):** **correctness before performance.** Close the
+  functional blockers first; speed parity is the *last* gate before retirement.
+
+**The parity gate (retire trigger) — ordered, honest status:**
+
+| # | Criterion | Status (verified vs. assumed) | Maps to |
+|---|---|---|---|
+| 1 | **Bearer passthrough** — per-user OIDC bearer reaches executors; the query authenticates *as the user* to Polaris/S3 (no service account) | **VERIFIED BROKEN.** D8: ballista drops the unprefixed `ConfigExtension` key; the ballista path falls back to single-tenant = *legacy* parity, not per-user. Fix designed (plan-node threading), not implemented. | G3, task 4b |
+| 2 | **Policy plans survive the codec** — injected column-mask / row-filter nodes round-trip through `SqeLogicalCodec` and enforce on executors | **TO ASSESS WHEN REACHED.** TPC-H 22/22 proves *ordinary* plans serialize; no benchmark exercises injected security nodes yet. | new |
+| 3 | **All catalog backends decode** — Glue/S3Tables/Unity/Nessie/Hadoop rebuild executor-side, not just REST/Polaris | **TO ASSESS WHEN REACHED.** | new |
+| 4 | **Protocols route** — both Flight SQL and Trino HTTP drive the ballista path | **TO ASSESS WHEN REACHED.** | new |
+| 5 | **Speed parity** — measured **multi-node at SF1+** (task 5b), ballista within an agreed band of bespoke (e.g. ≤1.2x). *Not* measurable on the 36GB co-located dev box: co-located executors share one machine's cores, so ballista can only win at multi-node SF1+. | DEFERRED to real hardware; band = G2's ≤1.2x. | G2 |
+
+Criteria 1-4 are the functional expansion of gate **G3** (plus **G1** robustness:
+a query that hangs fails both functionality and speed). Criterion 5 is gate
+**G2**. Retirement is post-**G4** soak. The G1-G4 table below is the engineering
+backlog; this checklist is the *contract* the gates serve.
 
 **What never moves (engine-agnostic, above the execution seam).** The product
 surface is coordinator-side and independent of the execution engine. It is
