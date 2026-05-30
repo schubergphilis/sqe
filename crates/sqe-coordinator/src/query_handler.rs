@@ -413,10 +413,48 @@ impl QueryHandler {
         if qualifiers.is_empty() {
             return Ok(());
         }
-        // Authority for "known" is the caller's session ctx: it already
-        // has every static + attached catalog registered, plus any
-        // catalog discovered earlier in this session (so a second
-        // reference never re-probes Polaris).
+
+        // First pass: build the "known" set from config + attached catalogs
+        // WITHOUT contacting Polaris. This preserves static-mode behavior: an
+        // unknown qualifier under `catalog_discovery = static` fails fast with
+        // no network IO (the pre-flight check fires before any connection).
+        let mut known: std::collections::HashSet<String> = self
+            .config
+            .flattened_catalogs()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        known.insert("system".to_string());
+        known.insert("datafusion".to_string());
+        known.extend(self.runtime_catalogs.list().map_err(SqeError::Catalog)?);
+
+        // Fast path: every qualifier is statically known — done, no Polaris.
+        if qualifiers.iter().all(|q| known.contains(q)) {
+            return Ok(());
+        }
+
+        // Static mode: an unknown qualifier is an error. Never probe Polaris.
+        if self.config.query.catalog_discovery
+            != sqe_core::config::CatalogDiscovery::PolarisAuto
+        {
+            let unknown = qualifiers
+                .iter()
+                .find(|q| !known.contains(*q))
+                .expect("at least one unknown qualifier (the all() check failed)");
+            let mut names: Vec<String> = known.into_iter().collect();
+            names.sort();
+            return Err(SqeError::Catalog(format!(
+                "unknown catalog '{}' in 3-part identifier; configured \
+                 catalogs are {:?}. Declare it via TOML `[catalogs.<name>]`, \
+                 `ATTACH` it, or enable `[query] catalog_discovery = \"polaris-auto\"`.",
+                unknown, names
+            )));
+        }
+
+        // PolarisAuto + at least one unknown qualifier: now build the session
+        // ctx (authoritative — it includes any catalog discovered earlier in
+        // this session, so a second reference never re-probes Polaris) and
+        // lazily discover the unknown warehouses.
         let (ctx, _) = self.create_session_context(session).await?;
         let mut known: std::collections::HashSet<String> =
             ctx.catalog_names().into_iter().collect();
