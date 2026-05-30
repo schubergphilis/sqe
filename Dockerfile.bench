@@ -9,8 +9,10 @@ FROM lukemathwalker/cargo-chef:latest-rust-bookworm AS chef
 ARG TARGETARCH
 ARG SCCACHE_VERSION=0.9.0
 
+# libprotobuf-dev provides the well-known .proto includes (google/protobuf/*)
+# that datafusion-substrait's build.rs needs; protobuf-compiler alone is not enough.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake protobuf-compiler libssl-dev pkg-config clang lld curl && \
+    cmake protobuf-compiler libprotobuf-dev libssl-dev pkg-config clang lld curl && \
     rm -rf /var/lib/apt/lists/* && \
     case "$TARGETARCH" in \
         amd64) SCCACHE_ARCH=x86_64 ;; \
