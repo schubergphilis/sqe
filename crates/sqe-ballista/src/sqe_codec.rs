@@ -59,6 +59,10 @@ use crate::block_on_in_runtime;
 /// ballista's default logical codec.
 pub struct SqeLogicalCodec {
     catalog: Arc<dyn CatalogProvider>,
+    /// The authenticated user's OIDC bearer, stamped alongside the table ref on
+    /// the client so the scheduler can attach it to the rehydrated
+    /// `SqeTableProvider` (parity #1 / D8). `None` = single-tenant fallback.
+    bearer: Option<Arc<str>>,
     default: BallistaLogicalExtensionCodec,
 }
 
@@ -70,10 +74,19 @@ impl Debug for SqeLogicalCodec {
 
 impl SqeLogicalCodec {
     /// `catalog` is the per-session `SqeCatalogProvider` registered on the
-    /// client context (cheap to clone; `Arc` of schema providers).
+    /// client context (cheap to clone; `Arc` of schema providers). No bearer;
+    /// the encoded ref carries an empty bearer field.
     pub fn new(catalog: Arc<dyn CatalogProvider>) -> Self {
+        Self::new_with_bearer(catalog, None)
+    }
+
+    /// Same as [`Self::new`] but carries the authenticated user's bearer, which
+    /// the encoder stamps before the table ref so the scheduler can re-attach
+    /// it to the rehydrated `SqeTableProvider` on decode.
+    pub fn new_with_bearer(catalog: Arc<dyn CatalogProvider>, bearer: Option<Arc<str>>) -> Self {
         Self {
             catalog,
+            bearer,
             default: BallistaLogicalExtensionCodec::default(),
         }
     }
@@ -102,6 +115,13 @@ impl LogicalExtensionCodec for SqeLogicalCodec {
         // SQE only registers iceberg-backed tables, so encoding the
         // reference and rehydrating on decode is sufficient. `Display`
         // gives `schema.table` (or `catalog.schema.table`).
+        //
+        // Wire format: `<bearer>\n<tableref>`. The bearer (possibly empty)
+        // comes first, then a single newline, then the ref. The decoder splits
+        // on the first newline only; table refs and JWTs never contain one.
+        let bearer = self.bearer.as_deref().unwrap_or("");
+        buf.extend_from_slice(bearer.as_bytes());
+        buf.push(b'\n');
         buf.extend_from_slice(table_ref.to_string().as_bytes());
         Ok(())
     }
@@ -113,8 +133,14 @@ impl LogicalExtensionCodec for SqeLogicalCodec {
         _schema: SchemaRef,
         _ctx: &TaskContext,
     ) -> DFResult<Arc<dyn TableProvider>> {
-        let encoded = std::str::from_utf8(buf)
+        let raw = std::str::from_utf8(buf)
             .map_err(|e| DataFusionError::Internal(format!("table ref not UTF-8: {e}")))?;
+        // Split the leading `<bearer>\n` off the table ref (see the encoder).
+        let (bearer_str, encoded) = raw.split_once('\n').ok_or_else(|| {
+            DataFusionError::Internal("missing bearer/tableref separator".into())
+        })?;
+        let bearer: Option<Arc<str>> =
+            (!bearer_str.is_empty()).then(|| Arc::from(bearer_str));
         let parsed = TableReference::parse_str(encoded);
 
         let (schema_name, table_name) = match &parsed {
@@ -143,6 +169,16 @@ impl LogicalExtensionCodec for SqeLogicalCodec {
                         "sqe codec: table '{schema_name}.{table_name}' not found"
                     ))
                 })?;
+
+        // Attach the decoded bearer to the rehydrated SQE provider so its
+        // `scan()` bakes it onto the `IcebergScanExec` (parity #1 / D8). A
+        // non-SQE provider (shouldn't happen for iceberg refs) passes through.
+        if let Some(sqe) = provider
+            .as_any()
+            .downcast_ref::<sqe_catalog::table_provider::SqeTableProvider>()
+        {
+            return Ok(Arc::new(sqe.clone().with_bearer(bearer)));
+        }
         Ok(provider)
     }
 }
@@ -441,10 +477,165 @@ fn build_file_io(storage: &StorageConfig, metadata_location: Option<&str>) -> DF
 
 #[cfg(test)]
 mod tests {
+    use datafusion::catalog::{MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider};
+    use datafusion::datasource::empty::EmptyTable;
+    use datafusion::prelude::SessionContext;
     use iceberg::expr::Reference;
     use iceberg::spec::Datum;
+    use sqe_catalog::table_provider::SqeTableProvider;
 
     use super::*;
+
+    /// Trivial sync catalog; the encode path never touches it.
+    fn test_catalog() -> Arc<dyn CatalogProvider> {
+        Arc::new(MemoryCatalogProvider::new())
+    }
+
+    /// Trivial sync provider; `try_encode_table_provider` ignores its argument.
+    fn test_provider() -> Arc<dyn TableProvider> {
+        Arc::new(EmptyTable::new(Arc::new(Schema::empty())))
+    }
+
+    /// Build a minimal `SqeTableProvider` from inline JSON metadata. Mirrors
+    /// `sqe-catalog`'s own test helper (its `cfg(test)` copy is invisible from
+    /// here). No snapshots, no I/O; only the schema is needed.
+    async fn make_sqe_provider() -> SqeTableProvider {
+        let metadata_json = r#"{
+            "format-version": 2,
+            "table-uuid": "fb072c92-a02b-11e9-ae9c-1bb7bc9eca94",
+            "location": "file:///tmp/test-table",
+            "last-sequence-number": 0,
+            "last-updated-ms": 1600000000000,
+            "last-column-id": 1,
+            "schemas": [{"schema-id":0,"type":"struct","fields":[{"id":1,"name":"id","required":false,"type":"long"}]}],
+            "current-schema-id": 0,
+            "partition-specs": [{"spec-id":0,"fields":[]}],
+            "default-spec-id": 0,
+            "last-partition-id": 999,
+            "properties": {},
+            "snapshots": [],
+            "snapshot-log": [],
+            "metadata-log": [],
+            "sort-orders": [{"order-id":0,"fields":[]}],
+            "default-sort-order-id": 0,
+            "refs": {}
+        }"#;
+        let metadata: TableMetadata =
+            serde_json::from_str(metadata_json).expect("test metadata must parse");
+        let file_io = FileIOBuilder::new_fs_io().build().expect("fs FileIO");
+        let ident = TableIdent::new(NamespaceIdent::new("ns".to_string()), "t".to_string());
+        let table = Table::builder()
+            .file_io(file_io)
+            .identifier(ident)
+            .metadata(Arc::new(metadata))
+            .build()
+            .expect("test Table");
+        SqeTableProvider::try_new(table)
+            .await
+            .expect("SqeTableProvider must build from test table")
+    }
+
+    /// A `TaskContext` for the decode call (which ignores it).
+    fn task_ctx() -> Arc<TaskContext> {
+        SessionContext::new().task_ctx()
+    }
+
+    /// Pin the wire format: bearer, a single newline, then the table ref.
+    #[test]
+    fn logical_codec_encodes_bearer_then_tableref() {
+        let codec = SqeLogicalCodec::new_with_bearer(test_catalog(), Some(Arc::from("btok")));
+        let mut buf = Vec::new();
+        codec
+            .try_encode_table_provider(
+                &TableReference::partial("ns", "t"),
+                test_provider(),
+                &mut buf,
+            )
+            .unwrap();
+        assert_eq!(String::from_utf8(buf).unwrap(), "btok\nns.t");
+    }
+
+    /// No bearer => empty field, so the buffer starts with the separator.
+    #[test]
+    fn logical_codec_encodes_empty_bearer() {
+        let codec = SqeLogicalCodec::new(test_catalog());
+        let mut buf = Vec::new();
+        codec
+            .try_encode_table_provider(
+                &TableReference::partial("ns", "t"),
+                test_provider(),
+                &mut buf,
+            )
+            .unwrap();
+        assert_eq!(String::from_utf8(buf).unwrap(), "\nns.t");
+    }
+
+    /// Decode resolves the ref against the catalog, then attaches the bearer so
+    /// the rehydrated provider's `scan()` bakes it onto the `IcebergScanExec`.
+    /// `block_on_in_runtime` uses `block_in_place`, so the test runtime must be
+    /// multi-threaded or the catalog lookup panics.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn logical_codec_decodes_bearer_onto_provider() {
+        // Register the SQE provider under schema "ns" as table "t". The catalog
+        // hands it back with bearer `None`; the codec clones + attaches.
+        let schema = Arc::new(MemorySchemaProvider::new());
+        schema
+            .register_table("t".to_string(), Arc::new(make_sqe_provider().await))
+            .unwrap();
+        let catalog = Arc::new(MemoryCatalogProvider::new());
+        catalog.register_schema("ns", schema).unwrap();
+
+        let codec = SqeLogicalCodec::new(catalog);
+        let buf = b"btok\nns.t".to_vec();
+        let provider = codec
+            .try_decode_table_provider(
+                &buf,
+                &TableReference::partial("ns", "t"),
+                Arc::new(Schema::empty()),
+                &task_ctx(),
+            )
+            .unwrap();
+
+        // Assert via the public scan path (proven in table_provider's own test):
+        // the bearer must reach the IcebergScanExec.
+        let ctx = SessionContext::new();
+        let exec = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let scan = exec
+            .as_any()
+            .downcast_ref::<IcebergScanExec>()
+            .expect("scan() must return an IcebergScanExec");
+        assert_eq!(scan.bearer(), Some("btok"));
+    }
+
+    /// Empty bearer field (leading separator) decodes to `None` on the exec.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn logical_codec_decodes_empty_bearer_as_none() {
+        let schema = Arc::new(MemorySchemaProvider::new());
+        schema
+            .register_table("t".to_string(), Arc::new(make_sqe_provider().await))
+            .unwrap();
+        let catalog = Arc::new(MemoryCatalogProvider::new());
+        catalog.register_schema("ns", schema).unwrap();
+
+        let codec = SqeLogicalCodec::new(catalog);
+        let buf = b"\nns.t".to_vec();
+        let provider = codec
+            .try_decode_table_provider(
+                &buf,
+                &TableReference::partial("ns", "t"),
+                Arc::new(Schema::empty()),
+                &task_ctx(),
+            )
+            .unwrap();
+
+        let ctx = SessionContext::new();
+        let exec = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let scan = exec
+            .as_any()
+            .downcast_ref::<IcebergScanExec>()
+            .expect("scan() must return an IcebergScanExec");
+        assert_eq!(scan.bearer(), None);
+    }
 
     /// The `EncodedSqeScan` wire format is what crosses the scheduler ->
     /// executor boundary. Pin the round-trip, including the predicate and
