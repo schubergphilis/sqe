@@ -44,6 +44,9 @@ pub struct SqeTableProvider {
     /// In-flight prefetch concurrency for the direct-read small-file fast path.
     /// Wired through to `IcebergScanExec::direct_read_concurrency`.
     prefetch_concurrency: usize,
+    /// Per-user bearer attached by the ballista logical codec on decode
+    /// (scheduler side). `None` on the coordinator's normal registration.
+    bearer: Option<Arc<str>>,
 }
 
 impl SqeTableProvider {
@@ -70,6 +73,7 @@ impl SqeTableProvider {
             small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
             manifest_concurrency: crate::iceberg_scan::DEFAULT_MANIFEST_CONCURRENCY,
             prefetch_concurrency: crate::iceberg_scan::DEFAULT_DIRECT_READ_CONCURRENCY,
+            bearer: None,
         })
     }
 
@@ -118,6 +122,17 @@ impl SqeTableProvider {
     #[must_use = "with_trust_sort_order consumes self; bind the returned provider"]
     pub fn with_trust_sort_order(mut self, trust: bool) -> Self {
         self.trust_sort_order = trust;
+        self
+    }
+
+    /// Attach a per-user bearer (ballista scheduler decode path only).
+    ///
+    /// On the normal coordinator registration path this is never called and the
+    /// field stays `None`. The ballista logical codec sets it on decode so the
+    /// bearer travels coordinator -> worker with the plan fragment.
+    #[must_use = "with_bearer consumes self; bind the returned provider"]
+    pub fn with_bearer(mut self, bearer: Option<Arc<str>>) -> Self {
+        self.bearer = bearer;
         self
     }
 
@@ -258,6 +273,73 @@ impl TableProvider for SqeTableProvider {
             }
         }
 
+        let exec = exec.with_bearer(self.bearer.clone());
+
         Ok(Arc::new(exec))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::prelude::SessionContext;
+    use iceberg::io::FileIOBuilder;
+    use iceberg::spec::TableMetadata;
+    use iceberg::{NamespaceIdent, TableIdent};
+
+    /// Build a minimal `SqeTableProvider` from inline JSON metadata.
+    /// No snapshots, no I/O performed; only the schema is needed for this test.
+    async fn make_test_provider() -> SqeTableProvider {
+        let metadata_json = r#"{
+            "format-version": 2,
+            "table-uuid": "fb072c92-a02b-11e9-ae9c-1bb7bc9eca94",
+            "location": "file:///tmp/test-table",
+            "last-sequence-number": 0,
+            "last-updated-ms": 1600000000000,
+            "last-column-id": 1,
+            "schemas": [{"schema-id":0,"type":"struct","fields":[{"id":1,"name":"id","required":false,"type":"long"}]}],
+            "current-schema-id": 0,
+            "partition-specs": [{"spec-id":0,"fields":[]}],
+            "default-spec-id": 0,
+            "last-partition-id": 999,
+            "properties": {},
+            "snapshots": [],
+            "snapshot-log": [],
+            "metadata-log": [],
+            "sort-orders": [{"order-id":0,"fields":[]}],
+            "default-sort-order-id": 0,
+            "refs": {}
+        }"#;
+        let metadata: TableMetadata =
+            serde_json::from_str(metadata_json).expect("test metadata must parse");
+        let file_io = FileIOBuilder::new_fs_io().build().expect("fs FileIO");
+        let ident = TableIdent::new(
+            NamespaceIdent::new("test_ns".to_string()),
+            "test_table".to_string(),
+        );
+        let table = iceberg::table::Table::builder()
+            .file_io(file_io)
+            .identifier(ident)
+            .metadata(Arc::new(metadata))
+            .build()
+            .expect("test Table");
+        SqeTableProvider::try_new(table)
+            .await
+            .expect("SqeTableProvider must build from test table")
+    }
+
+    #[tokio::test]
+    async fn scan_propagates_bearer_to_iceberg_scan_exec() {
+        let provider = make_test_provider()
+            .await
+            .with_bearer(Some(Arc::from("u-tok")));
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let exec = provider.scan(&state, None, &[], None).await.unwrap();
+        let scan = exec
+            .as_any()
+            .downcast_ref::<crate::iceberg_scan::IcebergScanExec>()
+            .expect("scan() must return an IcebergScanExec");
+        assert_eq!(scan.bearer(), Some("u-tok"));
     }
 }
