@@ -25,41 +25,30 @@
 //! then:
 //!   `cargo test -p sqe-coordinator --test catalog_discovery_test -- --ignored`
 //!
-//! - `static_mode_rejects_undeclared_warehouse` -- PASSES. Static mode returns
-//!   "unknown catalog" for a warehouse that exists in Polaris but isn't in
-//!   `[catalogs.*]`. No probe is made.
+//! - `static_mode_rejects_undeclared_warehouse` -- static mode returns "unknown
+//!   catalog" for a warehouse that exists in Polaris but isn't in `[catalogs.*]`.
+//!   No probe is made.
+//! - `polaris_auto_lazy_hit` -- an undeclared warehouse is discovered and its
+//!   table is queryable.
+//! - `polaris_auto_nonexistent_warehouse_returns_unknown_catalog` -- a warehouse
+//!   that does not exist in Polaris returns "unknown catalog".
+//! - `polaris_auto_in_session_reuse` -- referencing a discovered warehouse twice
+//!   in one session both succeed.
 //!
-//! ### Known-blocked live tests
+//! ## Two product bugs fixed in this branch (previously blocked these tests)
 //!
-//! The following tests are kept for documentation and future verification but
-//! cannot pass due to a product-level bug identified during test writing:
-//!
-//! **`REST_CATALOG_CACHE` aliasing bug** (tracked as a finding in this PR):
-//!
-//! `REST_CATALOG_CACHE` in `sqe-catalog` is keyed by `(catalog_url, token_fingerprint)`
-//! -- the warehouse name is NOT in the key. The discovery template inherits the
-//! default catalog's `catalog_url`, so it shares that cache key with the default
-//! catalog. When `preflight_resolve_catalogs` calls `create_session_context` (to
-//! enumerate known catalogs), that call warms the cache for the default warehouse.
-//! The subsequent discovery probe for any _other_ warehouse with the same
-//! `(url, token)` gets a cache hit and reuses the already-initialized RestCatalog,
-//! which has the default warehouse's `/v1/config` baked in. The probe's warehouse
-//! name is silently dropped.
-//!
-//! Consequences:
-//! - **Miss**: probing a nonexistent warehouse succeeds (cache hit returns the
-//!   default warehouse's context) -- the provider is registered, planning
-//!   fails with "table not found" instead of the specified "unknown catalog".
-//! - **Hit**: the discovered provider wraps the default warehouse, not the target
-//!   one -- tables in the target warehouse are invisible.
-//!
-//! **Pre-existing regression in multi_catalog_routing_test**:
-//!
-//! `unknown_catalog_qualifier_errors_clearly` in `multi_catalog_routing_test.rs`
-//! also fails without a live stack because `preflight_resolve_catalogs` now calls
-//! `create_session_context` (which contacts Polaris) before the "unknown catalog"
-//! check. The old design had the check fire before any network IO; that changed
-//! in Tasks 1-4. That test was designed to run offline.
+//! 1. `REST_CATALOG_CACHE` (`sqe-catalog/src/rest_catalog.rs`) was keyed by
+//!    `(catalog_url, token_fingerprint)` -- the warehouse was not in the key.
+//!    A second warehouse at the same URL+token aliased to the first warehouse's
+//!    cached `RestCatalog` (whose `context()` baked the first warehouse's
+//!    `/v1/config`). Fix: include `warehouse` in the cache key.
+//! 2. `preflight_resolve_catalogs` (`sqe-coordinator/src/query_handler.rs`)
+//!    contacted Polaris (`create_session_context`) before the unknown-catalog
+//!    check, breaking static-mode "no probe" behavior and the offline
+//!    `multi_catalog_routing_test::unknown_catalog_qualifier_errors_clearly`.
+//!    Fix: build the known set from config + attached catalogs first (no IO),
+//!    only build the session ctx + probe Polaris when discovery is on AND a
+//!    qualifier is still unknown.
 
 mod common;
 
@@ -295,6 +284,13 @@ s3_path_style = true
 /// REST_CATALOG_CACHE to prevent the seeding handler's cached context (which
 /// has `discovery_test_wh` as its default catalog) from polluting the
 /// polaris-auto handler's context.
+/// Serializes the live-stack tests. They all share one `discovery_test_wh` +
+/// `disc_ns.probe_t` and the process-global REST_CATALOG_CACHE / in-memory
+/// Polaris, so running them concurrently races on seed/read. Each live test
+/// holds this lock for its duration. (No `serial_test` dependency — a plain
+/// async mutex is enough.)
+static LIVE_STACK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn seed_discovery_warehouse() {
     let config = seed_config();
     let handler = make_handler(config);
@@ -332,6 +328,7 @@ async fn seed_discovery_warehouse() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn static_mode_rejects_undeclared_warehouse() {
+    let _live = LIVE_STACK_LOCK.lock().await;
     common::init_tracing();
     seed_discovery_warehouse().await;
 
@@ -361,24 +358,17 @@ async fn static_mode_rejects_undeclared_warehouse() {
 }
 
 // ---------------------------------------------------------------------------
-// Live-stack: known-blocked tests (see module-level doc for root cause)
+// Live-stack: lazy discovery (hit / miss / reuse)
 // ---------------------------------------------------------------------------
 
-/// CURRENTLY FAILS due to REST_CATALOG_CACHE aliasing bug.
-///
-/// `discovery_test_wh` is not in `[catalogs.*]`. With `catalog_discovery =
-/// "polaris-auto"` it should be lazily discovered and the SELECT should return
-/// the seeded row. However, `REST_CATALOG_CACHE` is keyed by `(catalog_url,
-/// token_fingerprint)` without the warehouse name. The default catalog
-/// (`test_warehouse`) warms the cache first via `create_session_context`, and
-/// the discovery probe for `discovery_test_wh` reuses that cache entry, aliasing
-/// to `test_warehouse`'s context. The query then fails with "table not found"
-/// because `discovery_test_wh.disc_ns.probe_t` is not in `test_warehouse`.
-///
-/// Fix required: include `warehouse` in the `REST_CATALOG_CACHE` key.
+/// Lazy hit: `discovery_test_wh` is not in `[catalogs.*]`. With
+/// `catalog_discovery = "polaris-auto"` it is lazily discovered at query time
+/// and the SELECT returns the seeded row from the DISCOVERED warehouse (not the
+/// default `test_warehouse`).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // BLOCKED: REST_CATALOG_CACHE key does not include warehouse (see module doc)
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn polaris_auto_lazy_hit() {
+    let _live = LIVE_STACK_LOCK.lock().await;
     common::init_tracing();
     seed_discovery_warehouse().await;
 
@@ -415,20 +405,15 @@ async fn polaris_auto_lazy_hit() {
     assert_eq!(label_arr.value(0), "discovered");
 }
 
-/// CURRENTLY FAILS due to REST_CATALOG_CACHE aliasing bug.
-///
-/// A warehouse name that does not exist in Polaris should return "unknown catalog"
-/// (the probe fails, `discover_catalog_provider` returns None, the pre-flight
-/// check produces "unknown catalog"). However, due to the aliasing bug, the
-/// nonexistent warehouse reuses the default warehouse's cached `RestCatalog`
-/// context, so the probe appears to succeed, the provider is registered, and
-/// the query fails at planning time with "table not found" rather than
-/// "unknown catalog".
-///
-/// Fix required: include `warehouse` in the `REST_CATALOG_CACHE` key.
+/// Miss: a warehouse name that does not exist in Polaris returns "unknown
+/// catalog". The probe's `list_namespaces` hits Polaris `/v1/config` for the
+/// (now warehouse-keyed) catalog, gets a 404, `discover_catalog_provider`
+/// returns None, and the pre-flight check produces "unknown catalog" with no
+/// Polaris HTTP details leaked to the caller.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // BLOCKED: REST_CATALOG_CACHE key does not include warehouse (see module doc)
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn polaris_auto_nonexistent_warehouse_returns_unknown_catalog() {
+    let _live = LIVE_STACK_LOCK.lock().await;
     common::init_tracing();
 
     let config = polaris_auto_config();
@@ -458,16 +443,13 @@ async fn polaris_auto_nonexistent_warehouse_returns_unknown_catalog() {
     );
 }
 
-/// CURRENTLY FAILS due to REST_CATALOG_CACHE aliasing bug.
-///
-/// Same warehouse referenced twice in one session should succeed both times
-/// (the second call reuses the registered provider). Cannot pass until the hit
-/// scenario works.
-///
-/// Fix required: include `warehouse` in the `REST_CATALOG_CACHE` key.
+/// In-session reuse: the same discovered warehouse referenced twice in one
+/// session succeeds both times. The second reference reuses the provider
+/// registered into the session context by the first discovery.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // BLOCKED: REST_CATALOG_CACHE key does not include warehouse (see module doc)
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn polaris_auto_in_session_reuse() {
+    let _live = LIVE_STACK_LOCK.lock().await;
     common::init_tracing();
     seed_discovery_warehouse().await;
 
