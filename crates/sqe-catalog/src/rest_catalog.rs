@@ -662,7 +662,14 @@ impl SessionCatalog {
         // Storage factory (OpenDAL S3) is configured automatically from the s3.*
         // properties in the props HashMap — no explicit with_storage_factory() needed.
         //
-        let catalog_key = format!("{}-{}", catalog_url, token_fingerprint);
+        // Include the warehouse in the cache key. The cache stores one
+        // `RestCatalog` per key, and a `RestCatalog`'s `context()` (which calls
+        // `/v1/config?warehouse=...`) is memoized in a `OnceCell` on first use.
+        // Without the warehouse in the key, a second warehouse at the same
+        // `catalog_url`+token would reuse the first warehouse's cached context
+        // and silently resolve to the wrong warehouse. Issue: lazy Polaris
+        // catalog discovery + static multi-warehouse-same-URL configs.
+        let catalog_key = format!("{}-{}-{}", catalog_url, warehouse, token_fingerprint);
         let inner = if let Some(cached) = REST_CATALOG_CACHE.get(&catalog_key).await {
             debug!(token_fingerprint = %token_fingerprint, "REST catalog cache hit");
             cached
