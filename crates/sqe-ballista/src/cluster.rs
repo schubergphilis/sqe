@@ -151,13 +151,19 @@ pub async fn build_cluster_catalog(config: &SqeConfig) -> Result<ClusterCatalog>
             .map_err(|e| anyhow::anyhow!("building cluster SessionCatalog: {e}"))?,
     );
 
+    // The cluster catalog is built once and reused for the cluster's lifetime,
+    // so it must resolve namespaces created after construction (e.g. a CTAS
+    // load that runs after the coordinator starts). Live schema resolution
+    // bypasses the construction-time namespace snapshot for point lookups
+    // (cutover ledger D12); table existence is still decided live on scan.
     let provider = SqeCatalogProvider::try_new(
         session_catalog.clone(),
         storage.clone(),
         cat_cfg.warehouse.clone(),
     )
     .await
-    .map_err(|e| anyhow::anyhow!("building cluster SqeCatalogProvider: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("building cluster SqeCatalogProvider: {e}"))?
+    .with_live_schema_resolution();
 
     Ok(ClusterCatalog {
         catalog_name,
