@@ -55,6 +55,17 @@ use sqe_core::config::{CatalogAuthConfig, CatalogConfig, SqeConfig, StorageConfi
 use crate::auth_ext::SqeAuthOptions;
 use crate::sqe_codec::{SqeLogicalCodec, SqePhysicalCodec};
 
+/// Derive the optional HMAC key for the `sha256` column-mask UDF from config,
+/// matching the coordinator (`[policy] mask_key`). Empty -> unkeyed SHA-256.
+/// Both engines read the same config so a masked value hashes identically.
+fn mask_key_from(config: &SqeConfig) -> Option<std::sync::Arc<Vec<u8>>> {
+    if config.policy.mask_key.is_empty() {
+        None
+    } else {
+        Some(std::sync::Arc::new(config.policy.mask_key.as_bytes().to_vec()))
+    }
+}
+
 /// A ballista config producer that registers the [`SqeAuthOptions`] extension
 /// so the per-query `sqe_auth.bearer` key round-trips (set/get succeed) on the
 /// scheduler and executor. Without registration ballista silently drops the
@@ -201,6 +212,18 @@ pub async fn run_executor(config: &SqeConfig, opts: ExecutorOptions) -> Result<(
         .await
         .context("building executor cluster catalog")?;
 
+    // Register SQE's scalar UDFs on the executor's function registry so it can
+    // RUN policy-rewritten (sha256 column mask) and JSON/Trino-function tasks.
+    // Built from a throwaway context, then converted to the
+    // `BallistaFunctionRegistry` executor tasks resolve UDFs against. Matches
+    // the scheduler + coordinator registries (parity criterion #2).
+    let mut udf_ctx = SessionContext::new();
+    crate::register_sqe_session_udfs(&mut udf_ctx, mask_key_from(config))
+        .map_err(|e| anyhow::anyhow!("registering SQE UDFs for executor: {e}"))?;
+    let function_registry = Arc::new(ballista_core::registry::BallistaFunctionRegistry::from(
+        &udf_ctx.state(),
+    ));
+
     let exec_config = ExecutorProcessConfig {
         bind_host: opts.bind_host,
         external_host: opts.external_host,
@@ -213,6 +236,7 @@ pub async fn run_executor(config: &SqeConfig, opts: ExecutorOptions) -> Result<(
         override_config_producer: Some(sqe_config_producer()),
         override_logical_codec: Some(cluster.logical_codec()),
         override_physical_codec: Some(cluster.physical_codec()),
+        override_function_registry: Some(function_registry),
         ..Default::default()
     };
 
@@ -239,6 +263,7 @@ pub async fn start_scheduler(
 
     let provider = cluster_catalog.provider.clone();
     let catalog_name = cluster_catalog.catalog_name.clone();
+    let mask_key = mask_key_from(config);
 
     // Session builder: register the catalog on every planning session so the
     // scheduler can resolve tables when it physical-plans the submitted
@@ -248,14 +273,14 @@ pub async fn start_scheduler(
             .with_config(session_config)
             .with_default_features()
             .build();
-        let ctx = SessionContext::new_with_state(state);
+        let mut ctx = SessionContext::new_with_state(state);
         ctx.register_catalog(catalog_name.clone(), provider.clone());
-        // Register SQE's Trino-compat functions so the scheduler can plan
-        // queries that use them (the coordinator registers the same set on
-        // its planning context). NOTE: executors also need these to *run*
-        // UDF-bearing physical tasks (override_function_registry) — follow-up.
-        sqe_trino_functions::register_trino_functions(&ctx);
-        sqe_trino_functions::register_extended_trino_functions(&ctx);
+        // Register SQE's scalar UDFs (sha256 column mask + Trino-compat + JSON)
+        // so the scheduler can resolve them when it physical-plans the
+        // submitted plan. The executor registers the identical set (below) so
+        // a policy-rewritten or function-bearing plan survives the round-trip
+        // (parity criterion #2).
+        crate::register_sqe_session_udfs(&mut ctx, mask_key.clone())?;
         Ok(ctx.state())
     });
 
