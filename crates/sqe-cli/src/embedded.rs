@@ -180,26 +180,32 @@ pub fn build_embedded_context(memory_limit_bytes: usize) -> anyhow::Result<Sessi
     datafusion_functions_json::register_all(&mut ctx)
         .map_err(|e| anyhow::anyhow!("failed to register JSON functions: {e}"))?;
 
-    // File-format TVFs for direct file access. Embedded mode passes a
-    // default `StorageConfig` so users can still hit S3 by supplying inline
-    // credentials in the TVF call. Filesystem paths work without any storage
-    // config.
+    // File-format TVFs for direct file access. The embedded CLI runs
+    // in-process as the local user, who already has shell + filesystem
+    // access, so local paths are enabled here. The server defaults
+    // `allow_local_paths` to false so a remote, authenticated user cannot
+    // read the host's /etc/shadow or a mounted token; that threat model does
+    // not apply to a local CLI, where rejecting local files would break the
+    // tool's whole point. Users can still hit S3 by supplying inline
+    // credentials in the TVF call.
+    let mut tvf_storage = StorageConfig::default();
+    tvf_storage.tvf.allow_local_paths = true;
     ctx.register_udtf(
         "read_parquet",
         Arc::new(sqe_catalog::read_parquet::ReadParquetFunction::new(
-            StorageConfig::default(),
+            tvf_storage.clone(),
         )),
     );
     ctx.register_udtf(
         "read_csv",
         Arc::new(sqe_catalog::read_csv::ReadCsvFunction::new(
-            StorageConfig::default(),
+            tvf_storage.clone(),
         )),
     );
     ctx.register_udtf(
         "read_json",
         Arc::new(sqe_catalog::read_json::ReadJsonFunction::new(
-            StorageConfig::default(),
+            tvf_storage.clone(),
         )),
     );
     // V11: Delta Lake reader. Wraps deltalake::open_table so users can
@@ -213,7 +219,7 @@ pub fn build_embedded_context(memory_limit_bytes: usize) -> anyhow::Result<Sessi
     ctx.register_udtf(
         "read_delta",
         Arc::new(sqe_catalog::read_delta::ReadDeltaFunction::new(
-            StorageConfig::default(),
+            tvf_storage,
         )),
     );
 
@@ -898,8 +904,8 @@ mod tests {
     }
 
     /// V8: `read_csv()` round-trips a local CSV file. The TVF wraps a
-    /// `ListingTable` over `CsvFormat` and the embedded mode passes the
-    /// default `StorageConfig`, so filesystem paths just work.
+    /// `ListingTable` over `CsvFormat` and the embedded mode enables
+    /// `tvf.allow_local_paths`, so local filesystem paths just work.
     /// Multi-thread flavor required: schema inference uses `block_in_place`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn read_csv_tvf_local_file() {
