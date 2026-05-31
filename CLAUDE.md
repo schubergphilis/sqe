@@ -61,7 +61,7 @@ Key docs:
 1. **Phase 1** -- Single-node: DataFusion + iceberg-rust + OIDC auth + Flight SQL
 2. **Phase 2** -- Views, INSERT INTO, manifest caching, audit logging
 3. **Phase 2c** -- dbt compatibility: write path (CTAS, MERGE, DELETE), information_schema, dbt-sqe adapter
-4. **Phase 3** -- Distributed execution: Ballista-derived scheduler + workers
+4. **Phase 3** -- Distributed execution: bespoke scheduler + stateless DataFusion workers (Ballista was evaluated and wound down; see `docs/ballista-evaluation-learnings.md`)
 5. **Phase 4** -- Production hardening: metrics, benchmarks, Helm, Trino compat
 6. **Phase 5** -- Security: OPA/Cedar policy engine, GRANT/REVOKE SQL, column masks, row filters
 
@@ -69,7 +69,7 @@ Key docs:
 
 - **Language**: Rust (engine), Python (dbt adapter)
 - **Query engine**: Apache DataFusion
-- **Distribution**: Ballista (forked)
+- **Distribution**: bespoke scheduler + stateless DataFusion workers over Arrow Flight
 - **Table format**: Apache Iceberg v3 via iceberg-rust 0.8.0+
 - **Catalog**: Apache Polaris (Iceberg REST)
 - **Auth**: OIDC (any provider: Keycloak, Auth0, Okta, etc.)

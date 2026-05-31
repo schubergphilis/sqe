@@ -4,6 +4,28 @@ All notable changes to SQE are documented in this file.
 
 ## [Unreleased]
 
+### Removed
+
+- Wind down the Apache Ballista distributed-execution integration
+
+    Ballista 53 was evaluated as an opt-in distributed engine behind a
+    `[query] engine = "ballista"` flag, with the bespoke layer staying the
+    default. It reached correctness parity on the common path (TPC-H 22/22)
+    but was ~2.2x slower where it completed, could not finish the TPC-DS
+    analytical core (an upstream datafusion-proto aggregate-serialization
+    assertion plus Ballista evicting an executor on a task-level error), and
+    its scheduler is less capable than SQE's `WeightedScheduler` (Ballista 53
+    dropped consistent-hash affinity, has no scan locality, no straggler
+    handling). The `sqe-ballista` crate, the `QueryEngine` enum, the
+    `[query] engine` config field, and all coordinator/worker integration
+    wiring are removed. Bespoke distributed execution is the only engine.
+
+    The ADBC unpadded-base64 Flight SQL Basic-auth handshake fix found during
+    this work is kept (it fixes dbt-sqe / Go ADBC driver connectivity
+    independent of the engine). Decision and borrowable findings:
+    `docs/ballista-evaluation-learnings.md`. Historical detail:
+    `docs/archive/ballista-evaluation/`.
+
 ### Bug Fixes
 
 - Flight SQL accepts JWT bearer tokens via the configured provider chain

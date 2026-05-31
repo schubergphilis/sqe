@@ -14,7 +14,7 @@ use tracing::{debug, info, warn, Span};
 
 use sqlparser::ast::{Statement, TableFactor};
 use sqe_catalog::{IcebergScanExec, SessionCatalog};
-use sqe_core::{QueryConfig, QueryEngine, SecretStore, Session, SortMode, SqeConfig, SqeError};
+use sqe_core::{QueryConfig, SecretStore, Session, SortMode, SqeConfig, SqeError};
 
 use crate::adaptive_sort;
 use sqe_policy::{PolicyEnforcer, PolicyStore};
@@ -1683,20 +1683,6 @@ impl QueryHandler {
         debug!("Policy-enforced plan (streaming): {:?}", enforced_plan);
         let tables_touched = sqe_lineage::extract::extract_table_names(&enforced_plan);
 
-        // Engine switch: route the policy-rewritten plan through an embedded
-        // ballista cluster instead of the bespoke distributed path. Default
-        // is legacy; flip [query] engine = "ballista" to opt in. See the
-        // cutover design doc. The ballista path keeps a locally-built
-        // physical plan only for finalizer introspection — execution happens
-        // on ballista.
-        let use_ballista =
-            QueryEngine::parse(&self.config.query.engine) == QueryEngine::Ballista;
-        let enforced_plan_for_ballista = if use_ballista {
-            Some(enforced_plan.clone())
-        } else {
-            None
-        };
-
         let enforced_df = ctx
             .execute_logical_plan(enforced_plan)
             .await
@@ -1738,45 +1724,7 @@ impl QueryHandler {
             debug!(warning = %warning, "Adaptive sort stripping applied (streaming)");
         }
 
-        // Ballista path: submit the policy-rewritten logical plan to an
-        // embedded ballista standalone cluster. The locally-built
-        // physical_plan is handed to the finalizer for introspection only;
-        // results stream from ballista. (Ballista-path plan metrics are not
-        // yet populated — Phase 2 limitation, tracked for later.)
-        if let Some(plan) = enforced_plan_for_ballista {
-            let final_plan = physical_plan; // introspection only
-            self.query_tracker
-                .running(query_id, start.elapsed().as_millis() as u64);
-
-            let target_partitions = ctx.state().config().target_partitions();
-
-            // Submit to the process-global embedded ballista scheduler +
-            // remote executors (started lazily on first ballista query). The
-            // cluster catalog is single-tenant (built from config) for the
-            // no-bearer fallback; the authenticated user bearer is threaded
-            // through the plan (Phase 4b) so executors mint per-user vended
-            // creds. On the single-principal stack the user bearer IS the
-            // service token, so this resolves to the same catalog.
-            let runtime = sqe_ballista::cluster::get_or_init_runtime(&self.config)
-                .await
-                .map_err(|e| {
-                    SqeError::Execution(format!("ballista runtime init failed: {e}"))
-                })?;
-
-            let (schema, stream) = sqe_ballista::cluster::submit_remote(
-                &runtime.scheduler_url,
-                plan,
-                &runtime.cluster,
-                target_partitions,
-                session.access_token().expose(),
-            )
-            .await
-            .map_err(|e| SqeError::Execution(format!("ballista execution failed: {e}")))?;
-
-            return Ok((schema, stream, final_plan, tt_cleanup, tables_touched));
-        }
-
-        // Legacy path: distribute scan across workers if possible.
+        // Distribute scan across workers if possible.
         let final_plan = self.try_distribute(physical_plan, session, query_id).await;
 
         // Planning complete — promote tracker to Running
@@ -1899,20 +1847,6 @@ impl QueryHandler {
         // a Box keeps the lineage path independent of DataFusion's
         // execute_logical_plan consumption pattern below.
         *plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(enforced_plan.clone())));
-
-        // Engine switch (parity criterion #4): the Trino HTTP protocol reaches
-        // the engine via execute -> execute_query, NOT the Flight
-        // execute_stream/open_stream path that carries the ballista branch. So
-        // the engine switch must also be applied here, else Trino HTTP queries
-        // silently run on the legacy bespoke path even in ballista mode. The
-        // legacy path below is left untouched; ballista is an isolated early
-        // return.
-        if QueryEngine::parse(&self.config.query.engine) == QueryEngine::Ballista {
-            let target_partitions = ctx.state().config().target_partitions();
-            return self
-                .execute_query_ballista(session, enforced_plan, target_partitions)
-                .await;
-        }
 
         // Create a new DataFrame from the enforced plan
         let enforced_df = ctx
@@ -2070,77 +2004,6 @@ impl QueryHandler {
             "Query execution complete"
         );
 
-        Ok(batches)
-    }
-
-    /// Ballista variant of [`execute_query`] (parity criterion #4): submit the
-    /// policy-rewritten logical plan to the embedded ballista cluster and
-    /// collect the result stream, applying the same row/memory caps as the
-    /// legacy path. Keeps the Trino HTTP protocol on the ballista engine when
-    /// `[query] engine = "ballista"`. Mirrors the Flight path's `open_stream`
-    /// ballista branch; plan/spill metrics are not populated on this path (same
-    /// limitation as the Flight ballista path).
-    async fn execute_query_ballista(
-        &self,
-        session: &Session,
-        enforced_plan: datafusion::logical_expr::LogicalPlan,
-        target_partitions: usize,
-    ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let runtime = sqe_ballista::cluster::get_or_init_runtime(&self.config)
-            .await
-            .map_err(|e| SqeError::Execution(format!("ballista runtime init failed: {e}")))?;
-        let (output_schema, mut stream) = sqe_ballista::cluster::submit_remote(
-            &runtime.scheduler_url,
-            enforced_plan,
-            &runtime.cluster,
-            target_partitions,
-            session.access_token().expose(),
-        )
-        .await
-        .map_err(|e| SqeError::Execution(format!("ballista execution failed: {e}")))?;
-
-        // Same row/memory caps as the legacy execute_query path: stream and
-        // count so an oversized result is rejected before it OOMs the process.
-        let configured_max = self.config.query.max_result_rows;
-        let memory_ceiling: usize = {
-            let bytes = crate::memory::limit_bytes(&self.runtime.memory_pool);
-            if bytes == 0 { 0 } else { bytes / 256 }
-        };
-        let effective_max: usize = match (configured_max, memory_ceiling) {
-            (0, 0) => 0,
-            (0, m) => m,
-            (c, 0) => c,
-            (c, m) => c.min(m),
-        };
-
-        let mut batches: Vec<RecordBatch> = Vec::new();
-        let mut rows_so_far: usize = 0;
-        while let Some(batch) = stream
-            .try_next()
-            .await
-            .map_err(|e| SqeError::Execution(format!("Query execution failed: {e}")))?
-        {
-            rows_so_far = rows_so_far.saturating_add(batch.num_rows());
-            if effective_max > 0 && rows_so_far > effective_max {
-                let reason = if configured_max > 0 && rows_so_far > configured_max {
-                    format!("configured max_result_rows={configured_max}")
-                } else {
-                    format!(
-                        "memory-derived ceiling={effective_max} (memory_limit / 256 bytes-per-row)"
-                    )
-                };
-                return Err(SqeError::Execution(format!(
-                    "Query result exceeds maximum allowed rows ({rows_so_far} > {effective_max}). \
-                     Reason: {reason}. Use LIMIT to reduce output or raise the limit in config."
-                )));
-            }
-            batches.push(batch);
-        }
-
-        // Always return at least one batch so callers can infer the schema.
-        if batches.is_empty() {
-            batches.push(RecordBatch::new_empty(output_schema));
-        }
         Ok(batches)
     }
 
