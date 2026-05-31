@@ -1,5 +1,11 @@
 # SQE-on-ballista cutover design
 
+> **SUPERSEDED (2026-05-31).** The ballista integration was evaluated and wound
+> down. Bespoke distributed execution remains the only engine. This document is
+> kept for historical detail (the divergence ledger D1-D13, phase reports, and
+> benchmark numbers). For the decision and the borrowable findings, read
+> `docs/ballista-evaluation-learnings.md`.
+
 Date: 2026-05-28 (migration contract added 2026-05-30)
 Status: approved-in-principle (user: "let's do the cutover", "keep on building");
 migration contract = Option 3, parity-gated retirement (see "Migration contract

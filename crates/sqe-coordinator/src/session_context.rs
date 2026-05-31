@@ -394,20 +394,30 @@ pub async fn create_session_context(
                 ctx.register_catalog(name.clone(), Arc::clone(provider));
             }
 
-            // Register SQE's scalar UDFs: sha256() column mask (HMAC-SHA256 when
-            // `[policy] mask_key` is set, issue #37), Trino-compat functions
-            // (year(), month(), day_of_week(), ... + the extended set), and JSON
-            // functions (json_get, json_contains, ...). Shared with the ballista
-            // scheduler + executor via `sqe_ballista::register_sqe_session_udfs`
-            // so the registered set cannot drift between engines (a drift that
-            // broke column masks on the ballista path, parity criterion #2).
+            // Register the sha256() scalar function for column masking.
+            // DataFusion does not ship a built-in sha256, we provide one via sqe-policy.
+            // When `coordinator.policy.mask_key` is set the UDF runs as
+            // HMAC-SHA256 with that key, blocking offline rainbow-table
+            // attacks against low-entropy masked columns (issue #37).
             let mask_key = if config.policy.mask_key.is_empty() {
                 None
             } else {
                 Some(std::sync::Arc::new(config.policy.mask_key.as_bytes().to_vec()))
             };
-            sqe_ballista::register_sqe_session_udfs(&mut ctx, mask_key)
-                .map_err(|e| Arc::new(SqeError::Config(format!("Failed to register SQE UDFs: {e}"))))?;
+            ctx.register_udf(sqe_policy::sha256_udf::sha256_udf(mask_key));
+
+            // Register Trino-compatible function aliases (year(), month(), day_of_week(), etc.)
+            // so Trino SQL and dbt models work without modification.
+            sqe_trino_functions::register_trino_functions(&ctx);
+
+            // Register extended Trino-compatible functions (soundex, regexp_extract, word_stem, etc.)
+            sqe_trino_functions::register_extended_trino_functions(&ctx);
+
+            // Register JSON functions from datafusion-functions-json crate.
+            // Provides: json_get, json_get_str, json_get_int, json_get_float, json_get_bool,
+            //           json_get_json, json_get_array, json_contains, json_as_text, json_length
+            datafusion_functions_json::register_all(&mut ctx)
+                .map_err(|e| Arc::new(SqeError::Config(format!("Failed to register JSON functions: {e}"))))?;
 
             // Register the read_parquet() table-valued function so users can
             // query external Parquet files directly from SQL:

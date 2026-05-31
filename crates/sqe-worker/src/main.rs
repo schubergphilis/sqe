@@ -27,52 +27,6 @@ async fn main() -> anyhow::Result<()> {
         config.metrics.prometheus_port,
     );
 
-    // Ballista executor mode: when the engine is ballista, this worker runs
-    // as a ballista executor that connects to the coordinator's embedded
-    // scheduler. The legacy WorkerFlightService path below is the
-    // engine=legacy fallback (instant rollback). Scheduler/executor
-    // endpoints come from env (SQE_BALLISTA_SCHEDULER_HOST/PORT,
-    // SQE_BALLISTA_EXECUTOR_HOST/GRPC_PORT); flight port from worker config.
-    if sqe_core::QueryEngine::parse(&config.query.engine) == sqe_core::QueryEngine::Ballista {
-        let flight_port = config.worker.flight_port;
-        let opts = sqe_ballista::cluster::ExecutorOptions {
-            bind_host: "0.0.0.0".to_string(),
-            external_host: std::env::var("SQE_BALLISTA_EXECUTOR_HOST").ok(),
-            flight_port,
-            grpc_port: std::env::var("SQE_BALLISTA_EXECUTOR_GRPC_PORT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(flight_port + 1),
-            scheduler_host: std::env::var("SQE_BALLISTA_SCHEDULER_HOST")
-                .unwrap_or_else(|_| "localhost".to_string()),
-            scheduler_port: std::env::var("SQE_BALLISTA_SCHEDULER_PORT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(50050),
-            concurrent_tasks: std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4),
-            // Bound the executor's DataFusion memory pool. Default 4 GiB;
-            // override via SQE_BALLISTA_EXECUTOR_MEM_GB. Unbounded executors
-            // co-located on one box OOM under sustained shuffle workloads.
-            memory_pool_bytes: Some(
-                std::env::var("SQE_BALLISTA_EXECUTOR_MEM_GB")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(4)
-                    * 1024
-                    * 1024
-                    * 1024,
-            ),
-        };
-        tracing::info!(
-            flight_port,
-            scheduler_host = %opts.scheduler_host,
-            scheduler_port = opts.scheduler_port,
-            "Starting SQE worker as ballista executor"
-        );
-        return sqe_ballista::cluster::run_executor(&config, opts).await;
-    }
 
     // Build a configured DataFusion SessionContext with memory limits and spill-to-disk.
     // The context is created early to fail fast on invalid config (e.g. bad memory_limit).
