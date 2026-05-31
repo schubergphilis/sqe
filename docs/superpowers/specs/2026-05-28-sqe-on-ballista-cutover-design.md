@@ -1,7 +1,10 @@
 # SQE-on-ballista cutover design
 
-Date: 2026-05-28
-Status: approved-in-principle (user: "let's do the cutover", "keep on building")
+Date: 2026-05-28 (migration contract added 2026-05-30)
+Status: approved-in-principle (user: "let's do the cutover", "keep on building");
+migration contract = Option 3, parity-gated retirement (see "Migration contract
+& parity gate", 2026-05-30) — bespoke default, ballista opt-in, retire at
+functional+speed parity, functional blockers first
 PoC: `docs/superpowers/specs/2026-05-28-sqe-on-ballista-poc-report.md` (GREEN)
 Branch: `feat/sqe-ballista-poc-spike` -> cutover work continues here / new `feat/sqe-ballista-cutover`
 
@@ -197,7 +200,10 @@ else is "wire ballista in, delete the old path".
   expected to show at SF1+ (Phase 5). Endpoints via env
   `SQE_BALLISTA_SCHEDULER_HOST/PORT`, `SQE_BALLISTA_EXECUTOR_HOST/GRPC_PORT`.
 - **Phase 4 — credential passthrough + refresh on the ballista path.**
-  **PARTIAL — infra in place, per-user passthrough blocked by ballista D8.**
+  **DONE (Phase 4b landed 2026-05-30): per-user bearer now threads through the
+  plan, not ballista session config.** The narrative below is the original
+  Phase 4 finding that motivated the plan-node design; the resolution is in
+  ledger D8 and the parity-gate table (criterion #1, code-complete).
   Built: `auth_ext::SqeAuthOptions` config extension, executor-side
   `SqePhysicalCodec::resolve_catalog` (mints + caches a per-user
   `SessionCatalog` from the bearer, falls back to the single-tenant config
@@ -417,16 +423,125 @@ upstream improvement. Appended as we build.
   `sqe_auth` extension -> silently dropped. *Why it matters:* blocks the
   simplest per-query-secret passthrough. *Upstream:* ballista should prefix
   extension keys in `to_key_value_pairs` (or DataFusion's extension
-  `entries()` should emit prefixed keys). *SQE workaround (designed, not yet
-  built):* thread the secret through the plan-node bytes instead of session
-  config. Verified empirically: client `bearer_len=630`, executor
-  `bearer_len=0`.
+  `entries()` should emit prefixed keys). Verified empirically: client
+  `bearer_len=630`, executor `bearer_len=0`.
+  *SQE resolution (BUILT 2026-05-30, plan `2026-05-30-ballista-bearer-passthrough.md`):*
+  thread the bearer through the plan instead of session config. The client
+  `SqeLogicalCodec` stamps the bearer onto the encoded table-provider bytes
+  (`"<bearer>\n<tableref>"`); the scheduler's `try_decode_table_provider`
+  attaches it to the rehydrated `SqeTableProvider`; `scan()` bakes it onto
+  `IcebergScanExec`; the physical codec writes it into `EncodedSqeScan.bearer`;
+  the executor mints a per-(user,table) `FileIO` from it, cached with a
+  per-key `OnceCell` single-flight so the D4 no-per-task-round-trip invariant
+  holds (one bearer->vended-creds exchange per (user,table) per executor, not
+  per task). Trust model preserved: only the bearer crosses the wire, never S3
+  secrets. The `SqeAuthOptions` session-config insert is retained as a no-op in
+  case a future ballista round-trips extension keys. Per-user isolation is NOT
+  end-to-end verifiable on the single-principal dev stack (all users share one
+  service token); unit-tested units are the wire round-trip, the cache keying
+  (keyed on the full bearer, no hash-collision crossover), and the no-bearer
+  static fallback.
+- **D12 — cluster catalog namespace snapshot is stale for namespaces created
+  after coordinator start.** Found during the 2026-05-30 bearer smoke. The
+  embedded scheduler/executor build their single-tenant cluster catalog
+  (`build_cluster_catalog`, service token) at coordinator startup. The codec's
+  `try_decode_table_provider` resolves the table against that catalog via
+  `self.catalog.schema(ns)`. A namespace created *after* startup (e.g.
+  `benchmark-test.sh` starts the coordinator, then runs CTAS load) is not
+  visible, so every ballista query fails fast with `sqe codec: namespace '<ns>'
+  not found on executor catalog` (scheduler gRPC parse). *Evidence:* fresh
+  coordinator started before load -> TPC-H 0/22 (all "namespace not found");
+  same build, coordinator restarted with the data already present -> **22/22**.
+  *Not a bearer-threading regression* (the bearer is stripped correctly; the
+  namespace string in the error is exact). *Why it matters:* ballista mode
+  needs the namespace to exist at cluster-catalog build time, or the catalog
+  must resolve schemas dynamically/refresh. *Fix options:* (a) resolve
+  `schema()` live against the catalog instead of a startup snapshot, or
+  (b) rebuild/invalidate the cluster catalog on DDL. Pre-existing; orthogonal to
+  parity #1. The single-node (legacy) path is unaffected (per-session catalog).
+  *FIXED (2026-05-30, option a, surgical):* `SqeCatalogProvider` gains an opt-in
+  `with_live_schema_resolution()` that makes `schema(name)` resolve the requested
+  namespace directly instead of gating on the construction-time
+  `cached_namespaces` snapshot; table existence is then decided live by the
+  schema provider's `table()`. Set ONLY on the long-lived cluster catalog
+  (`build_cluster_catalog`); the per-statement coordinator catalog keeps the
+  snapshot guard (always fresh, preserves "schema not found" semantics) so its
+  hot path is byte-for-byte unchanged. `schema_names()` enumeration still uses
+  the snapshot (no async in the sync trait method). *Verified:* the exact
+  failing scenario (coordinator started, THEN TPC-H SF0.1 loaded, ballista mode)
+  now passes **22/22** (was 0/22); plus a unit regression test in
+  `catalog_provider.rs`.
+- **D13 — cluster catalog bootstrap hardcodes OAuth `ClientCredentials`, so
+  non-OAuth backends (Glue/S3Tables/Hadoop) can't use the ballista path.**
+  Found during the 2026-05-31 parity #3 assessment. `build_cluster_catalog`
+  (`sqe-ballista/cluster.rs`, run at scheduler + executor bootstrap)
+  unconditionally builds `CatalogAuthConfig::ClientCredentials` from `[auth]`
+  and calls `resolve_bearer`, minting an OAuth token regardless of the catalog
+  backend. The coordinator's per-session path instead resolves auth per-backend
+  (`Aws` -> empty bearer for Glue/S3Tables; the AWS SDK chain supplies creds).
+  For an AWS-IAM deployment (Glue/S3Tables, `[auth].token_endpoint` empty), the
+  forced OAuth mint hits `OAuthClient::new("", ..).get_token()` and fails, so
+  the cluster catalog never builds and the whole ballista path is unavailable.
+  *Not verified at runtime* (no Glue/S3Tables creds on this stack); confirmed by
+  code reading. *Why it matters:* blocks non-OAuth backends on ballista even in
+  the `full-backends` image. *FIXED (2026-05-31):* `build_cluster_catalog` now
+  resolves the service identity per-backend, **mirroring SQE's Authenticator
+  mode selection** (sqe-auth `authenticator.rs`): an explicit `[catalogs.*.auth]`
+  override wins; otherwise for REST it uses OAuth `ClientCredentials` ONLY when
+  `token_endpoint` is set AND `keycloak_url` is empty (the client_credentials /
+  test-stack mode), else it builds `Anonymous` because the deployment is OIDC
+  password-grant (**ROPC** -- SQE's production model: user username+password ->
+  the user's bearer, no machine service token). Glue/S3Tables use `Aws`;
+  HMS/JDBC/Hadoop use `Anonymous`. This removes two bootstrap failures: the
+  forced OAuth mint against an empty `token_endpoint` (which broke BOTH AWS-IAM
+  backends AND every ROPC deployment) is gone. In ROPC mode the cluster catalog
+  has no service principal and per-user bearer passthrough (parity #1) carries
+  the real identity. Verified the client_credentials branch is unchanged
+  (Polaris `sha256` still returns through ballista); the ROPC + non-REST
+  branches are code-only (this stack is client_credentials-mode, no ROPC/Glue
+  creds). Orthogonal to the executor's D4 rebuild (backend-agnostic).
 
 ## End goal + plumbing-reduction gates
 
 **North Star (user, 2026-05-29):** reduce SQE's bespoke plumbing by leaning
 on ballista where possible — **without losing functionality or speed.** Both
 halves are hard constraints, and they shape what the cutover is allowed to do.
+
+### Migration contract & parity gate (user, 2026-05-30)
+
+The user reframed the relationship precisely: **SQE is the lakehouse SQL
+server** (like the Polaris / Iceberg-REST / Glue / S3Tables stack it fronts),
+and its identity is four pillars it owns — **protocols** (Flight SQL, Trino
+HTTP), **targets** (Polaris, Iceberg REST, Glue/S3Tables, Unity, Nessie,
+Hadoop), **speed** (our scan / IO / spill tuning), and **policy SQL**
+(GRANT/REVOKE, column masks, row filters). **Ballista's job is narrowed to one
+thing: the distributed scheduler / task-management brain** — chosen because its
+scheduling is more mature than the bespoke `WeightedScheduler` + `stage_planner`.
+
+**The contract (Option 3, parity-gated retirement):**
+
+- **Now:** bespoke is the **default**; ballista is **opt-in** behind
+  `[query] engine = "ballista"`. Nothing in the bespoke layer is touched.
+- **Retire trigger:** when ballista reaches **functional parity** *and* **speed
+  parity** (the gate below), the bespoke distributed layer retires and ballista
+  becomes the single path.
+- **Ordering (user directive):** **correctness before performance.** Close the
+  functional blockers first; speed parity is the *last* gate before retirement.
+
+**The parity gate (retire trigger) — ordered, honest status:**
+
+| # | Criterion | Status (verified vs. assumed) | Maps to |
+|---|---|---|---|
+| 1 | **Bearer passthrough** — per-user OIDC bearer reaches executors; the query authenticates *as the user* to Polaris/S3 (no service account) | **CODE-COMPLETE + E2E-SMOKED (2026-05-30).** Bearer threaded through the plan (logical codec -> provider -> `IcebergScanExec` -> `EncodedSqeScan` -> executor per-(user,table) `FileIO`, D4-safe cache); see D8. Unit-tested: wire round-trip, full-bearer cache keying, no-bearer fallback. **Ballista-mode smoke: TPC-H SF0.1 22/22** (single-principal stack; exercises the full bearer path with a real token). Per-user *isolation* still NOT E2E-verifiable on the single-principal stack (needs a multi-principal env). NB: the smoke first hit 0/22 from a pre-existing cluster-catalog freshness bug (D12, now FIXED), not from bearer threading; ballista-mode TPC-H is 22/22 in the start-then-load order too. | G3, task 4b |
+| 2 | **Policy plans survive the codec** — injected column-mask / row-filter nodes round-trip through `SqeLogicalCodec` and enforce on executors | **GAP FOUND + FIXED + VERIFIED E2E (2026-05-31).** Assessed: row filters (standard `Filter` exprs) and column restriction (projection) survive via ballista's default codec; **column masks did NOT** — the mask UDF (`sha256`) was registered on neither the scheduler (planning) nor the executor (run). Same gap hit JSON funcs + Trino-function *execution*. Fix (commit 2a06257): shared `register_sqe_session_udfs` (sha256 + Trino + extended-Trino + JSON) wired into coordinator + scheduler `session_builder` + executor `override_function_registry`. **E2E PROOF:** distributed stack (coordinator scheduler + rebuilt `sqe-worker` executor), ADBC FlightSQL client, ballista mode: `SELECT l_orderkey, sha256(l_comment) FROM tpch_sf0_1.lineitem LIMIT 3` returned real SHA-256 hashes, and `count(*)` returned 600000 (no regression). Plus a unit test (helper registers `sha256`, flows into `BallistaFunctionRegistry`). NB: reaching the E2E surfaced + fixed a **separate** coordinator bug (commit 3c280a5): the Flight Basic-auth handshake used a padding-strict base64 decoder and rejected the Go ADBC driver's unpadded base64 ("Invalid base64 in auth"), so **no ADBC client (incl. the dbt-sqe adapter) could connect at all**; now `DecodePaddingMode::Indifferent`. Row-filter *enforcement* E2E (with a live policy backend) still not stood up. | G3 |
+| 3 | **All catalog backends decode** — Glue/S3Tables/Unity/Nessie/Hadoop rebuild executor-side, not just REST/Polaris | **ASSESSED (2026-05-31): REST-family verified, non-REST code-only with a confirmed gap. NOT a blanket green.** The literal "rebuild executor-side" is **backend-agnostic by D4 design**: the executor rebuilds the `Table` from shipped `metadata_json` + an S3 `build_file_io`, never contacting the catalog — so any S3-backed Iceberg table decodes identically regardless of catalog. **REST-family (Polaris/Nessie/Unity)** share the REST path and are covered by the Polaris E2E (criterion #2 ran real queries through it). **Non-REST (Glue/S3Tables/HMS/JDBC):** code-only, NOT runtime-verified (no creds/stacks here), and **D13 (the cluster-bootstrap OAuth-hardcode blocker) is now FIXED** — `build_cluster_catalog` resolves the service identity per-backend (REST→OAuth unchanged, Glue/S3Tables→`Aws`, HMS/JDBC/Hadoop→`Anonymous`), so AWS-IAM backends can initialize the cluster catalog. Still requires the `full-backends` build (Dockerfile.full compiles both `sqe-server` + `sqe-worker` with it), and the non-REST paths remain runtime-unverified (no creds/stacks here — only the REST branch is exercised). **Out of scope:** Hadoop (catalog stubbed, `mount.rs` returns "not yet") and non-S3 storage (`build_file_io` is S3-only) — engine-wide limits, not ballista-specific. | G3 |
+| 4 | **Protocols route** — both Flight SQL and Trino HTTP drive the ballista path | **GAP FOUND + FIXED + VERIFIED E2E (2026-05-31).** Assessed: the `use_ballista` switch lived ONLY in `open_stream` (the Flight SQL streaming path). **Trino HTTP** (and any `execute`-based protocol, e.g. Quack) reaches the engine via `execute -> execute_query`, which had **no** ballista branch — so Trino queries ran on the legacy bespoke path even in ballista mode. Fix (commit 2cec096): early-return in `execute_query` to a new isolated `execute_query_ballista` helper (`submit_remote` + the same row/memory caps); the legacy path is untouched. **E2E PROOF:** Trino HTTP `SELECT sha256(l_comment) ...` returned the same hashes as the Flight/ADBC path; discriminating test = killing the executor makes the Trino sha256 *scan* stall ("no alive executors") while `count(*)` (metadata-answerable) still finishes, proving the scan routes through ballista. Flight SQL was already routed (criterion #2 E2E). | G3 |
+| 5 | **Speed parity** — measured **multi-node at SF1+** (task 5b), ballista within an agreed band of bespoke (e.g. ≤1.2x). *Not* measurable on the 36GB co-located dev box: co-located executors share one machine's cores, so ballista can only win at multi-node SF1+. | DEFERRED to real hardware; band = G2's ≤1.2x. | G2 |
+
+Criteria 1-4 are the functional expansion of gate **G3** (plus **G1** robustness:
+a query that hangs fails both functionality and speed). Criterion 5 is gate
+**G2**. Retirement is post-**G4** soak. The G1-G4 table below is the engineering
+backlog; this checklist is the *contract* the gates serve.
 
 **What never moves (engine-agnostic, above the execution seam).** The product
 surface is coordinator-side and independent of the execution engine. It is

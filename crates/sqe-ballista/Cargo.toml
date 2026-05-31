@@ -40,6 +40,11 @@ sqe-catalog = { path = "../sqe-catalog" }
 sqe-core = { path = "../sqe-core" }
 sqe-auth = { path = "../sqe-auth" }
 sqe-trino-functions = { path = "../sqe-trino-functions" }
+# Scalar UDFs that must be registered on the scheduler + executor so
+# policy-rewritten plans (sha256 column masks) and JSON/Trino-function queries
+# survive the codec round-trip. See `register_sqe_session_udfs`.
+sqe-policy = { path = "../sqe-policy" }
+datafusion-functions-json = { workspace = true }
 
 [lib]
 name = "sqe_ballista"

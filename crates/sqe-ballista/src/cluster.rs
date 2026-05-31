@@ -8,15 +8,21 @@
 //!   and submits each query to it via [`submit_remote`].
 //! - Each `sqe-worker` process is a ballista **executor** ([`run_executor`]).
 //!
-//! ## Auth scope (Phase 3)
+//! ## Auth scope (Phase 3 fallback + Phase 4b per-user)
 //!
-//! The legacy distributed path already used static `[storage]` creds (no
-//! per-session bearer). Phase 3 matches that: the scheduler and every
-//! executor build a single-tenant [`SessionCatalog`] / `SqeCatalogProvider`
-//! from their **own config** (catalog url + warehouse + static S3 creds via a
-//! client_credentials service token), and the SQE codecs on the cluster side
-//! hold that config-built catalog. Per-user OIDC bearer passthrough to
-//! executors is Phase 4. See the cutover design doc.
+//! The scheduler and every executor build a single-tenant [`SessionCatalog`] /
+//! `SqeCatalogProvider` from their **own config** (catalog url + warehouse +
+//! static S3 creds via a client_credentials service token), and the SQE codecs
+//! on the cluster side hold that config-built catalog. This is the no-bearer
+//! fallback (matches the legacy distributed path's static `[storage]` creds).
+//!
+//! Phase 4b adds per-user passthrough: the authenticated user bearer is
+//! threaded through the plan (client logical codec stamps it; the scheduler
+//! attaches it to the rehydrated provider; it rides the physical
+//! `EncodedSqeScan` to the executor, which mints a per-(user,table) `FileIO`
+//! from it). Only the bearer travels, never S3 secrets. See the cutover design
+//! doc (ledger D8) for the full path and why it bypasses ballista's
+//! `ConfigExtension` propagation.
 //!
 //! ## Codec placement
 //!
@@ -44,10 +50,21 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use ballista_core::ConfigProducer;
 use sqe_catalog::{SessionCatalog, SqeCatalogProvider, TableMetadataCache};
-use sqe_core::config::{CatalogAuthConfig, CatalogConfig, SqeConfig, StorageConfig};
+use sqe_core::config::{CatalogAuthConfig, CatalogBackend, CatalogConfig, SqeConfig, StorageConfig};
 
 use crate::auth_ext::SqeAuthOptions;
 use crate::sqe_codec::{SqeLogicalCodec, SqePhysicalCodec};
+
+/// Derive the optional HMAC key for the `sha256` column-mask UDF from config,
+/// matching the coordinator (`[policy] mask_key`). Empty -> unkeyed SHA-256.
+/// Both engines read the same config so a masked value hashes identically.
+fn mask_key_from(config: &SqeConfig) -> Option<std::sync::Arc<Vec<u8>>> {
+    if config.policy.mask_key.is_empty() {
+        None
+    } else {
+        Some(std::sync::Arc::new(config.policy.mask_key.as_bytes().to_vec()))
+    }
+}
 
 /// A ballista config producer that registers the [`SqeAuthOptions`] extension
 /// so the per-query `sqe_auth.bearer` key round-trips (set/get succeed) on the
@@ -88,6 +105,14 @@ impl ClusterCatalog {
         Arc::new(SqeLogicalCodec::new(self.provider.clone()))
     }
 
+    /// Bearer-aware variant of [`logical_codec`]. Used by [`submit_remote`] to
+    /// stamp the authenticated user's bearer onto the encoded plan so executors
+    /// can mint a per-user FileIO without relying on ballista session-config
+    /// propagation (which silently drops `ConfigExtension` keys).
+    fn logical_codec_with_bearer(&self, bearer: Option<Arc<str>>) -> Arc<SqeLogicalCodec> {
+        Arc::new(SqeLogicalCodec::new_with_bearer(self.provider.clone(), bearer))
+    }
+
     fn physical_codec(&self) -> Arc<SqePhysicalCodec> {
         Arc::new(SqePhysicalCodec::new(
             self.session_catalog.clone(),
@@ -120,13 +145,42 @@ pub async fn build_cluster_catalog(config: &SqeConfig) -> Result<ClusterCatalog>
     // executor re-fetches table metadata from Polaris on every scan task.
     let table_cache = TableMetadataCache::new(cat_cfg.metadata_cache_ttl_secs);
 
-    // Service token via client_credentials from the top-level [auth] block.
-    let auth = CatalogAuthConfig::ClientCredentials {
-        token_endpoint: config.auth.token_endpoint.clone(),
-        client_id: config.auth.client_id.clone(),
-        client_secret: config.auth.client_secret.expose().to_string(),
-        scope: None, // resolve_bearer defaults to PRINCIPAL_ROLE:ALL
-    };
+    // Service identity for the single-tenant cluster catalog. Resolve auth
+    // per-backend instead of forcing OAuth: hardcoding ClientCredentials made
+    // the bootstrap mint an OAuth token even for AWS-IAM backends (Glue/S3
+    // Tables) that have no `token_endpoint`, so the cluster catalog failed to
+    // build and the whole ballista path was unavailable for them (ledger D13).
+    // An explicit per-catalog `[catalogs.*.auth]` override wins; otherwise the
+    // backend implies the service identity. REST keeps OAuth client_credentials
+    // from `[auth]` (unchanged, tested path); AWS backends use the SDK provider
+    // chain (no bearer); HMS/JDBC/Hadoop carry no bearer.
+    let auth = cat_cfg.auth.clone().unwrap_or_else(|| match &cat_cfg.backend {
+        CatalogBackend::Rest => {
+            // Mirror SQE's Authenticator backend selection (sqe-auth
+            // authenticator.rs): use client_credentials ONLY when a
+            // `token_endpoint` is set AND `keycloak_url` is empty. Otherwise the
+            // deployment is OIDC password-grant (ROPC) -- the production model --
+            // which has NO machine service token (auth is per-user, username +
+            // password -> the user's bearer). In ROPC mode the cluster catalog
+            // has no service principal, so it builds anonymous; per-user bearer
+            // passthrough (parity #1) carries the real identity at query time.
+            // Forcing client_credentials here would mint against an empty
+            // token_endpoint and fail bootstrap in every ROPC deployment.
+            if !config.auth.token_endpoint.is_empty() && config.auth.keycloak_url.is_empty() {
+                CatalogAuthConfig::ClientCredentials {
+                    token_endpoint: config.auth.token_endpoint.clone(),
+                    client_id: config.auth.client_id.clone(),
+                    client_secret: config.auth.client_secret.expose().to_string(),
+                    scope: None, // resolve_bearer defaults to PRINCIPAL_ROLE:ALL
+                }
+            } else {
+                CatalogAuthConfig::Anonymous
+            }
+        }
+        CatalogBackend::Glue { .. } | CatalogBackend::S3tables { .. } => CatalogAuthConfig::Aws,
+        // HMS (Thrift), JDBC (SQL), Hadoop (filesystem): no OAuth bearer.
+        _ => CatalogAuthConfig::Anonymous,
+    });
     let bearer = sqe_auth::per_catalog::resolve_bearer(&auth, "")
         .await
         .map_err(|e| anyhow::anyhow!("minting cluster service token: {e}"))?;
@@ -137,13 +191,19 @@ pub async fn build_cluster_catalog(config: &SqeConfig) -> Result<ClusterCatalog>
             .map_err(|e| anyhow::anyhow!("building cluster SessionCatalog: {e}"))?,
     );
 
+    // The cluster catalog is built once and reused for the cluster's lifetime,
+    // so it must resolve namespaces created after construction (e.g. a CTAS
+    // load that runs after the coordinator starts). Live schema resolution
+    // bypasses the construction-time namespace snapshot for point lookups
+    // (cutover ledger D12); table existence is still decided live on scan.
     let provider = SqeCatalogProvider::try_new(
         session_catalog.clone(),
         storage.clone(),
         cat_cfg.warehouse.clone(),
     )
     .await
-    .map_err(|e| anyhow::anyhow!("building cluster SqeCatalogProvider: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("building cluster SqeCatalogProvider: {e}"))?
+    .with_live_schema_resolution();
 
     Ok(ClusterCatalog {
         catalog_name,
@@ -181,6 +241,18 @@ pub async fn run_executor(config: &SqeConfig, opts: ExecutorOptions) -> Result<(
         .await
         .context("building executor cluster catalog")?;
 
+    // Register SQE's scalar UDFs on the executor's function registry so it can
+    // RUN policy-rewritten (sha256 column mask) and JSON/Trino-function tasks.
+    // Built from a throwaway context, then converted to the
+    // `BallistaFunctionRegistry` executor tasks resolve UDFs against. Matches
+    // the scheduler + coordinator registries (parity criterion #2).
+    let mut udf_ctx = SessionContext::new();
+    crate::register_sqe_session_udfs(&mut udf_ctx, mask_key_from(config))
+        .map_err(|e| anyhow::anyhow!("registering SQE UDFs for executor: {e}"))?;
+    let function_registry = Arc::new(ballista_core::registry::BallistaFunctionRegistry::from(
+        &udf_ctx.state(),
+    ));
+
     let exec_config = ExecutorProcessConfig {
         bind_host: opts.bind_host,
         external_host: opts.external_host,
@@ -193,6 +265,7 @@ pub async fn run_executor(config: &SqeConfig, opts: ExecutorOptions) -> Result<(
         override_config_producer: Some(sqe_config_producer()),
         override_logical_codec: Some(cluster.logical_codec()),
         override_physical_codec: Some(cluster.physical_codec()),
+        override_function_registry: Some(function_registry),
         ..Default::default()
     };
 
@@ -219,6 +292,7 @@ pub async fn start_scheduler(
 
     let provider = cluster_catalog.provider.clone();
     let catalog_name = cluster_catalog.catalog_name.clone();
+    let mask_key = mask_key_from(config);
 
     // Session builder: register the catalog on every planning session so the
     // scheduler can resolve tables when it physical-plans the submitted
@@ -228,14 +302,14 @@ pub async fn start_scheduler(
             .with_config(session_config)
             .with_default_features()
             .build();
-        let ctx = SessionContext::new_with_state(state);
+        let mut ctx = SessionContext::new_with_state(state);
         ctx.register_catalog(catalog_name.clone(), provider.clone());
-        // Register SQE's Trino-compat functions so the scheduler can plan
-        // queries that use them (the coordinator registers the same set on
-        // its planning context). NOTE: executors also need these to *run*
-        // UDF-bearing physical tasks (override_function_registry) — follow-up.
-        sqe_trino_functions::register_trino_functions(&ctx);
-        sqe_trino_functions::register_extended_trino_functions(&ctx);
+        // Register SQE's scalar UDFs (sha256 column mask + Trino-compat + JSON)
+        // so the scheduler can resolve them when it physical-plans the
+        // submitted plan. The executor registers the identical set (below) so
+        // a policy-rewritten or function-bearing plan survives the round-trip
+        // (parity criterion #2).
+        crate::register_sqe_session_udfs(&mut ctx, mask_key.clone())?;
         Ok(ctx.state())
     });
 
@@ -322,26 +396,27 @@ pub async fn submit_remote(
     target_partitions: usize,
     user_bearer: &str,
 ) -> Result<(SchemaRef, SendableRecordBatchStream)> {
+    // The bearer is threaded through the plan: the logical codec stamps it onto
+    // the encoded SqeTableProvider node; the scheduler decodes it and attaches
+    // the bearer to the rehydrated provider; from there it flows to
+    // IcebergScanExec and the physical EncodedSqeScan, which uses it to mint a
+    // per-(user,table) FileIO. This is the primary bearer-passthrough path.
+    //
+    // The SqeAuthOptions session-config insert below is retained as harmless
+    // redundancy. Ballista currently drops ConfigExtension keys during
+    // `update_from_key_value_pair` (they are emitted unprefixed so the
+    // receiving `set()` cannot route them back), so the insert is a no-op at
+    // runtime. It is kept so the wiring is already in place should a future
+    // ballista version round-trip ConfigExtension keys correctly.
+    //
+    // Security: the bearer is a live OIDC token; do not log it at trace level.
     let mut config = SessionConfig::new_with_ballista()
         .with_target_partitions(target_partitions)
-        .with_ballista_logical_extension_codec(cluster.logical_codec())
+        .with_ballista_logical_extension_codec(cluster.logical_codec_with_bearer(
+            (!user_bearer.is_empty()).then(|| Arc::from(user_bearer)),
+        ))
         .with_ballista_physical_extension_codec(cluster.physical_codec());
 
-    // Carry the authenticated user's bearer to the executors so the physical
-    // codec can mint a per-user catalog (Polaris then vends per-user S3 creds).
-    //
-    // KNOWN LIMITATION (cutover design D8): this does NOT currently reach the
-    // executor. Ballista propagates session settings via
-    // `ConfigOptions::entries()` -> `set()`, but DataFusion emits
-    // `ConfigExtension` entries *unprefixed* ("bearer", not "sqe_auth.bearer"),
-    // and the receiving `set()` can't route an unprefixed key back to the
-    // extension, so it is silently dropped. The executor's `resolve_catalog`
-    // therefore falls back to its single-tenant config catalog today (which
-    // matches the legacy distributed path's static-creds model). True
-    // per-user passthrough needs the bearer threaded through the plan node
-    // (SqeTableProvider -> IcebergScanExec -> EncodedSqeScan) or an upstream
-    // ballista fix; tracked as a follow-up. We still set it here so the wiring
-    // is in place the moment that lands.
     config.options_mut().extensions.insert(SqeAuthOptions {
         bearer: user_bearer.to_string(),
     });
