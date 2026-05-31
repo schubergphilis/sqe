@@ -199,13 +199,14 @@ pub async fn create_session_context(
                     let pool = Arc::new(
                         datafusion::execution::memory_pool::FairSpillPool::new(max_memory),
                     );
-                    // V10 httpfs: lazy http(s) ObjectStoreRegistry mirrors the
-                    // primary coordinator runtime so the fallback path
-                    // (tests, one-shot helpers) also accepts URL-shaped
-                    // file paths in read_* TVFs.
+                    // V10 httpfs: lazy http(s) + s3 ObjectStoreRegistry mirrors
+                    // the primary coordinator runtime so the fallback path
+                    // (tests, one-shot helpers) also accepts URL-shaped file
+                    // paths and ad-hoc `s3://` buckets in read_* TVFs.
                     let registry = Arc::new(
-                        sqe_catalog::lazy_object_store::LazyHttpObjectStoreRegistry::new(
+                        sqe_catalog::lazy_object_store::LazyHttpObjectStoreRegistry::with_s3_fallback(
                             datafusion::execution::object_store::DefaultObjectStoreRegistry::new(),
+                            config.storage.clone(),
                         ),
                     );
                     let rt = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()

@@ -12,12 +12,23 @@
 //! the inner registry has no store for a URL whose scheme is `https` or
 //! `http`, build one with [`object_store::http::HttpBuilder`] using the URL's
 //! `scheme://host[:port]` as the root, register it, and return it. Subsequent
-//! lookups hit the cache. All other schemes (`s3`, `file`, ...) flow through
-//! the inner registry unchanged.
+//! lookups hit the cache.
+//!
+//! When constructed with [`LazyHttpObjectStoreRegistry::with_s3_fallback`] the
+//! same lazy treatment is extended to `s3://` / `s3a://` URLs: a registry miss
+//! builds an [`object_store::aws::AmazonS3`] from the coordinator-wide
+//! [`StorageConfig`]. This is what lets the file-reader TVFs (`read_csv` /
+//! `read_parquet`) resolve ad-hoc S3 buckets that were never pre-registered as
+//! Iceberg catalogs — without it, `read_csv('s3://…')` fails at physical-plan
+//! creation with `"No suitable object store found"`. The plain [`new`]
+//! constructor keeps `s3` / `file` flowing through the inner registry
+//! unchanged (embedded CLI, tests).
 //!
 //! The wrapper is used by both [`build_embedded_context`] and
 //! `coordinator::session_context`, so the cluster engine and the embedded CLI
 //! share one HTTP fetch path.
+//!
+//! [`new`]: LazyHttpObjectStoreRegistry::new
 
 use std::sync::Arc;
 
@@ -25,6 +36,7 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::object_store::ObjectStoreRegistry;
 use object_store::http::HttpBuilder;
 use object_store::ObjectStore;
+use sqe_core::config::StorageConfig;
 use url::Url;
 
 /// Wrap any inner [`ObjectStoreRegistry`] (typically
@@ -36,12 +48,26 @@ use url::Url;
 #[derive(Debug)]
 pub struct LazyHttpObjectStoreRegistry<R: ObjectStoreRegistry> {
     inner: R,
+    /// When `Some`, `s3://` / `s3a://` URLs that miss the inner registry are
+    /// built on demand from this coordinator-wide storage config (endpoint,
+    /// credentials, path-style, allow_http). `None` keeps the http-only
+    /// behaviour for callers that never read S3 via TVFs (embedded CLI, tests).
+    s3_storage: Option<StorageConfig>,
 }
 
 impl<R: ObjectStoreRegistry> LazyHttpObjectStoreRegistry<R> {
-    /// Wrap the given inner registry.
+    /// Wrap the given inner registry (lazy http/https build only; `s3` and
+    /// `file` flow through the inner registry unchanged).
     pub fn new(inner: R) -> Self {
-        Self { inner }
+        Self { inner, s3_storage: None }
+    }
+
+    /// Wrap the inner registry and additionally build `s3://` / `s3a://`
+    /// stores on demand from `storage`. Used by the coordinator runtime so the
+    /// file-reader TVFs (`read_csv` / `read_parquet`) resolve ad-hoc S3 buckets
+    /// that were never pre-registered as Iceberg catalogs.
+    pub fn with_s3_fallback(inner: R, storage: StorageConfig) -> Self {
+        Self { inner, s3_storage: Some(storage) }
     }
 }
 
@@ -63,6 +89,17 @@ impl<R: ObjectStoreRegistry> ObjectStoreRegistry for LazyHttpObjectStoreRegistry
             Ok(store) => Ok(store),
             Err(_) if matches!(url.scheme(), "http" | "https") => {
                 build_and_register_http_store(&self.inner, url)
+            }
+            // S3 lazy build only when a storage config was supplied
+            // (`with_s3_fallback`); otherwise fall through to the inner error.
+            Err(_)
+                if matches!(url.scheme(), "s3" | "s3a") && self.s3_storage.is_some() =>
+            {
+                build_and_register_s3_store(
+                    &self.inner,
+                    url,
+                    self.s3_storage.as_ref().expect("guarded by is_some above"),
+                )
             }
             Err(e) => Err(e),
         }
@@ -96,11 +133,47 @@ fn build_and_register_http_store(
     Ok(store)
 }
 
+fn build_and_register_s3_store(
+    inner: &dyn ObjectStoreRegistry,
+    url: &Url,
+    storage: &StorageConfig,
+) -> DFResult<Arc<dyn ObjectStore>> {
+    let bucket = url.host_str().ok_or_else(|| {
+        DataFusionError::Plan(format!("S3 URL '{url}' is missing a bucket (host)"))
+    })?;
+
+    let store = crate::file_tvf_common::build_s3_store_for_bucket(bucket, storage)?;
+    let store: Arc<dyn ObjectStore> = Arc::new(store);
+
+    // DataFusion keys the registry by `scheme://host`; register under the
+    // bucket-scoped URL so the constructed store is reused for every object in
+    // the bucket and the build happens at most once per session.
+    let scheme = url.scheme();
+    let key = Url::parse(&format!("{scheme}://{bucket}")).map_err(|e| {
+        DataFusionError::Plan(format!("failed to build object-store URL '{scheme}://{bucket}': {e}"))
+    })?;
+
+    inner.register_store(&key, Arc::clone(&store));
+    Ok(store)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use datafusion::execution::object_store::DefaultObjectStoreRegistry;
     use object_store::memory::InMemory;
+
+    /// Minimal storage config that lets `AmazonS3Builder::build()` succeed
+    /// (http endpoint + allow_http) without contacting any network.
+    fn http_s3_storage() -> StorageConfig {
+        StorageConfig {
+            s3_endpoint: "http://localhost:9000".to_string(),
+            s3_region: "us-east-1".to_string(),
+            s3_path_style: true,
+            s3_allow_http: true,
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn falls_back_to_inner_for_known_scheme() {
@@ -150,6 +223,46 @@ mod tests {
     fn https_with_explicit_port() {
         let lazy = LazyHttpObjectStoreRegistry::new(DefaultObjectStoreRegistry::new());
         let url = Url::parse("https://internal:8443/data.parquet").unwrap();
+        assert!(lazy.get_store(&url).is_ok());
+    }
+
+    #[test]
+    fn s3_without_storage_propagates_inner_error() {
+        // Plain `new()` keeps the http-only behaviour: an unregistered s3
+        // bucket must surface the standard registry error, not be auto-built.
+        let lazy = LazyHttpObjectStoreRegistry::new(DefaultObjectStoreRegistry::new());
+        let url = Url::parse("s3://my-bucket/data.csv").unwrap();
+        let err = lazy
+            .get_store(&url)
+            .expect_err("s3 must not be auto-built without a storage config");
+        assert!(
+            err.to_string().contains("No suitable object store"),
+            "expected the standard registry error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn s3_builds_store_on_demand_with_storage() {
+        // `with_s3_fallback` builds + caches the bucket store on first miss.
+        let lazy = LazyHttpObjectStoreRegistry::with_s3_fallback(
+            DefaultObjectStoreRegistry::new(),
+            http_s3_storage(),
+        );
+        let url = Url::parse("s3://my-bucket/data.csv").unwrap();
+        let store = lazy.get_store(&url).expect("lazy s3 build succeeds");
+        // A second object in the same bucket returns the cached instance.
+        let other = Url::parse("s3://my-bucket/other.parquet").unwrap();
+        let again = lazy.get_store(&other).unwrap();
+        assert!(Arc::ptr_eq(&store, &again));
+    }
+
+    #[test]
+    fn s3a_scheme_also_builds_with_storage() {
+        let lazy = LazyHttpObjectStoreRegistry::with_s3_fallback(
+            DefaultObjectStoreRegistry::new(),
+            http_s3_storage(),
+        );
+        let url = Url::parse("s3a://hadoop-bucket/data.csv").unwrap();
         assert!(lazy.get_store(&url).is_ok());
     }
 }
