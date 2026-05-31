@@ -471,6 +471,24 @@ upstream improvement. Appended as we build.
   failing scenario (coordinator started, THEN TPC-H SF0.1 loaded, ballista mode)
   now passes **22/22** (was 0/22); plus a unit regression test in
   `catalog_provider.rs`.
+- **D13 — cluster catalog bootstrap hardcodes OAuth `ClientCredentials`, so
+  non-OAuth backends (Glue/S3Tables/Hadoop) can't use the ballista path.**
+  Found during the 2026-05-31 parity #3 assessment. `build_cluster_catalog`
+  (`sqe-ballista/cluster.rs`, run at scheduler + executor bootstrap)
+  unconditionally builds `CatalogAuthConfig::ClientCredentials` from `[auth]`
+  and calls `resolve_bearer`, minting an OAuth token regardless of the catalog
+  backend. The coordinator's per-session path instead resolves auth per-backend
+  (`Aws` -> empty bearer for Glue/S3Tables; the AWS SDK chain supplies creds).
+  For an AWS-IAM deployment (Glue/S3Tables, `[auth].token_endpoint` empty), the
+  forced OAuth mint hits `OAuthClient::new("", ..).get_token()` and fails, so
+  the cluster catalog never builds and the whole ballista path is unavailable.
+  *Not verified at runtime* (no Glue/S3Tables creds on this stack); confirmed by
+  code reading. *Why it matters:* blocks non-OAuth backends on ballista even in
+  the `full-backends` image. *Fix (designed, NOT built):* `build_cluster_catalog`
+  should resolve auth per-backend (reuse the catalog's `CatalogAuthConfig` /
+  mirror the coordinator), using `Aws`/empty for AWS backends and OAuth only for
+  REST/OAuth ones. Orthogonal to the executor's D4 rebuild, which is
+  backend-agnostic (metadata + S3 FileIO, no catalog contact).
 
 ## End goal + plumbing-reduction gates
 
@@ -505,7 +523,7 @@ scheduling is more mature than the bespoke `WeightedScheduler` + `stage_planner`
 |---|---|---|---|
 | 1 | **Bearer passthrough** — per-user OIDC bearer reaches executors; the query authenticates *as the user* to Polaris/S3 (no service account) | **CODE-COMPLETE + E2E-SMOKED (2026-05-30).** Bearer threaded through the plan (logical codec -> provider -> `IcebergScanExec` -> `EncodedSqeScan` -> executor per-(user,table) `FileIO`, D4-safe cache); see D8. Unit-tested: wire round-trip, full-bearer cache keying, no-bearer fallback. **Ballista-mode smoke: TPC-H SF0.1 22/22** (single-principal stack; exercises the full bearer path with a real token). Per-user *isolation* still NOT E2E-verifiable on the single-principal stack (needs a multi-principal env). NB: the smoke first hit 0/22 from a pre-existing cluster-catalog freshness bug (D12, now FIXED), not from bearer threading; ballista-mode TPC-H is 22/22 in the start-then-load order too. | G3, task 4b |
 | 2 | **Policy plans survive the codec** — injected column-mask / row-filter nodes round-trip through `SqeLogicalCodec` and enforce on executors | **GAP FOUND + FIXED + VERIFIED E2E (2026-05-31).** Assessed: row filters (standard `Filter` exprs) and column restriction (projection) survive via ballista's default codec; **column masks did NOT** — the mask UDF (`sha256`) was registered on neither the scheduler (planning) nor the executor (run). Same gap hit JSON funcs + Trino-function *execution*. Fix (commit 2a06257): shared `register_sqe_session_udfs` (sha256 + Trino + extended-Trino + JSON) wired into coordinator + scheduler `session_builder` + executor `override_function_registry`. **E2E PROOF:** distributed stack (coordinator scheduler + rebuilt `sqe-worker` executor), ADBC FlightSQL client, ballista mode: `SELECT l_orderkey, sha256(l_comment) FROM tpch_sf0_1.lineitem LIMIT 3` returned real SHA-256 hashes, and `count(*)` returned 600000 (no regression). Plus a unit test (helper registers `sha256`, flows into `BallistaFunctionRegistry`). NB: reaching the E2E surfaced + fixed a **separate** coordinator bug (commit 3c280a5): the Flight Basic-auth handshake used a padding-strict base64 decoder and rejected the Go ADBC driver's unpadded base64 ("Invalid base64 in auth"), so **no ADBC client (incl. the dbt-sqe adapter) could connect at all**; now `DecodePaddingMode::Indifferent`. Row-filter *enforcement* E2E (with a live policy backend) still not stood up. | G3 |
-| 3 | **All catalog backends decode** — Glue/S3Tables/Unity/Nessie/Hadoop rebuild executor-side, not just REST/Polaris | **TO ASSESS WHEN REACHED.** | new |
+| 3 | **All catalog backends decode** — Glue/S3Tables/Unity/Nessie/Hadoop rebuild executor-side, not just REST/Polaris | **ASSESSED (2026-05-31): REST-family verified, non-REST code-only with a confirmed gap. NOT a blanket green.** The literal "rebuild executor-side" is **backend-agnostic by D4 design**: the executor rebuilds the `Table` from shipped `metadata_json` + an S3 `build_file_io`, never contacting the catalog — so any S3-backed Iceberg table decodes identically regardless of catalog. **REST-family (Polaris/Nessie/Unity)** share the REST path and are covered by the Polaris E2E (criterion #2 ran real queries through it). **Non-REST (Glue/S3Tables/HMS/JDBC):** code-only, NOT runtime-verified (no creds/stacks here), and **D13 is a confirmed ballista-specific blocker** — the cluster-catalog bootstrap hardcodes OAuth `ClientCredentials`, so AWS-IAM backends can't even initialize the scheduler/executor catalog. Also requires the `full-backends` build (Dockerfile.full compiles both `sqe-server` + `sqe-worker` with it). **Out of scope:** Hadoop (catalog stubbed, `mount.rs` returns "not yet") and non-S3 storage (`build_file_io` is S3-only) — engine-wide limits, not ballista-specific. *No fix applied: non-REST is untestable on this stack (don't ship what can't be verified); D13 carries the designed fix.* | G3 |
 | 4 | **Protocols route** — both Flight SQL and Trino HTTP drive the ballista path | **TO ASSESS WHEN REACHED.** | new |
 | 5 | **Speed parity** — measured **multi-node at SF1+** (task 5b), ballista within an agreed band of bespoke (e.g. ≤1.2x). *Not* measurable on the 36GB co-located dev box: co-located executors share one machine's cores, so ballista can only win at multi-node SF1+. | DEFERRED to real hardware; band = G2's ≤1.2x. | G2 |
 
