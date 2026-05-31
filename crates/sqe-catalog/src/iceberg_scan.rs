@@ -83,6 +83,10 @@ pub struct IcebergScanExec {
     df_filters: Vec<Expr>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
+    /// Per-user OIDC bearer, set ONLY on the ballista scheduler decode path so
+    /// the physical codec can ship it to executors (parity #1 / D8). `None` on
+    /// every non-ballista construction; this field is inert off that path.
+    bearer: Option<Arc<str>>,
     /// Optional snapshot ID for time travel queries.
     snapshot_id: Option<i64>,
     /// Trust Iceberg sort order metadata for ALL columns, not just partition keys.
@@ -212,7 +216,7 @@ impl IcebergScanExec {
             }
         };
         let properties = Arc::new(PlanProperties::new(eq_props, Partitioning::UnknownPartitioning(DEFAULT_TARGET_PARTITIONS), EmissionType::Incremental, Boundedness::Bounded));
-        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![], manifest_concurrency: DEFAULT_MANIFEST_CONCURRENCY, direct_read_concurrency: DEFAULT_DIRECT_READ_CONCURRENCY, target_partitions: DEFAULT_TARGET_PARTITIONS, cached_statistics: None }
+        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), bearer: None, snapshot_id: None, trust_sort_order: false, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![], manifest_concurrency: DEFAULT_MANIFEST_CONCURRENCY, direct_read_concurrency: DEFAULT_DIRECT_READ_CONCURRENCY, target_partitions: DEFAULT_TARGET_PARTITIONS, cached_statistics: None }
     }
 
     /// Attach pre-computed statistics aggregated from Iceberg manifests.
@@ -315,6 +319,18 @@ impl IcebergScanExec {
     pub fn projection(&self) -> Option<&[String]> { self.projection.as_deref() }
     pub fn pushed_down_filters(&self) -> &[Arc<dyn PhysicalExpr>] { &self.pushed_down_filters }
 
+    /// The per-user bearer, if this scan was rehydrated on the ballista path.
+    pub fn bearer(&self) -> Option<&str> {
+        self.bearer.as_deref()
+    }
+
+    /// Attach a per-user bearer (ballista scheduler decode path only).
+    #[must_use = "with_bearer consumes self; bind the returned scan"]
+    pub fn with_bearer(mut self, bearer: Option<Arc<str>>) -> Self {
+        self.bearer = bearer;
+        self
+    }
+
     // --- Accessors for distributed-plan serialization (sqe-ballista) -------
     // A ballista PhysicalExtensionCodec reads these to put the scan on the
     // wire, then rebuilds the node on the executor via `from_codec_parts`.
@@ -388,6 +404,7 @@ impl IcebergScanExec {
             df_filters: self.df_filters.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
+            bearer: self.bearer.clone(),
             snapshot_id: self.snapshot_id,
             trust_sort_order: self.trust_sort_order,
             small_file_threshold_bytes: self.small_file_threshold_bytes,
@@ -1649,4 +1666,64 @@ impl Stream for IcebergRecordBatchStream {
 
 impl datafusion::physical_plan::RecordBatchStream for IcebergRecordBatchStream {
     fn schema(&self) -> SchemaRef { self.schema.clone() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use iceberg::io::FileIOBuilder;
+    use iceberg::spec::TableMetadata;
+    use iceberg::{NamespaceIdent, TableIdent};
+
+    /// Build a minimal `Table` with a single-column schema, no snapshots,
+    /// and an in-memory-compatible FileIO. The table is only used to satisfy
+    /// `IcebergScanExec`'s constructor; no I/O is performed in these tests.
+    fn make_test_scan() -> IcebergScanExec {
+        let metadata_json = r#"{
+            "format-version": 2,
+            "table-uuid": "fb072c92-a02b-11e9-ae9c-1bb7bc9eca94",
+            "location": "file:///tmp/test-table",
+            "last-sequence-number": 0,
+            "last-updated-ms": 1600000000000,
+            "last-column-id": 1,
+            "schemas": [{"schema-id":0,"type":"struct","fields":[{"id":1,"name":"id","required":false,"type":"long"}]}],
+            "current-schema-id": 0,
+            "partition-specs": [{"spec-id":0,"fields":[]}],
+            "default-spec-id": 0,
+            "last-partition-id": 999,
+            "properties": {},
+            "snapshots": [],
+            "snapshot-log": [],
+            "metadata-log": [],
+            "sort-orders": [{"order-id":0,"fields":[]}],
+            "default-sort-order-id": 0,
+            "refs": {}
+        }"#;
+        let metadata: TableMetadata = serde_json::from_str(metadata_json)
+            .expect("test metadata must parse");
+        let file_io = FileIOBuilder::new_fs_io().build().expect("fs FileIO");
+        let ident = TableIdent::new(
+            NamespaceIdent::new("test_ns".to_string()),
+            "test_table".to_string(),
+        );
+        let table = iceberg::table::Table::builder()
+            .file_io(file_io)
+            .identifier(ident)
+            .metadata(Arc::new(metadata))
+            .build()
+            .expect("test Table");
+        let projected_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, true),
+        ]));
+        IcebergScanExec::new(table, projected_schema, None, None)
+    }
+
+    #[test]
+    fn bearer_defaults_none_and_is_settable() {
+        let scan = make_test_scan();
+        assert!(scan.bearer().is_none(), "non-ballista path must not set a bearer");
+        let scan = scan.with_bearer(Some(Arc::from("user-token")));
+        assert_eq!(scan.bearer(), Some("user-token"));
+    }
 }

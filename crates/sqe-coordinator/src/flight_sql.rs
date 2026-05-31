@@ -28,6 +28,18 @@ use arrow_flight::{
 use arrow_flight::error::FlightError;
 use arrow_ipc::writer::IpcWriteOptions;
 use base64::Engine;
+
+/// Base64 engine for the HTTP Basic `authorization` handshake header that
+/// accepts input WITH or WITHOUT `=` padding. RFC 4648 mandates padding and the
+/// Rust Flight clients send it, but the Go ADBC FlightSQL driver (and therefore
+/// the dbt-sqe adapter, which connects over ADBC) sends UNPADDED base64. A
+/// padding-strict decoder rejects those with "Invalid padding", breaking the
+/// handshake. `DecodePaddingMode::Indifferent` accepts both.
+const BASIC_AUTH_B64: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
+    &base64::alphabet::STANDARD,
+    base64::engine::GeneralPurposeConfig::new()
+        .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+);
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use prost::Message;
 use tonic::metadata::MetadataValue;
@@ -706,7 +718,8 @@ impl FlightSqlService for SqeFlightSqlService {
         }
 
         let base64_encoded = &authorization[basic_prefix.len()..];
-        let decoded = base64::engine::general_purpose::STANDARD
+        // Padding-indifferent: ADBC/Go FlightSQL clients send unpadded base64.
+        let decoded = BASIC_AUTH_B64
             .decode(base64_encoded)
             .map_err(|e| Status::invalid_argument(format!("Invalid base64 in auth: {e}")))?;
         let decoded_str = std::str::from_utf8(&decoded)
@@ -2692,5 +2705,29 @@ mod tests {
             test_ticket("part-0"),
         )]);
         assert!(loc.is_distributed());
+    }
+
+    /// The handshake Basic-auth decoder must accept base64 WITH and WITHOUT
+    /// padding. The Go ADBC FlightSQL driver (dbt-sqe's transport) sends
+    /// unpadded base64; a padding-strict decoder rejected it with "Invalid
+    /// padding", breaking the handshake. Regression guard.
+    #[test]
+    fn basic_auth_b64_accepts_padded_and_unpadded() {
+        let creds = b"root:s3cr3t";
+        let padded = base64::engine::general_purpose::STANDARD.encode(creds);
+        assert!(padded.ends_with('='), "fixture must actually be padded");
+        let unpadded = padded.trim_end_matches('=');
+        assert_ne!(padded, unpadded, "fixture must differ");
+
+        assert_eq!(
+            BASIC_AUTH_B64.decode(&padded).expect("padded must decode"),
+            creds,
+            "padded base64 (Rust clients) must decode"
+        );
+        assert_eq!(
+            BASIC_AUTH_B64.decode(unpadded).expect("unpadded must decode"),
+            creds,
+            "unpadded base64 (ADBC/Go clients) must decode -- the bug"
+        );
     }
 }
