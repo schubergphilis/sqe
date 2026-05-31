@@ -19,7 +19,6 @@ sqe-core = { path = "../sqe-core" }
 sqe-catalog = { path = "../sqe-catalog" }
 sqe-planner = { path = "../sqe-planner" }
 sqe-metrics = { path = "../sqe-metrics" }
-sqe-ballista = { path = "../sqe-ballista" }
 datafusion = { workspace = true }
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
