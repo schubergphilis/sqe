@@ -485,14 +485,21 @@ upstream improvement. Appended as we build.
   *Not verified at runtime* (no Glue/S3Tables creds on this stack); confirmed by
   code reading. *Why it matters:* blocks non-OAuth backends on ballista even in
   the `full-backends` image. *FIXED (2026-05-31):* `build_cluster_catalog` now
-  resolves the service identity per-backend: an explicit `[catalogs.*.auth]`
-  override wins; otherwise REST keeps OAuth `ClientCredentials` from `[auth]`
-  (unchanged, tested path), Glue/S3Tables use `Aws` (SDK provider chain, no
-  bearer), HMS/JDBC/Hadoop use `Anonymous`. The forced OAuth mint is gone, so
-  non-OAuth backends no longer fail cluster-catalog bootstrap. Verified the REST
-  branch is unchanged (Polaris `sha256` still returns through ballista); the
-  non-REST branches are code-only (no Glue/S3Tables creds here). Orthogonal to
-  the executor's D4 rebuild, which is backend-agnostic (metadata + S3 FileIO).
+  resolves the service identity per-backend, **mirroring SQE's Authenticator
+  mode selection** (sqe-auth `authenticator.rs`): an explicit `[catalogs.*.auth]`
+  override wins; otherwise for REST it uses OAuth `ClientCredentials` ONLY when
+  `token_endpoint` is set AND `keycloak_url` is empty (the client_credentials /
+  test-stack mode), else it builds `Anonymous` because the deployment is OIDC
+  password-grant (**ROPC** -- SQE's production model: user username+password ->
+  the user's bearer, no machine service token). Glue/S3Tables use `Aws`;
+  HMS/JDBC/Hadoop use `Anonymous`. This removes two bootstrap failures: the
+  forced OAuth mint against an empty `token_endpoint` (which broke BOTH AWS-IAM
+  backends AND every ROPC deployment) is gone. In ROPC mode the cluster catalog
+  has no service principal and per-user bearer passthrough (parity #1) carries
+  the real identity. Verified the client_credentials branch is unchanged
+  (Polaris `sha256` still returns through ballista); the ROPC + non-REST
+  branches are code-only (this stack is client_credentials-mode, no ROPC/Glue
+  creds). Orthogonal to the executor's D4 rebuild (backend-agnostic).
 
 ## End goal + plumbing-reduction gates
 

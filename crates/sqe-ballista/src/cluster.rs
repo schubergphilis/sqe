@@ -155,12 +155,28 @@ pub async fn build_cluster_catalog(config: &SqeConfig) -> Result<ClusterCatalog>
     // from `[auth]` (unchanged, tested path); AWS backends use the SDK provider
     // chain (no bearer); HMS/JDBC/Hadoop carry no bearer.
     let auth = cat_cfg.auth.clone().unwrap_or_else(|| match &cat_cfg.backend {
-        CatalogBackend::Rest => CatalogAuthConfig::ClientCredentials {
-            token_endpoint: config.auth.token_endpoint.clone(),
-            client_id: config.auth.client_id.clone(),
-            client_secret: config.auth.client_secret.expose().to_string(),
-            scope: None, // resolve_bearer defaults to PRINCIPAL_ROLE:ALL
-        },
+        CatalogBackend::Rest => {
+            // Mirror SQE's Authenticator backend selection (sqe-auth
+            // authenticator.rs): use client_credentials ONLY when a
+            // `token_endpoint` is set AND `keycloak_url` is empty. Otherwise the
+            // deployment is OIDC password-grant (ROPC) -- the production model --
+            // which has NO machine service token (auth is per-user, username +
+            // password -> the user's bearer). In ROPC mode the cluster catalog
+            // has no service principal, so it builds anonymous; per-user bearer
+            // passthrough (parity #1) carries the real identity at query time.
+            // Forcing client_credentials here would mint against an empty
+            // token_endpoint and fail bootstrap in every ROPC deployment.
+            if !config.auth.token_endpoint.is_empty() && config.auth.keycloak_url.is_empty() {
+                CatalogAuthConfig::ClientCredentials {
+                    token_endpoint: config.auth.token_endpoint.clone(),
+                    client_id: config.auth.client_id.clone(),
+                    client_secret: config.auth.client_secret.expose().to_string(),
+                    scope: None, // resolve_bearer defaults to PRINCIPAL_ROLE:ALL
+                }
+            } else {
+                CatalogAuthConfig::Anonymous
+            }
+        }
         CatalogBackend::Glue { .. } | CatalogBackend::S3tables { .. } => CatalogAuthConfig::Aws,
         // HMS (Thrift), JDBC (SQL), Hadoop (filesystem): no OAuth bearer.
         _ => CatalogAuthConfig::Anonymous,
