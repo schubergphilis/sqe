@@ -33,7 +33,6 @@ sqe-sql = { path = "../sqe-sql" }
 sqe-policy = { path = "../sqe-policy" }
 sqe-planner = { path = "../sqe-planner" }
 sqe-trino-functions = { path = "../sqe-trino-functions" }
-sqe-ballista = { path = "../sqe-ballista" }
 datafusion = { workspace = true }
 datafusion-proto = { workspace = true }
 arrow = { workspace = true }
