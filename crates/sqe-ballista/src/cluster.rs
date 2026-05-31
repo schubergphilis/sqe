@@ -50,7 +50,7 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use ballista_core::ConfigProducer;
 use sqe_catalog::{SessionCatalog, SqeCatalogProvider, TableMetadataCache};
-use sqe_core::config::{CatalogAuthConfig, CatalogConfig, SqeConfig, StorageConfig};
+use sqe_core::config::{CatalogAuthConfig, CatalogBackend, CatalogConfig, SqeConfig, StorageConfig};
 
 use crate::auth_ext::SqeAuthOptions;
 use crate::sqe_codec::{SqeLogicalCodec, SqePhysicalCodec};
@@ -145,13 +145,26 @@ pub async fn build_cluster_catalog(config: &SqeConfig) -> Result<ClusterCatalog>
     // executor re-fetches table metadata from Polaris on every scan task.
     let table_cache = TableMetadataCache::new(cat_cfg.metadata_cache_ttl_secs);
 
-    // Service token via client_credentials from the top-level [auth] block.
-    let auth = CatalogAuthConfig::ClientCredentials {
-        token_endpoint: config.auth.token_endpoint.clone(),
-        client_id: config.auth.client_id.clone(),
-        client_secret: config.auth.client_secret.expose().to_string(),
-        scope: None, // resolve_bearer defaults to PRINCIPAL_ROLE:ALL
-    };
+    // Service identity for the single-tenant cluster catalog. Resolve auth
+    // per-backend instead of forcing OAuth: hardcoding ClientCredentials made
+    // the bootstrap mint an OAuth token even for AWS-IAM backends (Glue/S3
+    // Tables) that have no `token_endpoint`, so the cluster catalog failed to
+    // build and the whole ballista path was unavailable for them (ledger D13).
+    // An explicit per-catalog `[catalogs.*.auth]` override wins; otherwise the
+    // backend implies the service identity. REST keeps OAuth client_credentials
+    // from `[auth]` (unchanged, tested path); AWS backends use the SDK provider
+    // chain (no bearer); HMS/JDBC/Hadoop carry no bearer.
+    let auth = cat_cfg.auth.clone().unwrap_or_else(|| match &cat_cfg.backend {
+        CatalogBackend::Rest => CatalogAuthConfig::ClientCredentials {
+            token_endpoint: config.auth.token_endpoint.clone(),
+            client_id: config.auth.client_id.clone(),
+            client_secret: config.auth.client_secret.expose().to_string(),
+            scope: None, // resolve_bearer defaults to PRINCIPAL_ROLE:ALL
+        },
+        CatalogBackend::Glue { .. } | CatalogBackend::S3tables { .. } => CatalogAuthConfig::Aws,
+        // HMS (Thrift), JDBC (SQL), Hadoop (filesystem): no OAuth bearer.
+        _ => CatalogAuthConfig::Anonymous,
+    });
     let bearer = sqe_auth::per_catalog::resolve_bearer(&auth, "")
         .await
         .map_err(|e| anyhow::anyhow!("minting cluster service token: {e}"))?;
