@@ -180,7 +180,7 @@ impl QueryHandler {
 
         // Build shared DataFusion runtime with FairSpillPool for memory management
         // and optional spill-to-disk. This is built once and shared across all queries.
-        let runtime = crate::runtime::build_coordinator_runtime(&config.coordinator)
+        let runtime = crate::runtime::build_coordinator_runtime(&config.coordinator, &config.storage)
             .map_err(|e| sqe_core::SqeError::Config(format!("Failed to build runtime: {e}")))?;
 
         let per_user_memory_budget_bytes = if config.query.per_user_memory_budget == "0" {
