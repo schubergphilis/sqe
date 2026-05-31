@@ -72,11 +72,17 @@ cargo-test:
     # at link time with `linker `clang` not found`.
     - apt-get update -qq && apt-get install -y -qq cmake protobuf-compiler libssl-dev pkg-config clang mold > /dev/null
   script:
-    - cargo test --release
+    # Debug, not --release. Tests need correctness, not query speed. The
+    # release profile's thin-LTO + opt-level 3 over the arrow / DataFusion /
+    # iceberg dependency tree dominates this job's wall time, while the test
+    # suite itself runs in well under a minute. Debug compiles far faster and
+    # additionally enables overflow-check assertions. Representative perf
+    # numbers come from the benchmark jobs, not from the test job.
+    - cargo test
     # Run the SQLite-backed runtime catalog tests behind the explicit
     # feature flag so unrelated workspace builds do not silently pick up
     # the SQLite driver via feature unification.
-    - cargo test --release -p sqe-coordinator --features test-sqlite --test runtime_catalog_test
+    - cargo test -p sqe-coordinator --features test-sqlite --test runtime_catalog_test
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes:
@@ -90,6 +96,11 @@ cargo-test:
         - Cargo.lock
   cache:
     key: cargo-${CI_COMMIT_REF_SLUG}
+    # Warm-start a new branch from main's cache instead of compiling the whole
+    # dependency tree cold on first push; cargo then recompiles only what
+    # actually changed.
+    fallback_keys:
+      - cargo-main
     paths:
       - target/
       - .cargo/registry/
