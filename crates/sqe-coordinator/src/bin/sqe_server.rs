@@ -43,6 +43,8 @@ struct HealthState {
     started_at: Instant,
     role: &'static str,
     worker_registry: Option<Arc<sqe_coordinator::worker_registry::WorkerRegistry>>,
+    query_tracker: Option<Arc<sqe_coordinator::query_tracker::QueryTracker>>,
+    web_ui: bool,
     catalog_url: String,
 }
 
@@ -436,6 +438,12 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         );
     }
 
+    // Created before the health server so the web UI can read it; the same Arc
+    // is moved into the QueryHandler below.
+    let query_tracker = Arc::new(
+        sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history),
+    );
+
     // Health server (start early so probes work during init)
     let health_state = Arc::new(HealthState {
         ready: ready.clone(),
@@ -446,6 +454,8 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         } else {
             Some(worker_registry.clone())
         },
+        query_tracker: Some(query_tracker.clone()),
+        web_ui: config.metrics.web_ui,
         catalog_url: config.catalog.catalog_url.clone(),
     });
     start_health_server(health_port, health_state);
@@ -557,10 +567,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         );
     }
 
-    // Query tracker and result cache
-    let query_tracker = Arc::new(
-        sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history),
-    );
+    // Query tracker and result cache (query_tracker Arc already created above for the health server)
     let query_cache = if config.query_cache.enabled {
         Some(Arc::new(sqe_coordinator::query_cache::ResultCache::new(&config.query_cache, Some(metrics.clone()))))
     } else {
@@ -772,6 +779,8 @@ async fn run_worker(config: SqeConfig) -> anyhow::Result<()> {
         started_at,
         role: "worker",
         worker_registry: None,
+        query_tracker: None,
+        web_ui: false,
         catalog_url: String::new(), // workers do not connect to Polaris directly
     });
     start_health_server(health_port, health_state);
@@ -1112,6 +1121,8 @@ mod tests {
             started_at: Instant::now(),
             role: "coordinator",
             worker_registry: None,
+            query_tracker: None,
+            web_ui: false,
             catalog_url: String::new(),
         });
 
@@ -1128,6 +1139,8 @@ mod tests {
             started_at: Instant::now(),
             role: "worker",
             worker_registry: None,
+            query_tracker: None,
+            web_ui: false,
             catalog_url: String::new(),
         });
 
@@ -1150,6 +1163,8 @@ mod tests {
             started_at: Instant::now(),
             role: "coordinator",
             worker_registry: Some(registry),
+            query_tracker: None,
+            web_ui: false,
             catalog_url: String::new(),
         });
 
@@ -1169,6 +1184,8 @@ mod tests {
             started_at: Instant::now(),
             role: "coordinator",
             worker_registry: None,
+            query_tracker: None,
+            web_ui: false,
             catalog_url: String::new(),
         });
 
@@ -1183,6 +1200,8 @@ mod tests {
             started_at: Instant::now(),
             role: "coordinator",
             worker_registry: None,
+            query_tracker: None,
+            web_ui: false,
             catalog_url: String::new(),
         });
 
