@@ -4,6 +4,20 @@
 //! 10 seconds over a 12-hour window (4320 samples at capacity). The
 //! `/api/v1/metrics/history` endpoint aggregates the raw ring-buffer into at
 //! most 48 fixed-width buckets before sending, keeping the payload small.
+//!
+//! ## Response shape (bucket fields)
+//!
+//! Each element of `buckets` contains:
+//! - `tUnixMs`        — bucket start time (floor to 900 s), Unix epoch ms
+//! - `total`          — Δtotal_queries in the bucket (completed + failed, clamped ≥0)
+//! - `finished`       — Δfinished_queries in the bucket (clamped ≥0)
+//! - `failed`         — Δfailed_queries in the bucket (clamped ≥0)
+//! - `rowsOut`        — Δtotal_output_rows in the bucket (clamped ≥0)
+//! - `avgLatencyMs`   — Δexec_ms_sum / Δfinished (0 when Δfinished==0)
+//! - `avgActive`      — mean active-query count within the bucket
+//! - `maxActive`      — peak active-query count within the bucket
+//! - `avgMemPct`      — mean memory-pool utilisation % within the bucket
+//! - `maxMemPct`      — peak memory-pool utilisation % within the bucket
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -26,6 +40,12 @@ pub struct MetricsSample {
     pub mem_limit_bytes: u64,
     pub total_queries: usize,
     pub failed_queries: usize,
+    /// Cumulative output rows across all tracked query records at sample time.
+    pub total_output_rows: u64,
+    /// Count of records in `QueryState::Finished` at sample time.
+    pub finished_queries: usize,
+    /// Sum of `execution_ms` across all `QueryState::Finished` records at sample time.
+    pub exec_ms_sum: u64,
 }
 
 // ── Ring-buffer ────────────────────────────────────────────────
@@ -94,6 +114,16 @@ pub fn spawn_sampler(
                 .iter()
                 .filter(|r| r.state == crate::query_tracker::QueryState::Failed)
                 .count();
+            let total_output_rows: u64 = records.iter().map(|r| r.output_rows as u64).sum();
+            let finished_queries = records
+                .iter()
+                .filter(|r| r.state == crate::query_tracker::QueryState::Finished)
+                .count();
+            let exec_ms_sum: u64 = records
+                .iter()
+                .filter(|r| r.state == crate::query_tracker::QueryState::Finished)
+                .map(|r| r.execution_ms)
+                .sum();
 
             let unix_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -107,6 +137,9 @@ pub fn spawn_sampler(
                 mem_limit_bytes: mem_limit,
                 total_queries,
                 failed_queries,
+                total_output_rows,
+                finished_queries,
+                exec_ms_sum,
             });
         }
     })
@@ -115,15 +148,31 @@ pub fn spawn_sampler(
 // ── Bucketing ──────────────────────────────────────────────────
 
 /// Wire-format bucket emitted by `/api/v1/metrics/history`.
+///
+/// All delta fields are clamped to 0 (the tracker's moka cache is not monotone:
+/// entries evict and counts can drop between samples).
 #[derive(serde::Serialize, PartialEq, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryBucket {
+    /// Bucket start time, floored to the nearest `BUCKET_SECS` boundary.
     pub t_unix_ms: u64,
-    pub queries_completed: u64,
-    pub queries_failed: u64,
+    /// Δtotal_queries (all completed+failed queries) within the bucket.
+    pub total: u64,
+    /// Δfinished_queries (successfully finished) within the bucket.
+    pub finished: u64,
+    /// Δfailed_queries within the bucket.
+    pub failed: u64,
+    /// Δtotal_output_rows within the bucket.
+    pub rows_out: u64,
+    /// Mean latency (ms) for finished queries: Δexec_ms_sum / Δfinished (0 when Δfinished==0).
+    pub avg_latency_ms: f64,
+    /// Mean active-query count within the bucket (point-in-time readings).
     pub avg_active: f64,
+    /// Peak active-query count within the bucket.
     pub max_active: usize,
+    /// Mean memory-pool utilisation % within the bucket.
     pub avg_mem_pct: f64,
+    /// Peak memory-pool utilisation % within the bucket.
     pub max_mem_pct: f64,
 }
 
@@ -191,18 +240,32 @@ pub fn bucket_samples(samples: &[MetricsSample]) -> HistoryResponse {
         let max_mem_pct = mem_pcts.iter().cloned().fold(0.0_f64, f64::max);
 
         // Query deltas: within-bucket (first sample to last sample).
-        // The moka cache is NOT monotonic (entries evict), so clamp to 0.
+        // The moka cache is NOT monotonic (entries evict), so clamp all deltas to 0.
         let first = group.first().unwrap();
         let last = group.last().unwrap();
-        let queries_completed =
+        let total =
             (last.total_queries as i64 - first.total_queries as i64).max(0) as u64;
-        let queries_failed =
+        let finished =
+            (last.finished_queries as i64 - first.finished_queries as i64).max(0) as u64;
+        let failed =
             (last.failed_queries as i64 - first.failed_queries as i64).max(0) as u64;
+        let rows_out =
+            (last.total_output_rows as i64 - first.total_output_rows as i64).max(0) as u64;
+        let delta_exec_ms =
+            (last.exec_ms_sum as i64 - first.exec_ms_sum as i64).max(0) as u64;
+        let avg_latency_ms = if finished == 0 {
+            0.0
+        } else {
+            delta_exec_ms as f64 / finished as f64
+        };
 
         buckets.push(HistoryBucket {
             t_unix_ms: *bucket_start_ms,
-            queries_completed,
-            queries_failed,
+            total,
+            finished,
+            failed,
+            rows_out,
+            avg_latency_ms,
             avg_active,
             max_active,
             avg_mem_pct,
@@ -242,6 +305,9 @@ mod tests {
                 mem_limit_bytes: 1024,
                 total_queries: i as usize,
                 failed_queries: 0,
+                total_output_rows: 0,
+                finished_queries: 0,
+                exec_ms_sum: 0,
             });
         }
         let snap = h.snapshot();
@@ -261,6 +327,9 @@ mod tests {
                 mem_limit_bytes: 0,
                 total_queries: 0,
                 failed_queries: 0,
+                total_output_rows: 0,
+                finished_queries: 0,
+                exec_ms_sum: 0,
             });
         }
         let snap = h.snapshot();
@@ -282,6 +351,9 @@ mod tests {
                 mem_limit_bytes: 0,
                 total_queries: 0,
                 failed_queries: 0,
+                total_output_rows: 0,
+                finished_queries: 0,
+                exec_ms_sum: 0,
             });
         }
         let snap = h.snapshot();
@@ -308,12 +380,19 @@ mod tests {
             mem_limit_bytes: 1024,
             total_queries: 10,
             failed_queries: 1,
+            total_output_rows: 50,
+            finished_queries: 8,
+            exec_ms_sum: 4000,
         };
         let r = bucket_samples(&[s]);
         assert_eq!(r.buckets.len(), 1);
         let b = &r.buckets[0];
-        assert_eq!(b.queries_completed, 0); // only one sample, first==last
-        assert_eq!(b.queries_failed, 0);
+        // Single sample: first==last, all deltas are 0
+        assert_eq!(b.total, 0);
+        assert_eq!(b.finished, 0);
+        assert_eq!(b.failed, 0);
+        assert_eq!(b.rows_out, 0);
+        assert_eq!(b.avg_latency_ms, 0.0); // Δfinished==0 guard
         assert_eq!(b.avg_active, 2.0);
         assert_eq!(b.max_active, 2);
         assert!((b.avg_mem_pct - 50.0).abs() < 0.001);
@@ -329,6 +408,9 @@ mod tests {
             mem_limit_bytes: 0, // unlimited pool
             total_queries: 0,
             failed_queries: 0,
+            total_output_rows: 0,
+            finished_queries: 0,
+            exec_ms_sum: 0,
         };
         let r = bucket_samples(&[s]);
         assert_eq!(r.buckets.len(), 1);
@@ -348,19 +430,27 @@ mod tests {
             mem_limit_bytes: 0,
             total_queries: 100,
             failed_queries: 10,
+            total_output_rows: 5000,
+            finished_queries: 80,
+            exec_ms_sum: 80_000,
         };
         let s2 = MetricsSample {
             unix_ms: base_ms + 10_000,
             active_queries: 0,
             mem_used_bytes: 0,
             mem_limit_bytes: 0,
-            total_queries: 5,  // eviction caused apparent drop
-            failed_queries: 1, // same
+            total_queries: 5,       // eviction caused apparent drop
+            failed_queries: 1,      // same
+            total_output_rows: 100, // apparent drop
+            finished_queries: 3,    // apparent drop
+            exec_ms_sum: 500,       // apparent drop
         };
         let r = bucket_samples(&[s1, s2]);
         assert_eq!(r.buckets.len(), 1);
-        assert_eq!(r.buckets[0].queries_completed, 0, "negative delta should be clamped to 0");
-        assert_eq!(r.buckets[0].queries_failed, 0);
+        assert_eq!(r.buckets[0].total, 0, "negative delta should be clamped to 0");
+        assert_eq!(r.buckets[0].failed, 0, "negative delta should be clamped to 0");
+        assert_eq!(r.buckets[0].rows_out, 0, "negative delta should be clamped to 0");
+        assert_eq!(r.buckets[0].avg_latency_ms, 0.0, "zero Δfinished -> 0 latency");
     }
 
     #[test]
@@ -374,6 +464,9 @@ mod tests {
             mem_limit_bytes: 1000,
             total_queries: 5,
             failed_queries: 0,
+            total_output_rows: 100,
+            finished_queries: 4,
+            exec_ms_sum: 2000,
         };
         let s2 = MetricsSample {
             unix_ms: base_ms + 10_000,
@@ -382,14 +475,54 @@ mod tests {
             mem_limit_bytes: 1000,
             total_queries: 10,
             failed_queries: 2,
+            total_output_rows: 350,
+            finished_queries: 7,
+            exec_ms_sum: 3500,
         };
         let r = bucket_samples(&[s1, s2]);
         assert_eq!(r.buckets.len(), 1);
         let b = &r.buckets[0];
-        assert_eq!(b.queries_completed, 5);
-        assert_eq!(b.queries_failed, 2);
+        assert_eq!(b.total, 5);      // Δtotal_queries
+        assert_eq!(b.finished, 3);   // Δfinished_queries
+        assert_eq!(b.failed, 2);     // Δfailed_queries
+        assert_eq!(b.rows_out, 250); // Δtotal_output_rows
+        // avg_latency_ms = Δexec_ms_sum / Δfinished = (3500-2000) / 3 = 500.0
+        assert!((b.avg_latency_ms - 500.0).abs() < 0.001);
         assert_eq!(b.max_active, 3);
         assert!((b.avg_active - 2.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn bucket_samples_avg_latency_zero_when_no_finished() {
+        // When Δfinished == 0, avgLatencyMs should be 0.0 (not NaN/Inf).
+        let base_ms: u64 = 0;
+        let s1 = MetricsSample {
+            unix_ms: base_ms,
+            active_queries: 1,
+            mem_used_bytes: 0,
+            mem_limit_bytes: 1000,
+            total_queries: 0,
+            failed_queries: 0,
+            total_output_rows: 0,
+            finished_queries: 0,
+            exec_ms_sum: 0,
+        };
+        let s2 = MetricsSample {
+            unix_ms: base_ms + 10_000,
+            active_queries: 2,
+            mem_used_bytes: 0,
+            mem_limit_bytes: 1000,
+            total_queries: 1,
+            failed_queries: 1, // all went to failed, none finished
+            total_output_rows: 0,
+            finished_queries: 0,
+            exec_ms_sum: 0,
+        };
+        let r = bucket_samples(&[s1, s2]);
+        assert_eq!(r.buckets.len(), 1);
+        let b = &r.buckets[0];
+        assert_eq!(b.finished, 0);
+        assert_eq!(b.avg_latency_ms, 0.0);
     }
 
     #[test]
@@ -406,6 +539,9 @@ mod tests {
                 mem_limit_bytes: 50_000,
                 total_queries: i as usize,
                 failed_queries: (i / 100) as usize,
+                total_output_rows: i * 20,
+                finished_queries: i.saturating_sub(i / 100) as usize,
+                exec_ms_sum: i * 100,
             });
         }
         let r = bucket_samples(&samples);
