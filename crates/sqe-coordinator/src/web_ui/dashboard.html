@@ -78,6 +78,38 @@
   #detail.hidden { display:none; }
   #detail pre { background:var(--soft-blue); border-radius:8px; padding:1rem;
                 font-family:var(--mono); font-size:12.5px; overflow:auto; max-width:920px; }
+
+  /* ── Dashboard stat cards ── */
+  .stat-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+               gap:.75rem; margin-bottom:1.25rem; }
+  .stat-card { background:var(--white); border-radius:8px; padding:1rem 1.25rem;
+               display:flex; flex-direction:column; gap:.25rem; }
+  .stat-num  { font-size:40px; font-weight:900; color:var(--sbp-blue);
+               font-variant-numeric:tabular-nums; line-height:1; }
+  .stat-num.fail { color:var(--red); }
+  .stat-label{ font-size:12px; color:var(--gray-medium); font-weight:600;
+               letter-spacing:.01em; }
+
+  /* ── Histogram ── */
+  .hist-wrap { background:var(--white); border-radius:8px; padding:1rem 1.25rem;
+               margin-bottom:1.25rem; }
+  .hist-muted { font-size:12px; color:var(--gray-medium); font-style:italic; }
+
+  /* ── Gauge cards ── */
+  .gauge-row  { display:grid; grid-template-columns:1fr 1fr; gap:.75rem;
+                margin-bottom:1.25rem; }
+  .gauge-card { background:var(--white); border-radius:8px; padding:1rem 1.25rem;
+                display:flex; flex-direction:column; gap:.5rem; }
+  .gauge-title{ font-size:12px; font-weight:700; color:var(--gray-medium);
+                letter-spacing:.01em; text-transform:uppercase; }
+  .gauge-pct  { font-size:36px; font-weight:900; color:var(--sbp-blue);
+                font-variant-numeric:tabular-nums; line-height:1; }
+  .bar-track  { background:var(--soft-blue); border-radius:4px; height:8px;
+                overflow:hidden; }
+  .bar-fill   { height:100%; border-radius:4px; background:var(--sbp-blue);
+                transition:width .4s; }
+  .spark-wrap { height:40px; }
+  svg.spark   { width:100%; height:40px; overflow:visible; }
 </style>
 </head>
 <body>
@@ -124,15 +156,125 @@ function showErr(e){ const el=$("#err"); el.textContent="lost connection: "+e.me
   el.style.display="block"; }
 function clearErr(){ $("#err").style.display="none"; }
 
+// ── SVG histogram ──────────────────────────────────────────────────────────
+function buildHistSvg(buckets, W, H) {
+  if (!buckets || buckets.length === 0) return "";
+  const maxVal = Math.max(...buckets.map(b => (b.queriesCompleted||0)+(b.queriesFailed||0)), 1);
+  const n = buckets.length;
+  const gap = 2;
+  const barW = Math.max(1, Math.floor((W - gap * (n - 1)) / n));
+  let bars = "";
+  for (let i = 0; i < n; i++) {
+    const x = i * (barW + gap);
+    const total = (buckets[i].queriesCompleted||0) + (buckets[i].queriesFailed||0);
+    const failed = buckets[i].queriesFailed||0;
+    const completed = buckets[i].queriesCompleted||0;
+    const totalH = Math.round((total / maxVal) * H);
+    const failH  = Math.round((failed / maxVal) * H);
+    if (completed > 0) {
+      bars += `<rect x="${x}" y="${H - totalH + failH}" width="${barW}" height="${totalH - failH}" fill="var(--sbp-blue)" />`;
+    }
+    if (failed > 0) {
+      bars += `<rect x="${x}" y="${H - failH}" width="${barW}" height="${failH}" fill="var(--red)" />`;
+    }
+    if (total === 0) {
+      bars += `<rect x="${x}" y="${H - 2}" width="${barW}" height="2" fill="var(--soft-blue)" />`;
+    }
+  }
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" preserveAspectRatio="none">${bars}</svg>`;
+}
+
+// ── SVG sparkline (polyline) ───────────────────────────────────────────────
+function buildSparkSvg(values, W, H) {
+  if (!values || values.length < 2) return "";
+  const maxV = Math.max(...values, 0.001);
+  const pts = values.map((v, i) => {
+    const x = (i / (values.length - 1)) * W;
+    const y = H - (v / maxV) * (H - 2) - 1;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">` +
+    `<polyline points="${pts}" fill="none" stroke="var(--sbp-blue)" stroke-width="1.5" stroke-linejoin="round" /></svg>`;
+}
+
 async function renderOverview(){
   try {
-    const o = await getJSON("/api/v1/overview"); clearErr();
+    const [o, hist] = await Promise.all([
+      getJSON("/api/v1/overview"),
+      getJSON("/api/v1/metrics/history").catch(() => ({ buckets: [] }))
+    ]);
+    clearErr();
     $("#meta").textContent = `${esc(o.node.role)} v${esc(o.node.version)} · up ${o.node.uptimeSeconds|0}s`;
     const cap = o.capabilities||{}, res = o.resources||{}, met = o.metrics||{};
+    const buckets = (hist && hist.buckets) ? hist.buckets : [];
+
+    // ── Stat cards ──────────────────────────────────────────────────────────
+    const stats = [
+      { label:"Total queries",  num: met.totalQueries|0,       cls:"" },
+      { label:"Finished",       num: met.finished|0,           cls:"" },
+      { label:"Failed",         num: met.failed|0,             cls:"fail" },
+      { label:"Running",        num: met.running|0,            cls:"" },
+      { label:"Avg latency",    num: ms(met.avgExecutionMs),   cls:"", raw:true },
+      { label:"Rows out",       num: met.totalOutputRows|0,    cls:"" },
+    ];
+    const statCards = stats.map(s =>
+      `<div class="stat-card"><div class="stat-num ${s.cls}">${s.raw ? esc(s.num) : (s.num|0)}</div>`+
+      `<div class="stat-label">${esc(s.label)}</div></div>`
+    ).join("");
+
+    // ── Memory gauge ────────────────────────────────────────────────────────
+    // Use latest maxMemPct from history; fall back to 0 when no history yet.
+    const lastBucket = buckets.length > 0 ? buckets[buckets.length - 1] : null;
+    const memPct = lastBucket ? (lastBucket.maxMemPct||0) : 0;
+    const memPctDisp = memPct.toFixed(1);
+    const memFill = memPct > 80 ? "#FF7000" : "var(--sbp-blue)";
+    const memSparkVals = buckets.map(b => b.avgMemPct||0);
+    const memSpark = buildSparkSvg(memSparkVals, 200, 40);
+
+    // ── Concurrency gauge ───────────────────────────────────────────────────
+    const maxConc = cap.maxConcurrentQueries || 0;
+    const activeQ = res.activeQueries || 0;
+    const concPct = maxConc > 0 ? Math.min((activeQ / maxConc) * 100, 100) : 0;
+    const concPctDisp = concPct.toFixed(1);
+    const concSparkVals = buckets.map(b => b.avgActive||0);
+    const concSpark = buildSparkSvg(concSparkVals, 200, 40);
+
+    // ── Histogram ───────────────────────────────────────────────────────────
+    const histSvg = buckets.length > 0
+      ? buildHistSvg(buckets, 900, 100)
+      : `<p class="hist-muted">collecting&hellip;</p>`;
+
     $("#overview").innerHTML =
       `<h2>${esc(o.node.name)} <span style="color:var(--mut)">v${esc(o.node.version)}</span>`+
       ` &mdash; <span class="s-FINISHED">${esc(o.node.role)}</span>`+
       ` &mdash; DataFusion ${esc(o.node.datafusionVersion)}</h2>`+
+
+      // a. Stat cards
+      `<h3>Activity</h3>`+
+      `<div class="stat-grid">${statCards}</div>`+
+
+      // b. Histogram
+      `<h3>Query activity (last 12h)</h3>`+
+      `<div class="hist-wrap">${histSvg}</div>`+
+
+      // c. Resource gauges
+      `<h3>Resource usage</h3>`+
+      `<div class="gauge-row">`+
+        `<div class="gauge-card">`+
+          `<div class="gauge-title">Memory</div>`+
+          `<div class="gauge-pct">${memPctDisp}%</div>`+
+          `<div class="bar-track"><div class="bar-fill" style="width:${Math.min(memPct,100).toFixed(1)}%;background:${memFill}"></div></div>`+
+          `<div class="spark-wrap">${memSpark}</div>`+
+        `</div>`+
+        `<div class="gauge-card">`+
+          `<div class="gauge-title">Concurrency ${activeQ|0} / ${maxConc|0}</div>`+
+          `<div class="gauge-pct">${concPctDisp}%</div>`+
+          `<div class="bar-track"><div class="bar-fill" style="width:${Math.min(concPct,100).toFixed(1)}%"></div></div>`+
+          `<div class="spark-wrap">${concSpark}</div>`+
+        `</div>`+
+      `</div>`+
+
+      // d. Capabilities (config reference)
       `<h3>Requirements</h3>`+
       `<div class=kv>`+
       `<div>Flight SQL port</div><div>${dash(cap.flightSqlPort)}</div>`+
@@ -145,20 +287,6 @@ async function renderOverview(){
       `<div>Max concurrent queries</div><div>${dash(cap.maxConcurrentQueries)}</div>`+
       `<div>CPU cores</div><div>${res.cpuCores|0}</div>`+
       `<div>Memory limit</div><div>${fmtBytes(res.memoryLimitBytes)}</div>`+
-      `</div>`+
-      `<h3>Metrics</h3>`+
-      `<div class=kv>`+
-      `<div>Total queries</div><div>${met.totalQueries|0}</div>`+
-      `<div>Running</div><div>${met.running|0}</div>`+
-      `<div>Finished</div><div>${met.finished|0}</div>`+
-      `<div>Failed</div><div>${met.failed|0}</div>`+
-      `<div>Canceled</div><div>${met.canceled|0}</div>`+
-      `<div>Active queries</div><div>${res.activeQueries|0}</div>`+
-      `<div>Total output rows</div><div>${met.totalOutputRows|0}</div>`+
-      `<div>Total bytes scanned</div><div>${fmtBytes(met.totalBytesScanned)}</div>`+
-      `<div>Avg execution time</div><div>${ms(met.avgExecutionMs)}</div>`+
-      `<div>Peak query memory</div><div>${fmtBytes(res.peakQueryMemoryBytes)}</div>`+
-      `<div>Total spill</div><div>${fmtBytes(res.totalSpillBytes)}</div>`+
       `</div>`;
   } catch(e){ showErr(e); }
 }

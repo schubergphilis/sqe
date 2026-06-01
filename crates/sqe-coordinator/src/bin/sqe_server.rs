@@ -48,6 +48,8 @@ struct HealthState {
     catalog_url: String,
     /// Populated from config in `run_coordinator`; `None` in `run_worker` and tests.
     node_info: Option<sqe_coordinator::web_ui::NodeInfo>,
+    /// Populated in `run_coordinator`; `None` in `run_worker` and tests.
+    metrics_history: Option<Arc<sqe_coordinator::metrics_history::MetricsHistory>>,
 }
 
 async fn healthz() -> &'static str {
@@ -258,6 +260,23 @@ async fn api_overview(
     Json(dto)
 }
 
+async fn api_metrics_history(
+    state: axum::extract::State<Arc<HealthState>>,
+) -> Json<sqe_coordinator::metrics_history::HistoryResponse> {
+    let response = state
+        .metrics_history
+        .as_ref()
+        .map(|h| {
+            let samples = h.snapshot();
+            sqe_coordinator::metrics_history::bucket_samples(&samples)
+        })
+        .unwrap_or_else(|| sqe_coordinator::metrics_history::HistoryResponse {
+            bucket_seconds: sqe_coordinator::metrics_history::BUCKET_SECS,
+            buckets: Vec::new(),
+        });
+    Json(response)
+}
+
 async fn dashboard() -> Response {
     (
         [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -278,7 +297,8 @@ fn start_health_server(port: u16, state: Arc<HealthState>) {
             .route("/api/v1/overview", get(api_overview))
             .route("/api/v1/queries", get(api_queries))
             .route("/api/v1/queries/{id}", get(api_query_detail))
-            .route("/api/v1/workers", get(api_workers));
+            .route("/api/v1/workers", get(api_workers))
+            .route("/api/v1/metrics/history", get(api_metrics_history));
     }
 
     let app = app.with_state(state);
@@ -608,6 +628,17 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         }
     };
 
+    // Metrics ring-buffer for the dashboard history endpoint (12 h at 10 s resolution).
+    let metrics_history = if config.metrics.web_ui {
+        Some(Arc::new(sqe_coordinator::metrics_history::MetricsHistory::new(4320)))
+    } else {
+        None
+    };
+
+    // Preserve a clone of query_tracker for the metrics sampler; the original
+    // is moved into QueryHandler::new below.
+    let sampler_tracker = query_tracker.clone();
+
     // Health server (start early so probes work during init)
     let health_state = Arc::new(HealthState {
         ready: ready.clone(),
@@ -622,6 +653,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         web_ui: config.metrics.web_ui,
         catalog_url: config.catalog.catalog_url.clone(),
         node_info: Some(node_info),
+        metrics_history: metrics_history.clone(),
     });
     start_health_server(health_port, health_state);
 
@@ -801,6 +833,17 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         metrics.clone(),
     );
 
+    // Spawn dashboard time-series sampler when the web UI is enabled.
+    if let Some(ref hist) = metrics_history {
+        _task_guards.push(sqe_coordinator::metrics_history::spawn_sampler(
+            hist.clone(),
+            query_handler.runtime().clone(),
+            sampler_tracker,
+            std::time::Duration::from_secs(10),
+        ));
+        tracing::info!("Started metrics history sampler (10 s interval, 12 h window)");
+    }
+
     // Bearer auth chain for the Trino-compat HTTP path. Reuses the same
     // chain instance the Flight SQL path uses so both endpoints accept
     // the same credentials with identical provider behaviour.
@@ -948,6 +991,7 @@ async fn run_worker(config: SqeConfig) -> anyhow::Result<()> {
         web_ui: false,
         catalog_url: String::new(), // workers do not connect to Polaris directly
         node_info: None,
+        metrics_history: None,
     });
     start_health_server(health_port, health_state);
 
@@ -1291,6 +1335,7 @@ mod tests {
             web_ui: false,
             catalog_url: String::new(),
             node_info: None,
+            metrics_history: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -1310,6 +1355,7 @@ mod tests {
             web_ui: false,
             catalog_url: String::new(),
             node_info: None,
+            metrics_history: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -1335,6 +1381,7 @@ mod tests {
             web_ui: false,
             catalog_url: String::new(),
             node_info: None,
+            metrics_history: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -1357,6 +1404,7 @@ mod tests {
             web_ui: false,
             catalog_url: String::new(),
             node_info: None,
+            metrics_history: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -1374,6 +1422,7 @@ mod tests {
             web_ui: false,
             catalog_url: String::new(),
             node_info: None,
+            metrics_history: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -1397,6 +1446,7 @@ mod tests {
             web_ui: true,
             catalog_url: String::new(),
             node_info: None,
+            metrics_history: None,
         });
 
         let Json(items) = api_queries(
@@ -1406,5 +1456,55 @@ mod tests {
         .await;
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].user, "alice");
+    }
+
+    #[tokio::test]
+    async fn api_metrics_history_returns_empty_without_history() {
+        let state = Arc::new(HealthState {
+            ready: Arc::new(AtomicBool::new(true)),
+            started_at: Instant::now(),
+            role: "coordinator",
+            worker_registry: None,
+            query_tracker: None,
+            web_ui: true,
+            catalog_url: String::new(),
+            node_info: None,
+            metrics_history: None,
+        });
+        let Json(resp) = api_metrics_history(axum::extract::State(state)).await;
+        assert_eq!(resp.bucket_seconds, sqe_coordinator::metrics_history::BUCKET_SECS);
+        assert!(resp.buckets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_metrics_history_returns_buckets_when_history_populated() {
+        use sqe_coordinator::metrics_history::{MetricsHistory, MetricsSample};
+        let hist = Arc::new(MetricsHistory::new(4320));
+        for i in 0..3u64 {
+            hist.record(MetricsSample {
+                unix_ms: i * 10_000,
+                active_queries: 1,
+                mem_used_bytes: 100,
+                mem_limit_bytes: 1000,
+                total_queries: i as usize + 1,
+                failed_queries: 0,
+            });
+        }
+        let state = Arc::new(HealthState {
+            ready: Arc::new(AtomicBool::new(true)),
+            started_at: Instant::now(),
+            role: "coordinator",
+            worker_registry: None,
+            query_tracker: None,
+            web_ui: true,
+            catalog_url: String::new(),
+            node_info: None,
+            metrics_history: Some(hist),
+        });
+        let Json(resp) = api_metrics_history(axum::extract::State(state)).await;
+        assert_eq!(resp.bucket_seconds, sqe_coordinator::metrics_history::BUCKET_SECS);
+        assert!(!resp.buckets.is_empty());
+        // 3 samples at 0, 10_000, 20_000 ms all fall in the same 900-s bucket
+        assert_eq!(resp.buckets.len(), 1);
     }
 }
