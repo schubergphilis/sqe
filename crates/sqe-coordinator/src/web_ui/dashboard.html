@@ -89,11 +89,18 @@
   .stat-num.fail { color:var(--red); }
   .stat-label{ font-size:12px; color:var(--gray-medium); font-weight:600;
                letter-spacing:.01em; }
+  .stat-spark { width:100%; height:36px; overflow:visible; display:block; }
 
   /* ── Histogram ── */
   .hist-wrap { background:var(--white); border-radius:8px; padding:1rem 1.25rem;
                margin-bottom:1.25rem; }
   .hist-muted { font-size:12px; color:var(--gray-medium); font-style:italic; }
+  /* Histogram legend */
+  .hist-legend { display:flex; align-items:center; gap:1rem; margin-top:.5rem;
+                 font-size:12px; color:var(--gray-medium); }
+  .hist-legend-swatch { display:inline-block; width:12px; height:10px;
+                        border-radius:2px; flex-shrink:0; }
+  .hist-caption { margin-left:auto; font-style:italic; }
 
   /* ── Gauge cards ── */
   .gauge-row  { display:grid; grid-template-columns:1fr 1fr; gap:.75rem;
@@ -110,6 +117,11 @@
                 transition:width .4s; }
   .spark-wrap { height:40px; }
   svg.spark   { width:100%; height:40px; overflow:visible; }
+
+  /* ── Tooltip ── */
+  #tip { position:fixed; pointer-events:none; display:none; z-index:9999;
+         background:#1a2535; color:#fff; font:600 12px var(--mono);
+         padding:.3rem .55rem; border-radius:5px; white-space:nowrap; }
 </style>
 </head>
 <body>
@@ -132,6 +144,9 @@
 <div id="cluster" style="display:none"></div>
 <div id="detail" class="hidden"></div>
 
+<!-- Shared tooltip: lives outside #overview so it survives innerHTML rewrites -->
+<div id="tip"></div>
+
 <script>
 const $ = s => document.querySelector(s);
 let tab = "overview", current = null;
@@ -148,6 +163,8 @@ function fmtBytes(n){ if(!n) return "0"; const u=["B","KB","MB","GB","TB"];
   let i=0,v=n; while(v>=1024&&i<u.length-1){v/=1024;i++;} return v.toFixed(1)+u[i]; }
 function ms(n){ return (n|0)>=1000 ? ((n|0)/1000).toFixed(2)+"s" : (n|0)+"ms"; }
 function dash(v){ return (v==null||v===0||v==="")?"--":esc(v); }
+// Format a Unix-epoch-ms timestamp as local HH:MM for chart tooltips.
+function hhmm(unixMs){ return new Date(unixMs).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}); }
 
 async function getJSON(u){ const r=await fetch(u); if(!r.ok) throw new Error(u+" "+r.status);
   return r.json(); }
@@ -156,45 +173,122 @@ function showErr(e){ const el=$("#err"); el.textContent="lost connection: "+e.me
   el.style.display="block"; }
 function clearErr(){ $("#err").style.display="none"; }
 
+// ── Shared tooltip (event-delegated) ──────────────────────────────────────────
+// The #tip div is static in <body> and never overwritten. Listeners are
+// attached once to document, reading the data-tip attribute of hovered SVG
+// elements. Using pageX/pageY keeps positioning correct regardless of any
+// positioned ancestors.
+const tip = $("#tip");
+
+document.addEventListener("mouseover", e => {
+  const t = e.target.closest("[data-tip]");
+  if (!t) return;
+  tip.textContent = t.getAttribute("data-tip");
+  tip.style.display = "block";
+});
+
+document.addEventListener("mousemove", e => {
+  if (tip.style.display === "none") return;
+  tip.style.left = (e.pageX + 14) + "px";
+  tip.style.top  = (e.pageY - 28) + "px";
+});
+
+document.addEventListener("mouseout", e => {
+  if (!e.target.closest("[data-tip]")) return;
+  tip.style.display = "none";
+});
+
+document.addEventListener("touchstart", e => {
+  const t = e.target.closest("[data-tip]");
+  if (!t) { tip.style.display = "none"; return; }
+  const touch = e.touches[0];
+  tip.textContent = t.getAttribute("data-tip");
+  tip.style.left  = (touch.pageX + 14) + "px";
+  tip.style.top   = (touch.pageY - 28) + "px";
+  tip.style.display = "block";
+}, { passive: true });
+
 // ── SVG histogram ──────────────────────────────────────────────────────────
+// Builds a stacked-bar histogram from bucket data.
+// "Completed" bars = b.finished (successfully finished, not double-counting failed).
+// "Failed" bars    = b.failed   (failed, stacked on top).
+// Each bar gets a transparent hit-target rect carrying the data-tip label.
 function buildHistSvg(buckets, W, H) {
   if (!buckets || buckets.length === 0) return "";
-  const maxVal = Math.max(...buckets.map(b => (b.queriesCompleted||0)+(b.queriesFailed||0)), 1);
+  const maxVal = Math.max(...buckets.map(b => (b.finished||0)+(b.failed||0)), 1);
   const n = buckets.length;
   const gap = 2;
   const barW = Math.max(1, Math.floor((W - gap * (n - 1)) / n));
   let bars = "";
   for (let i = 0; i < n; i++) {
     const x = i * (barW + gap);
-    const total = (buckets[i].queriesCompleted||0) + (buckets[i].queriesFailed||0);
-    const failed = buckets[i].queriesFailed||0;
-    const completed = buckets[i].queriesCompleted||0;
-    const totalH = Math.round((total / maxVal) * H);
-    const failH  = Math.round((failed / maxVal) * H);
-    if (completed > 0) {
+    const finished  = b => (b.finished||0);
+    const failed    = b => (b.failed||0);
+    const fin  = finished(buckets[i]);
+    const fail = failed(buckets[i]);
+    const totalQ = fin + fail;
+    const totalH = Math.round((totalQ / maxVal) * H);
+    const failH  = Math.round((fail / maxVal) * H);
+    if (fin > 0) {
       bars += `<rect x="${x}" y="${H - totalH + failH}" width="${barW}" height="${totalH - failH}" fill="var(--sbp-blue)" />`;
     }
-    if (failed > 0) {
+    if (fail > 0) {
       bars += `<rect x="${x}" y="${H - failH}" width="${barW}" height="${failH}" fill="var(--red)" />`;
     }
-    if (total === 0) {
+    if (totalQ === 0) {
       bars += `<rect x="${x}" y="${H - 2}" width="${barW}" height="2" fill="var(--soft-blue)" />`;
     }
+    // Transparent hit-target covering the full bar height for tooltip
+    const label = `${hhmm(buckets[i].tUnixMs)} · ${fin} completed, ${fail} failed`;
+    bars += `<rect x="${x}" y="0" width="${barW}" height="${H}" fill="transparent" data-tip="${esc(label)}" style="cursor:crosshair" />`;
   }
   return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" preserveAspectRatio="none">${bars}</svg>`;
 }
 
-// ── SVG sparkline (polyline) ───────────────────────────────────────────────
-function buildSparkSvg(values, W, H) {
-  if (!values || values.length < 2) return "";
-  const maxV = Math.max(...values, 0.001);
-  const pts = values.map((v, i) => {
-    const x = (i / (values.length - 1)) * W;
-    const y = H - (v / maxV) * (H - 2) - 1;
+// ── SVG sparkline (polyline + per-point hover rects) ─────────────────────────
+// Returns inline SVG for a small sparkline. The `series` array is
+// [{val, label}] objects; `color` is a CSS color string.
+function sparklineSvg(series, color, W, H, cssClass) {
+  if (!series || series.length < 2) return `<svg class="${cssClass||"stat-spark"}" viewBox="0 0 ${W} ${H}"></svg>`;
+  const vals = series.map(p => p.val);
+  const maxV = Math.max(...vals, 0.001);
+  const pts = vals.map((v, i) => {
+    const x = (i / (vals.length - 1)) * W;
+    const y = H - (v / maxV) * (H - 4) - 2;
     return `${x.toFixed(1)},${y.toFixed(1)}`;
   }).join(" ");
-  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">` +
-    `<polyline points="${pts}" fill="none" stroke="var(--sbp-blue)" stroke-width="1.5" stroke-linejoin="round" /></svg>`;
+
+  // Faint area fill under the line
+  const firstX = 0, lastX = W;
+  const firstY = H - (vals[0] / maxV) * (H - 4) - 2;
+  const lastY  = H - (vals[vals.length-1] / maxV) * (H - 4) - 2;
+  const areaPath = `M${firstX},${firstY} ` + pts.split(" ").slice(1).map(p => `L${p}`).join(" ") + ` L${lastX},${H} L${firstX},${H} Z`;
+
+  // Per-point transparent hit-target columns
+  const colW = W / vals.length;
+  let targets = "";
+  for (let i = 0; i < series.length; i++) {
+    const x = i * colW;
+    const label = series[i].label;
+    targets += `<rect x="${x.toFixed(1)}" y="0" width="${colW.toFixed(1)}" height="${H}" fill="transparent" data-tip="${esc(label)}" style="cursor:crosshair" />`;
+  }
+
+  return `<svg class="${cssClass||"stat-spark"}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">` +
+    `<path d="${areaPath}" fill="${color}" opacity="0.10" />` +
+    `<polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" />` +
+    targets +
+    `</svg>`;
+}
+
+// Build a sparkline series array from buckets given a value extractor and label template.
+function bucketSeries(buckets, valFn, labelFn) {
+  return buckets.map(b => ({ val: valFn(b), label: labelFn(b) }));
+}
+
+// ── SVG sparkline (gauge variant, polyline) ────────────────────────────────
+// Used for the two gauge-card sparklines (same shape, different CSS class).
+function buildSparkSvg(series, W, H) {
+  return sparklineSvg(series, "var(--sbp-blue)", W, H, "spark");
 }
 
 async function renderOverview(){
@@ -208,19 +302,63 @@ async function renderOverview(){
     const cap = o.capabilities||{}, res = o.resources||{}, met = o.metrics||{};
     const buckets = (hist && hist.buckets) ? hist.buckets : [];
 
-    // ── Stat cards ──────────────────────────────────────────────────────────
-    const stats = [
-      { label:"Total queries",  num: met.totalQueries|0,       cls:"" },
-      { label:"Finished",       num: met.finished|0,           cls:"" },
-      { label:"Failed",         num: met.failed|0,             cls:"fail" },
-      { label:"Running",        num: met.running|0,            cls:"" },
-      { label:"Avg latency",    num: ms(met.avgExecutionMs),   cls:"", raw:true },
-      { label:"Rows out",       num: met.totalOutputRows|0,    cls:"" },
+    // ── Stat cards with per-metric sparklines ───────────────────────────────
+    const W = 200, H = 36;
+    const statDefs = [
+      {
+        label:"Total queries",
+        num: met.totalQueries|0,
+        cls:"",
+        series: bucketSeries(buckets, b=>b.total||0,    b=>`${hhmm(b.tUnixMs)} · ${b.total||0} total`),
+        color:"var(--sbp-blue)"
+      },
+      {
+        label:"Finished",
+        num: met.finished|0,
+        cls:"",
+        series: bucketSeries(buckets, b=>b.finished||0, b=>`${hhmm(b.tUnixMs)} · ${b.finished||0} finished`),
+        color:"var(--sbp-blue)"
+      },
+      {
+        label:"Failed",
+        num: met.failed|0,
+        cls:"fail",
+        series: bucketSeries(buckets, b=>b.failed||0,   b=>`${hhmm(b.tUnixMs)} · ${b.failed||0} failed`),
+        color:"var(--red)"
+      },
+      {
+        label:"Running",
+        num: met.running|0,
+        cls:"",
+        series: bucketSeries(buckets, b=>b.avgActive||0, b=>`${hhmm(b.tUnixMs)} · ${(b.avgActive||0).toFixed(1)} avg active`),
+        color:"var(--sbp-blue)"
+      },
+      {
+        label:"Avg latency",
+        num: ms(met.avgExecutionMs),
+        cls:"",
+        raw:true,
+        series: bucketSeries(buckets, b=>b.avgLatencyMs||0, b=>`${hhmm(b.tUnixMs)} · ${ms(b.avgLatencyMs||0)} avg latency`),
+        color:"var(--sbp-blue)"
+      },
+      {
+        label:"Rows out",
+        num: met.totalOutputRows|0,
+        cls:"",
+        series: bucketSeries(buckets, b=>b.rowsOut||0,  b=>`${hhmm(b.tUnixMs)} · ${(b.rowsOut||0).toLocaleString()} rows`),
+        color:"var(--sbp-blue)"
+      },
     ];
-    const statCards = stats.map(s =>
-      `<div class="stat-card"><div class="stat-num ${s.cls}">${s.raw ? esc(s.num) : (s.num|0)}</div>`+
-      `<div class="stat-label">${esc(s.label)}</div></div>`
-    ).join("");
+    const statCards = statDefs.map(s => {
+      const spark = s.series.length >= 2
+        ? sparklineSvg(s.series, s.color, W, H, "stat-spark")
+        : `<svg class="stat-spark" viewBox="0 0 ${W} ${H}"></svg>`;
+      return `<div class="stat-card">` +
+        `<div class="stat-num ${s.cls}">${s.raw ? esc(s.num) : (s.num|0)}</div>` +
+        `<div class="stat-label">${esc(s.label)}</div>` +
+        spark +
+        `</div>`;
+    }).join("");
 
     // ── Memory gauge ────────────────────────────────────────────────────────
     // Use latest maxMemPct from history; fall back to 0 when no history yet.
@@ -228,21 +366,30 @@ async function renderOverview(){
     const memPct = lastBucket ? (lastBucket.maxMemPct||0) : 0;
     const memPctDisp = memPct.toFixed(1);
     const memFill = memPct > 80 ? "#FF7000" : "var(--sbp-blue)";
-    const memSparkVals = buckets.map(b => b.avgMemPct||0);
-    const memSpark = buildSparkSvg(memSparkVals, 200, 40);
+    const memSparkSeries = bucketSeries(buckets, b=>b.avgMemPct||0, b=>`${hhmm(b.tUnixMs)} · ${(b.avgMemPct||0).toFixed(1)}% mem`);
+    const memSpark = buildSparkSvg(memSparkSeries, 200, 40);
 
     // ── Concurrency gauge ───────────────────────────────────────────────────
     const maxConc = cap.maxConcurrentQueries || 0;
     const activeQ = res.activeQueries || 0;
     const concPct = maxConc > 0 ? Math.min((activeQ / maxConc) * 100, 100) : 0;
     const concPctDisp = concPct.toFixed(1);
-    const concSparkVals = buckets.map(b => b.avgActive||0);
-    const concSpark = buildSparkSvg(concSparkVals, 200, 40);
+    const concSparkSeries = bucketSeries(buckets, b=>b.avgActive||0, b=>`${hhmm(b.tUnixMs)} · ${(b.avgActive||0).toFixed(1)} avg active`);
+    const concSpark = buildSparkSvg(concSparkSeries, 200, 40);
 
     // ── Histogram ───────────────────────────────────────────────────────────
     const histSvg = buckets.length > 0
       ? buildHistSvg(buckets, 900, 100)
       : `<p class="hist-muted">collecting&hellip;</p>`;
+
+    // Histogram legend (only shown when there is data)
+    const histLegend = buckets.length > 0
+      ? `<div class="hist-legend">` +
+        `<span class="hist-legend-swatch" style="background:var(--sbp-blue)"></span> Completed` +
+        `<span class="hist-legend-swatch" style="background:var(--red)"></span> Failed` +
+        `<span class="hist-caption">15-min buckets &middot; last 12h</span>` +
+        `</div>`
+      : "";
 
     $("#overview").innerHTML =
       `<h2>${esc(o.node.name)} <span style="color:var(--mut)">v${esc(o.node.version)}</span>`+
@@ -255,7 +402,7 @@ async function renderOverview(){
 
       // b. Histogram
       `<h3>Query activity (last 12h)</h3>`+
-      `<div class="hist-wrap">${histSvg}</div>`+
+      `<div class="hist-wrap">${histSvg}${histLegend}</div>`+
 
       // c. Resource gauges
       `<h3>Resource usage</h3>`+

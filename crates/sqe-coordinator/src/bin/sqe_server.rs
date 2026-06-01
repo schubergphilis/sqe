@@ -1488,6 +1488,9 @@ mod tests {
                 mem_limit_bytes: 1000,
                 total_queries: i as usize + 1,
                 failed_queries: 0,
+                total_output_rows: i * 10,
+                finished_queries: i as usize + 1,
+                exec_ms_sum: (i + 1) * 100,
             });
         }
         let state = Arc::new(HealthState {
