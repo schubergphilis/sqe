@@ -5,44 +5,94 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>SQE</title>
 <style>
-  :root { --bg:#0f1115; --fg:#e6e6e6; --mut:#8a93a2; --line:#262b33;
-          --run:#2d6cdf; --ok:#2faa5a; --fail:#d6483b; }
-  * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg);
-         font:14px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace; }
-  header { display:flex; gap:1rem; align-items:center; padding:.6rem 1rem;
-           border-bottom:1px solid var(--line); }
-  header b { font-size:15px; letter-spacing:.05em; }
-  nav button { background:none; border:none; color:var(--mut); cursor:pointer;
-               padding:.4rem .6rem; font:inherit; }
-  nav button.active { color:var(--fg); border-bottom:2px solid var(--run); }
-  #err { color:var(--fail); padding:.3rem 1rem; display:none; }
-  table { width:100%; border-collapse:collapse; }
-  th,td { text-align:left; padding:.35rem .6rem; border-bottom:1px solid var(--line);
-          white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:40ch; }
-  th { color:var(--mut); font-weight:600; }
-  tr.q { cursor:pointer; } tr.q:hover { background:#171b22; }
-  .s-RUNNING { color:var(--run); } .s-FINISHED { color:var(--ok); }
-  .s-FAILED,.s-CANCELED { color:var(--fail); }
-  .num { text-align:right; font-variant-numeric:tabular-nums; }
-  #detail { padding:1rem; } #detail.hidden { display:none; }
-  .kv { display:grid; grid-template-columns:max-content 1fr; gap:.2rem 1rem; margin-bottom:1rem; }
-  .kv div:nth-child(odd){ color:var(--mut); }
-  a.back { color:var(--run); cursor:pointer; }
-  #overview { padding:1rem; }
-  #overview h2 { margin:.5rem 0; font-size:15px; }
-  #overview h3 { margin:.8rem 0 .3rem; color:var(--mut); font-size:13px; text-transform:uppercase; letter-spacing:.05em; }
+  /* Visual language adapted from the Schuberg Philis design system
+     (colours + layout: SBP Blue, Soft Blue panels, Space Gray header, the
+     marker bar, signal colours, no shadows/borders). Self-contained: system
+     fonts (no brand webfonts), no logos. */
+  :root {
+    --sbp-blue:#1E80ED; --soft-blue:#E8F2FD; --turquoise:#1EE8ED;
+    --midnight:#020C17; --space-gray:#082646; --white:#fff;
+    --yellow:#FFDB4E; --pale-blue:#F3F6FB;
+    --gray-medium:#5A6782; --gray-light:#AACBEF;
+    --green:#0E9F6E; --red:#D6336C;          /* readable-on-light state colours */
+    --mut:var(--gray-medium);                 /* secondary text (used by page JS) */
+    --font:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono",Monaco,Consolas,"Liberation Mono",monospace;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--pale-blue); color:var(--midnight);
+         font:14px/1.5 var(--font); -webkit-font-smoothing:antialiased; }
+
+  /* dark header (SBP Space Gray), brand wordmark + eyebrow + marker bar */
+  header { background:var(--space-gray); color:var(--white);
+           display:flex; align-items:center; gap:1.5rem; padding:.7rem 1.5rem; }
+  .brand { display:flex; flex-direction:column; gap:.2rem; }
+  .brand .eyebrow { font-family:var(--mono); font-size:11px; font-weight:700;
+                    letter-spacing:.04em; color:var(--turquoise); }
+  .brand .wordmark { font-size:20px; font-weight:900; letter-spacing:.01em; line-height:1; }
+  .brand .marker { width:56px; height:4px; background:var(--yellow); margin-top:.3rem; }
+  nav { display:flex; gap:.2rem; margin-left:1rem; }
+  nav button { background:none; border:none; color:var(--gray-light); cursor:pointer;
+               padding:.5rem .75rem; font:600 14px var(--font);
+               border-bottom:3px solid transparent; }
+  nav button:hover { color:var(--white); }
+  nav button.active { color:var(--white); border-bottom-color:var(--sbp-blue); }
+  #meta { margin-left:auto; font-family:var(--mono); font-size:12px; color:var(--gray-light); }
+
+  #err { color:var(--red); background:#ffe1ea; padding:.5rem 1.5rem;
+         display:none; font-weight:600; }
+
+  /* content */
+  #overview, #queries, #cluster, #detail { padding:1.5rem; }
+  h2 { margin:.25rem 0 1rem; font-size:20px; font-weight:900; color:var(--midnight); }
+  h3 { margin:1.4rem 0 .6rem; font-size:13px; font-weight:700; color:var(--sbp-blue);
+       display:flex; align-items:center; gap:.5rem; letter-spacing:.01em; }
+  h3::before { content:""; width:28px; height:3px; background:var(--sbp-blue); }
+  h4 { margin:1.2rem 0 .5rem; font-size:13px; font-weight:700; color:var(--midnight); }
+
+  /* pale-panel cards: Soft Blue fill, rounded, no border/shadow */
+  .kv { display:grid; grid-template-columns:max-content 1fr; gap:.4rem 1.5rem;
+        background:var(--soft-blue); border-radius:8px; padding:1rem 1.25rem;
+        margin-bottom:1rem; max-width:780px; font-variant-numeric:tabular-nums; }
+  .kv div:nth-child(odd) { color:var(--gray-medium); }
+
+  /* tables: Soft Blue header, white rows, fill-only separation, no shadow */
+  table { width:100%; border-collapse:collapse; background:var(--white);
+          border-radius:8px; overflow:hidden; }
+  thead th { background:var(--soft-blue); color:var(--gray-medium); font-weight:700;
+             text-align:left; padding:.55rem .75rem; font-size:12.5px; }
+  tbody td { padding:.5rem .75rem; border-bottom:1px solid var(--soft-blue);
+             white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:46ch; }
+  tbody tr:last-child td { border-bottom:none; }
+  tr.q { cursor:pointer; } tr.q:hover { background:var(--pale-blue); }
+  .num { text-align:right; font-variant-numeric:tabular-nums; font-family:var(--mono); }
+  th.num { font-family:var(--mono); }
+
+  /* state signal colours */
+  .s-RUNNING { color:var(--sbp-blue); font-weight:700; }
+  .s-FINISHED { color:var(--green); font-weight:700; }
+  .s-FAILED, .s-CANCELED { color:var(--red); font-weight:700; }
+
+  a.back { color:var(--sbp-blue); cursor:pointer; font-weight:600;
+           display:inline-block; margin-bottom:.6rem; }
+  #detail.hidden { display:none; }
+  #detail pre { background:var(--soft-blue); border-radius:8px; padding:1rem;
+                font-family:var(--mono); font-size:12.5px; overflow:auto; max-width:920px; }
 </style>
 </head>
 <body>
 <header>
-  <b>SQE</b>
+  <div class="brand">
+    <div class="eyebrow">Sovereign query engine</div>
+    <div class="wordmark">SQE</div>
+    <div class="marker"></div>
+  </div>
   <nav>
     <button data-tab="overview" class="active">Overview</button>
     <button data-tab="queries">Queries</button>
     <button data-tab="cluster">Cluster</button>
   </nav>
-  <span id="meta" style="margin-left:auto;color:var(--mut)"></span>
+  <span id="meta"></span>
 </header>
 <div id="err"></div>
 <div id="overview"></div>
