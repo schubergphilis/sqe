@@ -154,12 +154,87 @@ async fn cluster_status(
     })
 }
 
+// ── Read-only web UI JSON API ──────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct QueryListParams {
+    state: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn api_queries(
+    state: axum::extract::State<Arc<HealthState>>,
+    params: axum::extract::Query<QueryListParams>,
+) -> Json<Vec<sqe_coordinator::web_ui::QueryListItem>> {
+    let limit = params.limit.unwrap_or(200).min(1000);
+    let items = match &state.query_tracker {
+        Some(t) => sqe_coordinator::web_ui::query_list(t, params.state.as_deref(), limit),
+        None => Vec::new(),
+    };
+    Json(items)
+}
+
+async fn api_query_detail(
+    state: axum::extract::State<Arc<HealthState>>,
+    id: axum::extract::Path<String>,
+) -> Response {
+    let Ok(uuid) = uuid::Uuid::parse_str(&id) else {
+        return (axum::http::StatusCode::BAD_REQUEST, "invalid query id").into_response();
+    };
+    let detail = state
+        .query_tracker
+        .as_ref()
+        .and_then(|t| sqe_coordinator::web_ui::query_detail(t, &uuid));
+    match detail {
+        Some(d) => Json(d).into_response(),
+        None => (axum::http::StatusCode::NOT_FOUND, "query not found").into_response(),
+    }
+}
+
+async fn api_workers(
+    state: axum::extract::State<Arc<HealthState>>,
+) -> Json<sqe_coordinator::web_ui::WorkersDto> {
+    let (total, healthy_urls) = match &state.worker_registry {
+        Some(r) => (r.total_workers().await, r.healthy_workers().await),
+        None => (0, Vec::new()),
+    };
+    // With a tracker, derive per-worker in-flight from running fragments. Without
+    // one (it is always present on the coordinator path; this is the defensive
+    // branch), report health only.
+    let view = match &state.query_tracker {
+        Some(t) => sqe_coordinator::web_ui::workers_view(total, healthy_urls, t.active_count(), t),
+        None => sqe_coordinator::web_ui::WorkersDto {
+            total,
+            healthy_count: healthy_urls.len(),
+            active_queries: 0,
+            workers: healthy_urls
+                .into_iter()
+                .map(|url| sqe_coordinator::web_ui::WorkerDto { url, healthy: true, in_flight: 0 })
+                .collect(),
+        },
+    };
+    Json(view)
+}
+
+async fn dashboard() -> Response {
+    (axum::http::StatusCode::OK, "ui pending").into_response()
+}
+
 fn start_health_server(port: u16, state: Arc<HealthState>) {
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
-        .route("/api/v1/status", get(cluster_status))
-        .with_state(state);
+        .route("/api/v1/status", get(cluster_status));
+
+    if state.web_ui {
+        app = app
+            .route("/", get(dashboard))
+            .route("/api/v1/queries", get(api_queries))
+            .route("/api/v1/queries/{id}", get(api_query_detail))
+            .route("/api/v1/workers", get(api_workers));
+    }
+
+    let app = app.with_state(state);
 
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
@@ -1207,5 +1282,32 @@ mod tests {
 
         let response = readyz(axum::extract::State(state)).await;
         assert_eq!(response.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn api_queries_returns_tracked_queries() {
+        let tracker = Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(
+            &sqe_core::QueryHistoryConfig { max_entries: 100, ttl_secs: 60 },
+        ));
+        let id = uuid::Uuid::now_v7();
+        tracker.start(id, "alice", Some("cli"), "SELECT 1", "s1", None, vec![]);
+
+        let state = Arc::new(HealthState {
+            ready: Arc::new(AtomicBool::new(true)),
+            started_at: Instant::now(),
+            role: "coordinator",
+            worker_registry: None,
+            query_tracker: Some(tracker),
+            web_ui: true,
+            catalog_url: String::new(),
+        });
+
+        let Json(items) = api_queries(
+            axum::extract::State(state),
+            axum::extract::Query(QueryListParams { state: None, limit: None }),
+        )
+        .await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].user, "alice");
     }
 }
