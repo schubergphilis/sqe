@@ -217,7 +217,11 @@ async fn api_workers(
 }
 
 async fn dashboard() -> Response {
-    (axum::http::StatusCode::OK, "ui pending").into_response()
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        sqe_coordinator::web_ui::DASHBOARD_HTML,
+    )
+        .into_response()
 }
 
 fn start_health_server(port: u16, state: Arc<HealthState>) {

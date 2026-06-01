@@ -10,6 +10,9 @@ use uuid::Uuid;
 
 use crate::query_tracker::{QueryRecord, QueryState, QueryTracker};
 
+/// The dashboard single-page app, embedded at compile time.
+pub const DASHBOARD_HTML: &str = include_str!("web_ui/dashboard.html");
+
 /// SQL is truncated server-side; the full statement is not needed for an ops
 /// glance and bounds the payload.
 const SQL_MAX: usize = 512;
@@ -320,5 +323,11 @@ mod tests {
         let view = workers_view(0, vec![], 0, &t);
         assert_eq!(view.total, 0);
         assert!(view.workers.is_empty());
+    }
+
+    #[test]
+    fn dashboard_html_is_present_and_html() {
+        assert!(DASHBOARD_HTML.contains("<title>SQE</title>"));
+        assert!(DASHBOARD_HTML.contains("/api/v1/queries"));
     }
 }
