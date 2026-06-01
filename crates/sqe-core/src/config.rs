@@ -1594,6 +1594,12 @@ pub struct MetricsConfig {
     pub trace_sample_rate: f64,
     #[serde(default)]
     pub openlineage: OpenLineageConfig,
+    /// Serve the read-only web UI (HTML dashboard + /api/v1/queries* endpoints)
+    /// on the internal health port (metrics_port + 1). Default on; the UI is
+    /// already behind that internal port, like /api/v1/status. Turn off to keep
+    /// only /healthz, /readyz, /api/v1/status. The UI has no auth.
+    #[serde(default = "default_true")]
+    pub web_ui: bool,
 }
 
 fn default_trace_sample_rate() -> f64 {
@@ -1608,6 +1614,7 @@ impl Default for MetricsConfig {
             audit_log_path: String::new(),
             trace_sample_rate: default_trace_sample_rate(),
             openlineage: OpenLineageConfig::default(),
+            web_ui: true,
         }
     }
 }
