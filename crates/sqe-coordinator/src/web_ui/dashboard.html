@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SQE</title>
+<style>
+  :root { --bg:#0f1115; --fg:#e6e6e6; --mut:#8a93a2; --line:#262b33;
+          --run:#2d6cdf; --ok:#2faa5a; --fail:#d6483b; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  header { display:flex; gap:1rem; align-items:center; padding:.6rem 1rem;
+           border-bottom:1px solid var(--line); }
+  header b { font-size:15px; letter-spacing:.05em; }
+  nav button { background:none; border:none; color:var(--mut); cursor:pointer;
+               padding:.4rem .6rem; font:inherit; }
+  nav button.active { color:var(--fg); border-bottom:2px solid var(--run); }
+  #err { color:var(--fail); padding:.3rem 1rem; display:none; }
+  table { width:100%; border-collapse:collapse; }
+  th,td { text-align:left; padding:.35rem .6rem; border-bottom:1px solid var(--line);
+          white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:40ch; }
+  th { color:var(--mut); font-weight:600; }
+  tr.q { cursor:pointer; } tr.q:hover { background:#171b22; }
+  .s-RUNNING { color:var(--run); } .s-FINISHED { color:var(--ok); }
+  .s-FAILED,.s-CANCELED { color:var(--fail); }
+  .num { text-align:right; font-variant-numeric:tabular-nums; }
+  #detail { padding:1rem; } #detail.hidden { display:none; }
+  .kv { display:grid; grid-template-columns:max-content 1fr; gap:.2rem 1rem; margin-bottom:1rem; }
+  .kv div:nth-child(odd){ color:var(--mut); }
+  a.back { color:var(--run); cursor:pointer; }
+</style>
+</head>
+<body>
+<header>
+  <b>SQE</b>
+  <nav>
+    <button data-tab="queries" class="active">Queries</button>
+    <button data-tab="cluster">Cluster</button>
+  </nav>
+  <span id="meta" style="margin-left:auto;color:var(--mut)"></span>
+</header>
+<div id="err"></div>
+<div id="queries"></div>
+<div id="cluster" style="display:none"></div>
+<div id="detail" class="hidden"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+let tab = "queries", current = null;
+
+// HTML-escape every value that comes from the engine (usernames, SQL, error
+// messages, worker URLs are user- or config-controlled). Without this, a query
+// whose SQL contains "<script>" would execute in an operator's browser
+// (stored XSS). No DOMPurify dep: this page has no build step.
+function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g, c=>(
+  {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
+// State strings come from our own enum; strip to A-Z before using as a CSS class.
+function stClass(s){ return "s-"+String(s).replace(/[^A-Z]/g,""); }
+function fmtBytes(n){ if(!n) return "0"; const u=["B","KB","MB","GB","TB"];
+  let i=0,v=n; while(v>=1024&&i<u.length-1){v/=1024;i++;} return v.toFixed(1)+u[i]; }
+function ms(n){ return (n|0)>=1000 ? ((n|0)/1000).toFixed(2)+"s" : (n|0)+"ms"; }
+
+async function getJSON(u){ const r=await fetch(u); if(!r.ok) throw new Error(u+" "+r.status);
+  return r.json(); }
+
+function showErr(e){ const el=$("#err"); el.textContent="lost connection: "+e.message;
+  el.style.display="block"; }
+function clearErr(){ $("#err").style.display="none"; }
+
+async function renderQueries(){
+  try {
+    const rows = await getJSON("/api/v1/queries?limit=200"); clearErr();
+    if(current!==null) return; // detail open
+    $("#queries").innerHTML =
+      "<table><thead><tr><th>id</th><th>user</th><th>state</th><th>sql</th>"+
+      "<th class=num>elapsed</th><th class=num>rows</th><th class=num>scanned</th></tr></thead><tbody>"+
+      rows.map(q=>{
+        const el = (q.executionMs||0)+(q.planningMs||0)+(q.queuedMs||0);
+        return `<tr class=q data-id="${esc(q.queryId)}"><td>${esc(String(q.queryId).slice(0,8))}</td>`+
+          `<td>${esc(q.user)}</td><td class="${stClass(q.state)}">${esc(q.state)}</td>`+
+          `<td title="${esc(q.sql)}">${esc(q.sql)}</td>`+
+          `<td class=num>${ms(el)}</td><td class=num>${q.outputRows|0}</td>`+
+          `<td class=num>${fmtBytes(q.bytesScanned)}</td></tr>`;
+      }).join("")+"</tbody></table>";
+    document.querySelectorAll("tr.q").forEach(tr=>
+      tr.onclick=()=>openDetail(tr.dataset.id));
+  } catch(e){ showErr(e); }
+}
+
+async function openDetail(id){
+  current = id;
+  try {
+    const d = await getJSON("/api/v1/queries/"+encodeURIComponent(id)); clearErr();
+    $("#queries").style.display="none"; $("#cluster").style.display="none";
+    const det = $("#detail"); det.classList.remove("hidden");
+    const fr = (d.fragments||[]).map(f=>
+      `<tr><td>${esc(f.taskId)}</td><td>${esc(f.workerUrl)}</td>`+
+      `<td class="${stClass(f.state)}">${esc(f.state)}</td>`+
+      `<td class=num>${ms(f.elapsedMs)}</td><td class=num>${f.outputRows|0}</td></tr>`).join("");
+    det.innerHTML = `<a class=back onclick="closeDetail()">&larr; back</a>`+
+      `<h3>${esc(d.queryId)}</h3>`+
+      `<div class=kv><div>user</div><div>${esc(d.user)}</div>`+
+      `<div>state</div><div class="${stClass(d.state)}">${esc(d.state)}</div>`+
+      `<div>queued</div><div>${ms(d.queuedMs)}</div>`+
+      `<div>planning</div><div>${ms(d.planningMs)}</div>`+
+      `<div>execution</div><div>${ms(d.executionMs)}</div>`+
+      `<div>rows out</div><div>${d.outputRows|0}</div>`+
+      `<div>bytes scanned</div><div>${fmtBytes(d.bytesScanned)}</div>`+
+      `<div>spill</div><div>${fmtBytes(d.spillBytes)}</div>`+
+      `<div>peak mem</div><div>${fmtBytes(d.peakMemoryBytes)}</div>`+
+      (d.errorMessage?`<div>error</div><div class=s-FAILED>${esc(d.errorMessage)}</div>`:"")+
+      `</div><pre style="white-space:pre-wrap;color:var(--mut)">${esc(d.sql)}</pre>`+
+      (fr?`<h4>fragments</h4><table><thead><tr><th>task</th><th>worker</th><th>state</th>`+
+        `<th class=num>elapsed</th><th class=num>rows</th></tr></thead><tbody>${fr}</tbody></table>`:"");
+  } catch(e){ showErr(e); }
+}
+function closeDetail(){ current=null; $("#detail").classList.add("hidden");
+  $("#queries").style.display=""; switchTab(tab); }
+
+async function renderCluster(){
+  try {
+    const [w,st] = await Promise.all([getJSON("/api/v1/workers"), getJSON("/api/v1/status")]);
+    clearErr();
+    $("#meta").textContent = `${st.node.role} v${st.node.version} · up ${st.node.uptimeSeconds}s`;
+    $("#cluster").innerHTML =
+      `<div class=kv><div>workers</div><div>${w.healthyCount|0}/${w.total|0} healthy</div>`+
+      `<div>active queries</div><div>${w.activeQueries|0}</div></div>`+
+      "<table><thead><tr><th>worker</th><th>healthy</th><th class=num>in-flight</th></tr></thead><tbody>"+
+      (w.workers||[]).map(x=>`<tr><td>${esc(x.url)}</td><td>${x.healthy?"yes":"no"}</td>`+
+        `<td class=num>${x.inFlight|0}</td></tr>`).join("")+"</tbody></table>";
+  } catch(e){ showErr(e); }
+}
+
+function switchTab(t){
+  tab=t; current=null; $("#detail").classList.add("hidden");
+  document.querySelectorAll("nav button").forEach(b=>
+    b.classList.toggle("active", b.dataset.tab===t));
+  $("#queries").style.display = t==="queries" ? "" : "none";
+  $("#cluster").style.display = t==="cluster" ? "" : "none";
+  tick();
+}
+document.querySelectorAll("nav button").forEach(b=>
+  b.onclick=()=>switchTab(b.dataset.tab));
+
+function tick(){ if(current!==null) return;
+  if(tab==="queries") renderQueries(); else renderCluster(); }
+tick(); setInterval(tick, 2000);
+</script>
+</body>
+</html>
