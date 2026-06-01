@@ -21,7 +21,10 @@ fn truncate_sql(sql: &str) -> String {
     if sql.len() <= SQL_MAX {
         sql.to_string()
     } else {
-        format!("{}...", &sql[..SQL_MAX])
+        // Take SQL_MAX chars, not bytes: slicing `&sql[..SQL_MAX]` panics when
+        // byte SQL_MAX lands inside a multibyte UTF-8 sequence, and the SQL is
+        // user-controlled (a poison query would break the whole list render).
+        format!("{}...", sql.chars().take(SQL_MAX).collect::<String>())
     }
 }
 
@@ -113,9 +116,9 @@ pub struct FragmentDto {
 pub struct QueryDetail {
     #[serde(flatten)]
     pub summary: QueryListItem,
-    pub session_id: String,
-    pub client_ip: Option<String>,
-    pub roles: Vec<String>,
+    // session_id / client_ip / roles are deliberately NOT exposed: this endpoint
+    // has no auth (network-gated) and those are capability/PII-adjacent. The
+    // dashboard does not render them either.
     pub tables_touched: Vec<String>,
     pub error_code: Option<String>,
     pub fragments: Vec<FragmentDto>,
@@ -139,9 +142,6 @@ pub fn query_detail(tracker: &QueryTracker, id: &Uuid) -> Option<QueryDetail> {
         .collect();
     Some(QueryDetail {
         summary: to_list_item(&rec),
-        session_id: rec.session_id.clone(),
-        client_ip: rec.client_ip.clone(),
-        roles: rec.roles.clone(),
         tables_touched: rec.tables_touched.clone(),
         error_code: rec.error_code.clone(),
         fragments,
@@ -258,6 +258,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_list_truncates_multibyte_sql_without_panic() {
+        let t = tracker();
+        let id = Uuid::now_v7();
+        // Each 'λ' is 2 bytes, so a byte-slice at SQL_MAX would split a char and
+        // panic. Confirm we truncate on a char boundary instead.
+        let sql = "λ".repeat(SQL_MAX + 10);
+        t.start(id, "alice", None, &sql, "s1", None, vec![]);
+        let list = query_list(&t, None, 100);
+        assert_eq!(list.len(), 1);
+        assert!(list[0].sql.ends_with("..."));
+        assert_eq!(list[0].sql.chars().count(), SQL_MAX + 3);
+    }
+
+    #[tokio::test]
     async fn query_detail_includes_fragments() {
         use crate::query_tracker::{FragmentInfo, FragmentState};
         let t = tracker();
@@ -274,7 +288,7 @@ mod tests {
 
         let detail = query_detail(&t, &id).expect("detail present");
         assert_eq!(detail.summary.query_id, id.to_string());
-        assert_eq!(detail.roles, vec!["analyst".to_string()]);
+        assert_eq!(detail.summary.user, "alice");
         assert_eq!(detail.fragments.len(), 1);
         assert_eq!(detail.fragments[0].worker_url, "http://w1:50052");
         assert_eq!(detail.fragments[0].state, "RUNNING");
