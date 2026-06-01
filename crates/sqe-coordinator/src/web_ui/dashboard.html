@@ -188,7 +188,7 @@ document.addEventListener("mouseover", e => {
 });
 
 document.addEventListener("mousemove", e => {
-  if (tip.style.display === "none") return;
+  if (!e.target.closest("[data-tip]")) return;
   tip.style.left = (e.pageX + 14) + "px";
   tip.style.top  = (e.pageY - 28) + "px";
 });
@@ -261,7 +261,6 @@ function sparklineSvg(series, color, W, H, cssClass) {
   // Faint area fill under the line
   const firstX = 0, lastX = W;
   const firstY = H - (vals[0] / maxV) * (H - 4) - 2;
-  const lastY  = H - (vals[vals.length-1] / maxV) * (H - 4) - 2;
   const areaPath = `M${firstX},${firstY} ` + pts.split(" ").slice(1).map(p => `L${p}`).join(" ") + ` L${lastX},${H} L${firstX},${H} Z`;
 
   // Per-point transparent hit-target columns
