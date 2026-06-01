@@ -29,25 +29,30 @@
   .kv { display:grid; grid-template-columns:max-content 1fr; gap:.2rem 1rem; margin-bottom:1rem; }
   .kv div:nth-child(odd){ color:var(--mut); }
   a.back { color:var(--run); cursor:pointer; }
+  #overview { padding:1rem; }
+  #overview h2 { margin:.5rem 0; font-size:15px; }
+  #overview h3 { margin:.8rem 0 .3rem; color:var(--mut); font-size:13px; text-transform:uppercase; letter-spacing:.05em; }
 </style>
 </head>
 <body>
 <header>
   <b>SQE</b>
   <nav>
-    <button data-tab="queries" class="active">Queries</button>
+    <button data-tab="overview" class="active">Overview</button>
+    <button data-tab="queries">Queries</button>
     <button data-tab="cluster">Cluster</button>
   </nav>
   <span id="meta" style="margin-left:auto;color:var(--mut)"></span>
 </header>
 <div id="err"></div>
-<div id="queries"></div>
+<div id="overview"></div>
+<div id="queries" style="display:none"></div>
 <div id="cluster" style="display:none"></div>
 <div id="detail" class="hidden"></div>
 
 <script>
 const $ = s => document.querySelector(s);
-let tab = "queries", current = null;
+let tab = "overview", current = null;
 
 // HTML-escape every value that comes from the engine (usernames, SQL, error
 // messages, worker URLs are user- or config-controlled). Without this, a query
@@ -60,6 +65,7 @@ function stClass(s){ return "s-"+String(s).replace(/[^A-Z]/g,""); }
 function fmtBytes(n){ if(!n) return "0"; const u=["B","KB","MB","GB","TB"];
   let i=0,v=n; while(v>=1024&&i<u.length-1){v/=1024;i++;} return v.toFixed(1)+u[i]; }
 function ms(n){ return (n|0)>=1000 ? ((n|0)/1000).toFixed(2)+"s" : (n|0)+"ms"; }
+function dash(v){ return (v==null||v===0||v==="")?"--":esc(v); }
 
 async function getJSON(u){ const r=await fetch(u); if(!r.ok) throw new Error(u+" "+r.status);
   return r.json(); }
@@ -67,6 +73,45 @@ async function getJSON(u){ const r=await fetch(u); if(!r.ok) throw new Error(u+"
 function showErr(e){ const el=$("#err"); el.textContent="lost connection: "+e.message;
   el.style.display="block"; }
 function clearErr(){ $("#err").style.display="none"; }
+
+async function renderOverview(){
+  try {
+    const o = await getJSON("/api/v1/overview"); clearErr();
+    $("#meta").textContent = `${esc(o.node.role)} v${esc(o.node.version)} · up ${o.node.uptimeSeconds|0}s`;
+    const cap = o.capabilities||{}, res = o.resources||{}, met = o.metrics||{};
+    $("#overview").innerHTML =
+      `<h2>${esc(o.node.name)} <span style="color:var(--mut)">v${esc(o.node.version)}</span>`+
+      ` &mdash; <span class="s-FINISHED">${esc(o.node.role)}</span>`+
+      ` &mdash; DataFusion ${esc(o.node.datafusionVersion)}</h2>`+
+      `<h3>Requirements</h3>`+
+      `<div class=kv>`+
+      `<div>Flight SQL port</div><div>${dash(cap.flightSqlPort)}</div>`+
+      `<div>Trino HTTP port</div><div>${dash(cap.trinoHttpPort)}</div>`+
+      `<div>Quack port</div><div>${dash(cap.quackPort)}</div>`+
+      `<div>Catalog backend</div><div>${dash(cap.catalogBackend)}</div>`+
+      `<div>Catalog URL</div><div>${dash(cap.catalogUrl)}</div>`+
+      `<div>Storage</div><div>${dash(cap.storage)}</div>`+
+      `<div>Max query memory</div><div>${dash(cap.memoryLimit)}</div>`+
+      `<div>Max concurrent queries</div><div>${dash(cap.maxConcurrentQueries)}</div>`+
+      `<div>CPU cores</div><div>${res.cpuCores|0}</div>`+
+      `<div>Memory limit</div><div>${fmtBytes(res.memoryLimitBytes)}</div>`+
+      `</div>`+
+      `<h3>Metrics</h3>`+
+      `<div class=kv>`+
+      `<div>Total queries</div><div>${met.totalQueries|0}</div>`+
+      `<div>Running</div><div>${met.running|0}</div>`+
+      `<div>Finished</div><div>${met.finished|0}</div>`+
+      `<div>Failed</div><div>${met.failed|0}</div>`+
+      `<div>Canceled</div><div>${met.canceled|0}</div>`+
+      `<div>Active queries</div><div>${res.activeQueries|0}</div>`+
+      `<div>Total output rows</div><div>${met.totalOutputRows|0}</div>`+
+      `<div>Total bytes scanned</div><div>${fmtBytes(met.totalBytesScanned)}</div>`+
+      `<div>Avg execution time</div><div>${ms(met.avgExecutionMs)}</div>`+
+      `<div>Peak query memory</div><div>${fmtBytes(res.peakQueryMemoryBytes)}</div>`+
+      `<div>Total spill</div><div>${fmtBytes(res.totalSpillBytes)}</div>`+
+      `</div>`;
+  } catch(e){ showErr(e); }
+}
 
 async function renderQueries(){
   try {
@@ -92,7 +137,7 @@ async function openDetail(id){
   current = id;
   try {
     const d = await getJSON("/api/v1/queries/"+encodeURIComponent(id)); clearErr();
-    $("#queries").style.display="none"; $("#cluster").style.display="none";
+    $("#queries").style.display="none"; $("#cluster").style.display="none"; $("#overview").style.display="none";
     const det = $("#detail"); det.classList.remove("hidden");
     const fr = (d.fragments||[]).map(f=>
       `<tr><td>${esc(f.taskId)}</td><td>${esc(f.workerUrl)}</td>`+
@@ -136,15 +181,18 @@ function switchTab(t){
   tab=t; current=null; $("#detail").classList.add("hidden");
   document.querySelectorAll("nav button").forEach(b=>
     b.classList.toggle("active", b.dataset.tab===t));
-  $("#queries").style.display = t==="queries" ? "" : "none";
-  $("#cluster").style.display = t==="cluster" ? "" : "none";
+  $("#overview").style.display = t==="overview" ? "" : "none";
+  $("#queries").style.display  = t==="queries"  ? "" : "none";
+  $("#cluster").style.display  = t==="cluster"  ? "" : "none";
   tick();
 }
 document.querySelectorAll("nav button").forEach(b=>
   b.onclick=()=>switchTab(b.dataset.tab));
 
 function tick(){ if(current!==null) return;
-  if(tab==="queries") renderQueries(); else renderCluster(); }
+  if(tab==="overview") renderOverview();
+  else if(tab==="queries") renderQueries();
+  else renderCluster(); }
 tick(); setInterval(tick, 2000);
 </script>
 </body>
