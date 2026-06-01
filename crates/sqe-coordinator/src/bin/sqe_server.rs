@@ -46,6 +46,8 @@ struct HealthState {
     query_tracker: Option<Arc<sqe_coordinator::query_tracker::QueryTracker>>,
     web_ui: bool,
     catalog_url: String,
+    /// Populated from config in `run_coordinator`; `None` in `run_worker` and tests.
+    node_info: Option<sqe_coordinator::web_ui::NodeInfo>,
 }
 
 async fn healthz() -> &'static str {
@@ -216,6 +218,46 @@ async fn api_workers(
     Json(view)
 }
 
+async fn api_overview(
+    state: axum::extract::State<Arc<HealthState>>,
+) -> Json<sqe_coordinator::web_ui::OverviewDto> {
+    let uptime_seconds = state.started_at.elapsed().as_secs();
+    let cpu_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
+    // Build (or synthesise) the NodeInfo.
+    let node_info = state.node_info.clone().unwrap_or_else(|| {
+        sqe_coordinator::web_ui::NodeInfo {
+            name: "SQE",
+            version: sqe_core::VERSION,
+            role: state.role,
+            datafusion_version: "51",
+            flight_sql_port: 0,
+            trino_http_port: None,
+            quack_port: None,
+            catalog_backend: String::new(),
+            catalog_url: String::new(),
+            storage: String::new(),
+            memory_limit: None,
+            max_concurrent_queries: 0,
+        }
+    });
+
+    // Use the real tracker when available; fall back to an ephemeral empty one
+    // (tracker is always Some on coordinator path; this branch is defensive).
+    let dto = match &state.query_tracker {
+        Some(t) => sqe_coordinator::web_ui::overview(&node_info, uptime_seconds, cpu_cores, t),
+        None => {
+            let t = sqe_coordinator::query_tracker::QueryTracker::new(
+                &sqe_core::QueryHistoryConfig::default(),
+            );
+            sqe_coordinator::web_ui::overview(&node_info, uptime_seconds, cpu_cores, &t)
+        }
+    };
+    Json(dto)
+}
+
 async fn dashboard() -> Response {
     (
         [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -233,6 +275,7 @@ fn start_health_server(port: u16, state: Arc<HealthState>) {
     if state.web_ui {
         app = app
             .route("/", get(dashboard))
+            .route("/api/v1/overview", get(api_overview))
             .route("/api/v1/queries", get(api_queries))
             .route("/api/v1/queries/{id}", get(api_query_detail))
             .route("/api/v1/workers", get(api_workers));
@@ -523,6 +566,48 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history),
     );
 
+    // Build NodeInfo for the Overview endpoint from config (config is still in
+    // scope at this point; it gets moved into the handlers below).
+    let node_info = {
+        use sqe_core::config::CatalogBackend;
+        let catalog_backend = match &config.catalog.backend {
+            CatalogBackend::Rest => "rest",
+            CatalogBackend::Hms { .. } => "hms",
+            CatalogBackend::Glue { .. } => "glue",
+            CatalogBackend::Jdbc { .. } => "jdbc",
+            CatalogBackend::S3tables { .. } => "s3tables",
+        }
+        .to_string();
+        let storage = if config.storage.s3_endpoint.is_empty() {
+            "local".to_string()
+        } else {
+            config.storage.s3_endpoint.clone()
+        };
+        let trino_http_port = (config.coordinator.trino_http_port != 0)
+            .then_some(config.coordinator.trino_http_port);
+        let quack_port = (config.coordinator.quack_port != 0)
+            .then_some(config.coordinator.quack_port);
+        let memory_limit = if config.query.max_query_memory.is_empty() || config.query.max_query_memory == "0" {
+            None
+        } else {
+            Some(config.query.max_query_memory.clone())
+        };
+        sqe_coordinator::web_ui::NodeInfo {
+            name: "SQE",
+            version: sqe_core::VERSION,
+            role: "coordinator",
+            datafusion_version: "51",
+            flight_sql_port: config.coordinator.flight_sql_port,
+            trino_http_port,
+            quack_port,
+            catalog_backend,
+            catalog_url: config.catalog.catalog_url.clone(),
+            storage,
+            memory_limit,
+            max_concurrent_queries: config.query.max_concurrent_queries,
+        }
+    };
+
     // Health server (start early so probes work during init)
     let health_state = Arc::new(HealthState {
         ready: ready.clone(),
@@ -536,6 +621,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         query_tracker: Some(query_tracker.clone()),
         web_ui: config.metrics.web_ui,
         catalog_url: config.catalog.catalog_url.clone(),
+        node_info: Some(node_info),
     });
     start_health_server(health_port, health_state);
 
@@ -861,6 +947,7 @@ async fn run_worker(config: SqeConfig) -> anyhow::Result<()> {
         query_tracker: None,
         web_ui: false,
         catalog_url: String::new(), // workers do not connect to Polaris directly
+        node_info: None,
     });
     start_health_server(health_port, health_state);
 
@@ -1203,6 +1290,7 @@ mod tests {
             query_tracker: None,
             web_ui: false,
             catalog_url: String::new(),
+            node_info: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -1221,6 +1309,7 @@ mod tests {
             query_tracker: None,
             web_ui: false,
             catalog_url: String::new(),
+            node_info: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -1245,6 +1334,7 @@ mod tests {
             query_tracker: None,
             web_ui: false,
             catalog_url: String::new(),
+            node_info: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -1266,6 +1356,7 @@ mod tests {
             query_tracker: None,
             web_ui: false,
             catalog_url: String::new(),
+            node_info: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -1282,6 +1373,7 @@ mod tests {
             query_tracker: None,
             web_ui: false,
             catalog_url: String::new(),
+            node_info: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -1304,6 +1396,7 @@ mod tests {
             query_tracker: Some(tracker),
             web_ui: true,
             catalog_url: String::new(),
+            node_info: None,
         });
 
         let Json(items) = api_queries(
