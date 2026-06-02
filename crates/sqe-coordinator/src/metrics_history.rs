@@ -1,14 +1,16 @@
 //! In-memory time-series sampler for the web-UI metrics dashboard.
 //!
 //! `MetricsHistory` is a ring-buffer of `MetricsSample` values collected every
-//! 10 seconds over a 12-hour window (4320 samples at capacity). The
+//! 5 seconds over a 1-hour window (720 samples at capacity). The
 //! `/api/v1/metrics/history` endpoint aggregates the raw ring-buffer into at
-//! most 48 fixed-width buckets before sending, keeping the payload small.
+//! most 60 fixed-width buckets before sending, keeping the payload small. Small
+//! buckets plus fast sampling make the dashboard charts visibly advance over
+//! time: a new bar each minute, and the current bar refreshes every sample.
 //!
 //! ## Response shape (bucket fields)
 //!
 //! Each element of `buckets` contains:
-//! - `tUnixMs`        — bucket start time (floor to 900 s), Unix epoch ms
+//! - `tUnixMs`        — bucket start time (floor to 60 s), Unix epoch ms
 //! - `total`          — Δtotal_queries in the bucket (completed + failed, clamped ≥0)
 //! - `finished`       — Δfinished_queries in the bucket (clamped ≥0)
 //! - `failed`         — Δfailed_queries in the bucket (clamped ≥0)
@@ -184,10 +186,9 @@ pub struct HistoryResponse {
     pub buckets: Vec<HistoryBucket>,
 }
 
-/// Fixed bucket width: 900 s = 15 min. With a 12-hour window (43200 s) this
-/// gives at most 48 buckets. When history is partial, fewer buckets are
-/// returned.
-pub const BUCKET_SECS: u64 = 900;
+/// Fixed bucket width: 60 s = 1 min. With a 1-hour window (3600 s) this gives
+/// at most 60 buckets. When history is partial, fewer buckets are returned.
+pub const BUCKET_SECS: u64 = 60;
 
 /// Aggregate a raw sample snapshot into time buckets.
 ///
@@ -421,8 +422,8 @@ mod tests {
     #[test]
     fn bucket_samples_clamps_negative_delta() {
         // Simulate cache eviction: total_queries drops from bucket-first to bucket-last.
-        // Bucket width is 900_000 ms; put both samples in the same bucket.
-        let base_ms: u64 = 900_000; // exactly one bucket boundary
+        // Bucket width is 60_000 ms; both samples (10 s apart) fall in one bucket.
+        let base_ms: u64 = 900_000; // a bucket boundary (multiple of 60_000)
         let s1 = MetricsSample {
             unix_ms: base_ms,
             active_queries: 0,
@@ -526,14 +527,14 @@ mod tests {
     }
 
     #[test]
-    fn bucket_samples_produces_at_most_48_buckets_for_12h() {
-        // 4320 samples at 10 s each = 12 h. Each 900 s bucket holds 90 samples.
-        // Total distinct bucket keys = 12*60*60 / 900 = 48.
+    fn bucket_samples_produces_60_buckets_for_1h() {
+        // 720 samples at 5 s each = 1 h. Each 60 s bucket holds 12 samples.
+        // Total distinct bucket keys = 60*60 / 60 = 60.
         let base_ms: u64 = 0;
-        let mut samples = Vec::with_capacity(4320);
-        for i in 0..4320u64 {
+        let mut samples = Vec::with_capacity(720);
+        for i in 0..720u64 {
             samples.push(MetricsSample {
-                unix_ms: base_ms + i * 10_000,
+                unix_ms: base_ms + i * 5_000,
                 active_queries: (i % 5) as usize,
                 mem_used_bytes: i * 10,
                 mem_limit_bytes: 50_000,
@@ -545,6 +546,6 @@ mod tests {
             });
         }
         let r = bucket_samples(&samples);
-        assert_eq!(r.buckets.len(), 48);
+        assert_eq!(r.buckets.len(), 60);
     }
 }
