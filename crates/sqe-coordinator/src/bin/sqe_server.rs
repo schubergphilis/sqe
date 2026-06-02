@@ -628,9 +628,9 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         }
     };
 
-    // Metrics ring-buffer for the dashboard history endpoint (12 h at 10 s resolution).
+    // Metrics ring-buffer for the dashboard history endpoint (1 h at 5 s resolution).
     let metrics_history = if config.metrics.web_ui {
-        Some(Arc::new(sqe_coordinator::metrics_history::MetricsHistory::new(4320)))
+        Some(Arc::new(sqe_coordinator::metrics_history::MetricsHistory::new(720)))
     } else {
         None
     };
@@ -839,9 +839,9 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             hist.clone(),
             query_handler.runtime().clone(),
             sampler_tracker,
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(5),
         ));
-        tracing::info!("Started metrics history sampler (10 s interval, 12 h window)");
+        tracing::info!("Started metrics history sampler (5 s interval, 1 h window)");
     }
 
     // Bearer auth chain for the Trino-compat HTTP path. Reuses the same

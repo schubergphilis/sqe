@@ -386,7 +386,7 @@ async function renderOverview(){
       ? `<div class="hist-legend">` +
         `<span class="hist-legend-swatch" style="background:var(--sbp-blue)"></span> Completed` +
         `<span class="hist-legend-swatch" style="background:var(--red)"></span> Failed` +
-        `<span class="hist-caption">15-min buckets &middot; last 12h</span>` +
+        `<span class="hist-caption">1-min buckets &middot; last 1h</span>` +
         `</div>`
       : "";
 
@@ -400,7 +400,7 @@ async function renderOverview(){
       `<div class="stat-grid">${statCards}</div>`+
 
       // b. Histogram
-      `<h3>Query activity (last 12h)</h3>`+
+      `<h3>Query activity (last 1h)</h3>`+
       `<div class="hist-wrap">${histSvg}${histLegend}</div>`+
 
       // c. Resource gauges
