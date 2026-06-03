@@ -108,6 +108,12 @@ Client (JDBC / Flight SQL / HTTP)
 
 Detailed Mermaid diagrams (query pipeline, crate dependencies, caching layers, distributed execution, write path) in [`docs/architecture.md`](docs/architecture.md).
 
+## Web UI
+
+A read-only ops dashboard ships in the binary, on the coordinator's health port (`metrics_port + 1`). Queries with per-fragment timing, cluster nodes, and live engine metrics (stat cards, a query-activity histogram, memory and concurrency gauges), all from the coordinator's in-memory state. No login (network-gated), no build step, no external assets. Toggle with `[metrics] web_ui`. Full reference: [`docs/book/src/operations/web-ui.md`](docs/book/src/operations/web-ui.md).
+
+![SQE web UI: the Overview dashboard](docs/book/src/images/sqe-web-ui-overview.png)
+
 ## Get started
 
 Five-minute walkthrough covering all seven catalog backends with sample TOML and verification queries: [`QUICKSTART.md`](QUICKSTART.md).
