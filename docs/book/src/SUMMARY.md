@@ -72,6 +72,21 @@
 
 ---
 
+# Use Cases
+
+- [Overview and validation matrix](./use-cases/index.md)
+- [Flight SQL (single and distributed)](./use-cases/flight-sql.md)
+- [Trino HTTP compatibility (single and distributed)](./use-cases/trino-http.md)
+- [Quack (DuckDB wire protocol)](./use-cases/quack.md)
+  - [Quack protocol reference](./use-cases/quack-protocol.md)
+  - [Quack data-type matrix](./use-cases/quack-datatype-matrix.md)
+- [Catalog backends (Polaris, Glue, S3 Tables, Unity, HMS, Nessie, Hadoop)](./use-cases/catalog-backends.md)
+- [Embedded and single-node CLI](./use-cases/embedded.md)
+- [File-format TVFs (read_csv / read_parquet / read_json)](./use-cases/file-format-tvfs.md)
+- [Benchmarks (TPC-H / TPC-DS / SSB)](./use-cases/benchmarks.md)
+
+---
+
 # Deployment
 
 - [Configuration](./deployment/configuration.md)
