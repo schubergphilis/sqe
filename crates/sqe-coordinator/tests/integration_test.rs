@@ -732,6 +732,129 @@ async fn test_read_parquet_local_file() {
     // tmp_dir is dropped here, cleaning up the temp Parquet file.
 }
 
+/// Write a small CSV file (header row + three rows) into `dir`.
+/// Schema after inference: id INT64, name VARCHAR.
+fn write_test_csv(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("test.csv");
+    std::fs::write(&path, "id,name\n1,alice\n2,bob\n3,carol\n")
+        .expect("failed to write test csv file");
+    path
+}
+
+/// Write a small newline-delimited JSON file into `dir`.
+/// Schema after inference: id INT64, name VARCHAR.
+fn write_test_ndjson(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("test.json");
+    std::fs::write(
+        &path,
+        "{\"id\":1,\"name\":\"alice\"}\n{\"id\":2,\"name\":\"bob\"}\n{\"id\":3,\"name\":\"carol\"}\n",
+    )
+    .expect("failed to write test json file");
+    path
+}
+
+/// Assert that `batches` hold exactly the three (id, name) rows produced by the
+/// file-format TVF fixtures, in id order.
+fn assert_three_known_rows(batches: &[arrow_array::RecordBatch]) {
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3, "table should contain exactly 3 rows");
+
+    let mut ids: Vec<i64> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    for batch in batches {
+        let id_arr = batch
+            .column_by_name("id")
+            .expect("batch should have 'id' column")
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("'id' column should be Int64");
+        let name_arr = batch
+            .column_by_name("name")
+            .expect("batch should have 'name' column")
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .expect("'name' column should be Utf8");
+        for row in 0..batch.num_rows() {
+            ids.push(id_arr.value(row));
+            names.push(name_arr.value(row).to_string());
+        }
+    }
+    assert_eq!(ids, vec![1, 2, 3], "ids should be [1, 2, 3] in order");
+    assert_eq!(
+        names,
+        vec!["alice", "bob", "carol"],
+        "names should be [alice, bob, carol] in order"
+    );
+}
+
+// Test: read_csv() TVF — CTAS from a local CSV file, verify round-trip.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn test_read_csv_local_file() {
+    let (session, handler) = common::setup_handler().await;
+
+    let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let csv_path = write_test_csv(tmp_dir.path());
+    let csv_path_str = csv_path.to_str().expect("csv path not UTF-8").to_string();
+
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.from_csv")
+        .await;
+
+    let ctas_sql = format!(
+        "CREATE TABLE test_ns.from_csv AS SELECT * FROM read_csv('{csv_path_str}')"
+    );
+    handler
+        .execute(&session, &ctas_sql)
+        .await
+        .expect("CTAS from read_csv should succeed");
+
+    let batches = handler
+        .execute(&session, "SELECT id, name FROM test_ns.from_csv ORDER BY id")
+        .await
+        .expect("SELECT from from_csv should succeed");
+    assert_three_known_rows(&batches);
+
+    handler
+        .execute(&session, "DROP TABLE test_ns.from_csv")
+        .await
+        .expect("DROP TABLE cleanup should succeed");
+}
+
+// Test: read_json() TVF — CTAS from a local NDJSON file, verify round-trip.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn test_read_json_local_file() {
+    let (session, handler) = common::setup_handler().await;
+
+    let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let json_path = write_test_ndjson(tmp_dir.path());
+    let json_path_str = json_path.to_str().expect("json path not UTF-8").to_string();
+
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.from_json")
+        .await;
+
+    let ctas_sql = format!(
+        "CREATE TABLE test_ns.from_json AS SELECT * FROM read_json('{json_path_str}')"
+    );
+    handler
+        .execute(&session, &ctas_sql)
+        .await
+        .expect("CTAS from read_json should succeed");
+
+    let batches = handler
+        .execute(&session, "SELECT id, name FROM test_ns.from_json ORDER BY id")
+        .await
+        .expect("SELECT from from_json should succeed");
+    assert_three_known_rows(&batches);
+
+    handler
+        .execute(&session, "DROP TABLE test_ns.from_json")
+        .await
+        .expect("DROP TABLE cleanup should succeed");
+}
+
 // Test: information_schema.schemata is queryable
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
