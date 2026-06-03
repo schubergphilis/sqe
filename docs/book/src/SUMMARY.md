@@ -84,6 +84,7 @@
 
 - [Lineage (OpenLineage)](./operations/openlineage.md)
 - [Runtime catalog management (ATTACH / DETACH / SECRETS)](./operations/catalogs.md)
+- [Web UI](./operations/web-ui.md)
 
 ---
 

@@ -1,4 +1,5 @@
 pub mod adaptive_sort;
+pub mod metrics_history;
 pub mod catalog_ops;
 pub mod channel_pool;
 pub mod maintenance;
@@ -24,6 +25,7 @@ pub mod scheduler;
 pub mod streaming;
 pub mod suggest_bloom;
 pub mod session_manager;
+pub mod web_ui;
 pub mod worker_registry;
 pub mod write_handler;
 pub mod writer;
