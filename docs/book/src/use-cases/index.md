@@ -2,8 +2,10 @@
 
 This section is a set of runbooks. Each page takes one way of deploying or
 connecting to SQE and walks it end to end: what it is, what you need running,
-the config, the exact commands, and the output you should see. Every recipe
-here was run against a real stack, not sketched from memory.
+the config, the exact commands, and the output you should see. Each recipe is
+backed by a test or script in the repo; the validation matrix below is explicit
+about what was re-run live during the reveal-prep round versus what is covered
+by the automated suite.
 
 The pages group by how you connect and where your tables live:
 
@@ -27,25 +29,34 @@ HMS, Nessie, or a bare filesystem warehouse, selected by one config block.
 
 ## Validation matrix
 
-Status reflects a run done during the reveal-prep round (2026-06-03) unless a
-cell says otherwise. "How validated" links the test or script that proves it.
+The **Verified** column is honest about provenance:
 
-| # | Use case | Protocol / Backend | Topology | Infra | How validated | Status | Latest result |
-|---|----------|--------------------|----------|-------|---------------|--------|---------------|
-| 1 | Trino HTTP -> Polaris | Trino HTTP | single | `docker-compose.test.yml` | `integration_test.rs::test_trino_http_query`; `scripts/trino-parity-test.sh` | PASS | _see Trino page_ |
-| 2 | Trino HTTP -> Polaris | Trino HTTP | distributed | `+ docker-compose.distributed.yml` | `scripts/distributed-test.sh` | PASS | _see Trino page_ |
-| 3 | Flight SQL -> Polaris | Arrow Flight SQL | single | `docker-compose.test.yml` | `integration_test.rs` (auth, select, TVFs) | PASS | _see Flight page_ |
-| 4 | Flight SQL -> Polaris | Arrow Flight SQL | distributed | `+ docker-compose.distributed.yml` | `scripts/distributed-test.sh`; benchmark harness | PASS | _see Flight page_ |
-| 5a | AWS Glue catalog | Glue (native SDK) | any | live AWS (`jacobbuilder`) | `backends_integration.rs::glue::*` | _pending_ | _see Catalog backends_ |
-| 5b | AWS S3 Tables | S3 Tables (Glue REST + SigV4) | any | live AWS (`jacobbuilder`) | `backends_integration.rs::s3_tables::*` | _pending_ | _see Catalog backends_ |
-| 5c | Unity Catalog OSS | Iceberg REST adapter | any | `docker-compose.unity.yml` | `backends_integration.rs::unity_catalog::*` | _pending_ | _see Catalog backends_ |
-| 5d | Hive Metastore | HMS (Thrift) | any | `docker-compose.hms.yml` | `backends_integration.rs::hms::*` | _pending_ | _see Catalog backends_ |
-| 5e | Project Nessie | Iceberg REST | any | `docker-compose.nessie.yml` | `backends_integration.rs::nessie::*` | _pending_ | _see Catalog backends_ |
-| 6 | Embedded / single-node | in-process | single | none | `cli_smoke.rs`; embedded catalog tests | _pending_ | _see Embedded page_ |
-| 7 | Quack server + client | Quack (DuckDB wire) | single | `docker-compose.test.yml` | `quack_e2e.rs`; `sqe-quack-*` tests | _pending_ | _see Quack page_ |
-| 8 | read_csv / read_parquet / read_json | TVF | single | `docker-compose.test.yml` | `integration_test.rs::test_read_{csv,parquet,json}_local_file` | PASS | 3/3, 23.6s |
-| 9 | GRANT / REVOKE (Chameleon) | SQL | any | in-process | `query_handler.rs` grant tests | PASS | _see SQL reference_ |
-| 10 | Benchmarks | TPC-H / TPC-DS / SSB | single + distributed | bench stacks | `scripts/benchmark-test.sh`; `benchmarks/results/*.json` | PASS | _see Benchmarks page_ |
+- **live (2026-06-03)**: re-run this round with captured output.
+- **suite**: covered by automated tests in the repo, not re-run live this round.
+- **baseline**: a committed result file in `benchmarks/results/`.
+
+The infra ceiling on a single laptop is real: with the AWS backends, the local
+Polaris stack, and three optional catalog stacks all up, the Docker VM was
+saturated, so the docker-dependent re-runs (distributed, Quack, Unity/HMS/Nessie)
+are cited from their suites rather than re-run. The AWS backends and the
+in-process paths were run live.
+
+| # | Use case | Protocol / Backend | Topology | How validated | Verified | Latest result |
+|---|----------|--------------------|----------|---------------|----------|---------------|
+| 1 | Trino HTTP -> Polaris | Trino HTTP | single | `integration_test.rs::test_trino_http_query`; `scripts/trino-parity-test.sh` | suite | parity script + HTTP test in repo |
+| 2 | Trino HTTP -> Polaris | Trino HTTP | distributed | `scripts/distributed-test.sh` (Trino on :28080) | suite | distributed harness (test 11) |
+| 3 | Flight SQL -> Polaris | Arrow Flight SQL | single | `integration_test.rs` (auth, CTAS, SELECT, TVFs) | live (2026-06-03) | TVF round-trip incl. Polaris auth + CTAS + SELECT, 3/3 |
+| 4 | Flight SQL -> Polaris | Arrow Flight SQL | distributed | `scripts/distributed-test.sh` (Flight :60051); benchmark harness | suite / baseline | TPC-H SF1 distributed 22/22, 12.0s (committed) |
+| 5a | AWS Glue catalog | Glue (native SDK) | any | `backends_integration.rs::glue::live_glue_namespace_round_trip` | live (2026-06-03) | namespace round-trip ok, 8.38s |
+| 5b | AWS S3 Tables | S3 Tables (Glue REST + SigV4) | any | `backends_integration.rs::s3_tables::list_namespaces_via_glue_rest` | live (2026-06-03) | ns `table_demo_analytics`, table `table_user_events` |
+| 5c | Unity Catalog OSS | Iceberg REST adapter | any | `backends_integration.rs::unity_catalog::*` | suite | read smoke; live re-run blocked by local docker |
+| 5d | Hive Metastore | HMS (Thrift) | any | `backends_integration.rs::hms::*` | suite | namespace round-trip test |
+| 5e | Project Nessie | Iceberg REST | any | `backends_integration.rs::nessie::*` | suite | namespace round-trip test |
+| 6 | Embedded / single-node | in-process | single | `cli_smoke.rs`; live CLI run | live (2026-06-03) | `--embedded --memory` SELECT 1 -> 1 |
+| 7 | Quack server + client | Quack (DuckDB wire) | single | `quack_e2e.rs`; `sqe-quack-*` tests | suite | e2e + wire/server/client tests in repo |
+| 8 | read_csv / read_parquet / read_json | TVF | single | `integration_test.rs::test_read_{csv,parquet,json}_local_file` | live (2026-06-03) | 3/3, 23.6s |
+| 9 | GRANT / REVOKE (Chameleon) | SQL | any | `query_handler.rs::extract_grant_statement_*` | suite | parser unit-tested (6 cases) |
+| 10 | Benchmarks | TPC-H / TPC-DS / SSB | single + distributed | `scripts/benchmark-test.sh`; `benchmarks/results/*.json` | baseline | TPC-H SF1 22/22, 37.5s single (committed) |
 
 > GRANT/REVOKE and the access-control SQL surface are Chameleon/SBP-specific
 > and documented in [GRANT and REVOKE](../sql-reference/grant-revoke.md). They

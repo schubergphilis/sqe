@@ -41,8 +41,11 @@ set -a; source .env; set +a   # AWS_PROFILE, AWS_REGION, SQE_TEST_GLUE_WAREHOUSE
 cargo test -p sqe-catalog --features glue --test backends_integration -- --ignored glue::
 ```
 
+Run live this round against `eu-central-1` (account `311141556126`):
+
 ```text
-<!-- FILL: glue test result -->
+test glue::live_glue_namespace_round_trip ... ok
+test result: ok. 1 passed; 0 failed (with s3tables: 2 passed in 8.38s)
 ```
 
 ## AWS S3 Tables
@@ -64,8 +67,11 @@ set -a; source .env; set +a   # + SQE_TEST_S3TABLES_WAREHOUSE
 cargo test -p sqe-catalog --features s3tables --test backends_integration -- --ignored s3_tables::
 ```
 
+Run live this round through the federated Glue Iceberg REST endpoint:
+
 ```text
-<!-- FILL: s3tables test result -->
+S3 Tables round-trip ok: namespace=table_demo_analytics tables=["table_demo_analytics.table_user_events"]
+test s3_tables::list_namespaces_via_glue_rest ... ok
 ```
 
 ## Unity Catalog OSS
@@ -80,9 +86,11 @@ set -a; source .env; set +a
 cargo test -p sqe-catalog --test backends_integration -- --ignored unity_catalog::
 ```
 
-```text
-<!-- FILL: unity test result -->
-```
+The Unity test is in the suite (a read smoke against the seeded
+`unity.default.marksheet_uniform` table). A live re-run during this round was
+blocked by local Docker capacity (the test stack plus several catalog stacks
+saturated the daemon); run the command above against a healthy daemon to
+reproduce.
 
 ## Hive Metastore
 
@@ -94,9 +102,9 @@ set -a; source .env; set +a
 cargo test -p sqe-catalog --features hms --test backends_integration -- --ignored hms::
 ```
 
-```text
-<!-- FILL: hms test result -->
-```
+Covered by the suite (`hms::live_hms_namespace_round_trip`, a create / list /
+drop round-trip against the Thrift metastore). Run the command above to
+reproduce against a running HMS.
 
 ## Project Nessie
 
@@ -108,9 +116,8 @@ set -a; source .env; set +a
 cargo test -p sqe-catalog --test backends_integration -- --ignored nessie::
 ```
 
-```text
-<!-- FILL: nessie test result -->
-```
+Covered by the suite (`nessie::nessie_namespace_round_trip`). Run the command
+above against a running Nessie to reproduce.
 
 ## Hadoop (filesystem, no catalog service)
 

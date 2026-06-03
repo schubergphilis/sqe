@@ -38,13 +38,13 @@ and embeddable in Rust applications.
 
 ## Verified round-trip
 
-The end-to-end path was exercised against the live Polaris stack: authenticate
-against Polaris, spawn the Quack server, open a connection, prepare and run
-`SELECT 1`, and read the typed result back.
-
-```text
-<!-- FILL: quack_e2e tail -->
-```
+The end-to-end path is exercised by `quack_e2e::quack_select_one_round_trip`:
+authenticate against Polaris, spawn the Quack server, open a connection, prepare
+and run `SELECT 1`, and read the typed result back. The unit suites
+(`sqe-quack-server`, `sqe-quack-client`, `sqe-quack-wire`) cover the connection
+lifecycle, auth rejection, type round-trips, and the wire codec against captured
+DuckDB messages. The e2e re-run needs the Polaris stack; this round it was not
+repeated under the local Docker constraint noted in the validation matrix.
 
 ## How it is tested
 
