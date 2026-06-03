@@ -10,8 +10,8 @@
     "group": "3rd Party",
     "docUrl": "https://github.com/schubergphilis/sqe"
   },
-  "generatedAt": "2026-05-05T15:00:00Z",
-  "generatedBy": "fix/score-recount-after-merges: post !129 + !130 score is 167, not 166",
+  "generatedAt": "2026-06-03T00:00:00Z",
+  "generatedBy": "chore/bump-iceberg-rust-9491dcab: re-validated against vendored RW fork c034b19105fa (snapshot-summary panic fix #161 + V3 puffin file reader). Both are bug-fixes; no cell flips. The V3 puffin read fix is not yet verified end-to-end (needs the docker-compose stack), so no V3 deletion-vector cell changes. Score holds 167/189.",
   "score": {
     "raw": 167,
     "max": 189,
