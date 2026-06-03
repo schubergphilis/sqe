@@ -1,9 +1,10 @@
 # iceberg-rust (SQE vendored fork)
 
 This is a vendored copy of the [RisingWave Labs iceberg-rust fork](https://github.com/risingwavelabs/iceberg-rust),
-branch `dev_rebase_main_20260303` at commit `8f7c952f66de`. The branch carries
-DataFusion 53.0 / Arrow 58 / Parquet 58 (RW PR #148, 2026-04-15) plus 10 writer
-and transaction fixes on top.
+branch `dev_rebase_main_20260303` at commit `c034b19105fa`. The branch carries
+DataFusion 53.0 / Arrow 58 / Parquet 58 (RW PR #148, 2026-04-15) plus writer
+and transaction fixes on top. (The branch tip `9491dcab` is a CODEOWNERS-only
+change and is not vendored.)
 
 ## Vendored crates
 
@@ -37,7 +38,7 @@ The RisingWave fork provides all of these.
 
 ## Upstream tracking
 
-- RisingWave fork: `dev_rebase_main_20260303` @ `8f7c952f66de`
+- RisingWave fork: `dev_rebase_main_20260303` @ `c034b19105fa`
 - Apache upstream: tracking PRs #2185 (OverwriteAction) and #2203 (RowDeltaAction)
 - When upstream merges these, SQE will migrate to official apache/iceberg-rust
 
@@ -124,6 +125,45 @@ commits from the RW rebase branch:
   columns after schema change (PR #156)
 - REST client: refresh token after 401 unauthorized (PR #157)
 - opendal: skip TimeoutLayer under madsim (PR #160)
+
+## Bumped `8f7c952f66de` -> `c034b19105fa` (2026-06-02)
+
+Two more fixes from the same `dev_rebase_main_20260303` branch, applied on top
+of the vendored tree as patches. The branch tip `9491dcab` ("Add myself to code
+owners") is CODEOWNERS-only and is not vendored.
+
+- **#161 `fix: avoid panic in snapshot summary update_totals on malformed
+  values`** (vovacf201). `update_totals` called `.unwrap()` parsing the
+  `total-*` / `added-*` / `removed-*` summary properties and used checked
+  subtraction that could panic in debug on a corrupt prior summary. Now
+  parse-or-zero + saturating arithmetic, matching Java Iceberg's
+  `SnapshotSummary`, so one bad prior summary cannot wedge compaction/commit.
+  Adds 3 tests. File: `crates/iceberg/src/spec/snapshot_summary.rs`.
+- **`fix: iceberg V3 puffin file reader`** (Dylan, commit `c034b191`). Corrects
+  the V3 puffin (deletion-vector) read path. Files:
+  `crates/iceberg/src/arrow/{caching_delete_file_loader,delete_filter,reader}.rs`
+  and `crates/iceberg/src/scan/{context,mod,task}.rs`. Touches the same two
+  files as SQE-only patch family 1 (DynamicPredicate) but in disjoint regions;
+  verified by a clean workspace build.
+
+How this bump was validated: SQE builds the iceberg crate as a path dep
+inside its own workspace, where the lib compiles clean and the workspace
+`cargo test --lib` suite (sqe-catalog, sqe-coordinator, sqe-worker, ...)
+passes against it. The two fixes' own behavioral tests did not run here:
+the 3 bundled snapshot-summary tests compile in-module but the V3 puffin
+read path needs the docker-compose stack to exercise end-to-end (deferred).
+
+Note for the next rebaser: the vendored crate's **standalone** test target
+does not compile on its own. Running `cargo test --manifest-path
+vendor/iceberg-rust/Cargo.toml -p iceberg --lib` fails with ~49 errors
+(`ScanResult` not satisfying `futures::TryStreamExt` in the scan/arrow
+test modules, plus the resulting `type annotations needed`). This is a
+pre-existing futures/scan-test skew in the fork's isolated workspace, not
+introduced by this bump (it reproduces identically with these patches
+reverted). SQE excludes this vendor copy from its workspace and never
+compiles the vendor test target, so the breakage is invisible in practice.
+Validate iceberg changes through the SQE workspace path-dep
+(`cargo test --workspace --lib`), not the vendor's own test suite.
 
 ## Catalog config: URL and bucket conventions
 
