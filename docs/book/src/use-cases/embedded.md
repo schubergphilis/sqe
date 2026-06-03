@@ -25,7 +25,11 @@ sqe-cli --embedded --memory -e "SELECT 1 AS one"
 ```
 
 ```text
-<!-- FILL: embedded memory output -->
++-----+
+| one |
++-----+
+| 1   |
++-----+
 ```
 
 ## Filesystem warehouse (no catalog service)

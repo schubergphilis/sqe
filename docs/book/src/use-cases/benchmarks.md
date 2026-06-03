@@ -52,9 +52,10 @@ Baselines tracked in the repo:
 | TPC-H | SF1 | single | 22/22 | 37.5s | `tpch-sf1-flight-2026-04-02T14:16:27.json` |
 | TPC-H | SF1 | distributed (3w) | 22/22 | 12.0s (3.1x) | `tpch-sf1-flight-2026-04-06T20:57:10.json` |
 
-```text
-<!-- FILL: refreshed TPC-H SF1 run summary -->
-```
+These are the committed baselines used for regression comparison. A fresh
+SF1 re-run was not captured this round (the benchmark harness needs the docker
+stack, which was saturated; see the validation matrix). Reproduce with the
+command above.
 
 ## Parity
 

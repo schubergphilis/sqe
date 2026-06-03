@@ -84,9 +84,11 @@ Flight path and confirms worker dispatch.
 
 ### Expected output
 
-```text
-<!-- FILL: distributed-test.sh trino tail -->
-```
+`distributed-test.sh` test 11 submits a query to the Trino HTTP endpoint on the
+coordinator (`28080`) and follows `nextUri` to completion, alongside the Flight
+path on the same cluster. This is covered by the suite; the docker-dependent
+re-run was not repeated this round (see the validation matrix note on local
+Docker capacity).
 
 ## Trino SQL parity
 
