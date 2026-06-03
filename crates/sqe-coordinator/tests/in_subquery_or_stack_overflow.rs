@@ -49,8 +49,18 @@ use arrow_schema::{DataType, Field, Schema};
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 
-/// Match the production coordinator runtime: 8 MiB stack, thread name
-/// `sqe-coordinator`. See `crates/sqe-coordinator/src/main.rs:85-99`.
+/// Match the production coordinator runtime: 8 MiB worker stack, thread name
+/// `sqe-coordinator` (see `crates/sqe-coordinator/src/main.rs`).
+///
+/// The big sizes are RELEASE-ONLY guards (`#[cfg_attr(debug_assertions,
+/// ignore)]` below). The property under test, "a deep OR chain plans within
+/// production's 8 MiB stack", is about the shipped release binary. Debug
+/// inflates every recursive-visitor frame several-fold, so the same chain both
+/// overflows 8 MiB AND plans far slower in debug: a single 32k size took ~31
+/// minutes and still overflowed a 64 MiB stack. CI runs the suite in debug, so
+/// the big sizes run only in release builds; the cheap 1k smoke runs in debug
+/// to catch a gross unbounded-recursion regression. Run the full ladder with
+/// `cargo test --release -p sqe-coordinator --test in_subquery_or_stack_overflow`.
 fn prod_runtime() -> tokio::runtime::Runtime {
     const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
     tokio::runtime::Builder::new_multi_thread()
@@ -127,21 +137,25 @@ fn prod_stack_1k() {
 }
 
 #[test]
+#[cfg_attr(debug_assertions, ignore = "release-only: deep OR planning overflows 8 MiB + is very slow in debug")]
 fn prod_stack_4k() {
     run_on_prod_worker(4_000);
 }
 
 #[test]
+#[cfg_attr(debug_assertions, ignore = "release-only: deep OR planning overflows 8 MiB + is very slow in debug")]
 fn prod_stack_8k() {
     run_on_prod_worker(8_000);
 }
 
 #[test]
+#[cfg_attr(debug_assertions, ignore = "release-only: deep OR planning overflows 8 MiB + is very slow in debug")]
 fn prod_stack_16k() {
     run_on_prod_worker(16_000);
 }
 
 #[test]
+#[cfg_attr(debug_assertions, ignore = "release-only: deep OR planning overflows 8 MiB + is very slow in debug")]
 fn prod_stack_32k() {
     run_on_prod_worker(32_000);
 }
