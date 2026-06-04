@@ -214,14 +214,18 @@ pub fn build_embedded_context(memory_limit_bytes: usize) -> anyhow::Result<Sessi
     //   SELECT * FROM read_delta('s3://bucket/delta/orders',
     //     access_key => 'AKIA...', secret_key => '...');
     // Time-travel via version => '<int>' or timestamp => '<RFC3339>'.
-    // The CLI's Cargo.toml enables the sqe-catalog `delta` feature
-    // unconditionally, so this registration always runs.
+    // DEP-07: gated behind the `delta` feature (off by default) because
+    // deltalake-core pulls a second reqwest 0.13 + arrow/parquet tree.
+    // Enable with `--features delta`.
+    #[cfg(feature = "delta")]
     ctx.register_udtf(
         "read_delta",
         Arc::new(sqe_catalog::read_delta::ReadDeltaFunction::new(
             tvf_storage,
         )),
     );
+    #[cfg(not(feature = "delta"))]
+    let _ = &tvf_storage; // consumed by read_delta only when the feature is on
 
     Ok(ctx)
 }
