@@ -169,7 +169,7 @@ impl<'a> BinaryDeserializer<'a> {
 
     fn read_u16_le(&mut self) -> crate::Result<u16> {
         debug_assert!(self.pos <= self.buf.len(), "pos advanced past buffer end");
-        if self.buf.len().checked_sub(self.pos).unwrap_or(0) < 2 {
+        if self.buf.len().saturating_sub(self.pos) < 2 {
             return Err(crate::WireError::UnexpectedEof);
         }
         let v = u16::from_le_bytes([self.buf[self.pos], self.buf[self.pos + 1]]);
@@ -179,7 +179,7 @@ impl<'a> BinaryDeserializer<'a> {
 
     pub fn peek_field(&self) -> crate::Result<u16> {
         debug_assert!(self.pos <= self.buf.len(), "pos advanced past buffer end");
-        if self.buf.len().checked_sub(self.pos).unwrap_or(0) < 2 {
+        if self.buf.len().saturating_sub(self.pos) < 2 {
             return Err(crate::WireError::UnexpectedEof);
         }
         Ok(u16::from_le_bytes([
@@ -289,7 +289,7 @@ impl<'a> BinaryDeserializer<'a> {
 
     pub fn read_f32(&mut self) -> crate::Result<f32> {
         debug_assert!(self.pos <= self.buf.len(), "pos advanced past buffer end");
-        if self.buf.len().checked_sub(self.pos).unwrap_or(0) < 4 {
+        if self.buf.len().saturating_sub(self.pos) < 4 {
             return Err(crate::WireError::UnexpectedEof);
         }
         let mut buf = [0u8; 4];
@@ -300,7 +300,7 @@ impl<'a> BinaryDeserializer<'a> {
 
     pub fn read_f64(&mut self) -> crate::Result<f64> {
         debug_assert!(self.pos <= self.buf.len(), "pos advanced past buffer end");
-        if self.buf.len().checked_sub(self.pos).unwrap_or(0) < 8 {
+        if self.buf.len().saturating_sub(self.pos) < 8 {
             return Err(crate::WireError::UnexpectedEof);
         }
         let mut buf = [0u8; 8];
@@ -312,7 +312,7 @@ impl<'a> BinaryDeserializer<'a> {
     pub fn read_string(&mut self) -> crate::Result<String> {
         let len = self.read_u64()? as usize;
         debug_assert!(self.pos <= self.buf.len(), "pos advanced past buffer end");
-        if self.buf.len().checked_sub(self.pos).unwrap_or(0) < len {
+        if self.buf.len().saturating_sub(self.pos) < len {
             return Err(crate::WireError::UnexpectedEof);
         }
         let bytes = &self.buf[self.pos..self.pos + len];
@@ -331,7 +331,7 @@ impl<'a> BinaryDeserializer<'a> {
     pub fn skip_string(&mut self) -> crate::Result<()> {
         let len = self.read_u64()? as usize;
         debug_assert!(self.pos <= self.buf.len(), "pos advanced past buffer end");
-        if self.buf.len().checked_sub(self.pos).unwrap_or(0) < len {
+        if self.buf.len().saturating_sub(self.pos) < len {
             return Err(crate::WireError::UnexpectedEof);
         }
         self.pos += len;
@@ -364,7 +364,7 @@ impl<'a> BinaryDeserializer<'a> {
     pub fn read_data_ptr(&mut self) -> crate::Result<Vec<u8>> {
         let len = self.read_u64()? as usize;
         debug_assert!(self.pos <= self.buf.len(), "pos advanced past buffer end");
-        if self.buf.len().checked_sub(self.pos).unwrap_or(0) < len {
+        if self.buf.len().saturating_sub(self.pos) < len {
             return Err(crate::WireError::UnexpectedEof);
         }
         let bytes = self.buf[self.pos..self.pos + len].to_vec();

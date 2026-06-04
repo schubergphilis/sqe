@@ -696,8 +696,7 @@ mod tests {
     fn classifier_rejects_deep_expression_chain() {
         // 2000 OR-terms is far above the depth cap (256) and far below the
         // ~16k stack-overflow threshold, so the guard rejects it cleanly.
-        let chain = std::iter::repeat("a")
-            .take(2000)
+        let chain = std::iter::repeat_n("a", 2000)
             .collect::<Vec<_>>()
             .join(" OR ");
         let sql = format!("SELECT {chain} FROM t");
