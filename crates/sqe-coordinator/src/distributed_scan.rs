@@ -409,14 +409,18 @@ impl ExecutionPlan for DistributedScanExec {
                                 inner,
                                 task.fragment_id.clone(),
                             ));
-                        // Wrap the stream so the callback fires when it completes
+                        // Wrap the stream so the callback fires when it
+                        // completes and the credential-tracker entry is
+                        // released on completion (COORD-02). Wrap whenever
+                        // either a callback or a tracker is present.
                         let wrapped: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
-                            if let Some(cb) = fragment_callback.clone() {
+                            if fragment_callback.is_some() || credential_tracker.is_some() {
                                 Box::pin(CallbackStream::new(
                                     terminated,
                                     task.fragment_id.clone(),
-                                    cb,
+                                    fragment_callback.clone(),
                                     start,
+                                    credential_tracker.clone(),
                                 ))
                             } else {
                                 terminated
@@ -473,10 +477,11 @@ impl ExecutionPlan for DistributedScanExec {
                 }
             }
 
-            // All remote attempts exhausted — clean up credential tracker
-            if let Some(ref tracker) = credential_tracker {
-                tracker.unregister(&task.fragment_id).await;
-            }
+            // COORD-02: all remote attempts exhausted. The credential-tracker
+            // entry is released by the local-fallback stream's CallbackStream
+            // (on completion) or, when there is no fallback, by the explicit
+            // unregister on the error path below. No early unregister here so
+            // the local-fallback stream still tracks its own credentials.
 
             // Try local fallback
             if let Some(ref executor) = local_executor {
@@ -485,7 +490,17 @@ impl ExecutionPlan for DistributedScanExec {
                     failed_workers = ?failed_workers,
                     "All workers failed, falling back to local execution"
                 );
-                let local_stream = executor.execute_local(&task, schema)?;
+                let local_stream = match executor.execute_local(&task, schema) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // Local fallback failed to start: no stream is created,
+                        // so release the tracker entry here (COORD-02).
+                        if let Some(ref tracker) = credential_tracker {
+                            tracker.unregister(&task.fragment_id).await;
+                        }
+                        return Err(e);
+                    }
+                };
                 let inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
                     Box::pin(local_stream);
                 let terminated: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
@@ -494,13 +509,15 @@ impl ExecutionPlan for DistributedScanExec {
                         task.fragment_id.clone(),
                     ));
                 // Wrap the fallback stream so the callback fires on completion
+                // and the credential-tracker entry is released (COORD-02).
                 let wrapped: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
-                    if let Some(cb) = fragment_callback {
+                    if fragment_callback.is_some() || credential_tracker.is_some() {
                         Box::pin(CallbackStream::new(
                             terminated,
                             task.fragment_id.clone(),
-                            cb,
+                            fragment_callback,
                             start,
+                            credential_tracker,
                         ))
                     } else {
                         terminated
@@ -508,7 +525,12 @@ impl ExecutionPlan for DistributedScanExec {
                 return Ok(wrapped);
             }
 
-            // No local fallback available — fire callback with failure and propagate the last error
+            // No local fallback available — release the tracker entry
+            // (COORD-02: no stream is returned on this path), fire callback with
+            // failure, and propagate the last error.
+            if let Some(ref tracker) = credential_tracker {
+                tracker.unregister(&task.fragment_id).await;
+            }
             let err = last_error.unwrap_or_else(|| {
                 DataFusionError::Execution(
                     "All workers failed and no local fallback configured".to_string(),
@@ -665,19 +687,28 @@ impl datafusion::physical_plan::RecordBatchStream for DistributedRecordBatchStre
 struct CallbackStream {
     inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>,
     fragment_id: String,
-    callback: FragmentCallback,
+    callback: Option<FragmentCallback>,
     start: std::time::Instant,
     output_rows: usize,
-    /// Whether the callback has already been fired (ensures exactly-once semantics).
+    /// Whether the teardown (callback + credential unregister) has already
+    /// fired (ensures exactly-once semantics).
     fired: bool,
+    /// COORD-02: credential tracker to unregister this fragment from on
+    /// completion. The success path used to leak an entry per finished fragment
+    /// (register on dispatch, unregister only on the all-attempts-failed path),
+    /// growing the tracker map for the life of the process. Firing the
+    /// unregister here -- on the same exactly-once teardown that fires the
+    /// callback -- covers success, error, and local-fallback completions.
+    credential_tracker: Option<Arc<CredentialRefreshTracker>>,
 }
 
 impl CallbackStream {
     fn new(
         inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>,
         fragment_id: String,
-        callback: FragmentCallback,
+        callback: Option<FragmentCallback>,
         start: std::time::Instant,
+        credential_tracker: Option<Arc<CredentialRefreshTracker>>,
     ) -> Self {
         Self {
             inner,
@@ -686,6 +717,25 @@ impl CallbackStream {
             start,
             output_rows: 0,
             fired: false,
+            credential_tracker,
+        }
+    }
+
+    /// COORD-02: fire-and-forget unregister of this fragment from the
+    /// credential tracker. Called once on stream completion (EOF or error) and
+    /// from `Drop` (cancellation / early stop, e.g. `LIMIT`). `unregister` is
+    /// async; the poll/drop context is sync, so spawn it -- but only when a
+    /// tokio runtime is still alive. A bare `tokio::spawn` during runtime
+    /// teardown panics, and a panic inside `Drop` aborts the process, so guard
+    /// with `Handle::try_current()`.
+    fn unregister_credentials(&self) {
+        if let Some(tracker) = self.credential_tracker.clone() {
+            let fragment_id = self.fragment_id.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    tracker.unregister(&fragment_id).await;
+                });
+            }
         }
     }
 }
@@ -760,7 +810,11 @@ impl Stream for CallbackStream {
                 if !self.fired {
                     self.fired = true;
                     let elapsed_ms = self.start.elapsed().as_millis() as u64;
-                    (self.callback)(&self.fragment_id, true, elapsed_ms, self.output_rows);
+                    if let Some(cb) = &self.callback {
+                        cb(&self.fragment_id, true, elapsed_ms, self.output_rows);
+                    }
+                    // COORD-02: release the credential-tracker entry on success.
+                    self.unregister_credentials();
                 }
                 Poll::Ready(None)
             }
@@ -769,7 +823,11 @@ impl Stream for CallbackStream {
                 if !self.fired {
                     self.fired = true;
                     let elapsed_ms = self.start.elapsed().as_millis() as u64;
-                    (self.callback)(&self.fragment_id, false, elapsed_ms, self.output_rows);
+                    if let Some(cb) = &self.callback {
+                        cb(&self.fragment_id, false, elapsed_ms, self.output_rows);
+                    }
+                    // COORD-02: release the credential-tracker entry on error too.
+                    self.unregister_credentials();
                 }
                 Poll::Ready(Some(Err(e)))
             }
@@ -778,6 +836,25 @@ impl Stream for CallbackStream {
                 Poll::Ready(Some(Ok(batch)))
             }
             Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for CallbackStream {
+    /// COORD-02: when the stream is dropped before reaching EOF or an error --
+    /// `SELECT ... LIMIT n` stops polling once it has `n` rows, and query
+    /// cancellation / client disconnect drops the stream where it sits -- the
+    /// poll-path teardown never runs. Release the credential-tracker entry here
+    /// so cancelled / short-circuited fragments do not leak.
+    ///
+    /// Deliberately tracker-only: the `fragment_callback` marks the fragment
+    /// `Failed` and removes its memory reservation, which would mislabel a
+    /// cleanly-cancelled fragment, so it is NOT fired from `Drop`. The `fired`
+    /// guard gives exactly-once semantics shared with the poll path.
+    fn drop(&mut self) {
+        if !self.fired {
+            self.fired = true;
+            self.unregister_credentials();
         }
     }
 }
@@ -891,6 +968,125 @@ mod tests {
         .with_credential_tracker(tracker);
 
         assert!(exec.credential_tracker.is_some());
+    }
+
+    /// COORD-02 regression: a CallbackStream that completes successfully (EOF)
+    /// must unregister its fragment from the credential tracker. Before the fix
+    /// the success path returned the stream with no unregister, so the tracker
+    /// map grew by one entry per finished fragment for the life of the process.
+    #[tokio::test]
+    async fn coord02_callback_stream_unregisters_on_success() {
+        use futures::StreamExt;
+
+        let tracker = Arc::new(CredentialRefreshTracker::new());
+        let fragment_id = "frag-coord02".to_string();
+        tracker
+            .register(fragment_id.clone(), "http://w1:50052".to_string(), None)
+            .await;
+        assert_eq!(tracker.active_count().await, 1, "fragment registered");
+
+        // Empty inner stream -> immediate EOF -> success teardown.
+        let inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
+            Box::pin(futures::stream::empty());
+        let mut stream = CallbackStream::new(
+            inner,
+            fragment_id.clone(),
+            None, // no fragment callback; tracker teardown must still fire
+            std::time::Instant::now(),
+            Some(Arc::clone(&tracker)),
+        );
+
+        // Drain to EOF; this fires the teardown which spawns the unregister.
+        assert!(stream.next().await.is_none(), "empty stream yields EOF");
+
+        // unregister is spawned async; yield until the tracker is empty.
+        for _ in 0..100 {
+            if tracker.active_count().await == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            tracker.active_count().await,
+            0,
+            "COORD-02: completed fragment must be unregistered from the credential tracker"
+        );
+    }
+
+    /// COORD-02: the same teardown must fire when the stream ends in an error.
+    #[tokio::test]
+    async fn coord02_callback_stream_unregisters_on_error() {
+        use futures::StreamExt;
+
+        let tracker = Arc::new(CredentialRefreshTracker::new());
+        let fragment_id = "frag-coord02-err".to_string();
+        tracker
+            .register(fragment_id.clone(), "http://w1:50052".to_string(), None)
+            .await;
+
+        let inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> = Box::pin(
+            futures::stream::once(async { Err(DataFusionError::Execution("boom".into())) }),
+        );
+        let mut stream = CallbackStream::new(
+            inner,
+            fragment_id.clone(),
+            None,
+            std::time::Instant::now(),
+            Some(Arc::clone(&tracker)),
+        );
+
+        assert!(stream.next().await.unwrap().is_err(), "error surfaced");
+
+        for _ in 0..100 {
+            if tracker.active_count().await == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            tracker.active_count().await,
+            0,
+            "COORD-02: errored fragment must also be unregistered"
+        );
+    }
+
+    /// COORD-02: dropping the stream BEFORE it completes (the `LIMIT` /
+    /// cancellation case) must still unregister. This is the headline leak
+    /// vector -- LIMIT queries stop polling mid-stream and never reach EOF.
+    /// The poll-path teardown never fires here; only the `Drop` impl does.
+    #[tokio::test]
+    async fn coord02_callback_stream_unregisters_on_early_drop() {
+        let tracker = Arc::new(CredentialRefreshTracker::new());
+        let fragment_id = "frag-coord02-drop".to_string();
+        tracker
+            .register(fragment_id.clone(), "http://w1:50052".to_string(), None)
+            .await;
+        assert_eq!(tracker.active_count().await, 1);
+
+        // A non-empty, never-fully-drained stream: build it, never poll to EOF,
+        // then drop it (mimics LimitExec / cancellation dropping the child).
+        let inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
+            Box::pin(futures::stream::pending());
+        let stream = CallbackStream::new(
+            inner,
+            fragment_id.clone(),
+            None,
+            std::time::Instant::now(),
+            Some(Arc::clone(&tracker)),
+        );
+        drop(stream);
+
+        for _ in 0..100 {
+            if tracker.active_count().await == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            tracker.active_count().await,
+            0,
+            "COORD-02: a fragment dropped before EOF (LIMIT / cancel) must be unregistered"
+        );
     }
 
     #[test]
