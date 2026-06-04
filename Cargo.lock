@@ -6957,6 +6957,7 @@ dependencies = [
  "axum",
  "bytes",
  "chrono",
+ "governor",
  "moka",
  "reqwest 0.12.28",
  "sqe-auth",
