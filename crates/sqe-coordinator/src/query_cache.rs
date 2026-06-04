@@ -22,8 +22,11 @@ pub struct CachedResult {
 
 pub struct ResultCache {
     cache: Cache<String, Arc<CachedResult>>,
-    /// Secondary index: table_name → set of cache keys that touch this table
-    table_index: DashMap<String, HashSet<String>>,
+    /// Secondary index: canonical table name → set of cache keys that touch
+    /// this table. Shared with the moka eviction listener (COORD-03) so that
+    /// when an entry leaves `cache` (TTL, size, or capacity eviction) its key
+    /// is pruned from this index instead of accumulating forever.
+    table_index: Arc<DashMap<String, HashSet<String>>>,
     max_entry_bytes: usize,
     metrics: Option<Arc<MetricsRegistry>>,
 }
@@ -31,6 +34,15 @@ pub struct ResultCache {
 impl ResultCache {
     pub fn new(config: &QueryCacheConfig, metrics: Option<Arc<MetricsRegistry>>) -> Self {
         let max_bytes = config.max_memory_mb * 1024 * 1024;
+
+        // COORD-03: the secondary `table_index` is not bounded by moka's
+        // byte/TTL limits, so without an eviction listener it grows without
+        // bound for a table queried with many distinct SQL strings but rarely
+        // written. The evicted entry carries its own `tables_touched`, so the
+        // listener prunes exactly the affected index sets — no full-index scan.
+        let table_index: Arc<DashMap<String, HashSet<String>>> = Arc::new(DashMap::new());
+        let index_for_listener = Arc::clone(&table_index);
+
         let cache = Cache::builder()
             .max_capacity(max_bytes)
             .weigher(|_key: &String, val: &Arc<CachedResult>| -> u32 {
@@ -38,13 +50,49 @@ impl ResultCache {
                 val.size_bytes.min(u32::MAX as usize) as u32
             })
             .time_to_live(std::time::Duration::from_secs(config.ttl_secs))
+            .eviction_listener(move |key: Arc<String>, val: Arc<CachedResult>, _cause| {
+                // Prune the evicted cache key from each table it touched.
+                for table in &val.tables_touched {
+                    let canon = Self::canonical_table_key(table);
+                    if let Some(mut entry) = index_for_listener.get_mut(&canon) {
+                        entry.value_mut().remove(key.as_str());
+                    }
+                    // Drop now-empty index buckets to keep the map small.
+                    index_for_listener.remove_if(&canon, |_, set| set.is_empty());
+                }
+            })
             .build();
         Self {
             cache,
-            table_index: DashMap::new(),
+            table_index,
             max_entry_bytes: (config.max_entry_mb as usize) * 1024 * 1024,
             metrics,
         }
+    }
+
+    /// COORD-01: canonicalize a table name to a single key used by both the
+    /// `table_index` (store side) and `invalidate` (write side).
+    ///
+    /// The store side gets fully-qualified names from the logical plan via
+    /// lineage extraction (`iceberg.public.sales`, `datafusion.public.sales`),
+    /// while the invalidate side gets whatever the user typed in the DML
+    /// statement (`sales`, `myschema.sales`). Those strings never matched, so
+    /// invalidation was a silent no-op and SELECTs returned pre-write data
+    /// until TTL expiry.
+    ///
+    /// The only canonical form both sides can always reach is the bare table
+    /// name: the invalidate side may have only `orders` (unqualified DML), so
+    /// `schema.table` normalization fails on that common case. We take the last
+    /// dotted segment, lowercased. Over-invalidation across same-named tables in
+    /// different schemas costs a re-query (safe); under-invalidation serves
+    /// stale data (the bug we are fixing).
+    fn canonical_table_key(table_name: &str) -> String {
+        table_name
+            .rsplit('.')
+            .next()
+            .unwrap_or(table_name)
+            .trim()
+            .to_lowercase()
     }
 
     /// Compute a user-scoped cache key.
@@ -112,10 +160,11 @@ impl ResultCache {
 
         self.cache.insert(key.clone(), entry);
 
-        // Update secondary index
+        // Update secondary index. COORD-01: key the index by the canonical
+        // (bare, lowercased) table name so the write-path invalidate() matches.
         for table in &tables_touched {
             self.table_index
-                .entry(table.clone())
+                .entry(Self::canonical_table_key(table))
                 .or_default()
                 .insert(key.clone());
         }
@@ -128,6 +177,8 @@ impl ResultCache {
 
     /// Invalidate all cached results that touch the given table.
     pub fn invalidate(&self, table_name: &str) {
+        // COORD-01: canonicalize to match the key the store side indexed under.
+        let table_name = &Self::canonical_table_key(table_name);
         if let Some((_, keys)) = self.table_index.remove(table_name) {
             let count = keys.len();
             for key in &keys {
@@ -136,12 +187,14 @@ impl ResultCache {
             if count > 0 {
                 info!(table = table_name, evicted = count, "Cache invalidated for table write");
             }
-            // Also clean up other table_index entries that reference evicted keys
-            for key in &keys {
-                for mut entry in self.table_index.iter_mut() {
-                    entry.value_mut().remove(key);
-                }
-            }
+            // COORD-03: clean other index buckets that referenced the evicted
+            // keys in a SINGLE pass over the index (was O(keys x index_size):
+            // a nested scan of the whole index once per evicted key). Drop
+            // buckets that become empty so the map does not retain dead tables.
+            self.table_index.retain(|_table, set| {
+                set.retain(|k| !keys.contains(k));
+                !set.is_empty()
+            });
             if let Some(ref m) = self.metrics {
                 m.cache_invalidations.inc_by(count as f64);
                 m.cache_entries.set(self.cache.entry_count() as f64);
@@ -380,6 +433,69 @@ mod tests {
         // (unless they contain non-deterministic functions)
         assert!(!ResultCache::should_bypass("SELECT * FROM information_schema.tables"));
         assert!(!ResultCache::should_bypass("SELECT * FROM system.runtime.nodes"));
+    }
+
+    #[test]
+    fn coord01_qualified_store_bare_invalidate_matches() {
+        // COORD-01 regression: the store side receives the FULLY-QUALIFIED
+        // table name from lineage extraction (as `query_handler` does via
+        // `sqe_lineage::extract::extract_table_names`), while the write path
+        // invalidates with the BARE name from the raw DML statement (as
+        // `ins.table.to_string()` yields). Before the fix these strings never
+        // matched, the removal was a no-op, and the next SELECT returned
+        // pre-write data. This test fails against the unfixed cache.
+        let cache = ResultCache::new(&test_config(), None);
+
+        // Store as the read path does: qualified `catalog.schema.table`.
+        cache.store(
+            "alice",
+            "SELECT * FROM sales",
+            Uuid::now_v7(),
+            vec![make_batch(1)],
+            vec!["iceberg.public.sales".into()],
+        );
+        assert!(
+            cache.lookup("alice", "SELECT * FROM sales").is_some(),
+            "result should be cached before the write"
+        );
+
+        // Invalidate as the write path does: bare `sales`.
+        cache.invalidate("sales");
+
+        assert!(
+            cache.lookup("alice", "SELECT * FROM sales").is_none(),
+            "COORD-01: a write to `sales` must invalidate the prior SELECT \
+             result; serving pre-write data is a correctness bug"
+        );
+    }
+
+    #[test]
+    fn coord01_schema_qualified_invalidate_also_matches() {
+        // The write path can also yield `schema.table` (when the user wrote
+        // `INSERT INTO myschema.sales`). Canonicalization must still match the
+        // qualified store-side key.
+        let cache = ResultCache::new(&test_config(), None);
+        cache.store(
+            "alice",
+            "SELECT * FROM sales",
+            Uuid::now_v7(),
+            vec![make_batch(1)],
+            vec!["iceberg.myschema.sales".into()],
+        );
+        assert!(cache.lookup("alice", "SELECT * FROM sales").is_some());
+        cache.invalidate("myschema.sales");
+        assert!(
+            cache.lookup("alice", "SELECT * FROM sales").is_none(),
+            "schema-qualified invalidate must match the canonical key"
+        );
+    }
+
+    #[test]
+    fn coord01_canonical_key_is_case_and_prefix_insensitive() {
+        assert_eq!(ResultCache::canonical_table_key("iceberg.public.Sales"), "sales");
+        assert_eq!(ResultCache::canonical_table_key("SALES"), "sales");
+        assert_eq!(ResultCache::canonical_table_key("ns.orders"), "orders");
+        assert_eq!(ResultCache::canonical_table_key("orders"), "orders");
     }
 
     #[test]
