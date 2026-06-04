@@ -135,7 +135,17 @@ fn build_job(namespace: &str, kind: &str, sql: &str) -> Job {
         name: format!("{kind}:{hash}"),
         facets: JobFacets {
             sql: Some(SqlFacet {
-                query: sqe_metrics::audit::redact_pii(sql),
+                // SQL-07: lineage sinks (JSONL/HTTP/Marquez) are a different
+                // trust boundary than the SQL client, and `redact_pii` is
+                // pattern-only (misses free-form literals like
+                // `WHERE patient_id = 'P-998877'`). Strip ALL literals to
+                // placeholders so query SHAPE is recorded but no literal value
+                // reaches the sink; the exact text correlates via the job-name
+                // hash above. `redact_pii` first keeps secret-keyword literals
+                // out even from the placeholder pass.
+                query: sqe_metrics::audit::strip_sql_literals(
+                    &sqe_metrics::audit::redact_pii(sql),
+                ),
                 dialect: "sqe".into(),
             }),
         },
