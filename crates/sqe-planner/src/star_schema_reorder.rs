@@ -1027,7 +1027,14 @@ mod tests {
             vec!["c", "d"],
         );
         let fd1 = make_inner_hash_join(fact, dim1, "fact_d1", "d1_id");
-        let control = make_inner_hash_join(fd1, dim2, "fact_d1", "d2_id");
+        // Chain dim2 onto dim1 via distinct names (d1_id = d2_id), NOT a pure
+        // star off `fact`. A pure star (both joins keying off fact) can't be
+        // linearly reordered: the greedy joins the two smallest (dim1, dim2)
+        // first, but they share no key, so the rebuild bails -> control would
+        // not reorder and the assertion would wrongly fail. With the chain,
+        // dim1 ⋈ dim2 connects on d1_id=d2_id and ⋈ fact on d1_id=fact_d1, all
+        // distinct names, so the reorder fires both pre- and post-fix.
+        let control = make_inner_hash_join(fd1, dim2, "d1_id", "d2_id");
 
         let control_before = plan_str(&control);
         let control_out = rule.optimize(Arc::clone(&control), &config).unwrap();
