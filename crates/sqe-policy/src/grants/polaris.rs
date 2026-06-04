@@ -198,8 +198,11 @@ impl PolarisGrantBackend {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
+            // Log the raw Polaris body server-side only; it can name internal
+            // roles/catalogs. Return a generic message to the client (AUTH-06).
+            warn!(http_status = %status, polaris_body = %text, "Polaris token fetch failed");
             return Err(sqe_core::SqeError::Auth(format!(
-                "Polaris token fetch failed (HTTP {status}): {text}"
+                "Polaris token fetch failed (HTTP {status})"
             )));
         }
 
@@ -331,8 +334,9 @@ impl GrantBackend for PolarisGrantBackend {
         if !resp.status().is_success() && resp.status().as_u16() != 409 {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
+            warn!(http_status = %status, catalog_role = %cr_name, polaris_body = %text, "Failed to create catalog role");
             return Err(sqe_core::SqeError::Execution(format!(
-                "Failed to create catalog role '{cr_name}' (HTTP {status}): {text}"
+                "Failed to create catalog role '{cr_name}' (HTTP {status})"
             )));
         }
 
@@ -365,8 +369,9 @@ impl GrantBackend for PolarisGrantBackend {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
+            warn!(http_status = %status, catalog_role = %cr_name, polaris_body = %text, "Failed to grant privilege to catalog role");
             return Err(sqe_core::SqeError::Execution(format!(
-                "Failed to grant privilege to catalog role '{cr_name}' (HTTP {status}): {text}"
+                "Failed to grant privilege to catalog role '{cr_name}' (HTTP {status})"
             )));
         }
 
@@ -395,8 +400,9 @@ impl GrantBackend for PolarisGrantBackend {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
+            warn!(http_status = %status, catalog_role = %cr_name, principal_role = %principal_role, polaris_body = %text, "Failed to assign catalog role to principal role");
             return Err(sqe_core::SqeError::Execution(format!(
-                "Failed to assign catalog role '{cr_name}' to principal role '{principal_role}' (HTTP {status}): {text}"
+                "Failed to assign catalog role '{cr_name}' to principal role '{principal_role}' (HTTP {status})"
             )));
         }
 
@@ -462,8 +468,9 @@ impl GrantBackend for PolarisGrantBackend {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
+            warn!(http_status = %status, catalog_role = %cr_name, polaris_body = %text, "Failed to revoke privilege from catalog role");
             return Err(sqe_core::SqeError::Execution(format!(
-                "Failed to revoke privilege from catalog role '{cr_name}' (HTTP {status}): {text}"
+                "Failed to revoke privilege from catalog role '{cr_name}' (HTTP {status})"
             )));
         }
 
@@ -518,8 +525,9 @@ impl GrantBackend for PolarisGrantBackend {
                 if !resp.status().is_success() {
                     let status = resp.status();
                     let text = resp.text().await.unwrap_or_default();
+                    warn!(http_status = %status, polaris_body = %text, "Failed to list catalog roles");
                     return Err(sqe_core::SqeError::Execution(format!(
-                        "Failed to list catalog roles (HTTP {status}): {text}"
+                        "Failed to list catalog roles (HTTP {status})"
                     )));
                 }
 
@@ -648,8 +656,9 @@ impl GrantBackend for PolarisGrantBackend {
                 ));
             }
             let text = resp.text().await.unwrap_or_default();
+            warn!(http_status = %status, user = %user, polaris_body = %text, "Failed to list principal roles");
             return Err(sqe_core::SqeError::Execution(format!(
-                "Failed to list principal roles for '{user}' (HTTP {status}): {text}"
+                "Failed to list principal roles for '{user}' (HTTP {status})"
             )));
         }
 
