@@ -17,21 +17,14 @@ path = "src/main.rs"
 # build with no AWS SDK weight.
 default = ["aws"]
 aws = ["sqe-catalog/glue", "sqe-catalog/s3tables"]
-# TODO(DEP-07): make `delta` opt-in (it pulls a second reqwest 0.13 + a second
-# arrow/parquet tree via deltalake-core/buoyant_kernel). Cannot be done in this
-# file alone: `delta` is currently in the always-on `sqe-catalog` features on
-# line 23, and `embedded.rs:~219` registers `read_delta` UNCONDITIONALLY while
-# `sqe-catalog::read_delta` is `#[cfg(feature = "delta")]`. Dropping `delta`
-# here without gating that call breaks the default build. Paired change
-# (not owned by this fix bucket):
-#   - embedded.rs ~219-224: wrap the read_delta register_udtf in
-#     `#[cfg(feature = "delta")]`
-#   - here: add `delta = ["sqe-catalog/delta"]`, remove "delta" from line 23,
-#     keep it out of `default`.
+# DEP-07: `delta` is opt-in (off by default). deltalake-core pulls a second
+# reqwest 0.13 + a second arrow/parquet tree via buoyant_kernel, so a default
+# `cargo install` stays slim. Enable the read_delta() TVF with `--features delta`.
+delta = ["sqe-catalog/delta"]
 
 [dependencies]
 sqe-core = { path = "../sqe-core" }
-sqe-catalog = { path = "../sqe-catalog", default-features = false, features = ["rest", "sql-sqlite", "hadoop", "delta"] }
+sqe-catalog = { path = "../sqe-catalog", default-features = false, features = ["rest", "sql-sqlite", "hadoop"] }
 sqe-sql = { path = "../sqe-sql" }
 sqe-trino-functions = { path = "../sqe-trino-functions" }
 sqe-trino-compat = { path = "../sqe-trino-compat" }
