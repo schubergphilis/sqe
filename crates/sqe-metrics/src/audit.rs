@@ -21,6 +21,13 @@ use tracing::info;
 /// without it, `CREATE SECRET ... TOKEN '<jwt>'` lands verbatim in the audit
 /// JSONL, OTel/Loki sinks, and any debug-level trace, exfiltrating every
 /// long-lived bearer ever created in the cluster.
+///
+/// IMPORTANT (SQL-07): `redact_pii` is **best-effort pattern matching**, not a
+/// guarantee. It catches email / SSN / phone / card / secret-keyword *shapes*;
+/// it does NOT catch free-form sensitive literals such as
+/// `WHERE patient_id = 'P-998877'` or `WHERE diagnosis = 'HIV positive'`. For
+/// sinks at a different trust boundary (lineage), prefer [`strip_sql_literals`]
+/// (which removes ALL literals) plus the SQL hash.
 pub fn redact_pii(sql: &str) -> String {
     use std::sync::OnceLock;
 
@@ -62,6 +69,95 @@ pub fn redact_pii(sql: &str) -> String {
     result = card_re.replace_all(&result, "'[CARD]'").to_string();
     result = secret_re.replace_all(&result, "$1$2'[REDACTED]'").to_string();
     result
+}
+
+/// SQL-07: replace every string and numeric literal in `sql` with a `?`
+/// placeholder, leaving structure (keywords, identifiers, operators) intact.
+///
+/// Unlike [`redact_pii`] (pattern-only, best-effort), this removes ALL literal
+/// values, so free-form sensitive data in predicates
+/// (`WHERE patient_id = 'P-998877'`, `WHERE diagnosis = 'HIV positive'`,
+/// `WHERE balance > 50000`) cannot reach a sink. Use it for sinks that sit at
+/// a different trust boundary than the SQL client (lineage). The query shape is
+/// preserved for debugging; correlate exact text via the SQL hash if needed.
+///
+/// Single-quoted strings (with `''` escapes) become `'?'`; standalone numeric
+/// literals become `?`. A best-effort lexer, not a full SQL parser, but it is
+/// total (never panics) and fail-closed (an unterminated quote consumes to EOL).
+pub fn strip_sql_literals(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\'' {
+            // String literal: consume until the closing quote, handling the
+            // doubled-quote ('') escape. Emit a single placeholder.
+            out.push_str("'?'");
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    // Doubled quote -> escaped quote, stay in the string.
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1; // closing quote
+                    break;
+                }
+                i += 1;
+            }
+        } else if c.is_ascii_digit()
+            && (i == 0 || !is_ident_byte(bytes[i - 1]))
+        {
+            // Numeric literal not part of an identifier (e.g. not `col1`).
+            // Consume digits, decimal point, and exponent.
+            out.push('?');
+            i += 1;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_digit()
+                    || bytes[i] == b'.'
+                    || bytes[i] == b'e'
+                    || bytes[i] == b'E'
+                    || bytes[i] == b'+'
+                    || bytes[i] == b'-')
+            {
+                // Stop a trailing +/- that is an operator, not an exponent sign.
+                if (bytes[i] == b'+' || bytes[i] == b'-')
+                    && !(i > 0 && (bytes[i - 1] == b'e' || bytes[i - 1] == b'E'))
+                {
+                    break;
+                }
+                i += 1;
+            }
+        } else {
+            // Push this UTF-8 character whole (i is at a char boundary here
+            // because string/number branches only advance over ASCII bytes).
+            let ch_len = utf8_char_len(c);
+            let end = (i + ch_len).min(bytes.len());
+            out.push_str(&sql[i..end]);
+            i = end;
+        }
+    }
+    out
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn utf8_char_len(first: u8) -> usize {
+    if first < 0x80 {
+        1
+    } else if first >> 5 == 0b110 {
+        2
+    } else if first >> 4 == 0b1110 {
+        3
+    } else if first >> 3 == 0b11110 {
+        4
+    } else {
+        1
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -490,6 +586,56 @@ mod tests {
             "secret literal leaked to audit log: {content}"
         );
         assert!(content.contains("[REDACTED]"));
+    }
+
+    // --- SQL-07: literal stripping for lineage sinks ---
+
+    #[test]
+    fn strip_literals_removes_freeform_pii() {
+        // The exact case redact_pii misses: a non-pattern sensitive literal.
+        let sql = "SELECT * FROM patients WHERE patient_id = 'P-998877'";
+        let stripped = strip_sql_literals(sql);
+        assert!(!stripped.contains("P-998877"), "freeform literal leaked: {stripped}");
+        assert!(stripped.contains("'?'"), "string literal must become a placeholder");
+        // Structure (table + column) is preserved for debugging.
+        assert!(stripped.contains("patients"));
+        assert!(stripped.contains("patient_id"));
+    }
+
+    #[test]
+    fn strip_literals_removes_numbers_but_keeps_identifiers() {
+        let sql = "SELECT col1, col2 FROM t WHERE balance > 50000 AND year = 2026";
+        let stripped = strip_sql_literals(sql);
+        assert!(!stripped.contains("50000"), "numeric literal leaked: {stripped}");
+        assert!(!stripped.contains("2026"), "numeric literal leaked: {stripped}");
+        // `col1`/`col2` are identifiers with trailing digits, not literals.
+        assert!(stripped.contains("col1"), "identifier must survive: {stripped}");
+        assert!(stripped.contains("col2"), "identifier must survive: {stripped}");
+    }
+
+    #[test]
+    fn strip_literals_handles_escaped_quotes() {
+        let sql = "SELECT * FROM t WHERE name = 'O''Brien'";
+        let stripped = strip_sql_literals(sql);
+        assert!(!stripped.contains("Brien"), "escaped-quote literal leaked: {stripped}");
+        assert!(stripped.contains("'?'"));
+    }
+
+    #[test]
+    fn strip_literals_total_on_unterminated_quote() {
+        // Must not panic; consumes to end of input.
+        let sql = "SELECT * FROM t WHERE x = 'oops";
+        let stripped = strip_sql_literals(sql);
+        assert!(!stripped.contains("oops"));
+    }
+
+    #[test]
+    fn strip_literals_preserves_non_ascii_structure() {
+        // Non-ASCII identifier/comment bytes must pass through without panic.
+        let sql = "SELECT * FROM t -- café WHERE x = 'sécret'";
+        let stripped = strip_sql_literals(sql);
+        assert!(!stripped.contains("sécret"));
+        assert!(stripped.contains("café"));
     }
 
     #[test]
