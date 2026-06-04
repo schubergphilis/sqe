@@ -122,13 +122,33 @@ async fn async_main() -> anyhow::Result<()> {
     if !config.rate_limit.enabled {
         tracing::warn!("WARNING: Rate limiting is DISABLED -- no protection against query flooding. Set [rate_limit] enabled = true for production.");
     }
-    if config.auth.should_skip_tls_verify() {
-        tracing::warn!("WARNING: TLS certificate verification is DISABLED for auth endpoints -- vulnerable to MITM. Set auth.tls_skip_verify = false (or auth.ssl_verification = true) for production.");
+    if config.auth.should_skip_tls_verify()
+        || config
+            .auth
+            .external
+            .as_ref()
+            .is_some_and(|e| e.accept_invalid_certs)
+    {
+        // AUTH-04: the external (interactive) auth path has its own
+        // accept_invalid_certs flag that was not covered by this warning.
+        tracing::warn!("WARNING: TLS certificate verification is DISABLED for auth endpoints (auth.tls_skip_verify / auth.ssl_verification / auth.external.accept_invalid_certs) -- vulnerable to MITM. Disable these for production.");
     }
     if !config.coordinator.worker_urls.is_empty()
         && config.coordinator.allow_unauthenticated_workers
     {
         tracing::warn!("WARNING: coordinator.allow_unauthenticated_workers = true -- any client reachable on the cluster network can register as a worker and receive user bearer tokens. Set worker_secret for production.");
+    }
+    // AUTH-01: policy enforcement is hardcoded to passthrough below. If the
+    // operator configured a real engine (OPA/Cedar/InMemory) it is SILENTLY
+    // IGNORED -- every row filter and column mask is unenforced. Fail loud so
+    // an operator is never lulled into believing SQE-side policy is active.
+    if config.policy.engine != sqe_core::config::PolicyEngine::Passthrough {
+        tracing::error!(
+            configured_engine = ?config.policy.engine,
+            "CRITICAL: policy.engine is set but policy enforcement is NOT wired -- \
+             the engine runs PASSTHROUGH and NO row filters or column masks are \
+             applied. Do not rely on SQE-side policy until this is implemented."
+        );
     }
 
     // Initialize tracing + OTel (traces, metrics, logs via OTLP when configured)
@@ -172,6 +192,10 @@ async fn async_main() -> anyhow::Result<()> {
     ));
 
     // Initialize policy (passthrough)
+    // TODO(AUTH-01): wire PolicyPlanRewriter from config.policy.engine (Opa ->
+    // OpaStore, InMemory -> InMemoryPolicyStore) instead of hardcoding
+    // PassthroughEnforcer. Until then a non-passthrough engine is ignored and
+    // the startup error! above fires.
     let policy_enforcer: Arc<dyn sqe_policy::PolicyEnforcer> =
         Arc::new(sqe_policy::PassthroughEnforcer);
 

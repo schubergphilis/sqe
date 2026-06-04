@@ -52,6 +52,22 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // QUACK-07: the worker Flight service below serves plaintext (no TLS). The
+    // do_get ticket carries the user's live S3 access key/secret/session token,
+    // refresh_credentials carries fresh STS creds, and the shared worker_secret
+    // travels as a plaintext gRPC metadata header. On a plaintext channel an
+    // on-path observer harvests all of these. The worker has no TLS config path
+    // at all today (the coordinator Flight path does).
+    // TODO(QUACK-07): add a worker TLS config block and wrap the tonic server
+    // with .tls_config(rustls), refusing plaintext unless an explicit insecure
+    // flag is set.
+    tracing::warn!(
+        "WARNING: the worker Flight service is PLAINTEXT (no TLS) and binds \
+         0.0.0.0 -- user S3 credentials and the worker secret travel in \
+         cleartext. Do not run workers on untrusted networks until QUACK-07 \
+         (worker TLS) lands."
+    );
+
     // Start heartbeat to coordinator if a coordinator URL is configured.
     if !config.worker.coordinator_url.is_empty() {
         let worker_url = format!("http://0.0.0.0:{port}");

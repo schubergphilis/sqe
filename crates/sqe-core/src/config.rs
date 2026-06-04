@@ -546,7 +546,7 @@ impl TlsConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct WorkerConfig {
     #[serde(default)]
     pub coordinator_url: String,
@@ -597,6 +597,32 @@ impl Default for WorkerConfig {
     }
 }
 
+// Hand-written Debug so `worker_secret` (a live shared credential) is never
+// printed by `{:?}`, an anyhow chain, or a panic message (CORE-01). A bool
+// presence sentinel is enough for operators to tell whether it is set.
+impl std::fmt::Debug for WorkerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerConfig")
+            .field("coordinator_url", &self.coordinator_url)
+            .field("flight_port", &self.flight_port)
+            .field("heartbeat_interval_secs", &self.heartbeat_interval_secs)
+            .field("memory_limit", &self.memory_limit)
+            .field("spill_to_disk", &self.spill_to_disk)
+            .field("spill_dir", &self.spill_dir)
+            .field("scan_timeout_secs", &self.scan_timeout_secs)
+            .field(
+                "worker_secret",
+                if self.worker_secret.is_empty() {
+                    &"<empty>"
+                } else {
+                    &"[REDACTED]"
+                },
+            )
+            .field("allow_unauthenticated", &self.allow_unauthenticated)
+            .finish()
+    }
+}
+
 /// Parse a human-readable memory size string (e.g. "1GB", "512MB", "1024") into bytes.
 ///
 /// Supported suffixes (case-insensitive): `B`, `KB`/`K`, `MB`/`M`, `GB`/`G`, `TB`/`T`.
@@ -632,14 +658,26 @@ pub fn parse_memory_limit(s: &str) -> crate::error::Result<usize> {
         }
     };
 
-    Ok((num * multiplier) as usize)
+    // Bound the product before the `as usize` cast. A bare `as usize` on an
+    // oversized value (e.g. "99999999TB") saturates to `usize::MAX` rather than
+    // erroring, and that value feeds task sizing and pool budgets downstream.
+    // Reject non-finite, negative, or out-of-range results instead (CORE-02).
+    // The f64 parse is kept so fractional sizes ("1.5GB") still work.
+    let product = num * multiplier;
+    if !product.is_finite() || product < 0.0 || product > usize::MAX as f64 {
+        return Err(crate::error::SqeError::Config(format!(
+            "Memory limit '{s}' is out of range"
+        )));
+    }
+
+    Ok(product as usize)
 }
 
 /// Configuration for a single auth provider in the `[[auth.providers]]` array.
 ///
 /// Each variant maps to a concrete `AuthProvider` implementation in `sqe-auth`.
 /// The `type` field in TOML selects the variant via the serde tag.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuthProviderConfig {
     /// OIDC Resource Owner Password Credentials (ROPC) grant.
@@ -713,6 +751,13 @@ pub enum AuthProviderConfig {
         /// sharing the IdP will be accepted.
         #[serde(default)]
         allow_unbounded_audience: bool,
+        /// Explicit opt-in to allow a non-`https` `jwks_url`. Default
+        /// `false`: an `http://` JWKS endpoint then errors at startup. The
+        /// JWKS is the highest-trust input in the auth path; over plaintext
+        /// an on-path attacker can substitute the signing keys and forge
+        /// identities. Set `true` only for local/dev setups.
+        #[serde(default)]
+        allow_insecure_jwks: bool,
     },
     /// AWS IAM authentication via STS GetCallerIdentity.
     AwsIam {
@@ -761,6 +806,65 @@ pub enum AuthProviderConfig {
         #[serde(default)]
         roles: Vec<String>,
     },
+}
+
+// Hand-written Debug so the OAuth `client_secret`s on the three secret-bearing
+// variants are never printed by `{:?}`, an anyhow chain, or a panic message
+// (CORE-01). Non-secret variants fall through to a variant-name-only summary
+// (the catch-all also guards against a future variant leaking a secret without
+// a matching arm). Note `AuthConfig`'s own Debug already summarizes the
+// provider list as a count; this protects a stray `{:?}` of a single provider.
+impl std::fmt::Debug for AuthProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthProviderConfig::OidcPassword {
+                token_url,
+                client_id,
+                roles_claim,
+                ..
+            } => f
+                .debug_struct("OidcPassword")
+                .field("token_url", token_url)
+                .field("client_id", client_id)
+                .field("client_secret", &"[REDACTED]")
+                .field("roles_claim", roles_claim)
+                .finish(),
+            AuthProviderConfig::ClientCredentials {
+                token_endpoint,
+                client_id,
+                ..
+            } => f
+                .debug_struct("ClientCredentials")
+                .field("token_endpoint", token_endpoint)
+                .field("client_id", client_id)
+                .field("client_secret", &"[REDACTED]")
+                .finish(),
+            AuthProviderConfig::TokenExchange {
+                token_url,
+                client_id,
+                ..
+            } => f
+                .debug_struct("TokenExchange")
+                .field("token_url", token_url)
+                .field("client_id", client_id)
+                .field("client_secret", &"[REDACTED]")
+                .field("..", &"<other fields elided>")
+                .finish(),
+            other => {
+                let name = match other {
+                    AuthProviderConfig::BearerToken { .. } => "BearerToken",
+                    AuthProviderConfig::AwsIam { .. } => "AwsIam",
+                    AuthProviderConfig::ApiKey { .. } => "ApiKey",
+                    AuthProviderConfig::Mtls { .. } => "Mtls",
+                    AuthProviderConfig::Anonymous { .. } => "Anonymous",
+                    AuthProviderConfig::BearerPassthrough { .. } => "BearerPassthrough",
+                    // The three secret-bearing variants are handled above.
+                    _ => "AuthProviderConfig",
+                };
+                f.debug_struct(name).finish_non_exhaustive()
+            }
+        }
+    }
 }
 
 fn default_bearer_passthrough_user() -> String {
@@ -1595,10 +1699,11 @@ pub struct MetricsConfig {
     #[serde(default)]
     pub openlineage: OpenLineageConfig,
     /// Serve the read-only web UI (HTML dashboard + /api/v1/queries* endpoints)
-    /// on the internal health port (metrics_port + 1). Default on; the UI is
-    /// already behind that internal port, like /api/v1/status. Turn off to keep
-    /// only /healthz, /readyz, /api/v1/status. The UI has no auth.
-    #[serde(default = "default_true")]
+    /// on the internal health port (metrics_port + 1). Default OFF (WEB-01):
+    /// the server binds `0.0.0.0` and the UI has NO authentication, so it must
+    /// not be enabled implicitly. When `true`, the coordinator emits a startup
+    /// WARN. Leave off to keep only /healthz, /readyz, /api/v1/status.
+    #[serde(default)]
     pub web_ui: bool,
 }
 
@@ -1614,7 +1719,7 @@ impl Default for MetricsConfig {
             audit_log_path: String::new(),
             trace_sample_rate: default_trace_sample_rate(),
             openlineage: OpenLineageConfig::default(),
-            web_ui: true,
+            web_ui: false,
         }
     }
 }
@@ -1623,7 +1728,7 @@ impl Default for MetricsConfig {
 ///
 /// Controls whether SQE emits OpenLineage events for executed statements
 /// and where those events are delivered (file sink, HTTP endpoint, or both).
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct OpenLineageConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -1673,6 +1778,37 @@ impl Default for OpenLineageConfig {
             replay_interval_secs: default_ol_replay_secs(),
             channel_capacity: default_ol_channel_cap(),
         }
+    }
+}
+
+// Hand-written Debug so `api_key` (an OpenLineage HTTP-sink bearer credential,
+// reachable via `MetricsConfig`'s derived Debug) is never printed by `{:?}`
+// (CORE-01). `Serialize` is retained for config round-tripping.
+impl std::fmt::Debug for OpenLineageConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenLineageConfig")
+            .field("enabled", &self.enabled)
+            .field("job_namespace", &self.job_namespace)
+            .field("producer", &self.producer)
+            .field("emit_selects", &self.emit_selects)
+            .field("file_path", &self.file_path)
+            .field("http_endpoint", &self.http_endpoint)
+            .field("auth_mode", &self.auth_mode)
+            .field(
+                "api_key",
+                if self.api_key.is_empty() {
+                    &"<empty>"
+                } else {
+                    &"[REDACTED]"
+                },
+            )
+            .field("http_timeout_ms", &self.http_timeout_ms)
+            .field("http_retry_attempts", &self.http_retry_attempts)
+            .field("spool_path", &self.spool_path)
+            .field("spool_max_bytes", &self.spool_max_bytes)
+            .field("replay_interval_secs", &self.replay_interval_secs)
+            .field("channel_capacity", &self.channel_capacity)
+            .finish()
     }
 }
 
@@ -2694,6 +2830,82 @@ mod tests {
     #[test]
     fn test_parse_memory_limit_unknown_suffix() {
         assert!(parse_memory_limit("100XB").is_err());
+    }
+
+    #[test]
+    fn test_parse_memory_limit_fractional_still_supported() {
+        // CORE-02 fix must not regress fractional sizes.
+        assert_eq!(
+            parse_memory_limit("1.5GB").unwrap(),
+            (1.5 * 1024.0 * 1024.0 * 1024.0) as usize
+        );
+    }
+
+    #[test]
+    fn test_parse_memory_limit_overflow_errors_not_saturates() {
+        // CORE-02: an oversized value must error, not saturate to usize::MAX.
+        let result = parse_memory_limit("99999999TB");
+        assert!(result.is_err(), "oversized memory limit must be rejected");
+        // Confirm the previous saturating behaviour is gone.
+        assert_ne!(result.unwrap_or(0), usize::MAX);
+    }
+
+    // CORE-01: credential fields must never appear in Debug output.
+    #[test]
+    fn auth_provider_config_debug_redacts_client_secret() {
+        let cfg = AuthProviderConfig::OidcPassword {
+            token_url: "https://idp/token".to_string(),
+            client_id: "sqe".to_string(),
+            client_secret: "super-secret-value".to_string(),
+            roles_claim: "realm_access.roles".to_string(),
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("super-secret-value"), "leaked secret: {dbg}");
+        assert!(dbg.contains("[REDACTED]"), "expected redaction marker: {dbg}");
+
+        let cc = AuthProviderConfig::ClientCredentials {
+            token_endpoint: "https://idp/token".to_string(),
+            client_id: "sqe".to_string(),
+            client_secret: "cc-secret-xyz".to_string(),
+        };
+        assert!(!format!("{cc:?}").contains("cc-secret-xyz"));
+
+        let te = AuthProviderConfig::TokenExchange {
+            token_url: "https://idp/token".to_string(),
+            client_id: "sqe".to_string(),
+            client_secret: Some("te-secret-abc".to_string()),
+            audience: None,
+            user_claim: "sub".to_string(),
+            roles_claim: "realm_access.roles".to_string(),
+        };
+        assert!(!format!("{te:?}").contains("te-secret-abc"));
+    }
+
+    #[test]
+    fn worker_config_debug_redacts_worker_secret() {
+        let cfg = WorkerConfig {
+            worker_secret: "worker-secret-12345".to_string(),
+            ..Default::default()
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("worker-secret-12345"), "leaked secret: {dbg}");
+        assert!(dbg.contains("[REDACTED]"), "expected redaction marker: {dbg}");
+    }
+
+    #[test]
+    fn openlineage_config_debug_redacts_api_key() {
+        let cfg = OpenLineageConfig {
+            api_key: "ol-api-key-secret".to_string(),
+            ..Default::default()
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("ol-api-key-secret"), "leaked secret: {dbg}");
+        // Reachable via MetricsConfig's derived Debug too.
+        let metrics = MetricsConfig {
+            openlineage: cfg,
+            ..Default::default()
+        };
+        assert!(!format!("{metrics:?}").contains("ol-api-key-secret"));
     }
 
     #[test]
