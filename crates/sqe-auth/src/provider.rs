@@ -127,9 +127,41 @@ pub trait AuthProvider: Send + Sync {
     }
 }
 
+/// Truncate an (untrusted) IdP error body to at most `max` characters for
+/// logging, on a UTF-8 character boundary.
+///
+/// Slicing `&body[..max]` by byte index panics with "byte index is not a char
+/// boundary" whenever byte `max` lands mid-codepoint, which is routine for any
+/// localized error page or JSON over `max` bytes. This is the auth-failure
+/// path, so an ordinary non-ASCII IdP response must never crash the request
+/// task (DEP-04).
+pub(crate) fn truncate_for_log(body: &str, max: usize) -> String {
+    if body.chars().count() > max {
+        let truncated: String = body.chars().take(max).collect();
+        format!("{truncated}...[truncated]")
+    } else {
+        body.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_for_log_short_unchanged() {
+        assert_eq!(truncate_for_log("hello", 500), "hello");
+    }
+
+    #[test]
+    fn truncate_for_log_does_not_panic_on_multibyte_boundary() {
+        // A string whose byte length exceeds the cap but whose chars straddle
+        // the byte boundary. Slicing by byte would panic; by char it must not.
+        let body = "é".repeat(400); // 800 bytes, 400 chars
+        let out = truncate_for_log(&body, 300);
+        assert!(out.ends_with("...[truncated]"));
+        assert_eq!(out.chars().filter(|&c| c == 'é').count(), 300);
+    }
 
     #[test]
     fn auth_error_display_not_my_credentials() {

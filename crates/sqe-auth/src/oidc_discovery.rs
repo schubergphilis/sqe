@@ -1,5 +1,7 @@
 //! OIDC Discovery — fetch and cache `.well-known/openid-configuration`.
 
+use std::time::Duration;
+
 use serde::Deserialize;
 use tracing::{info, warn};
 
@@ -35,6 +37,8 @@ pub struct OidcDiscovery {
 impl OidcDiscovery {
     pub fn new(config: OidcDiscoveryConfig) -> Result<Self, AuthError> {
         let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
             .danger_accept_invalid_certs(config.accept_invalid_certs)
             .build()
             .map_err(|e| AuthError::Internal(e.into()))?;
