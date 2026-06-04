@@ -163,7 +163,11 @@ pub fn rewrite_trino_compat(sql: &str) -> String {
     }
 
     let mut visitor = TrinoCompatVisitor::default();
-    let _ = statements.visit(&mut visitor);
+    // Fully-qualified: `Visit` and `VisitMut` both expose a `visit` method, and
+    // with both traits in scope (DepthGuard needs `Visit`) a bare
+    // `statements.visit(..)` resolves to the `&self` `Visit::visit`, whose
+    // `Visitor` bound `TrinoCompatVisitor` (a `VisitorMut`) does not satisfy.
+    let _ = VisitMut::visit(&mut statements, &mut visitor);
 
     if visitor.rewrites == 0 {
         // Parsed cleanly but no rewrite fired. Avoid the round-trip
