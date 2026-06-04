@@ -833,7 +833,8 @@ impl WriteHandler {
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         let tracker = new_upload_tracker();
         let cleanup_guard =
-            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "ctas");
+            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "ctas")
+                .with_metrics(self.metrics.clone());
         let post_create: sqe_core::Result<()> = async {
             if total_rows > 0 {
                 // Clone batches cheaply for the Puffin sidecar when the table
@@ -1023,7 +1024,8 @@ impl WriteHandler {
         // location-uniqueness check rejects on every retry.
         let tracker = new_upload_tracker();
         let cleanup_guard =
-            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "ctas-streaming");
+            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "ctas-streaming")
+                .with_metrics(self.metrics.clone());
         let post_create: sqe_core::Result<()> = async {
             let stream = df.execute_stream().await.map_err(|e| {
                 SqeError::Execution(format!("Failed to start execution stream: {e}"))
@@ -1178,7 +1180,8 @@ impl WriteHandler {
 
         let tracker = new_upload_tracker();
         let cleanup_guard =
-            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "insert-streaming");
+            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "insert-streaming")
+                .with_metrics(self.metrics.clone());
         let (data_files, total_rows) = write_data_files_streaming_with_metrics(
             &table,
             stream,
@@ -1409,7 +1412,8 @@ impl WriteHandler {
         // Write data files
         let tracker = new_upload_tracker();
         let cleanup_guard =
-            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "insert");
+            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "insert")
+                .with_metrics(self.metrics.clone());
         let data_files = write_data_files_with_metrics(
             &table,
             batches,
@@ -1505,7 +1509,8 @@ impl WriteHandler {
 
         let tracker = new_upload_tracker();
         let cleanup_guard =
-            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "ingest");
+            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "ingest")
+                .with_metrics(self.metrics.clone());
         let data_files = write_data_files_with_metrics(
             &table,
             batches,
@@ -1630,7 +1635,8 @@ impl WriteHandler {
         let mut total_deleted = 0usize;
         let tracker = new_upload_tracker();
         let cleanup_guard =
-            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "delete-cow");
+            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "delete-cow")
+                .with_metrics(self.metrics.clone());
 
         for data_file in &old_data_files {
             let file_path = data_file.file_path();
@@ -2183,7 +2189,8 @@ impl WriteHandler {
         let mut total_updated = 0usize;
         let tracker = new_upload_tracker();
         let cleanup_guard =
-            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "update-cow");
+            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "update-cow")
+                .with_metrics(self.metrics.clone());
 
         for data_file in &old_data_files {
             let file_path = data_file.file_path();

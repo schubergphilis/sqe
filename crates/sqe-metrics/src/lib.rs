@@ -83,6 +83,11 @@ pub struct MetricsRegistry {
     // Adaptive sort metrics
     pub sorts_stripped_total: IntCounterVec,
 
+    // Write path: orphan parquet files from cancelled/failed writes (COORD-06).
+    // Labelled by op (ctas/insert/...) and cleanup outcome (deleted/leaked) so
+    // operators can alert on `outcome="leaked"` accumulation in S3.
+    pub write_orphan_files_total: IntCounterVec,
+
     // Catalog (Polaris) roundtrip + circuit breaker state
     pub catalog_request_duration_seconds: HistogramVec,
     pub catalog_circuit_breaker_state: GaugeVec,
@@ -483,6 +488,18 @@ impl MetricsRegistry {
             .register(Box::new(policy_circuit_breaker_state.clone()))
             .unwrap();
 
+        let write_orphan_files_total = IntCounterVec::new(
+            Opts::new(
+                "sqe_write_orphan_files_total",
+                "Orphan parquet files from cancelled/failed writes, by op and cleanup outcome",
+            ),
+            &["op", "outcome"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(write_orphan_files_total.clone()))
+            .unwrap();
+
         Self {
             registry,
             query_count,
@@ -533,6 +550,7 @@ impl MetricsRegistry {
             policy_cache_hits_total,
             policy_cache_misses_total,
             policy_circuit_breaker_state,
+            write_orphan_files_total,
         }
     }
 }
@@ -696,8 +714,25 @@ mod tests {
         metrics.token_refresh_total.with_label_values(&["success"]).inc_by(0);
         // Adaptive sort metric
         metrics.sorts_stripped_total.with_label_values(&["adaptive", "memory_pressure"]).inc_by(0);
+        // Write-path orphan cleanup (COORD-06)
+        metrics.write_orphan_files_total.with_label_values(&["ctas", "leaked"]).inc_by(0);
         // 17 original + 14 streaming + 7 new (S3 + auth) + 1 adaptive sort = 39 minimum
         assert!(metrics.registry.gather().len() >= 39);
+    }
+
+    #[test]
+    fn test_write_orphan_files_total() {
+        let metrics = MetricsRegistry::new();
+        metrics.write_orphan_files_total.with_label_values(&["insert", "leaked"]).inc_by(3);
+        metrics.write_orphan_files_total.with_label_values(&["insert", "deleted"]).inc_by(5);
+        assert_eq!(
+            metrics.write_orphan_files_total.with_label_values(&["insert", "leaked"]).get(),
+            3
+        );
+        assert_eq!(
+            metrics.write_orphan_files_total.with_label_values(&["insert", "deleted"]).get(),
+            5
+        );
     }
 
     #[test]
