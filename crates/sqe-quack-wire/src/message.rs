@@ -381,8 +381,7 @@ impl PrepareResponse {
         // Bound every wire count against bytes remaining before allocating, so
         // a bogus huge count can't drive a multi-GB `Vec::with_capacity`.
         let type_count = d.read_bounded_count()?;
-        let mut result_types = Vec::new();
-        result_types.reserve(type_count);
+        let mut result_types = Vec::with_capacity(type_count);
         for _ in 0..type_count {
             let t = LogicalType::decode(d)?;
             d.expect_object_end()?;
@@ -391,8 +390,7 @@ impl PrepareResponse {
 
         d.expect_field(2)?;
         let name_count = d.read_bounded_count()?;
-        let mut result_names = Vec::new();
-        result_names.reserve(name_count);
+        let mut result_names = Vec::with_capacity(name_count);
         for _ in 0..name_count {
             result_names.push(d.read_string()?);
         }
@@ -411,8 +409,7 @@ impl PrepareResponse {
         // zero rows, e.g. `WHERE 1=0`).
         let results = if d.read_optional(4)? {
             let results_count = d.read_bounded_count()?;
-            let mut out = Vec::new();
-            out.reserve(results_count);
+            let mut out = Vec::with_capacity(results_count);
             for _ in 0..results_count {
                 // Consume the leading nullable byte; a `false` value here
                 // would mean a null DataChunkWrapper, which the protocol
@@ -481,8 +478,7 @@ impl FetchResponse {
         // signalling an empty results list.
         let results = if d.read_optional(1)? {
             let count = d.read_bounded_count()?;
-            let mut out = Vec::new();
-            out.reserve(count);
+            let mut out = Vec::with_capacity(count);
             for _ in 0..count {
                 if !d.read_nullable_present()? {
                     return Err(crate::WireError::NullDataChunkWrapper);
