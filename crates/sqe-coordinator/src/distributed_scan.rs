@@ -620,9 +620,14 @@ async fn dispatch_to_worker(
     // Inject W3C TraceContext (traceparent/tracestate) into gRPC metadata
     inject_trace_context(parent_cx, request.metadata_mut());
 
-    // Wrap `do_get` with `tokio::time::timeout` so pooled channels (which
-    // don't carry an Endpoint-level timeout) still surface stalled workers
-    // as failures within `rpc_timeout`. Without this the await is unbounded.
+    // Wrap `do_get` with `tokio::time::timeout` so a stalled worker surfaces
+    // as a failure within the configured `rpc_timeout`. Pooled channels DO
+    // carry an Endpoint-level `.timeout(request_timeout)` (see
+    // `channel_pool.rs`), but it is the pool's fixed 30s default rather than
+    // this call's configurable `rpc_timeout`; the explicit wrap applies the
+    // per-deployment budget uniformly to both pooled and freshly-connected
+    // channels. (COORD-05: corrected the earlier comment claiming pooled
+    // channels carry no Endpoint timeout.)
     let response = tokio::time::timeout(rpc_timeout, client.do_get(request))
         .await
         .map_err(|_| {

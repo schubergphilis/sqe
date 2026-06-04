@@ -321,8 +321,19 @@ impl WorkerRegistry {
             inner.workers.keys().cloned().collect()
         };
 
-        for url in urls {
+        // COORD-05: run per-worker checks concurrently. Previously this was a
+        // sequential loop; a single kernel-paused worker that accepted the TCP
+        // connection but stalled the `do_action` reply blocked the whole loop
+        // for up to the pool's 30s request-timeout before the next worker was
+        // checked, serializing detection latency across N stalled workers and
+        // delaying failover.
+        let checks = urls.into_iter().map(|url| async move {
             let result = self.health_check_worker(&url).await;
+            (url, result)
+        });
+        let results = futures::future::join_all(checks).await;
+
+        for (url, result) in results {
             match result {
                 Ok(()) => self.mark_healthy(&url).await,
                 Err(e) => {
@@ -341,16 +352,36 @@ impl WorkerRegistry {
         use arrow_flight::flight_service_client::FlightServiceClient;
         use arrow_flight::Action;
 
-        let channel = self.channel_pool.get(url).await?;
-        let mut client = FlightServiceClient::new(channel);
-        let action = Action {
-            r#type: "health_check".to_string(),
-            body: bytes::Bytes::new(),
+        // COORD-05: bound the whole check with a short, dedicated timeout
+        // (independent of the pool's 30s data-RPC budget) so a stalled worker
+        // is marked failed within a few seconds, not after 30s.
+        let check = async {
+            let channel = self.channel_pool.get(url).await?;
+            let mut client = FlightServiceClient::new(channel);
+            let action = Action {
+                r#type: "health_check".to_string(),
+                body: bytes::Bytes::new(),
+            };
+            let _response = client.do_action(tonic::Request::new(action)).await?;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         };
-        let _response = client.do_action(tonic::Request::new(action)).await?;
-        Ok(())
+
+        match tokio::time::timeout(HEALTH_CHECK_TIMEOUT, check).await {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "health check for worker {url} exceeded {}s",
+                HEALTH_CHECK_TIMEOUT.as_secs()
+            )
+            .into()),
+        }
     }
 }
+
+/// COORD-05: per-worker health-check timeout. Deliberately short and
+/// independent of the channel pool's 30s data-RPC request-timeout so a
+/// stalled worker is detected and marked failed quickly, keeping failover
+/// responsive.
+const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[cfg(test)]
 mod tests {

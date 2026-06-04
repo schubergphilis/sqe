@@ -27,7 +27,7 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use sqe_catalog::parquet_writer_config::{self, writer_props_for_table as shared_writer_props_for_table};
 use sqe_core::SqeError;
-use tracing::{info, instrument, warn};
+use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
 
 /// Shared list of every parquet file location the rolling writer has handed out
@@ -132,17 +132,43 @@ impl Drop for WriteCleanupGuard {
                     orphan_count = count,
                     "write cancelled before commit; deleting orphan parquet files"
                 );
+                // COORD-06: count delete failures so operators can detect S3
+                // orphan accumulation (paid-for, never-queried storage). The
+                // per-file warns are easy to lose; the error-level summary with
+                // a stable `leaked` count is alertable.
+                //
+                // TODO(COORD-06): emit a `sqe_write_orphan_files_total{op}`
+                // Prometheus counter here. That needs a new field on
+                // `sqe_metrics::MetricsRegistry` (crates/sqe-metrics/src/lib.rs,
+                // not in this fix's owned-file set) threaded into
+                // `WriteCleanupGuard` from `write_handler.rs`. Until then the
+                // error-level summary below is the alerting signal. A periodic
+                // `remove_orphan_files` maintenance procedure reconciles leaks.
+                let mut leaked = 0usize;
                 for p in paths {
                     if let Err(e) = file_io.delete(&p).await {
                         warn!(op, path = %p, error = %e, "orphan cleanup: delete failed");
+                        leaked += 1;
                     }
+                }
+                if leaked > 0 {
+                    error!(
+                        op,
+                        leaked,
+                        attempted = count,
+                        "orphan cleanup: {leaked} parquet file(s) could not be deleted and \
+                         remain on S3 as uncommitted orphans; reconcile via remove_orphan_files"
+                    );
                 }
             });
         } else {
-            warn!(
+            // No runtime at drop -> every file is left behind. Surface at error
+            // level (COORD-06): these are guaranteed orphans, not best-effort.
+            error!(
                 op,
                 orphan_count = paths.len(),
-                "write cancelled outside tokio runtime; orphan parquet files left on S3"
+                "write cancelled outside tokio runtime; orphan parquet files left on S3 \
+                 (reconcile via remove_orphan_files)"
             );
         }
     }
