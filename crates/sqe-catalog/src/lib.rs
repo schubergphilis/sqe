@@ -12,7 +12,6 @@ pub mod catalog_provider;
 pub mod schema_provider;
 #[cfg(feature = "rest")]
 pub mod table_provider;
-pub mod credential_vending;
 pub mod expr_to_predicate;
 pub mod footer_cache;
 #[cfg(feature = "rest")]
