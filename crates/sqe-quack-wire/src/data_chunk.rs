@@ -363,8 +363,7 @@ impl ExtraTypeInfo {
                     // Bound the count against bytes remaining before allocating:
                     // each pair object costs well over one byte on the wire.
                     let count = d.read_bounded_count()?;
-                    let mut out = Vec::new();
-                    out.reserve(count);
+                    let mut out = Vec::with_capacity(count);
                     for _ in 0..count {
                         d.expect_field(0)?;
                         let name = d.read_string()?;
@@ -403,8 +402,7 @@ impl ExtraTypeInfo {
                         actual: listed as u16,
                     });
                 }
-                let mut values = Vec::new();
-                values.reserve(listed);
+                let mut values = Vec::with_capacity(listed);
                 for _ in 0..listed {
                     values.push(d.read_string()?);
                 }
@@ -769,8 +767,7 @@ impl Vector {
                 d.expect_field(105)?;
                 // Each entry object costs several bytes; bound before allocating.
                 let actual = d.read_bounded_count()?;
-                let mut entries = Vec::new();
-                entries.reserve(actual);
+                let mut entries = Vec::with_capacity(actual);
                 for _ in 0..actual {
                     d.expect_field(100)?;
                     let offset = d.read_u64()?;
@@ -841,8 +838,7 @@ impl Vector {
                         actual: child_count as u16,
                     });
                 }
-                let mut children = Vec::new();
-                children.reserve(child_count);
+                let mut children = Vec::with_capacity(child_count);
                 for ty in field_types {
                     let child = Vector::decode_with_depth(ty, count, d, child_depth)?;
                     d.expect_object_end()?;
@@ -882,8 +878,7 @@ impl Vector {
                 // Bound against bytes remaining: each string is >= 1 byte.
                 let actual = d.read_bounded_count()?;
                 let take = actual.min(count);
-                let mut values = Vec::new();
-                values.reserve(take);
+                let mut values = Vec::with_capacity(take);
                 let validity_ref = validity.as_deref();
                 for i in 0..actual {
                     let valid = validity_ref
@@ -906,8 +901,7 @@ impl Vector {
                 d.expect_field(102)?;
                 // Each blob entry is a length-prefixed slot (>= 1 byte): bound.
                 let actual = d.read_bounded_count()?;
-                let mut values = Vec::new();
-                values.reserve(actual);
+                let mut values = Vec::with_capacity(actual);
                 let validity_ref = validity.as_deref();
                 for i in 0..actual {
                     let bytes = d.read_data_ptr()?;
@@ -976,8 +970,7 @@ impl DataChunk {
         d.expect_field(101)?;
         // Each LogicalType object costs several bytes; bound before allocating.
         let type_count = d.read_bounded_count()?;
-        let mut types = Vec::new();
-        types.reserve(type_count);
+        let mut types = Vec::with_capacity(type_count);
         for _ in 0..type_count {
             let t = LogicalType::decode(d)?;
             d.expect_object_end()?;
@@ -992,8 +985,7 @@ impl DataChunk {
                 actual: column_count as u16,
             });
         }
-        let mut columns = Vec::new();
-        columns.reserve(column_count);
+        let mut columns = Vec::with_capacity(column_count);
         for t in types {
             let column = Vector::decode(t, row_count as usize, d)?;
             d.expect_object_end()?;
