@@ -278,8 +278,21 @@ async fn api_metrics_history(
 }
 
 async fn dashboard() -> Response {
+    // WEB-05: send nosniff plus a tight CSP. The dashboard is a self-contained
+    // single page (inline styles/scripts, same-origin fetches only), so a
+    // restrictive policy does not break it and blocks injected external loads.
     (
-        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; style-src 'unsafe-inline'; \
+                 script-src 'unsafe-inline'; connect-src 'self'; \
+                 img-src 'self' data:; base-uri 'none'; form-action 'none'; \
+                 frame-ancestors 'none'",
+            ),
+        ],
         sqe_coordinator::web_ui::DASHBOARD_HTML,
     )
         .into_response()
@@ -453,13 +466,37 @@ async fn async_main() -> anyhow::Result<()> {
     if !config.rate_limit.enabled {
         tracing::warn!("WARNING: Rate limiting is DISABLED -- no protection against query flooding. Set [rate_limit] enabled = true for production.");
     }
-    if config.auth.should_skip_tls_verify() {
-        tracing::warn!("WARNING: TLS certificate verification is DISABLED for auth endpoints -- vulnerable to MITM. Set auth.tls_skip_verify = false (or auth.ssl_verification = true) for production.");
+    if config.auth.should_skip_tls_verify()
+        || config
+            .auth
+            .external
+            .as_ref()
+            .is_some_and(|e| e.accept_invalid_certs)
+    {
+        // AUTH-04: the external (interactive) auth path has its own
+        // accept_invalid_certs flag that was not covered by this warning.
+        tracing::warn!("WARNING: TLS certificate verification is DISABLED for auth endpoints (auth.tls_skip_verify / auth.ssl_verification / auth.external.accept_invalid_certs) -- vulnerable to MITM. Disable these for production.");
     }
     if !config.coordinator.worker_urls.is_empty()
         && config.coordinator.allow_unauthenticated_workers
     {
         tracing::warn!("WARNING: coordinator.allow_unauthenticated_workers = true -- any client reachable on the cluster network can register as a worker and receive user bearer tokens. Set worker_secret for production.");
+    }
+    // AUTH-01: policy enforcement is hardcoded to passthrough below. A
+    // configured engine (OPA/Cedar/InMemory) is SILENTLY IGNORED, so every row
+    // filter and column mask is unenforced. Fail loud at startup.
+    if config.policy.engine != sqe_core::config::PolicyEngine::Passthrough {
+        tracing::error!(
+            configured_engine = ?config.policy.engine,
+            "CRITICAL: policy.engine is set but policy enforcement is NOT wired -- \
+             the engine runs PASSTHROUGH and NO row filters or column masks are \
+             applied. Do not rely on SQE-side policy until this is implemented."
+        );
+    }
+    // WEB-01: the web UI / JSON API serve on the health port over 0.0.0.0 with
+    // NO authentication. It now defaults off; warn loudly when explicitly on.
+    if config.metrics.web_ui {
+        tracing::warn!("WARNING: metrics.web_ui = true -- the ops dashboard and /api/v1/* endpoints are served on the health port (0.0.0.0) with NO authentication. Anyone able to reach that port sees cluster/query metadata. Network-gate it tightly or leave web_ui = false.");
     }
 
     // Priority: --mode flag > SQE_MODE env > config file mode
@@ -557,6 +594,10 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     ));
 
     // Policy
+    // TODO(AUTH-01): wire PolicyPlanRewriter from config.policy.engine (Opa ->
+    // OpaStore, InMemory -> InMemoryPolicyStore) instead of hardcoding
+    // PassthroughEnforcer. Until then a non-passthrough engine is ignored and
+    // the startup error! above fires.
     let policy_enforcer: Arc<dyn sqe_policy::PolicyEnforcer> =
         Arc::new(sqe_policy::PassthroughEnforcer);
 
@@ -926,11 +967,32 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         );
         let quack_state =
             sqe_quack_server::QuackServerState::new(Arc::clone(&auth_chain), executor);
+        // QUACK-08: unlike the Flight/Trino auth paths, the Quack router has no
+        // rate limiter, so the ConnectionRequest -> authenticate path is an
+        // un-throttled brute-force / IdP-amplification oracle. The existing
+        // limiters (QueryRateLimiter/AuthRateLimiter) are application-level, not
+        // a tower layer, and the router is built inside sqe-quack-server, so it
+        // cannot be attached here without changes in that crate.
+        // TODO(QUACK-08): add a per-IP rate limiter to the Quack
+        // ConnectionRequest path (in sqe-quack-server, or a tower layer here).
+        tracing::warn!("WARNING: the Quack endpoint has NO rate limiting on its auth path -- it is an un-throttled brute-force / IdP-amplification oracle. Restrict network access to the Quack port until QUACK-08 lands.");
         let quack_app = sqe_quack_server::router(quack_state);
         let bind = format!("0.0.0.0:{quack_port}");
         let listener = tokio::net::TcpListener::bind(&bind)
             .await
             .map_err(|e| anyhow::anyhow!("Quack server bind to {bind}: {e}"))?;
+        // QUACK-05: the Quack listener serves plain HTTP/1.1. The
+        // ConnectionRequest carries the user's OIDC bearer token, so on a
+        // plaintext channel any on-path observer can capture and replay it
+        // against Flight SQL / Polaris / S3 as that user. The Flight path right
+        // below wraps its listener with build_server_tls_config; the Quack path
+        // has no TLS plumbing yet.
+        // TODO(QUACK-05): wrap the Quack listener with the coordinator TLS
+        // config (axum-server + rustls), refusing plaintext unless an explicit
+        // allow_insecure flag is set.
+        if !config.coordinator.tls.is_enabled() {
+            tracing::warn!("WARNING: the Quack endpoint is PLAINTEXT (no TLS) and binds 0.0.0.0 -- user OIDC bearer tokens travel in cleartext and can be captured and replayed. Do not expose the Quack port on untrusted networks until QUACK-05 (TLS) lands.");
+        }
         tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, quack_app).await {
                 tracing::error!(error = %e, "Quack RPC server terminated unexpectedly");
@@ -1455,7 +1517,9 @@ mod tests {
         )
         .await;
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].user, "alice");
+        // WEB-02: the unauth list no longer exposes the username or raw SQL;
+        // it carries the SQL digest instead. Assert the item is populated.
+        assert!(!items[0].sql_hash.is_empty());
     }
 
     #[tokio::test]
