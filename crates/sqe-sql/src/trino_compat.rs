@@ -39,10 +39,74 @@ use sqlparser::ast::{
     DataType as SqlDataType, Expr, Function, FunctionArg, FunctionArgExpr,
     FunctionArgumentList, FunctionArguments, GroupByExpr, GroupByWithModifier, Ident,
     ObjectName, Query, Select, SetExpr, Statement, TableFactor, TableFunctionArgs, Value,
-    VisitMut, VisitorMut,
+    Visit, VisitMut, Visitor, VisitorMut,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+
+/// Maximum nesting depth permitted in any expression tree of attacker-supplied
+/// SQL. sqlparser's infix-parse loop builds a depth-N left-leaning tree for a
+/// flat chain like `a OR a OR ... OR a` WITHOUT consuming its recursion counter
+/// (default 50), so a few thousand terms produce a tree deep enough that the
+/// derived recursive `VisitMut` walk overflows the coordinator's stack — an
+/// uncatchable OS-level abort that kills every concurrent query. 256 is far
+/// above any genuine query and far below the ~16k-32k overflow threshold.
+const MAX_EXPRESSION_DEPTH: usize = 256;
+
+/// Visitor that tracks the live expression-nesting depth and bails the instant
+/// it exceeds [`MAX_EXPRESSION_DEPTH`]. Because `pre_visit_expr` runs top-down
+/// BEFORE the visitor descends into an expression's children, returning
+/// `Break` here stops the recursive walk before it can go any deeper than the
+/// cap — so this guard itself never recurses past the limit (plus the
+/// parser-bounded query-nesting overhead), and detects the deep tree without
+/// triggering the very overflow it prevents.
+#[derive(Default)]
+struct DepthGuard {
+    current: usize,
+    max_seen: usize,
+}
+
+impl Visitor for DepthGuard {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, _expr: &Expr) -> ControlFlow<Self::Break> {
+        self.current += 1;
+        if self.current > self.max_seen {
+            self.max_seen = self.current;
+        }
+        if self.current > MAX_EXPRESSION_DEPTH {
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_expr(&mut self, _expr: &Expr) -> ControlFlow<Self::Break> {
+        self.current = self.current.saturating_sub(1);
+        ControlFlow::Continue(())
+    }
+}
+
+/// Reject SQL whose expression trees are nested deeper than
+/// [`MAX_EXPRESSION_DEPTH`]. Run this BEFORE any recursive visitor (the
+/// Trino-compat rewrite, and later DataFusion's analyzer) walks the AST, so a
+/// crafted deep-chain query is turned into a clean error instead of a
+/// stack-overflow process abort. Returns `Err` with a short message on
+/// rejection.
+pub fn check_expression_depth(statements: &[Statement]) -> Result<(), String> {
+    let mut guard = DepthGuard::default();
+    // sqlparser implements `Visit` for `Statement` (derived) but not for a
+    // bare slice, so drive each statement individually. `guard.current` is
+    // reset to a clean baseline between statements by the post-visit
+    // decrements, so per-statement state does not leak.
+    for stmt in statements {
+        if let ControlFlow::Break(()) = stmt.visit(&mut guard) {
+            return Err(format!(
+                "expression nesting exceeds the maximum depth of {MAX_EXPRESSION_DEPTH}"
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Iceberg metadata-table suffixes Trino exposes via the `$<kind>` syntax
 /// on a table name. Each maps to an SQE TVF registered in
@@ -83,6 +147,18 @@ pub fn rewrite_trino_compat(sql: &str) -> String {
         || lower.contains("cube")
         || lower.contains("grouping sets");
     if !has_json_cast && !has_dollar && !has_grouping_set {
+        return sql.to_string();
+    }
+
+    // Guard against a wire-crafted deep expression tree BEFORE the recursive
+    // VisitMut walk below: a flat `a OR a OR ... OR a` chain parses into a
+    // depth-N tree that overflows the stack inside `statements.visit(...)`.
+    // The guard rides the (non-recursive-past-the-cap) visitor and bails
+    // before the dangerous depth is reached. On rejection we skip the rewrite
+    // and return the SQL untouched so the engine surfaces a normal error
+    // rather than aborting the process; `parse_and_classify` rejects the same
+    // input up front with a clean parse error.
+    if check_expression_depth(&statements).is_err() {
         return sql.to_string();
     }
 
@@ -819,6 +895,42 @@ mod tests {
             out.to_ascii_lowercase().contains("__sqe_rollup_q"),
             "nested ROLLUP should trigger wrap somewhere: {out}"
         );
+    }
+
+    // ── Expression-depth guard (SQL-01) ────────────────────────────────
+
+    #[test]
+    fn shallow_expression_passes_depth_check() {
+        let stmts = Parser::parse_sql(&GenericDialect {}, "SELECT a OR b OR c FROM t")
+            .expect("parse");
+        assert!(check_expression_depth(&stmts).is_ok());
+    }
+
+    #[test]
+    fn deep_binary_chain_is_rejected_by_depth_check() {
+        // A flat OR chain far past the cap parses cleanly (the parser's
+        // recursion counter is not consumed by the infix loop) but builds a
+        // very deep tree. The guard must reject it WITHOUT recursing deep
+        // enough to overflow.
+        let n = MAX_EXPRESSION_DEPTH + 200;
+        let chain = std::iter::repeat("a").take(n).collect::<Vec<_>>().join(" OR ");
+        let sql = format!("SELECT {chain} FROM t");
+        let stmts = Parser::parse_sql(&GenericDialect {}, &sql).expect("parse");
+        assert!(check_expression_depth(&stmts).is_err());
+    }
+
+    #[test]
+    fn rewrite_trino_compat_does_not_overflow_on_deep_chain() {
+        // The dollar fast-path trigger forces the rewriter past its skip, so
+        // without the guard this would reach the recursive VisitMut and
+        // overflow. With the guard it returns the SQL unchanged.
+        let n = MAX_EXPRESSION_DEPTH + 500;
+        let chain = std::iter::repeat("a").take(n).collect::<Vec<_>>().join(" OR ");
+        // Embed a `$` so the cheap fast-path does not skip the walk.
+        let sql = format!("SELECT {chain}, '$' AS marker FROM t");
+        let out = rewrite_trino_compat(&sql);
+        // No panic/abort; the deep input is returned untouched.
+        assert_eq!(out, sql);
     }
 
     #[test]
