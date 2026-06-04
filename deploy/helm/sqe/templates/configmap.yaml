@@ -10,6 +10,15 @@ data:
     flight_sql_port = {{ .Values.config.coordinator.flight_sql_port }}
     trino_http_port = {{ .Values.config.coordinator.trino_http_port }}
     mode = {{ .Values.config.coordinator.mode | quote }}
+    # DEP-02: the engine's tracked memory_limit defaults to 8GB in code, but
+    # the coordinator pod is capped at 2Gi by default -- DataFusion would
+    # allocate toward 8GB and the kernel OOMKills the pod long before spill
+    # fires. Render a coordinator memory_limit sized below the pod limit
+    # (~70-75%) so spill triggers before the cgroup OOM. DEP-01 gives /tmp the
+    # writable volume the spill needs.
+    memory_limit = {{ .Values.config.coordinator.memory_limit | quote }}
+    spill_to_disk = {{ .Values.config.coordinator.spill_to_disk }}
+    spill_dir = {{ .Values.config.coordinator.spill_dir | quote }}
     {{- if .Values.worker.enabled }}
     worker_urls = [{{ range $i, $e := until (int .Values.worker.replicas) }}{{ if $i }}, {{ end }}"http://{{ include "sqe.fullname" $ }}-worker-{{ $e }}.{{ include "sqe.fullname" $ }}-worker-headless:50052"{{ end }}]
     {{- end }}
@@ -17,6 +26,9 @@ data:
     [worker]
     coordinator_url = "http://{{ include "sqe.fullname" . }}-coordinator:50051"
     heartbeat_interval_secs = {{ .Values.config.worker.heartbeat_interval_secs }}
+    # DEP-02: worker engine memory_limit must sit below the worker pod limit
+    # (~75%) to leave headroom for Arrow buffers outside DataFusion's accounted
+    # pool; an 8GB engine limit in an 8Gi pod leaves zero headroom and OOMKills.
     memory_limit = {{ .Values.config.worker.memory_limit | quote }}
     spill_dir = {{ .Values.config.worker.spill_dir | quote }}
 
