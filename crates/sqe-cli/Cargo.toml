@@ -10,6 +10,14 @@ repository.workspace = true
 name = "sqe-cli"
 path = "src/main.rs"
 
+[features]
+# `aws` turns on the Glue + S3 Tables catalog backends for the embedded
+# engine (`--catalog-backend glue|s3tables`). Default-on so a normal
+# `cargo install` gets it; drop it (`--no-default-features`) for a slim
+# build with no AWS SDK weight.
+default = ["aws"]
+aws = ["sqe-catalog/glue", "sqe-catalog/s3tables"]
+
 [dependencies]
 sqe-core = { path = "../sqe-core" }
 sqe-catalog = { path = "../sqe-catalog", default-features = false, features = ["rest", "sql-sqlite", "hadoop", "delta"] }

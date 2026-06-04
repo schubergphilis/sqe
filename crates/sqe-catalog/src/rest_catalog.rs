@@ -463,20 +463,57 @@ impl SessionCatalog {
         table_cache: TableMetadataCache,
         backend: &sqe_core::config::CatalogBackend,
     ) -> sqe_core::Result<Self> {
+        let inner: Arc<dyn iceberg::Catalog> = Self::build_backend_catalog(backend).await?;
+
+        let token_fingerprint = {
+            use sha2::{Digest, Sha256};
+            let hash = Sha256::digest(bearer_token.as_bytes());
+            format!("{:x}", hash)[..16].to_string()
+        };
+
+        info!(
+            backend = ?backend,
+            token_fingerprint = %token_fingerprint,
+            "Creating SessionCatalog over non-REST backend"
+        );
+
+        let circuit_breaker = user_circuit_breaker(&token_fingerprint);
+        Ok(Self {
+            inner: CatalogHandle::Other(inner),
+            catalog_url: String::new(),
+            warehouse: catalog.warehouse.clone(),
+            bearer_token: bearer_token.to_string(),
+            token_fingerprint,
+            storage_config: storage.clone(),
+            http_client: SHARED_HTTP_CLIENT.clone(),
+            circuit_breaker,
+            table_cache,
+        })
+    }
+
+    /// Build a bare `iceberg::Catalog` for a non-REST backend.
+    ///
+    /// Shared by the coordinator's per-session catalog
+    /// (`for_session_other_backend_with`) and the embedded CLI, which
+    /// attaches the result through `iceberg-datafusion`'s read-only
+    /// catalog provider. Each backend translates its typed config into
+    /// the upstream loader's `(catalog_type, props)` shape; the loader
+    /// picks the matching `CatalogBuilder` and returns the catalog.
+    /// Backend support is gated by the same cargo features as the rest
+    /// of `sqe-catalog`. See `vendor/iceberg-rust/README.md` and
+    /// `docs/catalogs.md` for the supported prop keys per backend.
+    pub async fn build_backend_catalog(
+        backend: &sqe_core::config::CatalogBackend,
+    ) -> sqe_core::Result<Arc<dyn iceberg::Catalog>> {
         use sqe_core::config::CatalogBackend;
 
-        // Each non-REST backend translates its typed config into the
-        // upstream loader's `(catalog_type, props_map)` shape. The
-        // loader picks the right `CatalogBuilder`, applies the
-        // shared `OpenDalStorageFactory::Fs` we want for SQE, and
-        // returns an `Arc<dyn iceberg::Catalog>`. All of this used
-        // to live in per-backend wrappers under
-        // `crates/sqe-catalog/src/backends/`; the wrappers are gone
-        // because the loader's uniform shape made them redundant.
-        // See `vendor/iceberg-rust/README.md` and
-        // `docs/catalogs.md` for the supported prop keys per backend.
         let (catalog_type, name, props): (&str, &str, HashMap<String, String>) = match backend {
-            CatalogBackend::Rest => unreachable!("Rest handled in for_session"),
+            CatalogBackend::Rest => {
+                return Err(SqeError::Catalog(
+                    "build_backend_catalog is for non-REST backends; REST is built via for_session"
+                        .into(),
+                ));
+            }
 
             #[cfg(feature = "hms")]
             CatalogBackend::Hms { uri, warehouse } => {
@@ -553,40 +590,13 @@ impl SessionCatalog {
             }
         };
 
-        let inner: Arc<dyn iceberg::Catalog> = iceberg_catalog_loader::load(catalog_type)
-            .map_err(|e| SqeError::Catalog(format!(
-                "Catalog loader rejected type `{catalog_type}`: {e}"
-            )))?
+        iceberg_catalog_loader::load(catalog_type)
+            .map_err(|e| {
+                SqeError::Catalog(format!("Catalog loader rejected type `{catalog_type}`: {e}"))
+            })?
             .load(name.to_string(), props)
             .await
-            .map_err(|e| SqeError::Catalog(format!(
-                "Catalog `{catalog_type}` build failed: {e}"
-            )))?;
-
-        let token_fingerprint = {
-            use sha2::{Digest, Sha256};
-            let hash = Sha256::digest(bearer_token.as_bytes());
-            format!("{:x}", hash)[..16].to_string()
-        };
-
-        info!(
-            backend = ?backend,
-            token_fingerprint = %token_fingerprint,
-            "Creating SessionCatalog over non-REST backend"
-        );
-
-        let circuit_breaker = user_circuit_breaker(&token_fingerprint);
-        Ok(Self {
-            inner: CatalogHandle::Other(inner),
-            catalog_url: String::new(),
-            warehouse: catalog.warehouse.clone(),
-            bearer_token: bearer_token.to_string(),
-            token_fingerprint,
-            storage_config: storage.clone(),
-            http_client: SHARED_HTTP_CLIENT.clone(),
-            circuit_breaker,
-            table_cache,
-        })
+            .map_err(|e| SqeError::Catalog(format!("Catalog `{catalog_type}` build failed: {e}")))
     }
 
     pub async fn new(

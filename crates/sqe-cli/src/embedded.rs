@@ -342,6 +342,32 @@ async fn attach_sqlite_catalog(
     Ok(catalog)
 }
 
+/// Build an embedded context with a non-REST cloud catalog (Glue or
+/// S3 Tables) attached read-only under `catalog_name`.
+///
+/// The catalog is built through the shared `sqe_catalog` backend
+/// constructor and wrapped in `iceberg-datafusion`'s read-only
+/// `IcebergCatalogProvider`, so `SELECT` works but writes do not (use
+/// the server for writes). Credentials come from the AWS provider
+/// chain (`AWS_PROFILE`, SSO, instance profile). Requires the `aws`
+/// cargo feature on `sqe-cli`; without it the backend constructor
+/// returns a clear "requires the ... cargo feature" error.
+pub async fn build_embedded_context_with_backend(
+    memory_limit_bytes: usize,
+    backend: &sqe_core::config::CatalogBackend,
+    catalog_name: &str,
+) -> anyhow::Result<SessionContext> {
+    let ctx = build_embedded_context(memory_limit_bytes)?;
+    let catalog = sqe_catalog::SessionCatalog::build_backend_catalog(backend)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to build `{catalog_name}` catalog: {e}"))?;
+    let provider = iceberg_datafusion::IcebergCatalogProvider::try_new(catalog)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to attach `{catalog_name}` catalog: {e}"))?;
+    ctx.register_catalog(catalog_name, Arc::new(provider));
+    Ok(ctx)
+}
+
 /// `SqlClient` impl backed by an in-process [`SessionContext`].
 ///
 /// Mirrors the network clients (`flight.rs`, `http.rs`) so the CLI's
@@ -392,6 +418,26 @@ impl EmbeddedClient {
         Ok(Self {
             ctx,
             iceberg_catalogs,
+            secrets: SecretStore::new(),
+            attached_catalogs: HashMap::new(),
+        })
+    }
+
+    /// Build an embedded client backed by a cloud catalog (Glue or
+    /// S3 Tables), attached read-only and mounted under `catalog_name`.
+    /// Auth uses the AWS credential chain. Requires the `aws` cargo
+    /// feature; without it the backend constructor returns a clear
+    /// error naming the missing feature.
+    pub async fn with_backend(
+        memory_limit_bytes: usize,
+        backend: sqe_core::config::CatalogBackend,
+        catalog_name: &str,
+    ) -> anyhow::Result<Self> {
+        let ctx =
+            build_embedded_context_with_backend(memory_limit_bytes, &backend, catalog_name).await?;
+        Ok(Self {
+            ctx,
+            iceberg_catalogs: HashMap::new(),
             secrets: SecretStore::new(),
             attached_catalogs: HashMap::new(),
         })

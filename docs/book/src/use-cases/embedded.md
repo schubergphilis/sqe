@@ -49,15 +49,29 @@ config.
 
 ## Cloud catalogs embedded
 
-The embedded engine takes the same catalog config as the server, so it can run
-directly against Glue or S3 Tables without a coordinator. Credentials come from
-the standard AWS provider chain (`AWS_PROFILE`, instance profile, SSO):
+The embedded engine can attach a Glue or S3 Tables catalog directly, with no
+coordinator. Pass `--catalog-backend` plus the cloud warehouse; credentials come
+from the standard AWS provider chain (`AWS_PROFILE`, instance profile, SSO).
+These catalogs attach read-only (query, not write); use the server for writes.
+Requires the `aws` cargo feature (default-on).
 
 ```bash
+# AWS Glue Data Catalog (warehouse is an s3:// prefix)
 AWS_PROFILE=analytics sqe-cli --embedded \
-    --catalog glue=s3://my-bucket/warehouse \
-    -e "SELECT * FROM analytics.events LIMIT 10"
+    --catalog-backend glue \
+    --catalog-warehouse s3://my-bucket/warehouse --region eu-central-1 \
+    -e "SELECT * FROM glue.analytics.events LIMIT 10"
+
+# AWS S3 Tables (warehouse is the table-bucket ARN)
+AWS_PROFILE=analytics sqe-cli --embedded \
+    --catalog-backend s3tables \
+    --catalog-warehouse arn:aws:s3tables:eu-central-1:ACCOUNT:bucket/NAME \
+    --region eu-central-1 \
+    -e "SHOW SCHEMAS"
 ```
+
+The catalog mounts under the backend name by default (`glue.` / `s3tables.`);
+override with `--catalog-name`.
 
 ## How it is tested
 
