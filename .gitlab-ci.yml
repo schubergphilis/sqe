@@ -59,6 +59,10 @@ cargo-check:
         - deny.toml
   cache:
     key: cargo-check-${CI_COMMIT_REF_SLUG}
+    # Warm-start a new branch from main's cache instead of compiling the whole
+    # dependency tree cold on first push; cargo recompiles only what changed.
+    fallback_keys:
+      - cargo-check-main
     paths:
       - target/
       - .cargo/registry/
@@ -150,6 +154,8 @@ cargo-check-features:
         - Cargo.lock
   cache:
     key: cargo-features-${CI_COMMIT_REF_SLUG}
+    fallback_keys:
+      - cargo-features-main
     paths:
       - target/
       - .cargo/registry/
@@ -197,6 +203,8 @@ integration-test:
       allow_failure: true
   cache:
     key: cargo-integration-${CI_COMMIT_REF_SLUG}
+    fallback_keys:
+      - cargo-integration-main
     paths:
       - target/
       - .cargo/registry/
@@ -233,6 +241,8 @@ matrix-score:
         - xtask/**/*
   cache:
     key: xtask-${CI_COMMIT_REF_SLUG}
+    fallback_keys:
+      - xtask-main
     paths:
       - target/
       - .cargo/registry/
