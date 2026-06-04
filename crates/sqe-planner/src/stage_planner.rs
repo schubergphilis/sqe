@@ -147,6 +147,20 @@ impl StageBuilder {
 ///       IcebergScanExec(table_b)
 ///   ↓ join + projection              ← becomes stage_2 (inputs: [stage_0, stage_1])
 /// ```
+// TODO(PLAN-02): see GitLab issue. `decompose_recursive` produces overlapping
+// plan fragments with no shuffle wiring: the returned `extracted` map is
+// discarded by every caller, extracted children are never replaced with
+// `ShuffleReaderExec` placeholders, and when a join's `left` is itself a join
+// the nested boundary is emitted as a stage AND `left` is re-emitted whole
+// (overlapping/duplicated fragments). The intermediate stages get
+// `input_stages: vec![]`, so the stage DAG edges are missing. This is unwired
+// scaffolding -- `decompose_plan` has no callers outside this crate today and
+// the distributed scheduler does not consume it -- so it is latent until
+// distributed execution lands. Do NOT consume the output as-is: it would
+// execute overlapping work and/or a disconnected stage graph. The fix
+// (return + consume `extracted`, substitute `ShuffleReaderExec`, wire
+// `input_stages`, emit each subtree once) is deferred; add a test asserting the
+// stage DAG is connected and fragments are disjoint when wiring it up.
 pub fn decompose_plan(plan: Arc<dyn ExecutionPlan>) -> Vec<QueryStage> {
     let mut builder = StageBuilder::new();
     let _final_plan = decompose_recursive(&plan, &mut builder);
