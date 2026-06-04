@@ -47,6 +47,10 @@ pub enum WireError {
     NullExtraTypeInfo,
     #[error("ExtraTypeInfo carries an ExtensionTypeInfo (field 103), which the codec does not yet support")]
     UnsupportedExtensionTypeInfo,
+    #[error("nested type/vector decode exceeded the maximum depth of {max}")]
+    RecursionLimitExceeded { max: u8 },
+    #[error("wire count {count} exceeds {remaining} bytes remaining in the buffer")]
+    CountExceedsRemaining { count: u64, remaining: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, WireError>;
