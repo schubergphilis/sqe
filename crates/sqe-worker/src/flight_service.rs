@@ -421,6 +421,13 @@ impl FlightService for WorkerFlightService {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
+        // Gate the shuffle stream behind the worker secret before consuming
+        // the request, exactly as `do_get`/`refresh_credentials` do. Without
+        // this an attacker with network access could push arbitrary
+        // RecordBatches into a stage receiver (result poisoning) or drain a
+        // partition channel for an in-flight distributed query.
+        self.verify_worker_secret(request.metadata())?;
+
         let mut stream = request.into_inner();
 
         // 1. Read the first FlightData message to get the descriptor.
