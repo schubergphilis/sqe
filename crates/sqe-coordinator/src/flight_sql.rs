@@ -368,11 +368,33 @@ pub struct SqeFlightSqlService {
     metadata_rate_limiter: Option<Arc<crate::rate_limiter::MetadataRateLimiter>>,
     /// Parameter bindings for outstanding prepared statements.
     ///
-    /// Keyed by the encoded statement handle (bytes). Each entry holds the
-    /// inbound `RecordBatch` of bound parameter values, decoded into a
-    /// list of SQL literals. `do_get_prepared_statement` substitutes `?`
+    /// Keyed by `(authenticated session id, encoded statement handle)` so one
+    /// session can never read or overwrite another session's bound parameters
+    /// (WEB-03). Each entry holds the inbound parameter `RecordBatch` decoded
+    /// into a list of SQL literals; `do_get_prepared_statement` substitutes `?`
     /// placeholders in left-to-right order before executing.
-    prepared_params: Arc<dashmap::DashMap<Vec<u8>, Vec<String>>>,
+    ///
+    /// A bounded, TTL'd `moka` cache (WEB-04): abandoned binds expire instead
+    /// of leaking forever, and the entry count is capped so a client looping
+    /// binds it never fetches cannot exhaust coordinator memory.
+    prepared_params: Arc<moka::future::Cache<Vec<u8>, Vec<String>>>,
+}
+
+/// Maximum outstanding prepared-statement parameter binds across all sessions.
+const PREPARED_PARAMS_MAX_ENTRIES: u64 = 10_000;
+/// How long an unused parameter bind survives before eviction.
+const PREPARED_PARAMS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Build the per-session prepared-statement key from the authenticated session
+/// id and the client-supplied handle bytes. Binding to `session.id` (server
+/// assigned at authentication) means a peer cannot target another session's
+/// bind by guessing the deterministic handle (WEB-03).
+fn prepared_param_key(session_id: &str, handle: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(session_id.len() + 1 + handle.len());
+    key.extend_from_slice(session_id.as_bytes());
+    key.push(0); // separator that cannot appear in the utf-8 session id
+    key.extend_from_slice(handle);
+    key
 }
 
 impl SqeFlightSqlService {
@@ -394,7 +416,12 @@ impl SqeFlightSqlService {
             rate_limiter: None,
             auth_rate_limiter: None,
             metadata_rate_limiter: None,
-            prepared_params: Arc::new(dashmap::DashMap::new()),
+            prepared_params: Arc::new(
+                moka::future::Cache::builder()
+                    .max_capacity(PREPARED_PARAMS_MAX_ENTRIES)
+                    .time_to_live(PREPARED_PARAMS_TTL)
+                    .build(),
+            ),
         }
     }
 
@@ -1359,10 +1386,15 @@ impl FlightSqlService for SqeFlightSqlService {
         // Substitute any bound parameters before execution. Without this
         // the SQL still contains `?` placeholders and DataFusion rejects
         // the plan; previous behaviour silently returned wrong results.
-        let key: Vec<u8> = query.prepared_statement_handle.to_vec();
-        let sql = match self.prepared_params.remove(&key) {
-            Some((_, params)) => substitute_placeholders(&fetch.handle, &params)
-                .map_err(Status::invalid_argument)?,
+        // The bind is looked up under this authenticated session's key, so a
+        // peer cannot inject parameters into another user's statement (WEB-03).
+        let key = prepared_param_key(&session.id, &query.prepared_statement_handle);
+        let sql = match self.prepared_params.get(&key).await {
+            Some(params) => {
+                self.prepared_params.invalidate(&key).await;
+                substitute_placeholders(&fetch.handle, &params)
+                    .map_err(Status::invalid_argument)?
+            }
             None => fetch.handle.clone(),
         };
 
@@ -1694,20 +1726,26 @@ impl FlightSqlService for SqeFlightSqlService {
         query: CommandPreparedStatementQuery,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<DoPutPreparedStatementResult, Status> {
+        // WEB-03: this handler used to be unauthenticated, so any peer could
+        // write parameter values onto a deterministic, session-unbound handle
+        // that a victim's later `do_get` would execute. Authenticate first and
+        // key the bind to this session.
+        let session = self.get_session_from_request(&request).await?;
+
         // The inbound stream carries a parameter `RecordBatch` produced by
         // the JDBC driver. Decode it into a flat list of SQL literals and
-        // park the list on the handle; `do_get_prepared_statement` then
-        // substitutes `?` placeholders in left-to-right order before
+        // park the list on the per-session handle key; `do_get_prepared_statement`
+        // then substitutes `?` placeholders in left-to-right order before
         // executing.
-        let handle_bytes: Vec<u8> = query.prepared_statement_handle.to_vec();
+        let key = prepared_param_key(&session.id, &query.prepared_statement_handle);
         let stream = request.into_inner();
         match decode_parameter_stream(stream).await {
             Ok(params) if !params.is_empty() => {
-                self.prepared_params.insert(handle_bytes.clone(), params);
+                self.prepared_params.insert(key, params).await;
             }
             Ok(_) => {
                 // Empty parameter batch (driver issued bind with zero params).
-                self.prepared_params.remove(&handle_bytes);
+                self.prepared_params.invalidate(&key).await;
             }
             Err(e) => {
                 warn!(
@@ -1787,10 +1825,13 @@ impl FlightSqlService for SqeFlightSqlService {
     async fn do_action_close_prepared_statement(
         &self,
         query: ActionClosePreparedStatementRequest,
-        _request: Request<Action>,
+        request: Request<Action>,
     ) -> Result<(), Status> {
-        let key: Vec<u8> = query.prepared_statement_handle.to_vec();
-        self.prepared_params.remove(&key);
+        // WEB-03: authenticate so a peer cannot evict another session's bind,
+        // and scope the key to this session.
+        let session = self.get_session_from_request(&request).await?;
+        let key = prepared_param_key(&session.id, &query.prepared_statement_handle);
+        self.prepared_params.invalidate(&key).await;
         Ok(())
     }
 
