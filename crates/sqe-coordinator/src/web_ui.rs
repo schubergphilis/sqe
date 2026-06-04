@@ -5,6 +5,7 @@
 //! `docs/superpowers/specs/2026-06-01-sqe-web-ui-design.md`.
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -179,19 +180,16 @@ pub fn overview(node: &NodeInfo, uptime_seconds: u64, cpu_cores: usize, tracker:
 /// The dashboard single-page app, embedded at compile time.
 pub const DASHBOARD_HTML: &str = include_str!("web_ui/dashboard.html");
 
-/// SQL is truncated server-side; the full statement is not needed for an ops
-/// glance and bounds the payload.
-const SQL_MAX: usize = 512;
-
-fn truncate_sql(sql: &str) -> String {
-    if sql.len() <= SQL_MAX {
-        sql.to_string()
-    } else {
-        // Take SQL_MAX chars, not bytes: slicing `&sql[..SQL_MAX]` panics when
-        // byte SQL_MAX lands inside a multibyte UTF-8 sequence, and the SQL is
-        // user-controlled (a poison query would break the whole list render).
-        format!("{}...", sql.chars().take(SQL_MAX).collect::<String>())
-    }
+/// WEB-02: the raw SQL statement and submitting username are NOT exposed on
+/// this unauthenticated, network-gated endpoint. SQL routinely embeds literal
+/// PII and secrets in predicates/inserts (`WHERE email = '...'`, presigned
+/// URLs, tokens), and usernames are capability-adjacent. Instead the list
+/// surfaces a stable SHA-256 digest of the SQL so operators can correlate and
+/// group identical statements without reading their contents.
+fn sql_digest(sql: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(sql.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 #[derive(Serialize, PartialEq, Debug)]
@@ -199,9 +197,10 @@ fn truncate_sql(sql: &str) -> String {
 pub struct QueryListItem {
     pub query_id: String,
     pub state: String,
-    pub user: String,
     pub source: Option<String>,
-    pub sql: String,
+    /// SHA-256 hex digest of the SQL text. The raw SQL and the submitting
+    /// username are deliberately omitted (WEB-02).
+    pub sql_hash: String,
     pub created: String,
     pub started: Option<String>,
     pub ended: Option<String>,
@@ -221,9 +220,8 @@ fn to_list_item(r: &QueryRecord) -> QueryListItem {
     QueryListItem {
         query_id: r.query_id.to_string(),
         state: r.state.to_string(),
-        user: r.user.clone(),
         source: r.source.clone(),
-        sql: truncate_sql(&r.sql),
+        sql_hash: sql_digest(&r.sql),
         created: r.created.to_rfc3339(),
         started: r.started.map(|t| t.to_rfc3339()),
         ended: r.ended.map(|t| t.to_rfc3339()),
@@ -410,22 +408,26 @@ mod tests {
         assert_eq!(list.len(), 2);
         // id2 was created after id1, so it sorts first.
         assert_eq!(list[0].query_id, id2.to_string());
-        assert_eq!(list[0].user, "bob");
+        // WEB-02: the username is not exposed; the SQL is surfaced only as a hash.
         assert_eq!(list[0].state, "QUEUED");
+        assert_eq!(list[0].sql_hash, sql_digest("SELECT 2"));
     }
 
     #[tokio::test]
-    async fn query_list_filters_by_state_and_truncates_sql() {
+    async fn query_list_filters_by_state_and_hashes_sql() {
         let t = tracker();
         let id = Uuid::now_v7();
-        let long_sql = "X".repeat(SQL_MAX + 50);
-        t.start(id, "alice", None, &long_sql, "s1", None, vec![]);
+        let sql = "SELECT secret FROM t WHERE email = 'jane@x.com'";
+        t.start(id, "alice", None, sql, "s1", None, vec![]);
         t.running(&id, 5);
 
         let running = query_list(&t, Some("running"), 100);
         assert_eq!(running.len(), 1);
-        assert!(running[0].sql.ends_with("..."));
-        assert_eq!(running[0].sql.len(), SQL_MAX + 3);
+        // WEB-02: raw SQL must not be present anywhere in the serialized DTO.
+        let json = serde_json::to_string(&running[0]).unwrap();
+        assert!(!json.contains("jane@x.com"), "raw SQL leaked: {json}");
+        assert!(!json.contains("\"user\""), "username leaked: {json}");
+        assert_eq!(running[0].sql_hash, sql_digest(sql));
 
         let finished = query_list(&t, Some("finished"), 100);
         assert!(finished.is_empty());
@@ -444,17 +446,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_list_truncates_multibyte_sql_without_panic() {
+    async fn query_list_hashes_multibyte_sql_without_panic() {
         let t = tracker();
         let id = Uuid::now_v7();
-        // Each 'λ' is 2 bytes, so a byte-slice at SQL_MAX would split a char and
-        // panic. Confirm we truncate on a char boundary instead.
-        let sql = "λ".repeat(SQL_MAX + 10);
+        // Multibyte SQL must hash cleanly (the old byte-slice truncation could
+        // split a char; hashing operates on bytes and never panics).
+        let sql = "λ".repeat(600);
         t.start(id, "alice", None, &sql, "s1", None, vec![]);
         let list = query_list(&t, None, 100);
         assert_eq!(list.len(), 1);
-        assert!(list[0].sql.ends_with("..."));
-        assert_eq!(list[0].sql.chars().count(), SQL_MAX + 3);
+        assert_eq!(list[0].sql_hash, sql_digest(&sql));
     }
 
     #[tokio::test]
@@ -474,7 +475,8 @@ mod tests {
 
         let detail = query_detail(&t, &id).expect("detail present");
         assert_eq!(detail.summary.query_id, id.to_string());
-        assert_eq!(detail.summary.user, "alice");
+        // WEB-02: detail summary no longer carries the username.
+        assert_eq!(detail.summary.sql_hash, sql_digest("SELECT *"));
         assert_eq!(detail.fragments.len(), 1);
         assert_eq!(detail.fragments[0].worker_url, "http://w1:50052");
         assert_eq!(detail.fragments[0].state, "RUNNING");
