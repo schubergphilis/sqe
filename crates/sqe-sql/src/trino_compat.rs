@@ -917,7 +917,7 @@ mod tests {
         // very deep tree. The guard must reject it WITHOUT recursing deep
         // enough to overflow.
         let n = MAX_EXPRESSION_DEPTH + 200;
-        let chain = std::iter::repeat("a").take(n).collect::<Vec<_>>().join(" OR ");
+        let chain = std::iter::repeat_n("a", n).collect::<Vec<_>>().join(" OR ");
         let sql = format!("SELECT {chain} FROM t");
         let stmts = Parser::parse_sql(&GenericDialect {}, &sql).expect("parse");
         assert!(check_expression_depth(&stmts).is_err());
@@ -929,7 +929,7 @@ mod tests {
         // without the guard this would reach the recursive VisitMut and
         // overflow. With the guard it returns the SQL unchanged.
         let n = MAX_EXPRESSION_DEPTH + 500;
-        let chain = std::iter::repeat("a").take(n).collect::<Vec<_>>().join(" OR ");
+        let chain = std::iter::repeat_n("a", n).collect::<Vec<_>>().join(" OR ");
         // Embed a `$` so the cheap fast-path does not skip the walk.
         let sql = format!("SELECT {chain}, '$' AS marker FROM t");
         let out = rewrite_trino_compat(&sql);
