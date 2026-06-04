@@ -35,8 +35,11 @@ cargo-check:
     # binaries it expects. cargo-deny was already being installed this way;
     # same pattern for the rest.
     - rustup component add clippy
-    - cargo install cargo-audit --quiet 2>/dev/null || true
-    - cargo install cargo-deny --quiet 2>/dev/null || true
+    # DEP-09: install only when missing (cached in .cargo/bin across runs), and
+    # do NOT swallow install failures — a failed install must fail the job, not
+    # silently skip the `cargo audit` / `cargo deny` security gate below.
+    - command -v cargo-audit > /dev/null || cargo install cargo-audit --quiet
+    - command -v cargo-deny > /dev/null || cargo install cargo-deny --quiet
   script:
     - cargo clippy --all-targets --all-features -- -D warnings
     - cargo audit
@@ -59,7 +62,8 @@ cargo-check:
     paths:
       - target/
       - .cargo/registry/
-      - .cargo/bin/cargo-deny
+      # DEP-09: cache the whole bin dir so cargo-audit is not recompiled every run.
+      - .cargo/bin/
 
 # ── Tests ──────────────────────────────────────────────────────
 cargo-test:
