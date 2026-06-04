@@ -208,9 +208,12 @@ fn extract_component(
     match arg {
         ColumnarValue::Array(array) => {
             let result: Int64Array = if let Some(date_arr) = array.as_any().downcast_ref::<Date32Array>() {
-                date_arr.iter().map(|opt| opt.map(|days| {
-                    let date = temporal_conversions::date32_to_datetime(days).unwrap().date();
-                    f_date(date) as i64
+                date_arr.iter().map(|opt| opt.and_then(|days| {
+                    // date32_to_datetime returns None for Date32 values whose
+                    // day count overflows NaiveDateTime (near i32::MAX). Emit a
+                    // NULL row instead of unwrapping into a panic.
+                    temporal_conversions::date32_to_datetime(days)
+                        .map(|dt| f_date(dt.date()) as i64)
                 })).collect()
             } else if let Some(ts_arr) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
                 ts_arr.iter().map(|opt| opt.map(|v| f_ts(v) as i64)).collect()
@@ -234,8 +237,12 @@ fn extract_component(
             use datafusion::common::ScalarValue;
             let val = match scalar {
                 ScalarValue::Date32(Some(days)) => {
-                    let date = temporal_conversions::date32_to_datetime(*days).unwrap().date();
-                    f_date(date) as i64
+                    // None for extreme Date32 values that overflow NaiveDateTime;
+                    // surface a NULL rather than panicking on unwrap.
+                    match temporal_conversions::date32_to_datetime(*days) {
+                        Some(dt) => f_date(dt.date()) as i64,
+                        None => return Ok(ColumnarValue::Scalar(ScalarValue::Int64(None))),
+                    }
                 }
                 ScalarValue::TimestampMicrosecond(Some(us), _) => f_ts(*us) as i64,
                 ScalarValue::TimestampNanosecond(Some(ns), _) => f_ts_ns(*ns) as i64,
@@ -729,7 +736,12 @@ impl ScalarUDFImpl for DateDiff {
                     }
                     arr.as_any()
                         .downcast_ref::<Date32Array>()
-                        .map(|a| temporal_conversions::date32_to_datetime(a.value(i)).unwrap().date())
+                        .and_then(|a| {
+                            // None for out-of-range Date32; propagate as a NULL
+                            // date rather than panicking on unwrap.
+                            temporal_conversions::date32_to_datetime(a.value(i))
+                                .map(|dt| dt.date())
+                        })
                         .or_else(|| {
                             arr.as_any()
                                 .downcast_ref::<TimestampMicrosecondArray>()
@@ -859,9 +871,13 @@ impl ScalarUDFImpl for ToUnixtime {
                     ScalarValue::TimestampMicrosecond(Some(us), _) => Some(*us as f64 / 1_000_000.0),
                     ScalarValue::TimestampNanosecond(Some(ns), _) => Some(*ns as f64 / 1_000_000_000.0),
                     ScalarValue::Date32(Some(days)) => {
-                        let d = temporal_conversions::date32_to_datetime(*days).unwrap().date();
-                        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                        Some(d.signed_duration_since(epoch).num_seconds() as f64)
+                        // None for out-of-range Date32; yield a NULL result
+                        // instead of unwrapping into a panic.
+                        temporal_conversions::date32_to_datetime(*days).map(|dt| {
+                            let d = dt.date();
+                            let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                            d.signed_duration_since(epoch).num_seconds() as f64
+                        })
                     }
                     _ => None,
                 };
@@ -2132,14 +2148,17 @@ encoding_udf!(FromBase64, "from_base64", |s: &str| {
 // shadowing it breaks integer hex formatting. Use encode(s, 'hex') instead.
 
 encoding_udf!(FromHex, "from_hex", |s: &str| {
-    let bytes: Vec<u8> = (0..s.len())
+    // Slice the BYTE view, not the &str: stepping by 2 over a string with
+    // multi-byte UTF-8 characters and slicing `&s[i..i+2]` lands inside a
+    // character and panics ("not a char boundary"). Hex pairs are ASCII, so
+    // operating on the raw bytes is both correct and panic-free.
+    let raw = s.as_bytes();
+    let bytes: Vec<u8> = (0..raw.len())
         .step_by(2)
         .filter_map(|i| {
-            if i + 2 <= s.len() {
-                u8::from_str_radix(&s[i..i + 2], 16).ok()
-            } else {
-                None
-            }
+            raw.get(i..i + 2)
+                .and_then(|pair| std::str::from_utf8(pair).ok())
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
         })
         .collect();
     String::from_utf8_lossy(&bytes).to_string()
@@ -2152,14 +2171,15 @@ encoding_udf!(ToUtf8, "to_utf8", |s: &str| {
 
 encoding_udf!(FromUtf8, "from_utf8", |s: &str| {
     // Trino from_utf8 converts VARBINARY → VARCHAR; we accept hex-encoded string.
-    let bytes: Vec<u8> = (0..s.len())
+    // Slice the BYTE view, not the &str, so a non-ASCII input cannot panic on a
+    // char-boundary slice.
+    let raw = s.as_bytes();
+    let bytes: Vec<u8> = (0..raw.len())
         .step_by(2)
         .filter_map(|i| {
-            if i + 2 <= s.len() {
-                u8::from_str_radix(&s[i..i + 2], 16).ok()
-            } else {
-                None
-            }
+            raw.get(i..i + 2)
+                .and_then(|pair| std::str::from_utf8(pair).ok())
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
         })
         .collect();
     if bytes.is_empty() {
