@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use serde::Deserialize;
 use tracing::{debug, warn};
 
@@ -34,6 +36,8 @@ impl OAuthClient {
         accept_invalid_certs: bool,
     ) -> sqe_core::Result<Self> {
         let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
             .danger_accept_invalid_certs(accept_invalid_certs)
             .build()
             .map_err(|e| {
