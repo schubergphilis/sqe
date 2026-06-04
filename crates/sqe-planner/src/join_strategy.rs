@@ -227,10 +227,11 @@ fn is_sorted_on(plan: &Arc<dyn ExecutionPlan>, required: &[PhysicalSortExpr]) ->
     }
 
     for (existing, required_expr) in output_ordering.iter().zip(required.iter()) {
-        // Compare the expression string representations and sort options.
-        // This is a pragmatic approach — exact physical expression equality
-        // checking is complex in DataFusion.
-        if format!("{existing}") != format!("{required_expr}") {
+        // PLAN-05: compare `PhysicalSortExpr` structurally via its `PartialEq`
+        // impl (covers the inner expr + `SortOptions`) instead of allocating
+        // two `String`s per pair with `format!`. Same semantics, no per-compare
+        // allocation on the planning path.
+        if existing != required_expr {
             return false;
         }
     }
