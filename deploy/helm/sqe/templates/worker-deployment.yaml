@@ -83,12 +83,23 @@ spec:
             - name: config
               mountPath: /etc/sqe
               readOnly: true
+            # DEP-01: writable /tmp for spill-to-disk under
+            # readOnlyRootFilesystem. The worker spill_dir defaults to
+            # /tmp/sqe-spill; without this volume the first large sort/join
+            # that exceeds memory_limit fails with EROFS instead of spilling.
+            - name: tmp
+              mountPath: /tmp
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}
       volumes:
         - name: config
           configMap:
             name: {{ include "sqe.fullname" . }}-config
+        - name: tmp
+          emptyDir:
+            {{- with .Values.worker.spillVolumeSizeLimit }}
+            sizeLimit: {{ . }}
+            {{- end }}
       {{- with .Values.worker.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
