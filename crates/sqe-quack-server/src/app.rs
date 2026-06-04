@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -14,6 +14,7 @@ use bytes::Bytes;
 use sqe_auth::{AuthError, AuthProvider, FlightCredentials};
 use sqe_core::SecretString;
 use sqe_quack_wire::arrow_bridge::record_batch_to_data_chunk;
+use sqe_quack_wire::codec::BinaryDeserializer;
 use sqe_quack_wire::data_chunk::DataChunk;
 use sqe_quack_wire::message::{
     decode_message, encode_message, ConnectionResponse, ErrorResponse, MessageHeader, MessageType,
@@ -26,6 +27,13 @@ use crate::session::{identity_to_core_session, Session, SessionStore};
 
 const QUACK_VERSION: u64 = 1;
 const APPLICATION_VND_DUCKDB: &str = "application/vnd.duckdb";
+
+/// Explicit request-body cap for the `/quack` endpoint. The DataChunk-carrying
+/// decode paths are reachable pre-auth, so we keep the ceiling small and
+/// independent of axum's implicit default. 4 MiB comfortably covers a
+/// handshake, a DISCONNECT, and a reasonable PREPARE SQL string while leaving
+/// no room for a multi-MB recursion / allocation-count payload.
+const QUACK_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct QuackServerState {
@@ -58,7 +66,26 @@ pub fn router(state: QuackServerState) -> Router {
     Router::new()
         .route("/", get(identify))
         .route("/quack", post(handle_quack))
+        // Explicit body limit so the cap does not silently depend on axum's
+        // implicit default; the pre-auth decode paths must stay bounded.
+        .layer(DefaultBodyLimit::max(QUACK_MAX_BODY_BYTES))
         .with_state(Arc::new(state))
+}
+
+/// True for message types a *client* must never send: server-only responses
+/// and the invalid sentinel. We reject these from the wire-supplied header
+/// before decoding the (potentially DataChunk-carrying) body, so a malicious
+/// caller cannot drive the expensive response-body decode paths.
+fn is_server_only_message(ty: MessageType) -> bool {
+    matches!(
+        ty,
+        MessageType::Invalid
+            | MessageType::ConnectionResponse
+            | MessageType::PrepareResponse
+            | MessageType::FetchResponse
+            | MessageType::SuccessResponse
+            | MessageType::ErrorResponse
+    )
 }
 
 async fn identify() -> impl IntoResponse {
@@ -73,6 +100,25 @@ async fn handle_quack(
     State(state): State<Arc<QuackServerState>>,
     body: Bytes,
 ) -> impl IntoResponse {
+    // Decode only the header first and reject server-only / response message
+    // types up front. This avoids running the full body decoder (including the
+    // DataChunk-carrying response paths) for messages a client must never send.
+    let mut header_d = BinaryDeserializer::new(&body);
+    let pre_header = match MessageHeader::decode(&mut header_d) {
+        Ok(h) => h,
+        Err(e) => return error_response("", None, format!("SQE-PARSE: {e}")),
+    };
+    if is_server_only_message(pre_header.r#type) {
+        return error_response(
+            &pre_header.connection_id,
+            pre_header.client_query_id,
+            format!(
+                "SQE-DIALECT: message type {:?} is server-only and not accepted",
+                pre_header.r#type
+            ),
+        );
+    }
+
     let (request_header, request_body) = match decode_message(&body) {
         Ok(v) => v,
         Err(e) => return error_response("", None, format!("SQE-PARSE: {e}")),

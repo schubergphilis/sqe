@@ -11,6 +11,14 @@
 
 use crate::codec::{BinaryDeserializer, BinarySerializer};
 
+/// Maximum nesting depth for `LogicalType` / `ExtraTypeInfo` / `Vector`
+/// decode. A wire-controlled `LIST<LIST<LIST<...>>>` (or the equivalent
+/// `Vector` recursion) drives mutual recursion that overflows the stack and
+/// aborts the process via SIGSEGV — an uncatchable failure even under the
+/// unwind panic strategy. The cap turns that into a clean `WireError`.
+/// 32 levels is far past anything DuckDB emits in practice.
+pub const MAX_DECODE_DEPTH: u8 = 32;
+
 /// Subset of DuckDB's `LogicalTypeId` (uint8_t). Covers all common scalar
 /// types plus the nested-type markers; nested type _info_ (LIST<T>, STRUCT<...>)
 /// is not yet implemented in `LogicalType::type_info`.
@@ -303,6 +311,21 @@ impl ExtraTypeInfo {
     /// open. Reads the base discriminant first, then dispatches to the
     /// subclass; consumes the trailing 0xFFFF object terminator.
     pub fn decode_inner(d: &mut BinaryDeserializer<'_>) -> crate::Result<Self> {
+        Self::decode_inner_with_depth(d, MAX_DECODE_DEPTH)
+    }
+
+    /// Depth-bounded variant of [`decode_inner`]. `remaining_depth` is the
+    /// number of further nesting levels permitted before the codec bails with
+    /// [`crate::WireError::RecursionLimitExceeded`].
+    pub(crate) fn decode_inner_with_depth(
+        d: &mut BinaryDeserializer<'_>,
+        remaining_depth: u8,
+    ) -> crate::Result<Self> {
+        let Some(child_depth) = remaining_depth.checked_sub(1) else {
+            return Err(crate::WireError::RecursionLimitExceeded {
+                max: MAX_DECODE_DEPTH,
+            });
+        };
         d.expect_field(100)?;
         let kind = ExtraTypeInfoType::from_u8(d.read_u8()?)?;
         // Base field 101 (alias, default ""): consume if present.
@@ -329,7 +352,7 @@ impl ExtraTypeInfo {
             }
             ExtraTypeInfoType::List => {
                 d.expect_field(200)?;
-                let child = LogicalType::decode(d)?;
+                let child = LogicalType::decode_with_depth(d, child_depth)?;
                 d.expect_object_end()?;
                 Ok(ExtraTypeInfo::List {
                     child: Box::new(child),
@@ -337,13 +360,16 @@ impl ExtraTypeInfo {
             }
             ExtraTypeInfoType::Struct => {
                 let fields = if d.read_optional(200)? {
-                    let count = d.read_list_count()? as usize;
-                    let mut out = Vec::with_capacity(count);
+                    // Bound the count against bytes remaining before allocating:
+                    // each pair object costs well over one byte on the wire.
+                    let count = d.read_bounded_count()?;
+                    let mut out = Vec::new();
+                    out.reserve(count);
                     for _ in 0..count {
                         d.expect_field(0)?;
                         let name = d.read_string()?;
                         d.expect_field(1)?;
-                        let ty = LogicalType::decode(d)?;
+                        let ty = LogicalType::decode_with_depth(d, child_depth)?;
                         d.expect_object_end()?; // end inner LogicalType
                         d.expect_object_end()?; // end pair
                         out.push((name, ty));
@@ -356,7 +382,7 @@ impl ExtraTypeInfo {
             }
             ExtraTypeInfoType::Array => {
                 d.expect_field(200)?;
-                let child = LogicalType::decode(d)?;
+                let child = LogicalType::decode_with_depth(d, child_depth)?;
                 d.expect_object_end()?;
                 let size = if d.read_optional(201)? { d.read_u32()? } else { 0 };
                 Ok(ExtraTypeInfo::Array {
@@ -368,15 +394,18 @@ impl ExtraTypeInfo {
                 d.expect_field(200)?;
                 let count = d.read_u64()? as usize;
                 d.expect_field(201)?;
-                let listed = d.read_list_count()? as usize;
+                // `read_bounded_count` rejects a listed count larger than the
+                // bytes that could possibly back it (each string >= 1 byte).
+                let listed = d.read_bounded_count()?;
                 if listed != count {
                     return Err(crate::WireError::UnexpectedField {
                         expected: count as u16,
                         actual: listed as u16,
                     });
                 }
-                let mut values = Vec::with_capacity(count);
-                for _ in 0..count {
+                let mut values = Vec::new();
+                values.reserve(listed);
+                for _ in 0..listed {
                     values.push(d.read_string()?);
                 }
                 Ok(ExtraTypeInfo::Enum { values })
@@ -468,6 +497,22 @@ impl LogicalType {
     }
 
     pub fn decode(d: &mut BinaryDeserializer<'_>) -> crate::Result<Self> {
+        Self::decode_with_depth(d, MAX_DECODE_DEPTH)
+    }
+
+    /// Depth-bounded variant of [`decode`]. `remaining_depth` caps how many
+    /// further nesting levels the type tree may have before the codec returns
+    /// [`crate::WireError::RecursionLimitExceeded`], preventing a wire-driven
+    /// stack-overflow / process abort.
+    pub(crate) fn decode_with_depth(
+        d: &mut BinaryDeserializer<'_>,
+        remaining_depth: u8,
+    ) -> crate::Result<Self> {
+        let Some(child_depth) = remaining_depth.checked_sub(1) else {
+            return Err(crate::WireError::RecursionLimitExceeded {
+                max: MAX_DECODE_DEPTH,
+            });
+        };
         d.expect_field(100)?;
         let id = LogicalTypeId::from_u8(d.read_u8()?)?;
         let extra = if d.read_optional(101)? {
@@ -475,7 +520,7 @@ impl LogicalType {
             if !present {
                 return Err(crate::WireError::NullExtraTypeInfo);
             }
-            let extra = ExtraTypeInfo::decode_inner(d)?;
+            let extra = ExtraTypeInfo::decode_inner_with_depth(d, child_depth)?;
             d.expect_object_end()?;
             Some(extra)
         } else {
@@ -669,6 +714,23 @@ impl Vector {
         count: usize,
         d: &mut BinaryDeserializer<'_>,
     ) -> crate::Result<Self> {
+        Self::decode_with_depth(logical_type, count, d, MAX_DECODE_DEPTH)
+    }
+
+    /// Depth-bounded variant of [`decode`]. Caps nested LIST/ARRAY/STRUCT
+    /// recursion so a wire-controlled deeply nested vector cannot overflow the
+    /// stack and abort the process.
+    pub(crate) fn decode_with_depth(
+        logical_type: LogicalType,
+        count: usize,
+        d: &mut BinaryDeserializer<'_>,
+        remaining_depth: u8,
+    ) -> crate::Result<Self> {
+        let Some(child_depth) = remaining_depth.checked_sub(1) else {
+            return Err(crate::WireError::RecursionLimitExceeded {
+                max: MAX_DECODE_DEPTH,
+            });
+        };
         // Field 90 ("vector_type") is only present for compressed formats.
         // Standard DuckDB FLAT vectors skip it.
         if d.read_optional(90)? {
@@ -682,7 +744,11 @@ impl Vector {
         let validity = if has_validity {
             d.expect_field(101)?;
             let raw = d.read_data_ptr()?;
-            let mut bits = Vec::with_capacity(count);
+            // `count` is the parent's row_count, itself a wire-supplied value.
+            // Allocate incrementally instead of `with_capacity(count)` so a
+            // bogus 4e9 row_count does not pre-allocate gigabytes before the
+            // first byte is read.
+            let mut bits = Vec::new();
             for i in 0..count {
                 let byte = raw.get(i / 8).copied().unwrap_or(0);
                 bits.push(byte & (1 << (i % 8)) != 0);
@@ -701,8 +767,10 @@ impl Vector {
                 d.expect_field(104)?;
                 let child_count = d.read_u64()?;
                 d.expect_field(105)?;
-                let actual = d.read_list_count()? as usize;
-                let mut entries = Vec::with_capacity(actual);
+                // Each entry object costs several bytes; bound before allocating.
+                let actual = d.read_bounded_count()?;
+                let mut entries = Vec::new();
+                entries.reserve(actual);
                 for _ in 0..actual {
                     d.expect_field(100)?;
                     let offset = d.read_u64()?;
@@ -718,7 +786,8 @@ impl Vector {
                         return Err(crate::WireError::UnsupportedLogicalType(logical_type.id))
                     }
                 };
-                let child_vec = Vector::decode(child_logical, child_count as usize, d)?;
+                let child_vec =
+                    Vector::decode_with_depth(child_logical, child_count as usize, d, child_depth)?;
                 d.expect_object_end()?;
                 VectorData::List {
                     entries,
@@ -739,8 +808,12 @@ impl Vector {
                         ))
                     }
                 };
-                let child_vec =
-                    Vector::decode(child_logical, (array_size as usize) * count, d)?;
+                let child_vec = Vector::decode_with_depth(
+                    child_logical,
+                    (array_size as usize).saturating_mul(count),
+                    d,
+                    child_depth,
+                )?;
                 d.expect_object_end()?;
                 VectorData::Array {
                     array_size,
@@ -754,7 +827,8 @@ impl Vector {
             // difference is the parent LogicalTypeId.
             LogicalTypeId::Struct | LogicalTypeId::Union => {
                 d.expect_field(103)?;
-                let child_count = d.read_list_count()? as usize;
+                // Each child vector costs at least one byte; bound the count.
+                let child_count = d.read_bounded_count()?;
                 let field_types: Vec<LogicalType> = match &logical_type.extra {
                     Some(ExtraTypeInfo::Struct { fields }) => {
                         fields.iter().map(|(_, ty)| ty.clone()).collect()
@@ -767,9 +841,10 @@ impl Vector {
                         actual: child_count as u16,
                     });
                 }
-                let mut children = Vec::with_capacity(child_count);
+                let mut children = Vec::new();
+                children.reserve(child_count);
                 for ty in field_types {
-                    let child = Vector::decode(ty, count, d)?;
+                    let child = Vector::decode_with_depth(ty, count, d, child_depth)?;
                     d.expect_object_end()?;
                     children.push(child);
                 }
@@ -777,13 +852,38 @@ impl Vector {
             }
             _ if logical_type.physical_width().is_some() => {
                 d.expect_field(102)?;
-                VectorData::Fixed(d.read_data_ptr()?)
+                let bytes = d.read_data_ptr()?;
+                // Validate the buffer is large enough for `count` fixed-width
+                // values before building the Fixed vector. Without this, a
+                // server claiming row_count = 1e6 with a 4-byte buffer makes
+                // the Arrow bridge (`scalar_buffer_le`) slice out of bounds and
+                // panic the consuming query task. `physical_width()` is Some on
+                // this arm, and a wire-controlled DECIMAL precision can only
+                // pick a known small width (2/4/8/16).
+                let width = logical_type
+                    .physical_width()
+                    .expect("physical_width is Some on this match arm");
+                let needed = count.checked_mul(width).ok_or(
+                    crate::WireError::CountExceedsRemaining {
+                        count: count as u64,
+                        remaining: bytes.len() as u64,
+                    },
+                )?;
+                if bytes.len() < needed {
+                    return Err(crate::WireError::CountExceedsRemaining {
+                        count: needed as u64,
+                        remaining: bytes.len() as u64,
+                    });
+                }
+                VectorData::Fixed(bytes)
             }
             LogicalTypeId::Varchar => {
                 d.expect_field(102)?;
-                let actual = d.read_list_count()? as usize;
+                // Bound against bytes remaining: each string is >= 1 byte.
+                let actual = d.read_bounded_count()?;
                 let take = actual.min(count);
-                let mut values = Vec::with_capacity(take);
+                let mut values = Vec::new();
+                values.reserve(take);
                 let validity_ref = validity.as_deref();
                 for i in 0..actual {
                     let valid = validity_ref
@@ -804,8 +904,10 @@ impl Vector {
             }
             LogicalTypeId::Blob => {
                 d.expect_field(102)?;
-                let actual = d.read_list_count()? as usize;
-                let mut values = Vec::with_capacity(actual);
+                // Each blob entry is a length-prefixed slot (>= 1 byte): bound.
+                let actual = d.read_bounded_count()?;
+                let mut values = Vec::new();
+                values.reserve(actual);
                 let validity_ref = validity.as_deref();
                 for i in 0..actual {
                     let bytes = d.read_data_ptr()?;
@@ -872,8 +974,10 @@ impl DataChunk {
         let row_count = d.read_u32()?;
 
         d.expect_field(101)?;
-        let type_count = d.read_list_count()? as usize;
-        let mut types = Vec::with_capacity(type_count);
+        // Each LogicalType object costs several bytes; bound before allocating.
+        let type_count = d.read_bounded_count()?;
+        let mut types = Vec::new();
+        types.reserve(type_count);
         for _ in 0..type_count {
             let t = LogicalType::decode(d)?;
             d.expect_object_end()?;
@@ -881,14 +985,15 @@ impl DataChunk {
         }
 
         d.expect_field(102)?;
-        let column_count = d.read_list_count()? as usize;
+        let column_count = d.read_bounded_count()?;
         if column_count != type_count {
             return Err(crate::WireError::UnexpectedField {
                 expected: type_count as u16,
                 actual: column_count as u16,
             });
         }
-        let mut columns = Vec::with_capacity(column_count);
+        let mut columns = Vec::new();
+        columns.reserve(column_count);
         for t in types {
             let column = Vector::decode(t, row_count as usize, d)?;
             d.expect_object_end()?;
@@ -1683,5 +1788,135 @@ mod tests {
         let decoded = Vector::decode(map_lt, 1, &mut d).unwrap();
         d.expect_object_end().unwrap();
         assert_eq!(decoded, v);
+    }
+
+    // ── Decoder safety guards (QUACK-01/02/03/04) ───────────────────────
+
+    /// Build a `LogicalType` nested `depth` levels deep as
+    /// LIST<LIST<...<INTEGER>>>.
+    fn nested_list_type(depth: usize) -> LogicalType {
+        let mut t = LogicalType::new(LogicalTypeId::Integer);
+        for _ in 0..depth {
+            t = LogicalType::with_extra(
+                LogicalTypeId::List,
+                ExtraTypeInfo::List {
+                    child: Box::new(t),
+                },
+            );
+        }
+        t
+    }
+
+    #[test]
+    fn deeply_nested_logical_type_is_rejected_not_overflowed() {
+        // QUACK-01: a type nested past MAX_DECODE_DEPTH must return a clean
+        // error instead of overflowing the stack.
+        let lt = nested_list_type((MAX_DECODE_DEPTH as usize) + 5);
+        let mut s = BinarySerializer::new();
+        s.begin_object();
+        lt.encode(&mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+
+        let mut d = BinaryDeserializer::new(&bytes);
+        let err = LogicalType::decode(&mut d).unwrap_err();
+        assert!(matches!(err, crate::WireError::RecursionLimitExceeded { .. }));
+    }
+
+    #[test]
+    fn moderately_nested_logical_type_still_decodes() {
+        // A depth well within the cap must round-trip normally.
+        let lt = nested_list_type(8);
+        let mut s = BinarySerializer::new();
+        s.begin_object();
+        lt.encode(&mut s);
+        s.end_object();
+        let bytes = s.into_bytes();
+
+        let mut d = BinaryDeserializer::new(&bytes);
+        let decoded = LogicalType::decode(&mut d).unwrap();
+        d.expect_object_end().unwrap();
+        assert_eq!(decoded, lt);
+    }
+
+    #[test]
+    fn datachunk_rejects_oversized_type_count_without_allocating() {
+        // QUACK-02: a type-list count far larger than the bytes remaining must
+        // be rejected by the bounded-count check rather than driving a huge
+        // Vec::with_capacity.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&100u16.to_le_bytes()); // field 100 (row_count)
+        crate::varint::encode_unsigned(0, &mut bytes); // row_count = 0
+        bytes.extend_from_slice(&101u16.to_le_bytes()); // field 101 (types list)
+        crate::varint::encode_unsigned(1_000_000_000, &mut bytes); // bogus count
+        // no payload follows.
+
+        let mut d = BinaryDeserializer::new(&bytes);
+        let err = DataChunk::decode(&mut d).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::WireError::CountExceedsRemaining { .. }
+        ));
+    }
+
+    #[test]
+    fn fixed_vector_rejects_row_count_exceeding_buffer() {
+        // QUACK-03: a fixed-width column claiming many rows but carrying a tiny
+        // data buffer must error, not produce a Fixed vector that later panics
+        // on OOB slicing in the Arrow bridge.
+        // Hand-roll: has_validity=false, field 102 data_ptr of 4 bytes, decoded
+        // as INTEGER (width 4) with count = 1000.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&100u16.to_le_bytes()); // field 100 (has_validity)
+        bytes.push(0); // false
+        bytes.extend_from_slice(&102u16.to_le_bytes()); // field 102 (data ptr)
+        crate::varint::encode_unsigned(4, &mut bytes); // data length 4
+        bytes.extend_from_slice(&[1, 0, 0, 0]); // a single i32
+
+        let mut d = BinaryDeserializer::new(&bytes);
+        let err =
+            Vector::decode(LogicalType::new(LogicalTypeId::Integer), 1000, &mut d).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::WireError::CountExceedsRemaining { .. }
+        ));
+    }
+
+    #[test]
+    fn fixed_vector_accepts_buffer_matching_row_count() {
+        // The same shape with a buffer that matches count*width must decode.
+        let raw: Vec<u8> = [1i32, 2, 3].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&100u16.to_le_bytes());
+        bytes.push(0); // has_validity = false
+        bytes.extend_from_slice(&102u16.to_le_bytes());
+        crate::varint::encode_unsigned(raw.len() as u64, &mut bytes);
+        bytes.extend_from_slice(&raw);
+
+        let mut d = BinaryDeserializer::new(&bytes);
+        let decoded =
+            Vector::decode(LogicalType::new(LogicalTypeId::Integer), 3, &mut d).unwrap();
+        assert_eq!(decoded.data, VectorData::Fixed(raw));
+    }
+
+    #[test]
+    fn enum_decode_rejects_oversized_value_count() {
+        // QUACK-02/04: an ENUM type_info claiming a huge values_count with no
+        // backing bytes must be rejected, not pre-allocate gigabytes.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&100u16.to_le_bytes()); // field 100 discriminant
+        crate::varint::encode_unsigned(ExtraTypeInfoType::Enum as u64, &mut bytes);
+        bytes.extend_from_slice(&200u16.to_le_bytes()); // field 200 values_count
+        crate::varint::encode_unsigned(5_000_000_000, &mut bytes); // huge count
+        bytes.extend_from_slice(&201u16.to_le_bytes()); // field 201 values list
+        crate::varint::encode_unsigned(5_000_000_000, &mut bytes); // listed count
+        // no string payload follows.
+
+        let mut d = BinaryDeserializer::new(&bytes);
+        let err = ExtraTypeInfo::decode_inner(&mut d).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::WireError::CountExceedsRemaining { .. }
+        ));
     }
 }

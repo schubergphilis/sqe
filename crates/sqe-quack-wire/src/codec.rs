@@ -161,11 +161,15 @@ impl<'a> BinaryDeserializer<'a> {
     }
 
     pub fn remaining(&self) -> &'a [u8] {
-        &self.buf[self.pos..]
+        debug_assert!(self.pos <= self.buf.len(), "pos advanced past buffer end");
+        // `pos` is never advanced past `buf.len()` by any reader, but guard
+        // against a future regression turning this into a panic/overflow.
+        self.buf.get(self.pos..).unwrap_or(&[])
     }
 
     fn read_u16_le(&mut self) -> crate::Result<u16> {
-        if self.buf.len() - self.pos < 2 {
+        debug_assert!(self.pos <= self.buf.len(), "pos advanced past buffer end");
+        if self.buf.len().checked_sub(self.pos).unwrap_or(0) < 2 {
             return Err(crate::WireError::UnexpectedEof);
         }
         let v = u16::from_le_bytes([self.buf[self.pos], self.buf[self.pos + 1]]);
@@ -174,7 +178,8 @@ impl<'a> BinaryDeserializer<'a> {
     }
 
     pub fn peek_field(&self) -> crate::Result<u16> {
-        if self.buf.len() - self.pos < 2 {
+        debug_assert!(self.pos <= self.buf.len(), "pos advanced past buffer end");
+        if self.buf.len().checked_sub(self.pos).unwrap_or(0) < 2 {
             return Err(crate::WireError::UnexpectedEof);
         }
         Ok(u16::from_le_bytes([
@@ -235,15 +240,21 @@ impl<'a> BinaryDeserializer<'a> {
     }
 
     pub fn read_u8(&mut self) -> crate::Result<u8> {
-        self.read_u64().map(|v| v as u8)
+        // Reject values that don't fit rather than silently truncating: a
+        // 10-byte varint whose low bits match an expected small value must not
+        // be accepted, or count cross-checks downstream can be defeated.
+        let v = self.read_u64()?;
+        u8::try_from(v).map_err(|_| crate::WireError::VarintOverflow)
     }
 
     pub fn read_u16(&mut self) -> crate::Result<u16> {
-        self.read_u64().map(|v| v as u16)
+        let v = self.read_u64()?;
+        u16::try_from(v).map_err(|_| crate::WireError::VarintOverflow)
     }
 
     pub fn read_u32(&mut self) -> crate::Result<u32> {
-        self.read_u64().map(|v| v as u32)
+        let v = self.read_u64()?;
+        u32::try_from(v).map_err(|_| crate::WireError::VarintOverflow)
     }
 
     pub fn read_u64(&mut self) -> crate::Result<u64> {
@@ -277,7 +288,8 @@ impl<'a> BinaryDeserializer<'a> {
     }
 
     pub fn read_f32(&mut self) -> crate::Result<f32> {
-        if self.buf.len() - self.pos < 4 {
+        debug_assert!(self.pos <= self.buf.len(), "pos advanced past buffer end");
+        if self.buf.len().checked_sub(self.pos).unwrap_or(0) < 4 {
             return Err(crate::WireError::UnexpectedEof);
         }
         let mut buf = [0u8; 4];
@@ -287,7 +299,8 @@ impl<'a> BinaryDeserializer<'a> {
     }
 
     pub fn read_f64(&mut self) -> crate::Result<f64> {
-        if self.buf.len() - self.pos < 8 {
+        debug_assert!(self.pos <= self.buf.len(), "pos advanced past buffer end");
+        if self.buf.len().checked_sub(self.pos).unwrap_or(0) < 8 {
             return Err(crate::WireError::UnexpectedEof);
         }
         let mut buf = [0u8; 8];
@@ -298,7 +311,8 @@ impl<'a> BinaryDeserializer<'a> {
 
     pub fn read_string(&mut self) -> crate::Result<String> {
         let len = self.read_u64()? as usize;
-        if self.buf.len() - self.pos < len {
+        debug_assert!(self.pos <= self.buf.len(), "pos advanced past buffer end");
+        if self.buf.len().checked_sub(self.pos).unwrap_or(0) < len {
             return Err(crate::WireError::UnexpectedEof);
         }
         let bytes = &self.buf[self.pos..self.pos + len];
@@ -316,7 +330,8 @@ impl<'a> BinaryDeserializer<'a> {
     /// position without trying to interpret them.
     pub fn skip_string(&mut self) -> crate::Result<()> {
         let len = self.read_u64()? as usize;
-        if self.buf.len() - self.pos < len {
+        debug_assert!(self.pos <= self.buf.len(), "pos advanced past buffer end");
+        if self.buf.len().checked_sub(self.pos).unwrap_or(0) < len {
             return Err(crate::WireError::UnexpectedEof);
         }
         self.pos += len;
@@ -327,11 +342,29 @@ impl<'a> BinaryDeserializer<'a> {
         self.read_u64()
     }
 
+    /// Read a wire count and reject it when it exceeds the bytes remaining in
+    /// the buffer. Every list/array element consumes at least one byte on the
+    /// wire, so a count larger than `remaining().len()` can never be satisfied
+    /// and is a memory-bomb attempt (`Vec::with_capacity(huge)` -> OOM abort).
+    /// Callers must use the returned `usize` to size allocations.
+    pub fn read_bounded_count(&mut self) -> crate::Result<usize> {
+        let count = self.read_u64()?;
+        let remaining = self.remaining().len() as u64;
+        if count > remaining {
+            return Err(crate::WireError::CountExceedsRemaining {
+                count,
+                remaining,
+            });
+        }
+        Ok(count as usize)
+    }
+
     /// DuckDB `ReadDataPtr`: varint length followed by raw bytes. Returns an
     /// owned copy so the caller does not need to track buffer lifetimes.
     pub fn read_data_ptr(&mut self) -> crate::Result<Vec<u8>> {
         let len = self.read_u64()? as usize;
-        if self.buf.len() - self.pos < len {
+        debug_assert!(self.pos <= self.buf.len(), "pos advanced past buffer end");
+        if self.buf.len().checked_sub(self.pos).unwrap_or(0) < len {
             return Err(crate::WireError::UnexpectedEof);
         }
         let bytes = self.buf[self.pos..self.pos + len].to_vec();
@@ -538,6 +571,76 @@ mod tests {
         d.expect_field(4).unwrap();
         assert_eq!(d.read_string().unwrap(), "hello");
         d.expect_object_end().unwrap();
+    }
+
+    #[test]
+    fn read_u8_rejects_varint_that_does_not_fit() {
+        // A u64 varint of 0x1_0000_0001 must NOT silently truncate to 1.
+        let mut buf = Vec::new();
+        varint::encode_unsigned(0x1_0000_0001, &mut buf);
+        let mut d = BinaryDeserializer::new(&buf);
+        assert!(matches!(
+            d.read_u8().unwrap_err(),
+            crate::WireError::VarintOverflow
+        ));
+    }
+
+    #[test]
+    fn read_u16_rejects_varint_above_u16_max() {
+        let mut buf = Vec::new();
+        varint::encode_unsigned(u16::MAX as u64 + 1, &mut buf);
+        let mut d = BinaryDeserializer::new(&buf);
+        assert!(matches!(
+            d.read_u16().unwrap_err(),
+            crate::WireError::VarintOverflow
+        ));
+    }
+
+    #[test]
+    fn read_u32_rejects_varint_above_u32_max() {
+        let mut buf = Vec::new();
+        varint::encode_unsigned(u32::MAX as u64 + 1, &mut buf);
+        let mut d = BinaryDeserializer::new(&buf);
+        assert!(matches!(
+            d.read_u32().unwrap_err(),
+            crate::WireError::VarintOverflow
+        ));
+    }
+
+    #[test]
+    fn read_u8_u16_u32_accept_in_range_values() {
+        for v in [0u64, 1, 127, 200, 255] {
+            let mut buf = Vec::new();
+            varint::encode_unsigned(v, &mut buf);
+            let mut d = BinaryDeserializer::new(&buf);
+            assert_eq!(d.read_u8().unwrap() as u64, v);
+        }
+        let mut buf = Vec::new();
+        varint::encode_unsigned(65_535, &mut buf);
+        let mut d = BinaryDeserializer::new(&buf);
+        assert_eq!(d.read_u16().unwrap(), 65_535);
+    }
+
+    #[test]
+    fn read_bounded_count_rejects_count_exceeding_remaining() {
+        // Encode a count of 1000 with no payload bytes following.
+        let mut buf = Vec::new();
+        varint::encode_unsigned(1000, &mut buf);
+        let mut d = BinaryDeserializer::new(&buf);
+        assert!(matches!(
+            d.read_bounded_count().unwrap_err(),
+            crate::WireError::CountExceedsRemaining { count: 1000, .. }
+        ));
+    }
+
+    #[test]
+    fn read_bounded_count_accepts_count_within_remaining() {
+        // Count 3 followed by 3 payload bytes -> accepted.
+        let mut buf = Vec::new();
+        varint::encode_unsigned(3, &mut buf);
+        buf.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        let mut d = BinaryDeserializer::new(&buf);
+        assert_eq!(d.read_bounded_count().unwrap(), 3);
     }
 
     #[test]
