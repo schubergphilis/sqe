@@ -90,12 +90,23 @@ spec:
             - name: config
               mountPath: /etc/sqe
               readOnly: true
+            # DEP-01: with readOnlyRootFilesystem the whole FS (incl. /tmp) is
+            # unwritable, but the engine spills and persists sessions under
+            # /tmp by default. Mount a writable emptyDir at /tmp so spill-to-disk
+            # (the OOM defense) works without dropping readOnlyRootFilesystem.
+            - name: tmp
+              mountPath: /tmp
           resources:
             {{- toYaml .Values.coordinator.resources | nindent 12 }}
       volumes:
         - name: config
           configMap:
             name: {{ include "sqe.fullname" . }}-config
+        - name: tmp
+          emptyDir:
+            {{- with .Values.coordinator.spillVolumeSizeLimit }}
+            sizeLimit: {{ . }}
+            {{- end }}
       {{- with .Values.coordinator.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
