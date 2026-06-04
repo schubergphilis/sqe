@@ -54,6 +54,14 @@ pub struct BearerTokenProviderConfig {
     /// construction. Setting this `true` acknowledges that tokens issued
     /// for any service sharing the IdP will be accepted.
     pub allow_unbounded_audience: bool,
+    /// Explicit opt-in to allow a non-`https` `jwks_url`. Defaults to
+    /// `false`: a `http://` (or any non-https) JWKS endpoint then yields a
+    /// config error at construction. The JWKS is the highest-trust input in
+    /// the auth path. an on-path attacker who can rewrite an unencrypted
+    /// JWKS response substitutes their own RSA public key and mints tokens
+    /// SQE accepts as valid. Setting this `true` (visible in config diffs)
+    /// acknowledges that risk and is intended only for local/dev setups.
+    pub allow_insecure_jwks: bool,
 }
 
 impl Default for BearerTokenProviderConfig {
@@ -66,6 +74,7 @@ impl Default for BearerTokenProviderConfig {
             roles_claim: "realm_access.roles".to_string(),
             accept_invalid_certs: false,
             allow_unbounded_audience: false,
+            allow_insecure_jwks: false,
         }
     }
 }
@@ -107,7 +116,17 @@ pub struct BearerTokenProvider {
     jwks_cache: Cache<String, Arc<JwksMap>>,
     /// Mutex to prevent concurrent JWKS fetches (thundering herd).
     fetch_mutex: Mutex<()>,
+    /// Monotonic instant of the last successful or attempted refetch. Used to
+    /// rate-limit refetches triggered by unknown-`kid` / signature-mismatch
+    /// bearers so a stream of bad tokens cannot hammer the IdP (AUTH-07).
+    last_refetch: Mutex<Option<std::time::Instant>>,
 }
+
+/// Minimum interval between JWKS refetches triggered by an unknown `kid` or a
+/// signature mismatch. Independent of the request-level rate limiter so the
+/// IdP is protected even when rate limiting is disabled. A legitimate key
+/// rotation is still picked up within this window or by the 15-minute TTL.
+const REFETCH_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 impl BearerTokenProvider {
     /// Create a new bearer token provider with the given configuration.
@@ -137,6 +156,33 @@ impl BearerTokenProvider {
             }
         }
 
+        // The JWKS is the highest-trust input in the auth path: a forged
+        // public key on an unencrypted channel lets an attacker mint tokens
+        // SQE accepts as valid. Reject a non-`https` `jwks_url` unless the
+        // operator explicitly opts in (mirrors `allow_unbounded_audience`).
+        let is_https = config
+            .jwks_url
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with("https://");
+        if !is_https {
+            if config.allow_insecure_jwks {
+                tracing::warn!(
+                    jwks_url = %config.jwks_url,
+                    "JWKS endpoint is not HTTPS and allow_insecure_jwks = true. \
+                     An on-path attacker can substitute the signing keys and forge \
+                     identities. Use this only in local/dev environments."
+                );
+            } else {
+                return Err(AuthError::Internal(anyhow::anyhow!(
+                    "bearer_token provider requires an https `jwks_url` (got '{}'); \
+                     set allow_insecure_jwks = true to opt in to an insecure JWKS \
+                     endpoint for local/dev use",
+                    config.jwks_url
+                )));
+            }
+        }
+
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .danger_accept_invalid_certs(config.accept_invalid_certs)
@@ -155,6 +201,7 @@ impl BearerTokenProvider {
             config,
             jwks_cache,
             fetch_mutex: Mutex::new(()),
+            last_refetch: Mutex::new(None),
         })
     }
 
@@ -175,6 +222,7 @@ impl BearerTokenProvider {
             config,
             jwks_cache,
             fetch_mutex: Mutex::new(()),
+            last_refetch: Mutex::new(None),
         }
     }
 
@@ -189,17 +237,10 @@ impl BearerTokenProvider {
         self.fetch_and_cache_jwks().await
     }
 
-    /// Fetch the JWKS from the configured URL and cache it.
+    /// Fetch the JWKS from the configured URL and parse it into a key map.
     ///
-    /// Uses a mutex to prevent concurrent fetches (thundering herd protection).
-    async fn fetch_and_cache_jwks(&self) -> Result<Arc<JwksMap>, AuthError> {
-        let _guard = self.fetch_mutex.lock().await;
-
-        // Double-check: another task may have populated the cache while we waited.
-        if let Some(cached) = self.jwks_cache.get(Self::CACHE_KEY).await {
-            return Ok(cached);
-        }
-
+    /// Does not touch the cache; callers decide how to store the result.
+    async fn fetch_jwks_map(&self) -> Result<JwksMap, AuthError> {
         debug!(url = %self.config.jwks_url, "Fetching JWKS from endpoint");
 
         let response = self
@@ -247,8 +288,22 @@ impl BearerTokenProvider {
             }
         }
 
-        debug!(key_count = map.len(), "JWKS loaded and cached");
+        debug!(key_count = map.len(), "JWKS loaded");
+        Ok(map)
+    }
 
+    /// Fetch the JWKS from the configured URL and cache it.
+    ///
+    /// Uses a mutex to prevent concurrent fetches (thundering herd protection).
+    async fn fetch_and_cache_jwks(&self) -> Result<Arc<JwksMap>, AuthError> {
+        let _guard = self.fetch_mutex.lock().await;
+
+        // Double-check: another task may have populated the cache while we waited.
+        if let Some(cached) = self.jwks_cache.get(Self::CACHE_KEY).await {
+            return Ok(cached);
+        }
+
+        let map = self.fetch_jwks_map().await?;
         let cached = Arc::new(map);
         self.jwks_cache
             .insert(Self::CACHE_KEY.to_string(), Arc::clone(&cached))
@@ -256,10 +311,52 @@ impl BearerTokenProvider {
         Ok(cached)
     }
 
-    /// Force-invalidate the JWKS cache and re-fetch.
+    /// Refetch the JWKS and merge new keys into the cached map.
+    ///
+    /// Unlike a naive invalidate-then-fetch, the existing cache is never
+    /// dropped until a fresh fetch succeeds, so a transient IdP outage (or a
+    /// flood of unknown-`kid` bearers) cannot wipe good keys for legitimate
+    /// users (AUTH-07). Refetches are rate-limited to one per
+    /// `REFETCH_MIN_INTERVAL` to bound IdP amplification independent of the
+    /// request-level limiter. Within the cooldown the current cache is
+    /// returned unchanged.
     async fn refetch_jwks(&self) -> Result<Arc<JwksMap>, AuthError> {
-        self.jwks_cache.invalidate(Self::CACHE_KEY).await;
-        self.fetch_and_cache_jwks().await
+        let _guard = self.fetch_mutex.lock().await;
+
+        // Rate-limit: skip the network fetch if we refetched very recently.
+        {
+            let mut last = self.last_refetch.lock().await;
+            if let Some(prev) = *last {
+                if prev.elapsed() < REFETCH_MIN_INTERVAL {
+                    debug!("JWKS refetch suppressed (within cooldown); using cached keys");
+                    if let Some(cached) = self.jwks_cache.get(Self::CACHE_KEY).await {
+                        return Ok(cached);
+                    }
+                    // No cache yet and still cooling down: fetch fresh below.
+                }
+            }
+            *last = Some(std::time::Instant::now());
+        }
+
+        let fresh = self.fetch_jwks_map().await?;
+
+        // Merge fresh keys over the existing cache. New keys win; keys that
+        // disappeared from the JWKS are retained until the TTL expires so an
+        // in-flight token signed by a still-valid-but-rotating key is not
+        // rejected mid-rotation.
+        let mut merged: JwksMap = match self.jwks_cache.get(Self::CACHE_KEY).await {
+            Some(existing) => (*existing).clone(),
+            None => HashMap::new(),
+        };
+        for (kid, key) in fresh {
+            merged.insert(kid, key);
+        }
+
+        let cached = Arc::new(merged);
+        self.jwks_cache
+            .insert(Self::CACHE_KEY.to_string(), Arc::clone(&cached))
+            .await;
+        Ok(cached)
     }
 
     /// Validate and decode a JWT token against the cached JWKS.
@@ -308,9 +405,12 @@ impl BearerTokenProvider {
             match decode::<serde_json::Value>(token, decoding_key, &validation) {
                 Ok(token_data) => return Ok(token_data),
                 Err(e) => {
-                    // If it's not a key-related error, don't retry.
-                    let err_str = e.to_string();
-                    if !err_str.contains("InvalidSignature") {
+                    // Only a signature mismatch is worth a JWKS refetch (a key
+                    // may have rotated). Match on the typed `ErrorKind`, not the
+                    // Display string, so upstream wording changes do not silently
+                    // disable rotation handling (AUTH-05).
+                    use jsonwebtoken::errors::ErrorKind;
+                    if !matches!(e.kind(), ErrorKind::InvalidSignature) {
                         return Err(Self::map_jwt_error(e));
                     }
                     debug!(kid = %kid, "Signature validation failed, will try JWKS refetch");
@@ -574,6 +674,8 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             roles_claim: "realm_access.roles".to_string(),
             accept_invalid_certs: false,
             allow_unbounded_audience: true,
+            // Tests serve JWKS over a local http listener; opt in explicitly.
+            allow_insecure_jwks: true,
         }
     }
 
@@ -914,6 +1016,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         let config = BearerTokenProviderConfig {
             jwks_url: "http://localhost:0/jwks".to_string(),
             allow_unbounded_audience: true,
+            allow_insecure_jwks: true,
             ..Default::default()
         };
         let provider = BearerTokenProvider::new(config).unwrap();
@@ -937,6 +1040,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         let config = BearerTokenProviderConfig {
             jwks_url: "http://localhost:0/jwks".to_string(),
             allow_unbounded_audience: true,
+            allow_insecure_jwks: true,
             ..Default::default()
         };
         let provider = BearerTokenProvider::new(config).unwrap();
@@ -1014,6 +1118,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         let config = BearerTokenProviderConfig {
             jwks_url: jwks_url.clone(),
             audience: Some("expected-audience".to_string()),
+            allow_insecure_jwks: true,
             ..Default::default()
         };
         let provider = BearerTokenProvider::new(config).unwrap();
@@ -1052,6 +1157,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         let config = BearerTokenProviderConfig {
             jwks_url: jwks_url.clone(),
             audience: Some("sqe".to_string()),
+            allow_insecure_jwks: true,
             ..Default::default()
         };
         let provider = BearerTokenProvider::new(config).unwrap();
@@ -1091,6 +1197,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             jwks_url: jwks_url.clone(),
             issuer: Some("https://expected.example.com".to_string()),
             allow_unbounded_audience: true,
+            allow_insecure_jwks: true,
             ..Default::default()
         };
         let provider = BearerTokenProvider::new(config).unwrap();
@@ -1170,6 +1277,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             user_claim: "email".to_string(),
             roles_claim: "groups".to_string(),
             allow_unbounded_audience: true,
+            allow_insecure_jwks: true,
             ..Default::default()
         };
         let provider = BearerTokenProvider::new(config).unwrap();
@@ -1210,6 +1318,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             jwks_url: jwks_url.clone(),
             user_claim: "email".to_string(),
             allow_unbounded_audience: true,
+            allow_insecure_jwks: true,
             ..Default::default()
         };
         let provider = BearerTokenProvider::new(config).unwrap();
@@ -1246,6 +1355,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         let config = BearerTokenProviderConfig {
             jwks_url: "http://localhost:0/jwks".to_string(),
             allow_unbounded_audience: true,
+            allow_insecure_jwks: true,
             ..Default::default()
         };
         let provider = BearerTokenProvider::new(config).unwrap();
@@ -1271,6 +1381,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         let config = BearerTokenProviderConfig {
             jwks_url: "http://localhost:0/jwks".to_string(),
             allow_unbounded_audience: true,
+            allow_insecure_jwks: true,
             ..Default::default()
         };
         let provider = BearerTokenProvider::new(config).unwrap();
@@ -1305,6 +1416,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             roles_claim: "realm_access.roles".to_string(),
             accept_invalid_certs: false,
             allow_unbounded_audience: false,
+            allow_insecure_jwks: true,
         };
         assert!(BearerTokenProvider::new(config).is_ok());
     }
@@ -1355,6 +1467,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             jwks_url: "http://localhost:0/jwks".to_string(),
             audience: None,
             allow_unbounded_audience: true,
+            allow_insecure_jwks: true,
             ..Default::default()
         };
         assert!(BearerTokenProvider::new(config).is_ok());
@@ -1366,6 +1479,55 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             jwks_url: "http://localhost:0/jwks".to_string(),
             audience: Some("sqe".to_string()),
             allow_unbounded_audience: false,
+            allow_insecure_jwks: true,
+            ..Default::default()
+        };
+        assert!(BearerTokenProvider::new(config).is_ok());
+    }
+
+    // --- AUTH-02: JWKS URL must be HTTPS unless explicitly opted in ---
+
+    #[test]
+    fn new_rejects_http_jwks_by_default() {
+        let config = BearerTokenProviderConfig {
+            jwks_url: "http://idp.example.com/jwks".to_string(),
+            audience: Some("sqe".to_string()),
+            allow_unbounded_audience: false,
+            allow_insecure_jwks: false,
+            ..Default::default()
+        };
+        match BearerTokenProvider::new(config) {
+            Err(AuthError::Internal(e)) => {
+                let msg = format!("{e}").to_lowercase();
+                assert!(
+                    msg.contains("https") || msg.contains("allow_insecure_jwks"),
+                    "error must mention the https/jwks guard: {msg}"
+                );
+            }
+            Err(other) => panic!("expected Internal config error, got: {other:?}"),
+            Ok(_) => panic!("must reject http jwks_url without opt-in"),
+        }
+    }
+
+    #[test]
+    fn new_accepts_https_jwks_without_opt_in() {
+        let config = BearerTokenProviderConfig {
+            jwks_url: "https://idp.example.com/jwks".to_string(),
+            audience: Some("sqe".to_string()),
+            allow_unbounded_audience: false,
+            allow_insecure_jwks: false,
+            ..Default::default()
+        };
+        assert!(BearerTokenProvider::new(config).is_ok());
+    }
+
+    #[test]
+    fn new_accepts_http_jwks_with_opt_in() {
+        let config = BearerTokenProviderConfig {
+            jwks_url: "http://localhost:8080/jwks".to_string(),
+            audience: Some("sqe".to_string()),
+            allow_unbounded_audience: false,
+            allow_insecure_jwks: true,
             ..Default::default()
         };
         assert!(BearerTokenProvider::new(config).is_ok());
