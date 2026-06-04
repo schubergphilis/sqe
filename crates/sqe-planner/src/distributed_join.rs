@@ -131,10 +131,24 @@ impl PhysicalOptimizerRule for BroadcastJoinRule {
                         threshold as f64 / (1024.0 * 1024.0),
                     );
 
-                    let broadcast_plan = Arc::new(BroadcastJoinPlan::from_hash_join(
-                        hash_join, side,
-                    ));
-                    return Ok(Transformed::yes(broadcast_plan as Arc<dyn ExecutionPlan>));
+                    // PLAN-04: on a builder failure, keep the original join
+                    // rather than panicking inside the optimizer rule.
+                    match BroadcastJoinPlan::from_hash_join(hash_join, side) {
+                        Ok(broadcast_plan) => {
+                            let broadcast_plan = Arc::new(broadcast_plan);
+                            return Ok(Transformed::yes(
+                                broadcast_plan as Arc<dyn ExecutionPlan>,
+                            ));
+                        }
+                        Err(e) => {
+                            debug!(
+                                error = %e,
+                                "BroadcastJoinRule: failed to rebuild HashJoinExec, \
+                                 keeping original join"
+                            );
+                            return Ok(Transformed::no(node));
+                        }
+                    }
                 }
             }
             Ok(Transformed::no(node))
@@ -195,30 +209,34 @@ pub struct BroadcastJoinPlan {
 
 impl BroadcastJoinPlan {
     /// Create a `BroadcastJoinPlan` from an existing `HashJoinExec`.
+    ///
+    /// PLAN-04: returns `Result` instead of `.expect()`. If the upstream
+    /// `HashJoinExec::builder().build()` ever returns `Err` (e.g. a join shape
+    /// DataFusion's builder rejects after an upgrade), the rule should degrade
+    /// gracefully (the caller falls back to the original plan) rather than
+    /// panicking inside a `PhysicalOptimizerRule` and crashing the planning
+    /// thread for the query.
     pub fn from_hash_join(
         hash_join: &HashJoinExec,
         broadcast_side: BroadcastSide,
-    ) -> Self {
+    ) -> Result<Self> {
         let broadcast_size = match broadcast_side {
             BroadcastSide::Left => estimate_side_size(hash_join.left()),
             BroadcastSide::Right => estimate_side_size(hash_join.right()),
         };
 
         // Clone the HashJoinExec via its builder, which preserves all fields.
-        let inner = hash_join
-            .builder()
-            .build()
-            .expect("BroadcastJoinPlan: failed to reconstruct HashJoinExec");
+        let inner = hash_join.builder().build()?;
 
         let inner_join = Arc::new(inner);
         let inner_as_plan = Arc::clone(&inner_join) as Arc<dyn ExecutionPlan>;
 
-        Self {
+        Ok(Self {
             inner_join,
             inner_as_plan,
             broadcast_side,
             broadcast_size_bytes: broadcast_size,
-        }
+        })
     }
 
     /// Returns which side is broadcast.
@@ -295,7 +313,7 @@ impl ExecutionPlan for BroadcastJoinPlan {
             Ok(Arc::new(BroadcastJoinPlan::from_hash_join(
                 hash_join,
                 self.broadcast_side,
-            )))
+            )?))
         } else {
             // If it was wrapped differently, just return self
             Ok(self)
@@ -928,7 +946,7 @@ mod tests {
             JoinType::Inner,
         );
 
-        let plan = BroadcastJoinPlan::from_hash_join(&hash_join, BroadcastSide::Left);
+        let plan = BroadcastJoinPlan::from_hash_join(&hash_join, BroadcastSide::Left).unwrap();
         assert_eq!(plan.broadcast_side(), BroadcastSide::Left);
         assert_eq!(plan.name(), "BroadcastJoinPlan");
     }
@@ -943,7 +961,7 @@ mod tests {
             JoinType::Inner,
         );
 
-        let plan = BroadcastJoinPlan::from_hash_join(&hash_join, BroadcastSide::Left);
+        let plan = BroadcastJoinPlan::from_hash_join(&hash_join, BroadcastSide::Left).unwrap();
         let display = format!("{plan}");
         assert!(display.contains("BroadcastJoinPlan"));
         assert!(display.contains("Left"));
@@ -959,7 +977,7 @@ mod tests {
             JoinType::Inner,
         );
 
-        let plan = BroadcastJoinPlan::from_hash_join(&hash_join, BroadcastSide::Left);
+        let plan = BroadcastJoinPlan::from_hash_join(&hash_join, BroadcastSide::Left).unwrap();
         assert_eq!(plan.schema(), hash_join.schema());
     }
 
