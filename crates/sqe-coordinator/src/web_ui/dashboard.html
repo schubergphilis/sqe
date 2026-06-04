@@ -442,13 +442,13 @@ async function renderQueries(){
     const rows = await getJSON("/api/v1/queries?limit=200"); clearErr();
     if(current!==null) return; // detail open
     $("#queries").innerHTML =
-      "<table><thead><tr><th>id</th><th>user</th><th>state</th><th>sql</th>"+
+      "<table><thead><tr><th>id</th><th>state</th><th>sql hash</th>"+
       "<th class=num>elapsed</th><th class=num>rows</th><th class=num>scanned</th></tr></thead><tbody>"+
       rows.map(q=>{
         const el = (q.executionMs||0)+(q.planningMs||0)+(q.queuedMs||0);
         return `<tr class=q data-id="${esc(q.queryId)}"><td>${esc(String(q.queryId).slice(0,8))}</td>`+
-          `<td>${esc(q.user)}</td><td class="${stClass(q.state)}">${esc(q.state)}</td>`+
-          `<td title="${esc(q.sql)}">${esc(q.sql)}</td>`+
+          `<td class="${stClass(q.state)}">${esc(q.state)}</td>`+
+          `<td title="${esc(q.sqlHash)}">${esc(String(q.sqlHash).slice(0,16))}</td>`+
           `<td class=num>${ms(el)}</td><td class=num>${q.outputRows|0}</td>`+
           `<td class=num>${fmtBytes(q.bytesScanned)}</td></tr>`;
       }).join("")+"</tbody></table>";
@@ -469,7 +469,7 @@ async function openDetail(id){
       `<td class=num>${ms(f.elapsedMs)}</td><td class=num>${f.outputRows|0}</td></tr>`).join("");
     det.innerHTML = `<a class=back onclick="closeDetail()">&larr; back</a>`+
       `<h3>${esc(d.queryId)}</h3>`+
-      `<div class=kv><div>user</div><div>${esc(d.user)}</div>`+
+      `<div class=kv>`+
       `<div>state</div><div class="${stClass(d.state)}">${esc(d.state)}</div>`+
       `<div>queued</div><div>${ms(d.queuedMs)}</div>`+
       `<div>planning</div><div>${ms(d.planningMs)}</div>`+
@@ -479,7 +479,7 @@ async function openDetail(id){
       `<div>spill</div><div>${fmtBytes(d.spillBytes)}</div>`+
       `<div>peak mem</div><div>${fmtBytes(d.peakMemoryBytes)}</div>`+
       (d.errorMessage?`<div>error</div><div class=s-FAILED>${esc(d.errorMessage)}</div>`:"")+
-      `</div><pre style="white-space:pre-wrap;color:var(--mut)">${esc(d.sql)}</pre>`+
+      `</div><pre style="white-space:pre-wrap;color:var(--mut)">sql hash: ${esc(d.sqlHash)}</pre>`+
       (fr?`<h4>fragments</h4><table><thead><tr><th>task</th><th>worker</th><th>state</th>`+
         `<th class=num>elapsed</th><th class=num>rows</th></tr></thead><tbody>${fr}</tbody></table>`:"");
   } catch(e){ showErr(e); }

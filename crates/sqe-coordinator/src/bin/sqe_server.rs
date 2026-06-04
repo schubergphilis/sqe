@@ -1517,7 +1517,9 @@ mod tests {
         )
         .await;
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].user, "alice");
+        // WEB-02: the unauth list no longer exposes the username or raw SQL;
+        // it carries the SQL digest instead. Assert the item is populated.
+        assert!(!items[0].sql_hash.is_empty());
     }
 
     #[tokio::test]
