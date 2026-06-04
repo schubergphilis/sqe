@@ -136,7 +136,7 @@ pub fn logical_type_to_arrow(t: &LogicalType) -> crate::Result<arrow_schema::Dat
                 1 => A::UInt8,
                 2 => A::UInt16,
                 4 => A::UInt32,
-                _ => unreachable!(),
+                _ => return Err(crate::WireError::UnsupportedLogicalType(LogicalTypeId::Enum)),
             };
             A::Dictionary(Box::new(key_dt), Box::new(A::Utf8))
         }
@@ -783,7 +783,7 @@ fn dictionary_to_enum(
             1 => bytes.push(k as u8),
             2 => bytes.extend_from_slice(&(k as u16).to_le_bytes()),
             4 => bytes.extend_from_slice(&(k as u32).to_le_bytes()),
-            _ => unreachable!("enum_physical_width returned an unexpected width"),
+            _ => return Err(crate::WireError::UnsupportedLogicalType(LogicalTypeId::Enum)),
         }
     }
     Ok((
@@ -916,7 +916,11 @@ fn decimal128_to_decimal(
             4 => bytes.extend_from_slice(&(v as i32).to_le_bytes()),
             8 => bytes.extend_from_slice(&(v as i64).to_le_bytes()),
             16 => bytes.extend_from_slice(&v.to_le_bytes()),
-            _ => unreachable!("decimal_physical_width returned an unexpected width"),
+            _ => {
+                return Err(crate::WireError::UnsupportedLogicalType(
+                    LogicalTypeId::Decimal,
+                ))
+            }
         }
     }
     Ok((
@@ -1351,43 +1355,43 @@ fn fixed_to_array(
             Ok(Arc::new(builder.finish()))
         }
         LogicalTypeId::TinyInt => Ok(Arc::new(Int8Array::new(
-            scalar_buffer_le::<i8>(bytes, row_count),
+            scalar_buffer_le::<i8>(bytes, row_count)?,
             nulls,
         ))),
         LogicalTypeId::SmallInt => Ok(Arc::new(Int16Array::new(
-            scalar_buffer_le::<i16>(bytes, row_count),
+            scalar_buffer_le::<i16>(bytes, row_count)?,
             nulls,
         ))),
         LogicalTypeId::Integer => Ok(Arc::new(Int32Array::new(
-            scalar_buffer_le::<i32>(bytes, row_count),
+            scalar_buffer_le::<i32>(bytes, row_count)?,
             nulls,
         ))),
         LogicalTypeId::BigInt => Ok(Arc::new(Int64Array::new(
-            scalar_buffer_le::<i64>(bytes, row_count),
+            scalar_buffer_le::<i64>(bytes, row_count)?,
             nulls,
         ))),
         LogicalTypeId::UTinyInt => Ok(Arc::new(UInt8Array::new(
-            scalar_buffer_le::<u8>(bytes, row_count),
+            scalar_buffer_le::<u8>(bytes, row_count)?,
             nulls,
         ))),
         LogicalTypeId::USmallInt => Ok(Arc::new(UInt16Array::new(
-            scalar_buffer_le::<u16>(bytes, row_count),
+            scalar_buffer_le::<u16>(bytes, row_count)?,
             nulls,
         ))),
         LogicalTypeId::UInteger => Ok(Arc::new(UInt32Array::new(
-            scalar_buffer_le::<u32>(bytes, row_count),
+            scalar_buffer_le::<u32>(bytes, row_count)?,
             nulls,
         ))),
         LogicalTypeId::UBigInt => Ok(Arc::new(UInt64Array::new(
-            scalar_buffer_le::<u64>(bytes, row_count),
+            scalar_buffer_le::<u64>(bytes, row_count)?,
             nulls,
         ))),
         LogicalTypeId::Float => Ok(Arc::new(Float32Array::new(
-            scalar_buffer_le::<f32>(bytes, row_count),
+            scalar_buffer_le::<f32>(bytes, row_count)?,
             nulls,
         ))),
         LogicalTypeId::Double => Ok(Arc::new(Float64Array::new(
-            scalar_buffer_le::<f64>(bytes, row_count),
+            scalar_buffer_le::<f64>(bytes, row_count)?,
             nulls,
         ))),
         LogicalTypeId::Date => Ok(Arc::new(Date32Array::new(
@@ -1401,27 +1405,27 @@ fn fixed_to_array(
             nulls,
         ))),
         LogicalTypeId::Time => Ok(Arc::new(Time64MicrosecondArray::new(
-            scalar_buffer_le::<i64>(bytes, row_count),
+            scalar_buffer_le::<i64>(bytes, row_count)?,
             nulls,
         ))),
         LogicalTypeId::TimeNs => Ok(Arc::new(Time64NanosecondArray::new(
-            scalar_buffer_le::<i64>(bytes, row_count),
+            scalar_buffer_le::<i64>(bytes, row_count)?,
             nulls,
         ))),
         LogicalTypeId::Timestamp => Ok(Arc::new(TimestampMicrosecondArray::new(
-            scalar_buffer_le::<i64>(bytes, row_count),
+            scalar_buffer_le::<i64>(bytes, row_count)?,
             nulls,
         ))),
         LogicalTypeId::TimestampSec => Ok(Arc::new(TimestampSecondArray::new(
-            scalar_buffer_le::<i64>(bytes, row_count),
+            scalar_buffer_le::<i64>(bytes, row_count)?,
             nulls,
         ))),
         LogicalTypeId::TimestampMs => Ok(Arc::new(TimestampMillisecondArray::new(
-            scalar_buffer_le::<i64>(bytes, row_count),
+            scalar_buffer_le::<i64>(bytes, row_count)?,
             nulls,
         ))),
         LogicalTypeId::TimestampNs => Ok(Arc::new(TimestampNanosecondArray::new(
-            scalar_buffer_le::<i64>(bytes, row_count),
+            scalar_buffer_le::<i64>(bytes, row_count)?,
             nulls,
         ))),
         LogicalTypeId::Uuid => {
@@ -1430,8 +1434,8 @@ fn fixed_to_array(
             for i in 0..row_count {
                 let valid = nulls.as_ref().map(|n| n.is_valid(i)).unwrap_or(true);
                 if valid {
-                    let off = i * 16;
-                    builder.append_value(&bytes[off..off + 16]).map_err(|e| {
+                    let slice = checked_fixed_slice(bytes, i, 16)?;
+                    builder.append_value(slice).map_err(|e| {
                         crate::WireError::UnsupportedArrowType(format!("uuid append: {e}"))
                     })?;
                 } else {
@@ -1447,10 +1451,12 @@ fn fixed_to_array(
             use arrow_array::types::IntervalMonthDayNano;
             let mut values: Vec<IntervalMonthDayNano> = Vec::with_capacity(row_count);
             for i in 0..row_count {
-                let off = i * 16;
-                let months = i32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
-                let days = i32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
-                let micros = i64::from_le_bytes(bytes[off + 8..off + 16].try_into().unwrap());
+                // Checked slicing: row_count is wire-controlled and may exceed
+                // the supplied buffer; a clear error beats an OOB panic.
+                let chunk = checked_fixed_slice(bytes, i, 16)?;
+                let months = i32::from_le_bytes(chunk[0..4].try_into().unwrap());
+                let days = i32::from_le_bytes(chunk[4..8].try_into().unwrap());
+                let micros = i64::from_le_bytes(chunk[8..16].try_into().unwrap());
                 values.push(IntervalMonthDayNano {
                     months,
                     days,
@@ -1476,13 +1482,19 @@ fn fixed_to_array(
             let width = crate::data_chunk::decimal_physical_width(precision);
             let mut values: Vec<i128> = Vec::with_capacity(row_count);
             for i in 0..row_count {
-                let off = i * width;
+                // `width` is wire-influenced via `precision`; slice with bounds
+                // checks rather than trusting `row_count * width <= bytes.len()`.
+                let chunk = checked_fixed_slice(bytes, i, width)?;
                 let v: i128 = match width {
-                    2 => i16::from_le_bytes(bytes[off..off + 2].try_into().unwrap()) as i128,
-                    4 => i32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as i128,
-                    8 => i64::from_le_bytes(bytes[off..off + 8].try_into().unwrap()) as i128,
-                    16 => i128::from_le_bytes(bytes[off..off + 16].try_into().unwrap()),
-                    _ => unreachable!(),
+                    2 => i16::from_le_bytes(chunk[0..2].try_into().unwrap()) as i128,
+                    4 => i32::from_le_bytes(chunk[0..4].try_into().unwrap()) as i128,
+                    8 => i64::from_le_bytes(chunk[0..8].try_into().unwrap()) as i128,
+                    16 => i128::from_le_bytes(chunk[0..16].try_into().unwrap()),
+                    _ => {
+                        return Err(crate::WireError::UnsupportedLogicalType(
+                            LogicalTypeId::Decimal,
+                        ))
+                    }
                 };
                 values.push(v);
             }
@@ -1502,22 +1514,41 @@ fn fixed_to_array(
             let width = crate::data_chunk::enum_physical_width(values.len());
             match width {
                 1 => Ok(Arc::new(arrow_array::DictionaryArray::<arrow_array::types::UInt8Type>::new(
-                    arrow_array::UInt8Array::new(scalar_buffer_le::<u8>(bytes, row_count), nulls),
+                    arrow_array::UInt8Array::new(scalar_buffer_le::<u8>(bytes, row_count)?, nulls),
                     Arc::new(value_arr),
                 ))),
                 2 => Ok(Arc::new(arrow_array::DictionaryArray::<arrow_array::types::UInt16Type>::new(
-                    arrow_array::UInt16Array::new(scalar_buffer_le::<u16>(bytes, row_count), nulls),
+                    arrow_array::UInt16Array::new(scalar_buffer_le::<u16>(bytes, row_count)?, nulls),
                     Arc::new(value_arr),
                 ))),
                 4 => Ok(Arc::new(arrow_array::DictionaryArray::<arrow_array::types::UInt32Type>::new(
-                    arrow_array::UInt32Array::new(scalar_buffer_le::<u32>(bytes, row_count), nulls),
+                    arrow_array::UInt32Array::new(scalar_buffer_le::<u32>(bytes, row_count)?, nulls),
                     Arc::new(value_arr),
                 ))),
-                _ => unreachable!(),
+                _ => Err(crate::WireError::UnsupportedLogicalType(LogicalTypeId::Enum)),
             }
         }
         other => Err(crate::WireError::UnsupportedLogicalType(other)),
     }
+}
+
+/// Slice a fixed-width element out of a tightly-packed buffer with bounds
+/// checks. `index` is the row, `width` the per-element byte width. Returns a
+/// [`crate::WireError::CountExceedsRemaining`] instead of panicking when a
+/// wire-supplied `row_count` runs past the supplied buffer (remote DoS guard).
+fn checked_fixed_slice(bytes: &[u8], index: usize, width: usize) -> crate::Result<&[u8]> {
+    let start = index.checked_mul(width).ok_or_else(|| {
+        crate::WireError::UnsupportedArrowType("fixed buffer offset overflow".to_string())
+    })?;
+    let end = start.checked_add(width).ok_or_else(|| {
+        crate::WireError::UnsupportedArrowType("fixed buffer offset overflow".to_string())
+    })?;
+    bytes
+        .get(start..end)
+        .ok_or(crate::WireError::CountExceedsRemaining {
+            count: end as u64,
+            remaining: bytes.len() as u64,
+        })
 }
 
 fn validity_to_null_buffer(
@@ -1560,12 +1591,26 @@ impl_from_le!(f64, 8);
 fn scalar_buffer_le<T: FromLeBytesScalar>(
     bytes: &[u8],
     row_count: usize,
-) -> arrow_buffer::ScalarBuffer<T> {
+) -> crate::Result<arrow_buffer::ScalarBuffer<T>> {
     let width = std::mem::size_of::<T>();
-    let values: Vec<T> = (0..row_count)
-        .map(|i| T::from_le(&bytes[i * width..(i + 1) * width]))
-        .collect();
-    arrow_buffer::ScalarBuffer::from(values)
+    // Checked slicing: a wire `row_count` that exceeds the supplied byte
+    // buffer must surface a clear error instead of an index-out-of-bounds
+    // panic that aborts the consuming query task (remote DoS).
+    let mut values: Vec<T> = Vec::with_capacity(row_count);
+    for i in 0..row_count {
+        let start = i.checked_mul(width).ok_or_else(|| {
+            crate::WireError::UnsupportedArrowType("fixed buffer offset overflow".to_string())
+        })?;
+        let end = start.checked_add(width).ok_or_else(|| {
+            crate::WireError::UnsupportedArrowType("fixed buffer offset overflow".to_string())
+        })?;
+        let slice = bytes.get(start..end).ok_or(crate::WireError::CountExceedsRemaining {
+            count: end as u64,
+            remaining: bytes.len() as u64,
+        })?;
+        values.push(T::from_le(slice));
+    }
+    Ok(arrow_buffer::ScalarBuffer::from(values))
 }
 
 #[cfg(test)]
@@ -2290,5 +2335,51 @@ mod tests {
         let decoded = DataChunk::decode(&mut d).unwrap();
         d.expect_object_end().unwrap();
         assert_eq!(decoded, chunk);
+    }
+
+    // ── Arrow-bridge OOB guards (QUACK-03/04) ───────────────────────────
+
+    #[test]
+    fn fixed_to_array_rejects_short_buffer_without_panicking() {
+        // QUACK-03: a Fixed INTEGER vector claiming 1000 rows but carrying only
+        // 4 bytes must surface an error from the checked slicing, not panic.
+        let vector = Vector {
+            logical_type: LogicalType::new(LogicalTypeId::Integer),
+            validity: None,
+            data: VectorData::Fixed(vec![1, 0, 0, 0]), // one i32
+        };
+        let err = vector_to_array(&vector, 1000).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::WireError::CountExceedsRemaining { .. }
+        ));
+    }
+
+    #[test]
+    fn checked_fixed_slice_rejects_out_of_range_index() {
+        // QUACK-04: the shared UUID/Decimal/Interval slicer must return an error
+        // when row*width runs past the buffer instead of indexing OOB.
+        let bytes = [0u8; 16]; // room for exactly one 16-byte element
+        assert!(checked_fixed_slice(&bytes, 0, 16).is_ok());
+        let err = checked_fixed_slice(&bytes, 1, 16).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::WireError::CountExceedsRemaining { .. }
+        ));
+    }
+
+    #[test]
+    fn uuid_vector_with_short_buffer_errors_not_panics() {
+        // QUACK-04: a UUID column claiming 100 rows with a 16-byte buffer.
+        let vector = Vector {
+            logical_type: LogicalType::new(LogicalTypeId::Uuid),
+            validity: None,
+            data: VectorData::Fixed(vec![0u8; 16]),
+        };
+        let err = vector_to_array(&vector, 100).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::WireError::CountExceedsRemaining { .. }
+        ));
     }
 }
