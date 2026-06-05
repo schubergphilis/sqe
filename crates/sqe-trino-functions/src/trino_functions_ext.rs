@@ -392,6 +392,23 @@ impl ScalarUDFImpl for HammingDistance {
     }
 }
 
+/// Validate a base/radix argument is in Trino's accepted range `2..=36`.
+///
+/// Out-of-range values are not just wrong: `i64::from_str_radix` panics for a
+/// radix outside `2..=36`, the `to_base` long-division loop hits a
+/// modulo-by-zero (radix 0) or index-out-of-bounds (radix > 36) panic, and
+/// radix 1 makes `num /= 1` spin forever (CPU-pinning hang). A negative radix
+/// must be caught here too, before the lossy `as u32` cast wraps it to a huge
+/// value. Reject with a `Plan` error matching Trino's message.
+fn validate_radix(radix: i64) -> DFResult<u32> {
+    if !(2..=36).contains(&radix) {
+        return Err(DataFusionError::Plan(format!(
+            "Radix must be between 2 and 36, got {radix}"
+        )));
+    }
+    Ok(radix as u32)
+}
+
 /// from_base(s, radix) → BIGINT parsed from base-`radix` string
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct FromBase;
@@ -417,11 +434,12 @@ impl ScalarUDFImpl for FromBase {
                 ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))),
                 ColumnarValue::Scalar(v),
             ) => {
-                let radix = match v {
-                    ScalarValue::Int64(Some(r)) => *r as u32,
-                    ScalarValue::Int32(Some(r)) => *r as u32,
+                let radix_raw = match v {
+                    ScalarValue::Int64(Some(r)) => *r,
+                    ScalarValue::Int32(Some(r)) => *r as i64,
                     _ => return Ok(ColumnarValue::Scalar(ScalarValue::Int64(None))),
                 };
+                let radix = validate_radix(radix_raw)?;
                 let result = i64::from_str_radix(s, radix).ok();
                 Ok(ColumnarValue::Scalar(ScalarValue::Int64(result)))
             }
@@ -455,11 +473,12 @@ impl ScalarUDFImpl for ToBase {
                 ColumnarValue::Scalar(ScalarValue::Int64(Some(n))),
                 ColumnarValue::Scalar(v),
             ) => {
-                let radix = match v {
-                    ScalarValue::Int64(Some(r)) => *r as u32,
-                    ScalarValue::Int32(Some(r)) => *r as u32,
+                let radix_raw = match v {
+                    ScalarValue::Int64(Some(r)) => *r,
+                    ScalarValue::Int32(Some(r)) => *r as i64,
                     _ => return Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None))),
                 };
+                let radix = validate_radix(radix_raw)?;
                 let result = match radix {
                     2 => Some(format!("{:b}", n)),
                     8 => Some(format!("{:o}", n)),
@@ -786,6 +805,29 @@ fn last_day_of_month(date: NaiveDate) -> NaiveDate {
 // MEDIUM UDFs
 // ═══════════════════════════════════════════════════════════════════
 
+/// Compiled-program size cap for user-supplied regex patterns (bytes). A
+/// crafted pattern can compile to near the `regex` crate's 10 MB default; a
+/// 1 MB ceiling keeps a single query from pinning worker cores on compilation.
+const REGEX_SIZE_LIMIT: usize = 1 << 20;
+
+/// Compile a user-supplied regex with an explicit size limit. Use this instead
+/// of `regex::Regex::new` everywhere a pattern comes from query data.
+fn build_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    regex::RegexBuilder::new(pattern)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .build()
+}
+
+/// If `arg` is a constant string scalar, return its value. Used to compile a
+/// regex once outside the row loop instead of recompiling per row.
+fn const_str_scalar(arg: &ColumnarValue) -> Option<&str> {
+    match arg {
+        ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))
+        | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s))) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
 /// regexp_extract(s, pattern) → VARCHAR first match (or first capture group)
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct RegexpExtract;
@@ -806,14 +848,29 @@ impl ScalarUDFImpl for RegexpExtract {
         Ok(DataType::Utf8)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        str_transform_2(&args.args, |s, pattern| {
-            let re = regex::Regex::new(pattern).ok()?;
+        let extract = |re: &regex::Regex, s: &str| -> Option<String> {
             let caps = re.captures(s)?;
             if caps.len() > 1 {
                 caps.get(1).map(|m| m.as_str().to_string())
             } else {
                 caps.get(0).map(|m| m.as_str().to_string())
             }
+        };
+
+        // Fast path: when the pattern is a constant scalar, compile the regex
+        // once (with a size limit) instead of recompiling it on every row.
+        if let Some(pattern) = const_str_scalar(&args.args[1]) {
+            let re = build_regex(pattern).map_err(|e| {
+                DataFusionError::Plan(format!("regexp_extract: invalid regex pattern: {e}"))
+            })?;
+            return str_transform(&args.args[0], |s| extract(&re, s));
+        }
+
+        // General path: pattern varies per row (rare); compile per distinct
+        // call but still cap the compiled program size.
+        str_transform_2(&args.args, |s, pattern| {
+            let re = build_regex(pattern).ok()?;
+            extract(&re, s)
         })
     }
 }
@@ -849,11 +906,16 @@ impl ScalarUDFImpl for RegexpExtractAll {
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let strings = column_strings(&args.args, 0, "regexp_extract_all", args.number_rows)?;
+        let const_pattern = const_str_scalar(&args.args[1]);
         let pattern_arr =
             column_strings(&args.args, 1, "regexp_extract_all", args.number_rows)?;
-        build_regex_list_array("regexp_extract_all", &strings, &pattern_arr, |s, re| {
-            re.find_iter(s).map(|m| m.as_str().to_string()).collect()
-        })
+        build_regex_list_array(
+            "regexp_extract_all",
+            &strings,
+            &pattern_arr,
+            const_pattern,
+            |s, re| re.find_iter(s).map(|m| m.as_str().to_string()).collect(),
+        )
     }
 }
 
@@ -885,10 +947,15 @@ impl ScalarUDFImpl for RegexpSplit {
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let strings = column_strings(&args.args, 0, "regexp_split", args.number_rows)?;
+        let const_pattern = const_str_scalar(&args.args[1]);
         let pattern_arr = column_strings(&args.args, 1, "regexp_split", args.number_rows)?;
-        build_regex_list_array("regexp_split", &strings, &pattern_arr, |s, re| {
-            re.split(s).map(|p| p.to_string()).collect()
-        })
+        build_regex_list_array(
+            "regexp_split",
+            &strings,
+            &pattern_arr,
+            const_pattern,
+            |s, re| re.split(s).map(|p| p.to_string()).collect(),
+        )
     }
 }
 
@@ -951,22 +1018,37 @@ fn build_regex_list_array(
     fn_name: &str,
     strings: &StringArray,
     patterns: &StringArray,
+    const_pattern: Option<&str>,
     f: impl Fn(&str, &regex::Regex) -> Vec<String>,
 ) -> DFResult<ColumnarValue> {
     use arrow::array::{ListBuilder, StringBuilder};
     let n = strings.len();
     let mut builder = ListBuilder::new(StringBuilder::new());
+
+    // When the pattern is a constant scalar, compile it exactly once (with a
+    // size limit) rather than recompiling the identical program on every row.
+    let prebuilt = match const_pattern {
+        Some(p) => Some(build_regex(p).map_err(|e| {
+            DataFusionError::Plan(format!("{fn_name}: invalid regex pattern '{p}': {e}"))
+        })?),
+        None => None,
+    };
+
     for i in 0..n {
         if strings.is_null(i) || patterns.is_null(i) {
             builder.append_null();
             continue;
         }
         let s = strings.value(i);
-        let p = patterns.value(i);
-        let re = regex::Regex::new(p).map_err(|e| {
-            DataFusionError::Plan(format!("{fn_name}: invalid regex pattern '{p}': {e}"))
-        })?;
-        let parts = f(s, &re);
+        let parts = if let Some(re) = &prebuilt {
+            f(s, re)
+        } else {
+            let p = patterns.value(i);
+            let re = build_regex(p).map_err(|e| {
+                DataFusionError::Plan(format!("{fn_name}: invalid regex pattern '{p}': {e}"))
+            })?;
+            f(s, &re)
+        };
         for part in parts {
             builder.values().append_value(part);
         }

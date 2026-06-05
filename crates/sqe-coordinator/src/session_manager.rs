@@ -43,7 +43,21 @@ pub struct SessionManager {
     last_activity: DashMap<String, Arc<AtomicI64>>,
     /// Optional Prometheus metrics for tracking token refreshes.
     metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
+    /// COORD-04: hard upper bound on the number of live sessions. Each
+    /// successful auth allocates a fresh UUID-keyed session; without a cap the
+    /// map is bounded only by the idle/absolute sweeper, so a client that
+    /// re-authenticates per request (or a burst of valid logins) grows it
+    /// unbounded between sweeps. When an insert would exceed the cap, the
+    /// least-recently-active session is evicted first. `0` disables the cap
+    /// (TTL-only behaviour, the prior default).
+    max_sessions: usize,
 }
+
+/// COORD-04: default session-count cap when none is configured. Sized so a
+/// normal multi-tenant coordinator never hits it, while still bounding the map
+/// against a re-auth-per-request client between sweeps. Override via
+/// [`SessionManager::with_max_sessions`].
+const DEFAULT_MAX_SESSIONS: usize = 10_000;
 
 impl SessionManager {
     /// Create a new `SessionManager` with the legacy `Authenticator`.
@@ -57,6 +71,7 @@ impl SessionManager {
             sessions: DashMap::new(),
             last_activity: DashMap::new(),
             metrics: None,
+            max_sessions: DEFAULT_MAX_SESSIONS,
         }
     }
 
@@ -72,6 +87,7 @@ impl SessionManager {
             sessions: DashMap::new(),
             last_activity: DashMap::new(),
             metrics: None,
+            max_sessions: DEFAULT_MAX_SESSIONS,
         }
     }
 
@@ -102,6 +118,7 @@ impl SessionManager {
             sessions: DashMap::new(),
             last_activity: DashMap::new(),
             metrics: None,
+            max_sessions: DEFAULT_MAX_SESSIONS,
         }
     }
 
@@ -110,6 +127,62 @@ impl SessionManager {
     pub fn with_metrics(mut self, metrics: Arc<sqe_metrics::MetricsRegistry>) -> Self {
         self.metrics = Some(metrics);
         self
+    }
+
+    /// COORD-04: set the hard upper bound on live sessions. `0` disables the
+    /// cap (TTL-only). Wire this from `[coordinator]` config at startup.
+    #[must_use = "with_max_sessions consumes self; bind the returned SessionManager"]
+    pub fn with_max_sessions(mut self, max_sessions: usize) -> Self {
+        self.max_sessions = max_sessions;
+        self
+    }
+
+    /// COORD-04: when the sessions map is at or above the cap, evict
+    /// least-recently-active sessions until there is room for one more. Called
+    /// just before inserting a freshly-authenticated session. A no-op when the
+    /// cap is `0` (disabled) or the map is below the cap.
+    fn evict_to_make_room(&self) {
+        if self.max_sessions == 0 {
+            return;
+        }
+        // Evict until strictly below the cap so the upcoming insert lands at
+        // exactly `max_sessions`.
+        while self.sessions.len() >= self.max_sessions {
+            // Find the least-recently-active session id. `last_activity` holds
+            // an atomic micros timestamp per session; pick the smallest.
+            let lru_id = self
+                .sessions
+                .iter()
+                .map(|entry| {
+                    let id = entry.key().clone();
+                    let last = self
+                        .last_activity
+                        .get(&id)
+                        .map(|a| a.load(Ordering::Relaxed))
+                        .unwrap_or(0);
+                    (last, id)
+                })
+                .min_by_key(|(last, _)| *last)
+                .map(|(_, id)| id);
+
+            match lru_id {
+                Some(id) => {
+                    if self.sessions.remove(&id).is_some() {
+                        self.last_activity.remove(&id);
+                        warn!(
+                            session_id = %id,
+                            cap = self.max_sessions,
+                            "COORD-04: session cap reached, evicting least-recently-active session"
+                        );
+                    } else {
+                        // Concurrent removal won the race; re-check the loop.
+                        break;
+                    }
+                }
+                // Map drained underneath us (concurrent sweep); nothing to do.
+                None => break,
+            }
+        }
     }
 
     /// Authenticate using `FlightCredentials` via the configured provider chain.
@@ -129,6 +202,8 @@ impl SessionManager {
         let session = self.identity_to_session(&identity);
         let session_id = session.id.clone();
         let session = Arc::new(session);
+        // COORD-04: bound the sessions map before inserting the new entry.
+        self.evict_to_make_room();
         self.sessions.insert(session_id.clone(), session.clone());
         self.last_activity
             .insert(session_id.clone(), Arc::new(AtomicI64::new(now_micros())));
@@ -765,6 +840,61 @@ mod tests {
         let removed = manager.sweep_expired_sessions(large_timeout, large_timeout);
         assert_eq!(removed, 0, "No active sessions should be swept");
         assert_eq!(manager.sessions.len(), 10, "All sessions should survive the sweep");
+    }
+
+    // -----------------------------------------------------------------------
+    // COORD-04: session-count cap with LRU eviction
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn max_sessions_cap_evicts_least_recently_active() {
+        let auth = make_authenticator().await;
+        let manager = SessionManager::new(auth).with_max_sessions(2);
+
+        // Insert two sessions with distinct, increasing last_activity stamps.
+        let s1 = Arc::new(make_session("u1"));
+        let id1 = s1.id.clone();
+        manager.sessions.insert(id1.clone(), s1);
+        manager
+            .last_activity
+            .insert(id1.clone(), Arc::new(AtomicI64::new(100)));
+
+        let s2 = Arc::new(make_session("u2"));
+        let id2 = s2.id.clone();
+        manager.sessions.insert(id2.clone(), s2);
+        manager
+            .last_activity
+            .insert(id2.clone(), Arc::new(AtomicI64::new(200)));
+
+        assert_eq!(manager.sessions.len(), 2, "map at cap");
+
+        // Making room for a third must evict the least-recently-active (id1).
+        manager.evict_to_make_room();
+
+        assert!(
+            manager.sessions.get(&id1).is_none(),
+            "least-recently-active session must be evicted at the cap"
+        );
+        assert!(
+            manager.sessions.get(&id2).is_some(),
+            "more-recently-active session must survive"
+        );
+        assert_eq!(manager.sessions.len(), 1, "room made for one more insert");
+    }
+
+    #[tokio::test]
+    async fn max_sessions_zero_disables_cap() {
+        let auth = make_authenticator().await;
+        let manager = SessionManager::new(auth).with_max_sessions(0);
+        for i in 0..50u32 {
+            let s = Arc::new(make_session(&format!("user_{i}")));
+            manager.sessions.insert(s.id.clone(), s);
+        }
+        manager.evict_to_make_room();
+        assert_eq!(
+            manager.sessions.len(),
+            50,
+            "cap of 0 must not evict anything"
+        );
     }
 
     // -----------------------------------------------------------------------

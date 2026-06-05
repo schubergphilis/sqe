@@ -531,21 +531,33 @@ fn estimate_data_size(plan: &Arc<dyn ExecutionPlan>) -> usize {
 
 /// Estimate the number of distinct group keys from the aggregate's input statistics.
 ///
-/// Uses the `distinct_count` statistic from the first GROUP BY column if available.
-/// Returns `None` if statistics are unavailable (conservative: assume low cardinality).
+/// Uses the `distinct_count` statistic of the FIRST GROUP BY column if available.
+/// Returns `None` if statistics are unavailable or the first group-by expression
+/// is not a plain column (conservative: assume low cardinality).
 fn estimate_group_cardinality(agg: &AggregateExec) -> Option<usize> {
     let group_exprs = agg.group_expr().expr();
-    if group_exprs.is_empty() {
+    // PLAN-03: map the FIRST group-by expression to its INPUT column index.
+    // Previously this read `column_statistics.first()` (always column 0)
+    // regardless of which column the group-by referenced, so a group-by on a
+    // non-zero column got the wrong column's distinct-count, mis-picking the
+    // aggregate strategy (e.g. CoordinatorMerge for a high-cardinality key).
+    let Some((first_expr, _alias)) = group_exprs.first() else {
         // No GROUP BY → single group (global aggregation)
         return Some(1);
-    }
+    };
 
-    // Try to get distinct count from the first group-by column's statistics
+    // Only plain column references map to an input column index; anything else
+    // (expressions, function calls) has no single backing column statistic.
+    let column = first_expr
+        .as_any()
+        .downcast_ref::<datafusion::physical_expr::expressions::Column>()?;
+    let col_index = column.index();
+
     let input = &agg.children()[0];
     let stats = input.partition_statistics(None).ok()?;
 
-    // Check column statistics for the first group-by expression
-    let col_stats = stats.column_statistics.first()?;
+    // Index the input column statistics by the group-by column's index.
+    let col_stats = stats.column_statistics.get(col_index)?;
     col_stats.distinct_count.get_value().copied()
 }
 

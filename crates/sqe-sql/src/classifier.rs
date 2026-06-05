@@ -214,6 +214,27 @@ pub fn parse_and_classify_typed(
     parse_and_classify(sql.as_str())
 }
 
+/// Strip a case-insensitive ASCII `prefix` from `s`, returning the remainder.
+///
+/// The previous pre-scan tested `prefix` against `s.to_uppercase()` but sliced
+/// the ORIGINAL string by the prefix's byte length. `to_uppercase()` can change
+/// a string's byte length for some Unicode code points, so the matched-prefix
+/// length on the uppercased copy could differ from the byte span in the
+/// original and slice on a non-char-boundary (panic). Matching the prefix and
+/// slicing against the SAME string removes that mismatch entirely. All the
+/// keyword prefixes here are pure ASCII, so a byte-wise case-insensitive
+/// comparison is correct.
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let bytes = s.as_bytes();
+    let pfx = prefix.as_bytes();
+    if bytes.len() >= pfx.len() && bytes[..pfx.len()].eq_ignore_ascii_case(pfx) {
+        // `prefix` is ASCII, so its byte length is a valid char boundary in `s`.
+        s.get(pfx.len()..)
+    } else {
+        None
+    }
+}
+
 /// Parse a SQL string and classify the first statement.
 pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
     // Before parsing with sqlparser, check for SHOW CATALOGS which sqlparser
@@ -226,24 +247,21 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
     }
 
     // Pre-scan for EXPLAIN FULL — not standard SQL, sqlparser won't parse it.
-    if upper.starts_with("EXPLAIN FULL ") {
-        let inner = trimmed["EXPLAIN FULL ".len()..].trim().to_string();
+    if let Some(rest) = strip_prefix_ci(trimmed, "EXPLAIN FULL ") {
+        let inner = rest.trim().to_string();
         return Ok(StatementKind::ExplainFull(inner));
     }
 
     // Pre-scan for SHOW STATS FOR — sqlparser parses this as ShowVariable,
     // but we intercept it here for direct table name extraction.
-    if upper.starts_with("SHOW STATS FOR ") {
-        let table = trimmed["SHOW STATS FOR ".len()..]
-            .trim()
-            .trim_end_matches(';')
-            .to_string();
+    if let Some(rest) = strip_prefix_ci(trimmed, "SHOW STATS FOR ") {
+        let table = rest.trim().trim_end_matches(';').to_string();
         return Ok(StatementKind::ShowStats(table));
     }
 
     // Pre-scan for SHOW EFFECTIVE GRANTS FOR USER "name"
-    if upper.starts_with("SHOW EFFECTIVE GRANTS FOR USER ") {
-        let user = trimmed["SHOW EFFECTIVE GRANTS FOR USER ".len()..]
+    if let Some(rest) = strip_prefix_ci(trimmed, "SHOW EFFECTIVE GRANTS FOR USER ") {
+        let user = rest
             .trim()
             .trim_end_matches(';')
             .trim_matches('"')
@@ -253,11 +271,8 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
     }
 
     // Pre-scan for SHOW GRANTS ON resource / SHOW GRANTS TO type "name"
-    if upper.starts_with("SHOW GRANTS ON ") {
-        let rest = trimmed["SHOW GRANTS ON ".len()..]
-            .trim()
-            .trim_end_matches(';')
-            .to_string();
+    if let Some(rest) = strip_prefix_ci(trimmed, "SHOW GRANTS ON ") {
+        let rest = rest.trim().trim_end_matches(';').to_string();
         let (catalog, namespace, table) = parse_resource_reference(&rest)?;
         return Ok(StatementKind::ShowGrants(ShowGrantsTarget::OnResource {
             catalog,
@@ -265,10 +280,8 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
             table,
         }));
     }
-    if upper.starts_with("SHOW GRANTS TO ") {
-        let rest = trimmed["SHOW GRANTS TO ".len()..]
-            .trim()
-            .trim_end_matches(';');
+    if let Some(rest) = strip_prefix_ci(trimmed, "SHOW GRANTS TO ") {
+        let rest = rest.trim().trim_end_matches(';');
         let parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
         if parts.len() == 2 {
             let grantee_type = parts[0].to_uppercase();
@@ -288,8 +301,8 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
     }
 
     // Pre-scan for CHECK ACCESS privilege ON resource FOR USER "name"
-    if upper.starts_with("CHECK ACCESS ") {
-        let rest = trimmed["CHECK ACCESS ".len()..].trim().trim_end_matches(';');
+    if let Some(rest) = strip_prefix_ci(trimmed, "CHECK ACCESS ") {
+        let rest = rest.trim().trim_end_matches(';');
         return parse_check_access(rest);
     }
 
@@ -345,11 +358,8 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
     // SET WRITE_BRANCH = '<name>' routes writes to a named Iceberg branch.
     // We intercept it here so the coordinator can update session state
     // without going through DataFusion's generic SET handling.
-    if upper.starts_with("SET WRITE_BRANCH") {
-        let rest = trimmed["SET WRITE_BRANCH".len()..]
-            .trim()
-            .trim_end_matches(';')
-            .trim();
+    if let Some(rest) = strip_prefix_ci(trimmed, "SET WRITE_BRANCH") {
+        let rest = rest.trim().trim_end_matches(';').trim();
         // Accept: SET WRITE_BRANCH = 'name', SET WRITE_BRANCH 'name',
         //         SET WRITE_BRANCH = DEFAULT, SET WRITE_BRANCH = NULL
         let stripped = rest.strip_prefix('=').unwrap_or(rest).trim();
@@ -368,6 +378,14 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
 
     let dialect = GenericDialect {};
     let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|e| sqe_core::SqeError::Execution(format!("Parse error: {e}")))?;
+
+    // Reject pathologically deep expression trees up front, before any
+    // recursive AST visitor (the Trino-compat rewrite, then DataFusion's
+    // analyzer) walks them and overflows the stack. A flat `a OR a OR ...`
+    // chain parses cleanly but builds a depth-N tree; the guard turns that
+    // into a clean parse error instead of an uncatchable process abort.
+    crate::trino_compat::check_expression_depth(&statements)
         .map_err(|e| sqe_core::SqeError::Execution(format!("Parse error: {e}")))?;
 
     let stmt = statements
@@ -634,6 +652,61 @@ mod tests {
     #[test]
     fn test_select_is_query() {
         let result = parse_and_classify("SELECT 1");
+        assert!(matches!(result, Ok(StatementKind::Query(_))));
+    }
+
+    // ── SQL-08: prefix pre-scan slices the matched string, not a copy ───
+
+    #[test]
+    fn strip_prefix_ci_matches_case_insensitively() {
+        assert_eq!(
+            strip_prefix_ci("show stats for ns.t", "SHOW STATS FOR "),
+            Some("ns.t")
+        );
+        assert_eq!(
+            strip_prefix_ci("SHOW STATS FOR ns.t", "SHOW STATS FOR "),
+            Some("ns.t")
+        );
+        assert_eq!(strip_prefix_ci("SELECT 1", "SHOW STATS FOR "), None);
+    }
+
+    #[test]
+    fn strip_prefix_ci_does_not_panic_on_non_ascii_remainder() {
+        // The remainder after the ASCII prefix can contain multi-byte chars;
+        // slicing must land on a char boundary (the prefix is ASCII, so its
+        // byte length is always a boundary). No panic.
+        let s = "SHOW STATS FOR ☃ns";
+        assert_eq!(strip_prefix_ci(s, "SHOW STATS FOR "), Some("☃ns"));
+    }
+
+    #[test]
+    fn show_effective_grants_parses_with_lowercase_keyword() {
+        // Previously the match was on the uppercased copy but the slice came
+        // from the original; a lowercase input still classifies correctly now.
+        let result = parse_and_classify("show effective grants for user \"alice\"");
+        assert!(matches!(
+            result,
+            Ok(StatementKind::ShowEffectiveGrants(ref u)) if u == "alice"
+        ));
+    }
+
+    // ── SQL-01: deep expression chains rejected with a clean error ──────
+
+    #[test]
+    fn classifier_rejects_deep_expression_chain() {
+        // 2000 OR-terms is far above the depth cap (256) and far below the
+        // ~16k stack-overflow threshold, so the guard rejects it cleanly.
+        let chain = std::iter::repeat_n("a", 2000)
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql = format!("SELECT {chain} FROM t");
+        let result = parse_and_classify(&sql);
+        assert!(result.is_err(), "deep chain must be rejected, not overflow");
+    }
+
+    #[test]
+    fn classifier_accepts_normal_query() {
+        let result = parse_and_classify("SELECT a OR b OR c FROM t WHERE x > 1");
         assert!(matches!(result, Ok(StatementKind::Query(_))));
     }
 

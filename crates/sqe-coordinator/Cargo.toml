@@ -41,6 +41,11 @@ arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
 tonic = { workspace = true, features = ["tls-ring"] }
+# QUACK-05: TLS for the axum-based Quack listener. `tls-rustls-no-provider`
+# avoids pulling rustls/aws-lc-rs; we install the ring provider explicitly so
+# the Quack endpoint uses the same crypto backend as the tonic Flight path.
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", features = ["ring"] }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }

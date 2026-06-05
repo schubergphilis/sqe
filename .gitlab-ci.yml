@@ -35,8 +35,11 @@ cargo-check:
     # binaries it expects. cargo-deny was already being installed this way;
     # same pattern for the rest.
     - rustup component add clippy
-    - cargo install cargo-audit --quiet 2>/dev/null || true
-    - cargo install cargo-deny --quiet 2>/dev/null || true
+    # DEP-09: install only when missing (cached in .cargo/bin across runs), and
+    # do NOT swallow install failures — a failed install must fail the job, not
+    # silently skip the `cargo audit` / `cargo deny` security gate below.
+    - command -v cargo-audit > /dev/null || cargo install cargo-audit --quiet
+    - command -v cargo-deny > /dev/null || cargo install cargo-deny --quiet
   script:
     - cargo clippy --all-targets --all-features -- -D warnings
     - cargo audit
@@ -56,10 +59,15 @@ cargo-check:
         - deny.toml
   cache:
     key: cargo-check-${CI_COMMIT_REF_SLUG}
+    # Warm-start a new branch from main's cache instead of compiling the whole
+    # dependency tree cold on first push; cargo recompiles only what changed.
+    fallback_keys:
+      - cargo-check-main
     paths:
       - target/
       - .cargo/registry/
-      - .cargo/bin/cargo-deny
+      # DEP-09: cache the whole bin dir so cargo-audit is not recompiled every run.
+      - .cargo/bin/
 
 # ── Tests ──────────────────────────────────────────────────────
 cargo-test:
@@ -146,6 +154,8 @@ cargo-check-features:
         - Cargo.lock
   cache:
     key: cargo-features-${CI_COMMIT_REF_SLUG}
+    fallback_keys:
+      - cargo-features-main
     paths:
       - target/
       - .cargo/registry/
@@ -193,6 +203,8 @@ integration-test:
       allow_failure: true
   cache:
     key: cargo-integration-${CI_COMMIT_REF_SLUG}
+    fallback_keys:
+      - cargo-integration-main
     paths:
       - target/
       - .cargo/registry/
@@ -229,6 +241,8 @@ matrix-score:
         - xtask/**/*
   cache:
     key: xtask-${CI_COMMIT_REF_SLUG}
+    fallback_keys:
+      - xtask-main
     paths:
       - target/
       - .cargo/registry/

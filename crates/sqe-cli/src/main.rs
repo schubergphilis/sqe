@@ -85,6 +85,31 @@ struct Cli {
     #[arg(long, default_value_t = false, conflicts_with_all = ["warehouse", "catalog"])]
     memory: bool,
 
+    /// Embedded cloud catalog backend: `glue` or `s3tables`. When set,
+    /// the embedded engine attaches that AWS catalog read-only instead
+    /// of a local filesystem catalog. Credentials come from the AWS
+    /// provider chain (`AWS_PROFILE`, SSO, instance profile). Requires
+    /// the `aws` cargo feature (default-on). Mutually exclusive with
+    /// `--memory`, `--warehouse`, and `--catalog`.
+    #[arg(long, value_enum, conflicts_with_all = ["memory", "warehouse", "catalog"])]
+    catalog_backend: Option<CloudBackend>,
+
+    /// Cloud warehouse for `--catalog-backend`. For `glue`, an
+    /// `s3://bucket/prefix` URI. For `s3tables`, the table-bucket ARN
+    /// (`arn:aws:s3tables:REGION:ACCOUNT:bucket/NAME`).
+    #[arg(long, requires = "catalog_backend")]
+    catalog_warehouse: Option<String>,
+
+    /// AWS region for `--catalog-backend`. Sets the AWS SDK region for
+    /// the catalog; falls back to the AWS provider chain when omitted.
+    #[arg(long)]
+    region: Option<String>,
+
+    /// SQL identifier to mount the cloud catalog under. Defaults to the
+    /// backend name, so tables resolve as `glue.namespace.table`.
+    #[arg(long, requires = "catalog_backend")]
+    catalog_name: Option<String>,
+
     /// Read SQL statements from a file and execute them in order.
     /// Statements are separated by `;`. When combined with
     /// `-e/--execute`, the script runs first and the `-e` query
@@ -105,6 +130,15 @@ enum Protocol {
     Flight,
     /// Trino-compat HTTP REST (works through any HTTP proxy)
     Http,
+}
+
+/// Cloud catalog backend selectable in embedded mode.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CloudBackend {
+    /// AWS Glue Data Catalog (native AWS SDK).
+    Glue,
+    /// AWS S3 Tables (managed Iceberg).
+    S3tables,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -148,32 +182,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut client: Box<dyn SqlClient> = if cli.embedded {
         let limit = sqe_core::parse_memory_limit(&cli.memory_limit).unwrap_or(1024 * 1024 * 1024);
-        let mode = if cli.memory {
-            embedded::WarehouseMode::Memory
-        } else if !cli.catalog.is_empty() {
-            embedded::WarehouseMode::Persistent {
-                catalogs: cli
-                    .catalog
-                    .iter()
-                    .map(|(name, path)| embedded::EmbeddedCatalog {
-                        name: name.clone(),
-                        path: path.clone(),
-                    })
-                    .collect(),
+        if let Some(backend_kind) = cli.catalog_backend {
+            // Cloud catalog (Glue / S3 Tables), read-only. Region goes
+            // into the AWS SDK env so both the catalog builder and the
+            // credential chain see it.
+            if let Some(r) = &cli.region {
+                std::env::set_var("AWS_REGION", r);
             }
-        } else if let Some(path) = cli.warehouse.clone() {
-            embedded::WarehouseMode::single(path)
+            let warehouse = cli
+                .catalog_warehouse
+                .clone()
+                .ok_or("--catalog-warehouse is required with --catalog-backend")?;
+            let backend = match backend_kind {
+                CloudBackend::Glue => sqe_core::config::CatalogBackend::Glue {
+                    region: cli.region.clone().unwrap_or_default(),
+                    warehouse,
+                    endpoint: None,
+                },
+                CloudBackend::S3tables => sqe_core::config::CatalogBackend::S3tables {
+                    table_bucket_arn: warehouse,
+                    endpoint_url: None,
+                },
+            };
+            let backend_label = match backend_kind {
+                CloudBackend::Glue => "glue",
+                CloudBackend::S3tables => "s3tables",
+            };
+            let name = cli
+                .catalog_name
+                .clone()
+                .unwrap_or_else(|| backend_label.to_string());
+            let client = embedded::EmbeddedClient::with_backend(limit, backend, &name).await?;
+            eprintln!(
+                "sqe-cli {} embedded engine ({} memory pool, {} catalog: {})",
+                sqe_core::VERSION,
+                cli.memory_limit,
+                backend_label,
+                name
+            );
+            Box::new(client)
         } else {
-            embedded::WarehouseMode::default_persistent()
-        };
-        let client = embedded::EmbeddedClient::with_warehouse(limit, &mode).await?;
-        eprintln!(
-            "sqe-cli {} embedded engine ({} memory pool, {})",
-            sqe_core::VERSION,
-            cli.memory_limit,
-            warehouse_banner(&mode)
-        );
-        Box::new(client)
+            let mode = if cli.memory {
+                embedded::WarehouseMode::Memory
+            } else if !cli.catalog.is_empty() {
+                embedded::WarehouseMode::Persistent {
+                    catalogs: cli
+                        .catalog
+                        .iter()
+                        .map(|(name, path)| embedded::EmbeddedCatalog {
+                            name: name.clone(),
+                            path: path.clone(),
+                        })
+                        .collect(),
+                }
+            } else if let Some(path) = cli.warehouse.clone() {
+                embedded::WarehouseMode::single(path)
+            } else {
+                embedded::WarehouseMode::default_persistent()
+            };
+            let client = embedded::EmbeddedClient::with_warehouse(limit, &mode).await?;
+            eprintln!(
+                "sqe-cli {} embedded engine ({} memory pool, {})",
+                sqe_core::VERSION,
+                cli.memory_limit,
+                warehouse_banner(&mode)
+            );
+            Box::new(client)
+        }
     } else if let Some(ref token) = cli.token {
         // Token-based auth: skip username/password
         match cli.protocol {

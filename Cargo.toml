@@ -183,6 +183,15 @@ debug = 1
 # instead). Saves ~20-30% of link time on every rebuild.
 split-debuginfo = "unpacked"
 
+# Third-party dependencies (the `*` glob matches every non-workspace crate)
+# carry no debuginfo. We almost never step into the ~760 upstream crates with a
+# debugger, but generating + linking their line tables is a large slice of a
+# cold/feature-changed build. First-party crates keep `debug = 1` from above,
+# so panics and backtraces in our own code stay fully attributed. Behaviour is
+# unchanged; only debug symbols inside dependency frames are dropped.
+[profile.dev.package."*"]
+debug = false
+
 # ── Release profile: fast builds with good runtime performance ─
 [profile.release]
 codegen-units = 4        # More parallelism during codegen (default=1)

@@ -546,13 +546,22 @@ fn resolve_join_keys(
         // Extract column name from the right expression.
         let right_col_name = extract_column_name(right_expr)?;
 
-        // Find the column in the accumulated schema.
-        let left_idx = accumulated_schema.index_of(&left_col_name).ok()?;
+        // PLAN-01: Find the column in the accumulated schema by name, but bail
+        // if the name is ambiguous. After joins concatenate columns the
+        // accumulated (left) schema commonly carries duplicate column names (a
+        // shared surrogate key like `id`/`sk` across dimensions is the
+        // star-schema norm). `Schema::index_of` returns the FIRST field of that
+        // name, which would silently rebind the join key to the wrong table's
+        // column -- a valid join with the same output shape but WRONG rows.
+        // Returning `None` makes `find_condition_for_pair` (and thus
+        // `rebuild_join_chain`) bail, keeping the original, correct plan.
+        let left_idx = index_of_unique(accumulated_schema, &left_col_name)?;
         let new_left: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
             Arc::new(Column::new(&left_col_name, left_idx));
 
-        // Find the column in the new input schema.
-        let right_idx = new_schema.index_of(&right_col_name).ok()?;
+        // The new input is a single fresh leaf; its names are not subject to
+        // post-join duplication, but guard it the same way for safety.
+        let right_idx = index_of_unique(new_schema, &right_col_name)?;
         let new_right: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
             Arc::new(Column::new(&right_col_name, right_idx));
 
@@ -577,10 +586,13 @@ fn resolve_join_keys_by_name(
         let left_name = extract_column_name(left_expr)?;
         let right_name = extract_column_name(right_expr)?;
 
+        // PLAN-01: use unique-name resolution on both schemas. An ambiguous
+        // accumulated-side name (duplicate after join concatenation) would
+        // otherwise bind to the wrong column via `index_of`'s first-match.
         // Try: left_name in accumulated, right_name in new.
-        if let (Ok(acc_idx), Ok(new_idx)) = (
-            accumulated_schema.index_of(&left_name),
-            new_schema.index_of(&right_name),
+        if let (Some(acc_idx), Some(new_idx)) = (
+            index_of_unique(accumulated_schema, &left_name),
+            index_of_unique(new_schema, &right_name),
         ) {
             let acc_col: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
                 Arc::new(Column::new(&left_name, acc_idx));
@@ -591,9 +603,9 @@ fn resolve_join_keys_by_name(
         }
 
         // Try: right_name in accumulated, left_name in new.
-        if let (Ok(acc_idx), Ok(new_idx)) = (
-            accumulated_schema.index_of(&right_name),
-            new_schema.index_of(&left_name),
+        if let (Some(acc_idx), Some(new_idx)) = (
+            index_of_unique(accumulated_schema, &right_name),
+            index_of_unique(new_schema, &left_name),
         ) {
             let acc_col: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
                 Arc::new(Column::new(&right_name, acc_idx));
@@ -603,7 +615,7 @@ fn resolve_join_keys_by_name(
             continue;
         }
 
-        // Could not resolve this pair.
+        // Could not resolve this pair unambiguously.
         return None;
     }
 
@@ -622,6 +634,26 @@ fn extract_column_name(expr: &Arc<dyn datafusion::physical_expr::PhysicalExpr>) 
     expr.as_any()
         .downcast_ref::<Column>()
         .map(|c| c.name().to_string())
+}
+
+/// PLAN-01: resolve a column name to its index ONLY when the name is unique in
+/// the schema. Returns `None` when the name is missing OR appears more than
+/// once. `Schema::index_of` returns the first match, which silently binds a
+/// rebuilt join key to the wrong table's column when the accumulated left
+/// schema carries duplicate names (the shared-surrogate-key star-schema case).
+/// Bailing on ambiguity makes the reorder keep the original, correct plan.
+fn index_of_unique(schema: &arrow_schema::Schema, name: &str) -> Option<usize> {
+    let mut found: Option<usize> = None;
+    for (i, field) in schema.fields().iter().enumerate() {
+        if field.name() == name {
+            if found.is_some() {
+                // Ambiguous: more than one field with this name.
+                return None;
+            }
+            found = Some(i);
+        }
+    }
+    found
 }
 
 #[cfg(test)]
@@ -876,5 +908,171 @@ mod tests {
 
         let result = resolve_join_keys(&[left_col], &[right_col], &schema_left, &schema_right);
         assert!(result.is_none());
+    }
+
+    // ── PLAN-01: wrong-column rebind on ambiguous join keys ──────────────
+
+    /// Anchor test (correct-by-construction, trigger-independent): the
+    /// unique-name resolver returns the index only when the name is unique,
+    /// and bails on a duplicate. This is the core of the fix. Against the old
+    /// `Schema::index_of` the duplicate case returned `Some(0)` (the bug).
+    #[test]
+    fn plan01_index_of_unique_bails_on_duplicate_name() {
+        // Two `id` columns (the post-join accumulated-schema case) + one unique.
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, true),   // 0
+            Field::new("a_val", DataType::Utf8, true), // 1
+            Field::new("id", DataType::Int64, true),   // 2  <- duplicate name
+            Field::new("c_id", DataType::Int64, true), // 3  <- unique
+        ]);
+        assert_eq!(
+            index_of_unique(&schema, "id"),
+            None,
+            "ambiguous name must NOT resolve (would silently bind wrong column)"
+        );
+        assert_eq!(
+            index_of_unique(&schema, "c_id"),
+            Some(3),
+            "unique name resolves to its index"
+        );
+        assert_eq!(index_of_unique(&schema, "absent"), None, "missing name -> None");
+    }
+
+    /// `resolve_join_keys` must bail when the accumulated schema has a duplicate
+    /// key name (the wrong-rebind hazard), but still succeed when unique.
+    #[test]
+    fn plan01_resolve_join_keys_bails_on_ambiguous_accumulated_key() {
+        // Accumulated schema carries TWO `id` columns (post-join concatenation).
+        let accumulated = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("a_val", DataType::Utf8, true),
+            Field::new("id", DataType::Int64, true), // duplicate
+        ]));
+        let new_schema = make_schema(&[("id", DataType::Int64), ("c_val", DataType::Utf8)]);
+
+        let left_col: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+            Arc::new(Column::new("id", 0));
+        let right_col: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+            Arc::new(Column::new("id", 0));
+
+        let result = resolve_join_keys(&[left_col], &[right_col], &accumulated, &new_schema);
+        assert!(
+            result.is_none(),
+            "ambiguous accumulated key must bail (keeps original plan), \
+             not silently bind to the first `id`"
+        );
+    }
+
+    /// Control vs subject at the `rule.optimize()` level, compared by plan
+    /// STRUCTURE (stat-independent), defeating both the inert-trigger trap and
+    /// the absent-join-statistics trap.
+    ///
+    /// Flatten collects left-first, so `((fact JOIN dimA) JOIN dimB)` yields
+    /// inputs `[fact=100, dimA=2, dimB=2]`: not ascending (100 <= 2 is false),
+    /// so `already_optimal` is false and ratio 50 >= 10 passes -- the rule
+    /// reaches the rebuild path for BOTH cases. The difference is only at the
+    /// join-key rebind:
+    ///   - CONTROL (distinct FK names) resolves unambiguously and reorders, so
+    ///     the plan string changes. This proves the gate actually fired.
+    ///   - SUBJECT (shared `id`) hits a duplicate name in the accumulated
+    ///     schema after the first join, so the fix bails (`Transformed::no`,
+    ///     literally the same node) and the plan string is unchanged. Pre-fix,
+    ///     `index_of` would bind to the wrong `id` and emit a (wrong) reorder,
+    ///     changing the string -- so this assertion fails before the fix.
+    #[test]
+    fn plan01_control_reorders_subject_bails() {
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::physical_plan::displayable;
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+
+        // Build an executable, statistics-bearing leaf from real rows.
+        fn leaf(
+            fields: &[(&str, DataType)],
+            id_col: Vec<i64>,
+            val_col: Vec<&str>,
+        ) -> Arc<dyn ExecutionPlan> {
+            let schema = make_schema(fields);
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(id_col)),
+                    Arc::new(StringArray::from(val_col)),
+                ],
+            )
+            .unwrap();
+            MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap()
+        }
+
+        let plan_str = |p: &Arc<dyn ExecutionPlan>| {
+            displayable(p.as_ref()).indent(true).to_string()
+        };
+
+        let rule = StarSchemaReorderRule::new(10);
+        let config = ConfigOptions::new();
+
+        // --- CONTROL: distinct FK/PK names, big ratio -> must reorder. ---
+        let fact: Arc<dyn ExecutionPlan> = leaf(
+            &[("fact_d1", DataType::Int64), ("fact_val", DataType::Utf8)],
+            (0..100).map(|i| i % 2).collect(),
+            vec!["x"; 100],
+        );
+        let dim1: Arc<dyn ExecutionPlan> = leaf(
+            &[("d1_id", DataType::Int64), ("d1_val", DataType::Utf8)],
+            vec![0, 1],
+            vec!["a", "b"],
+        );
+        let dim2: Arc<dyn ExecutionPlan> = leaf(
+            &[("d2_id", DataType::Int64), ("d2_val", DataType::Utf8)],
+            vec![0, 1],
+            vec!["c", "d"],
+        );
+        let fd1 = make_inner_hash_join(fact, dim1, "fact_d1", "d1_id");
+        // Chain dim2 onto dim1 via distinct names (d1_id = d2_id), NOT a pure
+        // star off `fact`. A pure star (both joins keying off fact) can't be
+        // linearly reordered: the greedy joins the two smallest (dim1, dim2)
+        // first, but they share no key, so the rebuild bails -> control would
+        // not reorder and the assertion would wrongly fail. With the chain,
+        // dim1 ⋈ dim2 connects on d1_id=d2_id and ⋈ fact on d1_id=fact_d1, all
+        // distinct names, so the reorder fires both pre- and post-fix.
+        let control = make_inner_hash_join(fd1, dim2, "d1_id", "d2_id");
+
+        let control_before = plan_str(&control);
+        let control_out = rule.optimize(Arc::clone(&control), &config).unwrap();
+        let control_after = plan_str(&control_out);
+        assert_ne!(
+            control_before, control_after,
+            "CONTROL (distinct keys) must reorder -- if equal, the row-count / \
+             ratio gate never fired and this whole test is inert"
+        );
+
+        // --- SUBJECT: shared `id` key across all three -> must bail. ---
+        let fact2: Arc<dyn ExecutionPlan> = leaf(
+            &[("id", DataType::Int64), ("fact_val", DataType::Utf8)],
+            (0..100).map(|i| i % 2).collect(),
+            vec!["x"; 100],
+        );
+        let dim_a: Arc<dyn ExecutionPlan> = leaf(
+            &[("id", DataType::Int64), ("a_val", DataType::Utf8)],
+            vec![0, 1],
+            vec!["a", "b"],
+        );
+        let dim_b: Arc<dyn ExecutionPlan> = leaf(
+            &[("id", DataType::Int64), ("b_val", DataType::Utf8)],
+            vec![0, 1],
+            vec!["c", "d"],
+        );
+        let fa = make_inner_hash_join(fact2, dim_a, "id", "id");
+        let subject = make_inner_hash_join(fa, dim_b, "id", "id");
+
+        let subject_before = plan_str(&subject);
+        let subject_out = rule.optimize(Arc::clone(&subject), &config).unwrap();
+        let subject_after = plan_str(&subject_out);
+        assert_eq!(
+            subject_before, subject_after,
+            "SUBJECT (shared `id`) must bail and keep the original plan. A \
+             reorder here would rebind the shared key to the wrong table's \
+             column (same shape, WRONG rows). Pre-fix this assertion fails \
+             because the buggy `index_of` emitted a wrong reorder."
+        );
     }
 }

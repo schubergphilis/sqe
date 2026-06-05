@@ -366,6 +366,49 @@ impl std::fmt::Debug for SessionCatalog {
     }
 }
 
+/// CAT-02: emit the shared-identity warning at most once per backend variant
+/// per process. Non-REST catalog backends do not forward the user's bearer to
+/// the catalog or to cloud storage, so per-user identity is not enforced below
+/// the in-engine policy layer. `for_session_other_backend_with` runs once per
+/// session-catalog build; a plain `warn!` there would log on every login, so we
+/// dedup by backend kind.
+fn warn_shared_backend_identity_once(backend: &sqe_core::config::CatalogBackend) {
+    use std::sync::Once;
+    use sqe_core::config::CatalogBackend;
+
+    let (once, kind): (&'static Once, &'static str) = match backend {
+        CatalogBackend::Rest => return, // REST forwards the user bearer; no warning.
+        CatalogBackend::Glue { .. } => {
+            static W: Once = Once::new();
+            (&W, "glue")
+        }
+        CatalogBackend::Hms { .. } => {
+            static W: Once = Once::new();
+            (&W, "hms")
+        }
+        CatalogBackend::Jdbc { .. } => {
+            static W: Once = Once::new();
+            (&W, "jdbc")
+        }
+        CatalogBackend::S3tables { .. } => {
+            static W: Once = Once::new();
+            (&W, "s3tables")
+        }
+    };
+
+    once.call_once(|| {
+        warn!(
+            backend = kind,
+            "Catalog backend `{kind}` uses the coordinator's shared service \
+             identity (IAM role / AWS_PROFILE / HMS connection), NOT the \
+             authenticated user. Per-user identity is enforced only by SQE's \
+             in-engine policy layer; catalog and cloud-storage access are shared \
+             across all users. Use the REST/Polaris backend for per-user bearer \
+             passthrough to catalog + S3."
+        );
+    });
+}
+
 impl SessionCatalog {
     /// Create a new per-session catalog configured with the user's bearer token.
     ///
@@ -463,20 +506,72 @@ impl SessionCatalog {
         table_cache: TableMetadataCache,
         backend: &sqe_core::config::CatalogBackend,
     ) -> sqe_core::Result<Self> {
+        let inner: Arc<dyn iceberg::Catalog> = Self::build_backend_catalog(backend).await?;
+
+        let token_fingerprint = {
+            use sha2::{Digest, Sha256};
+            let hash = Sha256::digest(bearer_token.as_bytes());
+            format!("{:x}", hash)[..16].to_string()
+        };
+
+        info!(
+            backend = ?backend,
+            token_fingerprint = %token_fingerprint,
+            "Creating SessionCatalog over non-REST backend"
+        );
+
+        // CAT-02: SQE's identity model is "no service account; every query runs
+        // as the authenticated user." That holds for REST/Polaris, where the
+        // user's bearer is forwarded to the catalog and S3 (rest_catalog
+        // `new(...)`). Non-REST backends (Glue / HMS / JDBC / S3 Tables) build a
+        // catalog from `[catalog.backend]` props alone; the bearer is stored for
+        // cache-keying and logging only (`bearer_token` above) and is NOT passed
+        // to the backend. Catalog + cloud-storage access therefore runs under
+        // the pod's single shared identity (IAM role / `AWS_PROFILE` / HMS
+        // connection), not the user's. Surface that to operators loudly, once
+        // per process, mirroring the ClientCredentials warning in sqe-auth.
+        warn_shared_backend_identity_once(backend);
+
+        let circuit_breaker = user_circuit_breaker(&token_fingerprint);
+        Ok(Self {
+            inner: CatalogHandle::Other(inner),
+            catalog_url: String::new(),
+            warehouse: catalog.warehouse.clone(),
+            bearer_token: bearer_token.to_string(),
+            token_fingerprint,
+            storage_config: storage.clone(),
+            http_client: SHARED_HTTP_CLIENT.clone(),
+            circuit_breaker,
+            table_cache,
+        })
+    }
+
+    // (helper defined as a free function below `impl`; see
+    // `warn_shared_backend_identity_once`)
+
+    /// Build a bare `iceberg::Catalog` for a non-REST backend.
+    ///
+    /// Shared by the coordinator's per-session catalog
+    /// (`for_session_other_backend_with`) and the embedded CLI, which
+    /// attaches the result through `iceberg-datafusion`'s read-only
+    /// catalog provider. Each backend translates its typed config into
+    /// the upstream loader's `(catalog_type, props)` shape; the loader
+    /// picks the matching `CatalogBuilder` and returns the catalog.
+    /// Backend support is gated by the same cargo features as the rest
+    /// of `sqe-catalog`. See `vendor/iceberg-rust/README.md` and
+    /// `docs/catalogs.md` for the supported prop keys per backend.
+    pub async fn build_backend_catalog(
+        backend: &sqe_core::config::CatalogBackend,
+    ) -> sqe_core::Result<Arc<dyn iceberg::Catalog>> {
         use sqe_core::config::CatalogBackend;
 
-        // Each non-REST backend translates its typed config into the
-        // upstream loader's `(catalog_type, props_map)` shape. The
-        // loader picks the right `CatalogBuilder`, applies the
-        // shared `OpenDalStorageFactory::Fs` we want for SQE, and
-        // returns an `Arc<dyn iceberg::Catalog>`. All of this used
-        // to live in per-backend wrappers under
-        // `crates/sqe-catalog/src/backends/`; the wrappers are gone
-        // because the loader's uniform shape made them redundant.
-        // See `vendor/iceberg-rust/README.md` and
-        // `docs/catalogs.md` for the supported prop keys per backend.
         let (catalog_type, name, props): (&str, &str, HashMap<String, String>) = match backend {
-            CatalogBackend::Rest => unreachable!("Rest handled in for_session"),
+            CatalogBackend::Rest => {
+                return Err(SqeError::Catalog(
+                    "build_backend_catalog is for non-REST backends; REST is built via for_session"
+                        .into(),
+                ));
+            }
 
             #[cfg(feature = "hms")]
             CatalogBackend::Hms { uri, warehouse } => {
@@ -553,40 +648,13 @@ impl SessionCatalog {
             }
         };
 
-        let inner: Arc<dyn iceberg::Catalog> = iceberg_catalog_loader::load(catalog_type)
-            .map_err(|e| SqeError::Catalog(format!(
-                "Catalog loader rejected type `{catalog_type}`: {e}"
-            )))?
+        iceberg_catalog_loader::load(catalog_type)
+            .map_err(|e| {
+                SqeError::Catalog(format!("Catalog loader rejected type `{catalog_type}`: {e}"))
+            })?
             .load(name.to_string(), props)
             .await
-            .map_err(|e| SqeError::Catalog(format!(
-                "Catalog `{catalog_type}` build failed: {e}"
-            )))?;
-
-        let token_fingerprint = {
-            use sha2::{Digest, Sha256};
-            let hash = Sha256::digest(bearer_token.as_bytes());
-            format!("{:x}", hash)[..16].to_string()
-        };
-
-        info!(
-            backend = ?backend,
-            token_fingerprint = %token_fingerprint,
-            "Creating SessionCatalog over non-REST backend"
-        );
-
-        let circuit_breaker = user_circuit_breaker(&token_fingerprint);
-        Ok(Self {
-            inner: CatalogHandle::Other(inner),
-            catalog_url: String::new(),
-            warehouse: catalog.warehouse.clone(),
-            bearer_token: bearer_token.to_string(),
-            token_fingerprint,
-            storage_config: storage.clone(),
-            http_client: SHARED_HTTP_CLIENT.clone(),
-            circuit_breaker,
-            table_cache,
-        })
+            .map_err(|e| SqeError::Catalog(format!("Catalog `{catalog_type}` build failed: {e}")))
     }
 
     pub async fn new(
@@ -816,6 +884,12 @@ impl SessionCatalog {
     pub async fn load_table(&self, table_ident: &TableIdent) -> sqe_core::Result<Table> {
         let cache_key = self.table_cache_key(table_ident);
 
+        // CAT-04: when the ETag revalidation GET below fetches a changed
+        // metadata document (non-304), its response carries a fresh `ETag`
+        // header. Capture it here so the post-reload path can store it directly
+        // instead of firing a second fire-and-forget HEAD request to Polaris.
+        let mut etag_from_revalidation: Option<String> = None;
+
         // Fast path: return cached table that is still within the soft TTL.
         if let Some(cached) = self.table_cache.get_fresh(&cache_key).await {
             debug!(
@@ -881,8 +955,15 @@ impl SessionCatalog {
                     // The response body from this GET could in theory be parsed,
                     // but the Polaris loadTable response is complex (includes
                     // credential vending, FileIO config, etc.) and is best handled
-                    // by iceberg-rust's RestCatalog. So we discard this response
-                    // and let the normal path handle it.
+                    // by iceberg-rust's RestCatalog. So we discard the body and
+                    // let the normal path reload it -- but we DO keep this
+                    // response's `ETag` header (CAT-04) so the reload below can
+                    // store the fresh ETag without an extra HEAD round-trip.
+                    etag_from_revalidation = resp
+                        .headers()
+                        .get("etag")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
                     debug!(
                         table = ?table_ident,
                         status = %status,
@@ -920,22 +1001,37 @@ impl SessionCatalog {
         match &result {
             Ok(table) => {
                 self.circuit_breaker.record_success();
-                self.table_cache
-                    .insert_with_etag(cache_key.clone(), table.clone(), None)
-                    .await;
 
-                let http_client = self.http_client.clone();
-                let bearer_token = self.bearer_token.clone();
-                let url = self.table_url(table_ident);
-                let table_cache = self.table_cache.clone();
-                let table_ident_log = table_ident.clone();
-                tokio::spawn(async move {
-                    let etag = fetch_table_etag_inner(&http_client, &bearer_token, &url).await;
-                    if let Some(e) = etag.as_deref() {
-                        debug!(table = %table_ident_log, etag = %e, "Captured ETag for table");
-                    }
-                    table_cache.update_etag(&cache_key, etag).await;
-                });
+                if let Some(etag) = etag_from_revalidation {
+                    // CAT-04: the revalidation GET already returned the fresh
+                    // ETag header, so store it directly with the metadata. No
+                    // extra HEAD request to Polaris.
+                    debug!(table = ?table_ident, etag = %etag, "Captured ETag from revalidation response");
+                    self.table_cache
+                        .insert_with_etag(cache_key.clone(), table.clone(), Some(etag))
+                        .await;
+                } else {
+                    // Cold load with no prior stale entry: iceberg-rust's
+                    // `load_table` hides the HTTP response headers, so the ETag
+                    // is only obtainable via a follow-up HEAD. Keep it
+                    // fire-and-forget so the cold load isn't blocked on it.
+                    self.table_cache
+                        .insert_with_etag(cache_key.clone(), table.clone(), None)
+                        .await;
+
+                    let http_client = self.http_client.clone();
+                    let bearer_token = self.bearer_token.clone();
+                    let url = self.table_url(table_ident);
+                    let table_cache = self.table_cache.clone();
+                    let table_ident_log = table_ident.clone();
+                    tokio::spawn(async move {
+                        let etag = fetch_table_etag_inner(&http_client, &bearer_token, &url).await;
+                        if let Some(e) = etag.as_deref() {
+                            debug!(table = %table_ident_log, etag = %e, "Captured ETag for table");
+                        }
+                        table_cache.update_etag(&cache_key, etag).await;
+                    });
+                }
             }
             Err(_) => self.circuit_breaker.record_failure(),
         }

@@ -52,6 +52,22 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // QUACK-07: the worker Flight `do_get` ticket carries the user's live S3
+    // access key/secret/session token, `refresh_credentials` carries fresh STS
+    // creds, and the shared worker_secret travels as a gRPC metadata header. On
+    // a plaintext channel an on-path observer harvests all of these. Workers
+    // reuse the coordinator's `[coordinator.tls]` block: set cert_file/key_file
+    // there to wrap this listener in TLS. When TLS is not configured the
+    // listener stays plaintext, so warn loudly.
+    if !config.coordinator.tls.is_enabled() {
+        tracing::warn!(
+            "WARNING: the worker Flight service is PLAINTEXT (no TLS) and binds \
+             0.0.0.0 -- user S3 credentials and the worker secret travel in \
+             cleartext. Set [coordinator.tls] cert_file/key_file to enable TLS, \
+             or do not run workers on untrusted networks."
+        );
+    }
+
     // Start heartbeat to coordinator if a coordinator URL is configured.
     if !config.worker.coordinator_url.is_empty() {
         let worker_url = format!("http://0.0.0.0:{port}");
@@ -83,7 +99,19 @@ async fn main() -> anyhow::Result<()> {
         .with_shuffle_compression(shuffle_compression)
         .with_worker_secret(config.worker.worker_secret.clone());
 
-    tonic::transport::Server::builder()
+    // Optional TLS (QUACK-07): workers reuse the coordinator's TLS config.
+    let tls_config = sqe_worker::tls::build_server_tls_config(&config.coordinator.tls)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut server_builder = tonic::transport::Server::builder();
+    if let Some(tls) = tls_config {
+        server_builder = server_builder.tls_config(tls)?;
+        tracing::info!("Worker Flight listening on {addr} (TLS)");
+    } else {
+        tracing::info!("Worker Flight listening on {addr} (plaintext)");
+    }
+
+    server_builder
         .add_service(flight_service.into_server())
         .serve(addr)
         .await?;

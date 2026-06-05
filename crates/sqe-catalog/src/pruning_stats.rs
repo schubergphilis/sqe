@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array,
+    Array, ArrayRef, BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array,
     StringArray, TimestampMicrosecondArray, UInt64Array,
 };
 use arrow::datatypes::{DataType, Schema, SchemaRef, TimeUnit};
@@ -234,10 +234,177 @@ impl PruningStatistics for IcebergManifestStatistics {
     fn contained(&self, _column: &Column, _values: &HashSet<ScalarValue>) -> Option<BooleanArray> { None }
 }
 
+// ── Tier-1 clustering gate (issue #132) ──────────────────────────────────────
+//
+// MR #220's two-tier dynamic-filter pushdown wins big when a fact table's data
+// files are clustered on the filter column (tight per-file min/max -> Tier-1
+// manifest/row-group bounds pruning skips most files). It is pure overhead when
+// the data is uniformly distributed (e.g. SSB `lineorder` by `lo_orderdate`):
+// the bounds-only filter prunes nothing, yet iceberg-rust still pays the per-
+// file bind + RowFilter eval, which Tier-2 then repeats. This gate inspects the
+// already-loaded manifest bounds and lets the scan skip Tier-1 registration
+// when every filter column is effectively uniform.
+
+/// Read element `i` of a manifest-bounds array as `f64`, for the numeric and
+/// temporal types `build_bounds_array` produces. Non-numeric bounds (bool,
+/// string) and nulls return `None` — the column is then undecidable and the
+/// gate conservatively keeps Tier-1.
+fn numeric_bound_at(arr: &ArrayRef, i: usize) -> Option<f64> {
+    if !arr.is_valid(i) {
+        return None;
+    }
+    let any = arr.as_any();
+    if let Some(a) = any.downcast_ref::<Int32Array>() {
+        return Some(a.value(i) as f64);
+    }
+    if let Some(a) = any.downcast_ref::<Int64Array>() {
+        return Some(a.value(i) as f64);
+    }
+    if let Some(a) = any.downcast_ref::<Float32Array>() {
+        return Some(a.value(i) as f64);
+    }
+    if let Some(a) = any.downcast_ref::<Float64Array>() {
+        return Some(a.value(i));
+    }
+    if let Some(a) = any.downcast_ref::<Date32Array>() {
+        return Some(a.value(i) as f64);
+    }
+    if let Some(a) = any.downcast_ref::<TimestampMicrosecondArray>() {
+        return Some(a.value(i) as f64);
+    }
+    None
+}
+
+/// Median per-file spread relative to the column's overall range. `per_file` is
+/// each file's `(lower, upper)`. A spread near 1.0 means files each span most of
+/// the range (uniform); near 0.0 means tight, well-separated files (clustered).
+/// Returns `None` when undecidable: no files, or a degenerate (zero / non-finite)
+/// overall range.
+fn median_relative_spread(per_file: &[(f64, f64)]) -> Option<f64> {
+    if per_file.is_empty() {
+        return None;
+    }
+    let smin = per_file.iter().map(|(lo, _)| *lo).fold(f64::INFINITY, f64::min);
+    let smax = per_file.iter().map(|(_, hi)| *hi).fold(f64::NEG_INFINITY, f64::max);
+    let range = smax - smin;
+    if !range.is_finite() || range <= 0.0 {
+        return None;
+    }
+    let mut spreads: Vec<f64> = per_file
+        .iter()
+        .map(|(lo, hi)| ((hi - lo) / range).clamp(0.0, 1.0))
+        .collect();
+    spreads.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = spreads.len() / 2;
+    Some(if spreads.len() % 2 == 0 {
+        (spreads[mid - 1] + spreads[mid]) / 2.0
+    } else {
+        spreads[mid]
+    })
+}
+
+impl IcebergManifestStatistics {
+    /// Median per-file bounds spread for one column, or `None` if the column is
+    /// undecidable (unknown field, non-numeric bounds, no bounds, degenerate
+    /// range).
+    fn column_median_spread(&self, column: &str) -> Option<f64> {
+        let field_id = self.field_id(column)?;
+        let data_type = self.schema.field_with_name(column).ok()?.data_type();
+        let lo = build_bounds_array(&self.data_files, field_id, data_type, false)?;
+        let hi = build_bounds_array(&self.data_files, field_id, data_type, true)?;
+        let n = lo.len().min(hi.len());
+        let mut per_file = Vec::with_capacity(n);
+        for i in 0..n {
+            if let (Some(l), Some(h)) = (numeric_bound_at(&lo, i), numeric_bound_at(&hi, i)) {
+                per_file.push((l, h));
+            }
+        }
+        median_relative_spread(&per_file)
+    }
+
+    /// Tier-1 clustering gate (issue #132). Returns `true` when Tier-1 dynamic-
+    /// predicate registration should proceed — i.e. the planned files are
+    /// clustered tightly enough on at least one filter column that bounds
+    /// pruning is likely to help.
+    ///
+    /// Returns `false` (skip Tier-1; Tier-2 still applies) only when at least
+    /// one filter column is decidable **and every** decidable filter column is
+    /// effectively uniform (median spread >= `uniform_threshold`). Undecidable
+    /// cases (too few files, unknown/non-numeric columns) conservatively keep
+    /// Tier-1 so the gate can never regress a workload it cannot reason about.
+    pub fn clustered_on_filters(&self, filter_columns: &[String], uniform_threshold: f64) -> bool {
+        // With 0 or 1 file there is nothing to prune across; keep current behavior.
+        if self.data_files.len() < 2 {
+            return true;
+        }
+        let mut any_decidable = false;
+        for col in filter_columns {
+            if let Some(median) = self.column_median_spread(col) {
+                any_decidable = true;
+                if median < uniform_threshold {
+                    return true; // clustered on this column -> Tier-1 helps
+                }
+            }
+        }
+        // Decidable columns existed but all were uniform -> skip Tier-1.
+        // Nothing decidable -> keep Tier-1 (conservative).
+        !any_decidable
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::datatypes::{Field, Schema};
+
+    // ── Tier-1 clustering gate (issue #132) ─────────────────────────────
+    #[test]
+    fn spread_none_when_empty() {
+        assert_eq!(median_relative_spread(&[]), None);
+    }
+
+    #[test]
+    fn spread_none_when_range_degenerate() {
+        // Every file has the same single value -> zero overall range -> undecidable.
+        assert_eq!(median_relative_spread(&[(5.0, 5.0), (5.0, 5.0)]), None);
+    }
+
+    #[test]
+    fn spread_high_when_uniform() {
+        // SSB lineorder shape: every file spans (almost) the whole range.
+        let per_file = [(0.0, 100.0), (0.0, 100.0), (1.0, 99.0)];
+        let median = median_relative_spread(&per_file).unwrap();
+        assert!(median >= 0.8, "uniform data should report a high spread, got {median}");
+    }
+
+    #[test]
+    fn spread_low_when_clustered() {
+        // TPC-DS date-sorted shape: each file covers a narrow, disjoint slice.
+        let per_file = [(0.0, 10.0), (20.0, 30.0), (45.0, 55.0), (90.0, 100.0)];
+        let median = median_relative_spread(&per_file).unwrap();
+        assert!(median < 0.5, "clustered data should report a low spread, got {median}");
+    }
+
+    #[test]
+    fn spread_median_is_robust_to_one_wide_file() {
+        // Three tight files + one file spanning the range. Median stays low, so
+        // a single straggler file does not flip a clustered table to "uniform".
+        let per_file = [(0.0, 5.0), (10.0, 15.0), (20.0, 25.0), (0.0, 100.0)];
+        let median = median_relative_spread(&per_file).unwrap();
+        assert!(median < 0.5, "median should resist one wide file, got {median}");
+    }
+
+    #[test]
+    fn numeric_bound_reads_int_and_date_and_null() {
+        let ints: ArrayRef = Arc::new(Int32Array::from(vec![Some(7), None]));
+        assert_eq!(numeric_bound_at(&ints, 0), Some(7.0));
+        assert_eq!(numeric_bound_at(&ints, 1), None);
+        let dates: ArrayRef = Arc::new(Date32Array::from(vec![Some(19_000)]));
+        assert_eq!(numeric_bound_at(&dates, 0), Some(19_000.0));
+        // Non-numeric bounds (strings) are undecidable.
+        let strs: ArrayRef = Arc::new(StringArray::from(vec![Some("x")]));
+        assert_eq!(numeric_bound_at(&strs, 0), None);
+    }
 
     /// Test helper: datum_to_scalar conversion for various types.
     #[test]

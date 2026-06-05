@@ -1,8 +1,12 @@
+use std::time::Duration;
+
 use base64::Engine;
 use serde::Deserialize;
 use sqe_core::SecretString;
 use sqe_core::config::AuthConfig;
 use tracing::{debug, warn};
+
+use crate::provider::truncate_for_log;
 
 #[derive(Debug, Deserialize)]
 pub struct TokenResponse {
@@ -35,6 +39,8 @@ impl OidcPasswordClient {
         );
 
         let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
             .danger_accept_invalid_certs(config.should_skip_tls_verify())
             .build()
             .map_err(|e| sqe_core::SqeError::Auth(format!("Failed to build HTTP client: {e}")))?;
@@ -77,11 +83,7 @@ impl OidcPasswordClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "unable to read body".to_string());
-            let body = if body.len() > 500 {
-                format!("{}...[truncated]", &body[..500])
-            } else {
-                body
-            };
+            let body = truncate_for_log(&body, 500);
             warn!(status = %status, body = %body, "OIDC provider rejected credentials");
             return Err(sqe_core::SqeError::Auth(
                 "Authentication failed".to_string(),
@@ -121,11 +123,7 @@ impl OidcPasswordClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "unable to read body".to_string());
-            let body = if body.len() > 500 {
-                format!("{}...[truncated]", &body[..500])
-            } else {
-                body
-            };
+            let body = truncate_for_log(&body, 500);
             warn!(status = %status, body = %body, "OIDC provider rejected token refresh");
             return Err(sqe_core::SqeError::Auth(
                 "Authentication failed".to_string(),

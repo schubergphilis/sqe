@@ -95,6 +95,11 @@ pub(crate) async fn build_catalog_provider(
         catalog_provider.with_manifest_concurrency(cat_cfg.manifest_concurrency);
     catalog_provider = catalog_provider
         .with_prefetch_concurrency(prefetch_concurrency);
+    // Issue #132: Tier-1 dynamic-filter clustering gate (default off).
+    catalog_provider = catalog_provider.with_runtime_filter_clustering(
+        cat_cfg.runtime_filters.clustering_skip_enabled,
+        cat_cfg.runtime_filters.uniform_threshold,
+    );
 
     Ok((catalog_provider, session_catalog))
 }
@@ -222,14 +227,27 @@ pub async fn create_session_context(
                 }
             };
 
-            // V8: enable DuckDB-style `SELECT * FROM 'file.parquet'` auto-detection.
-            // DataFusion's DynamicFileCatalog wraps the current catalog list in a
-            // factory that resolves quoted-string table names against ListingTableFactory
-            // when nothing else matches. Extension drives the format (parquet / csv /
-            // json / avro). Must run before catalog registrations because it
-            // replaces the catalog list pointer; subsequent register_catalog calls
-            // attach to the wrapped list.
-            let ctx = ctx.enable_url_table();
+            // CAT-01: `enable_url_table()` is deliberately NOT called on the
+            // coordinator.
+            //
+            // DataFusion's `enable_url_table()` wraps the catalog list in a
+            // `DynamicFileCatalog` that resolves *any* quoted-string table name
+            // (`SELECT * FROM '<string>'`) against `ListingTableFactory` ->
+            // `ObjectStoreRegistry`. That parallel resolution path never touches
+            // `TvfPolicy::check`, so on the privileged coordinator pod it let an
+            // authenticated user read `SELECT * FROM '/etc/shadow'`,
+            // `'file:///var/run/secrets/.../token'`, or pivot via
+            // `SELECT * FROM 'https://internal-svc/...'` — bypassing the
+            // fail-closed `[storage.tvf]` guard entirely (the local-file vector
+            // resolves through the inner registry's pre-registered `file` store
+            // before any http allowlist check could fire).
+            //
+            // The guarded `read_parquet` / `read_csv` / `read_json` TVFs are
+            // registered independently via `register_udtf` below and each call
+            // `config.storage.tvf.check(...)`, so removing `enable_url_table()`
+            // costs the coordinator only the DuckDB-style bare-string shorthand,
+            // not the safe file-reader functions. The embedded CLI keeps
+            // `enable_url_table()` (single-tenant, `allow_local_paths = true`).
             let mut ctx = ctx;
 
             // Register DataFusion's built-in in-memory catalog so DML helpers can register

@@ -67,6 +67,13 @@ impl SecretString {
 
     /// Constant-time equality. Prevents callers from picking the variable-time
     /// short-circuit comparator by accident.
+    ///
+    /// CORE-03 (accepted tradeoff): the early return on a length mismatch leaks,
+    /// via timing, whether the candidate's length matches the secret's. This is
+    /// the standard tradeoff for variable-length secret comparison (the `subtle`
+    /// crate behaves the same), and the leaked length is far lower value than
+    /// the secret itself. Comparing fixed-length digests would close the leak
+    /// at the cost of hashing both sides on every check; not worth it here.
     pub fn ct_eq(&self, other: &Self) -> bool {
         let a = self.0.as_bytes();
         let b = other.0.as_bytes();
