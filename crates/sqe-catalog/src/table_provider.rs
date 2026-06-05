@@ -44,6 +44,11 @@ pub struct SqeTableProvider {
     /// In-flight prefetch concurrency for the direct-read small-file fast path.
     /// Wired through to `IcebergScanExec::direct_read_concurrency`.
     prefetch_concurrency: usize,
+    /// Issue #132: Tier-1 dynamic-filter clustering gate, from
+    /// `[catalog.runtime_filters]`. When `skip` is true, scans whose files are
+    /// uniform on every filter column skip Tier-1 registration.
+    runtime_filter_clustering_skip: bool,
+    runtime_filter_uniform_threshold: f64,
 }
 
 impl SqeTableProvider {
@@ -70,6 +75,8 @@ impl SqeTableProvider {
             small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
             manifest_concurrency: crate::iceberg_scan::DEFAULT_MANIFEST_CONCURRENCY,
             prefetch_concurrency: crate::iceberg_scan::DEFAULT_DIRECT_READ_CONCURRENCY,
+            runtime_filter_clustering_skip: false,
+            runtime_filter_uniform_threshold: 0.8,
         })
     }
 
@@ -103,6 +110,15 @@ impl SqeTableProvider {
     /// fed from `[storage] prefetch_concurrency`.
     pub fn with_prefetch_concurrency(mut self, concurrency: usize) -> Self {
         self.prefetch_concurrency = concurrency.max(1);
+        self
+    }
+
+    /// Configure the Tier-1 dynamic-filter clustering gate (issue #132) from
+    /// `[catalog.runtime_filters]`. Threads through to `IcebergScanExec`.
+    #[must_use = "with_runtime_filter_clustering consumes self; bind the returned provider"]
+    pub fn with_runtime_filter_clustering(mut self, skip: bool, uniform_threshold: f64) -> Self {
+        self.runtime_filter_clustering_skip = skip;
+        self.runtime_filter_uniform_threshold = uniform_threshold;
         self
     }
 
@@ -231,7 +247,11 @@ impl TableProvider for SqeTableProvider {
         exec = exec
             .with_small_file_threshold(self.small_file_threshold_bytes)
             .with_manifest_concurrency(self.manifest_concurrency)
-            .with_direct_read_concurrency(self.prefetch_concurrency);
+            .with_direct_read_concurrency(self.prefetch_concurrency)
+            .with_runtime_filter_clustering(
+                self.runtime_filter_clustering_skip,
+                self.runtime_filter_uniform_threshold,
+            );
 
         // Pre-compute per-column min/max/null_count from manifest entries so
         // DataFusion's join-order optimizer sees real selectivity and picks

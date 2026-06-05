@@ -95,6 +95,11 @@ pub(crate) async fn build_catalog_provider(
         catalog_provider.with_manifest_concurrency(cat_cfg.manifest_concurrency);
     catalog_provider = catalog_provider
         .with_prefetch_concurrency(prefetch_concurrency);
+    // Issue #132: Tier-1 dynamic-filter clustering gate (default off).
+    catalog_provider = catalog_provider.with_runtime_filter_clustering(
+        cat_cfg.runtime_filters.clustering_skip_enabled,
+        cat_cfg.runtime_filters.uniform_threshold,
+    );
 
     Ok((catalog_provider, session_catalog))
 }
