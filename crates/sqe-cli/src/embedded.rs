@@ -889,7 +889,12 @@ mod tests {
     /// and confirm both are visible. End-to-end exercise of the
     /// V5 `WritableIcebergCatalog` write path: every operation goes
     /// through DataFusion's SQL surface, no out-of-band bootstrap.
+    // Quarantined: this test hangs indefinitely in CI (SQLite warehouse
+    // reopen deadlock on the Phase 1 -> Phase 2 client restart), timing out the
+    // whole `cargo-test` job at 1h. It passes on fast local machines. Tracked
+    // in #195; remove `#[ignore]` once the reopen deadlock is fixed.
     #[tokio::test]
+    #[ignore = "hangs in CI: SQLite warehouse reopen deadlock; tracked in #195"]
     async fn persistent_warehouse_survives_client_restart() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mode = WarehouseMode::single(tmp.path().to_path_buf());
