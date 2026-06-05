@@ -6,15 +6,12 @@
 #
 # - RUSTSEC-2023-0071 (rsa Marvin attack): no fixed upgrade exists upstream;
 #   transitive-only signing path, no attacker-timed RSA decryption in SQE.
-# - RUSTSEC-2026-0098/0099/0104 (rustls-webpki 0.101.7): pulled only by the
-#   AWS SDK legacy connector (Glue / S3Tables catalogs). SQE's primary Polaris
-#   REST path already runs patched rustls 0.23 / webpki 0.103.13. The connector
-#   upgrade is tracked separately (needs an explicit modern HttpClient in the
-#   vendored iceberg fork; no aws-config feature selects it).
+#
+# RUSTSEC-2026-0098/0099/0104 (rustls-webpki 0.101.7) were removed here in #133:
+# the AWS Glue/S3Tables catalogs now use an explicit rustls-0.23 HttpClient, so
+# the legacy connector (rustls 0.21 / webpki 0.101.7 / hyper 0.14) is gone from
+# the tree and the advisories no longer apply.
 [advisories]
 ignore = [
     "RUSTSEC-2023-0071",
-    "RUSTSEC-2026-0098",
-    "RUSTSEC-2026-0099",
-    "RUSTSEC-2026-0104",
 ]
