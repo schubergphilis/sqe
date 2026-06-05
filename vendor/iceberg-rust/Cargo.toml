@@ -60,9 +60,20 @@ arrow-select = "58"
 arrow-string = "58"
 as-any = "0.3.2"
 async-trait = "0.1.89"
-aws-config = "1.8.7"
-aws-sdk-glue = "1.39"
-aws-sdk-s3tables = "1.28.0"
+# SQE #133: drop aws-config's `default-https-client`, which pulls the legacy
+# hyper-0.14 / rustls-0.21 / webpki-0.101.7 connector (RUSTSEC-2026-0098/0099/
+# 0104). The glue/s3tables catalogs supply an explicit modern HTTPS client via
+# `aws-smithy-http-client` (rustls 0.23) instead — see crates/catalog/*/src/utils.rs.
+aws-config = { version = "1.8.7", default-features = false, features = ["rt-tokio", "credentials-process", "sso", "behavior-version-latest"] }
+# `default-features = false` drops the SDK crates' `rustls` + `default-https-client`
+# defaults, which select aws-smithy-runtime's `tls-rustls` -> the legacy
+# `aws-smithy-http-client/legacy-rustls-ring` (hyper-0.14 / rustls-0.21) connector.
+# `rt-tokio` is the only default we still need; the HTTPS connector comes from the
+# explicit rustls-0.23 client built in each catalog's utils.rs.
+aws-sdk-glue = { version = "1.39", default-features = false, features = ["rt-tokio"] }
+aws-sdk-s3tables = { version = "1.28.0", default-features = false, features = ["rt-tokio"] }
+# Explicit modern HTTPS client (rustls 0.23 via ring) for the AWS catalogs.
+aws-smithy-http-client = { version = "1.1.12", default-features = false, features = ["rustls-ring"] }
 backon = "1.5.1"
 base64 = "0.22.1"
 bimap = "0.6"

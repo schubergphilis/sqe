@@ -57,7 +57,17 @@ pub(crate) async fn create_sdk_config(
     properties: &HashMap<String, String>,
     endpoint_uri: Option<&String>,
 ) -> SdkConfig {
-    let mut config = aws_config::defaults(BehaviorVersion::latest());
+    // SQE #133: supply an explicit rustls-0.23 (ring) HTTPS client so aws-config
+    // does not fall back to its default hyper-0.14 / rustls-0.21 / webpki-0.101.7
+    // connector (RUSTSEC-2026-0098/0099/0104). `default-https-client` is disabled
+    // on the aws-config dependency; this is the modern replacement.
+    let http_client = aws_smithy_http_client::Builder::new()
+        .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
+            aws_smithy_http_client::tls::rustls_provider::CryptoMode::Ring,
+        ))
+        .build_https();
+    let mut config =
+        aws_config::defaults(BehaviorVersion::latest()).http_client(http_client);
 
     if let Some(endpoint) = endpoint_uri {
         config = config.endpoint_url(endpoint)
