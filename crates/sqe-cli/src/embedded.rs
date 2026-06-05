@@ -188,8 +188,18 @@ pub fn build_embedded_context(memory_limit_bytes: usize) -> anyhow::Result<Sessi
     // not apply to a local CLI, where rejecting local files would break the
     // tool's whole point. Users can still hit S3 by supplying inline
     // credentials in the TVF call.
+    //
+    // For the same reason, arbitrary http(s) fetches are enabled here. The
+    // server defaults `allow_http` to false because a worker pod can reach the
+    // cloud metadata service (http://169.254.169.254) with privileges higher
+    // than the querying user's — an SSRF/credential-exfil vector. The embedded
+    // CLI has no such privilege gap: it runs as the local user, who can already
+    // `curl` any URL, so reading `read_csv('https://host/data.csv')` should just
+    // work like it does in DuckDB. Operators who want a locked-down embedded
+    // build can still gate egress at the network layer.
     let mut tvf_storage = StorageConfig::default();
     tvf_storage.tvf.allow_local_paths = true;
+    tvf_storage.tvf.allow_http = true;
     ctx.register_udtf(
         "read_parquet",
         Arc::new(sqe_catalog::read_parquet::ReadParquetFunction::new(
