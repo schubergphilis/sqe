@@ -40,6 +40,9 @@ pub struct SqeCatalogProvider {
     /// Prefetch concurrency for the direct-read fast path. Sourced from
     /// `[storage] prefetch_concurrency` and propagated downstream.
     prefetch_concurrency: usize,
+    /// Issue #132: Tier-1 dynamic-filter clustering gate, propagated downstream.
+    runtime_filter_clustering_skip: bool,
+    runtime_filter_uniform_threshold: f64,
 }
 
 impl std::fmt::Debug for SqeCatalogProvider {
@@ -99,6 +102,8 @@ impl SqeCatalogProvider {
             small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
             manifest_concurrency: crate::iceberg_scan::DEFAULT_MANIFEST_CONCURRENCY,
             prefetch_concurrency: crate::iceberg_scan::DEFAULT_DIRECT_READ_CONCURRENCY,
+            runtime_filter_clustering_skip: false,
+            runtime_filter_uniform_threshold: 0.8,
         })
     }
 
@@ -133,6 +138,15 @@ impl SqeCatalogProvider {
         self
     }
 
+    /// Configure the Tier-1 dynamic-filter clustering gate (issue #132).
+    /// Propagated to schema and table providers.
+    #[must_use = "with_runtime_filter_clustering consumes self; bind the returned provider"]
+    pub fn with_runtime_filter_clustering(mut self, skip: bool, uniform_threshold: f64) -> Self {
+        self.runtime_filter_clustering_skip = skip;
+        self.runtime_filter_uniform_threshold = uniform_threshold;
+        self
+    }
+
     /// Create a catalog provider with pre-populated namespace names.
     /// Useful when the namespace list is already known.
     pub fn with_namespaces(
@@ -152,6 +166,8 @@ impl SqeCatalogProvider {
             small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
             manifest_concurrency: crate::iceberg_scan::DEFAULT_MANIFEST_CONCURRENCY,
             prefetch_concurrency: crate::iceberg_scan::DEFAULT_DIRECT_READ_CONCURRENCY,
+            runtime_filter_clustering_skip: false,
+            runtime_filter_uniform_threshold: 0.8,
         }
     }
 }
@@ -196,6 +212,10 @@ impl CatalogProvider for SqeCatalogProvider {
         provider = provider.with_small_file_threshold(self.small_file_threshold_bytes);
         provider = provider.with_manifest_concurrency(self.manifest_concurrency);
         provider = provider.with_prefetch_concurrency(self.prefetch_concurrency);
+        provider = provider.with_runtime_filter_clustering(
+            self.runtime_filter_clustering_skip,
+            self.runtime_filter_uniform_threshold,
+        );
 
         Some(Arc::new(provider))
 
