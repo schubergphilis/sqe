@@ -23,24 +23,11 @@ ignore = [
     # signing path); SQE performs no RSA private-key decryption on
     # attacker-controlled timing. Re-evaluate when `rsa` ships a fix.
     "RUSTSEC-2023-0071",
-    # rustls-webpki (v0.101.7): three cert-validation advisories
-    # (RUSTSEC-2026-0098/0099/0104). SCOPED EXPOSURE: this version is pulled
-    # ONLY by the AWS SDK's legacy connector (aws-config default-https-client
-    # -> aws-smithy-http-client -> hyper-rustls 0.24 -> rustls 0.21), used by
-    # the AWS Glue / S3Tables catalog backends. SQE's primary Polaris REST
-    # path already runs patched rustls 0.23 / webpki 0.103.13 (also in-tree).
-    #
-    # DEP-06: enabling `glue` / `s3tables` (only in Dockerfile.full /
-    # --features glue,s3tables images) links a COMPLETE second, legacy
-    # TLS+HTTP stack: rustls 0.21 / rustls-webpki 0.101.7 (the three advisories
-    # below) / hyper 0.14 / h2 0.3 / http 0.2. It is a live cert-validation
-    # exposure in the full image plus the single largest source of
-    # duplicate-major-version bloat. The fix (build an explicit modern
-    # hyper-1 / rustls-0.23 HttpClient for the vendored iceberg Glue/S3Tables
-    # backends so aws-config stops selecting the legacy connector, then drop
-    # these three ignores) is tracked in GitLab issue (DEP-06) and deferred
-    # here -- do NOT swap the AWS connector in the correctness bucket.
-    "RUSTSEC-2026-0098",
-    "RUSTSEC-2026-0099",
-    "RUSTSEC-2026-0104",
+    # RUSTSEC-2026-0098/0099/0104 (rustls-webpki 0.101.7) were ignored while the
+    # AWS Glue/S3Tables backends used aws-config's legacy hyper-0.14/rustls-0.21
+    # connector. Fixed (#133): the vendored glue/s3tables catalogs now build an
+    # explicit rustls-0.23 HttpClient, and aws-config/aws-sdk-glue/aws-sdk-s3tables
+    # run with `default-features = false`, so the legacy stack (rustls 0.21,
+    # webpki 0.101.7, hyper 0.14) is gone from the tree. Ignores removed so the
+    # gate catches any regression.
 ]
