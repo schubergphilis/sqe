@@ -142,6 +142,13 @@ pub struct IcebergScanExec {
     /// `Absent`. Storing `Statistics` directly (rather than recomputing it)
     /// keeps `partition_statistics` synchronous as DataFusion requires.
     cached_statistics: Option<datafusion::common::Statistics>,
+    /// Issue #132: when true, skip Tier-1 dynamic-predicate registration on
+    /// scans whose planned files are effectively uniform on every filter
+    /// column. Sourced from `[catalog.runtime_filters]`. Default false.
+    runtime_filter_clustering_skip: bool,
+    /// Issue #132: per-file bounds-spread fraction above which a column is
+    /// considered uniform. Sourced from `[catalog.runtime_filters]`. Default 0.8.
+    runtime_filter_uniform_threshold: f64,
 }
 
 impl IcebergScanExec {
@@ -212,7 +219,7 @@ impl IcebergScanExec {
             }
         };
         let properties = Arc::new(PlanProperties::new(eq_props, Partitioning::UnknownPartitioning(DEFAULT_TARGET_PARTITIONS), EmissionType::Incremental, Boundedness::Bounded));
-        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![], manifest_concurrency: DEFAULT_MANIFEST_CONCURRENCY, direct_read_concurrency: DEFAULT_DIRECT_READ_CONCURRENCY, target_partitions: DEFAULT_TARGET_PARTITIONS, cached_statistics: None }
+        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![], manifest_concurrency: DEFAULT_MANIFEST_CONCURRENCY, direct_read_concurrency: DEFAULT_DIRECT_READ_CONCURRENCY, target_partitions: DEFAULT_TARGET_PARTITIONS, cached_statistics: None, runtime_filter_clustering_skip: false, runtime_filter_uniform_threshold: 0.8 }
     }
 
     /// Attach pre-computed statistics aggregated from Iceberg manifests.
@@ -263,6 +270,17 @@ impl IcebergScanExec {
     #[must_use = "with_direct_read_concurrency consumes self; bind the returned scan"]
     pub fn with_direct_read_concurrency(mut self, concurrency: usize) -> Self {
         self.direct_read_concurrency = concurrency.max(1);
+        self
+    }
+
+    /// Configure the Tier-1 clustering gate (issue #132). When `skip` is true,
+    /// scans whose planned files are effectively uniform (median per-file bounds
+    /// spread >= `uniform_threshold`) on every filter column skip Tier-1
+    /// dynamic-predicate registration; Tier-2 per-batch filtering still applies.
+    #[must_use = "with_runtime_filter_clustering consumes self; bind the returned scan"]
+    pub fn with_runtime_filter_clustering(mut self, skip: bool, uniform_threshold: f64) -> Self {
+        self.runtime_filter_clustering_skip = skip;
+        self.runtime_filter_uniform_threshold = uniform_threshold;
         self
     }
 
@@ -337,6 +355,8 @@ impl IcebergScanExec {
             direct_read_concurrency: self.direct_read_concurrency,
             target_partitions: self.target_partitions,
             cached_statistics: self.cached_statistics.clone(),
+            runtime_filter_clustering_skip: self.runtime_filter_clustering_skip,
+            runtime_filter_uniform_threshold: self.runtime_filter_uniform_threshold,
         }
     }
 
@@ -735,6 +755,8 @@ impl ExecutionPlan for IcebergScanExec {
         let manifest_concurrency = self.manifest_concurrency;
         let direct_read_concurrency = self.direct_read_concurrency;
         let pushed_down_filters = self.pushed_down_filters.clone();
+        let runtime_filter_clustering_skip = self.runtime_filter_clustering_skip;
+        let runtime_filter_uniform_threshold = self.runtime_filter_uniform_threshold;
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         let _files_pruned_minmax = MetricBuilder::new(&self.metrics).counter("files_pruned_minmax", partition);
         let files_pruned_dynamic = MetricBuilder::new(&self.metrics).counter("files_pruned_dynamic", partition);
@@ -1099,8 +1121,40 @@ impl ExecutionPlan for IcebergScanExec {
             // costs ~3ms when Tier 1 already pruned because every
             // surviving batch passes the wrapper cheaply.
             if !pushed_down_filters.is_empty() {
-                let dyn_pred = iceberg_datafusion::physical_plan::physical_to_predicate::RuntimeFiltersDynamicPredicate::new(pushed_down_filters.clone());
-                sb = sb.with_dynamic_predicate(dyn_pred);
+                // Tier-1 clustering gate (issue #132). When enabled, inspect the
+                // already-planned manifest bounds: if the fact table is
+                // effectively uniform on every filter column, bounds-only Tier-1
+                // pruning cannot skip anything and only adds per-file bind cost,
+                // so skip registration and let the Tier-2 wrapper below filter.
+                // Undecidable cases keep Tier-1 (the MR #220 behavior).
+                let register_tier1 = if runtime_filter_clustering_skip && file_entries.len() > 1 {
+                    let filter_columns = collect_filter_column_names(&pushed_down_filters);
+                    let file_paths: std::collections::HashSet<String> =
+                        file_entries.iter().map(|(p, _)| p.clone()).collect();
+                    match collect_data_files_for_pruning(&table, snapshot_id, &file_paths, manifest_concurrency).await {
+                        Ok(dfs) if !dfs.is_empty() => {
+                            let iceberg_schema = table.metadata().current_schema();
+                            let stats = IcebergManifestStatistics::new(dfs, schema.clone(), iceberg_schema);
+                            let keep = stats.clustered_on_filters(&filter_columns, runtime_filter_uniform_threshold);
+                            if !keep {
+                                debug!(
+                                    filter_columns = ?filter_columns,
+                                    threshold = runtime_filter_uniform_threshold,
+                                    "Tier-1 skipped: data uniform on all filter columns (issue #132)"
+                                );
+                            }
+                            keep
+                        }
+                        // Could not load bounds -> can't decide -> keep Tier-1.
+                        _ => true,
+                    }
+                } else {
+                    true
+                };
+                if register_tier1 {
+                    let dyn_pred = iceberg_datafusion::physical_plan::physical_to_predicate::RuntimeFiltersDynamicPredicate::new(pushed_down_filters.clone());
+                    sb = sb.with_dynamic_predicate(dyn_pred);
+                }
             }
             let scan = sb.build().map_err(|e| DataFusionError::External(Box::new(e)))?;
             let arrow_stream = scan.to_arrow().await.map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -1257,6 +1311,32 @@ async fn collect_data_files_via_plan(
 /// Routes reads through `Table::object_cache()` so warm queries (same
 /// snapshot after a prior `plan_files()` call) avoid redundant S3 GETs.
 /// Cold reads are parallelised with `buffer_unordered` at `concurrency`.
+/// Recursively collect the distinct `Column` names referenced by a set of
+/// physical filter expressions (issue #132 clustering gate). `DynamicFilter`
+/// expressions expose their referenced columns as children, so a tree walk
+/// finds the fact-table columns the runtime filter prunes on.
+fn collect_filter_column_names(filters: &[Arc<dyn PhysicalExpr>]) -> Vec<String> {
+    fn walk(expr: &Arc<dyn PhysicalExpr>, out: &mut Vec<String>) {
+        if let Some(col) = expr
+            .as_any()
+            .downcast_ref::<datafusion::physical_expr::expressions::Column>()
+        {
+            let name = col.name().to_string();
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+        for child in expr.children() {
+            walk(child, out);
+        }
+    }
+    let mut out = Vec::new();
+    for f in filters {
+        walk(f, &mut out);
+    }
+    out
+}
+
 async fn collect_data_files_for_pruning(
     table: &Table,
     snapshot_id: Option<i64>,

@@ -1194,6 +1194,9 @@ pub struct CatalogConfig {
     /// Default: 64.
     #[serde(default = "default_manifest_concurrency")]
     pub manifest_concurrency: usize,
+    /// Two-tier dynamic runtime-filter pushdown tuning (issue #132).
+    #[serde(default)]
+    pub runtime_filters: RuntimeFiltersConfig,
     /// Per-catalog auth override. When unset (the common case),
     /// SQE uses the user's session bearer token from the top-level
     /// `[auth]` block, matching V6 behaviour. Set this on
@@ -1213,6 +1216,46 @@ pub struct CatalogConfig {
     /// global block.
     #[serde(default)]
     pub storage: Option<StorageConfig>,
+}
+
+/// Tuning for the two-tier dynamic runtime-filter pushdown (MR #220, issue #132).
+///
+/// Tier 1 feeds runtime filters into iceberg-rust's manifest / row-group /
+/// page-index pruning at file open; Tier 2 re-applies them per batch. Tier 1 is
+/// a large win on fact tables clustered on the filter column (tight per-file
+/// min/max) and pure overhead on uniformly-distributed tables, where bounds
+/// pruning cannot skip anything. The clustering gate below inspects the
+/// already-loaded manifest bounds and skips Tier-1 registration when every
+/// filter column is effectively uniform.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RuntimeFiltersConfig {
+    /// When true, skip Tier-1 registration on scans whose planned files are
+    /// effectively uniform on every filter column. Tier-2 still applies.
+    ///
+    /// Default `false`: always register Tier-1 (the MR #220 behavior). The gate
+    /// is additive and benchmark-tuned per workload before being enabled; a
+    /// wrong answer only falls back to the current behavior.
+    #[serde(default)]
+    pub clustering_skip_enabled: bool,
+    /// A file whose per-column `[lower, upper]` covers more than this fraction
+    /// of the snapshot-wide range is "uniform" on that column. A scan is gated
+    /// out of Tier-1 only when every decidable filter column's median per-file
+    /// spread is at or above this threshold. Default `0.8`.
+    #[serde(default = "default_runtime_filter_uniform_threshold")]
+    pub uniform_threshold: f64,
+}
+
+impl Default for RuntimeFiltersConfig {
+    fn default() -> Self {
+        Self {
+            clustering_skip_enabled: false,
+            uniform_threshold: default_runtime_filter_uniform_threshold(),
+        }
+    }
+}
+
+fn default_runtime_filter_uniform_threshold() -> f64 {
+    0.8
 }
 
 #[derive(Deserialize, Clone)]
@@ -2981,6 +3024,7 @@ mod tests {
                 small_file_threshold_mb: 3,
                 parquet_compression: "zstd".to_string(),
                 manifest_concurrency: 64,
+                runtime_filters: RuntimeFiltersConfig::default(),
                 auth: None,
                 storage: None,
             },
@@ -3296,6 +3340,7 @@ mod tests {
                 small_file_threshold_mb: 3,
                 parquet_compression: "zstd".to_string(),
                 manifest_concurrency: 64,
+                runtime_filters: RuntimeFiltersConfig::default(),
                 auth: None,
                 storage: None,
             },
@@ -3324,6 +3369,7 @@ mod tests {
                     small_file_threshold_mb: 3,
                     parquet_compression: "zstd".to_string(),
                     manifest_concurrency: 64,
+                    runtime_filters: RuntimeFiltersConfig::default(),
                     auth: None,
                     storage: None,
                 },
@@ -3359,6 +3405,7 @@ mod tests {
                 small_file_threshold_mb: 3,
                 parquet_compression: "zstd".to_string(),
                 manifest_concurrency: 64,
+                runtime_filters: RuntimeFiltersConfig::default(),
                 auth: None,
                 storage: None,
             },

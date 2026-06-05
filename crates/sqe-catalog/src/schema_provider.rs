@@ -42,6 +42,10 @@ pub struct SqeSchemaProvider {
     /// Prefetch concurrency for the direct-read fast path, propagated to
     /// each `SqeTableProvider`.
     prefetch_concurrency: usize,
+    /// Issue #132: Tier-1 dynamic-filter clustering gate, propagated to each
+    /// `SqeTableProvider`.
+    runtime_filter_clustering_skip: bool,
+    runtime_filter_uniform_threshold: f64,
     /// Short-TTL cache of table_names() results so repeated planning
     /// lookups during a single dbt run do not pay two REST round trips
     /// per call.
@@ -69,6 +73,8 @@ impl SqeSchemaProvider {
             small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
             manifest_concurrency: crate::iceberg_scan::DEFAULT_MANIFEST_CONCURRENCY,
             prefetch_concurrency: crate::iceberg_scan::DEFAULT_DIRECT_READ_CONCURRENCY,
+            runtime_filter_clustering_skip: false,
+            runtime_filter_uniform_threshold: 0.8,
             table_names_cache,
         }
     }
@@ -99,6 +105,15 @@ impl SqeSchemaProvider {
     /// direct-read fast path. Sourced from `[storage] prefetch_concurrency`.
     pub fn with_prefetch_concurrency(mut self, concurrency: usize) -> Self {
         self.prefetch_concurrency = concurrency.max(1);
+        self
+    }
+
+    /// Configure the Tier-1 dynamic-filter clustering gate (issue #132),
+    /// propagated to every table provider.
+    #[must_use = "with_runtime_filter_clustering consumes self; bind the returned provider"]
+    pub fn with_runtime_filter_clustering(mut self, skip: bool, uniform_threshold: f64) -> Self {
+        self.runtime_filter_clustering_skip = skip;
+        self.runtime_filter_uniform_threshold = uniform_threshold;
         self
     }
 
@@ -249,7 +264,11 @@ impl SchemaProvider for SqeSchemaProvider {
                         let provider = provider
                             .with_small_file_threshold(self.small_file_threshold_bytes)
                             .with_manifest_concurrency(self.manifest_concurrency)
-                            .with_prefetch_concurrency(self.prefetch_concurrency);
+                            .with_prefetch_concurrency(self.prefetch_concurrency)
+                            .with_runtime_filter_clustering(
+                                self.runtime_filter_clustering_skip,
+                                self.runtime_filter_uniform_threshold,
+                            );
                         return Ok(Some(Arc::new(provider)));
                     }
                     Err(e) => {
