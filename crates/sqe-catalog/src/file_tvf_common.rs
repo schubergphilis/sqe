@@ -391,6 +391,13 @@ where
         }
     }
 
+    // Expand a leading `~`/`~/` in a local path to $HOME so read_csv('~/x.csv')
+    // resolves like the shell instead of listing a literal `~` directory (which
+    // silently returns zero rows). Runs before the policy check, which still
+    // classifies the expanded path as local — no change to the allow_local_paths
+    // decision. No-op for URL-scheme paths and for `~user` forms.
+    expand_local_tilde_in_place(&mut out);
+
     Ok(out)
 }
 
@@ -789,6 +796,29 @@ pub fn rewrite_hf_path_in_place(fn_name: &str, args: &mut FileTvfArgs) -> DFResu
     Ok(())
 }
 
+/// Expand a leading `~`/`~/` in `path` to `home`. Paths with a URL scheme
+/// (`s3://`, `https://`, `hf://`, ...) and the `~user` form are returned
+/// unchanged. Pure helper so the logic is unit-testable without touching env.
+fn expand_tilde(path: &str, home: Option<&str>) -> String {
+    if path.contains("://") {
+        return path.to_string();
+    }
+    if path == "~" || path.starts_with("~/") {
+        if let Some(home) = home {
+            // `&path[1..]` drops the leading '~' (1 ASCII byte): "" or "/rest".
+            return format!("{home}{}", &path[1..]);
+        }
+    }
+    path.to_string()
+}
+
+/// Expand a leading `~`/`~/` in a local filesystem path argument to `$HOME`.
+/// No-op when `HOME` is unset or the path is not a bare-`~` local path.
+fn expand_local_tilde_in_place(args: &mut FileTvfArgs) {
+    let home = std::env::var_os("HOME").map(|h| h.to_string_lossy().into_owned());
+    args.path = expand_tilde(&args.path, home.as_deref());
+}
+
 /// V12: pre-rewrite `'hf://...'` string literals in raw SQL to their HTTPS
 /// equivalent so DataFusion's URL-table auto-detect (`SELECT * FROM 'url'`)
 /// flows through V10's [`LazyHttpObjectStoreRegistry`] and finds an
@@ -879,6 +909,24 @@ mod tests {
             op: Operator::Eq,
             right: Box::new(make_str_literal(value)),
         })
+    }
+
+    #[test]
+    fn tilde_expands_only_for_local_paths() {
+        let home = Some("/home/u");
+        // Local paths with a leading ~ expand to $HOME.
+        assert_eq!(expand_tilde("~/Downloads/x.csv", home), "/home/u/Downloads/x.csv");
+        assert_eq!(expand_tilde("~", home), "/home/u");
+        // Absolute / relative local paths are untouched.
+        assert_eq!(expand_tilde("/abs/x.csv", home), "/abs/x.csv");
+        assert_eq!(expand_tilde("rel/x.csv", home), "rel/x.csv");
+        // URL-scheme paths are never touched, even if they contain a ~.
+        assert_eq!(expand_tilde("s3://b/~/x.csv", home), "s3://b/~/x.csv");
+        assert_eq!(expand_tilde("https://h/~/x.csv", home), "https://h/~/x.csv");
+        // `~user` (other users' homes) is intentionally not expanded.
+        assert_eq!(expand_tilde("~user/x.csv", home), "~user/x.csv");
+        // HOME unset -> leave the path unchanged.
+        assert_eq!(expand_tilde("~/x.csv", None), "~/x.csv");
     }
 
     #[test]
