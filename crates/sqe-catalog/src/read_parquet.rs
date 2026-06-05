@@ -338,8 +338,17 @@ async fn build_listing_table(
         .with_file_extension(".parquet");
 
     // Infer schema from the files (async — reads Parquet footers).
+    let state = tmp_ctx.state();
+    crate::file_tvf_common::ensure_local_files_exist(
+        "read_parquet",
+        &state,
+        &listing_url,
+        ".parquet",
+        &args.path,
+    )
+    .await?;
     let schema = listing_options
-        .infer_schema(&tmp_ctx.state(), &listing_url)
+        .infer_schema(&state, &listing_url)
         .await?;
 
     let config = ListingTableConfig::new(listing_url)
