@@ -978,27 +978,50 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         tracing::warn!("WARNING: the Quack endpoint has NO rate limiting on its auth path -- it is an un-throttled brute-force / IdP-amplification oracle. Restrict network access to the Quack port until QUACK-08 lands.");
         let quack_app = sqe_quack_server::router(quack_state);
         let bind = format!("0.0.0.0:{quack_port}");
-        let listener = tokio::net::TcpListener::bind(&bind)
-            .await
-            .map_err(|e| anyhow::anyhow!("Quack server bind to {bind}: {e}"))?;
-        // QUACK-05: the Quack listener serves plain HTTP/1.1. The
-        // ConnectionRequest carries the user's OIDC bearer token, so on a
-        // plaintext channel any on-path observer can capture and replay it
-        // against Flight SQL / Polaris / S3 as that user. The Flight path right
-        // below wraps its listener with build_server_tls_config; the Quack path
-        // has no TLS plumbing yet.
-        // TODO(QUACK-05): wrap the Quack listener with the coordinator TLS
-        // config (axum-server + rustls), refusing plaintext unless an explicit
-        // allow_insecure flag is set.
-        if !config.coordinator.tls.is_enabled() {
-            tracing::warn!("WARNING: the Quack endpoint is PLAINTEXT (no TLS) and binds 0.0.0.0 -- user OIDC bearer tokens travel in cleartext and can be captured and replayed. Do not expose the Quack port on untrusted networks until QUACK-05 (TLS) lands.");
-        }
-        tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, quack_app).await {
-                tracing::error!(error = %e, "Quack RPC server terminated unexpectedly");
+        // QUACK-05: the Quack ConnectionRequest carries the user's OIDC bearer
+        // token. On a plaintext channel any on-path observer can capture and
+        // replay it against Flight SQL / Polaris / S3 as that user. Reuse the
+        // coordinator's [coordinator.tls] block to serve the Quack endpoint over
+        // TLS; fall back to plaintext (with a loud warning) when TLS is off.
+        if config.coordinator.tls.is_enabled() {
+            let quack_addr: std::net::SocketAddr = bind
+                .parse()
+                .map_err(|e| anyhow::anyhow!("Quack server addr {bind}: {e}"))?;
+            // Install the ring crypto provider so rustls' default ServerConfig
+            // builder (used by RustlsConfig::from_pem_file) has a backend. This
+            // matches the tonic Flight path's `tls-ring`. Idempotent: a second
+            // install returns Err, which we ignore.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            if !config.coordinator.tls.ca_file.is_empty() {
+                tracing::warn!("Quack TLS is server-side only: client-CA (mTLS) from [coordinator.tls].ca_file is enforced on the Flight path but not on the Quack path");
             }
-        });
-        tracing::info!("DuckDB Quack RPC on port {quack_port}");
+            let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+                &config.coordinator.tls.cert_file,
+                &config.coordinator.tls.key_file,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Quack TLS config: {e}"))?;
+            tokio::spawn(async move {
+                if let Err(e) = axum_server::bind_rustls(quack_addr, tls)
+                    .serve(quack_app.into_make_service())
+                    .await
+                {
+                    tracing::error!(error = %e, "Quack RPC server (TLS) terminated unexpectedly");
+                }
+            });
+            tracing::info!("DuckDB Quack RPC on port {quack_port} (TLS)");
+        } else {
+            tracing::warn!("WARNING: the Quack endpoint is PLAINTEXT (no TLS) and binds 0.0.0.0 -- user OIDC bearer tokens travel in cleartext and can be captured and replayed. Set [coordinator.tls] cert_file/key_file to enable TLS, or do not expose the Quack port on untrusted networks.");
+            let listener = tokio::net::TcpListener::bind(&bind)
+                .await
+                .map_err(|e| anyhow::anyhow!("Quack server bind to {bind}: {e}"))?;
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(listener, quack_app).await {
+                    tracing::error!(error = %e, "Quack RPC server terminated unexpectedly");
+                }
+            });
+            tracing::info!("DuckDB Quack RPC on port {quack_port} (plaintext)");
+        }
     }
 
     // Mark ready
