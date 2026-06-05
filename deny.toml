@@ -2,10 +2,12 @@
 # https://embarkstudios.github.io/cargo-deny/
 #
 # SUPPLY CHAIN NOTE: Three iceberg crates are sourced from a third-party fork:
-#   github.com/risingwavelabs/iceberg-rust.git rev=1978911ec4
+#   github.com/risingwavelabs/iceberg-rust.git
+#   branch dev_rebase_main_20260303 @ c034b19105fa  (DEP-05: was stale 1978911ec4)
 # cargo-deny's advisory database does NOT cover git dependencies.
-# The pinned rev mitigates force-push attacks. Verify the SHA matches:
-#   git ls-remote https://github.com/risingwavelabs/iceberg-rust.git | grep 1978911
+# The pinned rev mitigates force-push attacks. Verify the SHA matches the
+# vendored tree (Cargo.toml:54 / vendor/iceberg-rust/README.md):
+#   git ls-remote https://github.com/risingwavelabs/iceberg-rust.git | grep c034b19105fa
 # Migration to upstream apache/iceberg-rust planned once OverwriteAction is merged.
 
 [advisories]
@@ -27,8 +29,17 @@ ignore = [
     # -> aws-smithy-http-client -> hyper-rustls 0.24 -> rustls 0.21), used by
     # the AWS Glue / S3Tables catalog backends. SQE's primary Polaris REST
     # path already runs patched rustls 0.23 / webpki 0.103.13 (also in-tree).
-    # The fix requires building an explicit modern HttpClient in the vendored
-    # iceberg fork (no aws-config feature selects it) -> tracked separately.
+    #
+    # DEP-06: enabling `glue` / `s3tables` (only in Dockerfile.full /
+    # --features glue,s3tables images) links a COMPLETE second, legacy
+    # TLS+HTTP stack: rustls 0.21 / rustls-webpki 0.101.7 (the three advisories
+    # below) / hyper 0.14 / h2 0.3 / http 0.2. It is a live cert-validation
+    # exposure in the full image plus the single largest source of
+    # duplicate-major-version bloat. The fix (build an explicit modern
+    # hyper-1 / rustls-0.23 HttpClient for the vendored iceberg Glue/S3Tables
+    # backends so aws-config stops selecting the legacy connector, then drop
+    # these three ignores) is tracked in GitLab issue (DEP-06) and deferred
+    # here -- do NOT swap the AWS connector in the correctness bucket.
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
     "RUSTSEC-2026-0104",

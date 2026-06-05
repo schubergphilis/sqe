@@ -1380,7 +1380,16 @@ impl QueryHandler {
                             ended_at: ol_ended_at,
                             duration: ol_duration,
                             statement_kind: kind_name.clone(),
-                            error_message: e.to_string(),
+                            // SQL-06: emit the SANITIZED client message to the
+                            // lineage sink, not the raw error. `e.to_string()`
+                            // can carry file paths, S3 URIs, schema/column names,
+                            // partition values, and literal data fragments that
+                            // the error-sanitization layer suppresses from the
+                            // client. Lineage sinks (JSONL/HTTP/Marquez) are a
+                            // different trust boundary, so they get the same
+                            // sanitized text the SQL client sees. Mirrors
+                            // query_tracker.rs:214.
+                            error_message: e.client_message(),
                             plan: captured_plan.take(),
                         });
                     }

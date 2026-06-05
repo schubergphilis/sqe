@@ -378,7 +378,9 @@ impl PrepareResponse {
 
     pub fn decode(d: &mut BinaryDeserializer<'_>) -> crate::Result<Self> {
         d.expect_field(1)?;
-        let type_count = d.read_list_count()? as usize;
+        // Bound every wire count against bytes remaining before allocating, so
+        // a bogus huge count can't drive a multi-GB `Vec::with_capacity`.
+        let type_count = d.read_bounded_count()?;
         let mut result_types = Vec::with_capacity(type_count);
         for _ in 0..type_count {
             let t = LogicalType::decode(d)?;
@@ -387,7 +389,7 @@ impl PrepareResponse {
         }
 
         d.expect_field(2)?;
-        let name_count = d.read_list_count()? as usize;
+        let name_count = d.read_bounded_count()?;
         let mut result_names = Vec::with_capacity(name_count);
         for _ in 0..name_count {
             result_names.push(d.read_string()?);
@@ -406,7 +408,7 @@ impl PrepareResponse {
         // field entirely (real `quack_serve` does this for queries that yield
         // zero rows, e.g. `WHERE 1=0`).
         let results = if d.read_optional(4)? {
-            let results_count = d.read_list_count()? as usize;
+            let results_count = d.read_bounded_count()?;
             let mut out = Vec::with_capacity(results_count);
             for _ in 0..results_count {
                 // Consume the leading nullable byte; a `false` value here
@@ -475,7 +477,7 @@ impl FetchResponse {
         // Mirror the encode elision: when field 1 is absent the server is
         // signalling an empty results list.
         let results = if d.read_optional(1)? {
-            let count = d.read_list_count()? as usize;
+            let count = d.read_bounded_count()?;
             let mut out = Vec::with_capacity(count);
             for _ in 0..count {
                 if !d.read_nullable_present()? {

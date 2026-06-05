@@ -10,9 +10,21 @@ repository.workspace = true
 name = "sqe-cli"
 path = "src/main.rs"
 
+[features]
+# `aws` turns on the Glue + S3 Tables catalog backends for the embedded
+# engine (`--catalog-backend glue|s3tables`). Default-on so a normal
+# `cargo install` gets it; drop it (`--no-default-features`) for a slim
+# build with no AWS SDK weight.
+default = ["aws"]
+aws = ["sqe-catalog/glue", "sqe-catalog/s3tables"]
+# DEP-07: `delta` is opt-in (off by default). deltalake-core pulls a second
+# reqwest 0.13 + a second arrow/parquet tree via buoyant_kernel, so a default
+# `cargo install` stays slim. Enable the read_delta() TVF with `--features delta`.
+delta = ["sqe-catalog/delta"]
+
 [dependencies]
 sqe-core = { path = "../sqe-core" }
-sqe-catalog = { path = "../sqe-catalog", default-features = false, features = ["rest", "sql-sqlite", "hadoop", "delta"] }
+sqe-catalog = { path = "../sqe-catalog", default-features = false, features = ["rest", "sql-sqlite", "hadoop"] }
 sqe-sql = { path = "../sqe-sql" }
 sqe-trino-functions = { path = "../sqe-trino-functions" }
 sqe-trino-compat = { path = "../sqe-trino-compat" }

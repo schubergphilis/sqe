@@ -1166,3 +1166,69 @@ async fn test_map_agg_with_group_by() {
     assert!(us_m.contains("k3"));
     assert!(!us_m.contains("k1"), "US map should not see EU keys: {us_m}");
 }
+
+// ─── Audit safety regressions (SQL-02 / SQL-03 / SQL-04) ─────────────────
+
+/// Run SQL through the full plan+execute path and report whether it errored.
+/// Used to prove a previously-panicking input now produces a clean error
+/// (caught at the task boundary) rather than aborting the process.
+async fn exec_errors(sql: &str) -> bool {
+    let ctx = ctx().await;
+    match ctx.sql(sql).await {
+        Ok(df) => df.collect().await.is_err(),
+        Err(_) => true,
+    }
+}
+
+#[tokio::test]
+async fn from_base_rejects_out_of_range_radix() {
+    // SQL-02: radix 0/1/40 previously panicked (from_str_radix) or hung
+    // (radix 1). They must now be clean errors, never a panic.
+    assert!(exec_errors("SELECT from_base('10', 0)").await);
+    assert!(exec_errors("SELECT from_base('10', 1)").await);
+    assert!(exec_errors("SELECT from_base('10', 40)").await);
+    assert!(exec_errors("SELECT from_base('10', -2)").await);
+    // A valid radix still works.
+    assert_eq!(eval_i64("SELECT from_base('ff', 16)").await, Some(255));
+}
+
+#[tokio::test]
+async fn to_base_rejects_out_of_range_radix() {
+    // SQL-02: radix 0 (modulo-by-zero), 1 (infinite loop), 40 (index OOB).
+    assert!(exec_errors("SELECT to_base(5, 0)").await);
+    assert!(exec_errors("SELECT to_base(5, 1)").await);
+    assert!(exec_errors("SELECT to_base(5, 40)").await);
+    // A valid radix still works.
+    assert_eq!(eval_str("SELECT to_base(255, 16)").await.as_deref(), Some("ff"));
+}
+
+#[tokio::test]
+async fn from_hex_handles_non_ascii_without_panicking() {
+    // SQL-03: a non-ASCII argument used to panic on a char-boundary slice.
+    // It must now complete (returning some string) without aborting.
+    assert!(!exec_errors("SELECT from_hex('café')").await);
+    // The ASCII happy path is preserved: '41' hex -> 'A'.
+    assert_eq!(eval_str("SELECT from_hex('41')").await.as_deref(), Some("A"));
+}
+
+#[tokio::test]
+async fn from_utf8_handles_non_ascii_without_panicking() {
+    // SQL-03: same char-boundary hazard on from_utf8.
+    assert!(!exec_errors("SELECT from_utf8('café')").await);
+}
+
+#[tokio::test]
+async fn date_part_extreme_date32_does_not_panic() {
+    // SQL-04: a Date32 value near i32::MAX overflows NaiveDateTime, which used
+    // to panic on .unwrap(). It must now yield NULL (or a clean error), never
+    // a panic. year() backs the whole date-part family via the macro.
+    assert!(!exec_errors("SELECT year(CAST(2000000000 AS DATE))").await);
+    // A normal date still extracts correctly.
+    assert_eq!(eval_i64("SELECT year(DATE '2021-06-15')").await, Some(2021));
+}
+
+#[tokio::test]
+async fn to_unixtime_extreme_date32_does_not_panic() {
+    // SQL-04: same overflow guard on the to_unixtime Date32 path.
+    assert!(!exec_errors("SELECT to_unixtime(CAST(2000000000 AS DATE))").await);
+}

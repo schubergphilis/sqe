@@ -6,12 +6,14 @@
 //! Unlike the legacy `OidcPasswordClient` (which hardwires Keycloak URL + realm),
 //! this provider takes a direct `token_url` and a configurable `roles_claim`.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use base64::Engine;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use crate::provider::{AuthError, AuthProvider, FlightCredentials, Identity};
+use crate::provider::{truncate_for_log, AuthError, AuthProvider, FlightCredentials, Identity};
 
 /// Configuration for the OIDC password grant provider.
 #[derive(Debug, Clone)]
@@ -66,6 +68,8 @@ impl OidcPasswordProvider {
     /// Create a new provider from the given configuration.
     pub fn new(config: OidcPasswordProviderConfig) -> Result<Self, AuthError> {
         let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
             .danger_accept_invalid_certs(config.accept_invalid_certs)
             .build()
             .map_err(|e| {
@@ -110,11 +114,7 @@ impl OidcPasswordProvider {
                 .text()
                 .await
                 .unwrap_or_else(|_| "unable to read body".to_string());
-            let body = if body.len() > 500 {
-                format!("{}...[truncated]", &body[..500])
-            } else {
-                body
-            };
+            let body = truncate_for_log(&body, 500);
             warn!(status = %status, body = %body, "OIDC provider rejected credentials");
             return Err(AuthError::AuthFailed(
                 "Authentication failed".to_string(),
@@ -159,11 +159,7 @@ impl OidcPasswordProvider {
                 .text()
                 .await
                 .unwrap_or_else(|_| "unable to read body".to_string());
-            let body = if body.len() > 500 {
-                format!("{}...[truncated]", &body[..500])
-            } else {
-                body
-            };
+            let body = truncate_for_log(&body, 500);
             warn!(status = %status, body = %body, "OIDC provider rejected token refresh");
             return Err(AuthError::AuthFailed(
                 "Authentication failed".to_string(),

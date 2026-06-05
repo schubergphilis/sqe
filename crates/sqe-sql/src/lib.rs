@@ -27,7 +27,7 @@ pub use procedures::{try_parse_call, NamespaceRef, ProcedureCall, TableRef};
 pub use time_travel::{
     extract_incremental_spec, extract_time_travel_spec, IncrementalSpec, TimeTravelSpec, VersionRef,
 };
-pub use trino_compat::rewrite_trino_compat;
+pub use trino_compat::{check_expression_depth, rewrite_trino_compat};
 pub use v3_types::{
     detect_ns_timestamp, extract_default_literal, is_tz_variant, is_v3_only_type,
     DefaultError, DefaultLiteral, NsTimestamp,

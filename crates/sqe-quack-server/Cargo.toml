@@ -13,6 +13,9 @@ sqe-core = { path = "../sqe-core" }
 axum = { workspace = true }
 tokio = { workspace = true }
 moka = { workspace = true }
+# QUACK-08: rate-limit the ConnectionRequest (auth) path so it is not an
+# un-throttled brute-force / IdP-amplification oracle.
+governor = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }

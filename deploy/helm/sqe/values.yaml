@@ -1,6 +1,13 @@
 image:
   repository: sqe
-  tag: latest
+  # DEP-08: leave `tag` empty so it resolves to the chart appVersion (a
+  # concrete version, currently 0.1.0) via the `sqe.image` helper, instead of
+  # the floating `latest` (non-reproducible: two installs a day apart could run
+  # different binaries with no record, and IfNotPresent never re-pulls a cached
+  # `latest`). For production, pin by digest:
+  #   tag: "0.1.0@sha256:<digest>"
+  # and keep pullPolicy: IfNotPresent (safe for an immutable digest).
+  tag: ""
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -15,6 +22,9 @@ coordinator:
     limits:
       memory: "2Gi"
       cpu: "2"
+  # DEP-01: optional sizeLimit for the writable /tmp emptyDir (spill + session
+  # files). Leave empty for node-default; set e.g. "1Gi" to bound spill usage.
+  spillVolumeSizeLimit: ""
   nodeSelector: {}
   tolerations: []
   affinity: {}
@@ -31,6 +41,8 @@ worker:
     limits:
       memory: "8Gi"
       cpu: "4"
+  # DEP-01: optional sizeLimit for the writable /tmp emptyDir (spill files).
+  spillVolumeSizeLimit: ""
   nodeSelector: {}
   tolerations: []
   affinity: {}
@@ -49,10 +61,20 @@ config:
     flight_sql_port: 50051
     trino_http_port: 8080
     mode: "hybrid"
+    # DEP-02: keep below coordinator.resources.limits.memory (2Gi) so spill
+    # fires before the kernel OOMKills the pod. ~70-75% of 2Gi.
+    memory_limit: "1500MB"
+    spill_to_disk: true
+    # DEP-01: spill dir lives under the writable /tmp emptyDir mounted on the
+    # coordinator pod.
+    spill_dir: "/tmp/sqe-coordinator-spill"
 
   worker:
     heartbeat_interval_secs: 5
-    memory_limit: "8GB"
+    # DEP-02: ~75% of worker.resources.limits.memory (8Gi) leaves headroom for
+    # Arrow buffers outside DataFusion's accounted pool. An 8GB engine limit in
+    # an 8Gi pod leaves zero headroom and OOMKills under load.
+    memory_limit: "6GB"
     spill_dir: "/tmp/sqe-spill"
 
   auth:

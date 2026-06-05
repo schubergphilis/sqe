@@ -27,7 +27,7 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use sqe_catalog::parquet_writer_config::{self, writer_props_for_table as shared_writer_props_for_table};
 use sqe_core::SqeError;
-use tracing::{info, instrument, warn};
+use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
 
 /// Shared list of every parquet file location the rolling writer has handed out
@@ -90,6 +90,7 @@ pub struct WriteCleanupGuard {
     tracker: UploadedPaths,
     committed: AtomicBool,
     op: &'static str,
+    metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
 }
 
 impl WriteCleanupGuard {
@@ -99,7 +100,18 @@ impl WriteCleanupGuard {
             tracker,
             committed: AtomicBool::new(false),
             op,
+            metrics: None,
         }
+    }
+
+    /// Attach the metrics registry so orphan cleanup emits
+    /// `sqe_write_orphan_files_total{op,outcome}` (COORD-06). A `None` registry
+    /// (e.g. the maintenance path) leaves the counter unset; the error-level
+    /// log line remains the alerting signal in that case.
+    #[must_use = "with_metrics returns the guard; bind the returned value"]
+    pub fn with_metrics(mut self, metrics: Option<Arc<sqe_metrics::MetricsRegistry>>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Signal that the Iceberg commit has succeeded; the guard's Drop becomes
@@ -125,6 +137,7 @@ impl Drop for WriteCleanupGuard {
         let file_io = self.file_io.clone();
         let op = self.op;
         let count = paths.len();
+        let metrics = self.metrics.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 warn!(
@@ -132,17 +145,55 @@ impl Drop for WriteCleanupGuard {
                     orphan_count = count,
                     "write cancelled before commit; deleting orphan parquet files"
                 );
+                // COORD-06: count delete failures so operators can detect S3
+                // orphan accumulation (paid-for, never-queried storage). The
+                // per-file warns are easy to lose; the error-level summary with
+                // a stable `leaked` count is alertable, and the
+                // `sqe_write_orphan_files_total{op,outcome}` counter lets a
+                // periodic `remove_orphan_files` procedure reconcile leaks.
+                let mut leaked = 0usize;
                 for p in paths {
                     if let Err(e) = file_io.delete(&p).await {
                         warn!(op, path = %p, error = %e, "orphan cleanup: delete failed");
+                        leaked += 1;
                     }
+                }
+                if let Some(m) = &metrics {
+                    let deleted = count - leaked;
+                    if deleted > 0 {
+                        m.write_orphan_files_total
+                            .with_label_values(&[op, "deleted"])
+                            .inc_by(deleted as u64);
+                    }
+                    if leaked > 0 {
+                        m.write_orphan_files_total
+                            .with_label_values(&[op, "leaked"])
+                            .inc_by(leaked as u64);
+                    }
+                }
+                if leaked > 0 {
+                    error!(
+                        op,
+                        leaked,
+                        attempted = count,
+                        "orphan cleanup: {leaked} parquet file(s) could not be deleted and \
+                         remain on S3 as uncommitted orphans; reconcile via remove_orphan_files"
+                    );
                 }
             });
         } else {
-            warn!(
+            // No runtime at drop -> every file is left behind. Surface at error
+            // level (COORD-06): these are guaranteed orphans, not best-effort.
+            if let Some(m) = &metrics {
+                m.write_orphan_files_total
+                    .with_label_values(&[op, "leaked"])
+                    .inc_by(count as u64);
+            }
+            error!(
                 op,
                 orphan_count = paths.len(),
-                "write cancelled outside tokio runtime; orphan parquet files left on S3"
+                "write cancelled outside tokio runtime; orphan parquet files left on S3 \
+                 (reconcile via remove_orphan_files)"
             );
         }
     }
