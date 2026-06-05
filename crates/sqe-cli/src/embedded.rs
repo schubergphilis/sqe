@@ -899,46 +899,76 @@ mod tests {
     /// and confirm both are visible. End-to-end exercise of the
     /// V5 `WritableIcebergCatalog` write path: every operation goes
     /// through DataFusion's SQL surface, no out-of-band bootstrap.
-    // Quarantined: this test hangs indefinitely in CI (SQLite warehouse
-    // reopen deadlock on the Phase 1 -> Phase 2 client restart), timing out the
-    // whole `cargo-test` job at 1h. It passes on fast local machines. Tracked
-    // in #195; remove `#[ignore]` once the reopen deadlock is fixed.
+    //
+    // #195 diagnostic: previously `#[ignore]`d because it timed out the
+    // `cargo-test` job at 1h on a Linux runner. The original "reopen
+    // deadlock" hypothesis was not confirmed. Each phase is now wrapped in
+    // a hard per-phase timeout so a hang fails fast (with the offending
+    // phase named) instead of stalling the whole job for an hour, and the
+    // phase timings are printed. This lets the actual Linux runner pinpoint
+    // where (if anywhere) it still hangs on the current tree.
     #[tokio::test]
-    #[ignore = "hangs in CI: SQLite warehouse reopen deadlock; tracked in #195"]
     async fn persistent_warehouse_survives_client_restart() {
+        use std::time::{Duration, Instant};
+        // Run `fut`, panicking (failing the test fast) if it doesn't finish
+        // within `secs`. Bounds the job so a hang can't burn the 1h CI limit.
+        async fn bounded<F: std::future::Future>(phase: &str, secs: u64, fut: F) -> F::Output {
+            match tokio::time::timeout(Duration::from_secs(secs), fut).await {
+                Ok(v) => v,
+                Err(_) => panic!(
+                    "#195 diagnostic: phase '{phase}' did not complete within {secs}s \
+                     (hang reproduced on this runner)"
+                ),
+            }
+        }
+
         let tmp = tempfile::tempdir().expect("tempdir");
         let mode = WarehouseMode::single(tmp.path().to_path_buf());
+        let t = Instant::now();
 
         // Phase 1: create namespace + table via SQL.
         {
-            let mut c = EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode)
-                .await
-                .expect("first client");
-            c.execute("CREATE SCHEMA iceberg.test_ns")
+            let mut c =
+                bounded("phase1_open", 90, EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode))
+                    .await
+                    .expect("first client");
+            eprintln!("#195 t={:?} phase1 client built", t.elapsed());
+            bounded("create_schema", 90, c.execute("CREATE SCHEMA iceberg.test_ns"))
                 .await
                 .expect("CREATE SCHEMA");
-            c.execute(
-                "CREATE TABLE iceberg.test_ns.greetings (id BIGINT, msg VARCHAR)",
+            eprintln!("#195 t={:?} schema created", t.elapsed());
+            bounded(
+                "create_table",
+                90,
+                c.execute("CREATE TABLE iceberg.test_ns.greetings (id BIGINT, msg VARCHAR)"),
             )
             .await
             .expect("CREATE TABLE");
+            eprintln!("#195 t={:?} table created", t.elapsed());
         }
+        eprintln!("#195 t={:?} phase1 client dropped", t.elapsed());
 
         // Phase 2: build the embedded client, confirm the iceberg
         // catalog is registered and the namespace + table are visible
         // via DataFusion's information_schema.
-        let mut c = EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode)
-            .await
-            .expect("client builds against existing warehouse");
-        let r = c
-            .execute(
+        let mut c =
+            bounded("phase2_open", 90, EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode))
+                .await
+                .expect("client builds against existing warehouse");
+        eprintln!("#195 t={:?} phase2 client built", t.elapsed());
+        let r = bounded(
+            "phase2_query",
+            90,
+            c.execute(
                 "SELECT table_schema, table_name \
                  FROM information_schema.tables \
                  WHERE table_catalog = 'iceberg' AND table_schema = 'test_ns' \
                  ORDER BY table_name",
-            )
-            .await
-            .expect("information_schema.tables");
+            ),
+        )
+        .await
+        .expect("information_schema.tables");
+        eprintln!("#195 t={:?} phase2 query done", t.elapsed());
         assert_eq!(r.columns, vec!["table_schema".to_string(), "table_name".to_string()]);
         // The iceberg-datafusion bridge exposes the user table plus
         // metadata pseudo-tables ($snapshots, $manifests). We only
