@@ -29,8 +29,9 @@
 use std::sync::Arc;
 
 use datafusion::common::{plan_err, ScalarValue};
+use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::execution::context::SessionContext;
+use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion_expr::Expr;
 use object_store::aws::AmazonS3Builder;
 use object_store::azure::MicrosoftAzureBuilder;
@@ -817,6 +818,38 @@ fn expand_tilde(path: &str, home: Option<&str>) -> String {
 fn expand_local_tilde_in_place(args: &mut FileTvfArgs) {
     let home = std::env::var_os("HOME").map(|h| h.to_string_lossy().into_owned());
     args.path = expand_tilde(&args.path, home.as_deref());
+}
+
+/// Error if a *local* listing URL matches no files, so a typo'd path or an
+/// empty glob surfaces clearly instead of silently returning zero rows.
+///
+/// Scoped to local filesystem paths (`original_path` has no `://` scheme):
+/// object-store and `http(s)` listing semantics vary (http stores don't
+/// enumerate), and a bad key/URL surfaces as a read error on those paths. An
+/// existing-but-empty file still matches (one object) and yields zero rows,
+/// which is correct — only a path matching *no* objects is an error.
+pub async fn ensure_local_files_exist(
+    fn_name: &str,
+    state: &SessionState,
+    listing_url: &ListingTableUrl,
+    file_extension: &str,
+    original_path: &str,
+) -> DFResult<()> {
+    use futures::StreamExt;
+    if original_path.contains("://") {
+        return Ok(());
+    }
+    let store = state.runtime_env().object_store(listing_url)?;
+    let mut files = listing_url
+        .list_all_files(state, store.as_ref(), file_extension)
+        .await?;
+    if files.next().await.is_none() {
+        return plan_err!(
+            "{fn_name}: no files matched '{original_path}' \
+             (file not found, or the glob matched nothing)"
+        );
+    }
+    Ok(())
 }
 
 /// V12: pre-rewrite `'hf://...'` string literals in raw SQL to their HTTPS

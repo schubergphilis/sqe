@@ -327,8 +327,17 @@ async fn build_csv_listing_table(
         .unwrap_or(derived_extension.as_str());
     let listing_options = ListingOptions::new(Arc::new(format)).with_file_extension(extension);
 
+    let state = tmp_ctx.state();
+    crate::file_tvf_common::ensure_local_files_exist(
+        FN_NAME,
+        &state,
+        &listing_url,
+        extension,
+        &args.path,
+    )
+    .await?;
     let schema = listing_options
-        .infer_schema(&tmp_ctx.state(), &listing_url)
+        .infer_schema(&state, &listing_url)
         .await?;
 
     let config = ListingTableConfig::new(listing_url)
