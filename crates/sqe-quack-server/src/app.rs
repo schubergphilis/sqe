@@ -1,7 +1,10 @@
 //! Axum HTTP application: `GET /` identification + `POST /quack` RPC.
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
+
+use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 
 use axum::{
     extract::{DefaultBodyLimit, State},
@@ -28,6 +31,15 @@ use crate::session::{identity_to_core_session, Session, SessionStore};
 const QUACK_VERSION: u64 = 1;
 const APPLICATION_VND_DUCKDB: &str = "application/vnd.duckdb";
 
+/// QUACK-08: ceiling on `ConnectionRequest` auth attempts per second, process
+/// wide. Each request triggers an IdP round-trip, so an un-throttled path is a
+/// brute-force / IdP-amplification oracle. Connections are long-lived and
+/// reused for queries, so legitimate clients connect rarely; this bound is
+/// generous for real use and hard on a credential-stuffing loop. Burst equals
+/// the per-second rate. (Per-IP keying is a follow-up: it needs the peer addr
+/// via `ConnectInfo`, i.e. serving with `into_make_service_with_connect_info`.)
+const QUACK_AUTH_RATE_PER_SEC: u32 = 10;
+
 /// Explicit request-body cap for the `/quack` endpoint. The DataChunk-carrying
 /// decode paths are reachable pre-auth, so we keep the ceiling small and
 /// independent of axum's implicit default. 4 MiB comfortably covers a
@@ -42,6 +54,8 @@ pub struct QuackServerState {
     pub server_platform: String,
     pub auth_provider: Arc<dyn AuthProvider>,
     pub query_executor: Arc<dyn QueryExecutor>,
+    /// QUACK-08: throttles the ConnectionRequest auth path (global, keyless).
+    pub auth_limiter: Arc<DefaultDirectRateLimiter>,
 }
 
 impl QuackServerState {
@@ -58,6 +72,9 @@ impl QuackServerState {
             server_platform: std::env::consts::OS.to_string(),
             auth_provider,
             query_executor,
+            auth_limiter: Arc::new(RateLimiter::direct(Quota::per_second(
+                NonZeroU32::new(QUACK_AUTH_RATE_PER_SEC).expect("auth rate must be > 0"),
+            ))),
         }
     }
 }
@@ -297,6 +314,17 @@ async fn handle_connection_request(
     request_header: &MessageHeader,
     req: sqe_quack_wire::message::ConnectionRequest,
 ) -> (StatusCode, [(&'static str, &'static str); 1], Vec<u8>) {
+    // QUACK-08: throttle before touching the IdP. Rejected attempts never reach
+    // authenticate(), so a credential-stuffing loop cannot amplify into the IdP.
+    if state.auth_limiter.check().is_err() {
+        tracing::warn!("Quack auth path rate-limited a ConnectionRequest");
+        return error_response(
+            "",
+            request_header.client_query_id,
+            "SQE-RATELIMIT: too many connection attempts; slow down".to_string(),
+        );
+    }
+
     if req.auth_string.is_empty() {
         return error_response(
             "",
@@ -381,4 +409,23 @@ fn error_response(
         [("content-type", APPLICATION_VND_DUCKDB)],
         bytes,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_limiter_denies_after_burst() {
+        // Built exactly like QuackServerState's auth_limiter (QUACK-08).
+        let limiter = RateLimiter::direct(Quota::per_second(
+            NonZeroU32::new(QUACK_AUTH_RATE_PER_SEC).unwrap(),
+        ));
+        // Burst capacity equals the per-second rate: that many pass instantly.
+        for _ in 0..QUACK_AUTH_RATE_PER_SEC {
+            assert!(limiter.check().is_ok());
+        }
+        // The next attempt in the same instant (no replenishment yet) is denied.
+        assert!(limiter.check().is_err());
+    }
 }
