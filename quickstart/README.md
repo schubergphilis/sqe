@@ -61,7 +61,7 @@ validated from a clean state.
 | Quickstart | What it shows | Status |
 |---|---|---|
 | `s3-tables` | AWS S3 Tables (managed Iceberg). CDK stack to create + destroy the test resources | planned |
-| `glue` | AWS Glue Data Catalog. CDK bootstrap + teardown | planned |
+| [`aws-glue`](./aws-glue/) | AWS Glue Data Catalog (CDK bootstrap + teardown; SQE creates the DB so it works under Lake Formation) | **validated 2026-06-06** |
 | `glue-lake-formation` | Glue with Lake Formation fine-grained access. CDK bootstrap + teardown | planned |
 
 ### C. Embedded (single binary, `sqe-cli`)
