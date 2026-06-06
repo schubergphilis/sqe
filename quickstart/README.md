@@ -61,7 +61,7 @@ validated from a clean state.
 | Quickstart | What it shows | Status |
 |---|---|---|
 | [`aws-s3-tables`](./aws-s3-tables/) | AWS S3 Tables (managed Iceberg). CDK bootstrap + teardown; SQE creates the namespace | **validated 2026-06-06** |
-| `glue` | AWS Glue Data Catalog. CDK bootstrap + teardown | planned |
+| [`aws-glue`](./aws-glue/) | AWS Glue Data Catalog (CDK bootstrap + teardown; SQE creates the DB so it works under Lake Formation) | **validated 2026-06-06** |
 | `glue-lake-formation` | Glue with Lake Formation fine-grained access. CDK bootstrap + teardown | planned |
 
 ### C. Embedded (single binary, `sqe-cli`)
@@ -69,10 +69,10 @@ validated from a clean state.
 | Quickstart | What it shows | Status |
 |---|---|---|
 | [`embedded-files`](./embedded-files/) | Read local and remote files directly with the `read_*` TVFs (no server, no catalog) | **validated 2026-06-06** |
-| `embedded-sqlite-catalog` | Local persistent Iceberg catalog backed by SQLite | planned |
+| [`embedded-sqlite-catalog`](./embedded-sqlite-catalog/) | Local persistent Iceberg catalog backed by SQLite (no server) | **validated 2026-06-06** |
 | `quack-server` | The Quack protocol server | planned |
 | `quack-client` | The Quack protocol client | planned |
-| `attach-catalogs` | Attaching multiple catalogs / cloud backends in embedded mode | planned |
+| [`attach-catalogs`](./attach-catalogs/) | Attach multiple persistent catalogs in embedded mode + cross-catalog JOIN | **validated 2026-06-06** |
 
 ### D. Operations
 
