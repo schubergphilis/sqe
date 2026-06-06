@@ -1095,6 +1095,23 @@ pub(crate) fn parse_table_ref(name: &ObjectName) -> sqe_core::Result<TableIdent>
     }
 }
 
+/// Extract the catalog qualifier from a 3-part table reference
+/// (`catalog.namespace.table`). Returns `None` for 1- or 2-part names, which
+/// resolve in the session's default warehouse as before.
+///
+/// `parse_table_ref` deliberately drops the catalog prefix (the iceberg
+/// `TableIdent` is namespace+table only); the write path uses this to resolve
+/// the *target* catalog instead of the configured default warehouse. Mirrors
+/// the read path's `sqe_sql::extract_catalog_qualifiers` access (`.value`, no
+/// quote/case normalisation) so reads and writes resolve the same catalog name.
+pub(crate) fn catalog_qualifier(name: &ObjectName) -> Option<String> {
+    let parts: Vec<&str> = name.0.iter().map(|ident| ident.value.as_str()).collect();
+    match parts.as_slice() {
+        [catalog, _namespace, _table] => Some((*catalog).to_string()),
+        _ => None,
+    }
+}
+
 /// Parse a sqlparser `SchemaName` into an iceberg `NamespaceIdent`.
 fn parse_schema_name(schema_name: &SchemaName) -> sqe_core::Result<NamespaceIdent> {
     match schema_name {
@@ -1282,6 +1299,39 @@ mod tests {
             Ident::new("d"),
         ]);
         assert!(parse_table_ref(&name).is_err());
+    }
+
+    #[test]
+    fn test_catalog_qualifier_one_part_is_none() {
+        let name = ObjectName(vec![Ident::new("my_table")]);
+        assert_eq!(catalog_qualifier(&name), None);
+    }
+
+    #[test]
+    fn test_catalog_qualifier_two_parts_is_none() {
+        let name = ObjectName(vec![Ident::new("my_schema"), Ident::new("my_table")]);
+        assert_eq!(catalog_qualifier(&name), None);
+    }
+
+    #[test]
+    fn test_catalog_qualifier_three_parts_returns_catalog() {
+        let name = ObjectName(vec![
+            Ident::new("team_a_data"),
+            Ident::new("public"),
+            Ident::new("events"),
+        ]);
+        assert_eq!(catalog_qualifier(&name), Some("team_a_data".to_string()));
+    }
+
+    #[test]
+    fn test_catalog_qualifier_four_parts_is_none() {
+        let name = ObjectName(vec![
+            Ident::new("a"),
+            Ident::new("b"),
+            Ident::new("c"),
+            Ident::new("d"),
+        ]);
+        assert_eq!(catalog_qualifier(&name), None);
     }
 
     // ─── Error discriminator tests ────────────────────────────────
