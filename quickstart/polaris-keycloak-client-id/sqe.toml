@@ -1,0 +1,75 @@
+# SQE config for the Polaris + Keycloak (client credentials) quickstart.
+#
+# All hostnames are in-network Docker names because SQE runs as a container
+# on the same compose network as Keycloak and Polaris. See README.md for a
+# line-by-line explanation of every option.
+
+[coordinator]
+flight_sql_port = 50051   # Arrow Flight SQL (mapped to host ${SQE_FLIGHT_PORT})
+trino_http_port = 8080    # Trino-compat HTTP (mapped to host ${SQE_TRINO_PORT})
+mode = "hybrid"           # coordinator + worker in one process: no remote worker to dial
+# Ship uncompressed so the DBeaver Flight SQL JDBC driver works out of the box.
+# Switch to "lz4" or "zstd" once your client is confirmed to decode it.
+flight_compression = "none"
+
+[worker]
+memory_limit = "4GB"
+spill_dir = "/tmp/sqe-spill"
+
+# ── Authentication ────────────────────────────────────────────────────────
+# The legacy [auth] block names the Keycloak realm + the confidential client
+# SQE uses. When [[auth.providers]] is present (below) it takes over, but the
+# struct still expects these fields.
+[auth]
+keycloak_url = "http://keycloak:8080"
+realm = "iceberg"
+client_id = "sqe-client"
+client_secret = ""
+ssl_verification = false
+
+# One provider: the OIDC password grant (ROPC). This is the "client credentials"
+# story -- a client connects with a username + password (e.g.
+# `sqe-cli --user adminuser`), and SQE exchanges those for that user's bearer
+# token using its OWN confidential client (sqe-client + secret), then passes the
+# token through to Polaris. No browser redirect, no pre-minted token.
+[[auth.providers]]
+type = "oidc_password"
+token_url = "http://keycloak:8080/realms/iceberg/protocol/openid-connect/token"
+client_id = "sqe-client"
+client_secret = "sqe-secret-change-me"   # must match Keycloak's sqe-client secret
+roles_claim = "realm_access.roles"        # where SQE reads the user's roles
+
+# ── Catalog ───────────────────────────────────────────────────────────────
+# The TOML key (`quickstart`) becomes the SQL catalog name, so tables are
+# addressed as quickstart.<namespace>.<table>.
+[catalogs.quickstart]
+polaris_url = "http://polaris:8181/api/catalog"
+warehouse = "quickstart"
+metadata_cache_ttl_secs = 30
+default_table_format_version = 2
+
+# Legacy single-catalog block: still required by the deserialiser even when
+# [catalogs.*] is set. The runtime drops it because [catalogs.*] is non-empty.
+[catalog]
+polaris_url = "http://polaris:8181/api/catalog"
+warehouse = "quickstart"
+
+# ── Storage (the object store behind the warehouse) ────────────────────────
+[storage]
+s3_endpoint = "http://rustfs:9000"
+s3_region = "us-east-1"
+s3_access_key = "s3admin"
+s3_secret_key = "s3adminpw"
+s3_path_style = true
+# Required for the plain-HTTP (non-TLS) endpoint above: the object_store builder
+# rejects an http:// endpoint unless this is explicitly opted in.
+s3_allow_http = true
+
+[policy]
+engine = "passthrough"   # no row/column policy enforcement in this quickstart
+
+[session]
+idle_timeout_secs = 900
+
+[metrics]
+prometheus_port = 9090

@@ -1,5 +1,13 @@
 # SQE Quickstart
 
+> **Looking for a runnable, validated setup?** The
+> [`quickstart/`](./quickstart/) directory has self-contained quickstarts you
+> can `docker compose up` and run end to end, each with captured output and a
+> per-use-case README. Start with
+> [`quickstart/polaris-keycloak-client-id`](./quickstart/polaris-keycloak-client-id/).
+> This page stays as the per-backend **config reference** (the TOML for every
+> catalog backend).
+
 Five minutes from a fresh checkout to your first query. SQE talks to
 six catalog backends and connects to anything that exposes Iceberg
 tables. This guide walks through each backend with a concrete
