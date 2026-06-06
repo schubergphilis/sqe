@@ -899,26 +899,41 @@ mod tests {
     /// and confirm both are visible. End-to-end exercise of the
     /// V5 `WritableIcebergCatalog` write path: every operation goes
     /// through DataFusion's SQL surface, no out-of-band bootstrap.
-    // Quarantined: this test hangs indefinitely in CI (SQLite warehouse
-    // reopen deadlock on the Phase 1 -> Phase 2 client restart), timing out the
-    // whole `cargo-test` job at 1h. It passes on fast local machines. Tracked
-    // in #195; remove `#[ignore]` once the reopen deadlock is fixed.
+    //
+    // #195: this was `#[ignore]`d after it timed out the `cargo-test` job at the
+    // 1h limit on a Linux runner. The original "SQLite reopen deadlock" hypothesis
+    // was never confirmed; the hang no longer reproduces on the current tree
+    // (verified green on the Linux runner via MR !284). Each phase is wrapped in a
+    // hard timeout so that if a regression ever reintroduces a stall, the test
+    // fails fast naming the offending phase instead of burning the 1h CI limit.
     #[tokio::test]
-    #[ignore = "hangs in CI: SQLite warehouse reopen deadlock; tracked in #195"]
     async fn persistent_warehouse_survives_client_restart() {
+        use std::time::Duration;
+        // Run `fut`, failing the test fast if it doesn't finish within `secs`,
+        // so a hang can never stall the whole `cargo-test` job for an hour.
+        async fn bounded<F: std::future::Future>(phase: &str, secs: u64, fut: F) -> F::Output {
+            match tokio::time::timeout(Duration::from_secs(secs), fut).await {
+                Ok(v) => v,
+                Err(_) => panic!("#195 guard: phase '{phase}' did not complete within {secs}s"),
+            }
+        }
+
         let tmp = tempfile::tempdir().expect("tempdir");
         let mode = WarehouseMode::single(tmp.path().to_path_buf());
 
         // Phase 1: create namespace + table via SQL.
         {
-            let mut c = EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode)
-                .await
-                .expect("first client");
-            c.execute("CREATE SCHEMA iceberg.test_ns")
+            let mut c =
+                bounded("phase1_open", 90, EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode))
+                    .await
+                    .expect("first client");
+            bounded("create_schema", 90, c.execute("CREATE SCHEMA iceberg.test_ns"))
                 .await
                 .expect("CREATE SCHEMA");
-            c.execute(
-                "CREATE TABLE iceberg.test_ns.greetings (id BIGINT, msg VARCHAR)",
+            bounded(
+                "create_table",
+                90,
+                c.execute("CREATE TABLE iceberg.test_ns.greetings (id BIGINT, msg VARCHAR)"),
             )
             .await
             .expect("CREATE TABLE");
@@ -927,18 +942,22 @@ mod tests {
         // Phase 2: build the embedded client, confirm the iceberg
         // catalog is registered and the namespace + table are visible
         // via DataFusion's information_schema.
-        let mut c = EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode)
-            .await
-            .expect("client builds against existing warehouse");
-        let r = c
-            .execute(
+        let mut c =
+            bounded("phase2_open", 90, EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode))
+                .await
+                .expect("client builds against existing warehouse");
+        let r = bounded(
+            "phase2_query",
+            90,
+            c.execute(
                 "SELECT table_schema, table_name \
                  FROM information_schema.tables \
                  WHERE table_catalog = 'iceberg' AND table_schema = 'test_ns' \
                  ORDER BY table_name",
-            )
-            .await
-            .expect("information_schema.tables");
+            ),
+        )
+        .await
+        .expect("information_schema.tables");
         assert_eq!(r.columns, vec!["table_schema".to_string(), "table_name".to_string()]);
         // The iceberg-datafusion bridge exposes the user table plus
         // metadata pseudo-tables ($snapshots, $manifests). We only
