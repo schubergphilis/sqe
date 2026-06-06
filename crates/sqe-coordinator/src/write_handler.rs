@@ -814,7 +814,7 @@ impl WriteHandler {
             .schema(iceberg_schema)
             .location_opt(location)
             .format_version(create_format_version)
-            .properties(format_version_properties(create_format_version))
+            .properties(self.format_version_props(create_format_version))
             .build();
 
         let _created_table = catalog
@@ -998,7 +998,7 @@ impl WriteHandler {
             .schema(iceberg_schema)
             .location_opt(location)
             .format_version(create_format_version)
-            .properties(format_version_properties(create_format_version))
+            .properties(self.format_version_props(create_format_version))
             .build();
 
         let _created_table = catalog
@@ -1326,7 +1326,7 @@ impl WriteHandler {
         // Merge in user-specified TBLPROPERTIES / WITH options so Polaris
         // stores them alongside the format-version directive. Without this
         // step CREATE TABLE silently drops every property the user typed.
-        let mut props = format_version_properties(format_version);
+        let mut props = self.format_version_props(format_version);
         merge_user_table_properties(&mut props, &ct.table_properties);
         merge_user_table_properties(&mut props, &ct.with_options);
 
@@ -4354,6 +4354,24 @@ impl WriteHandler {
         }
     }
 
+    /// Table-creation properties carrying the desired Iceberg format version.
+    ///
+    /// The reserved `format-version` property is a REST-catalog workaround:
+    /// iceberg-rust's REST `create_table` does not translate
+    /// `TableCreation.format_version` into the request, so the version is
+    /// communicated via the property instead. Every non-REST catalog (Glue,
+    /// S3 Tables, HMS, JDBC) reads `TableCreation.format_version` directly and
+    /// REJECTS `format-version` as a reserved property
+    /// (`Table properties should not contain reserved properties`). So we only
+    /// emit the property for the REST backend; other backends rely solely on
+    /// the `.format_version(...)` builder field.
+    fn format_version_props(
+        &self,
+        format_version: FormatVersion,
+    ) -> std::collections::HashMap<String, String> {
+        format_version_props_for_backend(&self.config.catalog.backend, format_version)
+    }
+
     /// Create a `SessionCatalogBridge` (which implements `iceberg::Catalog`)
     /// for the given session's write target.
     ///
@@ -5248,6 +5266,26 @@ pub(crate) fn format_version_properties(
     props
 }
 
+/// Format-version table properties, gated by catalog backend.
+///
+/// The reserved `format-version` property is a REST-only workaround (see
+/// [`format_version_properties`]). Non-REST catalogs (Glue, S3 Tables, HMS,
+/// JDBC) read `TableCreation.format_version` directly and reject the reserved
+/// property at `create_table` with "Table properties should not contain
+/// reserved properties, but got: [format-version]". So we emit it only for the
+/// REST backend; other backends get an empty map and rely on the builder's
+/// `.format_version(...)` field.
+pub(crate) fn format_version_props_for_backend(
+    backend: &sqe_core::config::CatalogBackend,
+    format_version: FormatVersion,
+) -> std::collections::HashMap<String, String> {
+    if matches!(backend, sqe_core::config::CatalogBackend::Rest) {
+        format_version_properties(format_version)
+    } else {
+        std::collections::HashMap::new()
+    }
+}
+
 /// Fold a `Vec<SqlOption>` (from sqlparser-rs `TBLPROPERTIES (...)` or
 /// `WITH (...)` clauses) into a property HashMap.
 ///
@@ -5575,6 +5613,54 @@ mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, TimeUnit};
     use sqlparser::ast::{DataType as SqlType, ExactNumberInfo, TimezoneInfo};
+
+    // -------------------------------------------------------------------------
+    // format-version property gating by catalog backend
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn format_version_property_only_for_rest_backend() {
+        use sqe_core::config::CatalogBackend;
+
+        // REST: the reserved `format-version` property IS emitted. iceberg-rust's
+        // REST create_table does not translate TableCreation.format_version, so
+        // Polaris reads the version from this property.
+        let rest = format_version_props_for_backend(&CatalogBackend::Rest, FormatVersion::V2);
+        assert_eq!(
+            rest.get("format-version").map(String::as_str),
+            Some("2"),
+            "REST backend must carry the format-version property"
+        );
+
+        // Non-REST backends honor TableCreation.format_version directly and
+        // REJECT `format-version` as a reserved property at create_table.
+        // Regression test for the Glue CREATE TABLE failure: "Table properties
+        // should not contain reserved properties, but got: [format-version]".
+        let glue = format_version_props_for_backend(
+            &CatalogBackend::Glue {
+                region: "eu-central-1".to_string(),
+                warehouse: String::new(),
+                endpoint: None,
+            },
+            FormatVersion::V2,
+        );
+        assert!(
+            glue.is_empty(),
+            "Glue backend must not carry the reserved format-version property, got: {glue:?}"
+        );
+
+        let s3tables = format_version_props_for_backend(
+            &CatalogBackend::S3tables {
+                table_bucket_arn: "arn:aws:s3tables:eu-west-1:123456789012:bucket/b".to_string(),
+                endpoint_url: None,
+            },
+            FormatVersion::V3,
+        );
+        assert!(
+            s3tables.is_empty(),
+            "S3 Tables backend must not carry the reserved format-version property"
+        );
+    }
 
     // -------------------------------------------------------------------------
     // build_partition_spec JSON shape (for catalog interop debugging)
