@@ -293,6 +293,41 @@ impl QueryHandler {
         Ok(catalog)
     }
 
+    /// Resolve the catalog whose metadata a `SHOW SCHEMAS/TABLES FROM <catalog>`
+    /// should read. When `catalog` names a non-default warehouse and
+    /// `catalog_discovery = polaris-auto`, discover THAT catalog via Polaris
+    /// (same resolution the write path uses), so `SHOW SCHEMAS FROM ws_team_a`
+    /// lists `ws_team_a`'s namespaces rather than the default warehouse's. An
+    /// unqualified SHOW (or a reference to the default warehouse) uses the
+    /// default session catalog as before.
+    async fn show_catalog(
+        &self,
+        session: &Session,
+        catalog: Option<&str>,
+    ) -> sqe_core::Result<Arc<SessionCatalog>> {
+        if let Some(cat) = catalog {
+            if cat != self.config.catalog.warehouse
+                && self.config.query.catalog_discovery
+                    == sqe_core::config::CatalogDiscovery::PolarisAuto
+            {
+                return crate::session_context::discover_session_catalog(
+                    cat,
+                    &self.config,
+                    session,
+                    self.table_cache.as_ref(),
+                )
+                .await
+                .ok_or_else(|| {
+                    sqe_core::SqeError::Catalog(format!(
+                        "Unknown catalog '{cat}': not resolvable via Polaris \
+                         (nonexistent or not authorized for this user)"
+                    ))
+                });
+            }
+        }
+        self.session_catalog(session).await
+    }
+
     /// List `(namespace, table_name)` pairs reachable by `session` across the
     /// default Iceberg catalog. Used by Flight SQL `do_get_tables` and the
     /// JDBC `DatabaseMetaData.getTables` path; bypasses the SQL planner so
@@ -750,8 +785,8 @@ impl QueryHandler {
 
                 StatementKind::ShowCatalogs => self.handle_show_catalogs(session).await,
 
-                StatementKind::ShowSchemas(_filter) => {
-                    self.handle_show_schemas(session).await
+                StatementKind::ShowSchemas(filter) => {
+                    self.handle_show_schemas(session, filter).await
                 }
 
                 StatementKind::ShowTables(filter) => {
@@ -2549,8 +2584,13 @@ impl QueryHandler {
     async fn handle_show_schemas(
         &self,
         session: &Session,
+        filter: &str,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let session_catalog = self.session_catalog(session).await?;
+        // `SHOW SCHEMAS FROM <catalog>` must list that catalog's namespaces, not
+        // the default warehouse's. Resolve the named catalog (discovered under
+        // polaris-auto) so reads line up with the write path.
+        let catalog = show_schemas_catalog(filter);
+        let session_catalog = self.show_catalog(session, catalog.as_deref()).await?;
 
         let namespaces = session_catalog.list_namespaces().await?;
 
@@ -2634,7 +2674,12 @@ impl QueryHandler {
         session: &Session,
         filter: &str,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let session_catalog = self.session_catalog(session).await?;
+        // `SHOW TABLES FROM <catalog>.<schema>` must list tables from that
+        // catalog, not the default warehouse. Resolve the leading catalog
+        // qualifier (discovered under polaris-auto); the schema part is parsed
+        // separately by parse_show_tables_namespace.
+        let catalog = show_tables_catalog(filter);
+        let session_catalog = self.show_catalog(session, catalog.as_deref()).await?;
 
         // If a filter is provided, use it as the namespace; otherwise list all namespaces
         let ns_name = parse_show_tables_namespace(filter);
@@ -4252,6 +4297,50 @@ fn should_emit(kind: &StatementKind, cfg: &sqe_core::config::OpenLineageConfig) 
 /// `"analytics_db"` (with the quote characters in it). The Flight SQL
 /// `do_get_tables` handler emits the quoted form, so DBeaver's database
 /// tree showed every schema as empty.
+/// Strip the leading `IN `/`FROM ` keyword (sqlparser renders a `show_in` clause
+/// as "FROM <x>" / "IN <x>") and return the trimmed remainder.
+fn strip_show_in_keyword(filter: &str) -> &str {
+    let raw = filter.trim();
+    raw.strip_prefix("IN ")
+        .or_else(|| raw.strip_prefix("FROM "))
+        .or_else(|| raw.strip_prefix("in "))
+        .or_else(|| raw.strip_prefix("from "))
+        .unwrap_or(raw)
+        .trim()
+}
+
+/// Strip a single pair of wrapping double quotes.
+fn unquote_segment(s: &str) -> &str {
+    s.strip_prefix('"')
+        .and_then(|x| x.strip_suffix('"'))
+        .unwrap_or(s)
+}
+
+/// Catalog named by `SHOW SCHEMAS FROM <catalog>`: the leading dotted segment.
+/// `None` when there is no FROM/IN clause (lists the default catalog).
+fn show_schemas_catalog(filter: &str) -> Option<String> {
+    let after = strip_show_in_keyword(filter);
+    if after.is_empty() {
+        return None;
+    }
+    let first = after.split('.').next().unwrap_or(after).trim();
+    let unq = unquote_segment(first).trim();
+    (!unq.is_empty()).then(|| unq.to_string())
+}
+
+/// Catalog named by `SHOW TABLES FROM <catalog>.<schema>`: the leading segment
+/// of a 2+ part filter. A 1-part filter names a schema in the current catalog,
+/// so it carries no catalog qualifier and returns `None`.
+fn show_tables_catalog(filter: &str) -> Option<String> {
+    let after = strip_show_in_keyword(filter);
+    let parts: Vec<&str> = after.split('.').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let unq = unquote_segment(parts[0].trim()).trim();
+    (!unq.is_empty()).then(|| unq.to_string())
+}
+
 fn parse_show_tables_namespace(filter: &str) -> Option<String> {
     let raw = filter.trim();
     if raw.is_empty() {
@@ -4390,6 +4479,34 @@ mod tests {
             parse_show_tables_namespace("IN main_warehouse.analytics_db"),
             Some("analytics_db".to_string())
         );
+    }
+
+    // ─── read-side catalog extraction (SHOW SCHEMAS/TABLES FROM <catalog>) ──
+    #[test]
+    fn show_schemas_catalog_extracts_from_clause() {
+        assert_eq!(show_schemas_catalog("FROM ws_team_a"), Some("ws_team_a".to_string()));
+        assert_eq!(show_schemas_catalog("IN ws_team_a"), Some("ws_team_a".to_string()));
+    }
+
+    #[test]
+    fn show_schemas_catalog_none_when_unqualified() {
+        assert_eq!(show_schemas_catalog(""), None);
+    }
+
+    #[test]
+    fn show_tables_catalog_extracts_leading_segment() {
+        // catalog.schema -> catalog
+        assert_eq!(
+            show_tables_catalog("FROM ws_team_a.dev_raw"),
+            Some("ws_team_a".to_string())
+        );
+    }
+
+    #[test]
+    fn show_tables_catalog_none_for_bare_schema() {
+        // a single segment is the schema in the current catalog, not a catalog
+        assert_eq!(show_tables_catalog("FROM dev_raw"), None);
+        assert_eq!(show_tables_catalog(""), None);
     }
 
     #[test]
