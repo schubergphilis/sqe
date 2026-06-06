@@ -352,12 +352,9 @@ impl CatalogOps {
             "Creating view"
         );
 
-        let session_catalog = SessionCatalog::for_session(
-            &self.config,
-            self.table_cache.clone(),
-            session.access_token().expose(),
-        )
-        .await?;
+        let session_catalog = self
+            .session_catalog_for(session, catalog_qualifier(view_name).as_deref())
+            .await?;
 
         // For CREATE OR REPLACE VIEW: drop the existing view first (if it exists).
         if or_replace {
@@ -418,12 +415,9 @@ impl CatalogOps {
             "Dropping view"
         );
 
-        let session_catalog = SessionCatalog::for_session(
-            &self.config,
-            self.table_cache.clone(),
-            session.access_token().expose(),
-        )
-        .await?;
+        let session_catalog = self
+            .session_catalog_for(session, catalog_qualifier(view_name).as_deref())
+            .await?;
 
         match session_catalog.drop_view(namespace, name).await {
             Ok(()) => Ok(()),
@@ -470,14 +464,9 @@ impl CatalogOps {
 
         // Use SessionCatalog directly so we can call commit_schema_update, which
         // bypasses the crate-private TableCommit::build() method.
-        let session_catalog = Arc::new(
-            SessionCatalog::for_session(
-                &self.config,
-                self.table_cache.clone(),
-                session.access_token().expose(),
-            )
-            .await?,
-        );
+        let session_catalog = self
+            .session_catalog_for(session, catalog_qualifier(table_name).as_deref())
+            .await?;
 
         // Load the table via the catalog bridge (iceberg's load_table returns a Table)
         let catalog = session_catalog.as_catalog();
@@ -732,14 +721,9 @@ impl CatalogOps {
             "Setting table properties"
         );
 
-        let session_catalog = Arc::new(
-            SessionCatalog::for_session(
-                &self.config,
-                self.table_cache.clone(),
-                session.access_token().expose(),
-            )
-            .await?,
-        );
+        let session_catalog = self
+            .session_catalog_for(session, catalog_qualifier(table_name).as_deref())
+            .await?;
 
         let table_updates = vec![TableUpdate::SetProperties { updates }];
         let requirements = vec![];
@@ -784,14 +768,9 @@ impl CatalogOps {
         let object_name = parse_object_name(table_ref)?;
         let table_ident = parse_table_ref(&object_name)?;
 
-        let session_catalog = Arc::new(
-            SessionCatalog::for_session(
-                &self.config,
-                self.table_cache.clone(),
-                session.access_token().expose(),
-            )
-            .await?,
-        );
+        let session_catalog = self
+            .session_catalog_for(session, catalog_qualifier(&object_name).as_deref())
+            .await?;
 
         let table = session_catalog.load_table(&table_ident).await?;
         let metadata = table.metadata();
@@ -921,14 +900,9 @@ impl CatalogOps {
         let object_name = parse_object_name(table_ref)?;
         let table_ident = parse_table_ref(&object_name)?;
 
-        let session_catalog = Arc::new(
-            SessionCatalog::for_session(
-                &self.config,
-                self.table_cache.clone(),
-                session.access_token().expose(),
-            )
-            .await?,
-        );
+        let session_catalog = self
+            .session_catalog_for(session, catalog_qualifier(&object_name).as_deref())
+            .await?;
 
         let table = session_catalog.load_table(&table_ident).await?;
         let metadata = table.metadata();
@@ -1087,7 +1061,27 @@ impl CatalogOps {
         session: &Session,
         target_warehouse: Option<&str>,
     ) -> sqe_core::Result<Arc<dyn Catalog>> {
-        let session_catalog = match target_warehouse {
+        let session_catalog = self.session_catalog_for(session, target_warehouse).await?;
+
+        // Warm up the REST catalog by listing namespaces (RisingWave fork's
+        // RestCatalog needs an initial API call before load/commit work).
+        let _ = session_catalog.list_namespaces().await;
+
+        Ok(session_catalog.as_catalog())
+    }
+
+    /// Resolve the per-session `SessionCatalog` for a DDL/view target's catalog
+    /// qualifier, returning the `SessionCatalog` itself (not just the iceberg
+    /// `Catalog` bridge) so callers can use REST-only methods (`create_view`,
+    /// `commit_schema_update`, ref/partition evolution). Discovers a non-default
+    /// catalog via Polaris under `polaris-auto`; otherwise the default warehouse.
+    /// `create_catalog_bridge` wraps this for the plain `iceberg::Catalog` path.
+    async fn session_catalog_for(
+        &self,
+        session: &Session,
+        target_warehouse: Option<&str>,
+    ) -> sqe_core::Result<Arc<SessionCatalog>> {
+        match target_warehouse {
             Some(warehouse)
                 if warehouse != self.config.catalog.warehouse
                     && self.config.query.catalog_discovery
@@ -1105,23 +1099,17 @@ impl CatalogOps {
                         "Unknown catalog '{warehouse}': not resolvable via Polaris \
                          (nonexistent or not authorized for this user)"
                     ))
-                })?
+                })
             }
-            _ => Arc::new(
+            _ => Ok(Arc::new(
                 SessionCatalog::for_session(
                     &self.config,
                     self.table_cache.clone(),
                     session.access_token().expose(),
                 )
                 .await?,
-            ),
-        };
-
-        // Warm up the REST catalog by listing namespaces (RisingWave fork's
-        // RestCatalog needs an initial API call before load/commit work).
-        let _ = session_catalog.list_namespaces().await;
-
-        Ok(session_catalog.as_catalog())
+            )),
+        }
     }
 }
 
