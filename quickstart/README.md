@@ -54,7 +54,7 @@ validated from a clean state.
 | [`polaris-keycloak-client-id`](./polaris-keycloak-client-id/) | Polaris + Keycloak; SQE mints user tokens via the OIDC password grant (client credentials) | **validated 2026-06-06** |
 | [`polaris-keycloak-user-token`](./polaris-keycloak-user-token/) | Same stack; clients bring a pre-minted Keycloak token (`--token`), SQE validates + passes it through | **validated 2026-06-06** |
 | [`nessie`](./nessie/) | Project Nessie as the Iceberg REST catalog (auth-less, anonymous SQE) | **validated 2026-06-06** |
-| `rest-catalogs` | Other Iceberg REST catalogs (Unity OSS, generic REST) | planned |
+| [`unity-oss`](./unity-oss/) | Unity Catalog OSS over Iceberg REST (read-only upstream; catalog-browse demo) | **validated 2026-06-06** |
 
 ### B. AWS managed catalogs (CDK bootstrap + teardown)
 
