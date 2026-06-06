@@ -68,7 +68,7 @@ validated from a clean state.
 
 | Quickstart | What it shows | Status |
 |---|---|---|
-| `embedded-files` | Read local and remote files directly with the `read_*` TVFs | planned |
+| [`embedded-files`](./embedded-files/) | Read local and remote files directly with the `read_*` TVFs (no server, no catalog) | **validated 2026-06-06** |
 | `embedded-sqlite-catalog` | Local persistent Iceberg catalog backed by SQLite | planned |
 | `quack-server` | The Quack protocol server | planned |
 | `quack-client` | The Quack protocol client | planned |
