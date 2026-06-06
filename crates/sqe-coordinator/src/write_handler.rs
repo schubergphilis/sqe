@@ -30,7 +30,7 @@ use sqe_core::table_properties::{
 use sqe_core::{Session, SqeConfig, SqeError};
 use tracing::instrument;
 
-use crate::catalog_ops::parse_table_ref;
+use crate::catalog_ops::{catalog_qualifier, parse_table_ref};
 use crate::writer::{
     new_upload_tracker, parse_parquet_compression, write_data_files_streaming_with_metrics,
     write_data_files_with_metrics, write_equality_delete_files, write_position_delete_files,
@@ -799,8 +799,12 @@ impl WriteHandler {
         // Convert Arrow schema to Iceberg schema
         let iceberg_schema = arrow_schema_to_iceberg(&arrow_schema)?;
 
-        // Create the catalog bridge for this session
-        let catalog = self.create_catalog_bridge(session).await?;
+        // Create the catalog bridge for this session, resolving the target
+        // catalog qualifier (`catalog.ns.table`) rather than the default warehouse.
+        let target_catalog = catalog_qualifier(table_name);
+        let catalog = self
+            .create_catalog_bridge(session, target_catalog.as_deref())
+            .await?;
 
         // Create the table in the catalog
         let create_format_version = self.format_version();
@@ -982,7 +986,10 @@ impl WriteHandler {
             "Executing CTAS (streaming)"
         );
 
-        let catalog = self.create_catalog_bridge(session).await?;
+        let target_catalog = catalog_qualifier(table_name);
+        let catalog = self
+            .create_catalog_bridge(session, target_catalog.as_deref())
+            .await?;
 
         let create_format_version = self.format_version();
         let location = unique_table_location(catalog.as_ref(), &namespace, &name).await;
@@ -1130,7 +1137,10 @@ impl WriteHandler {
             "Executing INSERT INTO SELECT (streaming)"
         );
 
-        let catalog = self.create_catalog_bridge(session).await?;
+        let target_catalog = catalog_qualifier(table_name);
+        let catalog = self
+            .create_catalog_bridge(session, target_catalog.as_deref())
+            .await?;
         let table = catalog
             .load_table(&table_ident)
             .await
@@ -1303,7 +1313,10 @@ impl WriteHandler {
             "Creating empty table"
         );
 
-        let catalog = self.create_catalog_bridge(session).await?;
+        let target_catalog = catalog_qualifier(&ct.name);
+        let catalog = self
+            .create_catalog_bridge(session, target_catalog.as_deref())
+            .await?;
 
         if ct.if_not_exists && catalog.load_table(&table_ident).await.is_ok() {
             info!(table = %table_ident, "Table already exists, skipping (IF NOT EXISTS)");
@@ -1397,8 +1410,12 @@ impl WriteHandler {
             return Ok(vec![]);
         }
 
-        // Create the catalog bridge and load the existing table
-        let catalog = self.create_catalog_bridge(session).await?;
+        // Create the catalog bridge and load the existing table, resolving the
+        // target catalog qualifier rather than the default warehouse.
+        let target_catalog = catalog_qualifier(table_name);
+        let catalog = self
+            .create_catalog_bridge(session, target_catalog.as_deref())
+            .await?;
 
         let table = catalog
             .load_table(&table_ident)
@@ -1480,9 +1497,9 @@ impl WriteHandler {
 
         // Parse "catalog.schema.table" or "schema.table"
         let parts: Vec<&str> = table_name.split('.').collect();
-        let (namespace_str, name) = match parts.as_slice() {
-            [ns, tbl] => (*ns, (*tbl).to_string()),
-            [_cat, ns, tbl] => (*ns, (*tbl).to_string()),
+        let (target_catalog, namespace_str, name) = match parts.as_slice() {
+            [ns, tbl] => (None, *ns, (*tbl).to_string()),
+            [cat, ns, tbl] => (Some(*cat), *ns, (*tbl).to_string()),
             _ => {
                 return Err(SqeError::Execution(format!(
                     "Invalid table name for ingest: {table_name}"
@@ -1500,7 +1517,7 @@ impl WriteHandler {
             "Executing DoPut ingest"
         );
 
-        let catalog = self.create_catalog_bridge(session).await?;
+        let catalog = self.create_catalog_bridge(session, target_catalog).await?;
 
         let table = catalog
             .load_table(&table_ident)
@@ -4338,16 +4355,50 @@ impl WriteHandler {
     }
 
     /// Create a `SessionCatalogBridge` (which implements `iceberg::Catalog`)
-    /// for the given session.
-    async fn create_catalog_bridge(&self, session: &Session) -> sqe_core::Result<Arc<dyn Catalog>> {
-        let session_catalog = Arc::new(
-            SessionCatalog::for_session(
-                &self.config,
-                self.table_cache.clone(),
-                session.access_token().expose(),
-            )
-            .await?,
-        );
+    /// for the given session's write target.
+    ///
+    /// `target_warehouse` is the catalog qualifier of a 3-part target
+    /// (`catalog.namespace.table`), or `None` for an unqualified target. When it
+    /// names a non-default catalog and `catalog_discovery = polaris-auto` is on,
+    /// the bridge is built against THAT catalog -- discovered via Polaris with the
+    /// caller's bearer, mirroring the read path's `discover_catalog_provider` --
+    /// instead of the configured default warehouse. Symmetric with the read
+    /// path: an explicit catalog Polaris cannot resolve is an "unknown catalog"
+    /// error, not a silent fall-through to the default warehouse.
+    async fn create_catalog_bridge(
+        &self,
+        session: &Session,
+        target_warehouse: Option<&str>,
+    ) -> sqe_core::Result<Arc<dyn Catalog>> {
+        let session_catalog = match target_warehouse {
+            Some(warehouse)
+                if warehouse != self.config.catalog.warehouse
+                    && self.config.query.catalog_discovery
+                        == sqe_core::config::CatalogDiscovery::PolarisAuto =>
+            {
+                crate::session_context::discover_session_catalog(
+                    warehouse,
+                    &self.config,
+                    session,
+                    self.table_cache.as_ref(),
+                )
+                .await
+                .ok_or_else(|| {
+                    SqeError::Catalog(format!(
+                        "Unknown catalog '{warehouse}': not resolvable via Polaris \
+                         (nonexistent or not authorized for this user)"
+                    ))
+                })?
+            }
+            _ => Arc::new(
+                SessionCatalog::for_session(
+                    &self.config,
+                    self.table_cache.clone(),
+                    session.access_token().expose(),
+                )
+                .await?,
+            ),
+        };
 
         // Warm up the REST catalog by listing namespaces. The RisingWave fork's
         // RestCatalog requires this initial API call to bootstrap its internal

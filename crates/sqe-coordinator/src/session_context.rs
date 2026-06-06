@@ -52,28 +52,8 @@ pub(crate) async fn build_catalog_provider(
     policy_store: Option<&Arc<dyn PolicyStore>>,
     prom_metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
 ) -> Result<(SqeCatalogProvider, Arc<SessionCatalog>), Arc<SqeError>> {
-    let auth = cat_cfg.auth.clone().unwrap_or_default();
-    let bearer = sqe_auth::per_catalog::resolve_bearer(
-        &auth,
-        session.access_token().expose(),
-    )
-    .await
-    .map_err(Arc::new)?;
-    let storage = cat_cfg
-        .storage
-        .clone()
-        .unwrap_or_else(|| global_storage.clone());
-
-    let session_catalog = Arc::new(
-        SessionCatalog::for_session_with(
-            cat_cfg,
-            &storage,
-            table_cache.cloned(),
-            &bearer,
-        )
-        .await
-        .map_err(Arc::new)?,
-    );
+    let (session_catalog, storage) =
+        build_session_catalog(cat_cfg, session, global_storage, table_cache).await?;
 
     let mut catalog_provider = SqeCatalogProvider::try_new_with_policy(
         session_catalog.clone(),
@@ -102,6 +82,42 @@ pub(crate) async fn build_catalog_provider(
     );
 
     Ok((catalog_provider, session_catalog))
+}
+
+/// Resolve the per-catalog bearer + storage and build the iceberg
+/// [`SessionCatalog`] for `cat_cfg`. Shared by [`build_catalog_provider`] (read
+/// path) and [`discover_session_catalog`] (write path) so both resolve auth and
+/// storage identically — keep them on one code path to avoid silent divergence.
+async fn build_session_catalog(
+    cat_cfg: &sqe_core::config::CatalogConfig,
+    session: &Session,
+    global_storage: &sqe_core::config::StorageConfig,
+    table_cache: Option<&TableMetadataCache>,
+) -> Result<(Arc<SessionCatalog>, sqe_core::config::StorageConfig), Arc<SqeError>> {
+    let auth = cat_cfg.auth.clone().unwrap_or_default();
+    let bearer = sqe_auth::per_catalog::resolve_bearer(
+        &auth,
+        session.access_token().expose(),
+    )
+    .await
+    .map_err(Arc::new)?;
+    let storage = cat_cfg
+        .storage
+        .clone()
+        .unwrap_or_else(|| global_storage.clone());
+
+    let session_catalog = Arc::new(
+        SessionCatalog::for_session_with(
+            cat_cfg,
+            &storage,
+            table_cache.cloned(),
+            &bearer,
+        )
+        .await
+        .map_err(Arc::new)?,
+    );
+
+    Ok((session_catalog, storage))
 }
 
 /// Build a DataFusion [`SessionContext`] for the given session.
@@ -595,6 +611,39 @@ pub(crate) async fn discover_catalog_provider(
                 warehouse,
                 error = %e,
                 "catalog discovery: Polaris did not resolve warehouse (treated as unknown catalog)"
+            );
+            None
+        }
+    }
+}
+
+/// Write-path counterpart of [`discover_catalog_provider`]: resolve `warehouse`
+/// as a Polaris catalog and return its [`SessionCatalog`] (the iceberg bridge
+/// used for `load_table` + commit) rather than a `SqeCatalogProvider`. Skips
+/// building the provider so no extra namespace enumeration happens on the write
+/// path. Returns `None` (not an error) when discovery is off, no REST template
+/// exists, or Polaris rejects the warehouse (unauthorized / nonexistent) — same
+/// semantics as [`discover_catalog_provider`], so the caller turns `None` into
+/// the existing "unknown catalog" error.
+pub(crate) async fn discover_session_catalog(
+    warehouse: &str,
+    config: &SqeConfig,
+    session: &Session,
+    table_cache: Option<&TableMetadataCache>,
+) -> Option<Arc<SessionCatalog>> {
+    if config.query.catalog_discovery != sqe_core::config::CatalogDiscovery::PolarisAuto {
+        return None;
+    }
+    let mut cfg = discovery_template(config)?;
+    cfg.warehouse = warehouse.to_string();
+
+    match build_session_catalog(&cfg, session, &config.storage, table_cache).await {
+        Ok((session_catalog, _storage)) => Some(session_catalog),
+        Err(e) => {
+            tracing::info!(
+                warehouse,
+                error = %e,
+                "write-target catalog discovery: Polaris did not resolve warehouse (treated as unknown catalog)"
             );
             None
         }

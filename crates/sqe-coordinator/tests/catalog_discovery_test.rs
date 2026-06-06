@@ -485,3 +485,35 @@ async fn polaris_auto_in_session_reuse() {
         .expect("'label' is Utf8");
     assert_eq!(label_arr.value(0), "discovered");
 }
+
+/// Write into a discovered warehouse: with `catalog_discovery = "polaris-auto"`
+/// and the default `[catalog]` warehouse = `test_warehouse`, an
+/// `INSERT INTO discovery_test_wh.disc_ns.probe_t …` must resolve its target in
+/// the DISCOVERED `discovery_test_wh`, not the default. Before the write-path
+/// fix this failed because `create_catalog_bridge` always used `config.catalog`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn polaris_auto_insert_lands_in_discovered_warehouse() {
+    let _live = LIVE_STACK_LOCK.lock().await;
+    common::init_tracing();
+    seed_discovery_warehouse().await; // discovery_test_wh.disc_ns.probe_t = {(42,"discovered")}
+
+    let config = polaris_auto_config(); // default warehouse = test_warehouse
+    let handler = make_handler(config);
+    let session = live_session().await;
+
+    handler
+        .execute(
+            &session,
+            "INSERT INTO discovery_test_wh.disc_ns.probe_t SELECT 99 as id, 'inserted' as label",
+        )
+        .await
+        .expect("polaris-auto INSERT must resolve the target in the discovered warehouse");
+
+    let batches = handler
+        .execute(&session, "SELECT id FROM discovery_test_wh.disc_ns.probe_t")
+        .await
+        .expect("read back from discovered warehouse");
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 2, "seed row + inserted row both live in discovery_test_wh");
+}
