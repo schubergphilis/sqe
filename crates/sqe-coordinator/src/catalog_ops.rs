@@ -77,7 +77,9 @@ impl CatalogOps {
             "Dropping table"
         );
 
-        let catalog = self.create_catalog_bridge(session).await?;
+        let catalog = self
+            .create_catalog_bridge(session, catalog_qualifier(table_name).as_deref())
+            .await?;
 
         match catalog.drop_table(&table_ident).await {
             Ok(()) => Ok(()),
@@ -126,16 +128,32 @@ impl CatalogOps {
             }
         };
 
-        let namespace = parse_schema_name(schema_name)?;
+        // CREATE SCHEMA `catalog.schema` carries the target catalog as the first
+        // part; peel it off so the namespace is just `schema` and route the
+        // create to that catalog (mirrors the write path for tables). Without
+        // this, dbt's `CREATE SCHEMA ws_team_a.dev_raw` created a `ws_team_a.dev_raw`
+        // two-level namespace in the DEFAULT warehouse, so the later CREATE TABLE
+        // into the discovered `ws_team_a` catalog failed "namespace does not exist".
+        let (target_catalog, namespace) = match schema_name {
+            SchemaName::Simple(obj) | SchemaName::NamedAuthorization(obj, _) => {
+                (schema_catalog_qualifier(obj), namespace_without_catalog(obj)?)
+            }
+            SchemaName::UnnamedAuthorization(ident) => {
+                (None, NamespaceIdent::new(ident.value.clone()))
+            }
+        };
 
         info!(
             username = %session.user.username,
             namespace = ?namespace,
+            target_catalog = ?target_catalog,
             if_not_exists = if_not_exists,
             "Creating schema"
         );
 
-        let catalog = self.create_catalog_bridge(session).await?;
+        let catalog = self
+            .create_catalog_bridge(session, target_catalog.as_deref())
+            .await?;
 
         match catalog
             .create_namespace(&namespace, HashMap::new())
@@ -186,16 +204,20 @@ impl CatalogOps {
             SqeError::Execution("DROP SCHEMA requires at least one schema name".to_string())
         })?;
 
-        let namespace = parse_namespace_from_object_name(schema_name_obj)?;
+        let target_catalog = schema_catalog_qualifier(schema_name_obj);
+        let namespace = namespace_without_catalog(schema_name_obj)?;
 
         info!(
             username = %session.user.username,
             namespace = ?namespace,
+            target_catalog = ?target_catalog,
             if_exists = if_exists,
             "Dropping schema"
         );
 
-        let catalog = self.create_catalog_bridge(session).await?;
+        let catalog = self
+            .create_catalog_bridge(session, target_catalog.as_deref())
+            .await?;
 
         match catalog.drop_namespace(&namespace).await {
             Ok(()) => Ok(()),
@@ -256,14 +278,33 @@ impl CatalogOps {
             parsed_dest
         };
 
+        // Resolve against the SOURCE catalog. Iceberg REST cannot rename across
+        // catalogs, so reject a destination that explicitly names a different
+        // one rather than silently renaming within the source.
+        let target_catalog = catalog_qualifier(source_name);
+        let src_catalog = target_catalog
+            .as_deref()
+            .unwrap_or(self.config.catalog.warehouse.as_str());
+        if let Some(dest_catalog) = catalog_qualifier(dest_obj_name) {
+            if dest_catalog != src_catalog {
+                return Err(SqeError::Execution(format!(
+                    "RENAME across catalogs is not supported: source catalog \
+                     '{src_catalog}', destination catalog '{dest_catalog}'"
+                )));
+            }
+        }
+
         info!(
             username = %session.user.username,
             src = %src_ident,
             dest = %dest_ident,
+            target_catalog = ?target_catalog,
             "Renaming table"
         );
 
-        let catalog = self.create_catalog_bridge(session).await?;
+        let catalog = self
+            .create_catalog_bridge(session, target_catalog.as_deref())
+            .await?;
         catalog
             .rename_table(&src_ident, &dest_ident)
             .await
@@ -1031,19 +1072,54 @@ impl CatalogOps {
     }
 
     /// Create a `SessionCatalogBridge` (which implements `iceberg::Catalog`)
-    /// for the given session.
+    /// for the given session's DDL target.
+    ///
+    /// `target_warehouse` is the catalog qualifier of the statement's target
+    /// (e.g. `ws_team_a` from `DROP TABLE ws_team_a.ns.t` or
+    /// `CREATE SCHEMA ws_team_a.s`), or `None` for an unqualified target. When it
+    /// names a non-default catalog and `catalog_discovery = polaris-auto` is on,
+    /// the bridge is built against THAT catalog -- discovered via Polaris with the
+    /// caller's bearer -- instead of the configured default warehouse. Mirrors
+    /// `WriteHandler::create_catalog_bridge` (MR !285); without it, DDL on a
+    /// workspace catalog silently resolved against the default warehouse.
     async fn create_catalog_bridge(
         &self,
         session: &Session,
+        target_warehouse: Option<&str>,
     ) -> sqe_core::Result<Arc<dyn Catalog>> {
-        let session_catalog = Arc::new(
-            SessionCatalog::for_session(
-                &self.config,
-                self.table_cache.clone(),
-                session.access_token().expose(),
-            )
-            .await?,
-        );
+        let session_catalog = match target_warehouse {
+            Some(warehouse)
+                if warehouse != self.config.catalog.warehouse
+                    && self.config.query.catalog_discovery
+                        == sqe_core::config::CatalogDiscovery::PolarisAuto =>
+            {
+                crate::session_context::discover_session_catalog(
+                    warehouse,
+                    &self.config,
+                    session,
+                    self.table_cache.as_ref(),
+                )
+                .await
+                .ok_or_else(|| {
+                    SqeError::Catalog(format!(
+                        "Unknown catalog '{warehouse}': not resolvable via Polaris \
+                         (nonexistent or not authorized for this user)"
+                    ))
+                })?
+            }
+            _ => Arc::new(
+                SessionCatalog::for_session(
+                    &self.config,
+                    self.table_cache.clone(),
+                    session.access_token().expose(),
+                )
+                .await?,
+            ),
+        };
+
+        // Warm up the REST catalog by listing namespaces (RisingWave fork's
+        // RestCatalog needs an initial API call before load/commit work).
+        let _ = session_catalog.list_namespaces().await;
 
         Ok(session_catalog.as_catalog())
     }
@@ -1112,14 +1188,29 @@ pub(crate) fn catalog_qualifier(name: &ObjectName) -> Option<String> {
     }
 }
 
-/// Parse a sqlparser `SchemaName` into an iceberg `NamespaceIdent`.
-fn parse_schema_name(schema_name: &SchemaName) -> sqe_core::Result<NamespaceIdent> {
-    match schema_name {
-        SchemaName::Simple(name) => parse_namespace_from_object_name(name),
-        SchemaName::UnnamedAuthorization(ident) => {
-            Ok(NamespaceIdent::new(ident.value.clone()))
-        }
-        SchemaName::NamedAuthorization(name, _) => parse_namespace_from_object_name(name),
+/// Extract the catalog qualifier from a 2-part *schema* reference
+/// (`catalog.schema`). Returns `None` for a 1-part bare schema (resolves in the
+/// default warehouse). This is the schema-DDL analogue of [`catalog_qualifier`]:
+/// `CREATE/DROP SCHEMA catalog.schema` is two parts (catalog + namespace),
+/// whereas a table reference is three (catalog + namespace + table).
+pub(crate) fn schema_catalog_qualifier(name: &ObjectName) -> Option<String> {
+    let parts: Vec<&str> = name.0.iter().map(|ident| ident.value.as_str()).collect();
+    match parts.as_slice() {
+        [catalog, _schema] => Some((*catalog).to_string()),
+        _ => None,
+    }
+}
+
+/// Strip a leading catalog qualifier from a 2-part schema `ObjectName`, yielding
+/// the bare namespace. `catalog.schema` -> namespace `schema`; a 1-part name is
+/// returned as-is. Used so `CREATE/DROP SCHEMA catalog.schema` creates/drops the
+/// `schema` namespace in the resolved catalog rather than a `catalog.schema`
+/// two-level namespace in the default warehouse.
+fn namespace_without_catalog(name: &ObjectName) -> sqe_core::Result<NamespaceIdent> {
+    let parts: Vec<String> = name.0.iter().map(|i| i.value.clone()).collect();
+    match parts.as_slice() {
+        [_catalog, schema] => Ok(NamespaceIdent::new(schema.clone())),
+        _ => parse_namespace_from_object_name(name),
     }
 }
 
@@ -1332,6 +1423,40 @@ mod tests {
             Ident::new("d"),
         ]);
         assert_eq!(catalog_qualifier(&name), None);
+    }
+
+    // ─── schema_catalog_qualifier: 2-part catalog.schema ──────────────
+    #[test]
+    fn test_schema_catalog_qualifier_one_part_is_none() {
+        let name = ObjectName(vec![Ident::new("dev_raw")]);
+        assert_eq!(schema_catalog_qualifier(&name), None);
+    }
+
+    #[test]
+    fn test_schema_catalog_qualifier_two_parts_returns_catalog() {
+        let name = ObjectName(vec![Ident::new("ws_team_a"), Ident::new("dev_raw")]);
+        assert_eq!(schema_catalog_qualifier(&name), Some("ws_team_a".to_string()));
+    }
+
+    #[test]
+    fn test_schema_catalog_qualifier_three_parts_is_none() {
+        let name = ObjectName(vec![Ident::new("a"), Ident::new("b"), Ident::new("c")]);
+        assert_eq!(schema_catalog_qualifier(&name), None);
+    }
+
+    // ─── namespace_without_catalog: peel the catalog off catalog.schema ──
+    #[test]
+    fn test_namespace_without_catalog_strips_catalog() {
+        let name = ObjectName(vec![Ident::new("ws_team_a"), Ident::new("dev_raw")]);
+        let ns = namespace_without_catalog(&name).unwrap();
+        assert_eq!(ns, NamespaceIdent::new("dev_raw".to_string()));
+    }
+
+    #[test]
+    fn test_namespace_without_catalog_one_part_unchanged() {
+        let name = ObjectName(vec![Ident::new("dev_raw")]);
+        let ns = namespace_without_catalog(&name).unwrap();
+        assert_eq!(ns, NamespaceIdent::new("dev_raw".to_string()));
     }
 
     // ─── Error discriminator tests ────────────────────────────────
