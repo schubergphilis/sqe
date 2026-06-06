@@ -900,31 +900,26 @@ mod tests {
     /// V5 `WritableIcebergCatalog` write path: every operation goes
     /// through DataFusion's SQL surface, no out-of-band bootstrap.
     //
-    // #195 diagnostic: previously `#[ignore]`d because it timed out the
-    // `cargo-test` job at 1h on a Linux runner. The original "reopen
-    // deadlock" hypothesis was not confirmed. Each phase is now wrapped in
-    // a hard per-phase timeout so a hang fails fast (with the offending
-    // phase named) instead of stalling the whole job for an hour, and the
-    // phase timings are printed. This lets the actual Linux runner pinpoint
-    // where (if anywhere) it still hangs on the current tree.
+    // #195: this was `#[ignore]`d after it timed out the `cargo-test` job at the
+    // 1h limit on a Linux runner. The original "SQLite reopen deadlock" hypothesis
+    // was never confirmed; the hang no longer reproduces on the current tree
+    // (verified green on the Linux runner via MR !284). Each phase is wrapped in a
+    // hard timeout so that if a regression ever reintroduces a stall, the test
+    // fails fast naming the offending phase instead of burning the 1h CI limit.
     #[tokio::test]
     async fn persistent_warehouse_survives_client_restart() {
-        use std::time::{Duration, Instant};
-        // Run `fut`, panicking (failing the test fast) if it doesn't finish
-        // within `secs`. Bounds the job so a hang can't burn the 1h CI limit.
+        use std::time::Duration;
+        // Run `fut`, failing the test fast if it doesn't finish within `secs`,
+        // so a hang can never stall the whole `cargo-test` job for an hour.
         async fn bounded<F: std::future::Future>(phase: &str, secs: u64, fut: F) -> F::Output {
             match tokio::time::timeout(Duration::from_secs(secs), fut).await {
                 Ok(v) => v,
-                Err(_) => panic!(
-                    "#195 diagnostic: phase '{phase}' did not complete within {secs}s \
-                     (hang reproduced on this runner)"
-                ),
+                Err(_) => panic!("#195 guard: phase '{phase}' did not complete within {secs}s"),
             }
         }
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let mode = WarehouseMode::single(tmp.path().to_path_buf());
-        let t = Instant::now();
 
         // Phase 1: create namespace + table via SQL.
         {
@@ -932,11 +927,9 @@ mod tests {
                 bounded("phase1_open", 90, EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode))
                     .await
                     .expect("first client");
-            eprintln!("#195 t={:?} phase1 client built", t.elapsed());
             bounded("create_schema", 90, c.execute("CREATE SCHEMA iceberg.test_ns"))
                 .await
                 .expect("CREATE SCHEMA");
-            eprintln!("#195 t={:?} schema created", t.elapsed());
             bounded(
                 "create_table",
                 90,
@@ -944,9 +937,7 @@ mod tests {
             )
             .await
             .expect("CREATE TABLE");
-            eprintln!("#195 t={:?} table created", t.elapsed());
         }
-        eprintln!("#195 t={:?} phase1 client dropped", t.elapsed());
 
         // Phase 2: build the embedded client, confirm the iceberg
         // catalog is registered and the namespace + table are visible
@@ -955,7 +946,6 @@ mod tests {
             bounded("phase2_open", 90, EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode))
                 .await
                 .expect("client builds against existing warehouse");
-        eprintln!("#195 t={:?} phase2 client built", t.elapsed());
         let r = bounded(
             "phase2_query",
             90,
@@ -968,7 +958,6 @@ mod tests {
         )
         .await
         .expect("information_schema.tables");
-        eprintln!("#195 t={:?} phase2 query done", t.elapsed());
         assert_eq!(r.columns, vec!["table_schema".to_string(), "table_name".to_string()]);
         // The iceberg-datafusion bridge exposes the user table plus
         // metadata pseudo-tables ($snapshots, $manifests). We only
