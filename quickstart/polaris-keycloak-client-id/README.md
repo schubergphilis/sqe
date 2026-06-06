@@ -20,14 +20,17 @@ your clients already hold a token and just want SQE to accept it, see the
 
 ## What you get
 
-`docker compose up` starts five things on one network:
+`docker compose up` starts these on one network (three long-running services
+plus three one-shot setup jobs and the engine):
 
 | Service | Image | Role |
 |---|---|---|
-| `keycloak` | `quay.io/keycloak/keycloak:26.5.4` | Identity provider. Imports the `iceberg` realm with one confidential client and three users. |
+| `keycloak` | `quay.io/keycloak/keycloak:26.5.4` | Identity provider. |
+| `keycloak-config` | `adorsys/keycloak-config-cli` | One-shot: imports the `iceberg` realm (one confidential client, three users), then exits. |
 | `rustfs` | `rustfs/rustfs` | S3-compatible object store. The Iceberg warehouse lives here. No MinIO. |
+| `bucket-init` | `amazon/aws-cli` | One-shot: creates the `warehouse` bucket (RustFS does not auto-create), then exits. |
 | `polaris` | `apache/polaris:1.5.0` | Iceberg REST catalog, federated to Keycloak (validates the tokens SQE forwards). |
-| `polaris-setup` | one-shot | Creates the catalog, the RBAC chain, the OIDC principals, and the `demo` namespace. |
+| `polaris-setup` | `curlimages/curl` | One-shot: creates the catalog, the RBAC chain, the OIDC principals, and the `demo` namespace, then exits. |
 | `sqe` | built from this repo | The query engine. Flight SQL on 50051, Trino-compat HTTP on 8080. |
 
 Everything addresses everything else by its in-network name (`keycloak:8080`,
@@ -201,11 +204,11 @@ Two layers, both run from a clean state:
 
 1. **The demo path** above: `run.sh` asserts the queries succeed for two users
    with different roles and captures the output.
-2. **The repo's gated integration tests** in
-   `crates/sqe-coordinator/tests/integration_test.rs` (`test_keycloak_auth_with_test_users`,
-   `test_keycloak_token_refresh`). They authenticate `adminuser` / `testuser`
-   against this exact realm, check the roles, and confirm a wrong password is
-   rejected. Run them with:
+2. **The repo's gated integration tests**: the `test_keycloak_*` tests in the
+   `sqe-coordinator` integration suite (`integration_test.rs`) (specifically
+   `test_keycloak_auth_with_test_users` and `test_keycloak_token_refresh`).
+   They authenticate `adminuser` / `testuser` against this exact realm, check
+   the roles, and confirm a wrong password is rejected. Run them with:
 
    ```bash
    ./run.sh --with-tests        # needs a Rust toolchain
@@ -229,3 +232,6 @@ Two layers, both run from a clean state:
 - **In-memory persistence**: Keycloak (`start-dev`) and Polaris run in-memory,
   so the realm and catalog are rebuilt on every fresh `up`. That is deliberate
   for a quickstart. For anything durable, back both with Postgres.
+- **Iterating on the engine?** `.env` pins `SQE_IMAGE`, so a plain
+  `docker compose up` reuses the already-built image. To pick up SQE source
+  changes, rebuild explicitly: `docker compose up -d --build sqe`.
