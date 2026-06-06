@@ -60,7 +60,7 @@ validated from a clean state.
 
 | Quickstart | What it shows | Status |
 |---|---|---|
-| `s3-tables` | AWS S3 Tables (managed Iceberg). CDK stack to create + destroy the test resources | planned |
+| [`aws-s3-tables`](./aws-s3-tables/) | AWS S3 Tables (managed Iceberg). CDK bootstrap + teardown; SQE creates the namespace | **validated 2026-06-06** |
 | `glue` | AWS Glue Data Catalog. CDK bootstrap + teardown | planned |
 | `glue-lake-formation` | Glue with Lake Formation fine-grained access. CDK bootstrap + teardown | planned |
 
