@@ -72,7 +72,7 @@ validated from a clean state.
 | `embedded-sqlite-catalog` | Local persistent Iceberg catalog backed by SQLite | planned |
 | `quack-server` | The Quack protocol server | planned |
 | `quack-client` | The Quack protocol client | planned |
-| `attach-catalogs` | Attaching multiple catalogs / cloud backends in embedded mode | planned |
+| [`attach-catalogs`](./attach-catalogs/) | Attach multiple persistent catalogs in embedded mode + cross-catalog JOIN | **validated 2026-06-06** |
 
 ### D. Operations
 
