@@ -169,7 +169,9 @@ impl MaintenanceHandler {
         table_ref: &TableRef,
         metadata_location: &str,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let catalog = self.create_catalog_bridge(session).await?;
+        let catalog = self
+            .create_catalog_bridge(session, table_ref.catalog.as_deref())
+            .await?;
         let ident = to_table_ident(table_ref);
 
         info!(
@@ -238,7 +240,9 @@ impl MaintenanceHandler {
             ));
         }
 
-        let catalog = self.create_catalog_bridge(session).await?;
+        let catalog = self
+            .create_catalog_bridge(session, table_ref.catalog.as_deref())
+            .await?;
         let ident = to_table_ident(table_ref);
 
         info!(
@@ -380,7 +384,9 @@ impl MaintenanceHandler {
         let max_concurrent =
             max_concurrent_file_group_rewrites.unwrap_or(DEFAULT_MAX_CONCURRENT_GROUPS);
 
-        let catalog = self.create_catalog_bridge(session).await?;
+        let catalog = self
+            .create_catalog_bridge(session, table_ref.catalog.as_deref())
+            .await?;
         let ident = to_table_ident(table_ref);
         let table = load_table(&catalog, &ident).await?;
 
@@ -611,7 +617,9 @@ impl MaintenanceHandler {
         older_than_ms: Option<i64>,
         retain_last: Option<usize>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let catalog = self.create_catalog_bridge(session).await?;
+        let catalog = self
+            .create_catalog_bridge(session, table_ref.catalog.as_deref())
+            .await?;
         let ident = to_table_ident(table_ref);
         let table = load_table(&catalog, &ident).await?;
 
@@ -668,7 +676,9 @@ impl MaintenanceHandler {
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         const DEFAULT_OLDER_THAN_DAYS: i64 = 3;
 
-        let catalog = self.create_catalog_bridge(session).await?;
+        let catalog = self
+            .create_catalog_bridge(session, table_ref.catalog.as_deref())
+            .await?;
         let ident = to_table_ident(table_ref);
         let table = load_table(&catalog, &ident).await?;
 
@@ -705,7 +715,9 @@ impl MaintenanceHandler {
         session: &Session,
         table_ref: &TableRef,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let catalog = self.create_catalog_bridge(session).await?;
+        let catalog = self
+            .create_catalog_bridge(session, table_ref.catalog.as_deref())
+            .await?;
         let ident = to_table_ident(table_ref);
         let table = load_table(&catalog, &ident).await?;
 
@@ -766,7 +778,9 @@ impl MaintenanceHandler {
         namespace: &NamespaceRef,
         dry_run: bool,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let catalog = self.create_catalog_bridge(session).await?;
+        let catalog = self
+            .create_catalog_bridge(session, namespace.catalog.as_deref())
+            .await?;
         let ns_ident = NamespaceIdent::new(namespace.namespace.clone());
 
         let table_idents = catalog.list_tables(&ns_ident).await.map_err(|e| {
@@ -927,18 +941,48 @@ impl MaintenanceHandler {
         Ok(vec![batch])
     }
 
+    /// Build the iceberg catalog bridge for a maintenance op's target.
+    ///
+    /// `target_warehouse` is the target's catalog qualifier (`TableRef.catalog` /
+    /// `NamespaceRef.catalog`), or `None` when unqualified. When it names a
+    /// non-default catalog and `catalog_discovery = polaris-auto` is on, resolve
+    /// THAT catalog via Polaris instead of the default warehouse -- so DROP and
+    /// the maintenance procedures act on the workspace catalog the caller named.
+    /// Mirrors `WriteHandler::create_catalog_bridge` (MR !285).
     async fn create_catalog_bridge(
         &self,
         session: &Session,
+        target_warehouse: Option<&str>,
     ) -> sqe_core::Result<Arc<dyn Catalog>> {
-        let session_catalog = Arc::new(
-            SessionCatalog::for_session(
-                &self.config,
-                self.table_cache.clone(),
-                session.access_token().expose(),
-            )
-            .await?,
-        );
+        let session_catalog = match target_warehouse {
+            Some(warehouse)
+                if warehouse != self.config.catalog.warehouse
+                    && self.config.query.catalog_discovery
+                        == sqe_core::config::CatalogDiscovery::PolarisAuto =>
+            {
+                crate::session_context::discover_session_catalog(
+                    warehouse,
+                    &self.config,
+                    session,
+                    self.table_cache.as_ref(),
+                )
+                .await
+                .ok_or_else(|| {
+                    SqeError::Catalog(format!(
+                        "Unknown catalog '{warehouse}': not resolvable via Polaris \
+                         (nonexistent or not authorized for this user)"
+                    ))
+                })?
+            }
+            _ => Arc::new(
+                SessionCatalog::for_session(
+                    &self.config,
+                    self.table_cache.clone(),
+                    session.access_token().expose(),
+                )
+                .await?,
+            ),
+        };
         let _ = session_catalog.list_namespaces().await;
         Ok(session_catalog.as_catalog())
     }

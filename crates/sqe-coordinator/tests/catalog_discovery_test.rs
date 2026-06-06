@@ -517,3 +517,47 @@ async fn polaris_auto_insert_lands_in_discovered_warehouse() {
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 2, "seed row + inserted row both live in discovery_test_wh");
 }
+
+/// CatalogOps DDL into a discovered (polaris-auto) warehouse: CREATE SCHEMA +
+/// CREATE TABLE + DROP TABLE must all resolve to the DISCOVERED `discovery_test_wh`,
+/// not the default. Before this fix, CatalogOps::create_catalog_bridge always used
+/// the default warehouse, so `CREATE SCHEMA ws.x` landed in the default and
+/// `DROP TABLE ws.x.t` reported "table does not exist".
+#[tokio::test(flavor = "multi_thread")]
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn polaris_auto_ddl_resolves_discovered_warehouse() {
+    let _live = LIVE_STACK_LOCK.lock().await;
+    common::init_tracing();
+    seed_discovery_warehouse().await;
+
+    let config = polaris_auto_config(); // default warehouse = test_warehouse
+    let handler = make_handler(config);
+    let session = live_session().await;
+
+    // CREATE SCHEMA into the discovered catalog (the dbt `create_schema` path).
+    handler
+        .execute(&session, "CREATE SCHEMA IF NOT EXISTS discovery_test_wh.ddl_ns")
+        .await
+        .expect("CREATE SCHEMA must create the namespace in the discovered warehouse");
+
+    // CREATE TABLE into that freshly-created namespace must succeed (the dbt seed
+    // failure was "namespace does not exist" because the schema landed elsewhere).
+    handler
+        .execute(
+            &session,
+            "CREATE TABLE discovery_test_wh.ddl_ns.t AS SELECT 1 AS x",
+        )
+        .await
+        .expect("CREATE TABLE into the discovered-warehouse namespace must succeed");
+
+    // DROP TABLE must resolve to the same discovered catalog (CatalogOps routing).
+    handler
+        .execute(&session, "DROP TABLE discovery_test_wh.ddl_ns.t")
+        .await
+        .expect("DROP TABLE must resolve the target in the discovered warehouse");
+
+    handler
+        .execute(&session, "DROP SCHEMA discovery_test_wh.ddl_ns")
+        .await
+        .expect("DROP SCHEMA must resolve the target in the discovered warehouse");
+}
