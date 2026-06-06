@@ -52,7 +52,7 @@ validated from a clean state.
 | Quickstart | What it shows | Status |
 |---|---|---|
 | [`polaris-keycloak-client-id`](./polaris-keycloak-client-id/) | Polaris + Keycloak; SQE mints user tokens via the OIDC password grant (client credentials) | **validated 2026-06-06** |
-| `polaris-keycloak-user-token` | Same stack; clients bring a pre-minted Keycloak token (`--token`), SQE validates + passes it through | planned |
+| [`polaris-keycloak-user-token`](./polaris-keycloak-user-token/) | Same stack; clients bring a pre-minted Keycloak token (`--token`), SQE validates + passes it through | **validated 2026-06-06** |
 | `nessie` | Project Nessie as the Iceberg REST catalog | planned |
 | `rest-catalogs` | Other Iceberg REST catalogs (Unity OSS, generic REST) | planned |
 
