@@ -1,0 +1,54 @@
+# SQE config for the Unity Catalog OSS quickstart (read-only).
+# Anonymous auth (Unity OSS has auth disabled); rest catalog pointed at Unity's
+# Iceberg REST mount. See README for Unity's read-only limitation.
+
+[coordinator]
+flight_sql_port = 50051
+trino_http_port = 8080
+mode = "hybrid"
+flight_compression = "none"
+
+[worker]
+memory_limit = "4GB"
+spill_dir = "/tmp/sqe-spill"
+
+[auth]
+keycloak_url = ""
+realm = ""
+client_id = ""
+client_secret = ""
+ssl_verification = false
+
+[[auth.providers]]
+type = "anonymous"
+user = "anonymous"
+roles = ["admin"]
+
+# Unity's catalog name is its "warehouse"; the Iceberg REST mount lives under
+# /api/2.1/unity-catalog/iceberg.
+[catalogs.unity]
+polaris_url = "http://unity:8080/api/2.1/unity-catalog/iceberg"
+warehouse = "unity"
+metadata_cache_ttl_secs = 30
+default_table_format_version = 2
+
+[catalog]
+polaris_url = "http://unity:8080/api/2.1/unity-catalog/iceberg"
+warehouse = "unity"
+
+[storage]
+s3_endpoint = "http://localhost:9000"
+s3_region = "us-east-1"
+s3_access_key = "unused"
+s3_secret_key = "unused"
+s3_path_style = true
+s3_allow_http = true
+
+[policy]
+engine = "passthrough"
+
+[session]
+idle_timeout_secs = 900
+
+[metrics]
+prometheus_port = 9090
