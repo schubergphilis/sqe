@@ -1,5 +1,11 @@
 # Use Cases
 
+> **Want to run one, not just read about it?** The `quickstart/` directory in
+> the repo has self-contained, validated quickstarts you can `docker compose up`
+> and run end to end, each with captured output. These pages are the conceptual
+> narrative; the quickstarts are the runnable source of truth. Start with
+> `quickstart/polaris-keycloak-client-id`.
+
 This section is a set of runbooks. Each page takes one way of deploying or
 connecting to SQE and walks it end to end: what it is, what you need running,
 the config, the exact commands, and the output you should see. Each recipe is
