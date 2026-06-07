@@ -1,0 +1,104 @@
+# SQE quickstart: Project Nessie (Iceberg REST catalog).
+#
+# Nessie speaks the Iceberg REST protocol, the same surface Polaris exposes, so
+# SQE talks to it through the exact same `rest` catalog code path. This stack
+# has no identity provider: Nessie runs auth-less and SQE uses its `anonymous`
+# auth provider (dev mode). The point of this quickstart is the catalog, not
+# auth (auth is covered by the polaris-keycloak-* quickstarts).
+#
+#   cp .env.example .env
+#   docker compose up -d --wait
+#   ./run.sh
+
+services:
+  # ── RustFS — S3-compatible object store (the warehouse) ───────────────
+  rustfs:
+    image: rustfs/rustfs:1.0.0-alpha.89
+    environment:
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:-s3admin}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:-s3adminpw}
+    volumes:
+      - rustfs-data:/data
+    ports:
+      - "${RUSTFS_PORT:-19000}:9000"
+      - "${RUSTFS_CONSOLE_PORT:-19001}:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  # ── bucket-init — create the warehouse bucket (RustFS needs real S3) ──
+  bucket-init:
+    image: amazon/aws-cli:2.31.15
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        aws s3api head-bucket --bucket warehouse --endpoint-url http://rustfs:9000 2>/dev/null \
+          || aws s3 mb s3://warehouse --endpoint-url http://rustfs:9000
+        echo "bucket ready"
+    environment:
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-s3admin}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-s3adminpw}
+    restart: "no"
+    depends_on:
+      rustfs:
+        condition: service_healthy
+
+  # ── Nessie — the Iceberg REST catalog ─────────────────────────────────
+  # In-memory version store (nothing persists across `down`). The Iceberg REST
+  # surface is mounted at /iceberg; storage points at RustFS.
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.107.5
+    environment:
+      NESSIE_VERSION_STORE_TYPE: IN_MEMORY
+      QUARKUS_HTTP_PORT: "19120"
+      NESSIE_CATALOG_DEFAULT_WAREHOUSE: warehouse
+      NESSIE_CATALOG_WAREHOUSES_WAREHOUSE_LOCATION: s3://warehouse/
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ENDPOINT: http://rustfs:9000
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_PATH_STYLE_ACCESS: "true"
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_REGION: us-east-1
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ACCESS_KEY: urn:nessie-secret:quarkus:nessie.catalog.secrets.s3
+      NESSIE_CATALOG_SECRETS_S3_NAME: ${S3_ACCESS_KEY:-s3admin}
+      NESSIE_CATALOG_SECRETS_S3_SECRET: ${S3_SECRET_KEY:-s3adminpw}
+    ports:
+      - "${NESSIE_PORT:-19120}:19120"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:19120/api/v2/config || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+    depends_on:
+      bucket-init:
+        condition: service_completed_successfully
+
+  # ── SQE — the query engine ────────────────────────────────────────────
+  sqe:
+    image: ${SQE_IMAGE:-sqe-quickstart:latest}
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["--config", "/etc/sqe/sqe.toml"]
+    environment:
+      RUST_LOG: "info,sqe_catalog=debug"
+    volumes:
+      - ./sqe.toml:/etc/sqe/sqe.toml:ro
+    ports:
+      - "${SQE_FLIGHT_PORT:-60051}:50051"
+      - "${SQE_TRINO_PORT:-18080}:8080"
+      - "${SQE_QUACK_PORT:-19494}:9494"   # DuckDB Quack RPC endpoint
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9091/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    depends_on:
+      nessie:
+        condition: service_healthy
+
+volumes:
+  rustfs-data:
