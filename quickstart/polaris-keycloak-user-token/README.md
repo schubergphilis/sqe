@@ -43,6 +43,12 @@ no `client_secret` and no call to Keycloak's token endpoint. `issuer` must match
 the token's `iss` claim exactly, which is why the stack fixes
 `KC_HOSTNAME=http://keycloak:8080`.
 
+## Prerequisites
+
+Docker (with Compose v2). Same stack as
+[`polaris-keycloak-client-id`](../polaris-keycloak-client-id/); see its
+Prerequisites for the full list.
+
 ## Run it
 
 ```bash
