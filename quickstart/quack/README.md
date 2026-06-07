@@ -1,18 +1,25 @@
 ---
 slug: quack
 title: "Quack: the DuckDB wire protocol"
-description: "Enable SQE's DuckDB Quack RPC endpoint so a DuckDB client can query SQE as if it were a local database. run.sh probes the server, then runs a real round-trip: a DuckDB 1.5.3 CLI queries an SQE Iceberg table over Quack."
+description: "SQE speaks DuckDB's Quack RPC protocol both ways: as a server (a DuckDB CLI queries SQE) and as a client (SQE's quack_query() pulls from a remote Quack endpoint). run.sh proves the forward round-trip with a local DuckDB 1.5.3; the reverse is documented and verified."
 ---
 
 # Quack: the DuckDB wire protocol
 
 Quack is DuckDB's RPC protocol. A DuckDB client can `ATTACH 'quack:host:port'`
-and query a remote engine as though it were a local database. SQE implements the
-server side, so a DuckDB client can run queries against SQE's catalogs over Quack.
+and query a remote engine as though it were a local database.
 
-This quickstart turns the Quack endpoint on, proves the server speaks it, and --
-if a quack-capable DuckDB CLI is on your PATH -- runs a real round-trip where a
-DuckDB client queries an SQE Iceberg table over Quack.
+SQE speaks Quack **both ways**:
+
+- **As a server** -- a DuckDB client queries SQE's catalogs over Quack
+  (`coordinator.quack_port`).
+- **As a client** -- SQE's `quack_query()` table function pulls rows from a
+  remote Quack endpoint (another SQE, or a DuckDB running `quack_serve`).
+
+`run.sh` turns the server on, proves it with the `GET /` probe, and -- if a
+quack-capable DuckDB CLI is on your PATH -- runs the forward round-trip (DuckDB
+querying an SQE Iceberg table). The reverse direction (SQE as the client) is a
+manual demo documented below.
 
 ## Status: working, but pre-release
 
@@ -103,6 +110,51 @@ let result = client.execute("SELECT 1 AS one")?;
 
 The DuckDB-to-Iceberg type mapping is in `docs/quack-datatype-matrix.md`; the
 wire reference is in `docs/quack-protocol.md`.
+
+## SQE as a Quack client (the reverse direction)
+
+The same `quack_query()` table function is registered on every SQE session, so
+SQE can be the *client*: it pulls rows from a remote Quack endpoint inline. That
+remote can be a DuckDB instance running `quack_serve`. Point a DuckDB at SQE and
+SQE at DuckDB and you have federation in both directions over one protocol.
+
+Start a DuckDB Quack server on the host (it returns immediately after spawning
+its background listener, so keep the process alive):
+
+```bash
+# 1-3 colors, served on 0.0.0.0:9495 with a static token, plaintext.
+{ printf "INSTALL quack FROM core_nightly; LOAD quack;
+  CREATE TABLE colors AS SELECT * FROM (VALUES (1,'red'),(2,'green'),(3,'blue')) t(id,name);
+  CALL quack_serve('quack:0.0.0.0:9495', disable_ssl := true, allow_other_hostname := true, token := 'sqe-token');
+"; sleep 600; } | duckdb :memory:
+```
+
+Then, from SQE (over Flight), run `quack_query()` against it. SQE in the
+container reaches the host server at `host.docker.internal` (Docker Desktop; on
+Linux add `extra_hosts: ["host.docker.internal:host-gateway"]` to the `sqe`
+service, or run DuckDB as a sidecar and use its service name):
+
+```bash
+docker compose exec -T -e SQE_PASSWORD=anonymous sqe sqe-cli --port 50051 --user anonymous \
+  -e "SELECT * FROM quack_query('quack:host.docker.internal:9495', 'sqe-token', 'SELECT id, name FROM colors ORDER BY id')"
+```
+
+Verified 2026-06-07 (SQE pulling from a duckdb 1.5.3 server):
+
+```
++----+-------+
+| id | name  |
++----+-------+
+| 1  | red   |
+| 2  | green |
+| 3  | blue  |
++----+-------+
+```
+
+Note the `quack_serve` argument shape: the first positional is a `quack:` URI;
+`disable_ssl`, `allow_other_hostname`, and `token` are **named** parameters
+(`name := value`). SQE's client uses plain HTTP for any `quack:` URI (only
+`quacks:` is TLS), which is why `disable_ssl := true` is required here.
 
 ## Security: read before exposing the port
 
