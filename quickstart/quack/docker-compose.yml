@@ -1,10 +1,10 @@
-# SQE quickstart: Project Nessie (Iceberg REST catalog).
+# SQE quickstart: Quack (DuckDB RPC protocol).
 #
-# Nessie speaks the Iceberg REST protocol, the same surface Polaris exposes, so
-# SQE talks to it through the exact same `rest` catalog code path. This stack
-# has no identity provider: Nessie runs auth-less and SQE uses its `anonymous`
-# auth provider (dev mode). The point of this quickstart is the catalog, not
-# auth (auth is covered by the polaris-keycloak-* quickstarts).
+# SQE runs with the DuckDB Quack RPC endpoint enabled (coordinator.quack_port =
+# 9494). The catalog underneath is auth-less Nessie over RustFS (anonymous SQE,
+# dev mode) -- the focus here is the Quack endpoint, not the catalog. Quack is a
+# pre-release DuckDB protocol; run.sh validates the server side (GET / probe).
+# See the README "Status" section for the client side and the caveats.
 #
 #   cp .env.example .env
 #   docker compose up -d --wait
