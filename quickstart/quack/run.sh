@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# Quack quickstart: bring SQE up with the DuckDB Quack RPC endpoint enabled and
-# prove the server speaks Quack (the `GET /` identification probe). Quack is a
-# pre-release DuckDB protocol; a full client round-trip needs a quack-capable
-# DuckDB build, so this run.sh validates the SERVER side and the README documents
-# how a client attaches. See the README "Status" section.
+# Quack quickstart: bring SQE up with the DuckDB Quack RPC endpoint enabled,
+# prove the server speaks Quack (the `GET /` probe), then -- if a quack-capable
+# DuckDB CLI is on PATH -- run a real client round-trip: a DuckDB client queries
+# an Iceberg table through SQE over the Quack protocol.
 #
-#   ./run.sh             # up -> GET / identification probe -> capture
+#   ./run.sh             # up -> GET / probe -> (DuckDB round-trip if available) -> capture
 #   ./run.sh --down      # tear everything down
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -22,7 +21,8 @@ require docker curl
 [ -f .env ] || { [ -f .env.example ] && cp .env.example .env; }
 # shellcheck disable=SC1091
 [ -f .env ] && { set -a; . ./.env; set +a; }
-QUACK="http://localhost:${SQE_QUACK_PORT:-19494}"
+QUACK_PORT="${SQE_QUACK_PORT:-19494}"
+QUACK="http://localhost:${QUACK_PORT}"
 
 step "bringing the stack up (rustfs, nessie, sqe with quack_port=9494)"
 docker compose up -d --wait
@@ -33,6 +33,34 @@ IDENT="$(curl -fsS -m 5 "$QUACK/" || true)"
 [ -n "$IDENT" ] || die "GET $QUACK/ returned nothing -- is the Quack port exposed?"
 echo "$IDENT"
 ok "the server identifies as a DuckDB Quack endpoint"
+
+sqe_exec() { docker compose exec -T -e SQE_PASSWORD=anonymous sqe \
+  sqe-cli --port 50051 --user anonymous --stop-on-error -e "$1" >/dev/null 2>&1; }
+
+# Real client round-trip, when a quack-capable DuckDB CLI is available. The Quack
+# protocol + its DuckDB extension are pre-release: this needs duckdb 1.5.3+ and
+# `INSTALL quack FROM core_nightly` (which fetches the extension over the net).
+ROUNDTRIP=""
+if command -v duckdb >/dev/null 2>&1; then
+  step "DuckDB client round-trip (duckdb $(duckdb --version | awk '{print $1}'))"
+  step "  seeding an Iceberg table in SQE (nessie.demo.events)"
+  sqe_exec "CREATE SCHEMA IF NOT EXISTS nessie.demo"
+  sqe_exec "CREATE TABLE IF NOT EXISTS nessie.demo.events (id BIGINT, kind VARCHAR, amount DOUBLE)"
+  sqe_exec "INSERT INTO nessie.demo.events VALUES (1,'click',1.5),(2,'purchase',42.0),(3,'click',0.75),(4,'purchase',13.25)"
+  # The anonymous provider accepts any non-empty token; CREATE SECRET supplies it.
+  ROUNDTRIP="$(duckdb -c "
+    INSTALL quack FROM core_nightly; LOAD quack;
+    CREATE SECRET (TYPE quack, TOKEN 'anonymous');
+    SELECT kind, COUNT(*) AS n, ROUND(SUM(amount),2) AS total
+    FROM quack_query('quack:localhost:${QUACK_PORT}', 'SELECT kind, amount FROM nessie.demo.events')
+    GROUP BY kind ORDER BY total DESC;
+  " 2>&1 || true)"
+  echo "$ROUNDTRIP"
+  ok "DuckDB queried an SQE Iceberg table over Quack"
+else
+  warn "duckdb not on PATH -- skipping the client round-trip (server probe still passed)."
+  echo "    Install duckdb 1.5.3+ and re-run to see a DuckDB client query SQE over Quack."
+fi
 
 OUT=OUTPUT.md
 step "capturing to $OUT"
@@ -47,14 +75,20 @@ step "capturing to $OUT"
   echo "$IDENT"
   echo '```'
   echo
+  if [ -n "$ROUNDTRIP" ]; then
+    echo '## A DuckDB CLI queries an SQE Iceberg table over Quack'
+    echo
+    echo 'DuckDB connects to `quack:localhost:'"${QUACK_PORT}"'`, runs `quack_query()` against'
+    echo 'SQE (which reads the table from the Nessie catalog + S3), and aggregates the result:'
+    echo '```'
+    echo "$ROUNDTRIP"
+    echo '```'
+    echo
+  fi
   echo '## SQE logs on startup (Quack enabled, with its security warnings)'
   echo '```'
   docker compose logs sqe 2>&1 | grep -iE 'Quack' | sed -E 's/.*"message":"([^"]*)".*/\1/' | head -5
   echo '```'
-  echo
-  echo "A full client round-trip (a DuckDB client running queries) needs a"
-  echo "quack-capable DuckDB build; see the README. The server side is what this"
-  echo "run validates: the endpoint is up and speaks Quack."
 } | tee "$OUT"
 ok "captured to $OUT"
 echo
