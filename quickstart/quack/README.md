@@ -1,35 +1,48 @@
 ---
 slug: quack
 title: "Quack: the DuckDB wire protocol"
-description: "Enable SQE's DuckDB Quack RPC endpoint so a DuckDB client can query SQE as if it were a local database. Quack is a pre-release DuckDB protocol; this quickstart validates the server side and documents how a client attaches."
+description: "SQE speaks DuckDB's Quack RPC protocol both ways: as a server (a DuckDB CLI queries SQE) and as a client (SQE's quack_query() pulls from a remote Quack endpoint). run.sh proves the forward round-trip with a local DuckDB 1.5.3; the reverse is documented and verified."
 ---
 
 # Quack: the DuckDB wire protocol
 
 Quack is DuckDB's RPC protocol. A DuckDB client can `ATTACH 'quack:host:port'`
-and query a remote engine as though it were a local database. SQE implements the
-server side, so a DuckDB client can run queries against SQE's catalogs over Quack.
+and query a remote engine as though it were a local database.
 
-This quickstart turns the Quack endpoint on and proves the server speaks it.
+SQE speaks Quack **both ways**:
 
-## Status: experimental (server enablement)
+- **As a server** -- a DuckDB client queries SQE's catalogs over Quack
+  (`coordinator.quack_port`).
+- **As a client** -- SQE's `quack_query()` table function pulls rows from a
+  remote Quack endpoint (another SQE, or a DuckDB running `quack_serve`).
 
-Read this first. Quack is **pre-release upstream** (DuckDB plans to stabilize it
-around v2.0), and that shapes what this quickstart can honestly claim:
+`run.sh` turns the server on, proves it with the `GET /` probe, and -- if a
+quack-capable DuckDB CLI is on your PATH -- runs the forward round-trip (DuckDB
+querying an SQE Iceberg table). The reverse direction (SQE as the client) is a
+manual demo documented below.
 
-- **What `run.sh` validates:** SQE starts with the Quack endpoint enabled and
-  answers the `GET /` identification probe. That is the server side.
-- **What it does not run:** a full client round-trip (a DuckDB client executing
-  queries). The client side needs a *quack-capable DuckDB build* (the protocol is
-  not in stock DuckDB releases), and SQE's own `sqe-quack-client` is a Rust
-  library, not a standalone CLI. So there is no clean, image-only client to drive
-  here. The end-to-end path is covered by the engine's test suite instead (see
-  "How it is tested").
+## Status: working, but pre-release
 
-So this is **one** quickstart, not the separate `quack-server` + `quack-client`
-pair on the roadmap: the client has no runnable of its own to ship as a quickstart.
-A small `sqe-quack-client` CLI would make a true round-trip demo possible; that is
-a potential follow-up, tracked separately from this docs work.
+Quack is **pre-release upstream** (DuckDB plans to stabilize it around v2.0), and
+the DuckDB client extension ships from the `core_nightly` repository. The
+round-trip works today (validated 2026-06-07 with duckdb 1.5.3) but is not a
+stable surface. Specifics:
+
+- **What `run.sh` always validates:** SQE starts with the Quack endpoint enabled
+  and answers the `GET /` identification probe (the server side, docker-only).
+- **The client round-trip:** if `duckdb` is on your PATH, `run.sh` seeds an
+  Iceberg table in SQE and has DuckDB query it over Quack (`quack_query()`),
+  capturing the result. This needs **duckdb 1.5.3+** with the quack extension
+  (`INSTALL quack FROM core_nightly`, fetched over the network). Without a local
+  DuckDB, `run.sh` skips this step and prints how to enable it; the server probe
+  still runs.
+- SQE also ships `sqe-quack-client`, a Rust **library** (`QuackClient`),
+  embeddable in Rust apps. It is not a standalone CLI -- a small CLI wrapper would
+  be a tidy follow-up, but the stock DuckDB CLI already gives a working client.
+
+This is **one** quickstart, not the separate `quack-server` + `quack-client` pair
+on the roadmap: the server and client are two ends of the same round-trip, and the
+client is a stock DuckDB CLI rather than a thing we ship.
 
 ## What you get
 
@@ -44,7 +57,7 @@ a potential follow-up, tracked separately from this docs work.
 ```bash
 cd quickstart/quack
 cp .env.example .env
-./run.sh             # up -> GET / identification probe -> capture OUTPUT.md
+./run.sh             # up -> GET / probe -> DuckDB round-trip (if duckdb on PATH) -> capture
 ./run.sh --down      # tear down
 ```
 
@@ -68,29 +81,80 @@ $ curl http://localhost:19494/
 This is a DuckDB Quack RPC endpoint, served by SQE.
 ```
 
-## Connecting a client
+## Connecting a DuckDB client
 
-Any quack-capable DuckDB client attaches by URI:
+This is what `run.sh` runs (host port `19494` maps to the container's `9494`).
+The quack extension is pre-release, so it comes from `core_nightly`; the
+`anonymous` provider accepts any non-empty token, supplied via `CREATE SECRET`:
 
 ```sql
--- from a DuckDB CLI that supports the Quack protocol
-ATTACH 'quack:localhost:9494' AS sqe;
-SELECT * FROM sqe.my_namespace.my_table LIMIT 10;
+INSTALL quack FROM core_nightly; LOAD quack;
+CREATE SECRET (TYPE quack, TOKEN 'anonymous');
 
--- or the table-function form
-SELECT * FROM quack_query('quack:localhost:9494', 'SELECT 1 AS one');
+-- table-function form: run SQL on SQE, stream the rows back into DuckDB
+SELECT * FROM quack_query('quack:localhost:19494', 'SELECT kind, amount FROM nessie.demo.events');
+
+-- or attach SQE as a database
+ATTACH 'quack:localhost:19494' AS sqe;
 ```
 
-SQE also ships `sqe-quack-client`, a synchronous Rust client (`QuackClient`)
-used by the test suite and embeddable in Rust applications:
+Against a real IdP-backed stack you would pass a real bearer token instead of
+`anonymous` (e.g. a Polaris/Keycloak access token). SQE also ships
+`sqe-quack-client`, a synchronous Rust client (`QuackClient`) for embedding in
+Rust applications:
 
 ```rust
-let mut client = QuackClient::connect("quack:localhost:9494", Some("token"))?;
+let mut client = QuackClient::connect("quack:localhost:19494", Some("token"))?;
 let result = client.execute("SELECT 1 AS one")?;
 ```
 
 The DuckDB-to-Iceberg type mapping is in `docs/quack-datatype-matrix.md`; the
 wire reference is in `docs/quack-protocol.md`.
+
+## SQE as a Quack client (the reverse direction)
+
+The same `quack_query()` table function is registered on every SQE session, so
+SQE can be the *client*: it pulls rows from a remote Quack endpoint inline. That
+remote can be a DuckDB instance running `quack_serve`. Point a DuckDB at SQE and
+SQE at DuckDB and you have federation in both directions over one protocol.
+
+Start a DuckDB Quack server on the host (it returns immediately after spawning
+its background listener, so keep the process alive):
+
+```bash
+# 1-3 colors, served on 0.0.0.0:9495 with a static token, plaintext.
+{ printf "INSTALL quack FROM core_nightly; LOAD quack;
+  CREATE TABLE colors AS SELECT * FROM (VALUES (1,'red'),(2,'green'),(3,'blue')) t(id,name);
+  CALL quack_serve('quack:0.0.0.0:9495', disable_ssl := true, allow_other_hostname := true, token := 'sqe-token');
+"; sleep 600; } | duckdb :memory:
+```
+
+Then, from SQE (over Flight), run `quack_query()` against it. SQE in the
+container reaches the host server at `host.docker.internal` (Docker Desktop; on
+Linux add `extra_hosts: ["host.docker.internal:host-gateway"]` to the `sqe`
+service, or run DuckDB as a sidecar and use its service name):
+
+```bash
+docker compose exec -T -e SQE_PASSWORD=anonymous sqe sqe-cli --port 50051 --user anonymous \
+  -e "SELECT * FROM quack_query('quack:host.docker.internal:9495', 'sqe-token', 'SELECT id, name FROM colors ORDER BY id')"
+```
+
+Verified 2026-06-07 (SQE pulling from a duckdb 1.5.3 server):
+
+```
++----+-------+
+| id | name  |
++----+-------+
+| 1  | red   |
+| 2  | green |
+| 3  | blue  |
++----+-------+
+```
+
+Note the `quack_serve` argument shape: the first positional is a `quack:` URI;
+`disable_ssl`, `allow_other_hostname`, and `token` are **named** parameters
+(`name := value`). SQE's client uses plain HTTP for any `quack:` URI (only
+`quacks:` is TLS), which is why `disable_ssl := true` is required here.
 
 ## Security: read before exposing the port
 
@@ -108,9 +172,11 @@ a dev-only stack (no IdP), exactly like the `nessie` quickstart.
 
 ## How it is tested
 
-`run.sh` brings the stack up and asserts the `GET /` identification probe from a
-clean state (validated 2026-06-07). The full connection -> prepare -> result-chunk
-round-trip is covered by the engine's tests, which need the catalog stack:
+`run.sh` brings the stack up, asserts the `GET /` probe, then (with a local
+duckdb 1.5.3) seeds `nessie.demo.events` and has DuckDB query it over Quack,
+capturing the aggregated result to [`OUTPUT.md`](./OUTPUT.md). Validated
+2026-06-07 from a clean state. The connection -> prepare -> result-chunk path is
+also covered by the engine's tests:
 
 - `crates/sqe-coordinator/tests/quack_e2e.rs::quack_select_one_round_trip`
 - `crates/sqe-quack-server/tests/` (connection lifecycle, auth rejection)
