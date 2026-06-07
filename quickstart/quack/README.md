@@ -1,7 +1,7 @@
 ---
 slug: quack
 title: "Quack: the DuckDB wire protocol"
-description: "Enable SQE's DuckDB Quack RPC endpoint so a DuckDB client can query SQE as if it were a local database. Quack is a pre-release DuckDB protocol; this quickstart validates the server side and documents how a client attaches."
+description: "Enable SQE's DuckDB Quack RPC endpoint so a DuckDB client can query SQE as if it were a local database. run.sh probes the server, then runs a real round-trip: a DuckDB 1.5.3 CLI queries an SQE Iceberg table over Quack."
 ---
 
 # Quack: the DuckDB wire protocol
@@ -10,26 +10,32 @@ Quack is DuckDB's RPC protocol. A DuckDB client can `ATTACH 'quack:host:port'`
 and query a remote engine as though it were a local database. SQE implements the
 server side, so a DuckDB client can run queries against SQE's catalogs over Quack.
 
-This quickstart turns the Quack endpoint on and proves the server speaks it.
+This quickstart turns the Quack endpoint on, proves the server speaks it, and --
+if a quack-capable DuckDB CLI is on your PATH -- runs a real round-trip where a
+DuckDB client queries an SQE Iceberg table over Quack.
 
-## Status: experimental (server enablement)
+## Status: working, but pre-release
 
-Read this first. Quack is **pre-release upstream** (DuckDB plans to stabilize it
-around v2.0), and that shapes what this quickstart can honestly claim:
+Quack is **pre-release upstream** (DuckDB plans to stabilize it around v2.0), and
+the DuckDB client extension ships from the `core_nightly` repository. The
+round-trip works today (validated 2026-06-07 with duckdb 1.5.3) but is not a
+stable surface. Specifics:
 
-- **What `run.sh` validates:** SQE starts with the Quack endpoint enabled and
-  answers the `GET /` identification probe. That is the server side.
-- **What it does not run:** a full client round-trip (a DuckDB client executing
-  queries). The client side needs a *quack-capable DuckDB build* (the protocol is
-  not in stock DuckDB releases), and SQE's own `sqe-quack-client` is a Rust
-  library, not a standalone CLI. So there is no clean, image-only client to drive
-  here. The end-to-end path is covered by the engine's test suite instead (see
-  "How it is tested").
+- **What `run.sh` always validates:** SQE starts with the Quack endpoint enabled
+  and answers the `GET /` identification probe (the server side, docker-only).
+- **The client round-trip:** if `duckdb` is on your PATH, `run.sh` seeds an
+  Iceberg table in SQE and has DuckDB query it over Quack (`quack_query()`),
+  capturing the result. This needs **duckdb 1.5.3+** with the quack extension
+  (`INSTALL quack FROM core_nightly`, fetched over the network). Without a local
+  DuckDB, `run.sh` skips this step and prints how to enable it; the server probe
+  still runs.
+- SQE also ships `sqe-quack-client`, a Rust **library** (`QuackClient`),
+  embeddable in Rust apps. It is not a standalone CLI -- a small CLI wrapper would
+  be a tidy follow-up, but the stock DuckDB CLI already gives a working client.
 
-So this is **one** quickstart, not the separate `quack-server` + `quack-client`
-pair on the roadmap: the client has no runnable of its own to ship as a quickstart.
-A small `sqe-quack-client` CLI would make a true round-trip demo possible; that is
-a potential follow-up, tracked separately from this docs work.
+This is **one** quickstart, not the separate `quack-server` + `quack-client` pair
+on the roadmap: the server and client are two ends of the same round-trip, and the
+client is a stock DuckDB CLI rather than a thing we ship.
 
 ## What you get
 
@@ -44,7 +50,7 @@ a potential follow-up, tracked separately from this docs work.
 ```bash
 cd quickstart/quack
 cp .env.example .env
-./run.sh             # up -> GET / identification probe -> capture OUTPUT.md
+./run.sh             # up -> GET / probe -> DuckDB round-trip (if duckdb on PATH) -> capture
 ./run.sh --down      # tear down
 ```
 
@@ -68,24 +74,30 @@ $ curl http://localhost:19494/
 This is a DuckDB Quack RPC endpoint, served by SQE.
 ```
 
-## Connecting a client
+## Connecting a DuckDB client
 
-Any quack-capable DuckDB client attaches by URI:
+This is what `run.sh` runs (host port `19494` maps to the container's `9494`).
+The quack extension is pre-release, so it comes from `core_nightly`; the
+`anonymous` provider accepts any non-empty token, supplied via `CREATE SECRET`:
 
 ```sql
--- from a DuckDB CLI that supports the Quack protocol
-ATTACH 'quack:localhost:9494' AS sqe;
-SELECT * FROM sqe.my_namespace.my_table LIMIT 10;
+INSTALL quack FROM core_nightly; LOAD quack;
+CREATE SECRET (TYPE quack, TOKEN 'anonymous');
 
--- or the table-function form
-SELECT * FROM quack_query('quack:localhost:9494', 'SELECT 1 AS one');
+-- table-function form: run SQL on SQE, stream the rows back into DuckDB
+SELECT * FROM quack_query('quack:localhost:19494', 'SELECT kind, amount FROM nessie.demo.events');
+
+-- or attach SQE as a database
+ATTACH 'quack:localhost:19494' AS sqe;
 ```
 
-SQE also ships `sqe-quack-client`, a synchronous Rust client (`QuackClient`)
-used by the test suite and embeddable in Rust applications:
+Against a real IdP-backed stack you would pass a real bearer token instead of
+`anonymous` (e.g. a Polaris/Keycloak access token). SQE also ships
+`sqe-quack-client`, a synchronous Rust client (`QuackClient`) for embedding in
+Rust applications:
 
 ```rust
-let mut client = QuackClient::connect("quack:localhost:9494", Some("token"))?;
+let mut client = QuackClient::connect("quack:localhost:19494", Some("token"))?;
 let result = client.execute("SELECT 1 AS one")?;
 ```
 
@@ -108,9 +120,11 @@ a dev-only stack (no IdP), exactly like the `nessie` quickstart.
 
 ## How it is tested
 
-`run.sh` brings the stack up and asserts the `GET /` identification probe from a
-clean state (validated 2026-06-07). The full connection -> prepare -> result-chunk
-round-trip is covered by the engine's tests, which need the catalog stack:
+`run.sh` brings the stack up, asserts the `GET /` probe, then (with a local
+duckdb 1.5.3) seeds `nessie.demo.events` and has DuckDB query it over Quack,
+capturing the aggregated result to [`OUTPUT.md`](./OUTPUT.md). Validated
+2026-06-07 from a clean state. The connection -> prepare -> result-chunk path is
+also covered by the engine's tests:
 
 - `crates/sqe-coordinator/tests/quack_e2e.rs::quack_select_one_round_trip`
 - `crates/sqe-quack-server/tests/` (connection lifecycle, auth rejection)
