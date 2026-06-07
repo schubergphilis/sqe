@@ -1,0 +1,73 @@
+# SQE config for the benchmark quickstart (Nessie catalog over RustFS).
+#
+# Nessie runs auth-less here, so SQE uses the `anonymous` auth provider: every
+# connection is accepted as a single "anonymous" identity. This is a DEV-ONLY
+# mode (SQE logs a security warning on startup). Use it to point SQE at any
+# Iceberg REST catalog without setting up an IdP; for real auth, see the
+# polaris-keycloak-* quickstarts.
+
+[coordinator]
+flight_sql_port = 50051
+trino_http_port = 8080
+mode = "hybrid"
+flight_compression = "none"
+
+[worker]
+memory_limit = "4GB"
+spill_dir = "/tmp/sqe-spill"
+
+# ── Authentication ────────────────────────────────────────────────────────
+[auth]
+# Unused by the anonymous provider, but the struct expects these.
+keycloak_url = ""
+realm = ""
+client_id = ""
+client_secret = ""
+ssl_verification = false
+
+# Accept every connection as "anonymous" with full roles. DEV ONLY.
+[[auth.providers]]
+type = "anonymous"
+user = "anonymous"
+roles = ["admin"]
+
+# ── Catalog ───────────────────────────────────────────────────────────────
+# `polaris_url` is just the Iceberg REST base URL; here it points at Nessie's
+# /iceberg mount instead of Polaris. The same `rest` backend handles both.
+[catalogs.nessie]
+polaris_url = "http://nessie:19120/iceberg"
+warehouse = "warehouse"
+metadata_cache_ttl_secs = 30
+default_table_format_version = 2
+
+[catalog]
+polaris_url = "http://nessie:19120/iceberg"
+warehouse = "warehouse"
+
+# ── Storage (SQE reads/writes Iceberg data files directly via S3) ──────────
+[storage]
+s3_endpoint = "http://rustfs:9000"
+s3_region = "us-east-1"
+s3_access_key = "s3admin"
+s3_secret_key = "s3adminpw"
+s3_path_style = true
+s3_allow_http = true
+
+# Table-valued functions (read_parquet, read_csv, ...) refuse local filesystem
+# paths by default. That gate is a security control: without it, a query like
+# read_parquet('/etc/shadow') or read_parquet('http://169.254.169.254/...')
+# could read host files or pivot to cloud metadata. We enable it ONLY because
+# `sqe-bench load` issues CTAS-over-read_parquet against the generated dataset
+# mounted read-only at /bench-data. In production, stage benchmark data in the
+# object store and read it via s3:// instead, leaving this off.
+[storage.tvf]
+allow_local_paths = true
+
+[policy]
+engine = "passthrough"
+
+[session]
+idle_timeout_secs = 900
+
+[metrics]
+prometheus_port = 9090
