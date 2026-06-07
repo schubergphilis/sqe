@@ -78,7 +78,7 @@ validated from a clean state.
 
 | Quickstart | What it shows | Status |
 |---|---|---|
-| `observability` | Metrics, logs, and traces (VictoriaMetrics + Grafana, or OpenObserve) | planned |
+| [`observability`](./observability/) | Scrape SQE's Prometheus metrics with VictoriaMetrics + Grafana (provisioned "SQE Overview" dashboard) | **validated 2026-06-07** |
 
 ### E. Benchmarks
 
