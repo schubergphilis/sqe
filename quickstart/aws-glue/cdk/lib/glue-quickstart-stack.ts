@@ -14,7 +14,8 @@ import * as s3 from "aws-cdk-lib/aws-s3";
  * Regular S3 is not an LF-registered data location, so writes use IAM access
  * control and the caller's bucket permissions suffice. Net: this works the same
  * with or without Lake Formation. (The dedicated glue-lake-formation quickstart
- * shows fine-grained LF grants explicitly.)
+ * keeps the database LF-governed and grants explicit table/database-level LF
+ * permissions; SQE does not enforce LF column/row masking.)
  *
  * RemovalPolicy.DESTROY + autoDeleteObjects so `cdk destroy` (run.sh teardown)
  * removes the bucket and its contents; run.sh drops the SQE-created database.
