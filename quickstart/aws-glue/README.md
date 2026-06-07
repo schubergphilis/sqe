@@ -74,8 +74,12 @@ Required Create Table on sqe_glue_quickstart
 A database that **SQE creates** makes the calling principal its owner, which
 carries the create/alter permissions. Regular S3 is not an LF-registered data
 location, so table data writes use ordinary IAM access control. Net: this works
-the same with or without Lake Formation. The dedicated `glue-lake-formation`
-quickstart demonstrates explicit fine-grained LF grants.
+the same with or without Lake Formation. The dedicated
+[`glue-lake-formation`](../glue-lake-formation/) quickstart keeps the database
+LF-governed and grants the principal explicit LF permissions instead. That is
+table/database-level permission gating: SQE does not enforce LF column-masking
+or row-filtering (it reads S3 directly with the caller's credentials). SQE's own
+column/row masking is the OPA/Cedar policy engine, not Lake Formation.
 
 ## Output
 

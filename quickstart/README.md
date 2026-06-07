@@ -62,7 +62,7 @@ validated from a clean state.
 |---|---|---|
 | [`aws-s3-tables`](./aws-s3-tables/) | AWS S3 Tables (managed Iceberg). CDK bootstrap + teardown; SQE creates the namespace | **validated 2026-06-06** |
 | [`aws-glue`](./aws-glue/) | AWS Glue Data Catalog (CDK bootstrap + teardown; SQE creates the DB so it works under Lake Formation) | **validated 2026-06-06** |
-| `glue-lake-formation` | Glue with Lake Formation fine-grained access. CDK bootstrap + teardown | planned |
+| [`glue-lake-formation`](./glue-lake-formation/) | Glue database governed by Lake Formation: SQE denied until an explicit LF grant, then succeeds (table/DB-level gating, not column/row masking) | **validated 2026-06-07** |
 
 ### C. Embedded (single binary, `sqe-cli`)
 
