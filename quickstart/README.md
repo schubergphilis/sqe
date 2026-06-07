@@ -70,8 +70,7 @@ validated from a clean state.
 |---|---|---|
 | [`embedded-files`](./embedded-files/) | Read local and remote files directly with the `read_*` TVFs (no server, no catalog) | **validated 2026-06-06** |
 | [`embedded-sqlite-catalog`](./embedded-sqlite-catalog/) | Local persistent Iceberg catalog backed by SQLite (no server) | **validated 2026-06-06** |
-| `quack-server` | The Quack protocol server | planned |
-| `quack-client` | The Quack protocol client | planned |
+| [`quack`](./quack/) | SQE's DuckDB Quack RPC endpoint (server enablement + `GET /` probe; client is documented) | **experimental 2026-06-07** |
 | [`attach-catalogs`](./attach-catalogs/) | Attach multiple persistent catalogs in embedded mode + cross-catalog JOIN | **validated 2026-06-06** |
 
 ### D. Operations
