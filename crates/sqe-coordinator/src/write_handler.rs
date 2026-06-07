@@ -801,7 +801,7 @@ impl WriteHandler {
 
         // Create the catalog bridge for this session, resolving the target
         // catalog qualifier (`catalog.ns.table`) rather than the default warehouse.
-        let target_catalog = catalog_qualifier(table_name);
+        let target_catalog = resolve_target_catalog(catalog_qualifier(table_name), session);
         let catalog = self
             .create_catalog_bridge(session, target_catalog.as_deref())
             .await?;
@@ -986,10 +986,14 @@ impl WriteHandler {
             "Executing CTAS (streaming)"
         );
 
-        let target_catalog = catalog_qualifier(table_name);
+        let target_catalog = resolve_target_catalog(catalog_qualifier(table_name), session);
         let catalog = self
             .create_catalog_bridge(session, target_catalog.as_deref())
             .await?;
+
+        // Defense-in-depth: ensure the target namespace exists in this catalog
+        // (dbt's CREATE SCHEMA may not have landed here); idempotent.
+        ensure_namespace(catalog.as_ref(), &namespace).await?;
 
         let create_format_version = self.format_version();
         let location = unique_table_location(catalog.as_ref(), &namespace, &name).await;
@@ -1137,7 +1141,7 @@ impl WriteHandler {
             "Executing INSERT INTO SELECT (streaming)"
         );
 
-        let target_catalog = catalog_qualifier(table_name);
+        let target_catalog = resolve_target_catalog(catalog_qualifier(table_name), session);
         let catalog = self
             .create_catalog_bridge(session, target_catalog.as_deref())
             .await?;
@@ -1313,10 +1317,21 @@ impl WriteHandler {
             "Creating empty table"
         );
 
-        let target_catalog = catalog_qualifier(&ct.name);
+        // Resolve the target catalog: an explicit 3-part qualifier wins, else the
+        // session's connection catalog (Trino `catalog=...` header / Flight
+        // default), else the configured default warehouse. Without the session
+        // fallback a dbt/Trino client connected with catalog=ws_team_a issuing an
+        // unqualified statement resolves against the default warehouse.
+        let target_catalog = resolve_target_catalog(catalog_qualifier(&ct.name), session);
         let catalog = self
             .create_catalog_bridge(session, target_catalog.as_deref())
             .await?;
+
+        // Defense-in-depth: make sure the namespace exists in THIS catalog before
+        // creating the table. dbt issues CREATE SCHEMA IF NOT EXISTS first; if that
+        // did not land in this catalog the create would fail opaquely with
+        // "namespace does not exist". Idempotent.
+        ensure_namespace(catalog.as_ref(), &namespace).await?;
 
         if ct.if_not_exists && catalog.load_table(&table_ident).await.is_ok() {
             info!(table = %table_ident, "Table already exists, skipping (IF NOT EXISTS)");
@@ -1412,7 +1427,7 @@ impl WriteHandler {
 
         // Create the catalog bridge and load the existing table, resolving the
         // target catalog qualifier rather than the default warehouse.
-        let target_catalog = catalog_qualifier(table_name);
+        let target_catalog = resolve_target_catalog(catalog_qualifier(table_name), session);
         let catalog = self
             .create_catalog_bridge(session, target_catalog.as_deref())
             .await?;
@@ -5286,6 +5301,46 @@ pub(crate) fn format_version_props_for_backend(
     }
 }
 
+/// Resolve the catalog a write statement targets: the explicit 3-part qualifier
+/// from the statement if present, else the session's connection catalog
+/// (`default_catalog`, set from the Trino `catalog=` header or a Flight default),
+/// else `None` (the configured default warehouse). This lets unqualified
+/// DDL/writes from a client connected to a non-default (polaris-auto workspace)
+/// catalog land in that catalog -- the case a dbt/Trino connection hits, since
+/// it sets the catalog once on the connection rather than in every statement.
+pub(crate) fn resolve_target_catalog(
+    explicit: Option<String>,
+    session: &Session,
+) -> Option<String> {
+    explicit.or_else(|| session.default_catalog.clone())
+}
+
+/// Ensure `namespace` exists in `catalog`, creating it if missing. Idempotent:
+/// treats already-exists (including losing a concurrent create) as success.
+/// Logs on a real create so namespace creation is visible alongside the
+/// "Creating empty table" line. Used as defense-in-depth before CREATE TABLE /
+/// CTAS so a workspace catalog whose CREATE SCHEMA did not land still gets the
+/// namespace, instead of failing opaquely with "namespace does not exist".
+pub(crate) async fn ensure_namespace(
+    catalog: &dyn Catalog,
+    namespace: &NamespaceIdent,
+) -> sqe_core::Result<()> {
+    if catalog.namespace_exists(namespace).await.unwrap_or(false) {
+        return Ok(());
+    }
+    match catalog
+        .create_namespace(namespace, std::collections::HashMap::new())
+        .await
+    {
+        Ok(_) => {
+            info!(namespace = ?namespace, "Created namespace (auto, for table create)");
+            Ok(())
+        }
+        Err(_) if catalog.namespace_exists(namespace).await.unwrap_or(false) => Ok(()),
+        Err(e) => Err(SqeError::Catalog(format!("Failed to ensure namespace: {e}"))),
+    }
+}
+
 /// Fold a `Vec<SqlOption>` (from sqlparser-rs `TBLPROPERTIES (...)` or
 /// `WITH (...)` clauses) into a property HashMap.
 ///
@@ -5613,6 +5668,37 @@ mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, TimeUnit};
     use sqlparser::ast::{DataType as SqlType, ExactNumberInfo, TimezoneInfo};
+
+    // -------------------------------------------------------------------------
+    // target-catalog resolution: explicit qualifier -> session catalog -> default
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn resolve_target_catalog_prefers_explicit_then_session() {
+        let mut session = sqe_core::Session::new(
+            "u".to_string(),
+            sqe_core::SecretString::new("t".to_string()),
+            None,
+            chrono::Utc::now(),
+            vec![],
+        );
+        // No explicit qualifier, no connection catalog -> None (default warehouse).
+        assert_eq!(resolve_target_catalog(None, &session), None);
+
+        // Unqualified statement uses the session's connection catalog (the dbt /
+        // Trino case: catalog set once on the connection).
+        session.default_catalog = Some("ws_team_a".to_string());
+        assert_eq!(
+            resolve_target_catalog(None, &session),
+            Some("ws_team_a".to_string())
+        );
+
+        // An explicit 3-part qualifier wins over the connection catalog.
+        assert_eq!(
+            resolve_target_catalog(Some("other_wh".to_string()), &session),
+            Some("other_wh".to_string())
+        );
+    }
 
     // -------------------------------------------------------------------------
     // format-version property gating by catalog backend
