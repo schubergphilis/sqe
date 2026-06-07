@@ -1,12 +1,13 @@
-# SQE quickstart: AWS Glue Data Catalog.
+# SQE quickstart: AWS Glue + Lake Formation.
 #
 # Just the SQE coordinator: AWS Glue is the catalog and S3 is the storage, so
 # there is no Polaris/Keycloak/RustFS to run. SQE talks to Glue + S3 over the
 # AWS SDK using the credentials passed in via the environment (resolved from
-# your AWS_PROFILE by run.sh). The warehouse bucket + Glue database are created
-# by the CDK stack in ./cdk.
+# your AWS_PROFILE by run.sh). The warehouse bucket + the LF-governed Glue
+# database are created by the CDK stack in ./cdk; run.sh grants the principal
+# Lake Formation permissions explicitly (see README).
 #
-#   ./run.sh            # cdk deploy -> up -> queries -> down -> cdk destroy
+#   ./run.sh            # cdk deploy -> denied -> grant -> succeeds -> cdk destroy
 #   docker compose up   # by hand, after: cp sqe.toml sqe.toml.local + fill in
 
 services:
