@@ -134,7 +134,7 @@ impl CatalogOps {
         // this, dbt's `CREATE SCHEMA ws_team_a.dev_raw` created a `ws_team_a.dev_raw`
         // two-level namespace in the DEFAULT warehouse, so the later CREATE TABLE
         // into the discovered `ws_team_a` catalog failed "namespace does not exist".
-        let (target_catalog, namespace) = match schema_name {
+        let (explicit_catalog, namespace) = match schema_name {
             SchemaName::Simple(obj) | SchemaName::NamedAuthorization(obj, _) => {
                 (schema_catalog_qualifier(obj), namespace_without_catalog(obj)?)
             }
@@ -142,6 +142,11 @@ impl CatalogOps {
                 (None, NamespaceIdent::new(ident.value.clone()))
             }
         };
+        // An explicit `catalog.schema` wins; otherwise fall back to the session's
+        // connection catalog (Trino `catalog=` header / Flight default). A
+        // dbt/Trino client sets the catalog once on the connection, so a
+        // session-relative CREATE SCHEMA must land there, not the default warehouse.
+        let target_catalog = explicit_catalog.or_else(|| session.default_catalog.clone());
 
         info!(
             username = %session.user.username,
@@ -204,7 +209,8 @@ impl CatalogOps {
             SqeError::Execution("DROP SCHEMA requires at least one schema name".to_string())
         })?;
 
-        let target_catalog = schema_catalog_qualifier(schema_name_obj);
+        let target_catalog =
+            schema_catalog_qualifier(schema_name_obj).or_else(|| session.default_catalog.clone());
         let namespace = namespace_without_catalog(schema_name_obj)?;
 
         info!(
