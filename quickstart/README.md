@@ -84,7 +84,7 @@ validated from a clean state.
 
 | Quickstart | What it shows | Status |
 |---|---|---|
-| `benchmark` | Run TPC-H / TPC-DS / SSB and produce comparable numbers | planned |
+| [`benchmark`](./benchmark/) | Generate + load + run TPC-H / TPC-DS / SSB against SQE, with per-query timings (`sqe-bench`) | **validated 2026-06-07** |
 
 ## Design
 
