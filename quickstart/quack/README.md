@@ -52,6 +52,13 @@ client is a stock DuckDB CLI rather than a thing we ship.
 | `nessie` | The Iceberg REST catalog (auth-less). |
 | `sqe` | The coordinator, with `quack_port = 9494` -> the Quack endpoint. |
 
+## Prerequisites
+
+- Docker (with Compose v2). The SQE image builds from this repo on first run.
+- Optional, for the client round-trip: a local `duckdb` 1.5.3+ on your PATH, with
+  network access to fetch the quack extension (`INSTALL quack FROM core_nightly`).
+  Without it, `run.sh` runs the server probe and skips the round-trip.
+
 ## Run it
 
 ```bash
@@ -182,3 +189,16 @@ also covered by the engine's tests:
 - `crates/sqe-quack-server/tests/` (connection lifecycle, auth rejection)
 - `crates/sqe-quack-client/tests/loopback.rs` (type round-trips)
 - `crates/sqe-quack-wire/tests/upstream_fixtures.rs` (wire codec vs real DuckDB)
+
+## Gotchas
+
+- **Pre-release.** The protocol targets DuckDB v2.0 and the client extension is
+  from `core_nightly`. The round-trip works with duckdb 1.5.3 but pin the version;
+  a different DuckDB build may not match the wire format.
+- **`quack_query` is invisible until the extension loads.** It will not show in
+  `duckdb_functions()` until `INSTALL quack FROM core_nightly; LOAD quack`.
+- **Token must be non-empty.** The anonymous provider takes any non-empty token;
+  an empty one is rejected before the auth provider runs.
+- **Reverse direction needs host networking.** SQE-in-a-container reaches a host
+  DuckDB at `host.docker.internal` on Docker Desktop; on Linux add
+  `extra_hosts: ["host.docker.internal:host-gateway"]` to the `sqe` service.
