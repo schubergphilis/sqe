@@ -1800,6 +1800,18 @@ impl QueryHandler {
         )?;
 
         if matches!(kind, StatementKind::Query(_)) {
+            // get_flight_info plans the result schema WITHOUT executing, so it
+            // must mirror execute()/execute_stream() and discover Polaris
+            // warehouses for the caller's token first. Otherwise a 3-part id
+            // into a workspace catalog (ws_*, dedicated team catalogs) fails
+            // "table not found" during the planning below, before do_get ->
+            // execute_stream (which discovers) ever runs. preflight registers
+            // the discovered warehouse on the per-token cached SessionContext
+            // that create_session_context returns here, so it is visible to the
+            // planner. kind.statement() is None for non-statement kinds (no-op).
+            if let Some(stmt) = kind.statement() {
+                self.preflight_resolve_catalogs(stmt, session).await?;
+            }
             let (ctx, session_catalog) = self.create_session_context(session).await?;
             // Register incremental providers so the planner can resolve the
             // tables with their augmented schemas. The FOR INCREMENTAL clause

@@ -202,6 +202,44 @@ async fn polaris_auto_known_catalog_passes_pre_flight() {
     }
 }
 
+/// Regression for the Flight `get_flight_info` path: `get_schema` plans the
+/// result schema WITHOUT executing, so it must run the same
+/// `preflight_resolve_catalogs` step `execute()` does. The reported bug was a
+/// 3-part id into a polaris-auto workspace catalog (`ws_*`) failing "table not
+/// found" during planning because `get_schema` skipped pre-flight (and so
+/// skipped the lazy Polaris discovery that registers the warehouse).
+///
+/// We prove the wiring deterministically in STATIC mode, where pre-flight
+/// rejects an unknown 3-part catalog with the bespoke "unknown catalog" error
+/// using NO network IO (it returns before `create_session_context`). Before the
+/// fix, `get_schema` skipped pre-flight and fell through to
+/// `create_session_context`, whose error never contains "unknown catalog" -- so
+/// this assertion is red without the fix and green with it. The polaris-auto
+/// discovery half (the live reproduction) is covered by
+/// `polaris_auto_get_schema_lazy_hit`.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_schema_runs_pre_flight_unknown_catalog() {
+    let config = parse_config(&offline_config_toml("static"));
+    let h = make_handler(config);
+    let session = fake_session();
+
+    let err = h
+        .get_schema(&session, "SELECT * FROM ws_undeclared.some_ns.some_tbl")
+        .await
+        .expect_err("unknown 3-part catalog must error in static mode");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unknown catalog"),
+        "get_schema must run pre-flight: expected the bespoke 'unknown catalog' \
+         error (returned with no network IO), got: {msg}"
+    );
+    assert!(
+        msg.contains("ws_undeclared"),
+        "pre-flight error must name the unknown catalog: {msg}"
+    );
+}
+
 /// Bare 1-part names never hit the pre-flight check. Mirrors
 /// `unqualified_name_skips_pre_flight` in `multi_catalog_routing_test.rs`.
 #[tokio::test(flavor = "multi_thread")]
@@ -403,6 +441,37 @@ async fn polaris_auto_lazy_hit() {
         .downcast_ref::<arrow_array::StringArray>()
         .expect("'label' is Utf8");
     assert_eq!(label_arr.value(0), "discovered");
+}
+
+/// Flight `get_flight_info` regression (the actual reported bug): `get_schema`
+/// on a discovered warehouse must return the table's schema, not "table not
+/// found". This is the schema-planning twin of `polaris_auto_lazy_hit` and the
+/// exact path `get_flight_info_statement` takes before `do_get` ever runs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn polaris_auto_get_schema_lazy_hit() {
+    let _live = LIVE_STACK_LOCK.lock().await;
+    common::init_tracing();
+    seed_discovery_warehouse().await;
+
+    let config = polaris_auto_config();
+    let handler = make_handler(config);
+    let session = live_session().await;
+
+    let schema = handler
+        .get_schema(
+            &session,
+            "SELECT id, label FROM discovery_test_wh.disc_ns.probe_t",
+        )
+        .await
+        .expect("get_schema must discover the warehouse and return the schema, not NOT_FOUND");
+
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["id", "label"],
+        "get_schema must return probe_t's columns from the discovered warehouse"
+    );
 }
 
 /// Miss: a warehouse name that does not exist in Polaris returns "unknown
