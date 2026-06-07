@@ -1,0 +1,9 @@
+# VictoriaMetrics scrape config: pull SQE's Prometheus metrics from the
+# in-network coordinator at sqe:9090/metrics.
+global:
+  scrape_interval: 5s
+scrape_configs:
+  - job_name: sqe-coordinator
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["sqe:9090"]
