@@ -1,4 +1,6 @@
 /target
+# Staged deployment configs from `make sqe-config` / `make build`.
+/dist
 *.swp
 *.swo
 .DS_Store
