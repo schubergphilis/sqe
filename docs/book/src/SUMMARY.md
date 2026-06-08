@@ -36,6 +36,10 @@
 - [Observability](./features/observability.md)
 - [Trino Compatibility](./features/trino-compatibility.md)
 - [Benchmark Suite](./features/benchmarks.md)
+- [Supported catalog backends](./features/catalog-backends.md)
+- [Embedded mode](./features/embedded.md)
+- [Flight SQL connectivity](./features/flight-sql.md)
+- [Trino HTTP connectivity](./features/trino-http.md)
 
 ---
 
@@ -72,18 +76,24 @@
 
 ---
 
-# Use Cases
+# Quickstart
 
-- [Overview and validation matrix](./use-cases/index.md)
-- [Flight SQL (single and distributed)](./use-cases/flight-sql.md)
-- [Trino HTTP compatibility (single and distributed)](./use-cases/trino-http.md)
-- [Quack (DuckDB wire protocol)](./use-cases/quack.md)
-  - [Quack protocol reference](./use-cases/quack-protocol.md)
-  - [Quack data-type matrix](./use-cases/quack-datatype-matrix.md)
-- [Catalog backends (Polaris, Glue, S3 Tables, Unity, HMS, Nessie, Hadoop)](./use-cases/catalog-backends.md)
-- [Embedded and single-node CLI](./use-cases/embedded.md)
-- [File-format TVFs (read_csv / read_parquet / read_json)](./use-cases/file-format-tvfs.md)
-- [Benchmarks (TPC-H / TPC-DS / SSB)](./use-cases/benchmarks.md)
+- [Overview](./quickstart/index.md)
+- [Polaris + Keycloak (client credentials)](./quickstart/polaris-keycloak-client-id.md)
+- [Polaris + Keycloak (user token)](./quickstart/polaris-keycloak-user-token.md)
+- [Project Nessie (Iceberg REST catalog)](./quickstart/nessie.md)
+- [Unity Catalog OSS (Iceberg REST, read-only)](./quickstart/unity-oss.md)
+- [AWS S3 Tables (managed Iceberg)](./quickstart/aws-s3-tables.md)
+- [AWS Glue Data Catalog](./quickstart/aws-glue.md)
+- [AWS Glue + Lake Formation](./quickstart/glue-lake-formation.md)
+- [Embedded: query local and remote files](./quickstart/embedded-files.md)
+- [Embedded: persistent local catalog (SQLite)](./quickstart/embedded-sqlite-catalog.md)
+- [Embedded: attach multiple catalogs](./quickstart/attach-catalogs.md)
+- [Quack: the DuckDB wire protocol](./quickstart/quack.md)
+  - [Quack protocol reference](./quickstart/quack-protocol.md)
+  - [Quack data-type matrix](./quickstart/quack-datatype-matrix.md)
+- [Observability: metrics + Grafana](./quickstart/observability.md)
+- [Benchmarks: TPC-H / TPC-DS / SSB](./quickstart/benchmark.md)
 
 ---
 
