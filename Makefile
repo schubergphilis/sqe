@@ -23,9 +23,65 @@ DEBUG_BIN    := target/debug
 BIN_CLI      := sqe-cli
 BIN_SERVER   := sqe-server
 
+# ── Container image (adapted from data-platform/Makefile) ──────────────────
+# Two build paths:
+#   * `build` (and `sbom`) produce a LOCAL single-arch image via plain
+#     `docker build`, loaded into the local image store for `docker run`/scan.
+#   * `push` produces a multi-arch image (amd64+arm64) via `docker buildx` and
+#     pushes it straight to the registry (manifest lists can't be `--load`ed).
+#
+# The image is built from Dockerfile.full by default (all catalog backends
+# compiled in: Polaris + Nessie + Glue + HMS + Unity). Override for the slim
+# image: `make SQE_DOCKERFILE=Dockerfile build`.
+DOCKER         ?= docker
+SQE_DOCKERFILE ?= Dockerfile.full
+
+# Optional registry/namespace prefix for the LOCAL `build`. Empty = bare name.
+# A trailing slash is added automatically when set.
+REGISTRY     ?=
+IMAGE_PREFIX := $(if $(REGISTRY),$(REGISTRY)/,)
+SQE_IMAGE    := $(IMAGE_PREFIX)sqe
+
+# Registry namespace `make push` tags into. `make login` (or `docker login`)
+# must run first; credentials come from ./.env or REGISTRY_USER /
+# REGISTRY_PASSWORD in the environment and are never written to this file.
+PUSH_REGISTRY ?= repo.sovereign-data.org/chameleon
+REGISTRY_HOST := $(firstword $(subst /, ,$(PUSH_REGISTRY)))
+PUSH_SQE      := $(PUSH_REGISTRY)/sqe
+
+# Multi-arch push platforms, the mutable tag published alongside the SHA, and
+# the dedicated buildx builder (the default `docker` driver can't emit manifest
+# lists, so `push` bootstraps this builder on demand).
+PLATFORMS      ?= linux/amd64,linux/arm64
+LATEST_TAG     ?= latest
+BUILDX_BUILDER ?= sqe-multiarch
+
+# Image tag = this repo's git short SHA: immutable, pins the exact commit, and
+# matches CI's CI_COMMIT_SHORT_SHA. Override with `make IMAGE_TAG=<custom>`.
+VCS_REF      := $(shell git rev-parse --short HEAD 2>/dev/null)
+GIT_REVISION := $(shell git rev-parse HEAD 2>/dev/null)
+IMAGE_TAG    ?= $(VCS_REF)
+BUILD_DATE   := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+DATE         := $(shell date +%Y-%m-%d)
+SBOM_DIR     := sbom
+
+# `make sqe-config` stages every quickstart/*/sqe.toml into dist/sqe-config/
+# for deployment (the runtime image is config-less: configs are mounted, see
+# the data-platform quickstart compose). Override the source/output dirs below.
+CONFIG_SRC_DIR ?= quickstart
+CONFIG_OUT_DIR ?= dist/sqe-config
+
+# Build args declared by the SQE Dockerfile(s) and stamped into OCI labels.
+SQE_BUILD_ARGS := \
+	--build-arg BUILD_DATE=$(BUILD_DATE) \
+	--build-arg GIT_REVISION=$(GIT_REVISION) \
+	--build-arg VERSION=$(IMAGE_TAG)
+
 .PHONY: help all dev release rustbook ebook ebook-pdf ebook-epub ebook-html \
         benchmark-charts test clippy fmt fmt-check clean clean-rust clean-rustbook \
-        clean-ebook clean-benchmark-charts check-tools
+        clean-ebook clean-benchmark-charts clean-images check-tools \
+        build build-sqe sbom sbom-sqe sqe-config images \
+        login buildx-builder push push-sqe
 
 # ── Default target ────────────────────────────────────────────────────────
 help:
@@ -47,19 +103,28 @@ help:
 	@echo "    make ebook-html       Build a self-contained HTML version"
 	@echo "    make benchmark-charts Re-render docs/benchmark/charts/ from benchmarks/results/*.json"
 	@echo ""
+	@echo "  Container image:"
+	@echo "    make build        Local single-arch image ($(SQE_IMAGE):$(IMAGE_TAG)) from $(SQE_DOCKERFILE)"
+	@echo "    make sbom         CycloneDX SBOM of the built image -> $(SBOM_DIR)/sqe-$(DATE).json"
+	@echo "    make sqe-config   Stage $(CONFIG_SRC_DIR)/*/sqe.toml -> $(CONFIG_OUT_DIR)/"
+	@echo "    make images       build + sbom + sqe-config"
+	@echo "    make login        docker login to $(REGISTRY_HOST) (creds from ./.env or env)"
+	@echo "    make push         Multi-arch buildx build + push ($(PUSH_SQE):$(IMAGE_TAG) and :$(LATEST_TAG))"
+	@echo ""
 	@echo "  Combined:"
-	@echo "    make all          dev build + rustbook + ebook"
+	@echo "    make all          dev build + rustbook + ebook + image build + sbom"
 	@echo ""
 	@echo "  Cleanup:"
 	@echo "    make clean        Remove all build artefacts (cargo + book + ebook)"
 	@echo "    make clean-rust   cargo clean"
 	@echo "    make clean-rustbook  Remove $(BOOK_OUT)"
 	@echo "    make clean-ebook  Remove $(EBOOK_DIR)/build"
+	@echo "    make clean-images Remove $(CONFIG_OUT_DIR) staged configs"
 	@echo ""
 	@echo "  Diagnostics:"
 	@echo "    make check-tools  Verify cargo / mdbook / pandoc / d2 / mmdc are present"
 
-all: dev rustbook ebook
+all: dev rustbook ebook build sbom
 
 # ── Code: cargo builds ────────────────────────────────────────────────────
 dev:
@@ -91,6 +156,66 @@ fmt:
 fmt-check:
 	@echo "==> Checking formatting"
 	$(CARGO) fmt --all --check
+
+# ── Container image: build / SBOM / config / push ─────────────────────────
+# Build context is the repo root (the Dockerfile COPYs Cargo.toml, crates/,
+# vendor/, xtask/ relative to it). `build` loads a single-arch image into the
+# local docker store so you can `docker run` / scan it immediately.
+build: build-sqe sqe-config  ## Local image build + staged configs
+
+build-sqe:
+	@echo "==> Building $(SQE_IMAGE):$(IMAGE_TAG) from $(SQE_DOCKERFILE)"
+	$(DOCKER) build $(SQE_BUILD_ARGS) -t $(SQE_IMAGE):$(IMAGE_TAG) -f $(SQE_DOCKERFILE) .
+
+# SBOM scans the freshly built local image (hence the build dependency) so the
+# component list always matches what was just produced. Needs `syft` on PATH.
+sbom: sbom-sqe
+
+sbom-sqe: build-sqe
+	@mkdir -p $(SBOM_DIR)
+	@echo "==> SBOM -> $(SBOM_DIR)/sqe-$(DATE).json"
+	syft docker:$(SQE_IMAGE):$(IMAGE_TAG) -o cyclonedx-json=$(SBOM_DIR)/sqe-$(DATE).json
+
+# Stage deployable configs: copy every quickstart/*/sqe.toml into
+# $(CONFIG_OUT_DIR)/<scenario>.toml and record the image ref they pair with.
+sqe-config:
+	@mkdir -p $(CONFIG_OUT_DIR)
+	@for cfg in $(CONFIG_SRC_DIR)/*/sqe.toml; do \
+		[ -f "$$cfg" ] || continue; \
+		scenario=$$(basename $$(dirname $$cfg)); \
+		cp "$$cfg" "$(CONFIG_OUT_DIR)/$$scenario.toml"; \
+		echo "  staged $$scenario.toml"; \
+	done
+	@echo "$(PUSH_SQE):$(IMAGE_TAG)" > $(CONFIG_OUT_DIR)/IMAGE
+	@echo "==> configs -> $(CONFIG_OUT_DIR)/ (pairs with $(PUSH_SQE):$(IMAGE_TAG))"
+
+images: build-sqe sbom-sqe sqe-config  ## Local image + SBOM + staged configs
+
+# ── Container image: push (multi-arch, production) ─────────────────────────
+# `make login` once per session, then `make push`. Credentials are read from
+# ./.env (gitignored) if present, else from REGISTRY_USER / REGISTRY_PASSWORD
+# in the environment. They are never stored in this file.
+login:
+	@set -a; [ -f .env ] && . ./.env || true; set +a; \
+		test -n "$$REGISTRY_USER" -a -n "$$REGISTRY_PASSWORD" || \
+			{ echo "set REGISTRY_USER and REGISTRY_PASSWORD (in ./.env or the environment)"; exit 1; }; \
+		printf '%s' "$$REGISTRY_PASSWORD" | $(DOCKER) login $(REGISTRY_HOST) -u "$$REGISTRY_USER" --password-stdin
+
+# Ensure a docker-container-driver buildx builder exists (the default `docker`
+# driver can't emit multi-platform manifest lists). Idempotent.
+buildx-builder:
+	@$(DOCKER) buildx inspect $(BUILDX_BUILDER) >/dev/null 2>&1 || \
+		$(DOCKER) buildx create --name $(BUILDX_BUILDER) --driver docker-container --bootstrap >/dev/null
+
+# buildx builds-and-pushes the multi-arch manifest list in one step (it does
+# NOT depend on the local build-sqe; depending on it would compile twice).
+push: push-sqe  ## Multi-arch build + push (run `make login` first)
+
+push-sqe: buildx-builder
+	@echo "==> buildx push $(PUSH_SQE):$(IMAGE_TAG) + :$(LATEST_TAG) [$(PLATFORMS)]"
+	$(DOCKER) buildx build $(SQE_BUILD_ARGS) --builder $(BUILDX_BUILDER) --platform $(PLATFORMS) \
+		-t $(PUSH_SQE):$(IMAGE_TAG) -t $(PUSH_SQE):$(LATEST_TAG) \
+		-f $(SQE_DOCKERFILE) --push .
 
 # ── Docs: rust book (mdbook) ──────────────────────────────────────────────
 rustbook:
@@ -135,7 +260,7 @@ benchmark-charts:
 	$(BENCH_PY) scripts/render-benchmark-charts.py
 
 # ── Cleanup ───────────────────────────────────────────────────────────────
-clean: clean-rust clean-rustbook clean-ebook clean-benchmark-charts
+clean: clean-rust clean-rustbook clean-ebook clean-benchmark-charts clean-images
 
 clean-rust:
 	@echo "==> cargo clean"
@@ -152,6 +277,10 @@ clean-ebook:
 clean-benchmark-charts:
 	@echo "==> Removing docs/benchmark/charts/"
 	rm -rf docs/benchmark/charts
+
+clean-images:
+	@echo "==> Removing $(CONFIG_OUT_DIR)"
+	rm -rf $(CONFIG_OUT_DIR)
 
 # ── Diagnostics ───────────────────────────────────────────────────────────
 check-tools:
