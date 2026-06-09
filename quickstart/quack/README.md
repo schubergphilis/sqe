@@ -186,9 +186,9 @@ capturing the aggregated result to [`OUTPUT.md`](./OUTPUT.md). Validated
 also covered by the engine's tests:
 
 - `crates/sqe-coordinator/tests/quack_e2e.rs::quack_select_one_round_trip`
-- `crates/sqe-quack-server/tests/` (connection lifecycle, auth rejection)
-- `crates/sqe-quack-client/tests/loopback.rs` (type round-trips)
-- `crates/sqe-quack-wire/tests/upstream_fixtures.rs` (wire codec vs real DuckDB)
+- `sqe-quack-server/tests/` (connection lifecycle, auth rejection)
+- `sqe-quack-client/tests/loopback.rs` (type round-trips)
+- `sqe-quack-wire/tests/upstream_fixtures.rs` (wire codec vs real DuckDB)
 
 ## Gotchas
 
