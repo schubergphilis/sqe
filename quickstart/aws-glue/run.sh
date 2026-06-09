@@ -33,7 +33,7 @@ require docker aws npx
 step "resolving AWS credentials (profile: ${AWS_PROFILE:-default})"
 eval "$(aws configure export-credentials --format env 2>/dev/null)" \
   || die "could not resolve AWS credentials. Set AWS_PROFILE or AWS_* env vars."
-export AWS_REGION="${AWS_REGION:-$(aws configure get region 2>/dev/null || echo eu-central-1)}"
+export AWS_REGION="${AWS_REGION:-$(aws configure get region 2>/dev/null || echo eu-example-1)}"
 export CDK_DEFAULT_REGION="$AWS_REGION"
 export CDK_DEFAULT_ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 ok "account $CDK_DEFAULT_ACCOUNT, region $AWS_REGION"
@@ -43,7 +43,7 @@ destroy() {
   docker compose down -v 2>/dev/null || true
   # SQE created the Glue database (not the CDK), so drop it here. Iceberg tables
   # are deleted with the bucket; delete-database removes the catalog entry.
-  aws glue delete-database --name sqe_glue_quickstart --region "${AWS_REGION:-eu-central-1}" 2>/dev/null \
+  aws glue delete-database --name sqe_glue_quickstart --region "${AWS_REGION:-eu-example-1}" 2>/dev/null \
     && ok "dropped glue database sqe_glue_quickstart" || true
   ( cd cdk && [ -d node_modules ] && npx cdk destroy --force 2>&1 | tail -3 ) || warn "cdk destroy: check the stack manually"
   rm -f sqe.toml.local cdk-outputs.json
