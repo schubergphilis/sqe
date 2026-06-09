@@ -28,7 +28,7 @@ bucket) and tears it back down, so the quickstart leaves nothing behind.
   with Glue + S3 permissions.
 - The account must be **cdk-bootstrapped** once (`cdk bootstrap`); most are.
 - The SQE image must include the Glue write fix
-  ([MR !286](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/merge_requests/286),
+  ([an earlier change](https://github.com/schubergphilis/sqe),
   now in `main`). Build it: `docker build -t sqe-quickstart:latest .` from the repo root.
 
 ## Run it
@@ -98,7 +98,7 @@ Captured live against AWS Glue (`./run.sh`), in [`OUTPUT.md`](./OUTPUT.md):
 
 `run.sh` runs the full create/write/read round-trip against a real Glue catalog
 + S3 bucket and asserts the queries succeed, then tears the resources down.
-Validated live 2026-06-06 (account `ACCOUNT_ID`, eu-central-1): CREATE SCHEMA ->
+Validated live 2026-06-06 (account `ACCOUNT_ID`, eu-example-1): CREATE SCHEMA ->
 CREATE TABLE -> INSERT -> SELECT, then a clean `cdk destroy` (no leftover stack,
 bucket, or database).
 
