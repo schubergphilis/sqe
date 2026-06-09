@@ -95,7 +95,7 @@ Docker capacity).
 SQE adds a Trino-compatibility function layer (date/time helpers like `year()`,
 `month()`, `day_of_week()`, JSON casts, and more) so dbt models and Trino SQL
 run with fewer rewrites. The current parity surface is tracked in
-[Trino Compatibility](../features/trino-compatibility.md). The parity scripts
+[Trino Compatibility](./trino-compatibility.md). The parity scripts
 above are the regression guard.
 
 ## Notes
