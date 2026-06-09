@@ -38,7 +38,7 @@ sqe-cli 0.31.4 connected to http://localhost:50051 (flight)
 
 $ sqe-cli --token <testuser-jwt> -e "INSERT ..."   # expect 403
 sqe-cli 0.31.4 connected to http://localhost:50051 (flight)
-Error: "Failed to fetch results: Tonic error: code: 'The caller does not have permission to execute the specified operation', message: \"Failed to commit INSERT transaction: Unexpected, context: { status: 403 Forbidden, headers: {\\\"x-request-id\\\": \\\"490a481e-64ab-4676-846f-625089e95004_0000000000000000048\\\", \\\"content-length\\\": \\\"216\\\", \\\"content-type\\\": \\\"application/json\\\"}, json: {\\\"error\\\":{\\\"message\\\":\\\"Principal 'testuser' with activated PrincipalRoles '[]' and activated grants via '[sqe_reader, table_reader]' is not authorized for op ADD_TABLE_SNAPSHOT\\\",\\\"type\\\":\\\"ForbiddenException\\\",\\\"code\\\":403}} } => Received response with unexpected status code\""
+Error: "Failed to fetch results: Tonic error: code: 'The caller does not have permission to execute the specified operation', message: \"Failed to commit INSERT transaction: Unexpected, context: { status: 403 Forbidden, headers: {\\\"x-request-id\\\": \\\"490a481e-64ab-4676-846f-625089e95004_8472810294\\\", \\\"content-length\\\": \\\"216\\\", \\\"content-type\\\": \\\"application/json\\\"}, json: {\\\"error\\\":{\\\"message\\\":\\\"Principal 'testuser' with activated PrincipalRoles '[]' and activated grants via '[sqe_reader, table_reader]' is not authorized for op ADD_TABLE_SNAPSHOT\\\",\\\"type\\\":\\\"ForbiddenException\\\",\\\"code\\\":403}} } => Received response with unexpected status code\""
 ```
 
 ## an invalid token is rejected by SQE before any query runs

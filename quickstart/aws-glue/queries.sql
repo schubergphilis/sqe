@@ -10,7 +10,7 @@ CREATE SCHEMA IF NOT EXISTS iceberg.sqe_glue_quickstart;
 
 -- 2. Create a table, write rows, read them back -- the full write path through
 --    the Glue catalog (CreateTable/UpdateTable) and S3 (data + metadata files).
---    This is what the format-version fix (MR !286) unblocked: before it, CREATE
+--    This is what the format-version fix (an earlier change) unblocked: before it, CREATE
 --    TABLE on Glue failed with "reserved properties [format-version]".
 DROP TABLE IF EXISTS iceberg.sqe_glue_quickstart.events;
 CREATE TABLE iceberg.sqe_glue_quickstart.events (
