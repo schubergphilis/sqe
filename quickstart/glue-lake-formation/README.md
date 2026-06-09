@@ -101,7 +101,7 @@ Phase B, after the grant, succeeds:
 
 `run.sh` runs the full denial -> grant -> success arc against a real
 LF-governed Glue database, then tears the resources down. Validated live
-2026-06-07 (account `311141556126`, eu-central-1): Phase A returned the LF
+2026-06-07 (account `123456789012`, eu-example-1): Phase A returned the LF
 `AccessDeniedException`; after `grant-permissions` Phase B did CREATE TABLE ->
 INSERT -> SELECT cleanly; teardown left no stack, database, bucket, or LF grant
 (verified with `describe-stacks` / `get-database` / `s3 ls` / `list-permissions`).

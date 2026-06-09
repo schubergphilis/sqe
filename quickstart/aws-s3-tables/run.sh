@@ -30,7 +30,7 @@ require docker aws npx
 step "resolving AWS credentials (profile: ${AWS_PROFILE:-default})"
 eval "$(aws configure export-credentials --format env 2>/dev/null)" \
   || die "could not resolve AWS credentials. Set AWS_PROFILE or AWS_* env vars."
-export AWS_REGION="${AWS_REGION:-$(aws configure get region 2>/dev/null || echo eu-central-1)}"
+export AWS_REGION="${AWS_REGION:-$(aws configure get region 2>/dev/null || echo eu-example-1)}"
 export CDK_DEFAULT_REGION="$AWS_REGION"
 export CDK_DEFAULT_ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 ok "account $CDK_DEFAULT_ACCOUNT, region $AWS_REGION"

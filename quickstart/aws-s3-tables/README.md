@@ -29,7 +29,7 @@ quickstart leaves nothing behind.
   region where S3 Tables is available.
 - A **cdk-bootstrapped** account.
 - The SQE image must include the Glue/non-REST write fix
-  ([!286](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/merge_requests/286),
+  ([!286](https://github.com/schubergphilis/sqe),
   in `main`) -- S3 Tables is a non-REST catalog, so `CREATE TABLE` hit the same
   reserved-`format-version` bug before that fix. Build: `docker build -t sqe-quickstart:latest .`.
 
@@ -78,7 +78,7 @@ Captured live against AWS S3 Tables (`./run.sh`), in [`OUTPUT.md`](./OUTPUT.md):
 `run.sh` runs the full create/write/read round-trip against a real S3 Tables
 table bucket and asserts the queries succeed, then deletes the table + namespace
 and destroys the bucket. Validated live 2026-06-06 (account `ACCOUNT_ID`,
-eu-central-1): CREATE SCHEMA -> CREATE TABLE -> INSERT -> SELECT, then a clean
+eu-example-1): CREATE SCHEMA -> CREATE TABLE -> INSERT -> SELECT, then a clean
 teardown (no leftover stack, bucket, namespace, or table).
 
 ## Gotchas
