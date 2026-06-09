@@ -333,6 +333,27 @@ Several Phase A/B metrics show 0 because the increment calls are not yet wired i
 
 These are wiring tasks for the next iteration.
 
+## Comparing against Trino
+
+The benchmark harness can run the same suite against a real Trino on the same
+data, so you can compare SQE and Trino directly. There are two modes:
+
+- **Correctness parity** — `--compare-trino` diffs SQE's results against
+  Trino's row-for-row. This is how SQL correctness is validated at scale, not
+  just timing. Small decimal differences on float-heavy aggregates are expected
+  and flagged for investigation rather than treated as failures.
+- **Timing** — the same run records per-query wall-clock for both engines, so a
+  head-to-head speed comparison falls out of the parity run.
+
+SQE's own distributed execution path (coordinator + workers, spill-to-disk,
+late materialization, file-level pruning) gives a measured ~3.1× speedup over
+single-node on TPC-H SF1, with metadata-light queries seeing more.
+
+Run a comparison yourself and see the captured numbers in the benchmark
+quickstart: [Benchmarks: TPC-H / TPC-DS / SSB](../quickstart/benchmark.md), or
+in the repo under
+[`benchmarks/`](https://github.com/schubergphilis/sqe/tree/main/benchmarks/).
+
 ## CI/CD Integration
 
 All three scripts support automated use without a TTY:
