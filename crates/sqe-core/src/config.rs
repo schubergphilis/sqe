@@ -396,6 +396,15 @@ pub struct CoordinatorConfig {
     /// Per-request timeout used when pushing refreshed credentials to a worker. Default: 10 s.
     #[serde(default = "default_credential_push_request_timeout_secs")]
     pub credential_push_request_timeout_secs: u64,
+    /// Grace period (seconds) to keep the process alive after SIGTERM before
+    /// shutting down the Flight server. On SIGTERM the readiness probe flips to
+    /// NOT-ready first so the Kubernetes Service stops routing new work, then
+    /// the process sleeps this long to let already-routed connections drain
+    /// before the tonic graceful boundary cuts remaining streams. Keep this
+    /// shorter than the pod's `terminationGracePeriodSeconds` so the process
+    /// exits cleanly before SIGKILL. Default: 25 s. Issue #250.
+    #[serde(default = "default_shutdown_drain_secs")]
+    pub shutdown_drain_secs: u64,
 }
 
 /// HTTP/2 + TCP knobs applied to every tonic Server / Client this
@@ -499,6 +508,7 @@ impl std::fmt::Debug for CoordinatorConfig {
                 "credential_push_request_timeout_secs",
                 &self.credential_push_request_timeout_secs,
             )
+            .field("shutdown_drain_secs", &self.shutdown_drain_secs)
             .finish()
     }
 }
@@ -2161,6 +2171,7 @@ fn default_health_check_max_failures() -> u32 { 3 }
 fn default_credential_refresh_interval_secs() -> u64 { 60 }
 fn default_credential_push_connect_timeout_secs() -> u64 { 5 }
 fn default_credential_push_request_timeout_secs() -> u64 { 10 }
+fn default_shutdown_drain_secs() -> u64 { 25 }  // < helm terminationGracePeriodSeconds
 fn default_query_timeout() -> u64 { 300 }       // 5 minutes
 fn default_max_result_rows() -> usize { 1_000_000 }
 fn default_max_concurrent_queries() -> usize { 100 }
@@ -3110,6 +3121,7 @@ mod tests {
                 credential_refresh_interval_secs: default_credential_refresh_interval_secs(),
                 credential_push_connect_timeout_secs: default_credential_push_connect_timeout_secs(),
                 credential_push_request_timeout_secs: default_credential_push_request_timeout_secs(),
+                shutdown_drain_secs: default_shutdown_drain_secs(),
             },
             worker: WorkerConfig::default(),
             auth: AuthConfig {
