@@ -1,10 +1,7 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use sqe_core::SqeConfig;
 use sqe_metrics::WorkerMetricsRegistry;
-use sqe_worker::flight_service::WorkerFlightService;
-use sqe_worker::heartbeat;
 use sqe_worker::runtime;
 
 #[tokio::main]
@@ -41,63 +38,18 @@ async fn main() -> anyhow::Result<()> {
     // Validate the worker config before binding any sockets. The check
     // refuses to boot a coordinator-connected worker with an empty secret
     // unless the operator explicitly waives via
-    // `worker.allow_unauthenticated = true`.
+    // `worker.allow_unauthenticated = true`, and refuses plaintext on a
+    // non-loopback distributed setup unless `security.allow_insecure_transport
+    // = true`.
     config.validate()?;
 
-    if config.worker.worker_secret.is_empty() && config.worker.allow_unauthenticated {
-        tracing::warn!(
-            "WARNING: worker.allow_unauthenticated = true -- any TCP-reachable \
-             client may send scan tickets or refresh S3 credentials on this \
-             worker. Set worker.worker_secret for production."
-        );
-    }
-
-    // QUACK-07: the worker Flight `do_get` ticket carries the user's live S3
-    // access key/secret/session token, `refresh_credentials` carries fresh STS
-    // creds, and the shared worker_secret travels as a gRPC metadata header. On
-    // a plaintext channel an on-path observer harvests all of these. Workers
-    // reuse the coordinator's `[coordinator.tls]` block: set cert_file/key_file
-    // there to wrap this listener in TLS. When TLS is not configured the
-    // listener stays plaintext, so warn loudly.
-    if !config.coordinator.tls.is_enabled() {
-        tracing::warn!(
-            "WARNING: the worker Flight service is PLAINTEXT (no TLS) and binds \
-             0.0.0.0 -- user S3 credentials and the worker secret travel in \
-             cleartext. Set [coordinator.tls] cert_file/key_file to enable TLS, \
-             or do not run workers on untrusted networks."
-        );
-    }
-
-    // Start heartbeat to coordinator if a coordinator URL is configured.
-    if !config.worker.coordinator_url.is_empty() {
-        let worker_url = format!("http://0.0.0.0:{port}");
-        let interval = Duration::from_secs(config.worker.heartbeat_interval_secs);
-        tracing::info!(
-            coordinator = %config.worker.coordinator_url,
-            interval_secs = config.worker.heartbeat_interval_secs,
-            "Starting heartbeat to coordinator"
-        );
-        heartbeat::start_heartbeat_task(
-            config.worker.coordinator_url.clone(),
-            worker_url,
-            interval,
-            config.worker.worker_secret.clone(),
-        );
-    }
-
-    // Parse Flight IPC compression from coordinator config (shared in sqe.toml).
-    // Workers use shuffle_compression for both DoGet (worker->coordinator) and
-    // DoExchange (shuffle) since all worker traffic is internal.
-    let shuffle_compression = sqe_core::FlightCompression::from_config(
-        &config.coordinator.shuffle_compression,
-    )
-    .unwrap_or(sqe_core::FlightCompression::Zstd);
-
-    let flight_service = WorkerFlightService::new(worker_metrics, session_ctx)
-        .with_scan_timeout(config.worker.scan_timeout_secs)
-        .with_flight_compression(shuffle_compression)
-        .with_shuffle_compression(shuffle_compression)
-        .with_worker_secret(config.worker.worker_secret.clone());
+    // Build the fully-wired Flight service (worker secret + footer cache +
+    // credential store + compression) and start the heartbeat task. Shared
+    // with `sqe-server --mode worker` so both worker paths stay identical
+    // (#219). The advertise URL is derived here and must be routable: an
+    // undeliverable URL aborts boot instead of poisoning the registry (#220).
+    let flight_service =
+        sqe_worker::bootstrap::build_worker_service(&config, worker_metrics, session_ctx)?;
 
     // Optional TLS (QUACK-07): workers reuse the coordinator's TLS config.
     let tls_config = sqe_worker::tls::build_server_tls_config(&config.coordinator.tls)
