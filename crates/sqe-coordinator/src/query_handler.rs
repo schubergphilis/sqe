@@ -2185,33 +2185,18 @@ impl QueryHandler {
             "Distributing scan across workers"
         );
 
-        // 6. Get projected columns + Iceberg field IDs from the scan. Field
-        // IDs (#43) let the worker project by the parquet PARQUET:field_id
-        // metadata key, so RENAME COLUMN / ADD COLUMN against post-evolution
-        // schema still resolves to the right parquet column in pre-evolution
-        // files. Names stay as a fallback for old workers and files without
-        // field IDs.
-        let projected_cols: Vec<String> = iceberg_scan
-            .projection()
-            .map(|cols| cols.to_vec())
-            .unwrap_or_default();
-        let iceberg_schema = iceberg_scan.table().metadata().current_schema().clone();
-        let projected_field_ids: Vec<i32> = if projected_cols.is_empty() {
-            Vec::new()
-        } else {
-            projected_cols
-                .iter()
-                .filter_map(|name| {
-                    iceberg_schema
-                        .as_struct()
-                        .fields()
-                        .iter()
-                        .find(|f| f.name == *name)
-                        .map(|f| f.id)
-                })
-                .collect()
-        };
-        let field_ids_complete = projected_field_ids.len() == projected_cols.len();
+        // 6. Projection is intentionally NOT pushed to workers. DistributedScanExec
+        // advertises the unprojected scan schema (`scan_node.schema()`), and the
+        // fragment-reassembly path in distributed_scan.rs requires each worker
+        // batch to carry the full table columns so it can narrow them by name to
+        // the expected schema (any ProjectionExec above narrows further). Sending
+        // a non-empty projection made the worker emit only the projected columns,
+        // which no longer matched the exec's full-width schema and failed every
+        // projected distributed scan with an Arrow "number of columns(N) must
+        // match number of fields(M)" error. Re-enabling worker-side projection
+        // requires DistributedScanExec to advertise the projected schema (and drop
+        // the now-redundant ProjectionExec); until then these stay empty so the
+        // worker returns full columns and the reassembly contract holds.
 
         // 6b. Push the scan predicate and (when safe) the query LIMIT into each
         // ScanTask (#233). Both are pure optimizations: the authoritative
@@ -2260,12 +2245,10 @@ impl QueryHandler {
                     fragment_id: uuid::Uuid::now_v7().to_string(),
                     data_file_paths,
                     file_sizes_bytes,
-                    projected_columns: projected_cols.clone(),
-                    projected_field_ids: if field_ids_complete {
-                        projected_field_ids.clone()
-                    } else {
-                        Vec::new()
-                    },
+                    // Empty: workers return full table columns, the coordinator
+                    // narrows by name during reassembly (see note at step 6).
+                    projected_columns: Vec::new(),
+                    projected_field_ids: Vec::new(),
                     s3_endpoint: storage.s3_endpoint.clone(),
                     s3_region: storage.s3_region.clone(),
                     s3_access_key: storage.s3_access_key.clone(),
