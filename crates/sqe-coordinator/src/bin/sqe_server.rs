@@ -965,17 +965,15 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         let executor: Arc<dyn sqe_quack_server::QueryExecutor> = Arc::new(
             sqe_coordinator::CoordinatorExecutor::new(query_handler.clone()),
         );
+        // QUACK-08: the Quack ConnectionRequest -> authenticate path is rate
+        // limited per client IP inside sqe-quack-server, mirroring the Flight /
+        // Trino auth limiters. We pass [security].trusted_proxies so the limiter
+        // keys on the real client IP (rightmost untrusted x-forwarded-for hop)
+        // when the peer is a trusted proxy, and on the raw TCP peer otherwise.
+        // Serving with connect-info hands the handler the peer SocketAddr.
         let quack_state =
-            sqe_quack_server::QuackServerState::new(Arc::clone(&auth_chain), executor);
-        // QUACK-08: unlike the Flight/Trino auth paths, the Quack router has no
-        // rate limiter, so the ConnectionRequest -> authenticate path is an
-        // un-throttled brute-force / IdP-amplification oracle. The existing
-        // limiters (QueryRateLimiter/AuthRateLimiter) are application-level, not
-        // a tower layer, and the router is built inside sqe-quack-server, so it
-        // cannot be attached here without changes in that crate.
-        // TODO(QUACK-08): add a per-IP rate limiter to the Quack
-        // ConnectionRequest path (in sqe-quack-server, or a tower layer here).
-        tracing::warn!("WARNING: the Quack endpoint has NO rate limiting on its auth path -- it is an un-throttled brute-force / IdP-amplification oracle. Restrict network access to the Quack port until QUACK-08 lands.");
+            sqe_quack_server::QuackServerState::new(Arc::clone(&auth_chain), executor)
+                .with_security(config.security.clone());
         let quack_app = sqe_quack_server::router(quack_state);
         let bind = format!("0.0.0.0:{quack_port}");
         // QUACK-05: the Quack ConnectionRequest carries the user's OIDC bearer
@@ -1003,7 +1001,9 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("Quack TLS config: {e}"))?;
             tokio::spawn(async move {
                 if let Err(e) = axum_server::bind_rustls(quack_addr, tls)
-                    .serve(quack_app.into_make_service())
+                    .serve(
+                        quack_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                    )
                     .await
                 {
                     tracing::error!(error = %e, "Quack RPC server (TLS) terminated unexpectedly");
@@ -1016,7 +1016,12 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("Quack server bind to {bind}: {e}"))?;
             tokio::spawn(async move {
-                if let Err(e) = axum::serve(listener, quack_app).await {
+                if let Err(e) = axum::serve(
+                    listener,
+                    quack_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .await
+                {
                     tracing::error!(error = %e, "Quack RPC server terminated unexpectedly");
                 }
             });
