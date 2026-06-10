@@ -3323,6 +3323,13 @@ impl QueryHandler {
         session: &Session,
         stmt: &Statement,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // Gate behind the admin allowlist BEFORE touching the backend
+        // (issue #204). In production the Polaris backend swaps the caller's
+        // token for a service token scoped PRINCIPAL_ROLE:ALL, so an
+        // ungated GRANT let any authenticated user self-escalate. The check
+        // sits here, ahead of `require_grant_backend`, so the service-token
+        // path is unreachable for non-admins.
+        self.require_admin(session, "GRANT")?;
         let backend = self.require_grant_backend()?;
         let grant_stmt = Self::extract_grant_statement(stmt)?;
         backend.grant(session.access_token().expose(), &grant_stmt).await?;
@@ -3335,6 +3342,9 @@ impl QueryHandler {
         session: &Session,
         stmt: &Statement,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // Same admin gate as GRANT (issue #204): REVOKE mutates grants under
+        // the service token too.
+        self.require_admin(session, "REVOKE")?;
         let backend = self.require_grant_backend()?;
         let grant_stmt = Self::extract_grant_statement(stmt)?;
         let revoke_stmt = RevokeStatement {
