@@ -150,6 +150,20 @@ prometheus_port = 9090
 # OTLP gRPC endpoint for traces, metrics, and logs (e.g. "http://otel-collector:4317")
 # Leave empty to disable OpenTelemetry export (structured JSON logs only)
 otlp_endpoint = ""
+# Security audit log (one JSONL entry per statement: who ran what, when, against
+# which tables). Empty disables it (the logger is a no-op). The default is empty
+# here because an unwritable path is fatal at startup, and a single example file
+# cannot know your durable location; leaving it off keeps a plain `cargo run`
+# and the quickstarts working.
+#
+# DURABILITY: the path MUST live on storage that survives process/host restart.
+# Records appended to an ephemeral location (a container emptyDir, a tmpfs, /tmp)
+# vanish on restart and the audit trail is lost. For a sovereign, fine-grained
+# security engine that is a compliance gap, so point this at a persistent mount,
+# e.g. a dedicated volume:
+#   audit_log_path = "/var/log/sqe/audit/audit.jsonl"
+# Under Helm this is wired automatically: set audit.enabled=true (default) plus
+# audit.persistence.enabled=true to back it with a PVC. See ISSUE-248.
 audit_log_path = ""
 
 # ── Query execution ───────────────────────────────────────────
