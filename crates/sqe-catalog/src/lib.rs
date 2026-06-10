@@ -35,7 +35,6 @@ pub mod read_csv;
 pub mod read_delta;
 pub mod read_json;
 pub mod read_parquet;
-pub mod s3_io;
 pub mod sort_order;
 #[cfg(feature = "rest")]
 pub mod system_catalog;
@@ -59,9 +58,5 @@ pub use mount::build_catalog;
 #[cfg(feature = "rest")]
 pub use rest_catalog::{invalidate_rest_catalog_cache_all, SessionCatalog, TableMetadataCache};
 pub use iceberg_scan::coalesce_file_entries;
-pub use s3_io::{
-    ByteRange, PrefetchHandle, coalesce_ranges, fetch_byte_ranges, fetch_column_chunks,
-    prefetch_footer, process_files_with_prefetch, process_files_with_prefetch_depth,
-};
 #[cfg(feature = "rest")]
 pub use system_catalog::SystemCatalogProvider;
