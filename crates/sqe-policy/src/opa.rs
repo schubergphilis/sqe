@@ -417,6 +417,16 @@ impl PolicyStore for OpaStore {
         self.cache.insert(key, policy.clone()).await;
         Ok(policy)
     }
+
+    /// Flush every cached OPA decision. Called after a GRANT/REVOKE so a
+    /// tightened policy or revoked grant takes effect on the next query
+    /// instead of lingering until the cache TTL expires (issue #207).
+    /// moka's `invalidate_all()` is synchronous: it marks all current
+    /// entries stale, so subsequent `resolve()` calls miss the cache and
+    /// re-query OPA.
+    fn invalidate_all(&self) {
+        self.cache.invalidate_all();
+    }
 }
 
 /// Parse a simple filter expression string (e.g., "clearance >= 3").

@@ -3202,6 +3202,22 @@ impl QueryHandler {
 
     // ── Access control handlers ──────────────────────────────────────────
 
+    /// Flush the policy decision cache after a policy-mutating statement so
+    /// the change takes effect on the next query instead of lingering until
+    /// the cache TTL elapses (default 60s, `[policy] cache_ttl_secs`).
+    /// Issue #207.
+    ///
+    /// No-op when no `PolicyStore` is wired (the current production default;
+    /// the OPA enforcer is gated behind AUTH-01). When OPA IS wired, the
+    /// SAME `Arc<dyn PolicyStore>` must back both the `PolicyPlanRewriter`
+    /// enforcer on the read path AND this `policy_store` field, otherwise the
+    /// flush hits a different cache than the one the read path consults.
+    fn invalidate_policy_cache(&self) {
+        if let Some(store) = &self.policy_store {
+            store.invalidate_all();
+        }
+    }
+
     /// Return the grant backend or a `NotImplemented` error.
     fn require_grant_backend(&self) -> sqe_core::Result<&dyn GrantBackend> {
         self.grant_backend
@@ -3333,6 +3349,9 @@ impl QueryHandler {
         let backend = self.require_grant_backend()?;
         let grant_stmt = Self::extract_grant_statement(stmt)?;
         backend.grant(session.access_token().expose(), &grant_stmt).await?;
+        // Flush the policy cache only after the mutation succeeds so the new
+        // grant is visible on the next query (issue #207).
+        self.invalidate_policy_cache();
         Ok(vec![])
     }
 
@@ -3355,6 +3374,9 @@ impl QueryHandler {
             grantee: grant_stmt.grantee,
         };
         backend.revoke(session.access_token().expose(), &revoke_stmt).await?;
+        // Flush the policy cache only after the mutation succeeds so the
+        // revoked grant stops working immediately (issue #207).
+        self.invalidate_policy_cache();
         Ok(vec![])
     }
 
@@ -3393,12 +3415,37 @@ impl QueryHandler {
         Self::grants_to_record_batch(&entries)
     }
 
+    /// Authorise a read-path grant introspection request (issue #260).
+    ///
+    /// A caller may always introspect THEIR OWN effective grants/access
+    /// (legitimate self-service). Targeting another principal requires an
+    /// admin role: in production the Polaris backend swaps the caller's bearer
+    /// for a service token scoped PRINCIPAL_ROLE:ALL, so an ungated read let
+    /// any authenticated user enumerate anyone's effective privileges. The
+    /// check sits ahead of `require_grant_backend`, so the service-token path
+    /// is unreachable for a non-admin targeting someone else.
+    fn require_self_or_admin(
+        &self,
+        session: &Session,
+        target_user: &str,
+        statement: &str,
+    ) -> sqe_core::Result<()> {
+        if target_user == session.user.username {
+            return Ok(());
+        }
+        self.require_admin(session, statement)
+    }
+
     /// Handle SHOW EFFECTIVE GRANTS by delegating to the configured grant backend.
     async fn handle_show_effective_grants(
         &self,
         session: &Session,
         user: &str,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // Self-introspection is allowed; introspecting another principal
+        // requires admin (issue #260). Gate BEFORE touching the backend so
+        // the service-token path is unreachable for an unauthorised caller.
+        self.require_self_or_admin(session, user, "SHOW EFFECTIVE GRANTS")?;
         let backend = self.require_grant_backend()?;
         let entries = backend.show_effective(session.access_token().expose(), user).await?;
         Self::grants_to_record_batch(&entries)
@@ -3410,6 +3457,10 @@ impl QueryHandler {
         session: &Session,
         params: &sqe_sql::CheckAccessParams,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // Same self-or-admin gate as SHOW EFFECTIVE GRANTS (issue #260):
+        // checking your own access is self-service, checking another
+        // principal's is admin-only.
+        self.require_self_or_admin(session, &params.user, "CHECK ACCESS")?;
         let backend = self.require_grant_backend()?;
 
         let check = AccessCheck {
