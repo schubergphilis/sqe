@@ -369,7 +369,7 @@ async fn handle_connection_request(
     let core_session = identity_to_core_session(&identity);
     state.sessions.insert(Session {
         connection_id: connection_id.clone(),
-        bearer_token: req.auth_string,
+        bearer_token: SecretString::new(req.auth_string),
         identity,
         core_session,
     });
