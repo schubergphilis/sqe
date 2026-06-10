@@ -113,6 +113,16 @@ spec:
             # (the OOM defense) works without dropping readOnlyRootFilesystem.
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.audit.enabled }}
+            # ISSUE-248: audit records go to a dedicated volume so they are not
+            # lost on pod restart. With audit.persistence.enabled the volume is
+            # a durable PVC; otherwise it is an emptyDir (functional but
+            # ephemeral). The rendered audit_log_path (configmap.yaml) is a file
+            # under this mount, so the engine writes here under
+            # readOnlyRootFilesystem.
+            - name: audit
+              mountPath: {{ .Values.audit.path | quote }}
+            {{- end }}
           resources:
             {{- toYaml .Values.coordinator.resources | nindent 12 }}
       volumes:
@@ -124,6 +134,19 @@ spec:
             {{- with .Values.coordinator.spillVolumeSizeLimit }}
             sizeLimit: {{ . }}
             {{- end }}
+        {{- if .Values.audit.enabled }}
+        # ISSUE-248: durable audit storage when persistence is on, ephemeral
+        # emptyDir otherwise. existingClaim mounts a PVC you manage; a non-empty
+        # persistence.enabled without existingClaim binds the chart-created PVC
+        # (see audit-pvc.yaml).
+        - name: audit
+          {{- if .Values.audit.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.audit.persistence.existingClaim | default (printf "%s-audit" (include "sqe.fullname" .)) }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- end }}
       {{- with .Values.coordinator.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

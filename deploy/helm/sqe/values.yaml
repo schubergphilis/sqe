@@ -128,7 +128,54 @@ config:
   metrics:
     prometheus_port: 9090
     otlp_endpoint: ""
-    audit_log_path: ""
+    # ISSUE-248: audit_log_path is NOT set here. The path is derived from the
+    # audit.* block below so the mounted volume and the rendered toml stay in
+    # lockstep (audit.path + audit.fileName). Setting it here would let the
+    # config drift from the mount and write audit records to a path that has no
+    # durable volume behind it.
+
+# -- Audit log (ISSUE-248) ----------------------------------------------------
+# The coordinator writes security-relevant audit records (one JSONL entry per
+# statement) to audit_log_path. Two problems were fixed here:
+#   1. off by default -- audit_log_path was empty, so the logger was a no-op.
+#   2. non-durable -- the only writable mount was the /tmp emptyDir, so any
+#      records written were lost on pod restart or reschedule.
+#
+# Workers do not audit (the coordinator owns auth, policy, and statement
+# routing), so the audit volume is mounted on the coordinator only.
+#
+# Default posture: audit is ENABLED so a security trail exists out of the box,
+# but persistence is OFF so a plain `helm install` does not require a
+# PersistentVolume to be provisioned. With persistence off the records live on
+# the same emptyDir as spill and are still ephemeral.
+#
+# FOR PRODUCTION set audit.persistence.enabled=true (or point existingClaim at
+# a PVC you manage). The chart then mounts a ReadWriteOnce PVC at audit.path and
+# the records survive pod restarts. RWO is single-writer, which matches the
+# single-replica coordinator (ISSUE-221).
+audit:
+  # Master switch. When false, audit_log_path renders empty and the logger is a
+  # no-op; no audit volume is mounted.
+  enabled: true
+  # Directory the audit log lives in. A volume (PVC or emptyDir) is mounted
+  # here, and audit_log_path becomes "<path>/<fileName>".
+  path: "/var/log/sqe/audit"
+  # File name under audit.path.
+  fileName: "audit.jsonl"
+  persistence:
+    # When true, back audit.path with a PersistentVolumeClaim instead of an
+    # emptyDir, so audit records survive pod restart and reschedule. When false
+    # (default), audit.path is an emptyDir and records are ephemeral.
+    enabled: false
+    # Name of a PVC you manage. When set, the chart mounts it instead of
+    # creating one (persistence.enabled is still required to mount a PVC at all).
+    existingClaim: ""
+    # Size of the PVC the chart creates (ignored when existingClaim is set).
+    size: "1Gi"
+    # StorageClass for the created PVC. Empty uses the cluster default.
+    storageClass: ""
+    # Access mode for the created PVC. RWO matches the single coordinator.
+    accessMode: "ReadWriteOnce"
 
 # ── Worker secret (distributed mode) ────────────────────────
 # ISSUE-218: in distributed mode the engine HARD-FAILS startup validation when

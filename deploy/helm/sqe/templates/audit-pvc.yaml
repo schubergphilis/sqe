@@ -1,0 +1,24 @@
+{{- /*
+ISSUE-248: durable storage for the coordinator audit log. Rendered only when
+audit is enabled, persistence is enabled, and no existingClaim is supplied (in
+which case you bring your own PVC). RWO matches the single-replica coordinator
+that owns the audit trail; the worker does not audit, so no PVC is needed there.
+*/ -}}
+{{- if and .Values.audit.enabled .Values.audit.persistence.enabled (not .Values.audit.persistence.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "sqe.fullname" . }}-audit
+  labels:
+    {{- include "sqe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: coordinator
+spec:
+  accessModes:
+    - {{ .Values.audit.persistence.accessMode | default "ReadWriteOnce" }}
+  resources:
+    requests:
+      storage: {{ .Values.audit.persistence.size | default "1Gi" | quote }}
+  {{- if .Values.audit.persistence.storageClass }}
+  storageClassName: {{ .Values.audit.persistence.storageClass | quote }}
+  {{- end }}
+{{- end }}
