@@ -410,29 +410,7 @@ impl ExecutionPlan for DistributedScanExec {
                                 flight_stream
                                     .map_err(|e| DataFusionError::External(Box::new(e)))
                                     .map(move |batch_result| {
-                                        let batch = batch_result?;
-                                        let expected_cols = expected_schema.fields().len();
-                                        if batch.num_columns() == expected_cols {
-                                            Ok(batch)
-                                        } else if expected_cols == 0 {
-                                            // COUNT(*) case: return empty-column batch with row count
-                                            Ok(RecordBatch::try_new_with_options(
-                                                expected_schema.clone(),
-                                                vec![],
-                                                &arrow_array::RecordBatchOptions::new()
-                                                    .with_row_count(Some(batch.num_rows())),
-                                            )?)
-                                        } else {
-                                            // Select matching columns by name
-                                            let columns: Vec<_> = expected_schema.fields().iter().map(|f| {
-                                                batch.column_by_name(f.name()).cloned().ok_or_else(|| {
-                                                    DataFusionError::Internal(format!(
-                                                        "Column '{}' not found in worker batch", f.name()
-                                                    ))
-                                                })
-                                            }).collect::<DFResult<Vec<_>>>()?;
-                                            Ok(RecordBatch::try_new(expected_schema.clone(), columns)?)
-                                        }
+                                        reassemble_worker_batch(batch_result?, &expected_schema)
                                     }),
                             );
                         // Terminate the fragment stream on the first mid-stream
@@ -915,9 +893,117 @@ impl Drop for CallbackStream {
     }
 }
 
+/// Reassemble a worker fragment batch to the schema `DistributedScanExec`
+/// advertises. Workers return the full table columns; the coordinator narrows
+/// them to `expected_schema` by name. Three cases:
+/// - column count already matches -> pass through,
+/// - expected is empty (COUNT(*)) -> empty-column batch preserving the row count,
+/// - otherwise -> select the expected fields by name from the worker batch.
+///
+/// This is why projection is NOT pushed to workers (see query_handler step 6):
+/// a projected worker batch would be narrower than `expected_schema` and the
+/// by-name selection below would fail to find the missing columns.
+fn reassemble_worker_batch(
+    batch: RecordBatch,
+    expected_schema: &SchemaRef,
+) -> DFResult<RecordBatch> {
+    let expected_cols = expected_schema.fields().len();
+    if batch.num_columns() == expected_cols {
+        Ok(batch)
+    } else if expected_cols == 0 {
+        // COUNT(*) case: return empty-column batch with row count.
+        Ok(RecordBatch::try_new_with_options(
+            expected_schema.clone(),
+            vec![],
+            &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+        )?)
+    } else {
+        // Select matching columns by name from the full worker batch.
+        let columns: Vec<_> = expected_schema
+            .fields()
+            .iter()
+            .map(|f| {
+                batch.column_by_name(f.name()).cloned().ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "Column '{}' not found in worker batch",
+                        f.name()
+                    ))
+                })
+            })
+            .collect::<DFResult<Vec<_>>>()?;
+        Ok(RecordBatch::try_new(expected_schema.clone(), columns)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod reassemble {
+        use super::*;
+        use arrow_array::Int64Array;
+        use arrow_schema::{DataType, Field, Schema};
+
+        fn col(v: i64) -> Arc<dyn arrow_array::Array> {
+            Arc::new(Int64Array::from(vec![v]))
+        }
+
+        fn batch(names: &[&str]) -> RecordBatch {
+            let fields: Vec<Field> = names
+                .iter()
+                .map(|n| Field::new(*n, DataType::Int64, false))
+                .collect();
+            let cols: Vec<Arc<dyn arrow_array::Array>> =
+                names.iter().enumerate().map(|(i, _)| col(i as i64)).collect();
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap()
+        }
+
+        fn schema(names: &[&str]) -> SchemaRef {
+            Arc::new(Schema::new(
+                names
+                    .iter()
+                    .map(|n| Field::new(*n, DataType::Int64, false))
+                    .collect::<Vec<_>>(),
+            ))
+        }
+
+        #[test]
+        fn full_batch_narrows_to_projected_schema_by_name() {
+            // The contract the fix relies on: workers return all 3 columns, the
+            // coordinator narrows to the 2 the exec expects, reordered by name.
+            let worker = batch(&["a", "b", "c"]);
+            let expected = schema(&["c", "a"]);
+            let out = reassemble_worker_batch(worker, &expected).unwrap();
+            assert_eq!(out.num_columns(), 2);
+            assert_eq!(out.schema().field(0).name(), "c");
+            assert_eq!(out.schema().field(1).name(), "a");
+        }
+
+        #[test]
+        fn equal_width_batch_passes_through() {
+            let out = reassemble_worker_batch(batch(&["a", "b"]), &schema(&["a", "b"])).unwrap();
+            assert_eq!(out.num_columns(), 2);
+        }
+
+        #[test]
+        fn count_star_empty_schema_preserves_row_count() {
+            let worker = batch(&["a", "b", "c"]); // 1 row
+            let out = reassemble_worker_batch(worker, &schema(&[])).unwrap();
+            assert_eq!(out.num_columns(), 0);
+            assert_eq!(out.num_rows(), 1);
+        }
+
+        #[test]
+        fn projected_worker_batch_narrower_than_expected_fails() {
+            // This is exactly the bug that pushing projection to workers caused:
+            // a 1-column worker batch cannot satisfy a 2-field expected schema.
+            // The fix keeps projected_columns empty so this never happens; this
+            // test pins the reason.
+            let projected_worker = batch(&["a"]);
+            let expected = schema(&["a", "b"]);
+            assert!(reassemble_worker_batch(projected_worker, &expected).is_err());
+        }
+    }
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::physical_plan::ExecutionPlanProperties;
 
