@@ -582,6 +582,7 @@ mod tests {
         // Trusted proxy: key follows the forwarded client.
         let trusted = SecurityConfig {
             trusted_proxies: vec!["10.0.0.1".to_string()],
+            ..SecurityConfig::default()
         };
         assert_eq!(client_key(proxy, Some("203.0.113.5"), &trusted), "203.0.113.5");
         assert_ne!(
