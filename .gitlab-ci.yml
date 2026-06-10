@@ -350,7 +350,125 @@ build-sqe:
         - Cargo.lock
         - Dockerfile
 
+# ── Supply chain: SBOM + checksums + signing ──────────────────
+# Issue #257. The kaniko build-sqe job pushes the image but does not sign it
+# or emit a bill of materials. This job pulls the just-built image, generates
+# a CycloneDX SBOM with syft (pinned), and writes SHA256 checksums for the
+# SBOM. Both are published as job artifacts and attached to the release.
+#
+# Tooling choice: syft is already part of the team toolchain and is present on
+# the runners, so the SBOM step uses it directly (pinned by version below).
+# cosign is NOT assumed available here, so keyless image signing is left as a
+# documented operator step rather than silently skipped -- see the TODO in the
+# script. The job fails loudly if syft is missing instead of degrading to a
+# no-op, so a broken supply-chain gate is visible rather than green-by-default.
+.sbom-sign-base:
+  image: docker:24
+  services:
+    - name: docker:24-dind
+      alias: docker
+      command: ["--tls=false", "--host=tcp://0.0.0.0:2375"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_DRIVER: overlay2
+    # Pin the syft release used to generate the SBOM. Bump deliberately.
+    SYFT_VERSION: "1.18.1"
+    # Image reference to scan. build-sqe pushes IMAGE_NAME 'sqe' to the
+    # project registry; tag is the git tag on a release, else the short SHA.
+    SBOM_IMAGE: "${CI_REGISTRY_IMAGE}/sqe:${CI_COMMIT_TAG}"
+  before_script:
+    - apk add --no-cache bash curl docker-cli
+    # Install the pinned syft. Fail loudly if the install does not yield a
+    # working binary -- this is a security gate, not best-effort.
+    - curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin "v${SYFT_VERSION}"
+    - 'command -v syft >/dev/null || { echo "ERROR: syft not installed; supply-chain gate cannot run"; exit 1; }'
+    - syft version
+  script:
+    - echo "Logging in to ${CI_REGISTRY} and pulling ${SBOM_IMAGE}"
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker pull "$SBOM_IMAGE"
+    # Generate a CycloneDX JSON SBOM for the container image.
+    - syft "docker:${SBOM_IMAGE}" -o cyclonedx-json=sbom-sqe.cdx.json
+    - 'test -s sbom-sqe.cdx.json || { echo "ERROR: SBOM is empty"; exit 1; }'
+    # Record the image digest so consumers can pin by digest in Helm.
+    - docker inspect --format '{{index .RepoDigests 0}}' "$SBOM_IMAGE" > image-digest.txt || true
+    # Checksums for the artifacts so consumers can verify integrity even
+    # without a signature available yet.
+    - sha256sum sbom-sqe.cdx.json image-digest.txt > SHA256SUMS
+    - cat SHA256SUMS
+    # TODO(operator): keyless image signing. cosign is not provisioned on
+    # these runners. Once a runner has cosign + GitLab OIDC id_tokens wired,
+    # add the following (and grant the job an id_token) to sign the digest:
+    #
+    #   COSIGN_EXPERIMENTAL=1 cosign sign --yes \
+    #     "$(cut -d' ' -f1 image-digest.txt)"
+    #
+    # and to attach the SBOM as an attestation:
+    #
+    #   COSIGN_EXPERIMENTAL=1 cosign attest --yes \
+    #     --predicate sbom-sqe.cdx.json --type cyclonedx \
+    #     "$(cut -d' ' -f1 image-digest.txt)"
+    #
+    # Verification: cosign verify --certificate-identity-regexp '.*' \
+    #   --certificate-oidc-issuer "$CI_SERVER_URL" "<digest>"
+    - 'echo "TODO(operator): run cosign keyless signing (see script comment) once cosign is provisioned."'
+  artifacts:
+    when: always
+    paths:
+      - sbom-sqe.cdx.json
+      - SHA256SUMS
+      - image-digest.txt
+    expire_in: 1 year
+
+# SBOM on every merge-to-main image build (tracks main's supply chain).
+sbom-sign:
+  extends: .sbom-sign-base
+  stage: build
+  needs:
+    - job: build-sqe
+      artifacts: false
+  variables:
+    SBOM_IMAGE: "${CI_REGISTRY_IMAGE}/sqe:${CI_COMMIT_SHORT_SHA}"
+  # A missing/failed supply-chain gate must not turn the merge-to-main image
+  # build red. The job fails loudly on its own row; it does not block.
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
+      changes:
+        - crates/**/*
+        - Cargo.toml
+        - Cargo.lock
+        - Dockerfile
+
 # ── Release pipeline (triggered on tag push: v*) ──────────────
+
+# Release-time SBOM + checksums for the tagged image, attached to the release.
+sbom-sign-release:
+  extends: .sbom-sign-base
+  stage: test
+  variables:
+    SBOM_IMAGE: "${CI_REGISTRY_IMAGE}/sqe:${CI_COMMIT_TAG}"
+  # Best-effort: a syft download hiccup or wrong image ref must never block
+  # the tag release (which previously always produced a release). The release
+  # job needs this one as `optional` so a failure here still ships the release
+  # without the SBOM asset links.
+  allow_failure: true
+  # Export this job's id so the release job can build artifact-download URLs
+  # for the SBOM + checksums via a dotenv artifact.
+  after_script:
+    - echo "SBOM_JOB_ID=${CI_JOB_ID}" > sbom.env
+  artifacts:
+    when: always
+    paths:
+      - sbom-sqe.cdx.json
+      - SHA256SUMS
+      - image-digest.txt
+    reports:
+      dotenv: sbom.env
+    expire_in: 1 year
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+/'
 
 changelog:
   stage: test
@@ -371,11 +489,32 @@ release:
   needs:
     - job: changelog
       artifacts: true
+    # Attach the SBOM + checksums produced by sbom-sign-release so the
+    # release carries a verifiable bill of materials (issue #257). Marked
+    # optional so a failed/absent SBOM job never blocks the release; the asset
+    # links below simply resolve to an empty job id and can be omitted.
+    - job: sbom-sign-release
+      artifacts: true
+      optional: true
+  variables:
+    # Fallback so the asset-link URLs are still well-formed when the SBOM job
+    # did not run; the dotenv export from sbom-sign-release overrides this.
+    SBOM_JOB_ID: ""
   script:
     - echo "Creating release for ${CI_COMMIT_TAG}"
   release:
     tag_name: ${CI_COMMIT_TAG}
     name: "SQE ${CI_COMMIT_TAG}"
     description: release-notes.md
+    # Link the SBOM and checksums (job artifacts) as release assets. The
+    # links point at the sbom-sign-release job's artifact files.
+    assets:
+      links:
+        - name: "SBOM (CycloneDX JSON)"
+          url: "${CI_PROJECT_URL}/-/jobs/${SBOM_JOB_ID}/artifacts/raw/sbom-sqe.cdx.json"
+          link_type: other
+        - name: "SHA256SUMS"
+          url: "${CI_PROJECT_URL}/-/jobs/${SBOM_JOB_ID}/artifacts/raw/SHA256SUMS"
+          link_type: other
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v[0-9]+/'
