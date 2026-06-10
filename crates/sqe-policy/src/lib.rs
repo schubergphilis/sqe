@@ -84,6 +84,16 @@ pub trait PolicyStore: Send + Sync {
         table_name: &str,
         namespace: &str,
     ) -> sqe_core::Result<ResolvedPolicy>;
+
+    /// Invalidate any cached policy decisions so the next `resolve()` call
+    /// re-reads from the backing engine.
+    ///
+    /// Called after a GRANT/REVOKE (or any policy-mutating statement) so the
+    /// change takes effect immediately rather than after the cache TTL elapses
+    /// (issue #207). Cacheless stores (e.g. `InMemoryPolicyStore`) inherit the
+    /// default no-op. The method is synchronous because moka's
+    /// `invalidate_all()` is synchronous (it only marks existing entries stale).
+    fn invalidate_all(&self) {}
 }
 
 #[cfg(test)]
