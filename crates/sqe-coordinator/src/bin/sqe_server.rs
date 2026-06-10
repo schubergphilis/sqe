@@ -604,7 +604,10 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     let worker_registry = Arc::new(
         sqe_coordinator::worker_registry::WorkerRegistry::with_options_and_failures(
             config.coordinator.worker_urls.clone(),
-            sqe_coordinator::channel_pool::ChannelPool::shared(),
+            sqe_coordinator::channel_pool::ChannelPool::shared_with_timeouts(
+                std::time::Duration::from_secs(config.coordinator.worker_connect_timeout_secs),
+                std::time::Duration::from_secs(config.coordinator.worker_rpc_timeout_secs),
+            ),
             config.coordinator.max_workers,
             config.coordinator.health_check_max_failures,
         ),
