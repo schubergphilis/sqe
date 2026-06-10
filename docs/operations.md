@@ -1,5 +1,9 @@
 # Operations
 
+For incident response (crashloops, catalog or OIDC outages, coordinator OOM,
+worker registry flapping), see the [Operational Runbook](runbook.md). This page
+covers planned day-two maintenance.
+
 Day-two operations for SQE run through `CALL system.*` SQL procedures. Each
 procedure wraps a vendored iceberg-rust transaction action and commits
 through the same REST catalog path that CTAS and INSERT use. Every
