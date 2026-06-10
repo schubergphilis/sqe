@@ -95,11 +95,21 @@ struct CachedTableEntry {
 /// only ever took the lock for read — `RestCatalog` is `Send + Sync` and
 /// stateless per call. The lock plus its yield point were pure overhead
 /// (~100-500 ns per dispatch, compounding on metadata fan-out). Issue #18.
+/// Max number of cached `RestCatalog` instances. Keyed per
+/// `catalog_url + warehouse + token_fingerprint`, so the bound is really
+/// "distinct concurrent user-token-warehouse triples". At 100 the 101st
+/// concurrent user evicted someone else's entry, and each rebuild costs a
+/// `/v1/config` round trip (~250ms) plus a `list_namespaces` on the next
+/// catalog-provider build. Raised to 2000 so a few thousand concurrent users
+/// stop thrashing; the 300s TTL still bounds memory by expiring idle entries.
+/// Entries are `Arc<RestCatalog>`, so the per-entry cost is small. Issue #240.
+pub(crate) const REST_CATALOG_CACHE_MAX_CAPACITY: u64 = 2000;
+
 pub(crate) static REST_CATALOG_CACHE: std::sync::LazyLock<
     moka::future::Cache<String, Arc<RestCatalog>>,
 > = std::sync::LazyLock::new(|| {
     moka::future::Cache::builder()
-        .max_capacity(100)
+        .max_capacity(REST_CATALOG_CACHE_MAX_CAPACITY)
         .time_to_live(std::time::Duration::from_secs(300))
         .build()
 });
@@ -113,8 +123,9 @@ pub(crate) static REST_CATALOG_CACHE: std::sync::LazyLock<
 /// Heavy hammer rather than per-entry invalidation: SQE does not maintain a
 /// `username -> token_fingerprint` reverse index, so we cannot scope the
 /// eviction to one user without a side-band map. Auth failures are rare; the
-/// rebuild cost is amortised across however many entries were cached (max 100,
-/// ~250 ms each, but lazily on next access — not all at once).
+/// rebuild cost is amortised across however many entries were cached (up to
+/// `REST_CATALOG_CACHE_MAX_CAPACITY`, ~250 ms each, but lazily on next access,
+/// not all at once).
 pub async fn invalidate_rest_catalog_cache_all() {
     REST_CATALOG_CACHE.invalidate_all();
     REST_CATALOG_CACHE.run_pending_tasks().await;
@@ -1614,5 +1625,34 @@ impl Catalog for SessionCatalogBridge {
             .invalidate(&self.session.table_cache_key(&ident))
             .await;
         result
+    }
+}
+
+#[cfg(test)]
+mod cache_capacity_tests {
+    use super::REST_CATALOG_CACHE_MAX_CAPACITY;
+
+    /// Issue #240: the REST catalog cache must hold well beyond the old cap of
+    /// 100 so concurrent user-token-warehouse triples stop evicting each other
+    /// and re-paying the ~250 ms `/v1/config` + `list_namespaces` rebuild. We
+    /// build a moka cache with the same capacity constant and confirm it
+    /// retains far more than 100 keys.
+    #[tokio::test]
+    async fn rest_catalog_cache_holds_well_beyond_100_keys() {
+        let cache: moka::future::Cache<String, u64> = moka::future::Cache::builder()
+            .max_capacity(REST_CATALOG_CACHE_MAX_CAPACITY)
+            .time_to_live(std::time::Duration::from_secs(300))
+            .build();
+
+        for i in 0..500u64 {
+            cache.insert(format!("url-wh-token-{i}"), i).await;
+        }
+        cache.run_pending_tasks().await;
+
+        assert!(
+            cache.entry_count() > 100,
+            "cache should retain far more than the old cap of 100, got {}",
+            cache.entry_count()
+        );
     }
 }
