@@ -36,6 +36,24 @@ enum CliMode {
     Worker,
 }
 
+/// Decide whether the coordinator should run the distributed worker path:
+/// consult the worker registry on queries, run health checks, and accept
+/// heartbeats into the registry that `try_distribute` reads.
+///
+/// Returns `true` whenever the operator has expressed distributed intent.
+/// Static seeding (`worker_urls`) is the explicit form. Dynamic heartbeat
+/// discovery has no URL list, so we key off the worker auth secret being set
+/// (the mechanism heartbeats authenticate against) or the explicit
+/// `allow_unauthenticated_workers` opt-in. The default single-node config
+/// (empty `worker_urls`, empty `worker_secret`, opt-in off) returns `false`,
+/// so it never wires the registry and never accepts unauthenticated heartbeats
+/// that would route user bearer tokens to unknown workers.
+fn distributed_enabled(coordinator: &sqe_core::config::CoordinatorConfig) -> bool {
+    !coordinator.worker_urls.is_empty()
+        || !coordinator.worker_secret.is_empty()
+        || coordinator.allow_unauthenticated_workers
+}
+
 // ── Health endpoints ───────────────────────────────────────────
 
 struct HealthState {
@@ -565,6 +583,12 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     let started_at = Instant::now();
     let ready = Arc::new(AtomicBool::new(false));
 
+    // Single source of truth for the distributed worker path. Computed once so
+    // the registry wiring, health checks, credential refresh, the health-server
+    // view, and the query handler can never drift out of agreement. See
+    // `distributed_enabled` for why heartbeat discovery keys off the secret.
+    let distributed = distributed_enabled(&config.coordinator);
+
     // Health endpoints on metrics port + 1 (or 9091 default)
     let health_port = config.metrics.prometheus_port + 1;
 
@@ -610,14 +634,14 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         ),
     );
 
-    if !config.coordinator.worker_urls.is_empty() {
+    if distributed {
         let interval =
             std::time::Duration::from_secs(config.coordinator.health_check_interval_secs);
         _task_guards.push(worker_registry.start_health_check_task(interval));
         tracing::info!(
-            workers = ?config.coordinator.worker_urls,
+            seeded_workers = ?config.coordinator.worker_urls,
             interval_secs = config.coordinator.health_check_interval_secs,
-            "Started worker health checks"
+            "Started worker health checks (covers heartbeat-discovered workers too)"
         );
     }
 
@@ -685,10 +709,10 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         ready: ready.clone(),
         started_at,
         role: "coordinator",
-        worker_registry: if config.coordinator.worker_urls.is_empty() {
-            None
-        } else {
+        worker_registry: if distributed {
             Some(worker_registry.clone())
+        } else {
+            None
         },
         query_tracker: Some(query_tracker.clone()),
         web_ui: config.metrics.web_ui,
@@ -713,7 +737,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         sqe_coordinator::credential_refresh::CredentialRefreshTracker::new(),
     );
 
-    if !config.coordinator.worker_urls.is_empty() {
+    if distributed {
         let interval =
             std::time::Duration::from_secs(config.coordinator.credential_refresh_interval_secs);
         _task_guards.push(
@@ -845,15 +869,15 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             policy_enforcer,
             None, // policy_store — wired when policy engine is enabled
             config.clone(),
-            if config.coordinator.worker_urls.is_empty() {
-                None
-            } else {
+            if distributed {
                 Some(worker_registry.clone())
-            },
-            if config.coordinator.worker_urls.is_empty() {
-                None
             } else {
+                None
+            },
+            if distributed {
                 Some(credential_tracker)
+            } else {
+                None
             },
             Some(metrics.clone()),
             Some(audit.clone()),
@@ -1033,11 +1057,19 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     ready.store(true, Ordering::Relaxed);
 
     // Flight SQL server with graceful shutdown
-    let flight_service =
+    let mut flight_service =
         SqeFlightSqlService::new(session_manager, query_handler, config.clone())
             .with_rate_limiter(rate_limiter)
             .with_auth_rate_limiter(Arc::clone(&auth_rate_limiter))
             .with_metadata_rate_limiter(metadata_rate_limiter);
+    // Hand the flight service the SAME registry the query handler reads, so
+    // worker heartbeats (handled on the DoAction path) actually register
+    // workers that `try_distribute` will route to. Without this the heartbeat
+    // handler has no registry and silently drops every heartbeat -- which made
+    // dynamic discovery dead even when health checks were running (#226).
+    if distributed {
+        flight_service = flight_service.with_worker_registry(worker_registry.clone());
+    }
     let addr = format!("0.0.0.0:{}", config.coordinator.flight_sql_port).parse()?;
 
     // Optional TLS
@@ -1079,7 +1111,18 @@ async fn run_worker(config: SqeConfig) -> anyhow::Result<()> {
         worker_registry: None,
         query_tracker: None,
         web_ui: false,
-        catalog_url: String::new(), // workers do not connect to Polaris directly
+        // Mirror the coordinator's readiness check (the established downstream
+        // probe) instead of short-circuiting on an empty URL. Leaving this
+        // empty made /readyz a bare process-up check, so Kubernetes routed
+        // do_get to a worker before it could serve a fragment (#245). Workers
+        // read S3 directly from the data-file paths in the secured plan
+        // fragment and do NOT query the catalog at runtime, so a catalog blip
+        // alone does not break a scan. Gating worker readiness on catalog
+        // reachability is a deliberately conservative cluster-health signal: if
+        // the catalog is down the coordinator cannot plan or dispatch anyway.
+        // config.validate() already requires catalog.catalog_url non-empty for
+        // both roles, so this always probes.
+        catalog_url: config.catalog.catalog_url.clone(),
         node_info: None,
         metrics_history: None,
     });
@@ -1498,6 +1541,68 @@ mod tests {
 
         let response = readyz(axum::extract::State(state)).await;
         assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_readyz_not_ready_when_catalog_unreachable() {
+        // #245: a worker with a populated but unreachable catalog_url must
+        // report NOT ready so Kubernetes keeps it out of rotation, rather than
+        // short-circuiting to ready on an empty URL.
+        let state = Arc::new(HealthState {
+            ready: Arc::new(AtomicBool::new(true)),
+            started_at: Instant::now(),
+            role: "worker",
+            worker_registry: None,
+            query_tracker: None,
+            web_ui: false,
+            // RFC 5737 TEST-NET-1; never routes, so the probe fails fast.
+            catalog_url: "http://192.0.2.1:1".to_string(),
+            node_info: None,
+            metrics_history: None,
+        });
+
+        let response = readyz(axum::extract::State(state)).await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    // All CoordinatorConfig fields carry `#[serde(default)]`, so an empty TOML
+    // table yields the single-node default we want to start each case from.
+    fn coordinator_config_from(toml_src: &str) -> sqe_core::config::CoordinatorConfig {
+        toml::from_str(toml_src).expect("coordinator config parses")
+    }
+
+    #[test]
+    fn distributed_enabled_off_for_single_node_default() {
+        // #226 security guard: the default single-node config (empty
+        // worker_urls, empty worker_secret, opt-in off) must NOT enable the
+        // worker path, or it would accept unauthenticated heartbeats and route
+        // user bearer tokens to unknown workers.
+        let coord = coordinator_config_from("");
+        assert!(!distributed_enabled(&coord));
+    }
+
+    #[test]
+    fn distributed_enabled_on_for_static_worker_urls() {
+        let coord = coordinator_config_from("worker_urls = [\"http://w1:50052\"]");
+        assert!(distributed_enabled(&coord));
+    }
+
+    #[test]
+    fn distributed_enabled_on_for_heartbeat_discovery_via_secret() {
+        // Dynamic discovery: no static URLs, but a worker_secret is set, so
+        // heartbeats are authenticated and the registry must be wired (#226).
+        let coord = coordinator_config_from("worker_secret = \"hunter2\"");
+        assert!(coord.worker_urls.is_empty());
+        assert!(distributed_enabled(&coord));
+    }
+
+    #[test]
+    fn distributed_enabled_on_for_explicit_unauthenticated_opt_in() {
+        let coord = coordinator_config_from("allow_unauthenticated_workers = true");
+        assert!(distributed_enabled(&coord));
     }
 
     #[tokio::test]
