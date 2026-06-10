@@ -57,6 +57,23 @@ spec:
                   key: SQE_STORAGE__S3_SECRET_KEY
                   optional: true
             {{- end }}
+            {{- if include "sqe.workerSecretConfigured" . }}
+            # ISSUE-218: the worker mounts the same ConfigMap as the coordinator,
+            # whose toml carries both coordinator_url and worker_urls. The
+            # engine's global validate() runs both guards on this pod, so the
+            # worker must satisfy the coordinator.worker_secret guard too. Inject
+            # both keys from one Secret; the values must match.
+            - name: SQE_WORKER__WORKER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sqe.workerSecretName" . }}
+                  key: {{ .Values.workerSecret.key }}
+            - name: SQE_COORDINATOR__WORKER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sqe.workerSecretName" . }}
+                  key: {{ .Values.workerSecret.key }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -104,9 +121,13 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.worker.affinity }}
+      {{- if .Values.worker.affinity }}
       affinity:
-        {{- toYaml . | nindent 8 }}
+        {{- toYaml .Values.worker.affinity | nindent 8 }}
+      {{- else if .Values.defaultAntiAffinity }}
+      # ISSUE-249: default preferred spread so replicas land on different nodes.
+      affinity:
+        {{- include "sqe.defaultAntiAffinity" (dict "ctx" $ "component" "worker") | nindent 8 }}
       {{- end }}
       {{- with .Values.worker.tolerations }}
       tolerations:
