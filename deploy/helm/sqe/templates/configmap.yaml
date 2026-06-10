@@ -24,7 +24,14 @@ data:
     {{- end }}
 
     [worker]
+    {{- if .Values.worker.enabled }}
+    # ISSUE-218: only render coordinator_url in distributed mode. The engine's
+    # config validation rejects a non-empty coordinator_url with an empty
+    # worker_secret, so emitting this in single-node mode would crash a plain
+    # `helm install` that never set a secret. In distributed mode the secret
+    # arrives as the SQE_WORKER__WORKER_SECRET env override.
     coordinator_url = "http://{{ include "sqe.fullname" . }}-coordinator:50051"
+    {{- end }}
     heartbeat_interval_secs = {{ .Values.config.worker.heartbeat_interval_secs }}
     # DEP-02: worker engine memory_limit must sit below the worker pod limit
     # (~75%) to leave headroom for Arrow buffers outside DataFusion's accounted

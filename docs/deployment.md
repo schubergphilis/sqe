@@ -327,10 +327,46 @@ helm install sqe deploy/helm/sqe/ \
   --set config.catalog.warehouse=production
 
 # Distributed mode (coordinator + 3 workers)
+# workerSecret is REQUIRED in distributed mode. Without it the coordinator and
+# workers fail startup validation and crashloop (ISSUE-218). Prefer an existing
+# Secret in production; the inline value below is for dev/test.
 helm install sqe deploy/helm/sqe/ \
   --set worker.enabled=true \
   --set worker.replicas=3 \
+  --set workerSecret.value=change-me-shared-secret \
   --set config.catalog.catalog_url=http://polaris:8181/api/catalog
+```
+
+### Worker secret (distributed mode)
+
+In distributed mode the coordinator and every worker share a secret that
+authenticates worker registration and credential push. The engine refuses to
+start when a `coordinator_url` / `worker_urls` is set with an empty
+`worker_secret`. The chart enforces this: it renders `coordinator_url` only when
+`worker.enabled=true`, so a single-node `helm install` needs no secret, while a
+distributed install needs one or the pods crashloop.
+
+Provide the secret one of two ways. Both pods mount the same ConfigMap, whose
+rendered config carries both `worker_urls` and `coordinator_url`, so the engine
+validates both guards on both pods. The chart injects the value under both
+`SQE_COORDINATOR__WORKER_SECRET` and `SQE_WORKER__WORKER_SECRET` on the
+coordinator and the workers, all from one Secret key, so every guard is
+satisfied and the values match.
+
+```bash
+# Preferred: reference a Secret you manage, naming the key that holds the value.
+kubectl create secret generic sqe-worker-secret \
+  --from-literal=SQE_WORKER_SECRET="$(openssl rand -hex 32)"
+
+helm install sqe deploy/helm/sqe/ \
+  --set worker.enabled=true \
+  --set workerSecret.existingSecret=sqe-worker-secret \
+  --set workerSecret.key=SQE_WORKER_SECRET
+
+# Dev/test: inline value. The chart creates the Secret for you.
+helm install sqe deploy/helm/sqe/ \
+  --set worker.enabled=true \
+  --set workerSecret.value=dev-only-shared-secret
 ```
 
 ### Helm values overview
@@ -457,6 +493,49 @@ Both coordinator and worker pods expose:
 
 - **Liveness**: `GET /healthz` on port 9091
 - **Readiness**: `GET /readyz` on port 9091
+
+### Disruption budgets and spreading
+
+The chart ships PodDisruptionBudgets and default pod anti-affinity so a node
+drain or rolling upgrade cannot take the cluster down at once (ISSUE-249).
+
+- **Coordinator PDB**: `minAvailable: 1`. The coordinator is single-replica
+  today, so this blocks an unforced eviction of the only coordinator. A node
+  drain that targets it will not proceed until you act (cordon and delete the
+  pod, or scale the deployment to 0 first). The budget protects a SPOF; it does
+  not provide HA. See the SPOF note below.
+- **Worker PDB**: `maxUnavailable: 1`. A drain rolls through one node at a time
+  while the rest keep serving fragments. Rendered only when `worker.enabled`.
+- **Anti-affinity**: when you leave a component's `affinity` empty, the chart
+  applies a preferred `podAntiAffinity` by hostname so replicas spread across
+  nodes. Workers always get it; the coordinator gets it only at `replicas > 1`.
+  We chose preferred `podAntiAffinity` over `topologySpreadConstraints` because
+  it slots into the existing per-component `affinity` passthrough: set
+  `affinity` to override the default entirely, or set `defaultAntiAffinity:
+  false` to render none.
+
+Toggle the budgets with `podDisruptionBudget.enabled` (default `true`) and tune
+`podDisruptionBudget.coordinator.minAvailable` /
+`podDisruptionBudget.worker.maxUnavailable`.
+
+### Coordinator is a single point of failure (ISSUE-221)
+
+The coordinator runs as a single replica. Session state, the worker registry,
+and in-flight query state are process-local. There is no shared store.
+
+A coordinator restart drops every in-flight query and invalidates client
+sessions: connected clients must re-authenticate and re-run. A node drain that
+moves the coordinator pod is a brief outage, not a transparent failover.
+
+Running more than one coordinator replica is **not yet safe**. Two replicas do
+not share sessions or the registry, so clients would land on a coordinator that
+has never seen their session. Keep `coordinator.replicas: 1`. The coordinator
+PDB and the default chart values reflect this single-replica reality on purpose;
+they do not imply HA. Full coordinator HA (shared session and registry state) is
+a separate design tracked in ISSUE-221.
+
+For the on-call response to a coordinator restart, OOM, or worker flap, see the
+[Operational Runbook](runbook.md).
 
 ---
 

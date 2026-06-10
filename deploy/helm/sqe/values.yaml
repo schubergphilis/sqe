@@ -48,6 +48,32 @@ worker:
   affinity: {}
   podAnnotations: {}
 
+# ── PodDisruptionBudget + spreading (ISSUE-249) ─────────────
+# A node drain or rolling upgrade can otherwise evict every worker and the
+# coordinator at once. Default scheduling can also pack all workers onto one
+# node, so a single node failure takes the whole tier down.
+podDisruptionBudget:
+  enabled: true
+  # The coordinator is a single replica today (ISSUE-221: process-local session
+  # and query state, no shared store). minAvailable: 1 keeps a voluntary drain
+  # from evicting the only coordinator without an operator decision. With
+  # replicas: 1 this blocks an unforced drain by design; cordon + delete the
+  # pod, or scale to 0 first, when you must move it. It does NOT provide HA.
+  coordinator:
+    minAvailable: 1
+  # Workers are stateless and replicated. maxUnavailable: 1 lets a drain roll
+  # through one node at a time while keeping the rest serving fragments.
+  worker:
+    maxUnavailable: 1
+
+# When affinity is left empty for a component, the chart applies a default
+# preferred podAntiAffinity by hostname so replicas spread across nodes. We
+# chose podAntiAffinity over topologySpreadConstraints because it slots into
+# the existing per-component `affinity` passthrough: set `affinity` on a
+# component to override the default entirely. Set this to false to render no
+# affinity at all when you leave `affinity` empty.
+defaultAntiAffinity: true
+
 # ── Service ─────────────────────────────────────────────────
 service:
   type: ClusterIP
@@ -103,6 +129,34 @@ config:
     prometheus_port: 9090
     otlp_endpoint: ""
     audit_log_path: ""
+
+# ── Worker secret (distributed mode) ────────────────────────
+# ISSUE-218: in distributed mode the engine HARD-FAILS startup validation when
+# a coordinator_url / worker_urls is set with an empty worker_secret. The
+# shared secret authenticates worker registration and credential push, so the
+# chart does not template it inline by default. You MUST set it when
+# worker.enabled=true. The same value is injected into both the coordinator
+# (SQE_COORDINATOR__WORKER_SECRET) and the workers (SQE_WORKER__WORKER_SECRET);
+# they must match for a worker to register.
+#
+# In single-node mode (worker.enabled=false) the chart renders neither
+# worker_urls nor coordinator_url, so no secret is required and a plain
+# `helm install` starts cleanly.
+#
+# Provide the secret one of two ways, mirroring the S3/OIDC secret story below:
+#   1. existingSecret (preferred): point at a Secret you manage and name the
+#      key holding the shared secret.
+#   2. value: inline string. A Secret is created for you. Fine for dev/test;
+#      avoid in production (ends up in `helm get values`).
+workerSecret:
+  # Name of an existing Secret holding the shared worker secret. Leave empty to
+  # fall back to `value` (which creates a Secret).
+  existingSecret: ""
+  # Key inside the Secret that holds the shared secret.
+  key: "SQE_WORKER_SECRET"
+  # Inline value. Only used when existingSecret is empty. Leave empty in
+  # single-node mode.
+  value: ""
 
 # ── Secrets (mounted as env var overrides) ──────────────────
 # Reference an existing K8s Secret containing sensitive config.

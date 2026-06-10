@@ -163,6 +163,7 @@ The reference docs:
 |---|---|
 | [Architecture](docs/architecture.md) | Mermaid diagrams across the engine |
 | [Deployment](docs/deployment.md) | Docker Compose, K8s, TLS, auth providers, monitoring |
+| [Operational Runbook](docs/runbook.md) | On-call triage: crashloops, catalog/OIDC outages, OOM, registry flap |
 | [Iceberg Matrix](docs/iceberg-matrix.md) | Per-cell SQE coverage on the public scoreboard |
 | [Iceberg Matrix Comparison](docs/iceberg-matrix-compare.md) | V2/V3 side-by-side against 20 engines |
 | [Trino Compatibility](docs/trino-compatibility.md) | SQL function and feature matrix vs Trino |

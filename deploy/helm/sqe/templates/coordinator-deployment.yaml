@@ -62,6 +62,23 @@ spec:
                   key: SQE_STORAGE__S3_SECRET_KEY
                   optional: true
             {{- end }}
+            {{- if and .Values.worker.enabled (include "sqe.workerSecretConfigured" .) }}
+            # ISSUE-218: both pods mount the same ConfigMap, whose toml carries
+            # both worker_urls and coordinator_url in distributed mode. The
+            # engine's global validate() runs both guards on both pods, so the
+            # coordinator must satisfy the worker.worker_secret guard too. Inject
+            # both keys from one Secret; the values must match.
+            - name: SQE_COORDINATOR__WORKER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sqe.workerSecretName" . }}
+                  key: {{ .Values.workerSecret.key }}
+            - name: SQE_WORKER__WORKER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sqe.workerSecretName" . }}
+                  key: {{ .Values.workerSecret.key }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -111,9 +128,15 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.coordinator.affinity }}
+      {{- if .Values.coordinator.affinity }}
       affinity:
-        {{- toYaml . | nindent 8 }}
+        {{- toYaml .Values.coordinator.affinity | nindent 8 }}
+      {{- else if and .Values.defaultAntiAffinity (gt (int .Values.coordinator.replicas) 1) }}
+      # ISSUE-249: default spread for multi-replica coordinators. Single-replica
+      # coordinators (the default) get no anti-affinity: there is nothing to
+      # spread, and a required rule would wedge scheduling on a one-node cluster.
+      affinity:
+        {{- include "sqe.defaultAntiAffinity" (dict "ctx" $ "component" "coordinator") | nindent 8 }}
       {{- end }}
       {{- with .Values.coordinator.tolerations }}
       tolerations:
