@@ -424,21 +424,39 @@ impl Stream for TrackedRecordBatchStream {
                 Poll::Ready(None)
             }
             Poll::Pending => {
-                // Idle-timeout guard. When the downstream Flight encoder has
-                // not pulled a batch within `idle_timeout`, abort the stream
-                // so the held semaphore permit cannot be pinned by a stalled
-                // or malicious client. Issue #75.
+                // Idle-timeout guard. When no batch has been produced within
+                // `idle_timeout` (stalled execution pipeline, or a client that
+                // stopped draining), abort the stream so the held semaphore
+                // permit cannot be pinned indefinitely. Issue #75.
+                //
+                // The abort must surface as an ERROR, not as end-of-stream:
+                // ending with `Ready(None)` makes a stalled query
+                // indistinguishable from a legitimately empty result. A
+                // TPC-DS run recorded a stalled query as "0 rows, no error"
+                // and the diff harness scored it as a row-count mismatch
+                // instead of a failure (Trino reports the equivalent as
+                // EXCEEDED_TIME_LIMIT).
                 if let Some(ref mut sleep) = self.idle_sleep {
                     if sleep.as_mut().poll(cx).is_ready() {
                         warn!(
                             rows_so_far = self.rows_so_far,
-                            "Stream idle-timeout reached, cancelling and releasing permits"
+                            "Stream idle-timeout reached, aborting query and releasing permits"
                         );
                         self.cancelled = true;
+                        let timeout = self.idle_timeout.unwrap_or_default();
+                        let msg = format!(
+                            "Query aborted: produced no results for {}s (idle timeout). \
+                             The execution pipeline stalled or the client stopped \
+                             consuming the result stream.",
+                            timeout.as_secs()
+                        );
                         if let Some(f) = self.finalizer.take() {
-                            f.on_cancel(self.rows_so_far);
+                            f.on_error(
+                                self.rows_so_far,
+                                &sqe_core::SqeError::Execution(msg.clone()),
+                            );
                         }
-                        return Poll::Ready(None);
+                        return Poll::Ready(Some(Err(DataFusionError::Execution(msg))));
                     }
                 }
                 Poll::Pending
@@ -609,6 +627,41 @@ mod tests {
         assert!(err.is_err());
         drop(stream);
 
+        let record = find_record(&tracker, qid);
+        assert_eq!(record.state, QueryState::Failed);
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_surfaces_error_not_empty_success() {
+        let (plan, schema, runtime) = trivial_plan().await;
+        let tracker = test_tracker();
+        let finalizer = test_finalizer(tracker.clone(), plan, runtime);
+        let qid = finalizer.query_id;
+        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![]);
+
+        // Inner stream never produces a batch: a stalled execution pipeline.
+        let pending = futures::stream::pending::<Result<RecordBatch, DataFusionError>>();
+        let inner: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, pending));
+
+        let mut stream = TrackedRecordBatchStream::new(inner, finalizer, None)
+            .with_idle_timeout(Duration::from_millis(50));
+
+        // The client must receive an explicit error. Ending the stream with
+        // a clean EOF here would present a stalled query as a legitimately
+        // empty result (observed in a TPC-DS compare run as "0 rows, no
+        // error" scored as a row diff).
+        let item = stream.next().await.expect("stream must yield an item");
+        let err = item.expect_err("idle timeout must surface as an error");
+        assert!(
+            err.to_string().contains("idle timeout"),
+            "unexpected error: {err}"
+        );
+
+        // After the abort the stream is terminated.
+        assert!(stream.next().await.is_none());
+
+        // And the tracker records a failure, not a cancel or success.
         let record = find_record(&tracker, qid);
         assert_eq!(record.state, QueryState::Failed);
     }
