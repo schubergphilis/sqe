@@ -668,6 +668,28 @@ impl SessionCatalog {
             .map_err(|e| SqeError::Catalog(format!("Catalog `{catalog_type}` build failed: {e}")))
     }
 
+    /// Build a `SessionCatalog` for a SIBLING warehouse on the same Polaris
+    /// endpoint, reusing this session's bearer token, storage config, shared
+    /// HTTP client, circuit breaker, and table cache.
+    ///
+    /// Used by the view planner: a view body may reference tables in a
+    /// different catalog than the one the view lives in (e.g. a workspace
+    /// ontology view in `ws_team_a.ontology` selecting from
+    /// `team_a_data.public.events`). Authorization is unchanged — the same
+    /// user token is presented, so Polaris/OPA still decide access.
+    pub async fn for_sibling_warehouse(&self, warehouse: &str) -> sqe_core::Result<Self> {
+        Self::new(
+            &self.catalog_url,
+            warehouse,
+            &self.bearer_token,
+            &self.storage_config,
+            Some(self.table_cache.clone()),
+            Some(self.http_client.clone()),
+            Some(self.circuit_breaker.clone()),
+        )
+        .await
+    }
+
     pub async fn new(
         catalog_url: &str,
         warehouse: &str,

@@ -304,6 +304,50 @@ impl SqeSchemaProvider {
 
         mini_ctx.register_catalog(catalog_name, Arc::new(catalog_provider));
 
+        // A view body may reference tables in OTHER catalogs (e.g. a workspace
+        // ontology view in `ws_team_a.ontology` selecting from
+        // `team_a_data.public.events`). Register every sibling warehouse the
+        // view's SQL names, using the same user token — Polaris/OPA still
+        // enforce access. Failures are logged and skipped so the planner
+        // below reports the precise unresolved reference.
+        for sibling in sqe_sql::extract_catalog_qualifiers_from_sql(&sql) {
+            if &sibling == catalog_name {
+                continue;
+            }
+            match self.session_catalog.for_sibling_warehouse(&sibling).await {
+                Ok(sc) => {
+                    match SqeCatalogProvider::try_new(
+                        Arc::new(sc),
+                        self.storage_config.clone(),
+                        sibling.clone(),
+                    )
+                    .await
+                    {
+                        Ok(p) => {
+                            mini_ctx.register_catalog(&sibling, Arc::new(p));
+                            tracing::info!(
+                                view = %name,
+                                catalog = %sibling,
+                                "view planning: registered sibling catalog referenced by view body"
+                            );
+                        }
+                        Err(e) => tracing::warn!(
+                            view = %name,
+                            catalog = %sibling,
+                            error = %e,
+                            "view planning: failed to build sibling catalog provider"
+                        ),
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    view = %name,
+                    catalog = %sibling,
+                    error = %e,
+                    "view planning: failed to open sibling warehouse session"
+                ),
+            }
+        }
+
         let df = mini_ctx.sql(&sql).await.map_err(|e| {
             datafusion::error::DataFusionError::External(
                 format!("Failed to plan view '{name}' SQL: {e}").into(),
