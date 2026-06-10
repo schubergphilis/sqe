@@ -26,6 +26,10 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      # On SIGTERM the coordinator flips readiness to NOT-ready, drains for
+      # coordinator.shutdown_drain_secs, then stops. Keep this above that
+      # drain so in-flight queries finish before SIGKILL (issue #250).
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000

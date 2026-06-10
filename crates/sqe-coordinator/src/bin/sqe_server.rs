@@ -366,6 +366,47 @@ async fn shutdown_signal() {
     }
 }
 
+/// Shutdown future for `serve_with_shutdown` that drains before stopping (#250).
+///
+/// On SIGTERM/SIGINT this:
+/// 1. flips `ready` to NOT-ready so `/readyz` returns 503 and the Kubernetes
+///    Service / load balancer stops routing NEW work to this pod;
+/// 2. sleeps `drain_secs` so connections already routed before the readiness
+///    flip propagated can finish at the tonic graceful boundary;
+/// 3. resolves, which tells tonic to stop accepting and shut down.
+///
+/// The grace period is bounded by `coordinator.shutdown_drain_secs` and must
+/// stay below the pod's `terminationGracePeriodSeconds` so the process exits
+/// before SIGKILL. NOTE: this is a time-bounded connection-drain, not a true
+/// in-flight-query drain. SQE has no query-lifecycle registry to wait on yet;
+/// tracking in-flight queries and blocking shutdown until they complete is a
+/// follow-up (see MR).
+async fn shutdown_with_drain(ready: Arc<AtomicBool>, drain_secs: u64) {
+    shutdown_signal().await;
+    flip_ready_and_drain(&ready, drain_secs).await;
+}
+
+/// Flip readiness to NOT-ready, then sleep the bounded drain period. Split out
+/// of [`shutdown_with_drain`] so the readiness-flip is unit-testable without a
+/// real OS signal.
+async fn flip_ready_and_drain(ready: &AtomicBool, drain_secs: u64) {
+    // Stop advertising readiness BEFORE we start draining so the Service
+    // routing table converges away from this pod while we wait.
+    ready.store(false, Ordering::Relaxed);
+
+    if drain_secs == 0 {
+        tracing::info!("shutdown_drain_secs = 0, shutting down immediately");
+        return;
+    }
+
+    tracing::info!(
+        drain_secs,
+        "readiness flipped to NOT-ready, draining connections before shutdown"
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(drain_secs)).await;
+    tracing::info!("drain period elapsed, shutting down");
+}
+
 // ── Trino adapters ─────────────────────────────────────────────
 struct AuthenticatorAdapter {
     authenticator: Arc<sqe_auth::Authenticator>,
@@ -495,10 +536,15 @@ async fn async_main() -> anyhow::Result<()> {
         // accept_invalid_certs flag that was not covered by this warning.
         tracing::warn!("WARNING: TLS certificate verification is DISABLED for auth endpoints (auth.tls_skip_verify / auth.ssl_verification / auth.external.accept_invalid_certs) -- vulnerable to MITM. Disable these for production.");
     }
-    if !config.coordinator.worker_urls.is_empty()
-        && config.coordinator.allow_unauthenticated_workers
-    {
-        tracing::warn!("WARNING: coordinator.allow_unauthenticated_workers = true -- any client reachable on the cluster network can register as a worker and receive user bearer tokens. Set worker_secret for production.");
+    // Fire whenever the unauthenticated-discovery path is actually live: the
+    // worker registry is attached (worker_urls non-empty), there is no secret
+    // to check (worker_secret empty), and the operator has waived the
+    // empty-secret refusal. A configured secret is enforced on the heartbeat
+    // path even with the waiver set, so gating on the empty secret avoids a
+    // false positive on authenticated-but-waived deployments. Shared with
+    // main.rs so the two coordinator binaries cannot drift.
+    if sqe_coordinator::mode::warns_unauthenticated_workers(&config.coordinator) {
+        tracing::warn!("WARNING: coordinator.allow_unauthenticated_workers = true with an empty coordinator.worker_secret -- any client reachable on the cluster network can register as a worker and receive user bearer tokens. Set worker_secret for production.");
     }
     // AUTH-01: policy enforcement is hardcoded to passthrough below. A
     // configured engine (OPA/Cedar/InMemory) is SILENTLY IGNORED, so every row
@@ -1094,7 +1140,10 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         .add_service(
             arrow_flight::flight_service_server::FlightServiceServer::new(flight_service),
         )
-        .serve_with_shutdown(addr, shutdown_signal())
+        .serve_with_shutdown(
+            addr,
+            shutdown_with_drain(ready.clone(), config.coordinator.shutdown_drain_secs),
+        )
         .await?;
 
     tracing::info!("SQE coordinator shut down");
@@ -1170,7 +1219,10 @@ async fn run_worker(config: SqeConfig) -> anyhow::Result<()> {
 
     server_builder
         .add_service(flight_service.into_server())
-        .serve_with_shutdown(addr, shutdown_signal())
+        .serve_with_shutdown(
+            addr,
+            shutdown_with_drain(ready.clone(), config.coordinator.shutdown_drain_secs),
+        )
         .await?;
 
     tracing::info!("SQE worker shut down");
@@ -1392,6 +1444,25 @@ fn build_oauth2_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn flip_ready_and_drain_flips_readiness_first() {
+        // drain_secs = 0 so the test does not sleep; readiness must still flip.
+        let ready = AtomicBool::new(true);
+        flip_ready_and_drain(&ready, 0).await;
+        assert!(
+            !ready.load(Ordering::Relaxed),
+            "readiness must be flipped to NOT-ready on shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn flip_ready_and_drain_flips_readiness_with_nonzero_drain() {
+        // A short non-zero drain still flips readiness immediately, then sleeps.
+        let ready = AtomicBool::new(true);
+        flip_ready_and_drain(&ready, 1).await;
+        assert!(!ready.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn test_cluster_status_serialization_coordinator() {
