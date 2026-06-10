@@ -498,8 +498,17 @@ async fn open_parquet_stream(
         }
     }
 
-    let schema = builder.schema().clone();
+    // Take the schema from the BUILT stream, not the builder:
+    // `builder.schema()` is always the full parquet file schema, while the
+    // stream's schema reflects the applied ProjectionMask. The caller hands
+    // this schema to the Flight encoder; advertising the full schema while
+    // shipping projected batches made every projected distributed scan fail
+    // on the coordinator with "number of columns(N) must match number of
+    // fields(M)" during Flight decode (the !327 regression, introduced when
+    // the streaming path replaced the buffering path that took the schema
+    // from `batches[0].schema()`).
     let stream = builder.build()?;
+    let schema = stream.schema().clone();
 
     if let Some(cm) = coordinator_metrics {
         let s3_elapsed = s3_start.elapsed();
@@ -1353,5 +1362,91 @@ mod tests {
             .map(|r| r.expect("batch ok").num_rows())
             .sum();
         assert_eq!(rows, 5, "RowFilter should keep only rows where a > 5");
+    }
+
+    /// Regression test for the projected-distributed-scan failure (!327):
+    /// `open_parquet_stream` must return the PROJECTED schema -- the schema of
+    /// the batches it actually emits -- not the full parquet file schema.
+    /// Before the fix it returned `builder.schema()` (full file width), the
+    /// Flight encoder advertised that full schema, and the coordinator's
+    /// Flight decode failed with "number of columns(N) must match number of
+    /// fields(M)" on every projected distributed scan.
+    #[tokio::test]
+    async fn open_parquet_stream_returns_projected_schema_matching_batches() {
+        use arrow_array::Int64Array;
+        use parquet::arrow::ArrowWriter;
+
+        // Three columns in the file; the task projects two of them.
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+            Field::new("c", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2])),
+                Arc::new(Int64Array::from(vec![10i64, 20])),
+                Arc::new(Int64Array::from(vec![100i64, 200])),
+            ],
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        {
+            let mut writer = ArrowWriter::try_new(&mut buf, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+        let size = buf.len() as u64;
+        let inner = Arc::new(InMemory::new());
+        inner
+            .put(&OsPath::from("data/f.parquet"), PutPayload::from(buf))
+            .await
+            .unwrap();
+        let store: Arc<dyn ObjectStore> = inner;
+
+        let mut task = scan_task_for_blob();
+        task.projected_columns = vec!["c".to_string(), "a".to_string()];
+
+        let (stream, advertised_schema, _bytes) = open_parquet_stream(
+            &task,
+            &task.data_file_paths[0],
+            store,
+            None,
+            None,
+            Some(size),
+            None,
+        )
+        .await
+        .expect("open should succeed");
+
+        let batches: Vec<RecordBatch> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.expect("batch ok"))
+            .collect();
+        assert!(!batches.is_empty(), "projected scan yields batches");
+
+        // The advertised schema must be exactly what the batches carry.
+        assert_eq!(
+            advertised_schema.fields().len(),
+            2,
+            "advertised schema must be projected (2 of 3 columns)"
+        );
+        for b in &batches {
+            assert_eq!(
+                b.schema().fields(),
+                advertised_schema.fields(),
+                "every emitted batch must match the advertised schema"
+            );
+        }
+        // ProjectionMask is a mask: output follows FILE order, not request order.
+        let names: Vec<&str> = advertised_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names, vec!["a", "c"], "projected columns come back in file order");
     }
 }

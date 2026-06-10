@@ -2185,18 +2185,29 @@ impl QueryHandler {
             "Distributing scan across workers"
         );
 
-        // 6. Projection is intentionally NOT pushed to workers. DistributedScanExec
-        // advertises the unprojected scan schema (`scan_node.schema()`), and the
-        // fragment-reassembly path in distributed_scan.rs requires each worker
-        // batch to carry the full table columns so it can narrow them by name to
-        // the expected schema (any ProjectionExec above narrows further). Sending
-        // a non-empty projection made the worker emit only the projected columns,
-        // which no longer matched the exec's full-width schema and failed every
-        // projected distributed scan with an Arrow "number of columns(N) must
-        // match number of fields(M)" error. Re-enabling worker-side projection
-        // requires DistributedScanExec to advertise the projected schema (and drop
-        // the now-redundant ProjectionExec); until then these stay empty so the
-        // worker returns full columns and the reassembly contract holds.
+        // 6. Get projected columns + Iceberg field IDs from the scan. Field
+        // IDs (#43) let the worker project by the parquet PARQUET:field_id
+        // metadata key, so RENAME COLUMN / ADD COLUMN against post-evolution
+        // schema still resolves to the right parquet column in pre-evolution
+        // files. Names stay as a fallback for old workers and files without
+        // field IDs.
+        //
+        // Worker-side projection is safe again: the !327 failure ("number of
+        // columns(N) must match number of fields(M)") was NOT a coordinator
+        // schema mismatch -- `scan_node.schema()` is the projected schema, and
+        // it is what DistributedScanExec advertises below. The real bug was the
+        // worker's streaming path advertising `builder.schema()` (the full
+        // parquet file schema) over Flight while shipping projected batches;
+        // the coordinator-side Flight DECODE then failed before reassembly ever
+        // ran. Fixed in sqe-worker::executor::open_parquet_stream (schema now
+        // taken from the built, projected stream). The reassembly path keeps a
+        // by-name safety net for order/width drift (workers emit projected
+        // columns in parquet FILE order, which may differ from the plan's
+        // projection order).
+        let (projected_cols, projected_field_ids) = scan_task_projection(
+            iceberg_scan.projection(),
+            iceberg_scan.table().metadata().current_schema(),
+        );
 
         // 6b. Push the scan predicate and (when safe) the query LIMIT into each
         // ScanTask (#233). Both are pure optimizations: the authoritative
@@ -2245,10 +2256,8 @@ impl QueryHandler {
                     fragment_id: uuid::Uuid::now_v7().to_string(),
                     data_file_paths,
                     file_sizes_bytes,
-                    // Empty: workers return full table columns, the coordinator
-                    // narrows by name during reassembly (see note at step 6).
-                    projected_columns: Vec::new(),
-                    projected_field_ids: Vec::new(),
+                    projected_columns: projected_cols.clone(),
+                    projected_field_ids: projected_field_ids.clone(),
                     s3_endpoint: storage.s3_endpoint.clone(),
                     s3_region: storage.s3_region.clone(),
                     s3_access_key: storage.s3_access_key.clone(),
@@ -4171,6 +4180,48 @@ fn replace_scan_in_plan(
     }
 }
 
+/// Derive the worker-side projection for a `ScanTask` from the scan's
+/// projection and the table's Iceberg schema.
+///
+/// Returns `(projected_columns, projected_field_ids)`:
+/// - both empty when the scan is unprojected (`SELECT *`) or the projection
+///   is empty (`COUNT(*)` -- workers return full columns, the reassembly
+///   path drops them),
+/// - field IDs only when EVERY projected column resolves to an Iceberg field
+///   ID; a partial mapping would silently project the wrong columns on
+///   post-evolution files, so incomplete IDs degrade to name-only projection.
+///
+/// Invariant (regression guard for !327): the names returned here are exactly
+/// the field names of `IcebergScanExec::schema()` (its `projected_schema`),
+/// which is the schema `DistributedScanExec` advertises. The worker projects
+/// these columns and ships batches that match that schema (modulo column
+/// order, which reassembly normalizes by name).
+fn scan_task_projection(
+    projection: Option<&[String]>,
+    iceberg_schema: &iceberg::spec::Schema,
+) -> (Vec<String>, Vec<i32>) {
+    let projected_cols: Vec<String> = projection.map(<[String]>::to_vec).unwrap_or_default();
+    if projected_cols.is_empty() {
+        return (projected_cols, Vec::new());
+    }
+    let projected_field_ids: Vec<i32> = projected_cols
+        .iter()
+        .filter_map(|name| {
+            iceberg_schema
+                .as_struct()
+                .fields()
+                .iter()
+                .find(|f| f.name == *name)
+                .map(|f| f.id)
+        })
+        .collect();
+    if projected_field_ids.len() == projected_cols.len() {
+        (projected_cols, projected_field_ids)
+    } else {
+        (projected_cols, Vec::new())
+    }
+}
+
 /// Convert an Arrow `SchemaRef` to Iceberg REST API schema JSON format.
 ///
 /// Produces a JSON object like:
@@ -4517,6 +4568,64 @@ mod tests {
         config.role_overrides.insert("admin".to_string(), 600);
         let session = test_session(vec![]);
         assert_eq!(timeout_for_session(&config, &session), 300);
+    }
+
+    // ── scan_task_projection ─────────────────────────────────────
+    // Regression coverage for the !327 projected-distributed-scan bug:
+    // the ScanTask's projected_columns must be exactly the field names of
+    // the scan's projected schema (which DistributedScanExec advertises),
+    // and field IDs are all-or-nothing.
+
+    fn iceberg_schema_abc() -> iceberg::spec::Schema {
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        iceberg::spec::Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "a", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "b", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(3, "c", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn scan_task_projection_matches_projected_schema_names_and_ids() {
+        // The projection the IcebergScanExec carries IS its projected_schema
+        // field-name list (they are built together in SqeTableProvider::scan),
+        // so the ScanTask projection derived here agrees with the schema
+        // DistributedScanExec advertises: no 16-vs-2 width mismatch.
+        let proj = vec!["c".to_string(), "a".to_string()];
+        let (cols, ids) = scan_task_projection(Some(&proj), &iceberg_schema_abc());
+        assert_eq!(cols, vec!["c".to_string(), "a".to_string()]);
+        assert_eq!(ids, vec![3, 1], "field IDs parallel the projected columns");
+    }
+
+    #[test]
+    fn scan_task_projection_unprojected_scan_sends_nothing() {
+        let (cols, ids) = scan_task_projection(None, &iceberg_schema_abc());
+        assert!(cols.is_empty());
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn scan_task_projection_count_star_sends_nothing() {
+        // COUNT(*) scans carry Some([]) — workers return full columns and the
+        // reassembly path drops them (expected schema has 0 fields).
+        let proj: Vec<String> = vec![];
+        let (cols, ids) = scan_task_projection(Some(&proj), &iceberg_schema_abc());
+        assert!(cols.is_empty());
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn scan_task_projection_incomplete_field_ids_degrade_to_names_only() {
+        // A projected column missing from the Iceberg schema (should not
+        // happen, but fail safe): partial IDs would project the wrong parquet
+        // columns, so the IDs are dropped and the name fallback is used.
+        let proj = vec!["a".to_string(), "ghost".to_string()];
+        let (cols, ids) = scan_task_projection(Some(&proj), &iceberg_schema_abc());
+        assert_eq!(cols, vec!["a".to_string(), "ghost".to_string()]);
+        assert!(ids.is_empty(), "incomplete ID mapping must send no IDs");
     }
 
     // ── parse_show_tables_namespace ──────────────────────────────
