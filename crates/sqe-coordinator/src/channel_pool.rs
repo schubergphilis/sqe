@@ -55,6 +55,26 @@ impl ChannelPool {
         Arc::new(Self::new(ChannelPoolConfig::default()))
     }
 
+    /// Build a shared pool whose Endpoint-level `connect_timeout` and
+    /// `request_timeout` come from the deployment's configured worker
+    /// timeouts rather than the hardcoded defaults.
+    ///
+    /// `request_timeout` matches the `worker_rpc_timeout` that
+    /// `distributed_scan.rs` wraps every `do_get` with, so pooled and
+    /// freshly-connected channels share one budget. Without this, a pooled
+    /// channel would be killed at the 30s default even on a deployment that
+    /// configured a longer rpc timeout (COORD-05 / #237).
+    pub fn shared_with_timeouts(
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Arc<Self> {
+        Arc::new(Self::new(ChannelPoolConfig {
+            connect_timeout,
+            request_timeout,
+            ..ChannelPoolConfig::default()
+        }))
+    }
+
     /// Return a clone of the cached channel for `url`, connecting on miss.
     pub async fn get(&self, url: &str) -> Result<Channel, tonic::transport::Error> {
         let entry = self
@@ -113,6 +133,23 @@ mod tests {
         assert_eq!(pool.len(), 1);
         pool.invalidate("http://127.0.0.1:1");
         assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn shared_with_timeouts_carries_configured_request_timeout() {
+        // A deployment configures a 630s rpc timeout; the pooled-channel
+        // request_timeout must follow it, not fall back to the 30s default.
+        let pool = ChannelPool::shared_with_timeouts(
+            Duration::from_secs(7),
+            Duration::from_secs(630),
+        );
+        assert_eq!(pool.config.request_timeout, Duration::from_secs(630));
+        assert_eq!(pool.config.connect_timeout, Duration::from_secs(7));
+        assert_ne!(
+            pool.config.request_timeout,
+            ChannelPoolConfig::default().request_timeout,
+            "configured rpc timeout must override the hardcoded pool default"
+        );
     }
 
     #[tokio::test]
