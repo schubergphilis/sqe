@@ -23,6 +23,15 @@ use crate::table_provider::SqeTableProvider;
 /// REST round trips against Polaris.
 const TABLE_NAMES_TTL_SECS: u64 = 5;
 
+/// Return true if `name` is present in the namespace's table/view name set.
+///
+/// Pulled out of [`SqeSchemaProvider::table_exist`] so the existence check is
+/// unit-testable without constructing a live `SessionCatalog` (which would
+/// require a running Polaris). Issue #238.
+fn name_exists_in(names: &[String], name: &str) -> bool {
+    names.iter().any(|n| n == name)
+}
+
 /// DataFusion `SchemaProvider` that maps an Iceberg namespace to a DataFusion schema.
 ///
 /// Tables are loaded lazily when `table()` is called. The `table_names()` method
@@ -183,63 +192,28 @@ impl SchemaProvider for SqeSchemaProvider {
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        // Optimized path: check existence directly via the catalog's table_exists()
-        // API instead of listing ALL tables and searching client-side. This avoids
-        // fetching the entire table list just to check if one table exists,
-        // a measurable improvement for namespaces with many tables.
-        let catalog = self.session_catalog.clone();
-        let catalog_for_view = catalog.clone();
-        let ns = self.namespace.clone();
-        let table_name = name.to_string();
-        let table_name_for_view = table_name.clone();
-
-        let ns_ident = NamespaceIdent::new(ns.clone());
-        let ns_ident_view = ns_ident.clone();
-        let table_ident = iceberg::TableIdent::new(ns_ident.clone(), table_name.clone());
-
-        let table_exists = crate::runtime_bridge::block_on_compat(async move {
-            catalog.table_exists(&table_ident).await
-        });
-        match table_exists {
-            Some(Ok(true)) => {
-                debug!(namespace = %ns, table = %table_name, "table_exist: found as table");
-                return true;
-            }
-            Some(Ok(false)) => {
-                // Not a table, check if it is a view.
-            }
-            Some(Err(e)) => {
-                debug!(namespace = %ns, table = %table_name, error = %e,
-                    "table_exist: table_exists() failed, falling back to list");
-            }
-            None => {
-                error!(namespace = %ns, table = %table_name, "No tokio runtime available for table_exist()");
-                return false;
-            }
-        }
-
-        let view_result = match crate::runtime_bridge::block_on_compat(async move {
-            catalog_for_view.load_view_sql(&ns_ident_view, &table_name_for_view).await
-        }) {
-            Some(r) => r,
-            None => return false,
-        };
-        match view_result {
-            Ok(Some(_)) => {
-                debug!(namespace = %ns, table = %table_name, "table_exist: found as view");
-                true
-            }
-            Ok(None) => {
-                debug!(namespace = %ns, table = %table_name, "table_exist: not found as table or view");
-                false
-            }
-            Err(e) => {
-                debug!(namespace = %ns, table = %table_name, error = %e,
-                    "table_exist: view check failed, falling back to table_names()");
-                // Final fallback: list all names (original behavior)
-                self.table_names().contains(&table_name)
-            }
-        }
+        // Issue #238: derive existence from the cached `table_names()` set
+        // instead of issuing a fresh `table_exists()` + `load_view_sql` round
+        // trip per call. `table_names()` already merges tables and views and is
+        // backed by the 5s `table_names_cache`, so repeated existence probes
+        // during one planning pass (DataFusion may call `table_exist` then
+        // `table_names` on the same provider, and a dbt run checks many
+        // relations) cost zero extra REST calls once the namespace list is warm.
+        // None of these probes steals a tokio worker thread via the
+        // `block_in_place + block_on` bridge any more.
+        //
+        // Freshness: `SqeCatalogProvider::schema()` builds a fresh
+        // `SqeSchemaProvider` (with an empty cache) per lookup, so a new query
+        // re-lists from Polaris and sees DDL committed by an earlier query. The
+        // 5s window only applies within a single provider instance's lifetime;
+        // `invalidate_table_names()` is available to drop the cache earlier if a
+        // future caller mutates and re-checks on the same provider.
+        //
+        // Tradeoff: a cold cache lists every table/view in the namespace once
+        // (one `list_tables` + one `list_views`) rather than a single
+        // `table_exists` HEAD. The dbt burst pattern warms the cache on the
+        // first probe, so subsequent checks are free. Issue #238.
+        name_exists_in(&self.table_names(), name)
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
@@ -343,5 +317,63 @@ impl SqeSchemaProvider {
         })?;
 
         Ok(Some(Arc::new(ViewTable::new(plan, Some(sql)))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn name_exists_in_matches_tables_and_views() {
+        let names = vec![
+            "orders".to_string(),
+            "customers".to_string(),
+            "sales_view".to_string(),
+        ];
+        assert!(name_exists_in(&names, "orders"));
+        assert!(name_exists_in(&names, "sales_view"));
+        assert!(!name_exists_in(&names, "missing"));
+        // Existence is case-sensitive and exact, mirroring catalog identifiers.
+        assert!(!name_exists_in(&names, "Orders"));
+        assert!(!name_exists_in(&[], "orders"));
+    }
+
+    /// Issue #238: a warm `table_names_cache` serves repeated existence probes
+    /// without recomputing the (in production, REST-backed) name list. We model
+    /// the REST round trip with a counter that increments only on a cache miss;
+    /// the second and third reads must not bump it.
+    #[test]
+    fn cached_table_names_avoid_recompute_on_repeated_existence_checks() {
+        let cache: SyncCache<String, Arc<Vec<String>>> = SyncCache::builder()
+            .max_capacity(128)
+            .time_to_live(Duration::from_secs(TABLE_NAMES_TTL_SECS))
+            .build();
+        let ns = "analytics".to_string();
+        let rest_calls = AtomicUsize::new(0);
+
+        // Mirror table_names(): cache hit short-circuits, miss "lists" once.
+        let names_for = |ns: &str| -> Arc<Vec<String>> {
+            if let Some(cached) = cache.get(ns) {
+                return cached;
+            }
+            rest_calls.fetch_add(1, Ordering::SeqCst);
+            let names = Arc::new(vec!["orders".to_string(), "customers".to_string()]);
+            cache.insert(ns.to_string(), names.clone());
+            names
+        };
+
+        // First probe: cold cache, one "REST" list.
+        assert!(name_exists_in(&names_for(&ns), "orders"));
+        // Repeated probes during the same dbt burst: served from cache.
+        assert!(name_exists_in(&names_for(&ns), "customers"));
+        assert!(!name_exists_in(&names_for(&ns), "missing"));
+
+        assert_eq!(
+            rest_calls.load(Ordering::SeqCst),
+            1,
+            "table_exist should hit the catalog at most once while the cache is warm"
+        );
     }
 }
