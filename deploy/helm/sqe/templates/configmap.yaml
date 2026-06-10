@@ -62,4 +62,11 @@ data:
     [metrics]
     prometheus_port = {{ .Values.config.metrics.prometheus_port }}
     otlp_endpoint = {{ .Values.config.metrics.otlp_endpoint | quote }}
-    audit_log_path = {{ .Values.config.metrics.audit_log_path | quote }}
+    # ISSUE-248: derive audit_log_path from the audit.* block so the toml and
+    # the mounted volume agree by construction. Empty when audit.enabled=false
+    # (the logger becomes a no-op); otherwise a file under the mounted audit dir.
+    {{- if .Values.audit.enabled }}
+    audit_log_path = {{ printf "%s/%s" (trimSuffix "/" .Values.audit.path) .Values.audit.fileName | quote }}
+    {{- else }}
+    audit_log_path = ""
+    {{- end }}
