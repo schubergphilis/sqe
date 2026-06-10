@@ -204,6 +204,17 @@ pub struct QueryConfig {
     /// Default: 300 (5 minutes). Issue #75.
     #[serde(default = "default_stream_idle_timeout")]
     pub stream_idle_timeout_secs: u64,
+    /// Push the scan's filter predicate and (where safe) the query LIMIT into
+    /// each distributed `ScanTask` so workers prune rows before shipping them
+    /// over Flight (#233). The coordinator always keeps the authoritative
+    /// `FilterExec` / `GlobalLimitExec` above `DistributedScanExec`, so this is
+    /// a pure optimization: workers double-filtering or over-counting a limit
+    /// cannot change results. Set to `false` to ship every projected row and
+    /// rely solely on coordinator-side filtering.
+    ///
+    /// Default: true.
+    #[serde(default = "default_true")]
+    pub distributed_scan_pushdown: bool,
 }
 
 impl Default for QueryConfig {
@@ -227,6 +238,7 @@ impl Default for QueryConfig {
             star_schema_reorder: default_true(),
             star_schema_min_ratio: default_star_schema_min_ratio(),
             stream_idle_timeout_secs: default_stream_idle_timeout(),
+            distributed_scan_pushdown: default_true(),
         }
     }
 }
