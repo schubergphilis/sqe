@@ -6,12 +6,16 @@ use std::time::Duration;
 use chrono::Utc;
 use moka::sync::Cache;
 use sqe_auth::Identity;
+use sqe_core::SecretString;
 use sqe_core::Session as CoreSession;
 
 #[derive(Debug, Clone)]
 pub struct Session {
     pub connection_id: String,
-    pub bearer_token: String,
+    /// The user's live OIDC bearer token. Wrapped in `SecretString` so a
+    /// `debug!(?session)` or panic redacts it to `<set>` instead of leaking the
+    /// raw credential into logs, and the material is zeroized on drop.
+    pub bearer_token: SecretString,
     pub identity: Identity,
     /// `sqe_core::Session` built from the `Identity` at connect time. Held so
     /// `PrepareRequest` can hand it directly to the `QueryExecutor` without
@@ -76,5 +80,46 @@ impl SessionStore {
     /// `insert`/`invalidate` calls. Useful in tests; harmless in production.
     pub fn run_pending_tasks(&self) {
         self.inner.run_pending_tasks();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_identity() -> Identity {
+        Identity {
+            user_id: "alice".to_string(),
+            display_name: "alice".to_string(),
+            roles: vec!["test-role".to_string()],
+            catalog_token: None,
+            refresh_token: None,
+            expires_at: None,
+        }
+    }
+
+    /// Regression guard for issue #197: a `Session` carries the live OIDC bearer
+    /// token, so its `Debug` output must never expose the raw credential. The
+    /// token lives in a `SecretString`, which renders as `<set>`.
+    #[test]
+    fn debug_does_not_leak_bearer_token() {
+        let raw_token = "ey-super-secret-bearer-token-do-not-log";
+        let identity = test_identity();
+        let session = Session {
+            connection_id: "conn-1".to_string(),
+            bearer_token: SecretString::new(raw_token.to_string()),
+            core_session: identity_to_core_session(&identity),
+            identity,
+        };
+
+        let rendered = format!("{session:?}");
+        assert!(
+            !rendered.contains(raw_token),
+            "Debug output leaked the bearer token: {rendered}"
+        );
+        assert!(
+            rendered.contains("<set>"),
+            "expected redacted SecretString sentinel `<set>` in Debug output: {rendered}"
+        );
     }
 }
