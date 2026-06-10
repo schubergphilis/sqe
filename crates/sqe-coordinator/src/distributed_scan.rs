@@ -36,6 +36,40 @@ const DEFAULT_MAX_RETRIES: u32 = 2;
 /// worker rejects `do_get` calls that don't carry it (issue #22).
 const WORKER_SECRET_HEADER: &str = "x-sqe-worker-secret";
 
+/// Metadata header carrying the HMAC-SHA256 tag (hex) over the exact ticket
+/// bytes, keyed by the shared worker_secret (issue #206). The worker
+/// recomputes the tag over the received bytes and constant-time compares
+/// before executing, proving the coordinator authored the exact ScanTask
+/// (file paths, credentials, predicate, and limit included).
+const SCAN_SIGNATURE_HEADER: &str = "x-sqe-scan-signature";
+
+/// Compute the HMAC-SHA256 tag (lowercase hex) over `bytes` keyed by `secret`.
+///
+/// Returns `None` when `secret` is empty: an empty key means the deployment
+/// opted into `worker.allow_unauthenticated`, so there is nothing to sign.
+pub(crate) fn sign_ticket(secret: &str, bytes: &[u8]) -> Option<String> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    if secret.is_empty() {
+        return None;
+    }
+    let mut mac = <Hmac<Sha256>>::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts keys of any length");
+    mac.update(bytes);
+    let tag = mac.finalize().into_bytes();
+    Some(hex_encode(&tag))
+}
+
+/// Lowercase hex encoding (avoids pulling in an extra crate for a 32-byte tag).
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 /// DataFusion `ExecutionPlan` that distributes scan work across workers.
 ///
 /// Each partition maps to one worker. When DataFusion calls `execute(i)`,
@@ -605,6 +639,12 @@ async fn dispatch_to_worker(
     };
     let mut client = FlightServiceClient::new(channel);
 
+    // Sign the exact ticket bytes (#206) before they are moved into the Ticket.
+    // Signing the wire bytes rather than a re-serialized struct guarantees the
+    // tag covers precisely what the worker decodes: file paths, credentials,
+    // and the #233 predicate and limit fields, with no canonicalization gap.
+    let scan_signature = sign_ticket(worker_secret, &ticket_bytes);
+
     let ticket = Ticket::new(ticket_bytes);
     let mut request = tonic::Request::new(ticket);
 
@@ -615,6 +655,17 @@ async fn dispatch_to_worker(
             ))
         })?;
         request.metadata_mut().insert(WORKER_SECRET_HEADER, value);
+
+        if let Some(sig) = scan_signature {
+            let sig_value = sig.parse().map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "scan signature cannot be encoded as a metadata header value: {e}"
+                ))
+            })?;
+            request
+                .metadata_mut()
+                .insert(SCAN_SIGNATURE_HEADER, sig_value);
+        }
     }
 
     // Inject W3C TraceContext (traceparent/tracestate) into gRPC metadata
@@ -870,6 +921,30 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::physical_plan::ExecutionPlanProperties;
 
+    #[test]
+    fn sign_ticket_empty_secret_yields_none() {
+        // Dev mode: no key to sign with, so no signature is attached.
+        assert!(sign_ticket("", b"payload").is_none());
+    }
+
+    #[test]
+    fn sign_ticket_is_deterministic_and_payload_sensitive() {
+        let a = sign_ticket("secret", b"payload").unwrap();
+        let b = sign_ticket("secret", b"payload").unwrap();
+        let c = sign_ticket("secret", b"payloaX").unwrap();
+        assert_eq!(a, b, "same key + payload must yield the same tag");
+        assert_ne!(a, c, "a changed payload must change the tag");
+        // HMAC-SHA256 is 32 bytes -> 64 hex chars.
+        assert_eq!(a.len(), 64);
+    }
+
+    #[test]
+    fn sign_ticket_is_key_sensitive() {
+        let a = sign_ticket("secret-1", b"payload").unwrap();
+        let b = sign_ticket("secret-2", b"payload").unwrap();
+        assert_ne!(a, b, "a changed key must change the tag");
+    }
+
     fn make_task(id: &str) -> ScanTask {
         ScanTask {
             fragment_id: id.to_string(),
@@ -884,6 +959,8 @@ mod tests {
             s3_session_token: String::new(),
             s3_path_style: false,
             s3_allow_http: true,
+            predicate_proto: None,
+            limit: None,
         }
     }
 
@@ -903,6 +980,8 @@ mod tests {
             s3_session_token: String::new(),
             s3_path_style: false,
             s3_allow_http: true,
+            predicate_proto: None,
+            limit: None,
         };
 
         let exec: Arc<dyn ExecutionPlan> = Arc::new(DistributedScanExec::new(

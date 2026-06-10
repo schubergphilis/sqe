@@ -21,6 +21,7 @@ pub mod session_context;
 pub mod query_cache;
 pub mod query_tracker;
 pub mod rate_limiter;
+pub mod scan_pushdown;
 pub mod scheduler;
 pub mod streaming;
 pub mod suggest_bloom;

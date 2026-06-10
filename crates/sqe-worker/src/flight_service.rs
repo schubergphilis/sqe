@@ -42,6 +42,24 @@ fn ipc_options_for(compression: FlightCompression) -> Result<IpcWriteOptions, St
 /// covers both directions.
 const WORKER_SECRET_HEADER: &str = "x-sqe-worker-secret";
 
+/// Metadata header carrying the HMAC-SHA256 tag (hex) over the ScanTask ticket
+/// bytes (issue #206). The worker recomputes the tag over the received bytes
+/// and constant-time compares before executing the task, proving the
+/// coordinator authored the exact file paths, credentials, predicate, and
+/// limit. Empty `worker_secret` (dev mode) skips this check.
+const SCAN_SIGNATURE_HEADER: &str = "x-sqe-scan-signature";
+
+/// Lowercase hex encoding for the 32-byte HMAC tag (#206). Kept local to avoid
+/// an extra crate dependency for such a small need.
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 /// Worker's Arrow Flight service.
 ///
 /// Handles three operations:
@@ -170,6 +188,52 @@ impl WorkerFlightService {
         Ok(())
     }
 
+    /// Verify the HMAC-SHA256 signature over the raw ScanTask ticket bytes
+    /// (issue #206). Recomputes the tag over `ticket_bytes` keyed by the shared
+    /// `worker_secret` and constant-time compares it to the
+    /// `x-sqe-scan-signature` header.
+    ///
+    /// Signing the wire bytes (rather than a re-serialized struct) means the
+    /// tag covers exactly what we decode: file paths, credentials, and the
+    /// #233 predicate/limit fields. A tampered ticket (swapped path, stripped
+    /// predicate) changes the bytes and fails verification.
+    ///
+    /// When `worker_secret` is empty the deployment opted into
+    /// `worker.allow_unauthenticated`; there is no key to sign with, so this
+    /// returns `Ok(())` (the insecure dev path, already gated at config load).
+    fn verify_scan_signature(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+        ticket_bytes: &[u8],
+    ) -> Result<(), Status> {
+        if self.worker_secret.is_empty() {
+            return Ok(());
+        }
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        use subtle::ConstantTimeEq;
+
+        let provided = metadata
+            .get(SCAN_SIGNATURE_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        let mut mac = <Hmac<Sha256>>::new_from_slice(self.worker_secret.as_bytes())
+            .expect("HMAC accepts keys of any length");
+        mac.update(ticket_bytes);
+        let expected = mac.finalize().into_bytes();
+        let expected_hex = hex_encode(&expected);
+
+        let provided_bytes = provided.as_bytes();
+        let expected_bytes = expected_hex.as_bytes();
+        if provided_bytes.len() != expected_bytes.len()
+            || !bool::from(provided_bytes.ct_eq(expected_bytes))
+        {
+            return Err(Status::unauthenticated("Invalid scan task signature"));
+        }
+        Ok(())
+    }
+
     /// Returns a reference to the credential store for use by executors.
     pub fn credential_store(&self) -> &CredentialStore {
         &self.credential_store
@@ -206,6 +270,13 @@ impl FlightService for WorkerFlightService {
         // scan task or even validate its shape until the coordinator has
         // proven itself.
         self.verify_worker_secret(request.metadata())?;
+
+        // Verify the HMAC over the exact ticket bytes (#206) before decoding or
+        // executing. This proves the coordinator authored this precise task; a
+        // tampered ticket (swapped file path, stripped predicate) fails here.
+        // Must run before from_bytes so a forged task is never even parsed.
+        let metadata_owned = request.metadata().clone();
+        self.verify_scan_signature(&metadata_owned, &request.get_ref().ticket)?;
 
         // Extract W3C TraceContext from incoming gRPC metadata so this
         // worker span becomes a child of the coordinator's trace.
@@ -245,13 +316,15 @@ impl FlightService for WorkerFlightService {
             let fragment_id = scan_task.fragment_id.clone();
             let cleanup_guard = credential_store.cleanup_guard(fragment_id.clone());
 
+            // The pushed-down predicate (#233) is carried inside `scan_task`
+            // (`predicate_proto`) and decoded by the executor; the late
+            // materialization RowFilter is wired from it there.
             let prepare = executor::execute_scan_streaming(
                 scan_task,
                 Some(metrics.clone()),
                 session_ctx.clone(),
                 Some(cred_rx),
                 footer_cache.clone(),
-                None, // Late materialization filter (not yet wired from coordinator)
                 None, // Coordinator metrics (workers don't have coordinator registry)
             );
 
@@ -600,6 +673,39 @@ mod tests {
             .with_worker_secret(secret.to_string())
     }
 
+    /// Recompute the HMAC-SHA256 tag (hex) the coordinator would attach, used
+    /// by the #206 signature tests to forge a valid header.
+    fn sign(secret: &str, bytes: &[u8]) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let mut mac = <Hmac<Sha256>>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(bytes);
+        hex_encode(&mac.finalize().into_bytes())
+    }
+
+    /// Build a real ScanTask ticket so the signature test exercises the actual
+    /// wire bytes (and so decoding succeeds past the signature gate).
+    fn make_scan_task_bytes() -> Vec<u8> {
+        sqe_planner::ScanTask {
+            fragment_id: "frag-sig".to_string(),
+            data_file_paths: vec!["s3://bucket/f.parquet".to_string()],
+            file_sizes_bytes: vec![1024],
+            projected_columns: vec![],
+            projected_field_ids: vec![],
+            s3_endpoint: String::new(),
+            s3_region: String::new(),
+            s3_access_key: String::new(),
+            s3_secret_key: String::new(),
+            s3_session_token: String::new(),
+            s3_path_style: false,
+            s3_allow_http: false,
+            predicate_proto: None,
+            limit: None,
+        }
+        .to_bytes()
+        .unwrap()
+    }
+
     fn make_refresh_creds() -> RefreshableCredentials {
         RefreshableCredentials {
             fragment_id: "frag-test".to_string(),
@@ -650,20 +756,84 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn do_get_accepts_correct_secret_then_fails_on_bad_ticket() {
-        // With the right secret the auth gate passes; ticket decoding then
-        // fails because the body is junk. The error must NOT be
-        // Unauthenticated, proving the gate let the call through.
+    async fn do_get_accepts_correct_secret_and_signature_then_fails_on_bad_ticket() {
+        // With the right secret AND a valid signature over the (junk) body, both
+        // auth gates pass; ticket decoding then fails. The error must NOT be
+        // Unauthenticated, proving both gates let the call through.
         let svc = make_service("expected-secret");
-        let ticket = Ticket {
-            ticket: bytes::Bytes::from_static(b"junk"),
-        };
-        let mut request = Request::new(ticket);
+        let body = b"junk";
+        let mut request = Request::new(Ticket {
+            ticket: bytes::Bytes::from_static(body),
+        });
+        request
+            .metadata_mut()
+            .insert(WORKER_SECRET_HEADER, "expected-secret".parse().unwrap());
+        request.metadata_mut().insert(
+            SCAN_SIGNATURE_HEADER,
+            sign("expected-secret", body).parse().unwrap(),
+        );
+        let err = unwrap_err(svc.do_get(request).await);
+        assert_ne!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn do_get_rejects_missing_signature() {
+        // Right secret, no signature header: the #206 gate rejects before decode.
+        let svc = make_service("expected-secret");
+        let mut request = Request::new(Ticket {
+            ticket: bytes::Bytes::from(make_scan_task_bytes()),
+        });
         request
             .metadata_mut()
             .insert(WORKER_SECRET_HEADER, "expected-secret".parse().unwrap());
         let err = unwrap_err(svc.do_get(request).await);
-        assert_ne!(err.code(), tonic::Code::Unauthenticated);
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn do_get_rejects_tampered_ticket() {
+        // A signature valid for the ORIGINAL bytes must fail once the ticket is
+        // mutated (e.g. a swapped file path). Sign the original, then tamper.
+        let svc = make_service("expected-secret");
+        let original = make_scan_task_bytes();
+        let signature = sign("expected-secret", &original);
+        let mut tampered = original.clone();
+        // Flip a byte to simulate a swapped file path / stripped predicate.
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xff;
+        let mut request = Request::new(Ticket {
+            ticket: bytes::Bytes::from(tampered),
+        });
+        request
+            .metadata_mut()
+            .insert(WORKER_SECRET_HEADER, "expected-secret".parse().unwrap());
+        request
+            .metadata_mut()
+            .insert(SCAN_SIGNATURE_HEADER, signature.parse().unwrap());
+        let err = unwrap_err(svc.do_get(request).await);
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn do_get_accepts_correctly_signed_ticket() {
+        // A correctly-signed, well-formed ScanTask passes both gates. Execution
+        // then fails downstream (no real S3), but NOT with Unauthenticated.
+        let svc = make_service("expected-secret");
+        let body = make_scan_task_bytes();
+        let signature = sign("expected-secret", &body);
+        let mut request = Request::new(Ticket {
+            ticket: bytes::Bytes::from(body),
+        });
+        request
+            .metadata_mut()
+            .insert(WORKER_SECRET_HEADER, "expected-secret".parse().unwrap());
+        request
+            .metadata_mut()
+            .insert(SCAN_SIGNATURE_HEADER, signature.parse().unwrap());
+        let result = svc.do_get(request).await;
+        if let Err(s) = result {
+            assert_ne!(s.code(), tonic::Code::Unauthenticated);
+        }
     }
 
     #[tokio::test]

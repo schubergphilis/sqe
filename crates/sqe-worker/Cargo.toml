@@ -20,6 +20,9 @@ sqe-catalog = { path = "../sqe-catalog" }
 sqe-planner = { path = "../sqe-planner" }
 sqe-metrics = { path = "../sqe-metrics" }
 datafusion = { workspace = true }
+datafusion-proto = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
 arrow-ipc = { workspace = true }
@@ -51,3 +54,4 @@ if-addrs = "0.15"
 
 [dev-dependencies]
 tokio = { workspace = true }
+async-trait = { workspace = true }

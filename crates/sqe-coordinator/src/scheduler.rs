@@ -229,6 +229,8 @@ mod tests {
             s3_session_token: String::new(),
             s3_path_style: false,
             s3_allow_http: true,
+            predicate_proto: None,
+            limit: None,
         }
     }
 
@@ -248,6 +250,8 @@ mod tests {
             s3_session_token: String::new(),
             s3_path_style: false,
             s3_allow_http: true,
+            predicate_proto: None,
+            limit: None,
         }
     }
 
@@ -683,6 +687,8 @@ mod tests {
             s3_session_token: String::new(),
             s3_path_style: false,
             s3_allow_http: true,
+            predicate_proto: None,
+            limit: None,
         };
         let task2 = ScanTask {
             fragment_id: "q2_scan".to_string(),
@@ -697,6 +703,8 @@ mod tests {
             s3_session_token: String::new(),
             s3_path_style: false,
             s3_allow_http: true,
+            predicate_proto: None,
+            limit: None,
         };
 
         let workers = vec![
