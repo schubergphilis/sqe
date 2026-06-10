@@ -329,6 +329,15 @@ fn random_date(rng: &mut StdRng) -> i32 {
     DS_DATE_START + rng.gen_range(0..DS_DATE_RANGE)
 }
 
+/// Random `d_date_sk` surrogate key for fact tables, constrained to the
+/// 1998-2003 sales window of `date_dim` (sk = row + 1, year = 1998 + row/366)
+/// so that the d_year/d_moy filters in the official query set actually select
+/// rows. Fact tables must reference date_dim by surrogate key, not by date
+/// value: writing dates here is what NULLed every *_date_sk column.
+fn random_date_sk(rng: &mut StdRng) -> i32 {
+    rng.gen_range(1..=DS_DATE_RANGE)
+}
+
 fn random_id(rng: &mut StdRng) -> String {
     const HEX: &[u8] = b"0123456789abcdef";
     (0..16).map(|_| HEX[rng.gen_range(0..16)] as char).collect()
@@ -438,39 +447,61 @@ enum ColVal {
 }
 
 fn cols_to_arrays(cols: Vec<Vec<ColVal>>, tbl_schema: &SchemaRef) -> Vec<Arc<dyn arrow_array::Array>> {
+    // A ColVal variant that does not match the declared field type is a
+    // generator bug. Panic instead of coercing to NULL: silent NULLs here made
+    // every *_date_sk column empty and turned 74/99 TPC-DS compare queries
+    // into vacuous empty-vs-empty matches before anyone noticed.
+    fn mismatch(field: &arrow_schema::Field, got: &ColVal) -> ! {
+        let got = match got {
+            ColVal::I32(_) => "I32",
+            ColVal::F64(_) => "F64",
+            ColVal::Str(_) => "Str",
+            ColVal::Date(_) => "Date",
+        };
+        panic!(
+            "generator bug: column '{}' is {:?} but row builder produced ColVal::{}",
+            field.name(),
+            field.data_type(),
+            got
+        );
+    }
     cols.into_iter()
         .enumerate()
         .map(|(idx, col)| {
-            match tbl_schema.field(idx).data_type() {
+            let field = tbl_schema.field(idx);
+            match field.data_type() {
                 DataType::Int32 => {
                     let v: Vec<Option<i32>> = col.into_iter().map(|c| match c {
                         ColVal::I32(x) => x,
-                        _ => None,
+                        other => mismatch(field, &other),
                     }).collect();
                     Arc::new(Int32Array::from(v)) as Arc<dyn arrow_array::Array>
                 }
                 DataType::Float64 => {
                     let v: Vec<Option<f64>> = col.into_iter().map(|c| match c {
                         ColVal::F64(x) => x,
-                        _ => None,
+                        other => mismatch(field, &other),
                     }).collect();
                     Arc::new(Float64Array::from(v)) as Arc<dyn arrow_array::Array>
                 }
                 DataType::Date32 => {
                     let v: Vec<Option<i32>> = col.into_iter().map(|c| match c {
                         ColVal::Date(x) => x,
-                        ColVal::I32(x) => x,
-                        _ => None,
+                        other => mismatch(field, &other),
                     }).collect();
                     Arc::new(Date32Array::from(v)) as Arc<dyn arrow_array::Array>
                 }
-                _ => {
+                DataType::Utf8 => {
                     let v: Vec<Option<String>> = col.into_iter().map(|c| match c {
                         ColVal::Str(x) => x,
-                        _ => None,
+                        other => mismatch(field, &other),
                     }).collect();
                     Arc::new(StringArray::from(v)) as Arc<dyn arrow_array::Array>
                 }
+                other => panic!(
+                    "generator bug: column '{}' has unsupported type {other:?}",
+                    field.name()
+                ),
             }
         })
         .collect()
@@ -495,7 +526,7 @@ fn generate_store_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let sp  = lp * rng.gen_range(50..100i32) as f64 / 100.0;
         let tax = sp * 0.08;
         vec![
-            d!(random_date(rng)), i!(rng.gen_range(0..86400i32)),
+            i!(random_date_sk(rng)), i!(rng.gen_range(0..86400i32)),
             i!(rng.gen_range(1..18_000i32)), i!(rng.gen_range(1..100_000i32)),
             i!(rng.gen_range(1..1_920_800i32)), i!(rng.gen_range(1..7200i32)),
             i!(rng.gen_range(1..50_000i32)), i!(rng.gen_range(1..12i32)),
@@ -516,7 +547,7 @@ fn generate_store_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let amt = rng.gen_range(10..500i32) as f64;
         let tax = amt * 0.08;
         vec![
-            d!(random_date(rng)), i!(rng.gen_range(0..86400i32)),
+            i!(random_date_sk(rng)), i!(rng.gen_range(0..86400i32)),
             i!(rng.gen_range(1..18_000i32)), i!(rng.gen_range(1..100_000i32)),
             i!(rng.gen_range(1..1_920_800i32)), i!(rng.gen_range(1..7200i32)),
             i!(rng.gen_range(1..50_000i32)), i!(rng.gen_range(1..12i32)),
@@ -538,7 +569,7 @@ fn generate_catalog_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let tax = sp * 0.08;
         let ship = sp * 0.05 * qty as f64;
         vec![
-            d!(random_date(rng)), i!(rng.gen_range(0..86400i32)), d!(random_date(rng)),
+            i!(random_date_sk(rng)), i!(rng.gen_range(0..86400i32)), i!(random_date_sk(rng)),
             i!(rng.gen_range(1..100_000i32)), i!(rng.gen_range(1..1_920_800i32)),
             i!(rng.gen_range(1..7200i32)), i!(rng.gen_range(1..50_000i32)),
             i!(rng.gen_range(1..100_000i32)), i!(rng.gen_range(1..1_920_800i32)),
@@ -563,7 +594,7 @@ fn generate_catalog_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let amt = rng.gen_range(10..500i32) as f64;
         let tax = amt * 0.08;
         vec![
-            d!(random_date(rng)), i!(rng.gen_range(0..86400i32)),
+            i!(random_date_sk(rng)), i!(rng.gen_range(0..86400i32)),
             i!(rng.gen_range(1..18_000i32)), i!(rng.gen_range(1..100_000i32)),
             i!(rng.gen_range(1..1_920_800i32)), i!(rng.gen_range(1..7200i32)),
             i!(rng.gen_range(1..50_000i32)), i!(rng.gen_range(1..100_000i32)),
@@ -589,7 +620,7 @@ fn generate_web_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let tax = sp * 0.08;
         let ship = sp * 0.05 * qty as f64;
         vec![
-            d!(random_date(rng)), i!(rng.gen_range(0..86400i32)), d!(random_date(rng)),
+            i!(random_date_sk(rng)), i!(rng.gen_range(0..86400i32)), i!(random_date_sk(rng)),
             i!(rng.gen_range(1..18_000i32)), i!(rng.gen_range(1..100_000i32)),
             i!(rng.gen_range(1..1_920_800i32)), i!(rng.gen_range(1..7200i32)),
             i!(rng.gen_range(1..50_000i32)), i!(rng.gen_range(1..100_000i32)),
@@ -614,7 +645,7 @@ fn generate_web_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let amt = rng.gen_range(10..500i32) as f64;
         let tax = amt * 0.08;
         vec![
-            d!(random_date(rng)), i!(rng.gen_range(0..86400i32)),
+            i!(random_date_sk(rng)), i!(rng.gen_range(0..86400i32)),
             i!(rng.gen_range(1..18_000i32)), i!(rng.gen_range(1..100_000i32)),
             i!(rng.gen_range(1..1_920_800i32)), i!(rng.gen_range(1..7200i32)),
             i!(rng.gen_range(1..50_000i32)), i!(rng.gen_range(1..100_000i32)),
@@ -632,7 +663,7 @@ fn generate_inventory(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let total = total.max(1);
     generate_batches(inventory_schema(), total, seed_for_table("inventory"), |_row, rng| {
         vec![
-            d!(random_date(rng)),
+            i!(random_date_sk(rng)),
             i!(rng.gen_range(1..18_000i32)),
             i!(rng.gen_range(1..5i32)),
             i!(rng.gen_range(0..1000i32)),
@@ -716,7 +747,7 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         vec![
             i!(sk), s!(random_id(rng)),
             i!(rng.gen_range(1..1_920_800i32)), i!(rng.gen_range(1..7200i32)),
-            i!(rng.gen_range(1..50_000i32)), d!(random_date(rng)), d!(random_date(rng)),
+            i!(rng.gen_range(1..50_000i32)), i!(random_date_sk(rng)), i!(random_date_sk(rng)),
             s!(random_str(rng, SALUTATIONS)), s!(random_name(rng)), s!(random_name(rng)),
             s!(random_str(rng, YN)), i!(rng.gen_range(1..28i32)),
             i!(rng.gen_range(1..12i32)), i!(rng.gen_range(1920..2000i32)),
@@ -1160,5 +1191,44 @@ mod tests {
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, (0.01_f64 * 18_000.0) as usize);
         assert_eq!(batches[0].schema(), sch);
+    }
+
+    #[test]
+    fn fact_date_sks_join_date_dim() {
+        use arrow_array::Array as _;
+        // Every fact *_date_sk must be a valid date_dim surrogate key inside
+        // the 1998-2003 sales window. These columns were silently NULL (Date
+        // values coerced into Int32 columns), which emptied every date join
+        // and made 74/99 compare queries vacuous.
+        type FactGen = fn(f64) -> (SchemaRef, Vec<RecordBatch>);
+        let facts: &[(&str, FactGen)] = &[
+            ("store_sales", |s| generate_store_sales(s)),
+            ("store_returns", |s| generate_store_returns(s)),
+            ("catalog_sales", |s| generate_catalog_sales(s)),
+            ("catalog_returns", |s| generate_catalog_returns(s)),
+            ("web_sales", |s| generate_web_sales(s)),
+            ("web_returns", |s| generate_web_returns(s)),
+            ("inventory", |s| generate_inventory(s)),
+        ];
+        for (name, gen) in facts {
+            let (sch, batches) = gen(0.001);
+            for (idx, field) in sch.fields().iter().enumerate() {
+                if !field.name().ends_with("_date_sk") {
+                    continue;
+                }
+                for b in &batches {
+                    let col = b.column(idx).as_any()
+                        .downcast_ref::<arrow_array::Int32Array>().unwrap();
+                    assert_eq!(col.null_count(), 0,
+                        "{name}.{} has NULLs", field.name());
+                    for i in 0..col.len() {
+                        let sk = col.value(i);
+                        assert!((1..=DS_DATE_RANGE).contains(&sk),
+                            "{name}.{} sk {sk} outside date_dim sales window",
+                            field.name());
+                    }
+                }
+            }
+        }
     }
 }

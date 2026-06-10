@@ -301,9 +301,12 @@ fn random_phone(rng: &mut StdRng, nation_idx: usize) -> String {
     )
 }
 
-/// City name format: "NATION_NAME 0" .. "NATION_NAME 9"
+/// City name format per ssb-dbgen (`"%-9.9s%d"`): the nation name truncated
+/// or space-padded to exactly 9 characters, followed by one digit. Queries
+/// q3.3/q3.4 probe literals like 'UNITED KI1', so any other format makes them
+/// select nothing.
 fn random_city(rng: &mut StdRng, nation_name: &str) -> String {
-    format!("{} {}", nation_name, rng.gen_range(0..10u32))
+    format!("{:<9.9}{}", nation_name, rng.gen_range(0..10u32))
 }
 
 // ---------------------------------------------------------------------------
@@ -565,7 +568,9 @@ fn generate_part(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             let key = (offset + i + 1) as i32;
             let mfgr_num = rng.gen_range(1..=5i32);
             let cat_num = rng.gen_range(1..=5i32);
-            let brand_num = rng.gen_range(1..=8i32);
+            // ssb-dbgen brand = category + zero-padded 01..40, e.g.
+            // 'MFGR#2221'. Queries q2.2/q2.3 probe 4-digit brand literals.
+            let brand_num = rng.gen_range(1..=40i32);
             let color = PART_COLORS[rng.gen_range(0..PART_COLORS.len())];
 
             p_partkey.push(key);
@@ -576,7 +581,7 @@ fn generate_part(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             ));
             p_mfgr.push(format!("MFGR#{}", mfgr_num));
             p_category.push(format!("MFGR#{}{}", mfgr_num, cat_num));
-            p_brand.push(format!("MFGR#{}{}{}", mfgr_num, cat_num, brand_num));
+            p_brand.push(format!("MFGR#{}{}{:02}", mfgr_num, cat_num, brand_num));
             p_color.push(color.to_string());
             p_type.push(PART_TYPES[rng.gen_range(0..PART_TYPES.len())].to_string());
             p_size.push(rng.gen_range(1..=50i32));
@@ -1013,5 +1018,54 @@ mod tests {
     fn test_unknown_table_errors() {
         let gen = SsbGenerator;
         assert!(gen.generate_table("no_such_table", 1.0, "/tmp", &Default::default()).is_err());
+    }
+
+    #[test]
+    fn p_brand_matches_dbgen_four_digit_format() {
+        use arrow_array::Array as _;
+        // q2.2 probes BETWEEN 'MFGR#2221' AND 'MFGR#2228'; 3-digit brand
+        // suffixes made that range empty.
+        let (sch, batches) = generate_part(0.1);
+        let idx = sch.index_of("p_brand").unwrap();
+        let mut in_q22_range = 0usize;
+        for b in &batches {
+            let col = b.column(idx).as_any().downcast_ref::<StringArray>().unwrap();
+            for i in 0..col.len() {
+                let v = col.value(i);
+                assert_eq!(v.len(), 9, "brand must be MFGR#mcnn, got '{v}'");
+                let digits = &v[5..];
+                let m: u32 = digits[0..1].parse().unwrap();
+                let c: u32 = digits[1..2].parse().unwrap();
+                let nn: u32 = digits[2..4].parse().unwrap();
+                assert!((1..=5).contains(&m) && (1..=5).contains(&c));
+                assert!((1..=40).contains(&nn), "brand number {nn} outside 01..40 in '{v}'");
+                if ("MFGR#2221".."MFGR#2229").contains(&v) {
+                    in_q22_range += 1;
+                }
+            }
+        }
+        assert!(in_q22_range > 0, "q2.2 brand range matched no parts");
+    }
+
+    #[test]
+    fn cities_use_nine_char_padded_nation_plus_digit() {
+        use arrow_array::Array as _;
+        // q3.3/q3.4 probe 'UNITED KI1'-style literals: nation truncated or
+        // space-padded to 9 chars, then one digit (ssb-dbgen "%-9.9s%d").
+        let (sch, batches) = generate_customer(0.1);
+        let idx = sch.index_of("c_city").unwrap();
+        let mut united_ki = false;
+        for b in &batches {
+            let col = b.column(idx).as_any().downcast_ref::<StringArray>().unwrap();
+            for i in 0..col.len() {
+                let v = col.value(i);
+                assert_eq!(v.chars().count(), 10, "city must be exactly 10 chars, got '{v}'");
+                assert!(v.chars().last().unwrap().is_ascii_digit());
+                if v.starts_with("UNITED KI") {
+                    united_ki = true;
+                }
+            }
+        }
+        assert!(united_ki, "no 'UNITED KI*' city generated; q3.3/q3.4 stay vacuous");
     }
 }

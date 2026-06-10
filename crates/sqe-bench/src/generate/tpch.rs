@@ -240,23 +240,12 @@ const SHIP_INSTRUCTS: &[&str] = &[
     "TAKE BACK RETURN",
 ];
 
-const PART_TYPES: &[&str] = &[
-    "STANDARD ANODIZED TIN",
-    "STANDARD ANODIZED NICKEL",
-    "STANDARD ANODIZED BRASS",
-    "STANDARD ANODIZED STEEL",
-    "STANDARD ANODIZED COPPER",
-    "STANDARD BURNISHED TIN",
-    "STANDARD BURNISHED NICKEL",
-    "STANDARD BURNISHED BRASS",
-    "ECONOMY ANODIZED TIN",
-    "ECONOMY ANODIZED NICKEL",
-    "ECONOMY BURNISHED TIN",
-    "PROMO BURNISHED COPPER",
-    "LARGE BURNISHED BRASS",
-    "MEDIUM BURNISHED STEEL",
-    "SMALL POLISHED COPPER",
-];
+// TPC-H p_type = one word from each list, drawn independently (6 x 5 x 5 =
+// 150 combinations). The query set probes specific combinations (q08 needs
+// "ECONOMY ANODIZED STEEL"), so a hardcoded subset silently empties them.
+const PART_TYPE_SYL1: &[&str] = &["STANDARD", "SMALL", "MEDIUM", "LARGE", "ECONOMY", "PROMO"];
+const PART_TYPE_SYL2: &[&str] = &["ANODIZED", "BURNISHED", "PLATED", "POLISHED", "BRUSHED"];
+const PART_TYPE_SYL3: &[&str] = &["TIN", "NICKEL", "BRASS", "STEEL", "COPPER"];
 
 const PART_CONTAINERS: &[&str] = &[
     "SM CASE", "SM BOX", "SM BAG", "SM JAR", "SM PACK", "SM CAN",
@@ -559,7 +548,12 @@ fn generate_part_range(
             p_name.push(format!("{color1} {color2} {color3} {color4} {color5}"));
             p_mfgr.push(format!("Manufacturer#{mfgr_num}"));
             p_brand.push(format!("Brand#{mfgr_num}{brand_num}"));
-            p_type.push(PART_TYPES[rng.gen_range(0..PART_TYPES.len())].to_string());
+            p_type.push(format!(
+                "{} {} {}",
+                PART_TYPE_SYL1[rng.gen_range(0..PART_TYPE_SYL1.len())],
+                PART_TYPE_SYL2[rng.gen_range(0..PART_TYPE_SYL2.len())],
+                PART_TYPE_SYL3[rng.gen_range(0..PART_TYPE_SYL3.len())],
+            ));
             p_size.push(rng.gen_range(1..=50i32));
             p_container.push(PART_CONTAINERS[rng.gen_range(0..PART_CONTAINERS.len())].to_string());
             // Retail price: 90001 + (key/10) mod 20001 + 0.nn
@@ -710,7 +704,14 @@ fn generate_orders_range(
             let clerk_num = rng.gen_range(1..=1000i32);
 
             o_orderkey.push(key);
-            o_custkey.push(rng.gen_range(1..=num_customers));
+            // dbgen never assigns orders to custkeys divisible by 3, leaving a
+            // third of customers orderless. q22 selects on NOT EXISTS(orders)
+            // and returns nothing when every customer has orders.
+            let mut ck = rng.gen_range(1..=num_customers);
+            if ck % 3 == 0 {
+                ck -= 1;
+            }
+            o_custkey.push(ck.max(1));
             o_orderstatus.push(status.to_string());
             o_totalprice.push((rng.gen_range(10_000..50_000_000_i64) as f64) / 100.0);
             o_orderdate.push(random_date(&mut rng));
@@ -1164,5 +1165,40 @@ mod tests {
         let gen = TpchGenerator;
         let result = gen.generate_table("nonexistent", 1.0, "/tmp", &Default::default());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn p_type_covers_all_150_spec_combinations() {
+        use arrow_array::Array as _;
+        // q08 selects p_type = 'ECONOMY ANODIZED STEEL'; a partial vocabulary
+        // silently empties it (and any other combo probe).
+        let (sch, batches) = generate_part(0.1);
+        let idx = sch.index_of("p_type").unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for b in &batches {
+            let col = b.column(idx).as_any().downcast_ref::<StringArray>().unwrap();
+            for i in 0..col.len() {
+                seen.insert(col.value(i).to_string());
+            }
+        }
+        assert_eq!(seen.len(), 150, "expected all 6x5x5 p_type combinations");
+        assert!(seen.contains("ECONOMY ANODIZED STEEL"));
+    }
+
+    #[test]
+    fn orders_leave_every_third_custkey_orderless() {
+        use arrow_array::Array as _;
+        // dbgen never references custkeys divisible by 3; q22 (NOT EXISTS
+        // orders) is vacuous when every customer has orders.
+        let (sch, batches) = generate_orders(0.01);
+        let idx = sch.index_of("o_custkey").unwrap();
+        for b in &batches {
+            let col = b.column(idx).as_any().downcast_ref::<Int32Array>().unwrap();
+            for i in 0..col.len() {
+                let ck = col.value(i);
+                assert!(ck >= 1, "custkey must be positive, got {ck}");
+                assert_ne!(ck % 3, 0, "custkey {ck} divisible by 3 should never get orders");
+            }
+        }
     }
 }

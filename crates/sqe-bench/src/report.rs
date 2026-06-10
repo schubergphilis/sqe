@@ -192,6 +192,11 @@ pub struct QueryComparison {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum CompareStatusReport {
     Match,
+    /// Both engines returned zero rows. They agree, but the query validated
+    /// nothing: with a shared (possibly broken) dataset, empty-vs-empty says
+    /// nothing about engine correctness. Tracked separately from Match so
+    /// vacuous coverage is visible in every report.
+    Vacuous,
     RowDiff,
     SqeFailed,
     TrinoFailed,
@@ -213,6 +218,8 @@ pub struct ComparisonReport {
 pub struct ComparisonSummary {
     pub total: usize,
     pub matched: usize,
+    #[serde(default)]
+    pub vacuous: usize,
     pub row_diff: usize,
     pub sqe_failed: usize,
     pub trino_failed: usize,
