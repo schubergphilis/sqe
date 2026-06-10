@@ -955,8 +955,8 @@ impl ExecutionPlan for IcebergScanExec {
                 // so clones are refcount bumps.
                 let concurrency = direct_read_concurrency.max(1);
                 let resolved_filters = Arc::new(resolved_filters);
-                let per_file_results: Vec<Vec<RecordBatch>> = futures::stream::iter(
-                    file_entries.into_iter().map(|(path, size)| {
+                let per_file_stream = futures::stream::iter(
+                    file_entries.into_iter().map(move |(path, size)| {
                         let file_io = file_io.clone();
                         let projection = projection.clone();
                         let schema = schema.clone();
@@ -1063,17 +1063,15 @@ impl ExecutionPlan for IcebergScanExec {
                         }
                     }),
                 )
-                .buffer_unordered(concurrency)
-                .try_collect()
-                .await?;
+                .buffer_unordered(concurrency);
 
-                let all_batches: Vec<RecordBatch> =
-                    per_file_results.into_iter().flatten().collect();
-
-                debug!(batch_count = all_batches.len(), "Direct-read: scan complete");
-                let s: BatchStream = futures::stream::iter(
-                    all_batches.into_iter().map(Ok::<RecordBatch, DataFusionError>)
-                ).boxed();
+                // Stream per-file batches as each read completes instead of
+                // collecting every file into memory first. The previous
+                // `try_collect()` held `Vec<Vec<RecordBatch>>` for the whole
+                // partition before yielding the first batch, pinning
+                // `file_count x decoded_size` of Arrow on the coordinator.
+                // See `flatten_per_file_batches` for the streaming semantics.
+                let s: BatchStream = flatten_per_file_batches(per_file_stream);
                 return Ok::<BatchStream, DataFusionError>(s);
             }
 
@@ -1224,6 +1222,43 @@ impl ExecutionPlan for IcebergScanExec {
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
+
+/// Flatten a stream of per-file batch results into a single lazy batch stream.
+///
+/// The direct-read fast path fans file reads out with
+/// `buffer_unordered(concurrency)`, so each stream item is the
+/// `DFResult<Vec<RecordBatch>>` for one decoded file. We splice those per-file
+/// vectors into one flat `RecordBatch` stream WITHOUT first collecting them:
+///
+/// - `map_ok` turns each completed file's `Vec<RecordBatch>` into an inner
+///   stream of `Ok(batch)`.
+/// - `try_flatten` emits each inner stream's batches as it is produced, so a
+///   file's batches are yielded as soon as that file finishes decoding. The
+///   `buffer_unordered(concurrency)` bound on the upstream is preserved, so
+///   in-flight decoded Arrow is ~`concurrency x decoded_size` instead of the
+///   whole partition.
+///
+/// Error semantics: a per-file `Err` propagates as a mid-stream `Err` item
+/// rather than failing eagerly. The caller wraps this in `try_flatten()` plus
+/// `IcebergRecordBatchStream`, both of which carry `DFResult` per item, so the
+/// error still terminates the scan.
+///
+/// Note: streaming is at file granularity, not row granularity. Each file is
+/// still read fully into memory by `input.read().await` before decode; the
+/// per-file size cap is the small-file threshold gate, not this function.
+fn flatten_per_file_batches<S>(
+    per_file_stream: S,
+) -> futures::stream::BoxStream<'static, DFResult<RecordBatch>>
+where
+    S: Stream<Item = DFResult<Vec<RecordBatch>>> + Send + 'static,
+{
+    per_file_stream
+        .map_ok(|batches| {
+            futures::stream::iter(batches.into_iter().map(Ok::<RecordBatch, DataFusionError>))
+        })
+        .try_flatten()
+        .boxed()
+}
 
 /// Collect `(file_path, file_size_bytes)` pairs for the given snapshot via
 /// iceberg-rust's scan planner.
@@ -1670,4 +1705,114 @@ impl Stream for IcebergRecordBatchStream {
 
 impl datafusion::physical_plan::RecordBatchStream for IcebergRecordBatchStream {
     fn schema(&self) -> SchemaRef { self.schema.clone() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn batch(schema: &SchemaRef, values: &[i32]) -> RecordBatch {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(values.to_vec()))],
+        )
+        .unwrap()
+    }
+
+    /// Each per-file `Vec<RecordBatch>` is spliced into one flat stream in file
+    /// order, with every batch and every row preserved. This is the correctness
+    /// guarantee the streaming rewrite must keep relative to the old
+    /// `try_collect().flatten()` form.
+    #[tokio::test]
+    async fn flatten_preserves_all_batches_in_order() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+
+        // Two files: the first yields two batches, the second yields one.
+        let per_file: Vec<DFResult<Vec<RecordBatch>>> = vec![
+            Ok(vec![batch(&schema, &[1, 2]), batch(&schema, &[3])]),
+            Ok(vec![batch(&schema, &[4, 5, 6])]),
+        ];
+
+        let flat = flatten_per_file_batches(futures::stream::iter(per_file));
+        let out: Vec<RecordBatch> = flat.try_collect().await.unwrap();
+
+        let rows: Vec<i32> = out
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+
+        assert_eq!(out.len(), 3, "all three batches survive the flatten");
+        assert_eq!(rows, vec![1, 2, 3, 4, 5, 6], "rows preserved in file order");
+    }
+
+    /// The stream must be lazy: polling for the first batch must NOT have driven
+    /// the producer of every downstream file. The old code collected all files
+    /// before emitting anything; this proves we no longer do.
+    #[tokio::test]
+    async fn flatten_is_lazy_not_pre_collected() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+
+        // Count how many per-file items the consumer has pulled from upstream.
+        let produced = Arc::new(AtomicUsize::new(0));
+        let produced_in = Arc::clone(&produced);
+
+        // Three files; `inspect` fires as each is pulled by the downstream.
+        let upstream = futures::stream::iter(vec![
+            Ok::<Vec<RecordBatch>, DataFusionError>(vec![batch(&schema, &[1])]),
+            Ok(vec![batch(&schema, &[2])]),
+            Ok(vec![batch(&schema, &[3])]),
+        ])
+        .inspect(move |_| {
+            produced_in.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let mut flat = flatten_per_file_batches(upstream);
+
+        // Pull exactly one batch.
+        let first = flat.next().await.unwrap().unwrap();
+        assert_eq!(first.num_rows(), 1);
+
+        // A pre-collecting implementation would have drained all three files to
+        // produce the first batch. A lazy one pulls only what it needs (one
+        // file yields one batch here, so at most one or two upstream items).
+        let pulled = produced.load(Ordering::SeqCst);
+        assert!(
+            pulled < 3,
+            "stream pre-collected all {pulled} files before first batch; expected lazy pull"
+        );
+    }
+
+    /// A per-file error surfaces as a mid-stream `Err` (not an eager panic or a
+    /// silently-dropped file), and batches emitted before it still arrive.
+    #[tokio::test]
+    async fn flatten_propagates_mid_stream_error() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+
+        let per_file: Vec<DFResult<Vec<RecordBatch>>> = vec![
+            Ok(vec![batch(&schema, &[1])]),
+            Err(DataFusionError::Internal("file read failed".into())),
+            Ok(vec![batch(&schema, &[2])]),
+        ];
+
+        let mut flat = flatten_per_file_batches(futures::stream::iter(per_file));
+
+        let first = flat.next().await.unwrap();
+        assert!(first.is_ok(), "first file's batch arrives before the error");
+
+        let second = flat.next().await.unwrap();
+        assert!(second.is_err(), "the failing file surfaces as a mid-stream Err");
+    }
 }
