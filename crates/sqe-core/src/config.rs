@@ -2033,7 +2033,12 @@ impl SecurityConfig {
 
 /// Strip the `:port` suffix from a peer-address-like string for
 /// allowlist comparison. IPv4 is `host:port`; IPv6 is `[host]:port`.
-fn strip_port(s: &str) -> &str {
+///
+/// Public so wire-protocol surfaces can derive a port-stable rate-limit
+/// key from a resolved client IP: the source port is ephemeral, so a key
+/// that kept it would hand every new TCP connection a fresh bucket and
+/// defeat per-IP limiting entirely.
+pub fn strip_port(s: &str) -> &str {
     let s = s.trim();
     if let Some(rest) = s.strip_prefix('[') {
         if let Some(end) = rest.find(']') {

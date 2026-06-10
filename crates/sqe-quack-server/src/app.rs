@@ -1,20 +1,23 @@
 //! Axum HTTP application: `GET /` identification + `POST /quack` RPC.
 
+use std::net::SocketAddr;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
+use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
 
 use axum::{
-    extract::{DefaultBodyLimit, State},
-    http::StatusCode,
+    extract::{ConnectInfo, DefaultBodyLimit, State},
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Router,
 };
 use bytes::Bytes;
 use sqe_auth::{AuthError, AuthProvider, FlightCredentials};
+use sqe_core::config::{strip_port, SecurityConfig};
 use sqe_core::SecretString;
 use sqe_quack_wire::arrow_bridge::record_batch_to_data_chunk;
 use sqe_quack_wire::codec::BinaryDeserializer;
@@ -31,14 +34,26 @@ use crate::session::{identity_to_core_session, Session, SessionStore};
 const QUACK_VERSION: u64 = 1;
 const APPLICATION_VND_DUCKDB: &str = "application/vnd.duckdb";
 
-/// QUACK-08: ceiling on `ConnectionRequest` auth attempts per second, process
-/// wide. Each request triggers an IdP round-trip, so an un-throttled path is a
-/// brute-force / IdP-amplification oracle. Connections are long-lived and
+/// QUACK-08: ceiling on `ConnectionRequest` auth attempts per second, per
+/// client IP. Each request triggers an IdP round-trip, so an un-throttled path
+/// is a brute-force / IdP-amplification oracle. Connections are long-lived and
 /// reused for queries, so legitimate clients connect rarely; this bound is
 /// generous for real use and hard on a credential-stuffing loop. Burst equals
-/// the per-second rate. (Per-IP keying is a follow-up: it needs the peer addr
-/// via `ConnectInfo`, i.e. serving with `into_make_service_with_connect_info`.)
+/// the per-second rate. The limiter is keyed by the resolved client IP (see
+/// `client_key`), so one abusive source cannot exhaust the budget for every
+/// other client the way a single global bucket would.
 const QUACK_AUTH_RATE_PER_SEC: u32 = 10;
+
+/// QUACK-08: opportunistic garbage-collection cadence for the keyed limiter.
+/// governor's keyed limiter never frees per-key state on its own, so every
+/// distinct source IP would otherwise leave a permanent map entry and an
+/// attacker spraying spoofed `x-forwarded-for` values (behind a trusted proxy)
+/// or rotating real source addresses could grow it without bound. Every Nth
+/// check we call `retain_recent`, which drops keys whose buckets have fully
+/// refilled (i.e. idle long enough to be indistinguishable from never having
+/// existed). The cadence keeps the sweep off the hot path while bounding the
+/// map to roughly the set of IPs active within one refill window.
+const QUACK_GC_EVERY_N_CHECKS: u64 = 256;
 
 /// Explicit request-body cap for the `/quack` endpoint. The DataChunk-carrying
 /// decode paths are reachable pre-auth, so we keep the ceiling small and
@@ -54,14 +69,24 @@ pub struct QuackServerState {
     pub server_platform: String,
     pub auth_provider: Arc<dyn AuthProvider>,
     pub query_executor: Arc<dyn QueryExecutor>,
-    /// QUACK-08: throttles the ConnectionRequest auth path (global, keyless).
-    pub auth_limiter: Arc<DefaultDirectRateLimiter>,
+    /// QUACK-08: per-client-IP throttle on the ConnectionRequest auth path.
+    /// Keyed so one source cannot deny auth to every other client.
+    pub auth_limiter: Arc<DefaultKeyedRateLimiter<String>>,
+    /// Trusted-proxy allowlist used to resolve the real client IP from the
+    /// peer address and `x-forwarded-for` (Issue #74 semantics). Empty by
+    /// default, so the limiter keys on the TCP peer and ignores the header.
+    pub security: SecurityConfig,
+    /// Counts limiter checks so we can run governor's `retain_recent` GC
+    /// once every `QUACK_GC_EVERY_N_CHECKS` rather than on every request.
+    gc_counter: Arc<AtomicU64>,
 }
 
 impl QuackServerState {
     /// Construct a server state with a pluggable auth provider and query
     /// executor. Use the production `AuthChain` + a `QueryHandler` adapter in
-    /// production; tests typically supply a stub for both.
+    /// production; tests typically supply a stub for both. The trusted-proxy
+    /// allowlist defaults to empty; call [`with_security`](Self::with_security)
+    /// to honour `x-forwarded-for` from known proxies.
     pub fn new(
         auth_provider: Arc<dyn AuthProvider>,
         query_executor: Arc<dyn QueryExecutor>,
@@ -72,11 +97,45 @@ impl QuackServerState {
             server_platform: std::env::consts::OS.to_string(),
             auth_provider,
             query_executor,
-            auth_limiter: Arc::new(RateLimiter::direct(Quota::per_second(
+            auth_limiter: Arc::new(RateLimiter::keyed(Quota::per_second(
                 NonZeroU32::new(QUACK_AUTH_RATE_PER_SEC).expect("auth rate must be > 0"),
             ))),
+            security: SecurityConfig::default(),
+            gc_counter: Arc::new(AtomicU64::new(0)),
         }
     }
+
+    /// Set the trusted-proxy allowlist used when resolving the client IP for
+    /// the per-IP auth limiter. Without it the limiter keys on the raw TCP
+    /// peer, which is correct for a directly-exposed deployment but wrong
+    /// behind a load balancer (every request would share the proxy's IP).
+    pub fn with_security(mut self, security: SecurityConfig) -> Self {
+        self.security = security;
+        self
+    }
+
+    /// Check the per-IP auth budget for `client_ip` (already port-stripped),
+    /// running an opportunistic GC sweep on a fixed cadence so the keyed map
+    /// stays bounded to recently-active sources.
+    fn check_auth_rate(&self, client_ip: &str) -> Result<(), ()> {
+        let result = self.auth_limiter.check_key(&client_ip.to_string());
+        if self.gc_counter.fetch_add(1, Ordering::Relaxed) % QUACK_GC_EVERY_N_CHECKS == 0 {
+            // Drops keys whose buckets have fully refilled; cheap relative to
+            // the IdP round-trip the limiter is gating.
+            self.auth_limiter.retain_recent();
+        }
+        result.map_err(|_| ())
+    }
+}
+
+/// Resolve the rate-limit key for a request: the client IP with its ephemeral
+/// source port stripped. `x-forwarded-for` is honoured only when the TCP peer
+/// is a configured trusted proxy (Issue #74, via `SecurityConfig`). The port
+/// strip is load-bearing: keeping it would give every fresh TCP connection a
+/// distinct key and defeat per-IP limiting entirely.
+fn client_key(peer: SocketAddr, forwarded_for: Option<&str>, security: &SecurityConfig) -> String {
+    let resolved = security.resolve_client_ip(Some(&peer.to_string()), forwarded_for);
+    strip_port(&resolved).to_string()
 }
 
 pub fn router(state: QuackServerState) -> Router {
@@ -115,6 +174,9 @@ async fn identify() -> impl IntoResponse {
 
 async fn handle_quack(
     State(state): State<Arc<QuackServerState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    // `Bytes` consumes the request body, so it must be the last extractor.
     body: Bytes,
 ) -> impl IntoResponse {
     // Decode only the header first and reject server-only / response message
@@ -143,7 +205,15 @@ async fn handle_quack(
 
     match (request_header.r#type, request_body) {
         (MessageType::ConnectionRequest, QuackMessage::ConnectionRequest(req)) => {
-            handle_connection_request(&state, &request_header, req).await
+            // Resolve the per-IP key only on the auth path; the limiter gates
+            // ConnectionRequest specifically, since that is the IdP-amplifying
+            // path. The header is read here (not in the dispatcher) so the
+            // other message types pay no resolution cost.
+            let forwarded_for = headers
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok());
+            let client_ip = client_key(peer, forwarded_for, &state.security);
+            handle_connection_request(&state, &request_header, &client_ip, req).await
         }
         (MessageType::DisconnectMessage, QuackMessage::DisconnectMessage) => {
             handle_disconnect_message(&state, &request_header)
@@ -312,12 +382,15 @@ fn handle_disconnect_message(
 async fn handle_connection_request(
     state: &QuackServerState,
     request_header: &MessageHeader,
+    client_ip: &str,
     req: sqe_quack_wire::message::ConnectionRequest,
 ) -> (StatusCode, [(&'static str, &'static str); 1], Vec<u8>) {
-    // QUACK-08: throttle before touching the IdP. Rejected attempts never reach
-    // authenticate(), so a credential-stuffing loop cannot amplify into the IdP.
-    if state.auth_limiter.check().is_err() {
-        tracing::warn!("Quack auth path rate-limited a ConnectionRequest");
+    // QUACK-08: throttle before touching the IdP, keyed by client IP. Rejected
+    // attempts never reach authenticate(), so a credential-stuffing loop cannot
+    // amplify into the IdP, and one abusive source cannot exhaust the budget
+    // for other clients.
+    if state.check_auth_rate(client_ip).is_err() {
+        tracing::warn!(client_ip = %client_ip, "Quack auth path rate-limited a ConnectionRequest");
         return error_response(
             "",
             request_header.client_query_id,
@@ -415,17 +488,106 @@ fn error_response(
 mod tests {
     use super::*;
 
-    #[test]
-    fn auth_limiter_denies_after_burst() {
+    fn keyed_limiter() -> DefaultKeyedRateLimiter<String> {
         // Built exactly like QuackServerState's auth_limiter (QUACK-08).
-        let limiter = RateLimiter::direct(Quota::per_second(
+        RateLimiter::keyed(Quota::per_second(
             NonZeroU32::new(QUACK_AUTH_RATE_PER_SEC).unwrap(),
-        ));
+        ))
+    }
+
+    #[test]
+    fn auth_limiter_denies_after_burst_per_key() {
+        let limiter = keyed_limiter();
+        let key = "203.0.113.5".to_string();
         // Burst capacity equals the per-second rate: that many pass instantly.
         for _ in 0..QUACK_AUTH_RATE_PER_SEC {
-            assert!(limiter.check().is_ok());
+            assert!(limiter.check_key(&key).is_ok());
         }
         // The next attempt in the same instant (no replenishment yet) is denied.
-        assert!(limiter.check().is_err());
+        assert!(limiter.check_key(&key).is_err());
+    }
+
+    /// The core fix: two distinct source IPs get independent buckets, so one
+    /// IP exhausting its budget never blocks another. A keyless global limiter
+    /// would fail this because both keys would share one counter.
+    #[test]
+    fn distinct_ips_get_independent_buckets() {
+        let limiter = keyed_limiter();
+        let attacker = "203.0.113.5".to_string();
+        let victim = "198.51.100.9".to_string();
+
+        // Attacker exhausts its own bucket entirely.
+        for _ in 0..QUACK_AUTH_RATE_PER_SEC {
+            assert!(limiter.check_key(&attacker).is_ok());
+        }
+        assert!(
+            limiter.check_key(&attacker).is_err(),
+            "attacker's bucket should be exhausted"
+        );
+
+        // The victim's first attempt still succeeds: separate bucket.
+        assert!(
+            limiter.check_key(&victim).is_ok(),
+            "a different IP must not be blocked by the attacker"
+        );
+    }
+
+    /// Guards the load-bearing port strip. The key must be derived the way
+    /// production derives it (peer SocketAddr -> resolve -> strip_port), not
+    /// from a bare IP literal. Two connections from one IP on different
+    /// ephemeral ports must collapse to one key; otherwise the limiter would
+    /// be a silent no-op (every new TCP connection a fresh bucket).
+    #[test]
+    fn client_key_collapses_ports_and_separates_ips() {
+        let sec = SecurityConfig::default();
+        let a1: SocketAddr = "203.0.113.5:40001".parse().unwrap();
+        let a2: SocketAddr = "203.0.113.5:55002".parse().unwrap();
+        let b: SocketAddr = "198.51.100.9:40001".parse().unwrap();
+
+        assert_eq!(
+            client_key(a1, None, &sec),
+            client_key(a2, None, &sec),
+            "same IP, different ports must share one bucket"
+        );
+        assert_ne!(
+            client_key(a1, None, &sec),
+            client_key(b, None, &sec),
+            "different IPs must map to different buckets"
+        );
+
+        // And the derived keys behave as independent buckets through the limiter.
+        let limiter = keyed_limiter();
+        let ka = client_key(a1, None, &sec);
+        let kb = client_key(b, None, &sec);
+        for _ in 0..QUACK_AUTH_RATE_PER_SEC {
+            assert!(limiter.check_key(&ka).is_ok());
+        }
+        // Same source IP on a new port is still rate-limited (one bucket).
+        assert!(limiter.check_key(&client_key(a2, None, &sec)).is_err());
+        // Different IP is unaffected.
+        assert!(limiter.check_key(&kb).is_ok());
+    }
+
+    /// `x-forwarded-for` is ignored unless the peer is a trusted proxy; with
+    /// the proxy trusted, the key follows the forwarded client IP, so distinct
+    /// real clients behind one proxy get distinct buckets.
+    #[test]
+    fn client_key_honours_trusted_proxy_xff() {
+        let proxy: SocketAddr = "10.0.0.1:50000".parse().unwrap();
+
+        // Untrusted by default: key is the proxy's own IP, header ignored.
+        let untrusted = SecurityConfig::default();
+        assert_eq!(client_key(proxy, Some("203.0.113.5"), &untrusted), "10.0.0.1");
+
+        // Trusted proxy: key follows the forwarded client.
+        let trusted = SecurityConfig {
+            trusted_proxies: vec!["10.0.0.1".to_string()],
+        };
+        assert_eq!(client_key(proxy, Some("203.0.113.5"), &trusted), "203.0.113.5");
+        assert_ne!(
+            client_key(proxy, Some("203.0.113.5"), &trusted),
+            client_key(proxy, Some("198.51.100.9"), &trusted),
+            "two real clients behind one trusted proxy must not share a bucket"
+        );
     }
 }
