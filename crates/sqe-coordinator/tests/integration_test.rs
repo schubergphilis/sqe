@@ -344,6 +344,8 @@ fn test_scan_task_roundtrip() {
         s3_session_token: String::new(),
         s3_path_style: true,
         s3_allow_http: true,
+        predicate_proto: None,
+        limit: None,
     };
 
     let bytes = task.to_bytes().unwrap();

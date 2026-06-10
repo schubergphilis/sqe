@@ -2213,6 +2213,31 @@ impl QueryHandler {
         };
         let field_ids_complete = projected_field_ids.len() == projected_cols.len();
 
+        // 6b. Push the scan predicate and (when safe) the query LIMIT into each
+        // ScanTask (#233). Both are pure optimizations: the authoritative
+        // FilterExec / GlobalLimitExec remain above DistributedScanExec (the
+        // IcebergScanExec rejects static filter pushdown, so the FilterExec is
+        // never elided), so a worker that double-filters or over-counts a
+        // per-fragment limit cannot change results. Gated by config so the
+        // pushdown can be disabled without a redeploy.
+        let (predicate_proto, scan_limit): (Option<Vec<u8>>, Option<usize>) =
+            if self.config.query.distributed_scan_pushdown {
+                let pred = crate::scan_pushdown::serialize_scan_predicate(
+                    iceberg_scan.df_filters(),
+                );
+                let lim = crate::scan_pushdown::extract_pushable_limit(&plan, &scan_node);
+                if pred.is_some() || lim.is_some() {
+                    debug!(
+                        has_predicate = pred.is_some(),
+                        limit = ?lim,
+                        "Scan pushdown: populating ScanTask predicate/limit"
+                    );
+                }
+                (pred, lim)
+            } else {
+                (None, None)
+            };
+
         // 7. Split (path, size) pairs into size-balanced bins using bin-packing.
         // target_size_bytes: read from config or fall back to 256 MiB.
         // max_bins: allow up to 3 tasks per worker so work is evenly spread
@@ -2248,6 +2273,8 @@ impl QueryHandler {
                     s3_session_token: String::new(),
                     s3_path_style: storage.s3_path_style,
                     s3_allow_http: storage.s3_endpoint.starts_with("http://"),
+                    predicate_proto: predicate_proto.clone(),
+                    limit: scan_limit,
                 }
             })
             .collect();
