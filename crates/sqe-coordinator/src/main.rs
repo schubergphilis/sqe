@@ -133,10 +133,15 @@ async fn async_main() -> anyhow::Result<()> {
         // accept_invalid_certs flag that was not covered by this warning.
         tracing::warn!("WARNING: TLS certificate verification is DISABLED for auth endpoints (auth.tls_skip_verify / auth.ssl_verification / auth.external.accept_invalid_certs) -- vulnerable to MITM. Disable these for production.");
     }
-    if !config.coordinator.worker_urls.is_empty()
-        && config.coordinator.allow_unauthenticated_workers
-    {
-        tracing::warn!("WARNING: coordinator.allow_unauthenticated_workers = true -- any client reachable on the cluster network can register as a worker and receive user bearer tokens. Set worker_secret for production.");
+    // Fire whenever the unauthenticated-discovery path is actually live: the
+    // worker registry is attached (worker_urls non-empty), there is no secret
+    // to check (worker_secret empty), and the operator has waived the
+    // empty-secret refusal. A configured secret is enforced on the heartbeat
+    // path even with the waiver set, so gating on the empty secret avoids a
+    // false positive on authenticated-but-waived deployments. Shared with
+    // bin/sqe_server.rs so the two coordinator binaries cannot drift.
+    if sqe_coordinator::mode::warns_unauthenticated_workers(&config.coordinator) {
+        tracing::warn!("WARNING: coordinator.allow_unauthenticated_workers = true with an empty coordinator.worker_secret -- any client reachable on the cluster network can register as a worker and receive user bearer tokens. Set worker_secret for production.");
     }
     // AUTH-01: policy enforcement is hardcoded to passthrough below. If the
     // operator configured a real engine (OPA/Cedar/InMemory) it is SILENTLY
@@ -397,10 +402,43 @@ async fn async_main() -> anyhow::Result<()> {
         .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(
             flight_service,
         ))
-        .serve(addr)
+        .serve_with_shutdown(addr, shutdown_signal())
         .await?;
 
+    tracing::info!("SQE coordinator shut down");
     Ok(())
+}
+
+/// Resolve once a SIGINT or SIGTERM arrives. Drives `serve_with_shutdown` so
+/// tonic stops accepting new connections and lets in-flight RPCs finish at the
+/// graceful boundary instead of being hard-killed on signal. Mirrors the
+/// `shutdown_signal` helper in `bin/sqe_server.rs` (#225). This compose-path
+/// binary has no health server, so there is no readiness flag to flip; the
+/// readiness-flip drain lives in `sqe_server.rs` (#250).
+async fn shutdown_signal() {
+    use tokio::signal;
+
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("Received SIGINT, shutting down"),
+        _ = terminate => tracing::info!("Received SIGTERM, shutting down"),
+    }
 }
 
 // ── External auth (OAuth2) construction ───────────────────────
