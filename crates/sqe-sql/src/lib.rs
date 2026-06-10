@@ -14,7 +14,7 @@ pub use attach::{
     build_secret_from_stmt, AttachStatement, CatalogKind, CreateSecretStatement, DetachStatement,
     DropSecretStatement, OptionValue, SecretKind,
 };
-pub use catalog_qualifiers::extract_catalog_qualifiers;
+pub use catalog_qualifiers::{extract_catalog_qualifiers, extract_catalog_qualifiers_from_sql};
 pub use classifier::{
     parse_and_classify, parse_and_classify_typed, CheckAccessParams, ShowGrantsTarget,
     StatementKind,
