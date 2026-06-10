@@ -18,11 +18,15 @@ ignore = [
     # Transitive dependency from arrow-flight, datafusion, parquet, tonic.
     # No known vulnerability. Upstream migration pending.
     "RUSTSEC-2024-0436",
-    # rsa (v0.9.10): Marvin Attack timing sidechannel (RUSTSEC-2023-0071).
-    # NO FIXED UPGRADE EXISTS upstream. Transitive only (AWS SDK / sqlx
-    # signing path); SQE performs no RSA private-key decryption on
-    # attacker-controlled timing. Re-evaluate when `rsa` ships a fix.
-    "RUSTSEC-2023-0071",
+    # IMPORTANT: cargo-deny and cargo-audit do NOT agree on every advisory, so
+    # this list intentionally differs from `.cargo/audit.toml`:
+    #   - RUSTSEC-2023-0071 (rsa Marvin attack) is NOT listed here. cargo-deny
+    #     does not match it against rsa 0.9.10 (advisory-not-detected), so an
+    #     ignore would be an unused-ignore warning. cargo-audit DOES raise it as
+    #     a vulnerability, so it is ignored in audit.toml only.
+    #   - RUSTSEC-2026-0173 (proc-macro-error2, unmaintained) is likewise not
+    #     matched by cargo-deny and is only a non-failing unmaintained warning in
+    #     cargo-audit, so it is not ignored in either tool's hard gate.
     # RUSTSEC-2026-0098/0099/0104 (rustls-webpki 0.101.7) were ignored while the
     # AWS Glue/S3Tables backends used aws-config's legacy hyper-0.14/rustls-0.21
     # connector. Fixed (#133): the vendored glue/s3tables catalogs now build an
