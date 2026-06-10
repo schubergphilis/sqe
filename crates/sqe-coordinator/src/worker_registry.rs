@@ -111,6 +111,11 @@ const DEFAULT_MAX_WORKERS: usize = 1024;
 pub enum RegistrationError {
     /// The registry already tracks `max_workers` URLs.
     CapacityExceeded { cap: usize },
+    /// The advertised worker URL is empty, unparseable, or points at an
+    /// unspecified address (`0.0.0.0` / `::`). Registering it would let
+    /// every misconfigured worker collide on one bogus loopback entry that
+    /// the scheduler then targets (issue #220).
+    InvalidAdvertiseUrl { url: String },
 }
 
 impl std::fmt::Display for RegistrationError {
@@ -120,11 +125,64 @@ impl std::fmt::Display for RegistrationError {
                 f,
                 "worker registry at max_workers cap ({cap}); refusing to track additional workers"
             ),
+            Self::InvalidAdvertiseUrl { url } => write!(
+                f,
+                "worker advertised an unroutable URL {url:?} (empty, unparseable, or \
+                 an unspecified 0.0.0.0 / :: address); the worker must advertise a \
+                 routable address. Set worker.advertise_url or expose POD_IP."
+            ),
         }
     }
 }
 
 impl std::error::Error for RegistrationError {}
+
+/// Returns `true` when an advertised worker URL is safe to register: it has a
+/// non-empty host that is not the unspecified address (`0.0.0.0` / `::`).
+///
+/// The host is extracted without pulling in the `url` crate: strip any
+/// `scheme://`, take everything before the first `/`, then strip a trailing
+/// `:port`. IPv6 literals are bracketed (`[::1]:50052`) and handled. A bare
+/// IP that parses as unspecified is rejected; hostnames and routable IPs pass.
+fn advertise_url_is_routable(url: &str) -> bool {
+    let url = url.trim();
+    if url.is_empty() {
+        return false;
+    }
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    // Drop userinfo if present, then path/query.
+    let authority = after_scheme
+        .split('/')
+        .next()
+        .unwrap_or(after_scheme)
+        .rsplit_once('@')
+        .map_or(after_scheme.split('/').next().unwrap_or(after_scheme), |(_, host)| host);
+
+    // Extract host, stripping a trailing :port. Bracketed IPv6 first.
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((h, _)) => h,
+            None => return false,
+        }
+    } else {
+        match authority.rsplit_once(':') {
+            // Only treat the trailing colon as a port separator when the host
+            // part has no further colons (i.e. not an unbracketed IPv6).
+            Some((h, _)) if !h.contains(':') => h,
+            _ => authority,
+        }
+    };
+
+    if host.is_empty() {
+        return false;
+    }
+    // A host that parses as an unspecified IP is the poisoning case.
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return !ip.is_unspecified();
+    }
+    // Non-IP hostnames are accepted (resolved by the coordinator's client).
+    true
+}
 
 impl WorkerRegistry {
     pub fn new(worker_urls: Vec<String>) -> Self {
@@ -222,6 +280,16 @@ impl WorkerRegistry {
     /// rejected with `Err` once the cap is reached so a buggy or malicious
     /// worker reporting rotating URLs cannot grow the registry without limit.
     pub async fn register_heartbeat(&self, url: &str) -> Result<(), RegistrationError> {
+        // Reject unroutable advertise URLs before touching the registry.
+        // A worker that advertises 0.0.0.0 (the old bug) would otherwise
+        // make every worker collide on one bogus loopback entry that the
+        // scheduler targets, causing flapping (issue #220).
+        if !advertise_url_is_routable(url) {
+            warn!(worker = url, "Rejected heartbeat: unroutable advertise URL");
+            return Err(RegistrationError::InvalidAdvertiseUrl {
+                url: url.to_string(),
+            });
+        }
         let mut inner = self.inner.write().await;
         if !inner.workers.contains_key(url) && inner.workers.len() >= self.max_workers {
             warn!(
@@ -679,5 +747,50 @@ mod tests {
             .await
             .expect_err("dynamic discovery refused above effective cap");
         assert!(matches!(err, RegistrationError::CapacityExceeded { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_register_heartbeat_rejects_unspecified_url() {
+        // A worker that advertises 0.0.0.0 (the issue #220 bug) must be
+        // rejected so it cannot poison the registry. The error is the
+        // dedicated InvalidAdvertiseUrl variant, and nothing is registered.
+        let registry = WorkerRegistry::with_options(vec![], ChannelPool::shared(), 16);
+
+        for bad in [
+            "http://0.0.0.0:50052",
+            "0.0.0.0:50052",
+            "http://[::]:50052",
+            "",
+        ] {
+            let err = registry
+                .register_heartbeat(bad)
+                .await
+                .expect_err(&format!("expected rejection for {bad:?}"));
+            assert!(
+                matches!(err, RegistrationError::InvalidAdvertiseUrl { .. }),
+                "wrong error for {bad:?}: {err:?}"
+            );
+        }
+        assert_eq!(registry.total_workers().await, 0, "nothing should register");
+
+        // A routable URL still registers.
+        registry
+            .register_heartbeat("http://10.1.2.3:50052")
+            .await
+            .expect("routable URL accepted");
+        assert_eq!(registry.total_workers().await, 1);
+    }
+
+    #[test]
+    fn test_advertise_url_is_routable_classifies() {
+        assert!(advertise_url_is_routable("http://10.1.2.3:50052"));
+        assert!(advertise_url_is_routable("http://worker-1.svc:50052"));
+        assert!(advertise_url_is_routable("https://[2001:db8::1]:50052"));
+        assert!(advertise_url_is_routable("worker-1:50052"));
+        assert!(!advertise_url_is_routable(""));
+        assert!(!advertise_url_is_routable("   "));
+        assert!(!advertise_url_is_routable("http://0.0.0.0:50052"));
+        assert!(!advertise_url_is_routable("0.0.0.0:50052"));
+        assert!(!advertise_url_is_routable("http://[::]:50052"));
     }
 }

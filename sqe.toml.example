@@ -27,6 +27,22 @@ coordinator_url = "http://coordinator:50052"
 heartbeat_interval_secs = 5
 memory_limit = "8GB"
 spill_dir = "/tmp/sqe-spill"
+# URL the coordinator uses to reach this worker's Flight service, sent in every
+# heartbeat. Leave empty to auto-derive a routable address at startup:
+#   1. POD_IP env var (Kubernetes downward API)
+#   2. HOSTNAME env var, only when it is an IP literal
+#   3. first non-loopback, non-link-local local interface address (IPv4 preferred)
+# Set explicitly when auto-derivation is wrong (NAT, multi-homed, overlay nets).
+# NEVER advertise 0.0.0.0: the coordinator rejects it (every worker would
+# collide on one bogus loopback registry entry). Scheme follows TLS:
+# https when [coordinator.tls] is set, otherwise http.
+# advertise_url = "http://worker-1.svc.cluster.local:50052"
+#
+# Shared secret authenticating worker <-> coordinator traffic. REQUIRED when
+# coordinator_url is set: the worker refuses to boot with an empty secret
+# (set worker.allow_unauthenticated = true to waive, dev only). Must match
+# coordinator.worker_secret.
+worker_secret = "change-me-shared-worker-secret"
 
 [auth]
 keycloak_url = "https://auth.local"
@@ -105,6 +121,22 @@ s3_region = "us-east-1"
 s3_access_key = "<your-s3-access-key>"
 s3_secret_key = "<your-s3-secret-key>"
 s3_path_style = true
+
+# ── Wire-protocol security ────────────────────────────────────
+[security]
+# trusted_proxies = ["10.0.0.1"]  # IPs allowed to set x-forwarded-for for audit IPs
+#
+# allow_insecure_transport: opt out of the TLS-on-the-wire requirement.
+# When distributed mode targets a NON-loopback peer (coordinator.worker_urls
+# or worker.coordinator_url pointing off-box) and [coordinator.tls] is not
+# configured, the engine refuses to start. User bearer tokens, the worker
+# secret, and vended S3 credentials would otherwise travel in cleartext.
+# Loopback-only setups (127.0.0.1 / ::1 / localhost) stay usable without TLS.
+#
+# This example talks to a non-loopback "coordinator" host over plaintext http,
+# so the opt-in is enabled here for dev. Remove it and configure
+# [coordinator.tls] before exposing the engine on an untrusted network.
+allow_insecure_transport = true  # dev only -- enable TLS for production
 
 [policy]
 engine = "passthrough"

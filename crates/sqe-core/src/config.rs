@@ -552,6 +552,16 @@ pub struct WorkerConfig {
     pub coordinator_url: String,
     #[serde(default = "default_worker_flight_port")]
     pub flight_port: u16,
+    /// URL the coordinator should use to reach this worker's Flight service,
+    /// sent verbatim in every heartbeat. When empty (the default) the worker
+    /// derives a routable address at startup: the `POD_IP` / `HOSTNAME` env
+    /// var (set on Kubernetes via the downward API), else the first
+    /// non-loopback local interface address. Set this explicitly when the
+    /// auto-derived address is wrong (NAT, multi-homed hosts, overlay
+    /// networks). Never advertise 0.0.0.0: the coordinator rejects it because
+    /// every worker would collide on one bogus loopback registry entry.
+    #[serde(default)]
+    pub advertise_url: String,
     #[serde(default = "default_heartbeat")]
     pub heartbeat_interval_secs: u64,
     #[serde(default = "default_memory")]
@@ -586,6 +596,7 @@ impl Default for WorkerConfig {
         Self {
             coordinator_url: String::new(),
             flight_port: default_worker_flight_port(),
+            advertise_url: String::new(),
             heartbeat_interval_secs: default_heartbeat(),
             memory_limit: default_memory(),
             spill_to_disk: true,
@@ -605,6 +616,7 @@ impl std::fmt::Debug for WorkerConfig {
         f.debug_struct("WorkerConfig")
             .field("coordinator_url", &self.coordinator_url)
             .field("flight_port", &self.flight_port)
+            .field("advertise_url", &self.advertise_url)
             .field("heartbeat_interval_secs", &self.heartbeat_interval_secs)
             .field("memory_limit", &self.memory_limit)
             .field("spill_to_disk", &self.spill_to_disk)
@@ -1961,6 +1973,14 @@ pub struct SecurityConfig {
     /// list each proxy IP explicitly. Hostnames are not resolved.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+    /// Opt-in escape hatch for the TLS-on-the-wire requirement. Leaving this
+    /// `false` (the default) makes the engine refuse to start when distributed
+    /// mode targets a non-loopback peer without TLS configured. Setting it
+    /// `true` is visible in config diffs and acknowledges that user bearer
+    /// tokens, the worker secret, and vended S3 credentials travel in
+    /// cleartext and can be captured and replayed by an on-path observer.
+    #[serde(default)]
+    pub allow_insecure_transport: bool,
 }
 
 impl SecurityConfig {
@@ -2026,6 +2046,53 @@ fn strip_port(s: &str) -> &str {
         Some(idx) if !s[..idx].contains(':') => &s[..idx],
         _ => s,
     }
+}
+
+/// Returns `true` when `host` is a loopback address or the `localhost`
+/// hostname. Used to decide whether distributed peers stay on the local
+/// machine (plaintext is fine) or reach over a network (TLS required).
+///
+/// A bare IP literal is parsed and checked with `IpAddr::is_loopback`
+/// (covers 127.0.0.0/8 and `::1`). Anything that is not a parseable IP is
+/// compared case-insensitively against `localhost`; all other hostnames are
+/// treated as non-loopback because we cannot resolve them safely at config
+/// time.
+fn host_is_loopback(host: &str) -> bool {
+    let host = host.trim();
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // Strip IPv6 brackets if present (e.g. "[::1]").
+    let bare = host.strip_prefix('[').and_then(|r| r.strip_suffix(']')).unwrap_or(host);
+    matches!(bare.parse::<std::net::IpAddr>(), Ok(ip) if ip.is_loopback())
+}
+
+/// Parse a URL-shaped string and return `true` when its host is a loopback
+/// address or `localhost`. A URL that does not parse, or has no host, is
+/// treated as NON-loopback (fail safe: assume it reaches the network).
+fn url_host_is_loopback(url: &str) -> bool {
+    match url::Url::parse(url) {
+        Ok(parsed) => match parsed.host_str() {
+            Some(h) => host_is_loopback(h),
+            None => false,
+        },
+        Err(_) => false,
+    }
+}
+
+/// Returns `true` when distributed mode reaches at least one NON-loopback
+/// peer. Used by transport validation: a coordinator with non-loopback
+/// `worker_urls`, or a worker with a non-loopback `coordinator_url`, is
+/// talking over a network and must use TLS unless the operator opts out.
+fn distributed_reaches_network(config: &SqeConfig) -> bool {
+    let worker_to_coordinator = !config.worker.coordinator_url.is_empty()
+        && !url_host_is_loopback(&config.worker.coordinator_url);
+    let coordinator_to_workers = config
+        .coordinator
+        .worker_urls
+        .iter()
+        .any(|u| !url_host_is_loopback(u));
+    worker_to_coordinator || coordinator_to_workers
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -2336,6 +2403,28 @@ impl SqeConfig {
             );
         }
 
+        // Plaintext-on-the-wire fail-closed (issue #211). When distributed
+        // mode reaches a non-loopback peer, every hop carries user OIDC
+        // bearer tokens, the shared worker secret, and vended S3 credentials.
+        // On a plaintext channel an on-path observer harvests all of these.
+        // Refuse to boot without TLS unless the operator explicitly waives via
+        // `security.allow_insecure_transport = true`. Loopback-only setups
+        // (127.0.0.1 / ::1 / localhost) stay usable without TLS for dev.
+        if distributed_reaches_network(self)
+            && !self.coordinator.tls.is_enabled()
+            && !self.security.allow_insecure_transport
+        {
+            errors.push(
+                "distributed mode targets a non-loopback peer (coordinator.worker_urls \
+                 or worker.coordinator_url) but TLS is not configured. User bearer \
+                 tokens, the worker secret, and vended S3 credentials would travel in \
+                 cleartext and can be captured and replayed by an on-path observer. \
+                 Set [coordinator.tls] cert_file/key_file to enable TLS (recommended), \
+                 or explicitly set security.allow_insecure_transport = true to opt out."
+                    .to_string(),
+            );
+        }
+
         // tokio::time::interval panics if the period is zero. Reject the
         // misconfig at load time with a message that names the field.
         if self.session.snapshot_interval_secs == 0 {
@@ -2428,6 +2517,7 @@ impl SqeConfig {
         // Worker
         env_override_str("SQE_WORKER__COORDINATOR_URL", &mut self.worker.coordinator_url);
         env_override_u16("SQE_WORKER__FLIGHT_PORT", &mut self.worker.flight_port);
+        env_override_str("SQE_WORKER__ADVERTISE_URL", &mut self.worker.advertise_url);
         env_override_u64("SQE_WORKER__HEARTBEAT_INTERVAL_SECS", &mut self.worker.heartbeat_interval_secs);
         env_override_str("SQE_WORKER__MEMORY_LIMIT", &mut self.worker.memory_limit);
         env_override_bool("SQE_WORKER__SPILL_TO_DISK", &mut self.worker.spill_to_disk);
@@ -2437,6 +2527,12 @@ impl SqeConfig {
         env_override_bool(
             "SQE_WORKER__ALLOW_UNAUTHENTICATED",
             &mut self.worker.allow_unauthenticated,
+        );
+
+        // Security
+        env_override_bool(
+            "SQE_SECURITY__ALLOW_INSECURE_TRANSPORT",
+            &mut self.security.allow_insecure_transport,
         );
 
         // Auth
@@ -3124,6 +3220,93 @@ mod tests {
         );
     }
 
+    // ── Insecure-transport fail-closed (issue #211) ─────────────
+
+    #[test]
+    fn test_validate_rejects_distributed_non_loopback_without_tls() {
+        // Coordinator side: a non-loopback worker URL with no TLS and no
+        // opt-in must be rejected.
+        let mut config = valid_config();
+        config.coordinator.worker_urls = vec!["http://worker-1.svc.cluster.local:50052".to_string()];
+        config.coordinator.worker_secret = SecretString::new("shared".to_string());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("non-loopback peer") && err.contains("allow_insecure_transport"),
+            "Expected insecure-transport error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_distributed_worker_non_loopback_without_tls() {
+        // Worker side: a non-loopback coordinator URL with no TLS and no
+        // opt-in must be rejected.
+        let mut config = valid_config();
+        config.worker.coordinator_url = "http://coordinator.svc.cluster.local:50051".to_string();
+        config.worker.worker_secret = "shared".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("non-loopback peer"),
+            "Expected insecure-transport error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_allows_distributed_non_loopback_with_opt_in() {
+        let mut config = valid_config();
+        config.coordinator.worker_urls = vec!["http://worker-1.svc.cluster.local:50052".to_string()];
+        config.coordinator.worker_secret = SecretString::new("shared".to_string());
+        config.security.allow_insecure_transport = true;
+        assert!(
+            config.validate().is_ok(),
+            "opt-in should permit plaintext distributed: {:?}",
+            config.validate().err()
+        );
+    }
+
+    #[test]
+    fn test_validate_allows_distributed_non_loopback_with_tls() {
+        let mut config = valid_config();
+        config.coordinator.worker_urls = vec!["http://worker-1.svc.cluster.local:50052".to_string()];
+        config.coordinator.worker_secret = SecretString::new("shared".to_string());
+        // is_enabled() only checks the strings are non-empty; the paths are
+        // validated elsewhere and the existing valid_config skips that check.
+        config.coordinator.tls.cert_file = "/etc/sqe/tls.crt".to_string();
+        config.coordinator.tls.key_file = "/etc/sqe/tls.key".to_string();
+        let err = config.validate().err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            !err.contains("non-loopback peer"),
+            "TLS-enabled distributed should not raise the transport error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_allows_loopback_distributed_without_tls() {
+        // All-loopback dev setup stays usable without TLS.
+        let mut config = valid_config();
+        config.coordinator.worker_urls = vec!["http://127.0.0.1:50052".to_string()];
+        config.worker.coordinator_url = "http://localhost:50051".to_string();
+        config.coordinator.worker_secret = SecretString::new("shared".to_string());
+        config.worker.worker_secret = "shared".to_string();
+        assert!(
+            config.validate().is_ok(),
+            "loopback distributed should be ok without TLS: {:?}",
+            config.validate().err()
+        );
+    }
+
+    #[test]
+    fn test_host_is_loopback_helper() {
+        assert!(host_is_loopback("127.0.0.1"));
+        assert!(host_is_loopback("127.5.6.7"));
+        assert!(host_is_loopback("::1"));
+        assert!(host_is_loopback("[::1]"));
+        assert!(host_is_loopback("localhost"));
+        assert!(host_is_loopback("LOCALHOST"));
+        assert!(!host_is_loopback("0.0.0.0"));
+        assert!(!host_is_loopback("10.0.0.5"));
+        assert!(!host_is_loopback("worker.svc.cluster.local"));
+    }
+
     #[test]
     fn test_validate_rejects_zero_snapshot_interval() {
         let mut config = valid_config();
@@ -3215,6 +3398,9 @@ mod tests {
         config.coordinator.worker_urls = vec!["http://worker-1:50051".to_string()];
         config.coordinator.worker_secret = SecretString::default();
         config.coordinator.allow_unauthenticated_workers = true;
+        // Non-loopback peer without TLS: waive the transport rule so this
+        // test stays focused on the worker_secret guard.
+        config.security.allow_insecure_transport = true;
         // The explicit opt-in is allowed, visible in config diffs.
         assert!(config.validate().is_ok());
     }
@@ -3224,6 +3410,7 @@ mod tests {
         let mut config = valid_config();
         config.coordinator.worker_urls = vec!["http://worker-1:50051".to_string()];
         config.coordinator.worker_secret = SecretString::new("shared-secret-value".to_string());
+        config.security.allow_insecure_transport = true;
         assert!(config.validate().is_ok());
     }
 
@@ -3260,6 +3447,7 @@ mod tests {
         config.worker.coordinator_url = "http://coordinator:50051".to_string();
         config.worker.worker_secret = String::new();
         config.worker.allow_unauthenticated = true;
+        config.security.allow_insecure_transport = true;
         assert!(config.validate().is_ok());
     }
 
@@ -3268,6 +3456,7 @@ mod tests {
         let mut config = valid_config();
         config.worker.coordinator_url = "http://coordinator:50051".to_string();
         config.worker.worker_secret = "shared-secret-value".to_string();
+        config.security.allow_insecure_transport = true;
         assert!(config.validate().is_ok());
     }
 
@@ -4314,6 +4503,7 @@ otlp_endpoint = ""
     fn security_trusted_proxy_returns_forwarded_for() {
         let security = SecurityConfig {
             trusted_proxies: vec!["10.0.0.1".to_string()],
+            ..Default::default()
         };
         let resolved = security
             .resolve_client_ip(Some("10.0.0.1:33333"), Some("203.0.113.7"));
@@ -4327,6 +4517,7 @@ otlp_endpoint = ""
                 "10.0.0.1".to_string(),
                 "10.0.0.2".to_string(),
             ],
+            ..Default::default()
         };
         let resolved = security.resolve_client_ip(
             Some("10.0.0.1"),
@@ -4339,6 +4530,7 @@ otlp_endpoint = ""
     fn security_untrusted_peer_keeps_peer_addr() {
         let security = SecurityConfig {
             trusted_proxies: vec!["10.0.0.99".to_string()],
+            ..Default::default()
         };
         let resolved = security
             .resolve_client_ip(Some("198.51.100.5"), Some("1.2.3.4"));
@@ -4349,6 +4541,7 @@ otlp_endpoint = ""
     fn security_handles_missing_forwarded_for() {
         let security = SecurityConfig {
             trusted_proxies: vec!["10.0.0.1".to_string()],
+            ..Default::default()
         };
         let resolved = security.resolve_client_ip(Some("10.0.0.1"), None);
         assert_eq!(resolved, "10.0.0.1");

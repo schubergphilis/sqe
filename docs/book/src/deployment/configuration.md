@@ -30,6 +30,10 @@ ca_file = ""                    # Optional PEM CA for mTLS client certificate ve
 [worker]
 coordinator_url = "http://coordinator:50051"
 flight_port = 50052             # Worker Flight port
+advertise_url = ""              # URL the coordinator uses to reach this worker.
+                                # Empty -> auto-derived (POD_IP, else HOSTNAME if
+                                # an IP, else first non-loopback interface). Never
+                                # advertise 0.0.0.0; the coordinator rejects it.
 heartbeat_interval_secs = 5     # Health check interval
 memory_limit = "8GB"            # Worker memory limit (supports B/KB/MB/GB/TB)
 spill_to_disk = true            # Allow spilling large sorts/joins to disk
@@ -143,6 +147,7 @@ Every config field can be overridden via environment variable. Convention: `SQE_
 | **Worker** | | |
 | `SQE_WORKER__COORDINATOR_URL` | `worker.coordinator_url` | string |
 | `SQE_WORKER__FLIGHT_PORT` | `worker.flight_port` | u16 |
+| `SQE_WORKER__ADVERTISE_URL` | `worker.advertise_url` | string |
 | `SQE_WORKER__HEARTBEAT_INTERVAL_SECS` | `worker.heartbeat_interval_secs` | u64 |
 | `SQE_WORKER__MEMORY_LIMIT` | `worker.memory_limit` | string |
 | `SQE_WORKER__SPILL_TO_DISK` | `worker.spill_to_disk` | bool |
