@@ -19,14 +19,22 @@ use crate::runtime_catalog::RuntimeCatalogRegistry;
 /// The cache holds `(SessionContext, Arc<SessionCatalog>)` pairs so that warm
 /// queries skip the ~50 ms registration overhead (UDFs, TVFs, catalog setup).
 /// Entries expire after 5 minutes (matching default idle session TTL) and the
-/// cache holds at most 100 entries to bound memory usage.
+/// cache holds at most `SESSION_CONTEXT_CACHE_MAX_CAPACITY` entries to bound
+/// memory usage.
 ///
 /// DataFusion's `SessionContext` is `Clone` and wraps an `Arc<SessionState>`
-/// internally, so a clone is O(1) — only the Arc ref-count changes.
+/// internally, so a clone is O(1): only the Arc ref-count changes.
+///
+/// Issue #240: at the old cap of 100 the 101st concurrent user-token pair
+/// evicted someone, and each rebuild re-pays catalog construction plus a
+/// `list_namespaces`. Raised to 2000 so a few thousand concurrent users stop
+/// LRU-thrashing; the 300s TTL still expires idle entries to bound memory.
+const SESSION_CONTEXT_CACHE_MAX_CAPACITY: u64 = 2000;
+
 static SESSION_CONTEXT_CACHE: LazyLock<Cache<String, (SessionContext, Arc<SessionCatalog>)>> =
     LazyLock::new(|| {
         Cache::builder()
-            .max_capacity(100)
+            .max_capacity(SESSION_CONTEXT_CACHE_MAX_CAPACITY)
             .time_to_live(std::time::Duration::from_secs(300))
             .build()
     });
@@ -748,5 +756,47 @@ s3_path_style = true
             cloned.backend,
             sqe_core::config::CatalogBackend::Rest
         ));
+    }
+
+    /// Issue #240: the session-context cache must hold well beyond the old cap
+    /// of 100 so the 101st concurrent user-token pair does not evict someone.
+    /// We build a cache with the same capacity constant and prove it retains
+    /// far more than 100 keys.
+    #[tokio::test]
+    async fn session_context_cache_holds_well_beyond_100_keys() {
+        let cache: Cache<String, u64> = Cache::builder()
+            .max_capacity(SESSION_CONTEXT_CACHE_MAX_CAPACITY)
+            .time_to_live(std::time::Duration::from_secs(300))
+            .build();
+
+        for i in 0..500u64 {
+            cache.insert(format!("token-{i}"), i).await;
+        }
+        cache.run_pending_tasks().await;
+
+        assert!(
+            cache.entry_count() > 100,
+            "cache should retain far more than the old cap of 100, got {}",
+            cache.entry_count()
+        );
+    }
+
+    /// Issue #240: idle entries must expire on the TTL rather than relying on
+    /// LRU eviction under concurrency. A zero TTL makes entries expire
+    /// immediately, so the cache reports no live entries after pending tasks.
+    #[tokio::test]
+    async fn session_context_cache_expires_on_ttl() {
+        let cache: Cache<String, u64> = Cache::builder()
+            .max_capacity(SESSION_CONTEXT_CACHE_MAX_CAPACITY)
+            .time_to_live(std::time::Duration::from_millis(0))
+            .build();
+
+        cache.insert("token-a".to_string(), 1).await;
+        cache.run_pending_tasks().await;
+
+        assert!(
+            cache.get("token-a").await.is_none(),
+            "entry should have expired immediately under a zero TTL"
+        );
     }
 }
