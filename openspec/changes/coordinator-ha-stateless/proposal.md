@@ -45,6 +45,17 @@ The work is phased. Phase 1 removes the hard blocker (server-minted session ids)
 - `deploy/helm/sqe`: `coordinator.replicas` default raised once Phase 1 lands; add a `PodDisruptionBudget`, a headless `Service` for pod addressing, and an optional Redis/Postgres dependency for Phase 2.
 - No change to the worker protocol. Workers already authenticate to Polaris and S3 as the user via token passthrough.
 
+## Success Criteria
+
+- With `session.validation = "jwt"`, any replica validates any client's JWT; no client sees `session not found` when load-balanced across replicas.
+- A rolling restart of one replica drops only that replica's in-flight queries; the others keep serving (PDB `minAvailable = replicas - 1`).
+- A `DoGet` that lands on a non-owning replica routes to the owner; on failover the call returns a retryable error and a client re-submit succeeds.
+- Phase 2: a per-user rate limit holds to `target` globally across replicas via the shared store; Phase 1 documents the divide-by-N drift.
+
+## Migration
+
+Two moving parts. Server side: flip `session.validation` from `session_id` to `jwt` once Phase 1 is verified. Client side: when the server runs in `jwt` mode, clients send the raw IdP-issued JWT as the bearer token instead of the server-minted session id. The two modes can run in parallel during a rollout by keeping `session_id` accepted alongside `jwt` for one release, then dropping `session_id`.
+
 ## Rollback
 
 Phase 1 is config-gated. `session.validation = "session_id"` keeps the current server-minted-UUID behaviour; `session.validation = "jwt"` enables stateless validation. Default stays `session_id` until Phase 1 is verified, then flips. Rolling back to one replica is a Helm value change with no data migration. Phase 2 shared stores are optional dependencies: if the store is unreachable, the coordinator falls back to per-replica limits and logs a warning rather than failing closed.

@@ -48,7 +48,7 @@ The `DashMap<String, Arc<Session>>` stays, but its key becomes `sha256(jwt)` and
 
 ### The lifecycle is not fully stateless
 
-Stateless *validation* is not a stateless *query lifecycle*. This is the part that is easy to overclaim.
+Stateless *validation* is not a stateless *query lifecycle*. The query lifecycle is the part that is easy to overclaim.
 
 A Flight `DoGet` ticket points at an in-flight result stream that lives in the memory of the replica that planned the query. The query tracker (`crates/sqe-coordinator/src/query_tracker.rs:94-97`) and the result cache are per-replica. So:
 

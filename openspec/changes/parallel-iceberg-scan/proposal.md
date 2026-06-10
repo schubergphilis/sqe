@@ -38,7 +38,7 @@ Recommendation: **emit proper `Partitioning` and place `RepartitionExec` explici
 
 ## Success Criteria
 
-- TPC-DS q72 SF1 single-node does not regress against the committed baseline `compare-tpcds-sf1-2026-05-28T14:19:18.json` (q72 = 756ms). Gate: parallel-scan q72 time <= 1.1x baseline.
+- TPC-DS q72 SF1 single-node does not regress against the committed baseline `compare-tpcds-sf1-2026-05-28T14:19:18.json` (q72 = 756ms). Gate: parallel-scan q72 time <= 1.1x baseline. The `~17s -> ~100s` figures above are the historical #131 regression delta; q72 has since improved to sub-second through later optimization, and the gate is against that current 756ms baseline, not the old numbers.
 - A scan-bound query (e.g. TPC-H Q1, TPC-H Q6, a `SELECT count(*) ... WHERE` over a large table) speeds up at least 2x on a 4+ core coordinator versus the single-partition baseline.
 - The TPC-H SF1 suite does not regress against `tpch-sf1-flight-2026-04-02T14:16:27.json` (22/22, 37.5s).
 - The plan for q72 under the flag contains no `CoalescePartitionsExec` directly above the scan and the join stays `Partitioned` (not `CollectLeft`).
