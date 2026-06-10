@@ -128,6 +128,8 @@ mod tests {
             s3_session_token: String::new(),
             s3_path_style: true,
             s3_allow_http: true,
+            predicate_proto: None,
+            limit: None,
         }
     }
 
