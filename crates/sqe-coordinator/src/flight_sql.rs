@@ -2016,9 +2016,12 @@ impl FlightSqlService for SqeFlightSqlService {
                         });
                     }
                 } else {
-                    debug!(
+                    warn!(
                         worker = %worker_url,
-                        "Received heartbeat but no worker registry configured, ignoring"
+                        "Received a worker heartbeat but the worker registry is not \
+                         wired -- the coordinator is running single-node and is \
+                         IGNORING this worker. Set coordinator.worker_secret (or \
+                         coordinator.worker_urls) to enable dynamic discovery."
                     );
                 }
 
