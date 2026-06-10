@@ -621,13 +621,13 @@ async fn dispatch_to_worker(
     inject_trace_context(parent_cx, request.metadata_mut());
 
     // Wrap `do_get` with `tokio::time::timeout` so a stalled worker surfaces
-    // as a failure within the configured `rpc_timeout`. Pooled channels DO
+    // as a failure within the configured `rpc_timeout`. Pooled channels also
     // carry an Endpoint-level `.timeout(request_timeout)` (see
-    // `channel_pool.rs`), but it is the pool's fixed 30s default rather than
-    // this call's configurable `rpc_timeout`; the explicit wrap applies the
-    // per-deployment budget uniformly to both pooled and freshly-connected
-    // channels. (COORD-05: corrected the earlier comment claiming pooled
-    // channels carry no Endpoint timeout.)
+    // `channel_pool.rs`), now built from the same configured worker timeouts
+    // via `ChannelPool::shared_with_timeouts`, so pooled and freshly-connected
+    // channels share one budget rather than the old fixed 30s pool default.
+    // The explicit wrap stays as the uniform per-deployment ceiling. (#237 /
+    // COORD-05: the pool timeout previously ignored `worker_rpc_timeout`.)
     let response = tokio::time::timeout(rpc_timeout, client.do_get(request))
         .await
         .map_err(|_| {
