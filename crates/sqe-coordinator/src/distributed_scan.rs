@@ -894,31 +894,49 @@ impl Drop for CallbackStream {
 }
 
 /// Reassemble a worker fragment batch to the schema `DistributedScanExec`
-/// advertises. Workers return the full table columns; the coordinator narrows
-/// them to `expected_schema` by name. Three cases:
-/// - column count already matches -> pass through,
+/// advertises (the scan's projected schema). Workers project the ScanTask's
+/// `projected_columns`, so a batch normally arrives with exactly the expected
+/// columns -- but the parquet `ProjectionMask` emits them in FILE order, which
+/// can differ from the plan's projection order, and a worker that could not
+/// apply the projection (no matching columns, old worker) ships the full
+/// table width. Three cases:
 /// - expected is empty (COUNT(*)) -> empty-column batch preserving the row count,
-/// - otherwise -> select the expected fields by name from the worker batch.
+/// - width AND positional field names match -> pass through,
+/// - otherwise -> select the expected fields by name from the worker batch
+///   (narrows a full-width batch, reorders a projected one).
 ///
-/// This is why projection is NOT pushed to workers (see query_handler step 6):
-/// a projected worker batch would be narrower than `expected_schema` and the
-/// by-name selection below would fail to find the missing columns.
+/// A batch missing an expected column fails loudly (fails closed, no silent
+/// wrong results).
 fn reassemble_worker_batch(
     batch: RecordBatch,
     expected_schema: &SchemaRef,
 ) -> DFResult<RecordBatch> {
     let expected_cols = expected_schema.fields().len();
-    if batch.num_columns() == expected_cols {
-        Ok(batch)
-    } else if expected_cols == 0 {
+    if expected_cols == 0 {
         // COUNT(*) case: return empty-column batch with row count.
-        Ok(RecordBatch::try_new_with_options(
+        return Ok(RecordBatch::try_new_with_options(
             expected_schema.clone(),
             vec![],
             &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
-        )?)
-    } else {
-        // Select matching columns by name from the full worker batch.
+        )?);
+    }
+    let positional_names_match = batch.num_columns() == expected_cols
+        && expected_schema
+            .fields()
+            .iter()
+            .zip(batch.schema().fields())
+            .all(|(e, a)| e.name() == a.name());
+    if positional_names_match {
+        return Ok(batch);
+    }
+    let all_expected_present = expected_schema
+        .fields()
+        .iter()
+        .all(|f| batch.schema().column_with_name(f.name()).is_some());
+    if all_expected_present {
+        // Select the expected columns by name from the worker batch. Handles
+        // both a full-width batch (narrow) and a projected batch whose file
+        // order differs from the plan's projection order (reorder).
         let columns: Vec<_> = expected_schema
             .fields()
             .iter()
@@ -932,6 +950,34 @@ fn reassemble_worker_batch(
             })
             .collect::<DFResult<Vec<_>>>()?;
         Ok(RecordBatch::try_new(expected_schema.clone(), columns)?)
+    } else if batch.num_columns() == expected_cols {
+        // Width matches but some expected names are absent: field-ID
+        // projection (#43) on a pre-rename file ships the file's OLD column
+        // names. The worker projected the right columns by field ID, so
+        // accept them positionally; `try_new` still validates the data types
+        // against the expected schema.
+        Ok(RecordBatch::try_new(
+            expected_schema.clone(),
+            batch.columns().to_vec(),
+        )?)
+    } else {
+        Err(DataFusionError::Internal(format!(
+            "Worker batch ({} columns: {:?}) cannot satisfy the expected scan schema \
+             ({} columns: {:?})",
+            batch.num_columns(),
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>(),
+            expected_cols,
+            expected_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>(),
+        )))
     }
 }
 
@@ -969,8 +1015,9 @@ mod tests {
 
         #[test]
         fn full_batch_narrows_to_projected_schema_by_name() {
-            // The contract the fix relies on: workers return all 3 columns, the
-            // coordinator narrows to the 2 the exec expects, reordered by name.
+            // Safety net: a worker that could not apply the projection ships
+            // all 3 columns; the coordinator narrows to the 2 the exec
+            // expects, reordered by name.
             let worker = batch(&["a", "b", "c"]);
             let expected = schema(&["c", "a"]);
             let out = reassemble_worker_batch(worker, &expected).unwrap();
@@ -981,8 +1028,34 @@ mod tests {
 
         #[test]
         fn equal_width_batch_passes_through() {
+            // The common projected case: worker projected exactly the expected
+            // columns in the expected order.
             let out = reassemble_worker_batch(batch(&["a", "b"]), &schema(&["a", "b"])).unwrap();
             assert_eq!(out.num_columns(), 2);
+        }
+
+        #[test]
+        fn equal_width_reordered_batch_is_reordered_by_name() {
+            // Parquet's ProjectionMask emits columns in FILE order. When the
+            // plan's projection order differs, the equal-width batch must be
+            // reordered by name, NOT passed through positionally.
+            let worker = batch(&["a", "c"]); // file order; values a=0, c=1
+            let expected = schema(&["c", "a"]); // plan order
+            let out = reassemble_worker_batch(worker, &expected).unwrap();
+            assert_eq!(out.schema().field(0).name(), "c");
+            assert_eq!(out.schema().field(1).name(), "a");
+            let c = out
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let a = out
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(c.value(0), 1, "column 'c' carries the file's c values");
+            assert_eq!(a.value(0), 0, "column 'a' carries the file's a values");
         }
 
         #[test]
@@ -994,11 +1067,22 @@ mod tests {
         }
 
         #[test]
+        fn equal_width_renamed_columns_accepted_positionally() {
+            // RENAME COLUMN survival (#43): field-ID projection on a
+            // pre-rename file ships the right columns under the file's OLD
+            // names. Width matches, names do not; accept positionally and
+            // restamp with the expected schema.
+            let worker = batch(&["old_a", "old_b"]);
+            let expected = schema(&["new_a", "new_b"]);
+            let out = reassemble_worker_batch(worker, &expected).unwrap();
+            assert_eq!(out.schema().field(0).name(), "new_a");
+            assert_eq!(out.schema().field(1).name(), "new_b");
+        }
+
+        #[test]
         fn projected_worker_batch_narrower_than_expected_fails() {
-            // This is exactly the bug that pushing projection to workers caused:
-            // a 1-column worker batch cannot satisfy a 2-field expected schema.
-            // The fix keeps projected_columns empty so this never happens; this
-            // test pins the reason.
+            // Fails closed: a 1-column worker batch can never satisfy a
+            // 2-field expected schema (missing column, wrong width).
             let projected_worker = batch(&["a"]);
             let expected = schema(&["a", "b"]);
             assert!(reassemble_worker_batch(projected_worker, &expected).is_err());
