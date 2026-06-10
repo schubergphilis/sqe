@@ -81,6 +81,23 @@ async fn execute(plan: LogicalPlan, mem: Arc<MemTable>, table_name: &str) -> Vec
     df.collect().await.unwrap()
 }
 
+/// Build a scan over a structured multi-level reference: catalog `cat`,
+/// schema `ns1.ns2` (how a multi-level Iceberg namespace renders in
+/// DataFusion), table `employees`. Stringified, this is the 4-part name
+/// `cat.ns1.ns2.employees` that the old split-on-'.' logic dropped into
+/// `_ => continue` and thus passed through unguarded (issue #205).
+fn build_multilevel_scan() -> LogicalPlan {
+    let schema = employee_schema();
+    let batch = employee_batch(schema.clone());
+    let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap());
+    let table_ref = TableReference::full("cat", "ns1.ns2", "employees");
+    LogicalPlanBuilder::scan(table_ref, provider_as_source(mem), None)
+        .unwrap()
+        .build()
+        .unwrap()
+}
+
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn row_filter_injects_filter_above_scan() {
     let (mem, plan) = build_scan("employees");
@@ -247,4 +264,104 @@ async fn poisoned_policy_store_fails_closed_to_zero_rows() {
     let batches = execute(rewritten, mem, "employees").await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 0, "fail-closed must drop every row");
+}
+
+// ── Multi-level namespace policy enforcement (issue #205) ────────────
+//
+// Before the fix, a 4-part name (catalog.ns1.ns2.table) hit `_ => continue`
+// in the rewriter, leaving an empty ResolvedPolicy that passed through. Any
+// row filter / mask / restriction on a multi-level-namespace table was
+// silently bypassed. The read path now keys by the LAST namespace component
+// (matching the write path's `namespace().last()`), so a policy stored under
+// `ns2` is found.
+
+// These four assert on rewritten plan shape rather than executing, because a
+// 4-part `cat.ns1.ns2.employees` reference cannot be registered in a default
+// SessionContext (no catalog `cat`). The rewriter operates on the
+// LogicalPlan, so plan shape proves the policy was applied. Execution of the
+// injected nodes is already covered by the single-level tests above.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multilevel_namespace_row_filter_is_applied() {
+    let plan = build_multilevel_scan();
+
+    // Policy keyed by the LAST namespace component, exactly as the write
+    // path stores it (write_handler keys by `namespace().last()`).
+    let store = InMemoryPolicyStore::new();
+    let mut policy = ResolvedPolicy::default();
+    policy.row_filters.push(col("region").eq(lit("EU")));
+    store.add_table_policy("ns2", "employees", policy).await;
+
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store));
+    let rewritten = rewriter
+        .evaluate(&user("alice", &[]), plan)
+        .await
+        .unwrap();
+
+    let s = format!("{}", rewritten.display_indent());
+    assert!(
+        s.starts_with("Filter:"),
+        "row filter must be injected over multi-level scan, got: {s}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multilevel_namespace_restriction_is_applied() {
+    let plan = build_multilevel_scan();
+
+    let store = InMemoryPolicyStore::new();
+    let policy = ResolvedPolicy {
+        restricted_columns: vec!["ssn".to_string()],
+        ..Default::default()
+    };
+    store.add_table_policy("ns2", "employees", policy).await;
+
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store));
+    let rewritten = rewriter.evaluate(&user("bob", &[]), plan).await.unwrap();
+
+    let s = format!("{}", rewritten.display_indent());
+    assert!(
+        s.starts_with("Projection:"),
+        "restriction must inject a Projection over multi-level scan, got: {s}"
+    );
+    assert!(
+        !s.contains("ssn"),
+        "ssn must be dropped from the multi-level namespace projection, got: {s}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multilevel_namespace_no_policy_still_passes_through() {
+    // A confidently-resolved 4-part name with no matching policy must keep
+    // working (pass through). Fail-closed is reserved for references we
+    // cannot resolve to a key, not for resolvable-but-unguarded tables.
+    let plan = build_multilevel_scan();
+
+    let store = InMemoryPolicyStore::new();
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store));
+    let rewritten = rewriter.evaluate(&user("carol", &[]), plan).await.unwrap();
+
+    let s = format!("{}", rewritten.display_indent());
+    assert!(
+        s.starts_with("TableScan:"),
+        "no policy on a resolvable table must pass through unchanged, got: {s}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multilevel_namespace_poisoned_store_fails_closed() {
+    // The bypass is gone even when the store errors: a multi-level table
+    // must fail closed (lit(false) filter injected), not pass through. The
+    // single-level poison test above proves lit(false) -> zero rows on
+    // execution; here we prove the filter is injected for a 4-part name.
+    let plan = build_multilevel_scan();
+
+    let rewriter = PolicyPlanRewriter::new(Arc::new(PoisonStore));
+    let rewritten = rewriter.evaluate(&user("dave", &[]), plan).await.unwrap();
+
+    let s = format!("{}", rewritten.display_indent());
+    assert!(
+        s.starts_with("Filter:"),
+        "multi-level table must fail closed with an injected filter, got: {s}"
+    );
 }
