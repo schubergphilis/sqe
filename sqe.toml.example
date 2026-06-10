@@ -106,6 +106,18 @@ s3_access_key = "<your-s3-access-key>"
 s3_secret_key = "<your-s3-secret-key>"
 s3_path_style = true
 
+# ── Wire-protocol security ────────────────────────────────────
+[security]
+# trusted_proxies = ["10.0.0.1"]  # IPs allowed to set x-forwarded-for for audit IPs
+#
+# allow_insecure_transport: opt out of the TLS-on-the-wire requirement.
+# When distributed mode targets a NON-loopback peer (coordinator.worker_urls
+# or worker.coordinator_url pointing off-box) and [coordinator.tls] is not
+# configured, the engine refuses to start. User bearer tokens, the worker
+# secret, and vended S3 credentials would otherwise travel in cleartext.
+# Loopback-only setups (127.0.0.1 / ::1 / localhost) stay usable without TLS.
+# allow_insecure_transport = false
+
 [policy]
 engine = "passthrough"
 
