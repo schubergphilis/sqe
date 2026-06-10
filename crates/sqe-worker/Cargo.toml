@@ -43,6 +43,11 @@ opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 ahash = { workspace = true }
 subtle = { workspace = true }
+prometheus = { workspace = true }
+# Local network interface enumeration for advertise-URL derivation (issue #220).
+# Used only at worker startup to pick the first non-loopback, non-link-local
+# address when POD_IP / HOSTNAME are not set. Cross-platform (posix + windows).
+if-addrs = "0.15"
 
 [dev-dependencies]
 tokio = { workspace = true }

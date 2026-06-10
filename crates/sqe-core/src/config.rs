@@ -552,6 +552,16 @@ pub struct WorkerConfig {
     pub coordinator_url: String,
     #[serde(default = "default_worker_flight_port")]
     pub flight_port: u16,
+    /// URL the coordinator should use to reach this worker's Flight service,
+    /// sent verbatim in every heartbeat. When empty (the default) the worker
+    /// derives a routable address at startup: the `POD_IP` / `HOSTNAME` env
+    /// var (set on Kubernetes via the downward API), else the first
+    /// non-loopback local interface address. Set this explicitly when the
+    /// auto-derived address is wrong (NAT, multi-homed hosts, overlay
+    /// networks). Never advertise 0.0.0.0: the coordinator rejects it because
+    /// every worker would collide on one bogus loopback registry entry.
+    #[serde(default)]
+    pub advertise_url: String,
     #[serde(default = "default_heartbeat")]
     pub heartbeat_interval_secs: u64,
     #[serde(default = "default_memory")]
@@ -586,6 +596,7 @@ impl Default for WorkerConfig {
         Self {
             coordinator_url: String::new(),
             flight_port: default_worker_flight_port(),
+            advertise_url: String::new(),
             heartbeat_interval_secs: default_heartbeat(),
             memory_limit: default_memory(),
             spill_to_disk: true,
@@ -605,6 +616,7 @@ impl std::fmt::Debug for WorkerConfig {
         f.debug_struct("WorkerConfig")
             .field("coordinator_url", &self.coordinator_url)
             .field("flight_port", &self.flight_port)
+            .field("advertise_url", &self.advertise_url)
             .field("heartbeat_interval_secs", &self.heartbeat_interval_secs)
             .field("memory_limit", &self.memory_limit)
             .field("spill_to_disk", &self.spill_to_disk)
@@ -2505,6 +2517,7 @@ impl SqeConfig {
         // Worker
         env_override_str("SQE_WORKER__COORDINATOR_URL", &mut self.worker.coordinator_url);
         env_override_u16("SQE_WORKER__FLIGHT_PORT", &mut self.worker.flight_port);
+        env_override_str("SQE_WORKER__ADVERTISE_URL", &mut self.worker.advertise_url);
         env_override_u64("SQE_WORKER__HEARTBEAT_INTERVAL_SECS", &mut self.worker.heartbeat_interval_secs);
         env_override_str("SQE_WORKER__MEMORY_LIMIT", &mut self.worker.memory_limit);
         env_override_bool("SQE_WORKER__SPILL_TO_DISK", &mut self.worker.spill_to_disk);
@@ -2514,6 +2527,12 @@ impl SqeConfig {
         env_override_bool(
             "SQE_WORKER__ALLOW_UNAUTHENTICATED",
             &mut self.worker.allow_unauthenticated,
+        );
+
+        // Security
+        env_override_bool(
+            "SQE_SECURITY__ALLOW_INSECURE_TRANSPORT",
+            &mut self.security.allow_insecure_transport,
         );
 
         // Auth

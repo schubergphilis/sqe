@@ -2002,9 +2002,18 @@ impl FlightSqlService for SqeFlightSqlService {
                 if let Some(ref registry) = self.worker_registry {
                     debug!(worker = %worker_url, "Received heartbeat from worker");
                     if let Err(err) = registry.register_heartbeat(worker_url).await {
-                        return Err(Status::resource_exhausted(format!(
-                            "worker heartbeat rejected: {err}"
-                        )));
+                        use crate::worker_registry::RegistrationError;
+                        let msg = format!("worker heartbeat rejected: {err}");
+                        return Err(match err {
+                            // A bad advertise URL is the worker's fault, not a
+                            // coordinator capacity problem: invalid_argument.
+                            RegistrationError::InvalidAdvertiseUrl { .. } => {
+                                Status::invalid_argument(msg)
+                            }
+                            RegistrationError::CapacityExceeded { .. } => {
+                                Status::resource_exhausted(msg)
+                            }
+                        });
                     }
                 } else {
                     debug!(
