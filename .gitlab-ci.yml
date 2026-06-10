@@ -8,6 +8,7 @@ include:
 stages:
   - check
   - test
+  - benchmark
   - secret-detection
   - discover
   - trigger
@@ -246,6 +247,78 @@ matrix-score:
     paths:
       - target/
       - .cargo/registry/
+
+# ── Benchmark regression gate (TPC-H SF1) ─────────────────────
+# Issue #256. Runs TPC-H SF1 against the lightweight test stack (the same
+# Polaris + RustFS stack integration-test uses) and fails if total runtime
+# regresses beyond BENCH_REGRESSION_THRESHOLD_PERCENT versus the committed
+# single-node baseline, or if any query stops passing. Benchmarks are slow,
+# so this never runs on a normal merge-request pipeline: scheduled pipelines
+# only, plus a manual opt-in on MRs. The schedule branch has NO allow_failure
+# on purpose -- a scheduled regression must turn the pipeline red. The MR
+# manual run is allow_failure so an opt-in benchmark cannot block a merge.
+benchmark-tpch:
+  stage: benchmark
+  image: docker:24
+  # docker-in-docker, mirroring integration-test: benchmark-test.sh runs
+  # `docker compose up` against docker-compose.test.yml and needs a real
+  # daemon. The dind service provides it; alias + non-TLS port keep the
+  # tcp://docker:2375 connection deterministic across runner versions.
+  services:
+    - name: docker:24-dind
+      alias: docker
+      command: ["--tls=false", "--host=tcp://0.0.0.0:2375"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_DRIVER: overlay2
+    BENCH_SCALE: "1"
+    # Committed single-node TPC-H SF1 baseline (22/22, 37.5s). See CLAUDE.md
+    # "Benchmarks". Override via CI variable when a new baseline is committed.
+    BENCH_BASELINE: "benchmarks/results/tpch-sf1-flight-2026-04-02T14:16:27.json"
+    # Max allowed slowdown (percent) before the gate fails. Configurable via
+    # CI/CD variable; 20 is the default the issue calls for.
+    BENCH_REGRESSION_THRESHOLD_PERCENT: "20"
+  before_script:
+    # Same toolchain install as integration-test (Alpine base): bash + the
+    # Rust/link toolchain so benchmark-test.sh can build sqe-bench. python3
+    # is required by both benchmark-test.sh (token parsing) and the
+    # compare-benchmark.py gate below.
+    - apk add --no-cache bash curl docker-compose rust cargo cmake protobuf-dev openssl-dev pkgconfig clang mold python3 jq
+  script:
+    # Snapshot existing result files so we can identify the NEW report this
+    # run writes. benchmarks/results/ already holds dozens of committed
+    # tpch-sf1 files; globbing "newest" could pick a baseline instead of our
+    # run. Diff before/after to find the single file produced here.
+    - ls benchmarks/results/ > /tmp/results-before.txt 2>/dev/null || true
+    - BENCH_SCALE="$BENCH_SCALE" ./scripts/benchmark-test.sh tpch
+    - ls benchmarks/results/ > /tmp/results-after.txt
+    - CANDIDATE=$(comm -13 /tmp/results-before.txt /tmp/results-after.txt | grep -E '^tpch-sf1-.*\.json$' | tail -1)
+    - 'test -n "$CANDIDATE" || { echo "ERROR: no new tpch-sf1 report was produced"; exit 1; }'
+    - echo "New report -> benchmarks/results/$CANDIDATE"
+    - >-
+      python3 scripts/compare-benchmark.py
+      --baseline "$BENCH_BASELINE"
+      --candidate "benchmarks/results/$CANDIDATE"
+      --threshold-percent "$BENCH_REGRESSION_THRESHOLD_PERCENT"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: manual
+      allow_failure: true
+  artifacts:
+    when: always
+    paths:
+      - benchmarks/results/
+    expire_in: 1 week
+  cache:
+    key: cargo-bench-${CI_COMMIT_REF_SLUG}
+    fallback_keys:
+      - cargo-bench-main
+    paths:
+      - target/
+      - .cargo/registry/
+  timeout: 1h
 
 # ── Container builds ───────────────────────────────────────────
 
