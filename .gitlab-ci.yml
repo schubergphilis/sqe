@@ -8,6 +8,7 @@ include:
 stages:
   - check
   - test
+  - benchmark
   - secret-detection
   - discover
   - trigger
@@ -247,6 +248,78 @@ matrix-score:
       - target/
       - .cargo/registry/
 
+# ── Benchmark regression gate (TPC-H SF1) ─────────────────────
+# Issue #256. Runs TPC-H SF1 against the lightweight test stack (the same
+# Polaris + RustFS stack integration-test uses) and fails if total runtime
+# regresses beyond BENCH_REGRESSION_THRESHOLD_PERCENT versus the committed
+# single-node baseline, or if any query stops passing. Benchmarks are slow,
+# so this never runs on a normal merge-request pipeline: scheduled pipelines
+# only, plus a manual opt-in on MRs. The schedule branch has NO allow_failure
+# on purpose -- a scheduled regression must turn the pipeline red. The MR
+# manual run is allow_failure so an opt-in benchmark cannot block a merge.
+benchmark-tpch:
+  stage: benchmark
+  image: docker:24
+  # docker-in-docker, mirroring integration-test: benchmark-test.sh runs
+  # `docker compose up` against docker-compose.test.yml and needs a real
+  # daemon. The dind service provides it; alias + non-TLS port keep the
+  # tcp://docker:2375 connection deterministic across runner versions.
+  services:
+    - name: docker:24-dind
+      alias: docker
+      command: ["--tls=false", "--host=tcp://0.0.0.0:2375"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_DRIVER: overlay2
+    BENCH_SCALE: "1"
+    # Committed single-node TPC-H SF1 baseline (22/22, 37.5s). See CLAUDE.md
+    # "Benchmarks". Override via CI variable when a new baseline is committed.
+    BENCH_BASELINE: "benchmarks/results/tpch-sf1-flight-2026-04-02T14:16:27.json"
+    # Max allowed slowdown (percent) before the gate fails. Configurable via
+    # CI/CD variable; 20 is the default the issue calls for.
+    BENCH_REGRESSION_THRESHOLD_PERCENT: "20"
+  before_script:
+    # Same toolchain install as integration-test (Alpine base): bash + the
+    # Rust/link toolchain so benchmark-test.sh can build sqe-bench. python3
+    # is required by both benchmark-test.sh (token parsing) and the
+    # compare-benchmark.py gate below.
+    - apk add --no-cache bash curl docker-compose rust cargo cmake protobuf-dev openssl-dev pkgconfig clang mold python3 jq
+  script:
+    # Snapshot existing result files so we can identify the NEW report this
+    # run writes. benchmarks/results/ already holds dozens of committed
+    # tpch-sf1 files; globbing "newest" could pick a baseline instead of our
+    # run. Diff before/after to find the single file produced here.
+    - ls benchmarks/results/ > /tmp/results-before.txt 2>/dev/null || true
+    - BENCH_SCALE="$BENCH_SCALE" ./scripts/benchmark-test.sh tpch
+    - ls benchmarks/results/ > /tmp/results-after.txt
+    - CANDIDATE=$(comm -13 /tmp/results-before.txt /tmp/results-after.txt | grep -E '^tpch-sf1-.*\.json$' | tail -1)
+    - 'test -n "$CANDIDATE" || { echo "ERROR: no new tpch-sf1 report was produced"; exit 1; }'
+    - echo "New report -> benchmarks/results/$CANDIDATE"
+    - >-
+      python3 scripts/compare-benchmark.py
+      --baseline "$BENCH_BASELINE"
+      --candidate "benchmarks/results/$CANDIDATE"
+      --threshold-percent "$BENCH_REGRESSION_THRESHOLD_PERCENT"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: manual
+      allow_failure: true
+  artifacts:
+    when: always
+    paths:
+      - benchmarks/results/
+    expire_in: 1 week
+  cache:
+    key: cargo-bench-${CI_COMMIT_REF_SLUG}
+    fallback_keys:
+      - cargo-bench-main
+    paths:
+      - target/
+      - .cargo/registry/
+  timeout: 1h
+
 # ── Container builds ───────────────────────────────────────────
 
 # Disable template default job — we define our own below
@@ -277,7 +350,125 @@ build-sqe:
         - Cargo.lock
         - Dockerfile
 
+# ── Supply chain: SBOM + checksums + signing ──────────────────
+# Issue #257. The kaniko build-sqe job pushes the image but does not sign it
+# or emit a bill of materials. This job pulls the just-built image, generates
+# a CycloneDX SBOM with syft (pinned), and writes SHA256 checksums for the
+# SBOM. Both are published as job artifacts and attached to the release.
+#
+# Tooling choice: syft is already part of the team toolchain and is present on
+# the runners, so the SBOM step uses it directly (pinned by version below).
+# cosign is NOT assumed available here, so keyless image signing is left as a
+# documented operator step rather than silently skipped -- see the TODO in the
+# script. The job fails loudly if syft is missing instead of degrading to a
+# no-op, so a broken supply-chain gate is visible rather than green-by-default.
+.sbom-sign-base:
+  image: docker:24
+  services:
+    - name: docker:24-dind
+      alias: docker
+      command: ["--tls=false", "--host=tcp://0.0.0.0:2375"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_DRIVER: overlay2
+    # Pin the syft release used to generate the SBOM. Bump deliberately.
+    SYFT_VERSION: "1.18.1"
+    # Image reference to scan. build-sqe pushes IMAGE_NAME 'sqe' to the
+    # project registry; tag is the git tag on a release, else the short SHA.
+    SBOM_IMAGE: "${CI_REGISTRY_IMAGE}/sqe:${CI_COMMIT_TAG}"
+  before_script:
+    - apk add --no-cache bash curl docker-cli
+    # Install the pinned syft. Fail loudly if the install does not yield a
+    # working binary -- this is a security gate, not best-effort.
+    - curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin "v${SYFT_VERSION}"
+    - 'command -v syft >/dev/null || { echo "ERROR: syft not installed; supply-chain gate cannot run"; exit 1; }'
+    - syft version
+  script:
+    - echo "Logging in to ${CI_REGISTRY} and pulling ${SBOM_IMAGE}"
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker pull "$SBOM_IMAGE"
+    # Generate a CycloneDX JSON SBOM for the container image.
+    - syft "docker:${SBOM_IMAGE}" -o cyclonedx-json=sbom-sqe.cdx.json
+    - 'test -s sbom-sqe.cdx.json || { echo "ERROR: SBOM is empty"; exit 1; }'
+    # Record the image digest so consumers can pin by digest in Helm.
+    - docker inspect --format '{{index .RepoDigests 0}}' "$SBOM_IMAGE" > image-digest.txt || true
+    # Checksums for the artifacts so consumers can verify integrity even
+    # without a signature available yet.
+    - sha256sum sbom-sqe.cdx.json image-digest.txt > SHA256SUMS
+    - cat SHA256SUMS
+    # TODO(operator): keyless image signing. cosign is not provisioned on
+    # these runners. Once a runner has cosign + GitLab OIDC id_tokens wired,
+    # add the following (and grant the job an id_token) to sign the digest:
+    #
+    #   COSIGN_EXPERIMENTAL=1 cosign sign --yes \
+    #     "$(cut -d' ' -f1 image-digest.txt)"
+    #
+    # and to attach the SBOM as an attestation:
+    #
+    #   COSIGN_EXPERIMENTAL=1 cosign attest --yes \
+    #     --predicate sbom-sqe.cdx.json --type cyclonedx \
+    #     "$(cut -d' ' -f1 image-digest.txt)"
+    #
+    # Verification: cosign verify --certificate-identity-regexp '.*' \
+    #   --certificate-oidc-issuer "$CI_SERVER_URL" "<digest>"
+    - 'echo "TODO(operator): run cosign keyless signing (see script comment) once cosign is provisioned."'
+  artifacts:
+    when: always
+    paths:
+      - sbom-sqe.cdx.json
+      - SHA256SUMS
+      - image-digest.txt
+    expire_in: 1 year
+
+# SBOM on every merge-to-main image build (tracks main's supply chain).
+sbom-sign:
+  extends: .sbom-sign-base
+  stage: build
+  needs:
+    - job: build-sqe
+      artifacts: false
+  variables:
+    SBOM_IMAGE: "${CI_REGISTRY_IMAGE}/sqe:${CI_COMMIT_SHORT_SHA}"
+  # A missing/failed supply-chain gate must not turn the merge-to-main image
+  # build red. The job fails loudly on its own row; it does not block.
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
+      changes:
+        - crates/**/*
+        - Cargo.toml
+        - Cargo.lock
+        - Dockerfile
+
 # ── Release pipeline (triggered on tag push: v*) ──────────────
+
+# Release-time SBOM + checksums for the tagged image, attached to the release.
+sbom-sign-release:
+  extends: .sbom-sign-base
+  stage: test
+  variables:
+    SBOM_IMAGE: "${CI_REGISTRY_IMAGE}/sqe:${CI_COMMIT_TAG}"
+  # Best-effort: a syft download hiccup or wrong image ref must never block
+  # the tag release (which previously always produced a release). The release
+  # job needs this one as `optional` so a failure here still ships the release
+  # without the SBOM asset links.
+  allow_failure: true
+  # Export this job's id so the release job can build artifact-download URLs
+  # for the SBOM + checksums via a dotenv artifact.
+  after_script:
+    - echo "SBOM_JOB_ID=${CI_JOB_ID}" > sbom.env
+  artifacts:
+    when: always
+    paths:
+      - sbom-sqe.cdx.json
+      - SHA256SUMS
+      - image-digest.txt
+    reports:
+      dotenv: sbom.env
+    expire_in: 1 year
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+/'
 
 changelog:
   stage: test
@@ -298,11 +489,32 @@ release:
   needs:
     - job: changelog
       artifacts: true
+    # Attach the SBOM + checksums produced by sbom-sign-release so the
+    # release carries a verifiable bill of materials (issue #257). Marked
+    # optional so a failed/absent SBOM job never blocks the release; the asset
+    # links below simply resolve to an empty job id and can be omitted.
+    - job: sbom-sign-release
+      artifacts: true
+      optional: true
+  variables:
+    # Fallback so the asset-link URLs are still well-formed when the SBOM job
+    # did not run; the dotenv export from sbom-sign-release overrides this.
+    SBOM_JOB_ID: ""
   script:
     - echo "Creating release for ${CI_COMMIT_TAG}"
   release:
     tag_name: ${CI_COMMIT_TAG}
     name: "SQE ${CI_COMMIT_TAG}"
     description: release-notes.md
+    # Link the SBOM and checksums (job artifacts) as release assets. The
+    # links point at the sbom-sign-release job's artifact files.
+    assets:
+      links:
+        - name: "SBOM (CycloneDX JSON)"
+          url: "${CI_PROJECT_URL}/-/jobs/${SBOM_JOB_ID}/artifacts/raw/sbom-sqe.cdx.json"
+          link_type: other
+        - name: "SHA256SUMS"
+          url: "${CI_PROJECT_URL}/-/jobs/${SBOM_JOB_ID}/artifacts/raw/SHA256SUMS"
+          link_type: other
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v[0-9]+/'
