@@ -65,8 +65,39 @@ async fn main() -> anyhow::Result<()> {
 
     server_builder
         .add_service(flight_service.into_server())
-        .serve(addr)
+        .serve_with_shutdown(addr, shutdown_signal())
         .await?;
 
+    tracing::info!("SQE worker shut down");
     Ok(())
+}
+
+/// Resolve once a SIGINT or SIGTERM arrives. Drives `serve_with_shutdown` so
+/// tonic stops accepting new connections and lets in-flight scans finish at
+/// the graceful boundary instead of being hard-killed on signal (#225).
+/// Mirrors the `shutdown_signal` helper in `sqe-coordinator/src/bin/sqe_server.rs`.
+async fn shutdown_signal() {
+    use tokio::signal;
+
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("Received SIGINT, shutting down"),
+        _ = terminate => tracing::info!("Received SIGTERM, shutting down"),
+    }
 }

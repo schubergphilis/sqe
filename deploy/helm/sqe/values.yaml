@@ -186,6 +186,15 @@ readinessProbe:
   initialDelaySeconds: 5
   periodSeconds: 5
 
+# ── Graceful shutdown (issue #250) ──────────────────────────
+# On SIGTERM the process flips /readyz to NOT-ready so the Service stops
+# routing new work, waits coordinator.shutdown_drain_secs (config default 25s),
+# then shuts the Flight server down. Keep terminationGracePeriodSeconds well
+# above shutdown_drain_secs so the process drains and exits cleanly before the
+# kubelet sends SIGKILL. Long-running analytical queries may need a larger
+# value than the k8s default of 30s.
+terminationGracePeriodSeconds: 90
+
 # ── ServiceMonitor (Prometheus Operator) ────────────────────
 serviceMonitor:
   enabled: false
