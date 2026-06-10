@@ -116,7 +116,14 @@ async fn quack_select_one_round_trip() {
         .expect("bind random port");
     let addr = listener.local_addr().expect("local addr");
     tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("axum serve");
+        // QUACK-08: the handler reads the peer SocketAddr via ConnectInfo for
+        // the per-IP auth limiter, so serve with connect-info.
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("axum serve");
     });
     tokio::time::sleep(Duration::from_millis(30)).await;
     let base = format!("http://{addr}");
