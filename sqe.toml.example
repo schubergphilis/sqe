@@ -27,6 +27,16 @@ coordinator_url = "http://coordinator:50052"
 heartbeat_interval_secs = 5
 memory_limit = "8GB"
 spill_dir = "/tmp/sqe-spill"
+# URL the coordinator uses to reach this worker's Flight service, sent in every
+# heartbeat. Leave empty to auto-derive a routable address at startup:
+#   1. POD_IP env var (Kubernetes downward API)
+#   2. HOSTNAME env var, only when it is an IP literal
+#   3. first non-loopback, non-link-local local interface address (IPv4 preferred)
+# Set explicitly when auto-derivation is wrong (NAT, multi-homed, overlay nets).
+# NEVER advertise 0.0.0.0: the coordinator rejects it (every worker would
+# collide on one bogus loopback registry entry). Scheme follows TLS:
+# https when [coordinator.tls] is set, otherwise http.
+# advertise_url = "http://worker-1.svc.cluster.local:50052"
 
 [auth]
 keycloak_url = "https://auth.local"

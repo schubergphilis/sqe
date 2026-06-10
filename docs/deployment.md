@@ -114,6 +114,7 @@ Every TOML key can be overridden via environment variable using the pattern `SQE
 |-----|---------|-------------|
 | `coordinator_url` | `""` | Coordinator Flight URL for heartbeat registration |
 | `flight_port` | `50052` | Worker Flight server port |
+| `advertise_url` | `""` | URL the coordinator uses to reach this worker. Empty -> auto-derived (`POD_IP` env, else `HOSTNAME` if an IP literal, else first non-loopback interface). Never advertise `0.0.0.0`: the coordinator rejects it |
 | `heartbeat_interval_secs` | `5` | Heartbeat interval in seconds |
 | `memory_limit` | `"8GB"` | Per-worker memory limit |
 | `spill_to_disk` | `true` | Enable spill-to-disk |
