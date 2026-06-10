@@ -40,6 +40,25 @@ pub fn extract_catalog_qualifiers(stmt: &Statement) -> Vec<String> {
     visitor.catalogs.into_iter().collect()
 }
 
+/// Like [`extract_catalog_qualifiers`] but takes raw SQL text — used by the
+/// view planner, which only holds the view's stored SQL string (not a parsed
+/// statement). Unions qualifiers across all parsed statements; returns an
+/// empty `Vec` when the SQL fails to parse (the caller's own planner will
+/// surface the real parse error).
+pub fn extract_catalog_qualifiers_from_sql(sql: &str) -> Vec<String> {
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    let Ok(statements) = Parser::parse_sql(&GenericDialect {}, sql) else {
+        return Vec::new();
+    };
+    let mut all = BTreeSet::new();
+    for stmt in &statements {
+        all.extend(extract_catalog_qualifiers(stmt));
+    }
+    all.into_iter().collect()
+}
+
 struct CatalogQualifierCollector {
     catalogs: BTreeSet<String>,
 }
@@ -150,5 +169,20 @@ mod tests {
             "WITH x AS (SELECT * FROM cat.ns.t) SELECT * FROM x",
         );
         assert_eq!(extract_catalog_qualifiers(&stmt), vec!["cat".to_string()]);
+    }
+
+    #[test]
+    fn from_sql_extracts_catalogs_from_raw_text() {
+        // The view-planner path: raw stored view SQL, possibly referencing a
+        // catalog other than the one the view lives in.
+        let got = extract_catalog_qualifiers_from_sql(
+            "SELECT src.id AS event_id FROM team_a_data.public.events src",
+        );
+        assert_eq!(got, vec!["team_a_data".to_string()]);
+    }
+
+    #[test]
+    fn from_sql_unparseable_returns_empty() {
+        assert!(extract_catalog_qualifiers_from_sql("THIS IS NOT SQL ???").is_empty());
     }
 }
