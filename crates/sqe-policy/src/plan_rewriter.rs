@@ -63,26 +63,43 @@ impl PolicyEnforcer for PolicyPlanRewriter {
         let _roles = user.roles.clone();
         let user_clone = user.clone();
 
-        // Collect all TableScan nodes and their policies
-        let mut table_policies: HashMap<String, ResolvedPolicy> = HashMap::new();
+        // Collect all TableScan nodes (keyed by their stringified reference,
+        // which is what the rewrite phase below matches on) together with the
+        // structured `TableReference`. We resolve from the structured form so
+        // multi-level Iceberg namespaces survive instead of being lost to a
+        // naive split on '.' (issue #205).
+        let mut table_refs: HashMap<String, datafusion::common::TableReference> = HashMap::new();
         plan.apply(|node| {
             if let LogicalPlan::TableScan(scan) = node {
                 let table_name = scan.table_name.to_string();
-                // We'll resolve policies after collecting all table names
-                table_policies.entry(table_name).or_default();
+                table_refs
+                    .entry(table_name)
+                    .or_insert_with(|| scan.table_name.clone());
             }
             Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
         })
         .map_err(|e| sqe_core::error::SqeError::Execution(format!("Plan traversal failed: {e}")))?;
 
         // Resolve policies for all tables
-        for table_name in table_policies.keys().cloned().collect::<Vec<_>>() {
-            let parts: Vec<&str> = table_name.split('.').collect();
-            let (namespace, table) = match parts.as_slice() {
-                [_catalog, ns, t] => (ns.to_string(), t.to_string()),
-                [ns, t] => (ns.to_string(), t.to_string()),
-                [t] => ("default".to_string(), t.to_string()),
-                _ => continue,
+        let mut table_policies: HashMap<String, ResolvedPolicy> = HashMap::new();
+        for (table_name, table_ref) in &table_refs {
+            // Derive the (namespace, table) policy key from the structured
+            // reference. This MUST match the write path's scheme
+            // (write_handler.rs keys by `namespace().last()`), otherwise
+            // reads and writes resolve different policies for the same table.
+            let Some((namespace, table)) = resolve_policy_key(table_ref) else {
+                // FAIL CLOSED: a reference we cannot confidently map to a
+                // policy key must never pass through. Deny all rows rather
+                // than risk leaking an unguarded table (issue #205).
+                warn!(
+                    user = %username,
+                    table = %table_name,
+                    "Could not resolve policy key for table reference, denying access"
+                );
+                let mut deny = ResolvedPolicy::default();
+                deny.row_filters.push(lit(false));
+                table_policies.insert(table_name.clone(), deny);
+                continue;
             };
 
             match store.resolve(&user_clone, &table, &namespace).await {
@@ -90,12 +107,13 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                     debug!(
                         user = %username,
                         table = %table_name,
+                        namespace = %namespace,
                         row_filters = policy.row_filters.len(),
                         column_masks = policy.column_masks.len(),
                         restricted = policy.restricted_columns.len(),
                         "Resolved policy for table"
                     );
-                    table_policies.insert(table_name, policy);
+                    table_policies.insert(table_name.clone(), policy);
                 }
                 Err(e) => {
                     warn!(
@@ -107,7 +125,7 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                     // On policy resolution failure, inject a FALSE filter (deny all)
                     let mut deny = ResolvedPolicy::default();
                     deny.row_filters.push(lit(false));
-                    table_policies.insert(table_name, deny);
+                    table_policies.insert(table_name.clone(), deny);
                 }
             }
         }
@@ -209,6 +227,44 @@ impl PolicyEnforcer for PolicyPlanRewriter {
 
         Ok(rewritten.data)
     }
+}
+
+/// Derive the `(namespace, table)` policy key from a structured DataFusion
+/// `TableReference`.
+///
+/// DataFusion's `TableReference` carries at most three slots: catalog,
+/// schema, table. Multi-level Iceberg namespaces (`a.b`) are registered as a
+/// single DataFusion schema name `"a.b"` (see
+/// `sqe-catalog/catalog_provider.rs`), so a 4-part qualified name like
+/// `cat.a.b.t` lands here as schema `"a.b"`, table `"t"`.
+///
+/// The policy key MUST match the write path, which keys by
+/// `TableIdent::namespace().last()` (`write_handler.rs`). For a schema of
+/// `"a.b"` the last namespace component is `"b"`. We take the last dotted
+/// component of the schema so reads and writes resolve the same policy.
+///
+/// Returns `None` when no table component can be determined. The caller
+/// treats `None` as fail-closed (deny all rows) rather than passthrough.
+fn resolve_policy_key(
+    table_ref: &datafusion::common::TableReference,
+) -> Option<(String, String)> {
+    let table = table_ref.table();
+    if table.is_empty() {
+        return None;
+    }
+
+    // `schema()` is the (possibly multi-level) namespace string. Take its
+    // last dotted component to match the write path's `namespace().last()`.
+    // A bare table name with no schema falls back to "default", preserving
+    // the existing 1-part behavior.
+    let namespace = match table_ref.schema() {
+        Some(schema) if !schema.is_empty() => {
+            schema.rsplit('.').next().unwrap_or(schema).to_string()
+        }
+        _ => "default".to_string(),
+    };
+
+    Some((namespace, table.to_string()))
 }
 
 /// Apply a mask type to a column, returning the masking expression.
@@ -360,6 +416,56 @@ mod tests {
 
         let int_expr = apply_mask("id", &DataType::Int64, &MaskType::Hash, key);
         assert!(matches!(int_expr, Expr::Cast(_)));
+    }
+
+    // ── resolve_policy_key (issue #205) ──────────────────────────
+    // The policy key MUST match the write path, which uses
+    // `namespace().last()`. For a multi-level schema "ns1.ns2" the key is
+    // ("ns2", table). A bare table falls back to "default".
+
+    #[test]
+    fn resolve_policy_key_bare_table_uses_default_namespace() {
+        let r = datafusion::common::TableReference::bare("employees");
+        assert_eq!(
+            resolve_policy_key(&r),
+            Some(("default".to_string(), "employees".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_policy_key_two_part_uses_schema_as_namespace() {
+        let r = datafusion::common::TableReference::partial("hr", "employees");
+        assert_eq!(
+            resolve_policy_key(&r),
+            Some(("hr".to_string(), "employees".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_policy_key_three_part_uses_schema_as_namespace() {
+        let r = datafusion::common::TableReference::full("cat", "hr", "employees");
+        assert_eq!(
+            resolve_policy_key(&r),
+            Some(("hr".to_string(), "employees".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_policy_key_multilevel_takes_last_namespace_component() {
+        // cat.ns1.ns2.employees -> schema "ns1.ns2" -> last component "ns2".
+        let r = datafusion::common::TableReference::full("cat", "ns1.ns2", "employees");
+        assert_eq!(
+            resolve_policy_key(&r),
+            Some(("ns2".to_string(), "employees".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_policy_key_empty_table_fails_closed() {
+        // An empty table component cannot be confidently keyed; the caller
+        // treats None as deny-all rather than passthrough.
+        let r = datafusion::common::TableReference::bare("");
+        assert_eq!(resolve_policy_key(&r), None);
     }
 
     #[test]
