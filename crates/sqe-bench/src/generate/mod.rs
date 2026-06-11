@@ -178,3 +178,28 @@ pub fn get_generator(name: &str) -> anyhow::Result<Box<dyn BenchmarkGenerator>> 
         ),
     }
 }
+
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+
+    /// Generate every table of every benchmark at small scale. Any ColVal
+    /// variant that does not match its declared field type panics in
+    /// cols_to_arrays (or the equivalent builder), so this sweep catches
+    /// schema/value drift in tables that have no dedicated test.
+    #[test]
+    fn every_generator_table_builds_clean_batches() {
+        let dir = std::env::temp_dir().join(format!("sqe-bench-sweep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = GenerateConfig { threads: 1, ..Default::default() };
+        for bench in ["tpch", "ssb", "tpcds", "tpcc", "tpce", "tpcbb", "clickbench"] {
+            let g = get_generator(bench).unwrap();
+            for t in g.tables() {
+                g.generate_table(&t.name, 0.001, dir.to_str().unwrap(), &config)
+                    .unwrap_or_else(|e| panic!("{bench}.{} failed: {e}", t.name));
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
