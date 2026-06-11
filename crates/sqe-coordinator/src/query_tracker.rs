@@ -82,6 +82,10 @@ pub struct QueryRecord {
     pub rows_scanned: u64,
     pub spill_bytes: u64,
     pub peak_memory_bytes: u64,
+    /// Passive per-operator profile rendered when `[query] query_profile`
+    /// requires one (mode "all", or "slow"/failure). Capped at 64 KiB by
+    /// the renderer.
+    pub profile: Option<String>,
     pub fragments: Arc<Mutex<Vec<FragmentInfo>>>,
 }
 
@@ -155,6 +159,7 @@ impl QueryTracker {
             rows_scanned: 0,
             spill_bytes: 0,
             peak_memory_bytes: 0,
+            profile: None,
             fragments: Arc::new(Mutex::new(Vec::new())),
         };
         self.history.insert(query_id, Arc::new(record));
@@ -225,6 +230,17 @@ impl QueryTracker {
             self.history.insert(*query_id, Arc::new(record));
         }
         self.active.remove(query_id);
+    }
+
+    /// Attach a rendered per-operator profile to a query record. Called by
+    /// the stream finalizer after `complete` / `failed`, so the terminal
+    /// record carries the profile.
+    pub fn set_profile(&self, query_id: &Uuid, profile: String) {
+        if let Some(old) = self.history.get(query_id) {
+            let mut record = (*old).clone();
+            record.profile = Some(profile);
+            self.history.insert(*query_id, Arc::new(record));
+        }
     }
 
     pub fn cancel(&self, query_id: &Uuid) -> bool {
@@ -371,6 +387,22 @@ mod tests {
         assert!(token.is_cancelled());
         let rec = tracker.history.get(&id).unwrap();
         assert_eq!(rec.state, QueryState::Canceled);
+    }
+
+    #[tokio::test]
+    async fn set_profile_attaches_to_terminal_record() {
+        let tracker = QueryTracker::new(&test_config());
+        let id = Uuid::now_v7();
+        tracker.start(id, "alice", None, "SELECT 1", "s1", None, vec![]);
+        tracker.running(&id, 1);
+        tracker.complete(&id, 5, 10, vec![], 0, 0, 0, 0);
+        tracker.set_profile(&id, "elapsed_ms=10\nProjectionExec".to_string());
+        let rec = tracker.history.get(&id).unwrap();
+        assert_eq!(rec.state, QueryState::Finished);
+        assert!(rec.profile.as_deref().unwrap().contains("ProjectionExec"));
+
+        // Unknown id is a no-op.
+        tracker.set_profile(&Uuid::now_v7(), "x".to_string());
     }
 
     #[tokio::test]

@@ -571,6 +571,10 @@ impl SessionCatalog {
     /// Backend support is gated by the same cargo features as the rest
     /// of `sqe-catalog`. See `vendor/iceberg-rust/README.md` and
     /// `docs/catalogs.md` for the supported prop keys per backend.
+    // With no backend cargo features enabled every match arm below diverges
+    // and the loader tail is unreachable; with any backend feature on it is
+    // live. The allow keeps default-feature clippy clean.
+    #[allow(unreachable_code)]
     pub async fn build_backend_catalog(
         backend: &sqe_core::config::CatalogBackend,
     ) -> sqe_core::Result<Arc<dyn iceberg::Catalog>> {

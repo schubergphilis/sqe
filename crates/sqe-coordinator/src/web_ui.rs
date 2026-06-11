@@ -286,6 +286,10 @@ pub struct QueryDetail {
     pub tables_touched: Vec<String>,
     pub error_code: Option<String>,
     pub fragments: Vec<FragmentDto>,
+    /// Passive per-operator profile (see `[query] query_profile`). Detail
+    /// response only: the rendered plan tree can reach 64 KiB and would
+    /// bloat the list endpoint.
+    pub profile: Option<String>,
 }
 
 /// Full record for one query plus its fragment list. `None` if the id is
@@ -309,6 +313,7 @@ pub fn query_detail(tracker: &QueryTracker, id: &Uuid) -> Option<QueryDetail> {
         tables_touched: rec.tables_touched.clone(),
         error_code: rec.error_code.clone(),
         fragments,
+        profile: rec.profile.clone(),
     })
 }
 

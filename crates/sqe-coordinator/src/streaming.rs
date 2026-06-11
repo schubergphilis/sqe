@@ -33,8 +33,10 @@ use arrow_schema::SchemaRef;
 use datafusion::error::DataFusionError;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::{ExecutionPlan, RecordBatchStream};
+use datafusion::physical_plan::display::DisplayableExecutionPlan;
+use datafusion::physical_plan::{displayable, ExecutionPlan, RecordBatchStream};
 use futures::Stream;
+use sqe_core::ProfileMode;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::Sleep;
 use tokio_util::sync::CancellationToken;
@@ -42,6 +44,70 @@ use tracing::warn;
 
 use crate::query_handler::{aggregate_spill_metrics, extract_plan_metrics};
 use crate::query_tracker::QueryTracker;
+
+/// Hard cap on a rendered profile. Deep plans with long predicate lists can
+/// blow up the tree text; 64 KiB keeps the log event and the tracker record
+/// bounded.
+const MAX_PROFILE_BYTES: usize = 64 * 1024;
+
+/// Render a passive query profile: a header (total elapsed, output rows,
+/// unpushed-scan flag) followed by the executed plan tree with the
+/// per-operator metrics DataFusion populated during normal execution.
+fn render_query_profile(plan: &Arc<dyn ExecutionPlan>, elapsed_ms: u64, rows: usize) -> String {
+    let tree = DisplayableExecutionPlan::with_metrics(plan.as_ref())
+        .indent(true)
+        .to_string();
+
+    let mut unpushed = 0usize;
+    let mut tables: Vec<String> = Vec::new();
+    collect_unpushed_scans(plan, &mut unpushed, &mut tables);
+    let tables_suffix = if tables.is_empty() {
+        String::new()
+    } else {
+        format!(" unpushed_tables=[{}]", tables.join(", "))
+    };
+
+    truncate_profile(format!(
+        "elapsed_ms={elapsed_ms} output_rows={rows} unpushed_scans={unpushed}{tables_suffix}\n{tree}"
+    ))
+}
+
+/// Cap a rendered profile at [`MAX_PROFILE_BYTES`], cutting on a char
+/// boundary so multibyte content cannot panic the truncation.
+fn truncate_profile(mut profile: String) -> String {
+    if profile.len() > MAX_PROFILE_BYTES {
+        let mut cut = MAX_PROFILE_BYTES;
+        while !profile.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        profile.truncate(cut);
+        profile.push_str("\n... [profile truncated at 64 KiB]");
+    }
+    profile
+}
+
+/// Count scan nodes whose display carries an empty pushed-down predicate
+/// (`IcebergScanExec` renders `predicate=[]` when nothing was pushed): each
+/// one is a full table scan. Table names are scraped from the same display
+/// line when present (`table=<name>,`).
+fn collect_unpushed_scans(
+    node: &Arc<dyn ExecutionPlan>,
+    count: &mut usize,
+    tables: &mut Vec<String>,
+) {
+    let line = displayable(node.as_ref()).one_line().to_string();
+    if line.contains("predicate=[]") {
+        *count += 1;
+        if let Some(rest) = line.split("table=").nth(1) {
+            if let Some(name) = rest.split(',').next() {
+                tables.push(name.trim().to_string());
+            }
+        }
+    }
+    for child in node.children() {
+        collect_unpushed_scans(child, count, tables);
+    }
+}
 
 /// State captured at query start that [`TrackedRecordBatchStream`] uses
 /// to finalize tracker / metrics / audit exactly once when the stream
@@ -65,9 +131,28 @@ pub struct StreamFinalizer {
     pub slow_query_threshold_secs: u64,
     pub sql_length: usize,
     pub tables_touched: Vec<String>,
+    /// Passive profiling mode (`[query] query_profile`). When a profile is
+    /// due, the executed plan tree is rendered with its populated metrics,
+    /// logged under the `query_profile` target, and stored on the tracker
+    /// record.
+    pub profile_mode: ProfileMode,
 }
 
 impl StreamFinalizer {
+    /// Render, log, and store the per-operator profile for this query.
+    /// Called from the success and error finalization paths once the
+    /// decision to profile has been made.
+    fn capture_profile(&self, elapsed_ms: u64, rows: usize) {
+        let profile = render_query_profile(&self.plan, elapsed_ms, rows);
+        warn!(
+            target: "query_profile",
+            query_id = %self.query_id,
+            elapsed_ms,
+            "query profile\n{profile}"
+        );
+        self.tracker.set_profile(&self.query_id, profile);
+    }
+
     fn record_spill_metrics(&self) {
         let Some(ref metrics) = self.metrics else {
             return;
@@ -148,6 +233,18 @@ impl StreamFinalizer {
                 "Slow streaming query detected"
             );
         }
+
+        let profile_due = match self.profile_mode {
+            ProfileMode::Off => false,
+            ProfileMode::All => true,
+            ProfileMode::Slow => {
+                self.slow_query_threshold_secs > 0
+                    && elapsed_secs >= self.slow_query_threshold_secs
+            }
+        };
+        if profile_due {
+            self.capture_profile(execution_ms, rows);
+        }
     }
 
     fn on_error(self, rows: usize, err: &sqe_core::SqeError) {
@@ -180,6 +277,12 @@ impl StreamFinalizer {
                 client_ip: None,
                 tables_touched: self.tables_touched.clone(),
             });
+        }
+
+        // Failures always profile when the feature is on at all: a failed
+        // query is exactly the case where per-operator evidence is wanted.
+        if self.profile_mode != ProfileMode::Off {
+            self.capture_profile(duration.as_millis() as u64, rows);
         }
     }
 
@@ -528,6 +631,7 @@ mod tests {
             slow_query_threshold_secs: 0,
             sql_length: 8,
             tables_touched: Vec::new(),
+            profile_mode: ProfileMode::Off,
         }
     }
 
@@ -629,6 +733,111 @@ mod tests {
 
         let record = find_record(&tracker, qid);
         assert_eq!(record.state, QueryState::Failed);
+    }
+
+    #[tokio::test]
+    async fn profile_mode_all_stores_profile_on_tracker() {
+        let (plan, schema, runtime) = trivial_plan().await;
+        let tracker = test_tracker();
+        let mut fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
+        fin.profile_mode = ProfileMode::All;
+        let qid = fin.query_id;
+        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![]);
+
+        let inner = fixed_stream(Arc::clone(&schema), vec![sample_batch(7)]);
+        let mut stream = TrackedRecordBatchStream::new(inner, fin, None);
+        while let Some(batch) = stream.next().await {
+            batch.unwrap();
+        }
+        drop(stream);
+
+        let record = find_record(&tracker, qid);
+        assert_eq!(record.state, QueryState::Finished);
+        let profile = record.profile.as_deref().expect("mode All must store a profile");
+        assert!(
+            profile.contains("Exec"),
+            "profile must contain at least one operator name: {profile}"
+        );
+        assert!(
+            profile.contains("elapsed_ms=") && profile.contains("unpushed_scans="),
+            "profile must carry the summary header: {profile}"
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_mode_off_leaves_profile_none() {
+        let (plan, schema, runtime) = trivial_plan().await;
+        let tracker = test_tracker();
+        let fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
+        let qid = fin.query_id;
+        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![]);
+
+        let inner = fixed_stream(Arc::clone(&schema), vec![sample_batch(7)]);
+        let mut stream = TrackedRecordBatchStream::new(inner, fin, None);
+        while let Some(batch) = stream.next().await {
+            batch.unwrap();
+        }
+        drop(stream);
+
+        let record = find_record(&tracker, qid);
+        assert_eq!(record.state, QueryState::Finished);
+        assert!(record.profile.is_none(), "mode Off must not store a profile");
+    }
+
+    #[tokio::test]
+    async fn profile_captured_on_error_when_mode_slow() {
+        use datafusion::error::DataFusionError;
+
+        let (plan, schema, runtime) = trivial_plan().await;
+        let tracker = test_tracker();
+        let mut fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
+        // Slow mode with a threshold the query never reaches: the error
+        // path must still profile (failures always leave evidence).
+        fin.profile_mode = ProfileMode::Slow;
+        fin.slow_query_threshold_secs = 3600;
+        let qid = fin.query_id;
+        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![]);
+
+        let s = futures::stream::iter(vec![
+            Ok(sample_batch(3)),
+            Err(DataFusionError::Execution("boom".to_string())),
+        ]);
+        let inner: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), s));
+        let mut stream = TrackedRecordBatchStream::new(inner, fin, None);
+
+        let _ok = stream.next().await.unwrap().unwrap();
+        assert!(stream.next().await.unwrap().is_err());
+        drop(stream);
+
+        let record = find_record(&tracker, qid);
+        assert_eq!(record.state, QueryState::Failed);
+        assert!(
+            record.profile.is_some(),
+            "failed query must carry a profile when mode != Off"
+        );
+    }
+
+    #[tokio::test]
+    async fn render_query_profile_carries_header() {
+        let (plan, _schema, _runtime) = trivial_plan().await;
+        let profile = render_query_profile(&plan, 12, 34);
+        assert!(profile.starts_with("elapsed_ms=12 output_rows=34 unpushed_scans="));
+        assert!(profile.contains("Exec"), "tree must list operators: {profile}");
+    }
+
+    #[test]
+    fn truncate_profile_caps_at_64kib_on_char_boundary() {
+        // Multibyte payload larger than the cap: must not panic, must not
+        // exceed the cap plus the truncation marker.
+        let big = "λ".repeat(MAX_PROFILE_BYTES);
+        let out = truncate_profile(big);
+        assert!(out.len() <= MAX_PROFILE_BYTES + 64);
+        assert!(out.ends_with("[profile truncated at 64 KiB]"));
+
+        // Small profiles pass through untouched.
+        let small = "elapsed_ms=1\nProjectionExec".to_string();
+        assert_eq!(truncate_profile(small.clone()), small);
     }
 
     #[tokio::test]
