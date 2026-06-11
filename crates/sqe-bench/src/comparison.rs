@@ -116,6 +116,7 @@ pub async fn run_comparison(
             sqe_error.is_none() && trino_error.is_none() && sqe_rows == trino_rows;
 
         let status = match (&sqe_error, &trino_error) {
+            (None, None) if rows_match && sqe_rows == 0 => CompareStatusReport::Vacuous,
             (None, None) if rows_match => CompareStatusReport::Match,
             (None, None) => CompareStatusReport::RowDiff,
             (Some(_), None) => CompareStatusReport::SqeFailed,
@@ -154,6 +155,10 @@ pub async fn run_comparison(
         .iter()
         .filter(|c| matches!(c.status, CompareStatusReport::Match))
         .count();
+    let vacuous = comparisons
+        .iter()
+        .filter(|c| matches!(c.status, CompareStatusReport::Vacuous))
+        .count();
     let row_diff = comparisons
         .iter()
         .filter(|c| matches!(c.status, CompareStatusReport::RowDiff))
@@ -179,7 +184,9 @@ pub async fn run_comparison(
         .filter(|c| {
             matches!(
                 c.status,
-                CompareStatusReport::Match | CompareStatusReport::RowDiff
+                CompareStatusReport::Match
+                    | CompareStatusReport::Vacuous
+                    | CompareStatusReport::RowDiff
             )
         })
         .map(|c| c.speedup)
@@ -207,6 +214,7 @@ pub async fn run_comparison(
         summary: ComparisonSummary {
             total,
             matched,
+            vacuous,
             row_diff,
             sqe_failed,
             trino_failed,
@@ -242,6 +250,7 @@ pub async fn run_comparison(
     for q in &report.queries {
         let status_icon = match q.status {
             CompareStatusReport::Match => "OK",
+            CompareStatusReport::Vacuous => "VACUOUS",
             CompareStatusReport::RowDiff => "DIFF",
             CompareStatusReport::SqeFailed => "FAIL SQE",
             CompareStatusReport::TrinoFailed => "FAIL Trino",
@@ -259,12 +268,13 @@ pub async fn run_comparison(
         );
     }
     println!(
-        "\n**Total:** SQE {}ms, Trino {}ms, Avg speedup {:.1}x, Matched {}/{}\n",
+        "\n**Total:** SQE {}ms, Trino {}ms, Avg speedup {:.1}x, Matched {}/{} ({} vacuous: 0 rows on both engines)\n",
         report.summary.sqe_total_ms,
         report.summary.trino_total_ms,
         report.summary.avg_speedup,
         report.summary.matched,
-        report.summary.total
+        report.summary.total,
+        report.summary.vacuous
     );
 
     Ok(report)
