@@ -38,13 +38,22 @@ cargo-check:
     - rustup component add clippy
     # DEP-09: with the CI cache disabled, `cargo install` would compile these
     # tools from source on every run (5-10 min). cargo-binstall fetches the
-    # prebuilt release binaries instead; fall back to compiling if the
-    # binstall bootstrap or a prebuilt artifact is unavailable. Do NOT swallow
-    # install failures — a failed install must fail the job, not silently skip
-    # the `cargo audit` / `cargo deny` security gate below.
-    - curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash || true
-    - command -v cargo-audit > /dev/null || cargo binstall -y --no-symlinks cargo-audit cargo-deny || cargo install --quiet cargo-audit cargo-deny
-    - command -v cargo-deny > /dev/null || cargo install cargo-deny --quiet
+    # prebuilt release binaries instead. The binstall binary itself is a
+    # version-pinned, checksum-verified direct download (no curl|bash of a
+    # moving script). If the pinned download fails (network, GitHub outage),
+    # fall back to compiling from crates.io source -- slow but safe. A failed
+    # install must still fail the job, never silently skip the
+    # `cargo audit` / `cargo deny` security gate below.
+    - |
+      BINSTALL_VERSION=v1.20.0
+      BINSTALL_SHA256=4d7875788d0505547c220d2b02d3619aac0dd19b7033eba7005a8d09ff1dc433
+      if curl -L --proto '=https' --tlsv1.2 -sSfo /tmp/binstall.tgz            "https://github.com/cargo-bins/cargo-binstall/releases/download/${BINSTALL_VERSION}/cargo-binstall-x86_64-unknown-linux-musl.tgz"          && echo "${BINSTALL_SHA256}  /tmp/binstall.tgz" | sha256sum -c -          && tar xzf /tmp/binstall.tgz -C /usr/local/cargo/bin 2>/dev/null || tar xzf /tmp/binstall.tgz -C "${CARGO_HOME:-$HOME/.cargo}/bin"; then
+        cargo binstall -y --no-symlinks cargo-audit cargo-deny
+      else
+        echo "cargo-binstall bootstrap unavailable; compiling tools from source"
+        cargo install --quiet cargo-audit cargo-deny
+      fi
+    - command -v cargo-audit > /dev/null && command -v cargo-deny > /dev/null
   script:
     - cargo clippy --all-targets --all-features -- -D warnings
     - cargo audit
