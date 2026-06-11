@@ -11,8 +11,8 @@ SELECT s_store_name, s_store_id,
 FROM date_dim, store_sales, store
 WHERE d_date_sk       = ss_sold_date_sk
   AND s_store_sk      = ss_store_sk
-  AND s_gmt_offset    = -6
-  AND d_year          = 1998
+  AND s_gmt_offset    = -5
+  AND d_year          = 2000
 GROUP BY s_store_name, s_store_id
 ORDER BY s_store_name, s_store_id, sun_sales, mon_sales, tue_sales,
          wed_sales, thu_sales, fri_sales, sat_sales

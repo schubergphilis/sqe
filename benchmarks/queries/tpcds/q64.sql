@@ -37,25 +37,20 @@ cross_sales AS (
       AND ss_item_sk               = i_item_sk
       AND ss_ticket_number         = sr_ticket_number
       AND ss_item_sk               = sr_item_sk
-      AND ss_customer_sk           = sr_customer_sk
-      AND sr_returned_date_sk      = d2.d_date_sk
       AND cs_ui.cs_item_sk         = ss_item_sk
       AND c_current_cdemo_sk       = cd2.cd_demo_sk
       AND c_current_hdemo_sk       = hd2.hd_demo_sk
       AND c_current_addr_sk        = ad2.ca_address_sk
-      AND c_first_sales_date_sk    = d3.d_date_sk
+      AND c_first_sales_date_sk    = d2.d_date_sk
+      AND c_first_shipto_date_sk   = d3.d_date_sk
+      AND ss_promo_sk              = p_promo_sk
       AND hd1.hd_income_band_sk    = ib1.ib_income_band_sk
       AND hd2.hd_income_band_sk    = ib2.ib_income_band_sk
       AND cd1.cd_marital_status    <> cd2.cd_marital_status
-      AND ss_promo_sk              = p_promo_sk
-      AND ib1.ib_lower_bound       >= 60306
-      AND ib1.ib_upper_bound       <= 60306 + 50000
-      AND ib2.ib_lower_bound       >= 69198
-      AND ib2.ib_upper_bound       <= 69198 + 50000
-      AND cd1.cd_marital_status    = 'S'
-      AND cd2.cd_marital_status    = 'M'
-      AND d1.d_year                = 2001
-      AND d2.d_year                BETWEEN 2001 AND 2001 + 3
+      AND i_color                  IN ('purple', 'burlywood', 'indian',
+                                       'spring', 'floral', 'medium')
+      AND i_current_price          BETWEEN 64 AND 64 + 10
+      AND i_current_price          BETWEEN 64 + 1 AND 64 + 15
     GROUP BY i_product_name, i_item_sk, s_store_name, s_zip,
              ad1.ca_street_number, ad1.ca_street_name, ad1.ca_city, ad1.ca_zip,
              ad2.ca_street_number, ad2.ca_street_name, ad2.ca_city, ad2.ca_zip,
@@ -63,11 +58,11 @@ cross_sales AS (
 )
 SELECT cs1.pname, cs1.sname, cs1.syear, cs1.cnt
 FROM cross_sales cs1, cross_sales cs2
-WHERE cs1.pname   = cs2.pname
+WHERE cs1.item_sk = cs2.item_sk
+  AND cs1.syear   = 1999
+  AND cs2.syear   = 1999 + 1
+  AND cs2.cnt     <= cs1.cnt
   AND cs1.sname   = cs2.sname
-  AND cs1.c_city  = cs2.c_city
-  AND cs1.b_city  = cs2.b_city
-  AND cs1.syear   = 2001
-  AND cs2.syear   = 2002
-ORDER BY cs1.pname, cs1.sname, cs1.syear, cs1.cnt
+  AND cs1.szip    = cs2.szip
+ORDER BY cs1.pname, cs1.sname, cs2.cnt, cs1.s1, cs2.s1
 LIMIT 100;

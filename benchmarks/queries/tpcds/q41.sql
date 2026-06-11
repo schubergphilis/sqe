@@ -17,7 +17,7 @@ WHERE i_manufact_id BETWEEN 738 AND 738 + 40
                    OR (i_category = 'Men'
                        AND (i_color = 'floral' OR i_color = 'deep')
                        AND (i_units = 'N/A' OR i_units = 'Dozen')
-                       AND (i_size = 'petite' OR i_size = 'large'))
+                       AND (i_size = 'petite' OR i_size = 'petite'))
                    OR (i_category = 'Men'
                        AND (i_color = 'light' OR i_color = 'cornflower')
                        AND (i_units = 'Box' OR i_units = 'Pound')
@@ -34,11 +34,11 @@ WHERE i_manufact_id BETWEEN 738 AND 738 + 40
                        OR (i_category = 'Men'
                            AND (i_color = 'orange' OR i_color = 'frosted')
                            AND (i_units = 'Each' OR i_units = 'Tbl')
-                           AND (i_size = 'petite' OR i_size = 'large'))
+                           AND (i_size = 'petite' OR i_size = 'petite'))
                        OR (i_category = 'Men'
                            AND (i_color = 'forest' OR i_color = 'ghost')
                            AND (i_units = 'Lb' OR i_units = 'Bundle')
                            AND (i_size = 'medium' OR i_size = 'extra large'))))
-       ) > 9
+       ) > 0
 ORDER BY i_product_name
 LIMIT 100;
