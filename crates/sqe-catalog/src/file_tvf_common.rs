@@ -111,6 +111,96 @@ pub fn enforce_tvf_path_policy(
         .map_err(|e| DataFusionError::Plan(format!("{fn_name}: {e}")))
 }
 
+/// Effective Azure credentials for a TVF connection, after applying the
+/// inline-credential carve-out exclusivity rule.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ResolvedAzureCredentials {
+    pub access_key: String,
+    pub sas_token: String,
+}
+
+/// Resolve the Azure credentials that [`build_azure_store`] will attach.
+///
+/// Carve-out invariant (E2E-identity item 1): the policy gate opens for a
+/// TVF call that carries its OWN Azure credential (`azure_access_key` or
+/// `azure_sas_token`). That bypass is only sound if the engine's static
+/// `[storage.azure]` credential is then NOT attached — otherwise a bogus
+/// SAS-only call flips the gate open while still reading with the engine's
+/// account key. So when the call supplies EITHER inline credential we use
+/// ONLY the inline values and suppress every engine fallback. With no
+/// inline credential, the engine config is used as before.
+pub fn resolve_azure_credentials(
+    args: &FileTvfArgs,
+    storage: &StorageConfig,
+) -> ResolvedAzureCredentials {
+    let inline_access = args.azure_access_key.as_deref().filter(|s| !s.is_empty());
+    let inline_sas = args.azure_sas_token.as_deref().filter(|s| !s.is_empty());
+    if inline_access.is_some() || inline_sas.is_some() {
+        return ResolvedAzureCredentials {
+            access_key: inline_access.unwrap_or_default().to_string(),
+            sas_token: inline_sas.unwrap_or_default().to_string(),
+        };
+    }
+    ResolvedAzureCredentials {
+        access_key: storage.azure_access_key.clone(),
+        sas_token: storage.azure_sas_token.clone(),
+    }
+}
+
+/// Effective GCS service-account credential for a TVF connection, after
+/// applying the inline-credential carve-out exclusivity rule.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ResolvedGcsCredentials {
+    /// Inline service-account JSON to attach, if any.
+    pub service_account_key: String,
+    /// Service-account key-file path to attach, if any.
+    pub service_account_path: String,
+}
+
+/// Resolve the GCS credential that [`build_gcs_store`] will attach.
+///
+/// Carve-out invariant (E2E-identity item 1): the gate opens for a TVF
+/// call that carries its own inline `gcs_service_account_key`. The bypass
+/// is only sound if the engine's static credential is then NOT attached,
+/// so an inline key must win over EVERYTHING — including the engine's
+/// `gcs_service_account_path` (which would otherwise read an arbitrary
+/// `gs://` path with the engine's identity while the attacker only had to
+/// supply a junk inline key to open the gate). Inline
+/// `gcs_service_account_path` is NOT a caller credential (it names a file
+/// on the engine's filesystem, see [`has_inline_credentials`]), so it does
+/// not trigger this exclusivity. With no inline key, engine config is used
+/// (path wins over the engine's inline key, matching prior precedence).
+pub fn resolve_gcs_credentials(
+    args: &FileTvfArgs,
+    storage: &StorageConfig,
+) -> ResolvedGcsCredentials {
+    if let Some(key_inline) = args
+        .gcs_service_account_key
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        return ResolvedGcsCredentials {
+            service_account_key: key_inline.to_string(),
+            service_account_path: String::new(),
+        };
+    }
+    let key_path = args
+        .gcs_service_account_path
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(storage.gcs_service_account_path.as_str());
+    if !key_path.is_empty() {
+        return ResolvedGcsCredentials {
+            service_account_key: String::new(),
+            service_account_path: key_path.to_string(),
+        };
+    }
+    ResolvedGcsCredentials {
+        service_account_key: storage.gcs_service_account_key.clone(),
+        service_account_path: String::new(),
+    }
+}
+
 /// Parse a `ScalarValue::Utf8` / `LargeUtf8` to `&str`.
 pub fn scalar_to_str(sv: &ScalarValue) -> Option<&str> {
     match sv {
@@ -671,31 +761,21 @@ pub fn build_azure_store(
         )));
     };
 
-    let access_key = args
-        .azure_access_key
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(storage.azure_access_key.as_str());
-
-    let sas_token = args
-        .azure_sas_token
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(storage.azure_sas_token.as_str());
+    let creds = resolve_azure_credentials(args, storage);
 
     let mut builder = MicrosoftAzureBuilder::new()
         .with_account(&account)
         .with_container_name(&container);
 
-    if !access_key.is_empty() {
-        builder = builder.with_access_key(access_key);
+    if !creds.access_key.is_empty() {
+        builder = builder.with_access_key(&creds.access_key);
     }
-    if !sas_token.is_empty() {
+    if !creds.sas_token.is_empty() {
         // The builder's `with_config` takes typed keys; a SAS token is a
         // bag of query parameters, fed verbatim.
         builder = builder.with_config(
             object_store::azure::AzureConfigKey::SasKey,
-            sas_token,
+            &creds.sas_token,
         );
     }
     if storage.azure_use_emulator {
@@ -761,22 +841,11 @@ pub fn build_gcs_store(
 
     let mut builder = GoogleCloudStorageBuilder::new().with_bucket_name(bucket);
 
-    let key_path = args
-        .gcs_service_account_path
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(storage.gcs_service_account_path.as_str());
-
-    let key_inline = args
-        .gcs_service_account_key
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(storage.gcs_service_account_key.as_str());
-
-    if !key_path.is_empty() {
-        builder = builder.with_service_account_path(key_path);
-    } else if !key_inline.is_empty() {
-        builder = builder.with_service_account_key(key_inline);
+    let creds = resolve_gcs_credentials(args, storage);
+    if !creds.service_account_path.is_empty() {
+        builder = builder.with_service_account_path(&creds.service_account_path);
+    } else if !creds.service_account_key.is_empty() {
+        builder = builder.with_service_account_key(&creds.service_account_key);
     }
     // When both are empty the builder will use Application Default
     // Credentials: env (`GOOGLE_APPLICATION_CREDENTIALS`), gcloud config,
@@ -1080,6 +1149,128 @@ mod tests {
         };
         let caller = TvfCaller::for_user("alice".to_string(), Vec::new());
         assert!(enforce_tvf_path_policy("read_csv", &args, &storage, &caller).is_ok());
+    }
+
+    #[test]
+    fn gcs_inline_key_suppresses_engine_path_fallback() {
+        // BITES the pre-fix bug: an attacker supplies a junk inline
+        // `gcs_service_account_key` (which opens the policy gate) WHILE the
+        // engine has `gcs_service_account_path` configured. The connection
+        // must use ONLY the inline key — never the engine's path.
+        let args = FileTvfArgs {
+            path: "gs://victim-bucket/x.csv".to_string(),
+            gcs_service_account_key: Some("{\"type\":\"service_account\"}".to_string()),
+            ..Default::default()
+        };
+        let storage = StorageConfig {
+            gcs_service_account_path: "/var/secrets/engine-sa.json".to_string(),
+            ..StorageConfig::default()
+        };
+        let creds = resolve_gcs_credentials(&args, &storage);
+        assert_eq!(
+            creds.service_account_path, "",
+            "engine GCS service-account PATH must NOT be used when the call \
+             carries an inline key (gate carve-out invariant)"
+        );
+        assert_eq!(
+            creds.service_account_key, "{\"type\":\"service_account\"}",
+            "only the caller's inline key may be attached"
+        );
+    }
+
+    #[test]
+    fn gcs_no_inline_key_falls_back_to_engine_path() {
+        // Legit engine-credentialed read (gate opened by prefix/role/trust,
+        // not by inline creds): engine path is used as before.
+        let args = FileTvfArgs {
+            path: "gs://staging/x.csv".to_string(),
+            ..Default::default()
+        };
+        let storage = StorageConfig {
+            gcs_service_account_path: "/var/secrets/engine-sa.json".to_string(),
+            ..StorageConfig::default()
+        };
+        let creds = resolve_gcs_credentials(&args, &storage);
+        assert_eq!(creds.service_account_path, "/var/secrets/engine-sa.json");
+        assert_eq!(creds.service_account_key, "");
+    }
+
+    #[test]
+    fn gcs_inline_path_does_not_suppress_engine_key() {
+        // An inline `gcs_service_account_path` is NOT a caller credential
+        // (it names a file on the engine's filesystem) and does NOT open the
+        // gate, so it must not trigger exclusivity — engine inline key still
+        // applies when no inline path is given. Here the call provides only
+        // an inline path; engine has an inline key. Path (caller) wins, as
+        // before — but crucially the call never opened the gate.
+        let args = FileTvfArgs {
+            path: "gs://b/x.csv".to_string(),
+            gcs_service_account_path: Some("/tmp/caller.json".to_string()),
+            ..Default::default()
+        };
+        let storage = StorageConfig {
+            gcs_service_account_key: "engine-inline-key".to_string(),
+            ..StorageConfig::default()
+        };
+        let creds = resolve_gcs_credentials(&args, &storage);
+        assert_eq!(creds.service_account_path, "/tmp/caller.json");
+        assert_eq!(creds.service_account_key, "");
+    }
+
+    #[test]
+    fn azure_sas_only_call_suppresses_engine_access_key() {
+        // BITES the pre-fix bug: a SAS-only call opens the policy gate while
+        // the engine `azure_access_key` would still fall back and be
+        // attached. The connection must carry ONLY the caller's SAS token.
+        let args = FileTvfArgs {
+            path: "azure://container/x.csv".to_string(),
+            azure_sas_token: Some("sv=2021-08-06&sig=junk".to_string()),
+            ..Default::default()
+        };
+        let storage = StorageConfig {
+            azure_access_key: "ENGINE-ACCOUNT-KEY".to_string(),
+            ..StorageConfig::default()
+        };
+        let creds = resolve_azure_credentials(&args, &storage);
+        assert_eq!(
+            creds.access_key, "",
+            "engine Azure access_key must NOT be attached when the call \
+             supplies an inline SAS token (gate carve-out invariant)"
+        );
+        assert_eq!(creds.sas_token, "sv=2021-08-06&sig=junk");
+    }
+
+    #[test]
+    fn azure_inline_access_key_suppresses_engine_sas() {
+        let args = FileTvfArgs {
+            path: "azure://c/x.csv".to_string(),
+            azure_access_key: Some("CALLER-KEY".to_string()),
+            ..Default::default()
+        };
+        let storage = StorageConfig {
+            azure_sas_token: "engine-sas".to_string(),
+            azure_access_key: "engine-key".to_string(),
+            ..StorageConfig::default()
+        };
+        let creds = resolve_azure_credentials(&args, &storage);
+        assert_eq!(creds.access_key, "CALLER-KEY");
+        assert_eq!(creds.sas_token, "", "engine SAS must not leak in");
+    }
+
+    #[test]
+    fn azure_no_inline_creds_falls_back_to_engine() {
+        let args = FileTvfArgs {
+            path: "azure://c/x.csv".to_string(),
+            ..Default::default()
+        };
+        let storage = StorageConfig {
+            azure_access_key: "engine-key".to_string(),
+            azure_sas_token: "engine-sas".to_string(),
+            ..StorageConfig::default()
+        };
+        let creds = resolve_azure_credentials(&args, &storage);
+        assert_eq!(creds.access_key, "engine-key");
+        assert_eq!(creds.sas_token, "engine-sas");
     }
 
     #[test]
