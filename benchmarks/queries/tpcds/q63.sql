@@ -13,11 +13,15 @@ FROM (
           1200, 1201, 1202, 1203, 1204, 1205,
           1206, 1207, 1208, 1209, 1210, 1211
       )
-      AND (i_category IN ('Books', 'Children', 'Electronics')
-           AND i_class  IN ('personal', 'portable', 'reference', 'self-help')
-           AND i_brand  IN ('scholaramalgamalg #14', 'scholaramalgamalg #7',
-                            'exportiunivamalg #9', 'scholaramalgamalg #9'))
-    GROUP BY i_manager_id
+      AND ((i_category IN ('Books', 'Children', 'Electronics')
+            AND i_class  IN ('personal', 'portable', 'reference', 'self-help')
+            AND i_brand  IN ('scholaramalgamalg #14', 'scholaramalgamalg #7',
+                             'exportiunivamalg #9', 'scholaramalgamalg #9'))
+           OR (i_category IN ('Women', 'Music', 'Men')
+               AND i_class  IN ('accessories', 'classical', 'fragrances', 'pants')
+               AND i_brand  IN ('amalgimporto #1', 'edu packscholar #1',
+                                'exportiimporto #1', 'importoamalg #1')))
+    GROUP BY i_manager_id, d_moy
 ) tmp1
 WHERE CASE WHEN avg_monthly_sales > 0
            THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales

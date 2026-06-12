@@ -6,19 +6,19 @@ WITH my_customers AS (
         SELECT cs_bill_customer_sk AS c_customer_sk, cs_item_sk
         FROM catalog_sales, date_dim
         WHERE cs_sold_date_sk = d_date_sk
-          AND d_year          = 2000
-          AND d_moy           = 7
+          AND d_year          = 1998
+          AND d_moy           = 12
         UNION ALL
         SELECT ws_bill_customer_sk AS c_customer_sk, ws_item_sk
         FROM web_sales, date_dim
         WHERE ws_sold_date_sk = d_date_sk
-          AND d_year          = 2000
-          AND d_moy           = 7
+          AND d_year          = 1998
+          AND d_moy           = 12
     ) cs_or_ws_sales,
     item, customer
     WHERE cs_item_sk        = i_item_sk
       AND i_category        = 'Women'
-      AND i_class           = 'accessories'
+      AND i_class           = 'maternity'
       AND customer.c_customer_sk = cs_or_ws_sales.c_customer_sk
 ),
 my_revenue AS (
@@ -33,12 +33,12 @@ my_revenue AS (
       AND d_month_seq       BETWEEN (
           SELECT DISTINCT d_month_seq + 1
           FROM date_dim
-          WHERE d_year = 2000 AND d_moy = 7
+          WHERE d_year = 1998 AND d_moy = 12
           LIMIT 1
       ) AND (
           SELECT DISTINCT d_month_seq + 3
           FROM date_dim
-          WHERE d_year = 2000 AND d_moy = 7
+          WHERE d_year = 1998 AND d_moy = 12
           LIMIT 1
       )
     GROUP BY c_customer_sk
