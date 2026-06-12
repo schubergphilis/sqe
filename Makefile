@@ -79,7 +79,7 @@ SQE_BUILD_ARGS := \
 
 .PHONY: help all dev release rustbook ebook ebook-pdf ebook-epub ebook-html \
         benchmark-charts test clippy fmt fmt-check clean clean-rust clean-rustbook \
-        clean-ebook clean-benchmark-charts clean-images check-tools \
+        clean-ebook clean-benchmark-charts clean-images check-tools maintain \
         build build-sqe sbom sbom-sqe sqe-config images \
         login buildx-builder push push-sqe
 
@@ -120,6 +120,8 @@ help:
 	@echo "    make clean-rustbook  Remove $(BOOK_OUT)"
 	@echo "    make clean-ebook  Remove $(EBOOK_DIR)/build"
 	@echo "    make clean-images Remove $(CONFIG_OUT_DIR) staged configs"
+	@echo "    make maintain     Incremental cache trim: cargo-sweep stale target/"
+	@echo "                      artifacts, prune docker build cache, sweep /tmp logs"
 	@echo ""
 	@echo "  Diagnostics:"
 	@echo "    make check-tools  Verify cargo / mdbook / pandoc / d2 / mmdc are present"
@@ -261,6 +263,9 @@ benchmark-charts:
 
 # ── Cleanup ───────────────────────────────────────────────────────────────
 clean: clean-rust clean-rustbook clean-ebook clean-benchmark-charts clean-images
+
+maintain:
+	@./scripts/dev-maintenance.sh
 
 clean-rust:
 	@echo "==> cargo clean"
