@@ -900,17 +900,43 @@ mod tests {
     /// V5 `WritableIcebergCatalog` write path: every operation goes
     /// through DataFusion's SQL surface, no out-of-band bootstrap.
     //
-    // #195: this was `#[ignore]`d after it timed out the `cargo-test` job at the
-    // 1h limit on a Linux runner. The original "SQLite reopen deadlock" hypothesis
-    // was never confirmed; the hang no longer reproduces on the current tree
-    // (verified green on the Linux runner via MR !284). Each phase is wrapped in a
-    // hard timeout so that if a regression ever reintroduces a stall, the test
-    // fails fast naming the offending phase instead of burning the 1h CI limit.
-    #[tokio::test]
-    async fn persistent_warehouse_survives_client_restart() {
+    // #195: this test wedged the 1h `cargo-test` job twice. The per-phase
+    // `tokio::time::timeout` guard added after the first wedge never fired on
+    // the second one (pipeline 1482960: no guard panic in the log, 35min
+    // stall): the hang blocks the current-thread runtime without yielding, so
+    // no timer can run. The only guard that works against a blocking wedge is
+    // an OS-level one: run the whole test on a sacrificial thread with its own
+    // runtime and join it with a hard deadline. On deadline the test fails in
+    // minutes naming the issue; the wedged thread stays detached and dies with
+    // the test process. The async per-phase bounds are kept inside the body so
+    // an async-visible stall still names its phase.
+    #[test]
+    fn persistent_warehouse_survives_client_restart() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rt.block_on(persistent_warehouse_body());
+            }));
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(300)) {
+            Ok(Ok(())) => {}
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Err(_) => panic!(
+                "#195 guard: test wedged for 300s in a blocking call the async \
+                 timeouts cannot see; failing fast instead of stalling the job"
+            ),
+        }
+    }
+
+    async fn persistent_warehouse_body() {
         use std::time::Duration;
         // Run `fut`, failing the test fast if it doesn't finish within `secs`,
-        // so a hang can never stall the whole `cargo-test` job for an hour.
+        // so an async-visible stall names its phase.
         async fn bounded<F: std::future::Future>(phase: &str, secs: u64, fut: F) -> F::Output {
             match tokio::time::timeout(Duration::from_secs(secs), fut).await {
                 Ok(v) => v,
