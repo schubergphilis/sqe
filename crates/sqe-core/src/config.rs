@@ -1241,6 +1241,17 @@ pub struct CatalogConfig {
     /// Only enable when you know all data files are physically sorted.
     #[serde(default)]
     pub trust_sort_order: bool,
+    /// Hide namespace NAMES the caller holds no grants in from metadata
+    /// listings (`SHOW SCHEMAS`, `information_schema.schemata`, Flight SQL
+    /// `GetDbSchemas`). REST/Polaris backend only: each listed namespace is
+    /// probed once per session-catalog build with the caller's bearer
+    /// (Polaris `LOAD_NAMESPACE_METADATA`); a 403 drops the name. Any other
+    /// probe failure fails OPEN and keeps the name — namespace contents stay
+    /// protected by the per-operation checks regardless. Single-identity
+    /// backends (Glue/HMS/JDBC/Hadoop) skip the filter: there is no
+    /// per-caller identity to scope the list to. Default: true.
+    #[serde(default = "default_true")]
+    pub namespace_visibility_filter: bool,
     /// Maximum file size in MB for the direct-read fast path.
     ///
     /// When all data files in a scan are smaller than this threshold, SQE reads
@@ -3190,6 +3201,7 @@ mod tests {
                 metadata_cache_ttl_secs: 30,
                 default_table_format_version: 2,
                 trust_sort_order: false,
+                namespace_visibility_filter: true,
                 small_file_threshold_mb: 3,
                 parquet_compression: "zstd".to_string(),
                 manifest_concurrency: 64,
@@ -3599,6 +3611,7 @@ mod tests {
                 metadata_cache_ttl_secs: 30,
                 default_table_format_version: 2,
                 trust_sort_order: false,
+                namespace_visibility_filter: true,
                 small_file_threshold_mb: 3,
                 parquet_compression: "zstd".to_string(),
                 manifest_concurrency: 64,
@@ -3628,6 +3641,7 @@ mod tests {
                     metadata_cache_ttl_secs: 30,
                     default_table_format_version: 2,
                     trust_sort_order: false,
+                namespace_visibility_filter: true,
                     small_file_threshold_mb: 3,
                     parquet_compression: "zstd".to_string(),
                     manifest_concurrency: 64,
@@ -3664,6 +3678,7 @@ mod tests {
                 metadata_cache_ttl_secs: 30,
                 default_table_format_version: 2,
                 trust_sort_order: false,
+                namespace_visibility_filter: true,
                 small_file_threshold_mb: 3,
                 parquet_compression: "zstd".to_string(),
                 manifest_concurrency: 64,

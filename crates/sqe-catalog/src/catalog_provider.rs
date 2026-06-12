@@ -2,6 +2,8 @@ use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
+use futures::StreamExt;
+use iceberg::NamespaceIdent;
 use tracing::debug;
 
 use sqe_core::config::StorageConfig;
@@ -10,6 +12,36 @@ use sqe_policy::PolicyStore;
 
 use crate::rest_catalog::SessionCatalog;
 use crate::schema_provider::SqeSchemaProvider;
+
+/// Maximum in-flight namespace visibility probes per provider build. A
+/// 30-namespace catalog costs ~4 round-trip waves, paid once per session
+/// catalog construction, never per query.
+const NAMESPACE_PROBE_CONCURRENCY: usize = 8;
+
+/// Probe-filter a namespace list with bounded concurrency, preserving the
+/// input order. `probe` answers "may this caller see the namespace?"; the
+/// fail-open decision for indeterminate probe errors lives inside the
+/// probe (see `SessionCatalog::namespace_visible`), so this function only
+/// keeps or drops on the boolean.
+pub(crate) async fn filter_visible_namespaces<F, Fut>(
+    namespaces: Vec<NamespaceIdent>,
+    concurrency: usize,
+    probe: F,
+) -> Vec<NamespaceIdent>
+where
+    F: Fn(NamespaceIdent) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    futures::stream::iter(namespaces)
+        .map(|ns| {
+            let visible = probe(ns.clone());
+            async move { (ns, visible.await) }
+        })
+        .buffered(concurrency.max(1))
+        .filter_map(|(ns, visible)| async move { visible.then_some(ns) })
+        .collect()
+        .await
+}
 
 /// DataFusion `CatalogProvider` that bridges Iceberg namespaces to DataFusion schemas.
 ///
@@ -73,6 +105,9 @@ impl SqeCatalogProvider {
     ///
     /// When `policy_store` and `session_user` are provided, `information_schema.columns`
     /// will filter out columns restricted by the policy engine.
+    ///
+    /// Namespace visibility filtering defaults ON; use
+    /// [`Self::try_new_with_options`] to control it from config.
     pub async fn try_new_with_policy(
         session_catalog: Arc<SessionCatalog>,
         storage_config: StorageConfig,
@@ -80,7 +115,57 @@ impl SqeCatalogProvider {
         policy_store: Option<Arc<dyn PolicyStore>>,
         session_user: Option<SessionUser>,
     ) -> sqe_core::Result<Self> {
-        let namespaces = session_catalog.list_namespaces().await?;
+        Self::try_new_with_options(
+            session_catalog,
+            storage_config,
+            warehouse,
+            policy_store,
+            session_user,
+            true,
+        )
+        .await
+    }
+
+    /// Full-option constructor.
+    ///
+    /// When `namespace_visibility_filter` is true and the backend is
+    /// REST/Polaris, each listed namespace is probed with the session's
+    /// bearer (`get_namespace` → Polaris `LOAD_NAMESPACE_METADATA`) and
+    /// names the caller is forbidden to load are dropped from the cached
+    /// list. Every metadata surface — `SHOW SCHEMAS`,
+    /// `information_schema.schemata`, Flight SQL `GetDbSchemas` — reads
+    /// that one list, so they can never disagree. Probe failures other
+    /// than 403 fail open (the name stays; contents remain protected by
+    /// the per-operation checks). Single-identity backends skip the
+    /// probes entirely: there is no caller to scope the list to.
+    pub async fn try_new_with_options(
+        session_catalog: Arc<SessionCatalog>,
+        storage_config: StorageConfig,
+        warehouse: String,
+        policy_store: Option<Arc<dyn PolicyStore>>,
+        session_user: Option<SessionUser>,
+        namespace_visibility_filter: bool,
+    ) -> sqe_core::Result<Self> {
+        let mut namespaces = session_catalog.list_namespaces().await?;
+
+        if namespace_visibility_filter && session_catalog.is_rest_backend() {
+            let listed = namespaces.len();
+            let catalog = &session_catalog;
+            namespaces = filter_visible_namespaces(
+                namespaces,
+                NAMESPACE_PROBE_CONCURRENCY,
+                |ns| async move { catalog.namespace_visible(&ns).await },
+            )
+            .await;
+            if namespaces.len() < listed {
+                debug!(
+                    listed,
+                    visible = namespaces.len(),
+                    "Namespace visibility filter hid ungranted namespace names"
+                );
+            }
+        }
+
         let cached_namespaces: Vec<String> = namespaces
             .iter()
             .map(|ns| ns.as_ref().iter().map(|s| s.as_str()).collect::<Vec<_>>().join("."))
@@ -191,7 +276,11 @@ impl CatalogProvider for SqeCatalogProvider {
                     self.warehouse.clone(),
                     self.policy_store.clone(),
                     self.session_user.clone(),
-                ),
+                )
+                // schemata/tables/columns must derive from the same
+                // (visibility-filtered) list SHOW SCHEMAS serves, not a
+                // second unfiltered listNamespaces.
+                .with_cached_namespaces(self.cached_namespaces.clone()),
             ));
         }
 
@@ -219,5 +308,55 @@ impl CatalogProvider for SqeCatalogProvider {
 
         Some(Arc::new(provider))
 
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn ns(name: &str) -> NamespaceIdent {
+        NamespaceIdent::new(name.to_string())
+    }
+
+    /// Mixed allow/deny probe results: only the allowed names survive, in
+    /// the original listing order.
+    #[tokio::test]
+    async fn filter_keeps_allowed_names_in_order() {
+        let input = vec![ns("public"), ns("limited"), ns("shared"), ns("secret")];
+        let out = filter_visible_namespaces(input, 8, |n| async move {
+            let name = n.as_ref().join(".");
+            name != "limited" && name != "secret"
+        })
+        .await;
+        let names: Vec<String> = out.iter().map(|n| n.as_ref().join(".")).collect();
+        assert_eq!(names, vec!["public", "shared"]);
+    }
+
+    /// All probes denied: a zero-grant caller gets an empty list (the
+    /// provider appends information_schema after filtering, never probed).
+    #[tokio::test]
+    async fn filter_all_denied_yields_empty() {
+        let input = vec![ns("a"), ns("b")];
+        let out = filter_visible_namespaces(input, 8, |_| async move { false }).await;
+        assert!(out.is_empty());
+    }
+
+    /// Every namespace gets exactly one probe, even with a concurrency cap
+    /// far below the list length, and a cap of 0 is clamped rather than
+    /// wedging the stream.
+    #[tokio::test]
+    async fn filter_probes_each_namespace_once_under_cap() {
+        let probes = AtomicUsize::new(0);
+        let input: Vec<NamespaceIdent> =
+            (0..20).map(|i| ns(&format!("ns{i}"))).collect();
+        let out = filter_visible_namespaces(input, 0, |_| {
+            probes.fetch_add(1, Ordering::SeqCst);
+            async move { true }
+        })
+        .await;
+        assert_eq!(out.len(), 20);
+        assert_eq!(probes.load(Ordering::SeqCst), 20);
     }
 }

@@ -114,6 +114,13 @@ metadata_cache_ttl_secs = 30
 default_table_format_version = 2  # 2 (default) or 3 for Iceberg v3 tables
 # trust_sort_order = false  # default: only partition columns declared as pre-sorted (safe)
 # trust_sort_order = true   # trust ALL Iceberg sort order columns (faster but risky for mixed-writer tables)
+# Hide namespace NAMES the caller has no grants in from SHOW SCHEMAS,
+# information_schema.schemata, and Flight SQL GetDbSchemas. REST/Polaris
+# backend only; probes each listed namespace once per session with the
+# caller's bearer (LOAD_NAMESPACE_METADATA) and drops names on 403.
+# Fails open on any other probe error. Set false to restore unfiltered
+# listings.
+# namespace_visibility_filter = true
 
 [storage]
 s3_endpoint = "http://s3:9000"
