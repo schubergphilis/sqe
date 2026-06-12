@@ -26,6 +26,9 @@ client_id = "root"
 client_secret = "s3cr3t"
 
 [query]
+# Passive per-operator profiles for every query (perf investigation;
+# cheap enough to leave on in the test stack).
+query_profile = "all"
 # Cap result rows streamed back to the client. The bench occasionally
 # hits pathological queries (e.g. TPC-E trade_result at SF1 returns 20M+
 # rows from a fact-to-dimension cross product because the generator's
