@@ -307,6 +307,58 @@ fn call_center_schema() -> SchemaRef {
 }
 
 // ---------------------------------------------------------------------------
+// Row counts
+//
+// Every function must reproduce BOTH official dsdgen reference points,
+// sf0.01 and sf1 (diffed by scripts/validate-generator-tpcds.py). The spec
+// does NOT scale all tables linearly: some are fixed, some are floored,
+// some derive from other tables. Shape and the two reference counts are
+// stated per function.
+// ---------------------------------------------------------------------------
+
+// Linear fact tables: official sf0.01 / sf1 counts in the trailing comment.
+// Returns tables are sampled per-sale in dsdgen, so small-scale counts are
+// approximate (within the harness 15% row-ratio tolerance).
+fn store_sales_rows(sf: f64) -> usize { super::scaled(sf, 2_880_000.0) }     // 28,810 / 2,880,404
+fn store_returns_rows(sf: f64) -> usize { super::scaled(sf, 287_999.0) }     // 2,810 / 287,867
+fn catalog_sales_rows(sf: f64) -> usize { super::scaled(sf, 1_441_548.0) }   // 14,313 / 1,441,548
+fn catalog_returns_rows(sf: f64) -> usize { super::scaled(sf, 144_067.0) }   // 1,358 / 144,067
+fn web_sales_rows(sf: f64) -> usize { super::scaled(sf, 719_384.0) }         // 7,212 / 719,384
+fn web_returns_rows(sf: f64) -> usize { super::scaled(sf, 71_763.0) }        // 679 / 71,654
+
+// Derived: 261 weekly snapshots covering half the item x warehouse grid.
+// 23,490 / 11,745,000.
+fn inventory_rows(sf: f64) -> usize { 261 * item_rows(sf) * warehouse_rows(sf) / 2 }
+
+// Linear dimensions. 180 / 18,000 etc.
+fn item_rows(sf: f64) -> usize { super::scaled(sf, 18_000.0) }               // 180 / 18,000
+fn customer_rows(sf: f64) -> usize { super::scaled(sf, 100_000.0) }          // 1,000 / 100,000
+fn customer_address_rows(sf: f64) -> usize { super::scaled(sf, 50_000.0) }   // 500 / 50,000
+
+// Linear below sf1, fixed at 1,920,800 from sf1 up. 19,208 / 1,920,800.
+fn customer_demographics_rows(sf: f64) -> usize {
+    (sf * 1_920_800.0).clamp(1.0, 1_920_800.0) as usize
+}
+
+// Linear with a floor of 1 row. Official sf0.01 / sf1 counts:
+fn store_rows(sf: f64) -> usize { super::scaled(sf, 12.0) }                  // 1 / 12
+fn web_site_rows(sf: f64) -> usize { super::scaled(sf, 30.0) }               // 1 / 30
+fn web_page_rows(sf: f64) -> usize { super::scaled(sf, 60.0) }               // 1 / 60
+fn warehouse_rows(sf: f64) -> usize { super::scaled(sf, 5.0) }               // 1 / 5
+fn promotion_rows(sf: f64) -> usize { super::scaled(sf, 300.0) }             // 3 / 300
+fn reason_rows(sf: f64) -> usize { super::scaled(sf, 35.0) }                 // 1 / 35
+fn call_center_rows(sf: f64) -> usize { super::scaled(sf, 6.0) }             // 1 / 6
+
+// Fixed at every scale (identical at sf0.01 and sf1).
+fn date_dim_rows(_sf: f64) -> usize { 73_049 }
+fn time_dim_rows(_sf: f64) -> usize { 86_400 }
+fn household_demographics_rows(_sf: f64) -> usize { 7_200 }
+fn income_band_rows(_sf: f64) -> usize { 20 }
+fn ship_mode_rows(_sf: f64) -> usize { 20 }
+// catalog_page only steps up above sf1; both reference points are 11,718.
+fn catalog_page_rows(_sf: f64) -> usize { 11_718 }
+
+// ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
 
@@ -336,6 +388,24 @@ fn random_date(rng: &mut StdRng) -> i32 {
 /// value: writing dates here is what NULLed every *_date_sk column.
 fn random_date_sk(rng: &mut StdRng) -> i32 {
     rng.gen_range(1..=DS_DATE_RANGE)
+}
+
+/// dsdgen emits SCD-2 dimensions (item, store, call_center, web_site,
+/// web_page) in a repeating 6-row cycle: a 1-revision entity, a 2-revision
+/// entity, a 3-revision entity. The last revision of each entity is the
+/// current row and must have a NULL rec_end_date, so cycle positions 0, 2
+/// and 5 are current: exactly 50% of rows at full cycles, and the single
+/// row of a 1-row table at sf0.01.
+fn scd2_is_current(row: usize) -> bool {
+    matches!(row % 6, 0 | 2 | 5)
+}
+
+fn scd2_rec_end_date(row: usize, rng: &mut StdRng) -> ColVal {
+    if scd2_is_current(row) {
+        ColVal::Date(None)
+    } else {
+        ColVal::Date(Some(random_date(rng)))
+    }
 }
 
 fn random_id(rng: &mut StdRng) -> String {
@@ -459,32 +529,60 @@ struct Basket {
     quantities: Vec<i32>,
 }
 
+/// Scale-dependent FK domains shared by the basket-based sales and returns
+/// generators. Both sides must derive identical dims from the same scale so
+/// recomputed baskets stay byte-for-byte identical. Ranges are inclusive of
+/// the dimension's last surrogate key; at small scales several dims collapse
+/// to a single row and an exclusive `1..1` range would panic.
+#[derive(Clone, Copy)]
+struct FkDims {
+    items: i32,
+    customers: i32,
+    cdemos: i32,
+    hdemos: i32,
+    addrs: i32,
+    promos: i32,
+}
+
+impl FkDims {
+    fn at(scale: f64) -> Self {
+        Self {
+            items: item_rows(scale) as i32,
+            customers: customer_rows(scale) as i32,
+            cdemos: customer_demographics_rows(scale) as i32,
+            hdemos: household_demographics_rows(scale) as i32,
+            addrs: customer_address_rows(scale) as i32,
+            promos: promotion_rows(scale) as i32,
+        }
+    }
+}
+
 fn nullable_fk(rng: &mut StdRng, upper: i32) -> Option<i32> {
     if rng.gen_bool(FK_NULL_RATE) {
         None
     } else {
-        Some(rng.gen_range(1..upper))
+        Some(rng.gen_range(1..=upper))
     }
 }
 
 /// Recompute the basket for `ticket` from scratch. Must stay byte-for-byte
 /// deterministic: the sales generator and the returns generator each call
 /// this independently and rely on identical output.
-fn basket(salt: u64, ticket: i32, channel_upper: i32) -> Basket {
+fn basket(salt: u64, ticket: i32, channel_upper: i32, dims: FkDims) -> Basket {
     let mut rng = StdRng::seed_from_u64(salt ^ ticket as u64);
     let lines = rng.gen_range(1..=MAX_BASKET_LINES);
     let date_sk = rng.gen_range(1..=DS_DATE_RANGE);
-    let customer_sk = nullable_fk(&mut rng, 100_000);
-    let cdemo_sk = nullable_fk(&mut rng, 1_920_800);
-    let hdemo_sk = nullable_fk(&mut rng, 7200);
-    let addr_sk = nullable_fk(&mut rng, 50_000);
-    let ship_customer_sk = nullable_fk(&mut rng, 100_000);
-    let ship_cdemo_sk = nullable_fk(&mut rng, 1_920_800);
-    let ship_hdemo_sk = nullable_fk(&mut rng, 7200);
-    let ship_addr_sk = nullable_fk(&mut rng, 50_000);
-    let channel_sk = rng.gen_range(1..channel_upper);
-    let promo_sk = nullable_fk(&mut rng, 300);
-    let items: Vec<i32> = (0..lines).map(|_| rng.gen_range(1..18_000)).collect();
+    let customer_sk = nullable_fk(&mut rng, dims.customers);
+    let cdemo_sk = nullable_fk(&mut rng, dims.cdemos);
+    let hdemo_sk = nullable_fk(&mut rng, dims.hdemos);
+    let addr_sk = nullable_fk(&mut rng, dims.addrs);
+    let ship_customer_sk = nullable_fk(&mut rng, dims.customers);
+    let ship_cdemo_sk = nullable_fk(&mut rng, dims.cdemos);
+    let ship_hdemo_sk = nullable_fk(&mut rng, dims.hdemos);
+    let ship_addr_sk = nullable_fk(&mut rng, dims.addrs);
+    let channel_sk = rng.gen_range(1..=channel_upper);
+    let promo_sk = nullable_fk(&mut rng, dims.promos);
+    let items: Vec<i32> = (0..lines).map(|_| rng.gen_range(1..=dims.items)).collect();
     let quantities: Vec<i32> = (0..lines).map(|_| rng.gen_range(1..100)).collect();
     Basket {
         lines, date_sk, customer_sk, cdemo_sk, hdemo_sk, addr_sk,
@@ -622,8 +720,11 @@ macro_rules! d { ($x:expr) => { ColVal::Date(Some($x)) }; }
 // ---------------------------------------------------------------------------
 
 fn generate_store_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = super::scaled(scale, 2_880_000.0);
-    let total = total.max(1);
+    let total = store_sales_rows(scale);
+    // FK ranges must track dimension cardinality at this scale;
+    // sf1-sized ranges empty out dimension joins at small scales.
+    let dims = FkDims::at(scale);
+    let stores = store_rows(scale) as i32;
     // Walk tickets in order, emitting all lines of a basket consecutively.
     // The row indices arrive strictly sequentially from generate_batches, so
     // a small amount of closure state maps row -> (ticket, line) without
@@ -638,7 +739,7 @@ fn generate_store_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         };
         if exhausted {
             ticket += 1;
-            cur = Some(basket(STORE_TICKET_SALT, ticket, 12));
+            cur = Some(basket(STORE_TICKET_SALT, ticket, stores, dims));
             line = 0;
         }
         let b = cur.as_ref().expect("basket set above");
@@ -664,15 +765,19 @@ fn generate_store_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_store_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = super::scaled(scale, 287_999.0);
-    let total = total.max(1);
+    let total = store_returns_rows(scale);
+    // FK ranges must track dimension cardinality at this scale;
+    // sf1-sized ranges empty out dimension joins at small scales.
+    let dims = FkDims::at(scale);
+    let stores = store_rows(scale) as i32;
+    let reasons = reason_rows(scale) as i32;
     let max_ticket = returnable_tickets(scale, 2_880_000.0);
     generate_batches(store_returns_schema(), total, seed_for_table("store_returns"), move |_row, rng| {
         // Pick a fully-emitted sales ticket, recompute its basket, and return
         // one of its actual line items so (sr_ticket_number, sr_item_sk)
         // joins store_sales (q01/q17/q24/q25/q29/q50/q64/q85).
         let ticket = rng.gen_range(1..=max_ticket);
-        let b = basket(STORE_TICKET_SALT, ticket, 12);
+        let b = basket(STORE_TICKET_SALT, ticket, stores, dims);
         let line = rng.gen_range(0..b.lines);
         let item_sk = b.items[line];
         let qty = rng.gen_range(1..=b.quantities[line]);
@@ -684,7 +789,7 @@ fn generate_store_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             i!(item_sk), ColVal::I32(b.customer_sk),
             ColVal::I32(b.cdemo_sk), ColVal::I32(b.hdemo_sk),
             ColVal::I32(b.addr_sk), i!(b.channel_sk),
-            i!(rng.gen_range(1..35i32)), i!(ticket), i!(qty),
+            i!(rng.gen_range(1..=reasons)), i!(ticket), i!(qty),
             f!(amt), f!(tax), f!(amt + tax), f!(amt * 0.02), f!(amt * 0.05),
             f!(amt * 0.6), f!(amt * 0.2), f!(amt * 0.2), f!(amt * 0.1),
         ]
@@ -692,8 +797,12 @@ fn generate_store_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_catalog_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = super::scaled(scale, 1_441_548.0);
-    let total = total.max(1);
+    let total = catalog_sales_rows(scale);
+    // FK ranges must track dimension cardinality at this scale;
+    // sf1-sized ranges empty out dimension joins at small scales.
+    let dims = FkDims::at(scale);
+    let ccs = call_center_rows(scale) as i32;
+    let whs = warehouse_rows(scale) as i32;
     let mut order: i32 = 0;
     let mut line: usize = 0;
     let mut cur: Option<Basket> = None;
@@ -704,7 +813,7 @@ fn generate_catalog_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         };
         if exhausted {
             order += 1;
-            cur = Some(basket(CATALOG_ORDER_SALT, order, 6));
+            cur = Some(basket(CATALOG_ORDER_SALT, order, ccs, dims));
             line = 0;
         }
         let b = cur.as_ref().expect("basket set above");
@@ -724,7 +833,7 @@ fn generate_catalog_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             ColVal::I32(b.ship_customer_sk), ColVal::I32(b.ship_cdemo_sk),
             ColVal::I32(b.ship_hdemo_sk), ColVal::I32(b.ship_addr_sk),
             i!(b.channel_sk), i!(rng.gen_range(1..11_718i32)),
-            i!(rng.gen_range(1..20i32)), i!(rng.gen_range(1..5i32)),
+            i!(rng.gen_range(1..20i32)), i!(rng.gen_range(1..=whs)),
             i!(item_sk), ColVal::I32(b.promo_sk),
             i!(order), i!(qty), f!(wc), f!(lp), f!(sp),
             f!(0.0), f!(sp * qty as f64), f!(wc * qty as f64), f!(lp * qty as f64),
@@ -736,12 +845,17 @@ fn generate_catalog_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_catalog_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = super::scaled(scale, 144_067.0);
-    let total = total.max(1);
+    let total = catalog_returns_rows(scale);
+    // FK ranges must track dimension cardinality at this scale;
+    // sf1-sized ranges empty out dimension joins at small scales.
+    let dims = FkDims::at(scale);
+    let ccs = call_center_rows(scale) as i32;
+    let whs = warehouse_rows(scale) as i32;
+    let reasons = reason_rows(scale) as i32;
     let max_order = returnable_tickets(scale, 1_441_548.0);
     generate_batches(catalog_returns_schema(), total, seed_for_table("catalog_returns"), move |_row, rng| {
         let order = rng.gen_range(1..=max_order);
-        let b = basket(CATALOG_ORDER_SALT, order, 6);
+        let b = basket(CATALOG_ORDER_SALT, order, ccs, dims);
         let line = rng.gen_range(0..b.lines);
         let item_sk = b.items[line];
         let qty = rng.gen_range(1..=b.quantities[line]);
@@ -756,7 +870,7 @@ fn generate_catalog_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             ColVal::I32(b.ship_cdemo_sk), ColVal::I32(b.ship_hdemo_sk),
             ColVal::I32(b.ship_addr_sk), i!(b.channel_sk),
             i!(rng.gen_range(1..11_718i32)), i!(rng.gen_range(1..20i32)),
-            i!(rng.gen_range(1..5i32)), i!(rng.gen_range(1..35i32)),
+            i!(rng.gen_range(1..=whs)), i!(rng.gen_range(1..=reasons)),
             i!(order), i!(qty),
             f!(amt), f!(tax), f!(amt + tax), f!(amt * 0.02), f!(amt * 0.05),
             f!(amt * 0.6), f!(amt * 0.2), f!(amt * 0.2), f!(amt * 0.1),
@@ -765,8 +879,13 @@ fn generate_catalog_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_web_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = super::scaled(scale, 719_384.0);
-    let total = total.max(1);
+    let total = web_sales_rows(scale);
+    // FK ranges must track dimension cardinality at this scale;
+    // sf1-sized ranges empty out dimension joins at small scales.
+    let dims = FkDims::at(scale);
+    let wpages = web_page_rows(scale) as i32;
+    let wsites = web_site_rows(scale) as i32;
+    let whs = warehouse_rows(scale) as i32;
     let mut order: i32 = 0;
     let mut line: usize = 0;
     let mut cur: Option<Basket> = None;
@@ -777,7 +896,7 @@ fn generate_web_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         };
         if exhausted {
             order += 1;
-            cur = Some(basket(WEB_ORDER_SALT, order, 30));
+            cur = Some(basket(WEB_ORDER_SALT, order, wsites, dims));
             line = 0;
         }
         let b = cur.as_ref().expect("basket set above");
@@ -796,9 +915,9 @@ fn generate_web_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             ColVal::I32(b.cdemo_sk), ColVal::I32(b.hdemo_sk),
             ColVal::I32(b.addr_sk), ColVal::I32(b.ship_customer_sk),
             ColVal::I32(b.ship_cdemo_sk), ColVal::I32(b.ship_hdemo_sk),
-            ColVal::I32(b.ship_addr_sk), i!(rng.gen_range(1..60i32)),
+            ColVal::I32(b.ship_addr_sk), i!(rng.gen_range(1..=wpages)),
             i!(b.channel_sk), i!(rng.gen_range(1..20i32)),
-            i!(rng.gen_range(1..5i32)), ColVal::I32(b.promo_sk),
+            i!(rng.gen_range(1..=whs)), ColVal::I32(b.promo_sk),
             i!(order), i!(qty), f!(wc), f!(lp), f!(sp),
             f!(0.0), f!(sp * qty as f64), f!(wc * qty as f64), f!(lp * qty as f64),
             f!(tax), f!(0.0), f!(ship), f!(sp * qty as f64),
@@ -809,12 +928,17 @@ fn generate_web_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_web_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = super::scaled(scale, 71_763.0);
-    let total = total.max(1);
+    let total = web_returns_rows(scale);
+    // FK ranges must track dimension cardinality at this scale;
+    // sf1-sized ranges empty out dimension joins at small scales.
+    let dims = FkDims::at(scale);
+    let wpages = web_page_rows(scale) as i32;
+    let wsites = web_site_rows(scale) as i32;
+    let reasons = reason_rows(scale) as i32;
     let max_order = returnable_tickets(scale, 719_384.0);
     generate_batches(web_returns_schema(), total, seed_for_table("web_returns"), move |_row, rng| {
         let order = rng.gen_range(1..=max_order);
-        let b = basket(WEB_ORDER_SALT, order, 30);
+        let b = basket(WEB_ORDER_SALT, order, wsites, dims);
         let line = rng.gen_range(0..b.lines);
         let item_sk = b.items[line];
         let qty = rng.gen_range(1..=b.quantities[line]);
@@ -827,8 +951,8 @@ fn generate_web_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             ColVal::I32(b.cdemo_sk), ColVal::I32(b.hdemo_sk),
             ColVal::I32(b.addr_sk), ColVal::I32(b.ship_customer_sk),
             ColVal::I32(b.ship_cdemo_sk), ColVal::I32(b.ship_hdemo_sk),
-            ColVal::I32(b.ship_addr_sk), i!(rng.gen_range(1..60i32)),
-            i!(rng.gen_range(1..35i32)), i!(order), i!(qty),
+            ColVal::I32(b.ship_addr_sk), i!(rng.gen_range(1..=wpages)),
+            i!(rng.gen_range(1..=reasons)), i!(order), i!(qty),
             f!(amt), f!(tax), f!(amt + tax), f!(amt * 0.02), f!(amt * 0.05),
             f!(amt * 0.6), f!(amt * 0.2), f!(amt * 0.2), f!(amt * 0.1),
         ]
@@ -836,13 +960,16 @@ fn generate_web_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_inventory(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = super::scaled(scale, 11_745_000.0);
-    let total = total.max(1);
+    let total = inventory_rows(scale);
+    // FK ranges must track dimension cardinality at this scale;
+    // sf1-sized ranges empty out dimension joins at small scales.
+    let items = item_rows(scale) as i32;
+    let whs = warehouse_rows(scale) as i32;
     generate_batches(inventory_schema(), total, seed_for_table("inventory"), |_row, rng| {
         vec![
             i!(random_date_sk(rng)),
-            i!(rng.gen_range(1..18_000i32)),
-            i!(rng.gen_range(1..5i32)),
+            i!(rng.gen_range(1..=items)),
+            i!(rng.gen_range(1..=whs)),
             i!(rng.gen_range(0..1000i32)),
         ]
     })
@@ -904,8 +1031,7 @@ fn generate_time_dim() -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_item(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = super::scaled(scale, 18_000.0);
-    let total = total.max(1);
+    let total = item_rows(scale);
     generate_batches(item_schema(), total, seed_for_table("item"), |row, rng| {
         let sk = (row + 1) as i32;
         let price = rng.gen_range(100..10_000i32) as f64 / 100.0;
@@ -915,7 +1041,7 @@ fn generate_item(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         // unique random name per item kept that count at zero.
         let manufact_id = rng.gen_range(1..1000i32);
         vec![
-            i!(sk), s!(random_id(rng)), d!(random_date(rng)), d!(random_date(rng)),
+            i!(sk), s!(random_id(rng)), d!(random_date(rng)), scd2_rec_end_date(row, rng),
             s!(random_name(rng)), f!(price), f!(wc),
             i!(rng.gen_range(1..1000i32)), s!(random_str(rng, BRANDS)),
             i!(rng.gen_range(1..16i32)), s!(random_str(rng, ITEM_CLASSES)),
@@ -930,14 +1056,17 @@ fn generate_item(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = super::scaled(scale, 100_000.0);
-    let total = total.max(1);
+    let total = customer_rows(scale);
+    // FK ranges must track dimension cardinality at this scale;
+    // sf1-sized ranges empty out dimension joins at small scales.
+    let cdemos = customer_demographics_rows(scale) as i32;
+    let addrs = customer_address_rows(scale) as i32;
     generate_batches(customer_schema(), total, seed_for_table("customer"), |row, rng| {
         let sk = (row + 1) as i32;
         vec![
             i!(sk), s!(random_id(rng)),
-            i!(rng.gen_range(1..1_920_800i32)), i!(rng.gen_range(1..7200i32)),
-            i!(rng.gen_range(1..50_000i32)), i!(random_date_sk(rng)), i!(random_date_sk(rng)),
+            i!(rng.gen_range(1..=cdemos)), i!(rng.gen_range(1..7200i32)),
+            i!(rng.gen_range(1..=addrs)), i!(random_date_sk(rng)), i!(random_date_sk(rng)),
             s!(random_str(rng, SALUTATIONS)), s!(random_name(rng)), s!(random_name(rng)),
             s!(random_str(rng, YN)), i!(rng.gen_range(1..28i32)),
             i!(rng.gen_range(1..12i32)), i!(rng.gen_range(1920..2000i32)),
@@ -949,8 +1078,7 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_customer_address(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = super::scaled(scale, 50_000.0);
-    let total = total.max(1);
+    let total = customer_address_rows(scale);
     generate_batches(customer_address_schema(), total, seed_for_table("customer_address"), |row, rng| {
         let sk = (row + 1) as i32;
         vec![
@@ -965,8 +1093,9 @@ fn generate_customer_address(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     })
 }
 
-fn generate_customer_demographics() -> (SchemaRef, Vec<RecordBatch>) {
-    generate_batches(customer_demographics_schema(), 1_920_800, seed_for_table("customer_demographics"), |row, rng| {
+fn generate_customer_demographics(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+    let total = customer_demographics_rows(scale);
+    generate_batches(customer_demographics_schema(), total, seed_for_table("customer_demographics"), |row, rng| {
         vec![
             i!((row + 1) as i32), s!(random_str(rng, GENDERS)),
             s!(random_str(rng, MARITAL)), s!(random_str(rng, EDUCATION)),
@@ -988,12 +1117,19 @@ fn generate_household_demographics() -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_store(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = (scale * 12.0).max(1.0) as usize;
+    let total = store_rows(scale);
     generate_batches(store_schema(), total, seed_for_table("store"), |row, rng| {
         let sk = (row + 1) as i32;
+        // Official sf1: s_closed_date_sk is set on 3 of every 12 rows
+        // (positions 0, 3, 4), NULL elsewhere; the single sf0.01 row has one.
+        let closed = if matches!(row % 12, 0 | 3 | 4) {
+            i!(rng.gen_range(1..73049i32))
+        } else {
+            ColVal::I32(None)
+        };
         vec![
-            i!(sk), s!(random_id(rng)), d!(random_date(rng)), d!(random_date(rng)),
-            i!(rng.gen_range(1..73049i32)), s!(random_name(rng)),
+            i!(sk), s!(random_id(rng)), d!(random_date(rng)), scd2_rec_end_date(row, rng),
+            closed, s!(random_name(rng)),
             i!(rng.gen_range(10..500i32)), i!(rng.gen_range(1000..100_000i32)),
             s!(random_str(rng, CC_HOURS)), s!(random_name(rng)),
             i!(rng.gen_range(1..10i32)), s!("Unknown"), s!(random_name(rng)),
@@ -1010,7 +1146,7 @@ fn generate_store(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_catalog_page(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = (scale * 11_718.0).max(1.0) as usize;
+    let total = catalog_page_rows(scale);
     generate_batches(catalog_page_schema(), total, seed_for_table("catalog_page"), |row, rng| {
         let sk = (row + 1) as i32;
         vec![
@@ -1023,13 +1159,20 @@ fn generate_catalog_page(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_web_site(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = (scale * 30.0).max(1.0) as usize;
+    let total = web_site_rows(scale);
     generate_batches(web_site_schema(), total, seed_for_table("web_site"), |row, rng| {
         let sk = (row + 1) as i32;
+        // Official: web_close_date_sk is NULL only on single-revision
+        // entities (cycle position 0): 100% NULL at sf0.01, 5/30 at sf1.
+        let close = if row % 6 == 0 {
+            ColVal::I32(None)
+        } else {
+            i!(rng.gen_range(1..73049i32))
+        };
         vec![
-            i!(sk), s!(random_id(rng)), d!(random_date(rng)), d!(random_date(rng)),
+            i!(sk), s!(random_id(rng)), d!(random_date(rng)), scd2_rec_end_date(row, rng),
             s!(random_name(rng)), i!(rng.gen_range(1..73049i32)),
-            i!(rng.gen_range(1..73049i32)), s!("Unknown"), s!(random_name(rng)),
+            close, s!("Unknown"), s!(random_name(rng)),
             i!(rng.gen_range(1..10i32)), s!(random_name(rng)), s!(random_name(rng)),
             s!(random_name(rng)), i!(rng.gen_range(1..6i32)), s!("web"),
             s!(format!("{}", rng.gen_range(1..999i32))), s!(random_name(rng)),
@@ -1043,13 +1186,16 @@ fn generate_web_site(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_web_page(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = (scale * 60.0).max(1.0) as usize;
+    let total = web_page_rows(scale);
+    // FK ranges must track dimension cardinality at this scale;
+    // sf1-sized ranges empty out dimension joins at small scales.
+    let customers = customer_rows(scale) as i32;
     generate_batches(web_page_schema(), total, seed_for_table("web_page"), |row, rng| {
         let sk = (row + 1) as i32;
         vec![
-            i!(sk), s!(random_id(rng)), d!(random_date(rng)), d!(random_date(rng)),
+            i!(sk), s!(random_id(rng)), d!(random_date(rng)), scd2_rec_end_date(row, rng),
             i!(rng.gen_range(1..73049i32)), i!(rng.gen_range(1..73049i32)),
-            s!(random_str(rng, YN)), i!(rng.gen_range(1..100_000i32)),
+            s!(random_str(rng, YN)), i!(rng.gen_range(1..=customers)),
             s!(format!("http://{}.com/{}", random_name(rng), sk)),
             s!(random_str(rng, WP_TYPES)), i!(rng.gen_range(0..100_000i32)),
             i!(rng.gen_range(0..25i32)), i!(rng.gen_range(0..20i32)),
@@ -1059,7 +1205,7 @@ fn generate_web_page(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_warehouse(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = (scale * 5.0).max(1.0) as usize;
+    let total = warehouse_rows(scale);
     generate_batches(warehouse_schema(), total, seed_for_table("warehouse"), |row, rng| {
         let sk = (row + 1) as i32;
         vec![
@@ -1075,7 +1221,7 @@ fn generate_warehouse(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_promotion(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = (scale * 300.0).max(1.0) as usize;
+    let total = promotion_rows(scale);
     generate_batches(promotion_schema(), total, seed_for_table("promotion"), |row, rng| {
         let sk = (row + 1) as i32;
         vec![
@@ -1091,8 +1237,9 @@ fn generate_promotion(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     })
 }
 
-fn generate_reason() -> (SchemaRef, Vec<RecordBatch>) {
-    generate_batches(reason_schema(), 35, seed_for_table("reason"), |row, _rng| {
+fn generate_reason(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+    let total = reason_rows(scale);
+    generate_batches(reason_schema(), total, seed_for_table("reason"), |row, _rng| {
         let sk = (row + 1) as i32;
         vec![
             i!(sk),
@@ -1123,12 +1270,13 @@ fn generate_ship_mode() -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_call_center(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    let total = (scale * 6.0).max(1.0) as usize;
+    let total = call_center_rows(scale);
     generate_batches(call_center_schema(), total, seed_for_table("call_center"), |row, rng| {
         let sk = (row + 1) as i32;
         vec![
-            i!(sk), s!(random_id(rng)), d!(random_date(rng)), d!(random_date(rng)),
-            i!(rng.gen_range(1..73049i32)), i!(rng.gen_range(1..73049i32)),
+            // cc_closed_date_sk is 100% NULL in official data at both scales.
+            i!(sk), s!(random_id(rng)), d!(random_date(rng)), scd2_rec_end_date(row, rng),
+            ColVal::I32(None), i!(rng.gen_range(1..73049i32)),
             s!(random_name(rng)), s!(random_str(rng, CC_CLASSES)),
             i!(rng.gen_range(100..5000i32)), i!(rng.gen_range(1000..100_000i32)),
             s!(random_str(rng, CC_HOURS)), s!(random_name(rng)),
@@ -1157,31 +1305,31 @@ impl BenchmarkGenerator for TpcdsGenerator {
     fn tables(&self) -> Vec<TableDef> {
         vec![
             // Fact tables
-            TableDef { name: "store_sales".into(),           schema: store_sales_schema(),           row_count: |sf| (sf * 2_880_000.0) as usize },
-            TableDef { name: "store_returns".into(),         schema: store_returns_schema(),         row_count: |sf| (sf * 287_999.0) as usize },
-            TableDef { name: "catalog_sales".into(),         schema: catalog_sales_schema(),         row_count: |sf| (sf * 1_441_548.0) as usize },
-            TableDef { name: "catalog_returns".into(),       schema: catalog_returns_schema(),       row_count: |sf| (sf * 144_067.0) as usize },
-            TableDef { name: "web_sales".into(),             schema: web_sales_schema(),             row_count: |sf| (sf * 719_384.0) as usize },
-            TableDef { name: "web_returns".into(),           schema: web_returns_schema(),           row_count: |sf| (sf * 71_763.0) as usize },
-            TableDef { name: "inventory".into(),             schema: inventory_schema(),             row_count: |sf| (sf * 11_745_000.0) as usize },
+            TableDef { name: "store_sales".into(),           schema: store_sales_schema(),           row_count: store_sales_rows },
+            TableDef { name: "store_returns".into(),         schema: store_returns_schema(),         row_count: store_returns_rows },
+            TableDef { name: "catalog_sales".into(),         schema: catalog_sales_schema(),         row_count: catalog_sales_rows },
+            TableDef { name: "catalog_returns".into(),       schema: catalog_returns_schema(),       row_count: catalog_returns_rows },
+            TableDef { name: "web_sales".into(),             schema: web_sales_schema(),             row_count: web_sales_rows },
+            TableDef { name: "web_returns".into(),           schema: web_returns_schema(),           row_count: web_returns_rows },
+            TableDef { name: "inventory".into(),             schema: inventory_schema(),             row_count: inventory_rows },
             // Dimension tables
-            TableDef { name: "date_dim".into(),              schema: date_dim_schema(),              row_count: |_| 73_049 },
-            TableDef { name: "time_dim".into(),              schema: time_dim_schema(),              row_count: |_| 86_400 },
-            TableDef { name: "item".into(),                  schema: item_schema(),                  row_count: |sf| (sf * 18_000.0) as usize },
-            TableDef { name: "customer".into(),              schema: customer_schema(),              row_count: |sf| (sf * 100_000.0) as usize },
-            TableDef { name: "customer_address".into(),      schema: customer_address_schema(),      row_count: |sf| (sf * 50_000.0) as usize },
-            TableDef { name: "customer_demographics".into(), schema: customer_demographics_schema(), row_count: |_| 1_920_800 },
-            TableDef { name: "household_demographics".into(),schema: household_demographics_schema(),row_count: |_| 7_200 },
-            TableDef { name: "store".into(),                 schema: store_schema(),                 row_count: |sf| (sf * 12.0).max(1.0) as usize },
-            TableDef { name: "catalog_page".into(),          schema: catalog_page_schema(),          row_count: |sf| (sf * 11_718.0).max(1.0) as usize },
-            TableDef { name: "web_site".into(),              schema: web_site_schema(),              row_count: |sf| (sf * 30.0).max(1.0) as usize },
-            TableDef { name: "web_page".into(),              schema: web_page_schema(),              row_count: |sf| (sf * 60.0).max(1.0) as usize },
-            TableDef { name: "warehouse".into(),             schema: warehouse_schema(),             row_count: |sf| (sf * 5.0).max(1.0) as usize },
-            TableDef { name: "promotion".into(),             schema: promotion_schema(),             row_count: |sf| (sf * 300.0).max(1.0) as usize },
-            TableDef { name: "reason".into(),                schema: reason_schema(),                row_count: |_| 35 },
-            TableDef { name: "income_band".into(),           schema: income_band_schema(),           row_count: |_| 20 },
-            TableDef { name: "ship_mode".into(),             schema: ship_mode_schema(),             row_count: |_| 20 },
-            TableDef { name: "call_center".into(),           schema: call_center_schema(),           row_count: |sf| (sf * 6.0).max(1.0) as usize },
+            TableDef { name: "date_dim".into(),              schema: date_dim_schema(),              row_count: date_dim_rows },
+            TableDef { name: "time_dim".into(),              schema: time_dim_schema(),              row_count: time_dim_rows },
+            TableDef { name: "item".into(),                  schema: item_schema(),                  row_count: item_rows },
+            TableDef { name: "customer".into(),              schema: customer_schema(),              row_count: customer_rows },
+            TableDef { name: "customer_address".into(),      schema: customer_address_schema(),      row_count: customer_address_rows },
+            TableDef { name: "customer_demographics".into(), schema: customer_demographics_schema(), row_count: customer_demographics_rows },
+            TableDef { name: "household_demographics".into(),schema: household_demographics_schema(),row_count: household_demographics_rows },
+            TableDef { name: "store".into(),                 schema: store_schema(),                 row_count: store_rows },
+            TableDef { name: "catalog_page".into(),          schema: catalog_page_schema(),          row_count: catalog_page_rows },
+            TableDef { name: "web_site".into(),              schema: web_site_schema(),              row_count: web_site_rows },
+            TableDef { name: "web_page".into(),              schema: web_page_schema(),              row_count: web_page_rows },
+            TableDef { name: "warehouse".into(),             schema: warehouse_schema(),             row_count: warehouse_rows },
+            TableDef { name: "promotion".into(),             schema: promotion_schema(),             row_count: promotion_rows },
+            TableDef { name: "reason".into(),                schema: reason_schema(),                row_count: reason_rows },
+            TableDef { name: "income_band".into(),           schema: income_band_schema(),           row_count: income_band_rows },
+            TableDef { name: "ship_mode".into(),             schema: ship_mode_schema(),             row_count: ship_mode_rows },
+            TableDef { name: "call_center".into(),           schema: call_center_schema(),           row_count: call_center_rows },
         ]
     }
 
@@ -1207,7 +1355,7 @@ impl BenchmarkGenerator for TpcdsGenerator {
             "item"                   => generate_item(scale),
             "customer"               => generate_customer(scale),
             "customer_address"       => generate_customer_address(scale),
-            "customer_demographics"  => generate_customer_demographics(),
+            "customer_demographics"  => generate_customer_demographics(scale),
             "household_demographics" => generate_household_demographics(),
             "store"                  => generate_store(scale),
             "catalog_page"           => generate_catalog_page(scale),
@@ -1215,7 +1363,7 @@ impl BenchmarkGenerator for TpcdsGenerator {
             "web_page"               => generate_web_page(scale),
             "warehouse"              => generate_warehouse(scale),
             "promotion"              => generate_promotion(scale),
-            "reason"                 => generate_reason(),
+            "reason"                 => generate_reason(scale),
             "income_band"            => generate_income_band(),
             "ship_mode"              => generate_ship_mode(),
             "call_center"            => generate_call_center(scale),
@@ -1271,27 +1419,93 @@ mod tests {
 
     #[test]
     fn test_row_counts_sf001() {
+        // Pinned to official dsdgen sf0.01 output. Tables generated from
+        // per-sale sampling in dsdgen (returns) match within the 15%
+        // harness tolerance; everything else must be exact.
         let sf = 0.01_f64;
+        let expected: &[(&str, usize)] = &[
+            ("store_sales", 28_800),            // official 28,810
+            ("store_returns", 2_879),           // official 2,810
+            ("catalog_sales", 14_415),          // official 14,313
+            ("catalog_returns", 1_440),         // official 1,358
+            ("web_sales", 7_193),               // official 7,212
+            ("web_returns", 717),               // official 679
+            ("inventory", 23_490),
+            ("date_dim", 73_049),
+            ("time_dim", 86_400),
+            ("item", 180),
+            ("customer", 1_000),
+            ("customer_address", 500),
+            ("customer_demographics", 19_208),
+            ("household_demographics", 7_200),
+            ("store", 1),
+            ("catalog_page", 11_718),
+            ("web_site", 1),
+            ("web_page", 1),
+            ("warehouse", 1),
+            ("promotion", 3),
+            ("reason", 1),
+            ("income_band", 20),
+            ("ship_mode", 20),
+            ("call_center", 1),
+        ];
         let gen = TpcdsGenerator;
         for t in gen.tables() {
-            let n = (t.row_count)(sf);
-            // Every table must yield at least 1 row at SF0.01
-            assert!(n >= 1, "table {} yielded 0 rows at SF0.01", t.name);
+            let want = expected.iter().find(|(n, _)| *n == t.name).unwrap().1;
+            assert_eq!((t.row_count)(sf), want, "table {} at SF0.01", t.name);
+        }
+    }
+
+    #[test]
+    fn test_row_counts_sf1() {
+        // Pinned to official dsdgen sf1 output (returns within tolerance).
+        let expected: &[(&str, usize)] = &[
+            ("store_sales", 2_880_000),         // official 2,880,404
+            ("store_returns", 287_999),         // official 287,867
+            ("catalog_sales", 1_441_548),
+            ("catalog_returns", 144_067),
+            ("web_sales", 719_384),
+            ("web_returns", 71_763),            // official 71,654
+            ("inventory", 11_745_000),
+            ("date_dim", 73_049),
+            ("time_dim", 86_400),
+            ("item", 18_000),
+            ("customer", 100_000),
+            ("customer_address", 50_000),
+            ("customer_demographics", 1_920_800),
+            ("household_demographics", 7_200),
+            ("store", 12),
+            ("catalog_page", 11_718),
+            ("web_site", 30),
+            ("web_page", 60),
+            ("warehouse", 5),
+            ("promotion", 300),
+            ("reason", 35),
+            ("income_band", 20),
+            ("ship_mode", 20),
+            ("call_center", 6),
+        ];
+        let gen = TpcdsGenerator;
+        for t in gen.tables() {
+            let want = expected.iter().find(|(n, _)| *n == t.name).unwrap().1;
+            assert_eq!((t.row_count)(1.0), want, "table {} at SF1", t.name);
         }
     }
 
     #[test]
     fn test_fixed_row_counts() {
+        // Tables that must not scale: identical at every scale factor.
+        // customer_demographics scales linearly below sf1 then caps.
         let gen = TpcdsGenerator;
         for t in gen.tables() {
             match t.name.as_str() {
-                "date_dim"               => assert_eq!((t.row_count)(1.0), 73_049),
-                "time_dim"               => assert_eq!((t.row_count)(1.0), 86_400),
-                "customer_demographics"  => assert_eq!((t.row_count)(1.0), 1_920_800),
-                "household_demographics" => assert_eq!((t.row_count)(1.0), 7_200),
-                "reason"                 => assert_eq!((t.row_count)(1.0), 35),
-                "income_band"            => assert_eq!((t.row_count)(1.0), 20),
-                "ship_mode"              => assert_eq!((t.row_count)(1.0), 20),
+                "date_dim"               => assert_eq!((t.row_count)(10.0), 73_049),
+                "time_dim"               => assert_eq!((t.row_count)(10.0), 86_400),
+                "customer_demographics"  => assert_eq!((t.row_count)(10.0), 1_920_800),
+                "household_demographics" => assert_eq!((t.row_count)(10.0), 7_200),
+                "catalog_page"           => assert_eq!((t.row_count)(0.01), 11_718),
+                "income_band"            => assert_eq!((t.row_count)(10.0), 20),
+                "ship_mode"              => assert_eq!((t.row_count)(10.0), 20),
                 _ => {}
             }
         }
@@ -1323,7 +1537,8 @@ mod tests {
     fn test_generate_inventory_sf001() {
         let (sch, batches) = generate_inventory(0.01);
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(rows, (0.01_f64 * 11_745_000.0) as usize);
+        // 261 weekly snapshots x (180 items x 1 warehouse) / 2
+        assert_eq!(rows, 23_490);
         assert_eq!(batches[0].schema(), sch);
     }
 
@@ -1345,10 +1560,13 @@ mod tests {
 
     #[test]
     fn test_generate_reason() {
-        let (sch, batches) = generate_reason();
+        let (sch, batches) = generate_reason(1.0);
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 35);
         assert_eq!(batches[0].schema(), sch);
+        let (_, batches) = generate_reason(0.01);
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1);
     }
 
     #[test]
@@ -1502,7 +1720,7 @@ mod tests {
             let ticket = tickets[r].unwrap();
             assert!((1..=max_ticket).contains(&ticket),
                 "row {r}: ticket {ticket} beyond returnable domain {max_ticket}");
-            let b = basket(STORE_TICKET_SALT, ticket, 12);
+            let b = basket(STORE_TICKET_SALT, ticket, store_rows(scale) as i32, FkDims::at(scale));
             let item = items[r].unwrap();
             let lines: Vec<usize> = (0..b.lines).filter(|&l| b.items[l] == item).collect();
             assert!(!lines.is_empty(),
@@ -1582,5 +1800,52 @@ mod tests {
         let distinct: HashSet<&str> = manufacts.iter().map(|m| m.as_str()).collect();
         assert!(distinct.len() < manufacts.len(),
             "no two items share an i_manufact value");
+    }
+
+    #[test]
+    fn scd2_null_fractions_match_dsdgen() {
+        use arrow_array::Array as _;
+        // Official dsdgen null counts. rec_end_date is NULL on the current
+        // revision of every entity: the single row at sf0.01, half the rows
+        // at sf1. cc_closed_date_sk is always NULL; web_close_date_sk is
+        // NULL only on single-revision entities; s_closed_date_sk is set on
+        // 3 of every 12 rows.
+        fn nulls(batches: &[RecordBatch], sch: &SchemaRef, col: &str) -> usize {
+            let idx = sch.index_of(col).unwrap();
+            batches.iter().map(|b| b.column(idx).null_count()).sum()
+        }
+        let cases: &[(&str, f64, &str, usize, usize)] = &[
+            // (table, scale, column, expected nulls, expected rows)
+            ("item", 0.01, "i_rec_end_date", 90, 180),
+            ("item", 1.0, "i_rec_end_date", 9_000, 18_000),
+            ("store", 0.01, "s_rec_end_date", 1, 1),
+            ("store", 0.01, "s_closed_date_sk", 0, 1),
+            ("store", 1.0, "s_rec_end_date", 6, 12),
+            ("store", 1.0, "s_closed_date_sk", 9, 12),
+            ("call_center", 0.01, "cc_rec_end_date", 1, 1),
+            ("call_center", 0.01, "cc_closed_date_sk", 1, 1),
+            ("call_center", 1.0, "cc_rec_end_date", 3, 6),
+            ("call_center", 1.0, "cc_closed_date_sk", 6, 6),
+            ("web_site", 0.01, "web_rec_end_date", 1, 1),
+            ("web_site", 0.01, "web_close_date_sk", 1, 1),
+            ("web_site", 1.0, "web_rec_end_date", 15, 30),
+            ("web_site", 1.0, "web_close_date_sk", 5, 30),
+            ("web_page", 0.01, "wp_rec_end_date", 1, 1),
+            ("web_page", 1.0, "wp_rec_end_date", 30, 60),
+        ];
+        for (table, sf, col, want_nulls, want_rows) in cases {
+            let (sch, batches) = match *table {
+                "item" => generate_item(*sf),
+                "store" => generate_store(*sf),
+                "call_center" => generate_call_center(*sf),
+                "web_site" => generate_web_site(*sf),
+                "web_page" => generate_web_page(*sf),
+                _ => unreachable!(),
+            };
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(rows, *want_rows, "{table} rows at sf{sf}");
+            assert_eq!(nulls(&batches, &sch, col), *want_nulls,
+                "{table}.{col} nulls at sf{sf}");
+        }
     }
 }
