@@ -380,6 +380,23 @@ pub struct CoordinatorConfig {
     /// Default: "8GB". Applies to all query operator memory (sorts, joins, aggregates).
     #[serde(default = "default_coordinator_memory")]
     pub memory_limit: String,
+    /// Memory pool strategy for the shared DataFusion runtime.
+    ///
+    /// - `"greedy"` (default): first-come first-served up to `memory_limit`;
+    ///   spillable operators spill when the pool is genuinely full. A single
+    ///   large consumer (a wide hash aggregate) may use the whole pool.
+    /// - `"fair"`: the previous behavior (`FairSpillPool`). Divides the pool
+    ///   evenly across every REGISTERED spillable consumer; wide plans
+    ///   (many partitions x many operators) shrink each consumer's cap to
+    ///   pool/N even when most consumers allocate nothing. TPC-DS q39 at
+    ///   SF10 registers ~90 spillable consumers, capping each at ~95 MB of
+    ///   an 8 GB pool, and DataFusion 53's partial aggregate cannot emit
+    ///   early under a constant GROUP BY ordering key -- the raw
+    ///   ResourcesExhausted error surfaces instead of spilling.
+    ///   Cross-query fairness is enforced separately by
+    ///   `query.per_user_memory_budget`.
+    #[serde(default = "default_memory_pool")]
+    pub memory_pool: String,
     /// Enable spill-to-disk when memory limit is reached. Default: true.
     #[serde(default = "default_true")]
     pub spill_to_disk: bool,
@@ -2243,6 +2260,7 @@ fn default_late_mat_min_projection_cols() -> usize { 1 }
 fn default_star_schema_min_ratio() -> usize { 10 }
 
 fn default_coordinator_memory() -> String { "8GB".to_string() }
+fn default_memory_pool() -> String { "greedy".to_string() }
 fn default_coordinator_spill_dir() -> String { "/tmp/sqe-coordinator-spill".to_string() }
 fn default_spill_compression() -> String { "lz4".to_string() }
 fn default_flight_compression() -> String { "lz4".to_string() }
@@ -3161,6 +3179,7 @@ mod tests {
                 worker_secret: SecretString::default(),
                 allow_unauthenticated_workers: false,
                 memory_limit: default_coordinator_memory(),
+                memory_pool: default_memory_pool(),
                 spill_to_disk: true,
                 spill_dir: default_coordinator_spill_dir(),
                 spill_compression: default_spill_compression(),
