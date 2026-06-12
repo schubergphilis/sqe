@@ -197,25 +197,35 @@ pub fn build_embedded_context(memory_limit_bytes: usize) -> anyhow::Result<Sessi
     // `curl` any URL, so reading `read_csv('https://host/data.csv')` should just
     // work like it does in DuckDB. Operators who want a locked-down embedded
     // build can still gate egress at the network layer.
+    // Object-store gating (E2E-identity item 1) is likewise skipped here:
+    // `TvfCaller::trusted_local()` marks the embedded, in-process caller as
+    // the owner of this config and its credentials, so `s3://` reads with
+    // the locally-configured key keep working without an
+    // `allowed_object_store_prefixes` list. The server constructs TVFs with
+    // the session's authenticated identity instead and fails closed.
     let mut tvf_storage = StorageConfig::default();
     tvf_storage.tvf.allow_local_paths = true;
     tvf_storage.tvf.allow_http = true;
+    let tvf_caller = sqe_core::config::TvfCaller::trusted_local();
     ctx.register_udtf(
         "read_parquet",
-        Arc::new(sqe_catalog::read_parquet::ReadParquetFunction::new(
+        Arc::new(sqe_catalog::read_parquet::ReadParquetFunction::with_caller(
             tvf_storage.clone(),
+            tvf_caller.clone(),
         )),
     );
     ctx.register_udtf(
         "read_csv",
-        Arc::new(sqe_catalog::read_csv::ReadCsvFunction::new(
+        Arc::new(sqe_catalog::read_csv::ReadCsvFunction::with_caller(
             tvf_storage.clone(),
+            tvf_caller.clone(),
         )),
     );
     ctx.register_udtf(
         "read_json",
-        Arc::new(sqe_catalog::read_json::ReadJsonFunction::new(
+        Arc::new(sqe_catalog::read_json::ReadJsonFunction::with_caller(
             tvf_storage.clone(),
+            tvf_caller.clone(),
         )),
     );
     // V11: Delta Lake reader. Wraps deltalake::open_table so users can
@@ -230,12 +240,13 @@ pub fn build_embedded_context(memory_limit_bytes: usize) -> anyhow::Result<Sessi
     #[cfg(feature = "delta")]
     ctx.register_udtf(
         "read_delta",
-        Arc::new(sqe_catalog::read_delta::ReadDeltaFunction::new(
+        Arc::new(sqe_catalog::read_delta::ReadDeltaFunction::with_caller(
             tvf_storage,
+            tvf_caller,
         )),
     );
     #[cfg(not(feature = "delta"))]
-    let _ = &tvf_storage; // consumed by read_delta only when the feature is on
+    let _ = (&tvf_storage, &tvf_caller); // consumed by read_delta only when the feature is on
 
     Ok(ctx)
 }

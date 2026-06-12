@@ -53,7 +53,7 @@ use datafusion::execution::context::SessionContext;
 use datafusion_expr::Expr;
 use tracing::debug;
 
-use sqe_core::config::StorageConfig;
+use sqe_core::config::{StorageConfig, TvfCaller};
 
 use crate::file_tvf_common::{
     parse_file_tvf_args, register_azure_store_if_needed, register_gcs_store_if_needed,
@@ -165,11 +165,22 @@ fn parse_bool(key: &str, value: &str) -> DFResult<bool> {
 #[derive(Debug)]
 pub struct ReadCsvFunction {
     storage: StorageConfig,
+    /// Authenticated caller identity for the object-store prefix gate.
+    /// `TvfCaller::default()` (anonymous, untrusted) fails closed.
+    caller: TvfCaller,
 }
 
 impl ReadCsvFunction {
     pub fn new(storage: StorageConfig) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            caller: TvfCaller::default(),
+        }
+    }
+
+    /// Create a new `ReadCsvFunction` bound to an authenticated caller.
+    pub fn with_caller(storage: StorageConfig, caller: TvfCaller) -> Self {
+        Self { storage, caller }
     }
 }
 
@@ -224,10 +235,14 @@ impl TableFunctionImpl for ReadCsvFunction {
         }
 
         // Issue #10: TVF path / host policy check before object-store
-        // construction.
-        self.storage.tvf.check(&args.path).map_err(|e| {
-            DataFusionError::Plan(format!("{FN_NAME}: {e}"))
-        })?;
+        // construction. Object-store paths are additionally gated per
+        // caller identity (E2E-identity item 1).
+        crate::file_tvf_common::enforce_tvf_path_policy(
+            FN_NAME,
+            &args,
+            &self.storage,
+            &self.caller,
+        )?;
 
         let storage = self.storage.clone();
         crate::runtime_bridge::block_on_compat(async move {

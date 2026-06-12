@@ -38,7 +38,7 @@ use object_store::azure::MicrosoftAzureBuilder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::http::HttpBuilder;
 
-use sqe_core::config::StorageConfig;
+use sqe_core::config::{StorageConfig, TvfCaller};
 
 /// Path + storage credential bag shared by every `read_*()` TVF.
 ///
@@ -70,6 +70,45 @@ pub struct FileTvfArgs {
     pub gcs_service_account_path: Option<String>,
     /// Inline service-account JSON (alternative to `gcs_service_account_path`).
     pub gcs_service_account_key: Option<String>,
+}
+
+/// `true` when the TVF call carries credentials of its own for the
+/// path's storage backend, i.e. the engine's static `[storage]` key will
+/// NOT be used for the read. Drives the inline-credential bypass of
+/// `[storage.tvf] allowed_object_store_prefixes`.
+///
+/// Note `gcs_service_account_path` deliberately does NOT count: it names a
+/// file on the ENGINE's filesystem, so it is engine-owned material, not a
+/// caller-supplied credential.
+pub fn has_inline_credentials(args: &FileTvfArgs) -> bool {
+    fn set(v: &Option<String>) -> bool {
+        v.as_deref().is_some_and(|s| !s.is_empty())
+    }
+    if is_s3_path(&args.path) {
+        set(&args.access_key) && set(&args.secret_key)
+    } else if is_azure_path(&args.path) {
+        set(&args.azure_access_key) || set(&args.azure_sas_token)
+    } else if is_gcs_path(&args.path) {
+        set(&args.gcs_service_account_key)
+    } else {
+        false
+    }
+}
+
+/// Identity-aware TVF path policy gate, shared by every `read_*()` TVF.
+/// Wraps [`sqe_core::config::TvfPolicy::check_path`] with the
+/// inline-credential detection above and maps denials to a plan error.
+/// Denials are logged at WARN (principal + path) inside `check_path`.
+pub fn enforce_tvf_path_policy(
+    fn_name: &str,
+    args: &FileTvfArgs,
+    storage: &StorageConfig,
+    caller: &TvfCaller,
+) -> DFResult<()> {
+    storage
+        .tvf
+        .check_path(&args.path, caller, has_inline_credentials(args))
+        .map_err(|e| DataFusionError::Plan(format!("{fn_name}: {e}")))
 }
 
 /// Parse a `ScalarValue::Utf8` / `LargeUtf8` to `&str`.
@@ -960,6 +999,100 @@ mod tests {
         assert_eq!(expand_tilde("~user/x.csv", home), "~user/x.csv");
         // HOME unset -> leave the path unchanged.
         assert_eq!(expand_tilde("~/x.csv", None), "~/x.csv");
+    }
+
+    #[test]
+    fn inline_credentials_detection() {
+        // S3 needs BOTH halves of the keypair to count as caller-supplied.
+        let mut args = FileTvfArgs {
+            path: "s3://b/f.csv".to_string(),
+            access_key: Some("AKID".to_string()),
+            ..Default::default()
+        };
+        assert!(!has_inline_credentials(&args));
+        args.secret_key = Some("SECRET".to_string());
+        assert!(has_inline_credentials(&args));
+        // Empty strings don't count.
+        args.secret_key = Some(String::new());
+        assert!(!has_inline_credentials(&args));
+
+        // Azure: a key or SAS token counts.
+        let args = FileTvfArgs {
+            path: "azure://c/f.csv".to_string(),
+            azure_sas_token: Some("sv=...".to_string()),
+            ..Default::default()
+        };
+        assert!(has_inline_credentials(&args));
+
+        // GCS: only the INLINE key counts; a path references a file on the
+        // engine's own filesystem and must not unlock the gate.
+        let args = FileTvfArgs {
+            path: "gs://b/f.csv".to_string(),
+            gcs_service_account_path: Some("/var/secrets/engine.json".to_string()),
+            ..Default::default()
+        };
+        assert!(!has_inline_credentials(&args));
+        let args = FileTvfArgs {
+            path: "gs://b/f.csv".to_string(),
+            gcs_service_account_key: Some("{\"type\":\"service_account\"}".to_string()),
+            ..Default::default()
+        };
+        assert!(has_inline_credentials(&args));
+
+        // Local / http paths never report inline object-store credentials.
+        let args = FileTvfArgs {
+            path: "/local/f.csv".to_string(),
+            access_key: Some("AKID".to_string()),
+            secret_key: Some("SECRET".to_string()),
+            ..Default::default()
+        };
+        assert!(!has_inline_credentials(&args));
+    }
+
+    #[test]
+    fn enforce_policy_denies_engine_credentialed_s3_by_default() {
+        let args = FileTvfArgs {
+            path: "s3://prod-data/secret.parquet".to_string(),
+            ..Default::default()
+        };
+        let storage = StorageConfig::default();
+        let caller = TvfCaller::for_user("alice".to_string(), Vec::new());
+        let err = enforce_tvf_path_policy("read_csv", &args, &storage, &caller).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("allowed_object_store_prefixes"), "got: {msg}");
+        assert!(msg.contains("alice"), "denial must name the principal: {msg}");
+    }
+
+    #[test]
+    fn enforce_policy_allows_configured_staging_prefix() {
+        let args = FileTvfArgs {
+            path: "s3://data-platform-staging/_table-load-staging/uuid-1/x.csv".to_string(),
+            ..Default::default()
+        };
+        let storage = StorageConfig {
+            tvf: sqe_core::config::TvfPolicy {
+                allowed_object_store_prefixes: vec![
+                    "s3://data-platform-staging/_table-load-staging/".to_string(),
+                ],
+                ..Default::default()
+            },
+            ..StorageConfig::default()
+        };
+        let caller = TvfCaller::for_user("alice".to_string(), Vec::new());
+        assert!(enforce_tvf_path_policy("read_csv", &args, &storage, &caller).is_ok());
+    }
+
+    #[test]
+    fn enforce_policy_inline_s3_credentials_bypass_prefix_gate() {
+        let args = FileTvfArgs {
+            path: "s3://their-own-bucket/x.csv".to_string(),
+            access_key: Some("AKID".to_string()),
+            secret_key: Some("SECRET".to_string()),
+            ..Default::default()
+        };
+        let storage = StorageConfig::default();
+        let caller = TvfCaller::for_user("alice".to_string(), Vec::new());
+        assert!(enforce_tvf_path_policy("read_csv", &args, &storage, &caller).is_ok());
     }
 
     #[test]

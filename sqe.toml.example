@@ -129,6 +129,37 @@ s3_access_key = "<your-s3-access-key>"
 s3_secret_key = "<your-s3-secret-key>"
 s3_path_style = true
 
+# ── File-TVF security (read_parquet / read_csv / read_json / read_delta) ──
+# All defaults fail closed.
+#
+# [storage.tvf]
+# Local filesystem paths in TVF calls (read_csv('/etc/passwd')). Default
+# false; leave false on any shared deployment.
+# allow_local_paths = false
+#
+# Arbitrary http(s):// fetches from TVF calls. Default false (IMDS lives at
+# http://169.254.169.254). When false, only allowed_http_hosts are reachable.
+# allow_http = false
+# allowed_http_hosts = ["huggingface.co"]
+#
+# Object-store URL prefixes (s3:// s3a:// abfss:// abfs:// azure:// az://
+# gs:// gcs://) that TVFs may read using the ENGINE's storage credentials
+# above. Default EMPTY = all such reads are DENIED: without this gate any
+# authenticated user could read_csv('s3://<any-bucket>/<any-key>') with the
+# engine's static S3 key, bypassing catalog authorization entirely. Prefixes
+# match on path-segment boundaries; the literal `{user}` expands to the
+# authenticated username. TVF calls that carry complete inline credentials
+# (access_key + secret_key, an Azure key / SAS token, or an inline GCS
+# service-account key) bypass this list — the engine's key is not used.
+# allowed_object_store_prefixes = [
+#   "s3://data-platform-staging/_table-load-staging/",
+#   "s3://notebook-scratch/{user}/",
+# ]
+#
+# JWT roles (case-insensitive) allowed to read ANY object-store path with
+# the engine's credentials. Default empty = no override.
+# object_store_admin_roles = ["sqe-storage-admin"]
+
 # ── Wire-protocol security ────────────────────────────────────
 [security]
 # trusted_proxies = ["10.0.0.1"]  # IPs allowed to set x-forwarded-for for audit IPs

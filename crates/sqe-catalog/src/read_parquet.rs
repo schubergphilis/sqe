@@ -35,7 +35,7 @@ use datafusion_expr::Expr;
 use object_store::aws::AmazonS3Builder;
 use tracing::debug;
 
-use sqe_core::config::StorageConfig;
+use sqe_core::config::{StorageConfig, TvfCaller};
 
 /// Named keyword arguments accepted by `read_parquet()`.
 #[derive(Debug, Clone, Default)]
@@ -217,12 +217,25 @@ pub struct ReadParquetFunction {
     /// Default S3 connection parameters from `sqe.toml`.
     /// Inline named arguments in the TVF call take precedence over these.
     storage: StorageConfig,
+    /// Authenticated caller identity for the object-store prefix gate.
+    /// `TvfCaller::default()` (anonymous, untrusted) fails closed.
+    caller: TvfCaller,
 }
 
 impl ReadParquetFunction {
-    /// Create a new `ReadParquetFunction` with the given storage defaults.
+    /// Create a new `ReadParquetFunction` with the given storage defaults
+    /// and an anonymous, untrusted caller (engine-credentialed object-store
+    /// reads denied unless `[storage.tvf]` allows them without `{user}`).
     pub fn new(storage: StorageConfig) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            caller: TvfCaller::default(),
+        }
+    }
+
+    /// Create a new `ReadParquetFunction` bound to an authenticated caller.
+    pub fn with_caller(storage: StorageConfig, caller: TvfCaller) -> Self {
+        Self { storage, caller }
     }
 }
 
@@ -233,10 +246,15 @@ impl TableFunctionImpl for ReadParquetFunction {
         // BEFORE constructing the object store. Without this guard,
         // `read_parquet('/etc/shadow')` or
         // `read_parquet('http://169.254.169.254/...')` reached the
-        // filesystem / IMDS endpoint.
-        self.storage.tvf.check(&args.path).map_err(|e| {
-            datafusion::error::DataFusionError::Plan(format!("read_parquet: {e}"))
-        })?;
+        // filesystem / IMDS endpoint. Object-store paths are additionally
+        // gated per caller identity (E2E-identity item 1): the engine's
+        // static storage key must not read arbitrary `s3://` paths.
+        crate::file_tvf_common::enforce_tvf_path_policy(
+            "read_parquet",
+            &args.as_file_tvf_args(),
+            &self.storage,
+            &self.caller,
+        )?;
         let storage = self.storage.clone();
 
         // `TableFunctionImpl::call` is sync; schema inference is async.
