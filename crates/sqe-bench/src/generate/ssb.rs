@@ -352,8 +352,10 @@ fn generate_dim_date() -> (SchemaRef, Vec<RecordBatch>) {
         let dow_idx = day_of_week_index(year, month, day); // Mon=0 .. Sun=6
         let dow_name = DAY_OF_WEEK_NAMES[dow_idx];
         let month_name = MONTH_NAMES[(month - 1) as usize];
-        // Abbreviated month + 2-digit year, e.g. "Jan92"
-        let yearmonth = format!("{}{}", &month_name[..3], year % 100);
+        // Abbreviated month + full 4-digit year, e.g. "Jan1992". Query q3.4
+        // probes d_yearmonth = 'Dec1997'; a 2-digit year ("Dec97") makes it
+        // vacuous.
+        let yearmonth = format!("{}{}", &month_name[..3], year);
         let week_num = ((day_in_year - 1) / 7 + 1) as i32;
         let last_day_in_month = if day == days_in_month(year, month) { 1i32 } else { 0 };
         let last_day_in_week = if dow_idx == 6 { 1i32 } else { 0 }; // Sunday
@@ -1045,6 +1047,30 @@ mod tests {
             }
         }
         assert!(in_q22_range > 0, "q2.2 brand range matched no parts");
+    }
+
+    #[test]
+    fn d_yearmonth_uses_three_letter_month_and_full_year() {
+        use arrow_array::Array as _;
+        // q3.4 probes d_yearmonth = 'Dec1997'; the old 'Dec97' format made
+        // the query vacuous.
+        let (sch, batches) = generate_dim_date();
+        let key_idx = sch.index_of("d_datekey").unwrap();
+        let ym_idx = sch.index_of("d_yearmonth").unwrap();
+        let mut dec_1997_rows = 0usize;
+        for b in &batches {
+            let keys = b.column(key_idx).as_any().downcast_ref::<Int32Array>().unwrap();
+            let yms = b.column(ym_idx).as_any().downcast_ref::<StringArray>().unwrap();
+            for i in 0..keys.len() {
+                let v = yms.value(i);
+                assert_eq!(v.len(), 7, "d_yearmonth must be MonYYYY, got '{v}'");
+                if (19971201..=19971231).contains(&keys.value(i)) {
+                    assert_eq!(v, "Dec1997");
+                    dec_1997_rows += 1;
+                }
+            }
+        }
+        assert_eq!(dec_1997_rows, 31, "December 1997 must have 31 days");
     }
 
     #[test]

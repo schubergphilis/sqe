@@ -659,13 +659,25 @@ impl SessionCatalog {
             }
         };
 
-        iceberg_catalog_loader::load(catalog_type)
-            .map_err(|e| {
-                SqeError::Catalog(format!("Catalog loader rejected type `{catalog_type}`: {e}"))
-            })?
-            .load(name.to_string(), props)
-            .await
-            .map_err(|e| SqeError::Catalog(format!("Catalog `{catalog_type}` build failed: {e}")))
+        // In a default-features build every backend arm above is a
+        // `return Err(feature not enabled)`, so rustc proves this tail
+        // unreachable and warns; with any backend feature enabled the arms
+        // return `(catalog_type, name, props)` and this is the live path.
+        // The allow silences the feature-combination-dependent warning only.
+        #[allow(unreachable_code)]
+        {
+            iceberg_catalog_loader::load(catalog_type)
+                .map_err(|e| {
+                    SqeError::Catalog(format!(
+                        "Catalog loader rejected type `{catalog_type}`: {e}"
+                    ))
+                })?
+                .load(name.to_string(), props)
+                .await
+                .map_err(|e| {
+                    SqeError::Catalog(format!("Catalog `{catalog_type}` build failed: {e}"))
+                })
+        }
     }
 
     /// Build a `SessionCatalog` for a SIBLING warehouse on the same Polaris
