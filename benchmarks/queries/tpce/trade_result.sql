@@ -31,4 +31,10 @@ WHERE
     t.t_st_id = 'PNDG'
 ORDER BY
     t.t_dts,
-    t.t_id;
+    t.t_id
+-- Cap the settlement worklist: without it this returns every pending
+-- trade x holding row (21.6M at SF1), which is a result-transfer
+-- stress test, not a query benchmark -- polling that over Trino's HTTP
+-- protocol OOM-killed the comparison container twice. The sort key
+-- (t_dts, t_id) is unique, so the top-N is deterministic.
+LIMIT 1000;

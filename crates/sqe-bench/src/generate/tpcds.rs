@@ -442,16 +442,87 @@ const EDUCATION: &[&str] = &[
     "Graduate", "Advanced Degree", "Unknown",
 ];
 const CREDIT: &[&str] = &["Good", "High Risk", "Low Risk", "Unknown"];
-const BUY_POTENTIAL: &[&str] = &["1001-5000", "501-1000", "0-500", ">10000", "5001-10000", "Unknown"];
+/// dsdgen stride order: hd_buy_potential advances every 20 hd rows in this
+/// exact sequence (verified against `CALL dsdgen(sf=0.1)`).
+const BUY_POTENTIAL: &[&str] = &["0-500", "501-1000", "1001-5000", "5001-10000", ">10000", "Unknown"];
 const YN: &[&str] = &["Y", "N"];
 const SALUTATIONS: &[&str] = &["Mr.", "Ms.", "Mrs.", "Dr.", "Sir", "Miss"];
 const STREET_TYPES: &[&str] = &["Street", "Ave", "Blvd", "Drive", "Road", "Way", "Lane"];
-const CATEGORIES: &[&str] = &["Electronics", "Clothing", "Sports", "Home", "Books", "Toys", "Music", "Food"];
-const BRANDS: &[&str] = &["Brand1", "Brand2", "Brand3", "Brand4", "Brand5", "Brand6"];
-const ITEM_CLASSES: &[&str] = &["Class1", "Class2", "Class3", "Class4", "Class5"];
-const ITEM_SIZES: &[&str] = &["small", "medium", "large", "N/A", "extra large", "petite"];
-const ITEM_COLORS: &[&str] = &["red", "blue", "green", "black", "white", "yellow", "purple", "orange"];
-const ITEM_UNITS: &[&str] = &["Ounce", "Pound", "Dozen", "Gram", "Bundle", "Each", "Tbl", "Cup"];
+/// Official dsdgen categories in i_category_id order (1=Women .. 10=Electronics).
+/// The qualification queries filter combos like i_category IN ('Books',
+/// 'Children','Electronics') AND i_class IN ('personal','portable',...);
+/// an invented vocabulary matched none of them (q63/q89 vacuous).
+const CATEGORIES: &[&str] = &[
+    "Women", "Men", "Children", "Shoes", "Music",
+    "Jewelry", "Home", "Sports", "Books", "Electronics",
+];
+/// Per-category i_class vocabulary, index-aligned with CATEGORIES.
+/// Extracted from dsdgen output; i_class_id stays an independent 1..16 draw
+/// because dsdgen itself does not keep class ids consistent with class names.
+const CATEGORY_CLASSES: &[&[&str]] = &[
+    &["dresses", "fragrances", "maternity", "swimwear"],
+    &["accessories", "pants", "shirts", "sports-apparel"],
+    &["infants", "newborn", "school-uniforms", "toddlers"],
+    &["athletic", "kids", "mens", "womens"],
+    &["classical", "country", "pop", "rock"],
+    &["birdal", "bracelets", "consignment", "costume", "custom", "diamonds",
+      "earings", "estate", "gold", "jewelry boxes", "loose stones", "mens watch",
+      "pendants", "rings", "semi-precious", "womens watch"],
+    &["accent", "bathroom", "bedding", "blinds/shades", "curtains/drapes", "decor",
+      "flatware", "furniture", "glassware", "kids", "lighting", "mattresses",
+      "paint", "rugs", "tables", "wallpaper"],
+    &["archery", "athletic shoes", "baseball", "basketball", "camping", "fishing",
+      "fitness", "football", "golf", "guns", "hockey", "optics", "outdoor",
+      "pools", "sailing", "tennis"],
+    &["arts", "business", "computers", "cooking", "entertainments", "fiction",
+      "history", "home repair", "mystery", "parenting", "reference", "romance",
+      "science", "self-help", "sports", "travel"],
+    &["audio", "automotive", "camcorders", "cameras", "disk drives",
+      "dvd/vcr players", "karoke", "memory", "monitors", "musical", "personal",
+      "portable", "scanners", "stereo", "televisions", "wireless"],
+];
+/// Brand base name per (category, class), index-aligned with
+/// CATEGORY_CLASSES. dsdgen derives the brand from the item's category and
+/// class deterministically (e.g. every Electronics/portable item is some
+/// 'scholaramalgamalg #N'), and q63's qualification parameters rely on that
+/// correlation: brand IN (...) AND category IN (...) AND class IN (...) is
+/// unsatisfiable when brands are drawn independently. Extracted from
+/// dsdgen output; only the " #N" suffix (1..=17) varies per item.
+const CATEGORY_CLASS_BRANDS: &[&[&str]] = &[
+    &["amalgamalg", "importoamalg", "exportiamalg", "edu packamalg"],
+    &["amalgimporto", "exportiimporto", "importoimporto", "edu packimporto"],
+    &["importoexporti", "amalgexporti", "edu packexporti", "exportiexporti"],
+    &["edu packedu pack", "exportiedu pack", "importoedu pack", "amalgedu pack"],
+    &["edu packscholar", "importoscholar", "exportischolar", "amalgscholar"],
+    &["amalgcorp", "edu packcorp", "corpbrand", "importobrand", "scholarbrand", "importocorp", "scholarcorp", "edu packbrand", "exporticorp", "univbrand", "exportibrand", "namelesscorp", "brandcorp", "corpcorp", "amalgbrand", "maxicorp"],
+    &["amalgnameless", "amalgbrand", "importobrand", "scholarbrand", "edu packbrand", "brandbrand", "univnameless", "corpnameless", "edu packnameless", "exportibrand", "namelessbrand", "maxibrand", "importonameless", "corpbrand", "scholarnameless", "exportinameless"],
+    &["amalgmaxi", "amalgnameless", "importonameless", "exportinameless", "edu packnameless", "scholarmaxi", "scholarnameless", "corpnameless", "corpmaxi", "importomaxi", "brandnameless", "maxinameless", "namelessnameless", "univmaxi", "exportimaxi", "edu packmaxi"],
+    &["amalgmaxi", "importomaxi", "exportimaxi", "amalgunivamalg", "edu packmaxi", "scholarunivamalg", "scholarmaxi", "importounivamalg", "corpunivamalg", "corpmaxi", "brandmaxi", "namelessmaxi", "maximaxi", "exportiunivamalg", "edu packunivamalg", "univunivamalg"],
+    &["edu packunivamalg", "edu packamalgamalg", "importounivamalg", "amalgunivamalg", "amalgamalgamalg", "exportiunivamalg", "scholarunivamalg", "univamalgamalg", "importoamalgamalg", "corpunivamalg", "brandunivamalg", "scholaramalgamalg", "namelessunivamalg", "exportiamalgamalg", "maxiunivamalg", "corpamalgamalg"],
+];
+const ITEM_SIZES: &[&str] = &["small", "medium", "large", "N/A", "extra large", "petite", "economy"];
+/// Official 92-color dsdgen vocabulary. q56's qualification parameters probe
+/// slate/blanched/burnished; an 8-color list never contained them.
+const ITEM_COLORS: &[&str] = &[
+    "almond", "antique", "aquamarine", "azure", "beige", "bisque", "black",
+    "blanched", "blue", "blush", "brown", "burlywood", "burnished", "chartreuse",
+    "chiffon", "chocolate", "coral", "cornflower", "cornsilk", "cream", "cyan",
+    "dark", "deep", "dim", "dodger", "drab", "firebrick", "floral", "forest",
+    "frosted", "gainsboro", "ghost", "goldenrod", "green", "grey", "honeydew",
+    "hot", "indian", "ivory", "khaki", "lace", "lavender", "lawn", "lemon",
+    "light", "lime", "linen", "magenta", "maroon", "medium", "metallic",
+    "midnight", "mint", "misty", "moccasin", "navajo", "navy", "olive", "orange",
+    "orchid", "pale", "papaya", "peach", "peru", "pink", "plum", "powder",
+    "puff", "purple", "red", "rose", "rosy", "royal", "saddle", "salmon",
+    "sandy", "seashell", "sienna", "sky", "slate", "smoke", "snow", "spring",
+    "steel", "tan", "thistle", "tomato", "turquoise", "violet", "wheat",
+    "white", "yellow",
+];
+const ITEM_UNITS: &[&str] = &[
+    "Box", "Bunch", "Bundle", "Carton", "Case", "Cup", "Dozen", "Dram", "Each",
+    "Gram", "Gross", "Lb", "N/A", "Ounce", "Oz", "Pallet", "Pound", "Tbl",
+    "Ton", "Tsp", "Unknown",
+];
 const AM_PM: &[&str] = &["AM", "PM"];
 const SHIFTS: &[&str] = &["Morning", "Afternoon", "Evening", "Night"];
 const MEAL_TIMES: &[&str] = &["breakfast", "lunch", "dinner", "unknown"];
@@ -483,6 +554,48 @@ const CA_CITIES: &[&str] = &[
     "Oakland", "Clinton", "Franklin", "Bridgeport", "Lakeview",
     "Highland", "Woodville", "Ashland", "Newport", "Sulphur Springs",
 ];
+
+/// Real county names: every county the qualification queries probe (q10's
+/// Rush/Toole/Jefferson/..., q34/q46's Williamson County/Franklin Parish/
+/// Bronx County/Orange County/...) plus the most frequent counties in dsdgen
+/// output. ca_county used to be `random_name()` letter soup, so every
+/// county-filtered query was vacuous.
+const COUNTIES: &[&str] = &[
+    // qualification parameters used by the query set
+    "Williamson County", "Franklin Parish", "Bronx County", "Orange County",
+    "Rush County", "Toole County", "Jefferson County", "Dona Ana County",
+    "La Porte County",
+    // high-frequency dsdgen counties
+    "Washington County", "Franklin County", "Clay County", "Madison County",
+    "Jackson County", "Marion County", "Lincoln County", "Grant County",
+    "Montgomery County", "Union County", "Monroe County", "Perry County",
+    "Cherokee County", "Carroll County", "Crawford County", "Wayne County",
+    "Henry County", "Knox County", "Douglas County", "Marshall County",
+    "Adams County", "Polk County", "Fayette County", "Scott County",
+    "Clinton County", "Lawrence County", "Brown County", "Lee County",
+    "Morgan County", "Lake County", "Clark County", "Johnson County",
+    "Greene County", "Pike County", "Warren County", "Cass County",
+    "Macon County", "Calhoun County", "Mercer County", "Logan County",
+    "Benton County", "Boone County", "Butler County", "Cedar County",
+    "Columbia County", "Dallas County", "Decatur County", "Garfield County",
+    "Hamilton County", "Hancock County", "Hardin County", "Harrison County",
+    "Howard County", "Huntington County", "Iron County", "Jasper County",
+    "Juniata County", "Kossuth County", "Lancaster County", "Liberty County",
+    "Linn County", "Lyon County", "Mason County", "Miami County",
+    "Mitchell County", "Newton County", "Noble County", "Oglethorpe County",
+    "Osceola County", "Page County", "Pierce County", "Pulaski County",
+    "Putnam County", "Randolph County", "Richland County", "Riley County",
+    "Saline County", "Sevier County", "Shelby County", "Sioux County",
+    "Stone County", "Sumner County", "Tama County", "Taylor County",
+    "Tipton County", "Tyler County", "Valley County", "Vernon County",
+    "Walker County", "Webster County", "White County", "Winnebago County",
+    "Wood County", "Wright County", "York County", "Ziebach County",
+];
+
+/// dsdgen places every store at sf <= 1 in Midway or Fairview, Williamson
+/// County, TN. The q34/q46 legs filter store.s_county and q46/q68/q79 filter
+/// store.s_city; q01's qualification parameter is s_state = 'TN'.
+const STORE_CITIES: &[&str] = &["Midway", "Fairview"];
 
 // ---------------------------------------------------------------------------
 // Deterministic baskets (multi-line tickets shared by sales and returns)
@@ -961,16 +1074,29 @@ fn generate_web_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
 fn generate_inventory(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let total = inventory_rows(scale);
-    // FK ranges must track dimension cardinality at this scale;
-    // sf1-sized ranges empty out dimension joins at small scales.
-    let items = item_rows(scale) as i32;
-    let whs = warehouse_rows(scale) as i32;
-    generate_batches(inventory_schema(), total, seed_for_table("inventory"), |_row, rng| {
+    let items = item_rows(scale) as i64;
+    let whs = warehouse_rows(scale) as i64;
+    // dsdgen inventory is a deterministic weekly snapshot, not a random
+    // tuple draw: 261 weekly dates x every warehouse x a FIXED half of the
+    // items, each of which then appears in EVERY week (official sf0.1:
+    // item 1 has all 261 snapshot dates, 900 of 1800 items per week).
+    // q72 joins catalog_sales to inventory on item + same d_week_seq;
+    // random (date, item) tuples covered only ~30% of weeks per item and
+    // starved that join. Rows per week = items/2 * whs, matching
+    // inventory_rows() = 261 * items * whs / 2.
+    let per_week = (items / 2).max(1) * whs;
+    generate_batches(inventory_schema(), total, seed_for_table("inventory"), |row, rng| {
+        let week = row as i64 / per_week;
+        let j = row as i64 % per_week;
+        let item = 2 * (j / whs) + 1;
+        let wh = j % whs + 1;
+        // date_dim sk 1 = 1998-01-01; weekly snapshots land every 7 days.
+        let date_sk = (week * 7 + 2).min(73_048) as i32;
         vec![
-            i!(random_date_sk(rng)),
-            i!(rng.gen_range(1..=items)),
-            i!(rng.gen_range(1..=whs)),
-            i!(rng.gen_range(0..1000i32)),
+            i!(date_sk),
+            i!(item.min(items) as i32),
+            i!(wh as i32),
+            i!(rng.gen_range(0..=1000i32)),
         ]
     })
 }
@@ -1034,18 +1160,34 @@ fn generate_item(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let total = item_rows(scale);
     generate_batches(item_schema(), total, seed_for_table("item"), |row, rng| {
         let sk = (row + 1) as i32;
-        let price = rng.gen_range(100..10_000i32) as f64 / 100.0;
+        // dsdgen prices are heavily skewed low (median 4.21, range
+        // 0.09..99.89); a uniform draw put only 1.3% of items in the
+        // 1.00..2.00 band that q72's qualification parameters probe
+        // (dsdgen: ~11%). Log-uniform reproduces the skew.
+        let price_ln = rng.gen_range(0.09_f64.ln()..99.99_f64.ln());
+        let price = (price_ln.exp() * 100.0).round() / 100.0;
         let wc = price * 0.6;
         // i_manufact is a function of i_manufact_id so items share manufact
         // names; q41's correlated subquery counts items per i_manufact and a
         // unique random name per item kept that count at zero.
         let manufact_id = rng.gen_range(1..1000i32);
+        // i_category_id and i_category are consistent (1=Women ..
+        // 10=Electronics) and i_class draws from that category's official
+        // class vocabulary; i_class_id stays independent like dsdgen's.
+        let cat = rng.gen_range(0..CATEGORIES.len());
+        let class_idx = rng.gen_range(0..CATEGORY_CLASSES[cat].len());
+        let class_id = rng.gen_range(1..16i32);
+        // dsdgen i_brand_id encodes <category><class:3><brand:3> (e.g.
+        // 1002001 = category 1, class 2, brand 1); the brand NAME is fully
+        // determined by (category, class) with only the #N suffix varying.
+        let brand_id = (cat as i32 + 1) * 1_000_000 + class_id * 1000 + rng.gen_range(1..=17i32);
+        let brand = format!("{} #{}", CATEGORY_CLASS_BRANDS[cat][class_idx], rng.gen_range(1..=17i32));
         vec![
             i!(sk), s!(random_id(rng)), d!(random_date(rng)), scd2_rec_end_date(row, rng),
             s!(random_name(rng)), f!(price), f!(wc),
-            i!(rng.gen_range(1..1000i32)), s!(random_str(rng, BRANDS)),
-            i!(rng.gen_range(1..16i32)), s!(random_str(rng, ITEM_CLASSES)),
-            i!(rng.gen_range(1..8i32)), s!(random_str(rng, CATEGORIES)),
+            i!(brand_id), s!(brand),
+            i!(class_id), s!(CATEGORY_CLASSES[cat][class_idx]),
+            i!((cat + 1) as i32), s!(CATEGORIES[cat]),
             i!(manufact_id), s!(format!("manufact#{manufact_id}")),
             s!(random_str(rng, ITEM_SIZES)), s!(random_id(rng)),
             s!(random_str(rng, ITEM_COLORS)), s!(random_str(rng, ITEM_UNITS)),
@@ -1085,7 +1227,7 @@ fn generate_customer_address(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             i!(sk), s!(random_id(rng)),
             s!(format!("{}", rng.gen_range(1..9999i32))), s!(random_name(rng)),
             s!(random_str(rng, STREET_TYPES)), s!(format!("Suite {}", rng.gen_range(1..999i32))),
-            s!(random_str(rng, CA_CITIES)), s!(random_name(rng)),
+            s!(random_str(rng, CA_CITIES)), s!(random_str(rng, COUNTIES)),
             s!(random_str(rng, STATES)), s!(format!("{:05}", rng.gen_range(10000..99999i32))),
             s!("United States"), f!(GMT_OFFSETS[rng.gen_range(0..GMT_OFFSETS.len())]),
             s!(random_str(rng, &["city", "suburb", "rural", "unknown"])),
@@ -1107,11 +1249,19 @@ fn generate_customer_demographics(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_household_demographics() -> (SchemaRef, Vec<RecordBatch>) {
-    generate_batches(household_demographics_schema(), 7_200, seed_for_table("household_demographics"), |row, rng| {
+    // dsdgen's hd table is a deterministic cross product, not a random draw:
+    // 7200 = 20 income bands x 6 buy potentials x 10 dep counts x 6 vehicle
+    // counts, with sk-derived strides (verified against CALL dsdgen(sf=0.1)).
+    // Random draws capped hd_dep_count at 5 and hd_vehicle_count at 2, so the
+    // q34/q46/q68/q73/q79 family's dep/vehicle windows matched nothing.
+    const VEHICLE_COUNTS: [i32; 6] = [0, 1, 2, 3, 4, -1];
+    generate_batches(household_demographics_schema(), 7_200, seed_for_table("household_demographics"), |row, _rng| {
+        let sk = (row + 1) as i32;
         vec![
-            i!((row + 1) as i32), i!(rng.gen_range(1..20i32)),
-            s!(random_str(rng, BUY_POTENTIAL)),
-            i!(rng.gen_range(0..6i32)), i!(rng.gen_range(-1..3i32)),
+            i!(sk), i!((sk % 20) + 1),
+            s!(BUY_POTENTIAL[(sk as usize / 20) % 6]),
+            i!((sk / 120) % 10),
+            i!(VEHICLE_COUNTS[(sk as usize / 1200) % 6]),
         ]
     })
 }
@@ -1137,8 +1287,11 @@ fn generate_store(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             i!(rng.gen_range(1..6i32)), s!("Company"), s!(format!("{}", rng.gen_range(1..999i32))),
             s!(random_name(rng)), s!(random_str(rng, STREET_TYPES)),
             s!(format!("Suite {}", rng.gen_range(1..99i32))),
-            s!(random_name(rng)), s!(random_name(rng)),
-            s!(random_str(rng, STATES)), s!(format!("{:05}", rng.gen_range(10000..99999i32))),
+            // dsdgen stores at sf <= 1 all sit in Midway/Fairview,
+            // Williamson County, TN; q01 filters s_state = 'TN' and
+            // q34/q46/q68/q79 probe these exact city/county names.
+            s!(STORE_CITIES[row % STORE_CITIES.len()]), s!("Williamson County"),
+            s!("TN"), s!(format!("{:05}", rng.gen_range(10000..99999i32))),
             s!("United States"), f!(GMT_OFFSETS[row % GMT_OFFSETS.len()]),
             f!(rng.gen_range(0..15i32) as f64 / 100.0),
         ]
@@ -1192,10 +1345,22 @@ fn generate_web_page(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let customers = customer_rows(scale) as i32;
     generate_batches(web_page_schema(), total, seed_for_table("web_page"), |row, rng| {
         let sk = (row + 1) as i32;
+        // dsdgen leaves wp_customer_sk NULL on most pages (only
+        // customer-specific pages carry one), and the fraction is
+        // scale-dependent: 5/6 at sf0.1 (6 rows), ~0.65 at sf1 (60 rows).
+        // A deterministic per-scale stripe keeps this tiny table inside the
+        // validator's 0.10 null-fraction tolerance at both scales; a random
+        // draw has far too much variance on 6 rows.
+        let non_null_stride = if total <= 30 { 6 } else { 3 };
+        let customer = if row % non_null_stride == 0 {
+            i!(rng.gen_range(1..=customers))
+        } else {
+            ColVal::I32(None)
+        };
         vec![
             i!(sk), s!(random_id(rng)), d!(random_date(rng)), scd2_rec_end_date(row, rng),
             i!(rng.gen_range(1..73049i32)), i!(rng.gen_range(1..73049i32)),
-            s!(random_str(rng, YN)), i!(rng.gen_range(1..=customers)),
+            s!(random_str(rng, YN)), customer,
             s!(format!("http://{}.com/{}", random_name(rng), sk)),
             s!(random_str(rng, WP_TYPES)), i!(rng.gen_range(0..100_000i32)),
             i!(rng.gen_range(0..25i32)), i!(rng.gen_range(0..20i32)),
@@ -1208,14 +1373,27 @@ fn generate_warehouse(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let total = warehouse_rows(scale);
     generate_batches(warehouse_schema(), total, seed_for_table("warehouse"), |row, rng| {
         let sk = (row + 1) as i32;
+        // dsdgen leaves the name/size/address fields NULL on ~1 in 5
+        // warehouses at sf1 (sf0.1's single warehouse is fully populated;
+        // row % 5 == 4 reproduces both).
+        let sparse = row % 5 == 4;
+        let name = random_name(rng);
+        let sq_ft = rng.gen_range(50_000..1_000_000i32);
+        let street_no = format!("{}", rng.gen_range(1..999i32));
+        let street_name = random_name(rng);
+        let street_type = random_str(rng, STREET_TYPES).to_string();
+        let suite = format!("Suite {}", rng.gen_range(1..99i32));
+        let gmt = rng.gen_range(-12..12i32) as f64;
+        let opt = |v: String| if sparse { ColVal::Str(None) } else { ColVal::Str(Some(v)) };
         vec![
-            i!(sk), s!(random_id(rng)), s!(random_name(rng)),
-            i!(rng.gen_range(50_000..1_000_000i32)),
-            s!(format!("{}", rng.gen_range(1..999i32))), s!(random_name(rng)),
-            s!(random_str(rng, STREET_TYPES)), s!(format!("Suite {}", rng.gen_range(1..99i32))),
+            i!(sk), s!(random_id(rng)), opt(name),
+            if sparse { ColVal::I32(None) } else { i!(sq_ft) },
+            opt(street_no), opt(street_name),
+            opt(street_type), opt(suite),
             s!(random_name(rng)), s!(random_name(rng)),
             s!(random_str(rng, STATES)), s!(format!("{:05}", rng.gen_range(10000..99999i32))),
-            s!("United States"), f!(rng.gen_range(-12..12i32) as f64),
+            s!("United States"),
+            if sparse { ColVal::F64(None) } else { f!(gmt) },
         ]
     })
 }
