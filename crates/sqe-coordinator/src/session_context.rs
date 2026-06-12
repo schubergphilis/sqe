@@ -275,7 +275,7 @@ pub async fn create_session_context(
             //
             // The guarded `read_parquet` / `read_csv` / `read_json` TVFs are
             // registered independently via `register_udtf` below and each call
-            // `config.storage.tvf.check(...)`, so removing `enable_url_table()`
+            // `config.storage.tvf.check_path(...)`, so removing `enable_url_table()`
             // costs the coordinator only the DuckDB-style bare-string shorthand,
             // not the safe file-reader functions. The embedded CLI keeps
             // `enable_url_table()` (single-tenant, `allow_local_paths = true`).
@@ -471,10 +471,23 @@ pub async fn create_session_context(
             // Register the read_parquet() table-valued function so users can
             // query external Parquet files directly from SQL:
             //   SELECT * FROM read_parquet('s3://bucket/path/*.parquet', ...)
+            //
+            // E2E-identity item 1: the TVFs are bound to the session's
+            // authenticated principal. Object-store paths (`s3://`, ...)
+            // read with the ENGINE's static storage key are denied unless
+            // they fall under `[storage.tvf] allowed_object_store_prefixes`
+            // (with `{user}` substitution) or the caller holds a role in
+            // `object_store_admin_roles`. Calls carrying complete inline
+            // credentials bypass the gate (the engine key is not used).
+            let tvf_caller = sqe_core::config::TvfCaller::for_user(
+                session.user.username.clone(),
+                session.user.roles.clone(),
+            );
             ctx.register_udtf(
                 "read_parquet",
-                Arc::new(sqe_catalog::read_parquet::ReadParquetFunction::new(
+                Arc::new(sqe_catalog::read_parquet::ReadParquetFunction::with_caller(
                     config.storage.clone(),
+                    tvf_caller.clone(),
                 )),
             );
 
@@ -486,14 +499,16 @@ pub async fn create_session_context(
             // overrides flow through the shared file_tvf_common helpers.
             ctx.register_udtf(
                 "read_csv",
-                Arc::new(sqe_catalog::read_csv::ReadCsvFunction::new(
+                Arc::new(sqe_catalog::read_csv::ReadCsvFunction::with_caller(
                     config.storage.clone(),
+                    tvf_caller.clone(),
                 )),
             );
             ctx.register_udtf(
                 "read_json",
-                Arc::new(sqe_catalog::read_json::ReadJsonFunction::new(
+                Arc::new(sqe_catalog::read_json::ReadJsonFunction::with_caller(
                     config.storage.clone(),
+                    tvf_caller,
                 )),
             );
 
