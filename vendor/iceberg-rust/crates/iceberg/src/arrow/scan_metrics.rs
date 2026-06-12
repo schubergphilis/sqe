@@ -94,3 +94,16 @@ impl ScanResult {
         &self.metrics
     }
 }
+
+/// Delegate to the inner record-batch stream so callers that don't care
+/// about metrics can consume a [`ScanResult`] directly as a stream.
+impl futures::Stream for ScanResult {
+    type Item = Result<arrow_array::RecordBatch>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.get_mut().stream.as_mut().poll_next(cx)
+    }
+}
