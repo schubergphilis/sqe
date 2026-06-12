@@ -30,7 +30,7 @@ sqe> SELECT snapshot_id, committed_at FROM s3tables.sales."orders$snapshots";
 
 **Top-five on the public [Iceberg matrix](https://icebergmatrix.org). 167/189. 88.4%.** Only non-Spark engine in the top five. Per-cell breakdown in [`docs/iceberg-matrix.md`](docs/iceberg-matrix.md); side-by-side against 20 other engines in [`docs/iceberg-matrix-compare.md`](docs/iceberg-matrix-compare.md).
 
-**Wins six of seven benchmark suites against Trino 465 at SF1.** TPC-H, SSB, TPC-DS, TPC-C, TPC-E, TPC-BB, ClickBench. 222 of 222 queries pass. Tables and method below.
+**Wins six of seven benchmark suites against Trino 465 at SF1.** TPC-H, SSB, TPC-DS, TPC-C, TPC-E, TPC-BB, ClickBench. 222 of 222 queries pass, and the results are differentially validated: every query runs against both engines and the rows are diffed, with DuckDB's official `dsdgen` as an independent data oracle. Tables and method below.
 
 **One binary scales from CLI to cluster.** `sqe-cli --embedded` is a DuckDB-class single-process engine with the same SQL surface as the distributed coordinator. Persistent SQLite-backed Iceberg catalogs at `~/.sqe/warehouse/` survive restarts. Cross-catalog joins across multiple `--catalog NAME=PATH` mounts, plus runtime mounts via SQL `ATTACH` against any of the six supported backends (REST, Glue, S3 Tables, HMS, JDBC, SQLite).
 
@@ -74,10 +74,25 @@ Two longer comparison docs trace the lineage of these positions:
 
 SQE wins six of seven suites. TPC-DS collapsed from 42.5s to 13.4s after we wired DataFusion's runtime filters into iceberg-rust's scan path through the vendor's `DynamicPredicate` bridge: q82 dropped 1787ms to 113ms (16x), q80 1398ms to 103ms (14x), q13 1317ms to 220ms (6x). The fix is a two-tier pushdown — iceberg-rust samples once per file scan task for row-group / page-index pruning, and a per-batch wrapper catches filters that resolve after the task opened. Earlier in the month we landed the dynamic-filter type-coercion fix that flipped q72 from 10.7s to 0.77s ([docs/blog/2026-05-16-q72-the-nemesis.md](docs/blog/2026-05-16-q72-the-nemesis.md)). SSB is the one suite we still trail; lineorder's uniform FK distribution defeats row-group pruning, so the runtime filter only helps at row level and Trino's vectorized decoder still wins. The remaining 6/99 TPC-DS mismatches are upstream DataFusion ROLLUP / GROUPING() gaps (apache/datafusion#4763, #13993), not engine regressions. The earlier "Our Nemesis" investigation is preserved as [docs/blog/2026-04-16-our-nemesis-q72.md](docs/blog/2026-04-16-our-nemesis-q72.md).
 
+### How we know the numbers are real
+
+A benchmark row that says "Match" can still validate nothing: if the generated data contains no rows a query can select, both engines agree on empty and the diff passes. We learned this the hard way. Since June 2026 the harness reports those cases as `Vacuous`, and the generators are validated against DuckDB's official `dsdgen` output as an engine-free oracle (`scripts/validate-generator-tpcds.py`). That oracle caught a TPC-C generator bug that zeroed every warehouse join at fractional scales and a set of TPC-DS vocabulary gaps that had silently blanked 16 query results. Details in [the validation blog post](docs/blog/2026-06-12-the-benchmark-that-lied.md).
+
+The same validation pass found one query where the engines disagree and SQE is right: TPC-DS q75 returns 57 rows on SQE and 55 on Trino, because Trino's `DECIMAL(17,2)` division rounds two sales ratios of 0.8983 and 0.8984 up to 0.90 and drops them from the `< 0.9` filter. DuckDB returns SQE's exact 57 rows on the same parquet files.
+
+Distributed mode gets the same scrutiny on a forced-distribution rig (single worker, distribution threshold zero, every fact scan shipped over Arrow Flight). That rig exposed that dynamic join filters never reached the workers; fixing the pushdown took TPC-DS SF1 under that worst case from 4.4x slower than Trino to 1.7x faster. SSB under the rig still trails: its star-join selectivity lives in the hash-set membership of the runtime filter, which a serialized predicate cannot carry. Shipping build-side key sets (bloom filters) to workers is the open follow-up.
+
 Run your own:
 
 ```bash
 BENCH_SCALE=1 ./scripts/benchmark-test.sh --compare-trino tpch tpcds ssb clickbench
+
+# differential compare against a live Trino on the same Iceberg catalog
+sqe-bench compare tpcds --scale 1 --trino-url http://localhost:38080
+
+# validate generated TPC-DS data against DuckDB's official dsdgen
+duckdb /tmp/dsdgen.db -c "INSTALL tpcds; LOAD tpcds; CALL dsdgen(sf=1)"
+scripts/validate-generator-tpcds.py --ours data/tpcds/sf1 --dsdgen-db /tmp/dsdgen.db
 ```
 
 ## Architecture
@@ -208,6 +223,7 @@ Engineering posts that double as design rationale:
 | [SQE Talks to Five Catalogs Now](docs/blog/2026-04-29-five-catalogs-live.md) | The live verification phase plus AWS SigV4 |
 | [How We Accidentally Created a DuckDB](docs/blog/2026-05-07-accidentally-duckdb.md) | V8 to V12: file-format TVFs, hf://, Delta, smarter read_csv |
 | [Shipping OpenLineage](docs/blog/2026-05-09-shipping-openlineage.md) | Column-level lineage from idea to merged MR |
+| [The Benchmark That Lied](docs/blog/2026-06-12-the-benchmark-that-lied.md) | Vacuous results, the DuckDB oracle, and the day Trino was wrong |
 
 Full archive in [`docs/blog/`](docs/blog/).
 
