@@ -333,7 +333,11 @@ fn generate_warehouse(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
 fn generate_district(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = district_schema();
-    let num_warehouses = scale as i32;
+    // At fractional scales `scale as i32` truncates to 0 while the
+    // warehouse table itself generates max(1) rows with w_id = 1; the
+    // .min(num_warehouses) clamp then pinned every FK to 0 and all
+    // warehouse joins were empty (SF0.1 vacuous compare results).
+    let num_warehouses = (scale as i32).max(1);
     // 10 districts per warehouse
     let total = super::scaled(scale, 10.0);
     let total = total.max(1);
@@ -407,7 +411,11 @@ fn generate_district(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
 fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = customer_schema();
-    let num_warehouses = scale as i32;
+    // At fractional scales `scale as i32` truncates to 0 while the
+    // warehouse table itself generates max(1) rows with w_id = 1; the
+    // .min(num_warehouses) clamp then pinned every FK to 0 and all
+    // warehouse joins were empty (SF0.1 vacuous compare results).
+    let num_warehouses = (scale as i32).max(1);
     // 3000 customers per district, 10 districts per warehouse
     let total = super::scaled(scale, 30_000.0);
     let total = total.max(1);
@@ -527,7 +535,11 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
 fn generate_history(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = history_schema();
-    let num_warehouses = scale as i32;
+    // At fractional scales `scale as i32` truncates to 0 while the
+    // warehouse table itself generates max(1) rows with w_id = 1; the
+    // .min(num_warehouses) clamp then pinned every FK to 0 and all
+    // warehouse joins were empty (SF0.1 vacuous compare results).
+    let num_warehouses = (scale as i32).max(1);
     // 1 history record per customer: SF * 30,000
     let total = super::scaled(scale, 30_000.0);
     let total = total.max(1);
@@ -588,7 +600,11 @@ fn generate_history(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
 fn generate_orders(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = orders_schema();
-    let num_warehouses = scale as i32;
+    // At fractional scales `scale as i32` truncates to 0 while the
+    // warehouse table itself generates max(1) rows with w_id = 1; the
+    // .min(num_warehouses) clamp then pinned every FK to 0 and all
+    // warehouse joins were empty (SF0.1 vacuous compare results).
+    let num_warehouses = (scale as i32).max(1);
     // 3000 orders per district, 10 districts per warehouse
     let total = super::scaled(scale, 30_000.0);
     let total = total.max(1);
@@ -655,7 +671,11 @@ fn generate_orders(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
 fn generate_new_order(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = new_order_schema();
-    let num_warehouses = scale as i32;
+    // At fractional scales `scale as i32` truncates to 0 while the
+    // warehouse table itself generates max(1) rows with w_id = 1; the
+    // .min(num_warehouses) clamp then pinned every FK to 0 and all
+    // warehouse joins were empty (SF0.1 vacuous compare results).
+    let num_warehouses = (scale as i32).max(1);
     // last 900 orders per district are new orders: SF * 10 districts * 900 = SF * 9000
     let total = super::scaled(scale, 9_000.0);
     let total = total.max(1);
@@ -699,7 +719,11 @@ fn generate_new_order(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
 fn generate_order_line(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = order_line_schema();
-    let num_warehouses = scale as i32;
+    // At fractional scales `scale as i32` truncates to 0 while the
+    // warehouse table itself generates max(1) rows with w_id = 1; the
+    // .min(num_warehouses) clamp then pinned every FK to 0 and all
+    // warehouse joins were empty (SF0.1 vacuous compare results).
+    let num_warehouses = (scale as i32).max(1);
     // average 10 lines per order (range 5-15), 30,000 orders per warehouse
     // TPC-C spec uses exactly 300,000 per warehouse for estimation
     let total = super::scaled(scale, 300_000.0);
@@ -839,7 +863,11 @@ fn generate_item() -> (SchemaRef, Vec<RecordBatch>) {
 
 fn generate_stock(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = stock_schema();
-    let num_warehouses = scale as i32;
+    // At fractional scales `scale as i32` truncates to 0 while the
+    // warehouse table itself generates max(1) rows with w_id = 1; the
+    // .min(num_warehouses) clamp then pinned every FK to 0 and all
+    // warehouse joins were empty (SF0.1 vacuous compare results).
+    let num_warehouses = (scale as i32).max(1);
     // 100,000 stock rows per warehouse
     let total = super::scaled(scale, 100_000.0);
     let total = total.max(1);
