@@ -2409,6 +2409,7 @@ impl QueryHandler {
             schema,
         )
         .with_fragment_callback(callback)
+        .with_pushed_down_filters(iceberg_scan.pushed_down_filters().to_vec())
         .with_worker_secret(self.config.coordinator.worker_secret.expose().to_string())
         .with_timeouts(
             std::time::Duration::from_secs(self.config.coordinator.worker_connect_timeout_secs),
@@ -4127,22 +4128,38 @@ pub(crate) fn aggregate_spill_metrics(plan: &Arc<dyn ExecutionPlan>) -> (usize, 
     (sort_spill_count, sort_spill_bytes, join_spill_count, join_spill_bytes)
 }
 
-/// Walk a physical plan tree to find the first `IcebergScanExec` node.
+/// Walk a physical plan tree and pick the `IcebergScanExec` worth
+/// distributing: the LARGEST by estimated row count (falling back to byte
+/// size, both from snapshot-summary statistics — no manifest I/O).
 ///
-/// Uses iterative depth-first search (plan trees are shallow, so no need
-/// for async recursion). Returns the first matching node, or `None` if the
-/// plan contains no Iceberg table scans.
+/// Only one scan per query is distributed, and first-match DFS picked an
+/// arbitrary one in multi-join plans: SSB q4.x shipped a dimension table to
+/// the workers while the 6M-row lineorder fact scan ran locally on the
+/// coordinator. Returns `None` if the plan contains no Iceberg table scans.
 fn find_iceberg_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+    let mut scans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
     let mut stack: Vec<Arc<dyn ExecutionPlan>> = vec![Arc::clone(plan)];
     while let Some(node) = stack.pop() {
         if node.as_any().downcast_ref::<IcebergScanExec>().is_some() {
-            return Some(node);
+            scans.push(node);
+            continue;
         }
         for child in node.children() {
             stack.push(Arc::clone(child));
         }
     }
-    None
+    let size_of = |node: &Arc<dyn ExecutionPlan>| -> u64 {
+        let stats = match node.partition_statistics(None) {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
+        match (stats.num_rows.get_value(), stats.total_byte_size.get_value()) {
+            (Some(rows), _) => *rows as u64,
+            (None, Some(bytes)) => *bytes as u64,
+            (None, None) => 0,
+        }
+    };
+    scans.into_iter().max_by_key(size_of)
 }
 
 /// Replace a specific scan node in a physical plan tree with a new node,
