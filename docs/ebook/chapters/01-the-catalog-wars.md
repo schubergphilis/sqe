@@ -304,7 +304,7 @@ For our development and test environment, we run Polaris in memory:
 
 ```yaml
 polaris:
-  image: apache/polaris:latest
+  image: apache/polaris:1.5.0
   environment:
     POLARIS_BOOTSTRAP_CREDENTIALS: "root:s3cr3t"
   ports:
