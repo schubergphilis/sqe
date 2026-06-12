@@ -1843,6 +1843,53 @@ mod tests {
         .unwrap()
     }
 
+    /// A pending dynamic filter snapshots to `lit(true)`; anything else (a
+    /// sealed bound, a constant false) must not be classified as pending.
+    #[test]
+    fn trivial_true_detects_placeholder_only() {
+        use datafusion::common::ScalarValue;
+        use datafusion::physical_expr::expressions::{Column, Literal};
+
+        let lit_true: Arc<dyn PhysicalExpr> =
+            Arc::new(Literal::new(ScalarValue::Boolean(Some(true))));
+        let lit_false: Arc<dyn PhysicalExpr> =
+            Arc::new(Literal::new(ScalarValue::Boolean(Some(false))));
+        let column: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+
+        assert!(is_trivial_true(&lit_true));
+        assert!(!is_trivial_true(&lit_false));
+        assert!(!is_trivial_true(&column));
+    }
+
+    /// `rows_seen` counts every row the predicate evaluates (pre-filter), and
+    /// stays silent when unset so chained predicates don't double-count.
+    #[test]
+    fn physical_expr_predicate_counts_rows_seen() {
+        use datafusion::common::ScalarValue;
+        use datafusion::physical_expr::expressions::Literal;
+        use datafusion::physical_plan::metrics::Count;
+
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let counter = Count::new();
+        let mut counted = PhysicalExprPredicate {
+            expr: Arc::new(Literal::new(ScalarValue::Boolean(Some(true)))),
+            projection: ProjectionMask::all(),
+            rows_seen: Some(counter.clone()),
+        };
+        let mut uncounted = PhysicalExprPredicate {
+            expr: Arc::new(Literal::new(ScalarValue::Boolean(Some(true)))),
+            projection: ProjectionMask::all(),
+            rows_seen: None,
+        };
+
+        counted.evaluate(batch(&schema, &[1, 2, 3])).unwrap();
+        counted.evaluate(batch(&schema, &[4, 5])).unwrap();
+        uncounted.evaluate(batch(&schema, &[6, 7, 8])).unwrap();
+
+        assert_eq!(counter.value(), 5, "two counted batches: 3 + 2 rows");
+    }
+
     /// Each per-file `Vec<RecordBatch>` is spliced into one flat stream in file
     /// order, with every batch and every row preserved. This is the correctness
     /// guarantee the streaming rewrite must keep relative to the old
