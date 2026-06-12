@@ -35,7 +35,7 @@ use deltalake_core::delta_datafusion::{DeltaScanConfigBuilder, DeltaTableProvide
 use deltalake_core::open_table_with_storage_options;
 use tracing::debug;
 
-use sqe_core::config::StorageConfig;
+use sqe_core::config::{StorageConfig, TvfCaller};
 
 use crate::file_tvf_common::{parse_file_tvf_args, FileTvfArgs};
 
@@ -50,11 +50,22 @@ struct DeltaOpts {
 #[derive(Debug)]
 pub struct ReadDeltaFunction {
     storage: StorageConfig,
+    /// Authenticated caller identity for the object-store prefix gate.
+    /// `TvfCaller::default()` (anonymous, untrusted) fails closed.
+    caller: TvfCaller,
 }
 
 impl ReadDeltaFunction {
     pub fn new(storage: StorageConfig) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            caller: TvfCaller::default(),
+        }
+    }
+
+    /// Create a new `ReadDeltaFunction` bound to an authenticated caller.
+    pub fn with_caller(storage: StorageConfig, caller: TvfCaller) -> Self {
+        Self { storage, caller }
     }
 }
 
@@ -89,10 +100,14 @@ impl TableFunctionImpl for ReadDeltaFunction {
             )));
         }
 
-        // Issue #10: TVF path / host policy check.
-        self.storage.tvf.check(&args.path).map_err(|e| {
-            DataFusionError::Plan(format!("{FN_NAME}: {e}"))
-        })?;
+        // Issue #10: TVF path / host policy check. Object-store paths are
+        // additionally gated per caller identity (E2E-identity item 1).
+        crate::file_tvf_common::enforce_tvf_path_policy(
+            FN_NAME,
+            &args,
+            &self.storage,
+            &self.caller,
+        )?;
 
         let storage = self.storage.clone();
         crate::runtime_bridge::block_on_compat(async move {

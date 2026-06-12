@@ -132,13 +132,20 @@ fn build_and_register_http_store(
     tvf_policy: Option<&TvfPolicy>,
 ) -> DFResult<Arc<dyn ObjectStore>> {
     // CAT-01 defense-in-depth: reject hosts the TVF policy would deny before a
-    // store is ever built. `TvfPolicy::check` allows the host when `allow_http`
-    // is set or the host is in `allowed_http_hosts`; otherwise it errors. When
+    // store is ever built. `TvfPolicy::check_path` allows the host when
+    // `allow_http` is set or the host is in `allowed_http_hosts`; otherwise it
+    // errors. The URL here is always `http(s)` (guarded by the caller's match),
+    // so the identity argument is irrelevant — an anonymous, untrusted caller
+    // keeps any non-http path that ever reached this helper fail-closed. When
     // no policy is supplied (embedded CLI / tests) the legacy permissive
     // behaviour is preserved.
     if let Some(policy) = tvf_policy {
         policy
-            .check(url.as_str())
+            .check_path(
+                url.as_str(),
+                &sqe_core::config::TvfCaller::default(),
+                false,
+            )
             .map_err(DataFusionError::Plan)?;
     }
 
@@ -321,9 +328,8 @@ mod tests {
     #[test]
     fn tvf_policy_allows_allowlisted_http_host() {
         let policy = TvfPolicy {
-            allow_local_paths: false,
-            allow_http: false,
             allowed_http_hosts: vec!["data.example.com".to_string()],
+            ..Default::default()
         };
         let lazy = LazyHttpObjectStoreRegistry::with_tvf_policy(
             DefaultObjectStoreRegistry::new(),
@@ -339,9 +345,8 @@ mod tests {
     #[test]
     fn tvf_policy_allow_http_permits_any_host() {
         let policy = TvfPolicy {
-            allow_local_paths: false,
             allow_http: true,
-            allowed_http_hosts: vec![],
+            ..Default::default()
         };
         let lazy = LazyHttpObjectStoreRegistry::with_tvf_policy(
             DefaultObjectStoreRegistry::new(),
