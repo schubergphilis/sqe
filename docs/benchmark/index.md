@@ -117,6 +117,19 @@ Numbers below are from the latest SF1 run on the same machine, against Trino 465
 
 The numbers are approximate (run-to-run variance is real) but the rank order is stable across the last month of runs. Two fixes landed in May moved the needle: the dynamic-filter type-coercion fix on May 16 collapsed q72 from 10.7s to 0.77s, and the runtime-filter pushdown into iceberg-rust's scan path on May 17 took TPC-DS from 42.5s to 13.4s, TPC-BB from 38.2s to 28.0s, and TPC-E from 10.8s to 9.3s. SSB regressed slightly (7.0s -> 8.3s) because lineorder's uniform FK distribution defeats row-group pruning.
 
+## Differential validation (June 2026)
+
+Timing data is only as good as the result data behind it. Two layers of validation now run before any number is trusted:
+
+1. **Engine diff.** `sqe-bench compare <suite>` runs every query against SQE (Flight SQL) and Trino (HTTP) on the same Iceberg tables and diffs the result rows. A row-count or value mismatch fails the query. A query that returns zero rows on BOTH engines is reported as `Vacuous`, not `Match`: agreement on nothing validates nothing.
+2. **Data oracle.** `scripts/validate-generator-tpcds.py` loads the generated parquet and DuckDB's official `CALL dsdgen` output side by side, checks per-table row counts and per-column null fractions, and runs all 99 queries against both datasets inside DuckDB. A query that returns rows on official data and none on ours is a generator-fidelity bug, found without either engine in the loop.
+
+The oracle earned its keep on day one. It proved 16 of 29 vacuous TPC-DS results were generator gaps (invented county names, colors, brand vocabularies the qualification queries cannot select), found that TPC-C generated zero-warehouse foreign keys at fractional scales, and settled the one genuine engine disagreement in SQE's favor: TPC-DS q75 differs by two rows because Trino's `DECIMAL(17,2)` division rounds ratios 0.8983 and 0.8984 up to 0.90 and drops them from a `< 0.9` filter. DuckDB matches SQE exactly.
+
+Known remaining vacuous queries (all need correlation machinery the generator does not have yet, each worth 5 or fewer rows on official data): q04, q11, q17, q39, q74 at SF0.1; q08, q24, q25, q41, q54, q85, q91 at SF1.
+
+Distributed execution is validated separately on a forced-distribution rig: single worker, distribution thresholds at zero, so every fact scan crosses Arrow Flight even for single-file tables. The rig exists because gates that decide whether code runs decide whether it gets tested. It exposed that dynamic join filters never reached the workers (fixed June 2026; TPC-DS SF1 under the rig went from 4.4x slower than Trino to 1.7x faster) and that SSB's remaining gap is hash-set join selectivity that a serialized range predicate cannot carry to a worker.
+
 ## Related
 
 - [Performance Roadmap](../specs/performance-roadmap.md): the optimisation backlog, in order.
@@ -124,3 +137,4 @@ The numbers are approximate (run-to-run variance is real) but the rank order is 
 - [Our Nemesis: TPC-DS Q72 (April)](../blog/2026-04-16-our-nemesis-q72.md): the original investigation, when the query was still 12x slower.
 - [q72, our nemesis, and the Int32 that hid for a month (May 16)](../blog/2026-05-16-q72-the-nemesis.md): the post-mortem on the fix that finally landed.
 - [Five Layers of Caching and an 8.8x Speedup](../blog/2026-04-12-caching-and-the-8x-speedup.md): the early-April caching work.
+- [The Benchmark That Lied (June 12)](../blog/2026-06-12-the-benchmark-that-lied.md): vacuous results, the DuckDB oracle, and the day Trino was the one with the wrong answer.
