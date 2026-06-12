@@ -55,6 +55,14 @@ pub const DEFAULT_SMALL_FILE_THRESHOLD_BYTES: u64 = 3 * 1024 * 1024;
 /// iceberg-rust's `ObjectCache` and ignore this knob.
 pub const DEFAULT_MANIFEST_CONCURRENCY: usize = 64;
 
+/// Default bounded wait (ms) at stream open for pending hash-join dynamic
+/// filters to seal. Dimension build sides typically complete within ~100ms;
+/// waiting lets scan-time pruning (manifest bounds, row groups, parquet
+/// RowFilter) see the build-side key set instead of the lit(true)
+/// placeholder, so rows die before decode instead of after. Mirrors the
+/// distributed dispatch wait and Trino's split-generation wait.
+pub const DEFAULT_RUNTIME_FILTER_WAIT_MS: u64 = 100;
+
 /// Default concurrency for the direct-read small-file fast path.
 ///
 /// The fast path reads each eligible file entirely in one S3 GET. Without
@@ -149,6 +157,10 @@ pub struct IcebergScanExec {
     /// Issue #132: per-file bounds-spread fraction above which a column is
     /// considered uniform. Sourced from `[catalog.runtime_filters]`. Default 0.8.
     runtime_filter_uniform_threshold: f64,
+    /// Bounded wait (ms) at stream open for pending hash-join dynamic filters
+    /// to seal before scan-time pruning samples them. Sourced from
+    /// `[catalog.runtime_filters] wait_ms`. 0 disables. Default 100.
+    runtime_filter_wait_ms: u64,
 }
 
 impl IcebergScanExec {
@@ -219,7 +231,7 @@ impl IcebergScanExec {
             }
         };
         let properties = Arc::new(PlanProperties::new(eq_props, Partitioning::UnknownPartitioning(DEFAULT_TARGET_PARTITIONS), EmissionType::Incremental, Boundedness::Bounded));
-        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![], manifest_concurrency: DEFAULT_MANIFEST_CONCURRENCY, direct_read_concurrency: DEFAULT_DIRECT_READ_CONCURRENCY, target_partitions: DEFAULT_TARGET_PARTITIONS, cached_statistics: None, runtime_filter_clustering_skip: false, runtime_filter_uniform_threshold: 0.8 }
+        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![], manifest_concurrency: DEFAULT_MANIFEST_CONCURRENCY, direct_read_concurrency: DEFAULT_DIRECT_READ_CONCURRENCY, target_partitions: DEFAULT_TARGET_PARTITIONS, cached_statistics: None, runtime_filter_clustering_skip: false, runtime_filter_uniform_threshold: 0.8, runtime_filter_wait_ms: DEFAULT_RUNTIME_FILTER_WAIT_MS }
     }
 
     /// Attach pre-computed statistics aggregated from Iceberg manifests.
@@ -277,6 +289,13 @@ impl IcebergScanExec {
     /// scans whose planned files are effectively uniform (median per-file bounds
     /// spread >= `uniform_threshold`) on every filter column skip Tier-1
     /// dynamic-predicate registration; Tier-2 per-batch filtering still applies.
+    /// Bounded wait (ms) at stream open for pending dynamic filters to seal.
+    #[must_use = "with_runtime_filter_wait_ms consumes self; bind the returned scan"]
+    pub fn with_runtime_filter_wait_ms(mut self, wait_ms: u64) -> Self {
+        self.runtime_filter_wait_ms = wait_ms;
+        self
+    }
+
     #[must_use = "with_runtime_filter_clustering consumes self; bind the returned scan"]
     pub fn with_runtime_filter_clustering(mut self, skip: bool, uniform_threshold: f64) -> Self {
         self.runtime_filter_clustering_skip = skip;
@@ -357,6 +376,7 @@ impl IcebergScanExec {
             cached_statistics: self.cached_statistics.clone(),
             runtime_filter_clustering_skip: self.runtime_filter_clustering_skip,
             runtime_filter_uniform_threshold: self.runtime_filter_uniform_threshold,
+            runtime_filter_wait_ms: self.runtime_filter_wait_ms,
         }
     }
 
@@ -757,6 +777,7 @@ impl ExecutionPlan for IcebergScanExec {
         let pushed_down_filters = self.pushed_down_filters.clone();
         let runtime_filter_clustering_skip = self.runtime_filter_clustering_skip;
         let runtime_filter_uniform_threshold = self.runtime_filter_uniform_threshold;
+        let runtime_filter_wait_ms = self.runtime_filter_wait_ms;
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         let _files_pruned_minmax = MetricBuilder::new(&self.metrics).counter("files_pruned_minmax", partition);
         let files_pruned_dynamic = MetricBuilder::new(&self.metrics).counter("files_pruned_dynamic", partition);
@@ -777,6 +798,7 @@ impl ExecutionPlan for IcebergScanExec {
         let rows_passed_filter_pending = MetricBuilder::new(&self.metrics).counter("rows_passed_filter_pending", partition);
         let dynamic_filters_resolved = MetricBuilder::new(&self.metrics).counter("dynamic_filters_resolved", partition);
         let dynamic_filters_pending = MetricBuilder::new(&self.metrics).counter("dynamic_filters_pending", partition);
+        let filter_wait_time = MetricBuilder::new(&self.metrics).subset_time("filter_wait_time", partition);
         debug!(table=%table.identifier(), predicates=?predicates, snapshot_id=?snapshot_id, pushed_filters=pushed_down_filters.len(), "Executing IcebergScanExec");
 
         // For time-travel: check the specified snapshot exists; for current: check current snapshot.
@@ -863,6 +885,17 @@ impl ExecutionPlan for IcebergScanExec {
             // `files_matched - files_pruned_dynamic` is the files actually read.
             files_matched.add(file_entries.len());
             bytes_planned.add(file_entries.iter().map(|(_, sz)| *sz as usize).sum());
+
+            // Waited AFTER manifest planning so that I/O overlaps the join
+            // build sides, and BEFORE either reader path samples the dynamic
+            // filters. Bounded; see wait_for_dynamic_filters.
+            if !pushed_down_filters.is_empty() && runtime_filter_wait_ms > 0 {
+                let _t = filter_wait_time.timer();
+                let waited = wait_for_dynamic_filters(&pushed_down_filters, runtime_filter_wait_ms).await;
+                if waited > 0 {
+                    debug!(waited_ms = waited, "Waited for dynamic filters to seal");
+                }
+            }
 
             // ── Direct-read fast path ────────────────────────────────────────
             //
@@ -1662,6 +1695,34 @@ struct PhysicalExprPredicate {
     rows_seen: Option<datafusion::physical_plan::metrics::Count>,
 }
 
+/// Bounded wait for hash-join dynamic filters to seal.
+///
+/// Polls every 5ms until no pushed-down `DynamicFilterPhysicalExpr` snapshots
+/// to the `lit(true)` placeholder, or `wait_ms` elapses. Returns the waited
+/// milliseconds. Bounded by construction: a probe-side scan that the build
+/// side is (indirectly) waiting on costs at most `wait_ms` extra, never a
+/// deadlock — which is why this must never call `wait_complete()`.
+async fn wait_for_dynamic_filters(filters: &[Arc<dyn PhysicalExpr>], wait_ms: u64) -> u64 {
+    fn any_pending(filters: &[Arc<dyn PhysicalExpr>]) -> bool {
+        filters.iter().any(|f| {
+            f.as_any()
+                .downcast_ref::<DynamicFilterPhysicalExpr>()
+                .is_some_and(|d| d.current().map(|e| is_trivial_true(&e)).unwrap_or(true))
+        })
+    }
+    if wait_ms == 0 || !any_pending(filters) {
+        return 0;
+    }
+    let start = std::time::Instant::now();
+    let deadline = std::time::Duration::from_millis(wait_ms);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        if !any_pending(filters) || start.elapsed() >= deadline {
+            return start.elapsed().as_millis() as u64;
+        }
+    }
+}
+
 /// True when a dynamic filter snapshot is still the `lit(true)` placeholder,
 /// i.e. the hash join build side has not sealed the filter yet.
 fn is_trivial_true(expr: &Arc<dyn PhysicalExpr>) -> bool {
@@ -1841,6 +1902,44 @@ mod tests {
             vec![Arc::new(Int32Array::from(values.to_vec()))],
         )
         .unwrap()
+    }
+
+    /// No dynamic filters (or already-sealed ones) must not wait at all;
+    /// a still-pending placeholder must wait out the bounded deadline and
+    /// return, never hang.
+    #[tokio::test]
+    async fn wait_for_dynamic_filters_bounded() {
+        use datafusion::common::ScalarValue;
+        use datafusion::physical_expr::expressions::{lit, Column, Literal};
+
+        // Static (non-dynamic) filters: nothing to wait for.
+        let static_filters: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::new(Column::new("a", 0))];
+        assert_eq!(wait_for_dynamic_filters(&static_filters, 1_000).await, 0);
+
+        // wait_ms = 0 disables waiting even for a pending placeholder.
+        let pending: Arc<dyn PhysicalExpr> = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::new(Column::new("a", 0))],
+            lit(true),
+        ));
+        assert_eq!(wait_for_dynamic_filters(&[Arc::clone(&pending)], 0).await, 0);
+
+        // A pending placeholder waits out the deadline and returns.
+        let waited = wait_for_dynamic_filters(&[Arc::clone(&pending)], 30).await;
+        assert!(waited >= 30, "deadline must be honored, waited {waited}ms");
+        assert!(waited < 1_000, "wait must be bounded, waited {waited}ms");
+
+        // A sealed filter returns without waiting.
+        let sealed: Arc<dyn PhysicalExpr> = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::new(Column::new("a", 0))],
+            lit(true),
+        ));
+        sealed
+            .as_any()
+            .downcast_ref::<DynamicFilterPhysicalExpr>()
+            .unwrap()
+            .update(Arc::new(Literal::new(ScalarValue::Boolean(Some(false)))))
+            .unwrap();
+        assert_eq!(wait_for_dynamic_filters(&[sealed], 1_000).await, 0);
     }
 
     /// A pending dynamic filter snapshots to `lit(true)`; anything else (a
