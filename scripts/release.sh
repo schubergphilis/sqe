@@ -53,19 +53,27 @@ if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null; then
 fi
 
 echo "==> Bumping crate versions to ${VERSION}"
-# Match exactly `version = "x.y.z"` on a line by itself (not inside [dependencies]).
-# `crates/*/Cargo.toml` covers every published crate; the root and xtask are
-# excluded intentionally.
+# Since f7a7e81 every crate inherits its version from [workspace.package] in
+# the root Cargo.toml (`version.workspace = true`), so the single source of
+# truth is the root manifest. Bump only the line inside [workspace.package];
+# the root is a virtual manifest, so that is its only `version = ` line.
+perl -i -0pe 's/(\[workspace\.package\]\n(?:[^\[]*?))version = ".*?"/${1}version = "'"$VERSION"'"/s' Cargo.toml
+echo "  Cargo.toml [workspace.package] -> $VERSION"
+
+# Belt and braces: bump any crate that still carries its own version line
+# instead of inheriting from the workspace.
 for crate_toml in crates/*/Cargo.toml; do
     if ! grep -q '^version = ' "$crate_toml"; then
-        echo "  skip $crate_toml (no version line)"
         continue
     fi
-    # In-place replace the first version line (the [package] one).
-    # Use a portable sed pattern that works on macOS and Linux.
     perl -i -pe 's/^version = ".*"$/version = "'"$VERSION"'"/' "$crate_toml"
     echo "  $crate_toml -> $VERSION"
 done
+
+if ! grep -A1 '\[workspace.package\]' Cargo.toml | grep -q "version = \"${VERSION}\""; then
+    echo "error: failed to bump [workspace.package] version in Cargo.toml" >&2
+    exit 1
+fi
 
 echo "==> Refreshing Cargo.lock"
 cargo check --workspace --offline --quiet 2>&1 | tail -3 || true
@@ -77,7 +85,7 @@ if [[ -z "$(git status --porcelain)" ]]; then
 fi
 
 echo "==> Committing"
-git add crates/*/Cargo.toml Cargo.lock
+git add Cargo.toml crates/*/Cargo.toml Cargo.lock
 git commit -m "chore(release): ${VERSION}
 
 Bump all workspace crate versions to ${VERSION} ahead of the v${VERSION}
