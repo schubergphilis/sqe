@@ -72,7 +72,25 @@ Two longer comparison docs trace the lineage of these positions:
 | TPC-BB (10) | 28.0s | 255.7s | **9.1x** | 10/10 |
 | ClickBench (43) | 1.3s | 4.46s | **3.4x** | 43/43 |
 
-SQE wins six of seven suites. TPC-DS collapsed from 42.5s to 13.4s after we wired DataFusion's runtime filters into iceberg-rust's scan path through the vendor's `DynamicPredicate` bridge: q82 dropped 1787ms to 113ms (16x), q80 1398ms to 103ms (14x), q13 1317ms to 220ms (6x). The fix is a two-tier pushdown — iceberg-rust samples once per file scan task for row-group / page-index pruning, and a per-batch wrapper catches filters that resolve after the task opened. Earlier in the month we landed the dynamic-filter type-coercion fix that flipped q72 from 10.7s to 0.77s ([docs/blog/2026-05-16-q72-the-nemesis.md](docs/blog/2026-05-16-q72-the-nemesis.md)). SSB is the one suite we still trail; lineorder's uniform FK distribution defeats row-group pruning, so the runtime filter only helps at row level and Trino's vectorized decoder still wins. The remaining 6/99 TPC-DS mismatches are upstream DataFusion ROLLUP / GROUPING() gaps (apache/datafusion#4763, #13993), not engine regressions. The earlier "Our Nemesis" investigation is preserved as [docs/blog/2026-04-16-our-nemesis-q72.md](docs/blog/2026-04-16-our-nemesis-q72.md).
+SQE wins six of seven suites. TPC-DS collapsed from 42.5s to 13.4s after we wired DataFusion's runtime filters into iceberg-rust's scan path through the vendor's `DynamicPredicate` bridge: q82 dropped 1787ms to 113ms (16x), q80 1398ms to 103ms (14x), q13 1317ms to 220ms (6x). The fix is a two-tier pushdown: iceberg-rust samples once per file scan task for row-group / page-index pruning, and a per-batch wrapper catches filters that resolve after the task opened. Earlier in the month we landed the dynamic-filter type-coercion fix that flipped q72 from 10.7s to 0.77s ([docs/blog/2026-05-16-q72-the-nemesis.md](docs/blog/2026-05-16-q72-the-nemesis.md)). SSB is the one suite we still trail; lineorder's uniform FK distribution defeats row-group pruning, so the runtime filter only helps at row level and Trino's vectorized decoder still wins. The remaining 6/99 TPC-DS mismatches are upstream DataFusion ROLLUP / GROUPING() gaps (apache/datafusion#4763, #13993), not engine regressions. The earlier "Our Nemesis" investigation is preserved as [docs/blog/2026-04-16-our-nemesis-q72.md](docs/blog/2026-04-16-our-nemesis-q72.md).
+
+## Performance receipts (SF10, vs Trino 481)
+
+June 2026, after the scan-parallelism work. Both engines run containerized in the same Docker network, read the same Iceberg tables from the same S3 store, and get the same envelope: 8 CPUs, bounded heaps, 5GB per query. Totals per suite; full per-query compare reports live in `benchmarks/results/`.
+
+| Suite | SQE single-node | SQE distributed (2 workers) | Trino 481 | Verdict |
+|---|---|---|---|---|
+| TPC-H (22) | 130.5s | **95.5s** | 106.4s - 138.6s | SQE distributed wins |
+| SSB (13) | **42.0s** | 53.6s | 28.0s - 41.1s | Trino, gap closing |
+| TPC-DS (99) | 543.9s | **338.3s** | 328.4s - 468.0s | even |
+
+Trino shows a range because every compare run re-measures it; the high end is the run where two idle SQE worker containers shared the VM. Three changes carried SF10 from "3 to 5x slower than Trino" in the morning to this table in the evening:
+
+1. **Parallel parquet decode.** The iceberg-rust reader overlapped I/O but decoded every file on the one thread polling the merged stream. Scan-bound queries pinned one core while ten sat idle. Now every 128MB byte-range subtask decodes on its own runtime task. TPC-H q06 went from 6.4s to 1.65s distributed.
+2. **A fair benchmark rig.** The old rig ran SQE on the host, reading the dockerized S3 store through the port-forward at ~160 MB/s aggregate, while Trino read container-to-container at ~320 MB/s. Half the reported gap was the pipe, not the engine. Measure your rig before you profile your engine.
+3. **A greedy memory pool.** FairSpillPool statically split the pool across every registered spillable consumer; wide TPC-DS plans register ~90 of them, capping each at ~95MB of an 8GB pool and failing queries Trino finished in 5GB. The pool is now greedy with tracked consumers; `coordinator.memory_pool = "fair"` restores the old behavior.
+
+Distribution is a per-shape decision, not a default: big fact-to-fact joins (TPC-H, TPC-DS) gain 25 to 40 percent from two workers, while star schemas (SSB) pay shuffle costs that single-node avoids. Known open items at SF10: four TPC-DS inventory queries (q23, q37, q72, q82) fail distributed when the worker's scan buffer outruns Flight shipment and exhausts the 4GB worker pool, and SSB still trails Trino on raw star-join throughput.
 
 ### How we know the numbers are real
 
