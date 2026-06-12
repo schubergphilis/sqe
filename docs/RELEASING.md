@@ -101,3 +101,22 @@ scripts/release.sh 0.30.2 --push
 ```
 
 The release pipeline fires on the tag push regardless of branch.
+
+## Retrospective tags (v0.31.5 .. v0.35.0)
+
+Between 2026-05-11 (v0.31.4) and 2026-06-12 no releases were cut while 150+
+MRs merged. On 2026-06-12 we tagged the milestone merge points
+retrospectively:
+
+| Tag | Commit | Wave |
+|---|---|---|
+| v0.31.5 | 882a662 | Security/hardening audit campaign (May 13-15) |
+| v0.32.0 | f9398c8 | Dynamic predicate pushdown, system.register_table |
+| v0.33.0 | ccf42b4 | DuckDB quack protocol, iceberg rebase + int96 |
+| v0.34.0 | 199f550 | Ballista wind-down, catalog discovery, S3 TVFs |
+| v0.35.0 | b7059a3 | Web UI, embedded cloud catalogs, quickstarts |
+
+These tags point at trees whose crates still read `0.31.4` -- the known
+drift exception. They were pushed with `-o ci.skip` so no release pipeline
+ran for them. v0.36.0 is the first normal release after the gap. Don't
+repeat this: cut a release when a feature wave merges, not a month later.
