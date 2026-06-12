@@ -140,7 +140,7 @@ async fn build_session_catalog(
 ///
 /// When a shared `runtime` is provided (built once at coordinator startup via
 /// [`crate::runtime::build_coordinator_runtime`]), it is used for all sessions
-/// so the FairSpillPool memory limit is enforced globally. When `None`, a
+/// so the shared memory pool limit is enforced globally. When `None`, a
 /// per-query runtime is created using the legacy `max_query_memory` setting.
 ///
 /// Results are cached per token fingerprint (5-minute TTL, max 100 entries).
@@ -218,16 +218,22 @@ pub async fn create_session_context(
                 .set_bool("datafusion.execution.parquet.reorder_filters", true);
 
             let ctx = if let Some(rt) = runtime {
-                // Use the shared coordinator runtime (FairSpillPool with spill-to-disk)
+                // Use the shared coordinator runtime (memory pool per
+                // `coordinator.memory_pool`, spill-to-disk per config)
                 SessionContext::new_with_config_rt(session_config, Arc::clone(rt))
             } else {
-                // Fallback path (tests, one-shot helpers): FairSpillPool with spill disabled.
-                // Still prevents OOM by dividing memory fairly among operators.
+                // Fallback path (tests, one-shot helpers): greedy pool with
+                // spill disabled. Greedy matches the shared runtime default;
+                // FairSpillPool's static pool/N split across registered
+                // consumers starves wide plans (see runtime::build_memory_pool).
                 let max_memory = sqe_core::parse_memory_limit(&config.query.max_query_memory)
                     .unwrap_or(256 * 1024 * 1024);
                 if max_memory > 0 {
                     let pool = Arc::new(
-                        datafusion::execution::memory_pool::FairSpillPool::new(max_memory),
+                        datafusion::execution::memory_pool::TrackConsumersPool::new(
+                            datafusion::execution::memory_pool::GreedyMemoryPool::new(max_memory),
+                            std::num::NonZeroUsize::new(5).expect("non-zero const"),
+                        ),
                     );
                     // V10 httpfs: lazy http(s) + s3 ObjectStoreRegistry mirrors
                     // the primary coordinator runtime so the fallback path
