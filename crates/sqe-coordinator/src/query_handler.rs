@@ -102,6 +102,9 @@ pub struct QueryHandler {
     /// Cached parse of `config.query.max_query_memory`. Used as the
     /// per-query reservation increment against the per-user budget.
     per_query_memory_bytes: usize,
+    /// Cached parse of `config.query.query_profile`. Parsed once at startup
+    /// so an unknown value warns once, not per query.
+    profile_mode: sqe_core::ProfileMode,
     /// Shared DataFusion runtime with FairSpillPool memory management.
     /// Built once at startup and reused across all queries.
     runtime: Arc<RuntimeEnv>,
@@ -204,6 +207,8 @@ impl QueryHandler {
             })? as usize
         };
 
+        let profile_mode = sqe_core::ProfileMode::parse(&config.query.query_profile);
+
         Ok(Self {
             policy_enforcer,
             policy_store,
@@ -224,6 +229,7 @@ impl QueryHandler {
             per_user_memory: Arc::new(crate::memory::PerUserMemoryRegistry::new()),
             per_user_memory_budget_bytes,
             per_query_memory_bytes,
+            profile_mode,
             runtime,
             table_cache: None,
             grant_backend,
@@ -1649,6 +1655,7 @@ impl QueryHandler {
                     slow_query_threshold_secs: self.config.query.slow_query_threshold_secs,
                     sql_length: sql.len(),
                     tables_touched,
+                    profile_mode: self.profile_mode,
                 };
 
                 let tracked = crate::streaming::TrackedRecordBatchStream::with_permits_reservation_and_cancel_token(

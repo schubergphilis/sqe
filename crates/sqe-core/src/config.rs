@@ -74,6 +74,37 @@ impl SortMode {
 }
 
 
+/// Controls passive per-query profiling: after a streaming query finishes
+/// (or fails), the coordinator renders the executed physical plan with the
+/// per-operator metrics DataFusion populated during normal execution. No
+/// re-run under EXPLAIN ANALYZE is needed to see where the time went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileMode {
+    /// No profiles are captured.
+    Off,
+    /// Profile queries that cross `slow_query_threshold_secs`, and every
+    /// failed query (failures are exactly when evidence is wanted).
+    Slow,
+    /// Profile every query.
+    All,
+}
+
+impl ProfileMode {
+    /// Parse from config string. Unknown values fall back to `Off` with a
+    /// WARN (profiling is opt-in; lenient like `SortMode::parse`).
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Self::Off,
+            "slow" => Self::Slow,
+            "all" => Self::All,
+            _ => {
+                tracing::warn!(query_profile = s, "Unknown query_profile, defaulting to off");
+                Self::Off
+            }
+        }
+    }
+}
+
 /// How the coordinator resolves a catalog name that is not statically
 /// declared in `[catalogs.*]`. `Static` (default) errors on an unknown
 /// 3-part identifier. `PolarisAuto` lazily probes Polaris for a warehouse
@@ -145,6 +176,17 @@ pub struct QueryConfig {
     /// Queries taking longer than this are logged at WARN level. Default: 30. Set to 0 to disable.
     #[serde(default = "default_slow_query_threshold")]
     pub slow_query_threshold_secs: u64,
+    /// Passive per-query profiling: log the executed physical plan with the
+    /// per-operator metrics DataFusion populated during normal execution.
+    ///
+    /// - `"off"`: no profiles (default).
+    /// - `"slow"`: log a profile for queries crossing `slow_query_threshold_secs`,
+    ///   and for every failed query.
+    /// - `"all"`: log every query's profile.
+    ///
+    /// Unknown values are treated as `"off"` with a WARN at startup.
+    #[serde(default = "default_query_profile")]
+    pub query_profile: String,
     /// Maximum memory per query. Default: "256MB". Supports: B, KB, MB, GB. Set to "0" for unlimited.
     #[serde(default = "default_max_query_memory")]
     pub max_query_memory: String,
@@ -229,6 +271,7 @@ impl Default for QueryConfig {
             max_concurrent_per_user: default_max_concurrent_per_user(),
             per_user_memory_budget: default_per_user_memory_budget(),
             slow_query_threshold_secs: default_slow_query_threshold(),
+            query_profile: default_query_profile(),
             max_query_memory: default_max_query_memory(),
             distribution_threshold: default_distribution_threshold(),
             distribution_file_threshold: default_distribution_file_threshold(),
@@ -2178,6 +2221,7 @@ fn default_max_concurrent_queries() -> usize { 100 }
 fn default_max_concurrent_per_user() -> usize { 20 }
 fn default_per_user_memory_budget() -> String { "1GB".to_string() }
 fn default_slow_query_threshold() -> u64 { 30 }
+fn default_query_profile() -> String { "off".to_string() }
 fn default_stream_idle_timeout() -> u64 { 300 }
 fn default_max_query_memory() -> String { "256MB".to_string() }
 fn default_distribution_threshold() -> String { "128MB".to_string() }
@@ -4102,6 +4146,27 @@ type = "aws"
         assert_eq!(config.max_concurrent_queries, 100);
         assert_eq!(config.slow_query_threshold_secs, 30);
         assert_eq!(config.max_query_memory, "256MB");
+        assert_eq!(config.query_profile, "off");
+    }
+
+    #[test]
+    fn test_profile_mode_parse() {
+        assert_eq!(ProfileMode::parse("off"), ProfileMode::Off);
+        assert_eq!(ProfileMode::parse("slow"), ProfileMode::Slow);
+        assert_eq!(ProfileMode::parse("all"), ProfileMode::All);
+        // Case-insensitive and whitespace-tolerant.
+        assert_eq!(ProfileMode::parse(" ALL "), ProfileMode::All);
+        assert_eq!(ProfileMode::parse("Slow"), ProfileMode::Slow);
+        // Unknown values fall back to Off (profiling is opt-in).
+        assert_eq!(ProfileMode::parse("verbose"), ProfileMode::Off);
+        assert_eq!(ProfileMode::parse(""), ProfileMode::Off);
+    }
+
+    #[test]
+    fn test_query_profile_from_toml() {
+        let config: QueryConfig = toml::from_str(r#"query_profile = "slow""#).unwrap();
+        assert_eq!(config.query_profile, "slow");
+        assert_eq!(ProfileMode::parse(&config.query_profile), ProfileMode::Slow);
     }
 
     #[test]

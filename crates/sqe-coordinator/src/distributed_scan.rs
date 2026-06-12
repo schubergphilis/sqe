@@ -14,6 +14,7 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
@@ -114,6 +115,9 @@ pub struct DistributedScanExec {
     worker_connect_timeout: std::time::Duration,
     /// gRPC request timeout for `do_get`. Issue #29.
     worker_rpc_timeout: std::time::Duration,
+    /// Per-operator metrics so EXPLAIN ANALYZE and passive query profiles
+    /// show real elapsed/rows for this node instead of blanks.
+    metrics: ExecutionPlanMetricsSet,
 }
 
 /// Trait for local execution fallback.
@@ -188,6 +192,7 @@ impl DistributedScanExec {
             worker_secret: String::new(),
             worker_connect_timeout: std::time::Duration::from_secs(5),
             worker_rpc_timeout: std::time::Duration::from_secs(630),
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 
@@ -304,6 +309,10 @@ impl ExecutionPlan for DistributedScanExec {
         _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn execute(
@@ -564,6 +573,7 @@ impl ExecutionPlan for DistributedScanExec {
         Ok(Box::pin(DistributedRecordBatchStream {
             schema: schema_for_stream,
             inner: Box::pin(stream),
+            baseline: BaselineMetrics::new(&self.metrics, partition),
         }))
     }
 }
@@ -694,13 +704,24 @@ async fn dispatch_to_worker(
 struct DistributedRecordBatchStream {
     schema: SchemaRef,
     inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>,
+    /// Records output rows and coordinator-side poll time so the exec's
+    /// `metrics()` reflect what actually flowed through this partition.
+    baseline: BaselineMetrics,
 }
 
 impl Stream for DistributedRecordBatchStream {
     type Item = DFResult<RecordBatch>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.inner.as_mut().poll_next(cx)
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let poll = {
+            // The poll itself is mostly waiting on the Flight stream; the
+            // timer still attributes coordinator-side decode/reassembly work
+            // to this node so the profile row is not blank.
+            let _timer = this.baseline.elapsed_compute().timer();
+            this.inner.as_mut().poll_next(cx)
+        };
+        this.baseline.record_poll(poll)
     }
 }
 
@@ -1532,6 +1553,47 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(col.value(0), 42, "Should get marker value from local executor");
+    }
+
+    #[tokio::test]
+    async fn metrics_populated_after_execution() {
+        // Drive a partition through the local-fallback path (worker is
+        // unreachable) and assert the exec's metrics carry the rows that
+        // flowed through the stream, so passive profiles and EXPLAIN
+        // ANALYZE show real numbers on the DistributedScanExec row.
+        let registry = Arc::new(WorkerRegistry::new(vec!["http://w1:50052".to_string()]));
+        registry.mark_healthy("http://w1:50052").await;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let local_exec = Arc::new(TestLocalExecutor::new());
+
+        let exec = DistributedScanExec::new(
+            vec![make_task("f1")],
+            vec!["http://w1:50052".to_string()],
+            schema,
+        )
+        .with_worker_registry(registry)
+        .with_max_retries(0)
+        .with_local_executor(Arc::new(LocalExecutorWrapper(local_exec)));
+
+        let context = Arc::new(TaskContext::default());
+        let stream = exec.execute(0, context).unwrap();
+
+        use futures::StreamExt;
+        let results: Vec<_> = stream.collect().await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok());
+
+        let metrics = exec.metrics().expect("metrics must be Some after execution");
+        assert_eq!(
+            metrics.output_rows(),
+            Some(1),
+            "baseline metrics must record the one fallback row"
+        );
+        assert!(
+            metrics.elapsed_compute().is_some(),
+            "elapsed_compute must be recorded"
+        );
     }
 
     #[tokio::test]
