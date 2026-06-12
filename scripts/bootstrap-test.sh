@@ -54,16 +54,21 @@ done
 # old implementation masked stderr and always printed "done", which hid
 # silent-creation failures until Polaris tried to write to the bucket
 # and got back a NoSuchBucket 404 hours later.
-echo -n "Creating S3 bucket 'warehouse'... "
+# Two buckets: 'warehouse' for test_warehouse and 'warehouse-discovery'
+# for discovery_test_wh. Polaris 1.5.0 rejects catalogs whose allowed
+# locations overlap an existing catalog, so the discovery warehouse can
+# no longer nest under s3://warehouse/.
+for BUCKET in warehouse warehouse-discovery; do
+echo -n "Creating S3 bucket '$BUCKET'... "
 if command -v aws &> /dev/null; then
     if AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" \
        aws --endpoint-url "$S3_URL" --region us-east-1 \
-       s3api head-bucket --bucket warehouse 2>/dev/null; then
+       s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
         echo "already exists"
     else
         MB_OUT=$(AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" \
             aws --endpoint-url "$S3_URL" --region us-east-1 \
-            s3 mb s3://warehouse 2>&1) || {
+            s3 mb "s3://$BUCKET" 2>&1) || {
             echo "FAILED"
             echo "  aws s3 mb stderr: $MB_OUT" >&2
             echo "  Check RustFS is up and credentials match docker-compose.test.yml." >&2
@@ -74,19 +79,20 @@ if command -v aws &> /dev/null; then
 else
     # curl fallback: HTTP PUT returns 200 on create, 409 on already-exists
     # (with RustFS), or 403/4xx on auth/config error. Capture status.
-    CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT "$S3_URL/warehouse" \
+    CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT "$S3_URL/$BUCKET" \
         -u "${S3_ACCESS_KEY}:${S3_SECRET_KEY}" 2>/dev/null || echo "000")
     case "$CODE" in
         200|204) echo "created" ;;
         409)     echo "already exists" ;;
         *)
             echo "FAILED (HTTP $CODE)"
-            echo "  PUT $S3_URL/warehouse returned $CODE" >&2
+            echo "  PUT $S3_URL/$BUCKET returned $CODE" >&2
             echo "  Install 'aws' CLI for a clearer error, or check RustFS auth." >&2
             exit 1
             ;;
     esac
 fi
+done
 
 # ── 2. Get Polaris OAuth2 token ────────────────────────────────
 echo -n "Getting Polaris token... "
@@ -170,6 +176,68 @@ HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
     -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
     -d '{"namespace": ["test_ns"]}' 2>/dev/null)
+
+case "$HTTP_CODE" in
+    200) echo "done" ;;
+    409) echo "already exists" ;;
+    *) echo "FAILED (HTTP $HTTP_CODE)"; exit 1 ;;
+esac
+
+# ── 7. Create discovery_test_wh (catalog_discovery_test.rs) ───
+# The polaris-auto catalog-discovery integration tests need a SECOND
+# warehouse that is NOT in [catalogs.*] of the test config. Polaris in
+# this stack is in-memory, so it must be re-created on every fresh
+# stack or those tests fail with "Unable to find warehouse".
+echo -n "Creating warehouse 'discovery_test_wh'... "
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+    "$POLARIS_URL/api/management/v1/catalogs" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "{
+        \"catalog\": {
+            \"name\": \"discovery_test_wh\",
+            \"type\": \"INTERNAL\",
+            \"storageConfigInfo\": {
+                \"storageType\": \"S3\",
+                \"allowedLocations\": [\"s3://warehouse-discovery/\"],
+                \"endpoint\": \"$S3_URL\",
+                \"endpointInternal\": \"http://rustfs:9000\",
+                \"pathStyleAccess\": true
+            },
+            \"properties\": {
+                \"default-base-location\": \"s3://warehouse-discovery/\",
+                \"polaris.config.drop-with-purge.enabled\": \"true\"
+            }
+        }
+    }" 2>/dev/null)
+
+case "$HTTP_CODE" in
+    200|201) echo "done" ;;
+    409) echo "already exists" ;;
+    *) echo "FAILED (HTTP $HTTP_CODE)"; exit 1 ;;
+esac
+
+curl -s -o /dev/null -X POST "$POLARIS_URL/api/management/v1/catalogs/discovery_test_wh/catalog-roles" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"catalogRole": {"name": "catalog_admin"}}' 2>/dev/null || true
+
+curl -s -o /dev/null -X PUT "$POLARIS_URL/api/management/v1/catalogs/discovery_test_wh/catalog-roles/catalog_admin/grants" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"grant": {"type": "catalog", "privilege": "CATALOG_MANAGE_CONTENT"}}' 2>/dev/null || true
+
+curl -s -o /dev/null -X PUT "$POLARIS_URL/api/management/v1/principal-roles/service_admin/catalog-roles/discovery_test_wh" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"catalogRole": {"name": "catalog_admin"}}' 2>/dev/null || true
+
+echo -n "Creating namespace 'disc_ns' in discovery_test_wh... "
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+    "$POLARIS_URL/api/catalog/v1/discovery_test_wh/namespaces" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"namespace": ["disc_ns"]}' 2>/dev/null)
 
 case "$HTTP_CODE" in
     200) echo "done" ;;
