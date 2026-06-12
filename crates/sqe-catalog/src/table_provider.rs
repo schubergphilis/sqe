@@ -49,6 +49,9 @@ pub struct SqeTableProvider {
     /// uniform on every filter column skip Tier-1 registration.
     runtime_filter_clustering_skip: bool,
     runtime_filter_uniform_threshold: f64,
+    /// Bounded wait (ms) at scan open for pending dynamic filters, from
+    /// `[catalog.runtime_filters] wait_ms`.
+    runtime_filter_wait_ms: u64,
 }
 
 impl SqeTableProvider {
@@ -77,6 +80,7 @@ impl SqeTableProvider {
             prefetch_concurrency: crate::iceberg_scan::DEFAULT_DIRECT_READ_CONCURRENCY,
             runtime_filter_clustering_skip: false,
             runtime_filter_uniform_threshold: 0.8,
+            runtime_filter_wait_ms: crate::iceberg_scan::DEFAULT_RUNTIME_FILTER_WAIT_MS,
         })
     }
 
@@ -119,6 +123,14 @@ impl SqeTableProvider {
     pub fn with_runtime_filter_clustering(mut self, skip: bool, uniform_threshold: f64) -> Self {
         self.runtime_filter_clustering_skip = skip;
         self.runtime_filter_uniform_threshold = uniform_threshold;
+        self
+    }
+
+    /// Bounded wait (ms) at scan open for pending dynamic filters, from
+    /// `[catalog.runtime_filters] wait_ms`. Threads through to `IcebergScanExec`.
+    #[must_use = "with_runtime_filter_wait_ms consumes self; bind the returned provider"]
+    pub fn with_runtime_filter_wait_ms(mut self, wait_ms: u64) -> Self {
+        self.runtime_filter_wait_ms = wait_ms;
         self
     }
 
@@ -251,7 +263,8 @@ impl TableProvider for SqeTableProvider {
             .with_runtime_filter_clustering(
                 self.runtime_filter_clustering_skip,
                 self.runtime_filter_uniform_threshold,
-            );
+            )
+            .with_runtime_filter_wait_ms(self.runtime_filter_wait_ms);
 
         // Pre-compute per-column min/max/null_count from manifest entries so
         // DataFusion's join-order optimizer sees real selectivity and picks

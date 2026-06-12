@@ -257,6 +257,24 @@ pub struct QueryConfig {
     /// Default: true.
     #[serde(default = "default_true")]
     pub distributed_scan_pushdown: bool,
+    /// Maximum distinct build-side join keys materialized as an IN-list
+    /// dynamic filter (DataFusion's
+    /// `optimizer.hash_join_inlist_pushdown_max_distinct_values`). Above
+    /// this the filter degrades to an opaque hash-table probe that cannot
+    /// be pushed into Iceberg scans or shipped to workers, so only min/max
+    /// bounds prune -- which is worthless on uniformly distributed join
+    /// keys (every SSB star query). DataFusion's default is 150; SSB-scale
+    /// dimension filters carry 160-6500 keys.
+    ///
+    /// Default: 65536. Set to 0 to keep DataFusion's default.
+    #[serde(default = "default_runtime_filter_inlist_max_values")]
+    pub runtime_filter_inlist_max_values: usize,
+    /// Companion byte cap for the IN-list dynamic filter (DataFusion's
+    /// `optimizer.hash_join_inlist_pushdown_max_size`, default 128KB).
+    /// Sized so `runtime_filter_inlist_max_values` keys of any fixed-width
+    /// type fit. Default: "4MB". Set to "0" to keep DataFusion's default.
+    #[serde(default = "default_runtime_filter_inlist_max_size")]
+    pub runtime_filter_inlist_max_size: String,
 }
 
 impl Default for QueryConfig {
@@ -282,6 +300,8 @@ impl Default for QueryConfig {
             star_schema_min_ratio: default_star_schema_min_ratio(),
             stream_idle_timeout_secs: default_stream_idle_timeout(),
             distributed_scan_pushdown: default_true(),
+            runtime_filter_inlist_max_values: default_runtime_filter_inlist_max_values(),
+            runtime_filter_inlist_max_size: default_runtime_filter_inlist_max_size(),
         }
     }
 }
@@ -1348,6 +1368,16 @@ pub struct RuntimeFiltersConfig {
     /// spread is at or above this threshold. Default `0.8`.
     #[serde(default = "default_runtime_filter_uniform_threshold")]
     pub uniform_threshold: f64,
+    /// Bounded wait (milliseconds) at scan-stream open for pending hash-join
+    /// dynamic filters to seal, mirroring the distributed dispatch wait and
+    /// Trino's split-generation wait. Dimension build sides typically seal
+    /// within ~100ms; waiting lets the scan apply their key sets BEFORE
+    /// decoding instead of filtering decoded batches afterwards. Set to 0
+    /// to open scans immediately (the pre-existing behavior).
+    ///
+    /// Default: 100.
+    #[serde(default = "default_runtime_filter_wait_ms")]
+    pub wait_ms: u64,
 }
 
 impl Default for RuntimeFiltersConfig {
@@ -1355,12 +1385,17 @@ impl Default for RuntimeFiltersConfig {
         Self {
             clustering_skip_enabled: false,
             uniform_threshold: default_runtime_filter_uniform_threshold(),
+            wait_ms: default_runtime_filter_wait_ms(),
         }
     }
 }
 
 fn default_runtime_filter_uniform_threshold() -> f64 {
     0.8
+}
+
+fn default_runtime_filter_wait_ms() -> u64 {
+    100
 }
 
 #[derive(Deserialize, Clone)]
@@ -2498,6 +2533,8 @@ fn default_max_concurrent_per_user() -> usize { 20 }
 fn default_per_user_memory_budget() -> String { "1GB".to_string() }
 fn default_slow_query_threshold() -> u64 { 30 }
 fn default_query_profile() -> String { "off".to_string() }
+fn default_runtime_filter_inlist_max_values() -> usize { 65536 }
+fn default_runtime_filter_inlist_max_size() -> String { "4MB".to_string() }
 fn default_stream_idle_timeout() -> u64 { 300 }
 fn default_max_query_memory() -> String { "256MB".to_string() }
 fn default_distribution_threshold() -> String { "128MB".to_string() }
@@ -4449,6 +4486,29 @@ type = "aws"
         let config: QueryConfig = toml::from_str(r#"query_profile = "slow""#).unwrap();
         assert_eq!(config.query_profile, "slow");
         assert_eq!(ProfileMode::parse(&config.query_profile), ProfileMode::Slow);
+    }
+
+    #[test]
+    fn test_runtime_filter_knobs_defaults_and_overrides() {
+        // Defaults: IN-list materialization sized for star-schema dimension
+        // filters, 100ms scan-open wait.
+        let q: QueryConfig = toml::from_str("").unwrap();
+        assert_eq!(q.runtime_filter_inlist_max_values, 65536);
+        assert_eq!(q.runtime_filter_inlist_max_size, "4MB");
+        let rf: RuntimeFiltersConfig = toml::from_str("").unwrap();
+        assert_eq!(rf.wait_ms, 100);
+
+        let q: QueryConfig = toml::from_str(
+            r#"
+            runtime_filter_inlist_max_values = 1000
+            runtime_filter_inlist_max_size = "256KB"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(q.runtime_filter_inlist_max_values, 1000);
+        assert_eq!(q.runtime_filter_inlist_max_size, "256KB");
+        let rf: RuntimeFiltersConfig = toml::from_str("wait_ms = 0").unwrap();
+        assert_eq!(rf.wait_ms, 0);
     }
 
     #[test]
