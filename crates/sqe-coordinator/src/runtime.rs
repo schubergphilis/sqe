@@ -8,7 +8,9 @@
 use std::sync::Arc;
 
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
-use datafusion::execution::memory_pool::FairSpillPool;
+use datafusion::execution::memory_pool::{
+    FairSpillPool, GreedyMemoryPool, MemoryPool, TrackConsumersPool,
+};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use tracing::info;
 
@@ -29,6 +31,39 @@ use sqe_core::parse_memory_limit;
 /// object-store registry so file-reader TVFs (`read_csv` / `read_parquet`) can
 /// lazily build `s3://` stores for ad-hoc buckets that were never
 /// pre-registered as Iceberg catalogs.
+/// Build the runtime memory pool from the `coordinator.memory_pool` knob.
+///
+/// `"greedy"` (default) hands out memory first-come first-served up to the
+/// limit; spillable operators spill when the pool is genuinely full, and
+/// [`TrackConsumersPool`] names the top consumers in exhaustion errors.
+/// `"fair"` restores the previous [`FairSpillPool`], which statically divides
+/// the pool across every registered spillable consumer. Wide plans register
+/// dozens of consumers (operators x partitions), capping each at pool/N even
+/// while most allocate nothing: TPC-DS q39 at SF10 registered ~90, capping
+/// every consumer at ~95 MB of an 8 GB pool and failing a partial aggregate
+/// that DataFusion 53 cannot emit early under a constant GROUP BY ordering
+/// key. Unknown values warn and fall back to greedy.
+fn build_memory_pool(kind: &str, memory_bytes: usize) -> Arc<dyn MemoryPool> {
+    const TOP_CONSUMERS_IN_ERROR: usize = 5;
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "fair" => Arc::new(FairSpillPool::new(memory_bytes)),
+        "greedy" => Arc::new(TrackConsumersPool::new(
+            GreedyMemoryPool::new(memory_bytes),
+            std::num::NonZeroUsize::new(TOP_CONSUMERS_IN_ERROR).expect("non-zero const"),
+        )),
+        other => {
+            tracing::warn!(
+                memory_pool = other,
+                "Unknown coordinator.memory_pool, defaulting to greedy"
+            );
+            Arc::new(TrackConsumersPool::new(
+                GreedyMemoryPool::new(memory_bytes),
+                std::num::NonZeroUsize::new(TOP_CONSUMERS_IN_ERROR).expect("non-zero const"),
+            ))
+        }
+    }
+}
+
 pub fn build_coordinator_runtime(
     config: &CoordinatorConfig,
     storage: &StorageConfig,
@@ -43,15 +78,14 @@ pub fn build_coordinator_runtime(
     info!(
         memory_limit = %config.memory_limit,
         memory_bytes = memory_bytes,
+        memory_pool = %config.memory_pool,
         spill_to_disk = config.spill_to_disk,
         spill_dir = %config.spill_dir,
         spill_compression = %config.spill_compression,
         "Configuring coordinator DataFusion runtime"
     );
 
-    // Use FairSpillPool directly — it divides memory fairly among spillable
-    // operators and triggers spill when the limit is reached.
-    let memory_pool = Arc::new(FairSpillPool::new(memory_bytes));
+    let memory_pool = build_memory_pool(&config.memory_pool, memory_bytes);
 
     // V10 httpfs: wrap the default ObjectStoreRegistry so http(s) URLs in
     // file-format TVFs (read_csv / read_json / read_parquet) get a backing
@@ -127,6 +161,22 @@ mod tests {
         match runtime.memory_pool.memory_limit() {
             MemoryLimit::Finite(limit) => assert_eq!(limit, expected_bytes),
             _ => panic!("Expected Finite memory limit"),
+        }
+    }
+
+    #[test]
+    fn test_memory_pool_knob() {
+        // Default is greedy: a single consumer may take the whole pool.
+        let config = config_no_spill("1GB");
+        assert_eq!(config.memory_pool, "greedy");
+
+        // "fair" restores FairSpillPool; both report a finite limit.
+        for kind in ["greedy", "fair", "GREEDY", " Fair ", "bogus"] {
+            let pool = build_memory_pool(kind, 1024 * 1024 * 1024);
+            match pool.memory_limit() {
+                MemoryLimit::Finite(limit) => assert_eq!(limit, 1024 * 1024 * 1024),
+                _ => panic!("Expected Finite memory limit for kind {kind}"),
+            }
         }
     }
 
