@@ -17,7 +17,6 @@
 //!   -> `PrepareResponse`
 //! - The decoded `PrepareResponse` carries the expected single INT64 column
 
-mod common;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,10 +54,10 @@ impl AuthProvider for FixedIdentityProvider {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn quack_select_one_round_trip() {
-    common::init_tracing();
+    crate::common::init_tracing();
 
     // ── 1. Authenticate against the lightweight Polaris stack ─────────────
-    let config = sqe_core::SqeConfig::load(&common::test_config_path()).expect("load test config");
+    let config = sqe_core::SqeConfig::load(&crate::common::test_config_path()).expect("load test config");
     let authenticator = sqe_auth::Authenticator::new(&config.auth)
         .await
         .expect("create authenticator");

@@ -23,7 +23,6 @@
 //! belt-and-braces measure against the in-memory Polaris's eventual
 //! consistency rather than a strict requirement.
 
-mod common;
 
 use arrow_array::{Array, Int64Array};
 
@@ -160,7 +159,7 @@ async fn reset_table(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn create_v3_table_with_nanosec_timestamp_round_trips_through_polaris() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     let ns = "default";
     let name = "v3_create_ns_ts";
@@ -197,7 +196,7 @@ async fn create_v3_table_with_nanosec_timestamp_round_trips_through_polaris() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn insert_then_select_round_trips_v3_table() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
     let name = "v3_insert_select";
     let fq = format!("{ns}.{name}");
@@ -253,7 +252,7 @@ async fn insert_then_select_round_trips_v3_table() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn alter_add_column_with_default_on_v3_table() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
     let name = "v3_alter_default";
     let fq = format!("{ns}.{name}");
@@ -317,7 +316,7 @@ async fn alter_add_column_with_default_on_v3_table() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn delete_cow_on_v3_table_drops_row() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
     let name = "v3_delete_cow";
     let fq = format!("{ns}.{name}");
@@ -370,7 +369,7 @@ async fn delete_cow_on_v3_table_drops_row() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn position_deletes_on_v3_table() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
     let name = "v3_pos_deletes_2";
     let fq = format!("{ns}.{name}");
@@ -437,7 +436,7 @@ async fn position_deletes_on_v3_table() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn equality_delete_update_on_v3_table() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
     let name = "v3_eq_update";
     let fq = format!("{ns}.{name}");
@@ -507,7 +506,7 @@ async fn equality_delete_update_on_v3_table() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn merge_into_on_v3_table() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
     let name = "v3_merge_into";
     let fq = format!("{ns}.{name}");
@@ -595,7 +594,7 @@ async fn merge_into_on_v3_table() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn time_travel_on_v3_table() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
     let name = "v3_time_travel";
     let fq = format!("{ns}.{name}");
@@ -659,7 +658,7 @@ async fn time_travel_on_v3_table() {
 async fn bloom_filter_property_round_trips_on_v3_table() {
     use arrow_array::StringArray;
 
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
     let name = "v3_bloom";
     let fq = format!("{ns}.{name}");
@@ -721,7 +720,7 @@ async fn bloom_filter_property_round_trips_on_v3_table() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn rewrite_data_files_on_v3_table() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
     let name = "v3_rewrite";
     let fq = format!("{ns}.{name}");
@@ -785,7 +784,7 @@ async fn rewrite_data_files_on_v3_table() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn for_version_as_of_on_v3_table() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
     let name = "v3_for_version";
     let fq = format!("{ns}.{name}");
@@ -869,7 +868,7 @@ async fn for_version_as_of_on_v3_table() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn cdc_incremental_scan_on_v3_table() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
     let name = "v3_cdc";
     let fq = format!("{ns}.{name}");
@@ -964,7 +963,7 @@ async fn cdc_incremental_scan_on_v3_table() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn type_promotion_int_to_bigint_on_v3_table() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
     let name = "v3_type_promo";
     let fq = format!("{ns}.{name}");
@@ -1020,7 +1019,7 @@ async fn type_promotion_int_to_bigint_on_v3_table() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn statistics_on_v3_table() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
     let name = "v3_stats";
     let fq = format!("{ns}.{name}");

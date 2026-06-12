@@ -22,7 +22,6 @@
 //! single output. The assertion loosens the upper bound to 10 to leave room
 //! for the writer's rolling cutoff.
 
-mod common;
 
 use arrow_array::{Array, Int64Array};
 
@@ -55,7 +54,7 @@ async fn live_data_file_count(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn rewrite_merges_small_files_preserves_rows() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     let namespace = "default";
     let table_name = "rewrite_real_test";
@@ -159,7 +158,7 @@ async fn rewrite_merges_small_files_preserves_rows() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn rewrite_skips_below_min_input_files() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     let namespace = "default";
     let table_name = "rewrite_real_min_skip";
