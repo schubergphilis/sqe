@@ -420,6 +420,26 @@ fn warn_shared_backend_identity_once(backend: &sqe_core::config::CatalogBackend)
     });
 }
 
+/// Detect a Forbidden answer across both error shapes iceberg-rust's REST
+/// client produces:
+///
+/// 1. The typed catalog `ErrorResponse`/`ErrorModel` path, rendered as
+///    `Error::new(DataInvalid, message).with_context("code", "403")` (the
+///    message usually also says Forbidden / NotAuthorized).
+/// 2. The raw wrapped HTTP status path,
+///    `Error::new(Unexpected, "Received response with unexpected status
+///    code").with_context("status", "403 Forbidden")`.
+///
+/// Both shapes only surface the status through the rendered context, and
+/// `iceberg::Error`'s kind cannot distinguish 403 from 500, so matching on
+/// the Debug rendering is the only detection that covers both. Timeouts,
+/// 5xx, and auth-refresh failures contain neither marker and therefore
+/// read as NOT forbidden — the callers fail open on those.
+pub(crate) fn iceberg_error_is_forbidden(e: &iceberg::Error) -> bool {
+    let rendered = format!("{e:?}").to_ascii_lowercase();
+    rendered.contains("403") || rendered.contains("forbidden")
+}
+
 impl SessionCatalog {
     /// Create a new per-session catalog configured with the user's bearer token.
     ///
@@ -873,6 +893,45 @@ impl SessionCatalog {
         );
         dispatch_catalog!(self.inner, get_namespace(namespace))
             .map_err(|e| sqe_core::SqeError::Catalog(format!("Failed to get namespace: {e}")))
+    }
+
+    /// True when the backend is the REST/Polaris variant — the only backend
+    /// that forwards the caller's bearer per request and can therefore
+    /// answer per-caller visibility probes. Single-identity backends
+    /// (Glue/HMS/JDBC/Hadoop) have no caller to scope a namespace list to.
+    pub fn is_rest_backend(&self) -> bool {
+        matches!(self.inner, CatalogHandle::Rest(_))
+    }
+
+    /// Probe whether this session's caller may see `namespace` at all.
+    ///
+    /// Issues `get_namespace` (Polaris `LOAD_NAMESPACE_METADATA`) on the
+    /// session bearer. `Ok` means visible. A Forbidden/403-shaped error
+    /// means Polaris+OPA denied this caller, so the NAME must be hidden
+    /// from metadata listings. Every other failure (timeout, 5xx, expired
+    /// token) fails OPEN: the name stays listed, and the per-operation
+    /// checks keep protecting the namespace contents regardless — the same
+    /// posture as the platform's browse-API filtering.
+    pub async fn namespace_visible(&self, namespace: &NamespaceIdent) -> bool {
+        match dispatch_catalog!(self.inner, get_namespace(namespace)) {
+            Ok(_) => true,
+            Err(e) => {
+                if iceberg_error_is_forbidden(&e) {
+                    debug!(
+                        namespace = ?namespace,
+                        "Namespace hidden from listings: visibility probe was denied (403)"
+                    );
+                    false
+                } else {
+                    debug!(
+                        namespace = ?namespace,
+                        error = %e,
+                        "Namespace visibility probe failed with a non-403 error; failing open"
+                    );
+                    true
+                }
+            }
+        }
     }
 
     /// List all tables in the given namespace.
@@ -1664,7 +1723,7 @@ impl Catalog for SessionCatalogBridge {
 
 #[cfg(test)]
 mod cache_capacity_tests {
-    use super::REST_CATALOG_CACHE_MAX_CAPACITY;
+    use super::{REST_CATALOG_CACHE_MAX_CAPACITY, iceberg_error_is_forbidden};
 
     /// Issue #240: the REST catalog cache must hold well beyond the old cap of
     /// 100 so concurrent user-token-warehouse triples stop evicting each other
@@ -1688,5 +1747,52 @@ mod cache_capacity_tests {
             "cache should retain far more than the old cap of 100, got {}",
             cache.entry_count()
         );
+    }
+
+    /// Shape 1: the typed ErrorResponse/ErrorModel path. The status only
+    /// survives as a `code` context entry on a DataInvalid error.
+    #[test]
+    fn forbidden_detected_on_typed_error_response_shape() {
+        let e = iceberg::Error::new(iceberg::ErrorKind::DataInvalid, "Not authorized")
+            .with_context("type", "NotAuthorizedException")
+            .with_context("code", "403");
+        assert!(iceberg_error_is_forbidden(&e));
+    }
+
+    /// Shape 2: the wrapped raw HTTP status path
+    /// (`deserialize_unexpected_catalog_error`).
+    #[test]
+    fn forbidden_detected_on_wrapped_http_status_shape() {
+        let e = iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            "Received response with unexpected status code",
+        )
+        .with_context("status", "403 Forbidden");
+        assert!(iceberg_error_is_forbidden(&e));
+    }
+
+    /// Timeout- and 5xx-shaped errors must NOT read as forbidden: the
+    /// visibility probe fails open on them and keeps the namespace listed.
+    #[test]
+    fn timeout_and_5xx_shapes_are_not_forbidden() {
+        let timeout = iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            "error sending request: operation timed out",
+        );
+        assert!(!iceberg_error_is_forbidden(&timeout));
+
+        let server_err = iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            "Received response with unexpected status code",
+        )
+        .with_context("status", "500 Internal Server Error");
+        assert!(!iceberg_error_is_forbidden(&server_err));
+
+        let unauthorized = iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            "Received response with unexpected status code",
+        )
+        .with_context("status", "401 Unauthorized");
+        assert!(!iceberg_error_is_forbidden(&unauthorized));
     }
 }

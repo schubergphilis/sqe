@@ -45,7 +45,7 @@ static SESSION_CONTEXT_CACHE: LazyLock<Cache<String, (SessionContext, Arc<Sessio
 /// Extracted from the `create_session_context` loop so that Task 4 (dynamic
 /// Polaris catalog discovery) can reuse identical construction logic without
 /// duplicating it. This is the only place that calls
-/// `SessionCatalog::for_session_with` and `SqeCatalogProvider::try_new_with_policy`.
+/// `SessionCatalog::for_session_with` and `SqeCatalogProvider::try_new_with_options`.
 ///
 /// Returns `(catalog_provider, session_catalog)` so the caller can register
 /// the provider under `cat_name` and optionally promote it to the primary
@@ -63,12 +63,13 @@ pub(crate) async fn build_catalog_provider(
     let (session_catalog, storage) =
         build_session_catalog(cat_cfg, session, global_storage, table_cache).await?;
 
-    let mut catalog_provider = SqeCatalogProvider::try_new_with_policy(
+    let mut catalog_provider = SqeCatalogProvider::try_new_with_options(
         session_catalog.clone(),
         storage.clone(),
         cat_cfg.warehouse.clone(),
         policy_store.cloned(),
         Some(session.user.clone()),
+        cat_cfg.namespace_visibility_filter,
     )
     .await
     .map_err(Arc::new)?;

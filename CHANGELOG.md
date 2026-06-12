@@ -4,6 +4,24 @@ All notable changes to SQE are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Per-caller namespace visibility in metadata listings
+
+    `SHOW SCHEMAS`, `information_schema.schemata`, and Flight SQL
+    `GetDbSchemas` no longer leak the NAMES of namespaces the caller holds
+    no grants in. On the REST/Polaris backend, each namespace returned by
+    `listNamespaces` is probed once per session-catalog build with the
+    caller's bearer (Polaris `LOAD_NAMESPACE_METADATA`, answered per caller
+    by the OPA bridge); a 403 drops the name from every metadata surface.
+    Any other probe failure fails open and keeps the name — namespace
+    contents remain protected by the per-operation checks regardless.
+    `information_schema` now derives its schema list from the same filtered
+    cache as `SHOW SCHEMAS`, removing the second unfiltered listing path.
+    Single-identity backends (Glue/HMS/JDBC/Hadoop) skip the filter; the
+    `[catalog] namespace_visibility_filter = false` flag restores the old
+    behavior. Probes run 8-at-a-time, once per session, never per query.
+
 ### Removed
 
 - Wind down the Apache Ballista distributed-execution integration
