@@ -27,6 +27,13 @@ pub struct InformationSchemaProvider {
     warehouse: String,
     policy_store: Option<Arc<dyn PolicyStore>>,
     session_user: Option<SessionUser>,
+    /// Namespace names resolved (and visibility-filtered) by the owning
+    /// `SqeCatalogProvider` at construction. When present, `schemata`,
+    /// `tables`, and `columns` derive from this list instead of issuing a
+    /// second, unfiltered `listNamespaces` — keeping every metadata
+    /// surface consistent with `SHOW SCHEMAS`. `None` falls back to a
+    /// live listing (test/loose construction paths).
+    cached_namespaces: Option<Vec<String>>,
 }
 
 impl fmt::Debug for InformationSchemaProvider {
@@ -51,7 +58,16 @@ impl InformationSchemaProvider {
             warehouse,
             policy_store,
             session_user,
+            cached_namespaces: None,
         }
+    }
+
+    /// Use a pre-resolved (visibility-filtered) namespace list instead of
+    /// re-listing live. See the `cached_namespaces` field doc.
+    #[must_use = "with_cached_namespaces consumes self; bind the returned provider"]
+    pub fn with_cached_namespaces(mut self, namespaces: Vec<String>) -> Self {
+        self.cached_namespaces = Some(namespaces);
+        self
     }
 }
 
@@ -292,6 +308,9 @@ impl InformationSchemaProvider {
     }
 
     async fn list_namespaces_safe(&self) -> Vec<String> {
+        if let Some(ref cached) = self.cached_namespaces {
+            return cached.clone();
+        }
         match self.session_catalog.list_namespaces().await {
             Ok(namespaces) => namespaces
                 .iter()
