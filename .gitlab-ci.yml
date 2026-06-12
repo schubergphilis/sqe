@@ -36,11 +36,24 @@ cargo-check:
     # binaries it expects. cargo-deny was already being installed this way;
     # same pattern for the rest.
     - rustup component add clippy
-    # DEP-09: install only when missing (cached in .cargo/bin across runs), and
-    # do NOT swallow install failures — a failed install must fail the job, not
-    # silently skip the `cargo audit` / `cargo deny` security gate below.
-    - command -v cargo-audit > /dev/null || cargo install cargo-audit --quiet
-    - command -v cargo-deny > /dev/null || cargo install cargo-deny --quiet
+    # DEP-09: with the CI cache disabled, `cargo install` would compile these
+    # tools from source on every run (5-10 min). cargo-binstall fetches the
+    # prebuilt release binaries instead. The binstall binary itself is a
+    # version-pinned, checksum-verified direct download (no curl|bash of a
+    # moving script). If the pinned download fails (network, GitHub outage),
+    # fall back to compiling from crates.io source -- slow but safe. A failed
+    # install must still fail the job, never silently skip the
+    # `cargo audit` / `cargo deny` security gate below.
+    - |
+      BINSTALL_VERSION=v1.20.0
+      BINSTALL_SHA256=4d7875788d0505547c220d2b02d3619aac0dd19b7033eba7005a8d09ff1dc433
+      if curl -L --proto '=https' --tlsv1.2 -sSfo /tmp/binstall.tgz            "https://github.com/cargo-bins/cargo-binstall/releases/download/${BINSTALL_VERSION}/cargo-binstall-x86_64-unknown-linux-musl.tgz"          && echo "${BINSTALL_SHA256}  /tmp/binstall.tgz" | sha256sum -c -          && tar xzf /tmp/binstall.tgz -C /usr/local/cargo/bin 2>/dev/null || tar xzf /tmp/binstall.tgz -C "${CARGO_HOME:-$HOME/.cargo}/bin"; then
+        cargo binstall -y --no-symlinks cargo-audit cargo-deny
+      else
+        echo "cargo-binstall bootstrap unavailable; compiling tools from source"
+        cargo install --quiet cargo-audit cargo-deny
+      fi
+    - command -v cargo-audit > /dev/null && command -v cargo-deny > /dev/null
   script:
     - cargo clippy --all-targets --all-features -- -D warnings
     - cargo audit
@@ -58,17 +71,6 @@ cargo-check:
         - Cargo.toml
         - Cargo.lock
         - deny.toml
-  cache:
-    key: cargo-check-${CI_COMMIT_REF_SLUG}
-    # Warm-start a new branch from main's cache instead of compiling the whole
-    # dependency tree cold on first push; cargo recompiles only what changed.
-    fallback_keys:
-      - cargo-check-main
-    paths:
-      - target/
-      - .cargo/registry/
-      # DEP-09: cache the whole bin dir so cargo-audit is not recompiled every run.
-      - .cargo/bin/
 
 # ── Tests ──────────────────────────────────────────────────────
 cargo-test:
@@ -103,16 +105,6 @@ cargo-test:
         - crates/**/*
         - Cargo.toml
         - Cargo.lock
-  cache:
-    key: cargo-${CI_COMMIT_REF_SLUG}
-    # Warm-start a new branch from main's cache instead of compiling the whole
-    # dependency tree cold on first push; cargo then recompiles only what
-    # actually changed.
-    fallback_keys:
-      - cargo-main
-    paths:
-      - target/
-      - .cargo/registry/
 
 # ── Feature subset check ───────────────────────────────────────
 # Default CI runs --all-features only. A #[cfg(feature = "hms")] block
@@ -153,13 +145,6 @@ cargo-check-features:
         - crates/sqe-catalog/**/*
         - Cargo.toml
         - Cargo.lock
-  cache:
-    key: cargo-features-${CI_COMMIT_REF_SLUG}
-    fallback_keys:
-      - cargo-features-main
-    paths:
-      - target/
-      - .cargo/registry/
 
 # ── Integration tests (Docker stack required) ─────────────────
 # Runs the 118 #[ignore] tests gated on docker-compose.test.yml. These
@@ -202,13 +187,6 @@ integration-test:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       when: manual
       allow_failure: true
-  cache:
-    key: cargo-integration-${CI_COMMIT_REF_SLUG}
-    fallback_keys:
-      - cargo-integration-main
-    paths:
-      - target/
-      - .cargo/registry/
   timeout: 1h
 
 # ── Iceberg matrix score regression guard ─────────────────────
@@ -240,13 +218,6 @@ matrix-score:
       changes:
         - docs/iceberg-matrix-state.json
         - xtask/**/*
-  cache:
-    key: xtask-${CI_COMMIT_REF_SLUG}
-    fallback_keys:
-      - xtask-main
-    paths:
-      - target/
-      - .cargo/registry/
 
 # ── Benchmark regression gate (TPC-H SF1) ─────────────────────
 # Issue #256. Runs TPC-H SF1 against the lightweight test stack (the same
@@ -311,13 +282,6 @@ benchmark-tpch:
     paths:
       - benchmarks/results/
     expire_in: 1 week
-  cache:
-    key: cargo-bench-${CI_COMMIT_REF_SLUG}
-    fallback_keys:
-      - cargo-bench-main
-    paths:
-      - target/
-      - .cargo/registry/
   timeout: 1h
 
 # ── Container builds ───────────────────────────────────────────

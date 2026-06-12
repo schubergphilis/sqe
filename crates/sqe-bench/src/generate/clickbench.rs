@@ -199,6 +199,40 @@ const URL_PREFIXES: &[&str] = &[
 ];
 
 // ---------------------------------------------------------------------------
+// Seeded literals
+// ---------------------------------------------------------------------------
+//
+// The ClickBench query set probes values from the real Yandex dataset that a
+// purely random generator never produces, which left q19/q22/q27/q28/q39/q42
+// vacuous (0 rows on both engines in differential testing). Each pattern is
+// seeded into ~0.5-1% of rows; everything else keeps its original
+// distribution and the row count is unchanged.
+
+/// q19 point lookup: WHERE "UserID" = 435090932899640449.
+const SEEDED_USER_ID: i64 = 435_090_932_899_640_449;
+const SEEDED_USER_ID_STRIDE: usize = 199;
+
+/// q22 probes "Title" LIKE '%Google%' (with "URL" NOT LIKE '%.google.%' and
+/// a non-empty "SearchPhrase").
+const GOOGLE_TITLE_STRIDE: usize = 211;
+
+/// q27 needs a CounterID with COUNT(*) > 100000 (reachable at full
+/// 100M-row dataset scale with a ~1% hot counter) and q42 needs a CounterID
+/// with more than 10 distinct UserIDs. 62 is the busiest counter in the
+/// real dataset.
+const HOT_COUNTER_ID: i32 = 62;
+const HOT_COUNTER_STRIDE: usize = 100;
+
+/// q28 groups referers by host with HAVING COUNT(*) > 100000; concentrate
+/// ~1% of referers on a single dedicated host so one hot host group exists.
+const HOT_REFERER_PREFIX: &str = "http://hot.example.ru/link";
+const HOT_REFERER_STRIDE: usize = 101;
+
+/// q39 probes "UTMSource" <> ''; ~1% of rows carry a UTM tag.
+const UTM_SOURCES: &[&str] = &["google_ads", "yandex_direct", "newsletter", "partner_blog"];
+const UTM_SOURCE_STRIDE: usize = 103;
+
+// ---------------------------------------------------------------------------
 // Seed derivation (consistent with other generators)
 // ---------------------------------------------------------------------------
 
@@ -360,11 +394,23 @@ fn generate_hits(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let mut from_tag: Vec<String> = Vec::with_capacity(n);
 
         for i in 0..n {
-            let row_id = (offset + i) as i64;
+            let global = offset + i;
+            let row_id = global as i64;
             let et = EVENT_TIME_BASE + rng.gen_range(0..EVENT_TIME_RANGE);
             let ed = EVENT_DATE_BASE + rng.gen_range(0..EVENT_DATE_RANGE);
-            let uid: i64 = rng.gen();
-            let search = random_opt_string(&mut rng, SEARCH_PHRASES).to_string();
+            // q19: seed the probed UserID into ~0.5% of rows.
+            let uid: i64 = if global % SEEDED_USER_ID_STRIDE == 7 {
+                SEEDED_USER_ID
+            } else {
+                rng.gen()
+            };
+            // q22: seeded rows get a Google title, a URL without '.google.',
+            // and a non-empty SearchPhrase so all three predicates can hold.
+            let google_title = global % GOOGLE_TITLE_STRIDE == 11;
+            let mut search = random_opt_string(&mut rng, SEARCH_PHRASES).to_string();
+            if google_title && search.is_empty() {
+                search = "google search".to_string();
+            }
             let adv_eng: i32 = if search.is_empty() {
                 0
             } else {
@@ -379,19 +425,38 @@ fn generate_hits(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
             watch_id.push(row_id.wrapping_add(rng.gen::<i32>() as i64));
             java_enable.push(rng.gen_range(0..2));
-            title.push(format!("Page title {}", rng.gen_range(1..10_000u32)));
+            title.push(if google_title {
+                format!("Google news digest {}", rng.gen_range(1..10_000u32))
+            } else {
+                format!("Page title {}", rng.gen_range(1..10_000u32))
+            });
             good_event.push(1);
             event_time.push(et);
             event_date.push(ed);
-            counter_id.push(rng.gen_range(1..100_000));
+            // q27/q42: a hot counter takes ~1% of rows.
+            counter_id.push(if global % HOT_COUNTER_STRIDE == 0 {
+                HOT_COUNTER_ID
+            } else {
+                rng.gen_range(1..100_000)
+            });
             client_ip.push(rng.gen());
             region_id.push(rng.gen_range(1..10_000));
             user_id.push(uid);
             counter_class.push(rng.gen_range(0..10));
             os.push(rng.gen_range(0..100));
             user_agent.push(rng.gen_range(0..1000));
-            url.push(random_url(&mut rng));
-            referer.push(random_url(&mut rng));
+            url.push(if google_title {
+                // q22 requires "URL" NOT LIKE '%.google.%' on these rows.
+                format!("http://example.com/page/{}", rng.gen_range(1..100_000u32))
+            } else {
+                random_url(&mut rng)
+            });
+            // q28: ~1% of referers share one dedicated host.
+            referer.push(if global % HOT_REFERER_STRIDE == 17 {
+                format!("{HOT_REFERER_PREFIX}/{}", rng.gen_range(1..100_000u32))
+            } else {
+                random_url(&mut rng)
+            });
             is_refresh.push(rng.gen_range(0..2));
             referer_category_id.push(rng.gen_range(0..1000));
             referer_region_id.push(rng.gen_range(0..10_000));
@@ -472,7 +537,12 @@ fn generate_hits(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             openstat_campaign_id.push(String::new());
             openstat_ad_id.push(String::new());
             openstat_source_id.push(String::new());
-            utm_source.push(String::new());
+            // q39: "UTMSource" <> '' must select rows; ~1% carry a UTM tag.
+            utm_source.push(if global % UTM_SOURCE_STRIDE == 13 {
+                random_opt_string(&mut rng, UTM_SOURCES).to_string()
+            } else {
+                String::new()
+            });
             utm_medium.push(String::new());
             utm_campaign.push(String::new());
             utm_content.push(String::new());
@@ -729,6 +799,107 @@ mod tests {
         for batch in &batches {
             assert_eq!(batch.schema(), schema);
             assert_eq!(batch.num_columns(), 105);
+        }
+    }
+
+    #[test]
+    fn seeded_literals_match_all_six_probed_query_patterns() {
+        use arrow_array::Array as _;
+        use std::collections::HashSet;
+
+        // q19/q22/q27/q28/q39/q42 probe values a purely random generator
+        // never produces; each seeded pattern must match a small but
+        // nonzero fraction of rows.
+        let (schema, batches) = generate_hits(0.1); // 10_000 rows
+        let col = |name: &str| schema.index_of(name).unwrap();
+        let uid_idx = col("UserID");
+        let title_idx = col("Title");
+        let url_idx = col("URL");
+        let referer_idx = col("Referer");
+        let phrase_idx = col("SearchPhrase");
+        let counter_idx = col("CounterID");
+        let utm_idx = col("UTMSource");
+        let interests_idx = col("Interests");
+
+        let mut total = 0usize;
+        let mut q19_rows = 0usize;
+        let mut q22_rows = 0usize;
+        let mut hot_counter_rows = 0usize;
+        let mut hot_referer_rows = 0usize;
+        let mut utm_rows = 0usize;
+        let mut hot_counter_users: HashSet<i64> = HashSet::new();
+
+        for b in &batches {
+            let uids = b.column(uid_idx).as_any().downcast_ref::<Int64Array>().unwrap();
+            let titles = b.column(title_idx).as_any().downcast_ref::<StringArray>().unwrap();
+            let urls = b.column(url_idx).as_any().downcast_ref::<StringArray>().unwrap();
+            let referers = b.column(referer_idx).as_any().downcast_ref::<StringArray>().unwrap();
+            let phrases = b.column(phrase_idx).as_any().downcast_ref::<StringArray>().unwrap();
+            let counters = b.column(counter_idx).as_any().downcast_ref::<Int32Array>().unwrap();
+            let utms = b.column(utm_idx).as_any().downcast_ref::<StringArray>().unwrap();
+            let interests = b
+                .column(interests_idx)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+
+            for i in 0..b.num_rows() {
+                total += 1;
+                if uids.value(i) == SEEDED_USER_ID {
+                    q19_rows += 1;
+                }
+                if titles.value(i).contains("Google")
+                    && !urls.value(i).contains(".google.")
+                    && !phrases.value(i).is_empty()
+                {
+                    q22_rows += 1;
+                }
+                if counters.value(i) == HOT_COUNTER_ID {
+                    hot_counter_rows += 1;
+                    if interests.value(i) > 0 {
+                        hot_counter_users.insert(uids.value(i));
+                    }
+                }
+                if referers.value(i).starts_with(HOT_REFERER_PREFIX) {
+                    hot_referer_rows += 1;
+                }
+                if !utms.value(i).is_empty() {
+                    utm_rows += 1;
+                }
+            }
+        }
+
+        assert_eq!(total, 10_000, "row count must stay scale * ROWS_PER_SF");
+        // q19: WHERE "UserID" = 435090932899640449
+        assert!(q19_rows > 0, "no row carries the q19 UserID literal");
+        // q22: Title LIKE '%Google%' AND URL NOT LIKE '%.google.%'
+        //      AND SearchPhrase <> ''
+        assert!(q22_rows > 0, "no row satisfies all three q22 predicates");
+        // q27: a hot CounterID concentrates rows so HAVING COUNT(*) > 100000
+        // is reachable at full dataset scale (~1% of all rows)
+        assert!(
+            hot_counter_rows >= total / 200,
+            "hot CounterID holds {hot_counter_rows} rows, expected >= 0.5%"
+        );
+        // q42: HAVING COUNT(DISTINCT "UserID") > 10 with "Interests" > 0
+        assert!(
+            hot_counter_users.len() > 10,
+            "hot CounterID has only {} distinct interested users",
+            hot_counter_users.len()
+        );
+        // q28: one referer host concentrates a hot group
+        assert!(hot_referer_rows > 0, "no row uses the hot referer host");
+        // q39: WHERE "UTMSource" <> ''
+        assert!(utm_rows > 0, "no row has a non-empty UTMSource");
+        // Seeded patterns must stay rare (< 2% of rows each)
+        for (name, count) in [
+            ("q19 UserID", q19_rows),
+            ("q22 Google title", q22_rows),
+            ("hot CounterID", hot_counter_rows),
+            ("hot Referer", hot_referer_rows),
+            ("UTMSource", utm_rows),
+        ] {
+            assert!(count < total / 50, "{name} seeded into {count} rows, expected < 2%");
         }
     }
 

@@ -10,23 +10,12 @@ FROM (
             SELECT ss_item_sk item_sk, AVG(ss_net_profit) rank_col
             FROM store_sales ss1
             WHERE ss_store_sk = 4
-              AND ss_addr_sk <> (
-                  SELECT ca_address_sk
-                  FROM customer_address
-                  WHERE ca_gmt_offset = -5
-                  LIMIT 1
-              )
             GROUP BY ss_item_sk
             HAVING AVG(ss_net_profit) > 0.9 * (
                 SELECT AVG(ss_net_profit) rank_col
                 FROM store_sales
                 WHERE ss_store_sk = 4
-                  AND ss_addr_sk = (
-                      SELECT ca_address_sk
-                      FROM customer_address
-                      WHERE ca_gmt_offset = -5
-                      LIMIT 1
-                  )
+                  AND ss_addr_sk IS NULL
                 GROUP BY ss_store_sk
             )
         ) V1
@@ -41,23 +30,12 @@ FROM (
             SELECT ss_item_sk item_sk, AVG(ss_net_profit) rank_col
             FROM store_sales ss1
             WHERE ss_store_sk = 4
-              AND ss_addr_sk <> (
-                  SELECT ca_address_sk
-                  FROM customer_address
-                  WHERE ca_gmt_offset = -5
-                  LIMIT 1
-              )
             GROUP BY ss_item_sk
             HAVING AVG(ss_net_profit) > 0.9 * (
                 SELECT AVG(ss_net_profit) rank_col
                 FROM store_sales
                 WHERE ss_store_sk = 4
-                  AND ss_addr_sk = (
-                      SELECT ca_address_sk
-                      FROM customer_address
-                      WHERE ca_gmt_offset = -5
-                      LIMIT 1
-                  )
+                  AND ss_addr_sk IS NULL
                 GROUP BY ss_store_sk
             )
         ) V2
