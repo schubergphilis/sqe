@@ -50,7 +50,6 @@
 //!    only build the session ctx + probe Polaris when discovery is on AND a
 //!    qualifier is still unknown.
 
-mod common;
 
 use std::sync::Arc;
 
@@ -263,7 +262,7 @@ async fn static_mode_unqualified_query_passes_pre_flight() {
 // ---------------------------------------------------------------------------
 
 fn test_config_path() -> String {
-    common::test_config_path()
+    crate::common::test_config_path()
 }
 
 /// Build a `SqeConfig` for the live stack with `catalog_discovery = "polaris-auto"`.
@@ -367,7 +366,7 @@ async fn seed_discovery_warehouse() {
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn static_mode_rejects_undeclared_warehouse() {
     let _live = LIVE_STACK_LOCK.lock().await;
-    common::init_tracing();
+    crate::common::init_tracing();
     seed_discovery_warehouse().await;
 
     // Mutate after loading to avoid duplicate [query] header.
@@ -407,7 +406,7 @@ async fn static_mode_rejects_undeclared_warehouse() {
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn polaris_auto_lazy_hit() {
     let _live = LIVE_STACK_LOCK.lock().await;
-    common::init_tracing();
+    crate::common::init_tracing();
     seed_discovery_warehouse().await;
 
     let config = polaris_auto_config();
@@ -451,7 +450,7 @@ async fn polaris_auto_lazy_hit() {
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn polaris_auto_get_schema_lazy_hit() {
     let _live = LIVE_STACK_LOCK.lock().await;
-    common::init_tracing();
+    crate::common::init_tracing();
     seed_discovery_warehouse().await;
 
     let config = polaris_auto_config();
@@ -483,7 +482,7 @@ async fn polaris_auto_get_schema_lazy_hit() {
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn polaris_auto_nonexistent_warehouse_returns_unknown_catalog() {
     let _live = LIVE_STACK_LOCK.lock().await;
-    common::init_tracing();
+    crate::common::init_tracing();
 
     let config = polaris_auto_config();
     let handler = make_handler(config);
@@ -519,7 +518,7 @@ async fn polaris_auto_nonexistent_warehouse_returns_unknown_catalog() {
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn polaris_auto_in_session_reuse() {
     let _live = LIVE_STACK_LOCK.lock().await;
-    common::init_tracing();
+    crate::common::init_tracing();
     seed_discovery_warehouse().await;
 
     let config = polaris_auto_config();
@@ -564,7 +563,7 @@ async fn polaris_auto_in_session_reuse() {
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn polaris_auto_insert_lands_in_discovered_warehouse() {
     let _live = LIVE_STACK_LOCK.lock().await;
-    common::init_tracing();
+    crate::common::init_tracing();
     seed_discovery_warehouse().await; // discovery_test_wh.disc_ns.probe_t = {(42,"discovered")}
 
     let config = polaris_auto_config(); // default warehouse = test_warehouse
@@ -596,7 +595,7 @@ async fn polaris_auto_insert_lands_in_discovered_warehouse() {
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn polaris_auto_ddl_resolves_discovered_warehouse() {
     let _live = LIVE_STACK_LOCK.lock().await;
-    common::init_tracing();
+    crate::common::init_tracing();
     seed_discovery_warehouse().await;
 
     let config = polaris_auto_config(); // default warehouse = test_warehouse

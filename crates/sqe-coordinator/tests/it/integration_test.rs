@@ -2,7 +2,6 @@
 //! These tests require a running lightweight test stack (Polaris in-memory + RustFS).
 //! Run with: ./scripts/integration-test.sh
 
-mod common;
 
 use std::sync::Arc;
 
@@ -11,7 +10,7 @@ use std::sync::Arc;
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_authentication() {
     let config =
-        sqe_core::SqeConfig::load(&common::test_config_path()).expect("Failed to load test config");
+        sqe_core::SqeConfig::load(&crate::common::test_config_path()).expect("Failed to load test config");
     let authenticator = sqe_auth::Authenticator::new(&config.auth)
         .await
         .expect("Failed to create authenticator");
@@ -32,7 +31,7 @@ async fn test_authentication() {
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_token_fingerprint() {
     let config =
-        sqe_core::SqeConfig::load(&common::test_config_path()).expect("Failed to load test config");
+        sqe_core::SqeConfig::load(&crate::common::test_config_path()).expect("Failed to load test config");
     let authenticator = sqe_auth::Authenticator::new(&config.auth)
         .await
         .expect("Failed to create authenticator");
@@ -54,7 +53,7 @@ async fn test_token_fingerprint() {
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_simple_select() {
     let config =
-        sqe_core::SqeConfig::load(&common::test_config_path()).expect("Failed to load test config");
+        sqe_core::SqeConfig::load(&crate::common::test_config_path()).expect("Failed to load test config");
     let authenticator = sqe_auth::Authenticator::new(&config.auth)
         .await
         .expect("Failed to create authenticator");
@@ -118,7 +117,7 @@ fn test_sql_classification() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_ctas_roundtrip() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     // Cleanup in case a previous run left the table behind
     let _ = handler
@@ -174,7 +173,7 @@ async fn test_ctas_roundtrip() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_insert_into() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     // Cleanup leftover
     let _ = handler
@@ -219,7 +218,7 @@ async fn test_insert_into() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_drop_table() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     // Cleanup leftover
     let _ = handler
@@ -255,7 +254,7 @@ async fn test_drop_table() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_drop_table_if_exists_no_error() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     // This table does not exist; IF EXISTS should prevent an error
     let result = handler
@@ -314,7 +313,7 @@ fn test_worker_registry_no_workers() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_local_fallback_without_workers() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     // SELECT 1 should work even without workers (local execution)
     let batches = handler
@@ -364,7 +363,7 @@ fn test_scan_task_roundtrip() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs docker-compose.test.yml + bootstrap-test.sh"]
 async fn test_local_fallback_select() {
-    let config = sqe_core::SqeConfig::load(&common::test_config_path())
+    let config = sqe_core::SqeConfig::load(&crate::common::test_config_path())
         .expect("Failed to load test config");
 
     let authenticator = sqe_auth::Authenticator::new(&config.auth)
@@ -421,7 +420,7 @@ async fn test_local_fallback_select() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs docker-compose.distributed.yml + a worker on :50052"]
 async fn test_distributed_select() {
-    let config = sqe_core::SqeConfig::load(&common::test_config_path())
+    let config = sqe_core::SqeConfig::load(&crate::common::test_config_path())
         .expect("Failed to load test config");
 
     let authenticator = sqe_auth::Authenticator::new(&config.auth)
@@ -601,7 +600,7 @@ fn test_trino_batches_to_json() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_information_schema_tables() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     let batches = handler
         .execute(&session, "SELECT * FROM information_schema.tables")
@@ -654,7 +653,7 @@ fn write_test_parquet(dir: &std::path::Path) -> std::path::PathBuf {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_read_parquet_local_file() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     // 1. Create a small Parquet file in a temp directory.
     let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
@@ -793,7 +792,7 @@ fn assert_three_known_rows(batches: &[arrow_array::RecordBatch]) {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_read_csv_local_file() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
     let csv_path = write_test_csv(tmp_dir.path());
@@ -827,7 +826,7 @@ async fn test_read_csv_local_file() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_read_json_local_file() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
     let json_path = write_test_ndjson(tmp_dir.path());
@@ -861,7 +860,7 @@ async fn test_read_json_local_file() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_information_schema_schemata() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     let batches = handler
         .execute(&session, "SELECT * FROM information_schema.schemata")
@@ -892,7 +891,7 @@ use arrow_array::{Int64Array, StringArray};
 /// Create employees + departments tables for join/aggregation tests.
 /// Returns (session, handler).
 async fn setup_join_fixture() -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     // employees: id BIGINT, name VARCHAR, dept_id BIGINT, salary DOUBLE
     let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.employees").await;
@@ -946,7 +945,7 @@ async fn test_create_and_drop_view() {
     let batches = handler.execute(&session, "SELECT * FROM test_ns.eng_view")
         .await.expect("SELECT from view should succeed");
 
-    common::print_results("CREATE VIEW + SELECT", "SELECT * FROM test_ns.eng_view", &batches);
+    crate::common::print_results("CREATE VIEW + SELECT", "SELECT * FROM test_ns.eng_view", &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 2, "Engineering dept has Alice and Bob");
@@ -992,7 +991,7 @@ async fn test_view_with_aggregation() {
         "SELECT dept_id, headcount, avg_salary FROM test_ns.dept_stats ORDER BY dept_id"
     ).await.expect("SELECT from aggregation view");
 
-    common::print_results("VIEW with GROUP BY", "SELECT * FROM test_ns.dept_stats", &batches);
+    crate::common::print_results("VIEW with GROUP BY", "SELECT * FROM test_ns.dept_stats", &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 4, "Four distinct dept_ids (10, 20, 30, 99)");
@@ -1019,7 +1018,7 @@ async fn test_inner_join() {
     let batches = handler.execute(&session, sql)
         .await.expect("INNER JOIN should succeed");
 
-    common::print_results("INNER JOIN", sql, &batches);
+    crate::common::print_results("INNER JOIN", sql, &batches);
 
     // Frank (dept_id=99) and HR (id=40) are excluded
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1048,7 +1047,7 @@ async fn test_left_join() {
     let batches = handler.execute(&session, sql)
         .await.expect("LEFT JOIN should succeed");
 
-    common::print_results("LEFT JOIN", sql, &batches);
+    crate::common::print_results("LEFT JOIN", sql, &batches);
 
     // All 6 employees, Frank gets NULL dept_name
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1076,7 +1075,7 @@ async fn test_right_join() {
     let batches = handler.execute(&session, sql)
         .await.expect("RIGHT JOIN should succeed");
 
-    common::print_results("RIGHT JOIN", sql, &batches);
+    crate::common::print_results("RIGHT JOIN", sql, &batches);
 
     // 5 matched + 1 HR row with NULL employee columns
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1099,7 +1098,7 @@ async fn test_full_outer_join() {
     let batches = handler.execute(&session, sql)
         .await.expect("FULL OUTER JOIN should succeed");
 
-    common::print_results("FULL OUTER JOIN", sql, &batches);
+    crate::common::print_results("FULL OUTER JOIN", sql, &batches);
 
     // 5 matched + 1 Frank unmatched + 1 HR unmatched = 7
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1112,7 +1111,7 @@ async fn test_full_outer_join() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_cross_join() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.colors").await;
     let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.sizes").await;
@@ -1130,7 +1129,7 @@ async fn test_cross_join() {
     let sql = "SELECT color, size FROM test_ns.colors CROSS JOIN test_ns.sizes ORDER BY color, size";
     let batches = handler.execute(&session, sql).await.expect("CROSS JOIN");
 
-    common::print_results("CROSS JOIN (3×3)", sql, &batches);
+    crate::common::print_results("CROSS JOIN (3×3)", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 9, "3 colors × 3 sizes = 9 combinations");
@@ -1143,7 +1142,7 @@ async fn test_cross_join() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_self_join() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.org").await;
     handler.execute(&session,
@@ -1161,7 +1160,7 @@ async fn test_self_join() {
                ORDER BY e.id";
 
     let batches = handler.execute(&session, sql).await.expect("Self-join");
-    common::print_results("SELF JOIN (org hierarchy)", sql, &batches);
+    crate::common::print_results("SELF JOIN (org hierarchy)", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 5, "5 employees in org");
@@ -1195,7 +1194,7 @@ async fn test_aggregation_basic() {
                ORDER BY dept_id";
 
     let batches = handler.execute(&session, sql).await.expect("Aggregation");
-    common::print_results("GROUP BY + aggregates", sql, &batches);
+    crate::common::print_results("GROUP BY + aggregates", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 4, "Four dept groups: 10, 20, 30, 99");
@@ -1222,7 +1221,7 @@ async fn test_having_clause() {
                ORDER BY dept_id";
 
     let batches = handler.execute(&session, sql).await.expect("HAVING clause");
-    common::print_results("HAVING AVG(salary) > 75000", sql, &batches);
+    crate::common::print_results("HAVING AVG(salary) > 75000", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     // dept 10: avg=87500 ✓, dept 20: avg=72500 ✗, dept 30: avg=95000 ✓, dept 99: avg=60000 ✗
@@ -1244,7 +1243,7 @@ async fn test_join_with_aggregation() {
                ORDER BY headcount DESC, d.dept_name";
 
     let batches = handler.execute(&session, sql).await.expect("JOIN + GROUP BY");
-    common::print_results("JOIN + GROUP BY", sql, &batches);
+    crate::common::print_results("JOIN + GROUP BY", sql, &batches);
 
     // 4 departments, HR has 0 employees
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1268,7 +1267,7 @@ async fn test_cte_join() {
                ORDER BY h.name";
 
     let batches = handler.execute(&session, sql).await.expect("CTE + JOIN");
-    common::print_results("CTE + INNER JOIN", sql, &batches);
+    crate::common::print_results("CTE + INNER JOIN", sql, &batches);
 
     // Alice (90000), Bob (85000), Eve (95000) earn > 80000 and have valid depts
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1289,7 +1288,7 @@ async fn test_subquery_where() {
                ORDER BY salary DESC";
 
     let batches = handler.execute(&session, sql).await.expect("Subquery in WHERE");
-    common::print_results("Subquery (salary > AVG)", sql, &batches);
+    crate::common::print_results("Subquery (salary > AVG)", sql, &batches);
 
     // AVG salary = (90000+85000+70000+75000+95000+60000)/6 = 79166.67
     // Above avg: Alice(90000), Bob(85000), Eve(95000)
@@ -1317,7 +1316,7 @@ async fn test_scalar_subquery_select() {
                ORDER BY salary_vs_avg DESC";
 
     let batches = handler.execute(&session, sql).await.expect("Scalar subquery in SELECT");
-    common::print_results("Salary vs AVG (scalar subquery)", sql, &batches);
+    crate::common::print_results("Salary vs AVG (scalar subquery)", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 6, "All 6 employees");
@@ -1329,7 +1328,7 @@ async fn test_scalar_subquery_select() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_union_all() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.q1_sales").await;
     let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.q2_sales").await;
@@ -1352,7 +1351,7 @@ async fn test_union_all() {
                ORDER BY quarter, product";
 
     let batches = handler.execute(&session, sql).await.expect("UNION ALL across tables");
-    common::print_results("UNION ALL across tables", sql, &batches);
+    crate::common::print_results("UNION ALL across tables", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 4, "2 rows from Q1 + 2 from Q2");
@@ -1369,7 +1368,7 @@ async fn test_order_limit_offset() {
 
     let sql = "SELECT name, salary FROM test_ns.employees ORDER BY salary DESC LIMIT 3 OFFSET 1";
     let batches = handler.execute(&session, sql).await.expect("ORDER BY + LIMIT + OFFSET");
-    common::print_results("ORDER BY DESC LIMIT 3 OFFSET 1", sql, &batches);
+    crate::common::print_results("ORDER BY DESC LIMIT 3 OFFSET 1", sql, &batches);
 
     // Sorted: Eve(95000), Alice(90000), Bob(85000), Dave(75000), Charlie(70000), Frank(60000)
     // Offset 1 skips Eve → Alice, Bob, Dave
@@ -1396,7 +1395,7 @@ async fn test_where_conditions() {
                ORDER BY salary DESC";
 
     let batches = handler.execute(&session, sql).await.expect("Complex WHERE");
-    common::print_results("WHERE (dept=10 OR dept=20) AND salary >= 75000", sql, &batches);
+    crate::common::print_results("WHERE (dept=10 OR dept=20) AND salary >= 75000", sql, &batches);
 
     // dept 10: Alice(90000)✓ Bob(85000)✓  |  dept 20: Dave(75000)✓ Charlie(70000)✗
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1421,7 +1420,7 @@ async fn test_case_expression() {
                ORDER BY salary DESC";
 
     let batches = handler.execute(&session, sql).await.expect("CASE expression");
-    common::print_results("CASE WHEN salary tiers", sql, &batches);
+    crate::common::print_results("CASE WHEN salary tiers", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 6);
@@ -1452,7 +1451,7 @@ async fn test_string_functions() {
                LIMIT 3";
 
     let batches = handler.execute(&session, sql).await.expect("String functions");
-    common::print_results("String functions (UPPER, LOWER, LENGTH, CONCAT)", sql, &batches);
+    crate::common::print_results("String functions (UPPER, LOWER, LENGTH, CONCAT)", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 3);
@@ -1478,7 +1477,7 @@ async fn test_math_expressions() {
                ORDER BY id";
 
     let batches = handler.execute(&session, sql).await.expect("Math expressions");
-    common::print_results("Math (ROUND, FLOOR, salary expressions)", sql, &batches);
+    crate::common::print_results("Math (ROUND, FLOOR, salary expressions)", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 6);
@@ -1505,7 +1504,7 @@ async fn test_multiple_ctes() {
                ORDER BY e.salary DESC";
 
     let batches = handler.execute(&session, sql).await.expect("Multiple CTEs");
-    common::print_results("Multiple CTEs (dept_avg → high_depts → employees)", sql, &batches);
+    crate::common::print_results("Multiple CTEs (dept_avg → high_depts → employees)", sql, &batches);
 
     // dept 10: avg=87500 ✓ (Alice+Bob), dept 30: avg=95000 ✓ (Eve), dept 20: avg=72500 ✗
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1536,7 +1535,7 @@ async fn test_three_way_join() {
                ORDER BY e.name, p.project_name";
 
     let batches = handler.execute(&session, sql).await.expect("Three-way JOIN");
-    common::print_results("Three-way JOIN (employees × departments × projects)", sql, &batches);
+    crate::common::print_results("Three-way JOIN (employees × departments × projects)", sql, &batches);
 
     // eng dept (10): Alice+Bob × Alpha+Gamma = 4 rows
     // mkt dept (20): Charlie+Dave × Beta = 2 rows
@@ -1560,7 +1559,7 @@ async fn test_in_subquery() {
                ORDER BY name";
 
     let batches = handler.execute(&session, sql).await.expect("IN subquery");
-    common::print_results("IN (subquery: depts with 'ing' in name)", sql, &batches);
+    crate::common::print_results("IN (subquery: depts with 'ing' in name)", sql, &batches);
 
     // 'Engineering' and 'Marketing' match — dept ids 10 and 20
     // Alice, Bob (dept 10), Charlie, Dave (dept 20)
@@ -1584,7 +1583,7 @@ async fn test_exists_subquery() {
                ORDER BY dept_name";
 
     let batches = handler.execute(&session, sql).await.expect("EXISTS subquery");
-    common::print_results("EXISTS (dept has high earner > 85000)", sql, &batches);
+    crate::common::print_results("EXISTS (dept has high earner > 85000)", sql, &batches);
 
     // dept 10: Alice(90000) > 85000 ✓ | dept 30: Eve(95000) > 85000 ✓ | others ✗
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1607,7 +1606,7 @@ async fn test_window_functions() {
                ORDER BY dept_id, salary DESC";
 
     let batches = handler.execute(&session, sql).await.expect("Window functions");
-    common::print_results("ROW_NUMBER + RANK (partition by dept)", sql, &batches);
+    crate::common::print_results("ROW_NUMBER + RANK (partition by dept)", sql, &batches);
 
     // dept 10: Alice row_num=1, Bob row_num=2 | dept 20: Dave row_num=1, Charlie row_num=2
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1628,7 +1627,7 @@ async fn test_window_running_total() {
                ORDER BY salary";
 
     let batches = handler.execute(&session, sql).await.expect("Running total window");
-    common::print_results("Running total (SUM OVER ORDER BY salary)", sql, &batches);
+    crate::common::print_results("Running total (SUM OVER ORDER BY salary)", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 6);
@@ -1651,7 +1650,7 @@ async fn test_explain_plan() {
         .await
         .expect("EXPLAIN should succeed");
 
-    common::print_results("EXPLAIN", sql, &batches);
+    crate::common::print_results("EXPLAIN", sql, &batches);
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 2, "EXPLAIN returns exactly 2 rows (logical + physical)");
@@ -1692,7 +1691,7 @@ async fn test_explain_analyze() {
         .await
         .expect("EXPLAIN ANALYZE should succeed");
 
-    common::print_results("EXPLAIN ANALYZE", sql, &batches);
+    crate::common::print_results("EXPLAIN ANALYZE", sql, &batches);
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert!(total_rows >= 1, "EXPLAIN ANALYZE should return at least one operator row");
@@ -1717,7 +1716,7 @@ async fn test_explain_full() {
         .await
         .expect("EXPLAIN FULL should succeed");
 
-    common::print_results("EXPLAIN FULL", sql, &batches);
+    crate::common::print_results("EXPLAIN FULL", sql, &batches);
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert!(total_rows >= 1, "EXPLAIN FULL should return at least one row");
@@ -1794,7 +1793,7 @@ async fn test_explain_policy_aware() {
 fn keycloak_config() -> Option<sqe_core::SqeConfig> {
     let kc_url = std::env::var("SQE_TEST_KEYCLOAK_URL").ok()?;
     let mut config =
-        sqe_core::SqeConfig::load(&common::test_config_path()).expect("Failed to load test config");
+        sqe_core::SqeConfig::load(&crate::common::test_config_path()).expect("Failed to load test config");
     config.auth.keycloak_url = kc_url;
     config.auth.realm = "iceberg".to_string();
     config.auth.client_id = "sqe-client".to_string();
@@ -1808,7 +1807,7 @@ fn keycloak_config() -> Option<sqe_core::SqeConfig> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: SQE quickstart with Keycloak running + SQE_TEST_KEYCLOAK_URL set
 async fn test_keycloak_auth_with_test_users() {
-    common::init_tracing();
+    crate::common::init_tracing();
     let config = match keycloak_config() {
         Some(c) => c,
         None => {
@@ -1861,7 +1860,7 @@ async fn test_keycloak_auth_with_test_users() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: SQE quickstart with Keycloak running + SQE_TEST_KEYCLOAK_URL set
 async fn test_keycloak_token_refresh() {
-    common::init_tracing();
+    crate::common::init_tracing();
     let config = match keycloak_config() {
         Some(c) => c,
         None => {
@@ -1899,7 +1898,7 @@ async fn test_keycloak_token_refresh() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: SQE quickstart with Keycloak + Polaris running + SQE_TEST_KEYCLOAK_URL set
 async fn test_different_user_catalog_visibility() {
-    common::init_tracing();
+    crate::common::init_tracing();
     let config = match keycloak_config() {
         Some(c) => c,
         None => {
@@ -2003,10 +2002,10 @@ impl sqe_trino_compat::server::TrinoQueryExecutor for TestTrinoQuery {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_trino_http_query() {
-    common::init_tracing();
+    crate::common::init_tracing();
 
     let config =
-        sqe_core::SqeConfig::load(&common::test_config_path()).expect("Failed to load test config");
+        sqe_core::SqeConfig::load(&crate::common::test_config_path()).expect("Failed to load test config");
     let authenticator = Arc::new(
         sqe_auth::Authenticator::new(&config.auth)
             .await
@@ -2123,7 +2122,7 @@ async fn test_trino_http_query() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_table_lifecycle_edge_cases() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     // Helper to run a SQL statement and check success/failure
     async fn check(
@@ -2285,7 +2284,7 @@ async fn test_table_lifecycle_edge_cases() {
     ).await.expect("COUNT should succeed");
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert!(total > 0, "COUNT query should return at least one row");
-    common::print_results("Multi-INSERT count", "SELECT COUNT(*)", &batches);
+    crate::common::print_results("Multi-INSERT count", "SELECT COUNT(*)", &batches);
 
     let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.edge_multi_insert").await;
 
@@ -2297,7 +2296,7 @@ async fn test_table_lifecycle_edge_cases() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_function_compat_and_type_errors() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     let cases: Vec<(&str, &str, bool)> = vec![
         // Type mismatches — should fail with clear errors
@@ -2350,7 +2349,7 @@ async fn test_function_compat_and_type_errors() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_large_insert_multi_batch() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     let _ = handler
         .execute(&session, "DROP TABLE IF EXISTS test_ns.large_insert_test")
@@ -2403,7 +2402,7 @@ async fn test_large_insert_multi_batch() {
         .await
         .expect("COUNT should succeed");
 
-    common::print_results(
+    crate::common::print_results(
         "Large multi-batch INSERT",
         "SELECT COUNT(*) FROM test_ns.large_insert_test",
         &batches,
@@ -2430,7 +2429,7 @@ async fn test_large_insert_multi_batch() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_error_classification_live() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     let cases: Vec<(&str, &str, &str)> = vec![
         // (label, sql, expected_error_code_name)
@@ -2523,7 +2522,7 @@ async fn test_error_classification_live() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_delete_with_where() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     // Cleanup leftover
     let _ = handler
@@ -2565,7 +2564,7 @@ async fn test_delete_with_where() {
         .await
         .expect("SELECT after DELETE should succeed");
 
-    common::print_results(
+    crate::common::print_results(
         "DELETE WHERE id = 2",
         "SELECT id, val FROM test_ns.delete_test ORDER BY id",
         &batches,
@@ -2601,7 +2600,7 @@ async fn test_delete_with_where() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_delete_all() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     // Cleanup leftover
     let _ = handler
@@ -2635,7 +2634,7 @@ async fn test_delete_all() {
         .await
         .expect("SELECT COUNT after DELETE ALL should succeed");
 
-    common::print_results(
+    crate::common::print_results(
         "DELETE ALL (truncate)",
         "SELECT COUNT(*) FROM test_ns.trunc_test",
         &batches,
@@ -2659,7 +2658,7 @@ async fn test_delete_all() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_update_with_where() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     // Cleanup leftover
     let _ = handler
@@ -2696,7 +2695,7 @@ async fn test_update_with_where() {
         .await
         .expect("SELECT after UPDATE should succeed");
 
-    common::print_results(
+    crate::common::print_results(
         "UPDATE SET val = 99 WHERE id = 2",
         "SELECT id, val FROM test_ns.update_test ORDER BY id",
         &batches,
@@ -2741,7 +2740,7 @@ async fn test_update_with_where() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_update_all_rows() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     // Cleanup leftover
     let _ = handler
@@ -2777,7 +2776,7 @@ async fn test_update_all_rows() {
         .await
         .expect("SELECT after UPDATE ALL should succeed");
 
-    common::print_results(
+    crate::common::print_results(
         "UPDATE ALL SET val = val + 100",
         "SELECT id, val FROM test_ns.update_all ORDER BY id",
         &batches,
@@ -2826,7 +2825,7 @@ async fn test_update_all_rows() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_merge_insert_and_update() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     // Cleanup leftover
     let _ = handler
@@ -2879,7 +2878,7 @@ async fn test_merge_insert_and_update() {
         .await
         .expect("SELECT after MERGE should succeed");
 
-    common::print_results(
+    crate::common::print_results(
         "MERGE INSERT + UPDATE",
         "SELECT id, val FROM test_ns.merge_target ORDER BY id",
         &batches,
@@ -2927,7 +2926,7 @@ async fn test_merge_insert_and_update() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_merge_delete_matched() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     // Cleanup leftover
     let _ = handler
@@ -2979,7 +2978,7 @@ async fn test_merge_delete_matched() {
         .await
         .expect("SELECT after MERGE DELETE should succeed");
 
-    common::print_results(
+    crate::common::print_results(
         "MERGE DELETE MATCHED",
         "SELECT id, val FROM test_ns.merge_del_target ORDER BY id",
         &batches,
@@ -3021,7 +3020,7 @@ async fn test_merge_delete_matched() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_delete_larger_dataset() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     // Cleanup leftover
     let _ = handler
@@ -3119,7 +3118,7 @@ async fn test_delete_larger_dataset() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_update_larger_dataset() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     // Cleanup leftover
     let _ = handler
@@ -3216,7 +3215,7 @@ async fn test_update_larger_dataset() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_delete_multiple_data_files() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     // Cleanup leftover
     let _ = handler
@@ -3293,7 +3292,7 @@ async fn test_delete_multiple_data_files() {
         .await
         .expect("SELECT after DELETE should succeed");
 
-    common::print_results(
+    crate::common::print_results(
         "DELETE across multiple data files",
         "SELECT id FROM test_ns.del_multi ORDER BY id",
         &batches,
@@ -3328,7 +3327,7 @@ async fn test_delete_multiple_data_files() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_update_multiple_data_files() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     // Cleanup leftover
     let _ = handler
@@ -3405,7 +3404,7 @@ async fn test_update_multiple_data_files() {
         .await
         .expect("SELECT after UPDATE should succeed");
 
-    common::print_results(
+    crate::common::print_results(
         "UPDATE across multiple data files",
         "SELECT id, val FROM test_ns.upd_multi ORDER BY id",
         &batches,

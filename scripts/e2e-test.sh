@@ -49,7 +49,7 @@ fi
 echo ""
 echo "Running Flight SQL integration tests..."
 if SQE_TEST_KEYCLOAK_URL="http://${FLIGHT_HOST}:8080" \
-   cargo test -p sqe-coordinator --test integration_test test_keycloak -- --ignored --nocapture 2>&1; then
+   cargo test -p sqe-coordinator --test it integration_test::test_keycloak -- --ignored --nocapture 2>&1; then
     pass "Keycloak auth via Flight SQL pipeline"
 else
     fail "Keycloak auth via Flight SQL pipeline"

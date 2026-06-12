@@ -16,7 +16,6 @@
 //! `cargo test -p sqe-coordinator --test partition_evolution_e2e -- --ignored
 //! --test-threads=1`.
 
-mod common;
 
 use arrow_array::{Array, Int64Array};
 
@@ -61,7 +60,7 @@ async fn reset_table(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn add_identity_partition_field_to_unpartitioned_table() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let fq = "default.pe_add_identity";
 
     reset_table(
@@ -105,7 +104,7 @@ async fn add_identity_partition_field_to_unpartitioned_table() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn add_day_partition_field_with_transform() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let fq = "default.pe_add_day";
 
     reset_table(
@@ -153,7 +152,7 @@ async fn add_day_partition_field_with_transform() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn drop_partition_field_from_partitioned_table() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let fq = "default.pe_drop";
 
     reset_table(
@@ -203,7 +202,7 @@ async fn drop_partition_field_from_partitioned_table() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn replace_partition_field_identity_to_bucket() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let fq = "default.pe_replace";
 
     reset_table(
@@ -256,7 +255,7 @@ async fn replace_partition_field_identity_to_bucket() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn add_partition_field_on_v3_table() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let fq = "default.pe_v3_add";
 
     reset_table(
@@ -303,7 +302,7 @@ async fn add_partition_field_on_v3_table() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn drop_unknown_partition_field_returns_error() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let fq = "default.pe_drop_unknown";
 
     reset_table(
@@ -339,7 +338,7 @@ async fn drop_unknown_partition_field_returns_error() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn add_partition_field_on_unknown_column_returns_error() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let fq = "default.pe_add_unknown";
 
     reset_table(

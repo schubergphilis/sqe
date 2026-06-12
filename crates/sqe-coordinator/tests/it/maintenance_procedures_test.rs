@@ -12,7 +12,6 @@
 //! Non-ignored tests in this file exercise the parser -> classifier path
 //! without requiring any live catalog, so they run on every `cargo test`.
 
-mod common;
 
 use sqe_sql::{parse_and_classify, ProcedureCall, StatementKind};
 
@@ -85,7 +84,7 @@ fn unknown_procedure_falls_through_to_call_error() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn rewrite_data_files_returns_summary() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     let table = "default.maint_rewrite_test";
     let _ = handler
@@ -143,7 +142,7 @@ async fn rewrite_data_files_returns_summary() {
 async fn rewrite_data_files_actually_compacts_parquet() {
     use datafusion::arrow::array::{Array, Int64Array};
 
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let table = "default.maint_rewrite_compaction_test";
 
     let _ = handler
@@ -275,7 +274,7 @@ fn extract_count(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> i6
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn expire_snapshots_retain_last_commits() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     let table = "default.maint_expire_test";
     let _ = handler
@@ -311,7 +310,7 @@ async fn expire_snapshots_retain_last_commits() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn remove_orphan_files_respects_default_threshold() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     let table = "default.maint_orphan_test";
     let _ = handler
@@ -359,7 +358,7 @@ async fn remove_orphan_files_respects_default_threshold() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn rewrite_manifests_commits_and_returns_summary() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     let table = "default.maint_rewrite_manifests_test";
     let _ = handler
@@ -409,7 +408,7 @@ async fn read_only_user_rejected_with_audit() {
     // engine-level check. Once OPA/Cedar lands this should instead drive a
     // real Polaris role.
     use chrono::{Duration, Utc};
-    let (_root_session, handler) = common::setup_handler().await;
+    let (_root_session, handler) = crate::common::setup_handler().await;
     let readonly = sqe_core::Session::new(
         "alice-readonly".to_string(),
         sqe_core::SecretString::new("deadbeef".to_string()),
