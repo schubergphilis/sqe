@@ -17,7 +17,6 @@
 //! not up, so plain `cargo test` on a developer box without the stack
 //! still passes.
 
-mod common;
 
 use std::process::Command;
 
