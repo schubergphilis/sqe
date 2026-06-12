@@ -1462,21 +1462,181 @@ pub struct TvfPolicy {
     /// qualified host explicitly.
     #[serde(default)]
     pub allowed_http_hosts: Vec<String>,
+    /// Object-store URL prefixes that file TVFs may read **with the
+    /// engine's own storage credentials**. Default: empty = DENY all
+    /// engine-credentialed object-store TVF reads. Without this gate any
+    /// authenticated user could `read_csv('s3://<any-bucket>/<any-key>')`
+    /// and the engine would fetch it with its static S3 key — a complete
+    /// bypass of the catalog authorization plane (Polaris/OPA), which only
+    /// covers catalog tables.
+    ///
+    /// Entries are compared on URL-path-segment boundaries (so
+    /// `"s3://staging"` does NOT match `s3://staging-evil/...`) after
+    /// scheme canonicalisation (`s3a://`→`s3://`, `abfs://`→`abfss://`,
+    /// `az://`→`azure://`, `gcs://`→`gs://`). The literal placeholder
+    /// `{user}` expands to the authenticated username, enabling per-user
+    /// staging areas:
+    ///
+    /// ```toml
+    /// [storage.tvf]
+    /// allowed_object_store_prefixes = [
+    ///   "s3://data-platform-staging/_table-load-staging/",
+    ///   "s3://notebook-scratch/{user}/",
+    /// ]
+    /// ```
+    ///
+    /// Paths whose TVF call carries complete *inline* credentials
+    /// (`access_key` + `secret_key`, an Azure key/SAS token, or an inline
+    /// GCS service-account key) bypass this list: the engine's storage key
+    /// is not used, so the object store itself enforces access.
+    #[serde(default)]
+    pub allowed_object_store_prefixes: Vec<String>,
+    /// Roles (matched case-insensitively against the caller's JWT roles)
+    /// that may read **any** object-store path with the engine's storage
+    /// credentials, bypassing `allowed_object_store_prefixes`. Default:
+    /// empty = no role-based override. Intended for platform
+    /// administrators / service identities that own the storage anyway.
+    #[serde(default)]
+    pub object_store_admin_roles: Vec<String>,
+}
+
+/// Identity of the caller invoking a file TVF, resolved at session-context
+/// build time from the authenticated session. Drives
+/// [`TvfPolicy::check_path`]'s object-store gating.
+#[derive(Debug, Clone, Default)]
+pub struct TvfCaller {
+    /// Authenticated username (JWT `user_claim`). `None` for callers with
+    /// no resolvable identity — `{user}` prefixes never match for them.
+    pub username: Option<String>,
+    /// Roles from the caller's JWT (`roles_claim`), matched against
+    /// `[storage.tvf] object_store_admin_roles`.
+    pub roles: Vec<String>,
+    /// `true` only for the embedded (in-process, single-tenant) CLI where
+    /// the caller already owns the process, its config, and its
+    /// credentials. Skips object-store prefix gating entirely. The
+    /// coordinator must NEVER set this for remote sessions.
+    pub trusted: bool,
+}
+
+impl TvfCaller {
+    /// Caller identity for an authenticated remote session.
+    pub fn for_user(username: String, roles: Vec<String>) -> Self {
+        Self {
+            username: Some(username),
+            roles,
+            trusted: false,
+        }
+    }
+
+    /// Trusted local caller (embedded CLI). Object-store prefix gating is
+    /// skipped — the local user owns the config and the credentials in it.
+    pub fn trusted_local() -> Self {
+        Self {
+            username: None,
+            roles: Vec::new(),
+            trusted: true,
+        }
+    }
+}
+
+/// Canonicalise an object-store URL for prefix comparison: scheme aliases
+/// collapse to one spelling, the scheme is lowercased, and dot path
+/// segments (`.` / `..`, raw or single-percent-encoded) are rejected
+/// because downstream URL/HTTP layers may normalise them AFTER the prefix
+/// check, silently escaping the allowed prefix.
+fn canonicalize_object_url(path: &str) -> Result<String, String> {
+    const ALIASES: &[(&str, &str)] = &[
+        ("s3a://", "s3://"),
+        ("abfs://", "abfss://"),
+        ("az://", "azure://"),
+        ("gcs://", "gs://"),
+    ];
+    let lower = path.to_lowercase();
+    let mut out = path.to_string();
+    for (from, to) in ALIASES {
+        if lower.starts_with(from) {
+            // Don't rewrite `abfss://` via the `abfs://` alias.
+            if *from == "abfs://" && lower.starts_with("abfss://") {
+                continue;
+            }
+            out = format!("{to}{}", &path[from.len()..]);
+            break;
+        }
+    }
+    if let Some(idx) = out.find("://") {
+        let (scheme, rest) = out.split_at(idx);
+        out = format!("{}{}", scheme.to_ascii_lowercase(), rest);
+    }
+    let after_scheme = out.split_once("://").map(|x| x.1).unwrap_or("");
+    for seg in after_scheme.split('/') {
+        let decoded = seg.to_ascii_lowercase().replace("%2e", ".");
+        if decoded == "." || decoded == ".." {
+            return Err(format!(
+                "TVF: object-store path '{path}' contains a dot path segment \
+                 ('.' / '..'), which is not allowed"
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// `true` when `path` falls under `prefix` on a path-segment boundary.
+/// `s3://staging` matches `s3://staging` and `s3://staging/x` but NOT
+/// `s3://staging-evil/x`.
+fn object_prefix_matches(path: &str, prefix: &str) -> bool {
+    if prefix.is_empty() {
+        return false;
+    }
+    match path.strip_prefix(prefix) {
+        Some(rest) => prefix.ends_with('/') || rest.is_empty() || rest.starts_with('/'),
+        None => false,
+    }
+}
+
+/// Expand the `{user}` placeholder in a configured prefix. Returns `None`
+/// when the prefix needs a username that is absent or contains characters
+/// that could rewrite the URL shape (anything outside `[A-Za-z0-9._@+-]`).
+fn substitute_user_placeholder(prefix: &str, username: Option<&str>) -> Option<String> {
+    if !prefix.contains("{user}") {
+        return Some(prefix.to_string());
+    }
+    let user = username?;
+    let safe = !user.is_empty()
+        && !user.chars().all(|c| c == '.')
+        && user
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@' | '+'));
+    if !safe {
+        return None;
+    }
+    Some(prefix.replace("{user}", user))
 }
 
 impl TvfPolicy {
-    /// Return `Ok(())` if a TVF may legitimately reference `path`, or an
-    /// error describing why it cannot. Object-store schemes (`s3://`,
-    /// `s3a://`, `abfss://`, `abfs://`, `azure://`, `az://`, `gs://`,
-    /// `gcs://`, `hf://`) are always allowed because they go through
-    /// SQE's credential-managed stores. Local paths (`/...`, `file://`,
-    /// no scheme) need `allow_local_paths = true`. `http(s)://` needs
-    /// either `allow_http = true` or an exact match in
-    /// `allowed_http_hosts`.
-    pub fn check(&self, path: &str) -> Result<(), String> {
+    /// Return `Ok(())` if a TVF invoked by `caller` may reference `path`,
+    /// or an error describing why it cannot.
+    ///
+    /// - Object-store schemes (`s3://`, `s3a://`, `abfss://`, `abfs://`,
+    ///   `azure://`, `az://`, `gs://`, `gcs://`) use the engine's own
+    ///   storage credentials, so they are gated per caller identity:
+    ///   allowed only under `allowed_object_store_prefixes` (with `{user}`
+    ///   substitution), for a role in `object_store_admin_roles`, for a
+    ///   trusted local caller, or when the call carries complete inline
+    ///   credentials (`inline_credentials = true`). Default: DENY.
+    /// - `hf://` resolves to anonymous HTTPS downloads from
+    ///   huggingface.co; no engine storage credentials are involved, so it
+    ///   stays allowed.
+    /// - Local paths (`/...`, `file://`, no scheme) need
+    ///   `allow_local_paths = true`.
+    /// - `http(s)://` needs either `allow_http = true` or an exact match
+    ///   in `allowed_http_hosts`.
+    pub fn check_path(
+        &self,
+        path: &str,
+        caller: &TvfCaller,
+        inline_credentials: bool,
+    ) -> Result<(), String> {
         let lower = path.to_lowercase();
-        // Object-store schemes — always allowed; credentials come from
-        // `[storage.*]`, not the TVF user's filesystem.
         if lower.starts_with("s3://")
             || lower.starts_with("s3a://")
             || lower.starts_with("abfss://")
@@ -1485,8 +1645,12 @@ impl TvfPolicy {
             || lower.starts_with("az://")
             || lower.starts_with("gs://")
             || lower.starts_with("gcs://")
-            || lower.starts_with("hf://")
         {
+            return self.check_object_store(path, caller, inline_credentials);
+        }
+        if lower.starts_with("hf://") {
+            // Resolved upstream to https://huggingface.co downloads; the
+            // engine's storage credentials are never attached.
             return Ok(());
         }
 
@@ -1533,6 +1697,76 @@ impl TvfPolicy {
              Path '{path}' is not an object-store URL (s3://, abfss://, gs://, hf://, ...). \
              Set `[storage.tvf] allow_local_paths = true` to permit local reads, \
              or stage the file in an object store."
+        ))
+    }
+
+    /// Identity-aware gate for engine-credentialed object-store TVF reads.
+    /// Fail-closed: with no configuration, every `s3://` / `abfss://` /
+    /// `gs://` (and alias-scheme) path is denied unless the call carries
+    /// complete inline credentials or the caller is trusted-local.
+    fn check_object_store(
+        &self,
+        path: &str,
+        caller: &TvfCaller,
+        inline_credentials: bool,
+    ) -> Result<(), String> {
+        if caller.trusted || inline_credentials {
+            return Ok(());
+        }
+        if !self.object_store_admin_roles.is_empty()
+            && caller.roles.iter().any(|r| {
+                self.object_store_admin_roles
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case(r))
+            })
+        {
+            return Ok(());
+        }
+
+        let principal = caller.username.as_deref().unwrap_or("<anonymous>");
+        let canon = match canonicalize_object_url(path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    principal = %principal,
+                    path = %path,
+                    "TVF object-store access denied: {e}"
+                );
+                return Err(e);
+            }
+        };
+        for raw_prefix in &self.allowed_object_store_prefixes {
+            let Some(substituted) =
+                substitute_user_placeholder(raw_prefix, caller.username.as_deref())
+            else {
+                continue;
+            };
+            // A misconfigured prefix (e.g. containing dot segments) is
+            // skipped rather than widened.
+            let Ok(canon_prefix) = canonicalize_object_url(&substituted) else {
+                continue;
+            };
+            if object_prefix_matches(&canon, &canon_prefix) {
+                return Ok(());
+            }
+        }
+
+        tracing::warn!(
+            principal = %principal,
+            path = %path,
+            "TVF object-store access denied: no matching \
+             `[storage.tvf] allowed_object_store_prefixes` entry"
+        );
+        Err(format!(
+            "TVF: object-store path '{path}' denied for user '{principal}'. \
+             Reads with the engine's storage credentials are limited to \
+             `[storage.tvf] allowed_object_store_prefixes` ({} configured). \
+             Add a matching prefix (the `{{user}}` placeholder expands to the \
+             authenticated username), grant a role listed in \
+             `[storage.tvf] object_store_admin_roles`, or pass complete inline \
+             credentials (e.g. access_key/secret_key) so the engine's storage \
+             key is not used.",
+            self.allowed_object_store_prefixes.len()
         ))
     }
 
@@ -4474,27 +4708,207 @@ otlp_endpoint = ""
     // --- TvfPolicy (issue #10 regression tests) ---
 
     #[test]
-    fn tvf_default_allows_object_store_schemes() {
+    fn tvf_object_store_config_deserializes_from_toml() {
+        #[derive(Deserialize)]
+        struct Wrap {
+            storage: StorageConfig,
+        }
+        let toml = r#"
+            [storage]
+            s3_endpoint = "http://s3:9000"
+
+            [storage.tvf]
+            allowed_object_store_prefixes = [
+                "s3://data-platform-staging/_table-load-staging/",
+                "s3://scratch/{user}/",
+            ]
+            object_store_admin_roles = ["sqe-storage-admin"]
+        "#;
+        let w: Wrap = toml::from_str(toml).expect("[storage.tvf] TOML deserializes");
+        assert_eq!(w.storage.tvf.allowed_object_store_prefixes.len(), 2);
+        assert_eq!(
+            w.storage.tvf.object_store_admin_roles,
+            vec!["sqe-storage-admin".to_string()]
+        );
+        // Untouched defaults stay fail-closed.
+        assert!(!w.storage.tvf.allow_local_paths);
+        assert!(!w.storage.tvf.allow_http);
+    }
+
+    /// Plain authenticated remote caller (no roles).
+    fn caller(name: &str) -> TvfCaller {
+        TvfCaller::for_user(name.to_string(), Vec::new())
+    }
+
+    /// Shorthand: check `path` as a default remote caller without inline
+    /// credentials.
+    fn check_remote(policy: &TvfPolicy, path: &str) -> Result<(), String> {
+        policy.check_path(path, &caller("alice"), false)
+    }
+
+    #[test]
+    fn tvf_default_denies_object_store_schemes_for_remote_callers() {
+        // Identity-aware gate: with no `allowed_object_store_prefixes`,
+        // engine-credentialed object-store reads are denied out of the box.
         let policy = TvfPolicy::default();
-        assert!(policy.check("s3://my-bucket/data.parquet").is_ok());
-        assert!(policy.check("s3a://my-bucket/data.parquet").is_ok());
-        assert!(policy.check("abfss://c@a.dfs.core.windows.net/x").is_ok());
-        assert!(policy.check("abfs://c@a.dfs.core.windows.net/x").is_ok());
-        assert!(policy.check("azure://container/x").is_ok());
-        assert!(policy.check("az://container/x").is_ok());
-        assert!(policy.check("gs://bucket/x").is_ok());
-        assert!(policy.check("gcs://bucket/x").is_ok());
-        assert!(policy.check("hf://datasets/foo/bar/x").is_ok());
+        for path in [
+            "s3://my-bucket/data.parquet",
+            "s3a://my-bucket/data.parquet",
+            "abfss://c@a.dfs.core.windows.net/x",
+            "abfs://c@a.dfs.core.windows.net/x",
+            "azure://container/x",
+            "az://container/x",
+            "gs://bucket/x",
+            "gcs://bucket/x",
+        ] {
+            let err = check_remote(&policy, path).unwrap_err();
+            assert!(
+                err.contains("allowed_object_store_prefixes"),
+                "expected deny naming the config for {path}, got: {err}"
+            );
+        }
+        // hf:// stays open — no engine storage credentials involved.
+        assert!(check_remote(&policy, "hf://datasets/foo/bar/x").is_ok());
+    }
+
+    #[test]
+    fn tvf_object_store_prefix_allows_exact_subtree() {
+        let policy = TvfPolicy {
+            allowed_object_store_prefixes: vec![
+                "s3://data-platform-staging/_table-load-staging/".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert!(check_remote(
+            &policy,
+            "s3://data-platform-staging/_table-load-staging/abc-123/data.csv"
+        )
+        .is_ok());
+        // s3a:// alias is covered by an s3:// prefix.
+        assert!(check_remote(
+            &policy,
+            "s3a://data-platform-staging/_table-load-staging/abc-123/data.csv"
+        )
+        .is_ok());
+        // Same bucket outside the prefix: denied.
+        assert!(check_remote(&policy, "s3://data-platform-staging/secret.parquet").is_err());
+        // Other buckets: denied.
+        assert!(check_remote(&policy, "s3://prod-data/customers.parquet").is_err());
+    }
+
+    #[test]
+    fn tvf_object_store_prefix_requires_segment_boundary() {
+        // `s3://staging-bucket` must not match `s3://staging-bucket-evil`.
+        let policy = TvfPolicy {
+            allowed_object_store_prefixes: vec!["s3://staging-bucket".to_string()],
+            ..Default::default()
+        };
+        assert!(check_remote(&policy, "s3://staging-bucket/x.csv").is_ok());
+        assert!(check_remote(&policy, "s3://staging-bucket").is_ok());
+        assert!(check_remote(&policy, "s3://staging-bucket-evil/x.csv").is_err());
+        // Same trickery against a prefix with a key part.
+        let policy = TvfPolicy {
+            allowed_object_store_prefixes: vec!["s3://b/staging".to_string()],
+            ..Default::default()
+        };
+        assert!(check_remote(&policy, "s3://b/staging/x.csv").is_ok());
+        assert!(check_remote(&policy, "s3://b/staging-evil/x.csv").is_err());
+    }
+
+    #[test]
+    fn tvf_object_store_rejects_dot_segment_traversal() {
+        let policy = TvfPolicy {
+            allowed_object_store_prefixes: vec!["s3://staging/uploads/".to_string()],
+            ..Default::default()
+        };
+        // Literal dot segments would be collapsed by url/HTTP layers AFTER
+        // the prefix check — reject outright.
+        let err = check_remote(&policy, "s3://staging/uploads/../../etc/x.csv").unwrap_err();
+        assert!(err.contains("dot path segment"), "got: {err}");
+        // Percent-encoded variants too.
+        let err =
+            check_remote(&policy, "s3://staging/uploads/%2e%2e/secret.csv").unwrap_err();
+        assert!(err.contains("dot path segment"), "got: {err}");
+        let err =
+            check_remote(&policy, "s3://staging/uploads/.%2E/secret.csv").unwrap_err();
+        assert!(err.contains("dot path segment"), "got: {err}");
+    }
+
+    #[test]
+    fn tvf_object_store_user_placeholder_substitution() {
+        let policy = TvfPolicy {
+            allowed_object_store_prefixes: vec!["s3://scratch/{user}/".to_string()],
+            ..Default::default()
+        };
+        // Own prefix: allowed.
+        assert!(policy
+            .check_path("s3://scratch/alice/data.csv", &caller("alice"), false)
+            .is_ok());
+        // Another user's prefix: denied.
+        assert!(policy
+            .check_path("s3://scratch/alice/data.csv", &caller("bob"), false)
+            .is_err());
+        // No username available -> `{user}` prefixes never match.
+        assert!(policy
+            .check_path("s3://scratch/alice/data.csv", &TvfCaller::default(), false)
+            .is_err());
+        // A username with URL-shape-rewriting characters is not substituted.
+        assert!(policy
+            .check_path("s3://scratch/a/b/data.csv", &caller("a/b"), false)
+            .is_err());
+        assert!(policy
+            .check_path("s3://scratch/../x/data.csv", &caller(".."), false)
+            .is_err());
+    }
+
+    #[test]
+    fn tvf_object_store_admin_role_override() {
+        let policy = TvfPolicy {
+            object_store_admin_roles: vec!["sqe-storage-admin".to_string()],
+            ..Default::default()
+        };
+        let admin = TvfCaller::for_user(
+            "root".to_string(),
+            vec!["uma_authorization".to_string(), "SQE-Storage-Admin".to_string()],
+        );
+        assert!(policy
+            .check_path("s3://any-bucket/any.parquet", &admin, false)
+            .is_ok());
+        // Without the role: denied.
+        assert!(check_remote(&policy, "s3://any-bucket/any.parquet").is_err());
+        // Empty role list never matches anything.
+        let no_roles = TvfPolicy::default();
+        assert!(no_roles
+            .check_path("s3://any-bucket/any.parquet", &admin, false)
+            .is_err());
+    }
+
+    #[test]
+    fn tvf_object_store_inline_credentials_bypass() {
+        // Complete inline credentials = the engine's storage key is not
+        // used; the object store enforces access itself.
+        let policy = TvfPolicy::default();
+        assert!(policy
+            .check_path("s3://their-own-bucket/x.csv", &caller("alice"), true)
+            .is_ok());
+    }
+
+    #[test]
+    fn tvf_object_store_trusted_local_bypass() {
+        let policy = TvfPolicy::default();
+        assert!(policy
+            .check_path("s3://bucket/x.csv", &TvfCaller::trusted_local(), false)
+            .is_ok());
     }
 
     #[test]
     fn tvf_default_rejects_local_absolute_paths() {
         let policy = TvfPolicy::default();
-        let err = policy.check("/etc/shadow").unwrap_err();
+        let err = check_remote(&policy, "/etc/shadow").unwrap_err();
         assert!(err.contains("local filesystem paths are disabled"));
-        let err = policy.check("/proc/self/environ").unwrap_err();
+        let err = check_remote(&policy, "/proc/self/environ").unwrap_err();
         assert!(err.contains("local filesystem"));
-        let err = policy.check("file:///root/.aws/credentials").unwrap_err();
+        let err = check_remote(&policy, "file:///root/.aws/credentials").unwrap_err();
         assert!(err.contains("local filesystem"));
     }
 
@@ -4502,9 +4916,11 @@ otlp_endpoint = ""
     fn tvf_default_rejects_arbitrary_http_hosts() {
         let policy = TvfPolicy::default();
         // The IMDS scenario from the issue.
-        let err = policy
-            .check("http://169.254.169.254/latest/meta-data/iam/security-credentials/")
-            .unwrap_err();
+        let err = check_remote(
+            &policy,
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        )
+        .unwrap_err();
         assert!(err.contains("not in `[storage.tvf] allowed_http_hosts`"));
         assert!(err.contains("169.254.169.254"));
     }
@@ -4512,54 +4928,48 @@ otlp_endpoint = ""
     #[test]
     fn tvf_allowed_http_host_is_accepted_exact_match() {
         let policy = TvfPolicy {
-            allow_local_paths: false,
-            allow_http: false,
             allowed_http_hosts: vec![
                 "data.example.com".to_string(),
                 "huggingface.co".to_string(),
             ],
+            ..Default::default()
         };
-        assert!(policy.check("https://data.example.com/file.parquet").is_ok());
+        assert!(check_remote(&policy, "https://data.example.com/file.parquet").is_ok());
         // Case-insensitive host comparison.
-        assert!(policy.check("https://DATA.EXAMPLE.COM/file.parquet").is_ok());
+        assert!(check_remote(&policy, "https://DATA.EXAMPLE.COM/file.parquet").is_ok());
         // Different port is still allowed (host match only).
-        assert!(policy.check("https://data.example.com:8080/file.parquet").is_ok());
+        assert!(check_remote(&policy, "https://data.example.com:8080/file.parquet").is_ok());
         // Subdomain that isn't allowlisted is rejected (no wildcards).
-        assert!(policy
-            .check("https://api.data.example.com/file.parquet")
-            .is_err());
+        assert!(check_remote(&policy, "https://api.data.example.com/file.parquet").is_err());
     }
 
     #[test]
     fn tvf_allow_http_true_bypasses_allowlist() {
         let policy = TvfPolicy {
-            allow_local_paths: false,
             allow_http: true,
-            allowed_http_hosts: Vec::new(),
+            ..Default::default()
         };
-        assert!(policy.check("http://169.254.169.254/").is_ok());
-        assert!(policy.check("https://anything.example/x").is_ok());
+        assert!(check_remote(&policy, "http://169.254.169.254/").is_ok());
+        assert!(check_remote(&policy, "https://anything.example/x").is_ok());
     }
 
     #[test]
     fn tvf_allow_local_paths_true_permits_filesystem() {
         let policy = TvfPolicy {
             allow_local_paths: true,
-            allow_http: false,
-            allowed_http_hosts: Vec::new(),
+            ..Default::default()
         };
-        assert!(policy.check("/var/data/foo.parquet").is_ok());
-        assert!(policy.check("file:///var/data/foo.parquet").is_ok());
+        assert!(check_remote(&policy, "/var/data/foo.parquet").is_ok());
+        assert!(check_remote(&policy, "file:///var/data/foo.parquet").is_ok());
     }
 
     #[test]
     fn tvf_malformed_http_url_returns_error() {
         let policy = TvfPolicy {
-            allow_local_paths: false,
-            allow_http: false,
             allowed_http_hosts: vec!["example.com".to_string()],
+            ..Default::default()
         };
-        let err = policy.check("http:///just-a-path").unwrap_err();
+        let err = check_remote(&policy, "http:///just-a-path").unwrap_err();
         assert!(err.contains("malformed URL") || err.contains("missing host"));
     }
 
@@ -4593,9 +5003,8 @@ otlp_endpoint = ""
     #[test]
     fn tvf_endpoint_allowed_http_host_passes() {
         let policy = TvfPolicy {
-            allow_local_paths: false,
-            allow_http: false,
             allowed_http_hosts: vec!["s3.us-east-1.amazonaws.com".to_string()],
+            ..Default::default()
         };
         assert!(policy
             .check_endpoint("https://s3.us-east-1.amazonaws.com")
@@ -4609,9 +5018,8 @@ otlp_endpoint = ""
     #[test]
     fn tvf_endpoint_allow_http_true_bypasses_allowlist() {
         let policy = TvfPolicy {
-            allow_local_paths: false,
             allow_http: true,
-            allowed_http_hosts: Vec::new(),
+            ..Default::default()
         };
         // Defense-in-depth surrenders when allow_http = true.
         assert!(policy.check_endpoint("http://169.254.169.254").is_ok());
