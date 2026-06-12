@@ -7,7 +7,7 @@
 
 services:
   polaris:
-    image: apache/polaris:1.3.0-incubating
+    image: apache/polaris:1.5.0
     environment:
       POLARIS_PERSISTENCE_TYPE: in-memory
       POLARIS_BOOTSTRAP_CREDENTIALS: "POLARIS,root,s3cr3t"
@@ -16,9 +16,16 @@ services:
       QUARKUS_LOG_LEVEL: INFO
       QUARKUS_LOG_CATEGORY__ORG_APACHE_POLARIS__LEVEL: WARN
       quarkus.otel.sdk.disabled: "true"
+      # 1.5.0 realm resolution is stricter than 1.3.0: declare the realm,
+      # make it the default, and do not require the realm header (clients
+      # in this stack never send one).
       polaris.realm-context.realms: POLARIS
-      # Allow DROP VIEW/TABLE to purge metadata files from object storage
-      POLARIS_FEATURES_DEFAULTS_DROP_WITH_PURGE_ENABLED: "true"
+      polaris.realm-context.default-realm: POLARIS
+      polaris.realm-context.require-header: "false"
+      # Allow DROP VIEW/TABLE to purge metadata files from object storage.
+      # 1.5.0 reads feature flags via polaris.features."NAME"; the old
+      # POLARIS_FEATURES_DEFAULTS_* env spelling is no longer honored.
+      polaris.features."DROP_WITH_PURGE_ENABLED": "true"
       # S3 credentials for RustFS — used by Polaris for its own S3 operations
       AWS_REGION: us-east-1
       AWS_ACCESS_KEY_ID: s3admin

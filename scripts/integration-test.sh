@@ -42,6 +42,14 @@ echo "Running integration tests..."
 SKIP_ARGS=()
 if [ "$#" -eq 0 ]; then
     SKIP_ARGS=(--skip test_distributed_select)
+    # The deep-OR stack-overflow guards (in_subquery_or_stack_overflow.rs
+    # prod_stack_4k..32k) are release-only via #[cfg_attr(debug_assertions,
+    # ignore)], but `--ignored` force-runs ignored tests, and in a debug
+    # build the overflow is an OS-level SIGABRT that kills the whole test
+    # binary. Skip them here (this script runs the debug profile); they run
+    # via `cargo test --release -p sqe-coordinator --test
+    # in_subquery_or_stack_overflow`.
+    SKIP_ARGS+=(--skip prod_stack_4k --skip prod_stack_8k --skip prod_stack_16k --skip prod_stack_32k)
 fi
 RUST_LOG="${RUST_LOG:-sqe_coordinator=info,sqe_catalog=info,sqe_auth=info,warn}" \
 RUST_MIN_STACK="${RUST_MIN_STACK:-8388608}" \
