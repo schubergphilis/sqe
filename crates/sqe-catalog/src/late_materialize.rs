@@ -238,14 +238,30 @@ pub fn build_predicate_schema(
     classification: &ColumnClassification,
     full_schema: &SchemaRef,
 ) -> SchemaRef {
-    let fields: Vec<Arc<Field>> = classification
+    // Field order MUST follow the full (file) schema, not the alphabetical
+    // order classify_columns uses for its column set: the parquet reader's
+    // phase-1 batch delivers predicate columns in file order regardless of
+    // the index order handed to ProjectionMask::roots, and the remapped
+    // Column indices are resolved against THIS schema. Alphabetical order
+    // misaligned every index whenever it differed from file order: typed
+    // mismatches failed the scan ("Invalid comparison operation: Utf8 ==
+    // Int32" on TPC-C order_status), and same-typed mismatches silently
+    // evaluated the wrong comparison and dropped rows.
+    let mut indexed: Vec<(usize, Arc<Field>)> = classification
         .predicate_columns
         .iter()
-        .filter_map(|name| full_schema.field_with_name(name).ok().cloned())
-        .map(Arc::new)
+        .filter_map(|name| {
+            full_schema
+                .index_of(name)
+                .ok()
+                .map(|i| (i, Arc::new(full_schema.field(i).clone())))
+        })
         .collect();
+    indexed.sort_by_key(|(i, _)| *i);
 
-    Arc::new(Schema::new(fields))
+    Arc::new(Schema::new(
+        indexed.into_iter().map(|(_, f)| f).collect::<Vec<_>>(),
+    ))
 }
 
 /// Remap a `PhysicalExpr` tree so that `Column` indices reference the predicate
@@ -1264,5 +1280,95 @@ mod tests {
         assert!(ctx.sort_order_columns.is_empty());
         assert!(ctx.columns_with_stats.is_empty());
         assert!(ctx.column_selectivity.is_empty());
+    }
+
+    /// Regression: predicate-schema column order must follow FILE order, not
+    /// alphabetical order. The parquet reader's phase-1 batch delivers
+    /// predicate columns in file-schema order regardless of the order of the
+    /// indices passed to ProjectionMask::roots. classify_columns sorts names
+    /// alphabetically; building the predicate schema in that order misaligns
+    /// every remapped Column index whenever alphabetical order differs from
+    /// file order. Observed on TPC-C order_status (customer predicate on
+    /// c_w_id, c_d_id, c_last): the remapped `c_last = 'BARBARBAR'` pointed at
+    /// the Int32 c_w_id column ("Invalid comparison operation: Utf8 == Int32").
+    /// When the swapped columns share a type the filter evaluates the WRONG
+    /// comparison silently and discards rows the coordinator never sees.
+    #[test]
+    fn predicate_schema_follows_file_order_not_alphabetical() {
+        use arrow_array::{Int32Array, RecordBatch, StringArray};
+
+        // File order deliberately differs from alphabetical order of the
+        // predicate columns: file = [c_d_id, c_w_id, c_last], predicate cols
+        // sorted alphabetically = [c_d_id, c_last, c_w_id].
+        let full_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("c_d_id", DataType::Int32, true),
+            Field::new("c_w_id", DataType::Int32, true),
+            Field::new("c_last", DataType::Utf8, true),
+        ]));
+
+        // Predicate: c_w_id = 1 AND c_last = 'BARBARBAR' (indices vs full schema)
+        let pred_w = expressions::binary(
+            col_expr("c_w_id", 1),
+            datafusion::logical_expr::Operator::Eq,
+            Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+            &full_schema,
+        )
+        .expect("build c_w_id = 1");
+        let pred_last = expressions::binary(
+            col_expr("c_last", 2),
+            datafusion::logical_expr::Operator::Eq,
+            Arc::new(Literal::new(ScalarValue::Utf8(Some("BARBARBAR".into())))),
+            &full_schema,
+        )
+        .expect("build c_last = literal");
+        let predicate = expressions::binary(
+            pred_w,
+            datafusion::logical_expr::Operator::And,
+            pred_last,
+            &full_schema,
+        )
+        .expect("build AND");
+
+        let projection = vec![
+            "c_d_id".to_string(),
+            "c_w_id".to_string(),
+            "c_last".to_string(),
+        ];
+        let classification = classify_columns(predicate.as_ref(), &projection);
+        let predicate_schema = build_predicate_schema(&classification, &full_schema);
+
+        // The schema the filter evaluates against must be in FILE order.
+        let names: Vec<&str> = predicate_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["c_w_id", "c_last"],
+            "predicate schema must follow file order, got {names:?}"
+        );
+
+        let remapped =
+            remap_predicate_columns(&predicate, &predicate_schema).expect("remap predicate");
+
+        // Phase-1 batch as the parquet reader delivers it: predicate columns
+        // in FILE order. Row 0 matches, row 1 fails c_w_id, row 2 fails c_last.
+        let batch = RecordBatch::try_new(
+            predicate_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 1])),
+                Arc::new(StringArray::from(vec!["BARBARBAR", "BARBARBAR", "OTHER"])),
+            ],
+        )
+        .expect("build phase-1 batch");
+
+        let value = remapped.evaluate(&batch).expect("evaluate remapped predicate");
+        let array = value
+            .into_array(batch.num_rows())
+            .expect("materialize boolean result");
+        let bools = array.as_boolean();
+        let kept: Vec<bool> = (0..bools.len()).map(|i| bools.value(i)).collect();
+        assert_eq!(kept, vec![true, false, false]);
     }
 }

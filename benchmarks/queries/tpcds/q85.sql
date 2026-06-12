@@ -20,22 +20,27 @@ WHERE ws_web_page_sk            = wp_web_page_sk
          AND cd1.cd_marital_status = cd2.cd_marital_status
          AND cd1.cd_education_status = 'Advanced Degree'
          AND cd1.cd_education_status = cd2.cd_education_status
-         AND ca_country          = 'United States'
-         AND ca_state            IN ('ND', 'WI', 'AL')
-         AND ws_net_profit       BETWEEN 100 AND 200)
+         AND ws_sales_price      BETWEEN 100.00 AND 150.00)
      OR (cd1.cd_marital_status  = 'S'
          AND cd1.cd_marital_status = cd2.cd_marital_status
          AND cd1.cd_education_status = 'College'
          AND cd1.cd_education_status = cd2.cd_education_status
-         AND ca_country          = 'United States'
-         AND ca_state            IN ('MD', 'IN', 'WA')
-         AND ws_net_profit       BETWEEN 150 AND 300)
-     OR (cd1.cd_marital_status  = 'D'
+         AND ws_sales_price      BETWEEN 50.00 AND 100.00)
+     OR (cd1.cd_marital_status  = 'W'
          AND cd1.cd_marital_status = cd2.cd_marital_status
          AND cd1.cd_education_status = '2 yr Degree'
          AND cd1.cd_education_status = cd2.cd_education_status
-         AND ca_country          = 'United States'
-         AND ca_state            IN ('WY', 'SD', 'HI')
+         AND ws_sales_price      BETWEEN 150.00 AND 200.00)
+  )
+  AND (
+        (ca_country              = 'United States'
+         AND ca_state            IN ('IN', 'OH', 'NJ')
+         AND ws_net_profit       BETWEEN 100 AND 200)
+     OR (ca_country              = 'United States'
+         AND ca_state            IN ('WI', 'CT', 'KY')
+         AND ws_net_profit       BETWEEN 150 AND 300)
+     OR (ca_country              = 'United States'
+         AND ca_state            IN ('LA', 'IA', 'AR')
          AND ws_net_profit       BETWEEN 50 AND 250)
   )
 GROUP BY r_reason_desc

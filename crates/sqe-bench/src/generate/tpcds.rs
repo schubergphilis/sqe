@@ -466,6 +466,139 @@ const WP_TYPES: &[&str] = &["dynamic", "static", "flash"];
 const DEPT: &[&str] = &["2001Q1", "2001Q2", "2001Q3", "2001Q4",
                          "2002Q1", "2002Q2", "2002Q3", "2002Q4"];
 
+/// US retail GMT offsets. The official queries filter `gmt_offset = -5`
+/// (q43/q56/q62/q99 on store, customer_address, call_center, web_site); a
+/// uniform -12..12 draw left -5 absent from 12-row dimensions entirely.
+const GMT_OFFSETS: &[f64] = &[-5.0, -6.0, -7.0, -8.0];
+
+/// Cities the official queries probe (q84 and the city legs of q46/q68/q79
+/// look for Edgewood, Fairview, Midway, Pleasant Hill, Riverside, Bethel,
+/// Oak Grove, ...). dsdgen draws ca_city from a fixed list; random letter
+/// soup never matched any predicate.
+const CA_CITIES: &[&str] = &[
+    "Edgewood", "Fairview", "Midway", "Pleasant Hill", "Riverside",
+    "Bethel", "Oak Grove", "Antioch", "Greenville", "Springfield",
+    "Salem", "Georgetown", "Centerville", "Mount Olive", "Glenwood",
+    "Marion", "Five Points", "Liberty", "Union", "Crossroads",
+    "Oakland", "Clinton", "Franklin", "Bridgeport", "Lakeview",
+    "Highland", "Woodville", "Ashland", "Newport", "Sulphur Springs",
+];
+
+// ---------------------------------------------------------------------------
+// Deterministic baskets (multi-line tickets shared by sales and returns)
+// ---------------------------------------------------------------------------
+
+/// Per-channel salts for the per-ticket rng. Sales and returns generators
+/// both seed `StdRng::seed_from_u64(salt ^ ticket)` and therefore recompute
+/// the exact same basket independently: returns join sales on
+/// (ticket/order, item) without ever materializing the sales table.
+const STORE_TICKET_SALT: u64 = 0x5351_455f_5354_4f52; // "SQE_STOR"
+const CATALOG_ORDER_SALT: u64 = 0x5351_455f_4341_544c; // "SQE_CATL"
+const WEB_ORDER_SALT: u64 = 0x5351_455f_5745_4253; // "SQE_WEBS"
+
+/// Maximum line items per ticket/order. Lines are uniform in 1..=25 so the
+/// `HAVING count(*) BETWEEN 15 AND 20` windows in q34/q46/q68/q73/q79 match
+/// a healthy fraction of tickets. The old generator emitted exactly one line
+/// per ticket and those queries returned nothing.
+const MAX_BASKET_LINES: usize = 25;
+
+/// NULL probability for nullable fact FK columns. q76 selects rows WHERE
+/// ss_customer_sk IS NULL (and the cs_/ws_ equivalents); the old generator
+/// never emitted NULLs. The null-or-not decision is made once per ticket so
+/// ticket-level grouping stays coherent.
+const FK_NULL_RATE: f64 = 0.04;
+
+/// Header fields and line items of one ticket/order, derived purely from
+/// (salt, ticket). All lines of a ticket share the header fields; only the
+/// item and quantity vary per line.
+struct Basket {
+    lines: usize,
+    date_sk: i32,
+    customer_sk: Option<i32>,
+    cdemo_sk: Option<i32>,
+    hdemo_sk: Option<i32>,
+    addr_sk: Option<i32>,
+    ship_customer_sk: Option<i32>,
+    ship_cdemo_sk: Option<i32>,
+    ship_hdemo_sk: Option<i32>,
+    ship_addr_sk: Option<i32>,
+    /// ss_store_sk / cs_call_center_sk / ws_web_site_sk depending on channel.
+    channel_sk: i32,
+    promo_sk: Option<i32>,
+    items: Vec<i32>,
+    quantities: Vec<i32>,
+}
+
+/// Scale-dependent FK domains shared by the basket-based sales and returns
+/// generators. Both sides must derive identical dims from the same scale so
+/// recomputed baskets stay byte-for-byte identical. Ranges are inclusive of
+/// the dimension's last surrogate key; at small scales several dims collapse
+/// to a single row and an exclusive `1..1` range would panic.
+#[derive(Clone, Copy)]
+struct FkDims {
+    items: i32,
+    customers: i32,
+    cdemos: i32,
+    hdemos: i32,
+    addrs: i32,
+    promos: i32,
+}
+
+impl FkDims {
+    fn at(scale: f64) -> Self {
+        Self {
+            items: item_rows(scale) as i32,
+            customers: customer_rows(scale) as i32,
+            cdemos: customer_demographics_rows(scale) as i32,
+            hdemos: household_demographics_rows(scale) as i32,
+            addrs: customer_address_rows(scale) as i32,
+            promos: promotion_rows(scale) as i32,
+        }
+    }
+}
+
+fn nullable_fk(rng: &mut StdRng, upper: i32) -> Option<i32> {
+    if rng.gen_bool(FK_NULL_RATE) {
+        None
+    } else {
+        Some(rng.gen_range(1..=upper))
+    }
+}
+
+/// Recompute the basket for `ticket` from scratch. Must stay byte-for-byte
+/// deterministic: the sales generator and the returns generator each call
+/// this independently and rely on identical output.
+fn basket(salt: u64, ticket: i32, channel_upper: i32, dims: FkDims) -> Basket {
+    let mut rng = StdRng::seed_from_u64(salt ^ ticket as u64);
+    let lines = rng.gen_range(1..=MAX_BASKET_LINES);
+    let date_sk = rng.gen_range(1..=DS_DATE_RANGE);
+    let customer_sk = nullable_fk(&mut rng, dims.customers);
+    let cdemo_sk = nullable_fk(&mut rng, dims.cdemos);
+    let hdemo_sk = nullable_fk(&mut rng, dims.hdemos);
+    let addr_sk = nullable_fk(&mut rng, dims.addrs);
+    let ship_customer_sk = nullable_fk(&mut rng, dims.customers);
+    let ship_cdemo_sk = nullable_fk(&mut rng, dims.cdemos);
+    let ship_hdemo_sk = nullable_fk(&mut rng, dims.hdemos);
+    let ship_addr_sk = nullable_fk(&mut rng, dims.addrs);
+    let channel_sk = rng.gen_range(1..=channel_upper);
+    let promo_sk = nullable_fk(&mut rng, dims.promos);
+    let items: Vec<i32> = (0..lines).map(|_| rng.gen_range(1..=dims.items)).collect();
+    let quantities: Vec<i32> = (0..lines).map(|_| rng.gen_range(1..100)).collect();
+    Basket {
+        lines, date_sk, customer_sk, cdemo_sk, hdemo_sk, addr_sk,
+        ship_customer_sk, ship_cdemo_sk, ship_hdemo_sk, ship_addr_sk,
+        channel_sk, promo_sk, items, quantities,
+    }
+}
+
+/// Highest ticket number a returns table may reference. The first K tickets
+/// occupy at most K * MAX_BASKET_LINES sales rows, so every ticket up to
+/// sales_rows / MAX_BASKET_LINES is guaranteed fully emitted (no line lost
+/// to the row-count cap) and safe to return against.
+fn returnable_tickets(scale: f64, sales_base: f64) -> i32 {
+    (super::scaled(scale, sales_base).max(1) / MAX_BASKET_LINES).max(1) as i32
+}
+
 // ---------------------------------------------------------------------------
 // Generic batch generator
 // ---------------------------------------------------------------------------
@@ -590,24 +723,39 @@ fn generate_store_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let total = store_sales_rows(scale);
     // FK ranges must track dimension cardinality at this scale;
     // sf1-sized ranges empty out dimension joins at small scales.
-    let items = item_rows(scale) as i32;
-    let customers = customer_rows(scale) as i32;
-    let cdemos = customer_demographics_rows(scale) as i32;
-    let addrs = customer_address_rows(scale) as i32;
+    let dims = FkDims::at(scale);
     let stores = store_rows(scale) as i32;
-    let promos = promotion_rows(scale) as i32;
-    generate_batches(store_sales_schema(), total, seed_for_table("store_sales"), |row, rng| {
-        let qty = rng.gen_range(1..100i32);
+    // Walk tickets in order, emitting all lines of a basket consecutively.
+    // The row indices arrive strictly sequentially from generate_batches, so
+    // a small amount of closure state maps row -> (ticket, line) without
+    // holding the table in memory.
+    let mut ticket: i32 = 0;
+    let mut line: usize = 0;
+    let mut cur: Option<Basket> = None;
+    generate_batches(store_sales_schema(), total, seed_for_table("store_sales"), move |_row, rng| {
+        let exhausted = match &cur {
+            None => true,
+            Some(b) => line >= b.lines,
+        };
+        if exhausted {
+            ticket += 1;
+            cur = Some(basket(STORE_TICKET_SALT, ticket, stores, dims));
+            line = 0;
+        }
+        let b = cur.as_ref().expect("basket set above");
+        let item_sk = b.items[line];
+        let qty = b.quantities[line];
+        line += 1;
         let wc  = rng.gen_range(10..500i32) as f64 / 10.0;
         let lp  = wc * 1.5;
         let sp  = lp * rng.gen_range(50..100i32) as f64 / 100.0;
         let tax = sp * 0.08;
         vec![
-            i!(random_date_sk(rng)), i!(rng.gen_range(0..86400i32)),
-            i!(rng.gen_range(1..=items)), i!(rng.gen_range(1..=customers)),
-            i!(rng.gen_range(1..=cdemos)), i!(rng.gen_range(1..7200i32)),
-            i!(rng.gen_range(1..=addrs)), i!(rng.gen_range(1..=stores)),
-            i!(rng.gen_range(1..=promos)), i!((row + 1) as i32), i!(qty),
+            i!(b.date_sk), i!(rng.gen_range(0..86400i32)),
+            i!(item_sk), ColVal::I32(b.customer_sk),
+            ColVal::I32(b.cdemo_sk), ColVal::I32(b.hdemo_sk),
+            ColVal::I32(b.addr_sk), i!(b.channel_sk),
+            ColVal::I32(b.promo_sk), i!(ticket), i!(qty),
             f!(wc), f!(lp), f!(sp), f!(0.0), f!(sp * qty as f64),
             f!(wc * qty as f64), f!(lp * qty as f64), f!(tax), f!(0.0),
             f!(sp * qty as f64), f!(sp * qty as f64 + tax),
@@ -620,22 +768,28 @@ fn generate_store_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let total = store_returns_rows(scale);
     // FK ranges must track dimension cardinality at this scale;
     // sf1-sized ranges empty out dimension joins at small scales.
-    let items = item_rows(scale) as i32;
-    let customers = customer_rows(scale) as i32;
-    let cdemos = customer_demographics_rows(scale) as i32;
-    let addrs = customer_address_rows(scale) as i32;
+    let dims = FkDims::at(scale);
     let stores = store_rows(scale) as i32;
     let reasons = reason_rows(scale) as i32;
-    generate_batches(store_returns_schema(), total, seed_for_table("store_returns"), |row, rng| {
-        let qty = rng.gen_range(1..50i32);
+    let max_ticket = returnable_tickets(scale, 2_880_000.0);
+    generate_batches(store_returns_schema(), total, seed_for_table("store_returns"), move |_row, rng| {
+        // Pick a fully-emitted sales ticket, recompute its basket, and return
+        // one of its actual line items so (sr_ticket_number, sr_item_sk)
+        // joins store_sales (q01/q17/q24/q25/q29/q50/q64/q85).
+        let ticket = rng.gen_range(1..=max_ticket);
+        let b = basket(STORE_TICKET_SALT, ticket, stores, dims);
+        let line = rng.gen_range(0..b.lines);
+        let item_sk = b.items[line];
+        let qty = rng.gen_range(1..=b.quantities[line]);
+        let ret_date = rng.gen_range(b.date_sk..=DS_DATE_RANGE);
         let amt = rng.gen_range(10..500i32) as f64;
         let tax = amt * 0.08;
         vec![
-            i!(random_date_sk(rng)), i!(rng.gen_range(0..86400i32)),
-            i!(rng.gen_range(1..=items)), i!(rng.gen_range(1..=customers)),
-            i!(rng.gen_range(1..=cdemos)), i!(rng.gen_range(1..7200i32)),
-            i!(rng.gen_range(1..=addrs)), i!(rng.gen_range(1..=stores)),
-            i!(rng.gen_range(1..=reasons)), i!((row + 1) as i32), i!(qty),
+            i!(ret_date), i!(rng.gen_range(0..86400i32)),
+            i!(item_sk), ColVal::I32(b.customer_sk),
+            ColVal::I32(b.cdemo_sk), ColVal::I32(b.hdemo_sk),
+            ColVal::I32(b.addr_sk), i!(b.channel_sk),
+            i!(rng.gen_range(1..=reasons)), i!(ticket), i!(qty),
             f!(amt), f!(tax), f!(amt + tax), f!(amt * 0.02), f!(amt * 0.05),
             f!(amt * 0.6), f!(amt * 0.2), f!(amt * 0.2), f!(amt * 0.1),
         ]
@@ -646,30 +800,42 @@ fn generate_catalog_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let total = catalog_sales_rows(scale);
     // FK ranges must track dimension cardinality at this scale;
     // sf1-sized ranges empty out dimension joins at small scales.
-    let items = item_rows(scale) as i32;
-    let customers = customer_rows(scale) as i32;
-    let cdemos = customer_demographics_rows(scale) as i32;
-    let addrs = customer_address_rows(scale) as i32;
+    let dims = FkDims::at(scale);
     let ccs = call_center_rows(scale) as i32;
     let whs = warehouse_rows(scale) as i32;
-    let promos = promotion_rows(scale) as i32;
-    generate_batches(catalog_sales_schema(), total, seed_for_table("catalog_sales"), |row, rng| {
-        let qty = rng.gen_range(1..100i32);
+    let mut order: i32 = 0;
+    let mut line: usize = 0;
+    let mut cur: Option<Basket> = None;
+    generate_batches(catalog_sales_schema(), total, seed_for_table("catalog_sales"), move |_row, rng| {
+        let exhausted = match &cur {
+            None => true,
+            Some(b) => line >= b.lines,
+        };
+        if exhausted {
+            order += 1;
+            cur = Some(basket(CATALOG_ORDER_SALT, order, ccs, dims));
+            line = 0;
+        }
+        let b = cur.as_ref().expect("basket set above");
+        let item_sk = b.items[line];
+        let qty = b.quantities[line];
+        line += 1;
         let wc  = rng.gen_range(10..500i32) as f64 / 10.0;
         let lp  = wc * 1.5;
         let sp  = lp * rng.gen_range(50..100i32) as f64 / 100.0;
         let tax = sp * 0.08;
         let ship = sp * 0.05 * qty as f64;
+        let ship_date = (b.date_sk + rng.gen_range(1..=120i32)).min(DS_DATE_RANGE);
         vec![
-            i!(random_date_sk(rng)), i!(rng.gen_range(0..86400i32)), i!(random_date_sk(rng)),
-            i!(rng.gen_range(1..=customers)), i!(rng.gen_range(1..=cdemos)),
-            i!(rng.gen_range(1..7200i32)), i!(rng.gen_range(1..=addrs)),
-            i!(rng.gen_range(1..=customers)), i!(rng.gen_range(1..=cdemos)),
-            i!(rng.gen_range(1..7200i32)), i!(rng.gen_range(1..=addrs)),
-            i!(rng.gen_range(1..=ccs)), i!(rng.gen_range(1..11_718i32)),
+            i!(b.date_sk), i!(rng.gen_range(0..86400i32)), i!(ship_date),
+            ColVal::I32(b.customer_sk), ColVal::I32(b.cdemo_sk),
+            ColVal::I32(b.hdemo_sk), ColVal::I32(b.addr_sk),
+            ColVal::I32(b.ship_customer_sk), ColVal::I32(b.ship_cdemo_sk),
+            ColVal::I32(b.ship_hdemo_sk), ColVal::I32(b.ship_addr_sk),
+            i!(b.channel_sk), i!(rng.gen_range(1..11_718i32)),
             i!(rng.gen_range(1..20i32)), i!(rng.gen_range(1..=whs)),
-            i!(rng.gen_range(1..=items)), i!(rng.gen_range(1..=promos)),
-            i!((row + 1) as i32), i!(qty), f!(wc), f!(lp), f!(sp),
+            i!(item_sk), ColVal::I32(b.promo_sk),
+            i!(order), i!(qty), f!(wc), f!(lp), f!(sp),
             f!(0.0), f!(sp * qty as f64), f!(wc * qty as f64), f!(lp * qty as f64),
             f!(tax), f!(0.0), f!(ship), f!(sp * qty as f64),
             f!(sp * qty as f64 + tax), f!(sp * qty as f64 + ship),
@@ -682,27 +848,30 @@ fn generate_catalog_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let total = catalog_returns_rows(scale);
     // FK ranges must track dimension cardinality at this scale;
     // sf1-sized ranges empty out dimension joins at small scales.
-    let items = item_rows(scale) as i32;
-    let customers = customer_rows(scale) as i32;
-    let cdemos = customer_demographics_rows(scale) as i32;
-    let addrs = customer_address_rows(scale) as i32;
+    let dims = FkDims::at(scale);
     let ccs = call_center_rows(scale) as i32;
     let whs = warehouse_rows(scale) as i32;
     let reasons = reason_rows(scale) as i32;
-    generate_batches(catalog_returns_schema(), total, seed_for_table("catalog_returns"), |row, rng| {
-        let qty = rng.gen_range(1..50i32);
+    let max_order = returnable_tickets(scale, 1_441_548.0);
+    generate_batches(catalog_returns_schema(), total, seed_for_table("catalog_returns"), move |_row, rng| {
+        let order = rng.gen_range(1..=max_order);
+        let b = basket(CATALOG_ORDER_SALT, order, ccs, dims);
+        let line = rng.gen_range(0..b.lines);
+        let item_sk = b.items[line];
+        let qty = rng.gen_range(1..=b.quantities[line]);
+        let ret_date = rng.gen_range(b.date_sk..=DS_DATE_RANGE);
         let amt = rng.gen_range(10..500i32) as f64;
         let tax = amt * 0.08;
         vec![
-            i!(random_date_sk(rng)), i!(rng.gen_range(0..86400i32)),
-            i!(rng.gen_range(1..=items)), i!(rng.gen_range(1..=customers)),
-            i!(rng.gen_range(1..=cdemos)), i!(rng.gen_range(1..7200i32)),
-            i!(rng.gen_range(1..=addrs)), i!(rng.gen_range(1..=customers)),
-            i!(rng.gen_range(1..=cdemos)), i!(rng.gen_range(1..7200i32)),
-            i!(rng.gen_range(1..=addrs)), i!(rng.gen_range(1..=ccs)),
+            i!(ret_date), i!(rng.gen_range(0..86400i32)),
+            i!(item_sk), ColVal::I32(b.customer_sk),
+            ColVal::I32(b.cdemo_sk), ColVal::I32(b.hdemo_sk),
+            ColVal::I32(b.addr_sk), ColVal::I32(b.ship_customer_sk),
+            ColVal::I32(b.ship_cdemo_sk), ColVal::I32(b.ship_hdemo_sk),
+            ColVal::I32(b.ship_addr_sk), i!(b.channel_sk),
             i!(rng.gen_range(1..11_718i32)), i!(rng.gen_range(1..20i32)),
             i!(rng.gen_range(1..=whs)), i!(rng.gen_range(1..=reasons)),
-            i!((row + 1) as i32), i!(qty),
+            i!(order), i!(qty),
             f!(amt), f!(tax), f!(amt + tax), f!(amt * 0.02), f!(amt * 0.05),
             f!(amt * 0.6), f!(amt * 0.2), f!(amt * 0.2), f!(amt * 0.1),
         ]
@@ -713,31 +882,43 @@ fn generate_web_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let total = web_sales_rows(scale);
     // FK ranges must track dimension cardinality at this scale;
     // sf1-sized ranges empty out dimension joins at small scales.
-    let items = item_rows(scale) as i32;
-    let customers = customer_rows(scale) as i32;
-    let cdemos = customer_demographics_rows(scale) as i32;
-    let addrs = customer_address_rows(scale) as i32;
+    let dims = FkDims::at(scale);
     let wpages = web_page_rows(scale) as i32;
     let wsites = web_site_rows(scale) as i32;
     let whs = warehouse_rows(scale) as i32;
-    let promos = promotion_rows(scale) as i32;
-    generate_batches(web_sales_schema(), total, seed_for_table("web_sales"), |row, rng| {
-        let qty = rng.gen_range(1..100i32);
+    let mut order: i32 = 0;
+    let mut line: usize = 0;
+    let mut cur: Option<Basket> = None;
+    generate_batches(web_sales_schema(), total, seed_for_table("web_sales"), move |_row, rng| {
+        let exhausted = match &cur {
+            None => true,
+            Some(b) => line >= b.lines,
+        };
+        if exhausted {
+            order += 1;
+            cur = Some(basket(WEB_ORDER_SALT, order, wsites, dims));
+            line = 0;
+        }
+        let b = cur.as_ref().expect("basket set above");
+        let item_sk = b.items[line];
+        let qty = b.quantities[line];
+        line += 1;
         let wc  = rng.gen_range(10..500i32) as f64 / 10.0;
         let lp  = wc * 1.5;
         let sp  = lp * rng.gen_range(50..100i32) as f64 / 100.0;
         let tax = sp * 0.08;
         let ship = sp * 0.05 * qty as f64;
+        let ship_date = (b.date_sk + rng.gen_range(1..=120i32)).min(DS_DATE_RANGE);
         vec![
-            i!(random_date_sk(rng)), i!(rng.gen_range(0..86400i32)), i!(random_date_sk(rng)),
-            i!(rng.gen_range(1..=items)), i!(rng.gen_range(1..=customers)),
-            i!(rng.gen_range(1..=cdemos)), i!(rng.gen_range(1..7200i32)),
-            i!(rng.gen_range(1..=addrs)), i!(rng.gen_range(1..=customers)),
-            i!(rng.gen_range(1..=cdemos)), i!(rng.gen_range(1..7200i32)),
-            i!(rng.gen_range(1..=addrs)), i!(rng.gen_range(1..=wpages)),
-            i!(rng.gen_range(1..=wsites)), i!(rng.gen_range(1..20i32)),
-            i!(rng.gen_range(1..=whs)), i!(rng.gen_range(1..=promos)),
-            i!((row + 1) as i32), i!(qty), f!(wc), f!(lp), f!(sp),
+            i!(b.date_sk), i!(rng.gen_range(0..86400i32)), i!(ship_date),
+            i!(item_sk), ColVal::I32(b.customer_sk),
+            ColVal::I32(b.cdemo_sk), ColVal::I32(b.hdemo_sk),
+            ColVal::I32(b.addr_sk), ColVal::I32(b.ship_customer_sk),
+            ColVal::I32(b.ship_cdemo_sk), ColVal::I32(b.ship_hdemo_sk),
+            ColVal::I32(b.ship_addr_sk), i!(rng.gen_range(1..=wpages)),
+            i!(b.channel_sk), i!(rng.gen_range(1..20i32)),
+            i!(rng.gen_range(1..=whs)), ColVal::I32(b.promo_sk),
+            i!(order), i!(qty), f!(wc), f!(lp), f!(sp),
             f!(0.0), f!(sp * qty as f64), f!(wc * qty as f64), f!(lp * qty as f64),
             f!(tax), f!(0.0), f!(ship), f!(sp * qty as f64),
             f!(sp * qty as f64 + tax), f!(sp * qty as f64 + ship),
@@ -750,24 +931,28 @@ fn generate_web_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let total = web_returns_rows(scale);
     // FK ranges must track dimension cardinality at this scale;
     // sf1-sized ranges empty out dimension joins at small scales.
-    let items = item_rows(scale) as i32;
-    let customers = customer_rows(scale) as i32;
-    let cdemos = customer_demographics_rows(scale) as i32;
-    let addrs = customer_address_rows(scale) as i32;
+    let dims = FkDims::at(scale);
     let wpages = web_page_rows(scale) as i32;
+    let wsites = web_site_rows(scale) as i32;
     let reasons = reason_rows(scale) as i32;
-    generate_batches(web_returns_schema(), total, seed_for_table("web_returns"), |row, rng| {
-        let qty = rng.gen_range(1..50i32);
+    let max_order = returnable_tickets(scale, 719_384.0);
+    generate_batches(web_returns_schema(), total, seed_for_table("web_returns"), move |_row, rng| {
+        let order = rng.gen_range(1..=max_order);
+        let b = basket(WEB_ORDER_SALT, order, wsites, dims);
+        let line = rng.gen_range(0..b.lines);
+        let item_sk = b.items[line];
+        let qty = rng.gen_range(1..=b.quantities[line]);
+        let ret_date = rng.gen_range(b.date_sk..=DS_DATE_RANGE);
         let amt = rng.gen_range(10..500i32) as f64;
         let tax = amt * 0.08;
         vec![
-            i!(random_date_sk(rng)), i!(rng.gen_range(0..86400i32)),
-            i!(rng.gen_range(1..=items)), i!(rng.gen_range(1..=customers)),
-            i!(rng.gen_range(1..=cdemos)), i!(rng.gen_range(1..7200i32)),
-            i!(rng.gen_range(1..=addrs)), i!(rng.gen_range(1..=customers)),
-            i!(rng.gen_range(1..=cdemos)), i!(rng.gen_range(1..7200i32)),
-            i!(rng.gen_range(1..=addrs)), i!(rng.gen_range(1..=wpages)),
-            i!(rng.gen_range(1..=reasons)), i!((row + 1) as i32), i!(qty),
+            i!(ret_date), i!(rng.gen_range(0..86400i32)),
+            i!(item_sk), ColVal::I32(b.customer_sk),
+            ColVal::I32(b.cdemo_sk), ColVal::I32(b.hdemo_sk),
+            ColVal::I32(b.addr_sk), ColVal::I32(b.ship_customer_sk),
+            ColVal::I32(b.ship_cdemo_sk), ColVal::I32(b.ship_hdemo_sk),
+            ColVal::I32(b.ship_addr_sk), i!(rng.gen_range(1..=wpages)),
+            i!(rng.gen_range(1..=reasons)), i!(order), i!(qty),
             f!(amt), f!(tax), f!(amt + tax), f!(amt * 0.02), f!(amt * 0.05),
             f!(amt * 0.6), f!(amt * 0.2), f!(amt * 0.2), f!(amt * 0.1),
         ]
@@ -799,14 +984,23 @@ fn generate_date_dim() -> (SchemaRef, Vec<RecordBatch>) {
         let moy  = (row as i32 / 30 % 12) + 1;
         let dom  = (row as i32 % 28) + 1;
         let dow  = row as i32 % 7;
+        let qoy  = (moy - 1) / 3 + 1;
+        // Spec-anchored sequences: dsdgen counts months/quarters/weeks from
+        // 1900, so Jan-2000 has d_month_seq = 1200. The official queries
+        // (q22/q54 and the q51/q53/q63/q89 family) filter windows like
+        // d_month_seq BETWEEN 1200 AND 1211; a 0-based row/30 counter never
+        // intersected them.
+        let month_seq   = (year - 1900) * 12 + (moy - 1);
+        let quarter_seq = (year - 1900) * 4 + (qoy - 1);
+        let week_seq    = (year - 1900) * 52 + (row as i32 % 366) / 7;
         vec![
             i!(sk), s!(format!("AAAA{:09}", sk)), d!(date_val),
-            i!(row as i32 / 30), i!(row as i32 / 7), i!(row as i32 / 90),
+            i!(month_seq), i!(week_seq), i!(quarter_seq),
             i!(year), i!(dow), i!(moy), i!(dom),
-            i!((moy - 1) / 3 + 1), i!(year), i!(row as i32 / 90),
+            i!(qoy), i!(year), i!(row as i32 / 90),
             i!(row as i32 / 7),
             s!(DAY_NAMES[dow as usize % 7]),
-            s!(format!("{}Q{}", year, (moy - 1) / 3 + 1)),
+            s!(format!("{}Q{}", year, qoy)),
             s!(random_str(rng, YN)), s!(random_str(rng, YN)),
             s!(random_str(rng, YN)),
             i!(sk - dom + 1), i!(sk - dom + 28),
@@ -842,13 +1036,17 @@ fn generate_item(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let sk = (row + 1) as i32;
         let price = rng.gen_range(100..10_000i32) as f64 / 100.0;
         let wc = price * 0.6;
+        // i_manufact is a function of i_manufact_id so items share manufact
+        // names; q41's correlated subquery counts items per i_manufact and a
+        // unique random name per item kept that count at zero.
+        let manufact_id = rng.gen_range(1..1000i32);
         vec![
             i!(sk), s!(random_id(rng)), d!(random_date(rng)), scd2_rec_end_date(row, rng),
             s!(random_name(rng)), f!(price), f!(wc),
             i!(rng.gen_range(1..1000i32)), s!(random_str(rng, BRANDS)),
             i!(rng.gen_range(1..16i32)), s!(random_str(rng, ITEM_CLASSES)),
             i!(rng.gen_range(1..8i32)), s!(random_str(rng, CATEGORIES)),
-            i!(rng.gen_range(1..1000i32)), s!(random_name(rng)),
+            i!(manufact_id), s!(format!("manufact#{manufact_id}")),
             s!(random_str(rng, ITEM_SIZES)), s!(random_id(rng)),
             s!(random_str(rng, ITEM_COLORS)), s!(random_str(rng, ITEM_UNITS)),
             s!(random_str(rng, ITEM_SIZES)), i!(rng.gen_range(1..100i32)),
@@ -887,9 +1085,9 @@ fn generate_customer_address(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             i!(sk), s!(random_id(rng)),
             s!(format!("{}", rng.gen_range(1..9999i32))), s!(random_name(rng)),
             s!(random_str(rng, STREET_TYPES)), s!(format!("Suite {}", rng.gen_range(1..999i32))),
-            s!(random_name(rng)), s!(random_name(rng)),
+            s!(random_str(rng, CA_CITIES)), s!(random_name(rng)),
             s!(random_str(rng, STATES)), s!(format!("{:05}", rng.gen_range(10000..99999i32))),
-            s!("United States"), f!(rng.gen_range(-12..12i32) as f64),
+            s!("United States"), f!(GMT_OFFSETS[rng.gen_range(0..GMT_OFFSETS.len())]),
             s!(random_str(rng, &["city", "suburb", "rural", "unknown"])),
         ]
     })
@@ -941,7 +1139,7 @@ fn generate_store(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             s!(format!("Suite {}", rng.gen_range(1..99i32))),
             s!(random_name(rng)), s!(random_name(rng)),
             s!(random_str(rng, STATES)), s!(format!("{:05}", rng.gen_range(10000..99999i32))),
-            s!("United States"), f!(rng.gen_range(-12..12i32) as f64),
+            s!("United States"), f!(GMT_OFFSETS[row % GMT_OFFSETS.len()]),
             f!(rng.gen_range(0..15i32) as f64 / 100.0),
         ]
     })
@@ -981,7 +1179,7 @@ fn generate_web_site(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             s!(random_str(rng, STREET_TYPES)), s!(format!("Suite {}", rng.gen_range(1..99i32))),
             s!(random_name(rng)), s!(random_name(rng)),
             s!(random_str(rng, STATES)), s!(format!("{:05}", rng.gen_range(10000..99999i32))),
-            s!("United States"), f!(rng.gen_range(-12..12i32) as f64),
+            s!("United States"), f!(GMT_OFFSETS[row % GMT_OFFSETS.len()]),
             f!(rng.gen_range(0..15i32) as f64 / 100.0),
         ]
     })
@@ -1089,7 +1287,7 @@ fn generate_call_center(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             s!(random_str(rng, STREET_TYPES)), s!(format!("Suite {}", rng.gen_range(1..99i32))),
             s!(random_name(rng)), s!(random_name(rng)),
             s!(random_str(rng, STATES)), s!(format!("{:05}", rng.gen_range(10000..99999i32))),
-            s!("United States"), f!(rng.gen_range(-12..12i32) as f64),
+            s!("United States"), f!(GMT_OFFSETS[row % GMT_OFFSETS.len()]),
             f!(rng.gen_range(0..15i32) as f64 / 100.0),
         ]
     })
@@ -1440,6 +1638,168 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -- column extraction helpers -----------------------------------------
+
+    fn col_i32(batches: &[RecordBatch], sch: &SchemaRef, name: &str) -> Vec<Option<i32>> {
+        use arrow_array::Array as _;
+        let idx = sch.index_of(name).unwrap();
+        batches.iter().flat_map(|b| {
+            let a = b.column(idx).as_any()
+                .downcast_ref::<arrow_array::Int32Array>().unwrap();
+            (0..a.len()).map(|i| if a.is_null(i) { None } else { Some(a.value(i)) })
+                .collect::<Vec<_>>()
+        }).collect()
+    }
+
+    fn col_f64(batches: &[RecordBatch], sch: &SchemaRef, name: &str) -> Vec<f64> {
+        use arrow_array::Array as _;
+        let idx = sch.index_of(name).unwrap();
+        batches.iter().flat_map(|b| {
+            let a = b.column(idx).as_any()
+                .downcast_ref::<arrow_array::Float64Array>().unwrap();
+            (0..a.len()).map(|i| a.value(i)).collect::<Vec<_>>()
+        }).collect()
+    }
+
+    fn col_str(batches: &[RecordBatch], sch: &SchemaRef, name: &str) -> Vec<String> {
+        use arrow_array::Array as _;
+        let idx = sch.index_of(name).unwrap();
+        batches.iter().flat_map(|b| {
+            let a = b.column(idx).as_any()
+                .downcast_ref::<arrow_array::StringArray>().unwrap();
+            (0..a.len()).map(|i| a.value(i).to_string()).collect::<Vec<_>>()
+        }).collect()
+    }
+
+    #[test]
+    fn store_sales_tickets_have_multi_line_baskets() {
+        use std::collections::HashMap;
+        // q34/q46/q68/q73/q79 GROUP BY ss_ticket_number HAVING count between
+        // 15 and 20; one line per ticket made them all empty.
+        let (sch, batches) = generate_store_sales(0.1);
+        let tickets = col_i32(&batches, &sch, "ss_ticket_number");
+        let customers = col_i32(&batches, &sch, "ss_customer_sk");
+        let dates = col_i32(&batches, &sch, "ss_sold_date_sk");
+        let stores = col_i32(&batches, &sch, "ss_store_sk");
+        let mut counts: HashMap<i32, usize> = HashMap::new();
+        for t in &tickets {
+            *counts.entry(t.unwrap()).or_default() += 1;
+        }
+        assert!(counts.values().any(|c| (15..=20).contains(c)),
+            "no ticket with 15..20 line items");
+        // All lines of one ticket share the basket header fields.
+        let (&sample, _) = counts.iter().find(|(_, c)| **c >= 2).unwrap();
+        let rows: Vec<usize> = tickets.iter().enumerate()
+            .filter(|(_, t)| **t == Some(sample))
+            .map(|(i, _)| i)
+            .collect();
+        let first = rows[0];
+        for &r in &rows[1..] {
+            assert_eq!(customers[r], customers[first], "ticket {sample} mixes customers");
+            assert_eq!(dates[r], dates[first], "ticket {sample} mixes dates");
+            assert_eq!(stores[r], stores[first], "ticket {sample} mixes stores");
+        }
+    }
+
+    #[test]
+    fn store_returns_match_recomputed_sales_baskets() {
+        // Every (sr_ticket_number, sr_item_sk) must exist in store_sales.
+        // Verified against the deterministic basket derivation instead of
+        // materializing the sales table: that derivation IS the contract.
+        let scale = 0.01;
+        let (sch, batches) = generate_store_returns(scale);
+        let tickets = col_i32(&batches, &sch, "sr_ticket_number");
+        let items = col_i32(&batches, &sch, "sr_item_sk");
+        let customers = col_i32(&batches, &sch, "sr_customer_sk");
+        let qtys = col_i32(&batches, &sch, "sr_return_quantity");
+        let dates = col_i32(&batches, &sch, "sr_returned_date_sk");
+        let max_ticket = returnable_tickets(scale, 2_880_000.0);
+        for r in 0..tickets.len() {
+            let ticket = tickets[r].unwrap();
+            assert!((1..=max_ticket).contains(&ticket),
+                "row {r}: ticket {ticket} beyond returnable domain {max_ticket}");
+            let b = basket(STORE_TICKET_SALT, ticket, store_rows(scale) as i32, FkDims::at(scale));
+            let item = items[r].unwrap();
+            let lines: Vec<usize> = (0..b.lines).filter(|&l| b.items[l] == item).collect();
+            assert!(!lines.is_empty(),
+                "row {r}: item {item} not in ticket {ticket} basket");
+            let qty = qtys[r].unwrap();
+            assert!(lines.iter().any(|&l| qty <= b.quantities[l]),
+                "row {r}: return qty {qty} exceeds sold qty for ticket {ticket}");
+            assert_eq!(customers[r], b.customer_sk,
+                "row {r}: sr_customer_sk diverges from the sale's customer");
+            let ret_date = dates[r].unwrap();
+            assert!(ret_date >= b.date_sk && ret_date <= DS_DATE_RANGE,
+                "row {r}: returned before sold");
+        }
+    }
+
+    #[test]
+    fn date_dim_month_seq_anchored_to_spec() {
+        // dsdgen anchors month_seq at 1900, so Jan-2000 = 1200; q22/q54
+        // filter d_month_seq windows like 1200..1211.
+        let (sch, batches) = generate_date_dim();
+        let years = col_i32(&batches, &sch, "d_year");
+        let moys = col_i32(&batches, &sch, "d_moy");
+        let seqs = col_i32(&batches, &sch, "d_month_seq");
+        let mut found = false;
+        for r in 0..years.len() {
+            if years[r] == Some(2000) && moys[r] == Some(1) {
+                assert_eq!(seqs[r], Some(1200),
+                    "row {r}: 2000-01 must have d_month_seq 1200");
+                found = true;
+            }
+        }
+        assert!(found, "no date_dim row for year 2000 moy 1");
+    }
+
+    #[test]
+    fn store_gmt_offsets_cover_minus_five() {
+        // q43/q56/q62/q99 filter gmt_offset = -5; with 12 stores a uniform
+        // -12..12 draw could miss -5 entirely. Cycling guarantees coverage.
+        let (sch, batches) = generate_store(1.0);
+        let offsets = col_f64(&batches, &sch, "s_gmt_offset");
+        assert!(offsets.contains(&-5.0), "no store with gmt_offset -5");
+        assert!(offsets.iter().all(|o| GMT_OFFSETS.contains(o)),
+            "store gmt_offset outside the US retail set");
+    }
+
+    #[test]
+    fn customer_address_cities_include_edgewood() {
+        // q84 and the city legs of q46/q68/q79 probe fixed city names.
+        let (sch, batches) = generate_customer_address(0.1);
+        let cities = col_str(&batches, &sch, "ca_city");
+        assert!(cities.iter().any(|c| c == "Edgewood"),
+            "ca_city never draws 'Edgewood'");
+        assert!(cities.iter().all(|c| CA_CITIES.contains(&c.as_str())),
+            "ca_city outside the fixed city list");
+    }
+
+    #[test]
+    fn store_sales_customer_sk_null_rate() {
+        // q76 selects WHERE ss_customer_sk IS NULL; the rate is ~4% decided
+        // per ticket, so all lines of a ticket are null-or-not together.
+        let (sch, batches) = generate_store_sales(0.01);
+        let customers = col_i32(&batches, &sch, "ss_customer_sk");
+        let nulls = customers.iter().filter(|c| c.is_none()).count();
+        let frac = nulls as f64 / customers.len() as f64;
+        assert!((0.01..=0.08).contains(&frac),
+            "ss_customer_sk null fraction {frac} outside 1%..8%");
+    }
+
+    #[test]
+    fn items_share_manufact_names() {
+        use std::collections::HashSet;
+        // q41 counts items per i_manufact; unique names made the count 0.
+        let (sch, batches) = generate_item(0.01);
+        let manufacts = col_str(&batches, &sch, "i_manufact");
+        assert!(manufacts.iter().all(|m| m.starts_with("manufact#")),
+            "i_manufact not derived from i_manufact_id");
+        let distinct: HashSet<&str> = manufacts.iter().map(|m| m.as_str()).collect();
+        assert!(distinct.len() < manufacts.len(),
+            "no two items share an i_manufact value");
     }
 
     #[test]
