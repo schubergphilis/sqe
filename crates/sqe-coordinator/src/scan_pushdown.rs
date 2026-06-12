@@ -27,6 +27,13 @@
 
 use std::sync::Arc;
 
+use datafusion::common::ScalarValue;
+use datafusion::logical_expr::{Expr, expr::InList};
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::{
+    BinaryExpr as PhysBinaryExpr, Column as PhysColumn, InListExpr, IsNotNullExpr, IsNullExpr,
+    Literal as PhysLiteral, NotExpr,
+};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
@@ -59,6 +66,91 @@ pub fn serialize_scan_predicate(
             None
         }
     }
+}
+
+/// Returns `true` when the expression is a bare `true` literal — the state a
+/// `DynamicFilterPhysicalExpr` snapshot has before its hash-join build side
+/// completes. Pushing it to a worker would be pure overhead.
+pub fn is_trivially_true(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    expr.as_any()
+        .downcast_ref::<PhysLiteral>()
+        .is_some_and(|l| matches!(l.value(), ScalarValue::Boolean(Some(true))))
+}
+
+/// Convert a dynamic-filter snapshot, keeping whatever top-level AND
+/// conjuncts are expressible as logical `Expr`s and dropping the rest.
+///
+/// DataFusion 53's hash-join filter snapshots look like
+/// `lo_partkey >= 8 AND lo_partkey <= 79984 AND hash_lookup` — min/max key
+/// bounds plus an opaque hash-set membership probe that has no logical
+/// equivalent. All-or-nothing conversion threw away the usable range bounds
+/// because of that last term. Dropping a CONJUNCT only widens a filter, so
+/// pushing the survivors to a worker is always sound (the coordinator's
+/// join stays authoritative); dropping inside OR/NOT would not be, which is
+/// why the split happens only at top-level ANDs and the strict converter
+/// handles everything below.
+pub fn physical_filter_to_logical_lenient(expr: &Arc<dyn PhysicalExpr>) -> Option<Expr> {
+    if let Some(b) = expr.as_any().downcast_ref::<PhysBinaryExpr>() {
+        if *b.op() == datafusion::logical_expr::Operator::And {
+            let left = physical_filter_to_logical_lenient(b.left());
+            let right = physical_filter_to_logical_lenient(b.right());
+            return match (left, right) {
+                (Some(l), Some(r)) => Some(l.and(r)),
+                (Some(l), None) => Some(l),
+                (None, Some(r)) => Some(r),
+                (None, None) => None,
+            };
+        }
+    }
+    physical_filter_to_logical(expr)
+}
+
+/// Convert a *snapshot* of a dynamic join filter (a `PhysicalExpr`) back into
+/// a logical `Expr` so it can ride the existing `ScanTask::predicate_proto`
+/// channel to workers (which rebuild physical predicates by column NAME
+/// against each parquet file schema).
+///
+/// Hash-join runtime filters only ever take simple shapes — `col >= lit AND
+/// col <= lit` range bounds, `col IN (...)` lists, null checks, and boolean
+/// combinations thereof — so this handles exactly those and returns `None`
+/// for anything else. `None` is non-fatal: the scan ships unfiltered, which
+/// is what happened unconditionally before this conversion existed.
+pub fn physical_filter_to_logical(expr: &Arc<dyn PhysicalExpr>) -> Option<Expr> {
+    let any = expr.as_any();
+    if let Some(c) = any.downcast_ref::<PhysColumn>() {
+        return Some(Expr::Column(datafusion::common::Column::from_name(c.name())));
+    }
+    if let Some(l) = any.downcast_ref::<PhysLiteral>() {
+        return Some(Expr::Literal(l.value().clone(), None));
+    }
+    if let Some(b) = any.downcast_ref::<PhysBinaryExpr>() {
+        let left = physical_filter_to_logical(b.left())?;
+        let right = physical_filter_to_logical(b.right())?;
+        return Some(Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr::new(
+            Box::new(left),
+            *b.op(),
+            Box::new(right),
+        )));
+    }
+    if let Some(il) = any.downcast_ref::<InListExpr>() {
+        let e = physical_filter_to_logical(il.expr())?;
+        let list = il
+            .list()
+            .iter()
+            .map(physical_filter_to_logical)
+            .collect::<Option<Vec<_>>>()?;
+        return Some(Expr::InList(InList::new(Box::new(e), list, il.negated())));
+    }
+    if let Some(n) = any.downcast_ref::<IsNullExpr>() {
+        return Some(Expr::IsNull(Box::new(physical_filter_to_logical(n.arg())?)));
+    }
+    if let Some(n) = any.downcast_ref::<IsNotNullExpr>() {
+        return Some(Expr::IsNotNull(Box::new(physical_filter_to_logical(n.arg())?)));
+    }
+    if let Some(n) = any.downcast_ref::<NotExpr>() {
+        return Some(Expr::Not(Box::new(physical_filter_to_logical(n.arg())?)));
+    }
+    None
 }
 
 /// Returns `true` if `node` is row-count-PRESERVING and order-insensitive, so a
@@ -268,5 +360,89 @@ mod tests {
         let limit: Arc<dyn ExecutionPlan> =
             Arc::new(GlobalLimitExec::new(scan.clone(), 5, None));
         assert_eq!(extract_pushable_limit(&limit, &scan), None);
+    }
+
+    /// A hash-join range snapshot (`a >= 3 AND a <= 17`) — the shape a
+    /// `DynamicFilterPhysicalExpr` materializes after its build side
+    /// completes — must convert to the equivalent logical Expr so it can
+    /// ride `ScanTask::predicate_proto` to a worker.
+    #[test]
+    fn physical_range_filter_converts_to_logical() {
+        let s = schema();
+        let ge: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            pcol("a", &s).unwrap(),
+            Operator::GtEq,
+            plit(3i64),
+        ));
+        let le: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            pcol("a", &s).unwrap(),
+            Operator::LtEq,
+            plit(17i64),
+        ));
+        let both: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(ge, Operator::And, le));
+        let logical = physical_filter_to_logical(&both).expect("convertible");
+        assert_eq!(
+            logical,
+            col("a").gt_eq(lit(3i64)).and(col("a").lt_eq(lit(17i64)))
+        );
+    }
+
+    #[test]
+    fn physical_in_list_converts_to_logical() {
+        let s = schema();
+        let in_list = datafusion::physical_expr::expressions::in_list(
+            pcol("b", &s).unwrap(),
+            vec![plit(1i64), plit(2i64)],
+            &false,
+            &s,
+        )
+        .unwrap();
+        let logical = physical_filter_to_logical(&in_list).expect("convertible");
+        assert_eq!(logical, col("b").in_list(vec![lit(1i64), lit(2i64)], false));
+    }
+
+    /// Unsupported shapes (e.g. a CASE expression) must yield None — the
+    /// scan then ships unfiltered, exactly the pre-conversion behavior.
+    #[test]
+    fn unconvertible_physical_filter_yields_none() {
+        use datafusion::physical_expr::expressions::CaseExpr;
+        let case: Arc<dyn PhysicalExpr> = Arc::new(
+            CaseExpr::try_new(None, vec![(plit(true), plit(1i64))], Some(plit(0i64)))
+                .unwrap(),
+        );
+        assert!(physical_filter_to_logical(&case).is_none());
+    }
+
+    /// DF 53 snapshots end with an opaque hash-set probe; the lenient
+    /// converter must keep the range conjuncts and drop only that term.
+    #[test]
+    fn lenient_conversion_keeps_convertible_conjuncts() {
+        use datafusion::physical_expr::expressions::CaseExpr;
+        let s = schema();
+        let ge: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            pcol("a", &s).unwrap(),
+            Operator::GtEq,
+            plit(3i64),
+        ));
+        // stand-in for the unconvertible hash_lookup term
+        let opaque: Arc<dyn PhysicalExpr> = Arc::new(
+            CaseExpr::try_new(None, vec![(plit(true), plit(true))], Some(plit(false)))
+                .unwrap(),
+        );
+        let both: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(ge, Operator::And, opaque));
+        let logical = physical_filter_to_logical_lenient(&both).expect("partial conversion");
+        assert_eq!(logical, col("a").gt_eq(lit(3i64)));
+        // strict conversion still refuses the same expr
+        assert!(physical_filter_to_logical(&both).is_none());
+    }
+
+    #[test]
+    fn trivially_true_literal_is_detected() {
+        assert!(is_trivially_true(&plit(true)));
+        assert!(!is_trivially_true(&plit(false)));
+        let s = schema();
+        assert!(!is_trivially_true(&pcol("a", &s).unwrap()));
     }
 }

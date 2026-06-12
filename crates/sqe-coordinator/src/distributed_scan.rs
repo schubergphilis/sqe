@@ -10,14 +10,23 @@ use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::Ticket;
 use arrow_schema::SchemaRef;
 use chrono::{DateTime, Utc};
+use datafusion::common::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::filter_pushdown::{
+    ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
+    PushedDown,
+};
+use datafusion::physical_plan::metrics::{
+    BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
+use datafusion_proto::bytes::Serializeable;
 use futures::{Stream, StreamExt, TryStreamExt};
 use tracing::{error, info, info_span, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -118,6 +127,14 @@ pub struct DistributedScanExec {
     /// Per-operator metrics so EXPLAIN ANALYZE and passive query profiles
     /// show real elapsed/rows for this node instead of blanks.
     metrics: ExecutionPlanMetricsSet,
+    /// Dynamic join filters (Path B-2) accepted from parent `HashJoinExec`s
+    /// via `handle_child_pushdown_result`. Snapshotted at dispatch time and
+    /// ANDed into each `ScanTask`'s `predicate_proto` so WORKERS prune rows
+    /// before shipping them over Flight. Without this, a forced-distribution
+    /// fact scan ships every row the static predicate allows (SSB SF1
+    /// lineorder: 6M rows / ~115MB per query) even when the dim build side
+    /// already proved only a few percent can survive the join.
+    pushed_down_filters: Vec<Arc<dyn PhysicalExpr>>,
 }
 
 /// Trait for local execution fallback.
@@ -193,7 +210,44 @@ impl DistributedScanExec {
             worker_connect_timeout: std::time::Duration::from_secs(5),
             worker_rpc_timeout: std::time::Duration::from_secs(630),
             metrics: ExecutionPlanMetricsSet::new(),
+            pushed_down_filters: vec![],
         }
+    }
+
+    /// Copy of this node with `pushed_down_filters` replaced; used by
+    /// `handle_child_pushdown_result` to absorb dynamic join filters.
+    fn clone_with_pushed_filters(&self, filters: Vec<Arc<dyn PhysicalExpr>>) -> Self {
+        Self {
+            scan_tasks: self.scan_tasks.clone(),
+            worker_urls: self.worker_urls.clone(),
+            schema: self.schema.clone(),
+            properties: self.properties.clone(),
+            credential_expiry: self.credential_expiry,
+            credential_tracker: self.credential_tracker.clone(),
+            worker_registry: self.worker_registry.clone(),
+            max_retries: self.max_retries,
+            local_executor: self.local_executor.clone(),
+            fragment_callback: FragmentCallbackOpt(self.fragment_callback.0.clone()),
+            worker_secret: self.worker_secret.clone(),
+            worker_connect_timeout: self.worker_connect_timeout,
+            worker_rpc_timeout: self.worker_rpc_timeout,
+            metrics: self.metrics.clone(),
+            pushed_down_filters: filters,
+        }
+    }
+
+    /// Carry over dynamic join filters from the `IcebergScanExec` this node
+    /// replaces. `try_distribute` runs AFTER the physical optimizer, so
+    /// DataFusion's filter-pushdown rule has already deposited the
+    /// `DynamicFilterPhysicalExpr`s on the Iceberg scan — swapping in the
+    /// distributed scan without carrying them over silently discarded them
+    /// (every SSB SF1 fact scan shipped all 6M rows). The exprs are shared
+    /// `Arc`s still updated by the parent `HashJoinExec` at runtime, so the
+    /// dispatch-time snapshot sees the materialized bounds.
+    #[must_use = "with_pushed_down_filters consumes self; bind the returned scan"]
+    pub fn with_pushed_down_filters(mut self, filters: Vec<Arc<dyn PhysicalExpr>>) -> Self {
+        self.pushed_down_filters = filters;
+        self
     }
 
     /// Set the shared secret attached to every outbound worker `do_get`.
@@ -272,13 +326,14 @@ impl DisplayAs for DistributedScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "DistributedScanExec: workers={}, total_files={}, max_retries={}",
+            "DistributedScanExec: workers={}, total_files={}, max_retries={}, dynamic_filters={}",
             self.worker_urls.len(),
             self.scan_tasks
                 .iter()
                 .map(|t| t.data_file_paths.len())
                 .sum::<usize>(),
             self.max_retries,
+            self.pushed_down_filters.len(),
         )
     }
 }
@@ -315,6 +370,61 @@ impl ExecutionPlan for DistributedScanExec {
         Some(self.metrics.clone_inner())
     }
 
+    /// Declare ourselves a pushdown leaf, exactly like `IcebergScanExec`:
+    /// the default `all_unsupported` would make the optimizer abandon the
+    /// dynamic filters a parent `HashJoinExec` tries to push down, and
+    /// `handle_child_pushdown_result` would never run. See the matching
+    /// comment in `sqe_catalog::iceberg_scan` for the investigation trail.
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        _parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> DFResult<FilterDescription> {
+        Ok(FilterDescription::new())
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> DFResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        // Accept only dynamic join filters (snapshotted at dispatch time);
+        // static parent filters stay in the coordinator's FilterExec, which
+        // remains authoritative either way — the worker-side predicate is a
+        // pure row-shipping optimization.
+        let mut dynamic_filters: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
+        let mut filter_results: Vec<PushedDown> = Vec::new();
+        for pf in &child_pushdown_result.parent_filters {
+            if pf
+                .filter
+                .as_any()
+                .downcast_ref::<DynamicFilterPhysicalExpr>()
+                .is_some()
+            {
+                dynamic_filters.push(Arc::clone(&pf.filter));
+                filter_results.push(PushedDown::Yes);
+            } else {
+                filter_results.push(PushedDown::No);
+            }
+        }
+
+        if dynamic_filters.is_empty() {
+            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+                filter_results,
+            ));
+        }
+
+        let mut all_pushed = self.pushed_down_filters.clone();
+        all_pushed.extend(dynamic_filters);
+        let new_scan = self.clone_with_pushed_filters(all_pushed);
+        Ok(
+            FilterPushdownPropagation::with_parent_pushdown_result(filter_results)
+                .with_updated_node(Arc::new(new_scan)),
+        )
+    }
+
     fn execute(
         &self,
         partition: usize,
@@ -327,7 +437,10 @@ impl ExecutionPlan for DistributedScanExec {
             )));
         }
 
-        let task = self.scan_tasks[partition].clone();
+        let mut task = self.scan_tasks[partition].clone();
+        let pushed_down_filters = self.pushed_down_filters.clone();
+        let dynamic_filters_pushed =
+            MetricBuilder::new(&self.metrics).counter("dynamic_filters_pushed", partition);
         let initial_worker_url = self.worker_urls[partition].clone();
         let schema = self.schema.clone();
         let schema_for_stream = self.schema.clone();
@@ -367,6 +480,104 @@ impl ExecutionPlan for DistributedScanExec {
         // We split these into two phases because the retry loop is async and
         // must complete before we know which inner stream to poll.
         let resolve_future = async move {
+            // Path B-2 for distributed scans: snapshot the dynamic join
+            // filters NOW — this future runs on the stream's first poll,
+            // which for a hash-join probe side happens only after the build
+            // side has completed and materialized its bounds. Convert each
+            // snapshot to a logical Expr and AND it into the ticket's
+            // predicate_proto so the WORKER prunes rows (via its RowFilter /
+            // late-materialization path) before they cross the network.
+            // A filter that is still `true` (build not finished) or has a
+            // shape the converter does not handle is skipped: the scan then
+            // ships exactly what it ships today, and the coordinator's join
+            // stays authoritative either way.
+            //
+            // Bounded readiness wait (Trino-style): with stacked joins only
+            // the LOWEST join's build is guaranteed done at first poll — the
+            // upper joins' builds (whose filters are usually the selective
+            // ones) may still be running, leaving their filters at
+            // `lit(true)`. Dispatching immediately then ships the full scan.
+            // Wait up to 100ms for the filters to materialize (the most
+            // selective one is often the LAST build to finish); dim builds
+            // finish in low tens of ms, and a scan whose builds are
+            // genuinely slow falls back to dispatching with whatever has
+            // materialized by the deadline. Bounded, so no deadlock is
+            // possible regardless of plan shape.
+            if !pushed_down_filters.is_empty() {
+                let dynamic: Vec<&DynamicFilterPhysicalExpr> = pushed_down_filters
+                    .iter()
+                    .filter_map(|f| f.as_any().downcast_ref::<DynamicFilterPhysicalExpr>())
+                    .collect();
+                if !dynamic.is_empty() {
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_millis(100);
+                    loop {
+                        let all_ready = dynamic.iter().all(|d| {
+                            d.current()
+                                .map(|e| !crate::scan_pushdown::is_trivially_true(&e))
+                                .unwrap_or(false)
+                        });
+                        if all_ready || std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                }
+            }
+            if !pushed_down_filters.is_empty() {
+                let mut snapshots: Vec<datafusion::logical_expr::Expr> = Vec::new();
+                for f in &pushed_down_filters {
+                    let resolved = match f
+                        .as_any()
+                        .downcast_ref::<DynamicFilterPhysicalExpr>()
+                    {
+                        Some(dynamic) => match dynamic.current() {
+                            Ok(expr) => expr,
+                            Err(_) => continue,
+                        },
+                        None => Arc::clone(f),
+                    };
+                    if crate::scan_pushdown::is_trivially_true(&resolved) {
+                        continue;
+                    }
+                    match crate::scan_pushdown::physical_filter_to_logical_lenient(&resolved) {
+                        Some(logical) => snapshots.push(logical),
+                        None => tracing::debug!(
+                            fragment_id = %task.fragment_id,
+                            filter = %resolved,
+                            "dynamic filter snapshot not convertible to a logical Expr; skipping"
+                        ),
+                    }
+                }
+                if !snapshots.is_empty() {
+                    let snapshot_count = snapshots.len();
+                    let existing = task
+                        .predicate_proto
+                        .as_deref()
+                        .and_then(|b| datafusion::logical_expr::Expr::from_bytes(b).ok());
+                    if let Some(combined) =
+                        existing.into_iter().chain(snapshots).reduce(|a, b| a.and(b))
+                    {
+                        match combined.to_bytes() {
+                            Ok(bytes) => {
+                                task.predicate_proto = Some(bytes.to_vec());
+                                dynamic_filters_pushed.add(snapshot_count);
+                                info!(
+                                    fragment_id = %task.fragment_id,
+                                    dynamic_filters = snapshot_count,
+                                    "ANDed dynamic join filter snapshots into worker predicate"
+                                );
+                            }
+                            Err(e) => warn!(
+                                fragment_id = %task.fragment_id,
+                                error = %e,
+                                "failed to serialize dynamic filter snapshot; shipping unfiltered"
+                            ),
+                        }
+                    }
+                }
+            }
+
             // Register fragment with the credential tracker if available
             if let Some(ref tracker) = credential_tracker {
                 tracker
