@@ -14,6 +14,13 @@
 #   path only). Re-evaluate when `rsa` ships a fix.
 # - RUSTSEC-2024-0436 (paste v1.0.15): unmaintained proc macro, transitive from
 #   arrow-flight/datafusion/parquet/tonic. No known vulnerability.
+# - RUSTSEC-2026-0176/0177 (pyo3 0.28.3): pyo3 sits in Cargo.lock only as the
+#   never-enabled optional `python` feature of jiter (via
+#   datafusion-functions-json); no SQE crate or feature activates it, so pyo3
+#   is never compiled into any SQE binary (`cargo tree -i pyo3` finds no
+#   dependents). The fix (pyo3 >=0.29) is unreachable anyway: jiter 0.13 pins
+#   ^0.28 and 0.29 is not in the escrow registry. Drop both ignores when
+#   datafusion-functions-json bumps jiter past pyo3 0.28.
 #
 # RUSTSEC-2026-0098/0099/0104 (rustls-webpki 0.101.7) were removed in #133:
 # the AWS Glue/S3Tables catalogs now use an explicit rustls-0.23 HttpClient, so
@@ -23,4 +30,6 @@
 ignore = [
     "RUSTSEC-2023-0071",
     "RUSTSEC-2024-0436",
+    "RUSTSEC-2026-0176",
+    "RUSTSEC-2026-0177",
 ]
