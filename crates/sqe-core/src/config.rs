@@ -1540,10 +1540,14 @@ impl TvfCaller {
 }
 
 /// Canonicalise an object-store URL for prefix comparison: scheme aliases
-/// collapse to one spelling, the scheme is lowercased, and dot path
-/// segments (`.` / `..`, raw or single-percent-encoded) are rejected
-/// because downstream URL/HTTP layers may normalise them AFTER the prefix
-/// check, silently escaping the allowed prefix.
+/// collapse to one spelling, and the scheme is lowercased. Any path segment
+/// that could be re-interpreted as a `.`/`..` traversal or a hidden segment
+/// boundary by a downstream URL/HTTP layer AFTER this prefix check is
+/// rejected outright: a literal `.`/`..`, the percent-encodings of `.`
+/// (`%2e`) and `/` (`%2f`), and double-encoding (`%25…`). We reject rather
+/// than decode-and-renormalise because object_store / reqwest decoding
+/// behaviour varies per backend, so the only sound stance is to refuse
+/// anything ambiguous.
 fn canonicalize_object_url(path: &str) -> Result<String, String> {
     const ALIASES: &[(&str, &str)] = &[
         ("s3a://", "s3://"),
@@ -1569,7 +1573,17 @@ fn canonicalize_object_url(path: &str) -> Result<String, String> {
     }
     let after_scheme = out.split_once("://").map(|x| x.1).unwrap_or("");
     for seg in after_scheme.split('/') {
-        let decoded = seg.to_ascii_lowercase().replace("%2e", ".");
+        let lower = seg.to_ascii_lowercase();
+        // A percent-encoded slash (`%2f`) or double-encoding (`%25…`) could
+        // smuggle an extra segment boundary or a dot segment past this
+        // check; reject any segment carrying them.
+        if lower.contains("%2f") || lower.contains("%25") {
+            return Err(format!(
+                "TVF: object-store path '{path}' contains a percent-encoded \
+                 slash or double-encoding in a path segment, which is not allowed"
+            ));
+        }
+        let decoded = lower.replace("%2e", ".");
         if decoded == "." || decoded == ".." {
             return Err(format!(
                 "TVF: object-store path '{path}' contains a dot path segment \
@@ -4832,6 +4846,17 @@ otlp_endpoint = ""
         let err =
             check_remote(&policy, "s3://staging/uploads/.%2E/secret.csv").unwrap_err();
         assert!(err.contains("dot path segment"), "got: {err}");
+        // Percent-encoded slash could smuggle a hidden segment boundary.
+        let err =
+            check_remote(&policy, "s3://staging/uploads%2f..%2fsecret.csv").unwrap_err();
+        assert!(
+            err.contains("percent-encoded slash") || err.contains("dot path segment"),
+            "got: {err}"
+        );
+        // Double-encoding (`%252e` -> `%2e` -> `.`).
+        let err =
+            check_remote(&policy, "s3://staging/uploads/%252e%252e/secret.csv").unwrap_err();
+        assert!(err.contains("double-encoding") || err.contains("dot path segment"), "got: {err}");
     }
 
     #[test]
