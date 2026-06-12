@@ -770,3 +770,27 @@ When two engines disagree, get a third opinion before you debug. The bug you are
 :::
 
 The hard part is knowing which numbers to look at. The harder part is knowing when a clean report means nothing happened.
+
+## The Rig Was the Bug
+
+A week after the validation work, we scaled the compare harness to SF10 and got a number that hurt. SSB ran at a fifth of Trino's speed. Every scan-bound TPC-H query lost by 3x or more. The join-heavy queries were fine. Only the scans were slow.
+
+The first profiles told a precise story. TPC-H q06 spent 6.3 seconds of its 6.4-second runtime waiting on the scan. The scan node decoded 8.5 million rows on one core while ten cores sat idle. The reader overlapped its I/O correctly, but every parquet decode ran on the single thread that polled the merged stream. Concurrency is not parallelism. We split large file tasks into 128MB byte ranges, gave each range its own runtime task, and q06 dropped by a third.
+
+Only a third. The profile now showed decode work spread across cores and the query still waiting on the scan. So we measured the thing nobody measures: the storage path itself. A single GET from the host to the dockerized S3 store ran at 96 MB/s. Eight parallel GETs reached 163 MB/s and flatlined. The same file fetched from inside the Docker network moved at twice that. Our coordinator ran on the host. Trino ran inside the VM, next to the storage. Half the benchmark gap was Docker's port-forward, and no engine change could ever have closed it.
+
+We rebuilt the rig so both engines run as containers in the same network, with the same CPU count, bounded heaps, and the same per-query memory. The first level run flipped the table. TPC-H went from 0.57x to winning outright in distributed mode. SSB went from 0.26x to 0.7x and closing.
+
+The level rig immediately earned its keep a second time. TPC-DS q39 failed with a memory error on an 8GB pool that Trino handled in 5GB. The instinct said memory leak. The profile said otherwise: the failing aggregate held 84MB when the pool refused it. FairSpillPool divides its budget across every registered spillable consumer, and q39's two pipelines register about ninety of them. Each consumer got 95MB of an 8GB pool. The aggregate that needed 700MB never had a chance, and the escape valve that should have saved it, emitting partial results early, was welded shut by an optimizer detail: a constant GROUP BY key marks the stream partially sorted, and the partial-order tracker never advances past a constant. Real demand, three gigabytes. Configured pool, eight. Usable by any single operator, ninety-five megabytes.
+
+Three lessons from one day.
+
+Measure the pipe before you profile the engine. We spent the morning reading per-operator metrics in a rig where the engine could never win.
+
+Concurrency is not parallelism. Buffered streams interleave work on one thread and look busy doing it.
+
+Fair sharing has a failure mode. Dividing a pool across registered consumers punishes wide plans for being wide, even when nobody else is using the memory.
+
+::: {.ailog}
+**AI Logbook:** The SF10 day ran as one long session: the agent enabled the profile logging it needed, read the scan times out of the profiles, wrote and tested the parallel decode patch against the vendored reader, then measured raw GET throughput when the patch bought less than expected. The rig asymmetry was its finding, not ours. The q39 root cause came from a second agent dispatched with one suspicion from the human: "must be a cast or logic bug." It was neither a cast nor a leak. It was a constant column and a division.
+:::

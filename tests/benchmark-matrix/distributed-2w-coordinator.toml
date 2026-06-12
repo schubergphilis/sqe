@@ -12,6 +12,10 @@ worker_urls = ["http://worker-1:50052", "http://worker-2:50052"]
 # deployments must set worker_secret instead.
 allow_unauthenticated_workers = true
 
+# Benchmark harness runs in a private docker network; production must use TLS.
+[security]
+allow_insecure_transport = true
+
 [metrics]
 prometheus_port = 9090
 
@@ -23,6 +27,8 @@ client_secret = "s3cr3t"
 [query]
 max_result_rows = 0
 timeout_secs = 600
+# Per-operator profiles for every query (perf analysis on the compare rig).
+query_profile = "all"
 
 [catalog]
 catalog_url = "http://polaris:8181/api/catalog"
