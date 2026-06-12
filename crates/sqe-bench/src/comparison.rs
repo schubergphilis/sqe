@@ -7,6 +7,19 @@ use crate::report::{
 use std::time::Instant;
 use tracing::info;
 
+/// Connection/transport-level failure, as opposed to a query-level error.
+/// These are safe to retry once: the query never reached execution, or the
+/// stream died for reasons unrelated to the SQL.
+fn is_transport_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("h2 protocol error")
+        || m.contains("transport error")
+        || m.contains("connection reset")
+        || m.contains("connection refused")
+        || m.contains("broken pipe")
+        || m.contains("goaway")
+}
+
 /// Run comparison benchmark.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_comparison(
@@ -87,10 +100,30 @@ pub async fn run_comparison(
 
         info!("  {} ...", query_name);
 
-        // Run against SQE
+        // Run against SQE. A long compare sweep reuses one gRPC channel
+        // for ~100 queries; a single h2-level connection failure (e.g.
+        // GoAway FRAME_SIZE_ERROR, seen once per multi-hour SF10 sweep)
+        // otherwise reports as a 1ms "0 rows" SqeFailed and poisons the
+        // comparison. tonic channels reconnect lazily, so one retry on a
+        // transport-shaped error runs on a fresh connection. Query-level
+        // errors (plan, execution) are NOT retried -- those are real.
         let sqe_start = Instant::now();
-        let sqe_result = sqe_client.execute(&sql).await;
-        let sqe_elapsed = sqe_start.elapsed();
+        let mut sqe_result = sqe_client.execute(&sql).await;
+        let mut sqe_elapsed = sqe_start.elapsed();
+        if sqe_result
+            .as_ref()
+            .err()
+            .is_some_and(|e| is_transport_error(&e.to_string()))
+        {
+            info!(
+                "  {} SQE transport error ({}), retrying once on a fresh connection",
+                query_name,
+                sqe_result.as_ref().err().map(|e| e.to_string()).unwrap_or_default()
+            );
+            let retry_start = Instant::now();
+            sqe_result = sqe_client.execute(&sql).await;
+            sqe_elapsed = retry_start.elapsed();
+        }
 
         // Run against Trino
         let trino_start = Instant::now();

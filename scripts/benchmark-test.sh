@@ -33,7 +33,7 @@ BENCH_PORT_TRINO="18080"
 # Trino comparison mode: start a Trino container and validate results against it
 COMPARE_TRINO="${COMPARE_TRINO:-}"
 TRINO_PORT="38080"
-TRINO_IMAGE="${TRINO_IMAGE:-trinodb/trino:465}"
+TRINO_IMAGE="${TRINO_IMAGE:-trinodb/trino:481}"
 
 # S3 credentials (match test stack)
 S3_ACCESS_KEY="${S3_ACCESS_KEY:-s3admin}"
@@ -198,6 +198,11 @@ coordinator=true
 node-scheduler.include-coordinator=true
 http-server.http.port=8080
 discovery.uri=http://localhost:8080
+# The image sizes the JVM heap at 80% of container memory (~13GB on a
+# 16GB Docker VM), but query memory defaults to 30% of heap (~4GB).
+# Raise it so SF10 hash joins are not unfairly memory-starved vs SQE.
+query.max-memory=8GB
+query.max-memory-per-node=8GB
 TRINOEOF
 
     # Stop any existing Trino container

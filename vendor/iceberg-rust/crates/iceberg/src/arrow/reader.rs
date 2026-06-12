@@ -64,11 +64,18 @@ use crate::expr::{Bind, BoundPredicate, BoundReference, DynamicPredicate};
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{RESERVED_FIELD_ID_FILE, is_metadata_field};
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
-use crate::spec::{DataContentType, Datum, NameMapping, NestedField, PrimitiveType, Schema, Type};
+use crate::spec::{
+    DataContentType, DataFileFormat, Datum, NameMapping, NestedField, PrimitiveType, Schema, Type,
+};
 use crate::util::available_parallelism;
 use crate::{Error, ErrorKind};
 
 const MAX_BYTE_RANGE_CONCURRENCY: usize = 16;
+
+/// Default split target for large file scan tasks, in bytes. Tasks whose
+/// byte length is at least twice this are split into ranged subtasks so
+/// their row groups decode in parallel across runtime worker threads.
+pub const DEFAULT_TASK_SPLIT_TARGET_SIZE: u64 = 128 * 1024 * 1024;
 
 /// Builder to create ArrowReader
 pub struct ArrowReaderBuilder {
@@ -79,6 +86,7 @@ pub struct ArrowReaderBuilder {
     row_selection_enabled: bool,
     metadata_size_hint: Option<usize>,
     dynamic_predicate: Option<Arc<dyn DynamicPredicate>>,
+    task_split_target_size: Option<u64>,
 }
 
 impl ArrowReaderBuilder {
@@ -94,7 +102,19 @@ impl ArrowReaderBuilder {
             row_selection_enabled: false,
             metadata_size_hint: None,
             dynamic_predicate: None,
+            task_split_target_size: Some(DEFAULT_TASK_SPLIT_TARGET_SIZE),
         }
+    }
+
+    /// Sets the byte-range split target for large Parquet file scan tasks,
+    /// or disables splitting entirely with `None`. Whole-file tasks at
+    /// least twice this size are split into ranged subtasks (row groups
+    /// assigned by midpoint) so a handful of large files can decode on
+    /// many cores instead of one. Has no effect when the data-file
+    /// concurrency limit is 1.
+    pub fn with_task_split_target_size(mut self, val: Option<u64>) -> Self {
+        self.task_split_target_size = val;
+        self
     }
 
     /// Attach a [`DynamicPredicate`] that the reader will sample once
@@ -156,6 +176,7 @@ impl ArrowReaderBuilder {
             row_selection_enabled: self.row_selection_enabled,
             metadata_size_hint: self.metadata_size_hint,
             dynamic_predicate: self.dynamic_predicate,
+            task_split_target_size: self.task_split_target_size,
         }
     }
 }
@@ -176,6 +197,10 @@ pub struct ArrowReader {
     /// Optional caller-supplied [`DynamicPredicate`] consulted once per
     /// file scan task. See [`ArrowReaderBuilder::with_dynamic_predicate`].
     dynamic_predicate: Option<Arc<dyn DynamicPredicate>>,
+    /// Byte-range split target for large whole-file tasks; `None`
+    /// disables splitting. See
+    /// [`ArrowReaderBuilder::with_task_split_target_size`].
+    task_split_target_size: Option<u64>,
 }
 
 impl ArrowReader {
@@ -193,6 +218,7 @@ impl ArrowReader {
         let row_selection_enabled = self.row_selection_enabled;
         let metadata_size_hint = self.metadata_size_hint;
         let dynamic_predicate = self.dynamic_predicate.clone();
+        let task_split_target_size = self.task_split_target_size;
 
         // Per-scan I/O metrics.  Cloned into both the data-file path
         // (`process_file_scan_task`) and the delete-file loader so the
@@ -232,32 +258,82 @@ impl ArrowReader {
                     .try_flatten(),
             )
         } else {
-            Box::pin(
-                tasks
-                    .map_ok(move |task| {
+            // Parallel decode path. `try_buffer_unordered` alone interleaves
+            // the per-file streams on whichever single runtime thread polls
+            // the merged stream: I/O overlaps, but Parquet decode is
+            // serialized onto one core no matter how high the concurrency
+            // limit is. Driving every (sub)task's stream from its own
+            // spawned runtime task spreads decode across worker threads.
+            // Large whole-file tasks are first split into byte-range
+            // subtasks (row groups assigned by midpoint) so a table laid
+            // out as a few large files still decodes on many cores.
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(
+                concurrency_limit_data_files.saturating_mul(2),
+            );
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency_limit_data_files));
+            crate::runtime::spawn(async move {
+                let mut tasks = std::pin::pin!(tasks);
+                'outer: while let Some(task_res) = tasks.next().await {
+                    let task = match task_res {
+                        Ok(task) => task,
+                        Err(err) => {
+                            let err =
+                                Error::new(ErrorKind::Unexpected, "file scan task generate failed")
+                                    .with_source(err);
+                            let _ = tx.send(Err(err)).await;
+                            break;
+                        }
+                    };
+                    for subtask in split_file_scan_task(task, task_split_target_size) {
+                        // Stop early once the consumer has gone away; the
+                        // workers below would otherwise keep opening files
+                        // whose batches nobody reads.
+                        if tx.is_closed() {
+                            break 'outer;
+                        }
+                        let permit = match semaphore.clone().acquire_owned().await {
+                            Ok(permit) => permit,
+                            // The semaphore is never closed; bail defensively.
+                            Err(_) => break 'outer,
+                        };
+                        let tx = tx.clone();
                         let file_io = file_io.clone();
+                        let delete_file_loader = delete_file_loader.clone();
                         let dynamic_predicate = dynamic_predicate.clone();
                         let bytes_read = bytes_read.clone();
-
-                        Self::process_file_scan_task(
-                            task,
-                            batch_size,
-                            file_io,
-                            delete_file_loader.clone(),
-                            row_group_filtering_enabled,
-                            row_selection_enabled,
-                            metadata_size_hint,
-                            dynamic_predicate,
-                            bytes_read,
-                        )
-                    })
-                    .map_err(|err| {
-                        Error::new(ErrorKind::Unexpected, "file scan task generate failed")
-                            .with_source(err)
-                    })
-                    .try_buffer_unordered(concurrency_limit_data_files)
-                    .try_flatten_unordered(concurrency_limit_data_files),
-            )
+                        crate::runtime::spawn(async move {
+                            let _permit = permit;
+                            let stream = Self::process_file_scan_task(
+                                subtask,
+                                batch_size,
+                                file_io,
+                                delete_file_loader,
+                                row_group_filtering_enabled,
+                                row_selection_enabled,
+                                metadata_size_hint,
+                                dynamic_predicate,
+                                bytes_read,
+                            )
+                            .await;
+                            match stream {
+                                Ok(mut stream) => {
+                                    while let Some(batch) = stream.next().await {
+                                        if tx.send(batch).await.is_err() {
+                                            return; // consumer dropped
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    let _ = tx.send(Err(err)).await;
+                                }
+                            }
+                        });
+                    }
+                }
+                // Workers hold their own `tx` clones; the output stream ends
+                // when the last worker finishes and the channel closes.
+            });
+            Box::pin(stream::poll_fn(move |cx| rx.poll_recv(cx)))
         };
 
         Ok(ScanResult::new(stream, scan_metrics))
@@ -1103,6 +1179,15 @@ impl ArrowReader {
     ///
     /// Iceberg splits large files at row group boundaries, so we only read row groups
     /// whose byte ranges overlap with [start, start+length).
+    /// Select the row groups whose byte midpoint falls inside
+    /// `[start, start + length)`. Midpoint assignment means a set of
+    /// consecutive, non-overlapping ranges covering the file selects
+    /// every row group exactly once no matter where the range
+    /// boundaries land relative to row-group boundaries — the property
+    /// `split_file_scan_task` relies on (Trino and Spark use the same
+    /// convention for their splits). Overlap-based selection would
+    /// instead hand a boundary-straddling row group to both subtasks
+    /// and duplicate its rows.
     fn filter_row_groups_by_byte_range(
         parquet_metadata: &Arc<ParquetMetaData>,
         start: u64,
@@ -1117,17 +1202,54 @@ impl ArrowReader {
 
         for (idx, row_group) in row_groups.iter().enumerate() {
             let row_group_size = row_group.compressed_size() as u64;
-            let row_group_end = current_byte_offset + row_group_size;
+            let midpoint = current_byte_offset + row_group_size / 2;
 
-            if current_byte_offset < end && start < row_group_end {
+            if start <= midpoint && midpoint < end {
                 selected.push(idx);
             }
 
-            current_byte_offset = row_group_end;
+            current_byte_offset += row_group_size;
         }
 
         Ok(selected)
     }
+}
+
+/// Split a whole-file Parquet scan task into byte-range subtasks of roughly
+/// `target` bytes each so its row groups can decode in parallel. Returns
+/// the task unchanged when splitting is disabled (`None` target), the task
+/// already covers a sub-range, the format is not Parquet, or the file is
+/// smaller than twice the target. Subtask boundaries are arbitrary byte
+/// offsets; `filter_row_groups_by_byte_range` assigns each row group to
+/// exactly one subtask by midpoint.
+fn split_file_scan_task(task: FileScanTask, target: Option<u64>) -> Vec<FileScanTask> {
+    let Some(target) = target else {
+        return vec![task];
+    };
+    let whole_file =
+        task.start == 0 && (task.length == 0 || task.length == task.file_size_in_bytes);
+    if target == 0
+        || !whole_file
+        || task.data_file_format != DataFileFormat::Parquet
+        || task.file_size_in_bytes < target.saturating_mul(2)
+    {
+        return vec![task];
+    }
+    let len = task.file_size_in_bytes;
+    let chunks = len.div_ceil(target);
+    let chunk_len = len.div_ceil(chunks);
+    (0..chunks)
+        .map(|i| {
+            let start = i * chunk_len;
+            FileScanTask {
+                start,
+                length: chunk_len.min(len - start),
+                // Per the field contract, only valid for whole-file reads.
+                record_count: None,
+                ..task.clone()
+            }
+        })
+        .collect()
 }
 
 /// Build the map of parquet field id to Parquet column index in the schema.
@@ -4499,6 +4621,229 @@ message schema {
             assert_eq!(all_file_nums[i], 2, "Last 10 rows should be from file_2");
             assert_eq!(all_ids[i], i as i32, "IDs should be 20-29");
         }
+    }
+
+    /// Build a whole-file Parquet scan task for the splitter/range tests.
+    fn make_scan_task(path: &str, size: u64, schema: &Arc<Schema>) -> FileScanTask {
+        FileScanTask {
+            file_size_in_bytes: size,
+            start: 0,
+            length: size,
+            record_count: Some(0),
+            data_file_path: path.to_string(),
+            referenced_data_file: None,
+            data_file_format: DataFileFormat::Parquet,
+            schema: schema.clone(),
+            project_field_ids: vec![1],
+            predicate: None,
+            deletes: vec![],
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
+            data_file_content: DataContentType::Data,
+            sequence_number: 0,
+            equality_ids: None,
+        }
+    }
+
+    #[test]
+    fn test_split_file_scan_task_boundaries() {
+        let schema = Arc::new(Schema::builder().with_schema_id(1).build().unwrap());
+
+        // Disabled target: unchanged.
+        let task = make_scan_task("f", 1000, &schema);
+        assert_eq!(super::split_file_scan_task(task, None).len(), 1);
+
+        // File smaller than twice the target: unchanged.
+        let task = make_scan_task("f", 199, &schema);
+        assert_eq!(super::split_file_scan_task(task, Some(100)).len(), 1);
+
+        // Non-Parquet: unchanged even when large.
+        let mut task = make_scan_task("f", 1000, &schema);
+        task.data_file_format = DataFileFormat::Avro;
+        assert_eq!(super::split_file_scan_task(task, Some(100)).len(), 1);
+
+        // Already-ranged task: unchanged.
+        let mut task = make_scan_task("f", 1000, &schema);
+        task.start = 100;
+        task.length = 200;
+        let subs = super::split_file_scan_task(task, Some(100));
+        assert_eq!(subs.len(), 1);
+        assert_eq!((subs[0].start, subs[0].length), (100, 200));
+
+        // 1000 bytes at target 300: 4 chunks of 250, contiguous, exact cover.
+        let task = make_scan_task("f", 1000, &schema);
+        let subs = super::split_file_scan_task(task, Some(300));
+        assert_eq!(subs.len(), 4);
+        let mut expected_start = 0u64;
+        for sub in &subs {
+            assert_eq!(sub.start, expected_start, "chunks must be contiguous");
+            assert_eq!(
+                sub.record_count, None,
+                "record_count is only valid for whole-file tasks"
+            );
+            expected_start += sub.length;
+        }
+        assert_eq!(expected_start, 1000, "chunks must cover the whole file");
+    }
+
+    /// A range boundary that lands strictly inside a row group must hand
+    /// that row group to exactly one of the two adjacent subtasks.
+    /// Overlap-based selection (the previous behavior) returned it from
+    /// both and duplicated its rows.
+    #[tokio::test]
+    async fn test_adjacent_byte_ranges_do_not_duplicate_row_groups() {
+        use arrow_array::Int32Array;
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().to_str().unwrap().to_string();
+        let file_io = FileIO::from_path(&table_location).unwrap().build().unwrap();
+        let path = format!("{table_location}/multi_rg.parquet");
+
+        // 100 rows in row groups of 10 -> 10 row groups.
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .set_max_row_group_size(10)
+            .build();
+        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+            Int32Array::from_iter_values(0..100),
+        ) as ArrayRef])
+        .unwrap();
+        let file = File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, to_write.schema(), Some(props)).unwrap();
+        writer.write(&to_write).unwrap();
+        writer.close().unwrap();
+
+        let size = std::fs::metadata(&path).unwrap().len();
+        // Pick a boundary guaranteed to fall strictly inside a row group:
+        // a handful of bytes past the 4-byte magic header puts it inside
+        // row group 0 regardless of compressed sizes.
+        let boundary = 24u64;
+        let mut first = make_scan_task(&path, size, &schema);
+        first.length = boundary;
+        first.record_count = None;
+        first.project_field_ids = vec![1];
+        let mut second = make_scan_task(&path, size, &schema);
+        second.start = boundary;
+        second.length = size - boundary;
+        second.record_count = None;
+        second.project_field_ids = vec![1];
+
+        let reader = ArrowReaderBuilder::new(file_io)
+            .with_data_file_concurrency_limit(2)
+            .build();
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(first), Ok(second)]))
+            as FileScanTaskStream;
+        let batches = reader
+            .read(tasks)
+            .unwrap()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|b| {
+                let col = b.column(0).as_primitive::<arrow_array::types::Int32Type>();
+                (0..b.num_rows()).map(|i| col.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            (0..100).collect::<Vec<i32>>(),
+            "adjacent ranges must partition row groups exactly: no duplicates, no gaps"
+        );
+    }
+
+    /// End-to-end: a single large-ish file read through the automatic
+    /// task splitter + spawned parallel decode must return every row
+    /// exactly once.
+    #[tokio::test]
+    async fn test_read_with_split_tasks_returns_each_row_once() {
+        use arrow_array::Int32Array;
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().to_str().unwrap().to_string();
+        let file_io = FileIO::from_path(&table_location).unwrap().build().unwrap();
+        let path = format!("{table_location}/split_me.parquet");
+
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .set_max_row_group_size(10)
+            .build();
+        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+            Int32Array::from_iter_values(0..100),
+        ) as ArrayRef])
+        .unwrap();
+        let file = File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, to_write.schema(), Some(props)).unwrap();
+        writer.write(&to_write).unwrap();
+        writer.close().unwrap();
+
+        let size = std::fs::metadata(&path).unwrap().len();
+        let task = make_scan_task(&path, size, &schema);
+
+        // Target a quarter of the file so the splitter produces several
+        // subtasks whose boundaries land at arbitrary offsets.
+        let reader = ArrowReaderBuilder::new(file_io)
+            .with_data_file_concurrency_limit(4)
+            .with_task_split_target_size(Some(size / 4))
+            .build();
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        let batches = reader
+            .read(tasks)
+            .unwrap()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|b| {
+                let col = b.column(0).as_primitive::<arrow_array::types::Int32Type>();
+                (0..b.num_rows()).map(|i| col.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            (0..100).collect::<Vec<i32>>(),
+            "split + parallel decode must return every row exactly once"
+        );
     }
 
     /// Test bucket partitioning reads source column from data file (not partition metadata).
