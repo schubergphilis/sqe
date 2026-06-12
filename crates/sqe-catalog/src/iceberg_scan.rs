@@ -760,6 +760,23 @@ impl ExecutionPlan for IcebergScanExec {
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         let _files_pruned_minmax = MetricBuilder::new(&self.metrics).counter("files_pruned_minmax", partition);
         let files_pruned_dynamic = MetricBuilder::new(&self.metrics).counter("files_pruned_dynamic", partition);
+        // Scan-level visibility: enough to answer "how much was planned, read,
+        // decoded, and dropped by runtime filters" from a profile alone.
+        // `rows_decoded` vs `output_rows` gives the post-decode filter kill
+        // rate; `rows_prefilter` vs `rows_decoded` gives the parquet RowFilter
+        // kill rate on the direct path; `rows_passed_filter_pending` counts
+        // rows that streamed through while a dynamic filter was still the
+        // lit(true) placeholder, i.e. the build side had not sealed yet.
+        let planning_time = MetricBuilder::new(&self.metrics).subset_time("planning_time", partition);
+        let files_matched = MetricBuilder::new(&self.metrics).counter("files_matched", partition);
+        let bytes_planned = MetricBuilder::new(&self.metrics).counter("bytes_planned", partition);
+        let bytes_scanned = MetricBuilder::new(&self.metrics).counter("bytes_scanned", partition);
+        let rows_prefilter = MetricBuilder::new(&self.metrics).counter("rows_prefilter", partition);
+        let rows_decoded = MetricBuilder::new(&self.metrics).counter("rows_decoded", partition);
+        let rows_filtered_dynamic = MetricBuilder::new(&self.metrics).counter("rows_filtered_dynamic", partition);
+        let rows_passed_filter_pending = MetricBuilder::new(&self.metrics).counter("rows_passed_filter_pending", partition);
+        let dynamic_filters_resolved = MetricBuilder::new(&self.metrics).counter("dynamic_filters_resolved", partition);
+        let dynamic_filters_pending = MetricBuilder::new(&self.metrics).counter("dynamic_filters_pending", partition);
         debug!(table=%table.identifier(), predicates=?predicates, snapshot_id=?snapshot_id, pushed_filters=pushed_down_filters.len(), "Executing IcebergScanExec");
 
         // For time-travel: check the specified snapshot exists; for current: check current snapshot.
@@ -789,12 +806,15 @@ impl ExecutionPlan for IcebergScanExec {
             // across queries because `TableMetadataCache` caches `Table` instances
             // globally. On a warm table this is served from memory; on cold, it
             // is one manifest-list GET plus one GET per manifest.
-            let mut file_entries = collect_data_files_via_plan(
-                &table,
-                snapshot_id,
-                projection.as_deref(),
-                predicates.as_ref(),
-            ).await?;
+            let mut file_entries = {
+                let _t = planning_time.timer();
+                collect_data_files_via_plan(
+                    &table,
+                    snapshot_id,
+                    projection.as_deref(),
+                    predicates.as_ref(),
+                ).await?
+            };
 
             if file_entries.is_empty() {
                 let empty = RecordBatch::new_empty(schema.clone());
@@ -837,6 +857,12 @@ impl ExecutionPlan for IcebergScanExec {
                     "IcebergScanExec: round-robin partition slice"
                 );
             }
+
+            // Counted after the partition slice so the per-partition values
+            // sum to the table-wide totals, and before dynamic file pruning so
+            // `files_matched - files_pruned_dynamic` is the files actually read.
+            files_matched.add(file_entries.len());
+            bytes_planned.add(file_entries.iter().map(|(_, sz)| *sz as usize).sum());
 
             // ── Direct-read fast path ────────────────────────────────────────
             //
@@ -882,10 +908,19 @@ impl ExecutionPlan for IcebergScanExec {
                     if let Some(dynamic) = filter.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
                         match dynamic.current() {
                             Ok(expr) => {
-                                debug!(filter = %expr, "Snapshot dynamic filter for direct-read");
-                                resolved_filters.push(expr);
+                                if is_trivial_true(&expr) {
+                                    // Placeholder snapshot: the build side has
+                                    // not sealed yet, so this filter prunes
+                                    // nothing for the whole direct read.
+                                    dynamic_filters_pending.add(1);
+                                } else {
+                                    dynamic_filters_resolved.add(1);
+                                    debug!(filter = %expr, "Snapshot dynamic filter for direct-read");
+                                    resolved_filters.push(expr);
+                                }
                             }
                             Err(e) => {
+                                dynamic_filters_pending.add(1);
                                 debug!(error = %e, "Dynamic filter not ready yet, skipping");
                             }
                         }
@@ -955,12 +990,18 @@ impl ExecutionPlan for IcebergScanExec {
                 // so clones are refcount bumps.
                 let concurrency = direct_read_concurrency.max(1);
                 let resolved_filters = Arc::new(resolved_filters);
+                let bytes_scanned = bytes_scanned.clone();
+                let rows_prefilter = rows_prefilter.clone();
+                let rows_decoded = rows_decoded.clone();
                 let per_file_stream = futures::stream::iter(
                     file_entries.into_iter().map(move |(path, size)| {
                         let file_io = file_io.clone();
                         let projection = projection.clone();
                         let schema = schema.clone();
                         let resolved_filters = Arc::clone(&resolved_filters);
+                        let bytes_scanned = bytes_scanned.clone();
+                        let rows_prefilter = rows_prefilter.clone();
+                        let rows_decoded = rows_decoded.clone();
                         async move {
                             debug!(path = %path, size = size, "Direct-read: reading file");
 
@@ -971,6 +1012,7 @@ impl ExecutionPlan for IcebergScanExec {
                                 .read()
                                 .await
                                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                            bytes_scanned.add(bytes.len());
 
                             // Parse Parquet from the in-memory bytes.
                             // `bytes::Bytes` implements `ChunkReader` so this works directly.
@@ -1027,10 +1069,15 @@ impl ExecutionPlan for IcebergScanExec {
                             // column indices were resolved against.
                             let builder = if !resolved_filters.is_empty() {
                                 let mut predicates: Vec<Box<dyn ArrowPredicate>> = Vec::new();
-                                for filter_expr in resolved_filters.iter() {
+                                for (idx, filter_expr) in resolved_filters.iter().enumerate() {
                                     predicates.push(Box::new(PhysicalExprPredicate {
                                         expr: Arc::clone(filter_expr),
                                         projection: filter_mask.clone(),
+                                        // Only the first predicate sees every
+                                        // row surviving row-group/page pruning;
+                                        // later predicates see already-filtered
+                                        // selections and would double-count.
+                                        rows_seen: (idx == 0).then(|| rows_prefilter.clone()),
                                     }));
                                 }
                                 builder.with_row_filter(RowFilter::new(predicates))
@@ -1047,6 +1094,7 @@ impl ExecutionPlan for IcebergScanExec {
                             let mut batches: Vec<RecordBatch> = Vec::new();
                             for batch_result in reader {
                                 let batch = batch_result.map_err(|e| DataFusionError::External(Box::new(e)))?;
+                                rows_decoded.add(batch.num_rows());
                                 if is_count_star {
                                     // For COUNT(*): return empty-column batch with correct row count.
                                     // DataFusion only needs the row count, not the data.
@@ -1155,23 +1203,44 @@ impl ExecutionPlan for IcebergScanExec {
                 }
             }
             let scan = sb.build().map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let arrow_stream = scan.to_arrow().await.map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let scan_result = scan.to_arrow_with_metrics().await.map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let scan_metrics = scan_result.metrics().clone();
+            let rows_decoded_inspect = rows_decoded.clone();
+            let arrow_stream = scan_result
+                .stream()
+                .inspect_ok(move |batch| rows_decoded_inspect.add(batch.num_rows()));
 
             let s: BatchStream = if !pushed_down_filters.is_empty() {
                 let filters = pushed_down_filters.clone();
                 let filtered_schema = schema.clone();
+                let rows_filtered_dynamic = rows_filtered_dynamic.clone();
+                let rows_passed_filter_pending = rows_passed_filter_pending.clone();
                 arrow_stream
                     .map_err(|e: iceberg::Error| DataFusionError::External(Box::new(e)))
                     .and_then(move |batch| {
                         let filters = filters.clone();
                         let filtered_schema = filtered_schema.clone();
+                        let rows_filtered_dynamic = rows_filtered_dynamic.clone();
+                        let rows_passed_filter_pending = rows_passed_filter_pending.clone();
                         async move {
+                            let rows_in = batch.num_rows();
+                            let mut saw_pending = false;
                             let mut result = batch;
                             for filter in &filters {
                                 let (expr, is_dynamic): (Arc<dyn PhysicalExpr>, bool) = if let Some(dynamic) = filter.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
                                     match dynamic.current() {
+                                        Ok(e) if is_trivial_true(&e) => {
+                                            // Build side not sealed yet: the
+                                            // snapshot is still the lit(true)
+                                            // placeholder, every row passes.
+                                            saw_pending = true;
+                                            continue;
+                                        }
                                         Ok(e) => (e, true),
-                                        Err(_) => continue,
+                                        Err(_) => {
+                                            saw_pending = true;
+                                            continue;
+                                        }
                                     }
                                 } else {
                                     (Arc::clone(filter), false)
@@ -1198,6 +1267,7 @@ impl ExecutionPlan for IcebergScanExec {
                                         if s == datafusion::common::ScalarValue::Boolean(Some(true)) {
                                             continue;
                                         } else {
+                                            rows_filtered_dynamic.add(rows_in);
                                             return Ok(RecordBatch::new_empty(filtered_schema));
                                         }
                                     }
@@ -1205,6 +1275,10 @@ impl ExecutionPlan for IcebergScanExec {
                                 };
                                 result = arrow::compute::filter_record_batch(&result, &predicate)
                                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                            }
+                            rows_filtered_dynamic.add(rows_in - result.num_rows());
+                            if saw_pending {
+                                rows_passed_filter_pending.add(result.num_rows());
                             }
                             Ok(result)
                         }
@@ -1215,6 +1289,16 @@ impl ExecutionPlan for IcebergScanExec {
                     .map_err(|e: iceberg::Error| DataFusionError::External(Box::new(e)))
                     .boxed()
             };
+            // Flush the vendored reader's storage byte counter into the
+            // DataFusion metric when the stream completes or is dropped, so
+            // early-terminated scans (LIMIT, join short-circuit) still report.
+            let flush = BytesScannedFlush { scan_metrics, counter: bytes_scanned.clone() };
+            let s: BatchStream = s
+                .chain(futures::stream::poll_fn(move |_| {
+                    let _keep_alive = &flush;
+                    Poll::Ready(None)
+                }))
+                .boxed();
             Ok::<BatchStream, DataFusionError>(s)
         }).try_flatten();
         Ok(Box::pin(IcebergRecordBatchStream { schema, inner: Box::pin(stream), baseline }))
@@ -1572,6 +1656,40 @@ pub fn coalesce_file_entries(
 struct PhysicalExprPredicate {
     expr: Arc<dyn PhysicalExpr>,
     projection: ProjectionMask,
+    /// When set, counts every row this predicate evaluates (the rows that
+    /// survived row-group/page pruning). Set only on the first predicate of a
+    /// `RowFilter` chain; later predicates see already-filtered selections.
+    rows_seen: Option<datafusion::physical_plan::metrics::Count>,
+}
+
+/// True when a dynamic filter snapshot is still the `lit(true)` placeholder,
+/// i.e. the hash join build side has not sealed the filter yet.
+fn is_trivial_true(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    expr.as_any()
+        .downcast_ref::<datafusion::physical_expr::expressions::Literal>()
+        .is_some_and(|lit| {
+            matches!(
+                lit.value(),
+                datafusion::common::ScalarValue::Boolean(Some(true))
+            )
+        })
+}
+
+/// Adds the vendored reader's storage byte counter to the DataFusion metric on
+/// drop, covering both normal completion and early termination (LIMIT, join
+/// short-circuit) of the scan stream.
+struct BytesScannedFlush {
+    scan_metrics: iceberg::arrow::ScanMetrics,
+    counter: datafusion::physical_plan::metrics::Count,
+}
+
+impl Drop for BytesScannedFlush {
+    fn drop(&mut self) {
+        let bytes = self.scan_metrics.bytes_read();
+        if bytes > 0 {
+            self.counter.add(bytes as usize);
+        }
+    }
 }
 
 impl PhysicalExprPredicate {
@@ -1650,6 +1768,9 @@ impl ArrowPredicate for PhysicalExprPredicate {
     }
 
     fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, ArrowError> {
+        if let Some(rows_seen) = &self.rows_seen {
+            rows_seen.add(batch.num_rows());
+        }
         // Step 1: Widen narrow types (Int32->Int64, Float32->Float64) to match
         // what DataFusion expressions expect. This fixes the "Utf8 >= Int32"
         // and "Int64 >= Int32" type mismatches from hash join dynamic filters.
