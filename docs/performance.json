@@ -1,0 +1,28 @@
+{
+  "asOf": "2026-06-12",
+  "headline": {
+    "suitesWon": "6/7",
+    "vsTrino": "Trino 465",
+    "queriesPass": "222/222",
+    "validated": "Differentially validated against Trino, with DuckDB's official dsdgen as an independent data oracle."
+  },
+  "scale": {
+    "dominant": "Decisive wins up to SF1 — across six of seven industry suites.",
+    "progress": "SF10+ (distributed) is closing fast: on a forced-distribution rig, TPC-DS SF1 went from 4.4x slower than Trino to 1.7x faster after the dynamic-filter pushdown fix. SSB is next — shipping build-side key sets (bloom filters) to workers."
+  },
+  "results": [
+    { "suite": "TPC-E (11)",      "sqe": "9.3s",  "trino": "172.0s", "speedup": "18.5x", "pass": "11/11" },
+    { "suite": "TPC-BB (10)",     "sqe": "28.0s", "trino": "255.7s", "speedup": "9.1x",  "pass": "10/10" },
+    { "suite": "TPC-C (8 read)",  "sqe": "0.41s", "trino": "2.65s",  "speedup": "6.5x",  "pass": "8/8" },
+    { "suite": "TPC-DS (99)",     "sqe": "13.4s", "trino": "45.6s",  "speedup": "3.4x",  "pass": "93/99" },
+    { "suite": "ClickBench (43)", "sqe": "1.3s",  "trino": "4.46s",  "speedup": "3.4x",  "pass": "43/43" },
+    { "suite": "TPC-H (22)",      "sqe": "16.8s", "trino": "26.7s",  "speedup": "1.6x",  "pass": "22/22" },
+    { "suite": "SSB (13)",        "sqe": "8.3s",  "trino": "5.8s",   "speedup": "0.70x", "pass": "13/13", "trails": true }
+  ],
+  "leaps": [
+    { "date": "2026-06-12", "title": "The benchmark that lied", "metric": "Differential validation with DuckDB as an independent oracle: caught 16 vacuous TPC-DS queries and a Trino rounding bug (q75).", "blog": "2026-06-12-the-benchmark-that-lied", "chart": "tpcds-cross-scale.png" },
+    { "date": "2026-04-16", "title": "Our nemesis: TPC-DS q72", "metric": "Runtime-filter pushdown drops q72 from 10.7s to 0.77s.", "blog": "2026-04-16-our-nemesis-q72", "chart": "tpcds-cross-scale.png" },
+    { "date": "2026-04-14", "title": "DataFusion 53 + vendored Iceberg fork", "metric": "~40x faster query planning.", "blog": "2026-04-14-datafusion-53-and-the-iceberg-fork", "chart": "tpch-cross-scale.png" },
+    { "date": "2026-04-12", "title": "Five layers of caching", "metric": "8.8x faster than Trino across the suite.", "blog": "2026-04-12-caching-and-the-8x-speedup", "chart": "tpch-cross-scale.png" }
+  ]
+}
