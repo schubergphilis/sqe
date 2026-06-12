@@ -16,7 +16,6 @@
 //!
 //! Run with: ./scripts/integration-test.sh
 
-mod common;
 
 use std::path::PathBuf;
 
@@ -154,7 +153,7 @@ async fn run_sql_file(filename: &str) {
     let blocks = parse_sql_file(&content);
     assert!(!blocks.is_empty(), "No test blocks found in {filename}");
 
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let mut failed = 0usize;
 
     for block in &blocks {
@@ -167,7 +166,7 @@ async fn run_sql_file(filename: &str) {
                 failed += 1;
             }
             Ok(batches) => {
-                common::print_results(&format!("{filename}::{}", block.name), &block.sql, &batches);
+                crate::common::print_results(&format!("{filename}::{}", block.name), &block.sql, &batches);
 
                 let actual_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
@@ -207,7 +206,7 @@ async fn run_sql_file(filename: &str) {
                             let actual_cols: Vec<String> = batch
                                 .columns()
                                 .iter()
-                                .map(|c| common::fmt_val(c.as_ref(), batch_row))
+                                .map(|c| crate::common::fmt_val(c.as_ref(), batch_row))
                                 .collect();
 
                             if actual_cols != *expected_cols {

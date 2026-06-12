@@ -6,6 +6,11 @@
 # Pipelined compilation: starts compiling a crate as soon as its metadata is
 # ready, without waiting for the full preceding crate to finish.
 pipelining = true
+# Force-disable any user-level rustc-wrapper (sccache) for this repo. Measured
+# 2026-06-12: 30 hits / 957 misses (3%) — on a Defender-scanned Mac every miss
+# writes artifacts to both target/ and the sccache dir and gets scanned twice.
+# The empty string overrides ~/.cargo/config.toml's rustc-wrapper.
+rustc-wrapper = ""
 # Pin target directory to prevent parallel agents from creating duplicate
 # build artifacts (which can balloon to 100GB+).
 target-dir = "target"

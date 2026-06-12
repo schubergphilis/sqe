@@ -9,7 +9,6 @@
 //! `cargo test -p sqe-coordinator --test partition_e2e -- --ignored
 //! --test-threads=1`.
 
-mod common;
 
 use arrow_array::{Array, Int64Array};
 
@@ -55,7 +54,7 @@ async fn reset_table(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn create_table_partitioned_by_identity() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
     let name = "part_identity";
     let fq = format!("{ns}.{name}");
@@ -101,7 +100,7 @@ async fn create_table_partitioned_by_identity() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn create_table_partitioned_by_day_transform() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
     let name = "part_day";
     let fq = format!("{ns}.{name}");
@@ -144,7 +143,7 @@ async fn create_table_partitioned_by_day_transform() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn create_table_partitioned_by_bucket_transform() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
     let name = "part_bucket";
     let fq = format!("{ns}.{name}");
@@ -184,7 +183,7 @@ async fn create_table_partitioned_by_bucket_transform() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn create_table_partitioned_by_truncate_transform() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
     let name = "part_truncate";
     let fq = format!("{ns}.{name}");
@@ -225,7 +224,7 @@ async fn create_table_partitioned_by_truncate_transform() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn create_table_partitioned_by_multiple_transforms() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
     let name = "part_multi";
     let fq = format!("{ns}.{name}");
@@ -268,7 +267,7 @@ async fn create_table_partitioned_by_multiple_transforms() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn create_table_partitioned_by_day_on_v3_table() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
     let name = "part_v3_day";
     let fq = format!("{ns}.{name}");
@@ -311,7 +310,7 @@ async fn create_table_partitioned_by_day_on_v3_table() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn unsupported_partition_transform_returns_error() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
     let name = "part_bad";
     let fq = format!("{ns}.{name}");
@@ -344,7 +343,7 @@ async fn unsupported_partition_transform_returns_error() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn unknown_partition_column_returns_error() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
     let name = "part_unknown";
     let fq = format!("{ns}.{name}");

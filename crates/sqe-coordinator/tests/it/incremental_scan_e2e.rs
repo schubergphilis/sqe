@@ -17,7 +17,6 @@
 //! The non-ignored tests stay on the static shape of the rewrite + provider
 //! construction so every PR exercises them without Docker.
 
-mod common;
 
 use std::sync::Arc;
 
@@ -173,7 +172,7 @@ fn incremental_provider_builds_with_empty_plan() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn incremental_scan_three_snapshots_returns_45_rows() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     // Setup: isolated namespace + table per run.
     let ns = format!("cdc_{}", uuid::Uuid::new_v4().simple());
@@ -289,7 +288,7 @@ async fn incremental_scan_three_snapshots_returns_45_rows() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn incremental_scan_meta_columns_are_populated() {
-    let (session, handler) = common::setup_handler().await;
+    let (session, handler) = crate::common::setup_handler().await;
 
     let ns = format!("cdc_meta_{}", uuid::Uuid::new_v4().simple());
     let table = format!("{ns}.events");
