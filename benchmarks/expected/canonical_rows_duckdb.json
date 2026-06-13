@@ -1,0 +1,369 @@
+{
+ "tpcds": {
+  "q01": {
+   "sf1_official_rows": 100
+  },
+  "q02": {
+   "sf1_official_rows": 2513
+  },
+  "q03": {
+   "sf1_official_rows": 89
+  },
+  "q04": {
+   "sf1_official_rows": 90
+  },
+  "q05": {
+   "sf1_official_rows": 100
+  },
+  "q06": {
+   "sf1_official_rows": 46
+  },
+  "q07": {
+   "sf1_official_rows": 100
+  },
+  "q08": {
+   "sf1_official_rows": 5
+  },
+  "q09": {
+   "sf1_official_rows": 1
+  },
+  "q10": {
+   "sf1_official_rows": 6
+  },
+  "q11": {
+   "sf1_official_rows": 90
+  },
+  "q12": {
+   "sf1_official_rows": 100
+  },
+  "q13": {
+   "sf1_official_rows": 1
+  },
+  "q14": {
+   "sf1_official_rows": 100
+  },
+  "q15": {
+   "sf1_official_rows": 100
+  },
+  "q16": {
+   "sf1_official_rows": 1
+  },
+  "q17": {
+   "sf1_official_rows": 0
+  },
+  "q18": {
+   "sf1_official_rows": 100
+  },
+  "q19": {
+   "sf1_official_rows": 100
+  },
+  "q20": {
+   "sf1_official_rows": 100
+  },
+  "q21": {
+   "sf1_official_rows": 100
+  },
+  "q22": {
+   "sf1_official_rows": 100
+  },
+  "q23": {
+   "sf1_official_rows": 1
+  },
+  "q24": {
+   "sf1_official_rows": 1
+  },
+  "q25": {
+   "sf1_official_rows": 1
+  },
+  "q26": {
+   "sf1_official_rows": 100
+  },
+  "q27": {
+   "sf1_official_rows": 100
+  },
+  "q28": {
+   "sf1_official_rows": 1
+  },
+  "q29": {
+   "sf1_official_rows": 1
+  },
+  "q30": {
+   "sf1_official_rows": 100
+  },
+  "q31": {
+   "sf1_official_rows": 44
+  },
+  "q32": {
+   "sf1_official_rows": 1
+  },
+  "q33": {
+   "sf1_official_rows": 100
+  },
+  "q34": {
+   "sf1_official_rows": 100
+  },
+  "q35": {
+   "sf1_official_rows": 100
+  },
+  "q36": {
+   "sf1_official_rows": 100
+  },
+  "q37": {
+   "sf1_official_rows": 1
+  },
+  "q38": {
+   "sf1_official_rows": 1
+  },
+  "q39": {
+   "sf1_official_rows": 122
+  },
+  "q40": {
+   "sf1_official_rows": 100
+  },
+  "q41": {
+   "sf1_official_rows": 4
+  },
+  "q42": {
+   "sf1_official_rows": 10
+  },
+  "q43": {
+   "sf1_official_rows": 6
+  },
+  "q44": {
+   "sf1_official_rows": 10
+  },
+  "q45": {
+   "sf1_official_rows": 19
+  },
+  "q46": {
+   "sf1_official_rows": 100
+  },
+  "q47": {
+   "sf1_official_rows": 100
+  },
+  "q48": {
+   "sf1_official_rows": 1
+  },
+  "q49": {
+   "sf1_official_rows": 100
+  },
+  "q50": {
+   "sf1_official_rows": 6
+  },
+  "q51": {
+   "sf1_official_rows": 100
+  },
+  "q52": {
+   "sf1_official_rows": 100
+  },
+  "q53": {
+   "sf1_official_rows": 14
+  },
+  "q54": {
+   "sf1_official_rows": 1
+  },
+  "q55": {
+   "sf1_official_rows": 100
+  },
+  "q56": {
+   "sf1_official_rows": 100
+  },
+  "q57": {
+   "sf1_official_rows": 100
+  },
+  "q58": {
+   "sf1_official_rows": 8
+  },
+  "q59": {
+   "sf1_official_rows": 100
+  },
+  "q60": {
+   "sf1_official_rows": 100
+  },
+  "q61": {
+   "sf1_official_rows": 1
+  },
+  "q62": {
+   "sf1_official_rows": 100
+  },
+  "q63": {
+   "sf1_official_rows": 100
+  },
+  "q64": {
+   "sf1_official_rows": 2
+  },
+  "q65": {
+   "sf1_official_rows": 100
+  },
+  "q66": {
+   "sf1_official_rows": 5
+  },
+  "q67": {
+   "sf1_official_rows": 100
+  },
+  "q68": {
+   "sf1_official_rows": 100
+  },
+  "q69": {
+   "sf1_official_rows": 100
+  },
+  "q70": {
+   "sf1_official_rows": 3
+  },
+  "q71": {
+   "sf1_official_rows": 100
+  },
+  "q72": {
+   "sf1_official_rows": 100
+  },
+  "q73": {
+   "sf1_official_rows": 17
+  },
+  "q74": {
+   "sf1_official_rows": 87
+  },
+  "q75": {
+   "sf1_official_rows": 100
+  },
+  "q76": {
+   "sf1_official_rows": 100
+  },
+  "q77": {
+   "sf1_official_rows": 40
+  },
+  "q78": {
+   "sf1_official_rows": 7
+  },
+  "q79": {
+   "sf1_official_rows": 100
+  },
+  "q80": {
+   "sf1_official_rows": 100
+  },
+  "q81": {
+   "sf1_official_rows": 100
+  },
+  "q82": {
+   "sf1_official_rows": 1
+  },
+  "q83": {
+   "sf1_official_rows": 24
+  },
+  "q84": {
+   "sf1_official_rows": 16
+  },
+  "q85": {
+   "sf1_official_rows": 1
+  },
+  "q86": {
+   "sf1_official_rows": 100
+  },
+  "q87": {
+   "sf1_official_rows": 1
+  },
+  "q88": {
+   "sf1_official_rows": 1
+  },
+  "q89": {
+   "sf1_official_rows": 100
+  },
+  "q90": {
+   "sf1_official_rows": 1
+  },
+  "q91": {
+   "sf1_official_rows": 2
+  },
+  "q92": {
+   "sf1_official_rows": 1
+  },
+  "q93": {
+   "sf1_official_rows": 100
+  },
+  "q94": {
+   "sf1_official_rows": 1
+  },
+  "q95": {
+   "sf1_official_rows": 1
+  },
+  "q96": {
+   "sf1_official_rows": 1
+  },
+  "q97": {
+   "sf1_official_rows": 1
+  },
+  "q98": {
+   "sf1_official_rows": 100
+  },
+  "q99": {
+   "sf1_official_rows": 90
+  }
+ },
+ "tpch": {
+  "q01": {
+   "sf1_official_rows": 4
+  },
+  "q02": {
+   "sf1_official_rows": 100
+  },
+  "q03": {
+   "sf1_official_rows": 10
+  },
+  "q04": {
+   "sf1_official_rows": 5
+  },
+  "q05": {
+   "sf1_official_rows": 5
+  },
+  "q06": {
+   "sf1_official_rows": 1
+  },
+  "q07": {
+   "sf1_official_rows": 4
+  },
+  "q08": {
+   "sf1_official_rows": 2
+  },
+  "q09": {
+   "sf1_official_rows": 175
+  },
+  "q10": {
+   "sf1_official_rows": 20
+  },
+  "q11": {
+   "sf1_official_rows": 1048
+  },
+  "q12": {
+   "sf1_official_rows": 2
+  },
+  "q13": {
+   "sf1_official_rows": 42
+  },
+  "q14": {
+   "sf1_official_rows": 1
+  },
+  "q15": {
+   "sf1_official_rows": 1
+  },
+  "q16": {
+   "sf1_official_rows": 18314
+  },
+  "q17": {
+   "sf1_official_rows": 1
+  },
+  "q18": {
+   "sf1_official_rows": 57
+  },
+  "q19": {
+   "sf1_official_rows": 1
+  },
+  "q20": {
+   "sf1_official_rows": 186
+  },
+  "q21": {
+   "sf1_official_rows": 100
+  },
+  "q22": {
+   "sf1_official_rows": 7
+  }
+ }
+}
