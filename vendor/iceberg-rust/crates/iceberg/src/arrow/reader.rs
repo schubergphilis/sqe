@@ -1969,10 +1969,25 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
                 .map(|lit| get_arrow_datum(lit).unwrap())
                 .collect();
 
+            // Hash-set membership for the common key types, built lazily on
+            // the first batch (after `try_cast_literal` alignment so cast
+            // semantics match the fallback). The or(eq) fallback below runs
+            // `list_len` FULL-COLUMN kernels per batch; runtime IN-list join
+            // filters carry thousands of keys, which made that path
+            // effectively quadratic (6.5K keys x 60M rows stalled scans for
+            // minutes and starved the I/O runtime).
+            let mut membership: Option<Option<MembershipSet>> = None;
+
             Ok(Box::new(move |batch| {
-                // update this if arrow ever adds a native is_in kernel
                 let left = project_column(&batch, idx)?;
 
+                let set = membership
+                    .get_or_insert_with(|| MembershipSet::try_build(left.data_type(), &literals));
+                if let Some(set) = set {
+                    return set.eval(left.as_ref());
+                }
+
+                // update this if arrow ever adds a native is_in kernel
                 let mut acc = BooleanArray::from(vec![false; batch.num_rows()]);
                 for literal in &literals {
                     let literal = try_cast_literal(literal, left.data_type())?;
@@ -2127,6 +2142,114 @@ impl AsyncFileReader for ArrowFileReader {
 ///
 /// The Arrow compute kernels that we use must match the type exactly, so first cast the literal
 /// into the type of the batch we read from Parquet before sending it to the compute kernel.
+/// Hash-set membership evaluator for `IN` predicates over the common join-key
+/// types. One set build, then O(1) per row -- versus the or(eq) fallback's
+/// one full-column comparison kernel per list element per batch.
+///
+/// Null semantics match the fallback: a null input row yields null (the
+/// or-chain over `eq(null, lit)` is null), so compositions like NOT keep
+/// their three-valued behavior.
+enum MembershipSet {
+    Int32(FnvHashSet<i32>),
+    Int64(FnvHashSet<i64>),
+    Date32(FnvHashSet<i32>),
+    Utf8(FnvHashSet<String>),
+}
+
+impl MembershipSet {
+    /// Build from literals aligned to `column_type` via [`try_cast_literal`].
+    /// Returns `None` (caller falls back to the or(eq) loop) for types
+    /// without a fast path or when any literal fails to cast or extract.
+    fn try_build(
+        column_type: &DataType,
+        literals: &[Arc<dyn ArrowDatum + Send + Sync>],
+    ) -> Option<MembershipSet> {
+        fn typed_values<A: Array + 'static, T>(
+            literals: &[Arc<dyn ArrowDatum + Send + Sync>],
+            column_type: &DataType,
+            extract: impl Fn(&A, usize) -> T,
+        ) -> Option<FnvHashSet<T>>
+        where
+            T: std::hash::Hash + Eq,
+        {
+            let mut set = FnvHashSet::default();
+            for literal in literals {
+                let cast = try_cast_literal(literal, column_type).ok()?;
+                let (arr, _) = cast.get();
+                let arr = arr.as_any().downcast_ref::<A>()?;
+                if arr.len() != 1 || arr.is_null(0) {
+                    return None;
+                }
+                set.insert(extract(arr, 0));
+            }
+            Some(set)
+        }
+
+        use arrow_array::{Date32Array, Int32Array, Int64Array, StringArray};
+        match column_type {
+            DataType::Int32 => {
+                typed_values(literals, column_type, |a: &Int32Array, i| a.value(i))
+                    .map(MembershipSet::Int32)
+            }
+            DataType::Int64 => {
+                typed_values(literals, column_type, |a: &Int64Array, i| a.value(i))
+                    .map(MembershipSet::Int64)
+            }
+            DataType::Date32 => {
+                typed_values(literals, column_type, |a: &Date32Array, i| a.value(i))
+                    .map(MembershipSet::Date32)
+            }
+            DataType::Utf8 => {
+                typed_values(literals, column_type, |a: &StringArray, i| {
+                    a.value(i).to_string()
+                })
+                .map(MembershipSet::Utf8)
+            }
+            _ => None,
+        }
+    }
+
+    fn eval(&self, column: &dyn Array) -> std::result::Result<BooleanArray, ArrowError> {
+        use arrow_array::{Date32Array, Int32Array, Int64Array, StringArray};
+
+        fn check<A: Array + 'static>(
+            column: &dyn Array,
+            contains: impl Fn(&A, usize) -> bool,
+        ) -> std::result::Result<BooleanArray, ArrowError> {
+            let arr = column.as_any().downcast_ref::<A>().ok_or_else(|| {
+                ArrowError::CastError(format!(
+                    "IN membership set built for a different type than column {:?}",
+                    column.data_type()
+                ))
+            })?;
+            Ok((0..arr.len())
+                .map(|i| {
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(contains(arr, i))
+                    }
+                })
+                .collect())
+        }
+
+        match self {
+            MembershipSet::Int32(set) => {
+                check::<Int32Array>(column, |a, i| set.contains(&a.value(i)))
+            }
+            MembershipSet::Int64(set) => {
+                check::<Int64Array>(column, |a, i| set.contains(&a.value(i)))
+            }
+            MembershipSet::Date32(set) => {
+                check::<Date32Array>(column, |a, i| set.contains(&a.value(i)))
+            }
+            MembershipSet::Utf8(set) => {
+                check::<StringArray>(column, |a, i| set.contains(a.value(i)))
+            }
+        }
+    }
+}
+
 fn try_cast_literal(
     literal: &Arc<dyn ArrowDatum + Send + Sync>,
     column_type: &DataType,
@@ -2173,6 +2296,47 @@ mod tests {
     use crate::spec::{
         DataContentType, DataFileFormat, Datum, NestedField, PrimitiveType, Schema, SchemaRef, Type,
     };
+
+    /// The IN-predicate hash-set fast path must match the or(eq) fallback's
+    /// semantics exactly: member rows true, non-member rows false, null rows
+    /// null (three-valued logic survives NOT composition), and unsupported
+    /// types must decline so the fallback handles them.
+    #[test]
+    fn membership_set_matches_or_eq_semantics() {
+        use arrow_array::{Array, Datum as ArrowDatum, Int32Array, Scalar};
+
+        use crate::arrow::reader::MembershipSet;
+
+        let literals: Vec<Arc<dyn ArrowDatum + Send + Sync>> = vec![
+            Arc::new(Scalar::new(Int32Array::from(vec![2]))),
+            Arc::new(Scalar::new(Int32Array::from(vec![4]))),
+        ];
+
+        let set = MembershipSet::try_build(&DataType::Int32, &literals)
+            .expect("Int32 has a fast path");
+        let column = Int32Array::from(vec![Some(1), Some(2), None, Some(4)]);
+        let result = set.eval(&column).unwrap();
+
+        assert_eq!(result.len(), 4);
+        assert!(!result.value(0) && !result.is_null(0), "1 not in set");
+        assert!(result.value(1), "2 in set");
+        assert!(result.is_null(2), "null input stays null, not false");
+        assert!(result.value(3), "4 in set");
+
+        // Int64 column with Int32 literals: try_cast_literal widens, same as
+        // the fallback path.
+        let set = MembershipSet::try_build(&DataType::Int64, &literals)
+            .expect("literals cast to the column type");
+        let column = arrow_array::Int64Array::from(vec![Some(2), Some(3)]);
+        let result = set.eval(&column).unwrap();
+        assert!(result.value(0) && !result.value(1));
+
+        // No fast path for this type: decline, never panic.
+        assert!(
+            MembershipSet::try_build(&DataType::Float64, &literals).is_none(),
+            "unsupported types fall back to the or(eq) loop"
+        );
+    }
 
     fn table_schema_simple() -> SchemaRef {
         Arc::new(

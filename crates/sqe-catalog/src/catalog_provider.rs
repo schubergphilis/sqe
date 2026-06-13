@@ -75,6 +75,9 @@ pub struct SqeCatalogProvider {
     /// Issue #132: Tier-1 dynamic-filter clustering gate, propagated downstream.
     runtime_filter_clustering_skip: bool,
     runtime_filter_uniform_threshold: f64,
+    /// Bounded wait (ms) at scan open for pending dynamic filters,
+    /// propagated downstream.
+    runtime_filter_wait_ms: u64,
 }
 
 impl std::fmt::Debug for SqeCatalogProvider {
@@ -189,6 +192,7 @@ impl SqeCatalogProvider {
             prefetch_concurrency: crate::iceberg_scan::DEFAULT_DIRECT_READ_CONCURRENCY,
             runtime_filter_clustering_skip: false,
             runtime_filter_uniform_threshold: 0.8,
+            runtime_filter_wait_ms: crate::iceberg_scan::DEFAULT_RUNTIME_FILTER_WAIT_MS,
         })
     }
 
@@ -232,6 +236,14 @@ impl SqeCatalogProvider {
         self
     }
 
+    /// Bounded wait (ms) at scan open for pending dynamic filters.
+    /// Propagated to schema and table providers.
+    #[must_use = "with_runtime_filter_wait_ms consumes self; bind the returned provider"]
+    pub fn with_runtime_filter_wait_ms(mut self, wait_ms: u64) -> Self {
+        self.runtime_filter_wait_ms = wait_ms;
+        self
+    }
+
     /// Create a catalog provider with pre-populated namespace names.
     /// Useful when the namespace list is already known.
     pub fn with_namespaces(
@@ -253,6 +265,7 @@ impl SqeCatalogProvider {
             prefetch_concurrency: crate::iceberg_scan::DEFAULT_DIRECT_READ_CONCURRENCY,
             runtime_filter_clustering_skip: false,
             runtime_filter_uniform_threshold: 0.8,
+            runtime_filter_wait_ms: crate::iceberg_scan::DEFAULT_RUNTIME_FILTER_WAIT_MS,
         }
     }
 }
@@ -305,6 +318,7 @@ impl CatalogProvider for SqeCatalogProvider {
             self.runtime_filter_clustering_skip,
             self.runtime_filter_uniform_threshold,
         );
+        provider = provider.with_runtime_filter_wait_ms(self.runtime_filter_wait_ms);
 
         Some(Arc::new(provider))
 
