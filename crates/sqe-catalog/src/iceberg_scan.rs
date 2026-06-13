@@ -72,6 +72,17 @@ pub const DEFAULT_RUNTIME_FILTER_WAIT_MS: u64 = 100;
 /// in-flight bytes bounded (`concurrency × small_file_threshold`).
 pub const DEFAULT_DIRECT_READ_CONCURRENCY: usize = 8;
 
+/// Target byte size for splitting one large data file into byte-range
+/// subtasks so its row groups decode across cores (issue #131). The
+/// `to_arrow` reader assigns each row group to exactly one subtask by
+/// midpoint, so this only adds parallelism, never re-reads. ~16 MiB keeps a
+/// typical fact-table row group (≈25 MiB at SF1/SF10) in its own subtask, so
+/// a single-file fact table (SSB SF1 lineorder is one 151 MiB / 6-row-group
+/// file) decodes on many threads instead of one. Files below twice this size
+/// are left whole. Trino uses 32-64 MiB splits; we go finer because our row
+/// groups are smaller and the decode, not split planning, is the cost.
+pub const DEFAULT_SCAN_SPLIT_TARGET_SIZE: u64 = 32 * 1024 * 1024;
+
 /// Default number of output partitions for [`IcebergScanExec`].
 ///
 /// One partition means the scan runs serially on a single thread regardless of
@@ -1177,6 +1188,11 @@ impl ExecutionPlan for IcebergScanExec {
             if let Some(sid) = snapshot_id { sb = sb.snapshot_id(sid); }
             if let Some(ref cols) = projection { sb = sb.select(cols.iter().map(|s| s.as_str())); }
             if let Some(pred) = predicates { sb = sb.with_filter(pred); }
+            // Split a large single data file into byte-range subtasks so its row
+            // groups decode in parallel (issue #131). The scan exec stays at one
+            // output partition; this is purely intra-scan decode fan-out, so the
+            // plan shape (and join distribution) is unchanged.
+            sb = sb.with_task_split_target_size(Some(DEFAULT_SCAN_SPLIT_TARGET_SIZE));
             // Two-tier dynamic-filter pushdown.
             //
             // Tier 1 (scan-time): the DynamicPredicate is sampled once
