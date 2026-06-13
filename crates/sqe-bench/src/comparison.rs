@@ -4,8 +4,85 @@ use crate::client::BenchClient;
 use crate::report::{
     CompareStatusReport, ComparisonReport, ComparisonSummary, QueryComparison,
 };
+use std::collections::HashMap;
 use std::time::Instant;
-use tracing::info;
+use tracing::{info, warn};
+
+/// Default location (relative to repo root) of the canonical-row manifest.
+const DEFAULT_EXPECTED_ROWS_PATH: &str = "benchmarks/expected/canonical_rows_duckdb.json";
+
+/// Canonical-row manifest: { benchmark -> { query_name -> { "sf{N}_official_rows": count } } }.
+type ExpectedRows = HashMap<String, HashMap<String, HashMap<String, i64>>>;
+
+/// Load the canonical-row manifest. Path comes from `BENCH_EXPECTED_ROWS`, or
+/// defaults to `benchmarks/expected/canonical_rows_duckdb.json`. Returns `None`
+/// if the file is absent (existing runs keep working) or unparseable (with a
+/// warning), so the assertion gracefully no-ops.
+fn load_expected_rows() -> Option<ExpectedRows> {
+    let path = std::env::var("BENCH_EXPECTED_ROWS")
+        .unwrap_or_else(|_| DEFAULT_EXPECTED_ROWS_PATH.to_string());
+    if !std::path::Path::new(&path).exists() {
+        return None;
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(s) => match serde_json::from_str::<ExpectedRows>(&s) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                warn!("Could not parse expected-rows manifest {}: {}", path, e);
+                None
+            }
+        },
+        Err(e) => {
+            warn!("Could not read expected-rows manifest {}: {}", path, e);
+            None
+        }
+    }
+}
+
+/// Look up the canonical row count for `(benchmark, query_name)` at `scale`.
+/// Returns `None` when there is no manifest, no entry, or no count for this
+/// scale (e.g. SF10, which is not in the manifest yet). The scale key is built
+/// from `format_scale` so it is forward-compatible: scale 1.0 -> `sf1_official_rows`.
+fn canonical_rows(
+    manifest: Option<&ExpectedRows>,
+    benchmark: &str,
+    query_name: &str,
+    scale: f64,
+) -> Option<i64> {
+    let key = format!("sf{}_official_rows", crate::format_scale(scale));
+    manifest?
+        .get(benchmark)?
+        .get(query_name)?
+        .get(&key)
+        .copied()
+}
+
+/// Classify a single query comparison. Pure: no I/O, so it is unit-testable.
+/// `canonical` is the manifest-declared row count for this query/scale, or
+/// `None` when unknown. The vacuous (0-rows-on-both) arm splits on `canonical`:
+/// unknown -> `Vacuous`, `Some(0)` -> `ExpectedEmpty` (pass), `Some(n>0)` ->
+/// `VacuousBug` (fail). All other arms are unchanged.
+fn classify_status(
+    sqe_error: &Option<String>,
+    trino_error: &Option<String>,
+    sqe_rows: usize,
+    trino_rows: usize,
+    canonical: Option<i64>,
+) -> CompareStatusReport {
+    let rows_match = sqe_error.is_none() && trino_error.is_none() && sqe_rows == trino_rows;
+    match (sqe_error, trino_error) {
+        (None, None) if rows_match && sqe_rows == 0 => match canonical {
+            Some(0) => CompareStatusReport::ExpectedEmpty,
+            Some(_) => CompareStatusReport::VacuousBug,
+            None => CompareStatusReport::Vacuous,
+        },
+        (None, None) if rows_match => CompareStatusReport::Match,
+        (None, None) => CompareStatusReport::RowDiff,
+        (Some(_), None) => CompareStatusReport::SqeFailed,
+        (None, Some(_)) => CompareStatusReport::TrinoFailed,
+        (Some(_), Some(_)) => CompareStatusReport::BothFailed,
+    }
+}
 
 /// Connection/transport-level failure, as opposed to a query-level error.
 /// These are safe to retry once: the query never reached execution, or the
@@ -50,6 +127,10 @@ pub async fn run_comparison(
     }
 
     info!("Comparing {} queries from {}", query_files.len(), benchmark);
+
+    // Canonical-row manifest for the expected-row-count assertion. Absent file
+    // => None => vacuous queries keep today's behavior.
+    let expected_rows = load_expected_rows();
 
     let mut comparisons = Vec::new();
 
@@ -148,14 +229,10 @@ pub async fn run_comparison(
         let rows_match =
             sqe_error.is_none() && trino_error.is_none() && sqe_rows == trino_rows;
 
-        let status = match (&sqe_error, &trino_error) {
-            (None, None) if rows_match && sqe_rows == 0 => CompareStatusReport::Vacuous,
-            (None, None) if rows_match => CompareStatusReport::Match,
-            (None, None) => CompareStatusReport::RowDiff,
-            (Some(_), None) => CompareStatusReport::SqeFailed,
-            (None, Some(_)) => CompareStatusReport::TrinoFailed,
-            (Some(_), Some(_)) => CompareStatusReport::BothFailed,
-        };
+        let canonical =
+            canonical_rows(expected_rows.as_ref(), benchmark, &query_name, scale);
+        let status =
+            classify_status(&sqe_error, &trino_error, sqe_rows, trino_rows, canonical);
 
         let speedup = if sqe_time_ms > 0 {
             trino_time_ms as f64 / sqe_time_ms as f64
@@ -192,6 +269,14 @@ pub async fn run_comparison(
         .iter()
         .filter(|c| matches!(c.status, CompareStatusReport::Vacuous))
         .count();
+    let expected_empty = comparisons
+        .iter()
+        .filter(|c| matches!(c.status, CompareStatusReport::ExpectedEmpty))
+        .count();
+    let vacuous_bug = comparisons
+        .iter()
+        .filter(|c| matches!(c.status, CompareStatusReport::VacuousBug))
+        .count();
     let row_diff = comparisons
         .iter()
         .filter(|c| matches!(c.status, CompareStatusReport::RowDiff))
@@ -219,6 +304,8 @@ pub async fn run_comparison(
                 c.status,
                 CompareStatusReport::Match
                     | CompareStatusReport::Vacuous
+                    | CompareStatusReport::ExpectedEmpty
+                    | CompareStatusReport::VacuousBug
                     | CompareStatusReport::RowDiff
             )
         })
@@ -248,6 +335,8 @@ pub async fn run_comparison(
             total,
             matched,
             vacuous,
+            expected_empty,
+            vacuous_bug,
             row_diff,
             sqe_failed,
             trino_failed,
@@ -284,6 +373,8 @@ pub async fn run_comparison(
         let status_icon = match q.status {
             CompareStatusReport::Match => "OK",
             CompareStatusReport::Vacuous => "VACUOUS",
+            CompareStatusReport::ExpectedEmpty => "EMPTY OK",
+            CompareStatusReport::VacuousBug => "VACUOUS BUG",
             CompareStatusReport::RowDiff => "DIFF",
             CompareStatusReport::SqeFailed => "FAIL SQE",
             CompareStatusReport::TrinoFailed => "FAIL Trino",
@@ -301,14 +392,99 @@ pub async fn run_comparison(
         );
     }
     println!(
-        "\n**Total:** SQE {}ms, Trino {}ms, Avg speedup {:.1}x, Matched {}/{} ({} vacuous: 0 rows on both engines)\n",
+        "\n**Total:** SQE {}ms, Trino {}ms, Avg speedup {:.1}x, Matched {}/{} ({} vacuous: 0 rows on both engines, {} expected-empty: canonically 0, {} vacuous-bug: canonically non-zero but empty)\n",
         report.summary.sqe_total_ms,
         report.summary.trino_total_ms,
         report.summary.avg_speedup,
         report.summary.matched,
         report.summary.total,
-        report.summary.vacuous
+        report.summary.vacuous,
+        report.summary.expected_empty,
+        report.summary.vacuous_bug
     );
 
     Ok(report)
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn none() -> Option<String> {
+        None
+    }
+    fn err() -> Option<String> {
+        Some("boom".to_string())
+    }
+
+    #[test]
+    fn vacuous_with_canonical_zero_is_expected_empty() {
+        let s = classify_status(&none(), &none(), 0, 0, Some(0));
+        assert!(matches!(s, CompareStatusReport::ExpectedEmpty));
+    }
+
+    #[test]
+    fn vacuous_with_canonical_nonzero_is_vacuous_bug() {
+        let s = classify_status(&none(), &none(), 0, 0, Some(5));
+        assert!(matches!(s, CompareStatusReport::VacuousBug));
+    }
+
+    #[test]
+    fn vacuous_without_manifest_entry_stays_vacuous() {
+        let s = classify_status(&none(), &none(), 0, 0, None);
+        assert!(matches!(s, CompareStatusReport::Vacuous));
+    }
+
+    #[test]
+    fn non_vacuous_unaffected_by_canonical() {
+        // Rows on both, matching => Match regardless of canonical.
+        assert!(matches!(
+            classify_status(&none(), &none(), 5, 5, Some(0)),
+            CompareStatusReport::Match
+        ));
+        // Row count differs => RowDiff.
+        assert!(matches!(
+            classify_status(&none(), &none(), 5, 7, Some(0)),
+            CompareStatusReport::RowDiff
+        ));
+        // Engine failures unchanged.
+        assert!(matches!(
+            classify_status(&err(), &none(), 0, 0, Some(0)),
+            CompareStatusReport::SqeFailed
+        ));
+        assert!(matches!(
+            classify_status(&none(), &err(), 0, 0, Some(7)),
+            CompareStatusReport::TrinoFailed
+        ));
+        assert!(matches!(
+            classify_status(&err(), &err(), 0, 0, None),
+            CompareStatusReport::BothFailed
+        ));
+    }
+
+    #[test]
+    fn canonical_rows_builds_scale_key_and_gates() {
+        let mut manifest: ExpectedRows = HashMap::new();
+        let mut tpcds = HashMap::new();
+        let mut q17 = HashMap::new();
+        q17.insert("sf1_official_rows".to_string(), 0i64);
+        tpcds.insert("q17".to_string(), q17);
+        manifest.insert("tpcds".to_string(), tpcds);
+
+        // sf1 entry exists -> Some(0).
+        assert_eq!(
+            canonical_rows(Some(&manifest), "tpcds", "q17", 1.0),
+            Some(0)
+        );
+        // sf10 has no key in the manifest -> None (treated as today).
+        assert_eq!(canonical_rows(Some(&manifest), "tpcds", "q17", 10.0), None);
+        // Unknown query -> None.
+        assert_eq!(canonical_rows(Some(&manifest), "tpcds", "q99", 1.0), None);
+        // No manifest at all -> None.
+        assert_eq!(canonical_rows(None, "tpcds", "q17", 1.0), None);
+    }
 }
