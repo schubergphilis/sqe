@@ -31,7 +31,7 @@ use futures::channel::mpsc::{Sender, channel};
 use futures::stream::BoxStream;
 use futures::{SinkExt, StreamExt, TryStreamExt};
 
-use crate::arrow::ArrowReaderBuilder;
+use crate::arrow::{ArrowReaderBuilder, DEFAULT_TASK_SPLIT_TARGET_SIZE};
 use crate::delete_file_index::DeleteFileIndex;
 use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
 use crate::expr::{Bind, BoundPredicate, DynamicPredicate, Predicate};
@@ -70,6 +70,7 @@ pub struct TableScanBuilder<'a> {
     concurrency_limit_manifest_files: usize,
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    task_split_target_size: Option<u64>,
 }
 
 impl<'a> TableScanBuilder<'a> {
@@ -91,7 +92,19 @@ impl<'a> TableScanBuilder<'a> {
             concurrency_limit_manifest_files: num_cpus,
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
+            task_split_target_size: Some(DEFAULT_TASK_SPLIT_TARGET_SIZE),
         }
+    }
+
+    /// Target byte size for splitting a single large data file into
+    /// byte-range subtasks so its row groups decode across cores. `None`
+    /// disables splitting (one task per file). A file is only split when it
+    /// exceeds twice this size; row groups are assigned to subtasks by
+    /// midpoint, so each row group is read exactly once. Defaults to
+    /// [`DEFAULT_TASK_SPLIT_TARGET_SIZE`].
+    pub fn with_task_split_target_size(mut self, target: Option<u64>) -> Self {
+        self.task_split_target_size = target;
+        self
     }
 
     /// Sets the desired size of batches in the response
@@ -271,6 +284,7 @@ impl<'a> TableScanBuilder<'a> {
                         concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
                         row_group_filtering_enabled: self.row_group_filtering_enabled,
                         row_selection_enabled: self.row_selection_enabled,
+                        task_split_target_size: self.task_split_target_size,
                         dynamic_predicate: self.dynamic_predicate.clone(),
                     });
                 };
@@ -366,6 +380,7 @@ impl<'a> TableScanBuilder<'a> {
             concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
+            task_split_target_size: self.task_split_target_size,
             dynamic_predicate: self.dynamic_predicate,
         })
     }
@@ -395,6 +410,11 @@ pub struct TableScan {
 
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+
+    /// Target byte size for splitting a large data file into byte-range
+    /// subtasks so its row groups decode in parallel. See
+    /// [`TableScanBuilder::with_task_split_target_size`].
+    task_split_target_size: Option<u64>,
 
     /// Optional caller-supplied [`DynamicPredicate`] (see
     /// [`TableScanBuilder::with_dynamic_predicate`]). Sampled by the
@@ -517,7 +537,8 @@ impl TableScan {
         let mut arrow_reader_builder = ArrowReaderBuilder::new(self.file_io.clone())
             .with_data_file_concurrency_limit(self.concurrency_limit_data_files)
             .with_row_group_filtering_enabled(self.row_group_filtering_enabled)
-            .with_row_selection_enabled(self.row_selection_enabled);
+            .with_row_selection_enabled(self.row_selection_enabled)
+            .with_task_split_target_size(self.task_split_target_size);
 
         if let Some(batch_size) = self.batch_size {
             arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);
