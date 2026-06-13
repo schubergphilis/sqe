@@ -197,6 +197,14 @@ pub enum CompareStatusReport {
     /// nothing about engine correctness. Tracked separately from Match so
     /// vacuous coverage is visible in every report.
     Vacuous,
+    /// Both engines returned zero rows AND the canonical answer for this query
+    /// is genuinely zero rows at this scale. The empty result is correct, so
+    /// this counts as a pass (distinct from a plain Match, which had rows).
+    ExpectedEmpty,
+    /// Both engines returned zero rows BUT the canonical answer for this query
+    /// is non-zero at this scale. Agreement-on-nothing is hiding a generator or
+    /// engine bug: this counts as a failure.
+    VacuousBug,
     RowDiff,
     SqeFailed,
     TrinoFailed,
@@ -220,6 +228,14 @@ pub struct ComparisonSummary {
     pub matched: usize,
     #[serde(default)]
     pub vacuous: usize,
+    /// Vacuous queries confirmed correct against the canonical-row manifest
+    /// (canonical count == 0). Counted as passes.
+    #[serde(default)]
+    pub expected_empty: usize,
+    /// Vacuous queries that should NOT be empty per the manifest (canonical
+    /// count > 0). Counted as failures.
+    #[serde(default)]
+    pub vacuous_bug: usize,
     pub row_diff: usize,
     pub sqe_failed: usize,
     pub trino_failed: usize,
