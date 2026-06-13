@@ -89,6 +89,8 @@ pub(crate) async fn build_catalog_provider(
         cat_cfg.runtime_filters.clustering_skip_enabled,
         cat_cfg.runtime_filters.uniform_threshold,
     );
+    catalog_provider = catalog_provider
+        .with_runtime_filter_wait_ms(cat_cfg.runtime_filters.wait_ms);
 
     Ok((catalog_provider, session_catalog))
 }
@@ -216,6 +218,33 @@ pub async fn create_session_context(
                 // on error, lets parent FilterExec handle the coercion).
                 .set_bool("datafusion.execution.parquet.pushdown_filters", true)
                 .set_bool("datafusion.execution.parquet.reorder_filters", true);
+
+            // Dynamic-filter membership pushdown sizing. DataFusion only
+            // materializes the build-side key set as an IN-list (extractable,
+            // pushable into Iceberg scans and worker tickets) below these
+            // thresholds; above them it falls back to an opaque hash-table
+            // probe that no scan can use. The 150-value default is far below
+            // star-schema dimension filters (SSB carries 160-6500 keys), so
+            // every such query shipped the full fact table. 0 keeps
+            // DataFusion's default.
+            let session_config = {
+                let mut sc = session_config;
+                if config.query.runtime_filter_inlist_max_values > 0 {
+                    sc = sc.set_usize(
+                        "datafusion.optimizer.hash_join_inlist_pushdown_max_distinct_values",
+                        config.query.runtime_filter_inlist_max_values,
+                    );
+                }
+                let max_size = sqe_core::parse_memory_limit(&config.query.runtime_filter_inlist_max_size)
+                    .unwrap_or(0);
+                if max_size > 0 {
+                    sc = sc.set_usize(
+                        "datafusion.optimizer.hash_join_inlist_pushdown_max_size",
+                        max_size,
+                    );
+                }
+                sc
+            };
 
             let ctx = if let Some(rt) = runtime {
                 // Use the shared coordinator runtime (memory pool per
