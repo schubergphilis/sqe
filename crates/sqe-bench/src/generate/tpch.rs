@@ -155,8 +155,24 @@ fn days_since_epoch(year: i32, month: u32, day: u32) -> i32 {
 const DATE_START: i32 = 8035; // days_since_epoch(1992, 1, 1)
 const DATE_RANGE: i32 = 2556; // ~7 years in days
 
-fn random_date(rng: &mut StdRng) -> i32 {
-    DATE_START + rng.gen_range(0..DATE_RANGE)
+// dbgen's fixed "current date" (1995-06-17). l_linestatus and l_returnflag are
+// derived from ship/receipt dates relative to this cutoff, which is what makes
+// (returnflag, linestatus) take exactly four valid combinations rather than six.
+const CURRENT_DATE: i32 = 9298; // days_since_epoch(1995, 6, 17)
+// Order dates are bounded so the derived shipdate (orderdate + up to 121 days)
+// never spills past DATE_START + DATE_RANGE (1998-12-31).
+const ORDER_DATE_RANGE: i32 = DATE_RANGE - 121;
+
+/// An order date bounded so the lineitem ship/commit/receipt chain stays in range.
+fn random_order_date(rng: &mut StdRng) -> i32 {
+    DATE_START + rng.gen_range(0..ORDER_DATE_RANGE)
+}
+
+/// TPC-H spec retail price for a part, a deterministic function of the part key,
+/// in dollars: rprice(cents) = 90000 + (partkey/10) mod 20001 + 100*(partkey mod 1000).
+/// Used by both the part table (p_retailprice) and lineitem (l_extendedprice).
+fn part_retailprice(partkey: i32) -> f64 {
+    (90000 + (partkey / 10) % 20001 + 100 * (partkey % 1000)) as f64 / 100.0
 }
 
 // ---------------------------------------------------------------------------
@@ -228,10 +244,6 @@ const ORDER_PRIORITIES: &[&str] = &[
 ];
 
 const SHIP_MODES: &[&str] = &["REG AIR", "AIR", "RAIL", "SHIP", "TRUCK", "MAIL", "FOB"];
-
-const RETURN_FLAGS: &[&str] = &["R", "A", "N"];
-
-const LINE_STATUSES: &[&str] = &["O", "F"];
 
 const SHIP_INSTRUCTS: &[&str] = &[
     "DELIVER IN PERSON",
@@ -556,9 +568,7 @@ fn generate_part_range(
             ));
             p_size.push(rng.gen_range(1..=50i32));
             p_container.push(PART_CONTAINERS[rng.gen_range(0..PART_CONTAINERS.len())].to_string());
-            // Retail price: 90001 + (key/10) mod 20001 + 0.nn
-            let base = 90001 + (key / 10) % 20001;
-            p_retailprice.push(base as f64 + (rng.gen_range(0..100) as f64) / 100.0);
+            p_retailprice.push(part_retailprice(key));
             p_comment.push(random_comment(&mut rng));
         }
 
@@ -699,9 +709,20 @@ fn generate_orders_range(
 
         for i in 0..n {
             let key = (offset + i + 1) as i64;
-            // status: O or F (P is not used in simple generators)
-            let status = LINE_STATUSES[rng.gen_range(0..LINE_STATUSES.len())];
             let clerk_num = rng.gen_range(1..=1000i32);
+
+            // o_orderstatus follows the line items: 'O' when every line is still
+            // open (orderdate at/after the cutoff so all shipdates are after it),
+            // 'F' when every line has shipped (orderdate + max 121d before cutoff),
+            // 'P' for the mixed boundary window. Matches the lineitem derivation.
+            let orderdate = random_order_date(&mut rng);
+            let status = if orderdate >= CURRENT_DATE {
+                "O"
+            } else if orderdate <= CURRENT_DATE - 121 {
+                "F"
+            } else {
+                "P"
+            };
 
             o_orderkey.push(key);
             // dbgen never assigns orders to custkeys divisible by 3, leaving a
@@ -714,7 +735,7 @@ fn generate_orders_range(
             o_custkey.push(ck.max(1));
             o_orderstatus.push(status.to_string());
             o_totalprice.push((rng.gen_range(10_000..50_000_000_i64) as f64) / 100.0);
-            o_orderdate.push(random_date(&mut rng));
+            o_orderdate.push(orderdate);
             o_orderpriority.push(ORDER_PRIORITIES[rng.gen_range(0..ORDER_PRIORITIES.len())].to_string());
             o_clerk.push(format!("Clerk#{clerk_num:09}"));
             o_shippriority.push(0i32);
@@ -792,16 +813,33 @@ fn generate_lineitem_range(
         for i in 0..n {
             let orderkey = rng.gen_range(1..=num_orders);
             let partkey = rng.gen_range(1..=num_parts);
-            let suppkey = 1 + (partkey + rng.gen_range(0..4i32)) % num_suppliers;
+            // Same (partkey -> supplier) association the partsupp table uses, so
+            // every lineitem (partkey, suppkey) pair joins to a partsupp row
+            // (q09/q11 read ps_supplycost through this join).
+            let suppkey = 1 + (partkey - 1 + rng.gen_range(0..4i32)) % num_suppliers.max(1);
             let linenumber = ((offset + i) % 7 + 1) as i32;
             let quantity = rng.gen_range(1..=50i32) as f64;
-            let retailprice = 90001.0 + (partkey as f64 / 10.0) % 20001.0;
             let discount = rng.gen_range(0..=10i32) as f64 / 100.0;
             let tax = rng.gen_range(0..=8i32) as f64 / 100.0;
-            let extendedprice = quantity * retailprice * (1.0 - discount);
-            let shipdate = random_date(&mut rng);
-            let commitdate = random_date(&mut rng);
-            let receiptdate = random_date(&mut rng);
+            // l_extendedprice is quantity * retail price; the discount is applied
+            // later in revenue, not baked into extendedprice.
+            let extendedprice = quantity * part_retailprice(partkey);
+            // Spec date chain: ship within 121d of the order, commit 30..90d after
+            // the order, receipt 1..30d after ship (so receipt is always > ship).
+            let orderdate = random_order_date(&mut rng);
+            let shipdate = orderdate + rng.gen_range(1..=121i32);
+            let commitdate = orderdate + rng.gen_range(30..=90i32);
+            let receiptdate = shipdate + rng.gen_range(1..=30i32);
+            // Derived from the dates relative to the cutoff: 'O' if not yet shipped
+            // by the cutoff; returnflag 'N' if not yet received, else 'R'/'A'.
+            let linestatus = if shipdate > CURRENT_DATE { "O" } else { "F" };
+            let returnflag = if receiptdate > CURRENT_DATE {
+                "N"
+            } else if rng.gen_bool(0.5) {
+                "R"
+            } else {
+                "A"
+            };
 
             l_orderkey.push(orderkey);
             l_partkey.push(partkey);
@@ -811,8 +849,8 @@ fn generate_lineitem_range(
             l_extendedprice.push(extendedprice);
             l_discount.push(discount);
             l_tax.push(tax);
-            l_returnflag.push(RETURN_FLAGS[rng.gen_range(0..RETURN_FLAGS.len())].to_string());
-            l_linestatus.push(LINE_STATUSES[rng.gen_range(0..LINE_STATUSES.len())].to_string());
+            l_returnflag.push(returnflag.to_string());
+            l_linestatus.push(linestatus.to_string());
             l_shipdate.push(shipdate);
             l_commitdate.push(commitdate);
             l_receiptdate.push(receiptdate);
@@ -1141,6 +1179,70 @@ mod tests {
         // 1992-01-01 should be 8035 days after 1970-01-01
         let days = days_since_epoch(1992, 1, 1);
         assert_eq!(days, DATE_START);
+    }
+
+    #[test]
+    fn test_lineitem_flag_and_date_fidelity() {
+        // returnflag/linestatus are derived from the dates relative to CURRENT_DATE,
+        // so they take exactly the four valid combinations -- never (A,O) or (R,O) --
+        // and the receipt date always falls after the ship date.
+        let (_schema, batches) = generate_lineitem(0.01);
+        let mut combos = std::collections::HashSet::new();
+        for b in &batches {
+            let rf = b.column_by_name("l_returnflag").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+            let ls = b.column_by_name("l_linestatus").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+            let ship = b.column_by_name("l_shipdate").unwrap().as_any().downcast_ref::<Date32Array>().unwrap();
+            let recv = b.column_by_name("l_receiptdate").unwrap().as_any().downcast_ref::<Date32Array>().unwrap();
+            for i in 0..b.num_rows() {
+                let (r, l) = (rf.value(i), ls.value(i));
+                combos.insert((r.to_string(), l.to_string()));
+                assert!(recv.value(i) > ship.value(i), "receipt must be after ship");
+                if l == "O" {
+                    assert_eq!(r, "N", "an open line can never be returned");
+                }
+            }
+        }
+        assert_eq!(combos.len(), 4, "expected exactly 4 (returnflag,linestatus) combos, got {combos:?}");
+        assert!(!combos.contains(&("A".to_string(), "O".to_string())));
+        assert!(!combos.contains(&("R".to_string(), "O".to_string())));
+    }
+
+    #[test]
+    fn test_part_retailprice_spec_range() {
+        // Spec retail price is a deterministic function of the part key in the
+        // ~[$900, $2100] band -- not the 100x-too-large value the old code produced.
+        assert_eq!(part_retailprice(1), 901.0);
+        let (_schema, batches) = generate_part(0.01);
+        for b in &batches {
+            let rp = b.column_by_name("p_retailprice").unwrap().as_any().downcast_ref::<Decimal128Array>().unwrap();
+            for i in 0..b.num_rows() {
+                let dollars = rp.value(i) as f64 / 100.0;
+                assert!((900.0..=2100.0).contains(&dollars), "retail price {dollars} out of spec band");
+            }
+        }
+    }
+
+    #[test]
+    fn test_lineitem_supplier_joins_partsupp() {
+        // Every lineitem (partkey, suppkey) pair must exist in partsupp, otherwise
+        // q09/q11 silently drop rows when joining for ps_supplycost.
+        let (_ps, ps_batches) = generate_partsupp(0.01);
+        let mut valid = std::collections::HashSet::new();
+        for b in &ps_batches {
+            let pk = b.column_by_name("ps_partkey").unwrap().as_any().downcast_ref::<Int32Array>().unwrap();
+            let sk = b.column_by_name("ps_suppkey").unwrap().as_any().downcast_ref::<Int32Array>().unwrap();
+            for i in 0..b.num_rows() {
+                valid.insert((pk.value(i), sk.value(i)));
+            }
+        }
+        let (_li, li_batches) = generate_lineitem(0.01);
+        for b in &li_batches {
+            let pk = b.column_by_name("l_partkey").unwrap().as_any().downcast_ref::<Int32Array>().unwrap();
+            let sk = b.column_by_name("l_suppkey").unwrap().as_any().downcast_ref::<Int32Array>().unwrap();
+            for i in 0..b.num_rows() {
+                assert!(valid.contains(&(pk.value(i), sk.value(i))), "lineitem (partkey,suppkey) not in partsupp");
+            }
+        }
     }
 
     #[test]
