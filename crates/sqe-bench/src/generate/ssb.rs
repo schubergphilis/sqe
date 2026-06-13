@@ -256,14 +256,6 @@ pub(crate) fn all_date_keys() -> Vec<i32> {
     keys
 }
 
-/// Pick a random datekey (YYYYMMDD) within the SSB date range.
-fn random_datekey(rng: &mut StdRng) -> i32 {
-    let year = rng.gen_range(SSB_YEAR_START..=SSB_YEAR_END);
-    let month = rng.gen_range(1u32..=12);
-    let day = rng.gen_range(1..=days_in_month(year, month));
-    year * 10000 + month as i32 * 100 + day as i32
-}
-
 // ---------------------------------------------------------------------------
 // Seed derivation
 // ---------------------------------------------------------------------------
@@ -631,10 +623,17 @@ fn generate_lineorder(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let mut rng = StdRng::seed_from_u64(seed_for_table("lineorder"));
     let mut batches = Vec::new();
 
+    // Ordered list of every valid date key, so a commit date can be expressed as
+    // the order date advanced by a number of days (datekeys are YYYYMMDD, which
+    // can't be added directly).
+    let date_keys = all_date_keys();
+    let n_dates = date_keys.len();
+
     // State for multi-line orders
     let mut order_key: i64 = 0;
     let mut line_number: i32 = 1;
-    let mut order_date: i32 = random_datekey(&mut rng);
+    let mut order_idx: usize = rng.gen_range(0..n_dates);
+    let mut order_date: i32 = date_keys[order_idx];
     let mut order_total: f64 = (rng.gen_range(10_000..5_000_000_i64) as f64) / 100.0;
 
     let mut offset = 0usize;
@@ -661,7 +660,8 @@ fn generate_lineorder(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         for _ in 0..n {
             if line_number == 1 {
                 order_key += 1;
-                order_date = random_datekey(&mut rng);
+                order_idx = rng.gen_range(0..n_dates);
+                order_date = date_keys[order_idx];
                 order_total = (rng.gen_range(10_000..5_000_000_i64) as f64) / 100.0;
             }
 
@@ -674,7 +674,9 @@ fn generate_lineorder(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             let revenue = extended_price * (1.0 - discount_pct as f64 / 100.0);
             let supply_cost = base_price * 0.6 + (rng.gen_range(0..100) as f64);
             let tax_pct = rng.gen_range(0..=8i32);
-            let commit_date = random_datekey(&mut rng);
+            // Commit date is the order date advanced 1..121 days (SSB inherits the
+            // TPC-H ship-window), expressed via the ordered date-key list.
+            let commit_date = date_keys[(order_idx + rng.gen_range(1..=121usize)).min(n_dates - 1)];
 
             lo_orderkey.push(order_key);
             lo_linenumber.push(line_number);
