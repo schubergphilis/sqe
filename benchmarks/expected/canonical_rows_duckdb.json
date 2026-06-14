@@ -486,5 +486,10 @@
    "sf0_1_official_rows": 7,
    "sf1_official_rows": 7
   }
+ },
+ "clickbench": {
+  "q28": {
+   "sf10_official_rows": 6
+  }
  }
 }

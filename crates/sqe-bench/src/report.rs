@@ -205,6 +205,13 @@ pub enum CompareStatusReport {
     /// is non-zero at this scale. Agreement-on-nothing is hiding a generator or
     /// engine bug: this counts as a failure.
     VacuousBug,
+    /// Both engines succeeded with DIFFERENT row counts, but SQE matches the
+    /// canonical answer (DuckDB/ClickHouse) and Trino diverges. This is a SQL
+    /// dialect difference where Trino is the outlier, not a SQE bug -- e.g.
+    /// clickbench q28's `regexp_replace(..., '\1')`: `\1` is a capture-group
+    /// backreference in DataFusion/Postgres/ClickHouse/DuckDB but a literal in
+    /// Trino. SQE is correct, so this counts as a pass.
+    DialectDiff,
     RowDiff,
     SqeFailed,
     TrinoFailed,
@@ -236,6 +243,10 @@ pub struct ComparisonSummary {
     /// count > 0). Counted as failures.
     #[serde(default)]
     pub vacuous_bug: usize,
+    /// Row counts differed but SQE matched the canonical answer while Trino
+    /// diverged on a SQL dialect difference (Trino is the outlier). Passes.
+    #[serde(default)]
+    pub dialect_diff: usize,
     pub row_diff: usize,
     pub sqe_failed: usize,
     pub trino_failed: usize,
