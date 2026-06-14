@@ -77,6 +77,15 @@ fn classify_status(
             None => CompareStatusReport::Vacuous,
         },
         (None, None) if rows_match => CompareStatusReport::Match,
+        // Row counts differ but both engines succeeded. When the manifest
+        // declares a canonical count and SQE matches it while Trino does not,
+        // Trino is the outlier on a SQL dialect difference (e.g. regexp_replace
+        // backreference syntax). SQE is correct -> pass.
+        (None, None)
+            if matches!(canonical, Some(c) if sqe_rows as i64 == c && trino_rows as i64 != c) =>
+        {
+            CompareStatusReport::DialectDiff
+        }
         (None, None) => CompareStatusReport::RowDiff,
         (Some(_), None) => CompareStatusReport::SqeFailed,
         (None, Some(_)) => CompareStatusReport::TrinoFailed,
@@ -277,6 +286,10 @@ pub async fn run_comparison(
         .iter()
         .filter(|c| matches!(c.status, CompareStatusReport::VacuousBug))
         .count();
+    let dialect_diff = comparisons
+        .iter()
+        .filter(|c| matches!(c.status, CompareStatusReport::DialectDiff))
+        .count();
     let row_diff = comparisons
         .iter()
         .filter(|c| matches!(c.status, CompareStatusReport::RowDiff))
@@ -306,6 +319,7 @@ pub async fn run_comparison(
                     | CompareStatusReport::Vacuous
                     | CompareStatusReport::ExpectedEmpty
                     | CompareStatusReport::VacuousBug
+                    | CompareStatusReport::DialectDiff
                     | CompareStatusReport::RowDiff
             )
         })
@@ -337,6 +351,7 @@ pub async fn run_comparison(
             vacuous,
             expected_empty,
             vacuous_bug,
+            dialect_diff,
             row_diff,
             sqe_failed,
             trino_failed,
@@ -375,6 +390,7 @@ pub async fn run_comparison(
             CompareStatusReport::Vacuous => "VACUOUS",
             CompareStatusReport::ExpectedEmpty => "EMPTY OK",
             CompareStatusReport::VacuousBug => "VACUOUS BUG",
+            CompareStatusReport::DialectDiff => "DIALECT OK",
             CompareStatusReport::RowDiff => "DIFF",
             CompareStatusReport::SqeFailed => "FAIL SQE",
             CompareStatusReport::TrinoFailed => "FAIL Trino",
@@ -392,7 +408,7 @@ pub async fn run_comparison(
         );
     }
     println!(
-        "\n**Total:** SQE {}ms, Trino {}ms, Avg speedup {:.1}x, Matched {}/{} ({} vacuous: 0 rows on both engines, {} expected-empty: canonically 0, {} vacuous-bug: canonically non-zero but empty)\n",
+        "\n**Total:** SQE {}ms, Trino {}ms, Avg speedup {:.1}x, Matched {}/{} ({} vacuous: 0 rows on both engines, {} expected-empty: canonically 0, {} vacuous-bug: canonically non-zero but empty, {} dialect-diff: SQE matches canonical, Trino diverges)\n",
         report.summary.sqe_total_ms,
         report.summary.trino_total_ms,
         report.summary.avg_speedup,
@@ -400,7 +416,8 @@ pub async fn run_comparison(
         report.summary.total,
         report.summary.vacuous,
         report.summary.expected_empty,
-        report.summary.vacuous_bug
+        report.summary.vacuous_bug,
+        report.summary.dialect_diff
     );
 
     Ok(report)
@@ -467,6 +484,27 @@ mod tests {
     }
 
     #[test]
+    fn rowdiff_with_sqe_matching_canonical_is_dialect_diff() {
+        // SQE 6 rows == canonical 6, Trino 1 row diverges => SQE is correct on a
+        // dialect difference (clickbench q28 regexp_replace backreference).
+        let s = classify_status(&none(), &none(), 6, 1, Some(6));
+        assert!(matches!(s, CompareStatusReport::DialectDiff));
+    }
+
+    #[test]
+    fn rowdiff_when_neither_engine_matches_canonical_stays_rowdiff() {
+        // Canonical present but SQE also wrong => genuine RowDiff, not a pass.
+        let s = classify_status(&none(), &none(), 5, 1, Some(6));
+        assert!(matches!(s, CompareStatusReport::RowDiff));
+    }
+
+    #[test]
+    fn rowdiff_without_canonical_stays_rowdiff() {
+        let s = classify_status(&none(), &none(), 6, 1, None);
+        assert!(matches!(s, CompareStatusReport::RowDiff));
+    }
+
+    #[test]
     fn canonical_rows_builds_scale_key_and_gates() {
         let mut manifest: ExpectedRows = HashMap::new();
         let mut tpcds = HashMap::new();
@@ -486,5 +524,24 @@ mod tests {
         assert_eq!(canonical_rows(Some(&manifest), "tpcds", "q99", 1.0), None);
         // No manifest at all -> None.
         assert_eq!(canonical_rows(None, "tpcds", "q17", 1.0), None);
+    }
+
+    #[test]
+    fn clickbench_q28_sf10_resolves_to_dialect_diff_end_to_end() {
+        // Locks the full seam: scale 10.0 -> key "sf10_official_rows" -> Some(6),
+        // then classify a 6-vs-1 row diff as DialectDiff. Mirrors the shipped
+        // manifest entry; guards against format_scale drift making the fix inert.
+        let mut manifest: ExpectedRows = HashMap::new();
+        let mut clickbench = HashMap::new();
+        let mut q28 = HashMap::new();
+        q28.insert("sf10_official_rows".to_string(), 6i64);
+        clickbench.insert("q28".to_string(), q28);
+        manifest.insert("clickbench".to_string(), clickbench);
+
+        let canonical = canonical_rows(Some(&manifest), "clickbench", "q28", 10.0);
+        assert_eq!(canonical, Some(6), "scale 10.0 must build the sf10 key");
+
+        let status = classify_status(&none(), &none(), 6, 1, canonical);
+        assert!(matches!(status, CompareStatusReport::DialectDiff));
     }
 }
