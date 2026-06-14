@@ -18,6 +18,33 @@ pub struct LoadArgs<'a> {
     pub namespace_override: Option<&'a str>,
 }
 
+/// Sort-on-write clustering key for a fact table.
+///
+/// Loads sort fact tables by their dominant date/range key so each Parquet
+/// row group gets a tight min/max on that column. Most analytical queries
+/// filter or range on the date key (directly or via a dim join whose dynamic
+/// filter pushes a contiguous date-key set to the fact scan), so tight zone
+/// maps let the reader prune whole row groups instead of decoding them
+/// (`files_pruned_minmax` was 0 on unsorted loads). Dimensions are small and
+/// left unsorted. Cross-engine fair: Trino reads the same sorted files.
+///
+/// Returns the column to `ORDER BY` in the load CTAS, or `None` to load as-is.
+fn clustering_key(benchmark: &str, table: &str) -> Option<&'static str> {
+    match (benchmark, table) {
+        ("tpch", "lineitem") => Some("l_shipdate"),
+        ("tpch", "orders") => Some("o_orderdate"),
+        ("ssb", "lineorder") => Some("lo_orderdate"),
+        ("tpcds" | "tpcbb", "store_sales") => Some("ss_sold_date_sk"),
+        ("tpcds" | "tpcbb", "catalog_sales") => Some("cs_sold_date_sk"),
+        ("tpcds" | "tpcbb", "web_sales") => Some("ws_sold_date_sk"),
+        ("tpcds" | "tpcbb", "inventory") => Some("inv_date_sk"),
+        ("tpcds" | "tpcbb", "store_returns") => Some("sr_returned_date_sk"),
+        ("tpcds" | "tpcbb", "catalog_returns") => Some("cr_returned_date_sk"),
+        ("tpcds" | "tpcbb", "web_returns") => Some("wr_returned_date_sk"),
+        _ => None,
+    }
+}
+
 pub async fn load_benchmark(
     client: &dyn BenchClient,
     args: &LoadArgs<'_>,
@@ -85,6 +112,12 @@ pub async fn load_benchmark(
         }
         sql.push_str(&format!(", region => '{}'", s3_args.region));
         sql.push(')');
+
+        // Sort-on-write: cluster fact tables by their date/range key so
+        // row-group zone maps are tight and the reader can prune row groups.
+        if let Some(key) = clustering_key(benchmark, &table_def.name) {
+            sql.push_str(&format!(" ORDER BY {key}"));
+        }
 
         println!("  Loading {}.{}...", qualified_ns, table_def.name);
         client.execute_update(&sql).await?;
