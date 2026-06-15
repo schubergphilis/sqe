@@ -45,6 +45,19 @@ fn clustering_key(benchmark: &str, table: &str) -> Option<&'static str> {
     }
 }
 
+/// Iceberg partition spec (transform expression) for a fact table's `PARTITIONED
+/// BY` clause, or `None` to leave it unpartitioned. Partitioning enables
+/// manifest-level file pruning (stronger than row-group min/max). Only
+/// date-typed columns get `month()`; integer surrogate date keys (TPC-DS/SSB)
+/// need bucket/truncate and are left for a later pass.
+fn partition_spec(benchmark: &str, table: &str) -> Option<&'static str> {
+    match (benchmark, table) {
+        ("tpch", "lineitem") => Some("month(l_shipdate)"),
+        ("tpch", "orders") => Some("month(o_orderdate)"),
+        _ => None,
+    }
+}
+
 /// True if `err` is a memory/resource-exhaustion failure (as opposed to a SQL
 /// or transport error). Used to decide whether a failed sort-on-write CTAS
 /// should fail over to an unsorted write.
@@ -105,11 +118,18 @@ pub async fn load_benchmark(
                 .await;
         }
 
-        // Build the base CTAS with read_parquet (no clustering yet).
-        let mut base_sql = format!(
-            "CREATE TABLE {qualified_ns}.{} AS SELECT * FROM read_parquet('{}/*.parquet'",
-            table_def.name, table_path
-        );
+        // Build the base CTAS: CREATE TABLE [PARTITIONED BY (...)] AS SELECT
+        // * FROM read_parquet(...). Partitioning (coarse, manifest-level file
+        // pruning) is part of the table definition; clustering (ORDER BY, the
+        // sort-on-write hint below) is appended per the failover path.
+        let mut base_sql = format!("CREATE TABLE {qualified_ns}.{}", table_def.name);
+        if let Some(spec) = partition_spec(benchmark, &table_def.name) {
+            base_sql.push_str(&format!(" PARTITIONED BY ({spec})"));
+        }
+        base_sql.push_str(&format!(
+            " AS SELECT * FROM read_parquet('{}/*.parquet'",
+            table_path
+        ));
 
         // Append S3 credentials if provided
         if let Some(ref key) = s3_args.access_key {

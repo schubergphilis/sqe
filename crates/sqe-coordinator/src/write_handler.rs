@@ -757,7 +757,7 @@ impl WriteHandler {
         stmt: &Statement,
         batches: Vec<RecordBatch>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let (table_name, _or_replace, arrow_schema) = match stmt {
+        let (table_name, _or_replace, arrow_schema, partition_by) = match stmt {
             Statement::CreateTable(ct) => {
                 if ct.query.is_none() {
                     return Err(SqeError::Execution(
@@ -775,7 +775,7 @@ impl WriteHandler {
                     ));
                 };
 
-                (&ct.name, ct.or_replace, schema)
+                (&ct.name, ct.or_replace, schema, ct.partition_by.as_deref())
             }
             other => {
                 return Err(SqeError::Execution(format!(
@@ -806,7 +806,9 @@ impl WriteHandler {
             .create_catalog_bridge(session, target_catalog.as_deref())
             .await?;
 
-        // Create the table in the catalog
+        // Create the table in the catalog. Honor PARTITIONED BY (see the
+        // streaming CTAS path for why).
+        let partition_spec = build_partition_spec(partition_by, &iceberg_schema)?;
         let create_format_version = self.format_version();
         let location = unique_table_location(catalog.as_ref(), &namespace, &name).await;
         let table_creation = TableCreation::builder()
@@ -814,6 +816,7 @@ impl WriteHandler {
             .schema(iceberg_schema)
             .location_opt(location)
             .format_version(create_format_version)
+            .partition_spec_opt(partition_spec)
             .properties(self.format_version_props(create_format_version))
             .build();
 
@@ -939,14 +942,14 @@ impl WriteHandler {
         select_sql: &str,
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let (table_name, _or_replace) = match stmt {
+        let (table_name, _or_replace, partition_by) = match stmt {
             Statement::CreateTable(ct) => {
                 if ct.query.is_none() {
                     return Err(SqeError::Execution(
                         "CTAS statement has no SELECT query".into(),
                     ));
                 }
-                (&ct.name, ct.or_replace)
+                (&ct.name, ct.or_replace, ct.partition_by.as_deref())
             }
             other => {
                 return Err(SqeError::Execution(format!(
@@ -995,6 +998,11 @@ impl WriteHandler {
         // (dbt's CREATE SCHEMA may not have landed here); idempotent.
         ensure_namespace(catalog.as_ref(), &namespace).await?;
 
+        // Honor PARTITIONED BY on CTAS (the plain CREATE TABLE path already
+        // does this). Without it, `CREATE TABLE ... PARTITIONED BY (month(d))
+        // AS SELECT ...` silently produced an unpartitioned table.
+        let partition_spec = build_partition_spec(partition_by, &iceberg_schema)?;
+
         let create_format_version = self.format_version();
         let location = unique_table_location(catalog.as_ref(), &namespace, &name).await;
         let table_creation = TableCreation::builder()
@@ -1002,6 +1010,7 @@ impl WriteHandler {
             .schema(iceberg_schema)
             .location_opt(location)
             .format_version(create_format_version)
+            .partition_spec_opt(partition_spec)
             .properties(self.format_version_props(create_format_version))
             .build();
 
