@@ -45,6 +45,17 @@ fn clustering_key(benchmark: &str, table: &str) -> Option<&'static str> {
     }
 }
 
+/// True if `err` is a memory/resource-exhaustion failure (as opposed to a SQL
+/// or transport error). Used to decide whether a failed sort-on-write CTAS
+/// should fail over to an unsorted write.
+fn is_resource_exhausted(err: &anyhow::Error) -> bool {
+    let m = err.to_string().to_ascii_lowercase();
+    m.contains("resources exhausted")
+        || m.contains("failed to allocate")
+        || m.contains("out of memory")
+        || m.contains("memory limit")
+}
+
 pub async fn load_benchmark(
     client: &dyn BenchClient,
     args: &LoadArgs<'_>,
@@ -94,33 +105,60 @@ pub async fn load_benchmark(
                 .await;
         }
 
-        // Build CTAS with read_parquet
-        let mut sql = format!(
+        // Build the base CTAS with read_parquet (no clustering yet).
+        let mut base_sql = format!(
             "CREATE TABLE {qualified_ns}.{} AS SELECT * FROM read_parquet('{}/*.parquet'",
             table_def.name, table_path
         );
 
         // Append S3 credentials if provided
         if let Some(ref key) = s3_args.access_key {
-            sql.push_str(&format!(", access_key => '{key}'"));
+            base_sql.push_str(&format!(", access_key => '{key}'"));
         }
         if let Some(ref key) = s3_args.secret_key {
-            sql.push_str(&format!(", secret_key => '{key}'"));
+            base_sql.push_str(&format!(", secret_key => '{key}'"));
         }
         if let Some(ref ep) = s3_args.endpoint {
-            sql.push_str(&format!(", endpoint => '{ep}'"));
+            base_sql.push_str(&format!(", endpoint => '{ep}'"));
         }
-        sql.push_str(&format!(", region => '{}'", s3_args.region));
-        sql.push(')');
+        base_sql.push_str(&format!(", region => '{}'", s3_args.region));
+        base_sql.push(')');
+
+        println!("  Loading {}.{}...", qualified_ns, table_def.name);
 
         // Sort-on-write: cluster fact tables by their date/range key so
         // row-group zone maps are tight and the reader can prune row groups.
-        if let Some(key) = clustering_key(benchmark, &table_def.name) {
-            sql.push_str(&format!(" ORDER BY {key}"));
+        // The sort is an optimization, not a correctness requirement, so if it
+        // exhausts memory (DataFusion's sort-merge cannot spill and OOMs rather
+        // than degrading) we fail over to an unsorted write -- the data lands
+        // correctly, just without clustering. A user's own CTAS ORDER BY is
+        // never touched; this fallback applies only to the bench clustering hint.
+        match clustering_key(benchmark, &table_def.name) {
+            Some(key) => {
+                let sorted_sql = format!("{base_sql} ORDER BY {key}");
+                if let Err(e) = client.execute_update(&sorted_sql).await {
+                    if is_resource_exhausted(&e) {
+                        eprintln!(
+                            "  ! sort-on-write OOM on {}.{} (key {key}); failing over to unsorted write",
+                            qualified_ns, table_def.name
+                        );
+                        // Drop the partial table the failed sort may have left.
+                        let _ = client
+                            .execute_update(&format!(
+                                "DROP TABLE IF EXISTS {qualified_ns}.{}",
+                                table_def.name
+                            ))
+                            .await;
+                        client.execute_update(&base_sql).await?;
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+            None => {
+                client.execute_update(&base_sql).await?;
+            }
         }
-
-        println!("  Loading {}.{}...", qualified_ns, table_def.name);
-        client.execute_update(&sql).await?;
         println!("  Done: {}.{}", qualified_ns, table_def.name);
     }
 
