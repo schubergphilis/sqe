@@ -45,6 +45,19 @@ fn clustering_key(benchmark: &str, table: &str) -> Option<&'static str> {
     }
 }
 
+/// Iceberg partition spec (transform expression) for a fact table's `PARTITIONED
+/// BY` clause, or `None` to leave it unpartitioned. Partitioning enables
+/// manifest-level file pruning (stronger than row-group min/max). Only
+/// date-typed columns get `month()`; integer surrogate date keys (TPC-DS/SSB)
+/// need bucket/truncate and are left for a later pass.
+fn partition_spec(benchmark: &str, table: &str) -> Option<&'static str> {
+    match (benchmark, table) {
+        ("tpch", "lineitem") => Some("month(l_shipdate)"),
+        ("tpch", "orders") => Some("month(o_orderdate)"),
+        _ => None,
+    }
+}
+
 pub async fn load_benchmark(
     client: &dyn BenchClient,
     args: &LoadArgs<'_>,
@@ -94,11 +107,15 @@ pub async fn load_benchmark(
                 .await;
         }
 
-        // Build CTAS with read_parquet
-        let mut sql = format!(
-            "CREATE TABLE {qualified_ns}.{} AS SELECT * FROM read_parquet('{}/*.parquet'",
-            table_def.name, table_path
-        );
+        // Build CTAS: CREATE TABLE [PARTITIONED BY (...)] AS SELECT ...
+        let mut sql = format!("CREATE TABLE {qualified_ns}.{}", table_def.name);
+        if let Some(spec) = partition_spec(benchmark, &table_def.name) {
+            sql.push_str(&format!(" PARTITIONED BY ({spec})"));
+        }
+        sql.push_str(&format!(
+            " AS SELECT * FROM read_parquet('{}/*.parquet'",
+            table_path
+        ));
 
         // Append S3 credentials if provided
         if let Some(ref key) = s3_args.access_key {
