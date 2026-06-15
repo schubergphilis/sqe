@@ -92,6 +92,8 @@ Trino shows a range because every compare run re-measures it; the high end is th
 
 Distribution is a per-shape decision, not a default: big fact-to-fact joins (TPC-H, TPC-DS) gain 25 to 40 percent from two workers, while star schemas (SSB) pay shuffle costs that single-node avoids. Known open items at SF10: four TPC-DS inventory queries (q23, q37, q72, q82) fail distributed when the worker's scan buffer outruns Flight shipment and exhausts the 4GB worker pool, and SSB still trails Trino on raw star-join throughput.
 
+A later SF10 pass found a separate blow-up: TPC-H q12, q17, and q10 ran 160 to 300 seconds against Trino's 2 to 8. The cause was not partition layout or join distribution. On a partitioned hash join the build-side runtime filter is a `CASE` over per-partition key sets (q12: eleven branches of ~28K keys, ~300K expression nodes), and the probe scan re-snapshotted it once per batch. Each snapshot rebuilt the whole tree (~10ms), so a 14,600-batch scan spent ~150s reconstructing a filter it then evaluated in under a second. We now cache the first sealed snapshot per scan: q12 161s to 2.7s, q17 176s to 7.1s, q10 from a 300s failure to 3.3s, result rows unchanged, no threshold touched. SSB improved too (q4.1 11.6s to 6.8s), which retired the IN-list-threshold tradeoff we thought we had. The walk-through is in [The Filter That Rebuilt Itself](docs/blog/2026-06-15-the-filter-that-rebuilt-itself.md); the EXPLAIN comparison is in [`docs/perf/sf10-slow-queries.md`](docs/perf/sf10-slow-queries.md).
+
 ### How we know the numbers are real
 
 A benchmark row that says "Match" can still validate nothing: if the generated data contains no rows a query can select, both engines agree on empty and the diff passes. We learned this the hard way. Since June 2026 the harness reports those cases as `Vacuous`, and the generators are validated against DuckDB's official `dsdgen` output as an engine-free oracle (`scripts/validate-generator-tpcds.py`). That oracle caught a TPC-C generator bug that zeroed every warehouse join at fractional scales and a set of TPC-DS vocabulary gaps that had silently blanked 16 query results. Details in [the validation blog post](docs/blog/2026-06-12-the-benchmark-that-lied.md).
@@ -242,6 +244,7 @@ Engineering posts that double as design rationale:
 | [How We Accidentally Created a DuckDB](docs/blog/2026-05-07-accidentally-duckdb.md) | V8 to V12: file-format TVFs, hf://, Delta, smarter read_csv |
 | [Shipping OpenLineage](docs/blog/2026-05-09-shipping-openlineage.md) | Column-level lineage from idea to merged MR |
 | [The Benchmark That Lied](docs/blog/2026-06-12-the-benchmark-that-lied.md) | Vacuous results, the DuckDB oracle, and the day Trino was wrong |
+| [The Filter That Rebuilt Itself 14,600 Times](docs/blog/2026-06-15-the-filter-that-rebuilt-itself.md) | A runtime filter re-snapshotted per batch made q12 161s instead of 2.7s |
 
 Full archive in [`docs/blog/`](docs/blog/).
 
