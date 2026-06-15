@@ -47,7 +47,7 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
 
 use sqe_core::SqeConfig;
-use sqe_sql::{StatementKind, parse_and_classify};
+use sqe_sql::{StatementKind, parse_and_classify_typed, pre_parse_pipeline, UserSql};
 
 use crate::query_handler::QueryHandler;
 use crate::query_tracker::QueryTracker;
@@ -599,7 +599,15 @@ impl SqeFlightSqlService {
         session: &sqe_core::Session,
         sql: &str,
     ) -> Result<Response<FlightStream>, Status> {
-        let kind = parse_and_classify(sql).map_err(|e| sqe_error_to_status(&e, None))?;
+        // Classify through the pre-parse pipeline (strips FOR INCREMENTAL /
+        // VERSION AS OF, rewrites Hive `PARTITIONED BY` -> sqlparser `PARTITION
+        // BY`) so routing matches the execute path. Classifying raw SQL here
+        // parse-fails on `PARTITIONED BY (month(col))` before the normalized
+        // execute() path is ever reached.
+        let kind = parse_and_classify_typed(
+            &pre_parse_pipeline(&UserSql::from(sql)).map_err(|e| sqe_error_to_status(&e, None))?,
+        )
+        .map_err(|e| sqe_error_to_status(&e, None))?;
 
         if matches!(kind, StatementKind::Query(_)) {
             let (schema, stream) = self
