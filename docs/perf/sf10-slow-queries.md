@@ -11,6 +11,65 @@ Trino from `EXPLAIN ANALYZE`.
 > wall-clock is indicative. The **plan shapes, scan byte/row counts, and join
 > strategies** below are the trustworthy signals.
 
+## RESOLVED 2026-06-15: the q12/q17/q10/q20 explosions were a dynamic-filter snapshot bug
+
+The first cut of this doc (below) blamed the q12/q17/q10/q20 blow-ups on partition
+over-scan, single-node `CollectLeft`, and a "q95 aggregated-subquery sibling".
+That was wrong. Root-causing with a CPU profile and per-operator timers found the
+real cause, which is the same for all four and has nothing to do with join
+distribution or partitioning.
+
+**Root cause.** On a `mode=Partitioned` hash join, DataFusion's build-side
+dynamic filter is a single `CASE hash_repartition % N WHEN i THEN <partition i's
+IN-list> ...` expression. Each per-partition branch carries that partition's
+build keys as an `IN (SET)` list, so the whole expression holds tens of thousands
+of literal nodes (q12 SF10: 11 branches × ~28K orderkeys ≈ 300K nodes). SQE's
+probe-side scan applies this filter per batch and called
+`DynamicFilterPhysicalExpr::current()` **once per batch** to re-sample it.
+`current()` rebuilds the entire expression every call (it walks the tree via
+`transform_up` to remap children), costing ~10 ms for a tree this size. Over a
+15M-row / ~14,600-batch probe scan that is ~150 s spent rebuilding the filter,
+versus ~0.2 s actually evaluating it. Per-operator timers (cumulative, dead
+linear): `current()` 41,156 ms vs `evaluate()` 399 ms at 4,000 batches.
+
+The `IN (SET)` hash membership already works; the cost was never the inlist
+evaluation. Lowering `runtime_filter_inlist_max_values` (the q95 lever) only
+"fixed" it by suppressing the inlist entirely, which is why it looked like the
+q95 family.
+
+**Fix** (`crates/sqe-catalog/src/iceberg_scan.rs`): cache the first sealed
+(non-`lit(true)`) snapshot of each dynamic filter per scan stream and reuse it,
+instead of calling `current()` every batch. The build side seals once and never
+reverts; while pending, the snapshot is the tiny `lit(true)` placeholder (cheap
+to re-sample), so only not-yet-sealed slots keep sampling. The dynamic filter is
+a probe-reduction optimization the hash join re-checks, so a cached (slightly
+stale) snapshot can only pass extra rows, never drop a match — correctness is
+unaffected.
+
+**Validation** (same rig, default `runtime_filter_inlist_max_values = 65536`, no
+threshold change):
+
+| Query | Before | After fix | Speedup |
+|---|---:|---:|---:|
+| tpch q12 | 161 s | 2.7 s | 60× |
+| tpch q17 | 176 s | 7.1 s | 25× |
+| tpch q10 | 300 s (FAIL) | 3.3 s | ~90× |
+| ssb q4.1 | 11.6 s | 6.8 s | 1.7× |
+| ssb q3.1 | 5.6 s | 3.1 s | 1.8× |
+
+q12 result rows are byte-identical before/after (MAIL 154,379 / SHIP 154,144).
+SSB improves too at the default threshold — the per-batch `current()` was taxing
+every Partitioned-join probe scan, just less visibly than the multi-minute
+TPC-H cases. This retires the SSB-vs-TPC-H threshold tradeoff: keep the 65536
+default; the fix makes it safe.
+
+The partition over-scan analysis below (root cause #1) is still valid for
+q08/q09/q19, which do not explode — they trail ~0.4× from reading all 84
+`lineitem` partition files. Root causes #2 (single-node CollectLeft) and #3 (the
+"q95 sibling" story) are **superseded** by the above for q12/q17/q10/q20.
+
+---
+
 ## Where SQE trails at SF10 (the rest of the suite SQE wins)
 
 SQE wins TPC-DS (1.30×), ClickBench (1.45×), and q95 (3.3×) at SF10. The losses

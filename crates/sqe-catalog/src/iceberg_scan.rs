@@ -826,6 +826,9 @@ impl ExecutionPlan for IcebergScanExec {
 
         // Type alias to avoid repeating the full BoxStream type in early-returns.
         type BatchStream = futures::stream::BoxStream<'static, DFResult<RecordBatch>>;
+        // Per-filter cache of each dynamic filter's first sealed snapshot, shared
+        // across the batches of one scan stream (see the Tier-2 wrapper below).
+        type ResolvedFilterCache = Arc<std::sync::Mutex<Vec<Option<Arc<dyn PhysicalExpr>>>>>;
 
         // `schema` is also needed after the stream is created (for IcebergRecordBatchStream),
         // so clone it before moving it into the async block.
@@ -1264,6 +1267,27 @@ impl ExecutionPlan for IcebergScanExec {
                 let filtered_schema = schema.clone();
                 let rows_filtered_dynamic = rows_filtered_dynamic.clone();
                 let rows_passed_filter_pending = rows_passed_filter_pending.clone();
+                // Cache the first sealed (non-`lit(true)`) snapshot of each
+                // dynamic filter so `DynamicFilterPhysicalExpr::current()` runs at
+                // most once per filter, not once per batch.
+                //
+                // `current()` rebuilds the whole filter expression every call: it
+                // walks the tree via `transform_up` to remap children. A
+                // partitioned-join dynamic filter is a `CASE hash_repartition % N
+                // WHEN i THEN <per-partition IN-list> ...` carrying tens of
+                // thousands of literals, so that walk costs ~10ms. Called once per
+                // 8K-row batch across a multi-million-row probe scan it dominated
+                // the scan -- TPC-H q12/q17/q10 at SF10 spent ~160s in `current()`
+                // versus ~0.2s actually evaluating the filter. The build side
+                // seals once and never reverts, so we snapshot the sealed
+                // expression a single time and reuse it; while a filter is still
+                // pending its snapshot is the tiny `lit(true)` placeholder (cheap
+                // to re-sample), so only not-yet-sealed slots keep sampling. The
+                // dynamic filter is a probe-reduction optimization the hash join
+                // re-checks, so a cached (slightly stale) snapshot can only pass
+                // extra rows, never drop a match.
+                let resolved_cache: ResolvedFilterCache =
+                    Arc::new(std::sync::Mutex::new(vec![None; filters.len()]));
                 arrow_stream
                     .map_err(|e: iceberg::Error| DataFusionError::External(Box::new(e)))
                     .and_then(move |batch| {
@@ -1271,22 +1295,38 @@ impl ExecutionPlan for IcebergScanExec {
                         let filtered_schema = filtered_schema.clone();
                         let rows_filtered_dynamic = rows_filtered_dynamic.clone();
                         let rows_passed_filter_pending = rows_passed_filter_pending.clone();
+                        let resolved_cache = resolved_cache.clone();
                         async move {
                             let rows_in = batch.num_rows();
                             let mut saw_pending = false;
                             let mut result = batch;
-                            for filter in &filters {
+                            for (idx, filter) in filters.iter().enumerate() {
                                 let (expr, is_dynamic): (Arc<dyn PhysicalExpr>, bool) = if let Some(dynamic) = filter.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
-                                    match dynamic.current() {
-                                        Ok(e) if is_trivial_true(&e) => {
+                                    // Short-circuit on the cached sealed snapshot:
+                                    // once present we never call `current()` again
+                                    // (that call is the whole cost). The lock is
+                                    // held only to read/store an `Arc`, never
+                                    // across `current()`, and the scan stream is
+                                    // polled one batch at a time, so it stays
+                                    // uncontended.
+                                    let cached = { resolved_cache.lock().unwrap()[idx].clone() };
+                                    let resolved = match cached {
+                                        Some(e) => Some(e),
+                                        None => match dynamic.current() {
                                             // Build side not sealed yet: the
                                             // snapshot is still the lit(true)
                                             // placeholder, every row passes.
-                                            saw_pending = true;
-                                            continue;
-                                        }
-                                        Ok(e) => (e, true),
-                                        Err(_) => {
+                                            Ok(e) if is_trivial_true(&e) => None,
+                                            Ok(e) => {
+                                                resolved_cache.lock().unwrap()[idx] = Some(Arc::clone(&e));
+                                                Some(e)
+                                            }
+                                            Err(_) => None,
+                                        },
+                                    };
+                                    match resolved {
+                                        Some(e) => (e, true),
+                                        None => {
                                             saw_pending = true;
                                             continue;
                                         }
