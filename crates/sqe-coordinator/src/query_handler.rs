@@ -8,6 +8,9 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::{execute_stream, ExecutionPlan};
+use datafusion::physical_plan::joins::HashJoinExec;
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::logical_expr::JoinType;
 use futures::TryStreamExt;
 use datafusion::prelude::SessionContext;
 use tracing::{debug, info, warn, Span};
@@ -1782,6 +1785,8 @@ impl QueryHandler {
         self.query_tracker
             .running(query_id, start.elapsed().as_millis() as u64);
 
+        // Remove dynamic filters from Iceberg self-joins (q95-class inlist blowup).
+        let final_plan = strip_self_join_dynamic_filters(final_plan);
         let schema = final_plan.schema();
         let stream = execute_stream(Arc::clone(&final_plan), ctx.task_ctx())
             .map_err(|e| SqeError::Execution(format!("Query execution failed: {e}")))?;
@@ -1992,6 +1997,8 @@ impl QueryHandler {
             (c, 0) => c,
             (c, m) => c.min(m),
         };
+        // Remove dynamic filters from Iceberg self-joins (q95-class inlist blowup).
+        let final_plan = strip_self_join_dynamic_filters(final_plan);
         let mut stream = execute_stream(final_plan.clone(), ctx.task_ctx())
             .map_err(|e| SqeError::Execution(format!("Query execution failed: {e}")))?;
         let mut batches: Vec<RecordBatch> = Vec::new();
@@ -4136,6 +4143,101 @@ pub(crate) fn aggregate_spill_metrics(plan: &Arc<dyn ExecutionPlan>) -> (usize, 
 /// arbitrary one in multi-join plans: SSB q4.x shipped a dimension table to
 /// the workers while the 6M-row lineorder fact scan ran locally on the
 /// coordinator. Returns `None` if the plan contains no Iceberg table scans.
+/// Collect the identifiers of Iceberg tables scanned under `plan`, stopping at
+/// any `AggregateExec` barrier.
+///
+/// The barrier matters: the q95-class inlist blowup happens only when a hash
+/// join's build side is a **raw** fact scan (tens of thousands of distinct
+/// keys). Year-over-year TPC-DS queries (q11, q64, ...) join the *same* table
+/// via pre-aggregated CTEs (a SUM per customer/year) -- a small, selective
+/// build that benefits from the dynamic filter and must not be stripped.
+/// Treating `AggregateExec` as a barrier means a table only counts toward
+/// self-join detection when it reaches the join without an aggregation in
+/// between, which distinguishes q95's raw `web_sales ⋈ web_sales` from the
+/// benign aggregated-CTE joins.
+fn collect_raw_iceberg_table_idents(
+    plan: &Arc<dyn ExecutionPlan>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    use datafusion::physical_plan::aggregates::AggregateExec;
+    if plan.as_any().downcast_ref::<AggregateExec>().is_some() {
+        return;
+    }
+    if let Some(scan) = plan.as_any().downcast_ref::<IcebergScanExec>() {
+        out.insert(scan.table().identifier().to_string());
+    }
+    for child in plan.children() {
+        collect_raw_iceberg_table_idents(child, out);
+    }
+}
+
+/// Strip the runtime dynamic filter from any `Inner` `HashJoinExec` whose two
+/// inputs both scan the **same** Iceberg table -- a self-join (e.g. TPC-DS
+/// q95's `ws_wh` CTE).
+///
+/// DataFusion only attaches a dynamic (runtime) filter to `Inner` joins, and
+/// below `hash_join_inlist_pushdown_max_distinct_values` it materializes that
+/// filter as an IN-list of the build side's distinct keys. For a self-join the
+/// build side carries tens of thousands of fact-table keys and the IN-list path
+/// collapses the join into a materialized cross product (q95: 0.2s -> 17s at the
+/// 65536 threshold SQE uses for SSB dimension pushdown). We rebuild only the
+/// offending self-join node without its dynamic filter, via
+/// [`HashJoinExec::try_new`] (which starts with `dynamic_filter: None`). Every
+/// other join -- including the dimension/fact joins inside the same query that
+/// legitimately prune via the key-set push-down -- is left untouched.
+///
+/// Detection keys on table *identity*, not cardinality, so it is scale-invariant
+/// (SF1/SF10/SF100) and never fires on dimension/fact joins (different tables).
+/// Removing a runtime filter only changes pruning, never results.
+///
+/// Note: this runs on the post-distribution coordinator plan; a self-join that
+/// is ever distributed (its `IcebergScanExec` replaced by a distributed exec)
+/// would no-op here, which is safe because workers do not raise the inlist
+/// threshold above DataFusion's default.
+fn strip_self_join_dynamic_filters(
+    plan: Arc<dyn ExecutionPlan>,
+) -> Arc<dyn ExecutionPlan> {
+    let original = Arc::clone(&plan);
+    let result = plan.transform_up(|node| {
+        let Some(hj) = node.as_any().downcast_ref::<HashJoinExec>() else {
+            return Ok(Transformed::no(node));
+        };
+        if *hj.join_type() != JoinType::Inner || hj.dynamic_filter_for_test().is_none() {
+            return Ok(Transformed::no(node));
+        }
+        let mut left = std::collections::HashSet::new();
+        let mut right = std::collections::HashSet::new();
+        collect_raw_iceberg_table_idents(hj.left(), &mut left);
+        collect_raw_iceberg_table_idents(hj.right(), &mut right);
+        if left.intersection(&right).next().is_none() {
+            return Ok(Transformed::no(node));
+        }
+        let rebuilt = HashJoinExec::try_new(
+            Arc::clone(hj.left()),
+            Arc::clone(hj.right()),
+            hj.on().to_vec(),
+            hj.filter().cloned(),
+            hj.join_type(),
+            hj.projection.as_ref().map(|p| p.to_vec()),
+            *hj.partition_mode(),
+            hj.null_equality(),
+            hj.null_aware,
+        )?;
+        debug!(
+            on = ?hj.on(),
+            "Stripped dynamic filter from Iceberg self-join HashJoinExec (q95-class)"
+        );
+        Ok(Transformed::yes(Arc::new(rebuilt) as Arc<dyn ExecutionPlan>))
+    });
+    match result {
+        Ok(t) => t.data,
+        Err(e) => {
+            debug!(error = %e, "strip_self_join_dynamic_filters failed; using original plan");
+            original
+        }
+    }
+}
+
 fn find_iceberg_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
     let mut scans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
     let mut stack: Vec<Arc<dyn ExecutionPlan>> = vec![Arc::clone(plan)];
