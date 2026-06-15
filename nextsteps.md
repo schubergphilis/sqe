@@ -272,7 +272,7 @@ Step 9g (cow-dml-parallel-streaming) is the immediate SF100 unblock. Step 5 (plu
 >
 > _SQE-filed, no upstream traction yet:_
 >
-> - **apache/iceberg-rust#2376 (DynamicPredicate API)** — SQE filed this; latest comment 2026-04-28 sharpens the cache-layer API ask (`is_sealed()` / `generation()`). MR !112 already shipped Path B-2 downstream so SQE is unblocked; the issue tracks getting the cache helper accepted upstream.
+> - **apache/iceberg-rust#2376 (DynamicPredicate API)** — SQE filed this; latest comment 2026-04-28 sharpens the cache-layer API ask (`is_sealed()` / `generation()`). MR !112 already shipped Path B-2 downstream so SQE is unblocked; the issue tracks getting the cache helper accepted upstream. **2026-06-15: this ask is now concrete.** The probe-scan Tier-2 wrapper called `DynamicFilterPhysicalExpr::current()` once per batch, and for a partitioned-join `CASE`-of-IN-lists (~300K nodes) `current()` rebuilds the whole tree via `transform_up` (~10ms/call), making TPC-H q12/q17/q10 SF10 run 160-300s. Worked around downstream by caching the first sealed snapshot per scan (MR !371, `iceberg_scan.rs`): q12 161s->2.7s, q17 176s->7.1s, q10 300s-FAIL->3.3s, SSB also faster, default threshold unchanged. A `generation()`/`is_sealed()` cache hook would make the snapshot refresh precise instead of "cache the first sealed value"; see [The Filter That Rebuilt Itself](docs/blog/2026-06-15-the-filter-that-rebuilt-itself.md).
 >
 > _Affecting older watchlist items:_
 >
