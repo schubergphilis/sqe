@@ -1,0 +1,86 @@
+Jun 16, 2026 11:37:25 AM org.jline.utils.Log logr
+WARNING: Unable to create a system terminal, creating a dumb terminal (enable debug logging for more information)
+"Trino version: 465
+Queued: 2.03ms, Analysis: 20.98ms, Planning: 30.36ms, Execution: 1.63s
+Fragment 1 [ROUND_ROBIN]
+    CPU: 1.26ms, Scheduled: 1.35ms, Blocked 13.41s (Input: 11.92s, Output: 0.00ns), Input: 4 rows (464B); per task: avg.: 4.00 std.dev.: 0.00, Output: 4 rows (464B)
+    Peak Memory: 1.17kB, Tasks count: 1; per task: max: 1.17kB
+    Output layout: [l_returnflag, l_linestatus, sum, sum_1, sum_2, sum_3, avg, avg_4, avg_5, count]
+    Output partitioning: SINGLE []
+    LocalMerge[orderBy = [l_returnflag ASC NULLS LAST, l_linestatus ASC NULLS LAST]]
+    │   Layout: [l_returnflag:varchar, l_linestatus:varchar, sum:decimal(38,2), sum_1:decimal(38,2), sum_2:decimal(38,4), sum_3:decimal(38,6), avg:decimal(15,2), avg_4:decimal(15,2), avg_5:decimal(15,2), count:bigint]
+    │   Estimates: {rows: ? (?), cpu: 0, memory: 0B, network: 0B}
+    │   CPU: 0.00ns (0.00%), Scheduled: 0.00ns (0.00%), Blocked: 1.49s (4.01%), Output: 4 rows (464B)
+    │   Input avg.: 0.50 rows, Input std.dev.: 173.21%
+    └─ PartialSort[orderBy = [l_returnflag ASC NULLS LAST, l_linestatus ASC NULLS LAST]]
+       │   Layout: [l_returnflag:varchar, l_linestatus:varchar, sum:decimal(38,2), sum_1:decimal(38,2), sum_2:decimal(38,4), sum_3:decimal(38,6), avg:decimal(15,2), avg_4:decimal(15,2), avg_5:decimal(15,2), count:bigint]
+       │   CPU: 0.00ns (0.00%), Scheduled: 0.00ns (0.00%), Blocked: 0.00ns (0.00%), Output: 4 rows (464B)
+       │   Input avg.: 0.50 rows, Input std.dev.: 173.21%
+       └─ RemoteSource[sourceFragmentIds = [2]]
+              Layout: [l_returnflag:varchar, l_linestatus:varchar, sum:decimal(38,2), sum_1:decimal(38,2), sum_2:decimal(38,4), sum_3:decimal(38,6), avg:decimal(15,2), avg_4:decimal(15,2), avg_5:decimal(15,2), count:bigint]
+              CPU: 0.00ns (0.00%), Scheduled: 0.00ns (0.00%), Blocked: 11.92s (32.09%), Output: 4 rows (464B)
+              Input avg.: 0.50 rows, Input std.dev.: 173.21%
+
+Fragment 2 [HASH]
+    CPU: 6.02ms, Scheduled: 7.87ms, Blocked 23.73s (Input: 11.86s, Output: 0.00ns), Input: 126 rows (19.69kB); per task: avg.: 126.00 std.dev.: 0.00, Output: 4 rows (464B)
+    Peak Memory: 1.92kB, Tasks count: 1; per task: max: 3.05MB
+    Output layout: [l_returnflag, l_linestatus, sum, sum_1, sum_2, sum_3, avg, avg_4, avg_5, count]
+    Output partitioning: ROUND_ROBIN []
+    Aggregate[type = FINAL, keys = [l_returnflag, l_linestatus]]
+    │   Layout: [l_returnflag:varchar, l_linestatus:varchar, sum:decimal(38,2), sum_1:decimal(38,2), sum_2:decimal(38,4), sum_3:decimal(38,6), avg:decimal(15,2), avg_4:decimal(15,2), avg_5:decimal(15,2), count:bigint]
+    │   Estimates: {rows: ? (?), cpu: 22.01G, memory: ?, network: 0B}
+    │   CPU: 3.00ms (0.03%), Scheduled: 4.00ms (0.02%), Blocked: 0.00ns (0.00%), Output: 4 rows (464B)
+    │   Input avg.: 15.75 rows, Input std.dev.: 181.08%
+    │   sum := sum(sum_6)
+    │   sum_1 := sum(sum_7)
+    │   sum_2 := sum(sum_8)
+    │   sum_3 := sum(sum_9)
+    │   avg := avg(avg_10)
+    │   avg_4 := avg(avg_11)
+    │   avg_5 := avg(avg_12)
+    │   count := count(count_13)
+    └─ LocalExchange[partitioning = HASH, arguments = [l_returnflag::varchar, l_linestatus::varchar]]
+       │   Layout: [l_returnflag:varchar, l_linestatus:varchar, sum_6:varbinary, sum_7:varbinary, sum_8:varbinary, sum_9:varbinary, avg_10:varbinary, avg_11:varbinary, avg_12:varbinary, count_13:bigint]
+       │   Estimates: {rows: 58473819 (22.01GB), cpu: 22.01G, memory: 0B, network: 0B}
+       │   CPU: 1.00ms (0.01%), Scheduled: 1.00ms (0.00%), Blocked: 11.87s (31.96%), Output: 126 rows (19.69kB)
+       │   Input avg.: 15.75 rows, Input std.dev.: 16.72%
+       └─ RemoteSource[sourceFragmentIds = [3]]
+              Layout: [l_returnflag:varchar, l_linestatus:varchar, sum_6:varbinary, sum_7:varbinary, sum_8:varbinary, sum_9:varbinary, avg_10:varbinary, avg_11:varbinary, avg_12:varbinary, count_13:bigint]
+              CPU: 1.00ms (0.01%), Scheduled: 1.00ms (0.00%), Blocked: 11.86s (31.93%), Output: 126 rows (19.69kB)
+              Input avg.: 15.75 rows, Input std.dev.: 16.72%
+
+Fragment 3 [SOURCE]
+    CPU: 9.16s, Scheduled: 21.94s, Blocked 0.00ns (Input: 0.00ns, Output: 0.00ns), Input: 59146208 rows (2.65GB); per task: avg.: 59146208.00 std.dev.: 0.00, Output: 126 rows (19.69kB)
+    Peak Memory: 32.44kB, Tasks count: 1; per task: max: 99.03MB
+    Output layout: [l_returnflag, l_linestatus, sum_6, sum_7, sum_8, sum_9, avg_10, avg_11, avg_12, count_13]
+    Output partitioning: HASH [l_returnflag, l_linestatus]
+    Aggregate[type = PARTIAL, keys = [l_returnflag, l_linestatus]]
+    │   Layout: [l_returnflag:varchar, l_linestatus:varchar, sum_6:varbinary, sum_7:varbinary, sum_8:varbinary, sum_9:varbinary, avg_10:varbinary, avg_11:varbinary, avg_12:varbinary, count_13:bigint]
+    │   Estimates: {rows: 58473819 (22.01GB), cpu: ?, memory: ?, network: ?}
+    │   CPU: 3.50s (38.22%), Scheduled: 6.99s (31.87%), Blocked: 0.00ns (0.00%), Output: 126 rows (19.69kB)
+    │   Input avg.: 722790.07 rows, Input std.dev.: 16.94%
+    │   sum_6 := sum(l_quantity)
+    │   sum_7 := sum(l_extendedprice)
+    │   sum_8 := sum(expr)
+    │   sum_9 := sum(expr_0)
+    │   avg_10 := avg(l_quantity)
+    │   avg_11 := avg(l_extendedprice)
+    │   avg_12 := avg(l_discount)
+    │   count_13 := count(*)
+    └─ ScanFilterProject[table = iceberg:tpch_sf10.lineitem$data@2337369359903125659, filterPredicate = (l_shipdate <= date '1998-09-02')]
+           Layout: [l_quantity:decimal(15,2), l_extendedprice:decimal(15,2), l_discount:decimal(15,2), expr:decimal(31,4), expr_0:decimal(38,6), l_returnflag:varchar, l_linestatus:varchar]
+           Estimates: {rows: 59146208 (3.92GB), cpu: 2.82G, memory: 0B, network: 0B}/{rows: 58473819 (3.88GB), cpu: 2.82G, memory: 0B, network: 0B}/{rows: 58473819 (3.88GB), cpu: 3.88G, memory: 0B, network: 0B}
+           CPU: 5.65s (61.72%), Scheduled: 14.94s (68.10%), Blocked: 0.00ns (0.00%), Output: 58545996 rows (3.76GB)
+           Input avg.: 730200.10 rows, Input std.dev.: 13.27%
+           expr := $operator$multiply(l_extendedprice, $operator$subtract(decimal(10,0) '1', l_discount))
+           expr_0 := $operator$multiply($operator$multiply(l_extendedprice, $operator$subtract(decimal(10,0) '1', l_discount)), $operator$add(l_tax, decimal(10,0) '1'))
+           l_tax := 8:l_tax:decimal(15,2)
+           l_shipdate := 11:l_shipdate:date
+           l_quantity := 5:l_quantity:decimal(15,2)
+           l_extendedprice := 6:l_extendedprice:decimal(15,2)
+           l_discount := 7:l_discount:decimal(15,2)
+           l_returnflag := 9:l_returnflag:varchar
+           l_linestatus := 10:l_linestatus:varchar
+           Input: 59146208 rows (2.65GB), Filtered: 1.01%, Physical input: 343.04MB, Physical input time: 3.11s
+
+"
