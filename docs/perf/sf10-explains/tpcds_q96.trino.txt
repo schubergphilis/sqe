@@ -1,0 +1,144 @@
+Jun 16, 2026 11:47:03 AM org.jline.utils.Log logr
+WARNING: Unable to create a system terminal, creating a dumb terminal (enable debug logging for more information)
+"Trino version: 465
+Queued: 415.85us, Analysis: 77.20ms, Planning: 61.66ms, Execution: 754.78ms
+Fragment 1 [SINGLE]
+    CPU: 2.58ms, Scheduled: 3.14ms, Blocked 5.13s (Input: 4.56s, Output: 0.00ns), Input: 29 rows (261B); per task: avg.: 29.00 std.dev.: 0.00, Output: 1 row (9B)
+    Peak Memory: 512B, Tasks count: 1; per task: max: 1.99kB
+    Output layout: [count]
+    Output partitioning: SINGLE []
+    Aggregate[type = FINAL]
+    │   Layout: [count:bigint]
+    │   Estimates: {rows: 1 (9B), cpu: ?, memory: 9B, network: 0B}
+    │   CPU: 0.00ns (0.00%), Scheduled: 0.00ns (0.00%), Blocked: 0.00ns (0.00%), Output: 1 row (9B)
+    │   Input avg.: 29.00 rows, Input std.dev.: 0.00%
+    │   count := count(count_6)
+    └─ LocalExchange[partitioning = SINGLE]
+       │   Layout: [count_6:bigint]
+       │   Estimates: {rows: ? (?), cpu: 0, memory: 0B, network: 0B}
+       │   CPU: 0.00ns (0.00%), Scheduled: 1.00ms (0.01%), Blocked: 573.00ms (7.84%), Output: 29 rows (261B)
+       │   Input avg.: 3.63 rows, Input std.dev.: 89.32%
+       └─ RemoteSource[sourceFragmentIds = [2]]
+              Layout: [count_6:bigint]
+              CPU: 1.00ms (0.03%), Scheduled: 1.00ms (0.01%), Blocked: 4.56s (62.40%), Output: 29 rows (261B)
+              Input avg.: 3.63 rows, Input std.dev.: 89.32%
+
+Fragment 2 [SOURCE]
+    CPU: 2.86s, Scheduled: 8.10s, Blocked 2.14s (Input: 389.35ms, Output: 0.00ns), Input: 16165336 rows (231.19MB); per task: avg.: 16165336.00 std.dev.: 0.00, Output: 29 rows (261B)
+    Peak Memory: 4.82MB, Tasks count: 1; per task: max: 58.19MB
+    Output layout: [count_6]
+    Output partitioning: SINGLE []
+    Aggregate[type = PARTIAL]
+    │   Layout: [count_6:bigint]
+    │   CPU: 10.00ms (0.35%), Scheduled: 12.00ms (0.15%), Blocked: 0.00ns (0.00%), Output: 29 rows (261B)
+    │   Input avg.: 0.00 rows, Input std.dev.: ?%
+    │   count_6 := count(*)
+    └─ InnerJoin[criteria = (ss_store_sk = s_store_sk), distribution = REPLICATED]
+       │   Layout: []
+       │   Estimates: {rows: ? (0B), cpu: ?, memory: 300B, network: 0B}
+       │   CPU: 18.00ms (0.63%), Scheduled: 41.00ms (0.51%), Blocked: 314.00ms (4.30%), Output: 0 rows (0B)
+       │   Left (probe) Input avg.: 1109.45 rows, Input std.dev.: 92.48%
+       │   Right (build) Input avg.: 0.00 rows, Input std.dev.: ?%
+       │   Distribution: REPLICATED
+       │   dynamicFilterAssignments = {s_store_sk -> #df_978}
+       ├─ InnerJoin[criteria = (ss_sold_time_sk = t_time_sk), distribution = REPLICATED]
+       │  │   Layout: [ss_store_sk:integer]
+       │  │   Estimates: {rows: ? (?), cpu: ?, memory: 186.63kB, network: 0B}
+       │  │   CPU: 84.00ms (2.93%), Scheduled: 214.00ms (2.64%), Blocked: 309.00ms (4.23%), Output: 32174 rows (282.78kB)
+       │  │   Left (probe) Input avg.: 53460.69 rows, Input std.dev.: 92.17%
+       │  │   Right (build) Input avg.: 1800.00 rows, Input std.dev.: 0.00%
+       │  │   Distribution: REPLICATED
+       │  │   dynamicFilterAssignments = {t_time_sk -> #df_979}
+       │  ├─ InnerJoin[criteria = (ss_hdemo_sk = hd_demo_sk), distribution = REPLICATED]
+       │  │  │   Layout: [ss_sold_time_sk:integer, ss_store_sk:integer]
+       │  │  │   Estimates: {rows: ? (?), cpu: ?, memory: ?, network: 0B}
+       │  │  │   CPU: 184.00ms (6.41%), Scheduled: 423.00ms (5.21%), Blocked: 555.00ms (7.59%), Output: 1550360 rows (14.79MB)
+       │  │  │   Left (probe) Input avg.: 53460.69 rows, Input std.dev.: 92.17%
+       │  │  │   Right (build) Input avg.: 720.00 rows, Input std.dev.: 0.00%
+       │  │  │   Distribution: REPLICATED
+       │  │  │   dynamicFilterAssignments = {hd_demo_sk -> #df_980}
+       │  │  ├─ ScanFilter[table = iceberg:tpcds_sf10.store_sales$data@1352118711566026187, dynamicFilters = {ss_store_sk = #df_978, ss_sold_time_sk = #df_979, ss_hdemo_sk = #df_980}]
+       │  │  │      Layout: [ss_sold_time_sk:integer, ss_hdemo_sk:integer, ss_store_sk:integer]
+       │  │  │      Estimates: {rows: 28800000 (407.60MB), cpu: 407.60M, memory: 0B, network: 0B}/{rows: 28800000 (407.60MB), cpu: 407.60M, memory: 0B, network: 0B}
+       │  │  │      CPU: 2.56s (89.20%), Scheduled: 7.41s (91.29%), Blocked: 0.00ns (0.00%), Output: 1550360 rows (22.18MB)
+       │  │  │      Input avg.: 557338.48 rows, Input std.dev.: 92.29%
+       │  │  │      ss_hdemo_sk := 6:ss_hdemo_sk:integer
+       │  │  │      ss_store_sk := 8:ss_store_sk:integer
+       │  │  │      ss_sold_time_sk := 2:ss_sold_time_sk:integer
+       │  │  │      Input: 16162816 rows (231.18MB), Filtered: 90.41%, Physical input: 64.23MB, Physical input time: 1.57s
+       │  │  │      Dynamic filters: 
+       │  │  │          - df_978, NONE, collection time=332.94ms
+       │  │  │          - df_979, [ SortedRangeSet[type=integer, ranges=1800, {[73801], ..., [75600]}] ], collection time=332.93ms
+       │  │  │          - df_980, [ SortedRangeSet[type=integer, ranges=720, {[840], ..., [6959]}] ], collection time=31.98ms
+       │  │  └─ LocalExchange[partitioning = SINGLE]
+       │  │     │   Layout: [hd_demo_sk:integer]
+       │  │     │   Estimates: {rows: ? (?), cpu: 0, memory: 0B, network: 0B}
+       │  │     │   CPU: 0.00ns (0.00%), Scheduled: 0.00ns (0.00%), Blocked: 13.00ms (0.18%), Output: 720 rows (3.52kB)
+       │  │     │   Input avg.: 90.00 rows, Input std.dev.: 173.21%
+       │  │     └─ RemoteSource[sourceFragmentIds = [3]]
+       │  │            Layout: [hd_demo_sk:integer]
+       │  │            CPU: 0.00ns (0.00%), Scheduled: 0.00ns (0.00%), Blocked: 90.00ms (1.23%), Output: 720 rows (3.52kB)
+       │  │            Input avg.: 90.00 rows, Input std.dev.: 173.21%
+       │  └─ LocalExchange[partitioning = SINGLE]
+       │     │   Layout: [t_time_sk:integer]
+       │     │   Estimates: {rows: 38221 (186.63kB), cpu: 0, memory: 0B, network: 0B}
+       │     │   CPU: 0.00ns (0.00%), Scheduled: 0.00ns (0.00%), Blocked: 293.00ms (4.01%), Output: 1800 rows (8.79kB)
+       │     │   Input avg.: 225.00 rows, Input std.dev.: 156.29%
+       │     └─ RemoteSource[sourceFragmentIds = [4]]
+       │            Layout: [t_time_sk:integer]
+       │            CPU: 0.00ns (0.00%), Scheduled: 0.00ns (0.00%), Blocked: 146.00ms (2.00%), Output: 1800 rows (8.79kB)
+       │            Input avg.: 225.00 rows, Input std.dev.: 156.29%
+       └─ LocalExchange[partitioning = SINGLE]
+          │   Layout: [s_store_sk:integer]
+          │   Estimates: {rows: 60 (300B), cpu: 0, memory: 0B, network: 0B}
+          │   CPU: 0.00ns (0.00%), Scheduled: 0.00ns (0.00%), Blocked: 301.00ms (4.12%), Output: 0 rows (0B)
+          │   Input avg.: 0.00 rows, Input std.dev.: ?%
+          └─ RemoteSource[sourceFragmentIds = [5]]
+                 Layout: [s_store_sk:integer]
+                 CPU: 0.00ns (0.00%), Scheduled: 0.00ns (0.00%), Blocked: 154.00ms (2.11%), Output: 0 rows (0B)
+                 Input avg.: 0.00 rows, Input std.dev.: ?%
+
+Fragment 3 [SOURCE]
+    CPU: 1.96ms, Scheduled: 2.09ms, Blocked 0.00ns (Input: 0.00ns, Output: 0.00ns), Input: 7200 rows (67.82kB); per task: avg.: 7200.00 std.dev.: 0.00, Output: 720 rows (3.52kB)
+    Peak Memory: 4.35kB, Tasks count: 1; per task: max: 4.35kB
+    Output layout: [hd_demo_sk]
+    Output partitioning: BROADCAST []
+    ScanFilterProject[table = iceberg:tpcds_sf10.household_demographics$data@1174780138357155807, filterPredicate = (hd_dep_count = integer '7')]
+        Layout: [hd_demo_sk:integer]
+        Estimates: {rows: 7200 (35.16kB), cpu: 70.31k, memory: 0B, network: 0B}/{rows: ? (?), cpu: 70.31k, memory: 0B, network: 0B}/{rows: ? (?), cpu: ?, memory: 0B, network: 0B}
+        CPU: 2.00ms (0.07%), Scheduled: 2.00ms (0.02%), Blocked: 0.00ns (0.00%), Output: 720 rows (3.52kB)
+        Input avg.: 7200.00 rows, Input std.dev.: 0.00%
+        hd_dep_count := 4:hd_dep_count:integer
+        hd_demo_sk := 1:hd_demo_sk:integer
+        Input: 7200 rows (67.82kB), Filtered: 90.00%, Physical input: 46.66kB, Physical input time: 14.91us
+
+Fragment 4 [SOURCE]
+    CPU: 10.16ms, Scheduled: 11.39ms, Blocked 0.00ns (Input: 0.00ns, Output: 0.00ns), Input: 86400 rows (541.88kB); per task: avg.: 86400.00 std.dev.: 0.00, Output: 1800 rows (8.79kB)
+    Peak Memory: 10.82kB, Tasks count: 1; per task: max: 10.82kB
+    Output layout: [t_time_sk]
+    Output partitioning: BROADCAST []
+    ScanFilterProject[table = iceberg:tpcds_sf10.time_dim$data@487749166003073129, filterPredicate = ((t_hour = integer '20') AND (t_minute >= integer '30'))]
+        Layout: [t_time_sk:integer]
+        Estimates: {rows: 86400 (421.88kB), cpu: 1.24M, memory: 0B, network: 0B}/{rows: 38221 (186.63kB), cpu: 1.24M, memory: 0B, network: 0B}/{rows: 38221 (186.63kB), cpu: 186.63k, memory: 0B, network: 0B}
+        CPU: 10.00ms (0.35%), Scheduled: 11.00ms (0.14%), Blocked: 0.00ns (0.00%), Output: 1800 rows (8.79kB)
+        Input avg.: 86400.00 rows, Input std.dev.: 0.00%
+        t_hour := 4:t_hour:integer
+        t_time_sk := 1:t_time_sk:integer
+        t_minute := 5:t_minute:integer
+        Input: 86400 rows (541.88kB), Filtered: 97.92%, Physical input: 1.05MB, Physical input time: 428.93us
+
+Fragment 5 [SOURCE]
+    CPU: 1.14ms, Scheduled: 1.77ms, Blocked 0.00ns (Input: 0.00ns, Output: 0.00ns), Input: 0 rows (0B); per task: avg.: 0.00 std.dev.: 0.00, Output: 0 rows (0B)
+    Peak Memory: 0B, Tasks count: 1; per task: max: 0B
+    Output layout: [s_store_sk]
+    Output partitioning: BROADCAST []
+    ScanFilterProject[table = iceberg:tpcds_sf10.store$data@8246713999940950807, filterPredicate = (s_store_name = varchar 'ese')]
+        Layout: [s_store_sk:integer]
+        Estimates: {rows: 120 (600B), cpu: 3.42k, memory: 0B, network: 0B}/{rows: 60 (300B), cpu: 3.42k, memory: 0B, network: 0B}/{rows: 60 (300B), cpu: 300, memory: 0B, network: 0B}
+        CPU: 1.00ms (0.03%), Scheduled: 2.00ms (0.02%), Blocked: 0.00ns (0.00%), Output: 0 rows (0B)
+        Input avg.: 0.00 rows, Input std.dev.: ?%
+        s_store_name := 6:s_store_name:varchar
+        s_store_sk := 1:s_store_sk:integer
+        Input: 0 rows (0B), Filtered: ?%
+
+"
