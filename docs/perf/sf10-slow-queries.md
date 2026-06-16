@@ -11,6 +11,49 @@ Trino from `EXPLAIN ANALYZE`.
 > wall-clock is indicative. The **plan shapes, scan byte/row counts, and join
 > strategies** below are the trustworthy signals.
 
+## VALIDATED 2026-06-16: clean-rig run confirms the fix and the honest crossover
+
+Re-ran the whole comparison on a dedicated 8-core / 31 GB box (nothing else on it),
+both engines containerized against the same Iceberg store, query cache off,
+single-node. This removes the contention caveat above: the suite totals here are
+trustworthy because both engines share the box, so the hardware cancels in the
+ratio. Trino is 465.
+
+The dynamic-filter fix holds at scale. The four queries that ran 160 to 300
+seconds are now 4.6s (q10), 4.9s (q12), 13.5s (q17), 3.1s (q20). No query explodes.
+
+| Suite | SQE | Trino | Ratio | Match |
+|---|---|---|---|---|
+| TPC-H SF1 | 15.8s | 36.4s | 2.3x | 22/22 |
+| SSB SF1 | 4.8s | 7.3s | 1.5x | 13/13 |
+| TPC-DS SF1 | 46.6s | 111.3s | 2.4x | 92/99 |
+| TPC-H SF10 | 126.4s | 108.8s | **0.86x** | 21/22 |
+| SSB SF10 | 31.8s | 16.8s | **0.53x** | 13/13 |
+| TPC-DS SF10 | 374s | 455s | **1.22x** | 95/99 |
+
+SQE wins every suite at SF1. At SF10 there is a real scaling crossover: SQE wins
+TPC-DS on breadth (q01/q02/q04/q05/q08/q11/q14/q22/q23 by 2 to 4x) even while
+losing the single biggest query q72 (0.7x, 140s of SQE's 374s total), but trails
+TPC-H on the heavy joins (q09 0.3x, q18 0.6x) and trails SSB across the board.
+The contended-Mac read of "SQE wins TPC-H SF10" did not survive a clean box. It is
+not a cache effect: the compare runs each query once, so the result cache cannot
+inflate a single sweep. On large data Trino's vectorized and distributed hash
+joins scale better. That is the work ahead.
+
+All three SF10 suites were measured under one memory budget (SQE 12 GB pool,
+Trino heap capped at 32 percent with 7 GB per query) after a host OOM-kill of the
+SQE process showed that a 16 GB pool plus Trino's default heap did not fit 31 GB.
+TPC-H and SSB were re-run at this budget to confirm the numbers did not move
+(both within a percent of the 16 GB run), so the TPC-DS win is not a Trino memory
+handicap.
+
+Loading SF10 also surfaced a write-path gap: a partitioned CTAS with a
+sort-on-write hint fans the sort into one non-spillable merge buffer per output
+partition, exhausting the pool (TPC-H lineitem at 60M rows across ~84 monthly
+partitions failed where the unpartitioned SSB lineorder of the same size sorted
+fine). The bench loader now skips the redundant sort on already-partitioned
+tables; the engine-level fix (bounded or spillable partition writers) is open.
+
 ## RESOLVED 2026-06-15: the q12/q17/q10/q20 explosions were a dynamic-filter snapshot bug
 
 The first cut of this doc (below) blamed the q12/q17/q10/q20 blow-ups on partition
