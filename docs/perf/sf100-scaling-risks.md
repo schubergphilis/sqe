@@ -14,20 +14,37 @@ and prove distributed execution at real multi-node scale.
 
 ## Ranked failure modes
 
-### 1. Non-spillable sort/merge OOMs hard (availability, not just speed)
+### 1. Non-spillable sort merge OOMs hard (availability, not just speed)
 
-`ExternalSorterMerge` reports `can_spill = false`. At SF10 this already crashed a
-*write*: a partitioned sort-on-write CTAS held ~11 GB across three `ExternalSorter`
-instances and the non-spillable merge could not allocate (the memory-safe-write MR
+Verified against DataFusion 53.1.0 `physical-plan/src/sorts/sort.rs`, not just the
+error text. The `ExternalSorter` has two reservations: the in-memory sort buffer is
+created `.with_can_spill(true)` (line 283), but the `merge_reservation`
+(`MemoryConsumer::new("ExternalSorterMerge[...]")`, line 286) is created **without**
+`with_can_spill`, so it defaults to **non-spillable**. The final merge takes **all**
+finished spill files in a **single pass** (`with_sorted_spill_files(take(finished_spill_files))`,
+line 358), so the non-spillable `merge_reservation` grows with the spill-file count
+(roughly one max-size batch per run). There is no bounded multi-pass merge.
+
+Consequence: the sort *phase* spills fine, but the final *merge* reserves
+non-spillable memory proportional to (spill runs) x (concurrent sorter instances).
+It OOMs hard rather than degrading once that product exceeds the pool. We hit
+exactly this at SF10 on a partitioned sort-on-write CTAS: many partitions each ran
+their own `ExternalSorterMerge` (the log showed several `(can spill: false)`
+consumers holding ~1.2 GB each) and the pool exhausted. The memory-safe-write MR
 worked around it by skipping the sort on partitioned tables; the engine gap is
-filed as an issue). At SF100 the same operator backs every large `ORDER BY`,
-sort-merge join, window function, and sort-on-write load, with 10x the rows. It
-OOMs hard instead of degrading. This caps the data a single node can process
-regardless of pool size, so it is the first thing to hit and the worst (a crash,
-not a slowdown).
+open.
 
-Lever: make the merge phase spillable. This is the single highest-value engine fix
-for scale and it gates almost everything below.
+Why it is the SF100 headline: at scale both multipliers grow. A single large
+`ORDER BY` / sort-merge join / window / sort-on-write spills into many more runs
+(bigger single-pass merge reservation), and wide or partitioned plans run many
+merges concurrently. It is not literally *every* sort, but the threshold where the
+non-spillable merge reservation exceeds the pool drops as data grows, and past it
+the failure is a crash, not a slowdown, regardless of pool size.
+
+Levers: (a) the real fix is a bounded multi-pass spill merge or a spillable merge
+reservation; (b) `datafusion.execution.sort_spill_reservation_bytes` (line 262)
+pre-reserves room for the merge and can delay the OOM, but does not remove the
+non-spillable single-pass merge. This gates almost everything below.
 
 ### 2. Broadcast (CollectLeft) joins stop fitting
 
@@ -94,7 +111,7 @@ path is spill-safe. Fix this first or none of the above is observable.
 
 | # | Failure mode | First bites | Lever | State |
 |---|---|---|---|---|
-| 1 | Non-spillable sort/merge OOM | any large sort/agg | spillable merge | engine fix, open (extends the partitioned-write issue) |
+| 1 | Non-spillable single-pass sort merge OOM | large sorts (many spill runs) + wide/partitioned plans | bounded multi-pass / spillable merge | engine fix, open (extends the partitioned-write issue) |
 | 2 | Broadcast joins overflow | big fact-fact joins | distributed shuffle join | exists, unproven at multi-node scale |
 | 3 | Single-partition scan | scan-bound (SSB) | broadcast-parallel probe | designed, not built |
 | 4 | Membership-set eval/memory | dim-filtered fact scans | pre-decode RowFilter pushdown | partial (SSB key-set) |
