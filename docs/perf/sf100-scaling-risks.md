@@ -52,14 +52,25 @@ uncapped greedy growth and reactive spill, the crash threshold drops below norma
 query sizes. It is a concurrency-and-pool-discipline problem, not a single-sort
 limit, and the failure is a crash, not a slowdown.
 
-Levers (see the closing section for the full plan): cap concurrent sort consumers
-SQE-side (reduce sort partition count / sequentialize sort-on-write under pressure,
-extending the existing adaptive-sort + memory governor); per-consumer pool
-discipline (a reservation cap or FairSpillPool for sort-heavy multi-consumer plans,
-traded against the greedy pool chosen for wide aggregates); distribute the sort
-(risk 2) to cut per-node concurrency; upstream the per-consumer cap (DataFusion's
-own TODO) and proactive spill (#17334). `sort_spill_reservation_bytes` pre-reserves
-merge room and buys headroom but does not remove the starvation.
+Reproduced and mitigation validated (2026-06-16). A fast safe proxy: 4 concurrent
+SF1 sorted CTAS on a 1 GB pool. Under the default **greedy** pool, one crashes with
+`Resources exhausted: ExternalSorterMerge[0]` while the spillable `ExternalSorter`
+buffers held ~735 MB **un-spilled** (greedy let them) and a non-spillable merge
+needed 109 KB it could not get. Under **FairSpillPool** (`memory_pool = "fair"`),
+the same four all succeed: fair caps each consumer and forces earlier spilling, so
+the non-spillable merges get their allocation. So FairSpillPool is a real
+mitigation, but SQE defaults to greedy because fair regressed TPC-DS q39 at SF10
+(it divides the pool across ~90 spillable consumers, ~95 MB each, and wide
+aggregates fail).
+
+Levers (see the closing section for the full plan): the SQE-side fix is
+**plan-adaptive pool selection** -- FairSpillPool when the plan has a few large
+spillable sort consumers, greedy when it has many (wide aggregate); cap concurrent
+sort consumers under pressure (extend the existing adaptive-sort + memory governor);
+distribute the sort (risk 2) to cut per-node concurrency; upstream the per-consumer
+reservation cap (DataFusion's own TODO) and proactive spill (#17334).
+`sort_spill_reservation_bytes` pre-reserves merge room and buys headroom but does
+not remove the starvation.
 
 ### 2. Broadcast (CollectLeft) joins stop fitting
 
