@@ -148,3 +148,95 @@ EXPLAIN-driven, on the clean rig (data already loaded):
 - This is a design. Phase 1 is one focused change (`repartitioned()` +
   config flag + morsel-balanced slicing) and is independently shippable and
   measurable before Phase 2.
+
+## Update 2026-06-16: Phase 1 above was built and it REGRESSED. Redesign below.
+
+The Phase 1 above (implement `repartitioned()` + enable
+`repartition_file_scans`) was implemented and measured on the clean rig. It made
+things worse, broadly:
+
+| Query | Baseline | With Phase 1 | Result |
+|---|---|---|---|
+| tpch q09 | 17.3s | 90.5s | 5x worse |
+| ssb q2.2 | 3.2s | 10.7s | 3.4x worse |
+| tpcds q50 | 11.0s | 12.8s | worse |
+
+The plan shape changed exactly as predicted (the scan now emits 8 partitions,
+confirmed by EXPLAIN). The assumption that was wrong: "the optimizer splits only
+where beneficial and CollectLeft builds stay single-partition, so no regression."
+
+**What actually happened (verified by EXPLAIN on q09):** `repartition_file_scans`
+is a global flag. Once the fact scans advertise `UnknownPartitioning(8)`,
+DataFusion's planner flips the big fact-to-fact joins from `CollectLeft` to
+`PartitionMode::Partitioned` and inserts `RepartitionExec(Hash)` on both sides. For
+q09 that means **hash-shuffling the 60M-row lineitem twice** (once on
+`(l_suppkey, l_partkey)` for the partsupp join, once on `l_orderkey` for the orders
+join). On a single node, shuffling the fact table costs far more than the
+baseline's `CollectLeft` (build the small/medium dim once, stream lineitem through
+once, no shuffle). The naive change traded a single-threaded scan for a
+multi-shuffle plan. This is the same join-mode-interaction trap the
+`table_provider.rs` comment warned about, now confirmed from the other direction.
+
+DataFusion-native `DataSourceExec` does not regress this way at SF10 because
+DataFusion is built for multi-core/distributed execution where the shuffle pays
+off; SQE single-node with a `CollectLeft`-friendly 64MB broadcast threshold wants
+the opposite: parallelize the probe, never shuffle the fact.
+
+### The real goal: parallel probe, broadcast build, no fact shuffle
+
+This is exactly Trino's `BROADCAST` join over a parallel SOURCE stage. The build
+side is replicated (collected once), and the probe side runs N-way in parallel with
+no repartition. In DataFusion terms: an N-partition probe scan feeding a
+`CollectLeft` hash join (which already supports a multi-partition probe against a
+single shared build). The enemy is the planner promoting the join to `Partitioned`.
+
+Split by the A1/A2 cardinality line from the aggregation, because the fix differs:
+
+### Phase 1 (revised): in-operator parallel filter for A1 (decode/filter-bound)
+
+A1 queries (q50, q17, SSB, q08 -- ~40-50s of the 114s) decode a large input and
+emit a small output. Their cost is not the scan-to-downstream handoff (output is
+tiny); it is that the **Tier-2 dynamic-filter runs single-threaded on the merged
+stream**. q50 shows 8.5s of `IcebergScanExec` elapsed_compute to emit 34k rows:
+the date-join dynamic filter seals after the scan task opened, so Tier-1 row-group
+pruning sampled `lit(true)` and pruned nothing, and all ~28M store_returns rows are
+filtered post-decode on the one poll thread.
+
+Fix without touching the plan shape (so no join-mode flip, no regression risk):
+keep the single output partition, but run the Tier-2 filter across a bounded set of
+spawned tasks instead of a serial `stream.map`. The decode is already
+`num_cpus`-concurrent inside iceberg-rust; parallelize the post-decode filter the
+same way (`map(spawn(filter)).buffered(N)`) so the single output stream carries
+already-filtered batches and the poll thread only forwards. This is morsel
+parallelism applied inside the operator. Confirm with a profile that the Tier-2
+filter (not the channel merge) is the single-threaded cost before building.
+Alternatively, make selective dynamic filters seal before decode (bounded wait on
+the build) so Tier-1 prunes row groups and far fewer rows reach the filter at all.
+
+### Phase 2: broadcast-parallel probe for A2 (high-output, e.g. q72)
+
+A2 queries push many rows through the scan-to-downstream handoff; the single output
+partition is a real ceiling and N partitions are required. To get N partitions
+without the `Partitioned`-shuffle regression, the join must stay `CollectLeft`
+(broadcast build) with an N-partition probe. Options, in rough order of
+invasiveness:
+
+1. A custom physical-optimizer rule that runs after `JoinSelection` /
+   `EnforceDistribution`: where a large fact-scan probe sits under a hash join whose
+   build side is broadcast-eligible, force `CollectLeft` with an N-partition probe
+   and strip any `RepartitionExec(Hash)` the optimizer added on the probe side.
+   This is the "Doris-style local shuffle" the `table_provider.rs` comment named:
+   fan the scan to N local pipelines, broadcast the build, never hash-shuffle the
+   fact.
+2. A dedicated parallel-scan exec the planner treats as broadcast-probe-friendly,
+   so `JoinSelection` does not flip to `Partitioned` when it appears.
+
+Phase 2 is genuinely harder and should follow Phase 1's measured win.
+
+### Status
+
+The regressing Phase-1 image is live on the bench rig (idle; the committed PR #3
+results and the engine source on `main` are unaffected -- the `repartitioned()`
+change is not committed). Reverting requires a rebuild with the `repartitioned()`
+hook removed (or guarded off). Next step is the Phase 1 (revised) in-operator
+parallel filter, profile-confirmed first.
