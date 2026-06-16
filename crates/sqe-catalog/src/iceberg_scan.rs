@@ -1288,15 +1288,28 @@ impl ExecutionPlan for IcebergScanExec {
                 // extra rows, never drop a match.
                 let resolved_cache: ResolvedFilterCache =
                     Arc::new(std::sync::Mutex::new(vec![None; filters.len()]));
+                let filter_concurrency = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(8);
                 arrow_stream
                     .map_err(|e: iceberg::Error| DataFusionError::External(Box::new(e)))
-                    .and_then(move |batch| {
+                    .map(move |batch_res| {
                         let filters = filters.clone();
                         let filtered_schema = filtered_schema.clone();
                         let rows_filtered_dynamic = rows_filtered_dynamic.clone();
                         let rows_passed_filter_pending = rows_passed_filter_pending.clone();
                         let resolved_cache = resolved_cache.clone();
                         async move {
+                            let batch = batch_res?;
+                            // The Tier-2 membership-filter evaluation is pure CPU and
+                            // was the single-threaded bottleneck: TPC-DS q50 SF10
+                            // spent ~30s applying 15 build-side IN-sets to 86M rows
+                            // on the one scan-output poll thread, while decoding the
+                            // same rows took ~37ms. Run the eval on the blocking pool
+                            // and let buffer_unordered keep `filter_concurrency`
+                            // batches in flight, so filtering scales across cores
+                            // (uniform join keys mean no row-group pruning can help).
+                            tokio::task::spawn_blocking(move || -> DFResult<RecordBatch> {
                             let rows_in = batch.num_rows();
                             let mut saw_pending = false;
                             let mut result = batch;
@@ -1370,8 +1383,12 @@ impl ExecutionPlan for IcebergScanExec {
                                 rows_passed_filter_pending.add(result.num_rows());
                             }
                             Ok(result)
+                            })
+                            .await
+                            .map_err(|e| DataFusionError::External(Box::new(e)))?
                         }
                     })
+                    .buffer_unordered(filter_concurrency)
                     .boxed()
             } else {
                 arrow_stream
