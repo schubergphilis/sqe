@@ -36,9 +36,9 @@ authors = ["Schuberg Philis"]
 [workspace.dependencies]
 # Query engine — DataFusion 53 with hash join dynamic filters, LIMIT-aware pruning,
 # 40x faster planning, nested field pushdown, and 42 function improvements.
-datafusion = "53.1"
-datafusion-expr = "53.1"
-datafusion-proto = "53.1"
+datafusion = "54"
+datafusion-expr = "54"
+datafusion-proto = "54"
 
 # Arrow 58 / Parquet 58 — aligned with DataFusion 53
 arrow = { version = "58", features = ["prettyprint", "ipc_compression"] }
@@ -88,7 +88,7 @@ sqlx = { version = "0.8.1", default-features = false }
 sqlparser = { version = "0.54", features = ["visitor"] }
 
 # JSON functions for DataFusion (Trino json_extract compat)
-datafusion-functions-json = "0.53"
+datafusion-functions-json = "0.54"
 
 # Async — use only what is needed; avoid ["full"] which includes fs/process/io-std
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "fs"] }

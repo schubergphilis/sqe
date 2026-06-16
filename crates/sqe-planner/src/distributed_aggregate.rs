@@ -21,7 +21,6 @@
 //!   aggregation into two-phase when distributed mode is active
 //! - [`AggregateStrategy`] — enum selecting between coordinator merge and shuffle merge
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -182,10 +181,6 @@ impl ExecutionPlan for PartialAggregateExec {
         "PartialAggregateExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> arrow_schema::SchemaRef {
         self.inner.schema()
     }
@@ -204,7 +199,6 @@ impl ExecutionPlan for PartialAggregateExec {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let new_inner = Arc::clone(&self.inner)
             .with_new_children(children)?
-            .as_any()
             .downcast_ref::<AggregateExec>()
             .ok_or_else(|| {
                 DataFusionError::Internal(
@@ -314,10 +308,6 @@ impl ExecutionPlan for FinalAggregateExec {
         "FinalAggregateExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> arrow_schema::SchemaRef {
         self.inner.schema()
     }
@@ -336,7 +326,6 @@ impl ExecutionPlan for FinalAggregateExec {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let new_inner = Arc::clone(&self.inner)
             .with_new_children(children)?
-            .as_any()
             .downcast_ref::<AggregateExec>()
             .ok_or_else(|| {
                 DataFusionError::Internal(
@@ -427,7 +416,7 @@ impl PhysicalOptimizerRule for DistributedAggregateRule {
         let hc_threshold = self.high_cardinality_threshold;
 
         let transformed = plan.transform_down(|node| {
-            if let Some(agg_exec) = node.as_any().downcast_ref::<AggregateExec>() {
+            if let Some(agg_exec) = node.downcast_ref::<AggregateExec>() {
                 // Only rewrite single-phase aggregations (not already split)
                 let mode = agg_exec.mode();
                 if *mode != AggregateMode::Single {
@@ -549,7 +538,6 @@ fn estimate_group_cardinality(agg: &AggregateExec) -> Option<usize> {
     // Only plain column references map to an input column index; anything else
     // (expressions, function calls) has no single backing column statistic.
     let column = first_expr
-        .as_any()
         .downcast_ref::<datafusion::physical_expr::expressions::Column>()?;
     let col_index = column.index();
 

@@ -22,7 +22,6 @@
 //! but produced wrong results in any aggregation context. This module
 //! replaces them.
 
-use std::any::Any;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -114,9 +113,6 @@ impl ArgExtremum {
 }
 
 impl AggregateUDFImpl for ArgExtremum {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &str {
         self.direction.primary_name()

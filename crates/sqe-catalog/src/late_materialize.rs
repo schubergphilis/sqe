@@ -62,7 +62,7 @@ fn collect_column_refs(expr: &dyn PhysicalExpr) -> HashSet<String> {
 
 fn collect_column_refs_inner(expr: &dyn PhysicalExpr, columns: &mut HashSet<String>) {
     // Check if this node is a Column expression
-    if let Some(col) = expr.as_any().downcast_ref::<Column>() {
+    if let Some(col) = expr.downcast_ref::<Column>() {
         columns.insert(col.name().to_string());
     }
 
@@ -281,7 +281,7 @@ fn remap_expr(
     expr: &Arc<dyn PhysicalExpr>,
     target_schema: &SchemaRef,
 ) -> Result<Arc<dyn PhysicalExpr>, datafusion::error::DataFusionError> {
-    if let Some(col) = expr.as_any().downcast_ref::<Column>() {
+    if let Some(col) = expr.downcast_ref::<Column>() {
         // Find this column's index in the target schema
         let new_index = target_schema.index_of(col.name()).map_err(|_| {
             datafusion::error::DataFusionError::Internal(format!(
@@ -418,7 +418,7 @@ fn decompose_conjunction_inner(
     use datafusion::logical_expr::Operator;
     use datafusion::physical_plan::expressions::BinaryExpr;
 
-    if let Some(binary) = expr.as_any().downcast_ref::<BinaryExpr>() {
+    if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
         if *binary.op() == Operator::And {
             decompose_conjunction_inner(binary.left(), terms);
             decompose_conjunction_inner(binary.right(), terms);
@@ -777,7 +777,6 @@ mod tests {
             remap_predicate_columns(&expr, &predicate_schema).expect("remap should succeed");
 
         let col = remapped
-            .as_any()
             .downcast_ref::<Column>()
             .expect("should be Column");
         assert_eq!(col.name(), "b");

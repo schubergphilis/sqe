@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
@@ -43,9 +42,6 @@ impl SystemCatalogProvider {
 }
 
 impl CatalogProvider for SystemCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn schema_names(&self) -> Vec<String> {
         let mut names = vec!["jdbc".to_string(), "metadata".to_string()];

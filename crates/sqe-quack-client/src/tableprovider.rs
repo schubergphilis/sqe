@@ -11,7 +11,6 @@
 //! always exists for non-empty queries (every PrepareResponse carries
 //! `result_names` plus the first DataChunk).
 
-use std::any::Any;
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
@@ -59,9 +58,6 @@ impl QuackTableProvider {
 
 #[async_trait]
 impl TableProvider for QuackTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

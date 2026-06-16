@@ -27,7 +27,6 @@
 //!   `SqeTableProvider`: `projection` contains indices into the augmented
 //!   schema (base columns plus three meta columns).
 
-use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -120,9 +119,6 @@ impl IncrementalTableProvider {
 
 #[async_trait]
 impl TableProvider for IncrementalTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn schema(&self) -> ArrowSchemaRef {
         self.augmented_schema.clone()
@@ -334,9 +330,6 @@ impl DisplayAs for IncrementalScanExec {
 impl ExecutionPlan for IncrementalScanExec {
     fn name(&self) -> &str {
         "IncrementalScanExec"
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
     }
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties

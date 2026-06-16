@@ -2119,7 +2119,7 @@ impl QueryHandler {
             }
         };
 
-        let iceberg_scan = match scan_node.as_any().downcast_ref::<IcebergScanExec>() {
+        let iceberg_scan = match scan_node.downcast_ref::<IcebergScanExec>() {
             Some(s) => s,
             None => {
                 tracing::warn!("find_iceberg_scan returned unexpected node type, falling back to local");
@@ -4160,10 +4160,10 @@ fn collect_raw_iceberg_table_idents(
     out: &mut std::collections::HashSet<String>,
 ) {
     use datafusion::physical_plan::aggregates::AggregateExec;
-    if plan.as_any().downcast_ref::<AggregateExec>().is_some() {
+    if plan.downcast_ref::<AggregateExec>().is_some() {
         return;
     }
-    if let Some(scan) = plan.as_any().downcast_ref::<IcebergScanExec>() {
+    if let Some(scan) = plan.downcast_ref::<IcebergScanExec>() {
         out.insert(scan.table().identifier().to_string());
     }
     for child in plan.children() {
@@ -4199,10 +4199,10 @@ fn strip_self_join_dynamic_filters(
 ) -> Arc<dyn ExecutionPlan> {
     let original = Arc::clone(&plan);
     let result = plan.transform_up(|node| {
-        let Some(hj) = node.as_any().downcast_ref::<HashJoinExec>() else {
+        let Some(hj) = node.downcast_ref::<HashJoinExec>() else {
             return Ok(Transformed::no(node));
         };
-        if *hj.join_type() != JoinType::Inner || hj.dynamic_filter_for_test().is_none() {
+        if *hj.join_type() != JoinType::Inner || hj.dynamic_filter_expr().is_none() {
             return Ok(Transformed::no(node));
         }
         let mut left = std::collections::HashSet::new();
@@ -4242,7 +4242,7 @@ fn find_iceberg_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionP
     let mut scans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
     let mut stack: Vec<Arc<dyn ExecutionPlan>> = vec![Arc::clone(plan)];
     while let Some(node) = stack.pop() {
-        if node.as_any().downcast_ref::<IcebergScanExec>().is_some() {
+        if node.downcast_ref::<IcebergScanExec>().is_some() {
             scans.push(node);
             continue;
         }

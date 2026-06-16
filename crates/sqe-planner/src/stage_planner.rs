@@ -201,7 +201,7 @@ fn decompose_recursive(
     let mut extracted = HashMap::new();
 
     // Check if this node is a shuffle boundary
-    if let Some(smj) = plan.as_any().downcast_ref::<SortMergeJoinExec>() {
+    if let Some(smj) = plan.downcast_ref::<SortMergeJoinExec>() {
         // SortMergeJoinExec: both sides need shuffle on join keys.
         let children = plan.children();
         let left = children[0];
@@ -255,7 +255,7 @@ fn decompose_recursive(
 
         extracted.insert(0, left_stage_id);
         extracted.insert(1, right_stage_id);
-    } else if let Some(hj) = plan.as_any().downcast_ref::<HashJoinExec>() {
+    } else if let Some(hj) = plan.downcast_ref::<HashJoinExec>() {
         // HashJoinExec: build side (left) needs shuffle on join keys.
         let children = plan.children();
         let left = children[0];
@@ -289,7 +289,7 @@ fn decompose_recursive(
         // Also recurse into probe side (right), which may have its own boundaries
         let right = children[1];
         decompose_recursive(right, builder);
-    } else if let Some(_sort) = plan.as_any().downcast_ref::<SortExec>() {
+    } else if let Some(_sort) = plan.downcast_ref::<SortExec>() {
         // SortExec with multiple input partitions may need range-shuffle
         // for distributed sort. For now, just mark it as a potential
         // boundary — the actual range boundary computation is in Stream 7.
@@ -437,7 +437,6 @@ mod tests {
     use datafusion::physical_plan::{
         DisplayAs, DisplayFormatType, Partitioning, PlanProperties,
     };
-    use std::any::Any;
 
     fn test_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -479,9 +478,6 @@ mod tests {
     impl ExecutionPlan for MockScanExec {
         fn name(&self) -> &str {
             "MockScanExec"
-        }
-        fn as_any(&self) -> &dyn Any {
-            self
         }
         fn schema(&self) -> SchemaRef {
             self.schema.clone()

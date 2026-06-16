@@ -27,7 +27,6 @@
 //! `ScalarValue::iter_to_array`. Multi-phase aggregation state is a
 //! `List<Struct{key, value}>` per partial accumulator.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -171,9 +170,6 @@ impl std::hash::Hash for MapAgg {
 }
 
 impl AggregateUDFImpl for MapAgg {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "map_agg"
     }
@@ -322,9 +318,6 @@ impl std::hash::Hash for MultimapAgg {
 }
 
 impl AggregateUDFImpl for MultimapAgg {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "multimap_agg"
     }
@@ -552,9 +545,6 @@ impl std::hash::Hash for MapUnion {
 }
 
 impl AggregateUDFImpl for MapUnion {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "map_union"
     }

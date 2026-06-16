@@ -75,7 +75,7 @@ impl PhysicalOptimizerRule for JoinStrategyRule {
 
         let threshold = self.hash_join_threshold;
         let transformed = plan.transform_down(|node| {
-            if let Some(hash_join) = node.as_any().downcast_ref::<HashJoinExec>() {
+            if let Some(hash_join) = node.downcast_ref::<HashJoinExec>() {
                 let build_side_size = estimate_build_side_size(hash_join);
                 trace!(
                     build_side_bytes = build_side_size,
@@ -301,7 +301,7 @@ mod tests {
 
         // Should still be HashJoinExec (unchanged)
         assert!(
-            result.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            result.downcast_ref::<HashJoinExec>().is_some(),
             "Expected HashJoinExec when threshold is 0, got: {:?}",
             result
         );
@@ -322,7 +322,7 @@ mod tests {
 
         // 0 bytes < 2 GB threshold, so it should stay as HashJoinExec
         assert!(
-            result.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            result.downcast_ref::<HashJoinExec>().is_some(),
             "Expected HashJoinExec when build side is below threshold"
         );
     }
@@ -358,7 +358,7 @@ mod tests {
         // Directly test the conversion function
         let result = convert_to_sort_merge_join(&hash_join).unwrap();
         assert!(
-            result.as_any().downcast_ref::<SortMergeJoinExec>().is_some(),
+            result.downcast_ref::<SortMergeJoinExec>().is_some(),
             "Expected SortMergeJoinExec after conversion"
         );
     }
@@ -404,7 +404,7 @@ mod tests {
 
             let smj = result.unwrap();
             assert!(
-                smj.as_any().downcast_ref::<SortMergeJoinExec>().is_some(),
+                smj.downcast_ref::<SortMergeJoinExec>().is_some(),
                 "Expected SortMergeJoinExec for join type {join_type:?}"
             );
         }
@@ -435,7 +435,6 @@ mod tests {
 
         let smj = convert_to_sort_merge_join(&hash_join).unwrap();
         let smj = smj
-            .as_any()
             .downcast_ref::<SortMergeJoinExec>()
             .expect("Expected SortMergeJoinExec");
 
@@ -445,11 +444,11 @@ mod tests {
         let right_child = &smj.children()[1];
 
         assert!(
-            left_child.as_any().downcast_ref::<SortExec>().is_some(),
+            left_child.downcast_ref::<SortExec>().is_some(),
             "Expected left input to be wrapped in SortExec"
         );
         assert!(
-            right_child.as_any().downcast_ref::<SortExec>().is_some(),
+            right_child.downcast_ref::<SortExec>().is_some(),
             "Expected right input to be wrapped in SortExec"
         );
     }
@@ -472,13 +471,13 @@ mod tests {
 
         // The result should be the same SortExec, not a SortExec wrapping SortExec
         assert!(
-            result.as_any().downcast_ref::<SortExec>().is_some(),
+            result.downcast_ref::<SortExec>().is_some(),
             "Expected SortExec"
         );
         // Check the child of the result SortExec is NOT another SortExec
         let children = result.children();
         assert!(
-            children[0].as_any().downcast_ref::<SortExec>().is_none(),
+            children[0].downcast_ref::<SortExec>().is_none(),
             "Should not double-wrap in SortExec"
         );
     }

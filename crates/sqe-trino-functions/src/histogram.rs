@@ -26,7 +26,6 @@
 //! same accumulator pattern but with different state/output shapes; they
 //! ship in a follow-up MR once the histogram path is exercised.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -83,9 +82,6 @@ impl std::hash::Hash for Histogram {
 }
 
 impl AggregateUDFImpl for Histogram {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &str {
         "histogram"
