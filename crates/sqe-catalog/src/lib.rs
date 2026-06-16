@@ -31,8 +31,11 @@ pub mod hf_tree_cache;
 pub mod runtime_bridge;
 pub mod lazy_object_store;
 pub mod read_csv;
-#[cfg(feature = "delta")]
-pub mod read_delta;
+// `read_delta` is temporarily unwired for the DataFusion 54 bump: deltalake-core
+// has no DF 54 release yet (its `DeltaTableProvider` targets an older DataFusion).
+// The module file is kept on disk; restore this `pub mod` and the `delta` feature
+// in Cargo.toml once delta-rs ships DF 54 support.
+// pub mod read_delta;
 pub mod read_json;
 pub mod read_parquet;
 pub mod sort_order;

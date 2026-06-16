@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -73,9 +72,6 @@ impl InformationSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for InformationSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn table_names(&self) -> Vec<String> {
         vec![

@@ -228,25 +228,15 @@ pub fn build_embedded_context(memory_limit_bytes: usize) -> anyhow::Result<Sessi
             tvf_caller.clone(),
         )),
     );
-    // V11: Delta Lake reader. Wraps deltalake::open_table so users can
-    // query a Delta table root directly:
-    //   SELECT count(*) FROM read_delta('/data/delta/sales');
-    //   SELECT * FROM read_delta('s3://bucket/delta/orders',
-    //     access_key => 'AKIA...', secret_key => '...');
-    // Time-travel via version => '<int>' or timestamp => '<RFC3339>'.
-    // DEP-07: gated behind the `delta` feature (off by default) because
-    // deltalake-core pulls a second reqwest 0.13 + arrow/parquet tree.
-    // Enable with `--features delta`.
-    #[cfg(feature = "delta")]
-    ctx.register_udtf(
-        "read_delta",
-        Arc::new(sqe_catalog::read_delta::ReadDeltaFunction::with_caller(
-            tvf_storage,
-            tvf_caller,
-        )),
-    );
-    #[cfg(not(feature = "delta"))]
-    let _ = (&tvf_storage, &tvf_caller); // consumed by read_delta only when the feature is on
+    // V11 Delta Lake reader (`read_delta` TVF) is temporarily disabled for the
+    // DataFusion 54 bump: delta-rs (deltalake-core) has no DF 54 release yet, so
+    // its `DeltaTableProvider` implements an older DataFusion's `TableProvider`.
+    // The optional `delta` feature and the deltalake-core dependency are removed
+    // until delta-rs ships a DF 54-compatible release. Re-enable by restoring the
+    // `delta` feature (sqe-cli + sqe-catalog Cargo.toml), the `read_delta` module
+    // in sqe-catalog/src/lib.rs, and this registration. read_delta.rs is kept on
+    // disk unchanged for that purpose.
+    let _ = (tvf_storage, tvf_caller);
 
     Ok(ctx)
 }

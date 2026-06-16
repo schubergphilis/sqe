@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -42,9 +41,6 @@ impl std::fmt::Debug for MetadataSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for MetadataSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn table_names(&self) -> Vec<String> {
         vec![

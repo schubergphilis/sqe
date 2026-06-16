@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
@@ -271,9 +270,6 @@ impl SqeCatalogProvider {
 }
 
 impl CatalogProvider for SqeCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn schema_names(&self) -> Vec<String> {
         let mut names = self.cached_namespaces.clone();

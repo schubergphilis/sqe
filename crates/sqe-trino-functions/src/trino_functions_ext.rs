@@ -3,7 +3,6 @@
 //! This module contains additional Trino SQL functions beyond the core set
 //! in `trino_functions.rs`. Split into a separate file for maintainability.
 
-use std::any::Any;
 use std::sync::{Arc, LazyLock};
 
 use serde_json;
@@ -101,9 +100,6 @@ use crate::helpers::{str_transform, str_transform_2};
 struct Millisecond;
 
 impl ScalarUDFImpl for Millisecond {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "millisecond"
     }
@@ -140,9 +136,6 @@ impl ScalarUDFImpl for Millisecond {
 struct Infinity;
 
 impl ScalarUDFImpl for Infinity {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "infinity"
     }
@@ -167,9 +160,6 @@ impl ScalarUDFImpl for Infinity {
 struct Nan;
 
 impl ScalarUDFImpl for Nan {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "nan"
     }
@@ -192,9 +182,6 @@ impl ScalarUDFImpl for Nan {
 struct IsJsonScalar;
 
 impl ScalarUDFImpl for IsJsonScalar {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "is_json_scalar"
     }
@@ -241,9 +228,6 @@ impl ScalarUDFImpl for IsJsonScalar {
 struct JsonArrayContains;
 
 impl ScalarUDFImpl for JsonArrayContains {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "json_array_contains"
     }
@@ -296,9 +280,6 @@ fn check_json_array_contains(json: &str, search_val: &str) -> bool {
 struct Soundex;
 
 impl ScalarUDFImpl for Soundex {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "soundex"
     }
@@ -359,9 +340,6 @@ fn compute_soundex(s: &str) -> String {
 struct HammingDistance;
 
 impl ScalarUDFImpl for HammingDistance {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "hamming_distance"
     }
@@ -414,9 +392,6 @@ fn validate_radix(radix: i64) -> DFResult<u32> {
 struct FromBase;
 
 impl ScalarUDFImpl for FromBase {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "from_base"
     }
@@ -453,9 +428,6 @@ impl ScalarUDFImpl for FromBase {
 struct ToBase;
 
 impl ScalarUDFImpl for ToBase {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "to_base"
     }
@@ -516,9 +488,6 @@ impl ScalarUDFImpl for ToBase {
 struct FromIso8601Date;
 
 impl ScalarUDFImpl for FromIso8601Date {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "from_iso8601_date"
     }
@@ -570,9 +539,6 @@ fn parse_iso_date(s: &str) -> Option<NaiveDate> {
 struct FromIso8601Timestamp;
 
 impl ScalarUDFImpl for FromIso8601Timestamp {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "from_iso8601_timestamp"
     }
@@ -616,9 +582,6 @@ fn parse_iso_timestamp(s: &str) -> Option<i64> {
 struct ToIso8601;
 
 impl ScalarUDFImpl for ToIso8601 {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "to_iso8601"
     }
@@ -654,9 +617,6 @@ impl ScalarUDFImpl for ToIso8601 {
 struct CurrentTimezone;
 
 impl ScalarUDFImpl for CurrentTimezone {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "current_timezone"
     }
@@ -681,9 +641,6 @@ impl ScalarUDFImpl for CurrentTimezone {
 struct HumanReadableSeconds;
 
 impl ScalarUDFImpl for HumanReadableSeconds {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "human_readable_seconds"
     }
@@ -743,9 +700,6 @@ fn format_seconds(total: f64) -> String {
 struct LastDayOfMonth;
 
 impl ScalarUDFImpl for LastDayOfMonth {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "last_day_of_month"
     }
@@ -833,9 +787,6 @@ fn const_str_scalar(arg: &ColumnarValue) -> Option<&str> {
 struct RegexpExtract;
 
 impl ScalarUDFImpl for RegexpExtract {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "regexp_extract"
     }
@@ -886,9 +837,6 @@ impl ScalarUDFImpl for RegexpExtract {
 struct RegexpExtractAll;
 
 impl ScalarUDFImpl for RegexpExtractAll {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "regexp_extract_all"
     }
@@ -927,9 +875,6 @@ impl ScalarUDFImpl for RegexpExtractAll {
 struct RegexpSplit;
 
 impl ScalarUDFImpl for RegexpSplit {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "regexp_split"
     }
@@ -1062,9 +1007,6 @@ fn build_regex_list_array(
 struct Normalize;
 
 impl ScalarUDFImpl for Normalize {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "normalize"
     }
@@ -1096,9 +1038,6 @@ impl ScalarUDFImpl for Normalize {
 struct WithTimezone;
 
 impl ScalarUDFImpl for WithTimezone {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "with_timezone"
     }
@@ -1141,9 +1080,6 @@ impl ScalarUDFImpl for WithTimezone {
 struct AtTimezone;
 
 impl ScalarUDFImpl for AtTimezone {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "at_timezone"
     }
@@ -1198,9 +1134,6 @@ impl ScalarUDFImpl for AtTimezone {
 struct FormatDatetime;
 
 impl ScalarUDFImpl for FormatDatetime {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "format_datetime"
     }
@@ -1233,9 +1166,6 @@ impl ScalarUDFImpl for FormatDatetime {
 struct ParseDatetime;
 
 impl ScalarUDFImpl for ParseDatetime {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "parse_datetime"
     }
@@ -1311,9 +1241,6 @@ fn joda_to_chrono(joda: &str) -> String {
 struct WordStem;
 
 impl ScalarUDFImpl for WordStem {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "word_stem"
     }
@@ -1384,9 +1311,6 @@ impl ScalarUDFImpl for WordStem {
 struct Arbitrary;
 
 impl ScalarUDFImpl for Arbitrary {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "arbitrary"
     }
@@ -1427,9 +1351,6 @@ impl ScalarUDFImpl for Arbitrary {
 struct Checksum;
 
 impl ScalarUDFImpl for Checksum {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "checksum"
     }
@@ -1485,9 +1406,6 @@ impl ScalarUDFImpl for Checksum {
 struct TimezoneHour;
 
 impl ScalarUDFImpl for TimezoneHour {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "timezone_hour"
     }
@@ -1518,9 +1436,6 @@ impl ScalarUDFImpl for TimezoneHour {
 struct TimezoneMinute;
 
 impl ScalarUDFImpl for TimezoneMinute {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "timezone_minute"
     }
@@ -1555,9 +1470,6 @@ impl ScalarUDFImpl for TimezoneMinute {
 struct JsonSize;
 
 impl ScalarUDFImpl for JsonSize {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "json_size"
     }
@@ -1606,9 +1518,6 @@ fn json_size_at_path(json: &str, path: &str) -> Option<i64> {
 struct JsonArrayGet;
 
 impl ScalarUDFImpl for JsonArrayGet {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "json_array_get"
     }
@@ -1669,9 +1578,6 @@ fn json_array_get_impl(json: &str, idx: i64) -> Option<String> {
 struct Try;
 
 impl ScalarUDFImpl for Try {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &str {
         "try"
@@ -1707,9 +1613,6 @@ impl ScalarUDFImpl for Try {
 struct Format;
 
 impl ScalarUDFImpl for Format {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &str {
         "format"
@@ -1897,9 +1800,6 @@ fn apply_format(fmt: &str, args: &[String]) -> DFResult<String> {
 struct ToJson;
 
 impl ScalarUDFImpl for ToJson {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &str {
         "to_json"

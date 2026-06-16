@@ -17,10 +17,10 @@ path = "src/main.rs"
 # build with no AWS SDK weight.
 default = ["aws"]
 aws = ["sqe-catalog/glue", "sqe-catalog/s3tables"]
-# DEP-07: `delta` is opt-in (off by default). deltalake-core pulls a second
-# reqwest 0.13 + a second arrow/parquet tree via buoyant_kernel, so a default
-# `cargo install` stays slim. Enable the read_delta() TVF with `--features delta`.
-delta = ["sqe-catalog/delta"]
+# DEP-07: the `delta` feature (read_delta() TVF) is REMOVED for the DataFusion 54
+# bump. deltalake-core has no DF 54 release yet. Restore this line and the
+# sqe-catalog `delta` feature once delta-rs ships DF 54 support.
+# delta = ["sqe-catalog/delta"]
 
 [dependencies]
 sqe-core = { path = "../sqe-core" }

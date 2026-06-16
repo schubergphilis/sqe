@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -599,7 +598,6 @@ impl DisplayAs for IcebergScanExec {
 
 impl ExecutionPlan for IcebergScanExec {
     fn name(&self) -> &str { "IcebergScanExec" }
-    fn as_any(&self) -> &dyn Any { self }
     fn schema(&self) -> SchemaRef { self.projected_schema.clone() }
     fn properties(&self) -> &Arc<PlanProperties> { &self.properties }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![] }
@@ -617,17 +615,17 @@ impl ExecutionPlan for IcebergScanExec {
     /// When `cached_statistics` is populated (via `with_cached_statistics`), the
     /// pre-computed manifest aggregation is returned. Otherwise we fall back to
     /// the snapshot summary's row count and byte size with column stats absent.
-    fn partition_statistics(&self, _partition: Option<usize>) -> DFResult<datafusion::common::Statistics> {
+    fn partition_statistics(&self, _partition: Option<usize>) -> DFResult<Arc<datafusion::common::Statistics>> {
         use datafusion::common::{stats::Precision, ColumnStatistics, Statistics};
 
         if let Some(cached) = &self.cached_statistics {
-            return Ok(cached.clone());
+            return Ok(Arc::new(cached.clone()));
         }
 
         let metadata = self.table.metadata();
         let snapshot = match metadata.current_snapshot() {
             Some(s) => s,
-            None => return Ok(Statistics::new_unknown(&self.projected_schema)),
+            None => return Ok(Arc::new(Statistics::new_unknown(&self.projected_schema))),
         };
 
         // Extract total-records and total-file-size from snapshot summary.
@@ -661,11 +659,11 @@ impl ExecutionPlan for IcebergScanExec {
             .map(|_| ColumnStatistics::new_unknown())
             .collect();
 
-        Ok(Statistics {
+        Ok(Arc::new(Statistics {
             num_rows,
             total_byte_size,
             column_statistics,
-        })
+        }))
     }
 
     /// Declare ourselves a leaf to DataFusion's filter pushdown rule.
@@ -717,7 +715,6 @@ impl ExecutionPlan for IcebergScanExec {
             .iter()
             .filter(|pf| {
                 pf.filter
-                    .as_any()
                     .downcast_ref::<DynamicFilterPhysicalExpr>()
                     .is_some()
             })
@@ -738,7 +735,7 @@ impl ExecutionPlan for IcebergScanExec {
         let mut filter_results: Vec<PushedDown> = Vec::new();
 
         for pf in &child_pushdown_result.parent_filters {
-            if pf.filter.as_any().downcast_ref::<DynamicFilterPhysicalExpr>().is_some() {
+            if pf.filter.downcast_ref::<DynamicFilterPhysicalExpr>().is_some() {
                 // Dynamic filter from hash join — accept it
                 dynamic_filters.push(Arc::clone(&pf.filter));
                 filter_results.push(PushedDown::Yes);
@@ -952,7 +949,7 @@ impl ExecutionPlan for IcebergScanExec {
                 // batches get the actual bounds once the build side completes.
                 let mut resolved_filters: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
                 for filter in &pushed_down_filters {
-                    if let Some(dynamic) = filter.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
+                    if let Some(dynamic) = filter.downcast_ref::<DynamicFilterPhysicalExpr>() {
                         match dynamic.current() {
                             Ok(expr) => {
                                 if is_trivial_true(&expr) {
@@ -1314,7 +1311,7 @@ impl ExecutionPlan for IcebergScanExec {
                             let mut saw_pending = false;
                             let mut result = batch;
                             for (idx, filter) in filters.iter().enumerate() {
-                                let (expr, is_dynamic): (Arc<dyn PhysicalExpr>, bool) = if let Some(dynamic) = filter.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
+                                let (expr, is_dynamic): (Arc<dyn PhysicalExpr>, bool) = if let Some(dynamic) = filter.downcast_ref::<DynamicFilterPhysicalExpr>() {
                                     // Short-circuit on the cached sealed snapshot:
                                     // once present we never call `current()` again
                                     // (that call is the whole cost). The lock is
@@ -1543,7 +1540,6 @@ async fn collect_data_files_via_plan(
 fn collect_filter_column_names(filters: &[Arc<dyn PhysicalExpr>]) -> Vec<String> {
     fn walk(expr: &Arc<dyn PhysicalExpr>, out: &mut Vec<String>) {
         if let Some(col) = expr
-            .as_any()
             .downcast_ref::<datafusion::physical_expr::expressions::Column>()
         {
             let name = col.name().to_string();
@@ -1778,8 +1774,7 @@ struct PhysicalExprPredicate {
 async fn wait_for_dynamic_filters(filters: &[Arc<dyn PhysicalExpr>], wait_ms: u64) -> u64 {
     fn any_pending(filters: &[Arc<dyn PhysicalExpr>]) -> bool {
         filters.iter().any(|f| {
-            f.as_any()
-                .downcast_ref::<DynamicFilterPhysicalExpr>()
+            f.downcast_ref::<DynamicFilterPhysicalExpr>()
                 .is_some_and(|d| d.current().map(|e| is_trivial_true(&e)).unwrap_or(true))
         })
     }
@@ -1799,8 +1794,7 @@ async fn wait_for_dynamic_filters(filters: &[Arc<dyn PhysicalExpr>], wait_ms: u6
 /// True when a dynamic filter snapshot is still the `lit(true)` placeholder,
 /// i.e. the hash join build side has not sealed the filter yet.
 fn is_trivial_true(expr: &Arc<dyn PhysicalExpr>) -> bool {
-    expr.as_any()
-        .downcast_ref::<datafusion::physical_expr::expressions::Literal>()
+    expr.downcast_ref::<datafusion::physical_expr::expressions::Literal>()
         .is_some_and(|lit| {
             matches!(
                 lit.value(),
@@ -2007,7 +2001,6 @@ mod tests {
             lit(true),
         ));
         sealed
-            .as_any()
             .downcast_ref::<DynamicFilterPhysicalExpr>()
             .unwrap()
             .update(Arc::new(Literal::new(ScalarValue::Boolean(Some(false)))))

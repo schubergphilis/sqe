@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -133,9 +132,6 @@ impl std::fmt::Debug for RuntimeSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for RuntimeSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn table_names(&self) -> Vec<String> {
         vec![
