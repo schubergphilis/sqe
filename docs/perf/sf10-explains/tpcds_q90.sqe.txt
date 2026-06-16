@@ -1,0 +1,56 @@
+sqe-cli 0.36.0 connected to http://localhost:50051 (flight)
++------+-------------------------------------------------------------+-------------+-----------------------+--------------+----------------+-------------+---------------+--------------+
+| step | operation                                                   | output_rows | elapsed_ms            | output_bytes | output_batches | spill_count | spilled_bytes | spilled_rows |
++------+-------------------------------------------------------------+-------------+-----------------------+--------------+----------------+-------------+---------------+--------------+
+| -5   | [phase] parse + logical plan                                |             | 37.71065              |              |                |             |               |              |
+| -4   | [phase] policy evaluate                                     |             | 0.0012109999999999998 |              |                |             |               |              |
+| -3   | [phase] physical plan                                       |             | 19.17693              |              |                |             |               |              |
+| -2   | [phase] execute (per-op detail below)                       |             | 616.925486            |              |                |             |               |              |
+| -1   | [phase] framework overhead (parse + plan + policy + result) |             | 56.89003500000001     |              |                |             |               |              |
+| 5    | IcebergScanExec                                             | 600         | 0.793635              | 0            | 0              |             |               |              |
+| 6    | RepartitionExec                                             | 600         | 0.032696              | 65536        | 1              | 0           | 0             | 0            |
+| 7    | FilterExec                                                  | 0           | 0.026996              | 0            | 0              |             |               |              |
+| 8    | CoalescePartitionsExec                                      | 0           | 0.009047              | 0            | 0              |             |               |              |
+| 9    | IcebergScanExec                                             | 86400       | 1.883587              | 0            | 0              |             |               |              |
+| 10   | RepartitionExec                                             | 86400       | 0.012804              | 720896       | 11             | 0           | 0             | 0            |
+| 11   | FilterExec                                                  | 7200        | 0.27406               | 65536        | 2              |             |               |              |
+| 12   | CoalescePartitionsExec                                      | 7200        | 0.007546              | 65536        | 2              |             |               |              |
+| 13   | IcebergScanExec                                             | 7200        | 0.787929              | 0            | 0              |             |               |              |
+| 14   | RepartitionExec                                             | 7200        | 0.003561              | 57600        | 1              | 0           | 0             | 0            |
+| 15   | FilterExec                                                  | 720         | 0.035572              | 32768        | 1              |             |               |              |
+| 16   | CoalescePartitionsExec                                      | 720         | 0.021794              | 32768        | 1              |             |               |              |
+| 17   | IcebergScanExec                                             | 58439       | 22.031538             | 0            | 0              |             |               |              |
+| 18   | RepartitionExec                                             | 58439       | 1.579482              | 786432       | 8              | 0           | 0             | 0            |
+| 19   | HashJoinExec                                                | 58439       | 2.06755               | 467512       | 8              |             |               |              |
+| 20   | HashJoinExec                                                | 58439       | 1.093303              | 233756       | 8              |             |               |              |
+| 21   | HashJoinExec                                                | 0           | 0.056428              | 0            | 0              |             |               |              |
+| 22   | AggregateExec                                               | 8           | 0.079611              | 64           | 8              |             |               |              |
+| 23   | CoalescePartitionsExec                                      | 8           | 0.008413              | 64           | 8              |             |               |              |
+| 24   | AggregateExec                                               | 1           | 0.01495               | 8            | 1              |             |               |              |
+| 25   | ProjectionExec                                              | 1           | 0.002576              | 8            | 1              |             |               |              |
+| 26   | IcebergScanExec                                             | 600         | 0.923967              | 0            | 0              |             |               |              |
+| 27   | RepartitionExec                                             | 600         | 0.022929              | 65536        | 1              | 0           | 0             | 0            |
+| 28   | FilterExec                                                  | 0           | 0.00739               | 0            | 0              |             |               |              |
+| 29   | CoalescePartitionsExec                                      | 0           | 0.022989              | 0            | 0              |             |               |              |
+| 30   | IcebergScanExec                                             | 86400       | 2.308682              | 0            | 0              |             |               |              |
+| 31   | RepartitionExec                                             | 86400       | 0.013837              | 720896       | 11             | 0           | 0             | 0            |
+| 32   | FilterExec                                                  | 7200        | 0.312233              | 54080        | 2              |             |               |              |
+| 33   | CoalescePartitionsExec                                      | 7200        | 0.015998              | 54080        | 2              |             |               |              |
+| 34   | IcebergScanExec                                             | 7200        | 0.730096              | 0            | 0              |             |               |              |
+| 35   | RepartitionExec                                             | 7200        | 0.011223              | 57600        | 1              | 0           | 0             | 0            |
+| 36   | FilterExec                                                  | 720         | 0.178948              | 32768        | 1              |             |               |              |
+| 37   | CoalescePartitionsExec                                      | 720         | 0.034004              | 32768        | 1              |             |               |              |
+| 38   | IcebergScanExec                                             | 58207       | 20.392781             | 0            | 0              |             |               |              |
+| 39   | RepartitionExec                                             | 58207       | 0.84244               | 786432       | 8              | 0           | 0             | 0            |
+| 40   | HashJoinExec                                                | 58207       | 1.857865              | 465656       | 8              |             |               |              |
+| 41   | HashJoinExec                                                | 58207       | 1.247236              | 232828       | 8              |             |               |              |
+| 42   | HashJoinExec                                                | 0           | 0.061004              | 0            | 0              |             |               |              |
+| 43   | AggregateExec                                               | 8           | 0.05864               | 64           | 8              |             |               |              |
+| 44   | CoalescePartitionsExec                                      | 8           | 0.057363              | 64           | 8              |             |               |              |
+| 45   | AggregateExec                                               | 1           | 0.00586               | 8            | 1              |             |               |              |
+| 46   | ProjectionExec                                              | 1           | 0.001264              | 8            | 1              |             |               |              |
+| 47   | CrossJoinExec                                               | 1           | 0.208768              | 16           | 1              |             |               |              |
+| 48   | ProjectionExec                                              | 1           | 0.046192              | 128          | 1              |             |               |              |
+| 49   | SortExec(TopK)                                              | 1           | 0.046156              | 24           | 1              |             |               |              |
++------+-------------------------------------------------------------+-------------+-----------------------+--------------+----------------+-------------+---------------+--------------+
+(50 rows)
