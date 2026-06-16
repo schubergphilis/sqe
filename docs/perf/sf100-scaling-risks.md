@@ -148,3 +148,27 @@ Single-node perf work (the parallel filter, the memory-safe write) is necessary 
 tops out around SF10 to SF30. SF100 needs memory-pool discipline under concurrency
 (risk 1: cap concurrent sort consumers and bound per-consumer reservations) and a
 proven multi-node distributed path (risk 2) before anything else is worth tuning.
+
+## Mitigation available today: `memory_pool` (opt-in, not a default change)
+
+Risk 1 has no engine fix yet, but it has a validated opt-in knob. If a
+concurrent sort-heavy workload crashes with `Resources exhausted:
+ExternalSorterMerge`, set on the coordinator:
+
+```toml
+[coordinator]
+memory_pool = "fair"
+```
+
+`FairSpillPool` caps each spillable consumer and forces it to spill earlier,
+leaving room for the non-spillable merge reservations. Validated: 4 concurrent SF1
+sorted CTAS on a 1 GB pool crash 1-of-4 under the default `greedy` and succeed
+4-of-4 under `fair`.
+
+Do not make this the default. SQE ships `greedy` on purpose: `fair` divides the
+pool evenly across every registered spillable consumer, so wide plans (TPC-DS q39
+at SF10 registers ~90) shrink each consumer to ~pool/N and large aggregates fail.
+Use `fair` only for workloads dominated by a few large sorts. The default-safe fix
+is plan-adaptive pool selection or the upstream per-consumer reservation cap +
+proactive spill (apache/datafusion#17334); until one of those lands this is an
+operator lever, not a default change.
