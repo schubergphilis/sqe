@@ -94,6 +94,20 @@ Distribution is a per-shape decision, not a default: big fact-to-fact joins (TPC
 
 A later SF10 pass found a separate blow-up: TPC-H q12, q17, and q10 ran 160 to 300 seconds against Trino's 2 to 8. The cause was not partition layout or join distribution. On a partitioned hash join the build-side runtime filter is a `CASE` over per-partition key sets (q12: eleven branches of ~28K keys, ~300K expression nodes), and the probe scan re-snapshotted it once per batch. Each snapshot rebuilt the whole tree (~10ms), so a 14,600-batch scan spent ~150s reconstructing a filter it then evaluated in under a second. We now cache the first sealed snapshot per scan: q12 161s to 2.7s, q17 176s to 7.1s, q10 from a 300s failure to 3.3s, result rows unchanged, no threshold touched. SSB improved too (q4.1 11.6s to 6.8s), which retired the IN-list-threshold tradeoff we thought we had. The walk-through is in [The Filter That Rebuilt Itself](docs/blog/2026-06-15-the-filter-that-rebuilt-itself.md); the EXPLAIN comparison is in [`docs/perf/sf10-slow-queries.md`](docs/perf/sf10-slow-queries.md).
 
+### Clean-rig SF10: an honest crossover (June 16, dedicated host, cache off)
+
+The table above came off a shared VM. A later run on a dedicated 8-core box, both engines containerized against the same Iceberg store, query cache off, single-node, settled the picture without contention noise. The dynamic-filter fix holds at scale (q10 4.6s, q12 4.9s, q17 13.5s, q20 3.1s, no query explodes) and correctness held throughout (TPC-H 21/22, SSB 13/13, TPC-DS 95/99, with the same generator-boundary vacuous rows as SF1). But the suite totals show a real scaling crossover.
+
+| Suite | SQE | Trino 465 | Ratio |
+|---|---|---|---|
+| TPC-H SF10 | 126.4s | 108.8s | 0.86x |
+| SSB SF10 | 31.8s | 16.8s | 0.53x |
+| TPC-DS SF10 | 374s | 455s | 1.22x |
+
+SQE wins every suite at SF1 (TPC-H 2.3x, SSB 1.5x, TPC-DS 2.4x). At SF10 it wins TPC-DS on breadth, taking q01/q02/q04/q05/q08/q11/q14/q22/q23 by 2 to 4x even while losing the single biggest query, q72, at 0.7x. It trails TPC-H on the heavy joins (q09 0.3x, q18 0.6x) and trails SSB across the board, where the scan-bound star joins favor Trino's vectorized decoder. The earlier "SQE distributed wins TPC-H SF10" read was a contended-host artifact, not a cache effect: the compare runs each query once, so the result cache cannot inflate a single sweep. On a quiet box with the cache off, Trino's vectorized and distributed hash joins scale better on large data. That is the next frontier, not a regression.
+
+Loading SF10 surfaced a separate write-path gap worth naming: a partitioned `CREATE TABLE AS SELECT` with a sort-on-write clustering hint fans the sort into one merge buffer per output partition, and that merge phase cannot spill. At SF10 the monthly-partitioned TPC-H lineitem (60M rows across ~84 partitions) exhausted the pool where the unpartitioned SSB lineorder of the same size sorted fine. The bench loader now skips the redundant sort on already-partitioned tables, since partition pruning already delivers the clustering; the engine-level fix (bounded or spillable partition writers) is still open.
+
 ### How we know the numbers are real
 
 A benchmark row that says "Match" can still validate nothing: if the generated data contains no rows a query can select, both engines agree on empty and the diff passes. We learned this the hard way. Since June 2026 the harness reports those cases as `Vacuous`, and the generators are validated against DuckDB's official `dsdgen` output as an engine-free oracle (`scripts/validate-generator-tpcds.py`). That oracle caught a TPC-C generator bug that zeroed every warehouse join at fractional scales and a set of TPC-DS vocabulary gaps that had silently blanked 16 query results. Details in [the validation blog post](docs/blog/2026-06-12-the-benchmark-that-lied.md).
