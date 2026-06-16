@@ -67,6 +67,15 @@ fn is_resource_exhausted(err: &anyhow::Error) -> bool {
         || m.contains("failed to allocate")
         || m.contains("out of memory")
         || m.contains("memory limit")
+        // The coordinator's admission gate rejects queries outright when the
+        // memory pool is in the Red band (>95% utilized). A sort-on-write CTAS
+        // whose non-spilling sort buffer fills the pool trips this at
+        // submission, before adaptive sort-stripping runs. Treat the rejection
+        // like execution-time exhaustion so the load fails over to an unsorted
+        // write instead of aborting the whole benchmark load.
+        || m.contains("server memory is")
+        || m.contains("memory is red")
+        || m.contains("95% utilized")
 }
 
 pub async fn load_benchmark(
@@ -153,8 +162,19 @@ pub async fn load_benchmark(
         // than degrading) we fail over to an unsorted write -- the data lands
         // correctly, just without clustering. A user's own CTAS ORDER BY is
         // never touched; this fallback applies only to the bench clustering hint.
+        // A PARTITIONED write fans the sort-on-write ORDER BY into one
+        // ExternalSorterMerge per output partition, and that merge phase cannot
+        // spill. At SF10, ~84 monthly partitions x a large fact table exhaust
+        // the pool (TPC-H orders at 15M rows survives; lineitem at 60M does
+        // not -- three ExternalSorters held ~11 GB before the non-spillable
+        // merge failed). When the table is already partitioned by its date key,
+        // month-level partition pruning delivers the clustering benefit, so the
+        // redundant, memory-unsafe sort is skipped. Unpartitioned fact tables
+        // (SSB lineorder, TPC-DS *_sales) keep the single-stream sort, which
+        // spills cleanly; if it still exhausts memory we fail over to unsorted.
+        let partitioned = partition_spec(benchmark, &table_def.name).is_some();
         match clustering_key(benchmark, &table_def.name) {
-            Some(key) => {
+            Some(key) if !partitioned => {
                 let sorted_sql = format!("{base_sql} ORDER BY {key}");
                 if let Err(e) = client.execute_update(&sorted_sql).await {
                     if is_resource_exhausted(&e) {
@@ -175,7 +195,7 @@ pub async fn load_benchmark(
                     }
                 }
             }
-            None => {
+            _ => {
                 client.execute_update(&base_sql).await?;
             }
         }
