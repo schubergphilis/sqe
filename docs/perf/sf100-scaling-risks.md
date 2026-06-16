@@ -14,37 +14,52 @@ and prove distributed execution at real multi-node scale.
 
 ## Ranked failure modes
 
-### 1. Non-spillable sort merge OOMs hard (availability, not just speed)
+### 1. Concurrent sorts starve a shared memory pool (availability)
 
-Verified against DataFusion 53.1.0 `physical-plan/src/sorts/sort.rs`, not just the
-error text. The `ExternalSorter` has two reservations: the in-memory sort buffer is
-created `.with_can_spill(true)` (line 283), but the `merge_reservation`
-(`MemoryConsumer::new("ExternalSorterMerge[...]")`, line 286) is created **without**
-`with_can_spill`, so it defaults to **non-spillable**. The final merge takes **all**
-finished spill files in a **single pass** (`with_sorted_spill_files(take(finished_spill_files))`,
-line 358), so the non-spillable `merge_reservation` grows with the spill-file count
-(roughly one max-size batch per run). There is no bounded multi-pass merge.
+Verified against DataFusion 53.1.0 `physical-plan/src/sorts/`, and the first cut of
+this section was wrong twice, so here is the checked version.
 
-Consequence: the sort *phase* spills fine, but the final *merge* reserves
-non-spillable memory proportional to (spill runs) x (concurrent sorter instances).
-It OOMs hard rather than degrading once that product exceeds the pool. We hit
-exactly this at SF10 on a partitioned sort-on-write CTAS: many partitions each ran
-their own `ExternalSorterMerge` (the log showed several `(can spill: false)`
-consumers holding ~1.2 GB each) and the pool exhausted. The memory-safe-write MR
-worked around it by skipping the sort on partitioned tables; the engine gap is
-open.
+A **single** large sort is fine. DF 53.1.0 has a multi-level merge
+(`multi_level_merge.rs`): it merges spill files in **bounded passes**, reducing the
+fan-in (`get_sorted_spill_files_to_merge`) when memory is tight and cascading, and
+its own comment says it can "handle any amount of data to sort as long as we have
+enough memory to merge at least 2 streams at a time." So one big `ORDER BY` spills
+and completes; it does not OOM on its own.
 
-Why it is the SF100 headline: at scale both multipliers grow. A single large
-`ORDER BY` / sort-merge join / window / sort-on-write spills into many more runs
-(bigger single-pass merge reservation), and wide or partitioned plans run many
-merges concurrently. It is not literally *every* sort, but the threshold where the
-non-spillable merge reservation exceeds the pool drops as data grows, and past it
-the failure is a crash, not a slowdown, regardless of pool size.
+The risk is **concurrency on a shared pool**. The sort buffer is spillable
+(`with_can_spill(true)`, `sort.rs:283`) but the `merge_reservation` is **not**
+(`sort.rs:286`, no `with_can_spill`), and each multi-level merge grows its
+reservation per spill file via `try_grow` until it fails, with **no per-consumer
+upper limit**. DataFusion's own code flags this: *"For memory pools that are not
+shared this is good, for others this is not and there should be some upper limit to
+memory reservation so we won't starve the system."* Spill is also reactive (it
+triggers on allocation failure, not proactively; apache/datafusion#17334). So when
+**many** sort/merge consumers run on one pool, they collectively exhaust it: the
+spillable sort buffers have not proactively spilled, the non-spillable merge
+reservations cannot, and a merge's `try_grow` fails (it needs >=2 streams) and the
+query crashes.
 
-Levers: (a) the real fix is a bounded multi-pass spill merge or a spillable merge
-reservation; (b) `datafusion.execution.sort_spill_reservation_bytes` (line 262)
-pre-reserves room for the merge and can delay the OOM, but does not remove the
-non-spillable single-pass merge. This gates almost everything below.
+That is exactly what we saw at SF10: a partitioned sort-on-write CTAS had three
+`ExternalSorter` buffers holding ~10.8 GB (spillable, not yet spilled) plus several
+`ExternalSorterMerge` reservations at ~1.2 GB each `(can spill: false)`, exhausting
+the 16 GB pool; the next allocation failed with 173 KB free. The memory-safe-write
+MR avoided it by skipping the sort on partitioned tables (one fewer concurrent
+merge per partition).
+
+Why it is the SF100 headline: more data widens plans and raises partition counts,
+so more sort/merge consumers share the pool at once. Combined with per-consumer
+uncapped greedy growth and reactive spill, the crash threshold drops below normal
+query sizes. It is a concurrency-and-pool-discipline problem, not a single-sort
+limit, and the failure is a crash, not a slowdown.
+
+Levers (see the closing section for the full plan): cap concurrent sort consumers
+SQE-side (reduce sort partition count / sequentialize sort-on-write under pressure,
+extending the existing adaptive-sort + memory governor); per-consumer pool
+discipline (a reservation cap or FairSpillPool for sort-heavy multi-consumer plans,
+traded against the greedy pool chosen for wide aggregates); distribute the sort
+(risk 2) to cut per-node concurrency; upstream the per-consumer cap (DataFusion's
+own TODO) and proactive spill (#17334). `sort_spill_reservation_bytes` pre-reserves
+merge room and buys headroom but does not remove the starvation.
 
 ### 2. Broadcast (CollectLeft) joins stop fitting
 
@@ -111,7 +126,7 @@ path is spill-safe. Fix this first or none of the above is observable.
 
 | # | Failure mode | First bites | Lever | State |
 |---|---|---|---|---|
-| 1 | Non-spillable single-pass sort merge OOM | large sorts (many spill runs) + wide/partitioned plans | bounded multi-pass / spillable merge | engine fix, open (extends the partitioned-write issue) |
+| 1 | Concurrent sorts starve shared pool | many concurrent sort/merge consumers (high partition count, wide plans) | cap concurrency SQE-side + per-consumer pool cap; distribute | SQE mitigations now; upstream per-consumer cap + #17334 |
 | 2 | Broadcast joins overflow | big fact-fact joins | distributed shuffle join | exists, unproven at multi-node scale |
 | 3 | Single-partition scan | scan-bound (SSB) | broadcast-parallel probe | designed, not built |
 | 4 | Membership-set eval/memory | dim-filtered fact scans | pre-decode RowFilter pushdown | partial (SSB key-set) |
@@ -119,5 +134,6 @@ path is spill-safe. Fix this first or none of the above is observable.
 | 6 | Generator/load OOM | generation itself | streaming generator + spill-safe load | blocks measurement |
 
 Single-node perf work (the parallel filter, the memory-safe write) is necessary and
-tops out around SF10 to SF30. SF100 needs spillable operators (risk 1) and a proven
-multi-node distributed path (risk 2) before anything else is worth tuning.
+tops out around SF10 to SF30. SF100 needs memory-pool discipline under concurrency
+(risk 1: cap concurrent sort consumers and bound per-consumer reservations) and a
+proven multi-node distributed path (risk 2) before anything else is worth tuning.
