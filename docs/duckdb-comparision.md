@@ -66,7 +66,7 @@ state.
 | Struct / list / map literals (`{a: 1}`, `[1, 2]`, `MAP {...}`) | partial (nested types work, syntax less ergonomic) | not planned |
 | List comprehensions, lambdas | missing | not planned (DataFusion does not support) |
 | `PIVOT` / `UNPIVOT` | missing | not planned (DataFusion does not support) |
-| `QUALIFY` | missing | not planned (DataFusion does not support) |
+| `QUALIFY` | have (DataFusion SQL planner handles it) | done (row was stale; verified working, test `sql_compat 06_qualify`) |
 | `ASOF JOIN` | missing | not planned (DataFusion has open issue, not landed) |
 
 ### Extensions
@@ -234,9 +234,8 @@ block is upstream parser work or a positioning decision.
 
 | Item | Reason |
 |---|---|
-| `PIVOT` / `UNPIVOT` | DataFusion parser does not support |
-| `QUALIFY` | DataFusion parser does not support |
-| `ASOF JOIN` | DataFusion has an open issue; not landed |
+| `PIVOT` / `UNPIVOT` | DataFusion planner rejects the parsed AST node (`Unsupported ast node Pivot`) |
+| `ASOF JOIN` | DataFusion has an open issue; not landed (parser wants `MATCH_CONDITION`) |
 | `FROM`-first syntax | DataFusion parser does not support |
 | List comprehensions, lambdas | DataFusion does not support |
 | `postgres` / `mysql` / `sqlite` TVFs | positioning: SQE is Iceberg-first |

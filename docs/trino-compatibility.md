@@ -42,6 +42,25 @@ noting semantic differences and gaps.
 > system limits, Iceberg spec gaps) or strategic (Parquet-only). See
 > the [Engine Limitations & Roadmap](#engine-limitations--roadmap)
 > section for the per-feature path forward.
+>
+> **DataFusion 54.0.0** brings execution and planning gains (RepartitionExec
+> throughput, hash-join dynamic comparator, faster semi/anti joins) but **no new
+> SQL surface that unblocks the ❌ items below.** We re-checked the candidates
+> empirically on the DF 54 build:
+> - **LATERAL / dependent joins**: accepted at the logical-plan level but still
+>   fail physical planning ("Physical plan does not support OuterReferenceColumn")
+>   for the dependent shapes (correlated projection, correlated `LIMIT` / top-N).
+>   DF 54 has no physical dependent-join operator. Only laterals that decorrelate
+>   into ordinary joins run, and those already worked. Keep using the documented
+>   join/subquery rewrites.
+> - **Array lambdas** (`transform`, `filter`, `reduce`): still unsupported
+>   ("Invalid function") since DataFusion has no higher-order-function support.
+> - **`PIVOT` / `UNPIVOT`, `ASOF JOIN`**: still rejected by the planner.
+>
+> The remaining gaps are unchanged: structural (Trino sketch types, Arrow type
+> limits, Iceberg/ORC). (Separately, the DF 54 re-check found the DuckDB doc's
+> `QUALIFY` row was stale: `QUALIFY` works via DataFusion's SQL planner. See
+> `docs/duckdb-comparision.md` and test `sql_compat 06_qualify`.)
 
 ## Summary
 
