@@ -145,8 +145,6 @@ base64 = "0.22"
 subtle = "2"
 zeroize = "1"
 
-# Hash maps
-ahash = "0.8"
 
 # Dev / test deps used by multiple crates
 tempfile = "3"

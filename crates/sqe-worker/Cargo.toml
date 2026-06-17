@@ -44,7 +44,6 @@ url = { workspace = true }
 chrono = { workspace = true }
 opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }
-ahash = { workspace = true }
 subtle = { workspace = true }
 prometheus = { workspace = true }
 # Local network interface enumeration for advertise-URL derivation (issue #220).
