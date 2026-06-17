@@ -38,8 +38,8 @@ use std::ops::ControlFlow;
 use sqlparser::ast::{
     DataType as SqlDataType, Expr, Function, FunctionArg, FunctionArgExpr,
     FunctionArgumentList, FunctionArguments, GroupByExpr, GroupByWithModifier, Ident,
-    ObjectName, Query, Select, SetExpr, Statement, TableFactor, TableFunctionArgs, Value,
-    Visit, VisitMut, Visitor, VisitorMut,
+    LimitClause, ObjectName, Query, Select, SetExpr, Statement, TableFactor,
+    TableFunctionArgs, Value, Visit, VisitMut, Visitor, VisitorMut,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -265,6 +265,7 @@ fn rewrite_cast_as_json(expr: &mut Expr) -> bool {
         expr: inner,
         data_type,
         format: _,
+        array: _,
     } = expr
     else {
         return false;
@@ -277,7 +278,7 @@ fn rewrite_cast_as_json(expr: &mut Expr) -> bool {
         Expr::Identifier(Ident::new("__cast_as_json_placeholder__")),
     );
     *expr = Expr::Function(Function {
-        name: ObjectName(vec![Ident::new("to_json")]),
+        name: ObjectName::from(vec![Ident::new("to_json")]),
         uses_odbc_syntax: false,
         parameters: FunctionArguments::None,
         args: FunctionArguments::List(FunctionArgumentList {
@@ -328,7 +329,7 @@ fn rewrite_metadata_dollar_table(factor: &mut TableFactor) -> bool {
     // The metadata suffix is on the LAST identifier component. Find it,
     // pull the suffix, and split into (bare_table, kind).
     let parts = &name.0;
-    let Some(last) = parts.last() else {
+    let Some(last) = parts.last().and_then(|p| p.as_ident()) else {
         return false;
     };
     let last_str = last.value.as_str();
@@ -356,6 +357,7 @@ fn rewrite_metadata_dollar_table(factor: &mut TableFactor) -> bool {
     let (namespace, table_name): (String, String) = if parts.len() >= 2 {
         let ns = parts[..parts.len() - 1]
             .iter()
+            .filter_map(|p| p.as_ident())
             .map(|i| i.value.clone())
             .collect::<Vec<_>>()
             .join(".");
@@ -375,15 +377,15 @@ fn rewrite_metadata_dollar_table(factor: &mut TableFactor) -> bool {
     // Build the TableFunctionArgs (two string-literal args).
     let args_vec = vec![
         FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
-            Value::SingleQuotedString(namespace),
+            Value::SingleQuotedString(namespace).into(),
         ))),
         FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
-            Value::SingleQuotedString(table_name),
+            Value::SingleQuotedString(table_name).into(),
         ))),
     ];
 
     // Replace the table name and attach args.
-    *name = ObjectName(vec![Ident::new(tvf_name)]);
+    *name = ObjectName::from(vec![Ident::new(tvf_name)]);
     *args = Some(TableFunctionArgs {
         args: args_vec,
         settings: None,
@@ -471,9 +473,11 @@ fn wrap_rollup_for_empty_input(query: &mut Query) -> bool {
     // wrapper, not the inner CTE, so paging and ordering apply after the
     // empty-input row has been added (or not).
     let outer_order_by = query.order_by.take();
-    let outer_limit = query.limit.take();
-    let outer_limit_by = std::mem::take(&mut query.limit_by);
-    let outer_offset = query.offset.take();
+    // sqlparser 0.62 folds the old `limit` / `limit_by` / `offset` fields into
+    // a single `limit_clause`. These three always rode together onto the same
+    // target, so carrying the whole `Option<LimitClause>` is exactly
+    // behaviour-preserving (and handles the MySQL `OFFSET,LIMIT` form for free).
+    let outer_limit_clause = query.limit_clause.take();
     let outer_fetch = query.fetch.take();
     let outer_with = query.with.take();
     let outer_body = std::mem::replace(
@@ -488,14 +492,13 @@ fn wrap_rollup_for_empty_input(query: &mut Query) -> bool {
         with: outer_with,
         body: Box::new(outer_body),
         order_by: None,
-        limit: None,
-        limit_by: vec![],
-        offset: None,
+        limit_clause: None,
         fetch: None,
         locks: vec![],
         for_clause: None,
         settings: None,
         format_clause: None,
+        pipe_operators: vec![],
     };
 
     // Build the wrapper by string-templating then re-parsing.  Trying to
@@ -522,9 +525,7 @@ fn wrap_rollup_for_empty_input(query: &mut Query) -> bool {
             query,
             inner_query,
             outer_order_by,
-            outer_limit,
-            outer_limit_by,
-            outer_offset,
+            outer_limit_clause,
             outer_fetch,
         );
         return false;
@@ -540,9 +541,7 @@ fn wrap_rollup_for_empty_input(query: &mut Query) -> bool {
     // Restore the outer clauses on the wrapper query so paging applies
     // to the unioned result, not the CTE.
     new_q.order_by = outer_order_by;
-    new_q.limit = outer_limit;
-    new_q.limit_by = outer_limit_by;
-    new_q.offset = outer_offset;
+    new_q.limit_clause = outer_limit_clause;
     new_q.fetch = outer_fetch;
 
     *query = new_q;
@@ -555,17 +554,13 @@ fn restore_query_fields(
     query: &mut Query,
     inner: Query,
     order_by: Option<sqlparser::ast::OrderBy>,
-    limit: Option<Expr>,
-    limit_by: Vec<Expr>,
-    offset: Option<sqlparser::ast::Offset>,
+    limit_clause: Option<LimitClause>,
     fetch: Option<sqlparser::ast::Fetch>,
 ) {
     query.with = inner.with;
     *query.body = *inner.body;
     query.order_by = order_by;
-    query.limit = limit;
-    query.limit_by = limit_by;
-    query.offset = offset;
+    query.limit_clause = limit_clause;
     query.fetch = fetch;
 }
 

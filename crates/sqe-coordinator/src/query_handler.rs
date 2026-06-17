@@ -1125,8 +1125,8 @@ impl QueryHandler {
                 StatementKind::Merge(stmt) => {
                     // Extract source SQL from the MERGE statement and execute it
                     // to get the source batches, then pass them to the write handler.
-                    let source_sql = if let Statement::Merge { source, .. } = stmt.as_ref() {
-                        match source {
+                    let source_sql = if let Statement::Merge(merge) = stmt.as_ref() {
+                        match &merge.source {
                             sqlparser::ast::TableFactor::Table { name, .. } => {
                                 format!("SELECT * FROM {name}")
                             }
@@ -1335,14 +1335,14 @@ impl QueryHandler {
                         }
                     }
                     StatementKind::Update(stmt) => {
-                        if let Statement::Update { table, .. } = stmt.as_ref() {
-                            let table_name = table.relation.to_string();
+                        if let Statement::Update(update) = stmt.as_ref() {
+                            let table_name = update.table.relation.to_string();
                             cache.invalidate(&table_name);
                         }
                     }
                     StatementKind::Merge(stmt) => {
-                        if let Statement::Merge { table, .. } = stmt.as_ref() {
-                            let table_name = table.to_string();
+                        if let Statement::Merge(merge) = stmt.as_ref() {
+                            let table_name = merge.table.to_string();
                             cache.invalidate(&table_name);
                         }
                     }
@@ -2780,7 +2780,7 @@ impl QueryHandler {
         stmt: &Statement,
     ) -> sqe_core::Result<()> {
         let query = match stmt {
-            Statement::CreateView { query, .. } => query,
+            Statement::CreateView(cv) => &cv.query,
             other => {
                 return Err(SqeError::Execution(format!(
                     "Expected CREATE VIEW statement, got: {other}"
@@ -3086,11 +3086,11 @@ impl QueryHandler {
                 // planner resolves it under the writable `datafusion.public`
                 // schema. Splitting on `.` reconstructs the ObjectName as
                 // three Idents (catalog / schema / table).
-                *name = sqlparser::ast::ObjectName(
+                *name = sqlparser::ast::ObjectName::from(
                     qualified
                         .split('.')
                         .map(|part| sqlparser::ast::Ident::new(part.to_string()))
-                        .collect(),
+                        .collect::<Vec<_>>(),
                 );
 
                 // Strip the temporal clause so DataFusion doesn't reject it
@@ -3266,19 +3266,19 @@ impl QueryHandler {
 
     /// Extract a `GrantStatement` from a sqlparser `Statement::Grant` or `Statement::Revoke`.
     fn extract_grant_statement(stmt: &Statement) -> sqe_core::Result<GrantStatement> {
+        // sqlparser 0.62: ObjectName holds `Vec<ObjectNamePart>` rather than
+        // `Vec<Ident>`; pull the bare identifier value out of each part.
+        fn object_name_parts(name: &sqlparser::ast::ObjectName) -> Vec<String> {
+            name.0
+                .iter()
+                .filter_map(|p| p.as_ident())
+                .map(|id| id.value.clone())
+                .collect()
+        }
+
         let (privileges, objects, grantees) = match stmt {
-            Statement::Grant {
-                privileges,
-                objects,
-                grantees,
-                ..
-            } => (privileges, objects, grantees),
-            Statement::Revoke {
-                privileges,
-                objects,
-                grantees,
-                ..
-            } => (privileges, objects, grantees),
+            Statement::Grant(g) => (&g.privileges, &g.objects, &g.grantees),
+            Statement::Revoke(r) => (&r.privileges, &r.objects, &r.grantees),
             other => {
                 return Err(SqeError::Execution(format!(
                     "Expected GRANT/REVOKE statement, got: {other}"
@@ -3289,9 +3289,9 @@ impl QueryHandler {
         let privilege = format!("{privileges}");
 
         let (catalog, namespace, table) = match objects {
-            sqlparser::ast::GrantObjects::Tables(tables) if !tables.is_empty() => {
+            Some(sqlparser::ast::GrantObjects::Tables(tables)) if !tables.is_empty() => {
                 let name = &tables[0];
-                let parts: Vec<String> = name.0.iter().map(|p| p.value.clone()).collect();
+                let parts: Vec<String> = object_name_parts(name);
                 match parts.len() {
                     1 => (None, None, Some(parts[0].clone())),
                     2 => (None, Some(parts[0].clone()), Some(parts[1].clone())),
@@ -3303,20 +3303,20 @@ impl QueryHandler {
                     _ => (None, None, Some(name.to_string())),
                 }
             }
-            sqlparser::ast::GrantObjects::Schemas(schemas) if !schemas.is_empty() => {
+            Some(sqlparser::ast::GrantObjects::Schemas(schemas)) if !schemas.is_empty() => {
                 let name = &schemas[0];
-                let parts: Vec<String> = name.0.iter().map(|p| p.value.clone()).collect();
+                let parts: Vec<String> = object_name_parts(name);
                 match parts.len() {
                     1 => (None, Some(parts[0].clone()), None),
                     2 => (Some(parts[0].clone()), Some(parts[1].clone()), None),
                     _ => (None, Some(name.to_string()), None),
                 }
             }
-            sqlparser::ast::GrantObjects::AllTablesInSchema { schemas }
+            Some(sqlparser::ast::GrantObjects::AllTablesInSchema { schemas })
                 if !schemas.is_empty() =>
             {
                 let name = &schemas[0];
-                let parts: Vec<String> = name.0.iter().map(|p| p.value.clone()).collect();
+                let parts: Vec<String> = object_name_parts(name);
                 match parts.len() {
                     1 => (None, Some(parts[0].clone()), None),
                     2 => (Some(parts[0].clone()), Some(parts[1].clone()), None),
@@ -3335,12 +3335,9 @@ impl QueryHandler {
         // such as `TO ROLE "analysts"`. We want the bare value instead.
         // In sqlparser 0.54, ObjectName is Vec<Ident>; each Ident.value is the raw string.
         let grantee_name = match raw_grantee.name.as_ref() {
-            Some(sqlparser::ast::GranteeName::ObjectName(obj)) => obj
-                .0
-                .iter()
-                .map(|id| id.value.clone())
-                .collect::<Vec<_>>()
-                .join("."),
+            Some(sqlparser::ast::GranteeName::ObjectName(obj)) => {
+                object_name_parts(obj).join(".")
+            }
             Some(other) => other.to_string(),
             None => String::new(),
         };
@@ -3623,7 +3620,11 @@ impl QueryHandler {
                         "COMMENT ON COLUMN requires table.column format".to_string(),
                     ));
                 }
-                let col_name = parts.last().map(|i| i.value.clone()).unwrap_or_default();
+                let col_name = parts
+                    .last()
+                    .and_then(|p| p.as_ident())
+                    .map(|i| i.value.clone())
+                    .unwrap_or_default();
                 let table_parts = sqlparser::ast::ObjectName(
                     object_name.0[..object_name.0.len() - 1].to_vec(),
                 );
@@ -3939,16 +3940,27 @@ fn is_ident_char(b: u8) -> bool {
 /// - `CAST('...' AS TIMESTAMP)` (Cast)
 /// - Raw integer literals (treated as epoch ms directly)
 fn resolve_timestamp_expr(expr: &sqlparser::ast::Expr) -> sqe_core::Result<i64> {
-    use sqlparser::ast::{Expr, Value};
+    use sqlparser::ast::{Expr, Value, ValueWithSpan};
 
     match expr {
-        Expr::TypedString { value, .. } => {
-            parse_timestamp_str(value)
-        }
-        Expr::Value(Value::SingleQuotedString(s)) | Expr::Value(Value::DoubleQuotedString(s)) => {
-            parse_timestamp_str(s)
-        }
-        Expr::Value(Value::Number(n, _)) => {
+        // sqlparser 0.62: TypedString is a tuple variant whose `value` is a
+        // ValueWithSpan; pull the string out (non-string typed literals are
+        // rejected by the catch-all arm below).
+        Expr::TypedString(ts) => match ts.value.clone().into_string() {
+            Some(s) => parse_timestamp_str(&s),
+            None => Err(SqeError::Execution(format!(
+                "Unsupported time travel expression: {expr}. \
+                 Use TIMESTAMP '2026-01-01 00:00:00' or epoch milliseconds."
+            ))),
+        },
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
+            ..
+        }) => parse_timestamp_str(s),
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(n, _),
+            ..
+        }) => {
             n.parse::<i64>().map_err(|_| SqeError::Execution(
                 format!("Cannot parse time travel integer expression: {n}")
             ))
@@ -4455,7 +4467,12 @@ fn arrow_type_to_iceberg(dt: &DataType) -> serde_json::Value {
 /// for OTel `db.namespace` and `db.collection.name` attributes.
 fn extract_otel_table_info(kind: &StatementKind) -> Option<(Option<String>, Option<String>)> {
     let from_object_name = |name: &sqlparser::ast::ObjectName| -> (Option<String>, Option<String>) {
-        let parts: Vec<String> = name.0.iter().map(|p| p.value.clone()).collect();
+        let parts: Vec<String> = name
+            .0
+            .iter()
+            .filter_map(|p| p.as_ident())
+            .map(|p| p.value.clone())
+            .collect();
         match parts.len() {
             1 => (None, Some(parts[0].clone())),
             2 => (Some(parts[0].clone()), Some(parts[1].clone())),
@@ -5012,22 +5029,27 @@ mod tests {
         assert!(matches!(stmt.grantee, Grantee::User(ref n) if n == "alice"));
     }
 
-    /// DENY is not a standard SQL keyword recognized by sqlparser.
-    /// It cannot be parsed as a Statement::Grant or Statement::Revoke.
-    /// SQE would need custom pre-scan logic to handle DENY syntax.
-    /// This test documents the current behavior: DENY is a parse error.
+    /// DENY is not a grant/revoke SQE understands. sqlparser 0.62 added a
+    /// dedicated `Statement::Deny` parse (older versions errored at parse
+    /// time), but SQE's classifier has no arm for it, so it is refused with a
+    /// `NotImplemented` error rather than being silently accepted. This test
+    /// documents that SQE's observable behavior is preserved: DENY is rejected,
+    /// and in particular it is NOT classified as a Grant or Revoke.
     #[test]
-    fn deny_is_not_parseable_by_sqlparser() {
-        use sqlparser::dialect::GenericDialect;
-        use sqlparser::parser::Parser;
-
+    fn deny_is_rejected_by_sqe() {
         let sql = "DENY SELECT ON my_table TO alice";
-        let result = Parser::parse_sql(&GenericDialect {}, sql);
+        let result = sqe_sql::parse_and_classify(sql);
 
         assert!(
             result.is_err(),
-            "DENY should not parse as valid SQL in sqlparser 0.54"
+            "DENY must be refused by SQE, got: {result:?}"
         );
+        if let Ok(kind) = &result {
+            assert!(
+                !matches!(kind, sqe_sql::StatementKind::Grant(_) | sqe_sql::StatementKind::Revoke(_)),
+                "DENY must never be treated as a Grant/Revoke, got: {kind:?}"
+            );
+        }
     }
 
     // ── should_emit (OpenLineage gating) tests ─────────────────────────

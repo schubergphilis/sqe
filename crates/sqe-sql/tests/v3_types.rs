@@ -128,10 +128,10 @@ fn function_default_is_rejected_with_clear_error() {
 #[test]
 fn alter_table_add_column_with_default_parses() {
     let stmt = parse("ALTER TABLE orders ADD COLUMN region STRING DEFAULT 'unknown'");
-    let Statement::AlterTable { operations, .. } = stmt else {
+    let Statement::AlterTable(alter) = stmt else {
         panic!("expected AlterTable");
     };
-    let op = &operations[0];
+    let op = &alter.operations[0];
     let sqlparser::ast::AlterTableOperation::AddColumn { column_def, .. } = op else {
         panic!("expected AddColumn");
     };

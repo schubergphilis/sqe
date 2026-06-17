@@ -439,9 +439,8 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
         Statement::Drop { .. } => Ok(StatementKind::Utility(Box::new(stmt))),
 
         // ALTER TABLE — check for RENAME operations
-        Statement::AlterTable {
-            ref operations, ..
-        } => {
+        Statement::AlterTable(ref alter) => {
+            let operations = &alter.operations;
             let is_rename = operations.iter().any(|op| {
                 matches!(op, AlterTableOperation::RenameTable { .. })
             });
@@ -484,13 +483,10 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
         Statement::Explain { .. } => Ok(StatementKind::Utility(Box::new(stmt))),
         Statement::ExplainTable { .. } => Ok(StatementKind::Utility(Box::new(stmt))),
 
-        // SET → Utility (sqlparser 0.53 uses separate variants per SET flavour)
-        Statement::SetVariable { .. }
-        | Statement::SetTimeZone { .. }
-        | Statement::SetNames { .. }
-        | Statement::SetNamesDefault { .. }
-        | Statement::SetTransaction { .. }
-        | Statement::SetRole { .. } => Ok(StatementKind::Utility(Box::new(stmt))),
+        // SET → Utility (sqlparser 0.62 consolidates every SET flavour
+        // (SetVariable / SetTimeZone / SetNames / SetNamesDefault /
+        // SetTransaction / SetRole) into a single Statement::Set(Set) variant)
+        Statement::Set(_) => Ok(StatementKind::Utility(Box::new(stmt))),
 
         // SHOW SCHEMAS — sqlparser has a ShowSchemas variant
         Statement::ShowSchemas { ref show_options, .. } => {
@@ -563,8 +559,9 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
         }
 
         // TRUNCATE TABLE — routes to DELETE FROM without WHERE
-        Statement::Truncate { ref table_names, .. } => {
-            let name = table_names
+        Statement::Truncate(ref truncate) => {
+            let name = truncate
+                .table_names
                 .first()
                 .map(|t| t.name.to_string())
                 .unwrap_or_default();

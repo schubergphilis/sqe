@@ -27,6 +27,7 @@
 use chrono::{DateTime, Utc};
 use sqlparser::ast::{
     Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Statement, Value,
+    ValueWithSpan,
 };
 
 use sqe_core::SqeError;
@@ -352,7 +353,10 @@ fn parse_rollback_to_snapshot(mut args: Vec<(String, Expr)>) -> sqe_core::Result
 fn expect_i64(expr: &Expr, field: &str) -> sqe_core::Result<i64> {
     use sqlparser::ast::UnaryOperator;
     match expr {
-        Expr::Value(Value::Number(n, _)) => n.parse::<i64>().map_err(|e| {
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(n, _),
+            ..
+        }) => n.parse::<i64>().map_err(|e| {
             SqeError::Execution(format!("Invalid integer for '{field}': {n} ({e})"))
         }),
         Expr::UnaryOp {
@@ -402,7 +406,10 @@ fn take_namespace(args: &mut Vec<(String, Expr)>) -> sqe_core::Result<NamespaceR
 
 fn expect_bool(expr: &Expr, field: &str) -> sqe_core::Result<bool> {
     match expr {
-        Expr::Value(Value::Boolean(b)) => Ok(*b),
+        Expr::Value(ValueWithSpan {
+            value: Value::Boolean(b),
+            ..
+        }) => Ok(*b),
         other => Err(SqeError::Execution(format!(
             "Expected boolean literal for '{field}', got: {other}"
         ))),
@@ -411,7 +418,12 @@ fn expect_bool(expr: &Expr, field: &str) -> sqe_core::Result<bool> {
 
 /// Split `system.rewrite_data_files` or similar into (schema, proc).
 fn split_system_name(name: &ObjectName) -> Option<(String, String)> {
-    let parts: Vec<String> = name.0.iter().map(|i| i.value.clone()).collect();
+    let parts: Vec<String> = name
+        .0
+        .iter()
+        .filter_map(|p| p.as_ident())
+        .map(|i| i.value.clone())
+        .collect();
     match parts.as_slice() {
         [a, b] => Some((a.clone(), b.clone())),
         _ => None,
@@ -503,8 +515,10 @@ fn expect_no_remaining(args: &[(String, Expr)], proc: &str) -> sqe_core::Result<
 
 fn expect_string(expr: &Expr, field: &str) -> sqe_core::Result<String> {
     match expr {
-        Expr::Value(Value::SingleQuotedString(s))
-        | Expr::Value(Value::DoubleQuotedString(s)) => Ok(s.clone()),
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
+            ..
+        }) => Ok(s.clone()),
         other => Err(SqeError::Execution(format!(
             "Expected string literal for '{field}', got: {other}"
         ))),
@@ -513,7 +527,10 @@ fn expect_string(expr: &Expr, field: &str) -> sqe_core::Result<String> {
 
 fn expect_u64(expr: &Expr, field: &str) -> sqe_core::Result<u64> {
     match expr {
-        Expr::Value(Value::Number(n, _)) => n.parse::<u64>().map_err(|e| {
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(n, _),
+            ..
+        }) => n.parse::<u64>().map_err(|e| {
             SqeError::Execution(format!("Invalid integer for '{field}': {n} ({e})"))
         }),
         other => Err(SqeError::Execution(format!(
@@ -532,9 +549,18 @@ fn expect_usize(expr: &Expr, field: &str) -> sqe_core::Result<usize> {
 
 fn expect_timestamp(expr: &Expr, field: &str) -> sqe_core::Result<DateTime<Utc>> {
     let s = match expr {
-        Expr::Value(Value::SingleQuotedString(s))
-        | Expr::Value(Value::DoubleQuotedString(s)) => s.clone(),
-        Expr::TypedString { value, .. } => value.clone(),
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
+            ..
+        }) => s.clone(),
+        Expr::TypedString(ts) => match ts.value.clone().into_string() {
+            Some(s) => s,
+            None => {
+                return Err(SqeError::Execution(format!(
+                    "Expected timestamp literal for '{field}', got: {expr}"
+                )));
+            }
+        },
         other => {
             return Err(SqeError::Execution(format!(
                 "Expected timestamp literal for '{field}', got: {other}"
