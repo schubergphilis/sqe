@@ -12,6 +12,7 @@ use arrow::array::{
     Array, Decimal128Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
 use datafusion::common::TableReference;
 use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::logical_expr::{col, lit, LogicalPlan, LogicalPlanBuilder};
@@ -97,6 +98,72 @@ fn build_multilevel_scan() -> LogicalPlan {
         .unwrap()
 }
 
+
+/// Like `build_multilevel_scan` but returns the MemTable so the plan can be
+/// executed against a registered multi-level catalog/schema.
+fn build_multilevel_scan_with_mem() -> (Arc<MemTable>, LogicalPlan) {
+    let schema = employee_schema();
+    let batch = employee_batch(schema.clone());
+    let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap());
+    let table_ref = TableReference::full("cat", "ns1.ns2", "employees");
+    let plan = LogicalPlanBuilder::scan(table_ref, provider_as_source(mem.clone()), None)
+        .unwrap()
+        .build()
+        .unwrap();
+    (mem, plan)
+}
+
+/// Execute a plan whose scan is the full `cat.ns1.ns2.employees` reference by
+/// registering the matching catalog + schema first.
+async fn execute_multilevel(plan: LogicalPlan, mem: Arc<MemTable>) -> Vec<RecordBatch> {
+    let ctx = SessionContext::new();
+    let catalog = Arc::new(MemoryCatalogProvider::new());
+    catalog
+        .register_schema("ns1.ns2", Arc::new(MemorySchemaProvider::new()))
+        .unwrap();
+    ctx.register_catalog("cat", catalog);
+    ctx.register_table(TableReference::full("cat", "ns1.ns2", "employees"), mem)
+        .unwrap();
+    let df = ctx.execute_logical_plan(plan).await.unwrap();
+    df.collect().await.unwrap()
+}
+
+/// Regression for the live Ranger demo failure: against a real Iceberg-style
+/// scan whose fields are FULLY QUALIFIED (`cat.ns1.ns2.employees.col`), the
+/// rewriter must normalize the bare-column row filter and mask args to the
+/// scan's qualifier. Before the LogicalPlanBuilder normalization fix this
+/// failed physical planning with
+/// "type_coercion ... No field named cat.ns1.ns2.employees.region". The
+/// existing tests used a 1-part bare ref, which DataFusion normalizes
+/// leniently, so they never reproduced it. This one executes the plan, so it
+/// exercises the analyzer + physical planner that actually broke.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn row_filter_and_mask_execute_over_qualified_multilevel_scan() {
+    let (mem, plan) = build_multilevel_scan_with_mem();
+
+    let store = InMemoryPolicyStore::new();
+    let mut policy = ResolvedPolicy::default();
+    policy.row_filters.push(col("region").eq(lit("EU")));
+    policy
+        .column_masks
+        .insert("salary".to_string(), MaskType::Nullify);
+    // schema "ns1.ns2" -> last dotted component "ns2" is the namespace key
+    store.add_table_policy("ns2", "employees", policy).await;
+
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store));
+    let rewritten = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
+
+    // The step that failed before the fix: analyze + physical-plan + run.
+    let batches = execute_multilevel(rewritten, mem).await;
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 2, "row filter should leave only the two EU rows");
+    let salary = batches[0].column_by_name("salary").unwrap();
+    assert_eq!(
+        salary.null_count(),
+        salary.len(),
+        "masked salary must be entirely NULL"
+    );
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn row_filter_injects_filter_above_scan() {
