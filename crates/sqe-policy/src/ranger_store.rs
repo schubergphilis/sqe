@@ -266,7 +266,29 @@ fn map_mask(info: &DataMaskInfo, column: &str) -> Result<Option<MaskType>, ()> {
                 .map(|e| Some(MaskType::Custom(e)))
                 .map_err(|_| ())
         }
-        // Phase 2: MASK, MASK_SHOW_LAST_4, MASK_SHOW_FIRST_4, MASK_DATE_SHOW_YEAR
+        "MASK" => Ok(Some(MaskType::PartialMask {
+            show_first: 0,
+            show_last: 0,
+            upper: 'X',
+            lower: 'x',
+            digit: 'n',
+        })),
+        "MASK_SHOW_LAST_4" => Ok(Some(MaskType::PartialMask {
+            show_first: 0,
+            show_last: 4,
+            upper: 'x',
+            lower: 'x',
+            digit: 'x',
+        })),
+        "MASK_SHOW_FIRST_4" => Ok(Some(MaskType::PartialMask {
+            show_first: 4,
+            show_last: 0,
+            upper: 'x',
+            lower: 'x',
+            digit: 'x',
+        })),
+        "MASK_DATE_SHOW_YEAR" => Ok(Some(MaskType::DateShowYear)),
+        // Genuinely unknown / unsupported types still fail closed (restrict).
         _ => Err(()),
     }
 }
@@ -519,7 +541,7 @@ mod tests {
         let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
         bundle.policies[0].data_mask_policy_items[0]
             .data_mask_info
-            .data_mask_type = "MASK_SHOW_LAST_4".to_string();
+            .data_mask_type = "MASK_FUTURE_UNSUPPORTED".to_string();
         let policy = resolve_from_bundle(
             &bundle,
             &user("alice", &["analyst"]),
@@ -651,5 +673,52 @@ mod tests {
         item.groups = vec!["analysts_group".to_string()];
         let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
         assert!(policy.column_masks.is_empty(), "group-bound item must not be enforced in MVP");
+    }
+
+    // --- map_mask arm tests ---
+
+    #[test]
+    fn maps_show_last_4() {
+        let info = DataMaskInfo { data_mask_type: "MASK_SHOW_LAST_4".into(), ..Default::default() };
+        match map_mask(&info, "ssn") {
+            Ok(Some(MaskType::PartialMask { show_last: 4, show_first: 0, .. })) => {}
+            other => panic!("expected show-last-4 PartialMask, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_show_first_4() {
+        let info = DataMaskInfo { data_mask_type: "MASK_SHOW_FIRST_4".into(), ..Default::default() };
+        assert!(matches!(
+            map_mask(&info, "ssn"),
+            Ok(Some(MaskType::PartialMask { show_first: 4, show_last: 0, .. }))
+        ));
+    }
+
+    #[test]
+    fn maps_full_mask_uses_hive_default_chars() {
+        let info = DataMaskInfo { data_mask_type: "MASK".into(), ..Default::default() };
+        match map_mask(&info, "name") {
+            Ok(Some(MaskType::PartialMask {
+                upper: 'X',
+                lower: 'x',
+                digit: 'n',
+                show_first: 0,
+                show_last: 0,
+            })) => {}
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_date_show_year() {
+        let info = DataMaskInfo { data_mask_type: "MASK_DATE_SHOW_YEAR".into(), ..Default::default() };
+        assert!(matches!(map_mask(&info, "hired_at"), Ok(Some(MaskType::DateShowYear))));
+    }
+
+    #[test]
+    fn truly_unknown_mask_is_err() {
+        let info = DataMaskInfo { data_mask_type: "MASK_FUTURE_UNSUPPORTED".into(), ..Default::default() };
+        assert!(map_mask(&info, "x").is_err());
     }
 }
