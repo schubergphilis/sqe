@@ -31,14 +31,29 @@ SQE should keep pull/rewrite. The work is not the model (it exists) but the
 policy VOCABULARY to express Snowflake-equivalent policies, plus a Ranger-backed
 policy source.
 
+## Which Ranger service-def (authoritative: `docs/ranger-fine-grained-service-type.md`)
+
+Fine-grained policies do NOT go on the `polaris` service (it has no
+`dataMaskDef`/`rowFilterDef` - coarse allow/deny only). Use the **`hive`
+service-def** (the service Apache Spark's Kyuubi Ranger plugin reads) so SQE and
+Spark share one policy set, plus a linked **`tag`** service for tag-based masking.
+Key consequences that shape this phase:
+- `hive` resources are `database -> table -> column` (NO catalog level). SQE must
+  flatten Iceberg catalog + namespace into the `database` string using the SAME
+  convention Kyuubi uses, or cross-engine policies silently won't match.
+- policyType integers: `0 = access`, `1 = DATAMASK`, `2 = ROWFILTER`.
+- mask transformers in the service-def are Hive UDFs (`mask`, `mask_show_last_n`,
+  `mask_hash`); SQE reimplements them as DataFusion UDFs or rewrites them.
+- pull everything in one call via the plugin DOWNLOAD endpoint (below).
+
 ## Ranger policy type -> where it is enforced
 
-| Ranger policy type | Enforcement | Status |
-|---|---|---|
-| resource access (catalog/ns/table allow-deny) | Polaris (embedded Ranger authorizer) | shipped |
-| row-filter | SQE PlanRewriter (Filter above scan) | this phase |
-| data-mask (column masking) | SQE PlanRewriter (column -> mask expr) | this phase |
-| tag (tag-based masking) | SQE, tag -> masking-policy binding | this phase |
+| Ranger policy type | Service | Enforcement | Status |
+|---|---|---|---|
+| resource access (catalog/ns/table allow-deny) | `polaris` | Polaris (embedded Ranger authorizer) | shipped |
+| row-filter (policyType 2) | `hive` | SQE PlanRewriter (Filter above scan) | this phase |
+| data-mask (policyType 1) | `hive` | SQE PlanRewriter (column -> mask expr) | this phase |
+| tag (mask/row-filter) | `tag` linked to `hive` | SQE, via tag-resource associations | this phase |
 
 A single Ranger policy store drives both: the coarse Polaris gate (already wired)
 and SQE's fine-grained rewriter (new `RangerStore: PolicyStore`).
@@ -92,13 +107,30 @@ and SQE's fine-grained rewriter (new `RangerStore: PolicyStore`).
 ## Component to build
 
 `RangerStore: PolicyStore` (new, modeled on `OpaStore`):
-- `resolve(user, table, namespace) -> ResolvedPolicy`: fetch the table's Ranger
-  row-filter, data-mask, and tag policies (Ranger Admin REST or the embedded
-  policy bundle), evaluate them for the user's roles (Ranger role membership),
-  and return row_filters + column_masks + restricted_columns.
+- Reads a **`hive`-type Ranger service** (the one Spark uses), NOT the `polaris`
+  service. Pull the whole bundle in one call:
+  `GET /service/plugins/policies/download/{serviceName}` returns `ServicePolicies`
+  = resource `policies[]` (access=0, datamask=1, rowfilter=2) + `serviceDef`
+  (mask transformer templates, rowFilterDef) + `tagPolicies` + `policyVersion`
+  (304 on unchanged -> cheap polling). The public-v2 `/api/policy` array is
+  resource-only and insufficient.
+- `resolve(user, table, namespace) -> ResolvedPolicy`: flatten the Iceberg
+  catalog/namespace/table to the hive `database/table/column` naming (match
+  Kyuubi's convention), select matching row-filter + data-mask (+ tag) items for
+  the user, and return row_filters + column_masks + restricted_columns. Match on
+  the user + `SessionUser.roles` DIRECTLY (SQE's session roles come from the
+  token, unlike the Polaris gate which needs Ranger role membership). Evaluation
+  order: tag policies first, deny-overrides, then resource access -> mask ->
+  row-filter. Translate `filterExpr`/`valueExpr` from Hive/Spark dialect to
+  DataFusion; realize Hive mask transformers as DataFusion UDFs (see the mask
+  table in `docs/ranger-fine-grained-service-type.md`).
 - Wire it as a `PolicyEngine::Ranger` variant in config, feeding the existing
   `PolicyEnforcer` / `PlanRewriter` (which today runs passthrough).
-- Cache + fail-closed like `OpaStore`.
+- Cache + fail-closed like `OpaStore` (use `policyVersion` for incremental refresh).
+
+See `docs/ranger-fine-grained-service-type.md` for the full service-type
+rationale, the mask-type mapping, the flattening sharp edge, and cross-engine
+sharing requirements.
 
 ## Snowflake context functions to mirror (reference)
 
