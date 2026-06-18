@@ -40,8 +40,14 @@ enough; the Polaris principal entity is required regardless of auth.type.
 External mode also disables the internal `root` token, creating a bootstrap
 chicken-and-egg (nothing can authenticate to create the first principal), which
 is why this stack uses `mixed` (internal token for provisioning + external OIDC
-for users). Eliminating per-user provisioning would require a non-default
-federated authenticator (`polaris.authentication.authenticator.type`), unverified.
+for users). Confirmed against source: `DefaultAuthenticator` (`@Identifier("default")`)
+is the ONLY authenticator in Polaris 1.5.0 and current `main`; it always looks the
+principal up in the metastore (`findPrincipalByName`/`findPrincipalById`) and 401s
+if absent, and its javadoc states it "does not support federated principals that
+are not managed by Polaris". `polaris.authentication.authenticator.type` only
+accepts `default`. So eliminating per-user principal provisioning is NOT a config
+option; it would require a custom `Authenticator` bean (a code change / custom
+build). Provision a principal per user instead.
 
 **Roles.** This is the surprising part. Polaris IGNORES the token's realm roles
 (they lack Polaris's expected `PRINCIPAL_ROLE:` prefix, so they are dropped
