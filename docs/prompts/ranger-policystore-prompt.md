@@ -43,36 +43,53 @@ Branch from `main`: `feat/ranger-policy-store`. Never push to main; open an MR.
 
 ## What to build
 
+   SERVICE TYPE (decided in `docs/ranger-fine-grained-service-type.md`): read a
+   **`hive`-type Ranger service** (the one Apache Spark's Kyuubi plugin reads),
+   NOT the `polaris` service (which has no row-filter/data-mask defs). This is
+   what lets SQE and Spark share one policy set. Resource model is
+   `database/table/column` (no catalog level): flatten the Iceberg
+   catalog/namespace/table into the `database`/`table` strings using the SAME
+   convention Kyuubi uses (two-part `db.table`; dotted namespace) or cross-engine
+   policies will not match.
+
 1. **`RangerStore` implementing `PolicyStore`** in a new file
    `crates/sqe-policy/src/ranger_store.rs`:
-   - Constructor takes the Ranger Admin base URL, service name (default `polaris`
-     or a dedicated SQE service), basic-auth admin user/password
-     (`SecretString`), timeout, cache TTL/size, and breaker settings (mirror
-     `OpaConfig`/`OpaStore::new`).
-   - `resolve(user, table, namespace)`:
-     a. Fetch the table's Ranger policies for the configured service. Use the
-        public v2 policy API which returns a bare array:
-        `GET {url}/service/public/v2/api/policy?serviceName={service}`
-        (NOT `/service/plugins/policies/...`, which wraps results in a paginated
-        object). Filter to policies whose `resources` match
-        catalog/namespace/table (resource keys `catalog`, `namespace`, `table`;
-        ignore the `root` level for matching here).
-     b. Among matching policies, read the two fine-grained policy TYPES:
-        - **row-filter** policies (`policyType == 1`): each has
-          `rowFilterPolicyItems[]` with `{users, groups, roles, rowFilterInfo:{filterExpr}}`.
-          For items whose `users`/`roles` match the `SessionUser`, parse
-          `filterExpr` (a SQL boolean string) into a DataFusion `Expr` and add to
-          `row_filters`. Reuse OPA's filter-string parsing approach
-          (`opa.rs` has a SQL-string -> Expr parser; factor it out and share it).
-        - **data-mask** policies (`policyType == 2`): each has
-          `dataMaskPolicyItems[]` with `{users, groups, roles, dataMaskInfo:{dataMaskType, valueExpr}}`.
-          For matching items, map the Ranger mask type to `MaskType`:
-          `MASK`/`MASK_NULL` -> `Nullify`; `MASK_NONE` -> none;
-          `CUSTOM` (with `valueExpr`) -> `Custom(parsed Expr)`;
-          a hash mask type -> `Hash`; a constant/redact -> `Redact(const)`.
-          Map the masked column name into `column_masks`.
-     c. Multiple matching items combine the OPA way (union restrictions, AND row
-        filters) -- mirror `InMemoryPolicyStore`/`OpaStore` merge semantics.
+   - Constructor takes the Ranger Admin base URL, the `hive` service name,
+     basic-auth admin user/password (`SecretString`), timeout, cache TTL/size,
+     and breaker settings (mirror `OpaConfig`/`OpaStore::new`).
+   - Fetch policies with the PLUGIN DOWNLOAD endpoint (one call gets everything):
+     `GET {url}/service/plugins/policies/download/{serviceName}?lastKnownVersion={v}`
+     returns `ServicePolicies` = `policies[]` + `serviceDef` (mask transformer
+     templates + rowFilterDef) + `tagPolicies` + `policyVersion`. Returns 304 when
+     `lastKnownVersion` matches -> use it for cheap incremental refresh. Do NOT
+     use `/service/public/v2/api/policy` (resource-only, no serviceDef/tags).
+   - `resolve(user, table, namespace)`: flatten to hive `database/table` (above),
+     select the policies whose `resources` match, then read the fine-grained
+     policy TYPES (NOTE the integers: `0 = access`, `1 = DATAMASK`,
+     `2 = ROWFILTER`):
+        - **data-mask** policies (`policyType == 1`): `dataMaskPolicyItems[]` with
+          `{users, groups, roles, dataMaskInfo:{dataMaskType, valueExpr}}`. Map
+          the Ranger mask type to `MaskType`:
+          `MASK_NULL` -> `Nullify`; `MASK_NONE` -> no mask (exemption, evaluate
+          first); `CUSTOM` (with `valueExpr`, `{col}` placeholder) ->
+          `Custom(parsed Expr)`; `MASK_HASH` -> `Hash`;
+          `MASK`/`MASK_SHOW_LAST_4`/`MASK_SHOW_FIRST_4`/`MASK_DATE_SHOW_YEAR` ->
+          new partial/regex/date mask types (need DataFusion UDFs; see the mask
+          table in `docs/ranger-fine-grained-service-type.md`). Map the masked
+          column into `column_masks`.
+        - **row-filter** policies (`policyType == 2`): `rowFilterPolicyItems[]`
+          with `{users, groups, roles, rowFilterInfo:{filterExpr}}`. Parse
+          `filterExpr` (a Hive/Spark-dialect SQL boolean string; translate to
+          DataFusion) into an `Expr` and add to `row_filters`. Reuse OPA's
+          filter-string parser (`opa.rs`; factor it out and share).
+        - **tag** policies (from `tagPolicies` in the bundle): apply when the
+          resource carries a matching tag. Tag-to-resource associations are NOT
+          in the policy bundle; fetch them from the tag store / tag REST (or defer
+          tag-based masking to a follow-up if no tag source exists yet).
+     Match items on the user + `SessionUser.roles` DIRECTLY (token roles).
+     Evaluation order: tag policies first, deny-overrides, then resource
+     access -> mask -> row-filter. Multiple matching items combine the OPA way
+     (union restrictions, AND row filters) -- mirror `OpaStore` merge semantics.
    - `invalidate_all`: clear the cache (called after GRANT/REVOKE).
    - Caching (moka), circuit breaker, and FAIL-CLOSED (deny / restrict on any
      fetch or parse error) exactly like `OpaStore`. Do not fail open.
@@ -82,9 +99,12 @@ Branch from `main`: `feat/ranger-policy-store`. Never push to main; open an MR.
      is added later.)
 
 2. **Config**: add `PolicyEngine::Ranger` and a `RangerPolicyConfig` nested under
-   `PolicyConfig` (mirror `OpaConfig`: url, service_name, admin_user,
-   admin_password: SecretString, timeout, cache TTL/size, breaker thresholds).
-   Update the `PolicyEngine` `FromStr` + the unknown-value error message.
+   `PolicyConfig` (mirror `OpaConfig`: url, `service_name` = the **hive** service
+   to share with Spark, admin_user, admin_password: SecretString, timeout, cache
+   TTL/size, breaker thresholds). Update the `PolicyEngine` `FromStr` + the
+   unknown-value error message. (This is the fine-grained POLICY engine, separate
+   from `access_control.backend = "ranger"` which is the GRANT/REVOKE write path
+   against the `polaris` service.)
 
 3. **Wiring**: where the coordinator builds the `PolicyStore` / `PolicyEnforcer`
    from `PolicyEngine` (search `sqe_server.rs` / wherever `OpaStore` is
