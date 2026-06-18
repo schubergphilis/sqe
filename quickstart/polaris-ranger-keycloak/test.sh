@@ -118,6 +118,14 @@ assert_fg_row_filter() { # desc user
       if echo "$out" | grep -qE '[0-9]+\.[0-9]+'; then
         red "FAIL  $1 (numeric amount visible, column mask not applied)"; echo "      $(echo "$out" | tr '\n' ' ' | cut -c1-200)"; FAIL=$((FAIL+1)); return
       fi
+      # Confirm at least one EU row IS returned: the row filter must restrict to
+      # EU rows, NOT deny/filter everything. An empty result would otherwise pass
+      # all the negative checks above and read as "masking works" vacuously (e.g.
+      # if the hive policy never applied, the service-name was wrong, or a rejected
+      # filterExpr fail-closed to deny-all).
+      if ! echo "$out" | grep -qi 'EU'; then
+        red "FAIL  $1 (no EU rows returned; policy may have filtered/denied everything, not masked)"; echo "      $(echo "$out" | tr '\n' ' ' | cut -c1-200)"; FAIL=$((FAIL+1)); return
+      fi
       green "PASS  $1"; PASS=$((PASS+1)); return 0
     fi
     sleep 5
