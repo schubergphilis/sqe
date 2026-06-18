@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Fields};
 use datafusion::common::{DFSchema, DFSchemaRef};
 use datafusion::logical_expr::Expr;
 use datafusion::prelude::SessionContext;
@@ -21,7 +21,11 @@ use datafusion::sql::sqlparser::ast::Expr as SqlExpr;
 ///   1. Parse with `DFParser::parse_sql_into_expr` to obtain the sqlparser AST.
 ///      This catches syntax errors and trailing garbage (fail-closed).
 ///   2. Walk the AST to collect all column-reference identifiers.
-///   3. Build a stub `DFSchema` containing those column names (all as `Utf8`).
+///   3. Build an UNQUALIFIED stub `DFSchema` containing those column names (all
+///      as `Utf8`) via `DFSchema::from_unqualified_fields`. Unqualified means
+///      each column gets `relation: None`, so when the expr is later spliced
+///      into a `Filter` above a real `TableScan`, DataFusion matches by name
+///      alone and does not compare against a fake table qualifier.
 ///   4. Call `SessionContext::parse_sql_expr` with that schema so DataFusion's
 ///      `validate_schema_satisfies_exprs` pass succeeds without real schema info.
 ///
@@ -47,16 +51,19 @@ pub fn parse_sql_predicate(sql: &str) -> sqe_core::Result<Expr> {
     let mut col_names: HashSet<String> = HashSet::new();
     collect_identifiers(&parsed.expr, &mut col_names);
 
-    // Build a stub DFSchema so validate_schema_satisfies_exprs passes.
-    // All fields are Utf8 (nullable); actual types are resolved when the expr
-    // is injected into a plan above the real TableScan.
-    let fields: Vec<Field> = col_names
+    // Build an UNQUALIFIED stub DFSchema so validate_schema_satisfies_exprs
+    // passes without a real table schema. Fields are Utf8 (nullable); actual
+    // types are resolved when the expr is injected into a plan above the real
+    // TableScan. Using from_unqualified_fields (not try_from_qualified_schema)
+    // is critical: qualified fields stamp a fake table name onto every
+    // Expr::Column, which causes FieldNotFound when the expr is later spliced
+    // into a Filter above a real scan (e.g. "employees.tier" != "__policy_stub__.tier").
+    let fields: Fields = col_names
         .iter()
         .map(|name| Field::new(name.as_str(), DataType::Utf8, true))
         .collect();
-    let arrow_schema = Schema::new(fields);
     let df_schema = DFSchemaRef::new(
-        DFSchema::try_from_qualified_schema("__policy_stub__", &arrow_schema).map_err(|e| {
+        DFSchema::from_unqualified_fields(fields, Default::default()).map_err(|e| {
             sqe_core::error::SqeError::Execution(format!(
                 "failed to build policy stub schema for '{trimmed}': {e}"
             ))
