@@ -131,6 +131,43 @@ The Polaris service-def hierarchy is `root -> catalog -> namespace -> table`. Th
 
 Resolved value for this stack: `"*"` (root required, wildcard-matched).
 
+## Fine-grained enforcement (SQE-side)
+
+The Polaris gate tested above is coarse: it answers "may this user load this table?" SQE also
+enforces row filters and column masks at the query-plan layer, reading a separate `hive`-type
+Ranger service. These two paths are independent.
+
+**How SQE reads the hive service.** On startup (and on a configurable refresh interval) SQE
+calls `GET /service/plugins/policies/download/hive` to download the policy set. The
+`[policy] engine = "ranger"` setting activates the `RangerStore: PolicyStore`, which caches
+these policies and evaluates them against each query's catalog, namespace, and table.
+
+**Plan rewriting.** SQE rewrites the `LogicalPlan` before DataFusion optimization. Row filters
+inject as `Filter` nodes above the `TableScan`; column masks replace column references with
+`CASE WHEN ... THEN NULL END` expressions. DataFusion's optimizer can push user predicates
+through row-filter nodes but not through masked columns (masking a column blocks predicate
+pushdown on that column's raw value, matching PostgreSQL RLS semantics).
+
+**Resource mapping.** SQE passes the last dotted component of the namespace as the `database`
+resource. For `sales_wh.sales.orders` the resource sent to Ranger is `database = "sales"`,
+`table = "orders"`. Ranger policies must use `"sales"` as the database value, not the full
+three-part path `"sales_wh.sales"`.
+
+**Separation from the coarse path.** `GRANT`/`REVOKE` go to the `polaris` Ranger service via
+`[access_control]`; Polaris enforces those at the catalog level. The `hive` Ranger service is
+read by SQE's policy engine for row/column enforcement. A query must pass both gates: the Polaris
+gate (can the user load the table?) and SQE's rewriter (what rows and columns may the user see?).
+Revoking the coarse `SELECT` grant still denies the query before any fine-grained check runs.
+
+**Shared with Apache Spark / Kyuubi.** The `hive` service is the same service those engines read,
+so the same policy set is shared across tools. A mask or row filter written for SQE applies to
+Spark queries through the same Ranger service and vice versa.
+
+**Phase 2 (not yet implemented).** The current enforcement covers `MASK_NULL` (replace column
+value with NULL) and row-filter expressions. Phase 2 will add mask UDFs (hash, partial, date
+truncation), session-context SQL functions (`current_user()`, `current_role()`) inside filter
+expressions, and tag-based masking via Ranger tag policies.
+
 ## Versions
 
 - Apache Polaris 1.5.0 (embedded Ranger authorizer, Beta).
