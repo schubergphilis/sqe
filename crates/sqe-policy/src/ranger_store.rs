@@ -62,6 +62,9 @@ pub struct DataMaskPolicyItem {
     pub users: Vec<String>,
     #[serde(default)]
     pub roles: Vec<String>,
+    // groups-based binding is NOT enforced (SQE matches token roles only); see Phase 2.
+    #[serde(default)]
+    pub groups: Vec<String>,
     #[serde(rename = "dataMaskInfo", default)]
     pub data_mask_info: DataMaskInfo,
 }
@@ -80,6 +83,9 @@ pub struct RowFilterPolicyItem {
     pub users: Vec<String>,
     #[serde(default)]
     pub roles: Vec<String>,
+    // groups-based binding is NOT enforced (SQE matches token roles only); see Phase 2.
+    #[serde(default)]
+    pub groups: Vec<String>,
     #[serde(rename = "rowFilterInfo", default)]
     pub row_filter_info: RowFilterInfo,
 }
@@ -190,6 +196,10 @@ fn hive_database(namespace: &str) -> String {
 
 /// True if a Ranger resource value list matches `target` (supports `*`
 /// wildcard and exact match; `isExcludes` inverts the result).
+///
+// Only exact match and bare "*" are supported. Ranger glob patterns (e.g.
+// "orders*", "*_pii") are NOT matched in MVP — author policies with exact
+// names or "*". An empty values list matches nothing.
 fn resource_matches(res: &RangerResource, target: &str) -> bool {
     let hit = res.values.iter().any(|v| v == "*" || v == target);
     hit ^ res.is_excludes
@@ -211,8 +221,25 @@ fn policy_matches_table(p: &RangerPolicy, database: &str, table: &str) -> bool {
 }
 
 /// True if a policy-item applies to this user/roles (token roles, matched directly).
-fn item_matches(users: &[String], roles: &[String], user: &SessionUser) -> bool {
-    users.iter().any(|u| u == &user.username) || roles.iter().any(|r| user.roles.contains(r))
+///
+/// `groups` is accepted but NOT enforced (SQE has no group info; token roles
+/// only, by design — Phase 2). A policy item bound ONLY via `groups` is skipped
+/// with a warning so operators see the gap instead of a silent drop.
+fn item_matches(
+    users: &[String],
+    roles: &[String],
+    groups: &[String],
+    user: &SessionUser,
+) -> bool {
+    let matched =
+        users.iter().any(|u| u == &user.username) || roles.iter().any(|r| user.roles.contains(r));
+    if !matched && !groups.is_empty() {
+        warn!(
+            ?groups,
+            "Ranger policy item is group-bound; SQE does not enforce group bindings (Phase 2) — policy item skipped"
+        );
+    }
+    matched
 }
 
 /// Map a Ranger hive data-mask type to an SQE `MaskType`.
@@ -258,31 +285,30 @@ fn resolve_from_bundle(
             continue;
         }
 
-        // Data-mask policy (policyType 1)
+        // Data-mask policy (policyType 1). A datamask policy's `column`
+        // resource can list several columns that all receive the same mask;
+        // iterate ALL of them so multi-column policies don't leak.
         if p.policy_type == 1 {
-            let column = p
-                .resources
-                .get("column")
-                .and_then(|r| r.values.first())
-                .cloned();
-            let Some(column) = column else { continue };
-            for item in &p.data_mask_policy_items {
-                if !item_matches(&item.users, &item.roles, user) {
-                    continue;
-                }
-                match map_mask(&item.data_mask_info, &column) {
-                    Ok(Some(mask)) => {
-                        policy.column_masks.insert(column.clone(), mask);
+            let Some(col_res) = p.resources.get("column") else { continue };
+            for column in &col_res.values {
+                for item in &p.data_mask_policy_items {
+                    if !item_matches(&item.users, &item.roles, &item.groups, user) {
+                        continue;
                     }
-                    Ok(None) => { /* MASK_NONE exemption: leave column visible */ }
-                    Err(()) => {
-                        warn!(
-                            column = %column,
-                            mask_type = %item.data_mask_info.data_mask_type,
-                            "unsupported Ranger mask type; restricting column (fail-closed)"
-                        );
-                        if !policy.restricted_columns.contains(&column) {
-                            policy.restricted_columns.push(column.clone());
+                    match map_mask(&item.data_mask_info, column) {
+                        Ok(Some(mask)) => {
+                            policy.column_masks.insert(column.clone(), mask);
+                        }
+                        Ok(None) => { /* MASK_NONE exemption: leave column visible */ }
+                        Err(()) => {
+                            warn!(
+                                column = %column,
+                                mask_type = %item.data_mask_info.data_mask_type,
+                                "unsupported Ranger mask type; restricting column (fail-closed)"
+                            );
+                            if !policy.restricted_columns.contains(column) {
+                                policy.restricted_columns.push(column.clone());
+                            }
                         }
                     }
                 }
@@ -292,7 +318,7 @@ fn resolve_from_bundle(
         // Row-filter policy (policyType 2)
         if p.policy_type == 2 {
             for item in &p.row_filter_policy_items {
-                if !item_matches(&item.users, &item.roles, user) {
+                if !item_matches(&item.users, &item.roles, &item.groups, user) {
                     continue;
                 }
                 if let Some(expr_str) = &item.row_filter_info.filter_expr {
@@ -365,7 +391,7 @@ mod tests {
         {
           "id": 1, "policyType": 1, "isEnabled": true,
           "resources": {
-            "database": {"values": ["sales_wh.sales"]},
+            "database": {"values": ["sales"]},
             "table": {"values": ["orders"]},
             "column": {"values": ["amount"]}
           },
@@ -377,7 +403,7 @@ mod tests {
         {
           "id": 2, "policyType": 2, "isEnabled": true,
           "resources": {
-            "database": {"values": ["sales_wh.sales"]},
+            "database": {"values": ["sales"]},
             "table": {"values": ["orders"]}
           },
           "rowFilterPolicyItems": [
@@ -443,7 +469,7 @@ mod tests {
             &bundle,
             &user("alice", &["analyst"]),
             "orders",
-            "sales_wh.sales",
+            "sales",
         );
         assert!(matches!(
             policy.column_masks.get("amount"),
@@ -458,7 +484,7 @@ mod tests {
             &bundle,
             &user("alice", &["analyst"]),
             "orders",
-            "sales_wh.sales",
+            "sales",
         );
         assert_eq!(policy.row_filters.len(), 1);
     }
@@ -470,7 +496,7 @@ mod tests {
             &bundle,
             &user("bob", &["engineer"]),
             "orders",
-            "sales_wh.sales",
+            "sales",
         );
         assert!(policy.column_masks.is_empty());
         assert!(policy.row_filters.is_empty());
@@ -482,7 +508,7 @@ mod tests {
         bundle.policies[0].data_mask_policy_items[0].roles.clear();
         bundle.policies[0].data_mask_policy_items[0].users = vec!["alice".to_string()];
         let policy =
-            resolve_from_bundle(&bundle, &user("alice", &[]), "orders", "sales_wh.sales");
+            resolve_from_bundle(&bundle, &user("alice", &[]), "orders", "sales");
         assert!(policy.column_masks.contains_key("amount"));
     }
 
@@ -496,7 +522,7 @@ mod tests {
             &bundle,
             &user("alice", &["analyst"]),
             "orders",
-            "sales_wh.sales",
+            "sales",
         );
         assert!(policy.restricted_columns.contains(&"amount".to_string()));
         assert!(!policy.column_masks.contains_key("amount"));
@@ -512,7 +538,7 @@ mod tests {
             &bundle,
             &user("alice", &["analyst"]),
             "orders",
-            "sales_wh.sales",
+            "sales",
         );
         assert!(!policy.column_masks.contains_key("amount"));
         assert!(!policy.restricted_columns.contains(&"amount".to_string()));
@@ -526,7 +552,7 @@ mod tests {
             &bundle,
             &user("alice", &["analyst"]),
             "orders",
-            "sales_wh.sales",
+            "sales",
         );
         assert!(policy.column_masks.is_empty());
     }
@@ -538,7 +564,7 @@ mod tests {
             &bundle,
             &user("alice", &["analyst"]),
             "customers",
-            "sales_wh.sales",
+            "sales",
         );
         assert!(policy.column_masks.is_empty());
         assert!(policy.row_filters.is_empty());
@@ -554,7 +580,7 @@ mod tests {
             &bundle,
             &user("alice", &["analyst"]),
             "orders",
-            "sales_wh.sales",
+            "sales",
         );
         // Fail-closed: a broken filter must NOT result in zero filters (which
         // would expose all rows). Expect a lit(false) deny filter instead.
@@ -565,5 +591,63 @@ mod tests {
             s.contains("false") || s.contains("boolean(false)"),
             "expected deny filter, got {s}"
         );
+    }
+
+    #[test]
+    fn masks_all_columns_in_multi_column_policy() {
+        let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
+        bundle.policies[0].resources.get_mut("column").unwrap().values =
+            vec!["amount".to_string(), "discount".to_string()];
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
+        assert!(policy.column_masks.contains_key("amount"));
+        assert!(policy.column_masks.contains_key("discount"));
+    }
+
+    #[test]
+    fn wildcard_table_matches() {
+        let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
+        bundle.policies[0].resources.get_mut("table").unwrap().values = vec!["*".to_string()];
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "anything", "sales");
+        assert!(policy.column_masks.contains_key("amount"));
+    }
+
+    #[test]
+    fn excludes_inverts_match() {
+        // is_excludes on table should make "orders" NOT match a values=["orders"] exclude.
+        let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
+        let tr = bundle.policies[0].resources.get_mut("table").unwrap();
+        tr.is_excludes = true; // exclude "orders"
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
+        assert!(policy.column_masks.is_empty());
+    }
+
+    #[test]
+    fn custom_mask_substitutes_column() {
+        let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
+        let mi = &mut bundle.policies[0].data_mask_policy_items[0].data_mask_info;
+        mi.data_mask_type = "CUSTOM".to_string();
+        mi.value_expr = Some("concat('x', {col})".to_string());
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
+        match policy.column_masks.get("amount") {
+            Some(crate::MaskType::Custom(e)) => {
+                let s = datafusion::sql::unparser::expr_to_sql(e)
+                    .unwrap()
+                    .to_string()
+                    .to_lowercase();
+                assert!(s.contains("amount"), "custom expr must reference the real column: {s}");
+            }
+            other => panic!("expected Custom mask, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_bound_item_is_skipped() {
+        let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
+        let item = &mut bundle.policies[0].data_mask_policy_items[0];
+        item.roles.clear();
+        item.users.clear();
+        item.groups = vec!["analysts_group".to_string()];
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
+        assert!(policy.column_masks.is_empty(), "group-bound item must not be enforced in MVP");
     }
 }
