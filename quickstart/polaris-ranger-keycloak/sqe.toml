@@ -35,16 +35,28 @@ client_secret = "sqe-secret-change-me"
 roles_claim = "realm_access.roles"
 accept_invalid_certs = true
 
-# ── Catalog ─────────────────────────────────────────────────────────────────
+# ── Catalogs ────────────────────────────────────────────────────────────────
 [catalogs.sales_wh]
 polaris_url = "http://polaris:8181/api/catalog"
 warehouse = "sales_wh"
 metadata_cache_ttl_secs = 30
 default_table_format_version = 2
 
+[catalogs.ops_wh]
+polaris_url = "http://polaris:8181/api/catalog"
+warehouse = "ops_wh"
+metadata_cache_ttl_secs = 30
+default_table_format_version = 2
+
 [catalog]
 polaris_url = "http://polaris:8181/api/catalog"
 warehouse = "sales_wh"
+
+# polaris-auto lets the write path route DML (CREATE/INSERT) into a non-default
+# catalog named in a 3-part identifier (e.g. ops_wh.ops.x), discovering it from
+# Polaris. Without this, writes fall back to the default catalog.
+[query]
+catalog_discovery = "polaris-auto"
 
 # ── Storage ─────────────────────────────────────────────────────────────────
 [storage]

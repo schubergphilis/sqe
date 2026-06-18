@@ -67,8 +67,8 @@ admin() { # desc sql
 echo "== 1. Data setup (carol = sqe_admin) =="
 admin "CREATE TABLE IF NOT EXISTS sales_wh.sales.orders (id BIGINT, region VARCHAR, amount DOUBLE)"
 admin "INSERT INTO sales_wh.sales.orders VALUES (1,'eu',10.0),(2,'us',20.0)"
-admin "CREATE TABLE IF NOT EXISTS sales_wh.ops.audit (id BIGINT, event VARCHAR)"
-admin "INSERT INTO sales_wh.ops.audit VALUES (1,'login'),(2,'logout')"
+admin "CREATE TABLE IF NOT EXISTS ops_wh.ops.audit (id BIGINT, event VARCHAR)"
+admin "INSERT INTO ops_wh.ops.audit VALUES (1,'login'),(2,'logout')"
 
 echo
 echo "== 2. Before any SQE grant: analyst has baseline metadata only, no data =="
@@ -79,18 +79,18 @@ echo "== 3. SQE grants (carol, one privilege per statement) =="
 admin 'GRANT SELECT ON sales_wh.sales.orders TO ROLE "analyst"'
 admin 'GRANT SELECT ON sales_wh.sales.orders TO ROLE "engineer"'
 admin 'GRANT INSERT ON sales_wh.sales.orders TO ROLE "engineer"'
-admin 'GRANT SELECT ON sales_wh.ops.audit TO USER "bob"'
-admin 'GRANT SELECT ON sales_wh.ops.audit TO ROLE "analyst"'
+admin 'GRANT SELECT ON ops_wh.ops.audit TO USER "bob"'
+admin 'GRANT SELECT ON ops_wh.ops.audit TO ROLE "analyst"'
 
 echo
 echo "== 4. Positive: the SQE grants enabled access =="
 assert_allow "alice (analyst) SELECT orders AFTER grant" alice "SELECT region FROM sales_wh.sales.orders LIMIT 1"
 assert_allow "bob (engineer) SELECT orders"             bob   "SELECT region FROM sales_wh.sales.orders LIMIT 1"
 assert_allow "bob (engineer) INSERT orders"             bob   "INSERT INTO sales_wh.sales.orders VALUES (3,'eu',30.0)"
-assert_allow "bob (user grant) SELECT audit"            bob   "SELECT event FROM sales_wh.ops.audit LIMIT 1"
+assert_allow "bob (user grant) SELECT audit"            bob   "SELECT event FROM ops_wh.ops.audit LIMIT 1"
 
 echo
-echo "== 5. Ranger DENY on sales_wh.ops.audit for role analyst (deny overrides allow) =="
+echo "== 5. Ranger DENY on ops_wh.ops.audit for role analyst (deny overrides allow) =="
 # Ranger keeps one policy per resource, and SQE's GRANT SELECT already created
 # the audit policy (with an allow for analyst). Deny precedence is expressed by
 # ADDING a denyPolicyItem to that same policy, so add it via PUT.
@@ -105,7 +105,8 @@ def req(method,path,body=None):
     return json.load(urllib.request.urlopen(r))
 pols=req("GET","/service/public/v2/api/policy?serviceName=polaris")
 match=[p for p in pols if p.get("resources",{}).get("table",{}).get("values")==["audit"]
-       and p.get("resources",{}).get("namespace",{}).get("values")==["ops"]]
+       and p.get("resources",{}).get("namespace",{}).get("values")==["ops"]
+       and p.get("resources",{}).get("catalog",{}).get("values")==["ops_wh"]]
 if not match: print("no audit policy found",file=sys.stderr); sys.exit(1)
 p=match[0]
 p.setdefault("denyPolicyItems",[]).append(
@@ -115,7 +116,7 @@ req("PUT",f"/service/public/v2/api/policy/{p['id']}",p)
 print("deny added to policy",p["id"])
 PY
 then green "ok    deny added to audit policy"; else red "could not add deny policy"; FAIL=$((FAIL+1)); fi
-assert_deny "alice SELECT audit (deny overrides analyst allow)" alice "SELECT event FROM sales_wh.ops.audit LIMIT 1"
+assert_deny "alice SELECT audit (deny overrides analyst allow)" alice "SELECT event FROM ops_wh.ops.audit LIMIT 1"
 
 echo
 echo "== 6. Negative tests =="
@@ -136,6 +137,15 @@ echo
 echo "== 8. Revoke, then re-check =="
 admin 'REVOKE SELECT ON sales_wh.sales.orders FROM ROLE "analyst"'
 assert_deny "alice SELECT orders AFTER revoke" alice "SELECT region FROM sales_wh.sales.orders LIMIT 1"
+
+echo
+echo "== 9. CHECK ACCESS introspection (user-dimension grants) =="
+CA="$(sqe carol 'CHECK ACCESS SELECT ON ops_wh.ops.audit FOR USER "bob"')"
+if echo "$CA" | grep -qi 'true'; then green "PASS  CHECK ACCESS: bob allowed on audit (user grant)"; PASS=$((PASS+1));
+else red "FAIL  CHECK ACCESS bob audit"; echo "      $(echo "$CA" | tr '\n' ' ' | cut -c1-200)"; FAIL=$((FAIL+1)); fi
+CA="$(sqe carol 'CHECK ACCESS SELECT ON ops_wh.ops.audit FOR USER "dave"')"
+if echo "$CA" | grep -qi 'false'; then green "PASS  CHECK ACCESS: dave denied on audit (no grant)"; PASS=$((PASS+1));
+else red "FAIL  CHECK ACCESS dave audit"; echo "      $(echo "$CA" | tr '\n' ' ' | cut -c1-200)"; FAIL=$((FAIL+1)); fi
 
 echo
 echo "================ RESULT: ${PASS} passed, ${FAIL} failed ================"
