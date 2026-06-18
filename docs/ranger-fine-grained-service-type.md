@@ -114,6 +114,77 @@ Trino is the exception: it reads its own `trino` service-def (catalog/schema/
 table/column), so it does not auto-share `hive` policies; it shares via the `tag`
 service or a duplicated policy set.
 
+## Catalog federation (internal vs external catalogs)
+
+Polaris "catalog federation" (an EXTERNAL/passthrough catalog proxying to a remote
+Iceberg REST / Hive / Glue catalog) changes where enforcement can happen, and it
+strengthens the case for engine-side fine-grained rather than weakening it.
+
+What Polaris does (verified against 1.5.0 + main):
+- Polaris does NO fine-grained (row/col/mask) for ANY catalog; its Ranger plugin
+  (`polaris` service-def) is allow/deny RBAC only.
+- For FEDERATED (passthrough) catalogs it is even coarser: the remote's
+  namespaces/tables are not persisted as Polaris entities, so path resolution
+  falls back to the parent and enforces at CATALOG level only. Per-table RBAC on
+  federated content needs `ENABLE_SUB_CATALOG_RBAC_FOR_FEDERATED_CATALOGS`
+  (default OFF; the synthetic-entity/JIT path is still a TODO in 1.5).
+- Polaris->remote uses a service credential, not the end-user identity.
+
+Why the `hive`-service (SQE-side) layer is the unifier: SQE applies row/col/mask
+in its plan rewriter keyed on TABLE IDENTITY, independent of Polaris's authorizer
+and of whether the catalog is internal or federated. So it behaves identically
+for both. Coverage matrix:
+
+| | coarse allow/deny | fine-grained (row/col/mask) |
+|---|---|---|
+| internal catalog | Polaris `polaris` service | SQE `hive` service |
+| federated catalog | Polaris CATALOG-level only (per-table opt-in, off) | SQE `hive` service (the ONLY fine-grained, and effectively the primary control) |
+
+Consequences:
+- **Federated = SQE is load-bearing -> fail-closed is non-negotiable.** If SQE
+  cannot reach Ranger or resolve a policy for a federated table, deny/restrict,
+  never pass through (Polaris will not catch it).
+- **Wire-name mapping.** SQE must map the `(catalog, namespace, table)` it sees
+  ON THE WIRE - including the Polaris federated-catalog ALIAS, not the remote's
+  native name - to the `hive` `database/table` resource string, consistently with
+  Spark. Policies are authored against the names SQE/Spark observe.
+- The two layers are decoupled by design: SQE's fine-grained does not wait on
+  Polaris federation authz maturing (issue #540 / the opt-in flag).
+
+## Effort estimate (rough, one engineer)
+
+Phased; the OpaStore template + the existing PlanRewriter cut a lot of the work.
+Estimates are engineering rough-cuts, not commitments; the risk drivers below can
+move them.
+
+- **Phase 1 - resource-based row-filter + column-mask, single-engine (~2-3 wk).**
+  `RangerStore: PolicyStore` (download-endpoint client + `ServicePolicies` parse +
+  user/role matching + merge + cache/breaker + fail-closed, modeled on
+  `OpaStore`); `MaskType` extended with partial/regex/date + the Hive-equivalent
+  mask UDFs (`mask`, `mask_show_last_n/first_n`, `mask_hash`); `filterExpr` parse
+  reusing OPA's parser; `PolicyEngine::Ranger` config + wiring; unit tests + a
+  row/mask demo on the existing quickstart. Demonstrable end of this phase.
+- **Phase 2 - Spark-shared + session-context functions (~2-3 wk).** Lock the
+  Iceberg->hive `database/table` flattening to Kyuubi's exact convention and
+  validate a single policy enforces in BOTH Spark and SQE; register
+  `current_user()/current_role()` (cheap) and `is_role_in_session()` (needs a
+  richer `SessionUser` role model in `sqe-auth` - active + inherited/secondary
+  roles - the bigger part); Hive->DataFusion dialect translation for
+  `filterExpr`/`valueExpr`.
+- **Phase 3 - tag-based masking (~2-3 wk + ops).** Evaluate `tagPolicies` from the
+  bundle + fetch tag-resource associations; a tag source for Iceberg (Atlas hook
+  is absent in OSS -> manual tag REST or a custom hook). Heaviest, mostly
+  operational.
+
+So: a usable single-engine MVP in ~2-3 weeks; Spark-shared + context functions in
+~1-1.5 months total; full Snowflake-parity incl. tags in ~1.5-2 months.
+
+Risk drivers (can expand the estimate): cross-engine resource-name match with
+Kyuubi (integration-fiddly); faithful reimplementation of Hive mask UDF
+semantics; dialect translation of `filterExpr`; robustness of the existing
+PlanRewriter for arbitrary mask expressions + column swaps; and the `sqe-auth`
+role-model change behind `is_role_in_session`.
+
 ## Net
 
 Bind SQE's fine-grained `RangerStore` to the **same `hive` service Spark uses**,
