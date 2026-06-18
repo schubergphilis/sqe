@@ -127,7 +127,7 @@ if curl -fsS $AUTH "${RANGER_URL}/service/public/v2/api/service/name/hive" >/dev
   echo "  service 'hive' already present, skipping."
 else
   curl -fsS $AUTH $CSRF $CT -X POST "${RANGER_URL}/service/public/v2/api/service" \
-    -d '{"name":"hive","type":"hive","configs":{"username":"admin","jdbc.driverClassName":"org.apache.hive.jdbc.HiveDriver","jdbc.url":"none"},"isEnabled":true}' >/dev/null \
+    -d '{"name":"hive","type":"hive","configs":{"username":"admin","password":"none","jdbc.driverClassName":"org.apache.hive.jdbc.HiveDriver","jdbc.url":"none"},"isEnabled":true}' >/dev/null \
     && echo "  service 'hive' created." || echo "  service 'hive' creation FAILED (check ranger logs)."
 fi
 
