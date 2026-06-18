@@ -27,20 +27,65 @@ pub enum ResourceLevel {
     Table,
 }
 
-/// Map a SQL privilege to a Ranger access type and the resource level it binds
-/// to. Unknown privileges pass through lowercased (lets callers use native
-/// Ranger access-type names directly).
-pub fn map_sql_to_ranger_access(sql_priv: &str) -> (String, ResourceLevel) {
+/// A SQL read (SELECT) through SQE loads the table then reads data files. The
+/// Polaris embedded Ranger authorizer does NOT honor service-def impliedGrants,
+/// so each required access type is listed explicitly.
+const READ_ACCESS: &[&str] = &["table-data-read", "table-properties-read", "table-list"];
+
+/// A SQL write (INSERT) loads the table and commits a new snapshot, which fans
+/// out into many fine-grained Polaris operations. This is the explicit
+/// equivalent of `table-data-write`'s impliedGrants (not auto-applied).
+const WRITE_ACCESS: &[&str] = &[
+    "table-data-write",
+    "table-data-read",
+    "table-properties-read",
+    "table-properties-write",
+    "table-properties-set",
+    "table-properties-remove",
+    "table-uuid-assign",
+    "table-format-version-upgrade",
+    "table-schema-add",
+    "table-schema-set-current",
+    "table-sort-order-add",
+    "table-sort-order-set-default",
+    "table-snapshot-add",
+    "table-snapshots-remove",
+    "table-snapshot-ref-set",
+    "table-snapshot-ref-remove",
+    "table-location-set",
+    "table-statistics-set",
+    "table-statistics-remove",
+    "table-partition-spec-add",
+    "table-partition-specs-remove",
+    "table-structure-manage",
+    "table-list",
+];
+
+fn to_vec(xs: &[&str]) -> Vec<String> {
+    xs.iter().map(|s| s.to_string()).collect()
+}
+
+/// Map a SQL privilege to the Ranger access type(s) it requires and the resource
+/// level it binds to. A single SQL privilege expands to every Polaris access
+/// type the corresponding operations check (impliedGrants are not honored).
+/// Unknown privileges pass through lowercased so callers can use native Ranger
+/// access-type names directly.
+pub fn map_sql_to_ranger_access(sql_priv: &str) -> (Vec<String>, ResourceLevel) {
     match sql_priv.to_uppercase().as_str() {
-        "SELECT" => ("table-data-read".into(), ResourceLevel::Table),
-        "INSERT" => ("table-data-write".into(), ResourceLevel::Table),
-        "DROP" => ("table-drop".into(), ResourceLevel::Table),
-        "CREATE TABLE" => ("table-create".into(), ResourceLevel::Namespace),
-        "USAGE" => ("namespace-list".into(), ResourceLevel::Namespace),
-        "DROP SCHEMA" => ("namespace-drop".into(), ResourceLevel::Namespace),
-        "CREATE SCHEMA" | "CREATE" => ("namespace-create".into(), ResourceLevel::Catalog),
-        "ALL" | "ALL PRIVILEGES" => ("catalog-content-manage".into(), ResourceLevel::Catalog),
-        other => (other.to_lowercase(), ResourceLevel::Table),
+        "SELECT" => (to_vec(READ_ACCESS), ResourceLevel::Table),
+        "INSERT" => (to_vec(WRITE_ACCESS), ResourceLevel::Table),
+        "DROP" => (to_vec(&["table-drop"]), ResourceLevel::Table),
+        "CREATE TABLE" => (to_vec(&["table-create"]), ResourceLevel::Namespace),
+        "USAGE" => (
+            to_vec(&["namespace-list", "namespace-properties-read"]),
+            ResourceLevel::Namespace,
+        ),
+        "DROP SCHEMA" => (to_vec(&["namespace-drop"]), ResourceLevel::Namespace),
+        "CREATE SCHEMA" | "CREATE" => (to_vec(&["namespace-create"]), ResourceLevel::Catalog),
+        "ALL" | "ALL PRIVILEGES" => {
+            (to_vec(&["catalog-content-manage"]), ResourceLevel::Catalog)
+        }
+        other => (vec![other.to_lowercase()], ResourceLevel::Table),
     }
 }
 
@@ -201,7 +246,7 @@ impl RangerGrantBackend {
             users,
             groups: vec![],
             roles,
-            access_types: vec![access],
+            access_types: access,
             delegate_admin: false,
             enable_audit: true,
             replace_existing_permissions: false,
@@ -347,8 +392,11 @@ pub fn entry_matches_grantee(entry: &GrantEntry, grantee: &Grantee) -> bool {
 impl RangerGrantBackend {
     /// Fetch all policies for this service from Ranger Admin.
     async fn fetch_policies(&self) -> sqe_core::Result<Vec<RangerPolicy>> {
+        // Public v2 endpoint returns a bare JSON array of policies. (The
+        // /service/plugins/policies/... endpoint wraps them in a paginated
+        // object, which does not match RangerPolicy deserialization.)
         let url = format!(
-            "{}/service/plugins/policies/service/name/{}",
+            "{}/service/public/v2/api/policy?serviceName={}",
             self.admin_url, self.service_name
         );
         let resp = self
@@ -484,6 +532,9 @@ impl GrantBackend for RangerGrantBackend {
         validate_identifier(catalog, "catalog")?;
 
         let (access, _) = map_sql_to_ranger_access(&check.privilege);
+        // The privilege maps to a set; the first entry is the primary access
+        // type that defines the privilege (e.g. SELECT -> table-data-read).
+        let primary = access.first().map(String::as_str).unwrap_or("");
         let mut parts = vec![catalog.to_string()];
         if let Some(n) = &check.namespace { parts.push(n.clone()); }
         if let Some(t) = &check.table { parts.push(t.clone()); }
@@ -493,7 +544,7 @@ impl GrantBackend for RangerGrantBackend {
         let entries = policies_to_entries(&policies);
         // Roles unknown at this layer; match on the user dimension only. Role
         // grants are surfaced via SHOW GRANTS and enforced by Polaris.
-        Ok(evaluate_access(&entries, &check.user, &[], &access, &resource))
+        Ok(evaluate_access(&entries, &check.user, &[], primary, &resource))
     }
 
     fn backend_name(&self) -> &str {
@@ -508,35 +559,42 @@ mod tests {
     #[test]
     fn select_maps_to_table_data_read() {
         let (a, lvl) = map_sql_to_ranger_access("SELECT");
-        assert_eq!(a, "table-data-read");
+        // SELECT expands to the full read set; table-data-read is the primary.
+        assert!(a.contains(&"table-data-read".to_string()));
+        assert!(a.contains(&"table-properties-read".to_string()));
+        assert_eq!(a.first().map(String::as_str), Some("table-data-read"));
         assert_eq!(lvl, ResourceLevel::Table);
     }
 
     #[test]
-    fn insert_maps_to_table_data_write() {
+    fn insert_maps_to_table_data_write_with_commit_grants() {
         let (a, lvl) = map_sql_to_ranger_access("insert");
-        assert_eq!(a, "table-data-write");
+        // INSERT expands to write + the snapshot/schema commit grants, since
+        // the embedded authorizer does not honor impliedGrants.
+        assert_eq!(a.first().map(String::as_str), Some("table-data-write"));
+        assert!(a.contains(&"table-snapshot-add".to_string()));
+        assert!(a.contains(&"table-schema-add".to_string()));
         assert_eq!(lvl, ResourceLevel::Table);
     }
 
     #[test]
     fn create_table_is_namespace_level() {
         let (a, lvl) = map_sql_to_ranger_access("CREATE TABLE");
-        assert_eq!(a, "table-create");
+        assert_eq!(a, vec!["table-create".to_string()]);
         assert_eq!(lvl, ResourceLevel::Namespace);
     }
 
     #[test]
     fn create_schema_is_catalog_level() {
         let (a, lvl) = map_sql_to_ranger_access("CREATE SCHEMA");
-        assert_eq!(a, "namespace-create");
+        assert_eq!(a, vec!["namespace-create".to_string()]);
         assert_eq!(lvl, ResourceLevel::Catalog);
     }
 
     #[test]
     fn unknown_passes_through_lowercased() {
         let (a, lvl) = map_sql_to_ranger_access("table-metadata-full");
-        assert_eq!(a, "table-metadata-full");
+        assert_eq!(a, vec!["table-metadata-full".to_string()]);
         assert_eq!(lvl, ResourceLevel::Table);
     }
 
@@ -646,7 +704,8 @@ mod tests {
             .build_grant_revoke("SELECT", Some("wh"), Some("sales"), Some("orders"),
                 &Grantee::Role("analyst".into()))
             .unwrap();
-        assert_eq!(body.access_types, vec!["table-data-read".to_string()]);
+        assert_eq!(body.access_types.first().map(String::as_str), Some("table-data-read"));
+        assert!(body.access_types.contains(&"table-properties-read".to_string()));
         assert_eq!(body.roles, vec!["analyst".to_string()]);
         assert!(body.users.is_empty());
         assert_eq!(body.resource.get("table").map(String::as_str), Some("orders"));
