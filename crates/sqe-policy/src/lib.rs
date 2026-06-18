@@ -1,5 +1,6 @@
 pub mod grants;
 pub mod plan_rewriter;
+pub mod policy_breaker;
 pub mod policy_store;
 pub mod opa;
 pub mod sha256_udf;
