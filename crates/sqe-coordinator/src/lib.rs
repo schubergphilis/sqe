@@ -1,5 +1,6 @@
 pub mod adaptive_sort;
 pub mod metrics_history;
+pub mod policy_wiring;
 pub mod catalog_ops;
 pub mod channel_pool;
 pub mod maintenance;
