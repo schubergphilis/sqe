@@ -2208,10 +2208,10 @@ pub struct RangerPolicyConfig {
     #[serde(default)]
     pub admin_password: SecretString,
     /// HTTP timeout for a single Ranger download call, in seconds.
-    #[serde(default = "default_opa_timeout_secs")]
+    #[serde(default = "default_ranger_policy_timeout_secs")]
     pub timeout_secs: u64,
     /// Maximum cached `ResolvedPolicy` entries.
-    #[serde(default = "default_opa_cache_max_entries")]
+    #[serde(default = "default_ranger_policy_cache_max_entries")]
     pub cache_max_entries: u64,
     /// Cache TTL in seconds.
     #[serde(default = "default_ranger_policy_cache_ttl_secs")]
@@ -2234,8 +2234,8 @@ impl Default for RangerPolicyConfig {
             service_name: default_ranger_policy_service_name(),
             admin_user: default_ranger_admin_user(),
             admin_password: SecretString::default(),
-            timeout_secs: default_opa_timeout_secs(),
-            cache_max_entries: default_opa_cache_max_entries(),
+            timeout_secs: default_ranger_policy_timeout_secs(),
+            cache_max_entries: default_ranger_policy_cache_max_entries(),
             cache_ttl_secs: default_ranger_policy_cache_ttl_secs(),
             breaker_failure_threshold: default_opa_breaker_failure_threshold(),
             breaker_recovery_secs: default_opa_breaker_recovery_secs(),
@@ -2246,6 +2246,14 @@ impl Default for RangerPolicyConfig {
 
 fn default_ranger_policy_service_name() -> String {
     "hive".to_string()
+}
+
+fn default_ranger_policy_timeout_secs() -> u64 {
+    5
+}
+
+fn default_ranger_policy_cache_max_entries() -> u64 {
+    10_000
 }
 
 fn default_ranger_policy_cache_ttl_secs() -> u64 {
@@ -3344,6 +3352,7 @@ fn validate_urls(config: &SqeConfig, errors: &mut Vec<String>) {
     }
 
     check("access_control.url", &config.access_control.url);
+    check("policy.ranger.url", &config.policy.ranger.url);
 }
 
 fn env_override_str(key: &str, target: &mut String) {
