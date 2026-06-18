@@ -601,3 +601,25 @@ That was the moment we knew the library approach would work.
 ::: {.ailog}
 **AI Logbook:** The AI scaffolded all six initial crates and implemented the `execute_query` pipeline (from SQL string to Arrow record batches) in a single session. The human made the decision to use DataFusion as a library rather than Trino, Spark, or DuckDB, after two years of maintaining a Trino fork. The `create_session_context` method. one `SessionContext` per user with per-session credentials. was specified by the human as the architectural constraint; the AI implemented it correctly because Rust's ownership model made the isolation boundaries explicit in the type signatures.
 :::
+
+## The Major Release That Tested Our Documentation
+
+A year later DataFusion 54 shipped, and the upgrade thread closed a loop. The DF 53 jump had been a fork-of-a-fork supply-chain decision. The DF 54 jump was a lesson in reading release notes.
+
+The mechanics were a day of compiler-guided edits. DataFusion 54 removed the boilerplate `as_any()` method from its core traits and gave them an `Any` supertrait with a provided `downcast_ref` instead. So you delete the hand-written impls and rewrite `x.as_any().downcast_ref::<T>()` to `x.downcast_ref::<T>()`, and the compiler walks you to every site. You leave the Arrow array downcasts alone, because Arrow did not make the same change. A few return types moved. None of it was interesting.
+
+One change was not cosmetic. DataFusion 54 swapped its hash backend from ahash to foldhash. Our distributed shuffle routes rows to workers by `hash % partitions`, so the hasher is a correctness boundary: every node has to agree on it. We pointed the shuffle at DataFusion's own fixed seed-0 state, the one its repartition operator uses, and proved it the only way that counts. We ran all 222 benchmark queries distributed, where a broken hasher produces wrong join results, not a crash. Every row matched.
+
+Then I went looking for the feature that pulled me to the release. The notes said LATERAL joins. LATERAL has been a real gap against Trino and DuckDB, and SQE wraps DataFusion, so we usually inherit a SQL feature for free. I wrote a test for it. It failed.
+
+DataFusion 54 parses LATERAL and builds a logical plan for it. Physical planning then fails, because there is no physical dependent-join operator yet. The correlated shapes that matter, a projection over the outer row, a top-N-per-group with an inner limit, hit that wall. Only the laterals that decorrelate into an ordinary join run, and those already ran on 53. I checked the other candidates the same way, against the running engine in one pass. Array lambdas still fail. PIVOT, UNPIVOT, and ASOF JOIN are still rejected. The compatibility list did not move.
+
+The one shift went the other way, and it was embarrassing in a useful way. QUALIFY worked. Our own DuckDB comparison document listed it as unsupported, and that was simply wrong. The planner had handled QUALIFY for two releases. A stale doc, not a missing feature. We had been telling readers we could not do something we could do.
+
+::: {.sovereignty}
+**Sovereignty principle:** When you wrap an engine, its release notes are marketing for a different audience than you. "LATERAL joins" meant the logical plan, not the physical execution you need. The only way to know what a dependency actually gives you is to test the claim against your own running build before you write it down. We found a feature that did not work and a feature we had wrongly documented as broken, in the same afternoon, with the same method. Own your supply chain includes owning the truth about it.
+:::
+
+The performance story matched the engineering one: quieter than the notes implied, real where it counted. At SF1 the DF 54 build is at parity with 53, inside the run-to-run noise, because small data is dominated by planning, not execution. At SF10 the execution-level gains show. On a dedicated single-node rig with the cache off, TPC-H runs 89 seconds against Trino's 106 and TPC-DS runs 234 against 448. Both wins. SSB still loses, because lineorder's uniform foreign-key distribution defeats row-group pruning and the runtime filter only helps at the row level. That suite remains the honest gap, and I will not pretend a version bump closed it.
+
+There is a closing symmetry with the fork. The DF 53 section ended with us vendoring a fork because upstream had not rebased. With DF 54, we are the ones ahead: our in-tree port runs on 54 while both apache main and the RisingWave rebase branch are still on 53. The delta-rs dependency for `read_delta` has no DF 54 release at all, so we removed the optional feature and left a note to restore it. Staying current is not a milestone you reach. It is a position you hold, and sometimes holding it means being the furthest forward in your own dependency graph.
