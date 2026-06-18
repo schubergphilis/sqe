@@ -1957,6 +1957,9 @@ pub enum AccessControlBackend {
     Chameleon,
     /// Apache Polaris 1.3 native (`PRINCIPAL` / `PRINCIPAL_ROLE` / `CATALOG_ROLE`).
     Polaris,
+    /// Apache Ranger via Polaris 1.5 embedded authorizer. SQE writes grants to
+    /// Ranger Admin; Polaris enforces. Requires `[access_control.ranger]`.
+    Ranger,
 }
 
 impl std::str::FromStr for AccessControlBackend {
@@ -1967,8 +1970,9 @@ impl std::str::FromStr for AccessControlBackend {
             "none" | "" => Ok(Self::None),
             "chameleon" => Ok(Self::Chameleon),
             "polaris" => Ok(Self::Polaris),
+            "ranger" => Ok(Self::Ranger),
             other => Err(format!(
-                "unknown access_control.backend {other:?}; expected one of none, chameleon, polaris"
+                "unknown access_control.backend {other:?}; expected one of none, chameleon, polaris, ranger"
             )),
         }
     }
@@ -1995,6 +1999,9 @@ pub struct AccessControlConfig {
     /// When absent, the user's passthrough OIDC token is used.
     #[serde(default)]
     pub client_secret: Option<String>,
+    /// Apache Ranger backend tuning. Used only when `backend = "ranger"`.
+    #[serde(default)]
+    pub ranger: RangerConfig,
 }
 
 impl Default for AccessControlConfig {
@@ -2005,11 +2012,66 @@ impl Default for AccessControlConfig {
             timeout_secs: 30,
             client_id: None,
             client_secret: None,
+            ranger: RangerConfig::default(),
         }
     }
 }
 
 fn default_access_control_timeout() -> u64 { 30 }
+
+/// Apache Ranger backend configuration (Polaris 1.5 embedded authorizer).
+///
+/// The Ranger Admin base URL is taken from `access_control.url`
+/// (e.g. `http://ranger-admin:6080`), consistent with the Polaris backend.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct RangerConfig {
+    /// Ranger service instance name. Must match the Polaris
+    /// `polaris.authorization.ranger.service-name` setting.
+    #[serde(default = "default_ranger_service_name")]
+    pub service_name: String,
+    /// Ranger Admin user for HTTP basic auth.
+    #[serde(default = "default_ranger_admin_user")]
+    pub admin_user: String,
+    /// Ranger Admin password. Set via `SQE_ACCESS_CONTROL__RANGER__ADMIN_PASSWORD`.
+    #[serde(default)]
+    pub admin_password: String,
+    /// Value for the top-level `root` resource (the Polaris realm/context the
+    /// embedded authorizer prefixes onto resource paths). When empty, the
+    /// `root` level is omitted from written policies. See Task 14 for how to
+    /// determine the correct value for a deployment.
+    #[serde(default)]
+    pub realm: String,
+    /// HTTP timeout for a single Ranger Admin call, in seconds.
+    #[serde(default = "default_ranger_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Accept self-signed TLS certs on the Ranger Admin endpoint.
+    #[serde(default)]
+    pub accept_invalid_certs: bool,
+}
+
+impl Default for RangerConfig {
+    fn default() -> Self {
+        Self {
+            service_name: default_ranger_service_name(),
+            admin_user: default_ranger_admin_user(),
+            admin_password: String::new(),
+            realm: String::new(),
+            timeout_secs: default_ranger_timeout_secs(),
+            accept_invalid_certs: false,
+        }
+    }
+}
+
+fn default_ranger_service_name() -> String {
+    "polaris".to_string()
+}
+fn default_ranger_admin_user() -> String {
+    "admin".to_string()
+}
+fn default_ranger_timeout_secs() -> u64 {
+    30
+}
 
 /// Policy engine backend used to compute row filters and column masks.
 ///
@@ -5276,5 +5338,59 @@ otlp_endpoint = ""
         config.query.per_user_memory_budget = "0".to_string();
         // "0" disables the gate, so the size relationship is irrelevant.
         assert!(config.validate().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod ranger_config_tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn parse_ranger_backend_from_str() {
+        assert_eq!(
+            AccessControlBackend::from_str("ranger").unwrap(),
+            AccessControlBackend::Ranger
+        );
+    }
+
+    #[test]
+    fn unknown_backend_lists_ranger() {
+        let err = AccessControlBackend::from_str("bogus").unwrap_err();
+        assert!(err.contains("ranger"), "error should mention ranger: {err}");
+    }
+
+    #[test]
+    fn ranger_config_defaults() {
+        let c = RangerConfig::default();
+        assert_eq!(c.service_name, "polaris");
+        assert_eq!(c.admin_user, "admin");
+        assert_eq!(c.timeout_secs, 30);
+        assert!(!c.accept_invalid_certs);
+        assert!(c.realm.is_empty());
+    }
+
+    #[test]
+    fn access_control_config_default_includes_ranger() {
+        let c = AccessControlConfig::default();
+        assert_eq!(c.ranger.service_name, "polaris");
+    }
+
+    #[test]
+    fn ranger_config_deserializes_from_toml() {
+        let toml = r#"
+            backend = "ranger"
+            url = "http://ranger-admin:6080"
+            [ranger]
+            service-name = "dev_polaris"
+            admin-user = "admin"
+            admin-password = "secret"
+            realm = "POLARIS"
+        "#;
+        let c: AccessControlConfig = toml::from_str(toml).unwrap();
+        assert_eq!(c.backend, AccessControlBackend::Ranger);
+        assert_eq!(c.ranger.service_name, "dev_polaris");
+        assert_eq!(c.ranger.admin_password, "secret");
+        assert_eq!(c.ranger.realm, "POLARIS");
     }
 }
