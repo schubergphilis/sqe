@@ -35,16 +35,10 @@ client_secret = "sqe-secret-change-me"
 roles_claim = "realm_access.roles"
 accept_invalid_certs = true
 
-# ── Catalogs ────────────────────────────────────────────────────────────────
+# ── Catalog ─────────────────────────────────────────────────────────────────
 [catalogs.sales_wh]
 polaris_url = "http://polaris:8181/api/catalog"
 warehouse = "sales_wh"
-metadata_cache_ttl_secs = 30
-default_table_format_version = 2
-
-[catalogs.ops_wh]
-polaris_url = "http://polaris:8181/api/catalog"
-warehouse = "ops_wh"
 metadata_cache_ttl_secs = 30
 default_table_format_version = 2
 
@@ -78,7 +72,11 @@ url = "http://ranger-admin:6080"
 service-name = "polaris"
 admin-user = "admin"
 admin-password = "rangerR0cks!"
-realm = ""
+# Polaris includes the `root` resource in every authorization request, so every
+# Ranger policy SQE writes must carry a matching `root` value. "*" matches the
+# realm Polaris sends (verified against this stack). Without it, GRANTs succeed
+# but enforcement silently never matches.
+realm = "*"
 
 [session]
 idle_timeout_secs = 900
