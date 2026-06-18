@@ -15,7 +15,7 @@ embedded side, the same binary scales to a multi-tenant cluster.
 
 | Capability | SQE | DuckDB |
 |---|---|---|
-| Distributed execution | Ballista-derived scheduler + workers | single-process |
+| Distributed execution | bespoke coordinator/worker scheduler over Arrow Flight | single-process |
 | Per-query OIDC bearer pass-through to Iceberg / S3 | yes | no |
 | OPA / Cedar policy enforcement (row filters, column masks) | yes | no |
 | Multi-catalog: Polaris + Nessie + Glue + HMS + S3Tables in one engine | yes (V6) | extension-by-extension |

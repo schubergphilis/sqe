@@ -577,7 +577,7 @@ The embedded prompt is the same SQL surface as the coordinator's Flight SQL endp
 - **Single-node execution.** No coordinator-worker shuffle, no spill across machines. Memory pool capped by `--memory-limit`.
 - **No metrics endpoint.** Prometheus, OpenTelemetry, audit log all live in the cluster path.
 
-Everything else is identical: DataFusion 53.1, Trino-compat function set, JSON helpers, Iceberg V2 / V3 read + write, time travel, branching, partition evolution, schema evolution, equality deletes, position deletes, MoR, CoW.
+Everything else is identical: DataFusion 54, Trino-compat function set, JSON helpers, Iceberg V2 / V3 read + write, time travel, branching, partition evolution, schema evolution, equality deletes, position deletes, MoR, CoW.
 
 ## Implementation references
 

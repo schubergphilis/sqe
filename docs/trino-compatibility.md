@@ -1,6 +1,6 @@
 # Trino SQL Compatibility Matrix
 
-> Living document. Last updated: 2026-05-08 (DataFusion 53.1.0; CHAR / UUID / CALL ⚠️ → ✅ accuracy pass).
+> Living document. Last updated: 2026-06-17 (DataFusion 54.0.0; full compatibility re-check, QUALIFY doc correction).
 > Rating: ✅ equivalent | ⚠️ partial/different semantics | ❌ missing | 🔧 SQE-specific
 
 SQE aims to be a drop-in replacement for Trino in Iceberg-only environments.
