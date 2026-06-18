@@ -13,9 +13,9 @@ use arrow::array::{
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
-use datafusion::common::TableReference;
+use datafusion::common::{Column, TableReference};
 use datafusion::datasource::{provider_as_source, MemTable};
-use datafusion::logical_expr::{col, lit, LogicalPlan, LogicalPlanBuilder};
+use datafusion::logical_expr::{col, lit, Expr, LogicalPlan, LogicalPlanBuilder};
 use datafusion::prelude::SessionContext;
 
 use sqe_core::SessionUser;
@@ -139,7 +139,21 @@ async fn execute_multilevel(plan: LogicalPlan, mem: Arc<MemTable>) -> Vec<Record
 /// exercises the analyzer + physical planner that actually broke.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn row_filter_and_mask_execute_over_qualified_multilevel_scan() {
-    let (mem, plan) = build_multilevel_scan_with_mem();
+    let (mem, scan) = build_multilevel_scan_with_mem();
+
+    // Mimic the real user query `SELECT region, salary FROM cat.ns1.ns2.employees`:
+    // an outer projection that references the columns by their QUALIFIED names
+    // (as the planner does against a real scan). The masked `salary` must keep
+    // its qualifier through the rewrite or this outer ref fails to resolve.
+    let tref = TableReference::full("cat", "ns1.ns2", "employees");
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![
+            Expr::Column(Column::new(Some(tref.clone()), "region")),
+            Expr::Column(Column::new(Some(tref.clone()), "salary")),
+        ])
+        .unwrap()
+        .build()
+        .unwrap();
 
     let store = InMemoryPolicyStore::new();
     let mut policy = ResolvedPolicy::default();
