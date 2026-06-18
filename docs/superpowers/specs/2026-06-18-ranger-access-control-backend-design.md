@@ -1,8 +1,15 @@
 # Apache Ranger access-control backend for SQE
 
 Date: 2026-06-18
-Status: Approved (design), pending implementation plan
+Status: Implemented. See `quickstart/polaris-ranger-keycloak/OVERVIEW.md` for the
+verified identity model, which SUPERSEDES the design-time assumptions below.
 Branch: `feat/ranger-access-control-backend`
+
+> Post-implementation correction: this spec assumed Polaris forwards the token's
+> roles to Ranger as `principal.getRoles()`. Live testing showed Polaris DROPS
+> token roles lacking the `PRINCIPAL_ROLE:` prefix, so the user->role mapping
+> lives in Ranger role membership (usersync in production), not Polaris
+> principal-roles. The OVERVIEW is authoritative.
 
 ## Summary
 
