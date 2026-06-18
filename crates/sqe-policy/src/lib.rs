@@ -5,6 +5,7 @@ pub mod policy_expr;
 pub mod policy_store;
 pub mod opa;
 pub mod ranger_store;
+pub mod mask_udf;
 pub mod sha256_udf;
 pub mod write_predicates;
 
