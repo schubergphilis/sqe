@@ -446,3 +446,175 @@ async fn multilevel_namespace_poisoned_store_fails_closed() {
         "multi-level table must fail closed with an injected filter, got: {s}"
     );
 }
+
+// ── Executable mask tests over qualified multilevel scan (Task 5) ─────────
+//
+// These three tests complement `row_filter_and_mask_execute_over_qualified_multilevel_scan`
+// by exercising PartialMask and DateShowYear through the full physical-plan
+// pipeline. They catch type_coercion failures that plan-shape-only tests miss.
+
+/// Test A: MASK_SHOW_LAST_4 on a Utf8 column over a qualified multilevel scan.
+///
+/// Policy masks `ssn` with PartialMask{show_first:0, show_last:4, 'x','x','x'}.
+/// The UDF keeps punctuation unchanged and masks digits with 'x', so
+/// "111-11-1111" -> "xxx-xx-1111". All three rows are asserted exactly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partial_mask_show_last4_on_ssn_over_qualified_multilevel_scan() {
+    let (mem, scan) = build_multilevel_scan_with_mem();
+
+    let tref = TableReference::full("cat", "ns1.ns2", "employees");
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![
+            Expr::Column(Column::new(Some(tref.clone()), "customer_id")),
+            Expr::Column(Column::new(Some(tref.clone()), "ssn")),
+        ])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let store = InMemoryPolicyStore::new();
+    let mut policy = ResolvedPolicy::default();
+    policy.column_masks.insert(
+        "ssn".to_string(),
+        MaskType::PartialMask {
+            show_first: 0,
+            show_last: 4,
+            upper: 'x',
+            lower: 'x',
+            digit: 'x',
+        },
+    );
+    store.add_table_policy("ns2", "employees", policy).await;
+
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store));
+    let rewritten = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
+
+    let batches = execute_multilevel(rewritten, mem).await;
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 3, "all three rows must be present (no row filter)");
+
+    let ssn = batches[0]
+        .column_by_name("ssn")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .clone();
+    assert_eq!(ssn.value(0), "xxx-xx-1111");
+    assert_eq!(ssn.value(1), "xxx-xx-2222");
+    assert_eq!(ssn.value(2), "xxx-xx-3333");
+}
+
+/// Test B: DateShowYear on a Timestamp(Microsecond, None) column over a qualified
+/// multilevel scan.
+///
+/// Policy masks `hired_at` with DateShowYear. The rewriter emits
+/// `CAST(date_trunc('year', hired_at) AS Timestamp(Microsecond, None))`.
+/// All three seed timestamps (2023-11-14, ~1_700_000_000_000_000 µs) truncate
+/// to 2023-01-01T00:00:00Z = 1_672_531_200_000_000 µs.
+/// The test asserts both type preservation (cast-back invariant) and the exact
+/// truncated value for all three rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn date_show_year_on_timestamp_over_qualified_multilevel_scan() {
+    let (mem, scan) = build_multilevel_scan_with_mem();
+
+    let tref = TableReference::full("cat", "ns1.ns2", "employees");
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![
+            Expr::Column(Column::new(Some(tref.clone()), "customer_id")),
+            Expr::Column(Column::new(Some(tref.clone()), "hired_at")),
+        ])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let store = InMemoryPolicyStore::new();
+    let mut policy = ResolvedPolicy::default();
+    policy
+        .column_masks
+        .insert("hired_at".to_string(), MaskType::DateShowYear);
+    store.add_table_policy("ns2", "employees", policy).await;
+
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store));
+    let rewritten = rewriter.evaluate(&user("bob", &[]), plan).await.unwrap();
+
+    let batches = execute_multilevel(rewritten, mem).await;
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 3, "all three rows must be present (no row filter)");
+
+    let ts_col = batches[0].column_by_name("hired_at").unwrap();
+    // Type-preservation invariant: cast-back must keep the original column type.
+    assert_eq!(
+        ts_col.data_type(),
+        &DataType::Timestamp(TimeUnit::Microsecond, None),
+        "DateShowYear must preserve Timestamp(Microsecond, None) column type"
+    );
+
+    // All three seeds are in 2023-11 and truncate to 2023-01-01T00:00:00Z.
+    // 2023-01-01T00:00:00Z = 1_672_531_200_000_000 microseconds since Unix epoch.
+    let ts_arr = ts_col
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .unwrap();
+    let expected_micros: i64 = 1_672_531_200_000_000;
+    assert_eq!(ts_arr.value(0), expected_micros);
+    assert_eq!(ts_arr.value(1), expected_micros);
+    assert_eq!(ts_arr.value(2), expected_micros);
+}
+
+/// Test C: PartialMask on a non-string (Int64) column falls back to typed NULL
+/// over a qualified multilevel scan.
+///
+/// A char-class mask is meaningless on an integer. The rewriter must emit a
+/// typed NULL (Int64 NULL) rather than coercing to Utf8, which would break
+/// downstream predicates and fail physical planning. Both the type and the
+/// null-ness are asserted, mirroring `nullify_mask_on_bigint_executes_without_type_error`
+/// but for the PartialMask non-string NULL-fallback path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partial_mask_on_non_string_falls_back_to_typed_null_over_qualified_multilevel_scan() {
+    let (mem, scan) = build_multilevel_scan_with_mem();
+
+    let tref = TableReference::full("cat", "ns1.ns2", "employees");
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![Expr::Column(Column::new(
+            Some(tref.clone()),
+            "customer_id",
+        ))])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let store = InMemoryPolicyStore::new();
+    let mut policy = ResolvedPolicy::default();
+    policy.column_masks.insert(
+        "customer_id".to_string(),
+        MaskType::PartialMask {
+            show_first: 0,
+            show_last: 4,
+            upper: 'x',
+            lower: 'x',
+            digit: 'x',
+        },
+    );
+    store.add_table_policy("ns2", "employees", policy).await;
+
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store));
+    let rewritten = rewriter.evaluate(&user("carol", &[]), plan).await.unwrap();
+
+    let batches = execute_multilevel(rewritten, mem).await;
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 3, "all three rows must be present (no row filter)");
+
+    let id_col = batches[0].column_by_name("customer_id").unwrap();
+    // Type-preservation invariant: non-string NULL-fallback must keep Int64.
+    assert_eq!(
+        id_col.data_type(),
+        &DataType::Int64,
+        "PartialMask on Int64 must fall back to Int64 NULL (not Utf8)"
+    );
+    assert_eq!(
+        id_col.null_count(),
+        id_col.len(),
+        "every customer_id value must be NULL after non-string PartialMask fallback"
+    );
+}
