@@ -7,13 +7,18 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
+use datafusion::logical_expr::lit;
 use moka::future::Cache;
 use reqwest::Client;
 use serde::Deserialize;
 use sqe_core::config::RangerPolicyConfig;
+use sqe_core::SessionUser;
+use tracing::{debug, warn};
 
 use crate::policy_breaker::PolicyCircuitBreaker;
-use crate::ResolvedPolicy;
+use crate::policy_expr::parse_sql_predicate;
+use crate::{MaskType, PolicyStore, ResolvedPolicy};
 
 // --- Ranger policy bundle model (ServicePolicies) ---
 
@@ -86,10 +91,8 @@ pub struct RowFilterInfo {
 }
 
 // --- RangerStore struct, constructor, and download fetch ---
-// dead_code allowed until Task 5 wires PolicyStore::resolve.
 
 /// Fine-grained policy store backed by a `hive`-type Ranger service.
-#[allow(dead_code)]
 pub struct RangerStore {
     client: Client,
     /// Base download URL, e.g. ".../service/plugins/policies/download/hive".
@@ -100,7 +103,6 @@ pub struct RangerStore {
     breaker: Arc<PolicyCircuitBreaker>,
 }
 
-#[allow(dead_code)]
 impl RangerStore {
     pub fn from_config(cfg: &RangerPolicyConfig) -> sqe_core::Result<Self> {
         let base = cfg.url.trim_end_matches('/');
@@ -166,6 +168,190 @@ impl RangerStore {
         })?;
         self.breaker.record_success();
         Ok(bundle)
+    }
+}
+
+// --- Pure resolution helpers ---
+
+/// Flatten an Iceberg namespace to a hive `database` name. SQE namespaces are
+/// already dotted multi-level strings and Kyuubi uses the same dotted
+/// convention, so this is identity for now. Catalog is intentionally dropped
+/// (hive has no catalog level); cross-engine policies must be written without a
+/// catalog prefix. See docs/ranger-fine-grained-service-type.md.
+///
+/// NOTE: `plan_rewriter.rs::resolve_policy_key` passes the **last** dotted
+/// component of the schema as `namespace` (e.g. schema `"sales_wh.sales"` ->
+/// `"sales"`). Ranger `database` resource values must match that last component
+/// for policies to fire. See project tracking for the namespace convention
+/// alignment task.
+fn hive_database(namespace: &str) -> String {
+    namespace.to_string()
+}
+
+/// True if a Ranger resource value list matches `target` (supports `*`
+/// wildcard and exact match; `isExcludes` inverts the result).
+fn resource_matches(res: &RangerResource, target: &str) -> bool {
+    let hit = res.values.iter().any(|v| v == "*" || v == target);
+    hit ^ res.is_excludes
+}
+
+/// True if a policy's database + table resources match the target table.
+fn policy_matches_table(p: &RangerPolicy, database: &str, table: &str) -> bool {
+    let db_ok = p
+        .resources
+        .get("database")
+        .map(|r| resource_matches(r, database))
+        .unwrap_or(false);
+    let tbl_ok = p
+        .resources
+        .get("table")
+        .map(|r| resource_matches(r, table))
+        .unwrap_or(false);
+    db_ok && tbl_ok
+}
+
+/// True if a policy-item applies to this user/roles (token roles, matched directly).
+fn item_matches(users: &[String], roles: &[String], user: &SessionUser) -> bool {
+    users.iter().any(|u| u == &user.username) || roles.iter().any(|r| user.roles.contains(r))
+}
+
+/// Map a Ranger hive data-mask type to an SQE `MaskType`.
+///  - `Ok(Some(mask))` supported,
+///  - `Ok(None)` for MASK_NONE (explicit exemption: no mask, not restricted),
+///  - `Err(())` for not-yet-supported types (caller restricts the column, fail-closed).
+fn map_mask(info: &DataMaskInfo, column: &str) -> Result<Option<MaskType>, ()> {
+    match info.data_mask_type.as_str() {
+        "MASK_NULL" => Ok(Some(MaskType::Nullify)),
+        "MASK_NONE" => Ok(None),
+        "MASK_HASH" => Ok(Some(MaskType::Hash)),
+        "CUSTOM" => {
+            let expr_str = info.value_expr.as_deref().ok_or(())?;
+            // Ranger CUSTOM masks use `{col}` as the column placeholder.
+            // Substitute with the real column name so the parsed Expr references
+            // the actual column. The rewriter splices the Expr as-is via
+            // `MaskType::Custom(expr) => expr.clone()` (plan_rewriter.rs:323),
+            // so the column name must be correct at parse time.
+            // If parsing fails -> Err(()) -> column restricted (fail-closed).
+            let substituted = expr_str.replace("{col}", column);
+            parse_sql_predicate(&substituted)
+                .map(|e| Some(MaskType::Custom(e)))
+                .map_err(|_| ())
+        }
+        // Phase 2: MASK, MASK_SHOW_LAST_4, MASK_SHOW_FIRST_4, MASK_DATE_SHOW_YEAR
+        _ => Err(()),
+    }
+}
+
+/// Build a `ResolvedPolicy` from an already-fetched bundle. Pure (no I/O), so it
+/// is unit-tested directly and reused by `resolve()` after a cache miss.
+fn resolve_from_bundle(
+    bundle: &ServicePolicies,
+    user: &SessionUser,
+    table: &str,
+    namespace: &str,
+) -> ResolvedPolicy {
+    let database = hive_database(namespace);
+    let mut policy = ResolvedPolicy::default();
+
+    for p in &bundle.policies {
+        if !p.is_enabled || !policy_matches_table(p, &database, table) {
+            continue;
+        }
+
+        // Data-mask policy (policyType 1)
+        if p.policy_type == 1 {
+            let column = p
+                .resources
+                .get("column")
+                .and_then(|r| r.values.first())
+                .cloned();
+            let Some(column) = column else { continue };
+            for item in &p.data_mask_policy_items {
+                if !item_matches(&item.users, &item.roles, user) {
+                    continue;
+                }
+                match map_mask(&item.data_mask_info, &column) {
+                    Ok(Some(mask)) => {
+                        policy.column_masks.insert(column.clone(), mask);
+                    }
+                    Ok(None) => { /* MASK_NONE exemption: leave column visible */ }
+                    Err(()) => {
+                        warn!(
+                            column = %column,
+                            mask_type = %item.data_mask_info.data_mask_type,
+                            "unsupported Ranger mask type; restricting column (fail-closed)"
+                        );
+                        if !policy.restricted_columns.contains(&column) {
+                            policy.restricted_columns.push(column.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Row-filter policy (policyType 2)
+        if p.policy_type == 2 {
+            for item in &p.row_filter_policy_items {
+                if !item_matches(&item.users, &item.roles, user) {
+                    continue;
+                }
+                if let Some(expr_str) = &item.row_filter_info.filter_expr {
+                    match parse_sql_predicate(expr_str) {
+                        Ok(expr) => policy.row_filters.push(expr),
+                        Err(e) => {
+                            warn!(
+                                filter = %expr_str,
+                                error = %e,
+                                "unparseable Ranger row filter; denying (fail-closed)"
+                            );
+                            policy.row_filters.push(lit(false));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    debug!(
+        user = %user.username,
+        table = %table,
+        db = %database,
+        masks = policy.column_masks.len(),
+        filters = policy.row_filters.len(),
+        restricted = policy.restricted_columns.len(),
+        "resolved Ranger policy"
+    );
+    policy
+}
+
+// --- Cache key + PolicyStore impl ---
+
+fn cache_key(user: &SessionUser, table: &str, namespace: &str) -> String {
+    let mut roles = user.roles.clone();
+    roles.sort();
+    format!("{}:{}:{}:{}", user.username, namespace, table, roles.join(","))
+}
+
+#[async_trait]
+impl PolicyStore for RangerStore {
+    async fn resolve(
+        &self,
+        user: &SessionUser,
+        table_name: &str,
+        namespace: &str,
+    ) -> sqe_core::Result<ResolvedPolicy> {
+        let key = cache_key(user, table_name, namespace);
+        if let Some(cached) = self.cache.get(&key).await {
+            return Ok(cached);
+        }
+        let bundle = self.fetch_bundle().await?;
+        let policy = resolve_from_bundle(&bundle, user, table_name, namespace);
+        self.cache.insert(key, policy.clone()).await;
+        Ok(policy)
+    }
+
+    fn invalidate_all(&self) {
+        self.cache.invalidate_all();
     }
 }
 
@@ -235,5 +421,149 @@ mod tests {
         // from_config must succeed even with an empty URL (no network call).
         let store = RangerStore::from_config(&cfg);
         assert!(store.is_ok(), "from_config failed: {:?}", store.err());
+    }
+
+    fn user(name: &str, roles: &[&str]) -> SessionUser {
+        SessionUser {
+            username: name.to_string(),
+            roles: roles.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn flattens_iceberg_to_hive_database() {
+        assert_eq!(hive_database("sales"), "sales");
+        assert_eq!(hive_database("sales.eu"), "sales.eu");
+    }
+
+    #[test]
+    fn mask_null_maps_to_nullify() {
+        let bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
+        let policy = resolve_from_bundle(
+            &bundle,
+            &user("alice", &["analyst"]),
+            "orders",
+            "sales_wh.sales",
+        );
+        assert!(matches!(
+            policy.column_masks.get("amount"),
+            Some(MaskType::Nullify)
+        ));
+    }
+
+    #[test]
+    fn row_filter_applied_for_matching_role() {
+        let bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
+        let policy = resolve_from_bundle(
+            &bundle,
+            &user("alice", &["analyst"]),
+            "orders",
+            "sales_wh.sales",
+        );
+        assert_eq!(policy.row_filters.len(), 1);
+    }
+
+    #[test]
+    fn no_match_for_other_role() {
+        let bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
+        let policy = resolve_from_bundle(
+            &bundle,
+            &user("bob", &["engineer"]),
+            "orders",
+            "sales_wh.sales",
+        );
+        assert!(policy.column_masks.is_empty());
+        assert!(policy.row_filters.is_empty());
+    }
+
+    #[test]
+    fn user_match_works_too() {
+        let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
+        bundle.policies[0].data_mask_policy_items[0].roles.clear();
+        bundle.policies[0].data_mask_policy_items[0].users = vec!["alice".to_string()];
+        let policy =
+            resolve_from_bundle(&bundle, &user("alice", &[]), "orders", "sales_wh.sales");
+        assert!(policy.column_masks.contains_key("amount"));
+    }
+
+    #[test]
+    fn unsupported_mask_restricts_column_failclosed() {
+        let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
+        bundle.policies[0].data_mask_policy_items[0]
+            .data_mask_info
+            .data_mask_type = "MASK_SHOW_LAST_4".to_string();
+        let policy = resolve_from_bundle(
+            &bundle,
+            &user("alice", &["analyst"]),
+            "orders",
+            "sales_wh.sales",
+        );
+        assert!(policy.restricted_columns.contains(&"amount".to_string()));
+        assert!(!policy.column_masks.contains_key("amount"));
+    }
+
+    #[test]
+    fn mask_none_is_exemption() {
+        let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
+        bundle.policies[0].data_mask_policy_items[0]
+            .data_mask_info
+            .data_mask_type = "MASK_NONE".to_string();
+        let policy = resolve_from_bundle(
+            &bundle,
+            &user("alice", &["analyst"]),
+            "orders",
+            "sales_wh.sales",
+        );
+        assert!(!policy.column_masks.contains_key("amount"));
+        assert!(!policy.restricted_columns.contains(&"amount".to_string()));
+    }
+
+    #[test]
+    fn disabled_policy_is_skipped() {
+        let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
+        bundle.policies[0].is_enabled = false; // the datamask policy
+        let policy = resolve_from_bundle(
+            &bundle,
+            &user("alice", &["analyst"]),
+            "orders",
+            "sales_wh.sales",
+        );
+        assert!(policy.column_masks.is_empty());
+    }
+
+    #[test]
+    fn wrong_table_does_not_match() {
+        let bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
+        let policy = resolve_from_bundle(
+            &bundle,
+            &user("alice", &["analyst"]),
+            "customers",
+            "sales_wh.sales",
+        );
+        assert!(policy.column_masks.is_empty());
+        assert!(policy.row_filters.is_empty());
+    }
+
+    #[test]
+    fn unparseable_row_filter_fails_closed() {
+        let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
+        bundle.policies[1].row_filter_policy_items[0]
+            .row_filter_info
+            .filter_expr = Some("this is not sql !!!".to_string());
+        let policy = resolve_from_bundle(
+            &bundle,
+            &user("alice", &["analyst"]),
+            "orders",
+            "sales_wh.sales",
+        );
+        // Fail-closed: a broken filter must NOT result in zero filters (which
+        // would expose all rows). Expect a lit(false) deny filter instead.
+        assert_eq!(policy.row_filters.len(), 1);
+        // The single filter should be the literal-false deny, not a parsed predicate.
+        let s = format!("{:?}", policy.row_filters[0]).to_lowercase();
+        assert!(
+            s.contains("false") || s.contains("boolean(false)"),
+            "expected deny filter, got {s}"
+        );
     }
 }
