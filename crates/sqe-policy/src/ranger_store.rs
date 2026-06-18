@@ -102,7 +102,7 @@ pub struct RangerStore {
 
 #[allow(dead_code)]
 impl RangerStore {
-    pub fn from_config(cfg: &RangerPolicyConfig, admin_password: &str) -> Result<Self, reqwest::Error> {
+    pub fn from_config(cfg: &RangerPolicyConfig) -> sqe_core::Result<Self> {
         let base = cfg.url.trim_end_matches('/');
         let download_url = format!(
             "{base}/service/plugins/policies/download/{}",
@@ -112,10 +112,15 @@ impl RangerStore {
             client: Client::builder()
                 .timeout(Duration::from_secs(cfg.timeout_secs))
                 .danger_accept_invalid_certs(cfg.accept_invalid_certs)
-                .build()?,
+                .build()
+                .map_err(|e| {
+                    sqe_core::error::SqeError::Config(format!(
+                        "Failed to build Ranger HTTP client: {e}"
+                    ))
+                })?,
             download_url,
             admin_user: cfg.admin_user.clone(),
-            admin_password: admin_password.to_string(),
+            admin_password: cfg.admin_password.expose().to_string(),
             cache: Cache::builder()
                 .time_to_live(Duration::from_secs(cfg.cache_ttl_secs))
                 .max_capacity(cfg.cache_max_entries)
@@ -228,7 +233,7 @@ mod tests {
     fn from_config_builds_store() {
         let cfg = RangerPolicyConfig::default();
         // from_config must succeed even with an empty URL (no network call).
-        let store = RangerStore::from_config(&cfg, "test-password");
+        let store = RangerStore::from_config(&cfg);
         assert!(store.is_ok(), "from_config failed: {:?}", store.err());
     }
 }
