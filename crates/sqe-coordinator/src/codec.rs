@@ -37,7 +37,7 @@ impl SqePhysicalCodec {
 
 impl PhysicalExtensionCodec for SqePhysicalCodec {
     fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> DFResult<()> {
-        if let Some(scan) = node.as_any().downcast_ref::<DistributedScanExec>() {
+        if let Some(scan) = node.downcast_ref::<DistributedScanExec>() {
             let proto_schema: protobuf::Schema =
                 scan.schema().as_ref().try_into().map_err(|e| {
                     DataFusionError::External(Box::new(std::io::Error::other(format!(
@@ -161,7 +161,6 @@ mod tests {
             .expect("decode failed");
 
         let decoded_scan = decoded
-            .as_any()
             .downcast_ref::<DistributedScanExec>()
             .expect("Expected DistributedScanExec");
 

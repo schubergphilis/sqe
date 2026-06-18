@@ -248,9 +248,7 @@ impl CatalogOps {
         stmt: &Statement,
     ) -> sqe_core::Result<()> {
         let (source_name, operations) = match stmt {
-            Statement::AlterTable {
-                name, operations, ..
-            } => (name, operations),
+            Statement::AlterTable(at) => (&at.name, &at.operations),
             other => {
                 return Err(SqeError::Execution(format!(
                     "Expected ALTER TABLE statement, got: {other}"
@@ -262,7 +260,12 @@ impl CatalogOps {
         let dest_obj_name = operations
             .iter()
             .find_map(|op| match op {
-                AlterTableOperation::RenameTable { table_name } => Some(table_name),
+                // sqlparser 0.62 wraps the rename target in RenameTableNameKind
+                // (`AS name` / `TO name`); both carry the destination ObjectName.
+                AlterTableOperation::RenameTable { table_name } => match table_name {
+                    sqlparser::ast::RenameTableNameKind::As(name)
+                    | sqlparser::ast::RenameTableNameKind::To(name) => Some(name),
+                },
                 _ => None,
             })
             .ok_or_else(|| {
@@ -337,7 +340,7 @@ impl CatalogOps {
         schema_json: &serde_json::Value,
     ) -> sqe_core::Result<()> {
         let (view_name, query, or_replace) = match stmt {
-            Statement::CreateView { name, query, or_replace, .. } => (name, query, *or_replace),
+            Statement::CreateView(cv) => (&cv.name, &cv.query, cv.or_replace),
             other => {
                 return Err(SqeError::Execution(format!(
                     "Expected CREATE VIEW statement, got: {other}"
@@ -450,9 +453,7 @@ impl CatalogOps {
         stmt: &Statement,
     ) -> sqe_core::Result<()> {
         let (table_name, operations) = match stmt {
-            Statement::AlterTable {
-                name, operations, ..
-            } => (name, operations),
+            Statement::AlterTable(at) => (&at.name, &at.operations),
             other => {
                 return Err(SqeError::Execution(format!(
                     "Expected ALTER TABLE statement, got: {other}"
@@ -556,16 +557,21 @@ impl CatalogOps {
                     fields.push(StdArc::new(new_field));
                 }
 
-                AlterTableOperation::DropColumn { column_name, if_exists, .. } => {
-                    let col = column_name.value.as_str();
-                    let pos = fields.iter().position(|f| f.name == col);
-                    match pos {
-                        Some(idx) => { fields.remove(idx); }
-                        None if *if_exists => {}
-                        None => {
-                            return Err(SqeError::Execution(format!(
-                                "Column '{col}' not found in table '{table_ident}'"
-                            )));
+                AlterTableOperation::DropColumn { column_names, if_exists, .. } => {
+                    // sqlparser 0.62 carries a Vec of column names (the old
+                    // single `column_name` field). Drop each in turn, keeping
+                    // the same not-found / IF EXISTS semantics per column.
+                    for column_name in column_names {
+                        let col = column_name.value.as_str();
+                        let pos = fields.iter().position(|f| f.name == col);
+                        match pos {
+                            Some(idx) => { fields.remove(idx); }
+                            None if *if_exists => {}
+                            None => {
+                                return Err(SqeError::Execution(format!(
+                                    "Column '{col}' not found in table '{table_ident}'"
+                                )));
+                            }
                         }
                     }
                 }
@@ -688,9 +694,7 @@ impl CatalogOps {
         stmt: &Statement,
     ) -> sqe_core::Result<()> {
         let (table_name, operations) = match stmt {
-            Statement::AlterTable {
-                name, operations, ..
-            } => (name, operations),
+            Statement::AlterTable(at) => (&at.name, &at.operations),
             other => {
                 return Err(SqeError::Execution(format!(
                     "Expected ALTER TABLE statement, got: {other}"
@@ -1125,8 +1129,10 @@ impl CatalogOps {
 /// returned directly. For everything else the Display representation is used.
 fn sql_expr_to_string(expr: &Expr) -> String {
     match expr {
-        Expr::Value(Value::SingleQuotedString(s)) => s.clone(),
-        Expr::Value(Value::DoubleQuotedString(s)) => s.clone(),
+        Expr::Value(v) => match &v.value {
+            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => s.clone(),
+            _ => format!("{expr}"),
+        },
         other => format!("{other}"),
     }
 }
@@ -1143,6 +1149,7 @@ pub(crate) fn parse_table_ref(name: &ObjectName) -> sqe_core::Result<TableIdent>
     let parts: Vec<String> = name
         .0
         .iter()
+        .filter_map(|p| p.as_ident())
         .map(|ident| ident.value.clone())
         .collect();
 
@@ -1175,7 +1182,12 @@ pub(crate) fn parse_table_ref(name: &ObjectName) -> sqe_core::Result<TableIdent>
 /// the read path's `sqe_sql::extract_catalog_qualifiers` access (`.value`, no
 /// quote/case normalisation) so reads and writes resolve the same catalog name.
 pub(crate) fn catalog_qualifier(name: &ObjectName) -> Option<String> {
-    let parts: Vec<&str> = name.0.iter().map(|ident| ident.value.as_str()).collect();
+    let parts: Vec<&str> = name
+        .0
+        .iter()
+        .filter_map(|p| p.as_ident())
+        .map(|ident| ident.value.as_str())
+        .collect();
     match parts.as_slice() {
         [catalog, _namespace, _table] => Some((*catalog).to_string()),
         _ => None,
@@ -1188,7 +1200,12 @@ pub(crate) fn catalog_qualifier(name: &ObjectName) -> Option<String> {
 /// `CREATE/DROP SCHEMA catalog.schema` is two parts (catalog + namespace),
 /// whereas a table reference is three (catalog + namespace + table).
 pub(crate) fn schema_catalog_qualifier(name: &ObjectName) -> Option<String> {
-    let parts: Vec<&str> = name.0.iter().map(|ident| ident.value.as_str()).collect();
+    let parts: Vec<&str> = name
+        .0
+        .iter()
+        .filter_map(|p| p.as_ident())
+        .map(|ident| ident.value.as_str())
+        .collect();
     match parts.as_slice() {
         [catalog, _schema] => Some((*catalog).to_string()),
         _ => None,
@@ -1201,7 +1218,12 @@ pub(crate) fn schema_catalog_qualifier(name: &ObjectName) -> Option<String> {
 /// `schema` namespace in the resolved catalog rather than a `catalog.schema`
 /// two-level namespace in the default warehouse.
 fn namespace_without_catalog(name: &ObjectName) -> sqe_core::Result<NamespaceIdent> {
-    let parts: Vec<String> = name.0.iter().map(|i| i.value.clone()).collect();
+    let parts: Vec<String> = name
+        .0
+        .iter()
+        .filter_map(|p| p.as_ident())
+        .map(|i| i.value.clone())
+        .collect();
     match parts.as_slice() {
         [_catalog, schema] => Ok(NamespaceIdent::new(schema.clone())),
         _ => parse_namespace_from_object_name(name),
@@ -1216,6 +1238,7 @@ fn parse_namespace_from_object_name(name: &ObjectName) -> sqe_core::Result<Names
     let parts: Vec<String> = name
         .0
         .iter()
+        .filter_map(|p| p.as_ident())
         .map(|ident| ident.value.clone())
         .collect();
 
@@ -1282,7 +1305,7 @@ fn parse_object_name(s: &str) -> sqe_core::Result<ObjectName> {
             "invalid table reference: '{s}'"
         )));
     }
-    Ok(ObjectName(idents))
+    Ok(ObjectName::from(idents))
 }
 
 /// Check if an iceberg error indicates a table was not found.
@@ -1343,7 +1366,7 @@ mod tests {
 
     #[test]
     fn test_parse_table_ref_one_part() {
-        let name = ObjectName(vec![Ident::new("my_table")]);
+        let name = ObjectName::from(vec![Ident::new("my_table")]);
         let ident = parse_table_ref(&name).unwrap();
         assert_eq!(ident.namespace(), &NamespaceIdent::new("default".to_string()));
         assert_eq!(ident.name(), "my_table");
@@ -1351,7 +1374,7 @@ mod tests {
 
     #[test]
     fn test_parse_table_ref_two_parts() {
-        let name = ObjectName(vec![Ident::new("my_schema"), Ident::new("my_table")]);
+        let name = ObjectName::from(vec![Ident::new("my_schema"), Ident::new("my_table")]);
         let ident = parse_table_ref(&name).unwrap();
         assert_eq!(ident.namespace(), &NamespaceIdent::new("my_schema".to_string()));
         assert_eq!(ident.name(), "my_table");
@@ -1359,7 +1382,7 @@ mod tests {
 
     #[test]
     fn test_parse_table_ref_three_parts() {
-        let name = ObjectName(vec![
+        let name = ObjectName::from(vec![
             Ident::new("my_catalog"),
             Ident::new("my_schema"),
             Ident::new("my_table"),
@@ -1371,13 +1394,13 @@ mod tests {
 
     #[test]
     fn test_parse_table_ref_empty_is_error() {
-        let name = ObjectName(vec![] as Vec<Ident>);
+        let name = ObjectName::from(vec![] as Vec<Ident>);
         assert!(parse_table_ref(&name).is_err());
     }
 
     #[test]
     fn test_parse_table_ref_four_parts_is_error() {
-        let name = ObjectName(vec![
+        let name = ObjectName::from(vec![
             Ident::new("a"),
             Ident::new("b"),
             Ident::new("c"),
@@ -1388,19 +1411,19 @@ mod tests {
 
     #[test]
     fn test_catalog_qualifier_one_part_is_none() {
-        let name = ObjectName(vec![Ident::new("my_table")]);
+        let name = ObjectName::from(vec![Ident::new("my_table")]);
         assert_eq!(catalog_qualifier(&name), None);
     }
 
     #[test]
     fn test_catalog_qualifier_two_parts_is_none() {
-        let name = ObjectName(vec![Ident::new("my_schema"), Ident::new("my_table")]);
+        let name = ObjectName::from(vec![Ident::new("my_schema"), Ident::new("my_table")]);
         assert_eq!(catalog_qualifier(&name), None);
     }
 
     #[test]
     fn test_catalog_qualifier_three_parts_returns_catalog() {
-        let name = ObjectName(vec![
+        let name = ObjectName::from(vec![
             Ident::new("team_a_data"),
             Ident::new("public"),
             Ident::new("events"),
@@ -1410,7 +1433,7 @@ mod tests {
 
     #[test]
     fn test_catalog_qualifier_four_parts_is_none() {
-        let name = ObjectName(vec![
+        let name = ObjectName::from(vec![
             Ident::new("a"),
             Ident::new("b"),
             Ident::new("c"),
@@ -1422,33 +1445,33 @@ mod tests {
     // ─── schema_catalog_qualifier: 2-part catalog.schema ──────────────
     #[test]
     fn test_schema_catalog_qualifier_one_part_is_none() {
-        let name = ObjectName(vec![Ident::new("dev_raw")]);
+        let name = ObjectName::from(vec![Ident::new("dev_raw")]);
         assert_eq!(schema_catalog_qualifier(&name), None);
     }
 
     #[test]
     fn test_schema_catalog_qualifier_two_parts_returns_catalog() {
-        let name = ObjectName(vec![Ident::new("ws_team_a"), Ident::new("dev_raw")]);
+        let name = ObjectName::from(vec![Ident::new("ws_team_a"), Ident::new("dev_raw")]);
         assert_eq!(schema_catalog_qualifier(&name), Some("ws_team_a".to_string()));
     }
 
     #[test]
     fn test_schema_catalog_qualifier_three_parts_is_none() {
-        let name = ObjectName(vec![Ident::new("a"), Ident::new("b"), Ident::new("c")]);
+        let name = ObjectName::from(vec![Ident::new("a"), Ident::new("b"), Ident::new("c")]);
         assert_eq!(schema_catalog_qualifier(&name), None);
     }
 
     // ─── namespace_without_catalog: peel the catalog off catalog.schema ──
     #[test]
     fn test_namespace_without_catalog_strips_catalog() {
-        let name = ObjectName(vec![Ident::new("ws_team_a"), Ident::new("dev_raw")]);
+        let name = ObjectName::from(vec![Ident::new("ws_team_a"), Ident::new("dev_raw")]);
         let ns = namespace_without_catalog(&name).unwrap();
         assert_eq!(ns, NamespaceIdent::new("dev_raw".to_string()));
     }
 
     #[test]
     fn test_namespace_without_catalog_one_part_unchanged() {
-        let name = ObjectName(vec![Ident::new("dev_raw")]);
+        let name = ObjectName::from(vec![Ident::new("dev_raw")]);
         let ns = namespace_without_catalog(&name).unwrap();
         assert_eq!(ns, NamespaceIdent::new("dev_raw".to_string()));
     }

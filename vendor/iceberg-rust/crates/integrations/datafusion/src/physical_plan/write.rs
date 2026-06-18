@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -137,10 +136,6 @@ impl DisplayAs for IcebergWriteExec {
 impl ExecutionPlan for IcebergWriteExec {
     fn name(&self) -> &str {
         "IcebergWriteExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     /// Prevents the introduction of additional `RepartitionExec` and processing input in parallel.

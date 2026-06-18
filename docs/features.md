@@ -1,12 +1,12 @@
 # SQL Feature Comparison: SQE vs Trino vs Spark SQL vs DuckDB
 
-SQE is built on **Apache DataFusion 53.1** which provides the SQL execution engine. All standard SQL features come from DataFusion; SQE adds catalog integration (Polaris / Iceberg / Glue / HMS / Nessie / S3 Tables / JDBC / Hadoop), pluggable auth, distributed execution, DDL routing, and a single-binary embedded mode that competes with DuckDB on laptop analytics.
+SQE is built on **Apache DataFusion 54** which provides the SQL execution engine. All standard SQL features come from DataFusion; SQE adds catalog integration (Polaris / Iceberg / Glue / HMS / Nessie / S3 Tables / JDBC / Hadoop), pluggable auth, distributed execution, DDL routing, and a single-binary embedded mode that competes with DuckDB on laptop analytics.
 
 > For a detailed function-by-function Trino compatibility matrix, see [trino-compatibility.md](trino-compatibility.md). For the audit-driven DuckDB compatibility track (V8 through V12.1, with status per item), see [duckdb-comparision.md](duckdb-comparision.md). For the embedded CLI reference, see [cli-embedded.md](cli-embedded.md).
 
 ## Quick Summary
 
-| Category | SQE (DataFusion 53.1) | Trino | Spark SQL | DuckDB |
+| Category | SQE (DataFusion 54) | Trino | Spark SQL | DuckDB |
 |----------|:---:|:---:|:---:|:---:|
 | Window functions | ✅ Full | ✅ Full | ✅ Full | ✅ Full |
 | Aggregate functions | ✅ Full | ✅ Full | ✅ Full | ✅ Full |

@@ -37,7 +37,6 @@
 //! not implemented here and is documented as blocked on the upstream fork.
 //! Track progress at: <https://github.com/risingwavelabs/iceberg-rust>
 
-use std::any::Any;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -98,9 +97,6 @@ struct IcebergMetadataProvider {
 
 #[async_trait]
 impl TableProvider for IcebergMetadataProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn schema(&self) -> SchemaRef {
         self.schema.clone()

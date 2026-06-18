@@ -245,9 +245,16 @@ impl HashPartitioner {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
-        // Compute hashes for all rows using DataFusion's hasher
+        // Compute hashes for all rows using DataFusion's hasher.
+        // DF 54 switched the hash backend from ahash to foldhash; `RandomState` is now
+        // an alias for `foldhash::fast::FixedState`. We use a fixed (seed-0) state so the
+        // shuffle is deterministic across all nodes, matching DF's own REPARTITION_RANDOM_STATE.
         let mut hashes = vec![0u64; batch.num_rows()];
-        create_hashes(&key_arrays, &ahash::RandomState::with_seeds(0, 0, 0, 0), &mut hashes)?;
+        create_hashes(
+            &key_arrays,
+            &datafusion::common::hash_utils::RandomState::default(),
+            &mut hashes,
+        )?;
 
         // Assign rows to partitions: hash % num_partitions
         let num_partitions = self.num_partitions as u64;

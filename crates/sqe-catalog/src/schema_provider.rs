@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -148,9 +147,6 @@ impl SqeSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for SqeSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     // SAFETY NOTE: DataFusion's SchemaProvider::table_names() is synchronous by design
     // (returns Vec<String>, not a Future). Since our catalog is async (HTTP calls to

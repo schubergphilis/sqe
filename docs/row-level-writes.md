@@ -32,7 +32,7 @@ SQE needed row-level mutations to be a viable Trino replacement:
 
 ### Iceberg Dependency
 
-Uses the iceberg-rust fork vendored at `vendor/iceberg-rust/` (DF 53 + Arrow 58 rebase of `risingwavelabs/iceberg-rust`) for `rewrite_files()` transaction support. When upstream iceberg-rust ships `OverwriteAction` (tracked in Epic #2186), the dependency can be migrated back to the official crate.
+Uses the iceberg-rust fork vendored at `vendor/iceberg-rust/` (a `risingwavelabs/iceberg-rust` DF 53 + Arrow 58 rebase, ported in-tree to DataFusion 54) for `rewrite_files()` transaction support. When upstream iceberg-rust ships `OverwriteAction` (tracked in Epic #2186), the dependency can be migrated back to the official crate.
 
 ### Future: Merge-on-Read
 
@@ -162,7 +162,7 @@ MERGE INTO target USING source ON condition
 
 | File | Change |
 |------|--------|
-| `Cargo.toml` | Vendored iceberg-rust fork at `vendor/iceberg-rust/` (DF 53 + Arrow 58 rebase) |
+| `Cargo.toml` | Vendored iceberg-rust fork at `vendor/iceberg-rust/` (DF 53 + Arrow 58 rebase, ported in-tree to DataFusion 54) |
 | `crates/sqe-coordinator/src/merge_handler.rs` | MERGE INTO execution via CoW |
 | `crates/sqe-coordinator/src/delete_handler.rs` | DELETE FROM execution via CoW |
 | `crates/sqe-coordinator/src/update_handler.rs` | UPDATE execution via CoW |

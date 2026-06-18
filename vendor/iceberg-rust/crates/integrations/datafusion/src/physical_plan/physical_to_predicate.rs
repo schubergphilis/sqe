@@ -93,12 +93,12 @@ pub fn convert_physical_filters_to_predicate(
 ) -> Option<Predicate> {
     filters
         .iter()
-        .filter_map(|f| convert_physical(f))
+        .filter_map(convert_physical)
         .reduce(Predicate::and)
 }
 
 fn convert_physical(expr: &Arc<dyn PhysicalExpr>) -> Option<Predicate> {
-    let any = expr.as_any();
+    let any = expr.as_ref();
 
     // 1. DynamicFilterPhysicalExpr: unwrap to the current inner.
     //    If the inner is still `lit(true)` we cannot produce anything
@@ -231,13 +231,13 @@ fn convert_in_list(in_list: &InListExpr) -> Option<Predicate> {
 }
 
 fn extract_column(expr: &Arc<dyn PhysicalExpr>) -> Option<String> {
-    expr.as_any()
+    expr.as_ref()
         .downcast_ref::<Column>()
         .map(|c| c.name().to_string())
 }
 
 fn extract_literal(expr: &Arc<dyn PhysicalExpr>) -> Option<ScalarValue> {
-    expr.as_any()
+    expr.as_ref()
         .downcast_ref::<Literal>()
         .map(|l| l.value().clone())
 }

@@ -468,7 +468,7 @@ fn walk_full(node: &Arc<dyn ExecutionPlan>, rows: &mut Vec<FullRow>) {
         .and_then(|m| m.spilled_rows())
         .map(|v| v as i64);
 
-    if let Some(scan) = node.as_any().downcast_ref::<IcebergScanExec>() {
+    if let Some(scan) = node.downcast_ref::<IcebergScanExec>() {
         let table = scan.table();
         let snap = table.metadata().current_snapshot();
         let props = snap.map(|s| s.summary().additional_properties.clone());

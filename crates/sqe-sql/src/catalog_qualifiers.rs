@@ -72,7 +72,9 @@ impl Visitor for CatalogQualifierCollector {
             // backtick / double-quote wrapping so the comparison
             // against `ctx.catalog_names()` works for both
             // `"cat".ns.t` and bare `cat.ns.t` shapes.
-            self.catalogs.insert(name.0[0].value.clone());
+            if let Some(ident) = name.0[0].as_ident() {
+                self.catalogs.insert(ident.value.clone());
+            }
         }
         ControlFlow::Continue(())
     }

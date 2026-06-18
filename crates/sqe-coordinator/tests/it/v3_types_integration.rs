@@ -107,10 +107,10 @@ fn alter_table_add_column_default_extraction() {
     )
     .unwrap()
     .remove(0);
-    let Statement::AlterTable { operations, .. } = stmt else {
+    let Statement::AlterTable(alter) = stmt else {
         panic!("expected AlterTable");
     };
-    let op = &operations[0];
+    let op = &alter.operations[0];
     let sqlparser::ast::AlterTableOperation::AddColumn { column_def, .. } = op else {
         panic!("expected AddColumn");
     };

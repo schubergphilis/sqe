@@ -49,10 +49,19 @@ use crate::writer::{
 /// as NULL.
 fn reorder_insert_select(
     select_sql: &str,
-    columns: &[sqlparser::ast::Ident],
+    // sqlparser 0.62: INSERT column list is Vec<ObjectName> (was Vec<Ident>).
+    // Each entry is a bare column name; use its last identifier part.
+    columns: &[sqlparser::ast::ObjectName],
     target_schema: &IcebergSchema,
 ) -> sqe_core::Result<String> {
     use std::collections::HashSet;
+
+    let column_value = |c: &sqlparser::ast::ObjectName| -> String {
+        c.0.last()
+            .and_then(|p| p.as_ident())
+            .map(|id| id.value.clone())
+            .unwrap_or_default()
+    };
 
     let target_fields = target_schema.as_struct().fields();
     let target_names: Vec<&str> = target_fields.iter().map(|f| f.name.as_str()).collect();
@@ -68,7 +77,7 @@ fn reorder_insert_select(
     let mut seen: HashSet<String> = HashSet::new();
     let provided_lower: Vec<String> = columns
         .iter()
-        .map(|c| c.value.to_ascii_lowercase())
+        .map(|c| column_value(c).to_ascii_lowercase())
         .collect();
     for name in &provided_lower {
         if !seen.insert(name.clone()) {
@@ -90,7 +99,7 @@ fn reorder_insert_select(
     // the value destined for `columns[i]`. Alias each output by that target
     // name in a CTE, then project the full target schema with NULLs for
     // unprovided columns.
-    let alias_list: Vec<String> = columns.iter().map(|c| quote_ident(&c.value)).collect();
+    let alias_list: Vec<String> = columns.iter().map(|c| quote_ident(&column_value(c))).collect();
     let alias_csv = alias_list.join(", ");
 
     let projection: Vec<String> = target_names
@@ -221,7 +230,7 @@ fn try_resolve_delete_target_ident(stmt: &Statement) -> Option<TableIdent> {
 /// Extract the target table `ObjectName` from a `Statement::Update`.
 fn update_target_object_name(stmt: &Statement) -> sqe_core::Result<&ObjectName> {
     let table_factor = match stmt {
-        Statement::Update { table, .. } => table,
+        Statement::Update(update) => &update.table,
         other => {
             return Err(SqeError::Execution(format!(
                 "Expected UPDATE statement, got: {other}"
@@ -1351,8 +1360,11 @@ impl WriteHandler {
         // stores them alongside the format-version directive. Without this
         // step CREATE TABLE silently drops every property the user typed.
         let mut props = self.format_version_props(format_version);
-        merge_user_table_properties(&mut props, &ct.table_properties);
-        merge_user_table_properties(&mut props, &ct.with_options);
+        // sqlparser 0.62 folds the old `table_properties` (TBLPROPERTIES) and
+        // `with_options` (WITH (...)) fields into a single `table_options`
+        // enum. Extract the user options regardless of which syntax produced
+        // them so CREATE TABLE keeps every property the user typed.
+        merge_user_table_properties(&mut props, create_table_options_as_slice(&ct.table_options));
 
         // Translate any PARTITIONED BY (...) clause into an Iceberg
         // UnboundPartitionSpec. Identity transforms cover bare column
@@ -2175,11 +2187,7 @@ impl WriteHandler {
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_ident = resolve_update_target_ident(stmt)?;
         let (assignments, selection) = match stmt {
-            Statement::Update {
-                assignments,
-                selection,
-                ..
-            } => (assignments, selection),
+            Statement::Update(update) => (&update.assignments, &update.selection),
             other => return Err(SqeError::Execution(format!(
                 "Expected UPDATE statement, got: {other}"
             ))),
@@ -2397,11 +2405,7 @@ impl WriteHandler {
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_ident = resolve_update_target_ident(stmt)?;
         let (assignments, selection) = match stmt {
-            Statement::Update {
-                assignments,
-                selection,
-                ..
-            } => (assignments, selection),
+            Statement::Update(update) => (&update.assignments, &update.selection),
             other => return Err(SqeError::Execution(format!(
                 "Expected UPDATE statement, got: {other}"
             ))),
@@ -2625,13 +2629,9 @@ impl WriteHandler {
         use sqlparser::ast::{MergeAction, MergeClauseKind, MergeInsertKind, TableFactor};
 
         let (table_factor, source_factor, on_expr, clauses) = match stmt {
-            Statement::Merge {
-                table,
-                source,
-                on,
-                clauses,
-                ..
-            } => (table, source, on, clauses),
+            Statement::Merge(merge) => {
+                (&merge.table, &merge.source, &merge.on, &merge.clauses)
+            }
             other => {
                 return Err(SqeError::Execution(format!(
                     "Expected MERGE statement, got: {other}"
@@ -2768,14 +2768,16 @@ impl WriteHandler {
         // Classify clauses
         let mut matched_update: Option<&[sqlparser::ast::Assignment]> = None;
         let mut matched_delete = false;
-        let mut not_matched_insert: Option<(&[sqlparser::ast::Ident], &MergeInsertKind)> = None;
+        let mut not_matched_insert: Option<(&[sqlparser::ast::ObjectName], &MergeInsertKind)> = None;
 
         for clause in clauses {
             match (&clause.clause_kind, &clause.action) {
-                (MergeClauseKind::Matched, MergeAction::Update { assignments }) => {
-                    matched_update = Some(assignments);
+                // sqlparser 0.62: MergeAction::Update is a tuple variant holding
+                // MergeUpdateExpr; Delete is a struct variant carrying a token.
+                (MergeClauseKind::Matched, MergeAction::Update(update_expr)) => {
+                    matched_update = Some(&update_expr.assignments);
                 }
-                (MergeClauseKind::Matched, MergeAction::Delete) => {
+                (MergeClauseKind::Matched, MergeAction::Delete { .. }) => {
                     matched_delete = true;
                 }
                 (
@@ -2784,7 +2786,7 @@ impl WriteHandler {
                 ) => {
                     not_matched_insert = Some((&insert_expr.columns, &insert_expr.kind));
                 }
-                (MergeClauseKind::NotMatchedBySource, MergeAction::Delete) => {
+                (MergeClauseKind::NotMatchedBySource, MergeAction::Delete { .. }) => {
                     // Not-matched-by-source DELETE means remove target-only rows
                     // This is handled below by omitting target-only rows from the output
                     // For now, we don't support this clause
@@ -3020,7 +3022,7 @@ impl WriteHandler {
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         // Peek at the target table to read its properties.
         let merge_table = match stmt {
-            Statement::Merge { table, .. } => table,
+            Statement::Merge(merge) => &merge.table,
             _ => {
                 return self
                     .handle_merge(session, stmt, source_batches, catalog, ctx)
@@ -3134,13 +3136,9 @@ impl WriteHandler {
         use sqlparser::ast::{MergeAction, MergeClauseKind, MergeInsertKind, TableFactor};
 
         let (table_factor, source_factor, on_expr, clauses) = match stmt {
-            Statement::Merge {
-                table,
-                source,
-                on,
-                clauses,
-                ..
-            } => (table, source, on, clauses),
+            Statement::Merge(merge) => {
+                (&merge.table, &merge.source, &merge.on, &merge.clauses)
+            }
             other => {
                 return Err(SqeError::Execution(format!(
                     "Expected MERGE statement, got: {other}"
@@ -3255,13 +3253,15 @@ impl WriteHandler {
         // Classify MERGE clauses.
         let mut matched_update: Option<&[sqlparser::ast::Assignment]> = None;
         let mut matched_delete = false;
-        let mut not_matched_insert: Option<(&[sqlparser::ast::Ident], &MergeInsertKind)> = None;
+        let mut not_matched_insert: Option<(&[sqlparser::ast::ObjectName], &MergeInsertKind)> = None;
         for clause in clauses {
             match (&clause.clause_kind, &clause.action) {
-                (MergeClauseKind::Matched, MergeAction::Update { assignments }) => {
-                    matched_update = Some(assignments);
+                // sqlparser 0.62: Update is a tuple variant (MergeUpdateExpr),
+                // Delete is a struct variant carrying a token.
+                (MergeClauseKind::Matched, MergeAction::Update(update_expr)) => {
+                    matched_update = Some(&update_expr.assignments);
                 }
-                (MergeClauseKind::Matched, MergeAction::Delete) => {
+                (MergeClauseKind::Matched, MergeAction::Delete { .. }) => {
                     matched_delete = true;
                 }
                 (
@@ -3270,7 +3270,7 @@ impl WriteHandler {
                 ) => {
                     not_matched_insert = Some((&insert_expr.columns, &insert_expr.kind));
                 }
-                (MergeClauseKind::NotMatchedBySource, MergeAction::Delete) => {
+                (MergeClauseKind::NotMatchedBySource, MergeAction::Delete { .. }) => {
                     return Err(SqeError::NotImplemented(
                         "WHEN NOT MATCHED BY SOURCE THEN DELETE is not yet supported".to_string(),
                     ));
@@ -3537,13 +3537,23 @@ impl WriteHandler {
             let col_name = match &a.target {
                 sqlparser::ast::AssignmentTarget::ColumnName(name) => {
                     // Could be "t.col" or just "col"
-                    let parts: Vec<String> = name.0.iter().map(|i| i.value.clone()).collect();
+                    let parts: Vec<String> = name
+                        .0
+                        .iter()
+                        .filter_map(|p| p.as_ident())
+                        .map(|i| i.value.clone())
+                        .collect();
                     parts.last().cloned().unwrap_or_default()
                 }
                 sqlparser::ast::AssignmentTarget::Tuple(names) => names
                     .first()
                     .map(|n| {
-                        let parts: Vec<String> = n.0.iter().map(|i| i.value.clone()).collect();
+                        let parts: Vec<String> = n
+                            .0
+                            .iter()
+                            .filter_map(|p| p.as_ident())
+                            .map(|i| i.value.clone())
+                            .collect();
                         parts.last().cloned().unwrap_or_default()
                     })
                     .unwrap_or_default(),
@@ -3569,7 +3579,8 @@ impl WriteHandler {
     fn resolve_insert_expr(
         &self,
         col: &str,
-        insert_columns: &[sqlparser::ast::Ident],
+        // sqlparser 0.62: MERGE INSERT column list is Vec<ObjectName> (was Vec<Ident>).
+        insert_columns: &[sqlparser::ast::ObjectName],
         insert_kind: &sqlparser::ast::MergeInsertKind,
         source_table_ref: &str,
         source_columns: &[String],
@@ -3598,8 +3609,15 @@ impl WriteHandler {
                     }
                     "NULL".to_string()
                 } else {
-                    // Explicit column list — find the column position
-                    if let Some(pos) = insert_columns.iter().position(|c| c.value == col) {
+                    // Explicit column list — find the column position. A MERGE
+                    // insert column is a bare name; compare against its last
+                    // identifier part (ObjectName in 0.62).
+                    if let Some(pos) = insert_columns.iter().position(|c| {
+                        c.0.last()
+                            .and_then(|p| p.as_ident())
+                            .map(|id| id.value == col)
+                            .unwrap_or(false)
+                    }) {
                         if let Some(row) = values.rows.first() {
                             if pos < row.len() {
                                 return rewrite_aliases(format!("{}", row[pos]));
@@ -4620,17 +4638,17 @@ fn collect_and_sentinel_in_subqueries(
         Expr::Case {
             operand,
             conditions,
-            results,
             else_result,
+            ..
         } => {
             if let Some(op) = operand {
                 collect_and_sentinel_in_subqueries(op, out);
             }
+            // sqlparser 0.62: each WHEN/THEN pair is a CaseWhen { condition, result }
+            // (previously parallel `conditions` and `results` Vecs).
             for c in conditions {
-                collect_and_sentinel_in_subqueries(c, out);
-            }
-            for r in results {
-                collect_and_sentinel_in_subqueries(r, out);
+                collect_and_sentinel_in_subqueries(&mut c.condition, out);
+                collect_and_sentinel_in_subqueries(&mut c.result, out);
             }
             if let Some(e) = else_result {
                 collect_and_sentinel_in_subqueries(e, out);
@@ -4758,17 +4776,16 @@ fn rewrite_subqueries_in_expr(
         Expr::Case {
             operand,
             conditions,
-            results,
             else_result,
+            ..
         } => {
             if let Some(op) = operand {
                 rewrite_subqueries_in_expr(op, target_name, next_idx, joins);
             }
+            // sqlparser 0.62: WHEN/THEN pairs live in CaseWhen { condition, result }.
             for c in conditions {
-                rewrite_subqueries_in_expr(c, target_name, next_idx, joins);
-            }
-            for r in results {
-                rewrite_subqueries_in_expr(r, target_name, next_idx, joins);
+                rewrite_subqueries_in_expr(&mut c.condition, target_name, next_idx, joins);
+                rewrite_subqueries_in_expr(&mut c.result, target_name, next_idx, joins);
             }
             if let Some(e) = else_result {
                 rewrite_subqueries_in_expr(e, target_name, next_idx, joins);
@@ -5357,6 +5374,25 @@ pub(crate) async fn ensure_namespace(
 /// (typically `format-version` set by the SQE auto-upgrade path) are
 /// preserved when the user did not explicitly set them; an explicit
 /// user-supplied value wins so callers can pin a different format version.
+/// Extract the user-specified option list from a sqlparser 0.62
+/// `CreateTableOptions`. The 0.62 AST collapses the old separate
+/// `table_properties` (TBLPROPERTIES) and `with_options` (WITH (...)) fields
+/// into this single enum; every property-bearing variant carries a
+/// `Vec<SqlOption>`, so we return that slice regardless of the syntax the user
+/// wrote. `None` (no options) yields an empty slice.
+pub(crate) fn create_table_options_as_slice(
+    options: &sqlparser::ast::CreateTableOptions,
+) -> &[sqlparser::ast::SqlOption] {
+    use sqlparser::ast::CreateTableOptions;
+    match options {
+        CreateTableOptions::With(opts)
+        | CreateTableOptions::Options(opts)
+        | CreateTableOptions::Plain(opts)
+        | CreateTableOptions::TableProperties(opts) => opts.as_slice(),
+        CreateTableOptions::None => &[],
+    }
+}
+
 pub(crate) fn merge_user_table_properties(
     props: &mut std::collections::HashMap<String, String>,
     options: &[sqlparser::ast::SqlOption],
@@ -5377,7 +5413,7 @@ pub(crate) fn merge_user_table_properties(
 fn sql_expr_to_property_string(expr: &sqlparser::ast::Expr) -> String {
     use sqlparser::ast::{Expr, Value};
     match expr {
-        Expr::Value(v) => match v {
+        Expr::Value(v) => match &v.value {
             Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => s.clone(),
             Value::Number(n, _) => n.clone(),
             Value::Boolean(b) => b.to_string(),
@@ -5526,6 +5562,7 @@ fn parse_partition_transform(
                 .name
                 .0
                 .last()
+                .and_then(|p| p.as_ident())
                 .map(|id| id.value.to_ascii_lowercase())
                 .ok_or_else(|| {
                     SqeError::Execution(
@@ -5569,7 +5606,7 @@ fn parse_partition_transform(
             };
             let int_arg = |arg: &Expr| -> sqe_core::Result<u32> {
                 match arg {
-                    Expr::Value(v) => match v {
+                    Expr::Value(v) => match &v.value {
                         Value::Number(n, _) => n.parse::<u32>().map_err(|e| {
                             SqeError::Execution(format!(
                                 "PARTITIONED BY {fn_name}(): integer parameter '{n}': {e}"
@@ -6023,7 +6060,7 @@ mod tests {
     #[test]
     fn test_sql_type_to_arrow_float_variants() {
         assert_eq!(
-            sql_type_to_arrow(&SqlType::Float(None)).unwrap(),
+            sql_type_to_arrow(&SqlType::Float(ExactNumberInfo::None)).unwrap(),
             DataType::Float32
         );
         assert_eq!(
@@ -6135,7 +6172,7 @@ mod tests {
         use sqlparser::ast::ObjectName;
 
         let custom = SqlType::Custom(
-            ObjectName(vec![sqlparser::ast::Ident::new("TIMESTAMP_NS")]),
+            ObjectName::from(vec![sqlparser::ast::Ident::new("TIMESTAMP_NS")]),
             vec!["9".to_string()],
         );
         let result = sql_type_to_arrow(&custom).unwrap();
@@ -6143,7 +6180,7 @@ mod tests {
 
         // Lowercase should map to the same type (identifiers are case-insensitive).
         let custom_lower = SqlType::Custom(
-            ObjectName(vec![sqlparser::ast::Ident::new("timestamp_ns")]),
+            ObjectName::from(vec![sqlparser::ast::Ident::new("timestamp_ns")]),
             vec!["9".to_string()],
         );
         let result_lower = sql_type_to_arrow(&custom_lower).unwrap();
@@ -6155,7 +6192,7 @@ mod tests {
         use sqlparser::ast::ObjectName;
 
         let custom = SqlType::Custom(
-            ObjectName(vec![sqlparser::ast::Ident::new("TIMESTAMPTZ_NS")]),
+            ObjectName::from(vec![sqlparser::ast::Ident::new("TIMESTAMPTZ_NS")]),
             vec!["9".to_string()],
         );
         let result = sql_type_to_arrow(&custom).unwrap();
@@ -6535,7 +6572,7 @@ mod tests {
         use sqlparser::parser::Parser;
         let stmts = Parser::parse_sql(&GenericDialect {}, sql).expect("parse UPDATE");
         match stmts.into_iter().next().expect("one statement") {
-            sqlparser::ast::Statement::Update { assignments, .. } => assignments,
+            sqlparser::ast::Statement::Update(update) => update.assignments,
             _ => panic!("expected UPDATE"),
         }
     }
@@ -6646,8 +6683,9 @@ SET c = ( \
             .unwrap()
     }
 
-    fn ident(name: &str) -> sqlparser::ast::Ident {
-        sqlparser::ast::Ident::new(name.to_string())
+    fn ident(name: &str) -> sqlparser::ast::ObjectName {
+        // reorder_insert_select takes a column list of ObjectName (sqlparser 0.62).
+        sqlparser::ast::ObjectName::from(vec![sqlparser::ast::Ident::new(name.to_string())])
     }
 
     #[test]
@@ -7022,7 +7060,7 @@ s3_path_style = true
             .pop()
             .unwrap();
         let assignments = match stmt {
-            sqlparser::ast::Statement::Update { assignments, .. } => assignments,
+            sqlparser::ast::Statement::Update(update) => update.assignments,
             _ => panic!("expected UPDATE"),
         };
         let batch = make_employee_batch();
@@ -7090,11 +7128,9 @@ s3_path_style = true
             .pop()
             .unwrap();
         let (assignments, where_sql) = match stmt {
-            sqlparser::ast::Statement::Update {
-                assignments,
-                selection,
-                ..
-            } => (assignments, format!("{}", selection.unwrap())),
+            sqlparser::ast::Statement::Update(update) => {
+                (update.assignments, format!("{}", update.selection.unwrap()))
+            }
             _ => panic!("expected UPDATE"),
         };
 

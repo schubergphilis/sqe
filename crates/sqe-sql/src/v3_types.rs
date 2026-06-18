@@ -13,7 +13,7 @@
 //! lives in `sqe-coordinator`, where the rest of the Arrow + Iceberg
 //! plumbing already sits.
 
-use sqlparser::ast::{DataType as SqlType, Expr, TimezoneInfo, Value};
+use sqlparser::ast::{DataType as SqlType, Expr, TimezoneInfo, Value, ValueWithSpan};
 
 /// Nanosecond timestamp flavour selected by the DDL parser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,7 +36,7 @@ pub fn detect_ns_timestamp(sql_type: &SqlType) -> Option<NsTimestamp> {
     if object_name.0.len() != 1 {
         return None;
     }
-    let name = object_name.0[0].value.to_ascii_uppercase();
+    let name = object_name.0[0].as_ident()?.value.to_ascii_uppercase();
     match name.as_str() {
         "TIMESTAMP_NS" => Some(NsTimestamp::WithoutTz),
         "TIMESTAMPTZ_NS" => Some(NsTimestamp::WithTz),
@@ -94,13 +94,16 @@ impl std::error::Error for DefaultError {}
 /// the accepted forms.
 pub fn extract_default_literal(expr: &Expr) -> Result<DefaultLiteral, DefaultError> {
     match expr {
-        Expr::Value(value) => value_to_literal(value),
+        Expr::Value(value) => value_to_literal(&value.value),
         Expr::UnaryOp { op, expr } => {
             // Allow `-42` and `-3.14` as signed literals.
             use sqlparser::ast::UnaryOperator;
             match op {
                 UnaryOperator::Minus => match expr.as_ref() {
-                    Expr::Value(Value::Number(s, _)) => {
+                    Expr::Value(ValueWithSpan {
+                        value: Value::Number(s, _),
+                        ..
+                    }) => {
                         if let Ok(i) = s.parse::<i64>() {
                             Ok(DefaultLiteral::Int(-i))
                         } else if let Ok(f) = s.parse::<f64>() {
@@ -112,7 +115,7 @@ pub fn extract_default_literal(expr: &Expr) -> Result<DefaultLiteral, DefaultErr
                     _ => Err(reject("unary operator applied to a non-literal")),
                 },
                 UnaryOperator::Plus => match expr.as_ref() {
-                    Expr::Value(v) => value_to_literal(v),
+                    Expr::Value(v) => value_to_literal(&v.value),
                     _ => Err(reject("unary operator applied to a non-literal")),
                 },
                 _ => Err(reject("unsupported unary operator in DEFAULT")),
@@ -123,6 +126,7 @@ pub fn extract_default_literal(expr: &Expr) -> Result<DefaultLiteral, DefaultErr
             data_type: _,
             format: _,
             kind: _,
+            array: _,
         } => {
             // Typed casts such as `CAST(1 AS BIGINT)` are allowed. The
             // target data type is already known from the column, so we
@@ -136,6 +140,7 @@ pub fn extract_default_literal(expr: &Expr) -> Result<DefaultLiteral, DefaultErr
                 .name
                 .0
                 .iter()
+                .filter_map(|p| p.as_ident())
                 .map(|i| i.value.as_str())
                 .collect::<Vec<_>>()
                 .join(".");

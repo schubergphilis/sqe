@@ -88,7 +88,7 @@ pub fn apply_adaptive_sort(
     let fallback = Arc::clone(&plan);
 
     let result = plan.transform_down(|node| {
-        if let Some(sort_exec) = node.as_any().downcast_ref::<SortExec>() {
+        if let Some(sort_exec) = node.downcast_ref::<SortExec>() {
             let has_fetch = sort_exec.fetch().is_some();
             let sort_cols = extract_sort_column_names(sort_exec);
             let input = Arc::clone(sort_exec.children()[0]);
@@ -178,7 +178,7 @@ pub fn apply_adaptive_sort(
 fn find_partition_columns(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
     let mut stack: Vec<Arc<dyn ExecutionPlan>> = vec![Arc::clone(plan)];
     while let Some(node) = stack.pop() {
-        if let Some(iceberg_scan) = node.as_any().downcast_ref::<IcebergScanExec>() {
+        if let Some(iceberg_scan) = node.downcast_ref::<IcebergScanExec>() {
             return iceberg_scan.partition_column_names();
         }
         for child in node.children() {
@@ -200,7 +200,7 @@ fn extract_sort_column_names(sort_exec: &SortExec) -> Vec<String> {
         .expr()
         .iter()
         .map(|sort_expr| {
-            if let Some(col) = sort_expr.expr.as_any().downcast_ref::<Column>() {
+            if let Some(col) = sort_expr.expr.downcast_ref::<Column>() {
                 col.name().to_string()
             } else {
                 // Fallback: use Display representation for complex expressions

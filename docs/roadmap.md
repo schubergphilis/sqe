@@ -10,8 +10,9 @@
 
 - [x] Single-node query engine (DataFusion + iceberg-rust + OIDC + Flight SQL)
 - [x] Distributed execution (coordinator-worker, shuffle, spill-to-disk)
+- [x] DataFusion 54 upgrade (RepartitionExec throughput, hash-join dynamic comparator, faster semi/anti joins; `as_any` blanket-downcast port; `foldhash` shuffle hasher; sqlparser pin aligned to 0.62 so a single parser ships and SQE shares DataFusion's grammar)
 - [x] DataFusion 53.1 upgrade (40x faster planning, hash join dynamic filters, three filter-pushdown bug fixes from 53.0 -> 53.1)
-- [x] Vendored iceberg-rust fork with DF 53 rebase + AWS SigV4 cargo feature for federated REST endpoints
+- [x] Vendored iceberg-rust fork: DF 53 rebase of `risingwavelabs/iceberg-rust` ported in-tree to DF 54 (apache main + RW rebase branch are both still on DF 53; apache PR #2648 open); AWS SigV4 cargo feature for federated REST endpoints
 - [x] Streaming writes (constant-memory CTAS/INSERT, no OOM on SF1+)
 - [x] CoW DML scales to TPC-E SF10+ (`IN (subquery)` lifted to a scratch-MemTable + LEFT JOIN; plan size O(1) in subquery cardinality, no stack overflow at 34K+ tuples)
 - [x] Trino UDFs split into `sqe-trino-functions` crate (4,175 LOC moved; coordinator incremental builds skip UDF recompile)
@@ -45,7 +46,7 @@
 - [x] V8: `read_parquet` / `read_csv` / `read_json` / `read_avro` TVFs; `SELECT * FROM 'file.ext'` quoted-string auto-detect; `COPY (...) TO 'path' (FORMAT ...)` (DuckDB-parity)
 - [x] V9: `.describe`, `.summarize`, `.tables`, `.catalogs`, `.timer`, `.format`, `.read` dot-commands; `SELECT * EXCLUDE` / `REPLACE` documented (DataFusion-native)
 - [x] V10: `LazyHttpObjectStoreRegistry` lazy HTTPS object-store; HuggingFace `hf://(datasets|models|spaces)/<owner>/<name>/<path>?revision=<rev>` resolver; AWS provider chain fallback for embedded mode
-- [x] V11: `read_delta()` TVF (deltalake-core 0.32.1; time travel via `version` / `timestamp`)
+- [x] V11: `read_delta()` TVF (deltalake-core 0.32.1; time travel via `version` / `timestamp`) -- temporarily disabled on the DataFusion 54 bump (delta-rs has no DF 54 release yet; module kept on disk, re-enable when it ships)
 - [x] V12: `'hf://...'` quoted-string auto-detect via SQL pre-rewriter
 - [x] V12.1: hf:// inline `@<rev>` revision spec + `@~parquet` auto-generated parquet view (`refs/convert/parquet`)
 - [x] V12 follow-up: smart `read_csv` (extension-based delimiter/codec, DuckDB-style `sep`/`delim`/`header`/`nullstr`/`compress` aliases)
@@ -74,6 +75,7 @@
 ### Observability and tooling
 
 - [x] Benchmark suite: 7 suites, 222 queries, `--compare-trino`
+- [x] SF1 + SF10 differential validation vs Trino on a dedicated rig (single-node + 2-worker distributed), re-confirmed on DataFusion 54; per-query compare reports committed under `benchmarks/results/`
 - [x] Parallel + streaming TPC-H data generation (SF1000 in 6:23 on 32 cores)
 - [x] dbt adapter (dbt-sqe via ADBC Flight SQL)
 - [x] OpenTelemetry + Prometheus + JSON audit log + `system.runtime.queries` virtual table
@@ -91,6 +93,7 @@
 
 ## Planned
 
+- [ ] SF100 scaling. The single-node tactics that win at SF1/SF10 (broadcast build sides, in-memory hash tables, single scan stream) invert at SF100. Needs memory-pool discipline under concurrency (cap concurrent sort consumers, bound per-consumer reservations, upstream proactive spill `apache/datafusion#17334`) and a proven multi-node distributed path. Generator must also stream row groups to disk first. Predicted failure modes and evidence in [`docs/perf/sf100-scaling-risks.md`](perf/sf100-scaling-risks.md).
 - [ ] Full cost-based join enumeration (DataFusion upstream DF#3843)
 - [ ] Local data file block cache (Alluxio-style)
 - [ ] Iceberg Puffin bloom filter reading

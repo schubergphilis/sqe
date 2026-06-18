@@ -15,7 +15,6 @@
 //! ([`super::stage_planner`]) at shuffle boundaries (joins, distributed sorts,
 //! repartitioning aggregates).
 
-use std::any::Any;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -192,10 +191,6 @@ impl ExecutionPlan for ShuffleWriterExec {
         "ShuffleWriterExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.input.schema()
     }
@@ -370,10 +365,6 @@ impl DisplayAs for ShuffleReaderExec {
 impl ExecutionPlan for ShuffleReaderExec {
     fn name(&self) -> &str {
         "ShuffleReaderExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {
@@ -573,9 +564,6 @@ mod tests {
     impl ExecutionPlan for SinglePartitionPlan {
         fn name(&self) -> &str {
             "SinglePartitionPlan"
-        }
-        fn as_any(&self) -> &dyn Any {
-            self
         }
         fn schema(&self) -> SchemaRef {
             self.schema.clone()

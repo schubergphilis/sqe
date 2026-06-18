@@ -102,9 +102,6 @@ impl Sha256Func {
 }
 
 impl ScalarUDFImpl for Sha256Func {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
     fn name(&self) -> &str {
         "sha256"

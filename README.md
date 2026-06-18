@@ -4,7 +4,7 @@
 
 **An Iceberg-first SQL server that scales.** Run SQE embedded as one binary on your laptop, or distributed across a cluster of stateless workers behind an Arrow Flight SQL or Trino HTTP endpoint. Same SQL surface, same Iceberg semantics, same identity model.
 
-SQE is a Rust-based SQL query engine for [Apache Iceberg](https://iceberg.apache.org/) tables, built on [DataFusion 53.1](https://datafusion.apache.org/) and [iceberg-rust](https://github.com/apache/iceberg-rust). Every query runs as the authenticated user. No service account. No shared root.
+SQE is a Rust-based SQL query engine for [Apache Iceberg](https://iceberg.apache.org/) tables, built on [DataFusion 54](https://datafusion.apache.org/) and [iceberg-rust](https://github.com/apache/iceberg-rust). Every query runs as the authenticated user. No service account. No shared root.
 
 ```bash
 # Point SQE at AWS S3 Tables (managed Iceberg) and run it as a SQL server.
@@ -94,19 +94,25 @@ Distribution is a per-shape decision, not a default: big fact-to-fact joins (TPC
 
 A later SF10 pass found a separate blow-up: TPC-H q12, q17, and q10 ran 160 to 300 seconds against Trino's 2 to 8. The cause was not partition layout or join distribution. On a partitioned hash join the build-side runtime filter is a `CASE` over per-partition key sets (q12: eleven branches of ~28K keys, ~300K expression nodes), and the probe scan re-snapshotted it once per batch. Each snapshot rebuilt the whole tree (~10ms), so a 14,600-batch scan spent ~150s reconstructing a filter it then evaluated in under a second. We now cache the first sealed snapshot per scan: q12 161s to 2.7s, q17 176s to 7.1s, q10 from a 300s failure to 3.3s, result rows unchanged, no threshold touched. SSB improved too (q4.1 11.6s to 6.8s), which retired the IN-list-threshold tradeoff we thought we had. The walk-through is in [The Filter That Rebuilt Itself](docs/blog/2026-06-15-the-filter-that-rebuilt-itself.md); the EXPLAIN comparison is in [`docs/perf/sf10-slow-queries.md`](docs/perf/sf10-slow-queries.md).
 
-### Clean-rig SF10: an honest crossover (June 16, dedicated host, cache off)
+### Clean-rig SF10: DataFusion 54 (June 18, dedicated host, cache off)
 
-The table above came off a shared VM. A later run on a dedicated 8-core box, both engines containerized against the same Iceberg store, query cache off, single-node, settled the picture without contention noise. The dynamic-filter fix holds at scale (q10 4.6s, q12 4.9s, q17 13.5s, q20 3.1s, no query explodes) and correctness held throughout (TPC-H 21/22, SSB 13/13, TPC-DS 95/99, with the same generator-boundary vacuous rows as SF1). But the suite totals show a real scaling crossover.
+The table above came off a shared VM. These numbers come off a dedicated 8-core box, both engines containerized against the same Iceberg store, query cache off, on DataFusion 54. One run per query, so the cache cannot inflate a sweep. Single-node correctness held: TPC-H 21/22, SSB 13/13, TPC-DS 95/99, the same generator-boundary vacuous rows as SF1, zero dialect diffs, no OOM, and q72 completes.
 
-| Suite | SQE | Trino 465 | Ratio |
-|---|---|---|---|
-| TPC-H SF10 | 126.4s | 108.8s | 0.86x |
-| SSB SF10 | 31.8s | 16.8s | 0.53x |
-| TPC-DS SF10 | 374s | 455s | 1.22x |
+| Suite | SQE single-node | SQE distributed (2w) | Trino 465 | Verdict |
+|---|---|---|---|---|
+| TPC-H SF10 | 89.0s | 85.8s | 105.7s | SQE 1.2x |
+| SSB SF10 | 31.7s | 29.3s | 14.5s | Trino 2.2x |
+| TPC-DS SF10 | 234.0s | 276.0s | 447.8s | SQE 1.9x |
 
-SQE wins every suite at SF1 (TPC-H 2.3x, SSB 1.5x, TPC-DS 2.4x). At SF10 it wins TPC-DS on breadth, taking q01/q02/q04/q05/q08/q11/q14/q22/q23 by 2 to 4x even while losing the single biggest query, q72, at 0.7x. It trails TPC-H on the heavy joins (q09 0.3x, q18 0.6x) and trails SSB across the board, where the scan-bound star joins favor Trino's vectorized decoder. The earlier "SQE distributed wins TPC-H SF10" read was a contended-host artifact, not a cache effect: the compare runs each query once, so the result cache cannot inflate a single sweep. On a quiet box with the cache off, Trino's vectorized and distributed hash joins scale better on large data. That is the next frontier, not a regression.
+The June-16 read on this rig called SF10 an "honest crossover" where SQE lost (TPC-H 126.4s/0.86x, SSB 31.8s/0.53x, TPC-DS 374s/1.22x on DataFusion 53). That reversed. The parallel Tier-2 scan filter and the move to DataFusion 54 flipped TPC-H to a 1.2x win and lifted TPC-DS to 1.9x. SSB is the one suite SQE still trails: lineorder's uniform foreign-key distribution defeats row-group pruning, so the runtime filter only helps at row level and Trino's vectorized decoder wins. These are single-run numbers on one box; read the ratios as directional, not certified.
+
+Distribution earns little on a single host. Two workers sit co-tenant with the coordinator and Trino on the same eight cores: TPC-H gains four percent, SSB a little, and TPC-DS regresses to 276s while three inventory queries (q23, q37, q72, q82) exhaust the 4GB worker pool and drop the pass count from 95/99 to 92/99. Distribution is a per-shape decision, and its real payoff needs separate worker hosts, which this rig does not have. A true multi-node verdict is still missing, and it is the SF100 question below.
 
 Loading SF10 surfaced a separate write-path gap worth naming: a partitioned `CREATE TABLE AS SELECT` with a sort-on-write clustering hint fans the sort into one merge buffer per output partition, and that merge phase cannot spill. At SF10 the monthly-partitioned TPC-H lineitem (60M rows across ~84 partitions) exhausted the pool where the unpartitioned SSB lineorder of the same size sorted fine. The bench loader now skips the redundant sort on already-partitioned tables, since partition pruning already delivers the clustering; the engine-level fix (bounded or spillable partition writers) is still open.
+
+### SF100: coming
+
+SF100 is the next frontier, and it inverts the SF1 and SF10 playbook. Broadcasting the build side, building hash tables in memory, and emitting one scan stream all win at SF10. Each becomes the bottleneck at SF100. Getting there needs three things: memory-pool discipline under concurrency (cap concurrent sort consumers, bound per-consumer reservations, proactive spill), a proven multi-node distributed path on separate worker hosts rather than one shared box, and a data generator that streams row groups to disk instead of buffering a whole table in memory. The predicted failure modes, each grounded in something we actually observed at SF1 or SF10, are written up in [`docs/perf/sf100-scaling-risks.md`](docs/perf/sf100-scaling-risks.md).
 
 ### How we know the numbers are real
 
@@ -285,7 +291,7 @@ Full archive in [`docs/blog/`](docs/blog/).
 | Component | Technology |
 |---|---|
 | Language | Rust |
-| Query Engine | Apache DataFusion 53.1 |
+| Query Engine | Apache DataFusion 54 |
 | Table Format | Apache Iceberg V2 / V3 |
 | Catalogs | Polaris, Nessie, Unity Catalog OSS, AWS Glue, AWS S3 Tables, Hive Metastore, JDBC, Hadoop |
 | Wire Protocols | Arrow Flight SQL + Trino HTTP |
