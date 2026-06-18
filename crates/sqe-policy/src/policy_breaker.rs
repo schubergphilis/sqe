@@ -10,6 +10,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tracing::{info, warn};
 
+// State encoding stored in `self.state`:
+// 0 = Closed, 1 = Open, 2 = Half-Open.
+// `state_code()` remaps to the external metrics-gauge encoding:
+// 0 = closed, 1 = half_open, 2 = open.
 const STATE_CLOSED: u32 = 0;
 const STATE_OPEN: u32 = 1;
 const STATE_HALF_OPEN: u32 = 2;
@@ -141,5 +145,25 @@ mod tests {
         b.record_failure();
         // Only one failure since the reset, breaker stays closed.
         assert!(b.check().is_ok());
+    }
+
+    #[test]
+    fn open_transitions_to_half_open_after_recovery() {
+        let b = PolicyCircuitBreaker::new("Test", 1, std::time::Duration::from_millis(0));
+        b.record_failure(); // opens
+        assert_eq!(b.state_code(), 2);
+        // recovery_timeout is 0, so check() should probe -> half_open
+        assert!(b.check().is_ok());
+        assert_eq!(b.state_code(), 1);
+    }
+
+    #[test]
+    fn half_open_probe_failure_reopens() {
+        let b = PolicyCircuitBreaker::new("Test", 1, std::time::Duration::from_millis(0));
+        b.record_failure(); // opens
+        let _ = b.check();  // -> half_open
+        assert_eq!(b.state_code(), 1);
+        b.record_failure(); // probe fails -> reopen
+        assert_eq!(b.state_code(), 2);
     }
 }
