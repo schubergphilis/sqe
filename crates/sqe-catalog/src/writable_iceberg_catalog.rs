@@ -36,7 +36,6 @@
 //! along — for free. Less code, fewer corner cases, no parser
 //! dialect to maintain.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -91,9 +90,6 @@ impl WritableIcebergCatalog {
 }
 
 impl CatalogProvider for WritableIcebergCatalog {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn schema_names(&self) -> Vec<String> {
         self.schemas.iter().map(|e| e.key().clone()).collect()

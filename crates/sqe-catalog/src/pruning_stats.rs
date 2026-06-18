@@ -227,7 +227,7 @@ impl PruningStatistics for IcebergManifestStatistics {
         if counts.iter().all(|c| c.is_none()) { return None; }
         Some(Arc::new(UInt64Array::from(counts)) as ArrayRef)
     }
-    fn row_counts(&self, _column: &Column) -> Option<ArrayRef> {
+    fn row_counts(&self) -> Option<ArrayRef> {
         let counts: Vec<Option<u64>> = self.data_files.iter().map(|df| Some(df.record_count())).collect();
         Some(Arc::new(UInt64Array::from(counts)) as ArrayRef)
     }

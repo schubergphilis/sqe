@@ -520,7 +520,6 @@ mod read_only_iceberg_like {
     //! modelling the production Iceberg catalog's refusal to accept
     //! scratch-table registrations.
 
-    use std::any::Any;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -536,9 +535,6 @@ mod read_only_iceberg_like {
 
     #[async_trait]
     impl SchemaProvider for ReadOnlySchema {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
         fn table_names(&self) -> Vec<String> {
             self.tables.keys().cloned().collect()
         }
@@ -560,9 +556,6 @@ mod read_only_iceberg_like {
     }
 
     impl CatalogProvider for ReadOnlyCatalog {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
         fn schema_names(&self) -> Vec<String> {
             self.schemas.keys().cloned().collect()
         }

@@ -83,6 +83,12 @@ fn extract_string_arg(
 
 #[cfg(test)]
 mod tests {
+    // These tests exercise the legacy `TableFunctionImpl::call` entry point that
+    // `QuackQueryTvf` implements. DF 54 deprecated `call` in favour of
+    // `call_with_args` (which by default delegates back to `call`), so the
+    // production path is unaffected; migrating the impls to `call_with_args` is a
+    // separate follow-up. Allow the deprecation locally so the strict build stays clean.
+    #![allow(deprecated)]
     use super::*;
 
     #[test]

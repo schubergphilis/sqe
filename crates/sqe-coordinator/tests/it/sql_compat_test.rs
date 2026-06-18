@@ -267,3 +267,13 @@ async fn test_sql_compat_04_string_functions() {
 async fn test_sql_compat_05_aggregations() {
     run_sql_file("05_aggregations.sql").await;
 }
+
+// QUALIFY (DuckDB-compatible window-rank filtering). docs/duckdb-comparision.md
+// previously listed this as unsupported; it is actually handled by DataFusion's
+// SQL planner (verified on the DataFusion 54 build; the planner is unchanged from
+// 53.1, so this is a stale-doc correction, not a DF 54 capability change).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_sql_compat_06_qualify() {
+    run_sql_file("06_qualify.sql").await;
+}

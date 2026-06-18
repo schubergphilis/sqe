@@ -332,7 +332,6 @@ macro_rules! trino_extract_fn {
         struct $struct_name;
 
         impl ScalarUDFImpl for $struct_name {
-            fn as_any(&self) -> &dyn std::any::Any { self }
 
             fn name(&self) -> &str { $fn_name }
 
@@ -514,9 +513,6 @@ fn ts_add_us(us: i64, unit: TimeUnit, amount: i64) -> DFResult<i64> {
 struct DateAdd;
 
 impl ScalarUDFImpl for DateAdd {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
     fn name(&self) -> &str {
         "date_add"
@@ -654,9 +650,6 @@ impl ScalarUDFImpl for DateAdd {
 struct DateDiff;
 
 impl ScalarUDFImpl for DateDiff {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
     fn name(&self) -> &str {
         "date_diff"
@@ -771,9 +764,6 @@ impl ScalarUDFImpl for DateDiff {
 struct FromUnixtime;
 
 impl ScalarUDFImpl for FromUnixtime {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
     fn name(&self) -> &str {
         "from_unixtime"
@@ -844,9 +834,6 @@ impl ScalarUDFImpl for FromUnixtime {
 struct ToUnixtime;
 
 impl ScalarUDFImpl for ToUnixtime {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
     fn name(&self) -> &str {
         "to_unixtime"
@@ -926,9 +913,6 @@ impl ScalarUDFImpl for ToUnixtime {
 struct TrinoDate;
 
 impl ScalarUDFImpl for TrinoDate {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
     fn name(&self) -> &str {
         "date"
@@ -1057,9 +1041,6 @@ fn invoke_if_impl(args: ScalarFunctionArgs, fn_name: &str) -> DFResult<ColumnarV
 struct TrinoIf;
 
 impl ScalarUDFImpl for TrinoIf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
     fn name(&self) -> &str {
         "if"
@@ -1086,9 +1067,6 @@ impl ScalarUDFImpl for TrinoIf {
 struct TrinoIff;
 
 impl ScalarUDFImpl for TrinoIff {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
     fn name(&self) -> &str {
         "iff"
@@ -1117,9 +1095,6 @@ impl ScalarUDFImpl for TrinoIff {
 struct TypeOf;
 
 impl ScalarUDFImpl for TypeOf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
     fn name(&self) -> &str {
         "typeof"
@@ -1172,7 +1147,6 @@ fn format_naive(dt: NaiveDateTime, pattern: &str) -> String {
 struct DateFormat;
 
 impl ScalarUDFImpl for DateFormat {
-    fn as_any(&self) -> &dyn std::any::Any { self }
     fn name(&self) -> &str { "date_format" }
 
     fn signature(&self) -> &Signature {
@@ -1274,7 +1248,6 @@ fn scalar_to_naive_dt(
 struct DateParse;
 
 impl ScalarUDFImpl for DateParse {
-    fn as_any(&self) -> &dyn std::any::Any { self }
     fn name(&self) -> &str { "date_parse" }
 
     fn signature(&self) -> &Signature {
@@ -1365,7 +1338,6 @@ impl ScalarUDFImpl for DateParse {
 struct TrinoNow;
 
 impl ScalarUDFImpl for TrinoNow {
-    fn as_any(&self) -> &dyn std::any::Any { self }
     fn name(&self) -> &str { "now" }
 
     fn signature(&self) -> &Signature {
@@ -1398,7 +1370,6 @@ impl ScalarUDFImpl for TrinoNow {
 struct JsonObject;
 
 impl ScalarUDFImpl for JsonObject {
-    fn as_any(&self) -> &dyn std::any::Any { self }
     fn name(&self) -> &str { "json_object" }
 
     fn signature(&self) -> &Signature {
@@ -1469,7 +1440,6 @@ impl ScalarUDFImpl for JsonObject {
 struct JsonFormat;
 
 impl ScalarUDFImpl for JsonFormat {
-    fn as_any(&self) -> &dyn std::any::Any { self }
     fn name(&self) -> &str { "json_format" }
 
     fn signature(&self) -> &Signature {
@@ -1520,7 +1490,6 @@ impl ScalarUDFImpl for JsonFormat {
 struct LocalTime;
 
 impl ScalarUDFImpl for LocalTime {
-    fn as_any(&self) -> &dyn std::any::Any { self }
     fn name(&self) -> &str { "localtime" }
 
     fn signature(&self) -> &Signature {
@@ -1553,7 +1522,6 @@ impl ScalarUDFImpl for LocalTime {
 struct TrinoE;
 
 impl ScalarUDFImpl for TrinoE {
-    fn as_any(&self) -> &dyn std::any::Any { self }
     fn name(&self) -> &str { "e" }
 
     fn signature(&self) -> &Signature {
@@ -1581,7 +1549,6 @@ impl ScalarUDFImpl for TrinoE {
 struct TrinoMod;
 
 impl ScalarUDFImpl for TrinoMod {
-    fn as_any(&self) -> &dyn std::any::Any { self }
     fn name(&self) -> &str { "mod" }
 
     fn signature(&self) -> &Signature {
@@ -1693,7 +1660,6 @@ fn take_function_args<const N: usize>(
 struct TrinoTruncate;
 
 impl ScalarUDFImpl for TrinoTruncate {
-    fn as_any(&self) -> &dyn std::any::Any { self }
     fn name(&self) -> &str { "truncate" }
 
     fn signature(&self) -> &Signature {
@@ -1760,7 +1726,6 @@ impl ScalarUDFImpl for TrinoTruncate {
 struct TrinoSign;
 
 impl ScalarUDFImpl for TrinoSign {
-    fn as_any(&self) -> &dyn std::any::Any { self }
     fn name(&self) -> &str { "sign" }
 
     fn signature(&self) -> &Signature {
@@ -1816,7 +1781,6 @@ impl ScalarUDFImpl for TrinoSign {
 struct TrinoCodepoint;
 
 impl ScalarUDFImpl for TrinoCodepoint {
-    fn as_any(&self) -> &dyn std::any::Any { self }
     fn name(&self) -> &str { "codepoint" }
 
     fn signature(&self) -> &Signature {
@@ -1885,7 +1849,6 @@ impl ScalarUDFImpl for TrinoCodepoint {
 struct LocalTimestamp;
 
 impl ScalarUDFImpl for LocalTimestamp {
-    fn as_any(&self) -> &dyn std::any::Any { self }
     fn name(&self) -> &str { "localtimestamp" }
 
     fn signature(&self) -> &Signature {
@@ -1984,9 +1947,6 @@ macro_rules! url_extract_udf {
         struct $name;
 
         impl ScalarUDFImpl for $name {
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
             fn name(&self) -> &str {
                 $func_name
             }
@@ -2043,9 +2003,6 @@ fn percent_decode(input: &[u8]) -> String {
 struct UrlEncode;
 
 impl ScalarUDFImpl for UrlEncode {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn name(&self) -> &str {
         "url_encode"
     }
@@ -2078,9 +2035,6 @@ impl ScalarUDFImpl for UrlEncode {
 struct UrlDecode;
 
 impl ScalarUDFImpl for UrlDecode {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn name(&self) -> &str {
         "url_decode"
     }
@@ -2110,9 +2064,6 @@ macro_rules! encoding_udf {
         struct $name;
 
         impl ScalarUDFImpl for $name {
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
             fn name(&self) -> &str {
                 $func_name
             }
@@ -2234,9 +2185,6 @@ fn extract_json_scalar(json: &str, key: &str) -> Option<String> {
 struct JsonExtract;
 
 impl ScalarUDFImpl for JsonExtract {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn name(&self) -> &str {
         "json_extract"
     }
@@ -2265,9 +2213,6 @@ impl ScalarUDFImpl for JsonExtract {
 struct JsonExtractScalar;
 
 impl ScalarUDFImpl for JsonExtractScalar {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn name(&self) -> &str {
         "json_extract_scalar"
     }
@@ -2296,9 +2241,6 @@ impl ScalarUDFImpl for JsonExtractScalar {
 struct JsonArrayLength;
 
 impl ScalarUDFImpl for JsonArrayLength {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn name(&self) -> &str {
         "json_array_length"
     }
@@ -2349,9 +2291,6 @@ impl ScalarUDFImpl for JsonArrayLength {
 struct JsonParse;
 
 impl ScalarUDFImpl for JsonParse {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn name(&self) -> &str {
         "json_parse"
     }

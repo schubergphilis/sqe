@@ -23,7 +23,6 @@
 //! - [`DistributedSortExec`] — `ExecutionPlan` that replaces `SortExec`
 //! - [`DistributedSortRule`] — `PhysicalOptimizerRule` that applies the rewrite
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -314,10 +313,6 @@ impl ExecutionPlan for DistributedSortExec {
         "DistributedSortExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> arrow_schema::SchemaRef {
         self.input.schema()
     }
@@ -433,7 +428,7 @@ impl PhysicalOptimizerRule for DistributedSortRule {
         let threshold = self.size_threshold;
 
         let transformed = plan.transform_down(|node| {
-            if let Some(sort_exec) = node.as_any().downcast_ref::<SortExec>() {
+            if let Some(sort_exec) = node.downcast_ref::<SortExec>() {
                 let input = &sort_exec.children()[0];
                 let input_size = estimate_data_size(input);
 
@@ -786,7 +781,7 @@ mod tests {
 
         let result = rule.optimize(plan, &config).unwrap();
         assert!(
-            result.as_any().downcast_ref::<SortExec>().is_some(),
+            result.downcast_ref::<SortExec>().is_some(),
             "Should keep SortExec when no executors available"
         );
     }
@@ -812,7 +807,7 @@ mod tests {
 
         let result = rule.optimize(plan, &config).unwrap();
         assert!(
-            result.as_any().downcast_ref::<SortExec>().is_some(),
+            result.downcast_ref::<SortExec>().is_some(),
             "Should keep SortExec when input size is below threshold"
         );
     }
@@ -837,7 +832,7 @@ mod tests {
 
         let result = rule.optimize(plan, &config).unwrap();
         assert!(
-            result.as_any().downcast_ref::<SortExec>().is_some(),
+            result.downcast_ref::<SortExec>().is_some(),
             "Should keep SortExec when fewer than MIN_EXECUTORS"
         );
     }

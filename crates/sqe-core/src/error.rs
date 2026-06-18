@@ -496,9 +496,15 @@ fn classify_execution_error(msg: &str) -> SqeErrorCode {
         return SqeErrorCode::AccessDenied;
     }
     // TypeMismatch must be checked BEFORE FunctionNotFound because DataFusion
-    // concatenates both messages: "TypeSignatureClass... No function matches..."
+    // concatenates both messages: DF 53 emitted "TypeSignatureClass... No function
+    // matches...", DF 54 emits "Function 'lower' requires String, but received
+    // Boolean... No function matches the given name and argument types. You might
+    // need to add explicit type casts." Both describe a real arg-type mismatch on
+    // an existing function (a genuinely missing function says "Invalid function
+    // 'X'"), so "add explicit type casts" is a precise TypeMismatch marker.
     if lower.contains("typesignatureclass")
         || lower.contains("type mismatch")
+        || lower.contains("add explicit type casts")
         || lower.contains("invalid comparison operation")
         || lower.contains("invalid argument error")
     {
@@ -793,6 +799,22 @@ mod tests {
         let code = err.error_code();
         assert_eq!(code, SqeErrorCode::TypeMismatch);
         assert!(code.is_user_error());
+    }
+
+    #[test]
+    fn error_code_type_mismatch_datafusion_54_wording() {
+        // DF 54 reworded arg-type-mismatch errors: it drops "TypeSignatureClass"
+        // and appends "No function matches... add explicit type casts" to a
+        // "requires X, but received Y" message. This must still classify as a
+        // TypeMismatch (the function exists; only the arg type is wrong), not as
+        // FunctionNotFound, even though the text contains "no function matches".
+        let err = SqeError::Execution(
+            "Function 'lower' requires String, but received Boolean (DataType: Boolean).. \
+             No function matches the given name and argument types 'lower(Boolean)'. \
+             You might need to add explicit type casts."
+                .into(),
+        );
+        assert_eq!(err.error_code(), SqeErrorCode::TypeMismatch);
     }
 
     #[test]

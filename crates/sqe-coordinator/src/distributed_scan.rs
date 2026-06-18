@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -343,9 +342,6 @@ impl ExecutionPlan for DistributedScanExec {
         "DistributedScanExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
@@ -399,7 +395,6 @@ impl ExecutionPlan for DistributedScanExec {
         for pf in &child_pushdown_result.parent_filters {
             if pf
                 .filter
-                .as_any()
                 .downcast_ref::<DynamicFilterPhysicalExpr>()
                 .is_some()
             {
@@ -506,7 +501,7 @@ impl ExecutionPlan for DistributedScanExec {
             if !pushed_down_filters.is_empty() {
                 let dynamic: Vec<&DynamicFilterPhysicalExpr> = pushed_down_filters
                     .iter()
-                    .filter_map(|f| f.as_any().downcast_ref::<DynamicFilterPhysicalExpr>())
+                    .filter_map(|f| f.downcast_ref::<DynamicFilterPhysicalExpr>())
                     .collect();
                 if !dynamic.is_empty() {
                     let deadline =
@@ -528,7 +523,6 @@ impl ExecutionPlan for DistributedScanExec {
                 let mut snapshots: Vec<datafusion::logical_expr::Expr> = Vec::new();
                 for f in &pushed_down_filters {
                     let resolved = match f
-                        .as_any()
                         .downcast_ref::<DynamicFilterPhysicalExpr>()
                     {
                         Some(dynamic) => match dynamic.current() {

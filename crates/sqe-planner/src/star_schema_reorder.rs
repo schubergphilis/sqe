@@ -152,7 +152,6 @@ impl PhysicalOptimizerRule for StarSchemaReorderRule {
             // non-INNER joins (LEFT, RIGHT, FULL) — transform_down will recurse
             // into their children, where we'll find the INNER chain.
             let is_inner_hash = node
-                .as_any()
                 .downcast_ref::<HashJoinExec>()
                 .is_some_and(|hj| *hj.join_type() == JoinType::Inner);
             if !is_inner_hash {
@@ -283,7 +282,7 @@ fn flatten_join_chain(
     inputs: &mut Vec<JoinInput>,
     conditions: &mut Vec<JoinCondition>,
 ) -> bool {
-    let Some(hash_join) = plan.as_any().downcast_ref::<HashJoinExec>() else {
+    let Some(hash_join) = plan.downcast_ref::<HashJoinExec>() else {
         // Not a HashJoinExec — this is a leaf input.
         let row_count = estimate_row_count(plan);
         let idx = inputs.len();
@@ -631,7 +630,7 @@ fn resolve_join_keys_by_name(
 /// Only supports `Column` expressions — returns `None` for complex
 /// expressions (casts, functions, etc.).
 fn extract_column_name(expr: &Arc<dyn datafusion::physical_expr::PhysicalExpr>) -> Option<String> {
-    expr.as_any()
+    expr
         .downcast_ref::<Column>()
         .map(|c| c.name().to_string())
 }
@@ -723,7 +722,7 @@ mod tests {
         let result = rule.optimize(plan.clone(), &config).unwrap();
         // Should remain unchanged.
         assert!(
-            result.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            result.downcast_ref::<HashJoinExec>().is_some(),
             "Expected unchanged HashJoinExec when rule is disabled"
         );
     }
@@ -742,7 +741,7 @@ mod tests {
         let result = rule.optimize(plan.clone(), &config).unwrap();
         // Two-input join should not be reordered.
         assert!(
-            result.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            result.downcast_ref::<HashJoinExec>().is_some(),
             "Expected unchanged two-input HashJoinExec"
         );
     }
@@ -785,7 +784,7 @@ mod tests {
         // has only 2 inputs (LEFT subtree + C), so it doesn't reorder
         // (needs 3+ inputs). Plan remains unchanged.
         assert!(
-            result.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            result.downcast_ref::<HashJoinExec>().is_some(),
             "Expected unchanged plan: LEFT join treated as leaf, only 2 inputs at INNER level"
         );
     }

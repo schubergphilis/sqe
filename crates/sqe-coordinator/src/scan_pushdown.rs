@@ -72,8 +72,7 @@ pub fn serialize_scan_predicate(
 /// `DynamicFilterPhysicalExpr` snapshot has before its hash-join build side
 /// completes. Pushing it to a worker would be pure overhead.
 pub fn is_trivially_true(expr: &Arc<dyn PhysicalExpr>) -> bool {
-    expr.as_any()
-        .downcast_ref::<PhysLiteral>()
+    expr.downcast_ref::<PhysLiteral>()
         .is_some_and(|l| matches!(l.value(), ScalarValue::Boolean(Some(true))))
 }
 
@@ -90,7 +89,7 @@ pub fn is_trivially_true(expr: &Arc<dyn PhysicalExpr>) -> bool {
 /// why the split happens only at top-level ANDs and the strict converter
 /// handles everything below.
 pub fn physical_filter_to_logical_lenient(expr: &Arc<dyn PhysicalExpr>) -> Option<Expr> {
-    if let Some(b) = expr.as_any().downcast_ref::<PhysBinaryExpr>() {
+    if let Some(b) = expr.downcast_ref::<PhysBinaryExpr>() {
         if *b.op() == datafusion::logical_expr::Operator::And {
             let left = physical_filter_to_logical_lenient(b.left());
             let right = physical_filter_to_logical_lenient(b.right());
@@ -116,7 +115,7 @@ pub fn physical_filter_to_logical_lenient(expr: &Arc<dyn PhysicalExpr>) -> Optio
 /// for anything else. `None` is non-fatal: the scan ships unfiltered, which
 /// is what happened unconditionally before this conversion existed.
 pub fn physical_filter_to_logical(expr: &Arc<dyn PhysicalExpr>) -> Option<Expr> {
-    let any = expr.as_any();
+    let any: &dyn PhysicalExpr = expr.as_ref();
     if let Some(c) = any.downcast_ref::<PhysColumn>() {
         return Some(Expr::Column(datafusion::common::Column::from_name(c.name())));
     }
@@ -164,10 +163,9 @@ pub fn physical_filter_to_logical(expr: &Arc<dyn PhysicalExpr>) -> Option<Expr> 
 /// limit, truncating before enough matches were found. Pushing a limit through
 /// a filter is therefore unsafe and DataFusion itself never does it.
 fn is_limit_safe_passthrough(node: &dyn ExecutionPlan) -> bool {
-    let any = node.as_any();
-    any.is::<ProjectionExec>()
-        || any.is::<CoalescePartitionsExec>()
-        || any.is::<RepartitionExec>()
+    node.is::<ProjectionExec>()
+        || node.is::<CoalescePartitionsExec>()
+        || node.is::<RepartitionExec>()
 }
 
 /// Walk down from `node` toward `scan`; return `true` if every intermediate
@@ -212,7 +210,7 @@ pub fn extract_pushable_limit(
 ) -> Option<usize> {
     let mut stack: Vec<&Arc<dyn ExecutionPlan>> = vec![plan];
     while let Some(node) = stack.pop() {
-        if let Some(gl) = node.as_any().downcast_ref::<GlobalLimitExec>() {
+        if let Some(gl) = node.downcast_ref::<GlobalLimitExec>() {
             if let Some(fetch) = gl.fetch() {
                 let cap = fetch.saturating_add(gl.skip());
                 // The single child of the limit is the start of the path.
@@ -224,7 +222,7 @@ pub fn extract_pushable_limit(
                     return Some(cap);
                 }
             }
-        } else if let Some(ll) = node.as_any().downcast_ref::<LocalLimitExec>() {
+        } else if let Some(ll) = node.downcast_ref::<LocalLimitExec>() {
             let cap = ll.fetch();
             if node
                 .children()

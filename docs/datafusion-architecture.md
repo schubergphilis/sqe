@@ -2,6 +2,17 @@
 
 **Goal:** Replace patched Trino with a purpose-built, distributed SQL query engine for Iceberg REST Catalog (Apache Polaris) with Keycloak OIDC auth passthrough, OPA-based fine-grained security, and petabyte-scale execution.
 
+> **Update (2026-06, DataFusion 54):** This is the original design rationale, not
+> the current implementation. Two sections are superseded:
+> - **Distributed execution.** The "Ballista-derived" model in section 2.3 (and the
+>   "fork Ballista scheduler" approach) was evaluated and **wound down** on
+>   2026-05-31. SQE ships a bespoke coordinator/worker scheduler over Arrow Flight,
+>   not a Ballista fork. See [`ballista-evaluation-learnings.md`](ballista-evaluation-learnings.md).
+> - **Engine version.** SQE is on **DataFusion 54** (this doc predates the 53 and 54
+>   upgrades).
+>
+> Current architecture overview lives in [`architecture.md`](architecture.md).
+
 ---
 
 ## 1. Core Architecture

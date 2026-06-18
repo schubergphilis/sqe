@@ -30,7 +30,7 @@ The headline scale. Q72 dominates the per-query view as the dark band near the b
 
 ## SF10
 
-No clean runs at SF10 yet. Both attempted runs errored on q72-related plan failures and were dropped from the timeline. Will fill in once we have a clean run.
+Clean SF10 runs landed in June 2026 on the dedicated rig (DataFusion 54, vs Trino, 8-core/31GB, both engines containerized against the same Iceberg tables and S3 store). Single-node: SQE 234.0s vs Trino 447.8s (1.9x by total wall-clock), 95/99 matched plus 4 vacuous (0 rows on both engines); no OOM, and q72 completes. The earlier q72 plan failures were resolved by the dynamic-filter type-coercion and snapshot-cache fixes (see the q72 deep-dive below and [`docs/perf/sf10-slow-queries.md`](../perf/sf10-slow-queries.md)). Per-query compare reports are committed under `benchmarks/results/` (`compare-tpcds-sf10-*.json`); distributed 2-worker totals are tracked there as well.
 
 ## Implementation references
 

@@ -91,7 +91,7 @@ impl PhysicalOptimizerRule for BroadcastJoinRule {
 
         let threshold = self.broadcast_threshold;
         let transformed = plan.transform_down(|node| {
-            if let Some(hash_join) = node.as_any().downcast_ref::<HashJoinExec>() {
+            if let Some(hash_join) = node.downcast_ref::<HashJoinExec>() {
                 let left_size = estimate_side_size(hash_join.left());
                 let right_size = estimate_side_size(hash_join.right());
 
@@ -282,10 +282,6 @@ impl ExecutionPlan for BroadcastJoinPlan {
         "BroadcastJoinPlan"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> arrow_schema::SchemaRef {
         self.inner_join.schema()
     }
@@ -309,7 +305,7 @@ impl ExecutionPlan for BroadcastJoinPlan {
             ));
         }
         // The child must be a HashJoinExec
-        if let Some(hash_join) = children[0].as_any().downcast_ref::<HashJoinExec>() {
+        if let Some(hash_join) = children[0].downcast_ref::<HashJoinExec>() {
             Ok(Arc::new(BroadcastJoinPlan::from_hash_join(
                 hash_join,
                 self.broadcast_side,
@@ -535,10 +531,6 @@ impl ExecutionPlan for ShuffleHashJoinPlan {
         "ShuffleHashJoinPlan"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> arrow_schema::SchemaRef {
         self.properties.eq_properties.schema().clone()
     }
@@ -626,7 +618,7 @@ impl PhysicalOptimizerRule for PreSortedJoinRule {
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let transformed = plan.transform_down(|node| {
-            if let Some(hash_join) = node.as_any().downcast_ref::<HashJoinExec>() {
+            if let Some(hash_join) = node.downcast_ref::<HashJoinExec>() {
                 let on = hash_join.on();
                 if on.is_empty() {
                     return Ok(Transformed::no(node));
@@ -895,7 +887,7 @@ mod tests {
 
         let result = rule.optimize(plan, &config).unwrap();
         assert!(
-            result.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            result.downcast_ref::<HashJoinExec>().is_some(),
             "Expected HashJoinExec when threshold is 0"
         );
     }
@@ -917,7 +909,7 @@ mod tests {
         let result = rule.optimize(plan, &config).unwrap();
         // With 0-byte stats, neither side triggers broadcast
         assert!(
-            result.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            result.downcast_ref::<HashJoinExec>().is_some(),
             "Expected HashJoinExec when stats are unavailable"
         );
     }
@@ -1084,14 +1076,12 @@ mod tests {
         // Both sides should be wrapped in ShuffleWriterExec
         assert!(
             plan.build_side()
-                .as_any()
                 .downcast_ref::<ShuffleWriterExec>()
                 .is_some(),
             "Build side should be wrapped in ShuffleWriterExec"
         );
         assert!(
             plan.probe_side()
-                .as_any()
                 .downcast_ref::<ShuffleWriterExec>()
                 .is_some(),
             "Probe side should be wrapped in ShuffleWriterExec"
@@ -1153,7 +1143,7 @@ mod tests {
 
         let result = rule.optimize(plan, &config).unwrap();
         assert!(
-            result.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            result.downcast_ref::<HashJoinExec>().is_some(),
             "Expected HashJoinExec when inputs are not sorted"
         );
     }
@@ -1181,7 +1171,6 @@ mod tests {
         let result = rule.optimize(plan, &config).unwrap();
         assert!(
             result
-                .as_any()
                 .downcast_ref::<SortMergeJoinExec>()
                 .is_some(),
             "Expected SortMergeJoinExec when both inputs are sorted on join keys"

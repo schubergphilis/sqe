@@ -77,12 +77,13 @@ s3tables = [
     "dep:aws-config",
     "dep:aws-credential-types",
 ]
-# Delta Lake read support via delta-rs (deltalake-core 0.32 — pinned to
-# DataFusion 53.1, same as our coordinator). Optional and gated so a
-# slim REST-only build does not pull in the delta_kernel crate or its
-# transitive S3 / Azure cloud handlers. Embedded mode enables it; the
-# cluster default leaves it off until ops asks for Delta tables.
-delta = ["dep:deltalake-core"]
+# Delta Lake read support (delta-rs) is REMOVED for the DataFusion 54 bump.
+# deltalake-core 0.32.1 targets DataFusion 53.1, so its `DeltaTableProvider`
+# implements an older DataFusion's `TableProvider` trait and will not satisfy
+# DF 54 (E0277 under `--all-features`). delta-rs has no DF 54 release yet.
+# Re-add the `delta` feature + the deltalake-core dependency (below) and the
+# `read_delta` module in src/lib.rs once delta-rs ships DF 54 support.
+# delta = ["dep:deltalake-core"]
 
 [dependencies]
 sqe-core = { path = "../sqe-core" }
@@ -134,12 +135,12 @@ iceberg-catalog-glue = { workspace = true, optional = true }
 iceberg-catalog-sql = { workspace = true, optional = true }
 iceberg-catalog-s3tables = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
-# Exact pin (=): delta-rs removes/renames public API in PATCH releases
-# (0.32.4 deleted delta_datafusion::DeltaTableProvider, which read_delta.rs
-# is built on). A floating 0.32.x spec lets any lockfile regeneration break
-# the optional `delta` feature without CI noticing until an --all-features
-# build. Bump deliberately, together with read_delta.rs.
-deltalake-core = { version = "=0.32.1", features = ["datafusion", "rustls", "cloud"], optional = true }
+# deltalake-core REMOVED for the DataFusion 54 bump (see the `delta` feature note
+# above). delta-rs has no DF 54-compatible release; 0.32.1 pins DataFusion 53.1,
+# which drags a whole second DF/arrow tree into the lock and fails to satisfy DF 54.
+# Restore (with an exact `=` pin, bumped together with read_delta.rs) once delta-rs
+# ships DF 54:
+# deltalake-core = { version = "=0.32.1", features = ["datafusion", "rustls", "cloud"], optional = true }
 # AWS SDK shared config used by `aws_config.rs` to layer ATTACH options +
 # secrets on top of the default credential chain. Pinned to the same
 # versions aws-sdk-glue / aws-sdk-s3tables already pull in transitively.

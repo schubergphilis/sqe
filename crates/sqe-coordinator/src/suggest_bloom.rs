@@ -116,6 +116,7 @@ fn table_factor_name(factor: &sqlparser::ast::TableFactor) -> Vec<String> {
         return name
             .0
             .iter()
+            .filter_map(|p| p.as_ident())
             .map(|p| p.value.to_lowercase())
             .collect();
     }
