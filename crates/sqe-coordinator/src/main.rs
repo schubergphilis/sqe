@@ -8,7 +8,7 @@ use sqe_catalog::grant_chameleon::ChameleonGrantBackend;
 use sqe_coordinator::flight_sql::SqeFlightSqlService;
 use sqe_coordinator::QueryHandler;
 use sqe_coordinator::SessionManager;
-use sqe_policy::grants::{polaris::PolarisGrantBackend, GrantBackend};
+use sqe_policy::grants::{polaris::PolarisGrantBackend, ranger::RangerGrantBackend, GrantBackend};
 
 // Trino adapter types
 use sqe_trino_compat::server::{NodeContext, TrinoAuthenticator, TrinoQueryExecutor};
@@ -525,8 +525,27 @@ fn build_grant_backend(
                 config.access_control.client_secret.clone(),
             )?)))
         }
+        AccessControlBackend::Ranger if !config.access_control.url.is_empty() => {
+            let r = &config.access_control.ranger;
+            tracing::info!(
+                backend = "ranger",
+                url = %config.access_control.url,
+                service = %r.service_name,
+                "Access control backend configured"
+            );
+            Ok(Some(Arc::new(RangerGrantBackend::new(
+                &config.access_control.url,
+                &r.service_name,
+                &r.admin_user,
+                &r.admin_password,
+                &r.realm,
+                r.timeout_secs,
+                r.accept_invalid_certs,
+            )?)))
+        }
         AccessControlBackend::None
         | AccessControlBackend::Chameleon
-        | AccessControlBackend::Polaris => Ok(None),
+        | AccessControlBackend::Polaris
+        | AccessControlBackend::Ranger => Ok(None),
     }
 }

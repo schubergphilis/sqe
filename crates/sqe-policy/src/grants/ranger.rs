@@ -538,21 +538,21 @@ mod tests {
     #[test]
     fn resource_map_namespace_level_omits_table() {
         let m = build_resource_map("POLARIS", "wh", Some("sales"), Some("orders"), ResourceLevel::Namespace);
-        assert!(m.get("table").is_none());
+        assert!(!m.contains_key("table"));
         assert_eq!(m.get("namespace").map(String::as_str), Some("sales"));
     }
 
     #[test]
     fn resource_map_catalog_level_only_catalog() {
         let m = build_resource_map("POLARIS", "wh", Some("sales"), None, ResourceLevel::Catalog);
-        assert!(m.get("namespace").is_none());
+        assert!(!m.contains_key("namespace"));
         assert_eq!(m.get("catalog").map(String::as_str), Some("wh"));
     }
 
     #[test]
     fn resource_map_empty_realm_omits_root() {
         let m = build_resource_map("", "wh", None, None, ResourceLevel::Catalog);
-        assert!(m.get("root").is_none());
+        assert!(!m.contains_key("root"));
     }
 
     #[test]
