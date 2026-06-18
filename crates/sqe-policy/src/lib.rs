@@ -75,6 +75,21 @@ pub enum MaskType {
     Hash,
     /// Replace with a custom expression
     Custom(datafusion::logical_expr::Expr),
+    /// Hive-style partial mask. Keep the first `show_first` and last `show_last`
+    /// characters; mask the rest by char class (ASCII upper->`upper`,
+    /// lower->`lower`, digit->`digit`). Realized by
+    /// `mask_udf::mask_partial_udf`. String-only; non-string columns fall back
+    /// to a typed NULL (see `plan_rewriter::apply_mask`).
+    PartialMask {
+        show_first: u32,
+        show_last: u32,
+        upper: char,
+        lower: char,
+        digit: char,
+    },
+    /// Show only the year of a date/timestamp (`YYYY-01-01`), via
+    /// `date_trunc('year', col)`. Non-temporal columns fall back to typed NULL.
+    DateShowYear,
 }
 
 /// Trait for policy storage backends. Implementations resolve policies
@@ -176,5 +191,10 @@ mod tests {
         assert!(format!("{redact:?}").contains("Redact"));
         assert!(format!("{hash:?}").contains("Hash"));
         assert!(format!("{custom:?}").contains("Custom"));
+
+        let partial = MaskType::PartialMask { show_first: 0, show_last: 4, upper: 'x', lower: 'x', digit: 'x' };
+        let date_year = MaskType::DateShowYear;
+        assert!(format!("{partial:?}").contains("PartialMask"));
+        assert!(format!("{date_year:?}").contains("DateShowYear"));
     }
 }
