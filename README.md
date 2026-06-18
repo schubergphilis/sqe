@@ -49,6 +49,7 @@ sqe> SELECT snapshot_id, committed_at FROM s3tables.sales."orders$snapshots";
 | **Iceberg V2 + V3 read + write** | native | V2 + partial V3 | extension, read-only |
 | **Per-query OIDC bearer passthrough** | yes | service account only | n/a (single-tenant) |
 | **OPA / Cedar policy at LogicalPlan** | roadmap | no | no |
+| **GRANT/REVOKE to Polaris or Apache Ranger** | yes | no | no |
 | **Multi-catalog in one engine** | 7 backends | one at a time | per-extension |
 | **Wire protocols** | Arrow Flight SQL + Trino HTTP | Trino HTTP | extension |
 | **Runtime** | Rust binary, no JVM | JVM | C++ binary |
