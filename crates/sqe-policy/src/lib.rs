@@ -4,6 +4,7 @@ pub mod policy_breaker;
 pub mod policy_expr;
 pub mod policy_store;
 pub mod opa;
+pub mod ranger_store;
 pub mod sha256_udf;
 pub mod write_predicates;
 
