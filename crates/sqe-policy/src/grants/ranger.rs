@@ -6,8 +6,17 @@
 //! namespace -> table. Access types are Polaris-native hyphenated names.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
+use async_trait::async_trait;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tracing::{debug, warn};
+
+use super::{
+    AccessCheck, AccessCheckResult, GrantBackend, GrantEntry, GrantFilter, GrantStatement,
+    Grantee, RevokeStatement,
+};
 
 /// Which resource levels a privilege applies to. Determines which keys go into
 /// the Ranger resource map.
@@ -84,6 +93,398 @@ pub fn build_resource_map(
         }
     }
     m
+}
+
+/// Reject identifier values that would alter a URL path when interpolated.
+/// Catalog/namespace/table/user/role names come from GRANT SQL and flow into
+/// Ranger resource values; this is defense-in-depth, matching the Polaris
+/// backend's `validate_url_identifier`.
+fn validate_identifier(value: &str, what: &str) -> sqe_core::Result<()> {
+    if value.is_empty() {
+        return Err(sqe_core::SqeError::Execution(format!("{what} must not be empty")));
+    }
+    if let Some(bad) = value.chars().find(|c| {
+        matches!(c, '/' | '?' | '#' | '%' | '\\') || c.is_whitespace() || c.is_control()
+    }) {
+        return Err(sqe_core::SqeError::Execution(format!(
+            "{what} '{value}' contains invalid character {bad:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Split a grantee into (users, roles) for a `GrantRevokeRequest`. Groups are
+/// rejected: Polaris does not deliver groups to Ranger unless usersync runs.
+fn grantee_to_fields(grantee: &Grantee) -> sqe_core::Result<(Vec<String>, Vec<String>)> {
+    match grantee {
+        Grantee::User(n) => Ok((vec![n.clone()], vec![])),
+        Grantee::Role(n) => Ok((vec![], vec![n.clone()])),
+        Grantee::Group(_) => Err(sqe_core::SqeError::NotImplemented(
+            "Ranger backend supports USER and ROLE grantees only; GROUP requires Ranger usersync"
+                .into(),
+        )),
+    }
+}
+
+/// Apache Ranger Admin grant backend.
+pub struct RangerGrantBackend {
+    client: Client,
+    /// Ranger Admin base URL, e.g. `http://ranger-admin:6080`.
+    admin_url: String,
+    service_name: String,
+    admin_user: String,
+    admin_password: String,
+    /// Value for the `root` resource level (empty = omit).
+    realm: String,
+}
+
+impl RangerGrantBackend {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        admin_url: &str,
+        service_name: &str,
+        admin_user: &str,
+        admin_password: &str,
+        realm: &str,
+        timeout_secs: u64,
+        accept_invalid_certs: bool,
+    ) -> sqe_core::Result<Self> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(timeout_secs))
+            .danger_accept_invalid_certs(accept_invalid_certs)
+            .build()
+            .map_err(|e| sqe_core::SqeError::Config(format!("Failed to build HTTP client: {e}")))?;
+        Ok(Self {
+            client,
+            admin_url: admin_url.trim_end_matches('/').to_string(),
+            service_name: service_name.to_string(),
+            admin_user: admin_user.to_string(),
+            admin_password: admin_password.to_string(),
+            realm: realm.to_string(),
+        })
+    }
+
+    /// Validate the resource identifiers in a grant/revoke statement and build
+    /// the (resource_map, access_type, users, roles) tuple shared by grant and
+    /// revoke.
+    fn build_grant_revoke(
+        &self,
+        privilege: &str,
+        catalog: Option<&str>,
+        namespace: Option<&str>,
+        table: Option<&str>,
+        grantee: &Grantee,
+    ) -> sqe_core::Result<GrantRevokeRequest> {
+        let catalog = catalog.ok_or_else(|| {
+            sqe_core::SqeError::Execution(
+                "Ranger GRANT requires a catalog (use catalog.namespace.table)".into(),
+            )
+        })?;
+        validate_identifier(catalog, "catalog")?;
+        if let Some(ns) = namespace {
+            validate_identifier(ns, "namespace")?;
+        }
+        if let Some(t) = table {
+            validate_identifier(t, "table")?;
+        }
+        validate_identifier(grantee.name(), "grantee")?;
+
+        let (access, level) = map_sql_to_ranger_access(privilege);
+        let resource = build_resource_map(&self.realm, catalog, namespace, table, level);
+        let (users, roles) = grantee_to_fields(grantee)?;
+
+        Ok(GrantRevokeRequest {
+            grantor: self.admin_user.clone(),
+            resource,
+            users,
+            groups: vec![],
+            roles,
+            access_types: vec![access],
+            delegate_admin: false,
+            enable_audit: true,
+            replace_existing_permissions: false,
+            is_recursive: false,
+        })
+    }
+
+    /// POST a GrantRevokeRequest to the grant or revoke endpoint.
+    async fn post_grant_revoke(&self, op: &str, body: &GrantRevokeRequest) -> sqe_core::Result<()> {
+        let url = format!(
+            "{}/service/plugins/services/{op}/{}",
+            self.admin_url, self.service_name
+        );
+        let resp = self
+            .client
+            .post(&url)
+            .basic_auth(&self.admin_user, Some(&self.admin_password))
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| sqe_core::SqeError::Execution(format!("Ranger {op} request failed: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            warn!(http_status = %status, ranger_body = %text, op, "Ranger {op} failed");
+            return Err(sqe_core::SqeError::Execution(format!(
+                "Ranger {op} failed (HTTP {status})"
+            )));
+        }
+        debug!(op, service = %self.service_name, "Ranger {op} completed");
+        Ok(())
+    }
+}
+
+// ── Ranger policy read model (subset) ─────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct RangerPolicy {
+    #[serde(default)]
+    resources: BTreeMap<String, RangerResourceValues>,
+    #[serde(default, rename = "policyItems")]
+    policy_items: Vec<RangerPolicyItem>,
+    #[serde(default, rename = "denyPolicyItems")]
+    deny_policy_items: Vec<RangerPolicyItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RangerResourceValues {
+    #[serde(default)]
+    values: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RangerPolicyItem {
+    #[serde(default)]
+    users: Vec<String>,
+    #[serde(default)]
+    roles: Vec<String>,
+    #[serde(default)]
+    accesses: Vec<RangerAccess>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RangerAccess {
+    #[serde(rename = "type")]
+    access_type: String,
+}
+
+/// Render a policy's resources as `catalog.namespace.table` (skipping `root`).
+fn format_policy_resource(resources: &BTreeMap<String, RangerResourceValues>) -> String {
+    let mut parts = Vec::new();
+    for key in ["catalog", "namespace", "table"] {
+        if let Some(v) = resources.get(key) {
+            if let Some(first) = v.values.first() {
+                parts.push(first.clone());
+            }
+        }
+    }
+    parts.join(".")
+}
+
+/// Flatten Ranger policies into GrantEntry rows (allow + deny items).
+pub fn policies_to_entries(policies: &[RangerPolicy]) -> Vec<GrantEntry> {
+    let mut out = Vec::new();
+    for p in policies {
+        let resource = format_policy_resource(&p.resources);
+        let mut push_items = |items: &[RangerPolicyItem], effect: &str| {
+            for item in items {
+                for access in &item.accesses {
+                    for u in &item.users {
+                        out.push(GrantEntry {
+                            privilege: access.access_type.clone(),
+                            resource: resource.clone(),
+                            grantee_type: "USER".into(),
+                            grantee_name: u.clone(),
+                            effect: effect.into(),
+                            granted_by: None,
+                            granted_at: None,
+                        });
+                    }
+                    for r in &item.roles {
+                        out.push(GrantEntry {
+                            privilege: access.access_type.clone(),
+                            resource: resource.clone(),
+                            grantee_type: "ROLE".into(),
+                            grantee_name: r.clone(),
+                            effect: effect.into(),
+                            granted_by: None,
+                            granted_at: None,
+                        });
+                    }
+                }
+            }
+        };
+        push_items(&p.policy_items, "ALLOW");
+        push_items(&p.deny_policy_items, "DENY");
+    }
+    out
+}
+
+/// Does an entry's grantee match the requested grantee (type + name)?
+pub fn entry_matches_grantee(entry: &GrantEntry, grantee: &Grantee) -> bool {
+    let want_type = match grantee {
+        Grantee::User(_) => "USER",
+        Grantee::Role(_) => "ROLE",
+        Grantee::Group(_) => "GROUP",
+    };
+    entry.grantee_type == want_type && entry.grantee_name == grantee.name()
+}
+
+impl RangerGrantBackend {
+    /// Fetch all policies for this service from Ranger Admin.
+    async fn fetch_policies(&self) -> sqe_core::Result<Vec<RangerPolicy>> {
+        let url = format!(
+            "{}/service/plugins/policies/service/name/{}",
+            self.admin_url, self.service_name
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .basic_auth(&self.admin_user, Some(&self.admin_password))
+            .send()
+            .await
+            .map_err(|e| sqe_core::SqeError::Execution(format!("Ranger policy fetch failed: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            warn!(http_status = %status, ranger_body = %text, "Ranger policy fetch failed");
+            return Err(sqe_core::SqeError::Execution(format!(
+                "Ranger policy fetch failed (HTTP {status})"
+            )));
+        }
+        resp.json().await.map_err(|e| {
+            sqe_core::SqeError::Execution(format!("Ranger policy parse failed: {e}"))
+        })
+    }
+}
+
+/// Best-effort local evaluation of GrantEntry rows: deny-overrides-allow for a
+/// given user (+roles), access type, and resource. This mirrors Ranger's deny
+/// precedence but does NOT account for tag policies, conditions, or wildcard
+/// resource matching beyond exact match. The authoritative decision is Polaris
+/// enforcement; this is for `CHECK ACCESS` introspection only.
+pub fn evaluate_access(
+    entries: &[GrantEntry],
+    user: &str,
+    roles: &[String],
+    access_type: &str,
+    resource: &str,
+) -> AccessCheckResult {
+    let principal_matches = |e: &GrantEntry| -> bool {
+        (e.grantee_type == "USER" && e.grantee_name == user)
+            || (e.grantee_type == "ROLE" && roles.iter().any(|r| r == &e.grantee_name))
+    };
+    let relevant = |e: &&GrantEntry| {
+        e.privilege == access_type && e.resource == resource && principal_matches(e)
+    };
+
+    if entries.iter().filter(|e| e.effect == "DENY").any(|e| relevant(&e)) {
+        return AccessCheckResult {
+            allowed: false,
+            reason: Some(format!("Denied by a DENY policy on {resource}")),
+        };
+    }
+    if let Some(e) = entries.iter().filter(|e| e.effect == "ALLOW").find(|e| relevant(e)) {
+        return AccessCheckResult {
+            allowed: true,
+            reason: Some(format!("Allowed via {} '{}'", e.grantee_type, e.grantee_name)),
+        };
+    }
+    AccessCheckResult {
+        allowed: false,
+        reason: Some(format!("No matching grant for {user} {access_type} on {resource}")),
+    }
+}
+
+#[async_trait]
+impl GrantBackend for RangerGrantBackend {
+    async fn grant(&self, _token: &str, stmt: &GrantStatement) -> sqe_core::Result<()> {
+        let body = self.build_grant_revoke(
+            &stmt.privilege,
+            stmt.catalog.as_deref(),
+            stmt.namespace.as_deref(),
+            stmt.table.as_deref(),
+            &stmt.grantee,
+        )?;
+        self.post_grant_revoke("grant", &body).await
+    }
+
+    async fn revoke(&self, _token: &str, stmt: &RevokeStatement) -> sqe_core::Result<()> {
+        let body = self.build_grant_revoke(
+            &stmt.privilege,
+            stmt.catalog.as_deref(),
+            stmt.namespace.as_deref(),
+            stmt.table.as_deref(),
+            &stmt.grantee,
+        )?;
+        self.post_grant_revoke("revoke", &body).await
+    }
+
+    async fn show_grants(
+        &self,
+        _token: &str,
+        filter: &GrantFilter,
+    ) -> sqe_core::Result<Vec<GrantEntry>> {
+        let policies = self.fetch_policies().await?;
+        let all = policies_to_entries(&policies);
+        let filtered = match filter {
+            GrantFilter::ToGrantee(g) => {
+                all.into_iter().filter(|e| entry_matches_grantee(e, g)).collect()
+            }
+            GrantFilter::OnResource { catalog, namespace, table } => {
+                // Build the dotted prefix that the entry resource must start with.
+                let mut prefix = Vec::new();
+                if let Some(c) = catalog { prefix.push(c.clone()); }
+                if let Some(n) = namespace { prefix.push(n.clone()); }
+                if let Some(t) = table { prefix.push(t.clone()); }
+                let prefix = prefix.join(".");
+                all.into_iter().filter(|e| e.resource.starts_with(&prefix)).collect()
+            }
+        };
+        Ok(filtered)
+    }
+
+    async fn show_effective(&self, _token: &str, user: &str) -> sqe_core::Result<Vec<GrantEntry>> {
+        // Best-effort: return policies naming this user directly. Role-derived
+        // grants are not expanded here (Ranger resolves roles at enforcement).
+        let policies = self.fetch_policies().await?;
+        let all = policies_to_entries(&policies);
+        Ok(all
+            .into_iter()
+            .filter(|e| e.grantee_type == "USER" && e.grantee_name == user)
+            .collect())
+    }
+
+    async fn check_access(
+        &self,
+        _token: &str,
+        check: &AccessCheck,
+    ) -> sqe_core::Result<AccessCheckResult> {
+        let catalog = check.catalog.as_deref().ok_or_else(|| {
+            sqe_core::SqeError::Execution(
+                "Ranger check_access requires a catalog; use catalog.namespace.table".into(),
+            )
+        })?;
+        validate_identifier(catalog, "catalog")?;
+
+        let (access, _) = map_sql_to_ranger_access(&check.privilege);
+        let mut parts = vec![catalog.to_string()];
+        if let Some(n) = &check.namespace { parts.push(n.clone()); }
+        if let Some(t) = &check.table { parts.push(t.clone()); }
+        let resource = parts.join(".");
+
+        let policies = self.fetch_policies().await?;
+        let entries = policies_to_entries(&policies);
+        // Roles unknown at this layer; match on the user dimension only. Role
+        // grants are surfaced via SHOW GRANTS and enforced by Polaris.
+        Ok(evaluate_access(&entries, &check.user, &[], &access, &resource))
+    }
+
+    fn backend_name(&self) -> &str {
+        "ranger"
+    }
 }
 
 #[cfg(test)]
@@ -181,5 +582,166 @@ mod tests {
         // empty grantee sets are omitted
         assert!(j.get("groups").is_none());
         assert!(j.get("roles").is_none());
+    }
+
+    // ── Task 4: constructor + grantee split + URL guard ──────────────
+
+    fn test_backend() -> RangerGrantBackend {
+        RangerGrantBackend::new(
+            "http://ranger:6080/",
+            "polaris",
+            "admin",
+            "admin-pw",
+            "POLARIS",
+            30,
+            false,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn constructor_trims_trailing_slash_and_sets_name() {
+        let b = test_backend();
+        assert_eq!(b.admin_url, "http://ranger:6080");
+        assert_eq!(b.service_name, "polaris");
+        assert_eq!(b.backend_name(), "ranger");
+    }
+
+    #[test]
+    fn grantee_to_user_role_fields() {
+        assert_eq!(
+            grantee_to_fields(&Grantee::User("alice".into())).unwrap(),
+            (vec!["alice".to_string()], vec![])
+        );
+        assert_eq!(
+            grantee_to_fields(&Grantee::Role("analyst".into())).unwrap(),
+            (vec![], vec!["analyst".to_string()])
+        );
+    }
+
+    #[test]
+    fn grantee_group_is_rejected() {
+        let err = grantee_to_fields(&Grantee::Group("sg".into())).unwrap_err();
+        assert!(matches!(err, sqe_core::SqeError::NotImplemented(_)));
+    }
+
+    #[test]
+    fn build_grant_revoke_select_to_role() {
+        let b = test_backend();
+        let body = b
+            .build_grant_revoke("SELECT", Some("wh"), Some("sales"), Some("orders"),
+                &Grantee::Role("analyst".into()))
+            .unwrap();
+        assert_eq!(body.access_types, vec!["table-data-read".to_string()]);
+        assert_eq!(body.roles, vec!["analyst".to_string()]);
+        assert!(body.users.is_empty());
+        assert_eq!(body.resource.get("table").map(String::as_str), Some("orders"));
+        assert_eq!(body.resource.get("root").map(String::as_str), Some("POLARIS"));
+    }
+
+    #[test]
+    fn build_grant_revoke_requires_catalog() {
+        let b = test_backend();
+        let err = b
+            .build_grant_revoke("SELECT", None, None, None, &Grantee::User("a".into()))
+            .unwrap_err();
+        assert!(matches!(err, sqe_core::SqeError::Execution(_)));
+    }
+
+    #[test]
+    fn build_grant_revoke_rejects_bad_identifier() {
+        let b = test_backend();
+        let err = b
+            .build_grant_revoke("SELECT", Some("wh/../x"), None, None, &Grantee::User("a".into()))
+            .unwrap_err();
+        assert!(matches!(err, sqe_core::SqeError::Execution(_)));
+    }
+
+    // ── Task 5: policy parsing ────────────────────────────────────────
+
+    #[test]
+    fn parse_policies_into_grant_entries() {
+        // Minimal Ranger policy JSON: one allow item granting table-data-read
+        // to role "analyst" on wh.sales.orders.
+        let json = r#"[
+          {
+            "name": "p1",
+            "resources": {
+              "catalog": {"values": ["wh"]},
+              "namespace": {"values": ["sales"]},
+              "table": {"values": ["orders"]}
+            },
+            "policyItems": [
+              {"users": [], "groups": [], "roles": ["analyst"],
+               "accesses": [{"type": "table-data-read", "isAllowed": true}]}
+            ],
+            "denyPolicyItems": [
+              {"users": ["mallory"], "groups": [], "roles": [],
+               "accesses": [{"type": "table-data-read", "isAllowed": true}]}
+            ]
+          }
+        ]"#;
+        let policies: Vec<RangerPolicy> = serde_json::from_str(json).unwrap();
+        let entries = policies_to_entries(&policies);
+        // one allow (analyst) + one deny (mallory)
+        assert_eq!(entries.len(), 2);
+        let allow = entries.iter().find(|e| e.effect == "ALLOW").unwrap();
+        assert_eq!(allow.privilege, "table-data-read");
+        assert_eq!(allow.grantee_type, "ROLE");
+        assert_eq!(allow.grantee_name, "analyst");
+        assert_eq!(allow.resource, "wh.sales.orders");
+        let deny = entries.iter().find(|e| e.effect == "DENY").unwrap();
+        assert_eq!(deny.grantee_type, "USER");
+        assert_eq!(deny.grantee_name, "mallory");
+    }
+
+    #[test]
+    fn entry_matches_grantee_filter() {
+        let e = GrantEntry {
+            privilege: "table-data-read".into(),
+            resource: "wh".into(),
+            grantee_type: "ROLE".into(),
+            grantee_name: "analyst".into(),
+            effect: "ALLOW".into(),
+            granted_by: None,
+            granted_at: None,
+        };
+        assert!(entry_matches_grantee(&e, &Grantee::Role("analyst".into())));
+        assert!(!entry_matches_grantee(&e, &Grantee::Role("other".into())));
+        assert!(!entry_matches_grantee(&e, &Grantee::User("analyst".into())));
+    }
+
+    // ── Task 6: check_access evaluator ───────────────────────────────
+
+    #[test]
+    fn check_match_allows_when_user_has_access() {
+        let entries = vec![
+            GrantEntry { privilege: "table-data-read".into(), resource: "wh.sales.orders".into(),
+                grantee_type: "USER".into(), grantee_name: "alice".into(), effect: "ALLOW".into(),
+                granted_by: None, granted_at: None },
+        ];
+        let r = evaluate_access(&entries, "alice", &[], "table-data-read", "wh.sales.orders");
+        assert!(r.allowed);
+    }
+
+    #[test]
+    fn check_match_deny_overrides_allow() {
+        let entries = vec![
+            GrantEntry { privilege: "table-data-read".into(), resource: "wh.sales.orders".into(),
+                grantee_type: "ROLE".into(), grantee_name: "analyst".into(), effect: "ALLOW".into(),
+                granted_by: None, granted_at: None },
+            GrantEntry { privilege: "table-data-read".into(), resource: "wh.sales.orders".into(),
+                grantee_type: "USER".into(), grantee_name: "alice".into(), effect: "DENY".into(),
+                granted_by: None, granted_at: None },
+        ];
+        let r = evaluate_access(&entries, "alice", &["analyst".into()], "table-data-read", "wh.sales.orders");
+        assert!(!r.allowed);
+        assert!(r.reason.as_deref().unwrap_or("").to_lowercase().contains("deny"));
+    }
+
+    #[test]
+    fn check_match_denies_when_no_grant() {
+        let r = evaluate_access(&[], "alice", &[], "table-data-read", "wh.sales.orders");
+        assert!(!r.allowed);
     }
 }
