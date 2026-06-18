@@ -5,6 +5,7 @@
 //! - `PolarisGrantBackend` — calls the Polaris Management REST API
 
 pub mod polaris;
+pub mod ranger;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
