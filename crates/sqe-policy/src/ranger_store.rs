@@ -13,7 +13,7 @@ use moka::future::Cache;
 use reqwest::Client;
 use serde::Deserialize;
 use sqe_core::config::RangerPolicyConfig;
-use sqe_core::SessionUser;
+use sqe_core::{SecretString, SessionUser};
 use tracing::{debug, warn};
 
 use crate::policy_breaker::PolicyCircuitBreaker;
@@ -23,77 +23,79 @@ use crate::{MaskType, PolicyStore, ResolvedPolicy};
 // --- Ranger policy bundle model (ServicePolicies) ---
 
 #[derive(Debug, Deserialize, Default)]
-pub struct ServicePolicies {
+pub(crate) struct ServicePolicies {
     #[serde(rename = "policyVersion", default)]
-    pub policy_version: Option<i64>,
+    #[allow(dead_code)] // read only in #[cfg(test)]; used by serde and test assertions
+    pub(crate) policy_version: Option<i64>,
     #[serde(default)]
-    pub policies: Vec<RangerPolicy>,
+    pub(crate) policies: Vec<RangerPolicy>,
 }
 
 #[derive(Debug, Deserialize, Default)]
-pub struct RangerPolicy {
+pub(crate) struct RangerPolicy {
     #[serde(default)]
-    pub id: i64,
+    #[allow(dead_code)] // read only in #[cfg(test)]; present in Ranger JSON for traceability
+    pub(crate) id: i64,
     /// 0 = access, 1 = DATAMASK, 2 = ROWFILTER.
     #[serde(rename = "policyType", default)]
-    pub policy_type: i32,
+    pub(crate) policy_type: i32,
     #[serde(rename = "isEnabled", default)]
-    pub is_enabled: bool,
+    pub(crate) is_enabled: bool,
     /// Resource map: keys are "database", "table", "column".
     #[serde(default)]
-    pub resources: HashMap<String, RangerResource>,
+    pub(crate) resources: HashMap<String, RangerResource>,
     #[serde(rename = "dataMaskPolicyItems", default)]
-    pub data_mask_policy_items: Vec<DataMaskPolicyItem>,
+    pub(crate) data_mask_policy_items: Vec<DataMaskPolicyItem>,
     #[serde(rename = "rowFilterPolicyItems", default)]
-    pub row_filter_policy_items: Vec<RowFilterPolicyItem>,
+    pub(crate) row_filter_policy_items: Vec<RowFilterPolicyItem>,
 }
 
 #[derive(Debug, Deserialize, Default)]
-pub struct RangerResource {
+pub(crate) struct RangerResource {
     #[serde(default)]
-    pub values: Vec<String>,
+    pub(crate) values: Vec<String>,
     #[serde(rename = "isExcludes", default)]
-    pub is_excludes: bool,
+    pub(crate) is_excludes: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
-pub struct DataMaskPolicyItem {
+pub(crate) struct DataMaskPolicyItem {
     #[serde(default)]
-    pub users: Vec<String>,
+    pub(crate) users: Vec<String>,
     #[serde(default)]
-    pub roles: Vec<String>,
+    pub(crate) roles: Vec<String>,
     // groups-based binding is NOT enforced (SQE matches token roles only); see Phase 2.
     #[serde(default)]
-    pub groups: Vec<String>,
+    pub(crate) groups: Vec<String>,
     #[serde(rename = "dataMaskInfo", default)]
-    pub data_mask_info: DataMaskInfo,
+    pub(crate) data_mask_info: DataMaskInfo,
 }
 
 #[derive(Debug, Deserialize, Default)]
-pub struct DataMaskInfo {
+pub(crate) struct DataMaskInfo {
     #[serde(rename = "dataMaskType", default)]
-    pub data_mask_type: String,
+    pub(crate) data_mask_type: String,
     #[serde(rename = "valueExpr", default)]
-    pub value_expr: Option<String>,
+    pub(crate) value_expr: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
-pub struct RowFilterPolicyItem {
+pub(crate) struct RowFilterPolicyItem {
     #[serde(default)]
-    pub users: Vec<String>,
+    pub(crate) users: Vec<String>,
     #[serde(default)]
-    pub roles: Vec<String>,
+    pub(crate) roles: Vec<String>,
     // groups-based binding is NOT enforced (SQE matches token roles only); see Phase 2.
     #[serde(default)]
-    pub groups: Vec<String>,
+    pub(crate) groups: Vec<String>,
     #[serde(rename = "rowFilterInfo", default)]
-    pub row_filter_info: RowFilterInfo,
+    pub(crate) row_filter_info: RowFilterInfo,
 }
 
 #[derive(Debug, Deserialize, Default)]
-pub struct RowFilterInfo {
+pub(crate) struct RowFilterInfo {
     #[serde(rename = "filterExpr", default)]
-    pub filter_expr: Option<String>,
+    pub(crate) filter_expr: Option<String>,
 }
 
 // --- RangerStore struct, constructor, and download fetch ---
@@ -104,7 +106,7 @@ pub struct RangerStore {
     /// Base download URL, e.g. ".../service/plugins/policies/download/hive".
     download_url: String,
     admin_user: String,
-    admin_password: String,
+    admin_password: SecretString,
     cache: Cache<String, ResolvedPolicy>,
     breaker: Arc<PolicyCircuitBreaker>,
 }
@@ -128,7 +130,7 @@ impl RangerStore {
                 })?,
             download_url,
             admin_user: cfg.admin_user.clone(),
-            admin_password: cfg.admin_password.expose().to_string(),
+            admin_password: cfg.admin_password.clone(),
             cache: Cache::builder()
                 .time_to_live(Duration::from_secs(cfg.cache_ttl_secs))
                 .max_capacity(cfg.cache_max_entries)
@@ -152,7 +154,7 @@ impl RangerStore {
         let resp = self
             .client
             .get(&self.download_url)
-            .basic_auth(&self.admin_user, Some(&self.admin_password))
+            .basic_auth(&self.admin_user, Some(self.admin_password.expose()))
             .send()
             .await
             .map_err(|e| {

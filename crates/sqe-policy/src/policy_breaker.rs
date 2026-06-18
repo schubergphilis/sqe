@@ -19,7 +19,7 @@ const STATE_OPEN: u32 = 1;
 const STATE_HALF_OPEN: u32 = 2;
 
 /// Three-state circuit breaker around a remote policy backend call.
-pub struct PolicyCircuitBreaker {
+pub(crate) struct PolicyCircuitBreaker {
     /// Backend label used in log lines (e.g. "OPA", "Ranger").
     name: &'static str,
     failure_count: AtomicU32,
@@ -30,7 +30,7 @@ pub struct PolicyCircuitBreaker {
 }
 
 impl PolicyCircuitBreaker {
-    pub fn new(name: &'static str, failure_threshold: u32, recovery_timeout: Duration) -> Self {
+    pub(crate) fn new(name: &'static str, failure_threshold: u32, recovery_timeout: Duration) -> Self {
         Self {
             name,
             failure_count: AtomicU32::new(0),
@@ -42,7 +42,7 @@ impl PolicyCircuitBreaker {
     }
 
     /// Returns Err when the breaker is open (caller must fail closed).
-    pub fn check(&self) -> Result<(), String> {
+    pub(crate) fn check(&self) -> Result<(), String> {
         let state = self.state.load(Ordering::Acquire);
         match state {
             STATE_CLOSED => Ok(()),
@@ -70,7 +70,7 @@ impl PolicyCircuitBreaker {
         }
     }
 
-    pub fn record_success(&self) {
+    pub(crate) fn record_success(&self) {
         if self.state.load(Ordering::Acquire) != STATE_CLOSED {
             self.state.store(STATE_CLOSED, Ordering::Release);
             self.failure_count.store(0, Ordering::Release);
@@ -80,7 +80,7 @@ impl PolicyCircuitBreaker {
         }
     }
 
-    pub fn record_failure(&self) {
+    pub(crate) fn record_failure(&self) {
         self.last_failure_ms.store(now_millis(), Ordering::Relaxed);
         let count = self.failure_count.fetch_add(1, Ordering::AcqRel) + 1;
         if count >= self.failure_threshold
@@ -101,7 +101,7 @@ impl PolicyCircuitBreaker {
     }
 
     /// 0 = closed, 1 = half-open, 2 = open (matches the metrics gauge encoding).
-    pub fn state_code(&self) -> u8 {
+    pub(crate) fn state_code(&self) -> u8 {
         match self.state.load(Ordering::Relaxed) {
             STATE_OPEN => 2,
             STATE_HALF_OPEN => 1,
