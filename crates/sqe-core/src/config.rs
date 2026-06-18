@@ -2035,7 +2035,7 @@ pub struct RangerConfig {
     pub admin_user: String,
     /// Ranger Admin password. Set via `SQE_ACCESS_CONTROL__RANGER__ADMIN_PASSWORD`.
     #[serde(default)]
-    pub admin_password: String,
+    pub admin_password: SecretString,
     /// Value for the top-level `root` resource (the Polaris realm/context the
     /// embedded authorizer prefixes onto resource paths). When empty, the
     /// `root` level is omitted from written policies. See Task 14 for how to
@@ -2055,7 +2055,7 @@ impl Default for RangerConfig {
         Self {
             service_name: default_ranger_service_name(),
             admin_user: default_ranger_admin_user(),
-            admin_password: String::new(),
+            admin_password: SecretString::default(),
             realm: String::new(),
             timeout_secs: default_ranger_timeout_secs(),
             accept_invalid_certs: false,
@@ -3061,6 +3061,10 @@ impl SqeConfig {
         // Access control
         env_override_parse("SQE_ACCESS_CONTROL__BACKEND", &mut self.access_control.backend);
         env_override_str("SQE_ACCESS_CONTROL__URL", &mut self.access_control.url);
+        env_override_secret(
+            "SQE_ACCESS_CONTROL__RANGER__ADMIN_PASSWORD",
+            &mut self.access_control.ranger.admin_password,
+        );
 
         // Metrics
         env_override_u16("SQE_METRICS__PROMETHEUS_PORT", &mut self.metrics.prometheus_port);
@@ -5390,7 +5394,7 @@ mod ranger_config_tests {
         let c: AccessControlConfig = toml::from_str(toml).unwrap();
         assert_eq!(c.backend, AccessControlBackend::Ranger);
         assert_eq!(c.ranger.service_name, "dev_polaris");
-        assert_eq!(c.ranger.admin_password, "secret");
+        assert_eq!(c.ranger.admin_password.expose(), "secret");
         assert_eq!(c.ranger.realm, "POLARIS");
     }
 }
