@@ -95,10 +95,12 @@ pub fn build_resource_map(
     m
 }
 
-/// Reject identifier values that would alter a URL path when interpolated.
+/// Reject identifier values that could inject into the Ranger resource map.
 /// Catalog/namespace/table/user/role names come from GRANT SQL and flow into
-/// Ranger resource values; this is defense-in-depth, matching the Polaris
-/// backend's `validate_url_identifier`.
+/// the JSON `resource` map body (not URL paths; the only URL-interpolated value
+/// is `service_name`, which is operator-controlled config). Rejecting path
+/// separators, control, and whitespace characters is defense-in-depth against
+/// resource-map injection, matching the Polaris backend's `validate_url_identifier`.
 fn validate_identifier(value: &str, what: &str) -> sqe_core::Result<()> {
     if value.is_empty() {
         return Err(sqe_core::SqeError::Execution(format!("{what} must not be empty")));
@@ -321,6 +323,17 @@ pub fn policies_to_entries(policies: &[RangerPolicy]) -> Vec<GrantEntry> {
     out
 }
 
+/// Does a dotted `resource` fall at or under `prefix`, matching on a dot
+/// boundary? `SHOW GRANTS ON CATALOG "wh"` (prefix `wh`) returns `wh` and
+/// `wh.sales.orders` but never sibling catalogs like `wharf.ns.t` or
+/// `wholesale`. An empty prefix matches everything (no resource filter).
+pub fn resource_matches_prefix(resource: &str, prefix: &str) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+    resource == prefix || resource.starts_with(&format!("{prefix}."))
+}
+
 /// Does an entry's grantee match the requested grantee (type + name)?
 pub fn entry_matches_grantee(entry: &GrantEntry, grantee: &Grantee) -> bool {
     let want_type = match grantee {
@@ -434,13 +447,14 @@ impl GrantBackend for RangerGrantBackend {
                 all.into_iter().filter(|e| entry_matches_grantee(e, g)).collect()
             }
             GrantFilter::OnResource { catalog, namespace, table } => {
-                // Build the dotted prefix that the entry resource must start with.
                 let mut prefix = Vec::new();
                 if let Some(c) = catalog { prefix.push(c.clone()); }
                 if let Some(n) = namespace { prefix.push(n.clone()); }
                 if let Some(t) = table { prefix.push(t.clone()); }
                 let prefix = prefix.join(".");
-                all.into_iter().filter(|e| e.resource.starts_with(&prefix)).collect()
+                all.into_iter()
+                    .filter(|e| resource_matches_prefix(&e.resource, &prefix))
+                    .collect()
             }
         };
         Ok(filtered)
@@ -709,6 +723,22 @@ mod tests {
         assert!(entry_matches_grantee(&e, &Grantee::Role("analyst".into())));
         assert!(!entry_matches_grantee(&e, &Grantee::Role("other".into())));
         assert!(!entry_matches_grantee(&e, &Grantee::User("analyst".into())));
+    }
+
+    #[test]
+    fn resource_prefix_matches_on_dot_boundary() {
+        // SHOW GRANTS ON CATALOG "wh" must match the catalog itself and
+        // anything nested under it.
+        assert!(resource_matches_prefix("wh", "wh"));
+        assert!(resource_matches_prefix("wh.sales.orders", "wh"));
+        // It must NOT match sibling catalogs that merely share the prefix bytes.
+        assert!(!resource_matches_prefix("wharf.ns.t", "wh"));
+        assert!(!resource_matches_prefix("wholesale", "wh"));
+        // Deeper prefixes behave the same.
+        assert!(resource_matches_prefix("wh.sales.orders", "wh.sales"));
+        assert!(!resource_matches_prefix("wh.salesforce", "wh.sales"));
+        // Empty prefix is "no filter".
+        assert!(resource_matches_prefix("anything", ""));
     }
 
     // ── Task 6: check_access evaluator ───────────────────────────────

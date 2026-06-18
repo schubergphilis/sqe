@@ -537,7 +537,7 @@ fn build_grant_backend(
                 &config.access_control.url,
                 &r.service_name,
                 &r.admin_user,
-                &r.admin_password,
+                r.admin_password.expose(),
                 &r.realm,
                 r.timeout_secs,
                 r.accept_invalid_certs,
