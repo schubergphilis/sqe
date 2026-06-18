@@ -182,13 +182,21 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                                 .map(|(qualifier, field)| {
                                     let name = field.name();
                                     if let Some(mask) = policy.column_masks.get(name) {
+                                        // Alias the mask expr to the column's
+                                        // QUALIFIED name so the output field
+                                        // keeps the scan's qualifier. A bare
+                                        // `.alias(name)` produces an unqualified
+                                        // field, which breaks the user's outer
+                                        // `SELECT t.col` reference (planned
+                                        // against the qualified scan) with
+                                        // "No field named <qualified>.col".
                                         apply_mask(
                                             name,
                                             field.data_type(),
                                             mask,
                                             mask_key.clone(),
                                         )
-                                        .alias(name.clone())
+                                        .alias_qualified(qualifier.cloned(), name.clone())
                                     } else {
                                         Expr::Column(datafusion::common::Column::new(
                                             qualifier.cloned(),
