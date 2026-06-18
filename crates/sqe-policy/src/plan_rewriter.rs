@@ -18,7 +18,7 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::logical_expr::{col, lit, Cast, Expr, Filter, LogicalPlan, Projection};
+use datafusion::logical_expr::{col, lit, Cast, Expr, LogicalPlan, LogicalPlanBuilder};
 use datafusion::scalar::ScalarValue;
 use tracing::{debug, warn};
 
@@ -143,75 +143,75 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                             return Ok(Transformed::no(node));
                         }
 
-                        let mut current = node;
+                        // Build the security wrappers with LogicalPlanBuilder so
+                        // injected expressions are NORMALIZED against the real
+                        // scan schema. An Iceberg TableScan exposes fully
+                        // qualified fields (`catalog.schema.table.col`), while
+                        // the policy row filters (parsed schema-free) and the
+                        // mask UDF args use BARE column names. Manual
+                        // Filter/Projection construction left those refs
+                        // unqualified, so physical planning failed with
+                        // "No field named <qualified>.col". `filter()` and
+                        // `project()` both run `normalize_col`, qualifying every
+                        // column reference (including those nested inside Hash /
+                        // Custom mask expressions) to the child schema.
+                        let mut builder = LogicalPlanBuilder::from(node);
 
-                        // 1. Inject row filters above the TableScan
+                        // 1. Inject row filters above the TableScan.
                         for filter_expr in &policy.row_filters {
-                            current = LogicalPlan::Filter(
-                                Filter::try_new(filter_expr.clone(), Arc::new(current))
-                                    .map_err(|e| {
-                                        datafusion::error::DataFusionError::Internal(format!(
-                                            "Failed to create policy filter: {e}"
-                                        ))
-                                    })?,
-                            );
+                            builder = builder.filter(filter_expr.clone()).map_err(|e| {
+                                datafusion::error::DataFusionError::Internal(format!(
+                                    "Failed to create policy filter: {e}"
+                                ))
+                            })?;
                         }
 
-                        // 2. Apply column masks via projection
-                        if !policy.column_masks.is_empty() {
-                            let schema = current.schema();
+                        // 2. Apply column masks and/or restrictions via a
+                        //    projection that drops restricted columns, masks
+                        //    masked columns, and passes the rest through with
+                        //    their real (qualified) column reference.
+                        if !policy.column_masks.is_empty()
+                            || !policy.restricted_columns.is_empty()
+                        {
+                            let schema = builder.schema().clone();
                             let exprs: Vec<Expr> = schema
-                                .fields()
                                 .iter()
-                                .filter(|f| !policy.restricted_columns.contains(f.name()))
-                                .map(|f| {
-                                    if let Some(mask) = policy.column_masks.get(f.name()) {
-                                        apply_mask(f.name(), f.data_type(), mask, mask_key.clone())
-                                            .alias(f.name())
+                                .filter(|(_q, f)| {
+                                    !policy.restricted_columns.contains(f.name())
+                                })
+                                .map(|(qualifier, field)| {
+                                    let name = field.name();
+                                    if let Some(mask) = policy.column_masks.get(name) {
+                                        apply_mask(
+                                            name,
+                                            field.data_type(),
+                                            mask,
+                                            mask_key.clone(),
+                                        )
+                                        .alias(name.clone())
                                     } else {
-                                        col(f.name())
+                                        Expr::Column(datafusion::common::Column::new(
+                                            qualifier.cloned(),
+                                            name,
+                                        ))
                                     }
                                 })
                                 .collect();
 
                             if !exprs.is_empty() {
-                                current = LogicalPlan::Projection(
-                                    Projection::try_new(exprs, Arc::new(current)).map_err(
-                                        |e| {
-                                            datafusion::error::DataFusionError::Internal(
-                                                format!(
-                                                    "Failed to create policy projection: {e}"
-                                                ),
-                                            )
-                                        },
-                                    )?,
-                                );
+                                builder = builder.project(exprs).map_err(|e| {
+                                    datafusion::error::DataFusionError::Internal(format!(
+                                        "Failed to create policy projection: {e}"
+                                    ))
+                                })?;
                             }
                         }
-                        // 3. Apply column restrictions (remove columns entirely)
-                        else if !policy.restricted_columns.is_empty() {
-                            let schema = current.schema();
-                            let exprs: Vec<Expr> = schema
-                                .fields()
-                                .iter()
-                                .filter(|f| !policy.restricted_columns.contains(f.name()))
-                                .map(|f| col(f.name()))
-                                .collect();
 
-                            if !exprs.is_empty() {
-                                current = LogicalPlan::Projection(
-                                    Projection::try_new(exprs, Arc::new(current)).map_err(
-                                        |e| {
-                                            datafusion::error::DataFusionError::Internal(
-                                                format!(
-                                                    "Failed to create restriction projection: {e}"
-                                                ),
-                                            )
-                                        },
-                                    )?,
-                                );
-                            }
-                        }
+                        let current = builder.build().map_err(|e| {
+                            datafusion::error::DataFusionError::Internal(format!(
+                                "Failed to build policy plan: {e}"
+                            ))
+                        })?;
 
                         // Jump: skip descending into the wrappers we just
                         // injected. Continue would re-enter the inner
