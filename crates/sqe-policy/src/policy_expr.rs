@@ -5,13 +5,14 @@
 //! a `Filter`/projection above the matching `TableScan`.
 
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 
 use arrow::datatypes::{DataType, Field, Fields};
 use datafusion::common::{DFSchema, DFSchemaRef};
 use datafusion::logical_expr::Expr;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::DFParser;
-use datafusion::sql::sqlparser::ast::Expr as SqlExpr;
+use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Visit, Visitor};
 
 /// Parse `sql` (a single SQL expression, NOT a full statement) into an `Expr`.
 /// Returns `Err` if the string is not a parseable expression. Callers MUST
@@ -32,6 +33,12 @@ use datafusion::sql::sqlparser::ast::Expr as SqlExpr;
 /// Column type coercion is not performed here; the resulting `Expr::Column`
 /// refs carry no type information and are resolved when the rewriter splices
 /// the expression into a `Filter`/`Projection` above the matching `TableScan`.
+///
+/// Only bare, unqualified column references are supported in this MVP. Qualified
+/// or compound identifiers (e.g. `t.col`) are NOT supported: the stub schema is
+/// unqualified, so a compound ref fails `validate_schema_satisfies_exprs` and
+/// this function returns `Err` (fail closed). Ranger `filterExpr`/`valueExpr`
+/// bodies use bare column names, so this is the expected shape.
 pub fn parse_sql_predicate(sql: &str) -> sqe_core::Result<Expr> {
     let trimmed = sql.trim();
     if trimmed.is_empty() {
@@ -43,13 +50,17 @@ pub fn parse_sql_predicate(sql: &str) -> sqe_core::Result<Expr> {
     // Pass 1: syntactic parse via DFParser (catches garbage + trailing tokens).
     let parsed = DFParser::parse_sql_into_expr(trimmed).map_err(|e| {
         sqe_core::error::SqeError::Execution(format!(
-            "failed to parse Ranger policy expression '{trimmed}': {e}"
+            "failed to parse policy expression '{trimmed}': {e}"
         ))
     })?;
 
     // Pass 2: collect all unqualified identifiers from the sqlparser AST.
+    // A Visitor is total by construction: it walks every AST variant (Cast,
+    // Substring, Extract, Trim, Case, ...) so a column nested inside any node
+    // is captured. A hand-written match with a catch-all would silently miss
+    // columns in un-enumerated variants and wrongly reject valid policies.
     let mut col_names: HashSet<String> = HashSet::new();
-    collect_identifiers(&parsed.expr, &mut col_names);
+    let _ = parsed.expr.visit(&mut IdentCollector(&mut col_names));
 
     // Build an UNQUALIFIED stub DFSchema so validate_schema_satisfies_exprs
     // passes without a real table schema. Fields are Utf8 (nullable); actual
@@ -71,94 +82,42 @@ pub fn parse_sql_predicate(sql: &str) -> sqe_core::Result<Expr> {
     );
 
     // Pass 3: build the DataFusion Expr using the stub schema.
+    //
+    // ISSUE 3 note: constructing a fresh SessionContext per call is acceptable
+    // for the MVP. parse_sql_predicate runs at policy-resolve frequency (i.e.
+    // on a cache miss in the policy store), not per row or per batch, so the
+    // per-call context setup cost is negligible against the surrounding I/O.
     let ctx = SessionContext::new();
     ctx.parse_sql_expr(trimmed, &df_schema).map_err(|e| {
         sqe_core::error::SqeError::Execution(format!(
-            "failed to plan Ranger policy expression '{trimmed}': {e}"
+            "failed to plan policy expression '{trimmed}': {e}"
         ))
     })
 }
 
-/// Recursively collect all bare identifier names referenced in `expr`.
-/// Only `Identifier` nodes are harvested; `CompoundIdentifier` nodes (e.g.
-/// `table.column`) are not expected in schema-free policy expressions and
-/// are intentionally left out — the planner handles them as qualified refs.
-fn collect_identifiers(expr: &SqlExpr, names: &mut HashSet<String>) {
-    match expr {
-        SqlExpr::Identifier(ident) => {
-            // Normalise to lowercase, matching DataFusion's default ident
-            // normalization (`enable_ident_normalization = true`).
-            names.insert(ident.value.to_lowercase());
+/// sqlparser `Visitor` that harvests every bare `Identifier` in an expression
+/// tree into a set of column names. Compound identifiers (`table.column`) are
+/// intentionally NOT collected: this MVP supports only bare column refs, and a
+/// compound ref against the unqualified stub schema fails closed.
+struct IdentCollector<'a>(&'a mut HashSet<String>);
+
+impl Visitor for IdentCollector<'_> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &SqlExpr) -> ControlFlow<()> {
+        if let SqlExpr::Identifier(ident) = expr {
+            // Only lowercase UNQUOTED identifiers. DataFusion's default ident
+            // normalization lowercases unquoted names but preserves the case of
+            // quoted ones. Lowercasing a quoted "Tier" here would put "tier" in
+            // the stub while parse_sql_expr later looks up "Tier" -> FieldNotFound.
+            let key = if ident.quote_style.is_none() {
+                ident.value.to_lowercase()
+            } else {
+                ident.value.clone()
+            };
+            self.0.insert(key);
         }
-        SqlExpr::BinaryOp { left, right, .. } => {
-            collect_identifiers(left, names);
-            collect_identifiers(right, names);
-        }
-        SqlExpr::UnaryOp { expr, .. } => {
-            collect_identifiers(expr, names);
-        }
-        SqlExpr::IsNull(e) | SqlExpr::IsNotNull(e) => {
-            collect_identifiers(e, names);
-        }
-        SqlExpr::Between {
-            expr, low, high, ..
-        } => {
-            collect_identifiers(expr, names);
-            collect_identifiers(low, names);
-            collect_identifiers(high, names);
-        }
-        SqlExpr::InList { expr, list, .. } => {
-            collect_identifiers(expr, names);
-            for item in list {
-                collect_identifiers(item, names);
-            }
-        }
-        SqlExpr::Function(f) => {
-            use datafusion::sql::sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
-            if let FunctionArguments::List(arg_list) = &f.args {
-                for item in &arg_list.args {
-                    let arg_expr = match item {
-                        FunctionArg::Named { arg, .. }
-                        | FunctionArg::Unnamed(arg)
-                        | FunctionArg::ExprNamed { arg, .. } => arg,
-                    };
-                    match arg_expr {
-                        FunctionArgExpr::Expr(e) => collect_identifiers(e, names),
-                        FunctionArgExpr::Wildcard
-                        | FunctionArgExpr::QualifiedWildcard(_)
-                        | FunctionArgExpr::WildcardWithOptions(_) => {}
-                    }
-                }
-            }
-        }
-        SqlExpr::Nested(e) => {
-            collect_identifiers(e, names);
-        }
-        SqlExpr::Like { expr, pattern, .. }
-        | SqlExpr::ILike { expr, pattern, .. }
-        | SqlExpr::SimilarTo { expr, pattern, .. } => {
-            collect_identifiers(expr, names);
-            collect_identifiers(pattern, names);
-        }
-        SqlExpr::Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } => {
-            if let Some(e) = operand {
-                collect_identifiers(e, names);
-            }
-            for c in conditions {
-                collect_identifiers(&c.condition, names);
-                collect_identifiers(&c.result, names);
-            }
-            if let Some(e) = else_result {
-                collect_identifiers(e, names);
-            }
-        }
-        // Everything else (literals, typed strings, etc.) has no identifiers.
-        _ => {}
+        ControlFlow::Continue(())
     }
 }
 
@@ -214,5 +173,34 @@ mod tests {
         // to just the prefix. DFParser::parse_into_expr enforces EOF after the
         // expression, so this must return Err.
         assert!(parse_sql_predicate("region = 'EU' bogus").is_err());
+    }
+
+    #[test]
+    fn parses_cast_in_filter() {
+        // Cast is its own AST variant; the hand-written walker missed it.
+        let e = parse_sql_predicate("CAST(tier AS INT) >= 3").unwrap();
+        let sql = datafusion::sql::unparser::expr_to_sql(&e).unwrap().to_string();
+        assert!(sql.to_lowercase().contains("tier"));
+    }
+
+    #[test]
+    fn parses_substring_mask() {
+        let e = parse_sql_predicate("substr(email, 1, 3)").unwrap();
+        let sql = datafusion::sql::unparser::expr_to_sql(&e).unwrap().to_string();
+        assert!(sql.to_lowercase().contains("email"));
+    }
+
+    #[test]
+    fn parses_or() {
+        let e = parse_sql_predicate("region = 'EU' OR dept = 'eng'").unwrap();
+        let sql = datafusion::sql::unparser::expr_to_sql(&e).unwrap().to_string();
+        assert!(sql.to_uppercase().contains("OR"));
+    }
+
+    #[test]
+    fn parses_quoted_mixed_case_column() {
+        // Quoted ident must NOT be lowercased into the stub.
+        let e = parse_sql_predicate("\"Tier\" >= 3").unwrap();
+        assert!(matches!(e, datafusion::logical_expr::Expr::BinaryExpr(_)));
     }
 }
