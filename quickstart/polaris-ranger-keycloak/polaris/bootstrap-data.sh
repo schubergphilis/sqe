@@ -75,35 +75,26 @@ mk_catalog() { # name
   }" || true
 }
 
-# ── Catalogs ──────────────────────────────────────────────────────────────
+# ── Catalog ───────────────────────────────────────────────────────────────
+# One catalog, several namespaces. (SQE routes 3-part names through its default
+# catalog, so a second catalog is not exercised by the SQL path here; namespace
+# depth is what varies.)
 mk_catalog sales_wh
-mk_catalog ops_wh
 
-# ── Nested namespaces ───────────────────────────────────────────────────────
+# ── Namespaces (including a nested one) ─────────────────────────────────────
 log "creating namespaces"
 api POST "$CAT/sales_wh/namespaces" '{"namespace":["sales"]}' || true
 api POST "$CAT/sales_wh/namespaces" '{"namespace":["sales","eu"]}' || true
-api POST "$CAT/ops_wh/namespaces" '{"namespace":["ops"]}' || true
+api POST "$CAT/sales_wh/namespaces" '{"namespace":["ops"]}' || true
 
-# ── Principal-roles (named like Keycloak realm roles) ───────────────────────
-log "creating principal-roles"
-for r in analyst engineer sqe_admin; do
-  api POST "$MGMT/principal-roles" "{\"principalRole\":{\"name\":\"$r\"}}" || true
-done
-
-# ── Principals (match Keycloak preferred_username) + role assignment ────────
-log "creating principals + assigning principal-roles"
+# ── Principals (match Keycloak preferred_username) ──────────────────────────
+# Polaris federation RESOLVES an existing principal by preferred_username; it
+# does not auto-create. So the principal ENTITY must exist or the user's token
+# is rejected with "Failed to resolve principal" (401). Principal-ROLES are NOT
+# created or assigned: Polaris takes the activated roles from the token
+# (realm_access.roles via the principal-roles-mapper) and forwards them to Ranger.
+log "creating principals (entities only; roles come from the token)"
 mkprincipal() { api POST "$MGMT/principals" "{\"principal\":{\"name\":\"$1\",\"type\":\"USER\"}}" || true; }
-assign() { api PUT "$MGMT/principals/$1/principal-roles" "{\"principalRole\":{\"name\":\"$2\"}}" || true; }
-
 for u in alice bob carol dave; do mkprincipal "$u"; done
-
-assign alice analyst
-assign bob engineer
-assign bob analyst
-assign carol sqe_admin
-assign carol engineer
-assign carol analyst
-# dave: no principal-roles (negative-test user)
 
 log "bootstrap complete: catalogs=sales_wh,ops_wh"
