@@ -115,4 +115,76 @@ for role in analyst engineer; do
   done
 done
 
+# ── Hive service instance for SQE fine-grained policy enforcement ────────────
+# Apache Ranger 2.8 ships the `hive` service-def built in; no servicedef POST
+# is needed. SQE reads this service via
+# GET /service/plugins/policies/download/hive and rewrites the query plan
+# (row filters above the scan, column masks). The `database` resource value
+# SQE sends is the LAST dotted component of the namespace, so for
+# `sales_wh.sales.orders` the resource is database=sales, table=orders.
+echo "Creating hive service instance for fine-grained policies (idempotent) ..."
+if curl -fsS $AUTH "${RANGER_URL}/service/public/v2/api/service/name/hive" >/dev/null 2>&1; then
+  echo "  service 'hive' already present, skipping."
+else
+  curl -fsS $AUTH $CSRF $CT -X POST "${RANGER_URL}/service/public/v2/api/service" \
+    -d '{"name":"hive","type":"hive","configs":{"username":"admin","jdbc.driverClassName":"org.apache.hive.jdbc.HiveDriver","jdbc.url":"none"},"isEnabled":true}' >/dev/null \
+    && echo "  service 'hive' created." || echo "  service 'hive' creation FAILED (check ranger logs)."
+fi
+
+# ── Fine-grained policies on the hive service ───────────────────────────────
+# Both policies target role 'engineer' (bob + carol). Role 'analyst' (alice +
+# bob + carol) serves as the unmasked / unfiltered baseline in test.sh: alice
+# (analyst-only, not engineer) sees real amounts and all regions, while bob
+# (engineer) gets amount masked to NULL and rows restricted to region = 'EU'.
+# Note: region values in the seed data are uppercase ('EU', 'US'), matching
+# this filter expression exactly.
+post_hive_policy() { # json_file
+  curl -fsS $AUTH $CSRF $CT -X POST "${RANGER_URL}/service/public/v2/api/policy" \
+    -d @"$1" >/dev/null 2>&1 \
+    && echo "  policy created" || echo "  policy exists or failed (idempotent)"
+}
+
+echo "Creating fine-grained mask + row-filter policies on hive service ..."
+
+# Column-mask policy (policyType 1): mask orders.amount -> NULL for role engineer.
+cat > /tmp/hive-mask.json <<'EOF'
+{
+  "service": "hive",
+  "name": "mask-sales-orders-amount",
+  "policyType": 1,
+  "isEnabled": true,
+  "resources": {
+    "database": {"values": ["sales"]},
+    "table":    {"values": ["orders"]},
+    "column":   {"values": ["amount"]}
+  },
+  "dataMaskPolicyItems": [{
+    "roles":   ["engineer"],
+    "accesses": [{"type": "select", "isAllowed": true}],
+    "dataMaskInfo": {"dataMaskType": "MASK_NULL"}
+  }]
+}
+EOF
+post_hive_policy /tmp/hive-mask.json
+
+# Row-filter policy (policyType 2): restrict orders to region = 'EU' for role engineer.
+cat > /tmp/hive-rowfilter.json <<'EOF'
+{
+  "service": "hive",
+  "name": "rowfilter-sales-orders-region",
+  "policyType": 2,
+  "isEnabled": true,
+  "resources": {
+    "database": {"values": ["sales"]},
+    "table":    {"values": ["orders"]}
+  },
+  "rowFilterPolicyItems": [{
+    "roles":   ["engineer"],
+    "accesses": [{"type": "select", "isAllowed": true}],
+    "rowFilterInfo": {"filterExpr": "region = 'EU'"}
+  }]
+}
+EOF
+post_hive_policy /tmp/hive-rowfilter.json
+
 echo "Ranger bootstrap complete."
