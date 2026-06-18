@@ -32,6 +32,17 @@ Polaris principal (the data bootstrap creates `alice`, `bob`, `carol`, `dave`).
 A token for a principal that does not exist is rejected with 401 "Failed to
 resolve principal". Polaris sends this principal name to Ranger as the `user`.
 
+This was tested directly with `polaris.authentication.type=external` (not just
+`mixed`): the `DefaultAuthenticator` still logs "Failed to resolve principal" and
+returns 401 for a Keycloak user with no Polaris principal, even though the JWT
+verifies and Ranger holds the user's roles. So Keycloak + Ranger alone is NOT
+enough; the Polaris principal entity is required regardless of auth.type.
+External mode also disables the internal `root` token, creating a bootstrap
+chicken-and-egg (nothing can authenticate to create the first principal), which
+is why this stack uses `mixed` (internal token for provisioning + external OIDC
+for users). Eliminating per-user provisioning would require a non-default
+federated authenticator (`polaris.authentication.authenticator.type`), unverified.
+
 **Roles.** This is the surprising part. Polaris IGNORES the token's realm roles
 (they lack Polaris's expected `PRINCIPAL_ROLE:` prefix, so they are dropped
 during authentication). And Polaris principal-roles cannot help either: the
