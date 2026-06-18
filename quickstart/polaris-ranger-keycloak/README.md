@@ -17,14 +17,15 @@ Or `./run.sh` (does both). Tear down with `./run.sh --down`.
 
 ## What it proves
 
-`test.sh` runs the full matrix (11 checks, all green from a clean bring-up):
+`test.sh` runs the full matrix (all green from a clean bring-up):
 
-- Multi-namespace resources (`sales_wh.sales`, `sales_wh.ops`).
+- Two catalogs (`sales_wh`, `ops_wh`); 3-part names route to the right one via
+  `[query] catalog_discovery = "polaris-auto"`.
 - A `GRANT SELECT` visibly enabling a read that was denied before it.
 - Role grants (`analyst`, `engineer`) and a user grant (`bob`).
 - A Ranger DENY added to the same policy, overriding an allow (deny precedence).
 - Negative tests: an ungranted user and a read-only role are denied.
-- `SHOW GRANTS` round-trip and a `REVOKE` that takes effect.
+- `SHOW GRANTS` round-trip, a `REVOKE` that takes effect, and `CHECK ACCESS`.
 
 ## Endpoints
 

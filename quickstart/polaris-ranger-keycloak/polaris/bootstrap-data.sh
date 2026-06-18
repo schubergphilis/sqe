@@ -75,17 +75,17 @@ mk_catalog() { # name
   }" || true
 }
 
-# ── Catalog ───────────────────────────────────────────────────────────────
-# One catalog, several namespaces. (SQE routes 3-part names through its default
-# catalog, so a second catalog is not exercised by the SQL path here; namespace
-# depth is what varies.)
+# ── Catalogs ────────────────────────────────────────────────────────────────
+# Two catalogs. SQE routes 3-part names (e.g. ops_wh.ops.audit) to the right
+# catalog because sqe.toml sets `[query] catalog_discovery = "polaris-auto"`.
 mk_catalog sales_wh
+mk_catalog ops_wh
 
-# ── Namespaces (including a nested one) ─────────────────────────────────────
+# ── Namespaces (sales has a nested child; ops lives in the second catalog) ───
 log "creating namespaces"
 api POST "$CAT/sales_wh/namespaces" '{"namespace":["sales"]}' || true
 api POST "$CAT/sales_wh/namespaces" '{"namespace":["sales","eu"]}' || true
-api POST "$CAT/sales_wh/namespaces" '{"namespace":["ops"]}' || true
+api POST "$CAT/ops_wh/namespaces" '{"namespace":["ops"]}' || true
 
 # ── Principals (match Keycloak preferred_username) ──────────────────────────
 # Polaris federation RESOLVES an existing principal by preferred_username; it
