@@ -198,9 +198,15 @@ impl InformationSchemaProvider {
                 // Resolve restricted columns for this table when policy is active.
                 // Fail closed on policy errors: skip the table entirely rather than leak
                 // the column list when the policy backend is degraded.
+                //
+                // Match plan_rewriter's policy key: the namespace is the LAST dotted
+                // component (resolve_policy_key uses rsplit('.').next()). Passing the
+                // full dotted namespace here would miss the policy and leak restricted
+                // column names in information_schema for multi-level namespaces.
+                let policy_ns = ns.rsplit('.').next().unwrap_or(ns);
                 let restricted_columns = match (&self.policy_store, &self.session_user) {
                     (Some(store), Some(user)) => {
-                        match store.resolve(user, table_ident.name(), ns).await {
+                        match store.resolve(user, table_ident.name(), policy_ns).await {
                             Ok(policy) => policy.restricted_columns,
                             Err(e) => {
                                 warn!(
