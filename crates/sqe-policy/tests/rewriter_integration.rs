@@ -654,6 +654,173 @@ async fn date_show_year_on_date32_executes_and_truncates_to_jan1() {
     assert_eq!(d_arr.value(1), expected_day, "2024-03-18 must truncate to 2024-01-01");
 }
 
+// ── Session-function row-filter tests (Phase 2B, Task 3) ─────────────────────
+//
+// These two tests prove that `is_role_in_session('admin') OR region = 'EU'`
+// used as a Ranger row filter:
+//   (a) works end-to-end: admin sees all 3 rows, analyst sees only 2 EU rows.
+//   (b) const-folds to a literal during DataFusion logical optimization on the
+//       coordinator, so the plan shipped to workers contains ONLY literals +
+//       column references -- no session UDF, no session state.
+//
+// DISTRIBUTION GATE: session functions are `Volatility::Immutable` and their
+// argument is a string literal, so DataFusion const-folds
+// `is_role_in_session('admin')` to `true`/`false` during coordinator-side
+// logical optimization. The optimized plan sent to workers contains only
+// Boolean literals and column predicates. Workers never see, evaluate, or
+// carry the UDF. This test is the gate for that property: if the fold does NOT
+// happen (the plan string still contains `is_role_in_session` after
+// `ctx.state().optimize()`), the test fails hard and this MUST be investigated
+// before shipping the distributed path.
+
+/// Build a SessionContext with the catalog/schema/table registration needed
+/// to optimize a plan that scans `cat.ns1.ns2.employees`, and return both the
+/// context and the optimized plan. Used to assert the const-fold property.
+async fn build_optimize_ctx_and_plan(
+    plan: LogicalPlan,
+    mem: Arc<MemTable>,
+) -> (SessionContext, LogicalPlan) {
+    let ctx = SessionContext::new();
+    let catalog = Arc::new(MemoryCatalogProvider::new());
+    catalog
+        .register_schema("ns1.ns2", Arc::new(MemorySchemaProvider::new()))
+        .unwrap();
+    ctx.register_catalog("cat", catalog);
+    ctx.register_table(TableReference::full("cat", "ns1.ns2", "employees"), mem)
+        .unwrap();
+    let optimized = ctx.state().optimize(&plan).unwrap();
+    (ctx, optimized)
+}
+
+/// Test A: admin role -- `is_role_in_session('admin')` folds to `true`.
+/// The OR short-circuits; the row filter disappears entirely. All 3 rows
+/// are returned. The optimized plan must contain no residual
+/// `is_role_in_session` call (it folded to the literal `true`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_fn_row_filter_admin_sees_all_rows_and_folds_to_literal() {
+    let (mem, scan) = build_multilevel_scan_with_mem();
+
+    let tref = TableReference::full("cat", "ns1.ns2", "employees");
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![
+            Expr::Column(Column::new(Some(tref.clone()), "customer_id")),
+            Expr::Column(Column::new(Some(tref.clone()), "region")),
+        ])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    // Build the filter expression with admin identity baked in.
+    let identity = sqe_policy::session_udf::SessionIdentity {
+        username: "carol".into(),
+        roles: vec!["admin".into()],
+        ..Default::default()
+    };
+    let filter_expr = sqe_policy::policy_expr::parse_sql_predicate(
+        "is_role_in_session('admin') OR region = 'EU'",
+        &identity,
+    )
+    .expect("parse_sql_predicate must succeed for admin identity");
+
+    let store = InMemoryPolicyStore::new();
+    let mut policy = ResolvedPolicy::default();
+    policy.row_filters.push(filter_expr);
+    store.add_table_policy("ns2", "employees", policy).await;
+
+    // SessionUser roles do not affect InMemoryPolicyStore resolution; the
+    // SessionIdentity baked into the UDF is what matters for fold behavior.
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store));
+    let rewritten = rewriter.evaluate(&user("carol", &["admin"]), plan).await.unwrap();
+
+    // --- (a) end-to-end correctness: admin sees all 3 rows ---
+    let mem_for_exec = Arc::clone(&mem);
+    let batches = execute_multilevel(rewritten.clone(), mem_for_exec).await;
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 3, "admin: filter must fold to true -> all 3 rows visible");
+
+    // --- (b) const-fold gate: optimized plan must contain no is_role_in_session ---
+    let (_ctx, optimized) = build_optimize_ctx_and_plan(rewritten, mem).await;
+    let plan_str = format!("{}", optimized.display_indent());
+    assert!(
+        !plan_str.contains("is_role_in_session"),
+        "DISTRIBUTION GATE FAILED: is_role_in_session was NOT const-folded in admin plan.\n\
+         Optimized plan:\n{plan_str}"
+    );
+}
+
+/// Test B: analyst role -- `is_role_in_session('admin')` folds to `false`.
+/// The OR reduces to `region = 'EU'`; only 2 EU rows are returned. The
+/// optimized plan must contain no residual `is_role_in_session` call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_fn_row_filter_analyst_sees_eu_only_and_folds_to_literal() {
+    let (mem, scan) = build_multilevel_scan_with_mem();
+
+    let tref = TableReference::full("cat", "ns1.ns2", "employees");
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![
+            Expr::Column(Column::new(Some(tref.clone()), "customer_id")),
+            Expr::Column(Column::new(Some(tref.clone()), "region")),
+        ])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    // Build the filter expression with analyst identity baked in.
+    let identity = sqe_policy::session_udf::SessionIdentity {
+        username: "dave".into(),
+        roles: vec!["analyst".into()],
+        ..Default::default()
+    };
+    let filter_expr = sqe_policy::policy_expr::parse_sql_predicate(
+        "is_role_in_session('admin') OR region = 'EU'",
+        &identity,
+    )
+    .expect("parse_sql_predicate must succeed for analyst identity");
+
+    let store = InMemoryPolicyStore::new();
+    let mut policy = ResolvedPolicy::default();
+    policy.row_filters.push(filter_expr);
+    store.add_table_policy("ns2", "employees", policy).await;
+
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store));
+    let rewritten = rewriter.evaluate(&user("dave", &["analyst"]), plan).await.unwrap();
+
+    // --- (a) end-to-end correctness: analyst sees only 2 EU rows ---
+    let mem_for_exec = Arc::clone(&mem);
+    let batches = execute_multilevel(rewritten.clone(), mem_for_exec).await;
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 2, "analyst: filter must reduce to region='EU' -> 2 EU rows");
+
+    // Also verify only EU values appear (US row is excluded).
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    for batch in &batches {
+        if let Some(region_col) = batch.column_by_name("region") {
+            let regions = region_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("region must be StringArray");
+            for i in 0..regions.len() {
+                assert_eq!(
+                    regions.value(i),
+                    "EU",
+                    "analyst must only see EU rows, got: {}",
+                    regions.value(i)
+                );
+            }
+        }
+    }
+    let _ = total_rows; // suppress unused warning
+
+    // --- (b) const-fold gate: optimized plan must contain no is_role_in_session ---
+    let (_ctx, optimized) = build_optimize_ctx_and_plan(rewritten, mem).await;
+    let plan_str = format!("{}", optimized.display_indent());
+    assert!(
+        !plan_str.contains("is_role_in_session"),
+        "DISTRIBUTION GATE FAILED: is_role_in_session was NOT const-folded in analyst plan.\n\
+         Optimized plan:\n{plan_str}"
+    );
+}
+
 /// Test C: PartialMask on a non-string (Int64) column falls back to typed NULL
 /// over a qualified multilevel scan.
 ///
