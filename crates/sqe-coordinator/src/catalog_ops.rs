@@ -742,6 +742,17 @@ impl CatalogOps {
             .commit_schema_update(&table_ident, table_updates, requirements)
             .await?;
 
+        // Explicitly evict the table metadata cache entry so the updated
+        // properties (e.g. sqe.column-tags) take effect on the next query.
+        // commit_schema_update already evicts the entry internally; this call
+        // is redundant but makes the intent visible at the DDL site and mirrors
+        // how SessionCatalog's own DDL handlers signal freshness.
+        //
+        // Note: policy-store cache invalidation (Arc<dyn PolicyStore>::invalidate_all)
+        // is handled one level up in QueryHandler::handle_statement, which has
+        // the policy store in scope. CatalogOps does not hold a PolicyStore.
+        session_catalog.invalidate_table(&table_ident).await;
+
         info!(
             table = %table_ident,
             "Table properties committed successfully"

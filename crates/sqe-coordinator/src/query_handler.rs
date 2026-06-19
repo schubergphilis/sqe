@@ -865,6 +865,11 @@ impl QueryHandler {
                 StatementKind::AlterTableProps(stmt) => {
                     self.catalog_ops.set_table_properties(session, stmt).await?;
                     crate::session_context::invalidate_session_cache(&session.user.username).await;
+                    // Flush cached tag policies so a SET TBLPROPERTIES on sqe.column-tags
+                    // takes effect on the next query rather than after the cache TTL.
+                    // Defense-in-depth: RangerStore::resolve_tags re-fetches the bundle
+                    // on every call regardless, so the tag path is not TTL-lagged.
+                    self.invalidate_policy_cache();
                     Ok(vec![])
                 }
                 StatementKind::RefDdl(ddl) => {
