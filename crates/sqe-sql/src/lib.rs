@@ -8,6 +8,7 @@ pub mod pipeline_types;
 pub mod procedures;
 pub mod time_travel;
 pub mod trino_compat;
+pub mod tvf_named_args;
 pub mod v3_types;
 
 pub use attach::{
@@ -28,6 +29,7 @@ pub use time_travel::{
     extract_incremental_spec, extract_time_travel_spec, IncrementalSpec, TimeTravelSpec, VersionRef,
 };
 pub use trino_compat::{check_expression_depth, rewrite_trino_compat};
+pub use tvf_named_args::rewrite_named_tvf_args;
 pub use v3_types::{
     detect_ns_timestamp, extract_default_literal, is_tz_variant, is_v3_only_type,
     DefaultError, DefaultLiteral, NsTimestamp,

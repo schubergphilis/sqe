@@ -493,7 +493,12 @@ impl SqlClient for EmbeddedClient {
         // path (`read_csv('hf://...')`) is unaffected; it does its own
         // rewrite via `rewrite_hf_path_in_place` inside the TVF.
         let rewritten = sqe_catalog::file_tvf_common::rewrite_hf_urls_in_sql(sql)?;
-        let df = self.ctx.sql(rewritten.as_ref()).await?;
+        // DF54: named TVF arguments (`delimiter => ';'`) are no longer
+        // accepted by DataFusion directly.  Convert them to the positional
+        // `'key=value'` form that `parse_file_tvf_args` understands, exactly
+        // as the coordinator does before handing SQL to DataFusion.
+        let rewritten = sqe_sql::rewrite_named_tvf_args(rewritten.as_ref());
+        let df = self.ctx.sql(&rewritten).await?;
         // Snapshot the DataFrame schema before collecting so we still
         // emit column names when the query produces zero batches (an
         // optimizer collapse like `WHERE FALSE` yields an EmptyExec).
