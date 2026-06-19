@@ -180,9 +180,53 @@ call or a NULL substitution before optimization. The complete set:
 The char convention matches the hive serviceDef transformers. Full `MASK` uses X/x/n; `MASK_SHOW_*`
 use x for every replaced character type. This is the complete Ranger hive built-in mask set.
 
-The quickstart seeds a `MASK_NULL` policy on `orders.amount` and a `MASK_SHOW_LAST_4` policy on
+The quickstart seeds a `MASK_NULL` policy on `orders.amount` and a CUSTOM show-last-4 policy on
 `orders.ssn`, both for role `engineer`. Test section 5 proves both: bob (engineer) sees
-`xxx-xx-1111` for ssn and an empty amount cell; alice (analyst-only) sees the raw values.
+`xxx-xx-1111` for ssn and an empty amount cell; alice (analyst-only) sees the raw values. No
+row-filter policy is seeded (see the SQE <-> Spark cross-compare below for why).
+
+## SQE <-> Spark cross-compare
+
+`parity-test.sh` runs `SELECT id, ssn FROM sales_wh.sales.orders` as `bob` (role `engineer`) in
+both SQE and Apache Spark 3.5 + the Kyuubi Spark AuthZ (Ranger) plugin, and asserts byte-identical
+masked output. Both engines read the SAME Polaris catalog and the SAME Ranger `hive` service.
+
+```
+bob --ROPC------> SQE   --reads hive svc--> mask applied by PlanRewriter
+bob --OS user---> Spark --reads hive svc--> mask applied by RangerSparkExtension (Kyuubi)
+                   |
+                   +-- both read the Iceberg table from the Polaris REST catalog
+                   +-- both resolve bob -> role engineer from the SAME Ranger `hive` service
+```
+
+Spark connects to Polaris as the `root` service account (client_credentials); the per-user mask is
+Kyuubi's job, keyed on `bob` via `HADOOP_USER_NAME`. SQE's coarse Polaris gate (the embedded Ranger
+authorizer on the `polaris` service) and Kyuubi's hive-service access policy are seeded separately
+because the two engines authorize through two different Ranger services.
+
+**Why the ssn mask is a CUSTOM portable-SQL expression, not a named type.** Named Ranger mask types
+are NOT byte-portable between SQE and Kyuubi:
+
+| Mask form | SQE | Spark / Kyuubi |
+|---|---|---|
+| Named `MASK_SHOW_LAST_4` | honors the servicedef transformer -> `xxx-xx-1111` | ignores it, applies its own mask chars -> `nnnUnnU1111` |
+| CUSTOM `mask_show_last_n({col},4,'x','x','x',-1,'1')` | plan-rewrite error (`type_coercion`) | `xxx-xx-1111`, but only after registering the Hive UDF |
+| CUSTOM `concat('xxx-xx-', substr({col},8,4))` | `xxx-xx-1111` | `xxx-xx-1111` |
+
+`concat` and `substr` are built-ins in both DataFusion (SQE) and Spark, so each engine injects the
+expression verbatim and both render the same result. That is the policy `bootstrap-ranger.sh` seeds.
+
+**Why no row filter in this cross-compare.** The base quickstart can seed a Ranger row filter, but
+parity-test.sh requires bob to see both rows of `orders`, and Kyuubi Spark 3.5 throws
+`MISSING_ATTRIBUTES` (#6889) on a row filter over a column the query does not project (`region`).
+Row-filter parity is out of scope on Spark 3.5 + Kyuubi 1.11 until #6889 is resolved.
+
+**Why Spark 3.5, not Spark 4.0.** Spark 4.0 is Scala 2.13-only and `kyuubi-spark-authz_2.13` is not
+published to Maven Central (verified 2026-06-19). Spark 3.5 (Scala 2.12) +
+`kyuubi-spark-authz-shaded_2.12-1.11.1` is the latest pre-built combo. The shaded Kyuubi jar bundles
+the Ranger plugin runtime (`ranger-plugins-common` + `ranger-plugins-audit`), which avoids the
+`AuditProviderFactory` ClassNotFound that the plain `kyuubi-spark-authz` jar hits. See
+`spark/Dockerfile`.
 
 **Phase 2B (not yet implemented).** Session-context SQL functions (`current_user()`,
 `current_role()`) inside row-filter expressions; richer role model in `SessionUser` for inherited

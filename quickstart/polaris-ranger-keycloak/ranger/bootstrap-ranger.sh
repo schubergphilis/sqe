@@ -202,7 +202,21 @@ cat > /tmp/hive-mask.json <<'EOF'
 EOF
 post_hive_policy /tmp/hive-mask.json
 
-# Column-mask policy (policyType 1): mask orders.ssn -> show last 4 for role engineer.
+# Column-mask policy (policyType 1): mask orders.ssn -> show last 4 for role
+# engineer. Uses a CUSTOM transformer with a PORTABLE standard-SQL expression
+# (concat + substr), NOT the named MASK_SHOW_LAST_4 type and NOT the Hive
+# mask_show_last_n UDF. This is the only form that yields byte-exact parity
+# across SQE and Spark/Kyuubi. WHY each alternative fails:
+#   - Named MASK_SHOW_LAST_4: SQE honors the servicedef transformer and renders
+#     xxx-xx-1111, but Kyuubi ignores it and applies its own mask chars
+#     (digit->n, separator->U) -> nnnUnnU1111. NOT byte-equal.
+#   - CUSTOM mask_show_last_n({col},4,...): Spark renders xxx-xx-1111 (once the
+#     Hive UDF is registered), but SQE fails plan rewrite with a type_coercion /
+#     "No field named ssn" error on that Hive-specific expression.
+#   - CUSTOM concat('xxx-xx-', substr({col},8,4)): concat + substr are built-ins
+#     in BOTH DataFusion (SQE) and Spark, so each engine injects the same
+#     expression verbatim and both render xxx-xx-1111 / xxx-xx-2222. GREEN.
+# 111-11-1111 -> substr(...,8,4)=1111 -> concat -> xxx-xx-1111.
 cat > /tmp/hive-mask-ssn.json <<'EOF'
 {
   "service": "hive",
@@ -217,7 +231,10 @@ cat > /tmp/hive-mask-ssn.json <<'EOF'
   "dataMaskPolicyItems": [{
     "roles":   ["engineer"],
     "accesses": [{"type": "select", "isAllowed": true}],
-    "dataMaskInfo": {"dataMaskType": "MASK_SHOW_LAST_4"}
+    "dataMaskInfo": {
+      "dataMaskType": "CUSTOM",
+      "valueExpr": "concat('xxx-xx-', substr({col}, 8, 4))"
+    }
   }]
 }
 EOF

@@ -50,26 +50,36 @@ echo
 # The Ranger plugin downloads policies on first query; allow up to 60s for that.
 echo "== Running query in Spark as bob (HADOOP_USER_NAME=bob) =="
 echo "(waiting up to 60s for Ranger policy download + first spark-sql start...)"
+# The shared CUSTOM mask expr is portable standard SQL
+# (concat('xxx-xx-', substr({col},8,4))). concat + substr are built-ins in
+# Spark, so Kyuubi injects the expr verbatim and Spark renders the same
+# xxx-xx-1111 as SQE -- no Hive UDF registration, no hive catalog impl, no
+# default-catalog gymnastics needed. The Iceberg catalog is referenced
+# fully-qualified (sales_wh.sales.orders) so no USE is required either.
+SPARK_CONF='--conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions,org.apache.kyuubi.plugin.spark.authz.ranger.RangerSparkExtension'
 SPARK_OUT=""
 for i in $(seq 1 6); do
   SPARK_OUT=$(docker compose exec -T \
     -e HADOOP_USER_NAME=bob \
     spark \
-    /opt/spark/bin/spark-sql \
-      --conf "spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions,org.apache.kyuubi.plugin.spark.authz.ranger.RangerSparkExtension" \
-      --conf "spark.driver.extraClassPath=/opt/spark/jars/*" \
-      -e "USE sales_wh.sales; $QUERY" 2>&1) || true
-  echo "$SPARK_OUT" | grep -qE 'xxx-xx-[0-9]{4}' && break
-  echo "  attempt $i/6: Spark not ready or mask not applied yet, retrying in 10s..."
+    /opt/spark/bin/spark-sql $SPARK_CONF -e "$QUERY" 2>&1) || true
+  # spark-sql prints "Fetched N row(s)" once the query actually executes.
+  echo "$SPARK_OUT" | grep -qE 'Fetched [0-9]+ row' && break
+  echo "  attempt $i/6: Spark not ready yet (policy download / first start), retrying in 10s..."
   sleep 10
 done
 echo "Spark raw output:"
 echo "$SPARK_OUT"
 echo
 
-# ── Normalize: extract the ssn column from each output, sorted ────────────────
+# ── Normalize: pull the ssn token from each engine's rows ─────────────────────
+# Both engines render the ssn as an 11-char token: 3 mask chars, a separator, 2
+# mask chars, a separator, then the 4 visible digits. Match exactly that shape
+# (canonical xxx-xx-NNNN, Kyuubi's built-in nnnUnnUNNNN, or a raw NNN-NN-NNNN).
+# The anchors keep stray URL/stack-trace text out of the comparison while still
+# letting a genuine mask-vocabulary difference show up in the diff.
 extract_ssn() {
-  echo "$1" | grep -oE '(xxx-xx-[0-9]{4}|[0-9]{3}-[0-9]{2}-[0-9]{4})' | sort
+  echo "$1" | grep -oE '[A-Za-z0-9]{3}[^A-Za-z0-9][A-Za-z0-9]{2}[^A-Za-z0-9][0-9]{4}' | sort -u
 }
 SQE_SSN=$(extract_ssn "$SQE_OUT")
 SPARK_SSN=$(extract_ssn "$SPARK_OUT")
@@ -81,28 +91,45 @@ echo
 
 # ── Assertions ────────────────────────────────────────────────────────────────
 PASS=0; FAIL=0
-EXPECTED=$'xxx-xx-1111\nxxx-xx-2222'
+green_pass() { green "PASS  $1"; PASS=$((PASS+1)); }
+red_fail()   { red   "FAIL  $1"; FAIL=$((FAIL+1)); }
 
-check() { # cond desc
-  if eval "$1"; then green "PASS  $2"; PASS=$((PASS+1)); else red "FAIL  $2"; FAIL=$((FAIL+1)); fi
-}
+# Raw-SSN leak guard: the full 9-digit dashed value must not appear in either.
+has_raw() { echo "$1" | grep -qE '[0-9]{3}-[0-9]{2}-[0-9]{4}'; }
+# Last-4 visible (show-last-4 actually applied, regardless of mask chars).
+shows_last4() { echo "$1" | grep -q '1111' && echo "$1" | grep -q '2222'; }
 
-# 1. SQE shows the masked pattern and not the raw ssn.
-check '[ "$SQE_SSN" = "$EXPECTED" ]' \
-  "SQE ssn = xxx-xx-1111 / xxx-xx-2222 (mask applied, raw hidden)"
-# 2. Spark shows the masked pattern and not the raw ssn.
-check '[ "$SPARK_SSN" = "$EXPECTED" ]' \
-  "Spark ssn = xxx-xx-1111 / xxx-xx-2222 (mask applied, raw hidden)"
-# 3. Neither engine leaks a raw 9-digit ssn.
-check '! echo "$SQE_SSN$SPARK_SSN" | grep -qE "^[0-9]{3}-[0-9]{2}-[0-9]{4}$"' \
-  "no raw SSN leaked by either engine"
-# 4. PARITY: the two engines produce byte-identical ssn output.
+# SEMANTIC checks (pass on this stack): both engines enforce the SAME Ranger
+# `hive` MASK_SHOW_LAST_4 policy -- raw hidden, last 4 visible.
+if ! has_raw "$SQE_SSN" && shows_last4 "$SQE_SSN"; then
+  green_pass "SQE: ssn masked show-last-4, raw hidden"
+else red_fail "SQE: ssn not masked as expected (got: $SQE_SSN)"; fi
+
+if ! has_raw "$SPARK_SSN" && shows_last4 "$SPARK_SSN"; then
+  green_pass "Spark: ssn masked show-last-4, raw hidden"
+else red_fail "Spark: ssn not masked as expected (got: $SPARK_SSN)"; fi
+
+# BYTE-EXACT PARITY (the headline assertion). This is deliberately NOT loosened:
+# if the two engines render the same Ranger mask type with different mask
+# characters, this FAILS and the diff shows exactly how -- that is the result,
+# not a bug in the test.
 if [ -n "$SQE_SSN" ] && [ "$SQE_SSN" = "$SPARK_SSN" ]; then
-  green "PASS  PARITY: SQE and Spark ssn output is byte-identical"; PASS=$((PASS+1))
+  green_pass "BYTE-EXACT PARITY: SQE and Spark ssn output is identical"
 else
-  red "FAIL  PARITY: SQE and Spark ssn output DIFFERS"
-  diff <(echo "$SQE_SSN") <(echo "$SPARK_SSN") || true
-  FAIL=$((FAIL+1))
+  red_fail "BYTE-EXACT PARITY: SQE and Spark ssn output DIFFERS"
+  echo "  SQE  : $(echo "$SQE_SSN"  | tr '\n' ' ')"
+  echo "  Spark: $(echo "$SPARK_SSN" | tr '\n' ' ')"
+  cat <<'NOTE'
+
+  Expected BOTH engines to render xxx-xx-1111 / xxx-xx-2222 from the shared
+  Ranger `hive` CUSTOM mask (mask_show_last_n({col},4,'x','x','x',-1,'1')).
+  If Spark shows nnnUnnU1111 the ssn policy reverted to the NAMED
+  MASK_SHOW_LAST_4 type -- Kyuubi does not honor that type's servicedef
+  transformer and applies its own mask chars. If Spark errors with
+  "Cannot load function mask_show_last_n", the temp-function registration or
+  the spark_catalog default-catalog scope did not take effect.
+  See OVERVIEW.md "SQE <-> Spark mask cross-compare" for the why.
+NOTE
 fi
 
 echo
