@@ -32,6 +32,23 @@ Polaris principal (the data bootstrap creates `alice`, `bob`, `carol`, `dave`).
 A token for a principal that does not exist is rejected with 401 "Failed to
 resolve principal". Polaris sends this principal name to Ranger as the `user`.
 
+This was tested directly with `polaris.authentication.type=external` (not just
+`mixed`): the `DefaultAuthenticator` still logs "Failed to resolve principal" and
+returns 401 for a Keycloak user with no Polaris principal, even though the JWT
+verifies and Ranger holds the user's roles. So Keycloak + Ranger alone is NOT
+enough; the Polaris principal entity is required regardless of auth.type.
+External mode also disables the internal `root` token, creating a bootstrap
+chicken-and-egg (nothing can authenticate to create the first principal), which
+is why this stack uses `mixed` (internal token for provisioning + external OIDC
+for users). Confirmed against source: `DefaultAuthenticator` (`@Identifier("default")`)
+is the ONLY authenticator in Polaris 1.5.0 and current `main`; it always looks the
+principal up in the metastore (`findPrincipalByName`/`findPrincipalById`) and 401s
+if absent, and its javadoc states it "does not support federated principals that
+are not managed by Polaris". `polaris.authentication.authenticator.type` only
+accepts `default`. So eliminating per-user principal provisioning is NOT a config
+option; it would require a custom `Authenticator` bean (a code change / custom
+build). Provision a principal per user instead.
+
 **Roles.** This is the surprising part. Polaris IGNORES the token's realm roles
 (they lack Polaris's expected `PRINCIPAL_ROLE:` prefix, so they are dropped
 during authentication). And Polaris principal-roles cannot help either: the
@@ -113,6 +130,66 @@ The Polaris service-def hierarchy is `root -> catalog -> namespace -> table`. Th
   `docker compose logs polaris`), then restart SQE.
 
 Resolved value for this stack: `"*"` (root required, wildcard-matched).
+
+## Fine-grained enforcement (SQE-side)
+
+The Polaris gate tested above is coarse: it answers "may this user load this table?" SQE also
+enforces row filters and column masks at the query-plan layer, reading a separate `hive`-type
+Ranger service. These two paths are independent.
+
+**How SQE reads the hive service.** On startup (and on a configurable refresh interval) SQE
+calls `GET /service/plugins/policies/download/hive` to download the policy set. The
+`[policy] engine = "ranger"` setting activates the `RangerStore: PolicyStore`, which caches
+these policies and evaluates them against each query's catalog, namespace, and table.
+
+**Plan rewriting.** SQE rewrites the `LogicalPlan` before DataFusion optimization. Row filters
+inject as `Filter` nodes above the `TableScan`; column masks replace column references with
+`CASE WHEN ... THEN NULL END` expressions. DataFusion's optimizer can push user predicates
+through row-filter nodes but not through masked columns (masking a column blocks predicate
+pushdown on that column's raw value, matching PostgreSQL RLS semantics).
+
+**Resource mapping.** SQE passes the last dotted component of the namespace as the `database`
+resource. For `sales_wh.sales.orders` the resource sent to Ranger is `database = "sales"`,
+`table = "orders"`. Ranger policies must use `"sales"` as the database value, not the full
+three-part path `"sales_wh.sales"`.
+
+**Separation from the coarse path.** `GRANT`/`REVOKE` go to the `polaris` Ranger service via
+`[access_control]`; Polaris enforces those at the catalog level. The `hive` Ranger service is
+read by SQE's policy engine for row/column enforcement. A query must pass both gates: the Polaris
+gate (can the user load the table?) and SQE's rewriter (what rows and columns may the user see?).
+Revoking the coarse `SELECT` grant still denies the query before any fine-grained check runs.
+
+**Shared with Apache Spark / Kyuubi.** The `hive` service is the same service those engines read,
+so the same policy set is shared across tools. A mask or row filter written for SQE applies to
+Spark queries through the same Ranger service and vice versa.
+
+**Supported mask types (Phase 2A, shipped).** The full Ranger hive built-in mask vocabulary is
+now enforced. SQE translates each `dataMaskType` string from the policy into a DataFusion UDF
+call or a NULL substitution before optimization. The complete set:
+
+| dataMaskType | Effect |
+|---|---|
+| `MASK_NULL` | Replace column value with NULL. |
+| `MASK` | Full character redact: uppercase -> X, lowercase -> x, digit -> n, punctuation kept. |
+| `MASK_SHOW_LAST_4` | Show last 4 characters; mask all others with x (digits and letters alike). Dashes and punctuation pass through. For `111-11-1111`: output is `xxx-xx-1111`. |
+| `MASK_SHOW_FIRST_4` | Show first 4 characters; mask the rest with x. |
+| `MASK_HASH` | Replace column value with an HMAC-SHA256 hex digest. |
+| `MASK_DATE_SHOW_YEAR` | Truncate a date to year: month and day zeroed out. |
+| `CUSTOM` | Arbitrary SQL expression evaluated per row. |
+
+The char convention matches the hive serviceDef transformers. Full `MASK` uses X/x/n; `MASK_SHOW_*`
+use x for every replaced character type. This is the complete Ranger hive built-in mask set.
+
+The quickstart seeds a `MASK_NULL` policy on `orders.amount` and a `MASK_SHOW_LAST_4` policy on
+`orders.ssn`, both for role `engineer`. Test section 5 proves both: bob (engineer) sees
+`xxx-xx-1111` for ssn and an empty amount cell; alice (analyst-only) sees the raw values.
+
+**Phase 2B (not yet implemented).** Session-context SQL functions (`current_user()`,
+`current_role()`) inside row-filter expressions; richer role model in `SessionUser` for inherited
+and secondary roles.
+
+**Phase 2C (not yet implemented).** Cross-engine dynamic transformer configuration for arbitrary-N
+show-first/show-last masks; tag-based masking via Ranger tag policies.
 
 ## Versions
 

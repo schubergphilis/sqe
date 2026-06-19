@@ -26,7 +26,6 @@
 use std::sync::Arc;
 
 use datafusion::catalog::{TableFunctionImpl, TableProvider};
-use datafusion::common::{plan_err, ScalarValue};
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl};
 use datafusion::error::Result as DFResult;
@@ -82,118 +81,27 @@ impl ReadParquetArgs {
     }
 }
 
-/// Parse a `ScalarValue::Utf8` or `ScalarValue::LargeUtf8` to `&str`.
-fn scalar_to_str(sv: &ScalarValue) -> Option<&str> {
-    match sv {
-        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Some(s.as_str()),
-        _ => None,
-    }
-}
-
 /// Extract positional + named arguments from the raw `Expr` slice that
 /// DataFusion passes to [`TableFunctionImpl::call`].
 ///
-/// Named args arrive as `BinaryExpr { left: Column(name), op: Eq, right: Literal(value) }`.
+/// Delegates to [`crate::file_tvf_common::parse_file_tvf_args`] so both
+/// named-arg form (`access_key => 'x'`) and the DF54 positional-literal form
+/// (`'access_key=x'`) are accepted for all storage credential keys.
+/// `read_parquet` has no format-specific extra args, so the `extra` closure
+/// always returns `false` (unknown keys produce a plan error).
 fn parse_args(exprs: &[Expr]) -> DFResult<ReadParquetArgs> {
-    // First positional arg must be a string literal (the path / URL).
-    let path = match exprs.first() {
-        Some(Expr::Literal(sv, _)) => scalar_to_str(sv)
-            .ok_or_else(|| datafusion::error::DataFusionError::Plan(
-                "read_parquet: first argument must be a non-null string literal (the path)".to_string(),
-            ))?
-            .to_string(),
-        Some(_) => {
-            return plan_err!(
-                "read_parquet: first argument must be a string literal (the path)"
-            );
-        }
-        None => {
-            return plan_err!("read_parquet: at least one argument (the path) is required");
-        }
-    };
-
-    let mut access_key: Option<String> = None;
-    let mut secret_key: Option<String> = None;
-    let mut endpoint: Option<String> = None;
-    let mut region: Option<String> = None;
-    let mut azure_account: Option<String> = None;
-    let mut azure_access_key: Option<String> = None;
-    let mut azure_sas_token: Option<String> = None;
-    let mut gcs_service_account_path: Option<String> = None;
-    let mut gcs_service_account_key: Option<String> = None;
-
-    // Remaining args are named: `name => 'value'` which the planner represents
-    // as `BinaryExpr { left: Column { name }, op: Eq, right: Literal(value) }`.
-    for expr in exprs.iter().skip(1) {
-        match expr {
-            Expr::BinaryExpr(binary) => {
-                use datafusion_expr::Operator;
-                if binary.op != Operator::Eq {
-                    return plan_err!(
-                        "read_parquet: named arguments must use '=>' / '=', got operator {:?}",
-                        binary.op
-                    );
-                }
-                let name = match binary.left.as_ref() {
-                    Expr::Column(col) => col.name.as_str(),
-                    other => {
-                        return plan_err!(
-                            "read_parquet: named argument key must be an identifier, got {other}"
-                        );
-                    }
-                };
-                let value = match binary.right.as_ref() {
-                    Expr::Literal(sv, _) => scalar_to_str(sv)
-                        .ok_or_else(|| datafusion::error::DataFusionError::Plan(
-                            format!("read_parquet: named argument '{name}' must be a non-null string"),
-                        ))?
-                        .to_string(),
-                    other => {
-                        return plan_err!(
-                            "read_parquet: named argument '{name}' value must be a string literal, got {other}"
-                        );
-                    }
-                };
-                match name {
-                    "access_key" => access_key = Some(value),
-                    "secret_key" => secret_key = Some(value),
-                    "endpoint" => endpoint = Some(value),
-                    "region" => region = Some(value),
-                    "azure_account" => azure_account = Some(value),
-                    "azure_access_key" => azure_access_key = Some(value),
-                    "azure_sas_token" => azure_sas_token = Some(value),
-                    "gcs_service_account_path" => gcs_service_account_path = Some(value),
-                    "gcs_service_account_key" => gcs_service_account_key = Some(value),
-                    unknown => {
-                        return plan_err!(
-                            "read_parquet: unknown named argument '{unknown}'; \
-                             supported: access_key, secret_key, endpoint, region, \
-                             azure_account, azure_access_key, azure_sas_token, \
-                             gcs_service_account_path, gcs_service_account_key"
-                        );
-                    }
-                }
-            }
-            other => {
-                return plan_err!(
-                    "read_parquet: unexpected argument expression {other}; \
-                     named arguments must use the form 'key => value'"
-                );
-            }
-        }
-    }
-
+    let f = crate::file_tvf_common::parse_file_tvf_args("read_parquet", exprs, |_, _| false)?;
     Ok(ReadParquetArgs {
-        path,
-        access_key,
-        secret_key,
-        endpoint,
-        region,
-        azure_account,
-        azure_access_key,
-        azure_sas_token,
-        gcs_service_account_path,
-        gcs_service_account_key,
+        path: f.path,
+        access_key: f.access_key,
+        secret_key: f.secret_key,
+        endpoint: f.endpoint,
+        region: f.region,
+        azure_account: f.azure_account,
+        azure_access_key: f.azure_access_key,
+        azure_sas_token: f.azure_sas_token,
+        gcs_service_account_path: f.gcs_service_account_path,
+        gcs_service_account_key: f.gcs_service_account_key,
     })
 }
 
@@ -468,6 +376,7 @@ fn extract_bucket(path: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::common::ScalarValue;
     use sqe_core::config::StorageConfig;
 
     fn default_storage() -> StorageConfig {
@@ -600,6 +509,58 @@ mod tests {
         let exprs = vec![Expr::Literal(ScalarValue::Int64(Some(42)), None)];
         let result = parse_args(&exprs);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_args_positional_kv_literals() {
+        // DF54 rewrite produces positional 'key=value' string literals for
+        // named TVF args. This is the exact shape the benchmark CTAS load uses:
+        //   SELECT * FROM read_parquet('s3://...', 'access_key=s3admin', ...)
+        let exprs = vec![
+            make_str_literal("s3://bucket/data.parquet"),
+            make_str_literal("access_key=s3admin"),
+            make_str_literal("secret_key=s3secret"),
+            make_str_literal("region=us-east-1"),
+        ];
+        let args = parse_args(&exprs).unwrap();
+        assert_eq!(args.path, "s3://bucket/data.parquet");
+        assert_eq!(args.access_key.as_deref(), Some("s3admin"));
+        assert_eq!(args.secret_key.as_deref(), Some("s3secret"));
+        assert_eq!(args.region.as_deref(), Some("us-east-1"));
+        assert!(args.endpoint.is_none());
+    }
+
+    #[test]
+    fn test_parse_args_positional_all_credential_keys() {
+        // Verify every supported credential key is reachable via positional literals.
+        let exprs = vec![
+            make_str_literal("azure://container/data.parquet"),
+            make_str_literal("azure_account=myaccount"),
+            make_str_literal("azure_access_key=mykey"),
+            make_str_literal("azure_sas_token=sv=2021"),
+            make_str_literal("gcs_service_account_path=/tmp/sa.json"),
+            make_str_literal("gcs_service_account_key={\"type\":\"service_account\"}"),
+        ];
+        let args = parse_args(&exprs).unwrap();
+        assert_eq!(args.azure_account.as_deref(), Some("myaccount"));
+        assert_eq!(args.azure_access_key.as_deref(), Some("mykey"));
+        assert_eq!(args.azure_sas_token.as_deref(), Some("sv=2021"));
+        assert_eq!(args.gcs_service_account_path.as_deref(), Some("/tmp/sa.json"));
+        assert_eq!(
+            args.gcs_service_account_key.as_deref(),
+            Some("{\"type\":\"service_account\"}")
+        );
+    }
+
+    #[test]
+    fn test_parse_args_positional_unknown_key_is_error() {
+        let exprs = vec![
+            make_str_literal("/data/file.parquet"),
+            make_str_literal("unknown_param=value"),
+        ];
+        let result = parse_args(&exprs);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown named argument"));
     }
 
     // ── S3 builder (unit-level, no network) ─────────────────────────────────

@@ -18,7 +18,7 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::logical_expr::{col, lit, Cast, Expr, Filter, LogicalPlan, Projection};
+use datafusion::logical_expr::{col, lit, Cast, Expr, LogicalPlan, LogicalPlanBuilder};
 use datafusion::scalar::ScalarValue;
 use tracing::{debug, warn};
 
@@ -143,75 +143,83 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                             return Ok(Transformed::no(node));
                         }
 
-                        let mut current = node;
+                        // Build the security wrappers with LogicalPlanBuilder so
+                        // injected expressions are NORMALIZED against the real
+                        // scan schema. An Iceberg TableScan exposes fully
+                        // qualified fields (`catalog.schema.table.col`), while
+                        // the policy row filters (parsed schema-free) and the
+                        // mask UDF args use BARE column names. Manual
+                        // Filter/Projection construction left those refs
+                        // unqualified, so physical planning failed with
+                        // "No field named <qualified>.col". `filter()` and
+                        // `project()` both run `normalize_col`, qualifying every
+                        // column reference (including those nested inside Hash /
+                        // Custom mask expressions) to the child schema.
+                        let mut builder = LogicalPlanBuilder::from(node);
 
-                        // 1. Inject row filters above the TableScan
+                        // 1. Inject row filters above the TableScan.
                         for filter_expr in &policy.row_filters {
-                            current = LogicalPlan::Filter(
-                                Filter::try_new(filter_expr.clone(), Arc::new(current))
-                                    .map_err(|e| {
-                                        datafusion::error::DataFusionError::Internal(format!(
-                                            "Failed to create policy filter: {e}"
-                                        ))
-                                    })?,
-                            );
+                            builder = builder.filter(filter_expr.clone()).map_err(|e| {
+                                datafusion::error::DataFusionError::Internal(format!(
+                                    "Failed to create policy filter: {e}"
+                                ))
+                            })?;
                         }
 
-                        // 2. Apply column masks via projection
-                        if !policy.column_masks.is_empty() {
-                            let schema = current.schema();
+                        // 2. Apply column masks and/or restrictions via a
+                        //    projection that drops restricted columns, masks
+                        //    masked columns, and passes the rest through with
+                        //    their real (qualified) column reference.
+                        if !policy.column_masks.is_empty()
+                            || !policy.restricted_columns.is_empty()
+                        {
+                            let schema = builder.schema().clone();
                             let exprs: Vec<Expr> = schema
-                                .fields()
                                 .iter()
-                                .filter(|f| !policy.restricted_columns.contains(f.name()))
-                                .map(|f| {
-                                    if let Some(mask) = policy.column_masks.get(f.name()) {
-                                        apply_mask(f.name(), f.data_type(), mask, mask_key.clone())
-                                            .alias(f.name())
+                                .filter(|(_q, f)| {
+                                    !policy.restricted_columns.contains(f.name())
+                                })
+                                .map(|(qualifier, field)| {
+                                    let name = field.name();
+                                    if let Some(mask) = policy.column_masks.get(name) {
+                                        // Alias the mask expr to the column's
+                                        // QUALIFIED name so the output field
+                                        // keeps the scan's qualifier. A bare
+                                        // `.alias(name)` produces an unqualified
+                                        // field, which breaks the user's outer
+                                        // `SELECT t.col` reference (planned
+                                        // against the qualified scan) with
+                                        // "No field named <qualified>.col".
+                                        apply_mask(
+                                            name,
+                                            field.data_type(),
+                                            mask,
+                                            mask_key.clone(),
+                                        )
+                                        .alias_qualified(qualifier.cloned(), name.clone())
                                     } else {
-                                        col(f.name())
+                                        Expr::Column(datafusion::common::Column::new(
+                                            qualifier.cloned(),
+                                            name,
+                                        ))
                                     }
                                 })
                                 .collect();
 
                             if !exprs.is_empty() {
-                                current = LogicalPlan::Projection(
-                                    Projection::try_new(exprs, Arc::new(current)).map_err(
-                                        |e| {
-                                            datafusion::error::DataFusionError::Internal(
-                                                format!(
-                                                    "Failed to create policy projection: {e}"
-                                                ),
-                                            )
-                                        },
-                                    )?,
-                                );
+                                builder = builder.project(exprs).map_err(|e| {
+                                    datafusion::error::DataFusionError::Internal(format!(
+                                        "Failed to create policy projection: {e}"
+                                    ))
+                                })?;
                             }
                         }
-                        // 3. Apply column restrictions (remove columns entirely)
-                        else if !policy.restricted_columns.is_empty() {
-                            let schema = current.schema();
-                            let exprs: Vec<Expr> = schema
-                                .fields()
-                                .iter()
-                                .filter(|f| !policy.restricted_columns.contains(f.name()))
-                                .map(|f| col(f.name()))
-                                .collect();
 
-                            if !exprs.is_empty() {
-                                current = LogicalPlan::Projection(
-                                    Projection::try_new(exprs, Arc::new(current)).map_err(
-                                        |e| {
-                                            datafusion::error::DataFusionError::Internal(
-                                                format!(
-                                                    "Failed to create restriction projection: {e}"
-                                                ),
-                                            )
-                                        },
-                                    )?,
-                                );
-                            }
-                        }
+                        let current = builder.build().map_err(|e| {
+                            datafusion::error::DataFusionError::Internal(format!(
+                                "Failed to build policy plan: {e}"
+                            ))
+                        })?;
 
                         // Jump: skip descending into the wrappers we just
                         // injected. Continue would re-enter the inner
@@ -267,6 +275,16 @@ fn resolve_policy_key(
     Some((namespace, table.to_string()))
 }
 
+/// A typed NULL literal of `data_type` (so projection output type == column
+/// type). Falls back to a Utf8 NULL cast into the target type for Arrow types
+/// that have no direct ScalarValue::try_from.
+fn typed_null(data_type: &DataType) -> Expr {
+    match ScalarValue::try_from(data_type) {
+        Ok(scalar) => lit(scalar),
+        Err(_) => Expr::Cast(Cast::new(Box::new(lit(ScalarValue::Utf8(None))), data_type.clone())),
+    }
+}
+
 /// Apply a mask type to a column, returning the masking expression.
 ///
 /// `data_type` is the Arrow type of the original column. The returned
@@ -281,15 +299,7 @@ fn apply_mask(
     mask_key: Option<Arc<Vec<u8>>>,
 ) -> Expr {
     match mask {
-        MaskType::Nullify => match ScalarValue::try_from(data_type) {
-            Ok(scalar) => lit(scalar),
-            // Unsupported Arrow type for typed NULL: cast a Utf8 NULL into
-            // the target type so the optimizer still sees the right shape.
-            Err(_) => Expr::Cast(Cast::new(
-                Box::new(lit(ScalarValue::Utf8(None))),
-                data_type.clone(),
-            )),
-        },
+        MaskType::Nullify => typed_null(data_type),
         MaskType::Redact(value) => {
             if matches!(data_type, DataType::Utf8 | DataType::LargeUtf8) {
                 lit(value.clone())
@@ -321,6 +331,53 @@ fn apply_mask(
             }
         }
         MaskType::Custom(expr) => expr.clone(),
+        MaskType::PartialMask { show_first, show_last, upper, lower, digit } => {
+            let mask_expr = |inner: Expr| {
+                Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+                    Arc::new(crate::mask_udf::mask_partial_udf(
+                        *show_first, *show_last, *upper, *lower, *digit,
+                    )),
+                    vec![inner],
+                ))
+            };
+            match data_type {
+                // Utf8 column: mask directly (UDF returns Utf8 == column type).
+                DataType::Utf8 => mask_expr(col(column_name)),
+                // LargeUtf8 column: the UDF only accepts Utf8, and the output
+                // must be LargeUtf8 to match the column type. Cast in and back.
+                DataType::LargeUtf8 => Expr::Cast(Cast::new(
+                    Box::new(mask_expr(Expr::Cast(Cast::new(
+                        Box::new(col(column_name)),
+                        DataType::Utf8,
+                    )))),
+                    DataType::LargeUtf8,
+                )),
+                // Non-string column: a char-class mask is meaningless; fall back
+                // to a typed NULL so the value is hidden AND output type ==
+                // column type (no type_coercion failure).
+                _ => {
+                    warn!(column = %column_name, ?data_type,
+                        "PartialMask on non-string column; falling back to NULL");
+                    typed_null(data_type)
+                }
+            }
+        }
+        MaskType::DateShowYear => match data_type {
+            DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _) => {
+                let truncated = datafusion::functions::expr_fn::date_trunc(
+                    lit("year"),
+                    col(column_name),
+                );
+                // date_trunc returns a Timestamp; cast back to the column's exact
+                // type so the projection schema matches (Date32 stays Date32).
+                Expr::Cast(Cast::new(Box::new(truncated), data_type.clone()))
+            }
+            _ => {
+                warn!(column = %column_name, ?data_type,
+                    "DateShowYear on non-temporal column; falling back to NULL");
+                typed_null(data_type)
+            }
+        },
     }
 }
 

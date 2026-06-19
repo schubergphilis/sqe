@@ -36,7 +36,7 @@ sqe> SELECT snapshot_id, committed_at FROM s3tables.sales."orders$snapshots";
 
 **Multi-catalog and multi-cloud, in one engine.** Apache Polaris, Project Nessie, Unity Catalog OSS, AWS Glue (native SDK), AWS S3 Tables (native SDK), Hive Metastore, JDBC (Postgres, MySQL, SQLite), and Hadoop storage-only. Object stores: S3 (with endpoint override for Ceph, R2, Garage, MinIO), Azure ADLS, GCS, local filesystem, HuggingFace `hf://`.
 
-**Identity flows end to end.** OIDC password grant. The user's bearer token is passed through to Polaris and S3 on every query. Row filters and column masks via OPA or Cedar at the LogicalPlan layer are on the roadmap, not yet wired: the policy crate (plan rewriter, row filters, column masks, OPA/Cedar stores) exists, but the coordinator currently runs passthrough enforcement only. Do not rely on SQE-side policy enforcement yet. Identity passthrough and PostgreSQL-style RLS semantics are the target design.
+**Identity flows end to end.** OIDC password grant. The user's bearer token is passed through to Polaris and S3 on every query. Row filters and column masks at the LogicalPlan layer are now enforced when `[policy] engine = "ranger"` is set: SQE downloads the `hive` Ranger service policy set and rewrites the plan before DataFusion optimization (row filters above the scan, column masks that block predicate pushdown). Phase 1 covers `MASK_NULL` and row-filter expressions. Phase 2A delivers the full mask vocabulary: hash, partial show-first/last, date truncation to year/month/day, full redact, and custom expressions, all with type preservation through the physical planner. Phase 2B (session-context functions, tag-based masking) is still on the roadmap. OPA and Cedar policy stores are also on the roadmap. The end-to-end demo is in `quickstart/polaris-ranger-keycloak/`.
 
 **Lineage shipped.** Coordinator emits OpenLineage 2-0-2 events with column-level lineage on writes. File and HTTP sinks. Disk-spool fallback for collector outages. Off by default. [`docs/book/src/operations/openlineage.md`](docs/book/src/operations/openlineage.md).
 
@@ -48,6 +48,7 @@ sqe> SELECT snapshot_id, committed_at FROM s3tables.sales."orders$snapshots";
 | **Distributed mode** (coordinator + workers) | yes | yes | no |
 | **Iceberg V2 + V3 read + write** | native | V2 + partial V3 | extension, read-only |
 | **Per-query OIDC bearer passthrough** | yes | service account only | n/a (single-tenant) |
+| **Ranger row filters + column masks at LogicalPlan** | yes (Phase 1 + Phase 2A) | no | no |
 | **OPA / Cedar policy at LogicalPlan** | roadmap | no | no |
 | **GRANT/REVOKE to Polaris or Apache Ranger** | yes | no | no |
 | **Multi-catalog in one engine** | 7 backends | one at a time | per-extension |
