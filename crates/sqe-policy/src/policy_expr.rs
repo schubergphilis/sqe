@@ -241,4 +241,40 @@ mod tests {
         let id = SessionIdentity::default();
         assert!(parse_sql_predicate("region = 'EU' AND tier < 3", &id).is_ok());
     }
+
+    #[test]
+    fn custom_mask_can_reference_sibling_column() {
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+        use datafusion::logical_expr::Expr;
+
+        let identity = SessionIdentity {
+            username: "bob".to_string(),
+            roles: vec![],
+            database: Some("db".to_string()),
+            schema: Some("sales".to_string()),
+        };
+
+        let expr = parse_sql_predicate(
+            "CASE WHEN department = 'HR' THEN salary ELSE '0' END",
+            &identity,
+        )
+        .expect("sibling-referencing CASE mask must parse");
+
+        let mut seen: Vec<String> = Vec::new();
+        expr.apply(|e| {
+            if let Expr::Column(c) = e {
+                seen.push(c.name.clone());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        assert!(
+            seen.iter().any(|n| n == "department"),
+            "sibling column `department` must be in scope, saw {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|n| n == "salary"),
+            "masked column `salary` must be referenced, saw {seen:?}"
+        );
+    }
 }
