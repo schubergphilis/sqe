@@ -8,7 +8,10 @@ pub mod ranger_store;
 pub mod mask_udf;
 pub mod sha256_udf;
 pub mod session_udf;
+pub mod tag_source;
 pub mod write_predicates;
+
+pub use tag_source::{NoopTagSource, TagSource};
 
 use async_trait::async_trait;
 use datafusion::logical_expr::LogicalPlan;
