@@ -10,10 +10,13 @@ policies when SQE asks Polaris for table access on behalf of a user.
 ```bash
 cp .env.example .env
 docker compose up -d --build --wait   # Ranger Admin first-boot takes 2-4 min
-./test.sh
+./test.sh            # SQE GRANT/REVOKE + fine-grained mask enforcement
+./parity-test.sh     # SQE <-> Spark (Kyuubi Authz) Ranger mask cross-compare
 ```
 
-Or `./run.sh` (does both). Tear down with `./run.sh --down`.
+Or `./run.sh` (does both). Tear down with `./run.sh --down`. First run also
+builds an Apache Spark image and downloads roughly 250 MB of Spark/Iceberg/Kyuubi
+jars.
 
 ## What it proves
 
@@ -26,6 +29,28 @@ Or `./run.sh` (does both). Tear down with `./run.sh --down`.
 - A Ranger DENY added to the same policy, overriding an allow (deny precedence).
 - Negative tests: an ungranted user and a read-only role are denied.
 - `SHOW GRANTS` round-trip, a `REVOKE` that takes effect, and `CHECK ACCESS`.
+
+## SQE <-> Spark cross-compare
+
+`parity-test.sh` proves SQE and Apache Spark agree on a Ranger column mask. Both
+engines share ONE Polaris catalog and ONE Ranger `hive` service. Running
+`SELECT id, ssn FROM sales_wh.sales.orders` as `bob` (role `engineer`) returns
+the SAME masked output in both:
+
+| Engine | Identity to Ranger | ssn output |
+|---|---|---|
+| SQE | `bob` (Keycloak ROPC) | `xxx-xx-1111`, `xxx-xx-2222` |
+| Spark 3.5 + Kyuubi Authz | `bob` (`HADOOP_USER_NAME`) | `xxx-xx-1111`, `xxx-xx-2222` |
+
+Spark connects to Polaris as the `root` service account; the per-user ssn mask
+is the Kyuubi `RangerSparkExtension`'s job, keyed on `bob`. The mask policy uses
+a CUSTOM portable-SQL transformer (`concat('xxx-xx-', substr({col},8,4))`) so the
+two engines render byte-identical output. See `OVERVIEW.md` for why named Ranger
+mask types are NOT byte-portable between SQE and Kyuubi.
+
+Spark 4.0 is not used: `kyuubi-spark-authz_2.13` is not published to Maven
+Central, so Spark 3.5 (Scala 2.12) + `kyuubi-spark-authz-shaded_2.12-1.11.1` is
+the latest pre-built combo. See `spark/Dockerfile`.
 
 ## Endpoints
 
