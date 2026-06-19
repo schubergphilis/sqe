@@ -275,6 +275,16 @@ fn resolve_policy_key(
     Some((namespace, table.to_string()))
 }
 
+/// A typed NULL literal of `data_type` (so projection output type == column
+/// type). Falls back to a Utf8 NULL cast into the target type for Arrow types
+/// that have no direct ScalarValue::try_from.
+fn typed_null(data_type: &DataType) -> Expr {
+    match ScalarValue::try_from(data_type) {
+        Ok(scalar) => lit(scalar),
+        Err(_) => Expr::Cast(Cast::new(Box::new(lit(ScalarValue::Utf8(None))), data_type.clone())),
+    }
+}
+
 /// Apply a mask type to a column, returning the masking expression.
 ///
 /// `data_type` is the Arrow type of the original column. The returned
@@ -289,15 +299,7 @@ fn apply_mask(
     mask_key: Option<Arc<Vec<u8>>>,
 ) -> Expr {
     match mask {
-        MaskType::Nullify => match ScalarValue::try_from(data_type) {
-            Ok(scalar) => lit(scalar),
-            // Unsupported Arrow type for typed NULL: cast a Utf8 NULL into
-            // the target type so the optimizer still sees the right shape.
-            Err(_) => Expr::Cast(Cast::new(
-                Box::new(lit(ScalarValue::Utf8(None))),
-                data_type.clone(),
-            )),
-        },
+        MaskType::Nullify => typed_null(data_type),
         MaskType::Redact(value) => {
             if matches!(data_type, DataType::Utf8 | DataType::LargeUtf8) {
                 lit(value.clone())
@@ -329,6 +331,53 @@ fn apply_mask(
             }
         }
         MaskType::Custom(expr) => expr.clone(),
+        MaskType::PartialMask { show_first, show_last, upper, lower, digit } => {
+            let mask_expr = |inner: Expr| {
+                Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+                    Arc::new(crate::mask_udf::mask_partial_udf(
+                        *show_first, *show_last, *upper, *lower, *digit,
+                    )),
+                    vec![inner],
+                ))
+            };
+            match data_type {
+                // Utf8 column: mask directly (UDF returns Utf8 == column type).
+                DataType::Utf8 => mask_expr(col(column_name)),
+                // LargeUtf8 column: the UDF only accepts Utf8, and the output
+                // must be LargeUtf8 to match the column type. Cast in and back.
+                DataType::LargeUtf8 => Expr::Cast(Cast::new(
+                    Box::new(mask_expr(Expr::Cast(Cast::new(
+                        Box::new(col(column_name)),
+                        DataType::Utf8,
+                    )))),
+                    DataType::LargeUtf8,
+                )),
+                // Non-string column: a char-class mask is meaningless; fall back
+                // to a typed NULL so the value is hidden AND output type ==
+                // column type (no type_coercion failure).
+                _ => {
+                    warn!(column = %column_name, ?data_type,
+                        "PartialMask on non-string column; falling back to NULL");
+                    typed_null(data_type)
+                }
+            }
+        }
+        MaskType::DateShowYear => match data_type {
+            DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _) => {
+                let truncated = datafusion::functions::expr_fn::date_trunc(
+                    lit("year"),
+                    col(column_name),
+                );
+                // date_trunc returns a Timestamp; cast back to the column's exact
+                // type so the projection schema matches (Date32 stays Date32).
+                Expr::Cast(Cast::new(Box::new(truncated), data_type.clone()))
+            }
+            _ => {
+                warn!(column = %column_name, ?data_type,
+                    "DateShowYear on non-temporal column; falling back to NULL");
+                typed_null(data_type)
+            }
+        },
     }
 }
 
