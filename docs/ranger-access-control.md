@@ -120,6 +120,19 @@ field names (`accessTypes`, `delegateAdmin`, `enableAudit`,
 `replaceExistingPermissions`, `isRecursive`). Audit is on; delegate-admin,
 replace-existing, and recursive are off.
 
+### Future tables in a schema
+
+`GRANT SELECT ON FUTURE TABLES IN SCHEMA sales_wh.sales TO ROLE analyst` grants
+the privilege across every table in the namespace. SQE translates it to a Ranger
+policy with a table wildcard (`table = "*"`). New tables created later in
+`sales` are covered automatically, with no follow-up grant.
+
+One difference from Snowflake: Snowflake's FUTURE grant applies only to objects
+created after the grant. Ranger has no future-only resource, so SQE's wildcard
+also covers tables that already exist in the schema. The grant means "every
+table in this schema, present and future." Use a table-specific grant when you
+need to scope to a single existing table.
+
 ### Identifier validation
 
 Catalog, namespace, table, and grantee names come from `GRANT` SQL and flow into
