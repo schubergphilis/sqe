@@ -3,12 +3,12 @@
 //! returns a `ResolvedPolicy` for the PlanRewriter. Shares the policy set with
 //! Apache Spark / Kyuubi. See docs/ranger-fine-grained-service-type.md.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use datafusion::logical_expr::lit;
+use datafusion::logical_expr::{lit, Expr};
 use moka::future::Cache;
 use reqwest::Client;
 use serde::Deserialize;
@@ -23,6 +23,18 @@ use crate::{MaskType, PolicyStore, ResolvedPolicy};
 
 // --- Ranger policy bundle model (ServicePolicies) ---
 
+// TODO(phase3): verify tagPolicies shape against a live tag-linked bundle
+/// Nested tag-service policy bundle. Present when Ranger has at least one
+/// tag-based policy. Structure mirrors the top-level `ServicePolicies` but
+/// with `tag` resources instead of database/table/column.
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct TagPolicies {
+    /// Same `RangerPolicy` type as resource policies; `resources` map carries
+    /// a `tag` key with the tag values (e.g. `["PII"]`).
+    #[serde(default)]
+    pub(crate) policies: Vec<RangerPolicy>,
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct ServicePolicies {
     #[serde(rename = "policyVersion", default)]
@@ -30,6 +42,10 @@ pub(crate) struct ServicePolicies {
     pub(crate) policy_version: Option<i64>,
     #[serde(default)]
     pub(crate) policies: Vec<RangerPolicy>,
+    /// Nested tag-service policies. Present when the Ranger bundle includes
+    /// tag-based policies. Absent in pure-resource bundles (default = None).
+    #[serde(rename = "tagPolicies", default)]
+    pub(crate) tag_policies: Option<TagPolicies>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -385,6 +401,142 @@ fn resolve_from_bundle(
     policy
 }
 
+/// Resolve tag-based mask and row-filter policies from the bundle for a given
+/// user identity and a set of column tags (Iceberg column-level tags).
+///
+/// Returns:
+/// - `HashMap<tag, MaskType>` -- masks keyed by **tag name** (not column name).
+///   The caller (Task 4 rewriter) maps tag -> column using the Iceberg schema's
+///   column->tags map.
+/// - `Vec<(tag, Expr)>` -- row filters keyed by the tag that triggered them.
+/// - `HashSet<tag>` -- tags that matched the user but whose mask could NOT be
+///   mapped to a supported `MaskType` (unsupported type, or CUSTOM which is not
+///   yet supported at tag-resolve time). The caller MUST restrict any column
+///   bearing one of these tags (fail-closed), mirroring the resource path's
+///   `Err(())` -> `restricted_columns` behaviour. Without this, a column whose
+///   only protection is an unmappable tag mask would be returned RAW.
+///
+/// This function is pure (no I/O) and unit-tested directly. It is wired into
+/// the plan rewriter in Task 4.
+///
+/// CUSTOM tag masks are reported as unmappable here: a CUSTOM mask requires the
+/// actual column name for `{col}` substitution, which is not yet known at this
+/// stage (tags bind to columns only at rewrite time). Reporting them as
+/// unmappable keeps the function fail-closed.
+/// TODO(phase3): support CUSTOM tag masks by {col}-substituting at merge time
+/// (the column name is known in the rewriter's merge_tag_masks).
+// The 3-tuple return (masks-by-tag, row-filters, unmappable-tags) is the
+// documented contract; factoring it into a named type would obscure rather
+// than clarify the shape at the single call site.
+#[allow(clippy::type_complexity)]
+pub(crate) fn resolve_tag_policies(
+    bundle: &ServicePolicies,
+    identity: &SessionIdentity,
+    tags: &HashSet<String>,
+) -> (HashMap<String, MaskType>, Vec<(String, Expr)>, HashSet<String>) {
+    let mut masks: HashMap<String, MaskType> = HashMap::new();
+    let mut filters: Vec<(String, Expr)> = Vec::new();
+    let mut unmappable: HashSet<String> = HashSet::new();
+
+    let tag_bundle = match &bundle.tag_policies {
+        Some(tp) => tp,
+        None => return (masks, filters, unmappable),
+    };
+
+    // Bridge SessionIdentity -> SessionUser for item_matches.
+    use sqe_core::SessionUser;
+    let user = SessionUser {
+        username: identity.username.clone(),
+        roles: identity.roles.clone(),
+    };
+
+    for p in &tag_bundle.policies {
+        if !p.is_enabled {
+            continue;
+        }
+
+        // Read tag resource values for this policy.
+        let tag_res = match p.resources.get("tag") {
+            Some(r) => r,
+            None => continue,
+        };
+
+        // Only process tags that the caller's column set carries.
+        for tag_value in &tag_res.values {
+            if !tags.contains(tag_value.as_str()) {
+                continue;
+            }
+
+            // policyType 1: datamask
+            if p.policy_type == 1 {
+                for item in &p.data_mask_policy_items {
+                    if !item_matches(&item.users, &item.roles, &item.groups, &user) {
+                        continue;
+                    }
+                    // CUSTOM masks are not yet supported at tag-resolve time
+                    // (the column name needed for `{col}` substitution is only
+                    // known in the rewriter). Report as unmappable so the caller
+                    // restricts the column (fail-closed) rather than leaking it.
+                    // TODO(phase3): support CUSTOM tag masks by {col}-substituting
+                    // at merge time (the column name is known there).
+                    if item.data_mask_info.data_mask_type == "CUSTOM" {
+                        warn!(
+                            tag = %tag_value,
+                            "CUSTOM tag mask not supported at tag-resolve time; \
+                             marking tag unmappable (caller restricts columns \
+                             bearing this tag, fail-closed)"
+                        );
+                        unmappable.insert(tag_value.clone());
+                        continue;
+                    }
+                    // column placeholder is empty; CUSTOM is already excluded above.
+                    match map_mask(&item.data_mask_info, "", identity) {
+                        Ok(Some(mask)) => {
+                            masks.insert(tag_value.clone(), mask);
+                        }
+                        Ok(None) => { /* MASK_NONE exemption: tag has no mask */ }
+                        Err(()) => {
+                            warn!(
+                                tag = %tag_value,
+                                mask_type = %item.data_mask_info.data_mask_type,
+                                "unsupported Ranger tag mask type; marking tag \
+                                 unmappable (caller restricts columns bearing this \
+                                 tag, fail-closed)"
+                            );
+                            unmappable.insert(tag_value.clone());
+                        }
+                    }
+                }
+            }
+
+            // policyType 2: rowfilter
+            if p.policy_type == 2 {
+                for item in &p.row_filter_policy_items {
+                    if !item_matches(&item.users, &item.roles, &item.groups, &user) {
+                        continue;
+                    }
+                    if let Some(expr_str) = &item.row_filter_info.filter_expr {
+                        match parse_sql_predicate(expr_str, identity) {
+                            Ok(expr) => filters.push((tag_value.clone(), expr)),
+                            Err(e) => {
+                                warn!(
+                                    tag = %tag_value,
+                                    filter = %expr_str,
+                                    error = %e,
+                                    "unparseable Ranger tag row filter; denying (fail-closed)"
+                                );
+                                filters.push((tag_value.clone(), lit(false)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (masks, filters, unmappable)
+}
+
 // --- Cache key + PolicyStore impl ---
 
 fn cache_key(user: &SessionUser, table: &str, namespace: &str) -> String {
@@ -409,6 +561,65 @@ impl PolicyStore for RangerStore {
         let policy = resolve_from_bundle(&bundle, user, table_name, namespace);
         self.cache.insert(key, policy.clone()).await;
         Ok(policy)
+    }
+
+    /// Resolve tag-based policies from the Ranger bundle for a given user and
+    /// set of tag names present on a table's columns.
+    ///
+    /// Fetches the bundle (or re-uses the in-flight breaker state). On any
+    /// fetch failure the method returns `(empty, [lit(false)])` — the
+    /// `lit(false)` row filter denies all rows (fail-closed), consistent with
+    /// how `resolve()` handles bundle errors.
+    ///
+    /// Masks are returned keyed by TAG NAME. The plan rewriter maps tag ->
+    /// column using the `TagSource` column->tags map. The third value is the
+    /// set of tags whose mask could not be mapped; the rewriter restricts any
+    /// column bearing one of those tags (fail-closed).
+    async fn resolve_tags(
+        &self,
+        user: &SessionUser,
+        tags: &std::collections::HashSet<String>,
+    ) -> (
+        std::collections::HashMap<String, MaskType>,
+        Vec<Expr>,
+        std::collections::HashSet<String>,
+    ) {
+        if tags.is_empty() {
+            return (
+                std::collections::HashMap::new(),
+                vec![],
+                std::collections::HashSet::new(),
+            );
+        }
+
+        let bundle = match self.fetch_bundle().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    user = %user.username,
+                    error = %e,
+                    "resolve_tags: failed to fetch Ranger bundle; \
+                     denying all rows (fail-closed)"
+                );
+                return (
+                    std::collections::HashMap::new(),
+                    vec![lit(false)],
+                    std::collections::HashSet::new(),
+                );
+            }
+        };
+
+        let identity = SessionIdentity {
+            username: user.username.clone(),
+            roles: user.roles.clone(),
+            database: None,
+            schema: None,
+        };
+
+        let (masks, tag_filters, unmappable) = resolve_tag_policies(&bundle, &identity, tags);
+        // Discard the tag keys from row filters — the rewriter only needs Exprs.
+        let filter_exprs: Vec<Expr> = tag_filters.into_iter().map(|(_, e)| e).collect();
+        (masks, filter_exprs, unmappable)
     }
 
     fn invalidate_all(&self) {
@@ -731,5 +942,113 @@ mod tests {
     fn truly_unknown_mask_is_err() {
         let info = DataMaskInfo { data_mask_type: "MASK_FUTURE_UNSUPPORTED".into(), ..Default::default() };
         assert!(map_mask(&info, "x", &SessionIdentity::default()).is_err());
+    }
+
+    // --- tagPolicies tests ---
+
+    /// A ServicePolicies bundle that includes a top-level `tagPolicies` block
+    /// with a datamask policy for tag "PII" (role=engineer) and a row-filter
+    /// policy for tag "RESTRICTED" (role=analyst).
+    ///
+    /// NOTE: the exact live shape of tagPolicies must be verified against a
+    /// real Ranger bundle that has tag-linked policies before this is used in
+    /// production. See the Phase 3 prerequisite task.
+    const TAG_BUNDLE: &str = r#"{
+      "policyVersion": 1,
+      "policies": [],
+      "tagPolicies": {
+        "serviceName": "tag",
+        "policies": [
+          {
+            "id": 1, "policyType": 1, "isEnabled": true,
+            "resources": { "tag": { "values": ["PII"] } },
+            "dataMaskPolicyItems": [
+              { "users": [], "roles": ["engineer"],
+                "dataMaskInfo": { "dataMaskType": "MASK_SHOW_LAST_4" } }
+            ]
+          },
+          {
+            "id": 2, "policyType": 2, "isEnabled": true,
+            "resources": { "tag": { "values": ["RESTRICTED"] } },
+            "rowFilterPolicyItems": [
+              { "users": [], "roles": ["analyst"],
+                "rowFilterInfo": { "filterExpr": "region = 'EU'" } }
+            ]
+          }
+        ]
+      }
+    }"#;
+
+    #[test]
+    fn tag_mask_resolved_for_matching_role() {
+        let sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE).unwrap();
+        let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
+        let id = SessionIdentity { username: "bob".into(), roles: vec!["engineer".into()], ..Default::default() };
+        let (masks, filters, unmappable) = resolve_tag_policies(&sp, &id, &tags);
+        // tag PII -> a PartialMask (MASK_SHOW_LAST_4) for engineer
+        assert!(masks.contains_key("PII"));
+        assert!(matches!(masks.get("PII"), Some(crate::MaskType::PartialMask { show_last: 4, .. })));
+        assert!(unmappable.is_empty(), "supported mask must not be unmappable");
+        let _ = filters; // not the focus of this test
+    }
+
+    #[test]
+    fn tag_mask_not_resolved_for_other_role() {
+        let sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE).unwrap();
+        let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
+        let id = SessionIdentity { username: "x".into(), roles: vec!["other".into()], ..Default::default() };
+        let (masks, _f, _u) = resolve_tag_policies(&sp, &id, &tags);
+        assert!(masks.is_empty());
+    }
+
+    #[test]
+    fn tag_row_filter_resolved() {
+        let sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE).unwrap();
+        let tags: HashSet<String> = ["RESTRICTED".to_string()].into_iter().collect();
+        let id = SessionIdentity { username: "a".into(), roles: vec!["analyst".into()], ..Default::default() };
+        let (_m, filters, _u) = resolve_tag_policies(&sp, &id, &tags);
+        assert_eq!(filters.len(), 1); // one (tag, Expr) row filter
+    }
+
+    #[test]
+    fn untagged_yields_nothing() {
+        let sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE).unwrap();
+        let tags: HashSet<String> = HashSet::new();
+        let id = SessionIdentity::default();
+        let (m, f, u) = resolve_tag_policies(&sp, &id, &tags);
+        assert!(m.is_empty() && f.is_empty() && u.is_empty());
+    }
+
+    /// An unsupported tag mask type must be reported as unmappable (not silently
+    /// skipped) so the rewriter restricts the column (fail-closed).
+    #[test]
+    fn unsupported_tag_mask_is_unmappable() {
+        let mut sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE).unwrap();
+        sp.tag_policies.as_mut().unwrap().policies[0]
+            .data_mask_policy_items[0]
+            .data_mask_info
+            .data_mask_type = "MASK_FUTURE_UNSUPPORTED".to_string();
+        let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
+        let id = SessionIdentity { username: "bob".into(), roles: vec!["engineer".into()], ..Default::default() };
+        let (masks, _f, unmappable) = resolve_tag_policies(&sp, &id, &tags);
+        assert!(!masks.contains_key("PII"), "unsupported mask must not produce a mask");
+        assert!(unmappable.contains("PII"), "unsupported mask must mark tag unmappable");
+    }
+
+    /// A CUSTOM tag mask must be reported as unmappable (fail-closed) until
+    /// CUSTOM tag masking is supported at merge time.
+    #[test]
+    fn custom_tag_mask_is_unmappable() {
+        let mut sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE).unwrap();
+        let mi = &mut sp.tag_policies.as_mut().unwrap().policies[0]
+            .data_mask_policy_items[0]
+            .data_mask_info;
+        mi.data_mask_type = "CUSTOM".to_string();
+        mi.value_expr = Some("concat('x', {col})".to_string());
+        let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
+        let id = SessionIdentity { username: "bob".into(), roles: vec!["engineer".into()], ..Default::default() };
+        let (masks, _f, unmappable) = resolve_tag_policies(&sp, &id, &tags);
+        assert!(!masks.contains_key("PII"), "CUSTOM mask must not produce a mask yet");
+        assert!(unmappable.contains("PII"), "CUSTOM mask must mark tag unmappable");
     }
 }

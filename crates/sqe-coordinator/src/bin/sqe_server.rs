@@ -671,16 +671,6 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         authenticator.clone(),
     ));
 
-    // AUTH-01: build the enforcer + store from config.policy.engine.
-    let (policy_enforcer, policy_store) =
-        sqe_coordinator::policy_wiring::build_policy_enforcer(&config.policy)?;
-    if config.policy.engine != sqe_core::config::PolicyEngine::Passthrough {
-        tracing::info!(
-            engine = ?config.policy.engine,
-            "policy enforcement ACTIVE (row filters + column masks)"
-        );
-    }
-
     let worker_registry = Arc::new(
         sqe_coordinator::worker_registry::WorkerRegistry::with_options_and_failures(
             config.coordinator.worker_urls.clone(),
@@ -914,6 +904,19 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         metadata_cache_ttl_secs = config.catalog.metadata_cache_ttl_secs,
         "Initialized global table metadata cache (shared across all sessions)"
     );
+
+    // AUTH-01: build the enforcer + store from config.policy.engine.
+    // table_cache is passed so the rewriter can wire CacheTagSource for
+    // tag-based column masking (Task 4). A clone is taken here; the original
+    // is passed to with_table_cache() on the QueryHandler below.
+    let (policy_enforcer, policy_store) =
+        sqe_coordinator::policy_wiring::build_policy_enforcer(&config.policy, Some(table_cache.clone()))?;
+    if config.policy.engine != sqe_core::config::PolicyEngine::Passthrough {
+        tracing::info!(
+            engine = ?config.policy.engine,
+            "policy enforcement ACTIVE (row filters + column masks + tag masking)"
+        );
+    }
 
     let grant_backend: Option<Arc<dyn GrantBackend>> = build_grant_backend(&config)?;
 
