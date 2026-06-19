@@ -90,41 +90,41 @@ assert_allow "bob (engineer) INSERT orders"             bob   "INSERT INTO sales
 assert_allow "bob (user grant) SELECT audit"            bob   "SELECT event FROM ops_wh.ops.audit LIMIT 1"
 
 echo
-echo "== 5. SQE-side fine-grained enforcement: row filter + column mask (hive Ranger service) =="
+echo "== 5. SQE-side fine-grained enforcement: column masks (hive Ranger service) =="
 # SQE reads the 'hive' Ranger service via GET /service/plugins/policies/download/hive
-# and rewrites the query plan before DataFusion optimization: row filters inject above
-# the scan, column masks block predicate pushdown on raw values. This is SEPARATE from
-# the coarse Polaris gate tested above.
+# and rewrites the query plan before DataFusion optimization: column masks block
+# predicate pushdown on raw values. This is SEPARATE from the coarse Polaris gate
+# tested above. The same hive service + the same ssn mask are read by Spark/Kyuubi
+# Authz in parity-test.sh (SQE<->Spark cross-compare).
 #
-# Policy targets role 'engineer' (bob + carol). Role 'analyst' gives alice SELECT access
-# but engineer policies do NOT apply to her, so alice sees all rows and real amounts.
-# bob is in both analyst and engineer: he sees only region='EU' rows and amount masked
-# to NULL (Arrow's default null rendering is an empty cell in the table output).
+# Policies target role 'engineer' (bob + carol). Role 'analyst' gives alice SELECT
+# access but engineer policies do NOT apply to her, so alice sees real amounts and
+# raw ssn. bob is in both analyst and engineer: amount masked to NULL (Arrow's
+# default null rendering is an empty cell) and ssn show-last-4.
+#
+# NO row-filter policy is seeded (dropped for the Spark cross-compare; see
+# bootstrap-ranger.sh and parity-test.sh). bob therefore sees ALL rows.
 #
 # After step 4, the table has: (1,'EU',10.0), (2,'US',20.0), (3,'EU',30.0).
-# alice: 3 rows, amounts 10.0/20.0/30.0, regions EU+US.
-# bob:   2 rows (EU only), amount column empty (NULL).
+# alice: 3 rows, amounts 10.0/20.0/30.0, regions EU+US, raw ssn.
+# bob:   3 rows, amount column empty (NULL), ssn show-last-4.
 
-assert_fg_row_filter() { # desc user
+assert_fg_amount_mask() { # desc user
   local out
   for _ in 1 2 3 4 5 6; do
     out="$(sqe "$2" "SELECT region, amount FROM sales_wh.sales.orders")"
     if ! is_error "$out"; then
-      # Confirm no US rows returned (row filter applied)
-      if echo "$out" | grep -qi 'US'; then
-        red "FAIL  $1 (US row visible, row filter not applied)"; echo "      $(echo "$out" | tr '\n' ' ' | cut -c1-200)"; FAIL=$((FAIL+1)); return
-      fi
       # Confirm amount column is masked (empty/NULL cells only, no numeric values)
       if echo "$out" | grep -qE '[0-9]+\.[0-9]+'; then
         red "FAIL  $1 (numeric amount visible, column mask not applied)"; echo "      $(echo "$out" | tr '\n' ' ' | cut -c1-200)"; FAIL=$((FAIL+1)); return
       fi
-      # Confirm at least one EU row IS returned: the row filter must restrict to
-      # EU rows, NOT deny/filter everything. An empty result would otherwise pass
-      # all the negative checks above and read as "masking works" vacuously (e.g.
-      # if the hive policy never applied, the service-name was wrong, or a rejected
-      # filterExpr fail-closed to deny-all).
-      if ! echo "$out" | grep -qi 'EU'; then
-        red "FAIL  $1 (no EU rows returned; policy may have filtered/denied everything, not masked)"; echo "      $(echo "$out" | tr '\n' ' ' | cut -c1-200)"; FAIL=$((FAIL+1)); return
+      # Confirm the US row IS returned: with NO row filter seeded (see
+      # bootstrap-ranger.sh, dropped for the SQE<->Spark mask cross-compare),
+      # bob (engineer) sees ALL rows; only the amount column is masked. A US row
+      # proves the result is non-empty and the engineer mask did not fail-closed
+      # to deny-all.
+      if ! echo "$out" | grep -qi 'US'; then
+        red "FAIL  $1 (no US row; expected all rows with amount masked, not a row filter)"; echo "      $(echo "$out" | tr '\n' ' ' | cut -c1-200)"; FAIL=$((FAIL+1)); return
       fi
       green "PASS  $1"; PASS=$((PASS+1)); return 0
     fi
@@ -193,10 +193,11 @@ assert_fg_ssn_unmasked() { # desc user
   red "FAIL  $1"; echo "      $(echo "$out" | tr '\n' ' ' | cut -c1-200)"; FAIL=$((FAIL+1))
 }
 
-# alice: analyst-only (no engineer role) -- no row filter, no column mask applied.
+# alice: analyst-only (no engineer role) -- no column mask applied.
 assert_fg_unmasked "alice (analyst-only) sees all regions + real amounts" alice
-# bob: engineer (also analyst) -- row filter restricts to EU, amount masked to NULL.
-assert_fg_row_filter "bob (engineer) sees EU-only rows + NULL amount" bob
+# bob: engineer (also analyst) -- amount masked to NULL on every row (no row
+# filter is seeded; see bootstrap-ranger.sh and parity-test.sh).
+assert_fg_amount_mask "bob (engineer) sees all rows + NULL amount (mask only)" bob
 # alice: ssn unmasked (analyst-only, engineer policy does not apply).
 assert_fg_ssn_unmasked "alice (analyst-only) sees raw ssn" alice
 # bob: ssn show-last-4 masked (engineer role). Expects xxx-xx-NNNN; dashes kept; last 4 digits visible.
