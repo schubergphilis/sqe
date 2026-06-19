@@ -167,6 +167,27 @@ cat > /tmp/hive-mask.json <<'EOF'
 EOF
 post_hive_policy /tmp/hive-mask.json
 
+# Column-mask policy (policyType 1): mask orders.ssn -> show last 4 for role engineer.
+cat > /tmp/hive-mask-ssn.json <<'EOF'
+{
+  "service": "hive",
+  "name": "mask-sales-orders-ssn",
+  "policyType": 1,
+  "isEnabled": true,
+  "resources": {
+    "database": {"values": ["sales"]},
+    "table":    {"values": ["orders"]},
+    "column":   {"values": ["ssn"]}
+  },
+  "dataMaskPolicyItems": [{
+    "roles":   ["engineer"],
+    "accesses": [{"type": "select", "isAllowed": true}],
+    "dataMaskInfo": {"dataMaskType": "MASK_SHOW_LAST_4"}
+  }]
+}
+EOF
+post_hive_policy /tmp/hive-mask-ssn.json
+
 # Row-filter policy (policyType 2): restrict orders to region = 'EU' for role engineer.
 cat > /tmp/hive-rowfilter.json <<'EOF'
 {
