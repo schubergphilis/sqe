@@ -98,6 +98,26 @@ pub enum MaskType {
     DateShowYear,
 }
 
+/// Tag-level mask carrier used by `PolicyStore::resolve_tags`.
+///
+/// Tag-based CUSTOM masks cannot be resolved to a full `MaskType::Custom(expr)` at
+/// tag-resolve time because the actual column name (needed for `{col}` substitution)
+/// is only known when the rewriter iterates over table columns. This enum defers the
+/// substitution until `merge_tag_masks` in the plan rewriter, where the column name
+/// is available.
+///
+/// Non-CUSTOM tag masks are wrapped in `Ready` so the rewriter can use them without
+/// any further processing.
+#[derive(Debug, Clone)]
+pub enum TagMaskSpec {
+    /// A fully-resolved mask ready to insert into `ResolvedPolicy::column_masks`.
+    Ready(MaskType),
+    /// A CUSTOM Ranger mask whose `value_expr` template still contains `{col}`.
+    /// The rewriter substitutes the real column name and parses the resulting SQL
+    /// expression. On parse failure the column is restricted (fail-closed).
+    Custom(String),
+}
+
 /// Trait for policy storage backends. Implementations resolve policies
 /// for a given (user, table) pair from an external system.
 #[async_trait]
@@ -114,16 +134,20 @@ pub trait PolicyStore: Send + Sync {
     /// of tag names present on columns in a table.
     ///
     /// Returns:
-    /// - `HashMap<tag_name, MaskType>` — masks keyed by TAG (not column name).
+    /// - `HashMap<tag_name, TagMaskSpec>` — mask specs keyed by TAG (not column name).
+    ///   `TagMaskSpec::Ready` holds a fully-resolved `MaskType`. `TagMaskSpec::Custom`
+    ///   holds the raw `{col}`-template string; the rewriter substitutes the real column
+    ///   name and parses the expression at merge time.
     ///   The `PlanRewriter` maps tag -> column using the Iceberg schema's
     ///   `column -> tags` map from the `TagSource`.
     /// - `Vec<Expr>` — row filter expressions to AND into the resolved policy.
     /// - `HashSet<tag_name>` — tags that matched the user but whose mask could
-    ///   NOT be mapped to a supported `MaskType` (unsupported type, or CUSTOM).
-    ///   The rewriter MUST restrict any column bearing one of these tags
-    ///   (fail-closed): without this, a column whose only protection is an
-    ///   unmappable tag mask would be returned RAW. This mirrors the resource
-    ///   path, where an unmappable mask adds the column to `restricted_columns`.
+    ///   NOT be mapped to any supported spec (genuinely unsupported type). The
+    ///   rewriter MUST restrict any column bearing one of these tags (fail-closed):
+    ///   without this, a column whose only protection is an unmappable tag mask would
+    ///   be returned RAW. This mirrors the resource path where an unmappable mask adds
+    ///   the column to `restricted_columns`. CUSTOM tags are no longer in this set;
+    ///   they appear in the masks map as `TagMaskSpec::Custom` instead.
     ///
     /// Default implementation returns empty (non-Ranger stores need no change).
     /// RangerStore overrides this to fetch the bundle and call `resolve_tag_policies`.
@@ -138,7 +162,7 @@ pub trait PolicyStore: Send + Sync {
         &self,
         _user: &SessionUser,
         _tags: &HashSet<String>,
-    ) -> (HashMap<String, MaskType>, Vec<Expr>, HashSet<String>) {
+    ) -> (HashMap<String, TagMaskSpec>, Vec<Expr>, HashSet<String>) {
         (HashMap::new(), vec![], HashSet::new())
     }
 
