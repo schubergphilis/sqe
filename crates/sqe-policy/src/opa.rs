@@ -24,127 +24,21 @@
 //!   }
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use moka::future::Cache;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use sqe_core::config::OpaConfig;
 use sqe_core::SessionUser;
 use sqe_metrics::MetricsRegistry;
 
+use crate::policy_breaker::PolicyCircuitBreaker;
 use crate::{MaskType, PolicyStore, ResolvedPolicy};
-
-const STATE_CLOSED: u32 = 0;
-const STATE_OPEN: u32 = 1;
-const STATE_HALF_OPEN: u32 = 2;
-
-/// Lightweight three-state circuit breaker around the OPA call.
-///
-/// Mirrors `sqe_catalog::CircuitBreaker`. The OPA crate cannot depend
-/// on sqe-catalog (the dependency direction is the other way around),
-/// so the smaller implementation lives here.
-struct OpaCircuitBreaker {
-    failure_count: AtomicU32,
-    failure_threshold: u32,
-    recovery_timeout: Duration,
-    last_failure_ms: AtomicU64,
-    state: AtomicU32,
-}
-
-impl OpaCircuitBreaker {
-    fn new(failure_threshold: u32, recovery_timeout: Duration) -> Self {
-        Self {
-            failure_count: AtomicU32::new(0),
-            failure_threshold,
-            recovery_timeout,
-            last_failure_ms: AtomicU64::new(0),
-            state: AtomicU32::new(STATE_CLOSED),
-        }
-    }
-
-    fn check(&self) -> Result<(), String> {
-        let state = self.state.load(Ordering::Acquire);
-        match state {
-            STATE_CLOSED => Ok(()),
-            STATE_OPEN => {
-                let elapsed_ms = now_millis()
-                    .saturating_sub(self.last_failure_ms.load(Ordering::Relaxed));
-                if elapsed_ms >= self.recovery_timeout.as_millis() as u64
-                    && self
-                        .state
-                        .compare_exchange(
-                            STATE_OPEN,
-                            STATE_HALF_OPEN,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                {
-                    info!("OPA circuit breaker moving to half_open (probe allowed)");
-                    return Ok(());
-                }
-                Err("OPA circuit breaker is open".to_string())
-            }
-            STATE_HALF_OPEN => Ok(()),
-            _ => Ok(()),
-        }
-    }
-
-    fn record_success(&self) {
-        if self.state.load(Ordering::Acquire) != STATE_CLOSED {
-            self.state.store(STATE_CLOSED, Ordering::Release);
-            self.failure_count.store(0, Ordering::Release);
-            info!("OPA circuit breaker closed after successful probe");
-        } else {
-            self.failure_count.store(0, Ordering::Relaxed);
-        }
-    }
-
-    fn record_failure(&self) {
-        self.last_failure_ms.store(now_millis(), Ordering::Relaxed);
-        let count = self.failure_count.fetch_add(1, Ordering::AcqRel) + 1;
-        if count >= self.failure_threshold
-            && self
-                .state
-                .compare_exchange(
-                    STATE_CLOSED,
-                    STATE_OPEN,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-        {
-            warn!(
-                failures = count,
-                threshold = self.failure_threshold,
-                "OPA circuit breaker opened"
-            );
-        } else if self.state.load(Ordering::Acquire) == STATE_HALF_OPEN {
-            self.state.store(STATE_OPEN, Ordering::Release);
-        }
-    }
-
-    fn state_code(&self) -> u8 {
-        match self.state.load(Ordering::Relaxed) {
-            STATE_OPEN => 2,
-            STATE_HALF_OPEN => 1,
-            _ => 0,
-        }
-    }
-}
-
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
 
 /// OPA policy store that evaluates policies via the OPA REST API.
 pub struct OpaStore {
@@ -152,7 +46,7 @@ pub struct OpaStore {
     opa_url: String,
     policy_path: String,
     cache: Cache<String, ResolvedPolicy>,
-    breaker: Arc<OpaCircuitBreaker>,
+    breaker: Arc<PolicyCircuitBreaker>,
     metrics: Option<Arc<MetricsRegistry>>,
 }
 
@@ -182,7 +76,8 @@ impl OpaStore {
                 .time_to_live(Duration::from_secs(cfg.cache_ttl_secs))
                 .max_capacity(cfg.cache_max_entries)
                 .build(),
-            breaker: Arc::new(OpaCircuitBreaker::new(
+            breaker: Arc::new(PolicyCircuitBreaker::new(
+                "OPA",
                 cfg.breaker_failure_threshold,
                 Duration::from_secs(cfg.breaker_recovery_secs),
             )),

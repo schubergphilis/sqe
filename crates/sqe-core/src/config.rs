@@ -2089,6 +2089,10 @@ pub enum PolicyEngine {
     Opa,
     /// Cedar policy engine (experimental).
     Cedar,
+    /// Apache Ranger fine-grained policies (hive service-def). Requires
+    /// `[policy.ranger]`. Reads row-filter + data-mask policies and feeds the
+    /// PlanRewriter. Separate from `access_control.backend = "ranger"`.
+    Ranger,
 }
 
 impl std::str::FromStr for PolicyEngine {
@@ -2100,8 +2104,9 @@ impl std::str::FromStr for PolicyEngine {
             "in-memory" | "inmemory" | "in_memory" => Ok(Self::InMemory),
             "opa" => Ok(Self::Opa),
             "cedar" => Ok(Self::Cedar),
+            "ranger" => Ok(Self::Ranger),
             other => Err(format!(
-                "unknown policy.engine {other:?}; expected one of passthrough, in-memory, opa, cedar"
+                "unknown policy.engine {other:?}; expected one of passthrough, in-memory, opa, cedar, ranger"
             )),
         }
     }
@@ -2128,6 +2133,9 @@ pub struct PolicyConfig {
     /// breaker, 30 s recovery window).
     #[serde(default)]
     pub opa: OpaConfig,
+    /// Ranger fine-grained backend tuning. Used only when `engine = "ranger"`.
+    #[serde(default)]
+    pub ranger: RangerPolicyConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -2174,6 +2182,81 @@ fn default_opa_breaker_failure_threshold() -> u32 {
     5
 }
 fn default_opa_breaker_recovery_secs() -> u64 {
+    30
+}
+
+/// Fine-grained policy engine backed by a `hive`-type Apache Ranger service.
+///
+/// The Ranger Admin base URL is taken from `policy.ranger.url`. This is the
+/// ENFORCEMENT path (row filters + column masks), distinct from
+/// `access_control.ranger` (the GRANT/REVOKE write path on the `polaris`
+/// service). `service_name` defaults to `hive` so policies are shared with
+/// Apache Spark / Kyuubi.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct RangerPolicyConfig {
+    /// Ranger Admin base URL, e.g. `http://ranger-admin:6080`.
+    #[serde(default)]
+    pub url: String,
+    /// The `hive` Ranger service instance to read. Shared with Spark/Kyuubi.
+    #[serde(default = "default_ranger_policy_service_name")]
+    pub service_name: String,
+    /// Ranger Admin user for HTTP basic auth.
+    #[serde(default = "default_ranger_admin_user")]
+    pub admin_user: String,
+    /// Ranger Admin password. Set via `SQE_POLICY__RANGER__ADMIN_PASSWORD`.
+    #[serde(default)]
+    pub admin_password: SecretString,
+    /// HTTP timeout for a single Ranger download call, in seconds.
+    #[serde(default = "default_ranger_policy_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Maximum cached `ResolvedPolicy` entries.
+    #[serde(default = "default_ranger_policy_cache_max_entries")]
+    pub cache_max_entries: u64,
+    /// Cache TTL in seconds.
+    #[serde(default = "default_ranger_policy_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+    /// Consecutive failures before the circuit breaker opens.
+    #[serde(default = "default_opa_breaker_failure_threshold")]
+    pub breaker_failure_threshold: u32,
+    /// How long to keep the breaker open before probing again, in seconds.
+    #[serde(default = "default_opa_breaker_recovery_secs")]
+    pub breaker_recovery_secs: u64,
+    /// Accept self-signed TLS certs on the Ranger Admin endpoint.
+    #[serde(default)]
+    pub accept_invalid_certs: bool,
+}
+
+impl Default for RangerPolicyConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            service_name: default_ranger_policy_service_name(),
+            admin_user: default_ranger_admin_user(),
+            admin_password: SecretString::default(),
+            timeout_secs: default_ranger_policy_timeout_secs(),
+            cache_max_entries: default_ranger_policy_cache_max_entries(),
+            cache_ttl_secs: default_ranger_policy_cache_ttl_secs(),
+            breaker_failure_threshold: default_opa_breaker_failure_threshold(),
+            breaker_recovery_secs: default_opa_breaker_recovery_secs(),
+            accept_invalid_certs: false,
+        }
+    }
+}
+
+fn default_ranger_policy_service_name() -> String {
+    "hive".to_string()
+}
+
+fn default_ranger_policy_timeout_secs() -> u64 {
+    5
+}
+
+fn default_ranger_policy_cache_max_entries() -> u64 {
+    10_000
+}
+
+fn default_ranger_policy_cache_ttl_secs() -> u64 {
     30
 }
 
@@ -3057,6 +3140,10 @@ impl SqeConfig {
         // Policy
         env_override_parse("SQE_POLICY__ENGINE", &mut self.policy.engine);
         env_override_str("SQE_POLICY__MASK_KEY", &mut self.policy.mask_key);
+        env_override_secret(
+            "SQE_POLICY__RANGER__ADMIN_PASSWORD",
+            &mut self.policy.ranger.admin_password,
+        );
 
         // Access control
         env_override_parse("SQE_ACCESS_CONTROL__BACKEND", &mut self.access_control.backend);
@@ -3265,6 +3352,7 @@ fn validate_urls(config: &SqeConfig, errors: &mut Vec<String>) {
     }
 
     check("access_control.url", &config.access_control.url);
+    check("policy.ranger.url", &config.policy.ranger.url);
 }
 
 fn env_override_str(key: &str, target: &mut String) {
@@ -5396,5 +5484,29 @@ mod ranger_config_tests {
         assert_eq!(c.ranger.service_name, "dev_polaris");
         assert_eq!(c.ranger.admin_password.expose(), "secret");
         assert_eq!(c.ranger.realm, "POLARIS");
+    }
+
+    #[test]
+    fn policy_engine_parses_ranger() {
+        use std::str::FromStr;
+        assert_eq!(
+            crate::config::PolicyEngine::from_str("ranger").unwrap(),
+            crate::config::PolicyEngine::Ranger
+        );
+    }
+
+    #[test]
+    fn policy_engine_unknown_lists_ranger() {
+        use std::str::FromStr;
+        let err = crate::config::PolicyEngine::from_str("nope").unwrap_err();
+        assert!(err.contains("ranger"), "error must list ranger: {err}");
+    }
+
+    #[test]
+    fn ranger_policy_config_defaults() {
+        let c = crate::config::RangerPolicyConfig::default();
+        assert_eq!(c.service_name, "hive");
+        assert_eq!(c.admin_user, "admin");
+        assert_eq!(c.cache_ttl_secs, 30);
     }
 }

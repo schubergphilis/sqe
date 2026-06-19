@@ -244,6 +244,7 @@ services:
     command: ["--config", "/etc/sqe/sqe.toml"]
     environment:
       RUST_LOG: "info,sqe_auth=debug,sqe_policy=debug,sqe_coordinator::session_manager=debug"
+      SQE_POLICY__RANGER__ADMIN_PASSWORD: ${RANGER_ADMIN_PASSWORD:-rangerR0cks!}
     volumes:
       - ./sqe.toml:/etc/sqe/sqe.toml:ro
     ports:

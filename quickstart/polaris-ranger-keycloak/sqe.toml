@@ -67,8 +67,20 @@ s3_secret_key = "s3adminpw"
 s3_path_style = true
 s3_allow_http = true
 
+# Fine-grained ENFORCEMENT (row filters + column masks) read by SQE directly
+# from a `hive`-type Ranger service. This is separate from the coarse
+# [access_control] path below (GRANT/REVOKE -> polaris service -> Polaris
+# enforces). The hive service is the one Apache Spark / Kyuubi would also read,
+# so the same policy set is shared. admin-password also via
+# SQE_POLICY__RANGER__ADMIN_PASSWORD.
 [policy]
-engine = "passthrough"
+engine = "ranger"
+
+[policy.ranger]
+url = "http://ranger-admin:6080"
+service-name = "hive"
+admin-user = "admin"
+admin-password = "rangerR0cks!"
 
 # ── Access control: Apache Ranger ────────────────────────────────────────────
 # SQE writes GRANT/REVOKE to Ranger Admin; Polaris enforces. service-name must

@@ -143,19 +143,6 @@ async fn async_main() -> anyhow::Result<()> {
     if sqe_coordinator::mode::warns_unauthenticated_workers(&config.coordinator) {
         tracing::warn!("WARNING: coordinator.allow_unauthenticated_workers = true with an empty coordinator.worker_secret -- any client reachable on the cluster network can register as a worker and receive user bearer tokens. Set worker_secret for production.");
     }
-    // AUTH-01: policy enforcement is hardcoded to passthrough below. If the
-    // operator configured a real engine (OPA/Cedar/InMemory) it is SILENTLY
-    // IGNORED -- every row filter and column mask is unenforced. Fail loud so
-    // an operator is never lulled into believing SQE-side policy is active.
-    if config.policy.engine != sqe_core::config::PolicyEngine::Passthrough {
-        tracing::error!(
-            configured_engine = ?config.policy.engine,
-            "CRITICAL: policy.engine is set but policy enforcement is NOT wired -- \
-             the engine runs PASSTHROUGH and NO row filters or column masks are \
-             applied. Do not rely on SQE-side policy until this is implemented."
-        );
-    }
-
     // Initialize tracing + OTel (traces, metrics, logs via OTLP when configured)
     let _otel_guard = sqe_metrics::otel::init_telemetry_with_sampling(
         "sqe-coordinator",
@@ -196,13 +183,15 @@ async fn async_main() -> anyhow::Result<()> {
         authenticator.clone(),
     ));
 
-    // Initialize policy (passthrough)
-    // TODO(AUTH-01): wire PolicyPlanRewriter from config.policy.engine (Opa ->
-    // OpaStore, InMemory -> InMemoryPolicyStore) instead of hardcoding
-    // PassthroughEnforcer. Until then a non-passthrough engine is ignored and
-    // the startup error! above fires.
-    let policy_enforcer: Arc<dyn sqe_policy::PolicyEnforcer> =
-        Arc::new(sqe_policy::PassthroughEnforcer);
+    // AUTH-01: build the enforcer + store from config.policy.engine.
+    let (policy_enforcer, policy_store) =
+        sqe_coordinator::policy_wiring::build_policy_enforcer(&config.policy)?;
+    if config.policy.engine != sqe_core::config::PolicyEngine::Passthrough {
+        tracing::info!(
+            engine = ?config.policy.engine,
+            "policy enforcement ACTIVE (row filters + column masks)"
+        );
+    }
 
     // Initialize worker registry
     let worker_registry = Arc::new(
@@ -273,7 +262,7 @@ async fn async_main() -> anyhow::Result<()> {
     let query_handler = Arc::new(
         QueryHandler::new(
             policy_enforcer,
-            None, // policy_store — wired when policy engine is enabled
+            policy_store,
             config.clone(),
             if config.coordinator.worker_urls.is_empty() {
                 None
