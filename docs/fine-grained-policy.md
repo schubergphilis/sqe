@@ -157,6 +157,15 @@ vocabulary is implemented and wired. Steps 3, 4, and 6 from the original list ar
   proves `111-11-1111` becomes `xxx-xx-1111` for bob (engineer) and stays raw for alice
   (analyst-only).
 
+**Phase 3a (shipped, branch `feat/tag-based-masking`).** Tag-based masking enforcement:
+
+- `TagSource` trait + `NoopTagSource` default + `CacheTagSource` production implementation. Tags stored as Iceberg `sqe.column-tags` table property.
+- `PolicyStore::resolve_tags` default no-op; `RangerStore` overrides to fetch `tagPolicies` from the Ranger bundle and return `(tag_masks_by_tag, tag_filters, unmappable_tags)`.
+- `PolicyPlanRewriter` wired: calls `tag_source.column_tags(catalog, full-namespace-vec, table)` using the FULL namespace path (not last component), then `resolve_tags`, then `merge_tag_masks`. Precedence rules: resource mask wins, restricted stays restricted, unmappable tag fails closed.
+- Four executable integration tests prove: tag mask end-to-end, full-namespace identity (FakeTagSource capture), resource-mask-wins precedence, unmappable-tag fail-closed.
+- NOT live-demoed (quickstart stack drift); the executable tests are the proof.
+- Phase 3b remains: tagging DDL (`ALTER TABLE SET TAGS`), Iceberg-to-Ranger sync, CUSTOM tag mask per-column substitution.
+
 **Phase 2B (not yet started).** Session-context SQL functions:
 
 1. `sqe-auth` / `SessionUser`: richer role model (active + inherited/secondary).

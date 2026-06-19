@@ -6,7 +6,8 @@
 //! regression suite for issues #84 (typed NULL masking) and #92
 //! (zero e2e coverage of the enforcement engine).
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use arrow::array::{
     Array, Date32Array, Decimal128Array, Int64Array, RecordBatch, StringArray,
@@ -21,6 +22,7 @@ use datafusion::prelude::SessionContext;
 
 use sqe_core::SessionUser;
 use sqe_policy::policy_store::InMemoryPolicyStore;
+use sqe_policy::tag_source::TagSource;
 use sqe_policy::{
     plan_rewriter::PolicyPlanRewriter, MaskType, PolicyEnforcer, PolicyStore, ResolvedPolicy,
 };
@@ -652,6 +654,317 @@ async fn date_show_year_on_date32_executes_and_truncates_to_jan1() {
     let expected_day: i32 = 19723; // 2024-01-01
     assert_eq!(d_arr.value(0), expected_day, "2024-01-16 must truncate to 2024-01-01");
     assert_eq!(d_arr.value(1), expected_day, "2024-03-18 must truncate to 2024-01-01");
+}
+
+// ── Tag-based masking: executable end-to-end tests (Phase 3a) ────────────────
+//
+// These four tests exercise the full TagSource -> resolve_tags -> merge_tag_masks
+// -> plan-rewrite pipeline end-to-end over a qualified multilevel scan.
+//
+// Infrastructure:
+//  - `TagTestStore`: a minimal `PolicyStore` for these tests. `resolve` returns
+//    a configured `ResolvedPolicy` (defaults to empty = passthrough). `resolve_tags`
+//    returns the configured (tag_masks, tag_filters, unmappable) triple.
+//  - `FakeTagSource`: a `TagSource` returning a configured column->tags map; also
+//    captures every `namespace` arg it receives into an `Arc<Mutex<...>>` log so
+//    tests can assert the FULL multi-level namespace was passed, not a truncated form.
+
+/// Configurable `PolicyStore` for tag-masking integration tests.
+///
+/// `resolve` returns `resource_policy` (cloned); useful for tests that need
+/// a resource-level mask pre-loaded (precedence test 3). Defaults to empty.
+/// `resolve_tags` returns the configured triple unchanged.
+struct TagTestStore {
+    resource_policy: ResolvedPolicy,
+    tag_masks: HashMap<String, MaskType>,
+    tag_filters: Vec<Expr>,
+    unmappable: HashSet<String>,
+}
+
+impl TagTestStore {
+    fn new() -> Self {
+        Self {
+            resource_policy: ResolvedPolicy::default(),
+            tag_masks: HashMap::new(),
+            tag_filters: vec![],
+            unmappable: HashSet::new(),
+        }
+    }
+
+    fn with_resource_policy(mut self, p: ResolvedPolicy) -> Self {
+        self.resource_policy = p;
+        self
+    }
+
+    fn with_tag_mask(mut self, tag: &str, mask: MaskType) -> Self {
+        self.tag_masks.insert(tag.to_string(), mask);
+        self
+    }
+
+    fn with_unmappable(mut self, tag: &str) -> Self {
+        self.unmappable.insert(tag.to_string());
+        self
+    }
+}
+
+#[async_trait::async_trait]
+impl PolicyStore for TagTestStore {
+    async fn resolve(
+        &self,
+        _user: &SessionUser,
+        _table: &str,
+        _namespace: &str,
+    ) -> sqe_core::Result<ResolvedPolicy> {
+        Ok(self.resource_policy.clone())
+    }
+
+    async fn resolve_tags(
+        &self,
+        _user: &SessionUser,
+        _tags: &HashSet<String>,
+    ) -> (HashMap<String, MaskType>, Vec<Expr>, HashSet<String>) {
+        (self.tag_masks.clone(), self.tag_filters.clone(), self.unmappable.clone())
+    }
+}
+
+/// A `TagSource` returning a fixed column->tags map.
+///
+/// Every call to `column_tags` appends the `namespace` argument (as a
+/// `Vec<String>`) to `calls`, so tests can assert the exact namespace
+/// components received (full multi-level path, not the last component).
+struct FakeTagSource {
+    col_tags: HashMap<String, Vec<String>>,
+    /// Log of namespace args passed to `column_tags`, one entry per call.
+    calls: Arc<Mutex<Vec<Vec<String>>>>,
+}
+
+impl FakeTagSource {
+    fn new(col_tags: HashMap<String, Vec<String>>) -> (Self, Arc<Mutex<Vec<Vec<String>>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let source = Self { col_tags, calls: Arc::clone(&calls) };
+        (source, calls)
+    }
+}
+
+impl TagSource for FakeTagSource {
+    fn column_tags(
+        &self,
+        _catalog: Option<&str>,
+        namespace: &[String],
+        _table: &str,
+    ) -> HashMap<String, Vec<String>> {
+        self.calls.lock().unwrap().push(namespace.to_vec());
+        self.col_tags.clone()
+    }
+}
+
+/// Test 1 -- tag mask applies end to end.
+///
+/// FakeTagSource returns `{"ssn": ["PII"]}`.
+/// TagTestStore.resolve_tags returns `{"PII": MaskType::Nullify}`.
+/// Over the qualified multilevel scan with a user projection selecting
+/// `customer_id, ssn`: rewrite (with `.with_tag_source(fake)`) +
+/// `execute_multilevel` -> assert `ssn` column is entirely NULL.
+/// Proves column_tags -> tag mask -> applied through the physical planner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tag_mask_applies_end_to_end() {
+    let (mem, scan) = build_multilevel_scan_with_mem();
+
+    let tref = TableReference::full("cat", "ns1.ns2", "employees");
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![
+            Expr::Column(Column::new(Some(tref.clone()), "customer_id")),
+            Expr::Column(Column::new(Some(tref.clone()), "ssn")),
+        ])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let mut col_tags = HashMap::new();
+    col_tags.insert("ssn".to_string(), vec!["PII".to_string()]);
+    let (fake_source, _calls) = FakeTagSource::new(col_tags);
+
+    let store = TagTestStore::new().with_tag_mask("PII", MaskType::Nullify);
+
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store))
+        .with_tag_source(Arc::new(fake_source));
+    let rewritten = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
+
+    let batches = execute_multilevel(rewritten, mem).await;
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 3, "all three rows must be present (no row filter)");
+
+    let ssn = batches[0].column_by_name("ssn").unwrap();
+    assert_eq!(
+        ssn.null_count(),
+        ssn.len(),
+        "tag-masked ssn must be entirely NULL (Nullify via PII tag)"
+    );
+}
+
+/// Test 2 -- multi-level namespace identity: FakeTagSource receives the FULL
+/// namespace path `["ns1","ns2"]`, not the last component `["ns2"]` or the
+/// dotted string `["ns1.ns2"]`.
+///
+/// This is the recurring identity bug: the rewriter previously split
+/// `table_ref.schema()` ("ns1.ns2") into components but then only passed the
+/// last one to the tag source cache, so a multi-level key missed the entry.
+/// The fix threads the full split vector through; this test is the regression
+/// gate proving that contract holds.
+///
+/// The test also asserts the mask was applied (ssn is NULL), confirming the tag
+/// source was called at all and not silently skipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tag_source_receives_full_multilevel_namespace() {
+    let (mem, scan) = build_multilevel_scan_with_mem();
+
+    let tref = TableReference::full("cat", "ns1.ns2", "employees");
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![
+            Expr::Column(Column::new(Some(tref.clone()), "customer_id")),
+            Expr::Column(Column::new(Some(tref.clone()), "ssn")),
+        ])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let mut col_tags = HashMap::new();
+    col_tags.insert("ssn".to_string(), vec!["PII".to_string()]);
+    let (fake_source, calls_log) = FakeTagSource::new(col_tags);
+
+    let store = TagTestStore::new().with_tag_mask("PII", MaskType::Nullify);
+
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store))
+        .with_tag_source(Arc::new(fake_source));
+    let rewritten = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
+
+    // --- Identity assertion: namespace arg must be the full ["ns1","ns2"] ---
+    // Assert before the async execute call so the MutexGuard is not held
+    // across an await point (clippy::await_holding_lock).
+    {
+        let calls = calls_log.lock().unwrap();
+        assert_eq!(calls.len(), 1, "column_tags must be called exactly once");
+        assert_eq!(
+            calls[0],
+            vec!["ns1".to_string(), "ns2".to_string()],
+            "column_tags must receive the FULL multi-level namespace components \
+             [\"ns1\",\"ns2\"], not [\"ns2\"] or [\"ns1.ns2\"] (identity bug regression)"
+        );
+    } // MutexGuard dropped here, before the await below.
+
+    // --- Mask assertion: ssn is NULL (tag route worked) ---
+    let batches = execute_multilevel(rewritten, mem).await;
+    let ssn = batches[0].column_by_name("ssn").unwrap();
+    assert_eq!(
+        ssn.null_count(),
+        ssn.len(),
+        "ssn must be NULL confirming the tag source call was used"
+    );
+}
+
+/// Test 3 -- resource mask wins over tag mask.
+///
+/// A resource policy (from `resolve`) already carries `ssn -> Redact("***")`.
+/// The tag source returns `{"ssn": ["PII"]}` and `resolve_tags` returns
+/// `{"PII": MaskType::Hash}`. The resource mask must win: ssn shows "***",
+/// not a 64-char SHA-256 hex string.
+///
+/// Proves the precedence rule: resource mask wins over tag mask (rule 2 of
+/// `merge_tag_masks` contract). A Hash result would be a 64-char hex string,
+/// so the constant "***" is an unambiguous discriminator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resource_mask_wins_over_tag_mask() {
+    let (mem, scan) = build_multilevel_scan_with_mem();
+
+    let tref = TableReference::full("cat", "ns1.ns2", "employees");
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![
+            Expr::Column(Column::new(Some(tref.clone()), "customer_id")),
+            Expr::Column(Column::new(Some(tref.clone()), "ssn")),
+        ])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let mut col_tags = HashMap::new();
+    col_tags.insert("ssn".to_string(), vec!["PII".to_string()]);
+    let (fake_source, _calls) = FakeTagSource::new(col_tags);
+
+    // Resource policy pre-loaded with Redact("***") on ssn.
+    let mut resource_policy = ResolvedPolicy::default();
+    resource_policy
+        .column_masks
+        .insert("ssn".to_string(), MaskType::Redact("***".to_string()));
+
+    // Tag store would apply Hash if resource mask did not win.
+    let store = TagTestStore::new()
+        .with_resource_policy(resource_policy)
+        .with_tag_mask("PII", MaskType::Hash);
+
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store))
+        .with_tag_source(Arc::new(fake_source));
+    let rewritten = rewriter.evaluate(&user("bob", &[]), plan).await.unwrap();
+
+    let batches = execute_multilevel(rewritten, mem).await;
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 3, "all three rows must be present (no row filter)");
+
+    let ssn_col = batches[0]
+        .column_by_name("ssn")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .clone();
+    for i in 0..ssn_col.len() {
+        assert_eq!(
+            ssn_col.value(i),
+            "***",
+            "resource Redact(\"***\") must win over tag Hash (row {})",
+            i
+        );
+    }
+}
+
+/// Test 4 -- unmappable tag fails closed: ssn is DROPPED from the output.
+///
+/// TagSource returns `{"ssn":["SECRET"]}`. `resolve_tags` returns empty masks
+/// + `unmappable={"SECRET"}`. Per the fail-closed contract, a column bearing
+/// only an unmappable tag (no resource mask) is RESTRICTED (dropped), not
+/// returned raw.
+///
+/// The plan is a bare scan (no outer projection selecting ssn) to avoid the
+/// "No field named ssn" planner error when the inner restriction drops the
+/// column before the outer ref can resolve. The test asserts ssn is absent
+/// from the output schema after rewrite + execute.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unmappable_tag_restricts_column_fail_closed() {
+    let (mem, scan) = build_multilevel_scan_with_mem();
+    // Use the bare scan (no outer projection) so the restricted ssn column
+    // does not appear in a user reference that would fail planning.
+    // The assertion is on the output schema: ssn must be absent.
+
+    let mut col_tags = HashMap::new();
+    col_tags.insert("ssn".to_string(), vec!["SECRET".to_string()]);
+    let (fake_source, _calls) = FakeTagSource::new(col_tags);
+
+    // resolve_tags returns empty masks, SECRET is unmappable.
+    let store = TagTestStore::new().with_unmappable("SECRET");
+
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store))
+        .with_tag_source(Arc::new(fake_source));
+    let rewritten = rewriter.evaluate(&user("carol", &[]), scan).await.unwrap();
+
+    let batches = execute_multilevel(rewritten, mem).await;
+    let schema = batches[0].schema();
+    assert!(
+        schema.column_with_name("ssn").is_none(),
+        "ssn must be ABSENT after unmappable-tag fail-closed restriction (got schema: {:?})",
+        schema
+    );
+    // All other columns must still be present.
+    assert!(schema.column_with_name("customer_id").is_some());
+    assert!(schema.column_with_name("salary").is_some());
 }
 
 // ── Session-function row-filter tests (Phase 2B, Task 3) ─────────────────────
