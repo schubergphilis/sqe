@@ -118,22 +118,28 @@ pub trait PolicyStore: Send + Sync {
     ///   The `PlanRewriter` maps tag -> column using the Iceberg schema's
     ///   `column -> tags` map from the `TagSource`.
     /// - `Vec<Expr>` — row filter expressions to AND into the resolved policy.
+    /// - `HashSet<tag_name>` — tags that matched the user but whose mask could
+    ///   NOT be mapped to a supported `MaskType` (unsupported type, or CUSTOM).
+    ///   The rewriter MUST restrict any column bearing one of these tags
+    ///   (fail-closed): without this, a column whose only protection is an
+    ///   unmappable tag mask would be returned RAW. This mirrors the resource
+    ///   path, where an unmappable mask adds the column to `restricted_columns`.
     ///
     /// Default implementation returns empty (non-Ranger stores need no change).
     /// RangerStore overrides this to fetch the bundle and call `resolve_tag_policies`.
     ///
     /// Fail-closed contract: on any fetch/parse failure the implementation
-    /// MUST return `(HashMap::new(), vec![lit(false)])` — the `lit(false)` row
-    /// filter denies all rows, consistent with how `resolve()` handles errors.
-    /// Returning an empty vec on failure would show tagged columns unmasked
-    /// while resource-policy cache-hits still work (fail-open on the security
-    /// path).
+    /// MUST return `(HashMap::new(), vec![lit(false)], HashSet::new())` — the
+    /// `lit(false)` row filter denies all rows, consistent with how `resolve()`
+    /// handles errors. Returning an empty filter vec on failure would show
+    /// tagged columns unmasked while resource-policy cache-hits still work
+    /// (fail-open on the security path).
     async fn resolve_tags(
         &self,
         _user: &SessionUser,
         _tags: &HashSet<String>,
-    ) -> (HashMap<String, MaskType>, Vec<Expr>) {
-        (HashMap::new(), vec![])
+    ) -> (HashMap<String, MaskType>, Vec<Expr>, HashSet<String>) {
+        (HashMap::new(), vec![], HashSet::new())
     }
 
     /// Invalidate any cached policy decisions so the next `resolve()` call
