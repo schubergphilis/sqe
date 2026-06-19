@@ -461,6 +461,28 @@ where
         ..Default::default()
     };
 
+    // Shared key-dispatch closure used by both the BinaryExpr (named) arm and
+    // the Literal (positional 'key=value') arm introduced for DF54.
+    let mut assign = |out: &mut FileTvfArgs, name: &str, value: &str| -> DFResult<()> {
+        match name {
+            "access_key" => out.access_key = Some(value.to_string()),
+            "secret_key" => out.secret_key = Some(value.to_string()),
+            "endpoint" => out.endpoint = Some(value.to_string()),
+            "region" => out.region = Some(value.to_string()),
+            "azure_account" => out.azure_account = Some(value.to_string()),
+            "azure_access_key" => out.azure_access_key = Some(value.to_string()),
+            "azure_sas_token" => out.azure_sas_token = Some(value.to_string()),
+            "gcs_service_account_path" => out.gcs_service_account_path = Some(value.to_string()),
+            "gcs_service_account_key" => out.gcs_service_account_key = Some(value.to_string()),
+            other => {
+                if !extra(other, value) {
+                    return plan_err!("{fn_name}: unknown named argument '{other}'");
+                }
+            }
+        }
+        Ok(())
+    };
+
     for expr in exprs.iter().skip(1) {
         match expr {
             Expr::BinaryExpr(binary) => {
@@ -493,24 +515,20 @@ where
                         );
                     }
                 };
-                match name {
-                    "access_key" => out.access_key = Some(value),
-                    "secret_key" => out.secret_key = Some(value),
-                    "endpoint" => out.endpoint = Some(value),
-                    "region" => out.region = Some(value),
-                    "azure_account" => out.azure_account = Some(value),
-                    "azure_access_key" => out.azure_access_key = Some(value),
-                    "azure_sas_token" => out.azure_sas_token = Some(value),
-                    "gcs_service_account_path" => out.gcs_service_account_path = Some(value),
-                    "gcs_service_account_key" => out.gcs_service_account_key = Some(value),
-                    other => {
-                        if !extra(other, &value) {
-                            return plan_err!(
-                                "{fn_name}: unknown named argument '{other}'"
-                            );
-                        }
-                    }
-                }
+                assign(&mut out, name, &value)?;
+            }
+            Expr::Literal(sv, _) => {
+                let kv = scalar_to_str(sv).ok_or_else(|| {
+                    datafusion::error::DataFusionError::Plan(format!(
+                        "{fn_name}: positional argument must be a non-null 'key=value' string"
+                    ))
+                })?;
+                let (name, value) = kv.split_once('=').ok_or_else(|| {
+                    datafusion::error::DataFusionError::Plan(format!(
+                        "{fn_name}: positional argument '{kv}' must be of the form 'key=value'"
+                    ))
+                })?;
+                assign(&mut out, name, value)?;
             }
             other => {
                 return plan_err!(
@@ -1754,5 +1772,61 @@ mod tests {
         let r = rewrite_hf_path_in_place("read_parquet", &mut args);
         assert!(r.is_err());
         assert!(r.unwrap_err().to_string().contains("malformed HuggingFace URL"));
+    }
+
+    // -----------------------------------------------------------------------
+    // DF54: positional 'key=value' literal arguments
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn positional_key_value_literal_parses_s3_creds() {
+        let exprs = vec![
+            datafusion_expr::lit("s3://bucket/data/*.parquet"),
+            datafusion_expr::lit("access_key=AKIA123"),
+            datafusion_expr::lit("secret_key=sekret"),
+            datafusion_expr::lit("region=eu-west-1"),
+        ];
+        let args = parse_file_tvf_args("read_parquet", &exprs, |_, _| false).unwrap();
+        assert_eq!(args.path, "s3://bucket/data/*.parquet");
+        assert_eq!(args.access_key.as_deref(), Some("AKIA123"));
+        assert_eq!(args.secret_key.as_deref(), Some("sekret"));
+        assert_eq!(args.region.as_deref(), Some("eu-west-1"));
+    }
+
+    #[test]
+    fn positional_value_may_contain_equals() {
+        let exprs = vec![
+            datafusion_expr::lit("s3://b/x.parquet"),
+            datafusion_expr::lit("secret_key=ab==cd=="),
+        ];
+        let args = parse_file_tvf_args("read_parquet", &exprs, |_, _| false).unwrap();
+        assert_eq!(args.secret_key.as_deref(), Some("ab==cd=="));
+    }
+
+    #[test]
+    fn positional_unknown_key_goes_to_extra_callback() {
+        let mut seen: Option<String> = None;
+        let exprs = vec![
+            datafusion_expr::lit("/x.csv"),
+            datafusion_expr::lit("delimiter=;"),
+        ];
+        let _ = parse_file_tvf_args("read_csv", &exprs, |k, v| {
+            if k == "delimiter" {
+                seen = Some(v.to_string());
+                true
+            } else {
+                false
+            }
+        });
+        assert_eq!(seen.as_deref(), Some(";"));
+    }
+
+    #[test]
+    fn positional_non_kv_literal_errors() {
+        let exprs = vec![
+            datafusion_expr::lit("/x.parquet"),
+            datafusion_expr::lit("notakeyvalue"),
+        ];
+        assert!(parse_file_tvf_args("read_parquet", &exprs, |_, _| false).is_err());
     }
 }

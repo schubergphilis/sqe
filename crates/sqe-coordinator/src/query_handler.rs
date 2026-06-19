@@ -938,7 +938,7 @@ impl QueryHandler {
                             if ct.or_replace {
                                 self.drop_table_if_exists(session, &ct.name).await?;
                             }
-                            let select_sql = format!("{query}");
+                            let select_sql = sqe_sql::rewrite_named_tvf_args(&format!("{query}"));
                             let (ctx, _) = self.create_session_context(session).await?;
                             let result = self.write_handler
                                 .handle_ctas_streaming(
@@ -964,7 +964,7 @@ impl QueryHandler {
                         let select_sql = ins
                             .source
                             .as_ref()
-                            .map(|q| format!("{q}"))
+                            .map(|q| sqe_sql::rewrite_named_tvf_args(&format!("{q}")))
                             .ok_or_else(|| {
                                 SqeError::Execution("INSERT without SELECT source".into())
                             })?;
@@ -1726,6 +1726,7 @@ impl QueryHandler {
         // CAST(v AS JSON) -> to_json(v) and the $-suffix metadata-table
         // rewrite also apply here when present.
         let sql = sqe_sql::rewrite_trino_compat(&sql);
+        let sql = sqe_sql::rewrite_named_tvf_args(&sql);
         let sql = sql.as_str();
 
         let df = ctx
@@ -1894,6 +1895,7 @@ impl QueryHandler {
         // through as the original string so DataFusion produces its own
         // error message.
         let sql = sqe_sql::rewrite_trino_compat(&sql);
+        let sql = sqe_sql::rewrite_named_tvf_args(&sql);
         let sql = sql.as_str();
 
         // Plan the query via DataFusion's SQL planner
