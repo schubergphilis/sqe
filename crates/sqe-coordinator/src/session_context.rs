@@ -484,6 +484,26 @@ pub async fn create_session_context(
             };
             ctx.register_udf(sqe_policy::sha256_udf::sha256_udf(mask_key));
 
+            // Register session-context UDFs: current_user(), is_role_in_session(),
+            // current_available_roles(), current_database(), current_schema().
+            //
+            // Each UDF bakes in the authenticated user's identity at construction
+            // time (Volatility::Immutable), so DataFusion const-folds them during
+            // logical optimization on the coordinator -- they never travel to workers
+            // as live function invocations.
+            //
+            // database: wired to config.catalog.warehouse (the Polaris warehouse name).
+            // schema: None -- no per-session default namespace is set at this point (MVP).
+            let session_identity = std::sync::Arc::new(sqe_policy::session_udf::SessionIdentity {
+                username: session.user.username.clone(),
+                roles: session.user.roles.clone(),
+                database: Some(config.catalog.warehouse.clone()),
+                schema: None,
+            });
+            for udf in sqe_policy::session_udf::session_udfs(session_identity) {
+                ctx.register_udf(udf);
+            }
+
             // Register Trino-compatible function aliases (year(), month(), day_of_week(), etc.)
             // so Trino SQL and dbt models work without modification.
             sqe_trino_functions::register_trino_functions(&ctx);
@@ -848,6 +868,78 @@ s3_path_style = true
         assert!(
             cache.get("token-a").await.is_none(),
             "entry should have expired immediately under a zero TTL"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Session-context UDF registration smoke tests (Task 4, Phase 2B)
+    // -----------------------------------------------------------------------
+
+    /// Verify that the five session-context UDFs can be registered on a bare
+    /// DataFusion SessionContext and that `is_role_in_session` and
+    /// `current_available_roles` execute correctly via `ctx.sql`.
+    ///
+    /// `current_user()` is skipped here: sqlparser treats `current_user`
+    /// (without parens) as a reserved keyword and normalises it to the built-in
+    /// form; `current_user()` WITH parens is rejected by DataFusion's SQL
+    /// parser (PlannerError). Use `is_role_in_session` or
+    /// `current_available_roles` for round-trip tests.
+    #[tokio::test]
+    async fn session_udfs_register_and_execute_via_ctx_sql() {
+        use datafusion::prelude::SessionContext;
+
+        let ctx = SessionContext::new();
+        let identity = std::sync::Arc::new(sqe_policy::session_udf::SessionIdentity {
+            username: "alice".into(),
+            roles: vec!["analyst".into(), "admin".into()],
+            database: Some("test_wh".into()),
+            schema: None,
+        });
+        for udf in sqe_policy::session_udf::session_udfs(identity) {
+            ctx.register_udf(udf);
+        }
+
+        // is_role_in_session('analyst') -> true
+        let df = ctx
+            .sql("SELECT is_role_in_session('analyst') AS r")
+            .await
+            .expect("plan is_role_in_session");
+        let batches = df.collect().await.expect("execute is_role_in_session");
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .expect("boolean array");
+        assert!(col.value(0), "is_role_in_session('analyst') should be true");
+
+        // is_role_in_session('engineer') -> false
+        let df2 = ctx
+            .sql("SELECT is_role_in_session('engineer') AS r")
+            .await
+            .expect("plan is_role_in_session false");
+        let batches2 = df2.collect().await.expect("execute is_role_in_session false");
+        let col2 = batches2[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .expect("boolean array");
+        assert!(!col2.value(0), "is_role_in_session('engineer') should be false");
+
+        // current_available_roles() -> JSON array of roles (sorted)
+        let df3 = ctx
+            .sql("SELECT current_available_roles() AS r")
+            .await
+            .expect("plan current_available_roles");
+        let batches3 = df3.collect().await.expect("execute current_available_roles");
+        let col3 = batches3[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("string array");
+        assert_eq!(
+            col3.value(0),
+            r#"["admin","analyst"]"#,
+            "current_available_roles() should return sorted JSON"
         );
     }
 }
