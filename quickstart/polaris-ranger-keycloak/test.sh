@@ -65,8 +65,8 @@ admin() { # desc sql
 }
 
 echo "== 1. Data setup (carol = sqe_admin) =="
-admin "CREATE TABLE IF NOT EXISTS sales_wh.sales.orders (id BIGINT, region VARCHAR, amount DOUBLE)"
-admin "INSERT INTO sales_wh.sales.orders VALUES (1,'EU',10.0),(2,'US',20.0)"
+admin "CREATE TABLE IF NOT EXISTS sales_wh.sales.orders (id BIGINT, region VARCHAR, amount DOUBLE, ssn VARCHAR)"
+admin "INSERT INTO sales_wh.sales.orders VALUES (1,'EU',10.0,'111-11-1111'),(2,'US',20.0,'222-22-2222')"
 admin "CREATE TABLE IF NOT EXISTS ops_wh.ops.audit (id BIGINT, event VARCHAR)"
 admin "INSERT INTO ops_wh.ops.audit VALUES (1,'login'),(2,'logout')"
 
@@ -86,7 +86,7 @@ echo
 echo "== 4. Positive: the SQE grants enabled access =="
 assert_allow "alice (analyst) SELECT orders AFTER grant" alice "SELECT region FROM sales_wh.sales.orders LIMIT 1"
 assert_allow "bob (engineer) SELECT orders"             bob   "SELECT region FROM sales_wh.sales.orders LIMIT 1"
-assert_allow "bob (engineer) INSERT orders"             bob   "INSERT INTO sales_wh.sales.orders VALUES (3,'EU',30.0)"
+assert_allow "bob (engineer) INSERT orders"             bob   "INSERT INTO sales_wh.sales.orders VALUES (3,'EU',30.0,'333-33-3333')"
 assert_allow "bob (user grant) SELECT audit"            bob   "SELECT event FROM ops_wh.ops.audit LIMIT 1"
 
 echo
@@ -153,10 +153,54 @@ assert_fg_unmasked() { # desc user
   red "FAIL  $1"; echo "      $(echo "$out" | tr '\n' ' ' | cut -c1-200)"; FAIL=$((FAIL+1))
 }
 
+assert_fg_partial_mask() { # desc user
+  local out
+  for _ in 1 2 3 4 5 6; do
+    out="$(sqe "$2" "SELECT ssn FROM sales_wh.sales.orders")"
+    if ! is_error "$out"; then
+      # Confirm at least one row was returned (no vacuous pass).
+      if ! echo "$out" | grep -qE 'xxx-|[0-9]{4}'; then
+        red "FAIL  $1 (no ssn rows returned; policy may not have applied)"; echo "      $(echo "$out" | tr '\n' ' ' | cut -c1-200)"; FAIL=$((FAIL+1)); return
+      fi
+      # Confirm the masked prefix pattern is present (digits replaced with x, dashes kept).
+      if ! echo "$out" | grep -qE 'xxx-xx-[0-9]{4}'; then
+        red "FAIL  $1 (expected xxx-xx-NNNN pattern not found)"; echo "      $(echo "$out" | tr '\n' ' ' | cut -c1-200)"; FAIL=$((FAIL+1)); return
+      fi
+      # Confirm the raw full SSN is NOT visible.
+      if echo "$out" | grep -q '111-11-1111'; then
+        red "FAIL  $1 (raw SSN 111-11-1111 visible, mask not applied)"; echo "      $(echo "$out" | tr '\n' ' ' | cut -c1-200)"; FAIL=$((FAIL+1)); return
+      fi
+      green "PASS  $1"; PASS=$((PASS+1)); return 0
+    fi
+    sleep 5
+  done
+  red "FAIL  $1"; echo "      $(echo "$out" | tr '\n' ' ' | cut -c1-200)"; FAIL=$((FAIL+1))
+}
+
+assert_fg_ssn_unmasked() { # desc user
+  local out
+  for _ in 1 2 3 4 5 6; do
+    out="$(sqe "$2" "SELECT ssn FROM sales_wh.sales.orders")"
+    if ! is_error "$out"; then
+      # Confirm the raw SSN is visible (no mask for this role).
+      if ! echo "$out" | grep -q '111-11-1111'; then
+        red "FAIL  $1 (raw SSN 111-11-1111 missing, unexpected mask)"; echo "      $(echo "$out" | tr '\n' ' ' | cut -c1-200)"; FAIL=$((FAIL+1)); return
+      fi
+      green "PASS  $1"; PASS=$((PASS+1)); return 0
+    fi
+    sleep 5
+  done
+  red "FAIL  $1"; echo "      $(echo "$out" | tr '\n' ' ' | cut -c1-200)"; FAIL=$((FAIL+1))
+}
+
 # alice: analyst-only (no engineer role) -- no row filter, no column mask applied.
 assert_fg_unmasked "alice (analyst-only) sees all regions + real amounts" alice
 # bob: engineer (also analyst) -- row filter restricts to EU, amount masked to NULL.
 assert_fg_row_filter "bob (engineer) sees EU-only rows + NULL amount" bob
+# alice: ssn unmasked (analyst-only, engineer policy does not apply).
+assert_fg_ssn_unmasked "alice (analyst-only) sees raw ssn" alice
+# bob: ssn show-last-4 masked (engineer role). Expects xxx-xx-NNNN; dashes kept; last 4 digits visible.
+assert_fg_partial_mask "bob (engineer) sees show-last-4 ssn (xxx-xx-NNNN)" bob
 
 echo
 echo "== 6. Ranger DENY on ops_wh.ops.audit for role analyst (deny overrides allow) =="
@@ -190,7 +234,7 @@ assert_deny "alice SELECT audit (deny overrides analyst allow)" alice "SELECT ev
 echo
 echo "== 7. Negative tests =="
 assert_deny "dave (no role) SELECT orders"        dave  "SELECT region FROM sales_wh.sales.orders LIMIT 1"
-assert_deny "alice (read-only) INSERT orders"     alice "INSERT INTO sales_wh.sales.orders VALUES (9,'x',0.0)"
+assert_deny "alice (read-only) INSERT orders"     alice "INSERT INTO sales_wh.sales.orders VALUES (9,'x',0.0,'000-00-0000')"
 assert_deny "alice (read-only) DROP orders"       alice "DROP TABLE sales_wh.sales.orders"
 
 echo
