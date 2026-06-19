@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!--
+  Ranger Spark plugin security configuration for the spark-parity stack.
+
+  Points the Kyuubi RangerSparkExtension at the Ranger Admin running in this
+  compose stack. Service name `hive` matches the hive service created by
+  bootstrap-ranger.sh, which is the same service SQE reads for fine-grained
+  policy enforcement.
+
+  Docs: https://kyuubi.readthedocs.io/en/master/security/authorization/spark/install.html
+-->
+<configuration>
+
+  <!-- Ranger Admin URL -->
+  <property>
+    <name>ranger.plugin.spark.policy.rest.url</name>
+    <value>http://ranger-admin:6080</value>
+  </property>
+
+  <!-- Ranger service name: must match the `hive` service created in bootstrap-ranger.sh -->
+  <property>
+    <name>ranger.plugin.spark.service.name</name>
+    <value>hive</value>
+  </property>
+
+  <!-- Policy cache: survive restarts without a Ranger round-trip on startup -->
+  <property>
+    <name>ranger.plugin.spark.policy.cache.dir</name>
+    <value>/tmp/ranger-policy-cache</value>
+  </property>
+
+  <!-- Poll interval (ms): pick up policy changes quickly in this dev stack -->
+  <property>
+    <name>ranger.plugin.spark.policy.pollIntervalMs</name>
+    <value>10000</value>
+  </property>
+
+  <!-- Plugin mode: ACTIVE = enforce; use PASSIVE to log-only during debugging -->
+  <property>
+    <name>ranger.plugin.spark.plugin.mode</name>
+    <value>ACTIVE</value>
+  </property>
+
+  <!-- Enable user-store enricher for role resolution (required for role-based masks) -->
+  <property>
+    <name>ranger.plugin.spark.enable.implicit.userstore.enricher</name>
+    <value>true</value>
+  </property>
+
+  <!-- Ranger admin auth -->
+  <property>
+    <name>ranger.plugin.spark.policy.rest.client.username</name>
+    <value>admin</value>
+  </property>
+
+  <property>
+    <name>ranger.plugin.spark.policy.rest.client.password</name>
+    <value>rangerR0cks!</value>
+  </property>
+
+  <!-- App ID sent to Ranger audit (informational) -->
+  <property>
+    <name>ranger.plugin.spark.policy.rest.client.appId</name>
+    <value>spark-parity</value>
+  </property>
+
+</configuration>
