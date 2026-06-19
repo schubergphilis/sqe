@@ -608,6 +608,23 @@ mod tests {
     }
 
     #[test]
+    fn build_resource_map_future_tables_emits_table_wildcard() {
+        // A FUTURE grant arrives as table = Some("*"). At table level the
+        // resource map must carry an explicit "table": "*" so Ranger applies
+        // the policy to every (existing and future) table in the namespace.
+        let m = build_resource_map(
+            "",
+            "sales_wh",
+            Some("sales"),
+            Some("*"),
+            ResourceLevel::Table,
+        );
+        assert_eq!(m.get("catalog").map(String::as_str), Some("sales_wh"));
+        assert_eq!(m.get("namespace").map(String::as_str), Some("sales"));
+        assert_eq!(m.get("table").map(String::as_str), Some("*"));
+    }
+
+    #[test]
     fn resource_map_namespace_level_omits_table() {
         let m = build_resource_map("POLARIS", "wh", Some("sales"), Some("orders"), ResourceLevel::Namespace);
         assert!(!m.contains_key("table"));
