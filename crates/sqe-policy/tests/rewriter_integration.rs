@@ -9,7 +9,8 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, Decimal128Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    Array, Date32Array, Decimal128Array, Int64Array, RecordBatch, StringArray,
+    TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
@@ -560,6 +561,97 @@ async fn date_show_year_on_timestamp_over_qualified_multilevel_scan() {
     assert_eq!(ts_arr.value(0), expected_micros);
     assert_eq!(ts_arr.value(1), expected_micros);
     assert_eq!(ts_arr.value(2), expected_micros);
+}
+
+/// Test D: DateShowYear on a Date32 column (the Iceberg DATE wire type).
+///
+/// Iceberg DATE columns surface as Arrow Date32 (days since Unix epoch).
+/// The `apply_mask` DateShowYear arm handles `Date32 | Date64 | Timestamp`, but
+/// only Timestamp was previously executed in tests. This test exercises the
+/// Date32 path end-to-end through the physical planner.
+///
+/// Schema: `(id Int64, d Date32)` with seed rows:
+///   - 19738 = 2024-01-16
+///   - 19800 = 2024-03-18
+/// Both are strictly after 2024-01-01, so year-truncation to 19723 (2024-01-01)
+/// is observable (the value changes). The expected output is 19723 for all rows.
+/// Verified: `python3 -c "import datetime; print((datetime.date(2024,1,1)-datetime.date(1970,1,1)).days)"` -> 19723.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn date_show_year_on_date32_executes_and_truncates_to_jan1() {
+    // Self-contained schema and batch; does not use the shared `employee_schema`.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("d", DataType::Date32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2_i64])),
+            // 19738 = 2024-01-16, 19800 = 2024-03-18 (both > 2024-01-01 = 19723)
+            Arc::new(Date32Array::from(vec![19738_i32, 19800_i32])),
+        ],
+    )
+    .unwrap();
+
+    let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap());
+    let tref = TableReference::full("cat", "ns", "t");
+    let scan = LogicalPlanBuilder::scan(tref.clone(), provider_as_source(mem.clone()), None)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![
+            Expr::Column(Column::new(Some(tref.clone()), "id")),
+            Expr::Column(Column::new(Some(tref.clone()), "d")),
+        ])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let store = InMemoryPolicyStore::new();
+    let mut policy = ResolvedPolicy::default();
+    policy
+        .column_masks
+        .insert("d".to_string(), MaskType::DateShowYear);
+    // namespace last component "ns" matches the catalog schema key
+    store.add_table_policy("ns", "t", policy).await;
+
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store));
+    let rewritten = rewriter.evaluate(&user("eve", &[]), plan).await.unwrap();
+
+    // Register under catalog "cat", schema "ns" and execute.
+    let ctx = SessionContext::new();
+    let catalog = Arc::new(MemoryCatalogProvider::new());
+    catalog
+        .register_schema("ns", Arc::new(MemorySchemaProvider::new()))
+        .unwrap();
+    ctx.register_catalog("cat", catalog);
+    ctx.register_table(tref, mem).unwrap();
+    let batches = ctx
+        .execute_logical_plan(rewritten)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 2, "both rows must be present (no row filter)");
+
+    let d_col = batches[0].column_by_name("d").unwrap();
+    // Type-preservation invariant: DateShowYear must keep Date32, not leave it as Timestamp.
+    assert_eq!(
+        d_col.data_type(),
+        &DataType::Date32,
+        "DateShowYear must preserve Date32 column type after cast-back"
+    );
+
+    // All rows must truncate to 2024-01-01 = 19723 days since 1970-01-01.
+    let d_arr = d_col.as_any().downcast_ref::<Date32Array>().unwrap();
+    let expected_day: i32 = 19723; // 2024-01-01
+    assert_eq!(d_arr.value(0), expected_day, "2024-01-16 must truncate to 2024-01-01");
+    assert_eq!(d_arr.value(1), expected_day, "2024-03-18 must truncate to 2024-01-01");
 }
 
 /// Test C: PartialMask on a non-string (Int64) column falls back to typed NULL
