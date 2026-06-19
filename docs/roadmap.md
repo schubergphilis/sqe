@@ -85,7 +85,8 @@
 ## In Progress
 
 - [x] Ranger fine-grained policy engine Phase 1: `RangerStore: PolicyStore` reads the `hive` Ranger service (download endpoint) and feeds the existing `PlanRewriter`; `MASK_NULL` column masking and row-filter expressions enforced at the `LogicalPlan` layer. Quickstart e2e demo in `quickstart/polaris-ranger-keycloak/`. Branch `feat/ranger-policy-store`.
-- [ ] Ranger fine-grained policy engine Phase 2: mask UDFs (hash, partial, date truncation), session-context SQL functions (`current_user()` / `current_role()` in filter expressions), tag-based masking via Ranger tag policies
+- [x] Ranger fine-grained policy engine Phase 2A: mask vocabulary (hash, partial show-first/last, date-truncation to year/month/day, full redact, custom expression); all masks execute through the physical planner with type preservation on Decimal, Timestamp, and Date32. Branch `feat/ranger-mask-vocabulary`.
+- [ ] Ranger fine-grained policy engine Phase 2B: session-context SQL functions (`current_user()` / `current_role()` in filter expressions), tag-based masking via Ranger tag policies
 - [ ] OPA/Cedar policy engine (row filters, column masks)
 - [ ] Helm chart for Kubernetes deployment
 - [ ] CoW DML scales to TPC-E SF100 (`cow-dml-parallel-streaming`: parallelise per-file rewrite + stream writes + drop double-WHERE; targets `trade_result_update_holding` under 120 s at SF100)

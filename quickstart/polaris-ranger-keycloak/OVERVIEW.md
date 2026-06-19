@@ -163,10 +163,33 @@ Revoking the coarse `SELECT` grant still denies the query before any fine-graine
 so the same policy set is shared across tools. A mask or row filter written for SQE applies to
 Spark queries through the same Ranger service and vice versa.
 
-**Phase 2 (not yet implemented).** The current enforcement covers `MASK_NULL` (replace column
-value with NULL) and row-filter expressions. Phase 2 will add mask UDFs (hash, partial, date
-truncation), session-context SQL functions (`current_user()`, `current_role()`) inside filter
-expressions, and tag-based masking via Ranger tag policies.
+**Supported mask types (Phase 2A, shipped).** The full Ranger hive built-in mask vocabulary is
+now enforced. SQE translates each `dataMaskType` string from the policy into a DataFusion UDF
+call or a NULL substitution before optimization. The complete set:
+
+| dataMaskType | Effect |
+|---|---|
+| `MASK_NULL` | Replace column value with NULL. |
+| `MASK` | Full character redact: uppercase -> X, lowercase -> x, digit -> n, punctuation kept. |
+| `MASK_SHOW_LAST_4` | Show last 4 characters; mask all others with x (digits and letters alike). Dashes and punctuation pass through. For `111-11-1111`: output is `xxx-xx-1111`. |
+| `MASK_SHOW_FIRST_4` | Show first 4 characters; mask the rest with x. |
+| `MASK_HASH` | Replace column value with an HMAC-SHA256 hex digest. |
+| `MASK_DATE_SHOW_YEAR` | Truncate a date to year: month and day zeroed out. |
+| `CUSTOM` | Arbitrary SQL expression evaluated per row. |
+
+The char convention matches the hive serviceDef transformers. Full `MASK` uses X/x/n; `MASK_SHOW_*`
+use x for every replaced character type. This is the complete Ranger hive built-in mask set.
+
+The quickstart seeds a `MASK_NULL` policy on `orders.amount` and a `MASK_SHOW_LAST_4` policy on
+`orders.ssn`, both for role `engineer`. Test section 5 proves both: bob (engineer) sees
+`xxx-xx-1111` for ssn and an empty amount cell; alice (analyst-only) sees the raw values.
+
+**Phase 2B (not yet implemented).** Session-context SQL functions (`current_user()`,
+`current_role()`) inside row-filter expressions; richer role model in `SessionUser` for inherited
+and secondary roles.
+
+**Phase 2C (not yet implemented).** Cross-engine dynamic transformer configuration for arbitrary-N
+show-first/show-last masks; tag-based masking via Ranger tag policies.
 
 ## Versions
 

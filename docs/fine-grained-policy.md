@@ -140,17 +140,36 @@ sharing requirements.
 The role-hierarchy ones (`IS_ROLE_IN_SESSION`) are what require the richer
 `SessionUser` role model.
 
-## Phase shape (when we build it)
+## Phase shape
+
+**Phase 2A (shipped, branch `feat/ranger-mask-vocabulary`).** The full Ranger hive built-in mask
+vocabulary is implemented and wired. Steps 3, 4, and 6 from the original list are done:
+
+- `MaskType` extended with `PartialMask { show_first, show_last, upper, lower, digit }` and
+  `DateShowYear`. `RangerStore` maps every standard `dataMaskType` string to the corresponding
+  `MaskType` variant.
+- `mask_partial` DataFusion UDF realises the Hive char-level transformer (uppercase, lowercase,
+  digit substitution chars; punctuation and non-ASCII pass through unchanged; Unicode scalar
+  counting). The full hive set is now: MASK_NULL, MASK, MASK_SHOW_LAST_4, MASK_SHOW_FIRST_4,
+  MASK_HASH, MASK_DATE_SHOW_YEAR, CUSTOM.
+- Quickstart `polaris-ranger-keycloak` updated: orders table gains an `ssn VARCHAR` column;
+  a `MASK_SHOW_LAST_4` policy seeds on that column for role `engineer`; test.sh section 5
+  proves `111-11-1111` becomes `xxx-xx-1111` for bob (engineer) and stays raw for alice
+  (analyst-only).
+
+**Phase 2B (not yet started).** Session-context SQL functions:
 
 1. `sqe-auth` / `SessionUser`: richer role model (active + inherited/secondary).
-2. Register session-context scalar UDFs resolved from the session.
-3. Extend `MaskType` with partial + regexp masks (+ matching mask UDFs).
-4. `RangerStore: PolicyStore` pulling Ranger row-filter / data-mask policies;
-   `PolicyEngine::Ranger` config; wire into the rewriter.
-5. Tag-based masking: Iceberg column-property tag source -> mask binding.
-6. Quickstart additions: row-filter + masking demo on the existing
-   `polaris-ranger-keycloak` stack (e.g. mask `orders.amount` for `analyst`,
-   row-filter `orders` by region per role), proving end to end.
+2. Register `current_user()`, `current_role()`, `current_available_roles()` as evaluable scalar
+   UDFs resolved per-session from `SessionUser`.
+
+**Phase 2C (not yet started).** Cross-engine dynamic transformer + tag-based masking:
+
+3. Dynamic transformer configuration for arbitrary-N show-first/show-last masks (currently
+   hard-coded to 4).
+4. Tag-based masking: Iceberg column-property tag source -> mask binding, plus Ranger tag
+   policies. The tag source for the Polaris gate has no Atlas hook today, but SQE can read
+   Iceberg column properties directly.
 
 ## Sources
 
