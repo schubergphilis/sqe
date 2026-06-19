@@ -184,3 +184,11 @@ Build matters. Test matters. Measure matters. Ship the matrix score next to the 
 The next cells are already in flight. HMS and Glue real implementations. The worker bloom-filter wiring. MERGE on V3 with a direct test. The score will keep moving.
 
 The only number worth quoting is the one earned by tests that ran against a real stack today.
+
+---
+
+## Update 2026-05-27
+
+The Quack protocol port that landed late May used the same pattern. The first MR wrote `docs/quack-datatype-matrix.md` with cells for every DuckDB type and a status column. The first run had only the trivial scalars green. Each subsequent MR (`DECIMAL`, `LIST`, `STRUCT`, `MAP`, `ARRAY`, `ENUM`, `UNION`) flipped its row to ✅ in the same diff as the code that earned it, with the verification command embedded in the cell. Two bugs surfaced through the same mechanism: `WriteListWithDefault` elision on empty results, and uninitialised bytes at NULL VARCHAR positions. Both were silent in unit tests and immediately visible in live-CLI verification.
+
+Matrix-driven shipping converged in two days for the Quack arc, same way it did for the Iceberg arc. The discipline transfers.
