@@ -164,7 +164,15 @@ vocabulary is implemented and wired. Steps 3, 4, and 6 from the original list ar
 - `PolicyPlanRewriter` wired: calls `tag_source.column_tags(catalog, full-namespace-vec, table)` using the FULL namespace path (not last component), then `resolve_tags`, then `merge_tag_masks`. Precedence rules: resource mask wins, restricted stays restricted, unmappable tag fails closed.
 - Four executable integration tests prove: tag mask end-to-end, full-namespace identity (FakeTagSource capture), resource-mask-wins precedence, unmappable-tag fail-closed.
 - NOT live-demoed (quickstart stack drift); the executable tests are the proof.
-- Phase 3b remains: tagging DDL (`ALTER TABLE SET TAGS`), Iceberg-to-Ranger sync, CUSTOM tag mask per-column substitution.
+- Phase 3b (shipped): CUSTOM tag masks + cache invalidation on `SET TBLPROPERTIES`.
+
+**Phase 3b (shipped, branch `feat/tag-ddl`).** CUSTOM tag mask support + cache invalidation:
+
+- `TagMaskSpec` enum (`Ready(MaskType)` or `Custom(String)`) replaces the raw `MaskType` in `PolicyStore::resolve_tags` return type. CUSTOM masks carry the raw `{col}` template; the rewriter substitutes the column name at merge time.
+- `resolve_tag_policies` in `ranger_store.rs`: CUSTOM tags with a `value_expr` now produce `TagMaskSpec::Custom(template)` instead of being marked unmappable. Tags with no `value_expr` remain unmappable (fail-closed, nothing to substitute).
+- `merge_tag_masks` in `plan_rewriter.rs`: `TagMaskSpec::Custom(template)` branches substitute `{col}` with the real column name, call `parse_sql_predicate`, produce `MaskType::Custom(expr)` on success, restrict column on parse failure (fail-closed).
+- `set_table_properties` in `catalog_ops.rs`: explicit `session_catalog.invalidate_table` call after `commit_schema_update` so a `SET TBLPROPERTIES('sqe.column-tags'=...)` is visible on the next query without waiting for TTL expiry. `invalidate_policy_cache()` also called in `QueryHandler` for defense-in-depth.
+- Two new tests cover: CUSTOM with valid expression applies `MaskType::Custom` (not restriction); CUSTOM with unparseable expression restricts the column.
 
 **Phase 2B (not yet started).** Session-context SQL functions:
 
