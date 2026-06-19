@@ -166,6 +166,25 @@ The unit test forges the exact wire layout (1 row, NULL validity, 1-byte `0x80` 
 
 This is the kind of bug a unit-test-only codec port would never catch. The source code is correct under the assumption that nothing reads the inline payload at NULL positions. The wire format leaks the assumption. Live testing made the leak visible.
 
+## A late simplification: widen on the reverse path
+
+A type-matrix audit a day later flagged that we had four ⚠️ rows for the unsigned ints (`UTINYINT`, `USMALLINT`, `UINTEGER`, `UBIGINT`) plus another for `HUGEINT` and `UHUGEINT`. The wire codec handled them all. What did not work was DataFusion's SQL planner: it rejects `1::UTINYINT`, will not parse `HUGEINT` literals, and is generally unhappy with unsigned types in `SELECT` outputs.
+
+The reverse Arrow bridge had been faithfully mapping `UTinyInt -> UInt8`, `USmallInt -> UInt16`, and so on. Faithful, but unhelpful: every query that returned an unsigned column was unusable from the moment DataFusion saw it.
+
+The fix is a one-line policy change per type. Widen on the reverse path. `UTinyInt -> Int16`. `USmallInt -> Int32`. `UInteger -> Int64`. `UBigInt -> Int64` (cast u64 -> i64; values above `i64::MAX` wrap, which is rare). `HugeInt` and `UHugeInt` collapse to `Int64` too, truncating the high 64 bits. The forward path stays unchanged: if DataFusion gives us a `UInt8Array` we still encode `UTinyInt` on the wire. Symmetry breaks, but only in the direction where pragmatism beats fidelity.
+
+```rust
+// reverse arrow_bridge::fixed_to_array, UTinyInt branch
+let widened: Vec<i16> = (0..row_count).map(|i| bytes[i] as i16).collect();
+Ok(Arc::new(Int16Array::new(
+    arrow_buffer::ScalarBuffer::from(widened),
+    nulls,
+)))
+```
+
+The matrix doc flipped four ⚠️ to ✅ in the same MR. DataFusion now handles every integer flavour DuckDB can return.
+
 ## What I would do differently
 
 Capture earlier. We had unit tests for every type before we ran a single end-to-end query against real DuckDB. They passed. The first live test surfaced two byte-level discrepancies in fifteen minutes that no unit test would have caught, because we did not know to write them.
