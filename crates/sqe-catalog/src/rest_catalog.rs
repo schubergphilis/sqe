@@ -260,6 +260,41 @@ impl TableMetadataCache {
     pub fn entry_count(&self) -> u64 {
         self.inner.entry_count()
     }
+
+    /// Return the table properties for `(namespace, table_name)` if ANY user's
+    /// entry is present in the cache.
+    ///
+    /// Cache keys are scoped by `{token_fingerprint}|{ns}.{table}` to prevent
+    /// per-user S3 vended credentials from crossing user boundaries (issue #49).
+    /// Table *properties* (e.g. `sqe.column-tags`) are user-independent:
+    /// they live in the Iceberg table metadata, not in the vended FileIO
+    /// credentials, so reading the first matching entry is safe.
+    ///
+    /// The scan is synchronous via `moka::future::Cache::iter()`, which
+    /// exposes the current snapshot of the cache without blocking on async I/O.
+    /// Returns `None` when no entry with a matching identity suffix exists.
+    ///
+    /// Key suffix format: `"|{namespace_display}.{table_name}"` — identical to
+    /// the tail of `table_cache_key` (which prefixes the token fingerprint).
+    pub fn properties_for(
+        &self,
+        namespace_display: &str,
+        table_name: &str,
+    ) -> Option<std::collections::HashMap<String, String>> {
+        let suffix = format!("|{}.{}", namespace_display, table_name);
+        for (key, entry) in self.inner.iter() {
+            if key.ends_with(&suffix) {
+                return Some(
+                    entry
+                        .table
+                        .metadata()
+                        .properties()
+                        .clone(),
+                );
+            }
+        }
+        None
+    }
 }
 
 /// Backend handle inside `SessionCatalog`.
