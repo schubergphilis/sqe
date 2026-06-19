@@ -72,10 +72,15 @@ impl SessionIdentity {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Render the role set as a sorted JSON array string.
-/// e.g. `["analyst","engineer"]`
+/// Render the role set as a sorted, deduplicated JSON array string.
+/// e.g. `["analyst","engineer"]`. Sorts at render time so the output is
+/// deterministic regardless of the stored order. Nothing may depend on
+/// `SessionIdentity::roles` being pre-sorted.
 fn render_roles(roles: &[String]) -> String {
-    serde_json::to_string(roles).unwrap_or_else(|_| "[]".to_string())
+    let mut sorted: Vec<&String> = roles.iter().collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    serde_json::to_string(&sorted).unwrap_or_else(|_| "[]".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -160,7 +165,7 @@ impl ScalarUDFImpl for IsRoleInSessionFunc {
         let arg = &args.args[0];
         match arg {
             ColumnarValue::Scalar(ScalarValue::Utf8(Some(role))) => {
-                let found = roles.binary_search(role).is_ok();
+                let found = roles.contains(role);
                 Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(found))))
             }
             ColumnarValue::Scalar(ScalarValue::Utf8(None)) => {
@@ -177,7 +182,7 @@ impl ScalarUDFImpl for IsRoleInSessionFunc {
                     })?;
                 let result: BooleanArray = str_array
                     .iter()
-                    .map(|opt_role| opt_role.map(|r| roles.binary_search(&r.to_string()).is_ok()))
+                    .map(|opt_role| opt_role.map(|r| roles.contains(&r.to_string())))
                     .collect();
                 Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
             }
@@ -501,6 +506,32 @@ mod tests {
     fn test_is_role_in_session_volatility_immutable() {
         let func = IsRoleInSessionFunc::new(alice_identity());
         assert_eq!(func.signature().volatility, Volatility::Immutable);
+    }
+
+    /// Regression: callers build SessionIdentity via struct literal (public
+    /// fields + Default) without sorting. binary_search returned false
+    /// negatives on unsorted roles, silently dropping role-conditional
+    /// masks/filters. Membership must work on unsorted input.
+    #[test]
+    fn is_role_in_session_works_on_unsorted_struct_literal_roles() {
+        let id = SessionIdentity {
+            username: "alice".into(),
+            roles: vec!["zebra".into(), "monkey".into(), "admin".into()],
+            ..Default::default()
+        };
+        let func = IsRoleInSessionFunc::new(Arc::new(id));
+
+        let present = ColumnarValue::Scalar(ScalarValue::Utf8(Some("admin".to_string())));
+        let result = func
+            .invoke_with_args(make_args_utf8(present, DataType::Boolean, 1))
+            .unwrap();
+        assert_eq!(scalar_bool(result), Some(true));
+
+        let absent = ColumnarValue::Scalar(ScalarValue::Utf8(Some("absent".to_string())));
+        let result = func
+            .invoke_with_args(make_args_utf8(absent, DataType::Boolean, 1))
+            .unwrap();
+        assert_eq!(scalar_bool(result), Some(false));
     }
 
     // -----------------------------------------------------------------------
