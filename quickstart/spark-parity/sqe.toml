@@ -1,0 +1,72 @@
+# SQE config for the spark-parity quickstart.
+#
+# SQE authenticates users against Keycloak (ROPC password grant), passes the
+# bearer token through to Polaris. Fine-grained ssn masking is enforced via the
+# Ranger `hive` service (same service Kyuubi Authz reads). No GRANT/REVOKE
+# access-control backend here: Polaris uses native catalog-role auth.
+
+[coordinator]
+flight_sql_port = 50051
+trino_http_port = 8080
+mode = "hybrid"
+flight_compression = "none"
+
+[worker]
+memory_limit = "4GB"
+spill_dir = "/tmp/sqe-spill"
+
+# ── Authentication ──────────────────────────────────────────────────────────
+[auth]
+keycloak_url = "http://keycloak:8080"
+realm = "iceberg-ranger"
+client_id = "sqe-client"
+client_secret = "sqe-secret-change-me"
+ssl_verification = false
+admin_roles = ["sqe_admin"]
+
+[[auth.providers]]
+type = "oidc_password"
+token_url = "http://keycloak:8080/realms/iceberg-ranger/protocol/openid-connect/token"
+client_id = "sqe-client"
+client_secret = "sqe-secret-change-me"
+roles_claim = "realm_access.roles"
+accept_invalid_certs = true
+
+# ── Catalog ──────────────────────────────────────────────────────────────────
+[catalogs.sales_wh]
+polaris_url = "http://polaris:8181/api/catalog"
+warehouse = "sales_wh"
+metadata_cache_ttl_secs = 30
+default_table_format_version = 2
+
+[catalog]
+polaris_url = "http://polaris:8181/api/catalog"
+warehouse = "sales_wh"
+
+# ── Storage ─────────────────────────────────────────────────────────────────
+[storage]
+s3_endpoint = "http://rustfs:9000"
+s3_region = "us-east-1"
+s3_access_key = "s3admin"
+s3_secret_key = "s3adminpw"
+s3_path_style = true
+s3_allow_http = true
+
+# ── Fine-grained policy: ssn masking via Ranger hive service ─────────────────
+# SQE reads MASK_SHOW_LAST_4 from the `hive` Ranger service and rewrites the
+# query plan (mask UDF injected above the scan). Kyuubi Authz reads the same
+# service. admin-password also via SQE_POLICY__RANGER__ADMIN_PASSWORD.
+[policy]
+engine = "ranger"
+
+[policy.ranger]
+url = "http://ranger-admin:6080"
+service-name = "hive"
+admin-user = "admin"
+admin-password = "rangerR0cks!"
+
+[session]
+idle_timeout_secs = 900
+
+[metrics]
+prometheus_port = 9090
