@@ -132,19 +132,54 @@ else
 fi
 
 # ── Fine-grained policies on the hive service ───────────────────────────────
-# Both policies target role 'engineer' (bob + carol). Role 'analyst' (alice +
-# bob + carol) serves as the unmasked / unfiltered baseline in test.sh: alice
-# (analyst-only, not engineer) sees real amounts and all regions, while bob
-# (engineer) gets amount masked to NULL and rows restricted to region = 'EU'.
-# Note: region values in the seed data are uppercase ('EU', 'US'), matching
-# this filter expression exactly.
+# All policies target role 'engineer' (bob + carol). Role 'analyst' (alice +
+# bob + carol) serves as the unmasked baseline in test.sh: alice (analyst-only,
+# not engineer) sees real amounts and raw ssn, while bob (engineer) gets amount
+# masked to NULL and ssn masked to show-last-4.
+#
+# NO row-filter policy is seeded. The SQE<->Spark cross-compare (parity-test.sh)
+# runs `SELECT id, ssn` as bob and asserts byte-identical masked ssn output in
+# both engines. A row-filter on `region` would break that two ways:
+#   1. Kyuubi Spark 3.5 throws MISSING_ATTRIBUTES (#6889) when the filter
+#      references a column the query does not project (region).
+#   2. The filter (region='EU') would drop the US row from bob's result, so the
+#      two engines could not both return ssn for id=1 AND id=2.
+# Mask parity is the cross-compare deliverable; row-filter parity is out of
+# scope on Spark 3.5 + Kyuubi 1.11 until #6889 is resolved.
 post_hive_policy() { # json_file
   curl -fsS $AUTH $CSRF $CT -X POST "${RANGER_URL}/service/public/v2/api/policy" \
     -d @"$1" >/dev/null 2>&1 \
     && echo "  policy created" || echo "  policy exists or failed (idempotent)"
 }
 
-echo "Creating fine-grained mask + row-filter policies on hive service ..."
+echo "Creating fine-grained access + mask policies on hive service ..."
+
+# Access policy (policyType 0): grant role engineer SELECT on sales.orders.*
+# This is for the Spark/Kyuubi cross-compare ONLY. Kyuubi Authz gates table
+# ACCESS on the hive service itself (it denies the query before applying any
+# mask if no access policy grants select). SQE does NOT use hive access
+# policies (its coarse gate is the Polaris `polaris` service); SQE reads only
+# the mask (type 1) and row-filter (type 2) policies from hive and ignores
+# type-0 access policies. So this policy is a no-op for SQE and a requirement
+# for Spark -- one role (engineer) drives both Spark access and the ssn mask.
+cat > /tmp/hive-access.json <<'EOF'
+{
+  "service": "hive",
+  "name": "access-sales-orders-engineer",
+  "policyType": 0,
+  "isEnabled": true,
+  "resources": {
+    "database": {"values": ["sales"]},
+    "table":    {"values": ["orders"]},
+    "column":   {"values": ["*"]}
+  },
+  "policyItems": [{
+    "roles":   ["engineer"],
+    "accesses": [{"type": "select", "isAllowed": true}]
+  }]
+}
+EOF
+post_hive_policy /tmp/hive-access.json
 
 # Column-mask policy (policyType 1): mask orders.amount -> NULL for role engineer.
 cat > /tmp/hive-mask.json <<'EOF'
@@ -167,7 +202,21 @@ cat > /tmp/hive-mask.json <<'EOF'
 EOF
 post_hive_policy /tmp/hive-mask.json
 
-# Column-mask policy (policyType 1): mask orders.ssn -> show last 4 for role engineer.
+# Column-mask policy (policyType 1): mask orders.ssn -> show last 4 for role
+# engineer. Uses a CUSTOM transformer with a PORTABLE standard-SQL expression
+# (concat + substr), NOT the named MASK_SHOW_LAST_4 type and NOT the Hive
+# mask_show_last_n UDF. This is the only form that yields byte-exact parity
+# across SQE and Spark/Kyuubi. WHY each alternative fails:
+#   - Named MASK_SHOW_LAST_4: SQE honors the servicedef transformer and renders
+#     xxx-xx-1111, but Kyuubi ignores it and applies its own mask chars
+#     (digit->n, separator->U) -> nnnUnnU1111. NOT byte-equal.
+#   - CUSTOM mask_show_last_n({col},4,...): Spark renders xxx-xx-1111 (once the
+#     Hive UDF is registered), but SQE fails plan rewrite with a type_coercion /
+#     "No field named ssn" error on that Hive-specific expression.
+#   - CUSTOM concat('xxx-xx-', substr({col},8,4)): concat + substr are built-ins
+#     in BOTH DataFusion (SQE) and Spark, so each engine injects the same
+#     expression verbatim and both render xxx-xx-1111 / xxx-xx-2222. GREEN.
+# 111-11-1111 -> substr(...,8,4)=1111 -> concat -> xxx-xx-1111.
 cat > /tmp/hive-mask-ssn.json <<'EOF'
 {
   "service": "hive",
@@ -182,30 +231,18 @@ cat > /tmp/hive-mask-ssn.json <<'EOF'
   "dataMaskPolicyItems": [{
     "roles":   ["engineer"],
     "accesses": [{"type": "select", "isAllowed": true}],
-    "dataMaskInfo": {"dataMaskType": "MASK_SHOW_LAST_4"}
+    "dataMaskInfo": {
+      "dataMaskType": "CUSTOM",
+      "valueExpr": "concat('xxx-xx-', substr({col}, 8, 4))"
+    }
   }]
 }
 EOF
 post_hive_policy /tmp/hive-mask-ssn.json
 
-# Row-filter policy (policyType 2): restrict orders to region = 'EU' for role engineer.
-cat > /tmp/hive-rowfilter.json <<'EOF'
-{
-  "service": "hive",
-  "name": "rowfilter-sales-orders-region",
-  "policyType": 2,
-  "isEnabled": true,
-  "resources": {
-    "database": {"values": ["sales"]},
-    "table":    {"values": ["orders"]}
-  },
-  "rowFilterPolicyItems": [{
-    "roles":   ["engineer"],
-    "accesses": [{"type": "select", "isAllowed": true}],
-    "rowFilterInfo": {"filterExpr": "region = 'EU'"}
-  }]
-}
-EOF
-post_hive_policy /tmp/hive-rowfilter.json
+# NOTE: no row-filter policy is seeded here (see the comment block above the
+# mask policies). SQE supports Ranger row filters, but the SQE<->Spark mask
+# cross-compare requires bob to see both rows of sales.orders, and Kyuubi Spark
+# 3.5 cannot evaluate a row filter on an unprojected column (#6889).
 
 echo "Ranger bootstrap complete."
