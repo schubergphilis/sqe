@@ -25,6 +25,7 @@ use sqe_policy::policy_store::InMemoryPolicyStore;
 use sqe_policy::tag_source::TagSource;
 use sqe_policy::{
     plan_rewriter::PolicyPlanRewriter, MaskType, PolicyEnforcer, PolicyStore, ResolvedPolicy,
+    TagMaskSpec,
 };
 
 fn user(name: &str, roles: &[&str]) -> SessionUser {
@@ -676,7 +677,7 @@ async fn date_show_year_on_date32_executes_and_truncates_to_jan1() {
 /// `resolve_tags` returns the configured triple unchanged.
 struct TagTestStore {
     resource_policy: ResolvedPolicy,
-    tag_masks: HashMap<String, MaskType>,
+    tag_masks: HashMap<String, TagMaskSpec>,
     tag_filters: Vec<Expr>,
     unmappable: HashSet<String>,
 }
@@ -697,7 +698,7 @@ impl TagTestStore {
     }
 
     fn with_tag_mask(mut self, tag: &str, mask: MaskType) -> Self {
-        self.tag_masks.insert(tag.to_string(), mask);
+        self.tag_masks.insert(tag.to_string(), TagMaskSpec::Ready(mask));
         self
     }
 
@@ -722,7 +723,7 @@ impl PolicyStore for TagTestStore {
         &self,
         _user: &SessionUser,
         _tags: &HashSet<String>,
-    ) -> (HashMap<String, MaskType>, Vec<Expr>, HashSet<String>) {
+    ) -> (HashMap<String, TagMaskSpec>, Vec<Expr>, HashSet<String>) {
         (self.tag_masks.clone(), self.tag_filters.clone(), self.unmappable.clone())
     }
 }
