@@ -13,8 +13,10 @@ pub mod write_predicates;
 
 pub use tag_source::{NoopTagSource, TagSource};
 
+use std::collections::{HashMap, HashSet};
+
 use async_trait::async_trait;
-use datafusion::logical_expr::LogicalPlan;
+use datafusion::logical_expr::{Expr, LogicalPlan};
 use sqe_core::SessionUser;
 
 /// Policy enforcement trait. Implementations receive a user and a logical plan,
@@ -107,6 +109,32 @@ pub trait PolicyStore: Send + Sync {
         table_name: &str,
         namespace: &str,
     ) -> sqe_core::Result<ResolvedPolicy>;
+
+    /// Resolve tag-based mask and row-filter policies for a user given a set
+    /// of tag names present on columns in a table.
+    ///
+    /// Returns:
+    /// - `HashMap<tag_name, MaskType>` — masks keyed by TAG (not column name).
+    ///   The `PlanRewriter` maps tag -> column using the Iceberg schema's
+    ///   `column -> tags` map from the `TagSource`.
+    /// - `Vec<Expr>` — row filter expressions to AND into the resolved policy.
+    ///
+    /// Default implementation returns empty (non-Ranger stores need no change).
+    /// RangerStore overrides this to fetch the bundle and call `resolve_tag_policies`.
+    ///
+    /// Fail-closed contract: on any fetch/parse failure the implementation
+    /// MUST return `(HashMap::new(), vec![lit(false)])` — the `lit(false)` row
+    /// filter denies all rows, consistent with how `resolve()` handles errors.
+    /// Returning an empty vec on failure would show tagged columns unmasked
+    /// while resource-policy cache-hits still work (fail-open on the security
+    /// path).
+    async fn resolve_tags(
+        &self,
+        _user: &SessionUser,
+        _tags: &HashSet<String>,
+    ) -> (HashMap<String, MaskType>, Vec<Expr>) {
+        (HashMap::new(), vec![])
+    }
 
     /// Invalidate any cached policy decisions so the next `resolve()` call
     /// re-reads from the backing engine.

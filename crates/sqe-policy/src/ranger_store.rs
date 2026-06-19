@@ -32,7 +32,6 @@ pub(crate) struct TagPolicies {
     /// Same `RangerPolicy` type as resource policies; `resources` map carries
     /// a `tag` key with the tag values (e.g. `["PII"]`).
     #[serde(default)]
-    #[allow(dead_code)] // consumed only by resolve_tag_policies; no non-test caller yet (Task 4)
     pub(crate) policies: Vec<RangerPolicy>,
 }
 
@@ -46,7 +45,6 @@ pub(crate) struct ServicePolicies {
     /// Nested tag-service policies. Present when the Ranger bundle includes
     /// tag-based policies. Absent in pure-resource bundles (default = None).
     #[serde(rename = "tagPolicies", default)]
-    #[allow(dead_code)] // consumed only by resolve_tag_policies; no non-test caller yet (Task 4)
     pub(crate) tag_policies: Option<TagPolicies>,
 }
 
@@ -420,7 +418,6 @@ fn resolve_from_bundle(
 /// (tags bind to columns only at rewrite time). Skipping with a warning keeps
 /// the function fail-safe.
 /// TODO(phase3): bind CUSTOM tag masks at apply time (Task 4 rewriter).
-#[allow(dead_code)] // no non-test caller yet -- wired in Task 4
 pub(crate) fn resolve_tag_policies(
     bundle: &ServicePolicies,
     identity: &SessionIdentity,
@@ -543,6 +540,51 @@ impl PolicyStore for RangerStore {
         let policy = resolve_from_bundle(&bundle, user, table_name, namespace);
         self.cache.insert(key, policy.clone()).await;
         Ok(policy)
+    }
+
+    /// Resolve tag-based policies from the Ranger bundle for a given user and
+    /// set of tag names present on a table's columns.
+    ///
+    /// Fetches the bundle (or re-uses the in-flight breaker state). On any
+    /// fetch failure the method returns `(empty, [lit(false)])` — the
+    /// `lit(false)` row filter denies all rows (fail-closed), consistent with
+    /// how `resolve()` handles bundle errors.
+    ///
+    /// Masks are returned keyed by TAG NAME. The plan rewriter maps tag ->
+    /// column using the `TagSource` column->tags map.
+    async fn resolve_tags(
+        &self,
+        user: &SessionUser,
+        tags: &std::collections::HashSet<String>,
+    ) -> (std::collections::HashMap<String, MaskType>, Vec<Expr>) {
+        if tags.is_empty() {
+            return (std::collections::HashMap::new(), vec![]);
+        }
+
+        let bundle = match self.fetch_bundle().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    user = %user.username,
+                    error = %e,
+                    "resolve_tags: failed to fetch Ranger bundle; \
+                     denying all rows (fail-closed)"
+                );
+                return (std::collections::HashMap::new(), vec![lit(false)]);
+            }
+        };
+
+        let identity = SessionIdentity {
+            username: user.username.clone(),
+            roles: user.roles.clone(),
+            database: None,
+            schema: None,
+        };
+
+        let (masks, tag_filters) = resolve_tag_policies(&bundle, &identity, tags);
+        // Discard the tag keys from row filters — the rewriter only needs Exprs.
+        let filter_exprs: Vec<Expr> = tag_filters.into_iter().map(|(_, e)| e).collect();
+        (masks, filter_exprs)
     }
 
     fn invalidate_all(&self) {

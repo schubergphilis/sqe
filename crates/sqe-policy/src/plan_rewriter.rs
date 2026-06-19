@@ -12,7 +12,7 @@
 //! - User predicates CANNOT push through column masks (expression boundary)
 //! - Restricted columns are invisible (not errors)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_schema::DataType;
@@ -24,7 +24,7 @@ use tracing::{debug, warn};
 
 use sqe_core::SessionUser;
 
-use crate::{MaskType, PolicyEnforcer, PolicyStore, ResolvedPolicy};
+use crate::{MaskType, NoopTagSource, PolicyEnforcer, PolicyStore, ResolvedPolicy, TagSource};
 
 /// Plan-rewriting policy enforcer. Uses a PolicyStore to resolve policies
 /// and rewrites the LogicalPlan accordingly.
@@ -34,11 +34,19 @@ pub struct PolicyPlanRewriter {
     /// back to plain SHA-256, which is vulnerable to offline brute force
     /// against low-entropy columns (issue #37).
     mask_key: Option<Arc<Vec<u8>>>,
+    /// Tag source used to look up column -> tags for each scanned table.
+    /// Defaults to `NoopTagSource` (no tag-based masking). Replaced at
+    /// startup with `CacheTagSource` when a `TableMetadataCache` is available.
+    tag_source: Arc<dyn TagSource>,
 }
 
 impl PolicyPlanRewriter {
     pub fn new(store: Arc<dyn PolicyStore>) -> Self {
-        Self { store, mask_key: None }
+        Self {
+            store,
+            mask_key: None,
+            tag_source: Arc::new(NoopTagSource),
+        }
     }
 
     /// Set the HMAC key used by Hash-type column masks. Pass `None` to
@@ -46,6 +54,14 @@ impl PolicyPlanRewriter {
     #[must_use = "with_mask_key consumes self; bind the returned rewriter"]
     pub fn with_mask_key(mut self, mask_key: Option<Arc<Vec<u8>>>) -> Self {
         self.mask_key = mask_key;
+        self
+    }
+
+    /// Inject the `TagSource` used to resolve column tags from Iceberg table
+    /// metadata. Defaults to `NoopTagSource` (no tag-based masking).
+    #[must_use = "with_tag_source consumes self; bind the returned rewriter"]
+    pub fn with_tag_source(mut self, tag_source: Arc<dyn TagSource>) -> Self {
+        self.tag_source = tag_source;
         self
     }
 }
@@ -59,6 +75,7 @@ impl PolicyEnforcer for PolicyPlanRewriter {
     ) -> sqe_core::Result<LogicalPlan> {
         let store = self.store.clone();
         let mask_key = self.mask_key.clone();
+        let tag_source = self.tag_source.clone();
         let username = user.username.clone();
         let _roles = user.roles.clone();
         let user_clone = user.clone();
@@ -103,7 +120,7 @@ impl PolicyEnforcer for PolicyPlanRewriter {
             };
 
             match store.resolve(&user_clone, &table, &namespace).await {
-                Ok(policy) => {
+                Ok(mut policy) => {
                     debug!(
                         user = %username,
                         table = %table_name,
@@ -113,6 +130,54 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                         restricted = policy.restricted_columns.len(),
                         "Resolved policy for table"
                     );
+
+                    // Tag-based masking: look up column -> tags from Iceberg
+                    // metadata (via the injected TagSource), then resolve tag
+                    // policies from the store and merge them into the resolved
+                    // policy.
+                    //
+                    // Identity threading: use the FULL namespace path from the
+                    // TableReference (split the schema string on '.') — NOT the
+                    // last-component `namespace` used by `resolve_policy_key`.
+                    // The CacheTagSource builds NamespaceIdent::from_vec which
+                    // Display-joins with '.', matching the cache key format
+                    // `{token}|{ns_display}.{table}`. Passing the reduced
+                    // last-component would silently miss for multi-level
+                    // namespaces (e.g. "ns1.ns2" -> "ns2" != cache key "ns1.ns2.t").
+                    let catalog = table_ref.catalog();
+                    let ns_path: Vec<String> = match table_ref.schema() {
+                        Some(s) if !s.is_empty() => {
+                            s.split('.').map(str::to_string).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    let col_tags = tag_source.column_tags(catalog, &ns_path, table_ref.table());
+
+                    if !col_tags.is_empty() {
+                        let all_tags: HashSet<String> =
+                            col_tags.values().flatten().cloned().collect();
+
+                        if !all_tags.is_empty() {
+                            let (tag_masks_by_tag, tag_filters) =
+                                store.resolve_tags(&user_clone, &all_tags).await;
+
+                            debug!(
+                                user = %username,
+                                table = %table_name,
+                                tag_masks = tag_masks_by_tag.len(),
+                                tag_filters = tag_filters.len(),
+                                "Resolved tag-based policies"
+                            );
+
+                            merge_tag_masks(
+                                &mut policy,
+                                &col_tags,
+                                &tag_masks_by_tag,
+                                tag_filters,
+                            );
+                        }
+                    }
+
                     table_policies.insert(table_name.clone(), policy);
                 }
                 Err(e) => {
@@ -235,6 +300,54 @@ impl PolicyEnforcer for PolicyPlanRewriter {
 
         Ok(rewritten.data)
     }
+}
+
+/// Merge tag-derived masks and row filters into an existing `ResolvedPolicy`.
+///
+/// # Precedence (LOCKED — security contract)
+///
+/// 1. **Restricted columns always win.** A column already in
+///    `policy.restricted_columns` stays dropped; no tag can un-restrict it.
+/// 2. **Resource masks win over tag masks.** If `policy.column_masks` already
+///    contains a mask for a column (from `store.resolve()`), that resource-
+///    level mask is more specific and MUST NOT be overwritten by a tag mask.
+/// 3. **Tag row filters are ANDed with resource row filters.** Both sets
+///    apply; the result is the most restrictive combination.
+/// 4. **Within-column tag ordering is deterministic.** The first tag in the
+///    stored tag list that has a matching mask in `tag_masks_by_tag` wins.
+///    This is stable because `col_tags` comes from Iceberg property JSON
+///    (parsed order preserved) and the caller iterates it in that order.
+///
+/// Known gap (out of scope for Task 4): CUSTOM tag mask types and unsupported
+/// tag mask types are silently skipped by `resolve_tag_policies` — columns
+/// whose only protection is such a tag mask will be shown unmasked. This is a
+/// pre-existing limitation in Task 1-3 (see TODO in `resolve_tag_policies`).
+pub(crate) fn merge_tag_masks(
+    policy: &mut ResolvedPolicy,
+    col_tags: &HashMap<String, Vec<String>>,
+    tag_masks_by_tag: &HashMap<String, MaskType>,
+    tag_filters: Vec<datafusion::logical_expr::Expr>,
+) {
+    for (column, tags) in col_tags {
+        // Restricted columns always win — tag cannot un-restrict.
+        if policy.restricted_columns.contains(column) {
+            continue;
+        }
+        // Resource mask wins — do not overwrite with a tag mask.
+        if policy.column_masks.contains_key(column) {
+            continue;
+        }
+        // Apply the first tag that has a matching mask (deterministic: first
+        // match in stored tag order).
+        for tag in tags {
+            if let Some(mask) = tag_masks_by_tag.get(tag) {
+                policy.column_masks.insert(column.clone(), mask.clone());
+                break;
+            }
+        }
+    }
+    // Tag row filters AND with resource row filters (most restrictive).
+    policy.row_filters.extend(tag_filters);
 }
 
 /// Derive the `(namespace, table)` policy key from a structured DataFusion
@@ -384,6 +497,102 @@ fn apply_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── merge_tag_masks precedence tests ──────────────────────────────────────
+
+    fn make_col_tags(pairs: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
+        pairs
+            .iter()
+            .map(|(col, tags)| (col.to_string(), tags.iter().map(|t| t.to_string()).collect()))
+            .collect()
+    }
+
+    fn make_tag_masks(pairs: &[(&str, MaskType)]) -> HashMap<String, MaskType> {
+        pairs.iter().map(|(t, m)| (t.to_string(), m.clone())).collect()
+    }
+
+    #[test]
+    fn merge_tag_masks_applies_tag_mask_to_unmasked_column() {
+        let mut policy = ResolvedPolicy::default();
+        let col_tags = make_col_tags(&[("email", &["PII"])]);
+        let tag_masks = make_tag_masks(&[("PII", MaskType::Nullify)]);
+        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![]);
+        assert!(
+            matches!(policy.column_masks.get("email"), Some(MaskType::Nullify)),
+            "tag mask must be applied when no resource mask exists"
+        );
+    }
+
+    #[test]
+    fn merge_tag_masks_resource_mask_wins_over_tag_mask() {
+        let mut policy = ResolvedPolicy::default();
+        // Resource mask: Hash on email
+        policy.column_masks.insert("email".to_string(), MaskType::Hash);
+        let col_tags = make_col_tags(&[("email", &["PII"])]);
+        // Tag mask: Nullify — MUST NOT overwrite the resource mask.
+        let tag_masks = make_tag_masks(&[("PII", MaskType::Nullify)]);
+        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![]);
+        assert!(
+            matches!(policy.column_masks.get("email"), Some(MaskType::Hash)),
+            "resource mask must win over tag mask"
+        );
+    }
+
+    #[test]
+    fn merge_tag_masks_restricted_column_stays_restricted() {
+        let mut policy = ResolvedPolicy::default();
+        policy.restricted_columns.push("ssn".to_string());
+        let col_tags = make_col_tags(&[("ssn", &["PII"])]);
+        let tag_masks = make_tag_masks(&[("PII", MaskType::Nullify)]);
+        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![]);
+        // No mask added; restricted stays restricted.
+        assert!(
+            !policy.column_masks.contains_key("ssn"),
+            "restricted column must not gain a mask from tags"
+        );
+        assert!(
+            policy.restricted_columns.contains(&"ssn".to_string()),
+            "column must remain in restricted_columns"
+        );
+    }
+
+    #[test]
+    fn merge_tag_masks_tag_filters_appended() {
+        let mut policy = ResolvedPolicy::default();
+        // Pre-existing resource filter.
+        policy.row_filters.push(lit(true));
+        let col_tags = make_col_tags(&[("region", &["RESTRICTED"])]);
+        let tag_masks = HashMap::new(); // no masks
+        let tag_filter = datafusion::logical_expr::col("region").eq(lit("EU"));
+        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![tag_filter]);
+        assert_eq!(
+            policy.row_filters.len(),
+            2,
+            "tag filter must be ANDed (appended) with resource filters"
+        );
+    }
+
+    #[test]
+    fn merge_tag_masks_first_matching_tag_wins() {
+        // Column has two tags; only the second has a mask.
+        let mut policy = ResolvedPolicy::default();
+        let col_tags = make_col_tags(&[("salary", &["INTERNAL", "PII"])]);
+        // Only PII has a mask.
+        let tag_masks = make_tag_masks(&[("PII", MaskType::Hash)]);
+        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![]);
+        assert!(
+            matches!(policy.column_masks.get("salary"), Some(MaskType::Hash)),
+            "first matching tag mask in stored order must be applied"
+        );
+    }
+
+    #[test]
+    fn merge_tag_masks_empty_col_tags_is_noop() {
+        let mut policy = ResolvedPolicy::default();
+        merge_tag_masks(&mut policy, &HashMap::new(), &HashMap::new(), vec![]);
+        assert!(policy.column_masks.is_empty());
+        assert!(policy.row_filters.is_empty());
+    }
 
     #[test]
     fn test_apply_mask_nullify_utf8() {
