@@ -18,6 +18,7 @@ use tracing::{debug, warn};
 
 use crate::policy_breaker::PolicyCircuitBreaker;
 use crate::policy_expr::parse_sql_predicate;
+use crate::session_udf::SessionIdentity;
 use crate::{MaskType, PolicyStore, ResolvedPolicy};
 
 // --- Ranger policy bundle model (ServicePolicies) ---
@@ -248,7 +249,7 @@ fn item_matches(
 ///  - `Ok(Some(mask))` supported,
 ///  - `Ok(None)` for MASK_NONE (explicit exemption: no mask, not restricted),
 ///  - `Err(())` for not-yet-supported types (caller restricts the column, fail-closed).
-fn map_mask(info: &DataMaskInfo, column: &str) -> Result<Option<MaskType>, ()> {
+fn map_mask(info: &DataMaskInfo, column: &str, identity: &SessionIdentity) -> Result<Option<MaskType>, ()> {
     match info.data_mask_type.as_str() {
         "MASK_NULL" => Ok(Some(MaskType::Nullify)),
         "MASK_NONE" => Ok(None),
@@ -262,7 +263,7 @@ fn map_mask(info: &DataMaskInfo, column: &str) -> Result<Option<MaskType>, ()> {
             // so the column name must be correct at parse time.
             // If parsing fails -> Err(()) -> column restricted (fail-closed).
             let substituted = expr_str.replace("{col}", column);
-            parse_sql_predicate(&substituted)
+            parse_sql_predicate(&substituted, identity)
                 .map(|e| Some(MaskType::Custom(e)))
                 .map_err(|_| ())
         }
@@ -304,6 +305,16 @@ fn resolve_from_bundle(
     let database = hive_database(namespace);
     let mut policy = ResolvedPolicy::default();
 
+    // Build the identity once for the whole resolution pass. database/schema
+    // are None here -- RangerStore doesn't hold the session warehouse; UDFs
+    // referencing current_database()/current_schema() fold to NULL (MVP).
+    let identity = SessionIdentity {
+        username: user.username.clone(),
+        roles: user.roles.clone(),
+        database: None,
+        schema: None,
+    };
+
     for p in &bundle.policies {
         if !p.is_enabled || !policy_matches_table(p, &database, table) {
             continue;
@@ -319,7 +330,7 @@ fn resolve_from_bundle(
                     if !item_matches(&item.users, &item.roles, &item.groups, user) {
                         continue;
                     }
-                    match map_mask(&item.data_mask_info, column) {
+                    match map_mask(&item.data_mask_info, column, &identity) {
                         Ok(Some(mask)) => {
                             policy.column_masks.insert(column.clone(), mask);
                         }
@@ -346,7 +357,7 @@ fn resolve_from_bundle(
                     continue;
                 }
                 if let Some(expr_str) = &item.row_filter_info.filter_expr {
-                    match parse_sql_predicate(expr_str) {
+                    match parse_sql_predicate(expr_str, &identity) {
                         Ok(expr) => policy.row_filters.push(expr),
                         Err(e) => {
                             warn!(
@@ -680,7 +691,7 @@ mod tests {
     #[test]
     fn maps_show_last_4() {
         let info = DataMaskInfo { data_mask_type: "MASK_SHOW_LAST_4".into(), ..Default::default() };
-        match map_mask(&info, "ssn") {
+        match map_mask(&info, "ssn", &SessionIdentity::default()) {
             Ok(Some(MaskType::PartialMask { show_last: 4, show_first: 0, .. })) => {}
             other => panic!("expected show-last-4 PartialMask, got {other:?}"),
         }
@@ -690,7 +701,7 @@ mod tests {
     fn maps_show_first_4() {
         let info = DataMaskInfo { data_mask_type: "MASK_SHOW_FIRST_4".into(), ..Default::default() };
         assert!(matches!(
-            map_mask(&info, "ssn"),
+            map_mask(&info, "ssn", &SessionIdentity::default()),
             Ok(Some(MaskType::PartialMask { show_first: 4, show_last: 0, .. }))
         ));
     }
@@ -698,7 +709,7 @@ mod tests {
     #[test]
     fn maps_full_mask_uses_hive_default_chars() {
         let info = DataMaskInfo { data_mask_type: "MASK".into(), ..Default::default() };
-        match map_mask(&info, "name") {
+        match map_mask(&info, "name", &SessionIdentity::default()) {
             Ok(Some(MaskType::PartialMask {
                 upper: 'X',
                 lower: 'x',
@@ -713,12 +724,12 @@ mod tests {
     #[test]
     fn maps_date_show_year() {
         let info = DataMaskInfo { data_mask_type: "MASK_DATE_SHOW_YEAR".into(), ..Default::default() };
-        assert!(matches!(map_mask(&info, "hired_at"), Ok(Some(MaskType::DateShowYear))));
+        assert!(matches!(map_mask(&info, "hired_at", &SessionIdentity::default()), Ok(Some(MaskType::DateShowYear))));
     }
 
     #[test]
     fn truly_unknown_mask_is_err() {
         let info = DataMaskInfo { data_mask_type: "MASK_FUTURE_UNSUPPORTED".into(), ..Default::default() };
-        assert!(map_mask(&info, "x").is_err());
+        assert!(map_mask(&info, "x", &SessionIdentity::default()).is_err());
     }
 }

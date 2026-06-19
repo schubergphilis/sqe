@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 use std::ops::ControlFlow;
+use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Fields};
 use datafusion::common::{DFSchema, DFSchemaRef};
@@ -13,6 +14,8 @@ use datafusion::logical_expr::Expr;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Visit, Visitor};
+
+use crate::session_udf::SessionIdentity;
 
 /// Parse `sql` (a single SQL expression, NOT a full statement) into an `Expr`.
 /// Returns `Err` if the string is not a parseable expression. Callers MUST
@@ -39,7 +42,7 @@ use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Visit, Visitor};
 /// unqualified, so a compound ref fails `validate_schema_satisfies_exprs` and
 /// this function returns `Err` (fail closed). Ranger `filterExpr`/`valueExpr`
 /// bodies use bare column names, so this is the expected shape.
-pub fn parse_sql_predicate(sql: &str) -> sqe_core::Result<Expr> {
+pub fn parse_sql_predicate(sql: &str, identity: &SessionIdentity) -> sqe_core::Result<Expr> {
     let trimmed = sql.trim();
     if trimmed.is_empty() {
         return Err(sqe_core::error::SqeError::Execution(
@@ -88,6 +91,11 @@ pub fn parse_sql_predicate(sql: &str) -> sqe_core::Result<Expr> {
     // on a cache miss in the policy store), not per row or per batch, so the
     // per-call context setup cost is negligible against the surrounding I/O.
     let ctx = SessionContext::new();
+    // Register session-context UDFs so policy expressions referencing
+    // is_role_in_session(), current_user(), etc. resolve correctly.
+    for udf in crate::session_udf::session_udfs(Arc::new(identity.clone())) {
+        ctx.register_udf(udf);
+    }
     ctx.parse_sql_expr(trimmed, &df_schema).map_err(|e| {
         sqe_core::error::SqeError::Execution(format!(
             "failed to plan policy expression '{trimmed}': {e}"
@@ -124,17 +132,18 @@ impl Visitor for IdentCollector<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_udf::SessionIdentity;
 
     #[test]
     fn parses_single_comparison() {
-        let e = parse_sql_predicate("clearance >= 3").unwrap();
+        let e = parse_sql_predicate("clearance >= 3", &SessionIdentity::default()).unwrap();
         assert!(matches!(e, Expr::BinaryExpr(_)));
     }
 
     #[test]
     fn parses_compound_and() {
         // The case the toy parser silently corrupts.
-        let e = parse_sql_predicate("region = 'EU' AND tier < 3").unwrap();
+        let e = parse_sql_predicate("region = 'EU' AND tier < 3", &SessionIdentity::default()).unwrap();
         assert!(matches!(e, Expr::BinaryExpr(_)));
         let sql = datafusion::sql::unparser::expr_to_sql(&e).unwrap().to_string();
         assert!(sql.contains("region"));
@@ -144,7 +153,7 @@ mod tests {
 
     #[test]
     fn parses_in_list() {
-        let e = parse_sql_predicate("dept IN ('hr', 'eng')").unwrap();
+        let e = parse_sql_predicate("dept IN ('hr', 'eng')", &SessionIdentity::default()).unwrap();
         let sql = datafusion::sql::unparser::expr_to_sql(&e).unwrap().to_string();
         assert!(sql.to_uppercase().contains("IN"));
     }
@@ -152,19 +161,19 @@ mod tests {
     #[test]
     fn parses_custom_mask_valueexpr() {
         // CUSTOM mask bodies are scalar exprs, often a function call.
-        let e = parse_sql_predicate("concat('***', email)").unwrap();
+        let e = parse_sql_predicate("concat('***', email)", &SessionIdentity::default()).unwrap();
         assert!(matches!(e, Expr::ScalarFunction(_)));
     }
 
     #[test]
     fn rejects_garbage() {
-        assert!(parse_sql_predicate("this is not sql !!!").is_err());
+        assert!(parse_sql_predicate("this is not sql !!!", &SessionIdentity::default()).is_err());
     }
 
     #[test]
     fn rejects_empty() {
-        assert!(parse_sql_predicate("").is_err());
-        assert!(parse_sql_predicate("   ").is_err());
+        assert!(parse_sql_predicate("", &SessionIdentity::default()).is_err());
+        assert!(parse_sql_predicate("   ", &SessionIdentity::default()).is_err());
     }
 
     #[test]
@@ -172,27 +181,27 @@ mod tests {
         // Fail-closed: a valid prefix followed by junk must not silently parse
         // to just the prefix. DFParser::parse_into_expr enforces EOF after the
         // expression, so this must return Err.
-        assert!(parse_sql_predicate("region = 'EU' bogus").is_err());
+        assert!(parse_sql_predicate("region = 'EU' bogus", &SessionIdentity::default()).is_err());
     }
 
     #[test]
     fn parses_cast_in_filter() {
         // Cast is its own AST variant; the hand-written walker missed it.
-        let e = parse_sql_predicate("CAST(tier AS INT) >= 3").unwrap();
+        let e = parse_sql_predicate("CAST(tier AS INT) >= 3", &SessionIdentity::default()).unwrap();
         let sql = datafusion::sql::unparser::expr_to_sql(&e).unwrap().to_string();
         assert!(sql.to_lowercase().contains("tier"));
     }
 
     #[test]
     fn parses_substring_mask() {
-        let e = parse_sql_predicate("substr(email, 1, 3)").unwrap();
+        let e = parse_sql_predicate("substr(email, 1, 3)", &SessionIdentity::default()).unwrap();
         let sql = datafusion::sql::unparser::expr_to_sql(&e).unwrap().to_string();
         assert!(sql.to_lowercase().contains("email"));
     }
 
     #[test]
     fn parses_or() {
-        let e = parse_sql_predicate("region = 'EU' OR dept = 'eng'").unwrap();
+        let e = parse_sql_predicate("region = 'EU' OR dept = 'eng'", &SessionIdentity::default()).unwrap();
         let sql = datafusion::sql::unparser::expr_to_sql(&e).unwrap().to_string();
         assert!(sql.to_uppercase().contains("OR"));
     }
@@ -200,7 +209,36 @@ mod tests {
     #[test]
     fn parses_quoted_mixed_case_column() {
         // Quoted ident must NOT be lowercased into the stub.
-        let e = parse_sql_predicate("\"Tier\" >= 3").unwrap();
+        let e = parse_sql_predicate("\"Tier\" >= 3", &SessionIdentity::default()).unwrap();
         assert!(matches!(e, datafusion::logical_expr::Expr::BinaryExpr(_)));
+    }
+
+    #[test]
+    fn parses_is_role_in_session_in_policy() {
+        let id = SessionIdentity { username: "bob".into(), roles: vec!["admin".into()], ..Default::default() };
+        let e = parse_sql_predicate("is_role_in_session('admin') OR region = 'EU'", &id).unwrap();
+        let s = datafusion::sql::unparser::expr_to_sql(&e).unwrap().to_string().to_lowercase();
+        assert!(s.contains("is_role_in_session"), "got: {s}");
+        assert!(s.contains("region"), "got: {s}");
+    }
+
+    // `current_user()` with parens is rejected by DFParser at Pass 1: sqlparser
+    // treats `current_user` as a SQL keyword, not a function identifier, so the
+    // open-paren after it is unexpected. Ranger CUSTOM mask expressions that
+    // reference the current user should use `current_user` (no parens) which
+    // sqlparser emits as a keyword expression. The registered UDF name
+    // "current_user" is also looked up without parens in practice.
+    #[test]
+    fn parses_current_user_in_mask_expr() {
+        let id = SessionIdentity { username: "alice".into(), ..Default::default() };
+        // Without parens: sqlparser accepts current_user as a keyword expr.
+        let result = parse_sql_predicate("current_user", &id);
+        assert!(result.is_ok(), "expected Ok for bare current_user, got: {:?}", result.err());
+    }
+
+    #[test]
+    fn plain_column_filter_still_parses() {
+        let id = SessionIdentity::default();
+        assert!(parse_sql_predicate("region = 'EU' AND tier < 3", &id).is_ok());
     }
 }
