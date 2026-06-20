@@ -2213,7 +2213,15 @@ pub struct RangerPolicyConfig {
     /// Maximum cached `ResolvedPolicy` entries.
     #[serde(default = "default_ranger_policy_cache_max_entries")]
     pub cache_max_entries: u64,
-    /// Cache TTL in seconds.
+    /// Cache TTL in seconds for resolved row-filter / data-mask policies.
+    ///
+    /// Masks and filters edited directly in Ranger Admin (the normal authoring
+    /// path) are not honored until this TTL elapses, leaving a bounded
+    /// over-permissive window of up to `cache_ttl_secs`. This is asymmetric with
+    /// the tag path, which re-fetches the column->tags map every call. A future
+    /// improvement is `lastKnownVersion` / HTTP-304 polling so external edits
+    /// are picked up promptly without a short TTL; until then, lower this value
+    /// if prompt propagation of Admin-side edits matters more than fetch load.
     #[serde(default = "default_ranger_policy_cache_ttl_secs")]
     pub cache_ttl_secs: u64,
     /// Consecutive failures before the circuit breaker opens.
@@ -2921,6 +2929,24 @@ impl SqeConfig {
                         .to_string(),
                 );
             }
+        }
+
+        // Table metadata cache vs. fine-grained policy. The column->tags map
+        // that drives tag masks and tag row-filters is read from the table
+        // metadata cache. With the cache disabled (ttl_secs = 0 ->
+        // max_capacity(0)), every tag lookup misses, and the rewriter now
+        // fails CLOSED on an unknown tag state (see TagSource::column_tags).
+        // The result under a policy engine is that every query is denied. Reject
+        // the misconfig at load time rather than denying every query at runtime.
+        if self.policy.engine != PolicyEngine::Passthrough
+            && self.catalog.metadata_cache_ttl_secs == 0
+        {
+            errors.push(
+                "catalog.metadata_cache_ttl_secs must be >= 1 when policy.engine \
+                 enforces fine-grained policy (0 disables the table metadata cache, \
+                 so tag lookups always miss and deny)"
+                    .to_string(),
+            );
         }
 
         // Distributed-mode worker secret is required unless explicitly waived.
@@ -5490,6 +5516,46 @@ otlp_endpoint = ""
         config.policy.ranger.breaker_failure_threshold = 0;
         // engine stays at its default (not Ranger), so these zeros are ignored.
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_metadata_cache_ttl_under_policy_engine() {
+        // A disabled table metadata cache (ttl=0) makes every tag lookup miss,
+        // and the rewriter now fails closed on an unknown tag state, denying
+        // every query. Reject the misconfig at load time under a policy engine.
+        let mut config = valid_config();
+        config.policy.engine = PolicyEngine::Ranger;
+        config.policy.ranger.url = "http://ranger:6080".to_string();
+        config.policy.ranger.service_name = "hive".to_string();
+        config.catalog.metadata_cache_ttl_secs = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("catalog.metadata_cache_ttl_secs"),
+            "expected metadata-cache-ttl guard, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_zero_metadata_cache_ttl_allowed_under_passthrough() {
+        // Passthrough applies no policy, so a disabled metadata cache is a
+        // legitimate tuning choice (no tag lookups happen).
+        let mut config = valid_config();
+        config.policy.engine = PolicyEngine::Passthrough;
+        config.catalog.metadata_cache_ttl_secs = 0;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_metadata_cache_ttl_under_inmemory_engine() {
+        // The guard fires for any non-passthrough engine, not just Ranger.
+        let mut config = valid_config();
+        config.policy.engine = PolicyEngine::InMemory;
+        config.catalog.metadata_cache_ttl_secs = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("catalog.metadata_cache_ttl_secs"),
+            "expected metadata-cache-ttl guard under in-memory engine, got: {err}"
+        );
     }
 }
 
