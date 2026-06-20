@@ -67,7 +67,7 @@ query scans all 6M lineorder rows even when the result is zero (q2.2,
 q3.3, q3.4 all return 0 rows after dim filters that match nothing).
 
 The expectation was that runtime filter pushdown (Path B-2,
-[runtime-filter-pushdown.md](runtime-filter-pushdown.md)) would prune
+[runtime-filter-pushdown.md](./runtime-filter-pushdown.md)) would prune
 lineorder via dim build-side filtering. The trace shows it does not.
 
 ## Why Path B-2 did not engage
