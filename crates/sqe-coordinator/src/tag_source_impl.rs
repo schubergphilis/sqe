@@ -40,6 +40,10 @@ use tracing::debug;
 
 use sqe_catalog::TableMetadataCache;
 use sqe_policy::TagSource;
+use sqe_sql::tags::{ColumnTagOp, TagAction};
+
+/// Iceberg table property key holding the column->tag-label JSON map.
+pub(crate) const PROP_KEY: &str = "sqe.column-tags";
 
 /// Tag source backed by the coordinator's shared `TableMetadataCache`.
 ///
@@ -108,8 +112,6 @@ impl TagSource for CacheTagSource {
 pub(crate) fn parse_column_tags(
     props: &HashMap<String, String>,
 ) -> HashMap<String, Vec<String>> {
-    const PROP_KEY: &str = "sqe.column-tags";
-
     let raw = match props.get(PROP_KEY) {
         Some(v) => v,
         None => return HashMap::new(),
@@ -128,12 +130,118 @@ pub(crate) fn parse_column_tags(
     }
 }
 
+/// Apply column-tag operations to the current tag map (merge semantics).
+/// `Set` unions tags (dedup, stable order). `Unset` removes the listed tags, or
+/// ALL tags on the column when the list is empty. A column whose tag list becomes
+/// empty is dropped from the map.
+pub(crate) fn apply_tag_ops(
+    current: &HashMap<String, Vec<String>>,
+    ops: &[ColumnTagOp],
+) -> HashMap<String, Vec<String>> {
+    let mut map = current.clone();
+    for op in ops {
+        match op.action {
+            TagAction::Set => {
+                let entry = map.entry(op.column.clone()).or_default();
+                for t in &op.tags {
+                    if !entry.contains(t) {
+                        entry.push(t.clone());
+                    }
+                }
+                if entry.is_empty() {
+                    map.remove(&op.column);
+                }
+            }
+            TagAction::Unset => {
+                if op.tags.is_empty() {
+                    map.remove(&op.column);
+                } else if let Some(entry) = map.get_mut(&op.column) {
+                    entry.retain(|t| !op.tags.contains(t));
+                    if entry.is_empty() {
+                        map.remove(&op.column);
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqe_sql::tags::{ColumnTagOp, TagAction};
 
     fn props(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    fn map(pairs: &[(&str, &[&str])]) -> std::collections::HashMap<String, Vec<String>> {
+        pairs
+            .iter()
+            .map(|(c, ts)| (c.to_string(), ts.iter().map(|t| t.to_string()).collect()))
+            .collect()
+    }
+
+    #[test]
+    fn apply_tag_ops_set_merges_and_dedups() {
+        let cur = map(&[("email", &["PII"])]);
+        let ops = vec![ColumnTagOp {
+            column: "email".into(),
+            tags: vec!["PII".into(), "GDPR".into()],
+            action: TagAction::Set,
+        }];
+        let got = apply_tag_ops(&cur, &ops);
+        assert_eq!(got.get("email").unwrap(), &vec!["PII".to_string(), "GDPR".to_string()]);
+    }
+
+    #[test]
+    fn apply_tag_ops_set_leaves_other_columns_untouched() {
+        let cur = map(&[("email", &["PII"]), ("region", &["GEO"])]);
+        let ops = vec![ColumnTagOp {
+            column: "email".into(),
+            tags: vec!["GDPR".into()],
+            action: TagAction::Set,
+        }];
+        let got = apply_tag_ops(&cur, &ops);
+        assert_eq!(got.get("region").unwrap(), &vec!["GEO".to_string()]);
+    }
+
+    #[test]
+    fn apply_tag_ops_unset_named_removes_one() {
+        let cur = map(&[("email", &["PII", "GDPR"])]);
+        let ops = vec![ColumnTagOp {
+            column: "email".into(),
+            tags: vec!["GDPR".into()],
+            action: TagAction::Unset,
+        }];
+        let got = apply_tag_ops(&cur, &ops);
+        assert_eq!(got.get("email").unwrap(), &vec!["PII".to_string()]);
+    }
+
+    #[test]
+    fn apply_tag_ops_unset_all_drops_column() {
+        let cur = map(&[("email", &["PII", "GDPR"]), ("region", &["GEO"])]);
+        let ops = vec![ColumnTagOp {
+            column: "email".into(),
+            tags: vec![],
+            action: TagAction::Unset,
+        }];
+        let got = apply_tag_ops(&cur, &ops);
+        assert!(!got.contains_key("email"));
+        assert!(got.contains_key("region"));
+    }
+
+    #[test]
+    fn apply_tag_ops_unset_last_tag_drops_column() {
+        let cur = map(&[("email", &["PII"])]);
+        let ops = vec![ColumnTagOp {
+            column: "email".into(),
+            tags: vec!["PII".into()],
+            action: TagAction::Unset,
+        }];
+        let got = apply_tag_ops(&cur, &ops);
+        assert!(!got.contains_key("email"));
     }
 
     #[test]
