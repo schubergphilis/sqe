@@ -28,7 +28,7 @@ sqe> SELECT snapshot_id, committed_at FROM s3tables.sales."orders$snapshots";
 
 ## Why it is cool
 
-**Top-five on the public [Iceberg matrix](https://icebergmatrix.org). 167/189. 88.4%.** Only non-Spark engine in the top five. Per-cell breakdown in [`docs/iceberg-matrix.md`](docs/iceberg-matrix.md); side-by-side against 20 other engines in [`docs/iceberg-matrix-compare.md`](docs/iceberg-matrix-compare.md).
+**Top-five on the public [Iceberg matrix](https://icebergmatrix.org). 167/189. 88.4%.** Only non-Spark engine in the top five. Per-cell breakdown and a side-by-side against 20 other engines tracked internally.
 
 **Wins six of seven benchmark suites against Trino 465 at SF1.** TPC-H, SSB, TPC-DS, TPC-C, TPC-E, TPC-BB, ClickBench. 222 of 222 queries pass, and the results are differentially validated: every query runs against both engines and the rows are diffed, with DuckDB's official `dsdgen` as an independent data oracle. Tables and method below.
 
@@ -38,7 +38,7 @@ sqe> SELECT snapshot_id, committed_at FROM s3tables.sales."orders$snapshots";
 
 **Identity flows end to end.** OIDC password grant. The user's bearer token is passed through to Polaris and S3 on every query. Row filters and column masks at the LogicalPlan layer are now enforced when `[policy] engine = "ranger"` is set: SQE downloads the `hive` Ranger service policy set and rewrites the plan before DataFusion optimization (row filters above the scan, column masks that block predicate pushdown). Phase 1 covers `MASK_NULL` and row-filter expressions. Phase 2A delivers the full mask vocabulary: hash, partial show-first/last, date truncation to year/month/day, full redact, and custom expressions, all with type preservation through the physical planner. Phase 2B delivers session-context SQL functions (`is_role_in_session`, `current_user`, `current_database`, `current_schema`) that const-fold to literals before plan distribution. Phase 3a delivers tag-based masking: `TagSource` reads Iceberg `sqe.column-tags` properties, `PolicyStore::resolve_tags` maps tags to `MaskType` via Ranger `tagPolicies`, and the rewriter joins them with resource-mask-wins precedence, unmappable-tag fail-closed, and full multi-level namespace identity. Proven by executable rewriter tests; live quickstart demo deferred to Phase 3b. OPA and Cedar policy stores are also on the roadmap. The end-to-end demo is in `quickstart/polaris-ranger-keycloak/`.
 
-**Lineage shipped.** Coordinator emits OpenLineage 2-0-2 events with column-level lineage on writes. File and HTTP sinks. Disk-spool fallback for collector outages. Off by default. [`docs/book/src/operations/openlineage.md`](docs/book/src/operations/openlineage.md).
+**Lineage shipped.** Coordinator emits OpenLineage 2-0-2 events with column-level lineage on writes. File and HTTP sinks. Disk-spool fallback for collector outages. Off by default. [`docs/site/book/src/operations/openlineage.md`](docs/site/book/src/operations/openlineage.md).
 
 ## How SQE differs
 
@@ -59,8 +59,8 @@ sqe> SELECT snapshot_id, committed_at FROM s3tables.sales."orders$snapshots";
 
 Two longer comparison docs trace the lineage of these positions:
 
-- vs Trino: [`docs/trino-compatibility.md`](docs/trino-compatibility.md). SQL function and feature parity by category. ~96% coverage.
-- vs DuckDB: [`docs/duckdb-comparision.md`](docs/duckdb-comparision.md). What SQE has that DuckDB does not, and vice versa, with the V8 to V12 work that closed the embedded-mode gap.
+- vs Trino: [`docs/site/compare/trino-compatibility.md`](docs/site/compare/trino-compatibility.md). SQL function and feature parity by category. ~96% coverage.
+- vs DuckDB: [`docs/site/compare/duckdb-comparision.md`](docs/site/compare/duckdb-comparision.md). What SQE has that DuckDB does not, and vice versa, with the V8 to V12 work that closed the embedded-mode gap.
 
 ## Performance receipts (SF1, vs Trino 465)
 
@@ -74,7 +74,7 @@ Two longer comparison docs trace the lineage of these positions:
 | TPC-BB (10) | 28.0s | 255.7s | **9.1x** | 10/10 |
 | ClickBench (43) | 1.3s | 4.46s | **3.4x** | 43/43 |
 
-SQE wins six of seven suites. TPC-DS collapsed from 42.5s to 13.4s after we wired DataFusion's runtime filters into iceberg-rust's scan path through the vendor's `DynamicPredicate` bridge: q82 dropped 1787ms to 113ms (16x), q80 1398ms to 103ms (14x), q13 1317ms to 220ms (6x). The fix is a two-tier pushdown: iceberg-rust samples once per file scan task for row-group / page-index pruning, and a per-batch wrapper catches filters that resolve after the task opened. Earlier in the month we landed the dynamic-filter type-coercion fix that flipped q72 from 10.7s to 0.77s ([docs/blog/2026-05-16-q72-the-nemesis.md](docs/blog/2026-05-16-q72-the-nemesis.md)). SSB is the one suite we still trail; lineorder's uniform FK distribution defeats row-group pruning, so the runtime filter only helps at row level and Trino's vectorized decoder still wins. The remaining 6/99 TPC-DS mismatches are upstream DataFusion ROLLUP / GROUPING() gaps (apache/datafusion#4763, #13993), not engine regressions. The earlier "Our Nemesis" investigation is preserved as [docs/blog/2026-04-16-our-nemesis-q72.md](docs/blog/2026-04-16-our-nemesis-q72.md).
+SQE wins six of seven suites. TPC-DS collapsed from 42.5s to 13.4s after we wired DataFusion's runtime filters into iceberg-rust's scan path through the vendor's `DynamicPredicate` bridge: q82 dropped 1787ms to 113ms (16x), q80 1398ms to 103ms (14x), q13 1317ms to 220ms (6x). The fix is a two-tier pushdown: iceberg-rust samples once per file scan task for row-group / page-index pruning, and a per-batch wrapper catches filters that resolve after the task opened. Earlier in the month we landed the dynamic-filter type-coercion fix that flipped q72 from 10.7s to 0.77s ([docs/site/blog/2026-05-16-q72-the-nemesis.md](docs/site/blog/2026-05-16-q72-the-nemesis.md)). SSB is the one suite we still trail; lineorder's uniform FK distribution defeats row-group pruning, so the runtime filter only helps at row level and Trino's vectorized decoder still wins. The remaining 6/99 TPC-DS mismatches are upstream DataFusion ROLLUP / GROUPING() gaps (apache/datafusion#4763, #13993), not engine regressions. The earlier "Our Nemesis" investigation is preserved as [docs/site/blog/2026-04-16-our-nemesis-q72.md](docs/site/blog/2026-04-16-our-nemesis-q72.md).
 
 ## Performance receipts (SF10, vs Trino 481)
 
@@ -94,7 +94,7 @@ Trino shows a range because every compare run re-measures it; the high end is th
 
 Distribution is a per-shape decision, not a default: big fact-to-fact joins (TPC-H, TPC-DS) gain 25 to 40 percent from two workers, while star schemas (SSB) pay shuffle costs that single-node avoids. Known open items at SF10: four TPC-DS inventory queries (q23, q37, q72, q82) fail distributed when the worker's scan buffer outruns Flight shipment and exhausts the 4GB worker pool, and SSB still trails Trino on raw star-join throughput.
 
-A later SF10 pass found a separate blow-up: TPC-H q12, q17, and q10 ran 160 to 300 seconds against Trino's 2 to 8. The cause was not partition layout or join distribution. On a partitioned hash join the build-side runtime filter is a `CASE` over per-partition key sets (q12: eleven branches of ~28K keys, ~300K expression nodes), and the probe scan re-snapshotted it once per batch. Each snapshot rebuilt the whole tree (~10ms), so a 14,600-batch scan spent ~150s reconstructing a filter it then evaluated in under a second. We now cache the first sealed snapshot per scan: q12 161s to 2.7s, q17 176s to 7.1s, q10 from a 300s failure to 3.3s, result rows unchanged, no threshold touched. SSB improved too (q4.1 11.6s to 6.8s), which retired the IN-list-threshold tradeoff we thought we had. The walk-through is in [The Filter That Rebuilt Itself](docs/blog/2026-06-15-the-filter-that-rebuilt-itself.md); the EXPLAIN comparison is in [`docs/perf/sf10-slow-queries.md`](docs/perf/sf10-slow-queries.md).
+A later SF10 pass found a separate blow-up: TPC-H q12, q17, and q10 ran 160 to 300 seconds against Trino's 2 to 8. The cause was not partition layout or join distribution. On a partitioned hash join the build-side runtime filter is a `CASE` over per-partition key sets (q12: eleven branches of ~28K keys, ~300K expression nodes), and the probe scan re-snapshotted it once per batch. Each snapshot rebuilt the whole tree (~10ms), so a 14,600-batch scan spent ~150s reconstructing a filter it then evaluated in under a second. We now cache the first sealed snapshot per scan: q12 161s to 2.7s, q17 176s to 7.1s, q10 from a 300s failure to 3.3s, result rows unchanged, no threshold touched. SSB improved too (q4.1 11.6s to 6.8s), which retired the IN-list-threshold tradeoff we thought we had. The walk-through is in [The Filter That Rebuilt Itself](docs/site/blog/2026-06-15-the-filter-that-rebuilt-itself.md); the EXPLAIN comparison is in [`docs/evidence/perf/sf10-slow-queries.md`](docs/evidence/perf/sf10-slow-queries.md).
 
 ### Clean-rig SF10: DataFusion 54 (June 18, dedicated host, cache off)
 
@@ -114,11 +114,11 @@ Loading SF10 surfaced a separate write-path gap worth naming: a partitioned `CRE
 
 ### SF100: coming
 
-SF100 is the next frontier, and it inverts the SF1 and SF10 playbook. Broadcasting the build side, building hash tables in memory, and emitting one scan stream all win at SF10. Each becomes the bottleneck at SF100. Getting there needs three things: memory-pool discipline under concurrency (cap concurrent sort consumers, bound per-consumer reservations, proactive spill), a proven multi-node distributed path on separate worker hosts rather than one shared box, and a data generator that streams row groups to disk instead of buffering a whole table in memory. The predicted failure modes, each grounded in something we actually observed at SF1 or SF10, are written up in [`docs/perf/sf100-scaling-risks.md`](docs/perf/sf100-scaling-risks.md).
+SF100 is the next frontier, and it inverts the SF1 and SF10 playbook. Broadcasting the build side, building hash tables in memory, and emitting one scan stream all win at SF10. Each becomes the bottleneck at SF100. Getting there needs three things: memory-pool discipline under concurrency (cap concurrent sort consumers, bound per-consumer reservations, proactive spill), a proven multi-node distributed path on separate worker hosts rather than one shared box, and a data generator that streams row groups to disk instead of buffering a whole table in memory. The predicted failure modes, each grounded in something we actually observed at SF1 or SF10, are written up in [`docs/evidence/perf/sf100-scaling-risks.md`](docs/evidence/perf/sf100-scaling-risks.md).
 
 ### How we know the numbers are real
 
-A benchmark row that says "Match" can still validate nothing: if the generated data contains no rows a query can select, both engines agree on empty and the diff passes. We learned this the hard way. Since June 2026 the harness reports those cases as `Vacuous`, and the generators are validated against DuckDB's official `dsdgen` output as an engine-free oracle (`scripts/validate-generator-tpcds.py`). That oracle caught a TPC-C generator bug that zeroed every warehouse join at fractional scales and a set of TPC-DS vocabulary gaps that had silently blanked 16 query results. Details in [the validation blog post](docs/blog/2026-06-12-the-benchmark-that-lied.md).
+A benchmark row that says "Match" can still validate nothing: if the generated data contains no rows a query can select, both engines agree on empty and the diff passes. We learned this the hard way. Since June 2026 the harness reports those cases as `Vacuous`, and the generators are validated against DuckDB's official `dsdgen` output as an engine-free oracle (`scripts/validate-generator-tpcds.py`). That oracle caught a TPC-C generator bug that zeroed every warehouse join at fractional scales and a set of TPC-DS vocabulary gaps that had silently blanked 16 query results. Details in [the validation blog post](docs/site/blog/2026-06-12-the-benchmark-that-lied.md).
 
 The same validation pass found one query where the engines disagree and SQE is right: TPC-DS q75 returns 57 rows on SQE and 55 on Trino, because Trino's `DECIMAL(17,2)` division rounds two sales ratios of 0.8983 and 0.8984 up to 0.90 and drops them from the `< 0.9` filter. DuckDB returns SQE's exact 57 rows on the same parquet files.
 
@@ -163,13 +163,13 @@ Client (JDBC / Flight SQL / HTTP)
    +-----------+
 ```
 
-Detailed Mermaid diagrams (query pipeline, crate dependencies, caching layers, distributed execution, write path) in [`docs/architecture.md`](docs/architecture.md).
+Detailed Mermaid diagrams (query pipeline, crate dependencies, caching layers, distributed execution, write path) in [`docs/site/book/src/architecture/overview.md`](docs/site/book/src/architecture/overview.md).
 
 ## Web UI
 
-A read-only ops dashboard ships in the binary, on the coordinator's health port (`metrics_port + 1`). Queries with per-fragment timing, cluster nodes, and live engine metrics (stat cards, a query-activity histogram, memory and concurrency gauges), all from the coordinator's in-memory state. No login (network-gated), no build step, no external assets. Toggle with `[metrics] web_ui`. Full reference: [`docs/book/src/operations/web-ui.md`](docs/book/src/operations/web-ui.md).
+A read-only ops dashboard ships in the binary, on the coordinator's health port (`metrics_port + 1`). Queries with per-fragment timing, cluster nodes, and live engine metrics (stat cards, a query-activity histogram, memory and concurrency gauges), all from the coordinator's in-memory state. No login (network-gated), no build step, no external assets. Toggle with `[metrics] web_ui`. Full reference: [`docs/site/book/src/operations/web-ui.md`](docs/site/book/src/operations/web-ui.md).
 
-![SQE web UI: the Overview dashboard](docs/book/src/images/sqe-web-ui-overview.png)
+![SQE web UI: the Overview dashboard](docs/site/book/src/images/sqe-web-ui-overview.png)
 
 ## Get started
 
@@ -192,7 +192,7 @@ sqe> ATTACH 'http://catalog.example.com/api/catalog' AS partner_cat
 sqe> SELECT * FROM partner_cat.sales.orders LIMIT 10;
 ```
 
-Full embedded reference: [`docs/cli-embedded.md`](docs/cli-embedded.md). Runtime ATTACH / SECRET reference: [`docs/book/src/operations/catalogs.md`](docs/book/src/operations/catalogs.md).
+Full embedded reference: [`docs/site/book/src/getting-started/cli.md`](docs/site/book/src/getting-started/cli.md). Runtime ATTACH / SECRET reference: [`docs/site/book/src/getting-started/catalogs.md`](docs/site/book/src/getting-started/catalogs.md).
 
 ### Cluster mode (Polaris + S3 + SQE locally)
 
@@ -208,9 +208,9 @@ sqe> SHOW CATALOGS;
 sqe> SELECT * FROM test_warehouse.default.my_table LIMIT 10;
 ```
 
-Same binary against external infrastructure (Glue, S3 Tables, HMS, JDBC, Hadoop): see [`QUICKSTART.md`](QUICKSTART.md) and [`docs/catalogs.md`](docs/catalogs.md).
+Same binary against external infrastructure (Glue, S3 Tables, HMS, JDBC, Hadoop): see [`QUICKSTART.md`](QUICKSTART.md) and [`docs/site/book/src/getting-started/catalogs.md`](docs/site/book/src/getting-started/catalogs.md).
 
-Docker, Kubernetes, TLS, and auth provider setup: [`docs/deployment.md`](docs/deployment.md).
+Docker, Kubernetes, TLS, and auth provider setup: [`docs/site/book/src/deployment/configuration.md`](docs/site/book/src/deployment/configuration.md).
 
 ## Documentation
 
@@ -218,37 +218,37 @@ The reference docs:
 
 | Doc | What |
 |---|---|
-| [Architecture](docs/architecture.md) | Mermaid diagrams across the engine |
-| [Deployment](docs/deployment.md) | Docker Compose, K8s, TLS, auth providers, monitoring |
-| [Operational Runbook](docs/runbook.md) | On-call triage: crashloops, catalog/OIDC outages, OOM, registry flap |
-| [Iceberg Matrix](docs/iceberg-matrix.md) | Per-cell SQE coverage on the public scoreboard |
-| [Iceberg Matrix Comparison](docs/iceberg-matrix-compare.md) | V2/V3 side-by-side against 20 engines |
-| [Trino Compatibility](docs/trino-compatibility.md) | SQL function and feature matrix vs Trino |
-| [DuckDB Comparison](docs/duckdb-comparision.md) | Symmetry between SQE and DuckDB on the embedded side |
-| [Embedded CLI Reference](docs/cli-embedded.md) | All flags, dot-commands, TVFs, catalog backends, storage backends |
-| [SQL Feature Comparison](docs/features.md) | SQE vs Trino vs Spark SQL vs DuckDB across windows, aggregates, DML, Iceberg, file-format TVFs |
-| [SQL Reference (book)](docs/book/src/sql-reference/index.md) | Every function, statement, operator, TVF, CALL procedure, GRANT extension, with origin and Trino / Snowflake / Spark / DuckDB alias columns |
-| [Catalog Backends](docs/catalogs.md) | Per-backend TOML, credentials, verification queries |
-| [Storage Backends](docs/book/src/getting-started/storage-backends.md) | S3, R2, MinIO/Ceph, Azure ADLS Gen2, Google Cloud Storage, HTTPS, hf:// |
-| [Operations: OpenLineage](docs/book/src/operations/openlineage.md) | Lineage emit, sinks, troubleshooting |
-| [Benchmark history](docs/benchmark/index.md) | Per-suite, per-scale, per-query plots over time |
-| [Roadmap](docs/roadmap.md) | Full feature checklist |
-| [Security Audit](docs/issues.md) | 43 findings, all resolved |
+| [Architecture](docs/site/book/src/architecture/overview.md) | Mermaid diagrams across the engine |
+| [Deployment](docs/site/book/src/deployment/configuration.md) | Docker Compose, K8s, TLS, auth providers, monitoring |
+| [Operational Runbook](docs/site/book/src/operations/runbook.md) | On-call triage: crashloops, catalog/OIDC outages, OOM, registry flap |
+| Iceberg Matrix | Per-cell SQE coverage on the public scoreboard |
+| Iceberg Matrix Comparison | V2/V3 side-by-side against 20 engines |
+| [Trino Compatibility](docs/site/compare/trino-compatibility.md) | SQL function and feature matrix vs Trino |
+| [DuckDB Comparison](docs/site/compare/duckdb-comparision.md) | Symmetry between SQE and DuckDB on the embedded side |
+| [Embedded CLI Reference](docs/site/book/src/getting-started/cli.md) | All flags, dot-commands, TVFs, catalog backends, storage backends |
+| [SQL Feature Comparison](docs/site/compare/features.md) | SQE vs Trino vs Spark SQL vs DuckDB across windows, aggregates, DML, Iceberg, file-format TVFs |
+| [SQL Reference (book)](docs/site/book/src/sql-reference/index.md) | Every function, statement, operator, TVF, CALL procedure, GRANT extension, with origin and Trino / Snowflake / Spark / DuckDB alias columns |
+| [Catalog Backends](docs/site/book/src/getting-started/catalogs.md) | Per-backend TOML, credentials, verification queries |
+| [Storage Backends](docs/site/book/src/getting-started/storage-backends.md) | S3, R2, MinIO/Ceph, Azure ADLS Gen2, Google Cloud Storage, HTTPS, hf:// |
+| [Operations: OpenLineage](docs/site/book/src/operations/openlineage.md) | Lineage emit, sinks, troubleshooting |
+| [Benchmark history](docs/evidence/benchmark/index.md) | Per-suite, per-scale, per-query plots over time |
+| [Roadmap](docs/site/book/src/development/roadmap.md) | Full feature checklist |
+| Security Audit | 43 findings, all resolved |
 
 ## The book
 
 SQE's design and development journey is documented in **"Sovereign by Design: Building a Production Query Engine on DataFusion"**.
 
-Twenty chapters across five parts. Roughly 370 pages. The story of choosing DataFusion, surviving the Iceberg fork rebase, lifting the matrix from 31% to 88%, building the embedded mode that turned out to be a DuckDB-shaped surprise, and shipping column-level lineage. Source in [`docs/ebook/`](docs/ebook/). Build with `cd docs/ebook && make`.
+Twenty chapters across five parts. Roughly 370 pages. The story of choosing DataFusion, surviving the Iceberg fork rebase, lifting the matrix from 31% to 88%, building the embedded mode that turned out to be a DuckDB-shaped surprise, and shipping column-level lineage. Source in [`docs/site/ebook/`](docs/site/ebook/). Build with `cd docs/site/ebook && make`.
 
 A few chapters worth reading first:
 
-- [chapter 04 ("You Are the Query")](docs/ebook/chapters/04-you-are-the-query.md) on per-query identity
-- [chapter 09 ("What You Cannot See")](docs/ebook/chapters/09-what-you-cant-see.md) on observability
-- [chapters 16b and 16c](docs/ebook/chapters/) on the Iceberg matrix journey from 99/189 to 164/189
-- [chapter 16d ("The DuckDB Drift")](docs/ebook/chapters/16d-the-duckdb-drift.md) on building embedded mode in two days
-- [chapter 16e ("The Lineage Trail")](docs/ebook/chapters/16e-the-lineage-trail.md) on shipping OpenLineage
-- [chapter 17 ("What We Would Do Differently")](docs/ebook/chapters/17-what-wed-do-differently.md) on the retro
+- [chapter 04 ("You Are the Query")](docs/site/ebook/chapters/04-you-are-the-query.md) on per-query identity
+- [chapter 09 ("What You Cannot See")](docs/site/ebook/chapters/09-what-you-cant-see.md) on observability
+- [chapters 16b and 16c](docs/site/ebook/chapters/) on the Iceberg matrix journey from 99/189 to 164/189
+- [chapter 16d ("The DuckDB Drift")](docs/site/ebook/chapters/16d-the-duckdb-drift.md) on building embedded mode in two days
+- [chapter 16e ("The Lineage Trail")](docs/site/ebook/chapters/16e-the-lineage-trail.md) on shipping OpenLineage
+- [chapter 17 ("What We Would Do Differently")](docs/site/ebook/chapters/17-what-wed-do-differently.md) on the retro
 
 ## Blog
 
@@ -256,19 +256,19 @@ Engineering posts that double as design rationale:
 
 | Post | Topic |
 |---|---|
-| [Why We Replaced Trino with Rust](docs/blog/2026-03-22-why-we-replaced-trino-with-rust.md) | The decision to build SQE |
-| [Five Layers of Caching and an 8.8x Speedup](docs/blog/2026-04-12-caching-and-the-8x-speedup.md) | Caching strategy across the stack |
-| [Security Hardening: 43 Findings](docs/blog/2026-04-13-security-hardening-43-findings.md) | Production audit |
-| [DataFusion 53 and the Iceberg Fork](docs/blog/2026-04-14-datafusion-53-and-the-iceberg-fork.md) | DF 53 upgrade and vendoring decision |
-| [Our Nemesis: TPC-DS Q72](docs/blog/2026-04-16-our-nemesis-q72.md) | The one query we cannot beat |
-| [Why a Public Iceberg Matrix Beats Vendor Spec Sheets](docs/blog/2026-04-29-the-iceberg-matrix-as-a-scoreboard.md) | A scoreboard for the lakehouse |
-| [SQE Talks to Five Catalogs Now](docs/blog/2026-04-29-five-catalogs-live.md) | The live verification phase plus AWS SigV4 |
-| [How We Accidentally Created a DuckDB](docs/blog/2026-05-07-accidentally-duckdb.md) | V8 to V12: file-format TVFs, hf://, Delta, smarter read_csv |
-| [Shipping OpenLineage](docs/blog/2026-05-09-shipping-openlineage.md) | Column-level lineage from idea to merged MR |
-| [The Benchmark That Lied](docs/blog/2026-06-12-the-benchmark-that-lied.md) | Vacuous results, the DuckDB oracle, and the day Trino was wrong |
-| [The Filter That Rebuilt Itself 14,600 Times](docs/blog/2026-06-15-the-filter-that-rebuilt-itself.md) | A runtime filter re-snapshotted per batch made q12 161s instead of 2.7s |
+| [Why We Replaced Trino with Rust](docs/site/blog/2026-03-22-why-we-replaced-trino-with-rust.md) | The decision to build SQE |
+| [Five Layers of Caching and an 8.8x Speedup](docs/site/blog/2026-04-12-caching-and-the-8x-speedup.md) | Caching strategy across the stack |
+| [Security Hardening: 43 Findings](docs/site/blog/2026-04-13-security-hardening-43-findings.md) | Production audit |
+| [DataFusion 53 and the Iceberg Fork](docs/site/blog/2026-04-14-datafusion-53-and-the-iceberg-fork.md) | DF 53 upgrade and vendoring decision |
+| [Our Nemesis: TPC-DS Q72](docs/site/blog/2026-04-16-our-nemesis-q72.md) | The one query we cannot beat |
+| [Why a Public Iceberg Matrix Beats Vendor Spec Sheets](docs/site/blog/2026-04-29-the-iceberg-matrix-as-a-scoreboard.md) | A scoreboard for the lakehouse |
+| [SQE Talks to Five Catalogs Now](docs/site/blog/2026-04-29-five-catalogs-live.md) | The live verification phase plus AWS SigV4 |
+| [How We Accidentally Created a DuckDB](docs/site/blog/2026-05-07-accidentally-duckdb.md) | V8 to V12: file-format TVFs, hf://, Delta, smarter read_csv |
+| [Shipping OpenLineage](docs/site/blog/2026-05-09-shipping-openlineage.md) | Column-level lineage from idea to merged MR |
+| [The Benchmark That Lied](docs/site/blog/2026-06-12-the-benchmark-that-lied.md) | Vacuous results, the DuckDB oracle, and the day Trino was wrong |
+| [The Filter That Rebuilt Itself 14,600 Times](docs/site/blog/2026-06-15-the-filter-that-rebuilt-itself.md) | A runtime filter re-snapshotted per batch made q12 161s instead of 2.7s |
 
-Full archive in [`docs/blog/`](docs/blog/).
+Full archive in [`docs/site/blog/`](docs/site/blog/).
 
 ## Crate structure
 

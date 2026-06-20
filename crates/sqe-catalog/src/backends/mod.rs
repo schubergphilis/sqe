@@ -14,7 +14,8 @@
 //!
 //! Old SQE wrappers `glue.rs`, `hms.rs`, `sql.rs` were removed in the
 //! `feat/iceberg-loader-s3tables` change. See
-//! `vendor/iceberg-rust/README.md` and `docs/catalogs.md` for the
+//! `vendor/iceberg-rust/README.md` and
+//! `docs/site/book/src/getting-started/catalogs.md` for the
 //! supported config keys per backend.
 
 #[cfg(feature = "hadoop")]

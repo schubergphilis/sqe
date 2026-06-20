@@ -670,7 +670,7 @@ impl SessionCatalog {
     /// picks the matching `CatalogBuilder` and returns the catalog.
     /// Backend support is gated by the same cargo features as the rest
     /// of `sqe-catalog`. See `vendor/iceberg-rust/README.md` and
-    /// `docs/catalogs.md` for the supported prop keys per backend.
+    /// `docs/site/book/src/getting-started/catalogs.md` for the supported prop keys per backend.
     pub async fn build_backend_catalog(
         backend: &sqe_core::config::CatalogBackend,
     ) -> sqe_core::Result<Arc<dyn iceberg::Catalog>> {

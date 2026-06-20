@@ -73,7 +73,7 @@ Out of scope:
 ## Hardening Guidance
 
 The
-[security audit summary](docs/issues.md)
+security audit summary
 documents the hardening work we have already done (43 findings
 resolved). New deployments should:
 
@@ -87,4 +87,4 @@ resolved). New deployments should:
   reach the configured catalog and storage backends.
 - Keep `cargo audit` and `cargo deny check advisories` in CI.
 
-For details on the auth chain, see [docs/deployment.md](docs/deployment.md).
+For details on the auth chain, see [docs/site/book/src/deployment/configuration.md](docs/site/book/src/deployment/configuration.md).
