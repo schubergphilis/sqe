@@ -120,6 +120,42 @@ SQL compatibility tests live in `crates/sqe-coordinator/tests/sql_compat_test.rs
 
 The SQL compat tests use the same test stack and configuration as the integration tests. They are also marked `#[ignore]` and run as part of `./scripts/integration-test.sh`.
 
+Each `.sql` file under `crates/sqe-coordinator/tests/sql/` is one `#[tokio::test]` registered in `sql_compat_test.rs`. The files use a simple block format and rely on CTEs rather than fixture tables, so each block is self-contained:
+
+```
+--- test_name
+SQL statement;
+--- expect
+col1 | col2
+val1 | val2
+```
+
+Add a new case by appending a block to an existing file, or by creating a new file and registering it in `sql_compat_test.rs`.
+
+### Fixture data
+
+Most join, aggregation, view, and window integration tests share two fixture tables, created fresh per test and torn down after:
+
+`test_ns.employees`
+
+| id | name    | dept_id | salary   |
+|----|---------|---------|----------|
+| 1  | Alice   | 10      | 90000.00 |
+| 2  | Bob     | 10      | 85000.00 |
+| 3  | Charlie | 20      | 70000.00 |
+| 4  | Dave    | 20      | 75000.00 |
+| 5  | Eve     | 30      | 95000.00 |
+| 6  | Frank   | 99      | 60000.00 |
+
+`test_ns.departments`
+
+| id | dept_name   | budget     |
+|----|-------------|------------|
+| 10 | Engineering | 500000.00  |
+| 20 | Marketing   | 200000.00  |
+| 30 | Executive   | 1000000.00 |
+| 40 | HR          | 150000.00  |
+
 ## Test Configuration
 
 ```toml

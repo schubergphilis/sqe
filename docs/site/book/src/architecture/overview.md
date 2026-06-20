@@ -125,3 +125,31 @@ graph LR
 | 8080 | HTTP | Trino-compatible endpoint |
 | 9090 | HTTP | Prometheus metrics |
 | 9091 | HTTP | Health probes (`/healthz`, `/readyz`) |
+
+## Caching
+
+SQE caches at five layers, each falling through to the next on a miss. The first two layers (session and catalog) live in memory and are short-lived; the last three (table metadata, manifest, footer) hold immutable or near-immutable Iceberg data.
+
+```mermaid
+graph TD
+    SC["Layer 1: SessionContext cache<br/>moka, SHA-256 token fingerprint<br/>TTL 5 min, max 100 entries"]
+    RC["Layer 2: RestCatalog cache<br/>moka, per-warehouse<br/>TTL 5 min"]
+    TMC["Layer 3: Table metadata cache<br/>moka, ETag validation<br/>TTL configurable (default 30s)"]
+    MC["Layer 4: Manifest file cache<br/>moka, content-addressed<br/>no TTL, default 512 MB"]
+    FC["Layer 5: Parquet footer cache<br/>object_store, byte-range<br/>default 256 MB"]
+
+    SC -->|miss| RC
+    RC -->|miss| TMC
+    TMC -->|miss| MC
+    MC -->|miss| FC
+    FC -->|miss| S3["S3 storage"]
+
+    DDL["DDL (CREATE / DROP / ALTER)"] -.->|invalidates| SC
+```
+
+Invalidation follows the Iceberg data model:
+
+- The session cache is invalidated after any DDL statement (CREATE TABLE, DROP TABLE, ALTER TABLE).
+- Table metadata uses ETag-based conditional requests. Polaris returns `304 Not Modified` when metadata has not changed, so a cache hit costs one cheap round-trip rather than a full metadata fetch.
+- Manifest files are immutable by Iceberg specification, so they need no TTL-based expiry. They evict only under memory pressure.
+- The footer cache evicts on an LRU basis within its configured memory budget.

@@ -195,6 +195,35 @@ REST is the most-tested path. Every benchmark suite (TPC-H, SSB,
 TPC-DS, TPC-C, TPC-E, TPC-BB, ClickBench) runs against the local
 Polaris stack on every release build.
 
+### Namespace visibility filtering
+
+On the REST backend, SQE hides the names of namespaces the caller
+holds no grants in from every metadata listing: `SHOW SCHEMAS`,
+`information_schema.schemata`, and Flight SQL `GetDbSchemas`. When the
+session's catalog provider is built, each namespace returned by
+`listNamespaces` is probed once with the caller's bearer token
+(`GetNamespace`, which Polaris authorizes as `LOAD_NAMESPACE_METADATA`
+per caller). A 403 drops the name. The probes run 8 at a time, once per
+session, never per query.
+
+The filter fails open. A probe that times out or errors for any reason
+other than 403 keeps the name listed. Namespace contents are protected
+by the per-operation checks regardless of what the list shows, so a
+catalog hiccup degrades to unfiltered listings instead of blanking the
+user's schema tree. `information_schema` itself is always listed and
+never probed.
+
+```toml
+[catalog]
+# default true; set false to restore unfiltered listings
+namespace_visibility_filter = false
+```
+
+Single-identity backends (Glue, HMS, JDBC, Hadoop) skip the filter
+entirely. They authenticate as the coordinator's service identity, so
+there is no per-caller answer to give. Those backends log a
+shared-identity warning at startup.
+
 ## HMS: Hive Metastore over Thrift
 
 For deployments still on Hive Metastore.

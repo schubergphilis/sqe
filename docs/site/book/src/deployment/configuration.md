@@ -20,7 +20,10 @@ flight_sql_port = 50051         # Flight SQL gRPC port
 trino_http_port = 8080          # Trino-compat HTTP port (0 to disable)
 mode = "hybrid"                 # "coordinator", "worker", "hybrid", "local", "distributed"
 worker_urls = []                # Worker Flight URLs for distributed mode
+worker_secret = ""              # Shared secret for worker heartbeat auth (empty disables the check)
 debug = false                   # When true, error messages include internal details (dev only)
+flight_compression = "lz4"      # IPC compression for client DoGet responses
+shuffle_compression = "zstd"    # IPC compression for internal DoExchange shuffle
 
 [coordinator.tls]
 cert_file = ""                  # PEM certificate — TLS enabled when both cert + key are set
@@ -53,6 +56,9 @@ catalog_url = "http://polaris:8181/api/catalog"   # REST catalog endpoint
 warehouse = "iceberg"           # warehouse identifier the catalog expects
 metadata_cache_ttl_secs = 30    # Table metadata cache TTL
 default_table_format_version = 2 # Iceberg table format version (2 or 3)
+trust_sort_order = false        # Trust Iceberg sort order for all columns, not just partition keys
+small_file_threshold_mb = 3     # Max file size for the direct-read fast path (0 to disable)
+parquet_compression = "zstd"    # Write-path Parquet codec: zstd, lz4, snappy, none
 
 # `catalog_url` accepts any Iceberg REST endpoint. SQE has been
 # verified live against Apache Polaris, Project Nessie 0.107+,
@@ -103,6 +109,12 @@ s3_region = "us-east-1"
 s3_access_key = ""              # Set via SQE_STORAGE__S3_ACCESS_KEY
 s3_secret_key = ""              # Set via SQE_STORAGE__S3_SECRET_KEY
 s3_path_style = true            # true for MinIO/Ceph, false for AWS S3
+s3_allow_http = false           # Allow plaintext HTTP for S3 (dev/test only)
+concurrent_requests_per_file = 4 # Max concurrent byte-range requests per file
+max_concurrent_files = 8        # Max files fetched concurrently
+prefetch_buffer = "32MB"        # Prefetch buffer for overlapping footer reads
+# coalesce_threshold and footer_cache_size are documented in
+# architecture/streaming-execution.md alongside the S3 I/O pipeline.
 
 [policy]
 engine = "passthrough"          # "passthrough" (only option currently; "opa", "cedar" planned)
@@ -110,13 +122,34 @@ engine = "passthrough"          # "passthrough" (only option currently; "opa", "
 [session]
 idle_timeout_secs = 900         # 15 min — sessions idle longer are expired
 absolute_timeout_secs = 28800   # 8 hours — hard session lifetime cap
+persistence = "memory"          # "memory" (default) or "file"
+persistence_path = "/tmp/sqe-sessions.json"  # Path for file-based persistence
+snapshot_interval_secs = 60     # How often file persistence snapshots sessions to disk
 
 [query]
 timeout_secs = 300              # 5 min — max execution time per query
+max_result_rows = 1000000       # Max rows per query (0 = unlimited)
+max_concurrent_queries = 100    # Concurrency limit (0 = unlimited)
+max_query_memory = "256MB"      # Per-query memory limit
+slow_query_threshold_secs = 30  # WARN-log threshold for slow queries
+distribution_threshold = "128MB" # Min scan size to distribute to workers
+distribution_file_threshold = 4 # Min file count to distribute
+target_task_size = "256MB"      # Target scan task size for bin-packing
+sort_mode = "adaptive"          # "adaptive", "partition_only", or "strict"
 
 [query.role_overrides]          # Per-role timeout overrides (seconds)
 # admin = 3600                  # Admins get 1 hour
 # analyst = 600                 # Analysts get 10 minutes
+
+[query_cache]
+enabled = false                 # Enable query result caching
+max_memory_mb = 128             # Total cache memory budget
+max_entry_mb = 5                # Max size per cached result
+ttl_secs = 300                  # Cache entry TTL
+
+[query_history]
+max_entries = 10000             # Max queries retained in history
+ttl_secs = 1800                 # History entry TTL (30 min)
 
 [rate_limit]
 enabled = false                 # Enable per-user and global rate limiting
@@ -237,6 +270,109 @@ client_secret = "s3cr3t"
 ```
 
 At least one of `keycloak_url` or `token_endpoint` must be configured. If both are set, `keycloak_url` takes priority (OIDC mode).
+
+### Provider chain
+
+The two flows above are the single-provider shorthand. For anything beyond one OIDC provider, configure a chain of `[[auth.providers]]` entries. SQE tries each in order and the first that authenticates a request wins. The chain takes precedence over the legacy `[auth]` fields when it is non-empty, and the legacy fields stay backward-compatible for existing single-provider configs.
+
+Each entry requires a `type`:
+
+| Type | Required fields | Description |
+|------|-----------------|-------------|
+| `oidc_password` | `token_url`, `client_id` | OIDC Resource Owner Password Credentials |
+| `client_credentials` | `token_endpoint`, `client_id`, `client_secret` | OAuth2 client credentials |
+| `oidc_m2m` | `token_endpoint`, `client_id`, `client_secret` | OIDC machine-to-machine client-credentials (Unity Catalog and generic IdPs) |
+| `bearer_token` | `jwks_url` | Pre-obtained JWT validated via JWKS |
+| `token_exchange` | `token_url`, `client_id` | RFC 8693 token exchange |
+| `aws_iam` | none | AWS IAM via STS `GetCallerIdentity` |
+| `api_key` | `keys_file` | API key from a TOML keys file |
+| `mtls` | none | Client certificate authentication |
+| `anonymous` | none | Fixed identity for dev / test |
+
+A common production chain accepts both interactive logins (password grant) and pre-minted JWTs from programmatic clients:
+
+```toml
+[[auth.providers]]
+type = "oidc_password"
+token_url = "https://keycloak.example.com/realms/iceberg/protocol/openid-connect/token"
+client_id = "sqe-client"
+client_secret = "your-client-secret"   # via SQE_AUTH__CLIENT_SECRET
+roles_claim = "realm_access.roles"
+
+[[auth.providers]]
+type = "bearer_token"
+jwks_url = "https://keycloak.example.com/realms/iceberg/protocol/openid-connect/certs"
+issuer = "https://keycloak.example.com/realms/iceberg"
+```
+
+Auth0 and Okta use the same two-provider shape, differing only in `token_url`, `jwks_url`, `issuer`, and the `roles_claim` path (Auth0 uses a namespaced claim, Okta uses `groups`).
+
+AWS IAM maps caller ARNs to SQE roles:
+
+```toml
+[[auth.providers]]
+type = "aws_iam"
+region = "eu-west-1"
+validate_with_sts = true
+
+[auth.role_mappings]
+"arn:aws:iam::123456789012:role/DataAnalyst" = ["analyst", "reader"]
+"arn:aws:iam::123456789012:role/DataEngineer" = ["admin"]
+```
+
+API keys read from a separate TOML file, each key carrying a user and roles:
+
+```toml
+[[auth.providers]]
+type = "api_key"
+keys_file = "/etc/sqe/api-keys.toml"
+key_prefix = "sqe_"
+```
+
+```toml
+# api-keys.toml
+[[keys]]
+key = "sqe_abc123def456"
+user = "service-account-etl"
+roles = ["writer"]
+```
+
+Unity Catalog REST accepts OAuth2 client-credentials (machine-to-machine) in addition to personal access tokens. The `oidc_m2m` provider caches the access token and refreshes it shortly before expiry, so catalog requests never see a stale token:
+
+```toml
+[catalog]
+catalog_url = "https://<workspace>.cloud.databricks.com/api/2.1/unity-catalog"
+warehouse = "main"
+
+[[auth.providers]]
+type = "oidc_m2m"
+token_endpoint = "https://<workspace>.cloud.databricks.com/oidc/v1/token"
+client_id = "<service-principal-application-id>"
+client_secret = "<service-principal-secret>"
+scope = "all-apis"
+```
+
+The `anonymous` provider pins a fixed identity for dev and test. SQE logs a startup warning whenever it is configured.
+
+```toml
+[[auth.providers]]
+type = "anonymous"
+user = "dev-user"
+roles = ["admin"]
+```
+
+For CLI logins without a username and password, configure the interactive device-code flow under `[auth.external]`:
+
+```toml
+[auth.external]
+issuer = "https://keycloak.example.com/realms/iceberg"
+client_id = "sqe-cli"
+scopes = ["openid", "profile"]
+
+[auth.external.device]
+client_id = "sqe-cli-device"
+scopes = ["openid", "profile"]
+```
 
 ## Validation
 

@@ -206,3 +206,41 @@ Logs are structured JSON — pipe to `jq` for readability:
 ```bash
 kubectl logs deploy/sqe-coordinator | jq .
 ```
+
+## Worker Secret (distributed mode)
+
+In distributed mode the coordinator and every worker share a secret that authenticates worker registration and credential push. The engine refuses to start when `coordinator_url` / `worker_urls` is set with an empty `worker_secret`, so a distributed install without a secret crashloops. The chart renders `coordinator_url` only when `worker.enabled=true`, so a single-node install needs no secret.
+
+Provide the secret one of two ways. The chart injects the value under both `SQE_COORDINATOR__WORKER_SECRET` and `SQE_WORKER__WORKER_SECRET` from one Secret key, so the guards on both pods are satisfied with matching values.
+
+```bash
+# Preferred: reference a Secret you manage, naming the key that holds the value.
+kubectl create secret generic sqe-worker-secret \
+  --from-literal=SQE_WORKER_SECRET="$(openssl rand -hex 32)"
+
+helm install sqe deploy/helm/sqe/ \
+  --set worker.enabled=true \
+  --set workerSecret.existingSecret=sqe-worker-secret \
+  --set workerSecret.key=SQE_WORKER_SECRET
+
+# Dev/test: inline value. The chart creates the Secret for you.
+helm install sqe deploy/helm/sqe/ \
+  --set worker.enabled=true \
+  --set workerSecret.value=dev-only-shared-secret
+```
+
+## Availability and Disruption Budgets
+
+The chart ships PodDisruptionBudgets and default pod anti-affinity so a node drain or rolling upgrade cannot take the cluster down at once.
+
+- **Coordinator PDB**: `minAvailable: 1`. The coordinator is single-replica today, so this blocks an unforced eviction of the only coordinator. A node drain that targets it will not proceed until you act (cordon and delete the pod, or scale the deployment to 0 first). The budget protects a single point of failure; it does not provide HA.
+- **Worker PDB**: `maxUnavailable: 1`. A drain rolls through one node at a time while the rest keep serving fragments. Rendered only when `worker.enabled`.
+- **Anti-affinity**: when a component's `affinity` is empty, the chart applies a preferred `podAntiAffinity` by hostname so replicas spread across nodes. Workers always get it; the coordinator gets it only at `replicas > 1`. Set `affinity` to override the default entirely, or `defaultAntiAffinity: false` to render none.
+
+Toggle the budgets with `podDisruptionBudget.enabled` (default `true`) and tune `podDisruptionBudget.coordinator.minAvailable` / `podDisruptionBudget.worker.maxUnavailable`.
+
+### The coordinator is a single point of failure
+
+The coordinator runs as a single replica. Session state, the worker registry, and in-flight query state are process-local; there is no shared store. A coordinator restart drops every in-flight query and invalidates client sessions, so connected clients must re-authenticate and re-run. A node drain that moves the coordinator pod is a brief outage, not a transparent failover.
+
+Running more than one coordinator replica is not yet safe. Two replicas do not share sessions or the registry, so clients would land on a coordinator that has never seen their session. Keep `coordinator.replicas: 1`. Full coordinator HA with shared session and registry state is a separate design.

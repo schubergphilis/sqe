@@ -34,6 +34,17 @@ histogram_quantile(0.99, rate(sqe_query_duration_seconds_bucket[5m]))
 sqe_active_sessions
 ```
 
+### Local observability stack
+
+For a self-contained metrics view alongside the test stack, SQE ships a Docker Compose overlay using VictoriaMetrics (Prometheus-compatible, around 30 MB RAM) and Grafana:
+
+```bash
+docker compose -f docker-compose.test.yml -f docker-compose.observability.yml up -d
+open http://localhost:13000    # Grafana, admin / admin
+```
+
+The overlay auto-scrapes the single-node coordinator (`localhost:19090`), the distributed coordinator (`localhost:29090`), and workers (`localhost:29091-29094`). A pre-built dashboard lives at `deploy/observability/sqe-benchmark-dashboard.json` and is auto-provisioned by the overlay. To import it manually, copy the JSON into your Grafana instance and point it at a Prometheus or VictoriaMetrics data source.
+
 ## Health Endpoints
 
 Available on port 9091 (metrics port + 1) for both coordinator and workers.

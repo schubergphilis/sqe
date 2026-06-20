@@ -117,11 +117,21 @@ Procedures inherit the calling user's grants on the target table:
 
 A user without the right grant gets a clear "policy denied" error instead of a generic execution failure.
 
+When no OPA / Cedar policy store is wired, an engine-level heuristic acts as the last line of defence. A session is treated as read-only when any of its roles matches `read*`, `select*`, or contains `readonly`, and no role contains `write`, `admin`, or `owner`. Read-only sessions are denied every maintenance procedure and the attempt is recorded in the audit log with `status = "denied"`. A policy store overrides this heuristic once configured.
+
 ## Safety notes
 
 - **`remove_orphan_files` with no `older_than`** uses the 3-day default, which is conservative against compaction or COPY jobs in flight. Override with `older_than` only after confirming no concurrent writers.
 - **`expire_snapshots` is destructive** for time-travel queries. Once a snapshot is expired, `FOR VERSION AS OF <id>` for that snapshot fails. Document a retention window your team agrees on, and stick to it.
 - **`rewrite_data_files` rewrites entire data files**, not row groups. Two consecutive calls can churn the same files; rely on the `min_input_files` floor (default 5) to keep churn bounded.
+- **Run procedures in a quiet window.** A concurrent writer that commits mid-run can cause `rewrite_data_files` to return a retryable error. The other procedures tolerate concurrency and reconcile against the live snapshot.
+
+## Commit failures
+
+Every procedure commits through the same REST catalog path that CTAS and INSERT use, so commit failures surface as `SqeError::Execution` and fall into two buckets:
+
+- **Retryable.** The message contains `conflict` or `retry`. The iceberg-rust retry loop has already given up, so the caller schedules another run after a back-off.
+- **Permanent.** Everything else. Check the message for the upstream cause.
 
 ## What is not exposed
 
