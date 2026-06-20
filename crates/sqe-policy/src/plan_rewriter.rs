@@ -299,8 +299,9 @@ impl PolicyEnforcer for PolicyPlanRewriter {
         // coordinator can record per-query masked/restricted/denied state
         // instead of a bare `status:"success"` with zero rows. `denied` is true
         // when any scan carries a deny-all `lit(false)` row filter (resolve
-        // failure, breaker-open, unknown-tag state, or fully-restricted table);
-        // those sentinels are NOT counted in `row_filters_applied`.
+        // failure, breaker-open, unknown-tag state, or an un-inlined view scan);
+        // those sentinels are NOT counted in `row_filters_applied`. A restricted
+        // column is NOT a deny: it stays in the schema as a forced NULL.
         let summary = summarise_policies(&table_policies);
 
         // Rewrite the plan
@@ -339,30 +340,40 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                             })?;
                         }
 
-                        // 2. Apply column masks and/or restrictions via a
-                        //    projection that drops restricted columns, masks
-                        //    masked columns, and passes the rest through with
-                        //    their real (qualified) column reference.
+                        // 2. Apply column masks and restrictions via a
+                        //    projection. A RESTRICTED column is kept in the
+                        //    schema but forced to a typed NULL (restriction is a
+                        //    forced Nullify), so `SELECT *` and any reference to
+                        //    it resolve and the raw value is never returned.
+                        //    Dropping the column (the old behavior) made any
+                        //    outer reference fail with FieldNotFound. A MASKED
+                        //    column gets its mask expression; everything else
+                        //    passes through with its real (qualified) reference.
+                        //    Restriction wins over a mask on the same column.
                         if !policy.column_masks.is_empty()
                             || !policy.restricted_columns.is_empty()
                         {
                             let schema = builder.schema().clone();
                             let exprs: Vec<Expr> = schema
                                 .iter()
-                                .filter(|(_q, f)| {
-                                    !policy.restricted_columns.contains(f.name())
-                                })
                                 .map(|(qualifier, field)| {
                                     let name = field.name();
-                                    if let Some(mask) = policy.column_masks.get(name) {
-                                        // Alias the mask expr to the column's
-                                        // QUALIFIED name so the output field
-                                        // keeps the scan's qualifier. A bare
-                                        // `.alias(name)` produces an unqualified
-                                        // field, which breaks the user's outer
-                                        // `SELECT t.col` reference (planned
-                                        // against the qualified scan) with
-                                        // "No field named <qualified>.col".
+                                    // Alias mask/null exprs to the column's
+                                    // QUALIFIED name so the output field keeps
+                                    // the scan's qualifier. A bare `.alias(name)`
+                                    // produces an unqualified field, which breaks
+                                    // the user's outer `SELECT t.col` reference
+                                    // (planned against the qualified scan) with
+                                    // "No field named <qualified>.col".
+                                    if policy.restricted_columns.contains(name) {
+                                        apply_mask(
+                                            name,
+                                            field.data_type(),
+                                            &MaskType::Nullify,
+                                            mask_key.clone(),
+                                        )
+                                        .alias_qualified(qualifier.cloned(), name.clone())
+                                    } else if let Some(mask) = policy.column_masks.get(name) {
                                         apply_mask(
                                             name,
                                             field.data_type(),
@@ -379,25 +390,7 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                                 })
                                 .collect();
 
-                            if exprs.is_empty() {
-                                // Every column is restricted. Falling through here
-                                // would return the raw TableScan (fail-open). Deny
-                                // instead: a `false` filter yields zero rows while
-                                // keeping the scan schema valid for the builder.
-                                // Structured WARN so this deny-all is visible in
-                                // logs (no expression bodies): the audit summary
-                                // already records the restricted column names.
-                                warn!(
-                                    user = %username,
-                                    table = %table_name,
-                                    "all columns restricted by policy; denying table (fail-closed)"
-                                );
-                                builder = builder.filter(lit(false)).map_err(|e| {
-                                    datafusion::error::DataFusionError::Internal(format!(
-                                        "Failed to create deny filter for fully-restricted table: {e}"
-                                    ))
-                                })?;
-                            } else {
+                            if !exprs.is_empty() {
                                 builder = builder.project(exprs).map_err(|e| {
                                     datafusion::error::DataFusionError::Internal(format!(
                                         "Failed to create policy projection: {e}"
