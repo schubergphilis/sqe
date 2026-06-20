@@ -1,9 +1,11 @@
+mod chain;
 mod event;
 mod logger;
 mod ocsf;
 mod redact;
 mod sink;
 
+pub use chain::{verify_chain, ChainError, HashChain};
 pub use event::{
     Actor, AuditEvent, AuditKind, Integrity, ObjectType, Outcome, PolicyAudit, QueryInfo,
     QueryStats, Resource, Timing,
