@@ -872,6 +872,14 @@ impl QueryHandler {
                     self.invalidate_policy_cache();
                     Ok(vec![])
                 }
+                StatementKind::SetTags(stmt) => {
+                    self.catalog_ops.set_column_tags(session, stmt).await?;
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
+                    // Tag->column associations changed; flush cached tag policies so
+                    // the next query re-resolves masks against the new tags.
+                    self.invalidate_policy_cache();
+                    Ok(vec![])
+                }
                 StatementKind::RefDdl(ddl) => {
                     self.catalog_ops.apply_ref_ddl(session, ddl).await?;
                     crate::session_context::invalidate_session_cache(&session.user.username).await;

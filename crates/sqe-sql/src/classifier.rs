@@ -10,6 +10,7 @@ use crate::attach::{
 use crate::ddl::{try_parse_ref_ddl, RefDdl};
 use crate::partition_evolution::{try_parse_partition_evolution, PartitionEvolution};
 use crate::procedures::{try_parse_call, ProcedureCall};
+use crate::tags::{try_parse_set_tags, SetTagsStatement};
 
 /// Target for SHOW GRANTS statements.
 #[derive(Debug)]
@@ -101,6 +102,9 @@ pub enum StatementKind {
     /// variant carries the pre-parsed `PartitionEvolution` and routes through
     /// a dedicated coordinator handler.
     PartitionEvolution(Box<PartitionEvolution>),
+    /// `ALTER TABLE ... SET TAGS / UNSET TAGS` and the Snowflake-compatible
+    /// `MODIFY|ALTER COLUMN ... SET TAG / UNSET TAG` column-tag authoring DDL.
+    SetTags(Box<SetTagsStatement>),
     /// `ATTACH '<location>' AS <name> (TYPE <kind>, ...)` — register a new
     /// Iceberg catalog at runtime. sqlparser-rs has no native AST for the
     /// SQE/DuckDB option list, so this variant carries the pre-parsed
@@ -160,6 +164,7 @@ impl StatementKind {
             StatementKind::RefDdl(_) => "refddl",
             StatementKind::SetWriteBranch(_) => "setwritebranch",
             StatementKind::PartitionEvolution(_) => "partitionevolution",
+            StatementKind::SetTags(_) => "settags",
             StatementKind::Attach(_) => "attach",
             StatementKind::Detach(_) => "detach",
             StatementKind::CreateSecret(_) => "create_secret",
@@ -318,6 +323,11 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
         // only Hive-style PARTITION (col=val), so we intercept here.
         if let Some(pe) = try_parse_partition_evolution(trimmed)? {
             return Ok(StatementKind::PartitionEvolution(Box::new(pe)));
+        }
+        // ALTER TABLE ... SET TAGS / UNSET TAGS / MODIFY|ALTER COLUMN ... SET TAG.
+        // Column-tag authoring; distinct from Iceberg snapshot CREATE/DROP TAG above.
+        if let Some(set_tags) = try_parse_set_tags(trimmed)? {
+            return Ok(StatementKind::SetTags(Box::new(set_tags)));
         }
     }
 
@@ -1317,6 +1327,37 @@ mod tests {
             matches!(result, Ok(StatementKind::AlterTableProps(_))),
             "Expected AlterTableProps for SET TBLPROPERTIES, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn set_tags_classifies_as_set_tags() {
+        let result = parse_and_classify("ALTER TABLE t SET TAGS (email = ('PII'))");
+        assert!(
+            matches!(result, Ok(StatementKind::SetTags(_))),
+            "expected SetTags, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn modify_column_set_tag_classifies_as_set_tags() {
+        let result = parse_and_classify("ALTER TABLE t MODIFY COLUMN email SET TAG PII = 'true'");
+        assert!(matches!(result, Ok(StatementKind::SetTags(_))));
+    }
+
+    #[test]
+    fn set_tblproperties_still_classifies_as_alter_table_props() {
+        // Guard: the new pre-scan must not steal SET TBLPROPERTIES.
+        let result = parse_and_classify(
+            "ALTER TABLE t SET TBLPROPERTIES ('write.format.default' = 'parquet')",
+        );
+        assert!(matches!(result, Ok(StatementKind::AlterTableProps(_))));
+    }
+
+    #[test]
+    fn create_tag_still_classifies_as_refddl() {
+        // Guard: Iceberg snapshot CREATE TAG must not be stolen.
+        let result = parse_and_classify("ALTER TABLE t CREATE TAG v1");
+        assert!(matches!(result, Ok(StatementKind::RefDdl(_))));
     }
 
     #[test]
