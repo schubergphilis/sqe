@@ -149,6 +149,47 @@ pub struct AuditEvent {
     pub integrity: Integrity,
 }
 
+/// Shared test fixture: a minimal valid Query event for use across test modules.
+#[cfg(test)]
+pub(crate) fn sample_query_event() -> AuditEvent {
+    use chrono::TimeZone;
+    AuditEvent {
+        time: chrono::Utc.with_ymd_and_hms(2026, 6, 20, 12, 0, 0).unwrap(),
+        kind: AuditKind::Query,
+        actor: Actor {
+            username: "alice".into(),
+            subject: Some("user-1".into()),
+            email: Some("alice@corp.example".into()),
+            roles: vec!["analyst".into()],
+            groups: vec!["hr".into()],
+        },
+        outcome: Outcome::Success,
+        resources: vec![Resource {
+            catalog: Some("polaris".into()),
+            namespace: vec!["hr".into()],
+            name: "employees".into(),
+            object_type: ObjectType::Table,
+        }],
+        policy: None,
+        timing: Some(Timing { duration_ms: 42, queued_ms: 0, planning_ms: 5, execution_ms: 37 }),
+        stats: Some(QueryStats {
+            rows_returned: 10,
+            bytes_scanned: 1024,
+            rows_scanned: 100,
+            spill_bytes: 0,
+            peak_memory_bytes: 0,
+        }),
+        query: Some(QueryInfo {
+            text: Some("SELECT 1".into()),
+            query_hash: "abc".into(),
+            statement_type: "query".into(),
+        }),
+        session_id: Some("sess-1".into()),
+        client_ip: Some("10.0.0.1".into()),
+        integrity: Integrity::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
