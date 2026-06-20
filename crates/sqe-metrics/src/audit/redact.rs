@@ -64,6 +64,71 @@ pub fn redact_pii(sql: &str) -> String {
     result
 }
 
+use sha2::{Digest, Sha256};
+
+/// Modes for handling GDPR-tagged column identifiers in logged SQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GdprIdentifierMode {
+    /// Replace the identifier with a stable per-(salt, column) token of the
+    /// form `col_<first 8 hex digits of sha256(salt + lowercased name)>`.
+    /// Queries referencing the same column share the same token across log
+    /// lines, so they remain correlatable without leaking the column name.
+    Tokenize,
+    /// Replace the identifier with the literal string `[GDPR]`.
+    Drop,
+    /// Leave the identifier in place (name is not sensitive by itself).
+    Keep,
+}
+
+/// Mask GDPR-tagged column identifiers (and adjacent literal values) in `sql`.
+///
+/// For each column name in `masked_columns`:
+/// - The identifier is replaced case-insensitively (word boundaries) per `mode`.
+/// - If any masked column matched, ALL string and numeric literals in the
+///   resulting SQL are stripped via [`strip_sql_literals`] so adjacent VALUES
+///   cannot survive regardless of quoting or position.
+///
+/// Empty `masked_columns` returns `sql` unchanged (byte-identical).
+pub fn mask_gdpr_columns(
+    sql: &str,
+    masked_columns: &[String],
+    mode: GdprIdentifierMode,
+    salt: &str,
+) -> String {
+    if masked_columns.is_empty() {
+        return sql.to_string();
+    }
+    let mut out = sql.to_string();
+    let mut any = false;
+    for col in masked_columns {
+        let pattern = format!(r"(?i)\b{}\b", regex::escape(col));
+        let re = match regex::Regex::new(&pattern) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if !re.is_match(&out) {
+            continue;
+        }
+        any = true;
+        let replacement = match mode {
+            GdprIdentifierMode::Keep => col.clone(),
+            GdprIdentifierMode::Drop => "[GDPR]".to_string(),
+            GdprIdentifierMode::Tokenize => {
+                let mut h = Sha256::new();
+                h.update(salt.as_bytes());
+                h.update(col.to_lowercase().as_bytes());
+                let hex = format!("{:x}", h.finalize());
+                format!("col_{}", &hex[..8])
+            }
+        };
+        out = re.replace_all(&out, replacement.as_str()).to_string();
+    }
+    if any {
+        out = strip_sql_literals(&out);
+    }
+    out
+}
+
 /// SQL-07: replace every string and numeric literal in `sql` with a `?`
 /// placeholder, leaving structure (keywords, identifiers, operators) intact.
 ///
@@ -156,6 +221,44 @@ fn utf8_char_len(first: u8) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Task 7: GDPR column masking ---
+
+    #[test]
+    fn tokenize_hides_value_and_replaces_identifier_stably() {
+        let sql = "SELECT id FROM users WHERE email = 'alice@x.io' AND email <> 'bob@x.io'";
+        let out = mask_gdpr_columns(sql, &["email".into()], GdprIdentifierMode::Tokenize, "s1");
+        assert!(!out.contains("alice@x.io"));
+        assert!(!out.contains("bob@x.io"));
+        assert!(!out.contains("email"));
+        // Same column tokenizes to the same token within one salt (correlatable).
+        let token_count = out.matches("col_").count();
+        assert_eq!(token_count, 2);
+    }
+
+    #[test]
+    fn drop_mode_removes_identifier_entirely() {
+        let sql = "SELECT email FROM users";
+        let out = mask_gdpr_columns(sql, &["email".into()], GdprIdentifierMode::Drop, "s1");
+        assert!(!out.contains("email"));
+    }
+
+    #[test]
+    fn keep_mode_keeps_identifier_but_strips_value() {
+        let sql = "SELECT id FROM users WHERE email = 'alice@x.io'";
+        let out = mask_gdpr_columns(sql, &["email".into()], GdprIdentifierMode::Keep, "s1");
+        assert!(out.contains("email"));
+        assert!(!out.contains("alice@x.io"));
+    }
+
+    #[test]
+    fn non_gdpr_columns_untouched() {
+        let sql = "SELECT id FROM users WHERE country = 'NL'";
+        let out = mask_gdpr_columns(sql, &["email".into()], GdprIdentifierMode::Tokenize, "s1");
+        assert_eq!(out, sql);
+    }
+
+
 
     #[test]
     fn redact_email_in_where_clause() {
