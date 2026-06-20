@@ -79,7 +79,6 @@ impl PolicyEnforcer for PolicyPlanRewriter {
         let mask_key = self.mask_key.clone();
         let tag_source = self.tag_source.clone();
         let username = user.username.clone();
-        let _roles = user.roles.clone();
         let user_clone = user.clone();
 
         // Collect all TableScan nodes (keyed by their stringified reference,

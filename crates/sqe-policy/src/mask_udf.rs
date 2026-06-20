@@ -40,32 +40,39 @@ fn mask_str(
     lower: char,
     digit: char,
 ) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let n = chars.len();
-    chars
-        .iter()
-        .enumerate()
-        .map(|(i, &c)| {
-            let shown = i < show_first || i >= n.saturating_sub(show_last);
-            if shown {
-                c
-            } else if c.is_alphabetic() {
-                // Unicode-aware: mask non-ASCII letters too (accented, Cyrillic,
-                // CJK, etc.). Caseless scripts report is_uppercase() == false and
-                // map to `lower`. ASCII-only checks here leaked non-Latin PII raw.
-                if c.is_uppercase() {
-                    upper
-                } else {
-                    lower
-                }
-            } else if c.is_numeric() {
-                digit
+    // The char count is only needed to locate the `show_last` tail. When
+    // show_last == 0 (MASK and MASK_SHOW_FIRST_4) no tail is kept, so skip the
+    // extra `chars().count()` pass entirely. `tail_start` is the first index
+    // that falls inside the kept tail (usize::MAX when no tail is kept, so the
+    // `i >= tail_start` check is always false).
+    let tail_start = if show_last > 0 {
+        s.chars().count().saturating_sub(show_last)
+    } else {
+        usize::MAX
+    };
+    let mut out = String::with_capacity(s.len());
+    for (i, c) in s.chars().enumerate() {
+        let shown = i < show_first || i >= tail_start;
+        let masked = if shown {
+            c
+        } else if c.is_alphabetic() {
+            // Unicode-aware: mask non-ASCII letters too (accented, Cyrillic,
+            // CJK, etc.). Caseless scripts report is_uppercase() == false and
+            // map to `lower`. ASCII-only checks here leaked non-Latin PII raw.
+            if c.is_uppercase() {
+                upper
             } else {
-                // Punctuation, whitespace, symbols pass through (Hive behavior).
-                c
+                lower
             }
-        })
-        .collect()
+        } else if c.is_numeric() {
+            digit
+        } else {
+            // Punctuation, whitespace, symbols pass through (Hive behavior).
+            c
+        };
+        out.push(masked);
+    }
+    out
 }
 
 #[derive(Debug)]

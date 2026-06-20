@@ -182,7 +182,7 @@ impl ScalarUDFImpl for IsRoleInSessionFunc {
                     })?;
                 let result: BooleanArray = str_array
                     .iter()
-                    .map(|opt_role| opt_role.map(|r| roles.contains(&r.to_string())))
+                    .map(|opt_role| opt_role.map(|r| roles.iter().any(|x| x.as_str() == r)))
                     .collect();
                 Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
             }
