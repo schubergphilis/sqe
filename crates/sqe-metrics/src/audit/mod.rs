@@ -12,7 +12,7 @@ pub use event::{
 };
 pub use logger::{query_hash, AuditEntry, AuditLogger};
 pub use ocsf::to_ocsf;
-pub use redact::{redact_pii, strip_sql_literals};
+pub use redact::{mask_gdpr_columns, redact_pii, strip_sql_literals, GdprIdentifierMode};
 pub use sink::{AuditFormat, AuditSink, NativeJsonlSink, OcsfJsonlSink};
 
 #[cfg(test)]
