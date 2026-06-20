@@ -236,43 +236,46 @@ impl AuditLogger {
 
         let native_path = std::path::Path::new(path);
 
-        let sinks: Vec<Box<dyn AuditSink>> = match format {
-            AuditFormat::Native => {
-                let file = open_sink_file(native_path)?;
-                vec![Box::new(NativeJsonlSink::from_writer(Box::new(file)))]
-            }
+        // Open exactly one handle per physical file. The legacy `log()` path
+        // routes through `native_sink.write_raw_line()` so there is never a
+        // second writer on the native file.
+        //
+        // Layout by format:
+        //   Native: native_sink -> path (legacy flat + canonical native JSON)
+        //   Ocsf:   native_sink -> path (legacy flat only), ocsf_sink -> path.ocsf.jsonl (canonical OCSF)
+        //   Both:   native_sink -> path (legacy flat + canonical native JSON), ocsf_sink -> path.ocsf.jsonl (canonical OCSF)
+        //
+        // `native_events` controls whether canonical events are also written to
+        // native_sink (true for Native/Both; false for Ocsf where path is legacy-only).
+        let native_file = open_sink_file(native_path)?;
+        let native_sink = NativeJsonlSink::from_writer(Box::new(
+            std::io::BufWriter::new(native_file),
+        ));
+
+        let (ocsf_sink, native_events): (Option<OcsfJsonlSink>, bool) = match format {
+            AuditFormat::Native => (None, true),
             AuditFormat::Ocsf => {
-                let file = open_sink_file(native_path)?;
-                vec![Box::new(OcsfJsonlSink::from_writer(Box::new(file)))]
-            }
-            AuditFormat::Both => {
-                let native_file = open_sink_file(native_path)?;
+                // Canonical events go to the derived .ocsf.jsonl file only;
+                // `path` carries legacy flat entries exclusively.
                 let ocsf_p = ocsf_path_from(native_path);
                 let ocsf_file = open_sink_file(&ocsf_p)?;
-                vec![
-                    Box::new(NativeJsonlSink::from_writer(Box::new(native_file))),
-                    Box::new(OcsfJsonlSink::from_writer(Box::new(ocsf_file))),
-                ]
+                (Some(OcsfJsonlSink::from_writer(Box::new(ocsf_file))), false)
+            }
+            AuditFormat::Both => {
+                let ocsf_p = ocsf_path_from(native_path);
+                let ocsf_file = open_sink_file(&ocsf_p)?;
+                (Some(OcsfJsonlSink::from_writer(Box::new(ocsf_file))), true)
             }
         };
-
-        // For the legacy `log()` path we need a direct-write file handle so we
-        // can write the flat AuditEntry + integrity JSON bypassing the sink trait.
-        // We open the same native file path a second time in append mode.
-        let legacy_file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(native_path)
-            .map_err(|e| format!("Failed to open legacy audit log file '{path}': {e}"))?;
 
         let path_owned = path.to_string();
         let (tx, rx) = mpsc::channel::<AuditMsg>();
         let worker = std::thread::Builder::new()
             .name("sqe-audit-writer".to_string())
             .spawn(move || {
-                let mut sinks = sinks;
+                let mut native_sink = native_sink;
+                let mut ocsf_sink = ocsf_sink;
                 let mut chain = HashChain::new();
-                let mut legacy_writer = std::io::BufWriter::new(legacy_file);
                 while let Ok(msg) = rx.recv() {
                     match msg {
                         AuditMsg::Legacy(entry) => {
@@ -281,25 +284,49 @@ impl AuditLogger {
                                 match more {
                                     AuditMsg::Legacy(e) => batch.push(*e),
                                     AuditMsg::Event(e) => {
-                                        Self::flush_legacy(&mut legacy_writer, &path_owned);
-                                        flush_sinks(&mut sinks, &path_owned);
-                                        // Process this event immediately.
-                                        Self::write_events(&mut sinks, &mut chain, &mut [*e], &path_owned);
-                                        flush_sinks(&mut sinks, &path_owned);
+                                        // Write and clear the pending legacy batch first so
+                                        // that the interleaved event gets a higher seq than
+                                        // all legacy entries that arrived before it.
+                                        Self::write_legacy_batch(
+                                            &mut native_sink,
+                                            &mut chain,
+                                            &batch,
+                                            &path_owned,
+                                        );
+                                        batch.clear();
+                                        Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &path_owned);
+                                        // Now stamp and write the canonical event.
+                                        Self::write_event(
+                                            &mut native_sink,
+                                            native_events,
+                                            &mut ocsf_sink,
+                                            &mut chain,
+                                            *e,
+                                            &path_owned,
+                                        );
+                                        Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &path_owned);
                                     }
                                     AuditMsg::Flush(ack) => {
-                                        Self::write_legacy_batch(&mut legacy_writer, &mut chain, &batch, &path_owned);
+                                        Self::write_legacy_batch(
+                                            &mut native_sink,
+                                            &mut chain,
+                                            &batch,
+                                            &path_owned,
+                                        );
                                         batch.clear();
-                                        Self::flush_legacy(&mut legacy_writer, &path_owned);
-                                        flush_sinks(&mut sinks, &path_owned);
+                                        Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &path_owned);
                                         let _ = ack.send(());
                                     }
                                 }
                             }
                             if !batch.is_empty() {
-                                Self::write_legacy_batch(&mut legacy_writer, &mut chain, &batch, &path_owned);
-                                Self::flush_legacy(&mut legacy_writer, &path_owned);
-                                flush_sinks(&mut sinks, &path_owned);
+                                Self::write_legacy_batch(
+                                    &mut native_sink,
+                                    &mut chain,
+                                    &batch,
+                                    &path_owned,
+                                );
+                                Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &path_owned);
                             }
                         }
                         AuditMsg::Event(event) => {
@@ -308,37 +335,59 @@ impl AuditLogger {
                                 match more {
                                     AuditMsg::Event(e) => batch.push(*e),
                                     AuditMsg::Legacy(e) => {
-                                        Self::write_events(&mut sinks, &mut chain, &mut batch, &path_owned);
+                                        Self::write_events(
+                                            &mut native_sink,
+                                            native_events,
+                                            &mut ocsf_sink,
+                                            &mut chain,
+                                            &mut batch,
+                                            &path_owned,
+                                        );
                                         batch.clear();
-                                        flush_sinks(&mut sinks, &path_owned);
+                                        Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &path_owned);
                                         // Process this legacy entry immediately.
-                                        Self::write_legacy_batch(&mut legacy_writer, &mut chain, &[*e], &path_owned);
-                                        Self::flush_legacy(&mut legacy_writer, &path_owned);
+                                        Self::write_legacy_batch(
+                                            &mut native_sink,
+                                            &mut chain,
+                                            &[*e],
+                                            &path_owned,
+                                        );
+                                        Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &path_owned);
                                     }
                                     AuditMsg::Flush(ack) => {
-                                        Self::write_events(&mut sinks, &mut chain, &mut batch, &path_owned);
+                                        Self::write_events(
+                                            &mut native_sink,
+                                            native_events,
+                                            &mut ocsf_sink,
+                                            &mut chain,
+                                            &mut batch,
+                                            &path_owned,
+                                        );
                                         batch.clear();
-                                        Self::flush_legacy(&mut legacy_writer, &path_owned);
-                                        flush_sinks(&mut sinks, &path_owned);
+                                        Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &path_owned);
                                         let _ = ack.send(());
                                     }
                                 }
                             }
                             if !batch.is_empty() {
-                                Self::write_events(&mut sinks, &mut chain, &mut batch, &path_owned);
-                                Self::flush_legacy(&mut legacy_writer, &path_owned);
-                                flush_sinks(&mut sinks, &path_owned);
+                                Self::write_events(
+                                    &mut native_sink,
+                                    native_events,
+                                    &mut ocsf_sink,
+                                    &mut chain,
+                                    &mut batch,
+                                    &path_owned,
+                                );
+                                Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &path_owned);
                             }
                         }
                         AuditMsg::Flush(ack) => {
-                            Self::flush_legacy(&mut legacy_writer, &path_owned);
-                            flush_sinks(&mut sinks, &path_owned);
+                            Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &path_owned);
                             let _ = ack.send(());
                         }
                     }
                 }
-                Self::flush_legacy(&mut legacy_writer, &path_owned);
-                flush_sinks(&mut sinks, &path_owned);
+                Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &path_owned);
             })
             .map_err(|e| format!("Failed to start audit writer thread: {e}"))?;
 
@@ -350,13 +399,15 @@ impl AuditLogger {
     }
 
     /// Write a batch of legacy `AuditEntry` records as flat JSON + integrity block.
+    ///
+    /// Routes through `native_sink.write_raw_line` so there is exactly one writer
+    /// on the native file (Defect 2 fix).
     fn write_legacy_batch(
-        writer: &mut std::io::BufWriter<std::fs::File>,
+        native_sink: &mut NativeJsonlSink,
         chain: &mut HashChain,
         batch: &[AuditEntry],
         path: &str,
     ) {
-        use std::io::Write;
         for entry in batch {
             let body_json = match serde_json::to_string(entry) {
                 Ok(j) => j,
@@ -373,32 +424,75 @@ impl AuditLogger {
             chain.advance(hash.clone());
             let integrity = Integrity { seq, prev_hash: prev, hash };
             let line = inject_integrity(&body_json, &integrity);
-            if let Err(e) = writeln!(writer, "{line}") {
+            if let Err(e) = native_sink.write_raw_line(&line) {
                 tracing::error!("AUDIT: write failed for '{path}': {e}");
             }
         }
     }
 
-    fn flush_legacy(writer: &mut std::io::BufWriter<std::fs::File>, path: &str) {
-        use std::io::Write;
-        if let Err(e) = writer.flush() {
-            tracing::error!("AUDIT: flush failed for '{path}': {e}");
+    /// Write a single canonical `AuditEvent` to active sinks with chain stamping.
+    ///
+    /// `native_events` controls whether the event is also written to `native_sink`
+    /// (native JSON format). When false (Ocsf-only mode), only the OCSF sink
+    /// receives canonical events; `native_sink` still handles legacy flat entries.
+    fn write_event(
+        native_sink: &mut NativeJsonlSink,
+        native_events: bool,
+        ocsf_sink: &mut Option<OcsfJsonlSink>,
+        chain: &mut HashChain,
+        mut event: AuditEvent,
+        path: &str,
+    ) {
+        chain.stamp(&mut event);
+        if native_events {
+            if let Err(e) = native_sink.write_line(&event) {
+                tracing::error!("AUDIT: write failed for '{path}': {e}");
+            }
+        }
+        if let Some(sink) = ocsf_sink.as_mut() {
+            if let Err(e) = sink.write_line(&event) {
+                tracing::error!("AUDIT: write failed for '{path}': {e}");
+            }
         }
     }
 
-    /// Write a batch of canonical `AuditEvent` records to all sinks with chain stamping.
+    /// Write a batch of canonical `AuditEvent` records to active sinks with chain stamping.
+    ///
+    /// See `write_event` for the `native_events` semantics.
     fn write_events(
-        sinks: &mut Vec<Box<dyn AuditSink>>,
+        native_sink: &mut NativeJsonlSink,
+        native_events: bool,
+        ocsf_sink: &mut Option<OcsfJsonlSink>,
         chain: &mut HashChain,
         batch: &mut [AuditEvent],
         path: &str,
     ) {
         for event in batch.iter_mut() {
             chain.stamp(event);
-            for sink in sinks.iter_mut() {
+            if native_events {
+                if let Err(e) = native_sink.write_line(event) {
+                    tracing::error!("AUDIT: write failed for '{path}': {e}");
+                }
+            }
+            if let Some(sink) = ocsf_sink.as_mut() {
                 if let Err(e) = sink.write_line(event) {
                     tracing::error!("AUDIT: write failed for '{path}': {e}");
                 }
+            }
+        }
+    }
+
+    fn flush_sinks(
+        native_sink: &mut NativeJsonlSink,
+        ocsf_sink: &mut Option<OcsfJsonlSink>,
+        path: &str,
+    ) {
+        if let Err(e) = native_sink.flush() {
+            tracing::error!("AUDIT: flush failed for '{path}': {e}");
+        }
+        if let Some(sink) = ocsf_sink.as_mut() {
+            if let Err(e) = sink.flush() {
+                tracing::error!("AUDIT: flush failed for '{path}': {e}");
             }
         }
     }
@@ -480,14 +574,6 @@ impl AuditLogger {
             return;
         }
         let _ = ack_rx.recv();
-    }
-}
-
-fn flush_sinks(sinks: &mut Vec<Box<dyn AuditSink>>, path: &str) {
-    for sink in sinks.iter_mut() {
-        if let Err(e) = sink.flush() {
-            tracing::error!("AUDIT: flush failed for '{path}': {e}");
-        }
     }
 }
 
@@ -709,6 +795,77 @@ mod tests {
         );
         assert!(!content.contains("carol@example.com"), "PII must not appear in audit log");
         assert!(content.contains("[EMAIL]"));
+    }
+
+    /// Regression test for two defects fixed in this commit:
+    ///
+    /// Defect 1 (ordering): interleaved log()/log_event() must preserve arrival order in
+    /// the file (seq strictly increasing, event at position 2 not position 0).
+    ///
+    /// Defect 2 (torn lines): every line in the native file must parse as valid JSON
+    /// (single-writer guarantee; a torn line would produce a partial JSON object).
+    ///
+    /// Pattern: log(), log(), log_event(), log() -> flush -> read file.
+    /// Expected file order: legacy(seq=0), legacy(seq=1), event(seq=2), legacy(seq=3).
+    #[test]
+    fn interleave_ordering_and_no_torn_lines() {
+        let (_dir, path) = fresh_audit_path("sqe-audit-interleave.jsonl");
+        let path_str = path.to_str().unwrap();
+
+        let logger = AuditLogger::with_config(path_str, crate::audit::AuditFormat::Native).unwrap();
+
+        // Send all four messages before calling flush so they queue up together
+        // and exercise the interleaved-batch code path in the worker.
+        logger.log(&test_entry());
+        logger.log(&test_entry());
+        logger.log_event(crate::audit::sample_query_event());
+        logger.log(&test_entry());
+        logger.flush();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 4, "expected 4 lines, got:\n{content}");
+
+        // Defect 2: every line must be valid JSON (no torn lines).
+        let parsed: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("line {l:?} is not valid JSON: {e}")))
+            .collect();
+
+        // Extract seq from each line's integrity block.
+        let seqs: Vec<u64> = parsed
+            .iter()
+            .map(|v| {
+                v.get("integrity")
+                    .and_then(|i| i.get("seq"))
+                    .and_then(|s| s.as_u64())
+                    .unwrap_or_else(|| panic!("missing integrity.seq in {v}"))
+            })
+            .collect();
+
+        // Defect 1: seqs must be strictly increasing 0,1,2,3 in file order
+        // (the event must not be stamped before the legacy entries that preceded it).
+        assert_eq!(seqs, vec![0, 1, 2, 3], "seq must be 0,1,2,3 in file order; got {seqs:?}");
+
+        // Position check: line[2] is the canonical event (has "kind":"query"),
+        // lines 0,1,3 are legacy flat entries (have "username" but no top-level "kind").
+        let event_line = &parsed[2];
+        assert_eq!(
+            event_line.get("kind").and_then(|k| k.as_str()),
+            Some("query"),
+            "line 2 must be the log_event (kind:query), got: {event_line}"
+        );
+        for i in [0usize, 1, 3] {
+            let line = &parsed[i];
+            assert!(
+                line.get("username").is_some(),
+                "line {i} must be a legacy flat entry (has 'username'), got: {line}"
+            );
+            assert!(
+                line.get("kind").is_none(),
+                "line {i} must not have top-level 'kind' (legacy flat format), got: {line}"
+            );
+        }
     }
 
     #[test]
