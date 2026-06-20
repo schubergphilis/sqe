@@ -2901,6 +2901,28 @@ impl SqeConfig {
             ));
         }
 
+        // Ranger policy engine: numeric fields that silently break the store at
+        // zero. A zero timeout yields an HTTP client that fails every fetch
+        // (deny-all); a zero breaker threshold opens the circuit on the first
+        // failure and denies permanently. Both are misconfigurations, not
+        // tuning choices, so fail fast rather than fail closed forever.
+        if self.policy.engine == PolicyEngine::Ranger {
+            if self.policy.ranger.timeout_secs == 0 {
+                errors.push(
+                    "policy.ranger.timeout_secs must be >= 1 (0 yields a zero-timeout \
+                     HTTP client that fails every Ranger fetch and denies all queries)"
+                        .to_string(),
+                );
+            }
+            if self.policy.ranger.breaker_failure_threshold == 0 {
+                errors.push(
+                    "policy.ranger.breaker_failure_threshold must be >= 1 (0 opens the \
+                     circuit breaker on the first failure and denies permanently)"
+                        .to_string(),
+                );
+            }
+        }
+
         // Distributed-mode worker secret is required unless explicitly waived.
         if !self.coordinator.worker_urls.is_empty()
             && self.coordinator.worker_secret.is_empty()
@@ -5429,6 +5451,44 @@ otlp_endpoint = ""
         config.query.max_query_memory = "32GB".to_string();
         config.query.per_user_memory_budget = "0".to_string();
         // "0" disables the gate, so the size relationship is irrelevant.
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_ranger_zero_timeout() {
+        let mut config = valid_config();
+        config.policy.engine = PolicyEngine::Ranger;
+        config.policy.ranger.url = "http://ranger:6080".to_string();
+        config.policy.ranger.service_name = "hive".to_string();
+        config.policy.ranger.timeout_secs = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("policy.ranger.timeout_secs"),
+            "expected zero-timeout guard, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_ranger_zero_breaker_threshold() {
+        let mut config = valid_config();
+        config.policy.engine = PolicyEngine::Ranger;
+        config.policy.ranger.url = "http://ranger:6080".to_string();
+        config.policy.ranger.service_name = "hive".to_string();
+        config.policy.ranger.breaker_failure_threshold = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("policy.ranger.breaker_failure_threshold"),
+            "expected zero-threshold guard, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_ranger_guards_do_not_fire_for_other_engines() {
+        // The Ranger numeric guards must not affect non-Ranger deployments.
+        let mut config = valid_config();
+        config.policy.ranger.timeout_secs = 0;
+        config.policy.ranger.breaker_failure_threshold = 0;
+        // engine stays at its default (not Ranger), so these zeros are ignored.
         assert!(config.validate().is_ok());
     }
 }

@@ -321,6 +321,37 @@ async fn restricted_column_is_dropped_from_projection() {
     );
 }
 
+// Fail-closed regression: when EVERY column is restricted, the masking
+// projection is empty. The rewriter must NOT fall through to the raw scan
+// (the old `if !exprs.is_empty()` skipped the projection and leaked all
+// columns). It now injects a deny filter, so the query returns zero rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_columns_restricted_denies_instead_of_leaking() {
+    let (mem, plan) = build_scan("employees");
+
+    let store = InMemoryPolicyStore::new();
+    let policy = ResolvedPolicy {
+        restricted_columns: vec![
+            "customer_id".to_string(),
+            "ssn".to_string(),
+            "salary".to_string(),
+            "hired_at".to_string(),
+            "region".to_string(),
+        ],
+        ..Default::default()
+    };
+    store.add_table_policy("default", "employees", policy).await;
+
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store));
+    let rewritten = rewriter.evaluate(&user("f", &[]), plan).await.unwrap();
+    let batches = execute(rewritten, mem, "employees").await;
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        rows, 0,
+        "fully-restricted table must deny (zero rows), not return the raw scan"
+    );
+}
+
 // Fail-closed: a PolicyStore that errors must cause the rewriter to
 // inject lit(false), returning zero rows.
 struct PoisonStore;

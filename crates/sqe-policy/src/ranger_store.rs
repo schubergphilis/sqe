@@ -341,6 +341,20 @@ fn resolve_from_bundle(
         // iterate ALL of them so multi-column policies don't leak.
         if p.policy_type == 1 {
             let Some(col_res) = p.resources.get("column") else { continue };
+            if col_res.is_excludes {
+                // "mask all columns EXCEPT these" cannot be honored on the
+                // resource path: the column complement needs the table schema,
+                // which is not available here. Treating excludes as includes
+                // (the previous behavior) left every intended-masked column raw.
+                // Fail closed: deny the table.
+                warn!(
+                    table = %table,
+                    policy_id = p.id,
+                    "datamask policy uses column isExcludes (unsupported); denying table (fail-closed)"
+                );
+                policy.row_filters.push(lit(false));
+                continue;
+            }
             for column in &col_res.values {
                 for item in &p.data_mask_policy_items {
                     if !item_matches(&item.users, &item.roles, &item.groups, user) {
@@ -376,8 +390,10 @@ fn resolve_from_bundle(
                     match parse_sql_predicate(expr_str, &identity) {
                         Ok(expr) => policy.row_filters.push(expr),
                         Err(e) => {
+                            // Do not log `expr_str`: a row-filter body routinely
+                            // embeds sensitive literals (e.g. region = 'EU'). The
+                            // expression lives in Ranger; log only that it failed.
                             warn!(
-                                filter = %expr_str,
                                 error = %e,
                                 "unparseable Ranger row filter; denying (fail-closed)"
                             );
@@ -517,9 +533,9 @@ pub(crate) fn resolve_tag_policies(
                         match parse_sql_predicate(expr_str, identity) {
                             Ok(expr) => filters.push((tag_value.clone(), expr)),
                             Err(e) => {
+                                // Do not log the filter body (may carry literals).
                                 warn!(
                                     tag = %tag_value,
-                                    filter = %expr_str,
                                     error = %e,
                                     "unparseable Ranger tag row filter; denying (fail-closed)"
                                 );
@@ -798,6 +814,31 @@ mod tests {
         assert!(
             !policy.column_masks.contains_key("amount"),
             "restricted column must not also carry a mask"
+        );
+    }
+
+    #[test]
+    fn datamask_column_isexcludes_denies_failclosed() {
+        // A datamask policy authored as "mask all columns EXCEPT these"
+        // (column.isExcludes = true) cannot be honored on the resource path
+        // (no schema for the complement). The previous code read the values as
+        // an include list, leaving every intended-masked column raw. It must
+        // now fail closed: deny the table.
+        let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
+        bundle.policies[0].resources.get_mut("column").unwrap().is_excludes = true;
+        let policy = resolve_from_bundle(
+            &bundle,
+            &user("alice", &["analyst"]),
+            "orders",
+            "sales",
+        );
+        assert!(
+            policy.row_filters.contains(&lit(false)),
+            "column isExcludes datamask must inject a deny (lit(false)) row filter"
+        );
+        assert!(
+            policy.column_masks.is_empty(),
+            "excludes datamask must not be treated as an include list"
         );
     }
 
