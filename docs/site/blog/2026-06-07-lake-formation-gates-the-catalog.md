@@ -56,7 +56,7 @@ Then we grant the principal permissions on the database:
 
 ```bash
 aws lakeformation grant-permissions \
-  --principal DataLakePrincipalIdentifier=arn:aws:iam::...:user/jacobadmin \
+  --principal DataLakePrincipalIdentifier=arn:aws:iam::...:user/quickstart-admin \
   --resource '{"Database":{"Name":"sqe_lf_quickstart"}}' \
   --permissions CREATE_TABLE ALTER DROP DESCRIBE
 ```

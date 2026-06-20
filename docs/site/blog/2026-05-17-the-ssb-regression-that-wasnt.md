@@ -12,7 +12,7 @@ tags:
 
 ## The setup
 
-MR #220 ([two-tier dynamic-filter pushdown](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/merge_requests/220)) hands DataFusion's runtime filters (HashJoin build-side bounds + membership) to iceberg-rust through the `DynamicPredicate` bridge. Tier 1 samples the filter once per file scan task and feeds it into manifest, row-group, page-index, and parquet `RowFilter` pruning. Tier 2 is a per-batch wrapper that catches filters resolving after the task opened.
+MR #220 ([two-tier dynamic-filter pushdown](https://github.com/schubergphilis/sqe)) hands DataFusion's runtime filters (HashJoin build-side bounds + membership) to iceberg-rust through the `DynamicPredicate` bridge. Tier 1 samples the filter once per file scan task and feeds it into manifest, row-group, page-index, and parquet `RowFilter` pruning. Tier 2 is a per-batch wrapper that catches filters resolving after the task opened.
 
 The merged numbers (single-shot warm runs against the 2026-05-16 baseline):
 
@@ -31,7 +31,7 @@ Six wins, one tie, one apparent regression. The PR shipped because -33% net buys
 
 ## First instinct: filter shape
 
-The vendor bridge ([`physical_to_predicate.rs`](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/blob/main/vendor/iceberg-rust/crates/integrations/datafusion/src/physical_plan/physical_to_predicate.rs)) translates three `PhysicalExpr` shapes into `iceberg::Predicate`:
+The vendor bridge ([`physical_to_predicate.rs`](https://github.com/schubergphilis/sqe)) translates three `PhysicalExpr` shapes into `iceberg::Predicate`:
 
 ```rust
 fn convert_physical(expr: &Arc<dyn PhysicalExpr>) -> Option<Predicate> {
@@ -97,7 +97,7 @@ SSB lineorder is loaded uniformly. Every row group's `lo_orderdate` stat spans t
 
 A heuristic based on filter shape can't tell these apart. Both shapes are `Binary(And, Binary(GtEq, col, lit), Binary(LtEq, col, lit))`. To distinguish, you'd need to look at the row-group min/max spread on the file's parquet metadata: load the manifest, compare each file's column bounds to the snapshot-level bounds, and skip Tier 1 only when the spread is wide enough that no pruning will happen.
 
-That's a real piece of work. Manifest-level stats are cheap (already loaded by `plan_files()`); per-row-group stats need a parquet footer read per file, which on a large multi-file scan eats most of the savings. I filed [issue #132](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/issues/132) to scope this.
+That's a real piece of work. Manifest-level stats are cheap (already loaded by `plan_files()`); per-row-group stats need a parquet footer read per file, which on a large multi-file scan eats most of the savings. I filed [issue #132](https://github.com/schubergphilis/sqe) to scope this.
 
 ## Then ten warm passes happened
 
@@ -150,6 +150,6 @@ For now, the SSB regression goes back in the box. There is no regression.
 ---
 
 **Receipts:**
-- MR #220: [two-tier dynamic-filter pushdown](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/merge_requests/220) (merged 2026-05-17)
-- Issue #132: [skip Tier 1 when fact table is not clustered on filter column](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/issues/132) (deferred)
+- MR #220: [two-tier dynamic-filter pushdown](https://github.com/schubergphilis/sqe) (merged 2026-05-17)
+- Issue #132: [skip Tier 1 when fact table is not clustered on filter column](https://github.com/schubergphilis/sqe) (deferred)
 - 10-pass stats run: `/tmp/warmup-stats.log` (not committed; the bench JSON files in `benchmarks/results/*-sf1-flight-2026-05-17*.json` cover the same ground with single-shot draws)
