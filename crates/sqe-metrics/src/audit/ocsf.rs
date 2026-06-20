@@ -122,4 +122,29 @@ mod tests {
         let v = to_ocsf(&ev);
         assert_eq!(v["status_id"], 2);
     }
+
+    #[test]
+    fn auth_session_grant_admin_class_uids() {
+        use crate::audit::*;
+        use chrono::TimeZone;
+        let base = |kind: AuditKind| AuditEvent {
+            time: chrono::Utc.with_ymd_and_hms(2026, 6, 20, 12, 0, 0).unwrap(),
+            kind,
+            actor: Actor { username: "bob".into(), subject: None, email: None, roles: vec![], groups: vec![] },
+            outcome: Outcome::Success,
+            resources: vec![],
+            policy: None, timing: None, stats: None, query: None,
+            session_id: None, client_ip: None, integrity: Integrity::default(),
+        };
+        assert_eq!(to_ocsf(&base(AuditKind::Auth))["class_uid"], 3002);
+        assert_eq!(to_ocsf(&base(AuditKind::Session))["class_uid"], 3003);
+        assert_eq!(to_ocsf(&base(AuditKind::Grant))["class_uid"], 3001);
+        assert_eq!(to_ocsf(&base(AuditKind::AdminDdl))["class_uid"], 3004);
+        // Policy deny rides on Datastore Activity with a Failure status.
+        let mut deny = base(AuditKind::PolicyDecision);
+        deny.outcome = Outcome::Failure { error_type: Some("PolicyDenied".into()), error_code: None, message: Some("deny-all".into()) };
+        let v = to_ocsf(&deny);
+        assert_eq!(v["class_uid"], 6005);
+        assert_eq!(v["status_id"], 2);
+    }
 }
