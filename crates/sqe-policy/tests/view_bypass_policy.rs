@@ -215,58 +215,44 @@ async fn nested_view_still_governed() {
     );
 }
 
-/// Test 4: through a view, selecting the PERMITTED columns is governed (row
-/// filter + mask apply, restricted `ssn` not selected). Selecting the restricted
-/// column (directly or via `SELECT *`, which expands to include `ssn`) must FAIL
-/// CLOSED, not leak it. SQE restriction drops the column from the scan, so an
-/// outer reference to it cannot resolve. This matches PostgreSQL column-level
-/// security, where `SELECT *` over a column you cannot read is an error, not a
-/// silent drop. See issue MED-restricted-column-select-star-ux.md for making
-/// this a clean "permission denied" rather than a planner error.
+/// Test 4: through a view, governance applies and the restricted column is a
+/// forced NULL. `SELECT *` works (no error); `ssn` is present but entirely NULL,
+/// the row filter and salary mask still apply. Restriction is a forced Nullify,
+/// so the raw value never leaks and references resolve. See issue
+/// MED-restricted-column-select-star-ux.md (resolved: always-NULL).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn view_permitted_columns_governed_restricted_fails_closed() {
+async fn view_select_star_restricted_column_is_nulled() {
     let (ctx, _mem) = ctx_with_base_table();
     register_view(&ctx, "v", "SELECT * FROM t").await;
     let rewriter = PolicyPlanRewriter::new(Arc::new(governed_store().await));
 
-    // Permitted columns: governed and returned.
-    let batches = enforce_and_run(&ctx, &rewriter, "SELECT salary, region FROM v").await;
+    let batches = enforce_and_run(&ctx, &rewriter, "SELECT * FROM v").await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(rows, 2, "row filter must apply to permitted columns through a view");
+    assert_eq!(rows, 2, "row filter must apply to SELECT * through a view");
+    let ssn = batches[0]
+        .column_by_name("ssn")
+        .expect("ssn must be present (forced NULL), not dropped");
+    assert_eq!(ssn.null_count(), ssn.len(), "restricted ssn must be entirely NULL");
     let salary = batches[0].column_by_name("salary").unwrap();
     assert_eq!(salary.null_count(), salary.len(), "salary mask must apply through a view");
-
-    // Referencing the restricted column (via SELECT *) must not leak it: the
-    // rewriter drops ssn from the scan, so the expanded outer ref fails to plan.
-    assert!(
-        try_enforce_and_run(&ctx, &rewriter, "SELECT * FROM v").await.is_err(),
-        "SELECT * over a restricted column must fail closed, not return ssn"
-    );
 }
 
-/// Test 5 (regression): a plain base-table query (no view) is governed for the
-/// permitted columns, and referencing the restricted column fails closed.
+/// Test 5 (regression): a plain base-table `SELECT *` (no view) is governed: the
+/// row filter and mask apply, and the restricted column is a forced NULL.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn plain_base_table_permitted_columns_governed() {
+async fn plain_base_table_select_star_restricted_column_is_nulled() {
     let (ctx, _mem) = ctx_with_base_table();
     let rewriter = PolicyPlanRewriter::new(Arc::new(governed_store().await));
 
-    let batches =
-        enforce_and_run(&ctx, &rewriter, "SELECT customer_id, salary, region FROM t").await;
+    let batches = enforce_and_run(&ctx, &rewriter, "SELECT * FROM t").await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(rows, 2, "base row filter must apply to a plain table query");
+    assert_eq!(rows, 2, "base row filter must apply to a plain SELECT *");
+    let ssn = batches[0]
+        .column_by_name("ssn")
+        .expect("ssn must be present (forced NULL), not dropped");
+    assert_eq!(ssn.null_count(), ssn.len(), "restricted ssn must be entirely NULL");
     let salary = batches[0].column_by_name("salary").unwrap();
     assert_eq!(salary.null_count(), salary.len(), "salary mask must apply");
-
-    // The restricted column cannot be read, directly or via SELECT *.
-    assert!(
-        try_enforce_and_run(&ctx, &rewriter, "SELECT ssn FROM t").await.is_err(),
-        "selecting a restricted column must fail closed, not leak it"
-    );
-    assert!(
-        try_enforce_and_run(&ctx, &rewriter, "SELECT * FROM t").await.is_err(),
-        "SELECT * over a restricted column must fail closed"
-    );
 }
 
 /// Test 6 (defense-in-depth): a `ViewTable` reached through a directly

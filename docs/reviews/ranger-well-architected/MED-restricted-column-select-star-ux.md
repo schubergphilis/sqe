@@ -3,8 +3,8 @@
 - **ID:** restricted-column-select-star-ux
 - **Pillar:** Operational Excellence
 - **Severity:** Medium
-- **Status:** Open
-- **Files:** `crates/sqe-policy/src/plan_rewriter.rs` (the restriction projection that drops the column), `crates/sqe-coordinator/src/query_handler.rs` (evaluate call sites)
+- **Status:** Resolved. Decision: **restriction is a forced Nullify** (always-NULL). The rewriter now keeps a restricted column in the output schema and emits a typed NULL for it instead of dropping it. `SELECT *` and any explicit reference resolve and return NULL; the raw value is never returned; predicate pushdown on the real value is blocked (the value is a NULL expression, not a column). This removes the cryptic `FieldNotFound`, is Snowflake-aligned, and is BI-tool friendly. Restriction wins over a mask on the same column. Implemented in `crates/sqe-policy/src/plan_rewriter.rs`; tests in `rewriter_integration.rs` (`restricted_column_is_nulled_not_dropped`, `all_columns_restricted_returns_all_nulls_no_leak`, `unmappable_tag_restricts_column_fail_closed`) and `view_bypass_policy.rs` (`*_restricted_column_is_nulled`). Note: restriction is now semantically close to a Nullify mask; the distinction is that it is policy-assigned as a denial rather than a value transform.
+- **Files:** `crates/sqe-policy/src/plan_rewriter.rs` (the restriction projection)
 
 ## Problem
 A restricted column is dropped from the scan projection by the rewriter. If the user's query references that column, directly (`SELECT ssn`) or via `SELECT *` (which the SQL planner expands to include `ssn` before the rewriter runs), the outer reference no longer resolves and execution fails with a cryptic `type_coercion` / `FieldNotFound` error.

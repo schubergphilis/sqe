@@ -300,8 +300,11 @@ async fn redact_mask_on_string_column_returns_constant() {
     }
 }
 
+// Restriction is a forced Nullify: the column stays in the output schema (so
+// SELECT * and any reference resolve) but every value is NULL. The raw value is
+// never returned. (Previously the column was dropped, which broke outer refs.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn restricted_column_is_dropped_from_projection() {
+async fn restricted_column_is_nulled_not_dropped() {
     let (mem, plan) = build_scan("employees");
 
     let store = InMemoryPolicyStore::new();
@@ -314,30 +317,27 @@ async fn restricted_column_is_dropped_from_projection() {
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
     let (rewritten, _summary) = rewriter.evaluate(&user("f", &[]), plan).await.unwrap();
     let batches = execute(rewritten, mem, "employees").await;
-    let schema = batches[0].schema();
-    assert!(
-        schema.column_with_name("ssn").is_none(),
-        "ssn must be absent from rewritten projection"
+    let col = batches[0]
+        .column_by_name("ssn")
+        .expect("ssn must remain in the schema as a forced NULL, not be dropped");
+    assert_eq!(
+        col.null_count(),
+        col.len(),
+        "every restricted ssn value must be NULL"
     );
 }
 
-// Fail-closed regression: when EVERY column is restricted, the masking
-// projection is empty. The rewriter must NOT fall through to the raw scan
-// (the old `if !exprs.is_empty()` skipped the projection and leaked all
-// columns). It now injects a deny filter, so the query returns zero rows.
+// When EVERY column is restricted, all columns stay in the schema as forced
+// NULLs (no raw value leaks); the rewriter does NOT drop them or error. Row
+// count is preserved (restriction nulls values, it does not filter rows).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn all_columns_restricted_denies_instead_of_leaking() {
+async fn all_columns_restricted_returns_all_nulls_no_leak() {
     let (mem, plan) = build_scan("employees");
 
+    let cols = ["customer_id", "ssn", "salary", "hired_at", "region"];
     let store = InMemoryPolicyStore::new();
     let policy = ResolvedPolicy {
-        restricted_columns: vec![
-            "customer_id".to_string(),
-            "ssn".to_string(),
-            "salary".to_string(),
-            "hired_at".to_string(),
-            "region".to_string(),
-        ],
+        restricted_columns: cols.iter().map(|c| c.to_string()).collect(),
         ..Default::default()
     };
     store.add_table_policy("default", "employees", policy).await;
@@ -346,10 +346,11 @@ async fn all_columns_restricted_denies_instead_of_leaking() {
     let (rewritten, _summary) = rewriter.evaluate(&user("f", &[]), plan).await.unwrap();
     let batches = execute(rewritten, mem, "employees").await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(
-        rows, 0,
-        "fully-restricted table must deny (zero rows), not return the raw scan"
-    );
+    assert_eq!(rows, 3, "restriction nulls values, it does not drop rows");
+    for c in cols {
+        let col = batches[0].column_by_name(c).expect("column must remain in schema");
+        assert_eq!(col.null_count(), col.len(), "{c} must be entirely NULL");
+    }
 }
 
 // Fail-closed: a PolicyStore that errors must cause the rewriter to
@@ -440,9 +441,11 @@ async fn multilevel_namespace_restriction_is_applied() {
         s.starts_with("Projection:"),
         "restriction must inject a Projection over multi-level scan, got: {s}"
     );
+    // Restriction is a forced Nullify: ssn stays in the projection but as a NULL
+    // expression, not a passthrough column reference.
     assert!(
-        !s.contains("ssn"),
-        "ssn must be dropped from the multi-level namespace projection, got: {s}"
+        s.contains("ssn") && s.to_uppercase().contains("NULL"),
+        "ssn must be present as a forced-NULL expression in the projection, got: {s}"
     );
 }
 
@@ -982,9 +985,6 @@ async fn resource_mask_wins_over_tag_mask() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unmappable_tag_restricts_column_fail_closed() {
     let (mem, scan) = build_multilevel_scan_with_mem();
-    // Use the bare scan (no outer projection) so the restricted ssn column
-    // does not appear in a user reference that would fail planning.
-    // The assertion is on the output schema: ssn must be absent.
 
     let mut col_tags = HashMap::new();
     col_tags.insert("ssn".to_string(), vec!["SECRET".to_string()]);
@@ -998,15 +998,18 @@ async fn unmappable_tag_restricts_column_fail_closed() {
     let (rewritten, _summary) = rewriter.evaluate(&user("carol", &[]), scan).await.unwrap();
 
     let batches = execute_multilevel(rewritten, mem).await;
-    let schema = batches[0].schema();
-    assert!(
-        schema.column_with_name("ssn").is_none(),
-        "ssn must be ABSENT after unmappable-tag fail-closed restriction (got schema: {:?})",
-        schema
+    // Fail-closed via restriction = forced Nullify: ssn stays in the schema but
+    // is entirely NULL (raw value never returned); other columns are unaffected.
+    let ssn = batches[0]
+        .column_by_name("ssn")
+        .expect("ssn must remain in the schema as a forced NULL");
+    assert_eq!(
+        ssn.null_count(),
+        ssn.len(),
+        "ssn must be entirely NULL after unmappable-tag fail-closed restriction"
     );
-    // All other columns must still be present.
-    assert!(schema.column_with_name("customer_id").is_some());
-    assert!(schema.column_with_name("salary").is_some());
+    let salary = batches[0].column_by_name("salary").expect("salary present");
+    assert!(salary.null_count() < salary.len(), "salary must keep real values");
 }
 
 /// Test 5 -- UNKNOWN tag state (None) fails closed: zero rows.

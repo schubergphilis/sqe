@@ -102,8 +102,11 @@ expressions normalize against the real (qualified) scan schema:
    expression, aliased back to the column's qualified name. User predicates
    cannot push through a mask expression (the expression boundary blocks
    pushdown on the raw value, matching PostgreSQL RLS).
-3. **Restricted columns** are dropped from the projection entirely. They are
-   invisible, not errors.
+3. **Restricted columns** are forced to NULL: the column stays in the output
+   schema but every value becomes a typed NULL (restriction is a forced
+   Nullify). `SELECT *` and any reference to the column resolve and return NULL;
+   the raw value is never returned, and predicate pushdown on the real value is
+   blocked. Restriction wins over a mask on the same column.
 
 ### Fail-closed throughout
 
@@ -175,7 +178,7 @@ CASE WHEN department = 'HR' THEN {col} ELSE '0' END
 
 Limitation: only bare column names resolve. A qualified reference such as
 `t.department` fails to parse, and SQE fails closed by restricting the column
-(it is dropped from the result, not returned raw). Reference siblings by their
+(it is forced to NULL, not returned raw). Reference siblings by their
 bare name.
 
 ## Role-conditional policy (session-context functions)
