@@ -152,40 +152,77 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                         }
                         _ => Vec::new(),
                     };
-                    let col_tags = tag_source.column_tags(catalog, &ns_path, table_ref.table());
+                    // Reserved virtual schemas (information_schema, the `system`
+                    // / `datafusion` catalogs) are served by in-memory providers
+                    // that are NEVER inserted into the table metadata cache, so
+                    // `column_tags` would always return None for them. They also
+                    // cannot host an Iceberg table (DataFusion/SQE reserve these
+                    // names), so they carry no tags by construction. Treat them
+                    // as known-no-tags rather than letting the fail-closed None
+                    // branch deny every information_schema query (which dbt and
+                    // SHOW COLUMNS / SHOW CREATE TABLE issue constantly).
+                    let tag_lookup = if is_reserved_virtual_ref(table_ref) {
+                        Some(HashMap::new())
+                    } else {
+                        tag_source.column_tags(catalog, &ns_path, table_ref.table())
+                    };
 
-                    if !col_tags.is_empty() {
-                        let all_tags: HashSet<String> =
-                            col_tags.values().flatten().cloned().collect();
-
-                        if !all_tags.is_empty() {
-                            let (tag_masks_by_tag, tag_filters, unmappable_tags) =
-                                store.resolve_tags(&user_clone, &all_tags).await;
-
-                            debug!(
+                    match tag_lookup {
+                        // Tag state UNKNOWN (cache miss / disabled cache /
+                        // unreadable metadata). Fail CLOSED exactly like the
+                        // resolve-failure path below: a tag mask or tag
+                        // row-filter may exist that we cannot see, so denying
+                        // is the only safe answer. Skipping tag work here would
+                        // silently bypass a security control.
+                        None => {
+                            warn!(
                                 user = %username,
                                 table = %table_name,
-                                tag_masks = tag_masks_by_tag.len(),
-                                tag_filters = tag_filters.len(),
-                                unmappable_tags = unmappable_tags.len(),
-                                "Resolved tag-based policies"
+                                namespace = %namespace,
+                                "Tag state unknown (cache miss or disabled); denying access"
                             );
-
-                            let identity = SessionIdentity {
-                                username: user_clone.username.clone(),
-                                roles: user_clone.roles.clone(),
-                                database: None,
-                                schema: None,
-                            };
-                            merge_tag_masks(
-                                &mut policy,
-                                &col_tags,
-                                &tag_masks_by_tag,
-                                tag_filters,
-                                &unmappable_tags,
-                                &identity,
-                            );
+                            let mut deny = ResolvedPolicy::default();
+                            deny.row_filters.push(lit(false));
+                            policy = deny;
                         }
+                        // Known: at least one column carries tags. Resolve tag
+                        // policies and merge them into the resolved policy.
+                        Some(col_tags) if !col_tags.is_empty() => {
+                            let all_tags: HashSet<String> =
+                                col_tags.values().flatten().cloned().collect();
+
+                            if !all_tags.is_empty() {
+                                let (tag_masks_by_tag, tag_filters, unmappable_tags) =
+                                    store.resolve_tags(&user_clone, &all_tags).await;
+
+                                debug!(
+                                    user = %username,
+                                    table = %table_name,
+                                    tag_masks = tag_masks_by_tag.len(),
+                                    tag_filters = tag_filters.len(),
+                                    unmappable_tags = unmappable_tags.len(),
+                                    "Resolved tag-based policies"
+                                );
+
+                                let identity = SessionIdentity {
+                                    username: user_clone.username.clone(),
+                                    roles: user_clone.roles.clone(),
+                                    database: None,
+                                    schema: None,
+                                };
+                                merge_tag_masks(
+                                    &mut policy,
+                                    &col_tags,
+                                    &tag_masks_by_tag,
+                                    tag_filters,
+                                    &unmappable_tags,
+                                    &identity,
+                                );
+                            }
+                        }
+                        // Known: no tags on this table. Proceed with the
+                        // resource-path policy unchanged, no tag work.
+                        Some(_) => {}
                     }
 
                     table_policies.insert(table_name.clone(), policy);
@@ -433,6 +470,40 @@ pub(crate) fn merge_tag_masks(
 ///
 /// Returns `None` when no table component can be determined. The caller
 /// treats `None` as fail-closed (deny all rows) rather than passthrough.
+/// True when `table_ref` names a reserved, virtual (non-Iceberg) relation that
+/// cannot carry Iceberg column tags and is never present in the table metadata
+/// cache: `information_schema.*` (DataFusion reserves this schema in every
+/// catalog), and anything under the reserved `system` / `datafusion` catalogs.
+///
+/// These names cannot be used for a user Iceberg table (DataFusion reserves the
+/// schema; the coordinator reserves the catalog names), so skipping the tag
+/// lookup here introduces no governance bypass: a real Iceberg table can never
+/// match. The resource policy (`store.resolve`) still runs for these refs.
+///
+/// `pg_catalog` is intentionally NOT matched: SQE does not register it as a
+/// virtual provider, so a user namespace named `pg_catalog` must still be tag-
+/// governed.
+fn is_reserved_virtual_ref(table_ref: &datafusion::common::TableReference) -> bool {
+    // Reserved catalogs (cannot host a user Iceberg table).
+    if let Some(cat) = table_ref.catalog() {
+        if cat.eq_ignore_ascii_case("system") || cat.eq_ignore_ascii_case("datafusion") {
+            return true;
+        }
+    }
+    // information_schema is reserved in every catalog. Match on the LAST schema
+    // component so `cat.information_schema.tables` (qualified) and
+    // `information_schema.tables` (bare) both match.
+    matches!(
+        table_ref.schema(),
+        Some(schema)
+            if schema
+                .rsplit('.')
+                .next()
+                .unwrap_or(schema)
+                .eq_ignore_ascii_case("information_schema")
+    )
+}
+
 fn resolve_policy_key(
     table_ref: &datafusion::common::TableReference,
 ) -> Option<(String, String)> {
@@ -898,6 +969,60 @@ mod tests {
         // treats None as deny-all rather than passthrough.
         let r = datafusion::common::TableReference::bare("");
         assert_eq!(resolve_policy_key(&r), None);
+    }
+
+    // ── is_reserved_virtual_ref ──────────────────────────────────
+    // Reserved virtual relations are skipped from the tag lookup so an
+    // unknown tag state never denies information_schema / system queries.
+    // The skip must be tight: a real Iceberg ref must never match.
+
+    #[test]
+    fn reserved_ref_matches_bare_information_schema() {
+        let r = datafusion::common::TableReference::partial("information_schema", "tables");
+        assert!(is_reserved_virtual_ref(&r));
+    }
+
+    #[test]
+    fn reserved_ref_matches_qualified_information_schema() {
+        let r =
+            datafusion::common::TableReference::full("cat", "information_schema", "columns");
+        assert!(is_reserved_virtual_ref(&r));
+    }
+
+    #[test]
+    fn reserved_ref_matches_system_and_datafusion_catalogs() {
+        let sys = datafusion::common::TableReference::full("system", "runtime", "queries");
+        assert!(is_reserved_virtual_ref(&sys));
+        let df = datafusion::common::TableReference::full("datafusion", "info", "version");
+        assert!(is_reserved_virtual_ref(&df));
+    }
+
+    #[test]
+    fn reserved_ref_does_not_match_real_iceberg_table() {
+        // A normal user table must be tag-governed.
+        let r = datafusion::common::TableReference::full("cat", "ns1.ns2", "employees");
+        assert!(!is_reserved_virtual_ref(&r));
+        // Bare and two-part user tables too.
+        assert!(!is_reserved_virtual_ref(&datafusion::common::TableReference::bare("employees")));
+        assert!(!is_reserved_virtual_ref(&datafusion::common::TableReference::partial(
+            "hr", "employees"
+        )));
+    }
+
+    #[test]
+    fn reserved_ref_does_not_match_namespace_ending_in_runtime() {
+        // The fix keys on reserved CATALOG names, not on the last namespace
+        // component, so a user namespace ending in "runtime" is NOT a bypass.
+        let r = datafusion::common::TableReference::full("cat", "app.runtime", "events");
+        assert!(!is_reserved_virtual_ref(&r));
+    }
+
+    #[test]
+    fn reserved_ref_does_not_match_pg_catalog() {
+        // SQE does not register pg_catalog as a virtual provider, so a user
+        // namespace named pg_catalog must still be tag-governed.
+        let r = datafusion::common::TableReference::partial("pg_catalog", "pg_class");
+        assert!(!is_reserved_virtual_ref(&r));
     }
 
     #[test]

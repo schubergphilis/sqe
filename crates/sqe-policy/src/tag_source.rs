@@ -14,20 +14,32 @@ use std::collections::HashMap;
 
 /// Resolves column -> tags for a table, from its metadata.
 pub trait TagSource: Send + Sync {
-    /// Return a map of column name -> tags for the given (fully-qualified)
-    /// table. Implementations MUST fail safe: any miss / unparseable metadata
-    /// returns an EMPTY map (no tags => no extra masking, which is correct
-    /// because tags only ADD restrictions). Never error.
+    /// Return the column name -> tags map for the given (fully-qualified)
+    /// table, distinguishing "known" from "unknown".
+    ///
+    /// - `Some(map)` means the table's tag state is KNOWN. `Some(empty)` is a
+    ///   valid known state ("this table carries no tags"); the caller does no
+    ///   tag work but does NOT deny.
+    /// - `None` means the tag state is UNKNOWN: a cache miss, a disabled cache,
+    ///   or unreadable metadata. The caller MUST fail closed (deny) for that
+    ///   scan, because a tag mask or tag row-filter may exist that we cannot
+    ///   see. Treating unknown as "no tags" would silently skip a security
+    ///   control.
+    ///
+    /// Implementations MUST NOT error: an I/O or parse failure is reported as
+    /// `None` (unknown), not propagated.
     fn column_tags(
         &self,
         catalog: Option<&str>,
         namespace: &[String],
         table: &str,
-    ) -> HashMap<String, Vec<String>>;
+    ) -> Option<HashMap<String, Vec<String>>>;
 }
 
-/// A TagSource that always returns no tags. Used when tag-based masking is
-/// disabled or no catalog/cache is wired.
+/// A TagSource that always reports "known: no tags". Used when no tag SOURCE is
+/// configured (passthrough / no-tag deployments). Returning `Some(empty)`
+/// rather than `None` is deliberate: the absence of a tag source means tags are
+/// definitively not in play, so it must NOT cause fail-closed denials.
 #[derive(Debug, Default)]
 pub struct NoopTagSource;
 
@@ -37,8 +49,8 @@ impl TagSource for NoopTagSource {
         _c: Option<&str>,
         _n: &[String],
         _t: &str,
-    ) -> HashMap<String, Vec<String>> {
-        HashMap::new()
+    ) -> Option<HashMap<String, Vec<String>>> {
+        Some(HashMap::new())
     }
 }
 
@@ -47,22 +59,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn noop_returns_empty() {
+    fn noop_returns_known_empty() {
         let s = NoopTagSource;
-        assert!(s
-            .column_tags(Some("cat"), &["ns1".into(), "ns2".into()], "t")
-            .is_empty());
+        // Some(empty) = "known: no tags", NOT None (unknown). A missing tag
+        // source must never fail closed.
+        let got = s.column_tags(Some("cat"), &["ns1".into(), "ns2".into()], "t");
+        assert_eq!(got, Some(HashMap::new()));
     }
 
     #[test]
-    fn noop_with_none_catalog_returns_empty() {
+    fn noop_with_none_catalog_returns_known_empty() {
         let s = NoopTagSource;
-        assert!(s.column_tags(None, &["ns".into()], "tbl").is_empty());
+        assert_eq!(s.column_tags(None, &["ns".into()], "tbl"), Some(HashMap::new()));
     }
 
     #[test]
-    fn noop_with_empty_namespace_returns_empty() {
+    fn noop_with_empty_namespace_returns_known_empty() {
         let s = NoopTagSource;
-        assert!(s.column_tags(Some("cat"), &[], "tbl").is_empty());
+        assert_eq!(s.column_tags(Some("cat"), &[], "tbl"), Some(HashMap::new()));
     }
 }

@@ -51,8 +51,10 @@ pub(crate) const PROP_KEY: &str = "sqe.column-tags";
 /// the cache via `SessionCatalog::load_table`. `CacheTagSource::column_tags`
 /// then reads the table properties out of the already-cached entry
 /// synchronously, with zero extra network calls. On a cache miss (table not
-/// yet loaded, or cache disabled via `ttl_secs = 0`) it returns an empty map,
-/// which is fail-safe: no tags means no extra masking.
+/// yet loaded, or cache disabled via `ttl_secs = 0`) it returns `None`
+/// (tag state UNKNOWN), which the rewriter treats as fail-CLOSED: an unseen
+/// tag mask or tag row-filter must not be silently skipped. A cache HIT
+/// returns `Some(map)` even when the parsed map is empty (known: no tags).
 pub struct CacheTagSource {
     cache: Arc<TableMetadataCache>,
 }
@@ -70,7 +72,7 @@ impl TagSource for CacheTagSource {
         _catalog: Option<&str>,
         namespace: &[String],
         table: &str,
-    ) -> HashMap<String, Vec<String>> {
+    ) -> Option<HashMap<String, Vec<String>>> {
         // Build the namespace display string the same way `table_cache_key` does:
         // `NamespaceIdent::Display` joins parts with `.`.
         let ns_display = match NamespaceIdent::from_vec(namespace.to_vec()) {
@@ -80,9 +82,10 @@ impl TagSource for CacheTagSource {
                     error = %e,
                     namespace = ?namespace,
                     table = %table,
-                    "tag_source: invalid namespace, returning empty tags"
+                    "tag_source: invalid namespace, tag state UNKNOWN (fail closed)"
                 );
-                return HashMap::new();
+                // Cannot build the cache key => cannot know the tag state.
+                return None;
             }
         };
 
@@ -92,13 +95,19 @@ impl TagSource for CacheTagSource {
                 debug!(
                     namespace = %ns_display,
                     table = %table,
-                    "tag_source: table not in cache, returning empty tags"
+                    "tag_source: table not in cache (miss or cache disabled), \
+                     tag state UNKNOWN (fail closed)"
                 );
-                return HashMap::new();
+                // Cache miss / disabled cache: the tag state is unknown, NOT
+                // known-empty. Return None so the rewriter fails closed.
+                return None;
             }
         };
 
-        parse_column_tags(&props)
+        // Cache hit: the tag state is KNOWN. `parse_column_tags` returns an
+        // empty map for a table with no `sqe.column-tags` property; that is a
+        // valid "known: no tags" answer, so wrap it in Some (never None here).
+        Some(parse_column_tags(&props))
     }
 }
 

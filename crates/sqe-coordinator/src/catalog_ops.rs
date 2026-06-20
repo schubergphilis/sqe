@@ -19,6 +19,11 @@ use crate::write_handler::{
     sql_type_to_arrow,
 };
 
+/// Per-table async lock used to serialize read-merge-commit sequences (see
+/// `keyed_lock`). The outer `std::Mutex` guards only the map; the inner
+/// `tokio::Mutex` is the per-table critical-section lock.
+type TableLockMap = StdArc<std::sync::Mutex<HashMap<String, StdArc<tokio::sync::Mutex<()>>>>>;
+
 /// Handles catalog DDL operations (DROP TABLE, ALTER TABLE RENAME, views).
 ///
 /// These operations go directly through the Iceberg REST catalog API
@@ -27,11 +32,23 @@ pub struct CatalogOps {
     config: SqeConfig,
     /// Shared global table metadata cache threaded from the coordinator.
     table_cache: Option<TableMetadataCache>,
+    /// Per-table async locks serializing read-merge-commit sequences that
+    /// cannot be protected by an Iceberg `TableRequirement` (notably the plain
+    /// `SetProperties` write in `set_column_tags`). Keyed by the table ident
+    /// string. `CatalogOps` is held as a single shared `Arc<QueryHandler>`
+    /// across all sessions, so this serializes concurrent writers cluster-wide
+    /// for THIS coordinator. The outer `std::Mutex` only guards map lookup and
+    /// is never held across an await.
+    table_locks: TableLockMap,
 }
 
 impl CatalogOps {
     pub fn new(config: SqeConfig) -> Self {
-        Self { config, table_cache: None }
+        Self {
+            config,
+            table_cache: None,
+            table_locks: StdArc::new(std::sync::Mutex::new(HashMap::new())),
+        }
     }
 
     /// Attach a global table metadata cache so DDL operations invalidate the right entry.
@@ -39,6 +56,27 @@ impl CatalogOps {
     pub fn with_table_cache(mut self, cache: TableMetadataCache) -> Self {
         self.table_cache = Some(cache);
         self
+    }
+
+    /// Evict every token's metadata cache entry for `table_ident`.
+    ///
+    /// See `TableMetadataCache::invalidate_table_all_tokens`. No-op when no
+    /// cache is wired (e.g. in unit tests constructed via `CatalogOps::new`).
+    async fn invalidate_table_all_tokens(&self, table_ident: &TableIdent) {
+        if let Some(cache) = &self.table_cache {
+            let suffix = format!("{}.{}", table_ident.namespace(), table_ident.name());
+            cache.invalidate_table_all_tokens(&suffix).await;
+        }
+    }
+
+    /// Return the per-table async lock for `table_ident`, creating it on first
+    /// use. The outer `std::Mutex` guards only the map insert/lookup and is
+    /// dropped before the caller awaits the returned per-table lock, so two
+    /// callers contending on DIFFERENT tables never block each other and the
+    /// std mutex is never held across an await point.
+    fn table_lock_for(&self, table_ident: &TableIdent) -> StdArc<tokio::sync::Mutex<()>> {
+        let key = format!("{}.{}", table_ident.namespace(), table_ident.name());
+        keyed_lock(&self.table_locks, key)
     }
 
     /// Drop a table via the Iceberg REST catalog.
@@ -751,7 +789,12 @@ impl CatalogOps {
         // Note: policy-store cache invalidation (Arc<dyn PolicyStore>::invalidate_all)
         // is handled one level up in QueryHandler::handle_statement, which has
         // the policy store in scope. CatalogOps does not hold a PolicyStore.
-        session_catalog.invalidate_table(&table_ident).await;
+        //
+        // Properties (incl. sqe.column-tags) are read user-independently via
+        // `properties_for`, which reads the first entry matching `|{ns}.{table}`
+        // from ANY token. Evict every token's entry so the updated properties
+        // are visible to all users immediately, not just the writer.
+        self.invalidate_table_all_tokens(&table_ident).await;
 
         info!(
             table = %table_ident,
@@ -909,6 +952,20 @@ impl CatalogOps {
             .session_catalog_for(session, catalog_qualifier(&object_name).as_deref())
             .await?;
 
+        // Serialize the read-merge-commit per table. `set_column_tags` does a
+        // read-current -> apply_tag_ops -> SetProperties commit. Two concurrent
+        // calls read the same base map and the second commit overwrites the
+        // first (last-writer-wins), silently dropping a tag change. An Iceberg
+        // `TableRequirement` CANNOT protect this: there is no property-CAS
+        // variant, and a plain `SetProperties` bumps no checkable assertion, so
+        // Polaris returns no 409. The only correct fix is to serialize on the
+        // coordinator. Hold the per-table lock across the whole read-modify-
+        // write-invalidate sequence; the prior writer's `invalidate_table_all_
+        // tokens` (inside the lock) forces the next `load_table` to refetch the
+        // post-commit properties, so no update is lost.
+        let table_lock = self.table_lock_for(&table_ident);
+        let _guard = table_lock.lock().await;
+
         let table = session_catalog.load_table(&table_ident).await?;
         let current = crate::tag_source_impl::parse_column_tags(table.metadata().properties());
 
@@ -930,7 +987,14 @@ impl CatalogOps {
         session_catalog
             .commit_schema_update(&table_ident, vec![TableUpdate::SetProperties { updates }], vec![])
             .await?;
-        session_catalog.invalidate_table(&table_ident).await;
+        // Tags are read user-independently via `properties_for`, which returns
+        // the first entry matching `|{ns}.{table}` from ANY token. The single
+        // -token `invalidate_table` (done inside commit_schema_update) only
+        // evicts the writer's own key, so other users would keep reading the
+        // stale tag map until TTL. Evict every token's entry so the new tags
+        // are visible to all users immediately. Still under `_guard`, so the
+        // next serialized writer's `load_table` sees the fresh map.
+        self.invalidate_table_all_tokens(&table_ident).await;
         Ok(())
     }
 
@@ -1225,6 +1289,19 @@ pub(crate) fn parse_table_ref(name: &ObjectName) -> sqe_core::Result<TableIdent>
     }
 }
 
+/// Return the per-key async lock, creating it on first use.
+///
+/// The `std::Mutex` guards only the map insert/lookup and is dropped before the
+/// caller awaits the returned lock, so it is never held across an await point
+/// and two callers contending on DIFFERENT keys never block each other. Keys
+/// are never removed (tag authoring is rare; the map stays small), so two calls
+/// with the same key always return the SAME `Arc<tokio::Mutex>` and therefore
+/// serialize.
+fn keyed_lock(locks: &TableLockMap, key: String) -> StdArc<tokio::sync::Mutex<()>> {
+    let mut map = locks.lock().expect("table_locks mutex poisoned");
+    StdArc::clone(map.entry(key).or_default())
+}
+
 /// Extract the catalog qualifier from a 3-part table reference
 /// (`catalog.namespace.table`). Returns `None` for 1- or 2-part names, which
 /// resolve in the session's default warehouse as before.
@@ -1416,6 +1493,61 @@ fn is_namespace_already_exists(err: &iceberg::Error) -> bool {
 mod tests {
     use super::*;
     use sqlparser::ast::Ident;
+
+    fn empty_locks() -> TableLockMap {
+        StdArc::new(std::sync::Mutex::new(HashMap::new()))
+    }
+
+    #[test]
+    fn keyed_lock_same_key_returns_same_arc() {
+        let locks = empty_locks();
+        let a = keyed_lock(&locks, "sales.orders".to_string());
+        let b = keyed_lock(&locks, "sales.orders".to_string());
+        // Same underlying Mutex => the two callers serialize on it.
+        assert!(StdArc::ptr_eq(&a, &b), "same key must share one lock");
+    }
+
+    #[test]
+    fn keyed_lock_different_keys_return_distinct_arcs() {
+        let locks = empty_locks();
+        let a = keyed_lock(&locks, "sales.orders".to_string());
+        let b = keyed_lock(&locks, "sales.customers".to_string());
+        // Different tables get independent locks => no false contention.
+        assert!(!StdArc::ptr_eq(&a, &b), "different keys must not share a lock");
+    }
+
+    /// Two tasks contending on the SAME keyed lock observe mutual exclusion:
+    /// the read-merge-commit critical section never interleaves, which is what
+    /// prevents the lost-update on concurrent SET TAGS. We model the critical
+    /// section with a non-atomic read-modify-write of a shared counter under the
+    /// lock; if the lock failed to serialize, the final value would be < the
+    /// number of increments.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn keyed_lock_serializes_same_key_critical_section() {
+        let locks = empty_locks();
+        let counter = StdArc::new(std::sync::Mutex::new(0u64));
+        let mut handles = Vec::new();
+        for _ in 0..50 {
+            let lock = keyed_lock(&locks, "ns.tbl".to_string());
+            let counter = StdArc::clone(&counter);
+            handles.push(tokio::spawn(async move {
+                let _guard = lock.lock().await;
+                // Non-atomic RMW across an await: only safe because _guard
+                // serializes. Read, yield, write-back.
+                let cur = *counter.lock().unwrap();
+                tokio::task::yield_now().await;
+                *counter.lock().unwrap() = cur + 1;
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(
+            *counter.lock().unwrap(),
+            50,
+            "serialized critical section must not lose updates"
+        );
+    }
 
     #[test]
     fn test_parse_table_ref_one_part() {

@@ -765,7 +765,9 @@ impl PolicyStore for TagTestStore {
 /// `Vec<String>`) to `calls`, so tests can assert the exact namespace
 /// components received (full multi-level path, not the last component).
 struct FakeTagSource {
-    col_tags: HashMap<String, Vec<String>>,
+    /// `Some(map)` = known tag state; `None` = unknown (cache miss / disabled),
+    /// which the rewriter must treat as fail-closed (deny).
+    col_tags: Option<HashMap<String, Vec<String>>>,
     /// Log of namespace args passed to `column_tags`, one entry per call.
     calls: Arc<Mutex<Vec<Vec<String>>>>,
 }
@@ -773,7 +775,15 @@ struct FakeTagSource {
 impl FakeTagSource {
     fn new(col_tags: HashMap<String, Vec<String>>) -> (Self, Arc<Mutex<Vec<Vec<String>>>>) {
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let source = Self { col_tags, calls: Arc::clone(&calls) };
+        let source = Self { col_tags: Some(col_tags), calls: Arc::clone(&calls) };
+        (source, calls)
+    }
+
+    /// A tag source whose state is UNKNOWN (returns `None`): models a cache
+    /// miss or a disabled metadata cache. Used to test fail-closed behavior.
+    fn new_unknown() -> (Self, Arc<Mutex<Vec<Vec<String>>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let source = Self { col_tags: None, calls: Arc::clone(&calls) };
         (source, calls)
     }
 }
@@ -784,7 +794,7 @@ impl TagSource for FakeTagSource {
         _catalog: Option<&str>,
         namespace: &[String],
         _table: &str,
-    ) -> HashMap<String, Vec<String>> {
+    ) -> Option<HashMap<String, Vec<String>>> {
         self.calls.lock().unwrap().push(namespace.to_vec());
         self.col_tags.clone()
     }
@@ -997,6 +1007,100 @@ async fn unmappable_tag_restricts_column_fail_closed() {
     // All other columns must still be present.
     assert!(schema.column_with_name("customer_id").is_some());
     assert!(schema.column_with_name("salary").is_some());
+}
+
+/// Test 5 -- UNKNOWN tag state (None) fails closed: zero rows.
+///
+/// A `TagSource` returning `None` models a metadata cache miss or a disabled
+/// cache: we cannot see whether a tag mask or tag row-filter applies. The
+/// rewriter must deny that scan (inject `lit(false)`), not pass it through as
+/// "no tags". Otherwise a cache miss silently bypasses tag-based governance.
+/// Proves the fail-closed-on-unknown contract: the query returns zero rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_tag_state_denies_all_rows() {
+    let (mem, scan) = build_multilevel_scan_with_mem();
+
+    // Tag source whose state is UNKNOWN (None). No tag store policy is needed:
+    // the deny must come purely from the unknown tag state.
+    let (fake_source, _calls) = FakeTagSource::new_unknown();
+    let store = TagTestStore::new();
+
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store))
+        .with_tag_source(Arc::new(fake_source));
+    let rewritten = rewriter.evaluate(&user("dave", &[]), scan).await.unwrap();
+
+    let batches = execute_multilevel(rewritten, mem).await;
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        rows, 0,
+        "unknown tag state (cache miss/disabled) must fail closed (zero rows)"
+    );
+}
+
+/// Test 6 -- reserved virtual relations must NOT be denied on an unknown tag
+/// state. `information_schema.*` and the `system` / `datafusion` catalogs are
+/// served by in-memory providers that are never in the table metadata cache, so
+/// the tag source returns `None` for them. They cannot host an Iceberg table
+/// and carry no tags, so the rewriter must skip the tag lookup (treat as
+/// known-no-tags) rather than deny. Without this skip, every
+/// `SELECT ... FROM information_schema.*` query (dbt, SHOW COLUMNS, SHOW CREATE
+/// TABLE) would return zero rows under a policy engine.
+///
+/// Each ref is exercised with `FakeTagSource::new_unknown()` (returns `None`):
+/// rows must be RETURNED, proving the reserved-ref skip beats the fail-closed
+/// None branch (which Test 5 pins for a non-reserved table).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reserved_virtual_refs_not_denied_on_unknown_tag_state() {
+    use datafusion::catalog::{MemoryCatalogProvider, MemorySchemaProvider};
+
+    // (catalog, schema, table) refs that must be treated as reserved/virtual.
+    let cases = [
+        (None, "information_schema", "tables"), // bare information_schema
+        (Some("cat"), "information_schema", "columns"), // qualified information_schema
+        (Some("system"), "runtime", "queries"), // reserved system catalog
+        (Some("datafusion"), "info", "version"), // reserved datafusion catalog
+    ];
+
+    for (catalog, schema, table) in cases {
+        let mem_schema = employee_schema();
+        let batch = employee_batch(mem_schema.clone());
+        let mem = Arc::new(MemTable::try_new(mem_schema, vec![vec![batch]]).unwrap());
+
+        let tref = match catalog {
+            Some(c) => TableReference::full(c, schema, table),
+            None => TableReference::partial(schema, table),
+        };
+        let plan = LogicalPlanBuilder::scan(tref.clone(), provider_as_source(mem.clone()), None)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // Unknown tag state for every table.
+        let (fake_source, _calls) = FakeTagSource::new_unknown();
+        let store = TagTestStore::new();
+        let rewriter = PolicyPlanRewriter::new(Arc::new(store))
+            .with_tag_source(Arc::new(fake_source));
+        let rewritten = rewriter.evaluate(&user("erin", &[]), plan).await.unwrap();
+
+        // Execute against a context registering exactly this ref.
+        let ctx = SessionContext::new();
+        let cat_name = catalog.unwrap_or("datafusion");
+        let cat_provider = Arc::new(MemoryCatalogProvider::new());
+        cat_provider
+            .register_schema(schema, Arc::new(MemorySchemaProvider::new()))
+            .unwrap();
+        ctx.register_catalog(cat_name, cat_provider);
+        let exec_ref = TableReference::full(cat_name, schema, table);
+        ctx.register_table(exec_ref, mem).unwrap();
+        let df = ctx.execute_logical_plan(rewritten).await.unwrap();
+        let batches = df.collect().await.unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            rows, 3,
+            "reserved virtual ref {tref} must NOT be denied on unknown tag state \
+             (all rows must pass through)"
+        );
+    }
 }
 
 // ── Session-function row-filter tests (Phase 2B, Task 3) ─────────────────────

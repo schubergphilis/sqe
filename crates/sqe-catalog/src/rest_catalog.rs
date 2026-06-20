@@ -256,6 +256,29 @@ impl TableMetadataCache {
         self.inner.invalidate(key).await;
     }
 
+    /// Evict EVERY cache entry for `(namespace, table)` regardless of which
+    /// token fingerprint it was cached under.
+    ///
+    /// Cache keys are `{token_fingerprint}|{ns}.{table}`. `invalidate` (via
+    /// `SessionCatalog::invalidate_table`) only evicts the caller's OWN token
+    /// key, but `properties_for` reads the FIRST entry matching the suffix from
+    /// ANY token. After a tag/property write, that leaves other users (and even
+    /// the writer, via first-match) reading the stale tag map until TTL. This
+    /// scans for every key ending in `|{ns}.{table}` and evicts each so the
+    /// write is visible to all users immediately.
+    ///
+    /// `ns_table_suffix` must be the key tail WITHOUT the leading `|`, i.e.
+    /// `"{namespace_display}.{table_name}"` (same shape as
+    /// `table_ident.namespace()` + `.` + `table_ident.name()`).
+    pub async fn invalidate_table_all_tokens(&self, ns_table_suffix: &str) {
+        // Collect first, then invalidate, to avoid mutating the map mid-iter.
+        let keys =
+            select_keys_for_suffix(self.inner.iter().map(|(k, _)| (*k).clone()), ns_table_suffix);
+        for key in keys {
+            self.inner.invalidate(&key).await;
+        }
+    }
+
     /// Number of entries currently held in the cache.
     pub fn entry_count(&self) -> u64 {
         self.inner.entry_count()
@@ -301,6 +324,22 @@ impl TableMetadataCache {
         }
         None
     }
+}
+
+/// Select every cache key belonging to `(ns, table)` regardless of token
+/// fingerprint, i.e. every key ending in `|{ns_table_suffix}`.
+///
+/// Cache keys are `{token_fingerprint}|{ns}.{table}`. The `|` boundary is
+/// included in the match so a table named `foo` never matches a key for a table
+/// named `barfoo` in the same namespace. Pure (no cache access) so the
+/// cross-token eviction contract is unit-testable without an iceberg `Table`
+/// fixture.
+fn select_keys_for_suffix<I>(keys: I, ns_table_suffix: &str) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let suffix = format!("|{ns_table_suffix}");
+    keys.into_iter().filter(|k| k.ends_with(&suffix)).collect()
 }
 
 /// Backend handle inside `SessionCatalog`.
@@ -1764,7 +1803,47 @@ impl Catalog for SessionCatalogBridge {
 
 #[cfg(test)]
 mod cache_capacity_tests {
-    use super::{REST_CATALOG_CACHE_MAX_CAPACITY, iceberg_error_is_forbidden};
+    use super::{REST_CATALOG_CACHE_MAX_CAPACITY, iceberg_error_is_forbidden, select_keys_for_suffix};
+
+    /// Cross-token invalidation must evict EVERY token's entry for the table,
+    /// not just one. Two users (different token fingerprints) cached the same
+    /// `ns.tbl`; after a tag write both keys must be selected for eviction so
+    /// the new tags are visible to all users immediately (issue: stale-tags-
+    /// cross-token). Entries for other tables must be left alone.
+    #[test]
+    fn select_keys_for_suffix_matches_all_tokens_same_table() {
+        let keys = vec![
+            "tokA|sales.orders".to_string(),
+            "tokB|sales.orders".to_string(),
+            "tokA|sales.customers".to_string(), // different table, keep
+            "tokC|other.orders".to_string(),    // different namespace, keep
+        ];
+        let mut got = select_keys_for_suffix(keys, "sales.orders");
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["tokA|sales.orders".to_string(), "tokB|sales.orders".to_string()],
+            "both tokens' entries for sales.orders must be selected; others untouched"
+        );
+    }
+
+    /// The `|` boundary must be part of the match so a table `foo` does not
+    /// evict an entry for a table `barfoo` in the same namespace.
+    #[test]
+    fn select_keys_for_suffix_respects_pipe_boundary() {
+        let keys = vec![
+            "tokA|ns.foo".to_string(),
+            "tokA|ns.barfoo".to_string(), // must NOT match suffix "ns.foo"
+        ];
+        let got = select_keys_for_suffix(keys, "ns.foo");
+        assert_eq!(got, vec!["tokA|ns.foo".to_string()]);
+    }
+
+    #[test]
+    fn select_keys_for_suffix_empty_when_no_match() {
+        let keys = vec!["tokA|ns.other".to_string()];
+        assert!(select_keys_for_suffix(keys, "ns.missing").is_empty());
+    }
 
     /// Issue #240: the REST catalog cache must hold well beyond the old cap of
     /// 100 so concurrent user-token-warehouse triples stop evicting each other
