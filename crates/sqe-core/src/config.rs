@@ -2125,6 +2125,12 @@ pub struct PolicyConfig {
     /// changes every masked digest, so the same key must persist across
     /// coordinator restarts and across all coordinators in an HA setup.
     ///
+    /// This applies to Ranger `MASK_HASH` and OPA `hash` column masks alike.
+    /// We warn rather than reject on `engine = ranger` + empty key (issue #37):
+    /// default-denying Hash without a key is the stronger control but is
+    /// breaking for deployments already relying on the unkeyed behaviour, so it
+    /// is deferred. Setting this key is the recommended hardening step.
+    ///
     /// Can be set via the `SQE_POLICY__MASK_KEY` environment variable.
     #[serde(default)]
     pub mask_key: String,

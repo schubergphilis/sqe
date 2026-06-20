@@ -81,7 +81,7 @@ pub async fn extract_write_predicates(
         .and_then(|b| b.build())
         .map_err(|e| SqeError::Execution(format!("policy probe scan: {e}")))?;
 
-    let rewritten = enforcer.evaluate(user, plan).await?;
+    let (rewritten, _summary) = enforcer.evaluate(user, plan).await?;
     Ok(unparse_predicates(&rewritten))
 }
 

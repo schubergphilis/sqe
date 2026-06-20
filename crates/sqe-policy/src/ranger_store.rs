@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use datafusion::logical_expr::{lit, Expr};
@@ -14,6 +14,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use sqe_core::config::RangerPolicyConfig;
 use sqe_core::{SecretString, SessionUser};
+use sqe_metrics::MetricsRegistry;
 use tracing::{debug, warn};
 
 use crate::policy_breaker::PolicyCircuitBreaker;
@@ -145,6 +146,7 @@ pub struct RangerStore {
     /// moka `get`/`insert` clones cheap.
     bundle_cache: Cache<&'static str, Arc<ServicePolicies>>,
     breaker: Arc<PolicyCircuitBreaker>,
+    metrics: Option<Arc<MetricsRegistry>>,
 }
 
 impl RangerStore {
@@ -180,17 +182,69 @@ impl RangerStore {
                 cfg.breaker_failure_threshold,
                 Duration::from_secs(cfg.breaker_recovery_secs),
             )),
+            metrics: None,
         })
+    }
+
+    /// Attach a metrics registry. Mirrors `OpaStore::with_metrics`: resolve
+    /// latency, cache hit/miss, and circuit-breaker state are recorded under the
+    /// shared `sqe_policy_*` series, all labelled `backend="ranger"`.
+    #[must_use = "with_metrics consumes self; bind the returned store"]
+    pub fn with_metrics(mut self, metrics: Arc<MetricsRegistry>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Record fetch latency + current breaker state. Mirrors
+    /// `OpaStore::record_metric`. `status` is `"ok"` or `"err"`; the breaker
+    /// state gauge always reflects the current `state_code()` so a breaker-open
+    /// deny-all is visible even when every query fails closed.
+    fn record_metric(&self, started: Instant, status: &'static str) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .policy_resolve_duration_seconds
+                .with_label_values(&["ranger", status])
+                .observe(started.elapsed().as_secs_f64());
+            metrics
+                .policy_circuit_breaker_state
+                .with_label_values(&["ranger"])
+                .set(self.breaker.state_code() as f64);
+        }
+    }
+
+    fn record_cache_hit(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .policy_cache_hits_total
+                .with_label_values(&["ranger"])
+                .inc();
+        }
+    }
+
+    fn record_cache_miss(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .policy_cache_misses_total
+                .with_label_values(&["ranger"])
+                .inc();
+        }
     }
 
     /// Fetch the full policy bundle. Fail-closed: any transport/parse error
     /// trips the breaker and returns Err so the caller denies.
     // TODO(phase2): lastKnownVersion + HTTP 304 incremental refresh.
     async fn fetch_bundle(&self) -> sqe_core::Result<ServicePolicies> {
+        // Breaker-open path: mirror OpaStore, which records NOTHING here. The
+        // call that trips the breaker (a failed fetch below) already sets the
+        // state gauge via record_metric, so the gauge reads `open` without a
+        // recording point here. Adding one would push a 0-second sample into the
+        // resolve-duration histogram on every query during an outage, skewing
+        // p50/p99 toward zero exactly when the metric is being read.
         self.breaker.check().map_err(|e| {
             sqe_core::error::SqeError::Execution(format!("Ranger unavailable: {e}"))
         })?;
 
+        let started = Instant::now();
         let resp = self
             .client
             .get(&self.download_url)
@@ -199,11 +253,13 @@ impl RangerStore {
             .await
             .map_err(|e| {
                 self.breaker.record_failure();
+                self.record_metric(started, "err");
                 sqe_core::error::SqeError::Execution(format!("Ranger download failed: {e}"))
             })?;
 
         if !resp.status().is_success() {
             self.breaker.record_failure();
+            self.record_metric(started, "err");
             return Err(sqe_core::error::SqeError::Execution(format!(
                 "Ranger download returned status {}",
                 resp.status()
@@ -212,9 +268,11 @@ impl RangerStore {
 
         let bundle: ServicePolicies = resp.json().await.map_err(|e| {
             self.breaker.record_failure();
+            self.record_metric(started, "err");
             sqe_core::error::SqeError::Execution(format!("Failed to parse Ranger bundle: {e}"))
         })?;
         self.breaker.record_success();
+        self.record_metric(started, "ok");
         Ok(bundle)
     }
 
@@ -292,7 +350,12 @@ fn item_matches(
     let matched =
         users.iter().any(|u| u == &user.username) || roles.iter().any(|r| user.roles.contains(r));
     if !matched && !groups.is_empty() {
-        warn!(
+        // Group-bound items are not enforced by design (SQE matches token roles
+        // only). This fires inside the per-item resolution loop on every cache
+        // miss for every user, so it is logged at `debug!` rather than `warn!`
+        // to avoid a WARN burst from a bundle with many group-bound items. The
+        // behaviour is unchanged: the item is still skipped (not enforced).
+        debug!(
             ?groups,
             "Ranger policy item is group-bound; SQE does not enforce group bindings (Phase 2) — policy item skipped"
         );
@@ -608,8 +671,10 @@ impl PolicyStore for RangerStore {
     ) -> sqe_core::Result<ResolvedPolicy> {
         let key = cache_key(user, table_name, namespace);
         if let Some(cached) = self.cache.get(&key).await {
+            self.record_cache_hit();
             return Ok(cached);
         }
+        self.record_cache_miss();
         let bundle = self.cached_bundle().await?;
         let policy = resolve_from_bundle(&bundle, user, table_name, namespace);
         self.cache.insert(key, policy.clone()).await;
@@ -749,6 +814,68 @@ mod tests {
         // from_config must succeed even with an empty URL (no network call).
         let store = RangerStore::from_config(&cfg);
         assert!(store.is_ok(), "from_config failed: {:?}", store.err());
+    }
+
+    /// Fix 1: a fetch failure trips the breaker and the breaker-state gauge must
+    /// read `open` (2). With no metrics wired the OPA-style record calls are
+    /// no-ops; here we attach a registry and assert the gauge after a forced
+    /// failure. `breaker_failure_threshold = 1` so a single failed download
+    /// opens the breaker. The download URL is an unroutable address so the HTTP
+    /// send fails fast (records a failure + records the "err" metric).
+    #[tokio::test]
+    async fn breaker_open_sets_state_gauge_for_ranger() {
+        let cfg = RangerPolicyConfig {
+            // RFC 5737 TEST-NET-1, unroutable; with a short timeout the send fails fast.
+            url: "http://192.0.2.1:6080".to_string(),
+            timeout_secs: 1,
+            breaker_failure_threshold: 1,
+            ..RangerPolicyConfig::default()
+        };
+        let metrics = Arc::new(MetricsRegistry::new());
+        let store = RangerStore::from_config(&cfg).unwrap().with_metrics(metrics.clone());
+
+        // First fetch fails (transport error) -> record_failure opens the
+        // breaker (threshold 1) and record_metric writes the gauge.
+        let err = store.fetch_bundle().await;
+        assert!(err.is_err(), "fetch against unroutable URL must fail");
+
+        let gauge = metrics
+            .policy_circuit_breaker_state
+            .with_label_values(&["ranger"])
+            .get();
+        assert_eq!(
+            gauge, 2.0,
+            "breaker must be open (gauge=2) after a fetch failure tripped it"
+        );
+
+        // The duration histogram must have at least one observation labelled err.
+        let observed = metrics
+            .policy_resolve_duration_seconds
+            .with_label_values(&["ranger", "err"])
+            .get_sample_count();
+        assert!(observed >= 1, "fetch failure must record a resolve-duration sample");
+    }
+
+    /// Fix 1: per-user cache hit/miss counters increment via `resolve`. We seed
+    /// the per-user cache directly so the hit path is taken without any network
+    /// call (the miss path would hit `cached_bundle`/`fetch_bundle`).
+    #[tokio::test]
+    async fn cache_hit_counter_increments_on_ranger() {
+        let metrics = Arc::new(MetricsRegistry::new());
+        let store = RangerStore::from_config(&RangerPolicyConfig::default())
+            .unwrap()
+            .with_metrics(metrics.clone());
+
+        let u = user("alice", &["analyst"]);
+        let key = cache_key(&u, "orders", "sales");
+        store.cache.insert(key, ResolvedPolicy::default()).await;
+
+        let _ = store.resolve(&u, "orders", "sales").await.unwrap();
+        let hits = metrics
+            .policy_cache_hits_total
+            .with_label_values(&["ranger"])
+            .get();
+        assert_eq!(hits, 1, "a warm per-user cache entry must record one hit");
     }
 
     /// `cached_bundle` serves a warm bundle from the cache without re-fetching.

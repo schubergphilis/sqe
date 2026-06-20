@@ -788,9 +788,13 @@ impl QueryHandler {
         // populates this after policy enforcement; non-Query branches leave
         // it as None and the observer falls back to plan-less inputs/outputs.
         let mut captured_plan: Option<sqe_lineage::PlanOrHint> = None;
+        // Slot for the policy-decision summary. `execute_query` populates this
+        // after policy enforcement; non-Query branches leave it None (the audit
+        // entry then records the all-zero, not-denied default).
+        let mut policy_summary: Option<sqe_policy::PolicySummary> = None;
         let execution_future = async {
             match &kind {
-                StatementKind::Query(_) => self.execute_query(session, sql, &query_id, &plan_metrics, &mut captured_plan).await,
+                StatementKind::Query(_) => self.execute_query(session, sql, &query_id, &plan_metrics, &mut captured_plan, &mut policy_summary).await,
 
                 StatementKind::ShowCatalogs => self.handle_show_catalogs(session).await,
 
@@ -1164,8 +1168,10 @@ impl QueryHandler {
                     // the write handler re-wraps this source plan as a
                     // synthetic INSERT against the target.
                     let mut merge_source_plan: Option<sqe_lineage::PlanOrHint> = None;
+                    // The MERGE source's policy summary is recorded against the
+                    // outer MERGE statement's audit entry via `policy_summary`.
                     let source_batches = self
-                        .execute_query(session, &source_sql, &query_id, &plan_metrics, &mut merge_source_plan)
+                        .execute_query(session, &source_sql, &query_id, &plan_metrics, &mut merge_source_plan, &mut policy_summary)
                         .await?;
                     let merge_source_logical = match merge_source_plan {
                         Some(sqe_lineage::PlanOrHint::Plan(p)) => Some(*p),
@@ -1455,6 +1461,10 @@ impl QueryHandler {
         }
 
         if let Some(ref audit) = self.audit {
+            // Copy the policy-decision summary (if the path produced one) into
+            // the audit entry so a deny-all / masked / filtered query is no
+            // longer indistinguishable from a bare success.
+            let ps = policy_summary.unwrap_or_default();
             audit.log(&sqe_metrics::audit::AuditEntry {
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 username: session.user.username.clone(),
@@ -1467,6 +1477,10 @@ impl QueryHandler {
                 status: status.to_string(),
                 client_ip: None,
                 tables_touched: tables_touched.clone(),
+                row_filters_applied: ps.row_filters_applied,
+                columns_masked: ps.columns_masked,
+                columns_restricted: ps.columns_restricted,
+                policy_denied: ps.denied,
             });
         }
 
@@ -1655,7 +1669,7 @@ impl QueryHandler {
         );
 
         match self.open_stream(session, sql, &query_id, start).await {
-            Ok((schema, inner_stream, final_plan, tt_cleanup, tables_touched)) => {
+            Ok((schema, inner_stream, final_plan, tt_cleanup, tables_touched, policy_summary)) => {
                 let finalizer = crate::streaming::StreamFinalizer {
                     tracker: Arc::clone(&self.query_tracker),
                     metrics: self.metrics.clone(),
@@ -1671,6 +1685,7 @@ impl QueryHandler {
                     slow_query_threshold_secs: self.config.query.slow_query_threshold_secs,
                     sql_length: sql.len(),
                     tables_touched,
+                    policy_summary,
                     profile_mode: self.profile_mode,
                 };
 
@@ -1727,6 +1742,7 @@ impl QueryHandler {
         Arc<dyn ExecutionPlan>,
         TimeTravelCleanup,
         Vec<String>,
+        sqe_policy::PolicySummary,
     )> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
 
@@ -1747,7 +1763,12 @@ impl QueryHandler {
             .await
             .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
         let plan = df.logical_plan().clone();
-        let enforced_plan = self.policy_enforcer.evaluate(&session.user, plan).await?;
+        // Streaming path: the audit entry is recorded by the
+        // TrackedRecordBatchStream finalizer (not the `execute` path), so carry
+        // the policy summary out to the caller, which stows it on the
+        // StreamFinalizer for the audit emission at stream end.
+        let (enforced_plan, policy_summary) =
+            self.policy_enforcer.evaluate(&session.user, plan).await?;
         debug!("Policy-enforced plan (streaming): {:?}", enforced_plan);
         let tables_touched = sqe_lineage::extract::extract_table_names(&enforced_plan);
 
@@ -1805,7 +1826,7 @@ impl QueryHandler {
         let stream = execute_stream(Arc::clone(&final_plan), ctx.task_ctx())
             .map_err(|e| SqeError::Execution(format!("Query execution failed: {e}")))?;
 
-        Ok((schema, stream, final_plan, tt_cleanup, tables_touched))
+        Ok((schema, stream, final_plan, tt_cleanup, tables_touched, policy_summary))
     }
 
     /// Return the schema for a SQL statement without executing it.
@@ -1884,6 +1905,7 @@ impl QueryHandler {
         query_id: &uuid::Uuid,
         plan_metrics: &Arc<Mutex<PlanMetrics>>,
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
+        summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
 
@@ -1919,12 +1941,18 @@ impl QueryHandler {
 
         // Get the logical plan and run policy enforcement
         let plan = df.logical_plan().clone();
-        let enforced_plan = self
+        let (enforced_plan, policy_summary) = self
             .policy_enforcer
             .evaluate(&session.user, plan)
             .await?;
 
         debug!("Policy-enforced plan: {:?}", enforced_plan);
+
+        // Surface the policy summary to the audit log (out-param, same pattern as
+        // `plan_out`). The caller copies the counts/names/denied flag into the
+        // AuditEntry so a deny-all (zero rows) is distinguishable from a
+        // legitimate empty result.
+        *summary_out = Some(policy_summary);
 
         // Capture the enforced plan for OpenLineage extraction. Cloning into
         // a Box keeps the lineage path independent of DataFusion's

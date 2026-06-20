@@ -131,6 +131,11 @@ pub struct StreamFinalizer {
     pub slow_query_threshold_secs: u64,
     pub sql_length: usize,
     pub tables_touched: Vec<String>,
+    /// Policy-decision summary from the enforcer for this query. Copied into the
+    /// audit entry on stream finalization so a masked / filtered / denied SELECT
+    /// (the primary Flight SQL path) records what policy did, not a bare
+    /// `status:"success"` with zero rows.
+    pub policy_summary: sqe_policy::PolicySummary,
     /// Passive profiling mode (`[query] query_profile`). When a profile is
     /// due, the executed plan tree is rendered with its populated metrics,
     /// logged under the `query_profile` target, and stored on the tracker
@@ -219,6 +224,12 @@ impl StreamFinalizer {
                 status: "success".to_string(),
                 client_ip: None,
                 tables_touched: self.tables_touched.clone(),
+                // Policy-decision summary captured at query start (see
+                // `StreamFinalizer::policy_summary`).
+                row_filters_applied: self.policy_summary.row_filters_applied,
+                columns_masked: self.policy_summary.columns_masked.clone(),
+                columns_restricted: self.policy_summary.columns_restricted.clone(),
+                policy_denied: self.policy_summary.denied,
             });
         }
 
@@ -276,6 +287,12 @@ impl StreamFinalizer {
                 status: "error".to_string(),
                 client_ip: None,
                 tables_touched: self.tables_touched.clone(),
+                // Policy-decision summary captured at query start (see
+                // `StreamFinalizer::policy_summary`).
+                row_filters_applied: self.policy_summary.row_filters_applied,
+                columns_masked: self.policy_summary.columns_masked.clone(),
+                columns_restricted: self.policy_summary.columns_restricted.clone(),
+                policy_denied: self.policy_summary.denied,
             });
         }
 
@@ -314,6 +331,12 @@ impl StreamFinalizer {
                 status: "cancelled".to_string(),
                 client_ip: None,
                 tables_touched: self.tables_touched.clone(),
+                // Policy-decision summary captured at query start (see
+                // `StreamFinalizer::policy_summary`).
+                row_filters_applied: self.policy_summary.row_filters_applied,
+                columns_masked: self.policy_summary.columns_masked.clone(),
+                columns_restricted: self.policy_summary.columns_restricted.clone(),
+                policy_denied: self.policy_summary.denied,
             });
         }
     }
@@ -631,6 +654,7 @@ mod tests {
             slow_query_threshold_secs: 0,
             sql_length: 8,
             tables_touched: Vec::new(),
+            policy_summary: sqe_policy::PolicySummary::default(),
             profile_mode: ProfileMode::Off,
         }
     }
@@ -685,6 +709,45 @@ mod tests {
         let record = find_record(&tracker, qid);
         assert_eq!(record.state, QueryState::Finished);
         assert_eq!(record.output_rows, 35);
+    }
+
+    /// Fix 2 (streaming path): a masked / filtered / denied SELECT records the
+    /// policy-decision fields in its audit entry. The streaming finalizer copies
+    /// the `policy_summary` it was built with into the AuditEntry on success.
+    #[tokio::test]
+    async fn audit_entry_records_policy_summary_on_streaming_success() {
+        let (plan, schema, runtime) = trivial_plan().await;
+        let tracker = test_tracker();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let audit = Arc::new(
+            sqe_metrics::audit::AuditLogger::new(path.to_str().unwrap()).unwrap(),
+        );
+
+        let mut fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
+        fin.audit = Some(Arc::clone(&audit));
+        fin.policy_summary = sqe_policy::PolicySummary {
+            row_filters_applied: 1,
+            columns_masked: vec!["ssn".to_string()],
+            columns_restricted: vec!["notes".to_string()],
+            denied: false,
+        };
+        let qid = fin.query_id;
+        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![]);
+
+        let inner = fixed_stream(Arc::clone(&schema), vec![sample_batch(3)]);
+        let mut stream = TrackedRecordBatchStream::new(inner, fin, None);
+        while let Some(b) = stream.next().await {
+            let _ = b.unwrap();
+        }
+        drop(stream);
+        audit.flush();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("\"row_filters_applied\":1"), "got: {content}");
+        assert!(content.contains("\"columns_masked\":[\"ssn\"]"), "got: {content}");
+        assert!(content.contains("\"columns_restricted\":[\"notes\"]"), "got: {content}");
+        assert!(content.contains("\"policy_denied\":false"), "got: {content}");
     }
 
     #[tokio::test]

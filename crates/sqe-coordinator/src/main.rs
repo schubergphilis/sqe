@@ -250,8 +250,11 @@ async fn async_main() -> anyhow::Result<()> {
     // table_cache is passed so the rewriter can wire CacheTagSource for
     // tag-based column masking (Task 4). A clone is taken here; the original
     // is passed to with_table_cache() on the QueryHandler below.
-    let (policy_enforcer, policy_store) =
-        sqe_coordinator::policy_wiring::build_policy_enforcer(&config.policy, Some(table_cache.clone()))?;
+    let (policy_enforcer, policy_store) = sqe_coordinator::policy_wiring::build_policy_enforcer(
+        &config.policy,
+        Some(table_cache.clone()),
+        Some(Arc::clone(&metrics)),
+    )?;
     if config.policy.engine != sqe_core::config::PolicyEngine::Passthrough {
         tracing::info!(
             engine = ?config.policy.engine,
