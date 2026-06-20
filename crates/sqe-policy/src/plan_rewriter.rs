@@ -90,9 +90,30 @@ impl PolicyEnforcer for PolicyPlanRewriter {
         // multi-level Iceberg namespaces survive instead of being lost to a
         // naive split on '.' (issue #205).
         let mut table_refs: HashMap<String, datafusion::common::TableReference> = HashMap::new();
+        // Defense-in-depth for the `view-bypass-policy` finding. DataFusion 54
+        // inlines views into their base scans at `ctx.sql` planning time, so the
+        // rewriter normally sees the governed base `TableScan`. But a scan whose
+        // provider is still a `ViewTable` (a hand-built scan, or any residual
+        // un-inlined view) would be keyed by the VIEW name, whose policy is
+        // usually empty, leaking the base table raw. Mark such scans for a
+        // fail-closed deny rather than trusting the view-name policy.
+        let mut view_scans: HashSet<String> = HashSet::new();
         plan.apply(|node| {
             if let LogicalPlan::TableScan(scan) = node {
                 let table_name = scan.table_name.to_string();
+                if let Ok(provider) =
+                    datafusion::datasource::source_as_provider(&scan.source)
+                {
+                    // TableProvider has `Any` as a supertrait but no `as_any()`
+                    // method; upcast the reference to downcast to ViewTable.
+                    let any_provider: &dyn std::any::Any = provider.as_ref();
+                    if any_provider
+                        .downcast_ref::<datafusion::datasource::ViewTable>()
+                        .is_some()
+                    {
+                        view_scans.insert(table_name.clone());
+                    }
+                }
                 table_refs
                     .entry(table_name)
                     .or_insert_with(|| scan.table_name.clone());
@@ -104,6 +125,19 @@ impl PolicyEnforcer for PolicyPlanRewriter {
         // Resolve policies for all tables
         let mut table_policies: HashMap<String, ResolvedPolicy> = HashMap::new();
         for (table_name, table_ref) in &table_refs {
+            // Un-inlined view scan: deny rather than govern by the (ungoverned)
+            // view name. See `view_scans` above.
+            if view_scans.contains(table_name) {
+                warn!(
+                    user = %username,
+                    table = %table_name,
+                    "Un-inlined view scan reached the rewriter; denying access (fail-closed)"
+                );
+                let mut deny = ResolvedPolicy::default();
+                deny.row_filters.push(lit(false));
+                table_policies.insert(table_name.clone(), deny);
+                continue;
+            }
             // Derive the (namespace, table) policy key from the structured
             // reference. This MUST match the write path's scheme
             // (write_handler.rs keys by `namespace().last()`), otherwise

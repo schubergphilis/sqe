@@ -3,7 +3,7 @@
 - **ID:** view-bypass-policy
 - **Pillar:** Security
 - **Severity:** P0/Critical
-- **Status:** Open
+- **Status:** Resolved (WA review batch 5). The original diagnosis assumed DataFusion's `InlineTableScan` analyzer runs during optimization (after `evaluate`). On DataFusion 54 that rule was removed and view inlining moved into `LogicalPlanBuilder` at `ctx.sql` planning time, so `SELECT * FROM v` already produces `Projection -> SubqueryAlias(v) -> TableScan(base)` BEFORE `evaluate`. The rewriter therefore sees and governs the base `TableScan`. Verified by `crates/sqe-policy/tests/view_bypass_policy.rs` (row filter + mask apply through single, projecting, and nested views). Defense-in-depth added: if the rewriter ever encounters a `TableScan` whose provider is still a `ViewTable` (a hand-built scan or any residual un-inlined view), it now fails closed (deny `lit(false)`) instead of governing by the ungoverned view name. A separate UX gap (restricted column + `SELECT *` errors instead of a clean deny) is filed as MED-restricted-column-select-star-ux.
 - **Files:** crates/sqe-coordinator/src/query_handler.rs:1749-1750; crates/sqe-catalog/src/schema_provider.rs:372; crates/sqe-policy/src/plan_rewriter.rs:91-100
 
 ## Problem
