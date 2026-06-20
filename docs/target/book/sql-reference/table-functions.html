@@ -1,0 +1,385 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Table-valued functions - SQE — Sovereign Query Engine</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-ae938929.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "navy";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex-13c61270.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-91ed1b0b.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">SQE — Sovereign Query Engine</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/schuberg/sqe" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="table-valued-functions"><a class="header" href="#table-valued-functions">Table-valued functions</a></h1>
+<p>A TVF returns a table you can use in a <code>FROM</code> clause. SQE ships two families:</p>
+<ol>
+<li><strong>File format readers</strong>: <code>read_parquet</code>, <code>read_csv</code>, <code>read_json</code>, <code>read_delta</code>. Implemented in <code>crates/sqe-catalog/</code>.</li>
+<li><strong>Iceberg metadata readers</strong>: <code>table_snapshots</code>, <code>table_history</code>, <code>table_files</code>, <code>table_partitions</code>, <code>table_manifests</code>, <code>table_refs</code>. Implemented in <code>crates/sqe-catalog/src/iceberg_metadata_tvf.rs</code>.</li>
+</ol>
+<p>DataFusion contributes the generators (<code>generate_series</code>, <code>unnest</code>) and the URL-table auto-detect path (<code>SELECT * FROM 'file.parquet'</code>).</p>
+<h2 id="file-format-tvfs"><a class="header" href="#file-format-tvfs">File format TVFs</a></h2>
+<p>Detailed per-function docs: <a href="../features/file-format-tvfs.html">File-format TVFs</a>, <a href="../features/read-parquet.html">read_parquet TVF</a>. Quick reference here.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>TVF</th><th>Origin</th><th>Notes</th><th>Trino</th><th>Snowflake</th><th>Spark SQL</th><th>DuckDB</th></tr>
+</thead>
+<tbody>
+<tr><td><code>read_parquet(path, ...)</code></td><td><code>sqe-catalog</code></td><td>Parquet on local FS / S3 / HTTPS / <code>hf://</code>. Inline auth args. <code>read_parquet.rs</code></td><td>Hive table only</td><td><code>infer_schema</code>+stage</td><td><code>parquet</code> source</td><td><code>read_parquet</code></td></tr>
+<tr><td><code>read_csv(path, ...)</code></td><td><code>sqe-catalog</code></td><td>DuckDB-style aliases (<code>sep</code>, <code>delim</code>, <code>header</code>, <code>nullstr</code>, <code>compress</code>). Smart defaults from extension. <code>read_csv.rs</code></td><td>-</td><td><code>infer_schema</code>+stage</td><td><code>csv</code> source</td><td><code>read_csv</code></td></tr>
+<tr><td><code>read_json(path, ...)</code></td><td><code>sqe-catalog</code></td><td>NDJSON (one document per line). <code>read_json.rs</code></td><td>-</td><td>-</td><td><code>json</code> source</td><td><code>read_json</code></td></tr>
+<tr><td><code>read_delta(path, ...)</code></td><td><code>sqe-catalog</code></td><td>Read-only Delta Lake reader. Time travel via <code>version =&gt; N</code> or <code>timestamp =&gt; 'RFC3339'</code>. <code>read_delta.rs</code></td><td>via connector</td><td>-</td><td>native</td><td>via extension</td></tr>
+<tr><td><code>SELECT * FROM 'file.ext'</code></td><td><code>datafusion-builtin</code></td><td>Quoted-string auto-detect. Dispatches by extension to one of the readers above. Requires <code>enable_url_table()</code>.</td><td>-</td><td>-</td><td>-</td><td>yes</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="common-arguments"><a class="header" href="#common-arguments">Common arguments</a></h3>
+<p>All four file readers accept the same path scheme set: local, S3, HTTPS, <code>hf://</code>. Arguments are positional path + named keyword arguments:</p>
+<pre><code class="language-sql">SELECT * FROM read_parquet(
+    's3://bucket/key.parquet',
+    access_key =&gt; 'AKIA...',
+    secret_key =&gt; '...',
+    endpoint =&gt; 'http://localhost:9000',
+    region =&gt; 'us-east-1'
+);
+</code></pre>
+<p>The full keyword list per reader lives in <a href="../features/file-format-tvfs.html">File-format TVFs</a>. The same shape works for <code>read_csv</code>, <code>read_json</code>, <code>read_delta</code>.</p>
+<h3 id="path-schemes"><a class="header" href="#path-schemes">Path schemes</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Scheme</th><th>Auth</th><th>Example</th></tr>
+</thead>
+<tbody>
+<tr><td>Local</td><td>filesystem perms</td><td><code>/data/sales.parquet</code></td></tr>
+<tr><td><code>s3://</code></td><td>inline args, <code>[storage]</code> block, or AWS provider chain (V10)</td><td><code>s3://bucket/key.parquet</code></td></tr>
+<tr><td><code>https://</code></td><td>session bearer for HF, otherwise public</td><td><code>https://example.com/data.csv</code></td></tr>
+<tr><td><code>hf://datasets/&lt;org&gt;/&lt;name&gt;/...</code></td><td><code>HF_TOKEN</code> env var, optional <code>?revision=</code></td><td><code>hf://datasets/squad/plain_text/train.parquet</code></td></tr>
+<tr><td><code>hf://...@v1.0/...</code></td><td>revision inline (V12.1)</td><td><code>hf://datasets/foo/bar@v1.0/train.parquet</code></td></tr>
+<tr><td><code>hf://...@~parquet/...</code></td><td>auto-generated parquet view (V12.1)</td><td><code>hf://datasets/foo/bar@~parquet/default/train/0.parquet</code></td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="iceberg-metadata-tvfs"><a class="header" href="#iceberg-metadata-tvfs">Iceberg metadata TVFs</a></h2>
+<p>Six TVFs that expose Iceberg internal state without leaving SQL. Useful for observability, audit, planning.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>TVF</th><th>Origin</th><th>Returns</th><th>Trino</th><th>Snowflake</th><th>Spark SQL</th></tr>
+</thead>
+<tbody>
+<tr><td><code>table_snapshots(ns, table)</code></td><td><code>sqe-catalog</code></td><td>One row per snapshot. Columns: <code>snapshot_id</code>, <code>parent_snapshot_id</code>, <code>timestamp_ms</code>, <code>operation</code>, <code>summary</code>. <code>iceberg_metadata_tvf.rs:93</code></td><td><code>t$snapshots</code></td><td>-</td><td><code>t.snapshots</code></td></tr>
+<tr><td><code>table_history(ns, table)</code></td><td><code>sqe-catalog</code></td><td>Linear snapshot history. Columns: <code>made_current_at</code>, <code>snapshot_id</code>, <code>parent_id</code>, <code>is_current_ancestor</code>. <code>iceberg_metadata_tvf.rs:356</code></td><td><code>t$history</code></td><td>-</td><td><code>t.history</code></td></tr>
+<tr><td><code>table_files(ns, table)</code></td><td><code>sqe-catalog</code></td><td>One row per data file in the current snapshot. Columns: <code>content</code>, <code>file_path</code>, <code>partition</code>, <code>record_count</code>, <code>file_size_in_bytes</code>. <code>iceberg_metadata_tvf.rs:469</code></td><td><code>t$files</code></td><td>-</td><td><code>t.files</code></td></tr>
+<tr><td><code>table_manifests(ns, table)</code></td><td><code>sqe-catalog</code></td><td>One row per manifest in the current snapshot. <code>iceberg_metadata_tvf.rs:217</code></td><td><code>t$manifests</code></td><td>-</td><td><code>t.manifests</code></td></tr>
+<tr><td><code>table_partitions(ns, table)</code></td><td><code>sqe-catalog</code></td><td>Per-partition aggregate. <code>iceberg_metadata_tvf.rs:622</code></td><td><code>t$partitions</code></td><td>-</td><td><code>t.partitions</code></td></tr>
+<tr><td><code>table_refs(ns, table)</code></td><td><code>sqe-catalog</code></td><td>One row per branch / tag. Columns: <code>name</code>, <code>type</code>, <code>snapshot_id</code>, <code>max_ref_age_ms</code>. <code>iceberg_metadata_tvf.rs:768</code></td><td><code>t$refs</code></td><td>-</td><td><code>t.refs</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Trino’s <code>table$snapshots</code> syntax is also accepted; <code>crates/sqe-coordinator/src/query_handler.rs</code> rewrites it to the TVF call.</p>
+<pre><code class="language-sql">-- DuckDB / Trino-style $-syntax
+SELECT * FROM analytics."events$snapshots";
+
+-- Equivalent SQE TVF call
+SELECT * FROM table_snapshots('analytics', 'events');
+</code></pre>
+<h3 id="examples"><a class="header" href="#examples">Examples</a></h3>
+<p>What’s the current snapshot’s row count?</p>
+<pre><code class="language-sql">SELECT SUM(record_count) AS rows
+FROM table_files('analytics', 'events');
+</code></pre>
+<p>When did each branch fork?</p>
+<pre><code class="language-sql">SELECT name, type, snapshot_id
+FROM table_refs('analytics', 'events')
+WHERE type = 'branch';
+</code></pre>
+<p>How big are recent snapshots in megabytes?</p>
+<pre><code class="language-sql">SELECT
+    snapshot_id,
+    summary['added-files-size'] AS added_bytes,
+    summary['total-files-size'] AS total_bytes
+FROM table_snapshots('analytics', 'events')
+ORDER BY timestamp_ms DESC
+LIMIT 10;
+</code></pre>
+<p>The <code>summary</code> column is a <code>MAP&lt;VARCHAR, VARCHAR&gt;</code>; cast values numerically when needed.</p>
+<h2 id="generators-datafusion-built-ins"><a class="header" href="#generators-datafusion-built-ins">Generators (DataFusion built-ins)</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Function</th><th>Origin</th><th>Notes</th><th>Trino</th><th>Snowflake</th><th>Spark SQL</th><th>DuckDB</th></tr>
+</thead>
+<tbody>
+<tr><td><code>generate_series(start, stop)</code></td><td><code>datafusion-builtin</code></td><td>Integer sequence, inclusive both ends.</td><td><code>sequence</code></td><td><code>sequence</code></td><td><code>sequence</code></td><td><code>generate_series</code></td></tr>
+<tr><td><code>generate_series(start, stop, step)</code></td><td><code>datafusion-builtin</code></td><td>With step. Negative step counts down.</td><td><code>sequence</code></td><td>-</td><td>-</td><td><code>generate_series</code></td></tr>
+<tr><td><code>range(start, stop)</code> / <code>range(start, stop, step)</code></td><td><code>datafusion-builtin</code></td><td>Half-open: includes <code>start</code>, excludes <code>stop</code>.</td><td>-</td><td>-</td><td>-</td><td><code>range</code></td></tr>
+<tr><td><code>unnest(array)</code></td><td><code>datafusion-builtin</code></td><td>Lateral expansion: one input row -&gt; N output rows.</td><td><code>unnest</code></td><td><code>flatten</code></td><td><code>explode</code></td><td><code>unnest</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Examples:</p>
+<pre><code class="language-sql">SELECT * FROM generate_series(1, 5);
+-- 1, 2, 3, 4, 5
+
+SELECT day FROM generate_series(DATE '2026-05-01', DATE '2026-05-07') AS t(day);
+-- 7 dates, May 1 through May 7
+
+SELECT id, value FROM orders, UNNEST(items) AS t(value);
+-- Lateral unnest: one row per (order, item)
+</code></pre>
+<h2 id="quoted-string-auto-detect"><a class="header" href="#quoted-string-auto-detect">Quoted-string auto-detect</a></h2>
+<p><code>SELECT * FROM '&lt;path&gt;'</code> works as a shortcut when the path’s extension is recognised:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Extension</th><th>Dispatches to</th></tr>
+</thead>
+<tbody>
+<tr><td><code>.parquet</code></td><td><code>read_parquet</code></td></tr>
+<tr><td><code>.csv</code>, <code>.tsv</code>, <code>.psv</code>, <code>.ssv</code> (with optional <code>.gz</code> / <code>.bz2</code> / <code>.xz</code> / <code>.zst</code>)</td><td><code>read_csv</code></td></tr>
+<tr><td><code>.json</code>, <code>.jsonl</code>, <code>.ndjson</code> (with optional codec suffix)</td><td><code>read_json</code></td></tr>
+<tr><td><code>.avro</code></td><td>DataFusion’s avro reader</td></tr>
+</tbody>
+</table>
+</div>
+<p>The mechanism is DataFusion’s <code>enable_url_table()</code> SessionConfig, called at <code>crates/sqe-cli/src/embedded.rs:158</code>. Auto-detect works in cluster mode too.</p>
+<pre><code class="language-sql">-- All three are equivalent (assuming the file is a CSV)
+SELECT * FROM read_csv('/data/sales.csv');
+SELECT * FROM '/data/sales.csv';
+SELECT * FROM 'hf://datasets/squad/plain_text/train.csv';
+</code></pre>
+<h2 id="when-to-register-vs-query-directly"><a class="header" href="#when-to-register-vs-query-directly">When to register vs query directly</a></h2>
+<p>A <code>read_*</code> TVF call reads on every query. Two cases where registering as a table is better:</p>
+<ol>
+<li><strong>Repeated queries</strong>: register once via <code>CREATE TABLE foo AS SELECT * FROM read_parquet(...)</code> so subsequent queries skip the URL fetch.</li>
+<li><strong>You need writes</strong>: TVFs are read-only. Writes need a catalog-registered Iceberg table.</li>
+</ol>
+<p>For ad-hoc analytics on a one-shot file, the TVF is faster: no schema decision, no commit, no metadata.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../sql-reference/window.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../sql-reference/ddl.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../sql-reference/window.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../sql-reference/ddl.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../mermaid-eefea253.min.js"></script>
+        <script src="../mermaid-init-ccf746f1.js"></script>
+
+
+
+    </div>
+    </body>
+</html>
