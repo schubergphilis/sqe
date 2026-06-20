@@ -1296,7 +1296,7 @@ mod tests {
             roles: vec![],
         };
 
-        let rewritten = rewriter
+        let (rewritten, _summary) = rewriter
             .evaluate(&user, scan)
             .await
             .expect("rewrite with sibling-referencing CUSTOM mask must succeed");
