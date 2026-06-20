@@ -1,119 +1,343 @@
-# SQE Roadmap
+# Roadmap
 
-## Iceberg matrix coverage
+SQE is developed in phases, each building on the previous.
 
-**Score: 167/189 (88.4%)** on the public [icebergmatrix.org](https://icebergmatrix.org) scoreboard, fifth overall behind only Spark distributions (EMR, AWS Glue, OSS Spark, Dataproc). See [`docs/iceberg-matrix.md`](iceberg-matrix.md) for the per-cell breakdown and [`docs/iceberg-matrix-compare.md`](iceberg-matrix-compare.md) for the V2/V3 comparison against every other engine on the public scoreboard.
+## Phase Overview
 
-## Completed
+```mermaid
+gantt
+    title SQE Implementation Phases
+    dateFormat YYYY-MM
+    axisFormat %b %Y
 
-### Engine
+    section Core
+    Phase 1 - Single Node        :done, p1, 2026-01, 2026-02
+    Phase 2 - Write Path         :done, p2, 2026-02, 2026-03
+    Phase 3 - Row-Level Writes   :done, p3, 2026-03, 2026-04
 
-- [x] Single-node query engine (DataFusion + iceberg-rust + OIDC + Flight SQL)
-- [x] Distributed execution (coordinator-worker, shuffle, spill-to-disk)
-- [x] DataFusion 54 upgrade (RepartitionExec throughput, hash-join dynamic comparator, faster semi/anti joins; `as_any` blanket-downcast port; `foldhash` shuffle hasher; sqlparser pin aligned to 0.62 so a single parser ships and SQE shares DataFusion's grammar)
-- [x] DataFusion 53.1 upgrade (40x faster planning, hash join dynamic filters, three filter-pushdown bug fixes from 53.0 -> 53.1)
-- [x] Vendored iceberg-rust fork: DF 53 rebase of `risingwavelabs/iceberg-rust` ported in-tree to DF 54 (apache main + RW rebase branch are both still on DF 53; apache PR #2648 open); AWS SigV4 cargo feature for federated REST endpoints
-- [x] Streaming writes (constant-memory CTAS/INSERT, no OOM on SF1+)
-- [x] CoW DML scales to TPC-E SF10+ (`IN (subquery)` lifted to a scratch-MemTable + LEFT JOIN; plan size O(1) in subquery cardinality, no stack overflow at 34K+ tuples)
-- [x] Trino UDFs split into `sqe-trino-functions` crate (4,175 LOC moved; coordinator incremental builds skip UDF recompile)
-- [x] macOS dev build config: `jobs = 8`, `ld64.lld` linker (2-3x faster link on M-series)
-- [x] 5-layer metadata caching (SessionContext, RestCatalog, table metadata, manifest, footer)
-- [x] ETag validation with Polaris (30-50% fewer REST calls)
-- [x] ZSTD compression (shuffle, Parquet writes, Flight SQL responses)
-- [x] Star-schema join reorder optimizer rule
-- [x] Dynamic filter pushdown with type coercion
-- [x] Runtime filter pushdown into IcebergTableScan (TPC-H SF1 -21.3%, SF10 -12.4%)
-- [x] Broadcast threshold 64MB (matches Trino/Spark)
-- [x] Table statistics from Iceberg snapshot for CBO
+    section Scale
+    Phase 3b - Benchmarks        :done, p3b, 2026-03, 2026-04
+    Phase 4 - Pluggable Auth     :done, p4, 2026-03, 2026-04
+    Phase 4b - Streaming/Distributed :done, p4b, 2026-04, 2026-04
 
-### SQL surface
+    section Shipped
+    Phase 2c - dbt Compatibility :done, p2c, 2026-03, 2026-04
+    Phase 5 - Pluggable Catalogs :done, p5, 2026-04, 2026-05
+    Phase 7 - Iceberg V3         :done, p7, 2026-04, 2026-05
+    Phase 9 - OpenLineage        :done, p9, 2026-05, 2026-05
 
-- [x] Trino SQL compatibility ~96% (70+ UDFs, USE, SHOW CREATE TABLE, TRUNCATE, etc.)
-- [x] Arrow Flight SQL (DoPut, DoExchange shuffle, GetTableTypes, GetXdbcTypeInfo)
-- [x] Trino HTTP compatibility (pagination, headers, dual auth, system.jdbc.*)
-- [x] Full DML: CTAS, INSERT INTO, DELETE, UPDATE, MERGE INTO (Copy-on-Write default)
-- [x] Merge-on-Read DELETE via `TBLPROPERTIES ('write.delete.mode' = 'merge-on-read')`: position-delete writer (no PK), equality-delete writer (with PK), commits via `FastAppendAction` / `RowDeltaAction`
-- [x] JSON columns (alias to Utf8; CAST(json_col AS T) rides DataFusion coercion; full json_extract / json_get_* family)
-- [x] TIME / TIME(p) columns mapped to `Time64(Microsecond)`; `localtime()`, `hour() / minute() / second()` work on TIME; `year() / month() / day()` raise plan errors per Trino spec
-- [x] Iceberg time travel (FOR SYSTEM_TIME AS OF + FOR VERSION AS OF)
-- [x] Iceberg metadata TVFs (snapshots, manifests, history, files, partitions, refs)
-- [x] ALTER TABLE schema evolution (ADD/DROP/RENAME COLUMN, type widening, partition evolution)
-- [x] PARTITIONED BY for the six standard Iceberg transforms (identity, year, month, day, hour, bucket, truncate, void)
-- [x] V3 features end-to-end (TIMESTAMP_NS, column defaults, equality-delete UPDATE on identifier-fields, partition evolution, branching/tagging)
+    section Next
+    Phase 6 - Security Policies  :p6, 2026-05, 2026-07
+    Phase 8 - Trino Decommission :p8, 2026-07, 2026-09
+```
 
-### File-format TVFs and embedded persona (V8 through V12.1)
+---
 
-- [x] V8: `read_parquet` / `read_csv` / `read_json` / `read_avro` TVFs; `SELECT * FROM 'file.ext'` quoted-string auto-detect; `COPY (...) TO 'path' (FORMAT ...)` (DuckDB-parity)
-- [x] V9: `.describe`, `.summarize`, `.tables`, `.catalogs`, `.timer`, `.format`, `.read` dot-commands; `SELECT * EXCLUDE` / `REPLACE` documented (DataFusion-native)
-- [x] V10: `LazyHttpObjectStoreRegistry` lazy HTTPS object-store; HuggingFace `hf://(datasets|models|spaces)/<owner>/<name>/<path>?revision=<rev>` resolver; AWS provider chain fallback for embedded mode
-- [x] V11: `read_delta()` TVF (deltalake-core 0.32.1; time travel via `version` / `timestamp`) -- temporarily disabled on the DataFusion 54 bump (delta-rs has no DF 54 release yet; module kept on disk, re-enable when it ships)
-- [x] V12: `'hf://...'` quoted-string auto-detect via SQL pre-rewriter
-- [x] V12.1: hf:// inline `@<rev>` revision spec + `@~parquet` auto-generated parquet view (`refs/convert/parquet`)
-- [x] V12 follow-up: smart `read_csv` (extension-based delimiter/codec, DuckDB-style `sep`/`delim`/`header`/`nullstr`/`compress` aliases)
-- [x] HuggingFace tree-API cache module with TTL + `Link` pagination (V12.2 prerequisite)
+## Phase 1 - Single-Node Engine (Done)
 
-### Catalogs
+The foundation: a working SQL engine that queries Iceberg tables through Polaris with Keycloak auth.
 
-- [x] Apache Polaris (Iceberg REST, default)
-- [x] Project Nessie via Iceberg REST (live test against `ghcr.io/projectnessie/nessie:0.107.5`)
-- [x] Unity Catalog OSS via Iceberg REST adapter (live test against `unitycatalog/unitycatalog:main-2f2e32d`)
-- [x] AWS Glue native SDK (live test against AWS account 123456789012 in eu-central-1)
-- [x] AWS S3 Tables native SDK (live test against eu-west-1 testtablebucket/testnamespace/daily_sales)
-- [x] AWS Glue / S3 Tables via federated Iceberg REST + SigV4 (alternative path)
-- [x] Hive Metastore (Thrift, live test against `apache/hive:standalone-metastore-4.1.0`)
-- [x] JDBC: PostgreSQL, MySQL, SQLite (live test against `docker-compose.test.yml` postgres at V2 and V3)
-- [x] Hadoop storage-only (warehouse path scanner, read-only)
-- [x] Generic loader dispatch through upstream `iceberg-catalog-loader` factory; per-backend wrapper code deleted
-- [x] Runtime catalog mounting via SQL `ATTACH` / `DETACH` and credential management via `CREATE` / `DROP` / `SHOW SECRETS` (DuckDB-shape syntax; same six backends plus SQLite for local prototyping). See `docs/book/src/operations/catalogs.md`.
+- DataFusion query execution
+- Keycloak OIDC authentication (ROPC grant)
+- Per-session catalog with bearer token passthrough
+- Arrow Flight SQL server
+- CLI client (`sqe-cli`)
+- `SELECT`, `SHOW CATALOGS/SCHEMAS/TABLES`, `EXPLAIN`
+- Prometheus metrics + structured JSON logging
 
-### Auth and security
+## Phase 2 - Write Path & Views (Done)
 
-- [x] Pluggable auth (OIDC, bearer, API key, mTLS, anonymous, AWS IAM, device code, token exchange)
-- [x] GRANT/REVOKE/SHOW GRANTS SQL via platform API
-- [x] Security audit: 43/43 findings resolved
+SQL write operations and catalog DDL.
 
-### Observability and tooling
+- `CREATE TABLE AS SELECT`
+- `CREATE OR REPLACE TABLE`
+- `INSERT INTO SELECT`
+- `CREATE VIEW` / `DROP VIEW`
+- `CREATE SCHEMA` / `DROP SCHEMA`
+- `DROP TABLE` / `DROP TABLE IF EXISTS`
+- Parquet writer (to S3 via Iceberg)
+- Audit logging (JSONL)
+- OpenTelemetry export (OTLP/gRPC)
+- Trino-compatible HTTP endpoint
 
-- [x] Benchmark suite: 7 suites, 222 queries, `--compare-trino`
-- [x] SF1 + SF10 differential validation vs Trino on a dedicated rig (single-node + 2-worker distributed), re-confirmed on DataFusion 54; per-query compare reports committed under `benchmarks/results/`
-- [x] Parallel + streaming TPC-H data generation (SF1000 in 6:23 on 32 cores)
-- [x] dbt adapter (dbt-sqe via ADBC Flight SQL)
-- [x] OpenTelemetry + Prometheus + JSON audit log + `system.runtime.queries` virtual table
-- [x] OpenLineage 2-0-2 emitter (`sqe-lineage` crate; column-level lineage on INSERT/CTAS/MERGE/UPDATE/DELETE/DDL; file + HTTP sinks; disk-spool fallback; off by default). See `docs/book/src/operations/openlineage.md`.
-- [x] OSS release preparation (Apache 2.0, CONTRIBUTING.md, docs)
+## Phase 2c - dbt Compatibility (Done)
 
-## In Progress
+Native dbt support via `dbt-sqe` adapter over ADBC Flight SQL.
 
-- [x] Ranger fine-grained policy engine Phase 1: `RangerStore: PolicyStore` reads the `hive` Ranger service (download endpoint) and feeds the existing `PlanRewriter`; `MASK_NULL` column masking and row-filter expressions enforced at the `LogicalPlan` layer. Quickstart e2e demo in `quickstart/polaris-ranger-keycloak/`. Branch `feat/ranger-policy-store`.
-- [x] Ranger fine-grained policy engine Phase 2A: mask vocabulary (hash, partial show-first/last, date-truncation to year/month/day, full redact, custom expression); all masks execute through the physical planner with type preservation on Decimal, Timestamp, and Date32. Branch `feat/ranger-mask-vocabulary`.
-- [ ] Ranger fine-grained policy engine Phase 2B: session-context SQL functions (`current_user()` / `current_role()` in filter expressions), tag-based masking via Ranger tag policies
-- [ ] OPA/Cedar policy engine (row filters, column masks)
-- [ ] Helm chart for Kubernetes deployment
-- [ ] CoW DML scales to TPC-E SF100 (`cow-dml-parallel-streaming`: parallelise per-file rewrite + stream writes + drop double-WHERE; targets `trade_result_update_holding` under 120 s at SF100)
-- [ ] Parallel + streaming generation for the other 6 benchmarks (SSB, TPC-DS, TPC-C, TPC-E, TPC-BB, ClickBench)
-- [ ] Snowflake Horizon catalog: live integration test against a real Snowflake account (currently REST-compatible, no live test)
-- [ ] V12.2: custom `HfObjectStore` plugged into `LazyHttpObjectStoreRegistry` so `SELECT * FROM 'hf://datasets/foo/bar/**/*.parquet'` enumerates files via the HF tree API and the V12 SQL pre-rewriter retires (design in `docs/hf-glob-research.md`)
+- `information_schema` virtual providers (tables, schemata, columns)
+- `dbt-sqe` Python adapter (connection manager, materializations)
+- `ALTER TABLE RENAME`
+- dbt `table`, `view`, and append-only `incremental` materializations
+- `incremental` with `merge` strategy (CoW + MoR)
+- Adapter lives at `adapters/dbt-sqe/dbt/`
 
-## Planned
+---
 
-- [ ] SF100 scaling. The single-node tactics that win at SF1/SF10 (broadcast build sides, in-memory hash tables, single scan stream) invert at SF100. Needs memory-pool discipline under concurrency (cap concurrent sort consumers, bound per-consumer reservations, upstream proactive spill `apache/datafusion#17334`) and a proven multi-node distributed path. Generator must also stream row groups to disk first. Predicted failure modes and evidence in [`docs/perf/sf100-scaling-risks.md`](perf/sf100-scaling-risks.md).
-- [ ] **DataFusion 54 follow-up: ship physical dynamic filters to workers.** SQE currently ships hash-join dynamic filters to workers via a lossy physical-to-logical `Expr` conversion (`scan_pushdown.rs::physical_filter_to_logical`) that drops the hash-set membership, which is why SSB trails when distributed (the star-join selectivity lives in that membership set). DF 54 added `DynamicFilter` protobuf serialization (`datafusion-proto-54`). Gated on a feasibility spike: confirm a serialized `DynamicFilter` carries the membership set *after the build side seals it*, and that SQE can serialize at that point rather than shipping an empty placeholder. If it works, this is the direct fix for the SSB-distributed gap.
-- [ ] **DataFusion 54 follow-up: adopt native-scan wins into the vendored Iceberg reader.** `IcebergScanExec` bypasses DataFusion's native Parquet scan, so DF 54's scan-side improvements do not reach Iceberg queries: struct-field pushdown in the Parquet `RowFilter`, row-group reordering by statistics for TopK queries, and MIN/MAX resolution from Parquet metadata for single-mode aggregates. Port the worthwhile ones into `vendor/iceberg-rust/.../reader.rs`. (NDV-from-metadata is *not* replicable: Iceberg manifests carry min/max/null bounds, not distinct counts. Column min/max/null are already fed to the optimizer via `compute_table_statistics`.) Note: config-default audit (DF 53.1 vs 54) came back clean, so no default pinning is needed.
-- [ ] Full cost-based join enumeration (DataFusion upstream DF#3843)
-- [ ] Local data file block cache (Alluxio-style)
-- [ ] Iceberg Puffin bloom filter reading
-- [ ] Map-producing aggregates (`histogram`, `map_agg`, `multimap_agg`) via Arrow `MapBuilder` UDAFs
-- [ ] Sort-on-write enforcement (writer pass after planner)
-- [ ] Semantic AI layer (RDF/SPARQL, property graph, vector search)
-- [ ] Hash join spill support (DataFusion upstream DF#17267)
-- [ ] Azure ADLS Gen2 / GCS object stores (one-line `Cargo.toml` feature flip + `register_*_store_if_needed` helpers; tracked in [`cli-embedded.md`](cli-embedded.md))
-- [ ] Smart-CSV byte sampling (current `read_csv` infers delimiter / codec from path extension; DuckDB samples bytes for the same)
+## Phase 3 - Row-Level Writes (Done)
 
-## Blocked upstream
+DELETE FROM, UPDATE, and MERGE INTO are implemented via Copy-on-Write using the iceberg-rust fork vendored at `vendor/iceberg-rust/` (DF 53.1 + Arrow 58 rebase of `risingwavelabs/iceberg-rust`), which provides `rewrite_files()` transaction support.
 
-- [ ] Iceberg V3 Variant type (`apache/iceberg-rust#2188`, `apache/arrow-rs#7142`)
-- [ ] Iceberg V3 shredded Variant (`apache/arrow-rs#9790`)
-- [ ] Iceberg V3 Geometry types (DataFusion UDT `apache/datafusion#12644`)
-- [ ] Iceberg V3 Vector / Embedding types (spec not finalised)
-- [ ] Iceberg V3 row lineage (deferred upstream)
-- [ ] Multi-argument partition transforms on V3 (spec not stable)
+### Strategy: Copy-on-Write
+
+```mermaid
+graph TB
+    subgraph "Copy-on-Write (Implemented)"
+        READ["Read affected<br/>data files"] --> FILTER["Apply WHERE filter"]
+        FILTER --> REWRITE["Rewrite without<br/>deleted/modified rows"]
+        REWRITE --> COMMIT["Commit via<br/>rewrite_files()"]
+    end
+
+    subgraph "Merge-on-Read (Future)"
+        DELFILE["Write position<br/>delete files"] --> COMMITDEL["Commit via<br/>RowDeltaAction"]
+        COMMITDEL --> COMPACT["Background<br/>compaction"]
+    end
+
+    style READ fill:#6f9
+    style FILTER fill:#6f9
+    style REWRITE fill:#6f9
+    style COMMIT fill:#6f9
+```
+
+CoW rewrites affected data files entirely. MoR has shipped: set `TBLPROPERTIES ('write.delete.mode' = 'merge-on-read')` to opt in. SQE writes a position-delete file (no PK) or an equality-delete file (with PK) and commits via `FastAppendAction` / `RowDeltaAction`. CoW remains the default for backward compatibility.
+
+### Delivered
+
+- `DELETE FROM table WHERE condition` - removes matching rows; supports cross-table subqueries; DELETE without WHERE = truncate
+- `UPDATE table SET col = expr WHERE condition` - modifies matching rows; supports CASE WHEN transformations and cross-table subqueries
+- `MERGE INTO target USING source ON condition WHEN MATCHED/NOT MATCHED ...` - full outer join approach with WHEN MATCHED/NOT MATCHED clauses
+- All operations atomic via Iceberg snapshot isolation
+- dbt `incremental` with `merge` strategy
+- Integration tests against Polaris + MinIO
+- TPC-C write queries (17/17 pass), TPC-E write queries enabled
+
+### Iceberg Dependency
+
+Uses the iceberg-rust fork vendored at `vendor/iceberg-rust/` for `rewrite_files()`. When upstream apache/iceberg-rust ships `OverwriteAction` (tracked in Epic #2186), the dependency can be migrated back to the official crate.
+
+### SQE Changes
+
+| File | Change |
+|---|---|
+| `Cargo.toml` | Vendored iceberg-rust fork (DF 53 + Arrow 58 rebase) at `vendor/iceberg-rust/` |
+| `crates/sqe-coordinator/src/delete_handler.rs` | DELETE FROM execution via CoW |
+| `crates/sqe-coordinator/src/update_handler.rs` | UPDATE execution via CoW |
+| `crates/sqe-coordinator/src/merge_handler.rs` | MERGE INTO execution via CoW |
+| `crates/sqe-coordinator/src/query_handler.rs` | Routes Merge/Delete/Update to handlers |
+| `crates/sqe-coordinator/src/write_handler.rs` | Shared CoW rewrite logic |
+
+---
+
+## Phase 7 - Iceberg V3 (Done)
+
+Iceberg V3 table format support landed end-to-end. The vendored fork at `vendor/iceberg-rust/` is rebased onto DataFusion 53.1 + Arrow 58 and carries V3 spec coverage. SQE Iceberg matrix score: 167/189 = 88.4% (per `docs/iceberg-matrix.md`).
+
+### V3 Features Shipped
+
+| Feature | Status |
+|---|---|
+| Default values (`ALTER TABLE ADD COLUMN ... DEFAULT`) | Done |
+| Schema evolution (`ALTER TABLE ADD/DROP COLUMN`) | Done |
+| Nanosecond timestamps (`TIMESTAMP_NS`, `TIMESTAMPTZ_NS`) | Done |
+| Partition evolution | Done |
+| Equality deletes + position deletes (MoR) | Done |
+
+### V3 Features Still Blocked Upstream
+
+| Feature | Blocker |
+|---|---|
+| Variant type | iceberg-rust [#2188](https://github.com/apache/iceberg-rust/pull/2188) not merged |
+| Geometry type | DataFusion UDT [#12644](https://github.com/apache/datafusion/issues/12644) |
+| Vector / Embedding type | Iceberg V3 vector spec not finalised |
+| Multi-arg partition transforms | Iceberg Java spec alignment in progress |
+| Row lineage | Deferred upstream |
+
+### Other Hardening
+
+- Metadata cache invalidation on DDL
+- Large result-set streaming (Flight SQL `do_get` back-pressure)
+- Error messages tuned for catalog and auth failures
+- Partition pruning across all predicate types
+
+---
+
+## Phase 4b/4c - Distributed Execution (Done)
+
+Scale-out query execution with stateless workers. Implemented via streaming execution in two phases.
+
+```mermaid
+graph TB
+    subgraph Coordinator
+        PLAN["Query Planner"] --> STAGE["Stage Decomposition"]
+        STAGE --> SCHED["Scheduler"]
+    end
+
+    subgraph Workers
+        SCHED -->|ScanTask| W1["Worker 1"]
+        SCHED -->|ScanTask| W2["Worker 2"]
+        SCHED -->|ScanTask| W3["Worker 3"]
+    end
+
+    W1 <-->|DoExchange shuffle| W2
+    W2 <-->|DoExchange shuffle| W3
+    W1 -->|Arrow stream| MERGE["Multi-endpoint merge"]
+    W2 -->|Arrow stream| MERGE
+    W3 -->|Arrow stream| MERGE
+    MERGE --> CLIENT["Client"]
+```
+
+### Delivered
+
+- **Phase A (spill-to-disk):** FairSpillPool with watermarks, late materialization, file/page pruning, TopK, S3 I/O pipeline (coalescing, footer cache, prefetch), SortMergeJoin fallback
+- **Phase B (distributed):** DoExchange shuffle, distributed sort (range-partition with sampling), two-phase aggregation, distributed joins (broadcast, shuffle hash, pre-sorted merge, predicate transfer), multi-endpoint Flight SQL, stage decomposition
+- **Adaptive sort stripping** - memory-aware sort mode selection
+- **Metrics** - spill, shuffle, late-mat, pruning, time-to-first-row, S3 I/O, auth, write path
+
+### Benchmark Results (SF1, distributed 2-worker)
+
+| Suite | Pass Rate | Time | Speedup vs single |
+|---|---|---|---|
+| TPC-H | 22/22 | 13.5s | 2.1x |
+| TPC-DS | 98/99 | 36.1s | 2.8x |
+| SSB | 13/13 | 5.3s | 2.7x |
+| TPC-C | 17/17 | 8.6s | 2.6x |
+
+---
+
+## Phase 5 - Pluggable Catalogs (Done)
+
+`CatalogBackend` trait replaced the hard-coded Polaris REST catalog. Seven catalog backends ship today:
+
+| Backend | Status |
+|---|---|
+| Iceberg REST (Polaris, Lakeformation) | Done - default |
+| AWS Glue | Done |
+| Nessie | Done |
+| Hive Metastore (Thrift) | Done |
+| AWS S3 Tables | Done |
+| Snowflake Horizon (REST-compatible) | Done |
+| JDBC | Done |
+
+Multi-cloud storage via `object_store`: S3 (+ endpoint override for R2, Ceph, Garage, MinIO), Azure ADLS Gen2/Blob, GCS, local filesystem. Engine-side session-manager wiring for Delta + remaining edge cases is the only deferred item; tracked in `nextsteps.md`.
+
+---
+
+## Phase 6 - Security Policies (Planned)
+
+Fine-grained access control via LogicalPlan rewriting.
+
+- `PolicyEnforcer` implementations (OPA via Rego, Cedar)
+- `GRANT/REVOKE` with `ROWS WHERE` and `MASKED WITH`
+- `SHOW GRANTS` / `SHOW EFFECTIVE POLICY`
+- Column restriction (invisible columns)
+- Policy caching with TTL (moka)
+- No-information-leakage model (PostgreSQL RLS style)
+
+---
+
+## Phase 9 - OpenLineage Emitter (Done)
+
+Coordinator-side OpenLineage 2-0-2 emitter with column-level lineage. Off by default; zero hot-path overhead when disabled.
+
+- `sqe-lineage` crate: event types, observer, emitter task, file/HTTP/spool sinks, multi-catalog dataset extractor, column-lineage trace rules across 11 LogicalPlan node types
+- `OpenLineageConfig` in `sqe-core` with TOML + env-var overrides + startup validation
+- Hooks in `QueryHandler::execute_statement` (START / COMPLETE / FAIL)
+- Documented at `docs/book/src/operations/openlineage.md`
+
+Deferrals (documented): mTLS, per-event user-OIDC bearer forwarding, MERGE per-branch column annotations, embedded CLI emit, DDL hint extraction.
+
+---
+
+## Phase 10 - Performance & Reliability Testing (Planned)
+
+Validate SQE is production-ready through systematic benchmarking and reliability testing.
+
+### Performance Benchmarks
+
+```mermaid
+graph LR
+    subgraph "Benchmark Suite"
+        TPCH["TPC-H<br/>22 queries<br/>SF 10/100/1000"]
+        TPCDS["TPC-DS<br/>99 queries<br/>SF 10/100"]
+        CUSTOM["Custom workloads<br/>Iceberg-specific<br/>partition pruning"]
+    end
+
+    subgraph "Comparison Targets"
+        TRINO["Trino<br/>(current prod)"]
+        SQE["SQE"]
+        SPARK["Spark SQL<br/>(reference)"]
+    end
+
+    TPCH --> TRINO
+    TPCH --> SQE
+    TPCH --> SPARK
+    TPCDS --> TRINO
+    TPCDS --> SQE
+```
+
+| Benchmark | Scale Factors | Purpose |
+|---|---|---|
+| **TPC-H** | SF10, SF100, SF1000 | Standard analytical workload, join-heavy |
+| **TPC-DS** | SF10, SF100 | Complex analytics, subqueries, window functions |
+| **Iceberg-specific** | Varies | Partition pruning, metadata operations, time travel |
+| **Write path** | 1M, 10M, 100M rows | CTAS, INSERT, MERGE throughput |
+| **Concurrent users** | 10, 50, 100 sessions | Connection handling, session isolation |
+
+#### Key Metrics
+
+- **Query latency** - P50, P95, P99 per query
+- **Throughput** - queries/second under load
+- **Memory usage** - peak RSS per query complexity
+- **Startup time** - cold start to first query
+- **Scan speed** - GB/s from S3 (single-node vs distributed)
+
+#### Performance Targets
+
+| Metric | Target | Rationale |
+|---|---|---|
+| TPC-H SF100 geometric mean | Within 2x of Trino | Parity goal for migration |
+| Cold start to ready | < 2 seconds | K8s autoscaling responsiveness |
+| Peak memory (SF100 query) | < 4GB coordinator | Fit in standard K8s pod limits |
+| Concurrent session overhead | < 10MB per session | Support 100+ sessions |
+
+### Reliability Testing
+
+| Test | Method | What it validates |
+|---|---|---|
+| **Chaos: kill worker mid-query** | `kubectl delete pod` during scan | Coordinator retries/fails gracefully |
+| **Chaos: kill coordinator** | SIGKILL during query | In-flight queries fail cleanly, no data corruption |
+| **Chaos: Polaris unavailable** | Block network to Polaris | Graceful error, no hang, cached metadata still works |
+| **Chaos: Keycloak unavailable** | Block network to Keycloak | Existing sessions continue, new auth fails cleanly |
+| **Chaos: S3 latency spike** | tc netem delay on S3 | Query timeout, not hang |
+| **Memory pressure** | Large query + small memory limit | Spill-to-disk or clean OOM, no silent corruption |
+| **Token expiry during query** | Set very short token TTL | Refresh mid-query, or clean auth error |
+| **Concurrent DDL + DML** | CTAS while DROP TABLE on same table | Iceberg conflict detection, clean error |
+| **Long-running soak test** | 24h mixed workload | No memory leaks, no connection leaks, stable latency |
+
+### Profiling & Optimization
+
+- **CPU profiling** - `perf` + flamegraphs on hot queries
+- **Memory profiling** - `jemalloc` stats, allocation tracking
+- **I/O profiling** - S3 request counts, Parquet read amplification
+- **Query plan analysis** - DataFusion `EXPLAIN ANALYZE` for bottleneck identification
+
+### Deliverables
+
+- Automated benchmark harness (run TPC-H/DS, collect results, compare)
+- Performance regression CI (catch slowdowns before merge)
+- Published benchmark results: SQE vs Trino on identical data
+- Reliability test playbook with pass/fail criteria
+- Memory/CPU profiling report with optimization recommendations
+- Soak test (24h) passing without degradation
+
+---
+
+## Phase 8 - Trino Decommission (Future)
+
+Complete migration from Trino DCAF fork.
+
+- Full Trino wire protocol compatibility for remaining tools
+- Dashboard migration playbook (Superset, Grafana, etc.)
+- JDBC driver migration guide (Trino JDBC → Flight SQL JDBC)
+- Performance parity validation (benchmark comparison)
+- Runbook for operators
+- Trino fork sunset and decommission
