@@ -37,7 +37,7 @@ impl ExplainHandler {
             .map_err(|e| SqeError::Execution(format!("EXPLAIN planning failed: {e}")))?;
 
         let logical = df.logical_plan().clone();
-        let enforced = self
+        let (enforced, _policy_summary) = self
             .policy_enforcer
             .evaluate(&session.user, logical)
             .await?;
@@ -95,7 +95,7 @@ impl ExplainHandler {
         let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
 
         let policy_start = std::time::Instant::now();
-        let enforced = self
+        let (enforced, _policy_summary) = self
             .policy_enforcer
             .evaluate(&session.user, logical)
             .await?;
@@ -227,7 +227,7 @@ impl ExplainHandler {
         let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
 
         let policy_start = std::time::Instant::now();
-        let enforced = self
+        let (enforced, _policy_summary) = self
             .policy_enforcer
             .evaluate(&session.user, logical)
             .await?;

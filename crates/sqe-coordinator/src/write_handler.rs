@@ -564,7 +564,9 @@ impl WriteHandler {
         plan: LogicalPlan,
     ) -> sqe_core::Result<LogicalPlan> {
         match &self.policy_enforcer {
-            Some(enf) => enf.evaluate(&session.user, plan).await,
+            // The write path does not yet surface a policy summary to the audit
+            // log (deferred — see review note); discard it here.
+            Some(enf) => enf.evaluate(&session.user, plan).await.map(|(p, _summary)| p),
             None => Ok(plan),
         }
     }

@@ -26,7 +26,10 @@ use sqe_core::SessionUser;
 
 use crate::policy_expr::parse_sql_predicate;
 use crate::session_udf::SessionIdentity;
-use crate::{MaskType, NoopTagSource, PolicyEnforcer, PolicyStore, ResolvedPolicy, TagMaskSpec, TagSource};
+use crate::{
+    MaskType, NoopTagSource, PolicyEnforcer, PolicySummary, PolicyStore, ResolvedPolicy,
+    TagMaskSpec, TagSource,
+};
 
 /// Plan-rewriting policy enforcer. Uses a PolicyStore to resolve policies
 /// and rewrites the LogicalPlan accordingly.
@@ -74,7 +77,7 @@ impl PolicyEnforcer for PolicyPlanRewriter {
         &self,
         user: &SessionUser,
         plan: LogicalPlan,
-    ) -> sqe_core::Result<LogicalPlan> {
+    ) -> sqe_core::Result<(LogicalPlan, PolicySummary)> {
         let store = self.store.clone();
         let mask_key = self.mask_key.clone();
         let tag_source = self.tag_source.clone();
@@ -119,6 +122,21 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                 table_policies.insert(table_name.clone(), deny);
                 continue;
             };
+
+            // Diagnostic: log the EXACT (database, table) lookup keys sent to the
+            // policy store. `namespace` here is the flattened last dotted
+            // component of the schema (see `resolve_policy_key`), which is what
+            // Ranger `database` resource values must match. When a policy silently
+            // does not fire, operators compare `lookup_database` against the
+            // Ranger policy resource to catch a multi-level-namespace mismatch
+            // (e.g. schema "ns1.ns2" flattens to "ns2"). No row values are logged.
+            debug!(
+                user = %username,
+                full_ref = %table_name,
+                lookup_database = %namespace,
+                lookup_table = %table,
+                "Resolving policy with flattened lookup keys"
+            );
 
             match store.resolve(&user_clone, &table, &namespace).await {
                 Ok(mut policy) => {
@@ -242,6 +260,15 @@ impl PolicyEnforcer for PolicyPlanRewriter {
             }
         }
 
+        // Summarise what the resolved policies do, for the audit log. Folded
+        // out of `table_policies` here (we hold every ResolvedPolicy) so the
+        // coordinator can record per-query masked/restricted/denied state
+        // instead of a bare `status:"success"` with zero rows. `denied` is true
+        // when any scan carries a deny-all `lit(false)` row filter (resolve
+        // failure, breaker-open, unknown-tag state, or fully-restricted table);
+        // those sentinels are NOT counted in `row_filters_applied`.
+        let summary = summarise_policies(&table_policies);
+
         // Rewrite the plan
         let rewritten = plan
             .transform_down(|node| {
@@ -323,6 +350,14 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                                 // would return the raw TableScan (fail-open). Deny
                                 // instead: a `false` filter yields zero rows while
                                 // keeping the scan schema valid for the builder.
+                                // Structured WARN so this deny-all is visible in
+                                // logs (no expression bodies): the audit summary
+                                // already records the restricted column names.
+                                warn!(
+                                    user = %username,
+                                    table = %table_name,
+                                    "all columns restricted by policy; denying table (fail-closed)"
+                                );
                                 builder = builder.filter(lit(false)).map_err(|e| {
                                     datafusion::error::DataFusionError::Internal(format!(
                                         "Failed to create deny filter for fully-restricted table: {e}"
@@ -355,7 +390,50 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                 sqe_core::error::SqeError::Execution(format!("Plan rewrite failed: {e}"))
             })?;
 
-        Ok(rewritten.data)
+        Ok((rewritten.data, summary))
+    }
+}
+
+/// Fold the per-table resolved policies into a single audit summary.
+///
+/// `denied` is true when any policy injected a deny-all `lit(false)` row filter
+/// (resolve failure, breaker-open, unknown-tag state, or a column-isExcludes
+/// datamask). The `lit(false)` sentinel is excluded from `row_filters_applied`
+/// so the count reflects real, user-visible row filters only. Masked and
+/// restricted column names are deduplicated and sorted for stable audit output.
+fn summarise_policies(table_policies: &HashMap<String, ResolvedPolicy>) -> PolicySummary {
+    let deny = lit(false);
+    let mut row_filters_applied = 0usize;
+    let mut masked: HashSet<String> = HashSet::new();
+    let mut restricted: HashSet<String> = HashSet::new();
+    let mut denied = false;
+
+    for policy in table_policies.values() {
+        for f in &policy.row_filters {
+            if f == &deny {
+                denied = true;
+            } else {
+                row_filters_applied += 1;
+            }
+        }
+        for col in policy.column_masks.keys() {
+            masked.insert(col.clone());
+        }
+        for col in &policy.restricted_columns {
+            restricted.insert(col.clone());
+        }
+    }
+
+    let mut columns_masked: Vec<String> = masked.into_iter().collect();
+    columns_masked.sort();
+    let mut columns_restricted: Vec<String> = restricted.into_iter().collect();
+    columns_restricted.sort();
+
+    PolicySummary {
+        row_filters_applied,
+        columns_masked,
+        columns_restricted,
+        denied,
     }
 }
 
@@ -635,6 +713,46 @@ fn apply_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── summarise_policies (audit summary) tests ──────────────────────────────
+
+    #[test]
+    fn summary_counts_masks_filters_and_restrictions() {
+        let mut policy = ResolvedPolicy::default();
+        policy.row_filters.push(col("region").eq(lit("EU")));
+        policy.column_masks.insert("ssn".to_string(), MaskType::Hash);
+        policy.column_masks.insert("salary".to_string(), MaskType::Nullify);
+        policy.restricted_columns.push("notes".to_string());
+        let mut table_policies = HashMap::new();
+        table_policies.insert("sales.orders".to_string(), policy);
+
+        let s = summarise_policies(&table_policies);
+        assert_eq!(s.row_filters_applied, 1);
+        assert_eq!(s.columns_masked, vec!["salary".to_string(), "ssn".to_string()]);
+        assert_eq!(s.columns_restricted, vec!["notes".to_string()]);
+        assert!(!s.denied, "a real row filter is not a deny");
+    }
+
+    #[test]
+    fn summary_marks_denied_on_deny_all_filter() {
+        let mut policy = ResolvedPolicy::default();
+        policy.row_filters.push(lit(false));
+        let mut table_policies = HashMap::new();
+        table_policies.insert("sales.orders".to_string(), policy);
+
+        let s = summarise_policies(&table_policies);
+        assert!(s.denied, "lit(false) deny-all must set denied=true");
+        assert_eq!(
+            s.row_filters_applied, 0,
+            "the deny-all sentinel must not be counted as a real row filter"
+        );
+    }
+
+    #[test]
+    fn summary_default_when_no_policies() {
+        let table_policies: HashMap<String, ResolvedPolicy> = HashMap::new();
+        assert_eq!(summarise_policies(&table_policies), PolicySummary::default());
+    }
 
     // ── merge_tag_masks precedence tests ──────────────────────────────────────
 

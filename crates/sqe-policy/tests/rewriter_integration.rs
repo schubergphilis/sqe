@@ -169,7 +169,7 @@ async fn row_filter_and_mask_execute_over_qualified_multilevel_scan() {
     store.add_table_policy("ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
 
     // The step that failed before the fix: analyze + physical-plan + run.
     let batches = execute_multilevel(rewritten, mem).await;
@@ -193,7 +193,7 @@ async fn row_filter_injects_filter_above_scan() {
     store.add_table_policy("default", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter
+    let (rewritten, _summary) = rewriter
         .evaluate(&user("alice", &[]), plan)
         .await
         .unwrap();
@@ -222,7 +222,7 @@ async fn nullify_mask_on_bigint_executes_without_type_error() {
     store.add_table_policy("default", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter
+    let (rewritten, _summary) = rewriter
         .evaluate(&user("bob", &[]), plan)
         .await
         .unwrap();
@@ -245,7 +245,7 @@ async fn nullify_mask_on_decimal_executes_without_type_error() {
     store.add_table_policy("default", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("c", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("c", &[]), plan).await.unwrap();
     let batches = execute(rewritten, mem, "employees").await;
     let salary = batches[0].column_by_name("salary").unwrap();
     assert_eq!(salary.data_type(), &DataType::Decimal128(18, 2));
@@ -264,7 +264,7 @@ async fn nullify_mask_on_timestamp_executes_without_type_error() {
     store.add_table_policy("default", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("d", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("d", &[]), plan).await.unwrap();
     let batches = execute(rewritten, mem, "employees").await;
     let ts = batches[0].column_by_name("hired_at").unwrap();
     assert_eq!(
@@ -286,7 +286,7 @@ async fn redact_mask_on_string_column_returns_constant() {
     store.add_table_policy("default", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("e", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("e", &[]), plan).await.unwrap();
     let batches = execute(rewritten, mem, "employees").await;
     let ssn = batches[0]
         .column_by_name("ssn")
@@ -312,7 +312,7 @@ async fn restricted_column_is_dropped_from_projection() {
     store.add_table_policy("default", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("f", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("f", &[]), plan).await.unwrap();
     let batches = execute(rewritten, mem, "employees").await;
     let schema = batches[0].schema();
     assert!(
@@ -343,7 +343,7 @@ async fn all_columns_restricted_denies_instead_of_leaking() {
     store.add_table_policy("default", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("f", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("f", &[]), plan).await.unwrap();
     let batches = execute(rewritten, mem, "employees").await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(
@@ -375,7 +375,7 @@ async fn poisoned_policy_store_fails_closed_to_zero_rows() {
     let (mem, plan) = build_scan("employees");
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(PoisonStore));
-    let rewritten = rewriter.evaluate(&user("g", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("g", &[]), plan).await.unwrap();
 
     let batches = execute(rewritten, mem, "employees").await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -409,7 +409,7 @@ async fn multilevel_namespace_row_filter_is_applied() {
     store.add_table_policy("ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter
+    let (rewritten, _summary) = rewriter
         .evaluate(&user("alice", &[]), plan)
         .await
         .unwrap();
@@ -433,7 +433,7 @@ async fn multilevel_namespace_restriction_is_applied() {
     store.add_table_policy("ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("bob", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("bob", &[]), plan).await.unwrap();
 
     let s = format!("{}", rewritten.display_indent());
     assert!(
@@ -455,7 +455,7 @@ async fn multilevel_namespace_no_policy_still_passes_through() {
 
     let store = InMemoryPolicyStore::new();
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("carol", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("carol", &[]), plan).await.unwrap();
 
     let s = format!("{}", rewritten.display_indent());
     assert!(
@@ -473,7 +473,7 @@ async fn multilevel_namespace_poisoned_store_fails_closed() {
     let plan = build_multilevel_scan();
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(PoisonStore));
-    let rewritten = rewriter.evaluate(&user("dave", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("dave", &[]), plan).await.unwrap();
 
     let s = format!("{}", rewritten.display_indent());
     assert!(
@@ -522,7 +522,7 @@ async fn partial_mask_show_last4_on_ssn_over_qualified_multilevel_scan() {
     store.add_table_policy("ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
 
     let batches = execute_multilevel(rewritten, mem).await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -571,7 +571,7 @@ async fn date_show_year_on_timestamp_over_qualified_multilevel_scan() {
     store.add_table_policy("ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("bob", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("bob", &[]), plan).await.unwrap();
 
     let batches = execute_multilevel(rewritten, mem).await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -652,7 +652,7 @@ async fn date_show_year_on_date32_executes_and_truncates_to_jan1() {
     store.add_table_policy("ns", "t", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("eve", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("eve", &[]), plan).await.unwrap();
 
     // Register under catalog "cat", schema "ns" and execute.
     let ctx = SessionContext::new();
@@ -830,7 +830,7 @@ async fn tag_mask_applies_end_to_end() {
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store))
         .with_tag_source(Arc::new(fake_source));
-    let rewritten = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
 
     let batches = execute_multilevel(rewritten, mem).await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -878,7 +878,7 @@ async fn tag_source_receives_full_multilevel_namespace() {
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store))
         .with_tag_source(Arc::new(fake_source));
-    let rewritten = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
 
     // --- Identity assertion: namespace arg must be the full ["ns1","ns2"] ---
     // Assert before the async execute call so the MutexGuard is not held
@@ -945,7 +945,7 @@ async fn resource_mask_wins_over_tag_mask() {
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store))
         .with_tag_source(Arc::new(fake_source));
-    let rewritten = rewriter.evaluate(&user("bob", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("bob", &[]), plan).await.unwrap();
 
     let batches = execute_multilevel(rewritten, mem).await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -995,7 +995,7 @@ async fn unmappable_tag_restricts_column_fail_closed() {
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store))
         .with_tag_source(Arc::new(fake_source));
-    let rewritten = rewriter.evaluate(&user("carol", &[]), scan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("carol", &[]), scan).await.unwrap();
 
     let batches = execute_multilevel(rewritten, mem).await;
     let schema = batches[0].schema();
@@ -1027,7 +1027,7 @@ async fn unknown_tag_state_denies_all_rows() {
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store))
         .with_tag_source(Arc::new(fake_source));
-    let rewritten = rewriter.evaluate(&user("dave", &[]), scan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("dave", &[]), scan).await.unwrap();
 
     let batches = execute_multilevel(rewritten, mem).await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1080,7 +1080,7 @@ async fn reserved_virtual_refs_not_denied_on_unknown_tag_state() {
         let store = TagTestStore::new();
         let rewriter = PolicyPlanRewriter::new(Arc::new(store))
             .with_tag_source(Arc::new(fake_source));
-        let rewritten = rewriter.evaluate(&user("erin", &[]), plan).await.unwrap();
+        let (rewritten, _summary) = rewriter.evaluate(&user("erin", &[]), plan).await.unwrap();
 
         // Execute against a context registering exactly this ref.
         let ctx = SessionContext::new();
@@ -1179,7 +1179,7 @@ async fn session_fn_row_filter_admin_sees_all_rows_and_folds_to_literal() {
     // SessionUser roles do not affect InMemoryPolicyStore resolution; the
     // SessionIdentity baked into the UDF is what matters for fold behavior.
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("carol", &["admin"]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("carol", &["admin"]), plan).await.unwrap();
 
     // --- (a) end-to-end correctness: admin sees all 3 rows ---
     let mem_for_exec = Arc::clone(&mem);
@@ -1232,7 +1232,7 @@ async fn session_fn_row_filter_analyst_sees_eu_only_and_folds_to_literal() {
     store.add_table_policy("ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("dave", &["analyst"]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("dave", &["analyst"]), plan).await.unwrap();
 
     // --- (a) end-to-end correctness: analyst sees only 2 EU rows ---
     let mem_for_exec = Arc::clone(&mem);
@@ -1307,7 +1307,7 @@ async fn partial_mask_on_non_string_falls_back_to_typed_null_over_qualified_mult
     store.add_table_policy("ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("carol", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("carol", &[]), plan).await.unwrap();
 
     let batches = execute_multilevel(rewritten, mem).await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
