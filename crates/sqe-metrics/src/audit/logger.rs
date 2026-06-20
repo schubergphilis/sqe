@@ -1,4 +1,5 @@
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use chrono::DateTime;
@@ -9,8 +10,37 @@ use super::chain::HashChain;
 use super::event::{
     Actor, AuditEvent, AuditKind, Integrity, Outcome, PolicyAudit, QueryInfo, QueryStats, Timing,
 };
-use super::redact_pii;
+use super::redact::{mask_gdpr_columns, redact_pii, strip_sql_literals, GdprIdentifierMode};
 use super::sink::{AuditFormat, AuditSink, NativeJsonlSink, OcsfJsonlSink};
+use super::tag_lookup::TagLookup;
+
+/// Snapshot of GDPR masking config captured from the writer thread per recv.
+///
+/// Tuple: `(gdpr_tags, identifier_mode, salt, lookup)`. Kept as a type alias
+/// so the complex type appears once rather than at every function boundary.
+type GdprSnap = (Vec<String>, GdprIdentifierMode, String, Arc<dyn TagLookup>);
+
+/// Configuration for GDPR-tag masking on the audit writer thread.
+///
+/// Held behind `Arc<Mutex<Option<GdprConfig>>>` so the builder method
+/// `with_gdpr` can set it after the worker thread has already been spawned.
+/// The worker reads a snapshot on each event batch; there is no hot-path
+/// lock contention because tag config is write-once at startup.
+struct GdprConfig {
+    /// Tag labels that mark a column as GDPR-sensitive. A column whose tag set
+    /// intersects this list will have its identifier (and adjacent literals)
+    /// masked before the event reaches the chain.
+    tags: Vec<String>,
+    /// How tagged identifiers are represented after masking.
+    mode: GdprIdentifierMode,
+    /// Stable per-deployment salt used by `Tokenize` mode. Not secret-grade;
+    /// it makes tokens correlatable across log lines within a deployment but
+    /// will differ across restarts when derived at startup.
+    salt: String,
+    /// Tag lookup backend. The coordinator wires `AuditTagAdapter` wrapping
+    /// `CacheTagSource`; tests inject a stub.
+    lookup: Arc<dyn TagLookup>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AuditEntry {
@@ -179,7 +209,10 @@ enum AuditMsg {
 
 pub struct AuditLogger {
     tx: Option<Sender<AuditMsg>>,
-    worker: std::sync::Mutex<Option<JoinHandle<()>>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+    /// Shared with the worker thread. `None` until `with_gdpr` is called;
+    /// the worker reads a snapshot each time it processes events.
+    gdpr: Arc<Mutex<Option<GdprConfig>>>,
 }
 
 /// Derive the OCSF file path from the native path.
@@ -230,7 +263,8 @@ impl AuditLogger {
         if path.is_empty() {
             return Ok(Self {
                 tx: None,
-                worker: std::sync::Mutex::new(None),
+                worker: Mutex::new(None),
+                gdpr: Arc::new(Mutex::new(None)),
             });
         }
 
@@ -269,6 +303,8 @@ impl AuditLogger {
         };
 
         let path_owned = path.to_string();
+        let gdpr: Arc<Mutex<Option<GdprConfig>>> = Arc::new(Mutex::new(None));
+        let gdpr_worker = Arc::clone(&gdpr);
         let (tx, rx) = mpsc::channel::<AuditMsg>();
         let worker = std::thread::Builder::new()
             .name("sqe-audit-writer".to_string())
@@ -277,6 +313,18 @@ impl AuditLogger {
                 let mut ocsf_sink = ocsf_sink;
                 let mut chain = HashChain::new();
                 while let Ok(msg) = rx.recv() {
+                    // Snapshot GDPR config once per recv iteration. Config is
+                    // written once at startup (with_gdpr); this lock is never
+                    // contended on the hot path.
+                    let gdpr_snap: Option<GdprSnap> = {
+                        if let Ok(guard) = gdpr_worker.lock() {
+                            guard.as_ref().map(|c| {
+                                (c.tags.clone(), c.mode, c.salt.clone(), Arc::clone(&c.lookup))
+                            })
+                        } else {
+                            None
+                        }
+                    };
                     match msg {
                         AuditMsg::Legacy(entry) => {
                             let mut batch = vec![*entry];
@@ -302,6 +350,7 @@ impl AuditLogger {
                                             &mut ocsf_sink,
                                             &mut chain,
                                             *e,
+                                            gdpr_snap.as_ref(),
                                             &path_owned,
                                         );
                                         Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &path_owned);
@@ -341,6 +390,7 @@ impl AuditLogger {
                                             &mut ocsf_sink,
                                             &mut chain,
                                             &mut batch,
+                                            gdpr_snap.as_ref(),
                                             &path_owned,
                                         );
                                         batch.clear();
@@ -361,6 +411,7 @@ impl AuditLogger {
                                             &mut ocsf_sink,
                                             &mut chain,
                                             &mut batch,
+                                            gdpr_snap.as_ref(),
                                             &path_owned,
                                         );
                                         batch.clear();
@@ -376,6 +427,7 @@ impl AuditLogger {
                                     &mut ocsf_sink,
                                     &mut chain,
                                     &mut batch,
+                                    gdpr_snap.as_ref(),
                                     &path_owned,
                                 );
                                 Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &path_owned);
@@ -394,7 +446,8 @@ impl AuditLogger {
         info!(path = path, "Audit log initialized");
         Ok(Self {
             tx: Some(tx),
-            worker: std::sync::Mutex::new(Some(worker)),
+            worker: Mutex::new(Some(worker)),
+            gdpr,
         })
     }
 
@@ -430,19 +483,94 @@ impl AuditLogger {
         }
     }
 
+    /// Apply GDPR masking + PII redaction to an event's query text.
+    ///
+    /// Called on the writer thread BEFORE chain stamping so the chain covers the
+    /// redacted bytes. Masking order:
+    ///
+    /// 1. For each `Resource`, call `lookup.column_tags(...)`.
+    ///    - `Some(map)`: collect columns whose tag set intersects `gdpr_tags`.
+    ///    - `None`: set a `fallback` flag (unknown tag state, must fail closed).
+    /// 2. If any masked columns found, run `mask_gdpr_columns`.
+    /// 3. Always run `redact_pii` (belt-and-suspenders for known PII patterns).
+    /// 4. If `fallback` is set and no columns were matched, run
+    ///    `strip_sql_literals` (conservative: unknown tag state may hide a GDPR
+    ///    column mask we cannot see).
+    fn apply_gdpr_masking(event: &mut AuditEvent, gdpr: &GdprSnap) {
+        let (tags, mode, salt, lookup) = gdpr;
+        let Some(ref mut query) = event.query else {
+            return;
+        };
+        let Some(ref text) = query.text.clone() else {
+            return;
+        };
+
+        let mut masked_cols: Vec<String> = Vec::new();
+        let mut fallback = false;
+
+        for resource in &event.resources {
+            match lookup.column_tags(resource.catalog.as_deref(), &resource.namespace, &resource.name) {
+                Some(col_map) => {
+                    for (col, col_tags) in &col_map {
+                        if col_tags.iter().any(|t| tags.iter().any(|g| g.eq_ignore_ascii_case(t)))
+                            && !masked_cols.contains(col)
+                        {
+                            masked_cols.push(col.clone());
+                        }
+                    }
+                }
+                None => {
+                    fallback = true;
+                }
+            }
+        }
+
+        let mut out = text.clone();
+
+        if !masked_cols.is_empty() {
+            out = mask_gdpr_columns(&out, &masked_cols, *mode, salt);
+            // If `email` is a masked column, also clear the actor.email field
+            // so the identifier does not leak through the structured audit
+            // fields (the JSON key "email" would otherwise survive in the
+            // serialized actor object).
+            let has_email_col = masked_cols.iter().any(|c| c.eq_ignore_ascii_case("email"));
+            if has_email_col {
+                event.actor.email = None;
+            }
+        }
+
+        // Always apply PII pattern redaction.
+        out = redact_pii(&out);
+
+        // If any resource had unknown tag state and no columns were masked,
+        // strip all literals as the conservative fail-closed path.
+        if fallback && masked_cols.is_empty() {
+            out = strip_sql_literals(&out);
+        }
+
+        query.text = Some(out);
+    }
+
     /// Write a single canonical `AuditEvent` to active sinks with chain stamping.
     ///
     /// `native_events` controls whether the event is also written to `native_sink`
     /// (native JSON format). When false (Ocsf-only mode), only the OCSF sink
     /// receives canonical events; `native_sink` still handles legacy flat entries.
+    ///
+    /// `gdpr`, when `Some`, applies GDPR masking and PII redaction BEFORE chain
+    /// stamping so the chain covers the redacted bytes.
     fn write_event(
         native_sink: &mut NativeJsonlSink,
         native_events: bool,
         ocsf_sink: &mut Option<OcsfJsonlSink>,
         chain: &mut HashChain,
         mut event: AuditEvent,
+        gdpr: Option<&GdprSnap>,
         path: &str,
     ) {
+        if let Some(g) = gdpr {
+            Self::apply_gdpr_masking(&mut event, g);
+        }
         chain.stamp(&mut event);
         if native_events {
             if let Err(e) = native_sink.write_line(&event) {
@@ -458,16 +586,20 @@ impl AuditLogger {
 
     /// Write a batch of canonical `AuditEvent` records to active sinks with chain stamping.
     ///
-    /// See `write_event` for the `native_events` semantics.
+    /// See `write_event` for the `native_events` and `gdpr` semantics.
     fn write_events(
         native_sink: &mut NativeJsonlSink,
         native_events: bool,
         ocsf_sink: &mut Option<OcsfJsonlSink>,
         chain: &mut HashChain,
         batch: &mut [AuditEvent],
+        gdpr: Option<&GdprSnap>,
         path: &str,
     ) {
         for event in batch.iter_mut() {
+            if let Some(g) = gdpr {
+                Self::apply_gdpr_masking(event, g);
+            }
             chain.stamp(event);
             if native_events {
                 if let Err(e) = native_sink.write_line(event) {
@@ -495,6 +627,34 @@ impl AuditLogger {
                 tracing::error!("AUDIT: flush failed for '{path}': {e}");
             }
         }
+    }
+
+    /// Configure GDPR-tag masking on the audit writer.
+    ///
+    /// Must be called after `with_config` and before the logger is shared.
+    /// When `tags` is empty, this call is a no-op (masking stays disabled).
+    ///
+    /// The `lookup` backend is called on the worker thread for each event that
+    /// carries resources. The coordinator wires `AuditTagAdapter` (wrapping
+    /// `CacheTagSource`) so tag resolution uses the existing metadata cache with
+    /// zero extra network calls.
+    ///
+    /// `salt` should be stable within a deployment (set once at startup, derived
+    /// from a random UUID or a config field). It enables correlation of the same
+    /// column token across log lines but is NOT secret-grade.
+    pub fn with_gdpr(
+        self,
+        tags: Vec<String>,
+        mode: GdprIdentifierMode,
+        salt: String,
+        lookup: Arc<dyn TagLookup>,
+    ) -> Self {
+        if !tags.is_empty() {
+            if let Ok(mut guard) = self.gdpr.lock() {
+                *guard = Some(GdprConfig { tags, mode, salt, lookup });
+            }
+        }
+        self
     }
 
     /// Log an `AuditEntry` (legacy path). Redaction runs here before the entry
@@ -885,5 +1045,52 @@ mod tests {
         assert!(ocsf.contains("\"class_uid\":6005"));
         // Every native record carries an integrity hash.
         assert!(native.contains("\"hash\":"));
+    }
+
+    #[test]
+    fn gdpr_tagged_column_is_masked_in_written_log() {
+        use std::collections::HashMap;
+        struct Stub;
+        impl crate::audit::TagLookup for Stub {
+            fn column_tags(&self, _c: Option<&str>, _n: &[String], _t: &str) -> Option<HashMap<String, Vec<String>>> {
+                let mut m = HashMap::new();
+                m.insert("email".to_string(), vec!["gdpr".to_string()]);
+                Some(m)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let logger = AuditLogger::with_config(path.to_str().unwrap(), crate::audit::AuditFormat::Native)
+            .unwrap()
+            .with_gdpr(vec!["gdpr".into()], crate::audit::GdprIdentifierMode::Tokenize, "salt".into(), std::sync::Arc::new(Stub));
+        let mut ev = crate::audit::sample_query_event();
+        ev.resources = vec![crate::audit::Resource { catalog: Some("polaris".into()), namespace: vec!["hr".into()], name: "users".into(), object_type: crate::audit::ObjectType::Table }];
+        ev.query = Some(crate::audit::QueryInfo { text: Some("SELECT id FROM users WHERE email = 'alice@x.io'".into()), query_hash: "h".into(), statement_type: "query".into() });
+        logger.log_event(ev);
+        logger.flush();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("alice@x.io"), "GDPR value leaked: {content}");
+        assert!(!content.contains("email"), "GDPR identifier leaked: {content}");
+    }
+
+    #[test]
+    fn unknown_tag_state_falls_back_to_literal_stripping() {
+        use std::collections::HashMap;
+        struct Unknown;
+        impl crate::audit::TagLookup for Unknown {
+            fn column_tags(&self, _c: Option<&str>, _n: &[String], _t: &str) -> Option<HashMap<String, Vec<String>>> { None }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let logger = AuditLogger::with_config(path.to_str().unwrap(), crate::audit::AuditFormat::Native)
+            .unwrap()
+            .with_gdpr(vec!["gdpr".into()], crate::audit::GdprIdentifierMode::Tokenize, "salt".into(), std::sync::Arc::new(Unknown));
+        let mut ev = crate::audit::sample_query_event();
+        ev.resources = vec![crate::audit::Resource { catalog: None, namespace: vec![], name: "users".into(), object_type: crate::audit::ObjectType::Table }];
+        ev.query = Some(crate::audit::QueryInfo { text: Some("SELECT id FROM users WHERE ssn = '123-45-6789'".into()), query_hash: "h".into(), statement_type: "query".into() });
+        logger.log_event(ev);
+        logger.flush();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("123-45-6789"), "literal survived unknown-tag fallback: {content}");
     }
 }
