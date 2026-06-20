@@ -1348,4 +1348,59 @@ mod tests {
             "CUSTOM mask with no value_expr must be unmappable (fail-closed)"
         );
     }
+
+    // --- tagPolicies live-sample validation (HIGH-tagpolicies-shape-unvalidated) ---
+
+    /// Placeholder bundle for the live-capture validation. Ships as an empty
+    /// `tagPolicies` block (valid JSON) so this file compiles before the real
+    /// capture exists. During the Ranger-backend validation run, replace
+    /// `src/testdata/tag_bundle_live_sample.json` with a bundle captured from a
+    /// real Ranger (`GET /service/plugins/policies/download/<service>`) that
+    /// carries at least one tag-linked datamask and one tag-linked rowfilter,
+    /// then remove the `#[ignore]` below and adjust the constants to match the
+    /// capture.
+    const TAG_BUNDLE_LIVE_SAMPLE: &str = include_str!("testdata/tag_bundle_live_sample.json");
+
+    /// Expected identity/tag the captured sample must resolve a non-empty result
+    /// for. Whoever drops in the real capture aligns these with the policies in
+    /// it (role bound to the datamask/rowfilter items, tag on the resources).
+    const LIVE_SAMPLE_ROLE: &str = "engineer";
+    const LIVE_SAMPLE_TAG: &str = "PII";
+
+    /// HIGH-tagpolicies-shape-unvalidated: deserialize a bundle captured from a
+    /// LIVE Ranger and assert `resolve_tag_policies` returns a non-empty result
+    /// (at least one mask OR one row filter). The whole tag-masking path is
+    /// currently validated only against a hand-authored `TAG_BUNDLE` fixture
+    /// whose shape is flagged unconfirmed (`TODO(phase3)` at the top of this
+    /// file). If the live `tagPolicies` JSON differs, `bundle.tag_policies`
+    /// deserializes to `None` and this test fails, surfacing the shape drift
+    /// instead of silently returning raw PII columns.
+    ///
+    /// `#[ignore]`-d until `tag_bundle_live_sample.json` is replaced with a real
+    /// capture during the Ranger-backend validation run. Dropping in the JSON
+    /// and removing `#[ignore]` makes this an active gate; no code change needed.
+    #[test]
+    #[ignore = "pending a real tagPolicies capture; see testdata/tag_bundle_live_sample.json"]
+    fn resolve_tag_policies_against_live_sample() {
+        let sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE_LIVE_SAMPLE)
+            .expect("captured live sample must be valid ServicePolicies JSON");
+        assert!(
+            sp.tag_policies.is_some(),
+            "live bundle must deserialize a tagPolicies block (None means the \
+             shape drifted and tag masking would silently no-op)"
+        );
+
+        let tags: HashSet<String> = [LIVE_SAMPLE_TAG.to_string()].into_iter().collect();
+        let id = SessionIdentity {
+            username: "live-sample-user".into(),
+            roles: vec![LIVE_SAMPLE_ROLE.into()],
+            ..Default::default()
+        };
+        let (masks, filters, _unmappable) = resolve_tag_policies(&sp, &id, &tags);
+        assert!(
+            !masks.is_empty() || !filters.is_empty(),
+            "live tagPolicies capture must yield at least one mask or row filter; \
+             got empty (shape mismatch or wrong role/tag constants)"
+        );
+    }
 }

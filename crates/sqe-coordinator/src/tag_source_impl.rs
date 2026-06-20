@@ -305,4 +305,81 @@ mod tests {
         let got = parse_column_tags(&p);
         assert!(got.is_empty());
     }
+
+    // ── set_column_tags read-merge-serialize round-trip ──────────────────────
+    //
+    // `CatalogOps::set_column_tags` does: load table -> `parse_column_tags` ->
+    // `apply_tag_ops` -> `serde_json::to_string` under `PROP_KEY` ->
+    // SetProperties commit. The commit hop needs a live REST catalog
+    // (`session_catalog_for`), and sqe-coordinator has no in-memory Iceberg
+    // catalog harness, so the FULL commit path is exercised by the separate
+    // Ranger-backend validation run (live-catalog integration test). These tests
+    // pin the pure read-merge-serialize core of that method: the same parse ->
+    // apply -> serialize -> parse-back loop, asserting the written property
+    // round-trips and a second SET merges into the first. `apply_tag_ops` itself
+    // is covered above; this targets the JSON serialize + property round-trip.
+
+    /// Serialize the merged map exactly as `set_column_tags` does (to a JSON
+    /// string under `PROP_KEY`), wrap it back into a property map, and parse it
+    /// out — mirroring write-then-read against the catalog property store.
+    fn serialize_to_props(map: &HashMap<String, Vec<String>>) -> HashMap<String, String> {
+        let json = serde_json::to_string(map).expect("merged tag map must serialize");
+        props(&[(PROP_KEY, &json)])
+    }
+
+    #[test]
+    fn set_tags_writes_property_that_reads_back_merged() {
+        // No existing tags (fresh table).
+        let current = parse_column_tags(&HashMap::new());
+        assert!(current.is_empty());
+
+        // SET TAGS ('PII','GDPR') ON COLUMN email.
+        let ops = vec![ColumnTagOp {
+            column: "email".into(),
+            tags: vec!["PII".into(), "GDPR".into()],
+            action: TagAction::Set,
+        }];
+        let merged = apply_tag_ops(&current, &ops);
+
+        // Serialize under PROP_KEY (what set_column_tags commits) and read back.
+        let written = serialize_to_props(&merged);
+        assert!(written.contains_key(PROP_KEY), "property must be written under PROP_KEY");
+        let read_back = parse_column_tags(&written);
+        assert_eq!(
+            read_back.get("email").unwrap(),
+            &vec!["PII".to_string(), "GDPR".to_string()],
+            "written property must read back as the merged tag map"
+        );
+    }
+
+    #[test]
+    fn second_set_tags_merges_into_persisted_map() {
+        // First SET TAGS, persisted to a property map.
+        let first = apply_tag_ops(
+            &HashMap::new(),
+            &[ColumnTagOp {
+                column: "email".into(),
+                tags: vec!["PII".into()],
+                action: TagAction::Set,
+            }],
+        );
+        let persisted = serialize_to_props(&first);
+
+        // Second SET TAGS reads the persisted property and merges a new tag.
+        let current = parse_column_tags(&persisted);
+        let second = apply_tag_ops(
+            &current,
+            &[ColumnTagOp {
+                column: "email".into(),
+                tags: vec!["GDPR".into()],
+                action: TagAction::Set,
+            }],
+        );
+        let read_back = parse_column_tags(&serialize_to_props(&second));
+        assert_eq!(
+            read_back.get("email").unwrap(),
+            &vec!["PII".to_string(), "GDPR".to_string()],
+            "second SET TAGS must merge into the persisted map (PII + GDPR)"
+        );
+    }
 }
