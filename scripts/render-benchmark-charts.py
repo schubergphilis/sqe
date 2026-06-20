@@ -12,8 +12,8 @@ Plus one cross-scale chart per suite:
 
 Usage: /tmp/sqe-bench-env/bin/python3 scripts/render-benchmark-charts.py
 
-Charts land in docs/benchmark/charts/ and are referenced from
-docs/benchmark/index.md.
+Charts land in docs/evidence/benchmark/charts/ and are referenced from
+docs/evidence/benchmark/index.md.
 """
 
 import json
@@ -30,7 +30,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = ROOT / "benchmarks" / "results"
-OUT_DIR = ROOT / "docs" / "benchmark" / "charts"
+OUT_DIR = ROOT / "docs" / "evidence" / "benchmark" / "charts"
 
 # Scales we care about for the headline charts. SF0.01 is too tiny to be
 # interesting; SF100 has only one TPC-E run.

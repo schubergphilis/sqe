@@ -3,8 +3,8 @@
 # Convenience wrappers around cargo, mdbook, and the ebook build pipeline.
 # The actual build logic lives in:
 #   - cargo (Cargo.toml): Rust binaries `sqe-cli` and `sqe-server`
-#   - mdbook (docs/book/book.toml): the rust book
-#   - pandoc (docs/ebook/Makefile): the PDF / EPUB ebook
+#   - mdbook (docs/site/book/book.toml): the rust book
+#   - pandoc (docs/site/ebook/Makefile): the PDF / EPUB ebook
 #
 # This Makefile orchestrates them so a contributor can run `make rustbook`
 # without remembering the mdbook invocation, and `make all` to build
@@ -13,8 +13,8 @@
 # ── Configuration ─────────────────────────────────────────────────────────
 CARGO        ?= cargo
 MDBOOK       ?= mdbook
-BOOK_DIR     := docs/book
-EBOOK_DIR    := docs/ebook
+BOOK_DIR     := docs/site/book
+EBOOK_DIR    := docs/site/ebook
 BOOK_OUT     := target/book
 RELEASE_BIN  := target/release
 DEBUG_BIN    := target/debug
@@ -101,7 +101,7 @@ help:
 	@echo "    make ebook-pdf        Build only the PDF"
 	@echo "    make ebook-epub       Build only the EPUB"
 	@echo "    make ebook-html       Build a self-contained HTML version"
-	@echo "    make benchmark-charts Re-render docs/benchmark/charts/ from benchmarks/results/*.json"
+	@echo "    make benchmark-charts Re-render docs/evidence/benchmark/charts/ from benchmarks/results/*.json"
 	@echo ""
 	@echo "  Container image:"
 	@echo "    make build        Local single-arch image ($(SQE_IMAGE):$(IMAGE_TAG)) from $(SQE_DOCKERFILE)"
@@ -227,7 +227,7 @@ rustbook:
 	@echo "Open: $(BOOK_OUT)/index.html"
 
 # ── Docs: ebook (pandoc) ──────────────────────────────────────────────────
-# Delegate to docs/ebook/Makefile; it owns the PDF / EPUB / HTML pipeline.
+# Delegate to docs/site/ebook/Makefile; it owns the PDF / EPUB / HTML pipeline.
 ebook:
 	@echo "==> Building ebook (PDF + EPUB)"
 	$(MAKE) -C $(EBOOK_DIR) all
@@ -245,7 +245,7 @@ ebook-html:
 	$(MAKE) -C $(EBOOK_DIR) html
 
 # ── Docs: benchmark history charts ────────────────────────────────────────
-# Walks benchmarks/results/*.json and re-renders docs/benchmark/charts/.
+# Walks benchmarks/results/*.json and re-renders docs/evidence/benchmark/charts/.
 # Needs matplotlib in a Python venv. The script self-tests for matplotlib
 # and prints how to set it up if missing.
 BENCH_PY ?= /tmp/sqe-bench-env/bin/python3
@@ -258,7 +258,7 @@ benchmark-charts:
 		echo "Then re-run \`make benchmark-charts\`."; \
 		exit 1; \
 	fi
-	@echo "==> Rendering benchmark charts -> docs/benchmark/charts/"
+	@echo "==> Rendering benchmark charts -> docs/evidence/benchmark/charts/"
 	$(BENCH_PY) scripts/render-benchmark-charts.py
 
 # ── Cleanup ───────────────────────────────────────────────────────────────
@@ -280,8 +280,8 @@ clean-ebook:
 	$(MAKE) -C $(EBOOK_DIR) clean
 
 clean-benchmark-charts:
-	@echo "==> Removing docs/benchmark/charts/"
-	rm -rf docs/benchmark/charts
+	@echo "==> Removing docs/evidence/benchmark/charts/"
+	rm -rf docs/evidence/benchmark/charts
 
 clean-images:
 	@echo "==> Removing $(CONFIG_OUT_DIR)"
