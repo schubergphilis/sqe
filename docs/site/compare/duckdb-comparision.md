@@ -305,7 +305,7 @@ The full V8-V12 narrative lives in
 
 ## Related docs
 
-- [Embedded CLI reference](cli-embedded.md): all flags, dot-commands, TVFs,
+- [Embedded CLI reference](https://docs.getsqe.com/getting-started/cli.html): all flags, dot-commands, TVFs,
   catalog backends, storage backends, write paths in one place
 - [Architecture](architecture.md): overall SQE design
 - [Catalogs](book/src/getting-started/catalogs.md): multi-catalog config

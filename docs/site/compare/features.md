@@ -2,7 +2,7 @@
 
 SQE is built on **Apache DataFusion 54** which provides the SQL execution engine. All standard SQL features come from DataFusion; SQE adds catalog integration (Polaris / Iceberg / Glue / HMS / Nessie / S3 Tables / JDBC / Hadoop), pluggable auth, distributed execution, DDL routing, and a single-binary embedded mode that competes with DuckDB on laptop analytics.
 
-> For a detailed function-by-function Trino compatibility matrix, see [trino-compatibility.md](trino-compatibility.md). For the audit-driven DuckDB compatibility track (V8 through V12.1, with status per item), see [duckdb-comparision.md](duckdb-comparision.md). For the embedded CLI reference, see [cli-embedded.md](cli-embedded.md).
+> For a detailed function-by-function Trino compatibility matrix, see [trino-compatibility.md](trino-compatibility.md). For the audit-driven DuckDB compatibility track (V8 through V12.1, with status per item), see [duckdb-comparision.md](duckdb-comparision.md). For the embedded CLI reference, see [the CLI reference](https://docs.getsqe.com/getting-started/cli.html).
 
 ## Quick Summary
 
@@ -445,7 +445,7 @@ The V8-V12 audit closed the file-format TVF and httpfs / hf:// gaps. SQE now mat
 3. **Multi-catalog cluster**: Polaris, Nessie, AWS Glue, Hive Metastore, JDBC, AWS S3 Tables, Hadoop in one engine, behind one auth chain. DuckDB is extension-by-extension and runs on one machine.
 4. **Iceberg V3 read AND write**: position deletes, equality deletes, MoR + CoW for DELETE / UPDATE / MERGE, branches, tags, partition evolution, schema evolution, nanosecond timestamps, column defaults. DuckDB's Iceberg extension is read-only.
 5. **Trino HTTP wire compatibility**: dbt models that work against Trino 465 work against SQE without changes. DuckDB has no Trino wire support.
-6. **One binary, two modes**: the same `sqe` binary serves both the embedded laptop persona and the cluster mode. Same SQL surface, same TVFs, same dot-commands. See [`cli-embedded.md`](cli-embedded.md).
+6. **One binary, two modes**: the same `sqe` binary serves both the embedded laptop persona and the cluster mode. Same SQL surface, same TVFs, same dot-commands. See [the CLI reference](https://docs.getsqe.com/getting-started/cli.html).
 
 ## What DuckDB still has that SQE does not
 

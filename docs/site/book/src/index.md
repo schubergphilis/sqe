@@ -35,7 +35,7 @@ sqe> SELECT * FROM 'hf://datasets/squad/plain_text/train-00000-of-00001.parquet'
 sqe> SELECT * FROM read_delta('/data/delta/sales', version => '5');
 ```
 
-Full embedded reference: [`cli-embedded.md`](../../cli-embedded.md). DuckDB comparison: [`duckdb-comparision.md`](../../duckdb-comparision.md).
+Full embedded reference: [Using the CLI](./getting-started/cli.md). DuckDB comparison: [getsqe.com/compare/duckdb](https://getsqe.com/compare/duckdb).
 
 ## Quick Start (cluster mode)
 
