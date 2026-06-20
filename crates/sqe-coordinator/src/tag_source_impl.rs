@@ -51,8 +51,10 @@ pub(crate) const PROP_KEY: &str = "sqe.column-tags";
 /// the cache via `SessionCatalog::load_table`. `CacheTagSource::column_tags`
 /// then reads the table properties out of the already-cached entry
 /// synchronously, with zero extra network calls. On a cache miss (table not
-/// yet loaded, or cache disabled via `ttl_secs = 0`) it returns an empty map,
-/// which is fail-safe: no tags means no extra masking.
+/// yet loaded, or cache disabled via `ttl_secs = 0`) it returns `None`
+/// (tag state UNKNOWN), which the rewriter treats as fail-CLOSED: an unseen
+/// tag mask or tag row-filter must not be silently skipped. A cache HIT
+/// returns `Some(map)` even when the parsed map is empty (known: no tags).
 pub struct CacheTagSource {
     cache: Arc<TableMetadataCache>,
 }
@@ -70,7 +72,7 @@ impl TagSource for CacheTagSource {
         _catalog: Option<&str>,
         namespace: &[String],
         table: &str,
-    ) -> HashMap<String, Vec<String>> {
+    ) -> Option<HashMap<String, Vec<String>>> {
         // Build the namespace display string the same way `table_cache_key` does:
         // `NamespaceIdent::Display` joins parts with `.`.
         let ns_display = match NamespaceIdent::from_vec(namespace.to_vec()) {
@@ -80,9 +82,10 @@ impl TagSource for CacheTagSource {
                     error = %e,
                     namespace = ?namespace,
                     table = %table,
-                    "tag_source: invalid namespace, returning empty tags"
+                    "tag_source: invalid namespace, tag state UNKNOWN (fail closed)"
                 );
-                return HashMap::new();
+                // Cannot build the cache key => cannot know the tag state.
+                return None;
             }
         };
 
@@ -92,13 +95,19 @@ impl TagSource for CacheTagSource {
                 debug!(
                     namespace = %ns_display,
                     table = %table,
-                    "tag_source: table not in cache, returning empty tags"
+                    "tag_source: table not in cache (miss or cache disabled), \
+                     tag state UNKNOWN (fail closed)"
                 );
-                return HashMap::new();
+                // Cache miss / disabled cache: the tag state is unknown, NOT
+                // known-empty. Return None so the rewriter fails closed.
+                return None;
             }
         };
 
-        parse_column_tags(&props)
+        // Cache hit: the tag state is KNOWN. `parse_column_tags` returns an
+        // empty map for a table with no `sqe.column-tags` property; that is a
+        // valid "known: no tags" answer, so wrap it in Some (never None here).
+        Some(parse_column_tags(&props))
     }
 }
 
@@ -295,5 +304,82 @@ mod tests {
         let p = props(&[("sqe.column-tags", "{}")]);
         let got = parse_column_tags(&p);
         assert!(got.is_empty());
+    }
+
+    // ── set_column_tags read-merge-serialize round-trip ──────────────────────
+    //
+    // `CatalogOps::set_column_tags` does: load table -> `parse_column_tags` ->
+    // `apply_tag_ops` -> `serde_json::to_string` under `PROP_KEY` ->
+    // SetProperties commit. The commit hop needs a live REST catalog
+    // (`session_catalog_for`), and sqe-coordinator has no in-memory Iceberg
+    // catalog harness, so the FULL commit path is exercised by the separate
+    // Ranger-backend validation run (live-catalog integration test). These tests
+    // pin the pure read-merge-serialize core of that method: the same parse ->
+    // apply -> serialize -> parse-back loop, asserting the written property
+    // round-trips and a second SET merges into the first. `apply_tag_ops` itself
+    // is covered above; this targets the JSON serialize + property round-trip.
+
+    /// Serialize the merged map exactly as `set_column_tags` does (to a JSON
+    /// string under `PROP_KEY`), wrap it back into a property map, and parse it
+    /// out — mirroring write-then-read against the catalog property store.
+    fn serialize_to_props(map: &HashMap<String, Vec<String>>) -> HashMap<String, String> {
+        let json = serde_json::to_string(map).expect("merged tag map must serialize");
+        props(&[(PROP_KEY, &json)])
+    }
+
+    #[test]
+    fn set_tags_writes_property_that_reads_back_merged() {
+        // No existing tags (fresh table).
+        let current = parse_column_tags(&HashMap::new());
+        assert!(current.is_empty());
+
+        // SET TAGS ('PII','GDPR') ON COLUMN email.
+        let ops = vec![ColumnTagOp {
+            column: "email".into(),
+            tags: vec!["PII".into(), "GDPR".into()],
+            action: TagAction::Set,
+        }];
+        let merged = apply_tag_ops(&current, &ops);
+
+        // Serialize under PROP_KEY (what set_column_tags commits) and read back.
+        let written = serialize_to_props(&merged);
+        assert!(written.contains_key(PROP_KEY), "property must be written under PROP_KEY");
+        let read_back = parse_column_tags(&written);
+        assert_eq!(
+            read_back.get("email").unwrap(),
+            &vec!["PII".to_string(), "GDPR".to_string()],
+            "written property must read back as the merged tag map"
+        );
+    }
+
+    #[test]
+    fn second_set_tags_merges_into_persisted_map() {
+        // First SET TAGS, persisted to a property map.
+        let first = apply_tag_ops(
+            &HashMap::new(),
+            &[ColumnTagOp {
+                column: "email".into(),
+                tags: vec!["PII".into()],
+                action: TagAction::Set,
+            }],
+        );
+        let persisted = serialize_to_props(&first);
+
+        // Second SET TAGS reads the persisted property and merges a new tag.
+        let current = parse_column_tags(&persisted);
+        let second = apply_tag_ops(
+            &current,
+            &[ColumnTagOp {
+                column: "email".into(),
+                tags: vec!["GDPR".into()],
+                action: TagAction::Set,
+            }],
+        );
+        let read_back = parse_column_tags(&serialize_to_props(&second));
+        assert_eq!(
+            read_back.get("email").unwrap(),
+            &vec!["PII".to_string(), "GDPR".to_string()],
+            "second SET TAGS must merge into the persisted map (PII + GDPR)"
+        );
     }
 }

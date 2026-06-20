@@ -40,26 +40,39 @@ fn mask_str(
     lower: char,
     digit: char,
 ) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let n = chars.len();
-    chars
-        .iter()
-        .enumerate()
-        .map(|(i, &c)| {
-            let shown = i < show_first || i >= n.saturating_sub(show_last);
-            if shown {
-                c
-            } else if c.is_ascii_uppercase() {
+    // The char count is only needed to locate the `show_last` tail. When
+    // show_last == 0 (MASK and MASK_SHOW_FIRST_4) no tail is kept, so skip the
+    // extra `chars().count()` pass entirely. `tail_start` is the first index
+    // that falls inside the kept tail (usize::MAX when no tail is kept, so the
+    // `i >= tail_start` check is always false).
+    let tail_start = if show_last > 0 {
+        s.chars().count().saturating_sub(show_last)
+    } else {
+        usize::MAX
+    };
+    let mut out = String::with_capacity(s.len());
+    for (i, c) in s.chars().enumerate() {
+        let shown = i < show_first || i >= tail_start;
+        let masked = if shown {
+            c
+        } else if c.is_alphabetic() {
+            // Unicode-aware: mask non-ASCII letters too (accented, Cyrillic,
+            // CJK, etc.). Caseless scripts report is_uppercase() == false and
+            // map to `lower`. ASCII-only checks here leaked non-Latin PII raw.
+            if c.is_uppercase() {
                 upper
-            } else if c.is_ascii_lowercase() {
-                lower
-            } else if c.is_ascii_digit() {
-                digit
             } else {
-                c
+                lower
             }
-        })
-        .collect()
+        } else if c.is_numeric() {
+            digit
+        } else {
+            // Punctuation, whitespace, symbols pass through (Hive behavior).
+            c
+        };
+        out.push(masked);
+    }
+    out
 }
 
 #[derive(Debug)]
@@ -242,6 +255,32 @@ mod tests {
     fn overlap_first_and_last_all_shown() {
         // show_first 2 + show_last 2 on a 3-char string => all shown.
         assert_eq!(mask_str("abc", 2, 2, 'x', 'x', 'x'), "abc");
+    }
+
+    #[test]
+    fn full_mask_hides_non_ascii_letters() {
+        // Regression: ASCII-only char classes left non-Latin PII unmasked.
+        // A full MASK over Cyrillic must not return the original characters.
+        let masked = mask_str("Иван", 0, 0, 'X', 'x', 'n');
+        assert_ne!(masked, "Иван", "non-ASCII letters must be masked");
+        assert!(
+            !masked.chars().any(|c| c.is_alphabetic() && c != 'X' && c != 'x'),
+            "every letter must be replaced by a mask char, got {masked:?}"
+        );
+    }
+
+    #[test]
+    fn full_mask_hides_cjk_and_keeps_show_last() {
+        // CJK has no case -> maps to `lower`. show_last keeps the tail visible.
+        let masked = mask_str("北京1", 0, 1, 'X', 'x', 'n');
+        assert!(masked.ends_with('1'), "show_last tail kept: {masked:?}");
+        assert!(!masked.contains('北') && !masked.contains('京'), "CJK masked: {masked:?}");
+    }
+
+    #[test]
+    fn full_mask_keeps_ascii_punctuation_and_behaviour() {
+        // Existing ASCII behaviour is preserved by the Unicode-aware logic.
+        assert_eq!(mask_str("Ab9-z", 0, 0, 'X', 'x', 'n'), "Xxn-x");
     }
 
     // ---- UDF-level tests -----------------------------------------------------

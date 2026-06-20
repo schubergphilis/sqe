@@ -2,7 +2,7 @@ use std::io::Write;
 use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
 /// Redact common PII patterns and secret literals from SQL text for audit
@@ -160,7 +160,7 @@ fn utf8_char_len(first: u8) -> usize {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AuditEntry {
     pub timestamp: String,
     pub username: String,
@@ -178,6 +178,26 @@ pub struct AuditEntry {
     pub client_ip: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tables_touched: Vec<String>,
+
+    // --- Policy-decision fields (issue: no-policy-decision-audit) ---
+    // Populated from the `PolicySummary` the enforcer returns. `serde(default)`
+    // so existing call sites and log consumers that don't set them keep working,
+    // and a deny-all (zero rows) is no longer indistinguishable from a
+    // legitimate empty result.
+    /// Count of row-filter expressions injected by policy (excludes the
+    /// deny-all sentinel; a deny is reflected in `policy_denied`).
+    #[serde(default)]
+    pub row_filters_applied: usize,
+    /// Columns masked by policy (sorted names).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns_masked: Vec<String>,
+    /// Columns restricted/dropped by policy (sorted names).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns_restricted: Vec<String>,
+    /// True when at least one scanned table was denied (deny-all row filter:
+    /// resolve failure, breaker-open, unknown-tag state, or fully-restricted).
+    #[serde(default)]
+    pub policy_denied: bool,
 }
 
 /// Compute SHA-256 hash of normalised SQL (whitespace-collapsed, uppercase keywords).
@@ -301,6 +321,10 @@ impl AuditLogger {
                 status: entry.status.clone(),
                 client_ip: entry.client_ip.clone(),
                 tables_touched: entry.tables_touched.clone(),
+                row_filters_applied: entry.row_filters_applied,
+                columns_masked: entry.columns_masked.clone(),
+                columns_restricted: entry.columns_restricted.clone(),
+                policy_denied: entry.policy_denied,
             }
         } else {
             AuditEntry {
@@ -315,6 +339,10 @@ impl AuditLogger {
                 status: entry.status.clone(),
                 client_ip: entry.client_ip.clone(),
                 tables_touched: entry.tables_touched.clone(),
+                row_filters_applied: entry.row_filters_applied,
+                columns_masked: entry.columns_masked.clone(),
+                columns_restricted: entry.columns_restricted.clone(),
+                policy_denied: entry.policy_denied,
             }
         };
 
@@ -383,6 +411,10 @@ mod tests {
             status: "success".to_string(),
             client_ip: Some("127.0.0.1".to_string()),
             tables_touched: Vec::new(),
+            row_filters_applied: 0,
+            columns_masked: Vec::new(),
+            columns_restricted: Vec::new(),
+            policy_denied: false,
         }
     }
 
@@ -411,6 +443,48 @@ mod tests {
         assert!(!json.contains("query_text"));
         assert!(!json.contains("client_ip"));
         assert!(!json.contains("session_id"));
+    }
+
+    #[test]
+    fn test_audit_entry_policy_fields_serialize() {
+        let mut entry = test_entry();
+        entry.row_filters_applied = 2;
+        entry.columns_masked = vec!["salary".to_string(), "ssn".to_string()];
+        entry.columns_restricted = vec!["notes".to_string()];
+        entry.policy_denied = false;
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"row_filters_applied\":2"));
+        assert!(json.contains("\"columns_masked\":[\"salary\",\"ssn\"]"));
+        assert!(json.contains("\"columns_restricted\":[\"notes\"]"));
+        assert!(json.contains("\"policy_denied\":false"));
+    }
+
+    #[test]
+    fn test_audit_entry_policy_denied_serialize() {
+        let mut entry = test_entry();
+        entry.policy_denied = true;
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"policy_denied\":true"));
+    }
+
+    #[test]
+    fn test_audit_entry_deserializes_legacy_without_policy_fields() {
+        // A pre-existing log line (no policy fields) must still parse, defaulting
+        // the new fields. Guards the `serde(default)` contract for log consumers.
+        let legacy = r#"{
+            "timestamp": "2026-01-01T00:00:00Z",
+            "username": "bob",
+            "query_hash": "abc",
+            "statement_type": "query",
+            "duration_ms": 1,
+            "rows_returned": 0,
+            "status": "success"
+        }"#;
+        let entry: AuditEntry = serde_json::from_str(legacy).unwrap();
+        assert_eq!(entry.row_filters_applied, 0);
+        assert!(entry.columns_masked.is_empty());
+        assert!(entry.columns_restricted.is_empty());
+        assert!(!entry.policy_denied);
     }
 
     #[test]

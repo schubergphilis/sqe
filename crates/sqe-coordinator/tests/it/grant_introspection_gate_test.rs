@@ -320,6 +320,27 @@ async fn check_access_other_principal_requires_admin() {
 }
 
 #[tokio::test]
+async fn show_effective_policy_other_principal_requires_admin() {
+    // SHOW EFFECTIVE POLICY mirrors SHOW EFFECTIVE GRANTS: the self-or-admin
+    // gate runs BEFORE any catalog load or policy resolution, so a non-admin
+    // targeting another principal is rejected with a 403 without the resolver
+    // ever running. The rejection does not depend on a live catalog.
+    let backend = Arc::new(RecordingBackend::default());
+    let store = Arc::new(RecordingStore::default());
+    let handler = make_handler(backend.clone(), store.clone());
+    let session = session_for("alice", vec!["analyst"]);
+
+    let err = handler
+        .execute(
+            &session,
+            "SHOW EFFECTIVE POLICY FOR USER \"bob\" ON cat.ns.orders",
+        )
+        .await
+        .expect_err("non-admin must not introspect another principal's policy");
+    assert!(err.to_string().contains("403"), "expected 403: {err}");
+}
+
+#[tokio::test]
 async fn check_access_admin_can_check_anyone() {
     let backend = Arc::new(RecordingBackend::default());
     let store = Arc::new(RecordingStore::default());

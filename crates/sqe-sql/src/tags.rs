@@ -118,20 +118,36 @@ fn split_identifier(s: &str) -> Result<(String, &str)> {
             _ => break,
         }
     }
+    if in_quote {
+        return Err(SqeError::Execution(format!(
+            "SET TAGS: unterminated double-quote in identifier near `{s}`"
+        )));
+    }
     if out.is_empty() {
-        return Err(SqeError::Execution("SET TAGS: expected an identifier".into()));
+        return Err(SqeError::Execution(format!(
+            "SET TAGS: expected an identifier near `{s}`"
+        )));
     }
     Ok((out, &s[end..]))
 }
 
-/// Strip a balanced outer `( ... )` and return the inner slice.
-fn strip_parens(s: &str) -> Result<&str> {
+/// Strip a balanced outer `( ... )` and return the inner slice. `context`
+/// names what is being parsed (e.g. the column) so a missing paren points the
+/// operator at the offending token.
+fn strip_parens<'a>(s: &'a str, context: &str) -> Result<&'a str> {
     let s = s.trim();
-    let inner = s
-        .strip_prefix('(')
+    if !s.starts_with('(') {
+        return Err(SqeError::Execution(format!(
+            "SET TAGS: {context}: expected a `(` to open the tag list, got `{s}`"
+        )));
+    }
+    s.strip_prefix('(')
         .and_then(|x| x.strip_suffix(')'))
-        .ok_or_else(|| SqeError::Execution("SET TAGS: expected parentheses".into()))?;
-    Ok(inner)
+        .ok_or_else(|| {
+            SqeError::Execution(format!(
+                "SET TAGS: {context}: missing closing `)` for the tag list near `{s}`"
+            ))
+        })
 }
 
 /// Split on top-level `,` (ignoring commas inside parentheses or single quotes).
@@ -181,7 +197,7 @@ fn unquote(s: &str) -> String {
 
 /// `( col = ( 'tag', ... ), col2 = (...) )`
 fn parse_native_set_list(body: &str) -> Result<Vec<ColumnTagOp>> {
-    let inner = strip_parens(body)?;
+    let inner = strip_parens(body, "tag list")?;
     let mut ops = Vec::new();
     for item in split_top_level(inner) {
         let eq = item.find('=').ok_or_else(|| {
@@ -189,7 +205,7 @@ fn parse_native_set_list(body: &str) -> Result<Vec<ColumnTagOp>> {
         })?;
         let (col, _) = split_identifier(item[..eq].trim())?;
         let tags_part = item[eq + 1..].trim();
-        let tags_inner = strip_parens(tags_part)?;
+        let tags_inner = strip_parens(tags_part, &format!("column `{col}`"))?;
         let tags: Vec<String> = split_top_level(tags_inner)
             .into_iter()
             .map(|t| unquote(&t))
@@ -214,7 +230,7 @@ fn parse_native_set_list(body: &str) -> Result<Vec<ColumnTagOp>> {
 
 /// `( col, col2, ... )` -> Unset with empty tags (remove all on each column).
 fn parse_native_unset_list(body: &str) -> Result<Vec<ColumnTagOp>> {
-    let inner = strip_parens(body)?;
+    let inner = strip_parens(body, "column list")?;
     let mut ops = Vec::new();
     for item in split_top_level(inner) {
         let (col, _) = split_identifier(item.trim())?;
@@ -376,5 +392,38 @@ mod tests {
         // Recognizably SET TAGS but broken -> Err, not None (clear diagnostic).
         assert!(try_parse_set_tags("ALTER TABLE t SET TAGS (email = )").is_err());
         assert!(try_parse_set_tags("ALTER TABLE t SET TAGS email = ('PII')").is_err());
+    }
+
+    #[test]
+    fn unbalanced_inner_paren_errors_and_names_column() {
+        // `SET TAGS (email = ('PII'` — missing the closing `)` on both the tag
+        // list and the column's value list. Must Err (not None, not a wrong
+        // parse) and name the offending column.
+        let err = try_parse_set_tags("ALTER TABLE t SET TAGS (email = ('PII'")
+            .expect_err("unbalanced parens must error");
+        let msg = err.to_string();
+        assert!(msg.contains("email"), "error must name the column, got: {msg}");
+    }
+
+    #[test]
+    fn trailing_garbage_after_tag_list_errors() {
+        // Junk after the closing `)` of the tag list must not be silently
+        // ignored -- it indicates a malformed statement.
+        assert!(
+            try_parse_set_tags("ALTER TABLE t SET TAGS (email = ('PII')) junk").is_err(),
+            "trailing garbage after the tag list must error"
+        );
+    }
+
+    #[test]
+    fn unterminated_quoted_identifier_errors() {
+        // An unterminated double-quote in an identifier must error instead of
+        // silently truncating the rest of the statement.
+        let err = try_parse_set_tags(r#"ALTER TABLE "orders SET TAGS (email = ('PII'))"#)
+            .expect_err("unterminated quote must error");
+        assert!(
+            err.to_string().contains("unterminated"),
+            "error must mention the unterminated quote, got: {err}"
+        );
     }
 }

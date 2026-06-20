@@ -169,7 +169,7 @@ async fn row_filter_and_mask_execute_over_qualified_multilevel_scan() {
     store.add_table_policy("ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
 
     // The step that failed before the fix: analyze + physical-plan + run.
     let batches = execute_multilevel(rewritten, mem).await;
@@ -193,7 +193,7 @@ async fn row_filter_injects_filter_above_scan() {
     store.add_table_policy("default", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter
+    let (rewritten, _summary) = rewriter
         .evaluate(&user("alice", &[]), plan)
         .await
         .unwrap();
@@ -222,7 +222,7 @@ async fn nullify_mask_on_bigint_executes_without_type_error() {
     store.add_table_policy("default", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter
+    let (rewritten, _summary) = rewriter
         .evaluate(&user("bob", &[]), plan)
         .await
         .unwrap();
@@ -245,7 +245,7 @@ async fn nullify_mask_on_decimal_executes_without_type_error() {
     store.add_table_policy("default", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("c", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("c", &[]), plan).await.unwrap();
     let batches = execute(rewritten, mem, "employees").await;
     let salary = batches[0].column_by_name("salary").unwrap();
     assert_eq!(salary.data_type(), &DataType::Decimal128(18, 2));
@@ -264,7 +264,7 @@ async fn nullify_mask_on_timestamp_executes_without_type_error() {
     store.add_table_policy("default", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("d", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("d", &[]), plan).await.unwrap();
     let batches = execute(rewritten, mem, "employees").await;
     let ts = batches[0].column_by_name("hired_at").unwrap();
     assert_eq!(
@@ -286,7 +286,7 @@ async fn redact_mask_on_string_column_returns_constant() {
     store.add_table_policy("default", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("e", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("e", &[]), plan).await.unwrap();
     let batches = execute(rewritten, mem, "employees").await;
     let ssn = batches[0]
         .column_by_name("ssn")
@@ -300,8 +300,11 @@ async fn redact_mask_on_string_column_returns_constant() {
     }
 }
 
+// Restriction is a forced Nullify: the column stays in the output schema (so
+// SELECT * and any reference resolve) but every value is NULL. The raw value is
+// never returned. (Previously the column was dropped, which broke outer refs.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn restricted_column_is_dropped_from_projection() {
+async fn restricted_column_is_nulled_not_dropped() {
     let (mem, plan) = build_scan("employees");
 
     let store = InMemoryPolicyStore::new();
@@ -312,13 +315,42 @@ async fn restricted_column_is_dropped_from_projection() {
     store.add_table_policy("default", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("f", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("f", &[]), plan).await.unwrap();
     let batches = execute(rewritten, mem, "employees").await;
-    let schema = batches[0].schema();
-    assert!(
-        schema.column_with_name("ssn").is_none(),
-        "ssn must be absent from rewritten projection"
+    let col = batches[0]
+        .column_by_name("ssn")
+        .expect("ssn must remain in the schema as a forced NULL, not be dropped");
+    assert_eq!(
+        col.null_count(),
+        col.len(),
+        "every restricted ssn value must be NULL"
     );
+}
+
+// When EVERY column is restricted, all columns stay in the schema as forced
+// NULLs (no raw value leaks); the rewriter does NOT drop them or error. Row
+// count is preserved (restriction nulls values, it does not filter rows).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_columns_restricted_returns_all_nulls_no_leak() {
+    let (mem, plan) = build_scan("employees");
+
+    let cols = ["customer_id", "ssn", "salary", "hired_at", "region"];
+    let store = InMemoryPolicyStore::new();
+    let policy = ResolvedPolicy {
+        restricted_columns: cols.iter().map(|c| c.to_string()).collect(),
+        ..Default::default()
+    };
+    store.add_table_policy("default", "employees", policy).await;
+
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store));
+    let (rewritten, _summary) = rewriter.evaluate(&user("f", &[]), plan).await.unwrap();
+    let batches = execute(rewritten, mem, "employees").await;
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 3, "restriction nulls values, it does not drop rows");
+    for c in cols {
+        let col = batches[0].column_by_name(c).expect("column must remain in schema");
+        assert_eq!(col.null_count(), col.len(), "{c} must be entirely NULL");
+    }
 }
 
 // Fail-closed: a PolicyStore that errors must cause the rewriter to
@@ -344,7 +376,7 @@ async fn poisoned_policy_store_fails_closed_to_zero_rows() {
     let (mem, plan) = build_scan("employees");
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(PoisonStore));
-    let rewritten = rewriter.evaluate(&user("g", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("g", &[]), plan).await.unwrap();
 
     let batches = execute(rewritten, mem, "employees").await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -378,7 +410,7 @@ async fn multilevel_namespace_row_filter_is_applied() {
     store.add_table_policy("ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter
+    let (rewritten, _summary) = rewriter
         .evaluate(&user("alice", &[]), plan)
         .await
         .unwrap();
@@ -402,16 +434,18 @@ async fn multilevel_namespace_restriction_is_applied() {
     store.add_table_policy("ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("bob", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("bob", &[]), plan).await.unwrap();
 
     let s = format!("{}", rewritten.display_indent());
     assert!(
         s.starts_with("Projection:"),
         "restriction must inject a Projection over multi-level scan, got: {s}"
     );
+    // Restriction is a forced Nullify: ssn stays in the projection but as a NULL
+    // expression, not a passthrough column reference.
     assert!(
-        !s.contains("ssn"),
-        "ssn must be dropped from the multi-level namespace projection, got: {s}"
+        s.contains("ssn") && s.to_uppercase().contains("NULL"),
+        "ssn must be present as a forced-NULL expression in the projection, got: {s}"
     );
 }
 
@@ -424,7 +458,7 @@ async fn multilevel_namespace_no_policy_still_passes_through() {
 
     let store = InMemoryPolicyStore::new();
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("carol", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("carol", &[]), plan).await.unwrap();
 
     let s = format!("{}", rewritten.display_indent());
     assert!(
@@ -442,7 +476,7 @@ async fn multilevel_namespace_poisoned_store_fails_closed() {
     let plan = build_multilevel_scan();
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(PoisonStore));
-    let rewritten = rewriter.evaluate(&user("dave", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("dave", &[]), plan).await.unwrap();
 
     let s = format!("{}", rewritten.display_indent());
     assert!(
@@ -491,7 +525,7 @@ async fn partial_mask_show_last4_on_ssn_over_qualified_multilevel_scan() {
     store.add_table_policy("ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
 
     let batches = execute_multilevel(rewritten, mem).await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -540,7 +574,7 @@ async fn date_show_year_on_timestamp_over_qualified_multilevel_scan() {
     store.add_table_policy("ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("bob", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("bob", &[]), plan).await.unwrap();
 
     let batches = execute_multilevel(rewritten, mem).await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -621,7 +655,7 @@ async fn date_show_year_on_date32_executes_and_truncates_to_jan1() {
     store.add_table_policy("ns", "t", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("eve", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("eve", &[]), plan).await.unwrap();
 
     // Register under catalog "cat", schema "ns" and execute.
     let ctx = SessionContext::new();
@@ -734,7 +768,9 @@ impl PolicyStore for TagTestStore {
 /// `Vec<String>`) to `calls`, so tests can assert the exact namespace
 /// components received (full multi-level path, not the last component).
 struct FakeTagSource {
-    col_tags: HashMap<String, Vec<String>>,
+    /// `Some(map)` = known tag state; `None` = unknown (cache miss / disabled),
+    /// which the rewriter must treat as fail-closed (deny).
+    col_tags: Option<HashMap<String, Vec<String>>>,
     /// Log of namespace args passed to `column_tags`, one entry per call.
     calls: Arc<Mutex<Vec<Vec<String>>>>,
 }
@@ -742,7 +778,15 @@ struct FakeTagSource {
 impl FakeTagSource {
     fn new(col_tags: HashMap<String, Vec<String>>) -> (Self, Arc<Mutex<Vec<Vec<String>>>>) {
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let source = Self { col_tags, calls: Arc::clone(&calls) };
+        let source = Self { col_tags: Some(col_tags), calls: Arc::clone(&calls) };
+        (source, calls)
+    }
+
+    /// A tag source whose state is UNKNOWN (returns `None`): models a cache
+    /// miss or a disabled metadata cache. Used to test fail-closed behavior.
+    fn new_unknown() -> (Self, Arc<Mutex<Vec<Vec<String>>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let source = Self { col_tags: None, calls: Arc::clone(&calls) };
         (source, calls)
     }
 }
@@ -753,7 +797,7 @@ impl TagSource for FakeTagSource {
         _catalog: Option<&str>,
         namespace: &[String],
         _table: &str,
-    ) -> HashMap<String, Vec<String>> {
+    ) -> Option<HashMap<String, Vec<String>>> {
         self.calls.lock().unwrap().push(namespace.to_vec());
         self.col_tags.clone()
     }
@@ -789,7 +833,7 @@ async fn tag_mask_applies_end_to_end() {
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store))
         .with_tag_source(Arc::new(fake_source));
-    let rewritten = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
 
     let batches = execute_multilevel(rewritten, mem).await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -837,7 +881,7 @@ async fn tag_source_receives_full_multilevel_namespace() {
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store))
         .with_tag_source(Arc::new(fake_source));
-    let rewritten = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
 
     // --- Identity assertion: namespace arg must be the full ["ns1","ns2"] ---
     // Assert before the async execute call so the MutexGuard is not held
@@ -904,7 +948,7 @@ async fn resource_mask_wins_over_tag_mask() {
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store))
         .with_tag_source(Arc::new(fake_source));
-    let rewritten = rewriter.evaluate(&user("bob", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("bob", &[]), plan).await.unwrap();
 
     let batches = execute_multilevel(rewritten, mem).await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -941,9 +985,6 @@ async fn resource_mask_wins_over_tag_mask() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unmappable_tag_restricts_column_fail_closed() {
     let (mem, scan) = build_multilevel_scan_with_mem();
-    // Use the bare scan (no outer projection) so the restricted ssn column
-    // does not appear in a user reference that would fail planning.
-    // The assertion is on the output schema: ssn must be absent.
 
     let mut col_tags = HashMap::new();
     col_tags.insert("ssn".to_string(), vec!["SECRET".to_string()]);
@@ -954,18 +995,115 @@ async fn unmappable_tag_restricts_column_fail_closed() {
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store))
         .with_tag_source(Arc::new(fake_source));
-    let rewritten = rewriter.evaluate(&user("carol", &[]), scan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("carol", &[]), scan).await.unwrap();
 
     let batches = execute_multilevel(rewritten, mem).await;
-    let schema = batches[0].schema();
-    assert!(
-        schema.column_with_name("ssn").is_none(),
-        "ssn must be ABSENT after unmappable-tag fail-closed restriction (got schema: {:?})",
-        schema
+    // Fail-closed via restriction = forced Nullify: ssn stays in the schema but
+    // is entirely NULL (raw value never returned); other columns are unaffected.
+    let ssn = batches[0]
+        .column_by_name("ssn")
+        .expect("ssn must remain in the schema as a forced NULL");
+    assert_eq!(
+        ssn.null_count(),
+        ssn.len(),
+        "ssn must be entirely NULL after unmappable-tag fail-closed restriction"
     );
-    // All other columns must still be present.
-    assert!(schema.column_with_name("customer_id").is_some());
-    assert!(schema.column_with_name("salary").is_some());
+    let salary = batches[0].column_by_name("salary").expect("salary present");
+    assert!(salary.null_count() < salary.len(), "salary must keep real values");
+}
+
+/// Test 5 -- UNKNOWN tag state (None) fails closed: zero rows.
+///
+/// A `TagSource` returning `None` models a metadata cache miss or a disabled
+/// cache: we cannot see whether a tag mask or tag row-filter applies. The
+/// rewriter must deny that scan (inject `lit(false)`), not pass it through as
+/// "no tags". Otherwise a cache miss silently bypasses tag-based governance.
+/// Proves the fail-closed-on-unknown contract: the query returns zero rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_tag_state_denies_all_rows() {
+    let (mem, scan) = build_multilevel_scan_with_mem();
+
+    // Tag source whose state is UNKNOWN (None). No tag store policy is needed:
+    // the deny must come purely from the unknown tag state.
+    let (fake_source, _calls) = FakeTagSource::new_unknown();
+    let store = TagTestStore::new();
+
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store))
+        .with_tag_source(Arc::new(fake_source));
+    let (rewritten, _summary) = rewriter.evaluate(&user("dave", &[]), scan).await.unwrap();
+
+    let batches = execute_multilevel(rewritten, mem).await;
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        rows, 0,
+        "unknown tag state (cache miss/disabled) must fail closed (zero rows)"
+    );
+}
+
+/// Test 6 -- reserved virtual relations must NOT be denied on an unknown tag
+/// state. `information_schema.*` and the `system` / `datafusion` catalogs are
+/// served by in-memory providers that are never in the table metadata cache, so
+/// the tag source returns `None` for them. They cannot host an Iceberg table
+/// and carry no tags, so the rewriter must skip the tag lookup (treat as
+/// known-no-tags) rather than deny. Without this skip, every
+/// `SELECT ... FROM information_schema.*` query (dbt, SHOW COLUMNS, SHOW CREATE
+/// TABLE) would return zero rows under a policy engine.
+///
+/// Each ref is exercised with `FakeTagSource::new_unknown()` (returns `None`):
+/// rows must be RETURNED, proving the reserved-ref skip beats the fail-closed
+/// None branch (which Test 5 pins for a non-reserved table).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reserved_virtual_refs_not_denied_on_unknown_tag_state() {
+    use datafusion::catalog::{MemoryCatalogProvider, MemorySchemaProvider};
+
+    // (catalog, schema, table) refs that must be treated as reserved/virtual.
+    let cases = [
+        (None, "information_schema", "tables"), // bare information_schema
+        (Some("cat"), "information_schema", "columns"), // qualified information_schema
+        (Some("system"), "runtime", "queries"), // reserved system catalog
+        (Some("datafusion"), "info", "version"), // reserved datafusion catalog
+    ];
+
+    for (catalog, schema, table) in cases {
+        let mem_schema = employee_schema();
+        let batch = employee_batch(mem_schema.clone());
+        let mem = Arc::new(MemTable::try_new(mem_schema, vec![vec![batch]]).unwrap());
+
+        let tref = match catalog {
+            Some(c) => TableReference::full(c, schema, table),
+            None => TableReference::partial(schema, table),
+        };
+        let plan = LogicalPlanBuilder::scan(tref.clone(), provider_as_source(mem.clone()), None)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // Unknown tag state for every table.
+        let (fake_source, _calls) = FakeTagSource::new_unknown();
+        let store = TagTestStore::new();
+        let rewriter = PolicyPlanRewriter::new(Arc::new(store))
+            .with_tag_source(Arc::new(fake_source));
+        let (rewritten, _summary) = rewriter.evaluate(&user("erin", &[]), plan).await.unwrap();
+
+        // Execute against a context registering exactly this ref.
+        let ctx = SessionContext::new();
+        let cat_name = catalog.unwrap_or("datafusion");
+        let cat_provider = Arc::new(MemoryCatalogProvider::new());
+        cat_provider
+            .register_schema(schema, Arc::new(MemorySchemaProvider::new()))
+            .unwrap();
+        ctx.register_catalog(cat_name, cat_provider);
+        let exec_ref = TableReference::full(cat_name, schema, table);
+        ctx.register_table(exec_ref, mem).unwrap();
+        let df = ctx.execute_logical_plan(rewritten).await.unwrap();
+        let batches = df.collect().await.unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            rows, 3,
+            "reserved virtual ref {tref} must NOT be denied on unknown tag state \
+             (all rows must pass through)"
+        );
+    }
 }
 
 // ── Session-function row-filter tests (Phase 2B, Task 3) ─────────────────────
@@ -1044,7 +1182,7 @@ async fn session_fn_row_filter_admin_sees_all_rows_and_folds_to_literal() {
     // SessionUser roles do not affect InMemoryPolicyStore resolution; the
     // SessionIdentity baked into the UDF is what matters for fold behavior.
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("carol", &["admin"]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("carol", &["admin"]), plan).await.unwrap();
 
     // --- (a) end-to-end correctness: admin sees all 3 rows ---
     let mem_for_exec = Arc::clone(&mem);
@@ -1097,7 +1235,7 @@ async fn session_fn_row_filter_analyst_sees_eu_only_and_folds_to_literal() {
     store.add_table_policy("ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("dave", &["analyst"]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("dave", &["analyst"]), plan).await.unwrap();
 
     // --- (a) end-to-end correctness: analyst sees only 2 EU rows ---
     let mem_for_exec = Arc::clone(&mem);
@@ -1172,7 +1310,7 @@ async fn partial_mask_on_non_string_falls_back_to_typed_null_over_qualified_mult
     store.add_table_policy("ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let rewritten = rewriter.evaluate(&user("carol", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("carol", &[]), plan).await.unwrap();
 
     let batches = execute_multilevel(rewritten, mem).await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
