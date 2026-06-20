@@ -216,18 +216,51 @@ recorded in `docs/ranger-tag-storage-decision.md`.
    bundle's `tagPolicies` block. Shared with Spark/Kyuubi like resource policies.
 2. **The tag-to-column ASSOCIATION** ("column `ssn` has tag `PII`") lives in the
    Iceberg/Polaris table property `sqe.column-tags`, a JSON object mapping column
-   name to a list of tags.
+   name to a list of tags. The mask RULE is shared with Spark/Kyuubi; the
+   association is not yet, pending the Iceberg-to-Ranger tag sync.
 
-Associations are authored as a table property:
+### Authoring column tags
+
+Attach tags to columns with `SET TAGS`. SQE stores the association in the
+`sqe.column-tags` table property; the DDL writes that property for you.
 
 ```sql
-ALTER TABLE sales_wh.sales.orders
-  SET TBLPROPERTIES ('sqe.column-tags' = '{"ssn":["PII"],"amount":["FINANCIAL"]}');
+ALTER TABLE sales.orders SET TAGS (email = ('PII', 'GDPR'), salary = ('PII'));
+
+-- remove all tags on a column:
+ALTER TABLE sales.orders UNSET TAGS (salary);
+```
+
+Snowflake's column-tag syntax works too. The tag name becomes the label; SQE has
+no tag values, so the assigned value is ignored. `ALTER COLUMN` is accepted as a
+synonym for `MODIFY COLUMN`.
+
+```sql
+ALTER TABLE sales.orders MODIFY COLUMN email SET TAG PII = 'true';
+ALTER TABLE sales.orders MODIFY COLUMN email UNSET TAG GDPR;
+```
+
+`SET TAGS` merges: it changes only the columns you name and leaves the rest of
+the table's tags in place. Tags within a column are unioned and deduped.
+`UNSET TAGS (col)` removes all tags on that column. The mask that a tag triggers
+still lives in the Ranger tagPolicy; `SET TAGS` only authors which columns carry
+which label.
+
+Underneath, the association is one JSON value in the `sqe.column-tags` table
+property, mapping each column to its list of tags:
+
+```
+sqe.column-tags = {"email": ["PII", "GDPR"], "salary": ["PII"]}
 ```
 
 The write goes through a Polaris `updateProperties` commit. After the commit SQE
 calls `invalidate_table` on the catalog and `invalidate_policy_cache()`, so the
 new tags are visible on the next query without waiting for the cache TTL.
+
+The association lives in the Iceberg property that SQE reads. Until the separate
+Iceberg-to-Ranger tag sync lands, other engines (Spark/Kyuubi) do not see these
+column tags. The mask-per-tag rule in the Ranger tagPolicy is shared with those
+engines; the column-to-tag association is not yet.
 
 Tags as table properties (rather than the Ranger tag store) win on four counts:
 they cover federated catalogs that Polaris cannot gate, they need no Atlas/tagsync
@@ -284,8 +317,9 @@ There are three authoring surfaces, one per layer.
   `hive` Ranger service (row-filter policyType 2, data-mask policyType 1),
   through the Ranger Admin UI or REST. SQE downloads and enforces them. The same
   policies enforce in Spark/Kyuubi.
-- **Tag-to-column associations.** `ALTER TABLE ... SET TBLPROPERTIES
-  ('sqe.column-tags' = ...)`. The mask-per-tag rule itself is a `hive`/`tag`
+- **Tag-to-column associations.** `ALTER TABLE ... SET TAGS / UNSET TAGS` (the
+  Snowflake `MODIFY|ALTER COLUMN ... SET TAG` forms work too). The DDL writes the
+  `sqe.column-tags` table property. The mask-per-tag rule itself is a `hive`/`tag`
   service policy in Ranger.
 
 ## Catalog path vs fine-grained path
@@ -295,7 +329,7 @@ There are three authoring surfaces, one per layer.
 | Config block | `[access_control] backend = "ranger"` | `[policy] engine = "ranger"` |
 | Ranger service | `polaris` | `hive` (+ linked `tag`) |
 | Granularity | catalog / namespace / table allow-deny | row filters, column masks, restricted columns, tag masks |
-| Authored via | SQL `GRANT` / `REVOKE` | Ranger UI/REST + `SET TBLPROPERTIES` for tags |
+| Authored via | SQL `GRANT` / `REVOKE` | Ranger UI/REST + `ALTER TABLE SET TAGS` for tags |
 | Enforced by | Polaris embedded authorizer | SQE `PolicyPlanRewriter` (plan rewrite) |
 | Does SQE filter? | No (write/read policies only) | Yes (rewrites the plan) |
 | Shared with Spark? | No (Polaris-specific service) | Yes (the `hive` service Kyuubi reads) |
