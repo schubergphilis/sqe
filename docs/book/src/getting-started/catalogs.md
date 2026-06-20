@@ -22,7 +22,7 @@ just a warehouse path to walk.
 
 All six are smoke-tested in CI. Two of them, Glue and S3 Tables,
 are verified live against production AWS deployments (account
-`311141556126`, eu-central-1 and eu-west-1).
+`123456789012`, eu-central-1 and eu-west-1).
 
 ## Multiple catalogs in one coordinator
 
@@ -241,7 +241,7 @@ tables.
 Pulls in `aws-sdk-glue` + `aws-config` (~50-80 MB).
 
 **Live verification (2026-05-05)** against AWS Glue in eu-central-1
-(account `311141556126`, database `iceberg_demo_analytics`):
+(account `123456789012`, database `iceberg_demo_analytics`):
 
 ```
 sqe> SHOW SCHEMAS;
@@ -297,7 +297,7 @@ Pulls in `aws-sdk-s3tables`. Shares the AWS SDK runtime that
 AWS-enabled build is small (~5 MB).
 
 **Live verification (2026-05-05)** against
-`arn:aws:s3tables:eu-west-1:311141556126:bucket/testtablebucket`:
+`arn:aws:s3tables:eu-west-1:123456789012:bucket/testtablebucket`:
 
 ```
 sqe> SHOW SCHEMAS;

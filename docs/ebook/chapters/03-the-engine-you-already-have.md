@@ -599,7 +599,7 @@ That was the moment we knew the library approach would work.
 :::
 
 ::: {.ailog}
-**AI Logbook:** The AI scaffolded all six initial crates and implemented the `execute_query` pipeline (from SQL string to Arrow record batches) in a single session. The human made the decision to use DataFusion as a library rather than Trino, Spark, or DuckDB, after two years of maintaining a Trino fork. The `create_session_context` method. one `SessionContext` per user with per-session credentials. was specified by the human as the architectural constraint; the AI implemented it correctly because Rust's ownership model made the isolation boundaries explicit in the type signatures.
+**AI Logbook:** The AI scaffolded all six initial crates and implemented the `execute_query` pipeline (from SQL string to Arrow record batches) in a single session. The human made the decision to use DataFusion as a library rather than Trino, Spark, or DuckDB, after two years of maintaining a Trino fork. The `create_session_context` method, one `SessionContext` per user with per-session credentials, was specified by the human as the architectural constraint; the AI implemented it correctly because Rust's ownership model made the isolation boundaries explicit in the type signatures.
 :::
 
 ## The Major Release That Tested Our Documentation

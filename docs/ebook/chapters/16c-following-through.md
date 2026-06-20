@@ -98,7 +98,7 @@ cargo test -p sqe-catalog --features glue backends_integration -- \
     --ignored glue::live_glue_namespace_round_trip
 ```
 
-The first time we ran it, the live test found `iceberg_demo_analytics.iceberg_user_events` (around 1.5 million rows) on account 311141556126 in `eu-central-1`. The second time, we pointed the same code at S3 Tables in `eu-west-1` and got back `testtablebucket/testnamespace/daily_sales`. Both worked. Same code path, different region, different service.
+The first time we ran it, the live test found `iceberg_demo_analytics.iceberg_user_events` (around 1.5 million rows) on account 123456789012 in `eu-central-1`. The second time, we pointed the same code at S3 Tables in `eu-west-1` and got back `testtablebucket/testnamespace/daily_sales`. Both worked. Same code path, different region, different service.
 
 Nessie ran against `ghcr.io/projectnessie/nessie:0.107.5` over Iceberg REST. PostgreSQL JDBC ran against `postgres:15` from `docker-compose.test.yml`. Five matrix cells flipped from partial to full: `hive-metastore:v2/v3`, `aws-glue-catalog:v2/v3`, and `nessie:v3`. Score 153 to 158.
 

@@ -57,7 +57,7 @@
 - [x] Apache Polaris (Iceberg REST, default)
 - [x] Project Nessie via Iceberg REST (live test against `ghcr.io/projectnessie/nessie:0.107.5`)
 - [x] Unity Catalog OSS via Iceberg REST adapter (live test against `unitycatalog/unitycatalog:main-2f2e32d`)
-- [x] AWS Glue native SDK (live test against AWS account 311141556126 in eu-central-1)
+- [x] AWS Glue native SDK (live test against AWS account 123456789012 in eu-central-1)
 - [x] AWS S3 Tables native SDK (live test against eu-west-1 testtablebucket/testnamespace/daily_sales)
 - [x] AWS Glue / S3 Tables via federated Iceberg REST + SigV4 (alternative path)
 - [x] Hive Metastore (Thrift, live test against `apache/hive:standalone-metastore-4.1.0`)
