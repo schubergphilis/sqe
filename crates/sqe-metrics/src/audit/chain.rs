@@ -13,6 +13,24 @@ impl HashChain {
         Self { next_seq: 0, prev_hash: GENESIS.to_string() }
     }
 
+    /// Return the sequence number that will be assigned to the next record.
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    /// Return the hash of the last committed record (or the genesis sentinel).
+    pub fn current_prev_hash(&self) -> &str {
+        &self.prev_hash
+    }
+
+    /// Advance the chain: record `hash` as the new tip and increment the sequence.
+    /// Used by callers that compute the hash externally (e.g., for legacy records
+    /// that are not `AuditEvent`-shaped).
+    pub fn advance(&mut self, hash: String) {
+        self.prev_hash = hash;
+        self.next_seq += 1;
+    }
+
     pub fn stamp(&mut self, event: &mut AuditEvent) {
         event.integrity.seq = self.next_seq;
         event.integrity.prev_hash = self.prev_hash.clone();

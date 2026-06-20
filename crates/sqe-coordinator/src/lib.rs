@@ -39,6 +39,25 @@ pub use query_handler::QueryHandler;
 pub use runtime_catalog::{AttachedCatalog, RuntimeCatalogRegistry};
 pub use session_manager::SessionManager;
 
+/// Parse the `audit.format` config string into an `AuditFormat` enum value.
+///
+/// Accepts "native", "ocsf", or "both" (case-insensitive). Any unknown value
+/// falls back to `Native` with a warning, preserving existing behavior.
+pub fn parse_audit_format(s: &str) -> sqe_metrics::audit::AuditFormat {
+    match s.to_lowercase().as_str() {
+        "ocsf" => sqe_metrics::audit::AuditFormat::Ocsf,
+        "both" => sqe_metrics::audit::AuditFormat::Both,
+        "native" => sqe_metrics::audit::AuditFormat::Native,
+        other => {
+            tracing::warn!(
+                format = other,
+                "Unknown audit.format value; falling back to \"native\""
+            );
+            sqe_metrics::audit::AuditFormat::Native
+        }
+    }
+}
+
 /// Test-only re-exports used by integration tests under `tests/`.
 ///
 /// Kept behind a sentinel name so accidental use in production code

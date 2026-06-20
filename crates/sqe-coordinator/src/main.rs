@@ -210,8 +210,11 @@ async fn async_main() -> anyhow::Result<()> {
     // Initialize metrics
     let metrics = Arc::new(sqe_metrics::MetricsRegistry::new());
     let audit = Arc::new(
-        sqe_metrics::audit::AuditLogger::new(&config.metrics.audit_log_path)
-            .map_err(|e| anyhow::anyhow!(e))?,
+        sqe_metrics::audit::AuditLogger::with_config(
+            &config.metrics.audit_log_path,
+            sqe_coordinator::parse_audit_format(&config.metrics.audit.format),
+        )
+        .map_err(|e| anyhow::anyhow!(e))?,
     );
 
     // Start metrics server
