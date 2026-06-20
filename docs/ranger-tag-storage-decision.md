@@ -26,8 +26,10 @@ mistake.
   sqe.column-tags = {"ssn": ["PII"], "amount": ["FINANCIAL"]}
   ```
   Stored in `TableMetadata.properties` (an arbitrary key/value map that Polaris
-  persists and SQE already reads via `table.metadata()`). Written by a SQE
-  tagging DDL/API (an `ALTER TABLE ... SET` that edits this one property).
+  persists and SQE already reads via `table.metadata()`). The user-facing surface
+  is now `ALTER TABLE ... SET TAGS / UNSET TAGS` (with the Snowflake
+  `MODIFY|ALTER COLUMN ... SET TAG` forms), not raw `SET TBLPROPERTIES`; the DDL
+  writes this one property for you.
 
 - **Cross-engine (Spark) tag enforcement is an OPTIONAL one-way sync**, not a
   dependency: a Phase-3.1 job mirrors `sqe.column-tags` into Ranger's tag store
