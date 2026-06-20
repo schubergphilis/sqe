@@ -6,6 +6,7 @@ pub mod partition;
 pub mod partition_evolution;
 pub mod pipeline_types;
 pub mod procedures;
+pub mod tags;
 pub mod time_travel;
 pub mod trino_compat;
 pub mod tvf_named_args;
