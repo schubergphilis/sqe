@@ -282,7 +282,17 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                                 })
                                 .collect();
 
-                            if !exprs.is_empty() {
+                            if exprs.is_empty() {
+                                // Every column is restricted. Falling through here
+                                // would return the raw TableScan (fail-open). Deny
+                                // instead: a `false` filter yields zero rows while
+                                // keeping the scan schema valid for the builder.
+                                builder = builder.filter(lit(false)).map_err(|e| {
+                                    datafusion::error::DataFusionError::Internal(format!(
+                                        "Failed to create deny filter for fully-restricted table: {e}"
+                                    ))
+                                })?;
+                            } else {
                                 builder = builder.project(exprs).map_err(|e| {
                                     datafusion::error::DataFusionError::Internal(format!(
                                         "Failed to create policy projection: {e}"
@@ -385,10 +395,12 @@ pub(crate) fn merge_tag_masks(
                             policy.column_masks.insert(column.clone(), MaskType::Custom(expr));
                         }
                         Err(e) => {
+                            // Do not log `template`: a CUSTOM mask body can embed
+                            // sensitive literals or keyed values. Column + tag are
+                            // enough to locate the offending Ranger policy.
                             warn!(
                                 column = %column,
                                 tag = %tag,
-                                template = %template,
                                 error = %e,
                                 "CUSTOM tag mask expression failed to parse; \
                                  restricting column (fail-closed)"
