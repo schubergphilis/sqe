@@ -1,4 +1,5 @@
 pub mod adaptive_sort;
+pub mod audit_tag_adapter;
 pub mod metrics_history;
 pub mod policy_wiring;
 pub mod tag_source_impl;
@@ -38,6 +39,25 @@ pub use quack_executor::CoordinatorExecutor;
 pub use query_handler::QueryHandler;
 pub use runtime_catalog::{AttachedCatalog, RuntimeCatalogRegistry};
 pub use session_manager::SessionManager;
+
+/// Parse the `audit.gdpr_identifier_mode` config string.
+///
+/// Accepts "tokenize", "drop", or "keep" (case-insensitive).
+/// Any unknown value falls back to `Tokenize` (most privacy-preserving).
+pub fn parse_gdpr_mode(s: &str) -> sqe_metrics::audit::GdprIdentifierMode {
+    match s.to_lowercase().as_str() {
+        "drop" => sqe_metrics::audit::GdprIdentifierMode::Drop,
+        "keep" => sqe_metrics::audit::GdprIdentifierMode::Keep,
+        "tokenize" => sqe_metrics::audit::GdprIdentifierMode::Tokenize,
+        other => {
+            tracing::warn!(
+                mode = other,
+                "Unknown audit.gdpr_identifier_mode value; falling back to \"tokenize\""
+            );
+            sqe_metrics::audit::GdprIdentifierMode::Tokenize
+        }
+    }
+}
 
 /// Parse the `audit.format` config string into an `AuditFormat` enum value.
 ///
