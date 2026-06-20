@@ -7,11 +7,11 @@
 > - **Distributed execution.** The "Ballista-derived" model in section 2.3 (and the
 >   "fork Ballista scheduler" approach) was evaluated and **wound down** on
 >   2026-05-31. SQE ships a bespoke coordinator/worker scheduler over Arrow Flight,
->   not a Ballista fork. See [`ballista-evaluation-learnings.md`](ballista-evaluation-learnings.md).
+>   not a Ballista fork. See [`ballista-evaluation-learnings.md`](./ballista-evaluation-learnings.md).
 > - **Engine version.** SQE is on **DataFusion 54** (this doc predates the 53 and 54
 >   upgrades).
 >
-> Current architecture overview lives in [`architecture.md`](architecture.md).
+> The current architecture overview lives in the published [Architecture](../architecture/overview.md) section.
 
 ---
 
