@@ -892,6 +892,48 @@ impl CatalogOps {
         Ok(())
     }
 
+    /// Author column tags (`ALTER TABLE ... SET TAGS / UNSET TAGS` and the
+    /// Snowflake column forms). Reads the current `sqe.column-tags` property,
+    /// applies merge semantics, and commits the new map as a single
+    /// `TableUpdate::SetProperties`.
+    #[instrument(skip(self, session, stmt), fields(username = %session.user.username))]
+    pub async fn set_column_tags(
+        &self,
+        session: &Session,
+        stmt: &sqe_sql::tags::SetTagsStatement,
+    ) -> sqe_core::Result<()> {
+        let object_name = parse_object_name(&stmt.table)?;
+        let table_ident = parse_table_ref(&object_name)?;
+
+        let session_catalog = self
+            .session_catalog_for(session, catalog_qualifier(&object_name).as_deref())
+            .await?;
+
+        let table = session_catalog.load_table(&table_ident).await?;
+        let current = crate::tag_source_impl::parse_column_tags(table.metadata().properties());
+
+        let new_map = crate::tag_source_impl::apply_tag_ops(&current, &stmt.ops);
+        let json = serde_json::to_string(&new_map).map_err(|e| {
+            SqeError::Execution(format!("failed to serialize column tags: {e}"))
+        })?;
+
+        let mut updates = HashMap::new();
+        updates.insert(crate::tag_source_impl::PROP_KEY.to_string(), json);
+
+        info!(
+            username = %session.user.username,
+            table = %table_ident,
+            num_cols = new_map.len(),
+            "Authoring column tags"
+        );
+
+        session_catalog
+            .commit_schema_update(&table_ident, vec![TableUpdate::SetProperties { updates }], vec![])
+            .await?;
+        session_catalog.invalidate_table(&table_ident).await;
+        Ok(())
+    }
+
     /// Execute a parsed `PartitionEvolution` (ALTER TABLE ... ADD/DROP/REPLACE
     /// PARTITION FIELD) against the catalog.
     ///
