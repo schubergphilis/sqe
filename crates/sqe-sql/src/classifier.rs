@@ -38,6 +38,19 @@ pub struct CheckAccessParams {
     pub user: String,
 }
 
+/// Parameters for `SHOW EFFECTIVE POLICY [FOR USER <u>] ON <table>`.
+///
+/// `user` is `None` for the self form (`SHOW EFFECTIVE POLICY ON t`); the
+/// coordinator substitutes the session user. The `FOR USER u` form is gated
+/// `require_self_or_admin` exactly like SHOW EFFECTIVE GRANTS. `table` is the
+/// raw (possibly dotted/quoted) reference; the handler parses it into a
+/// `(namespace, table)` policy key using the same scheme as the plan rewriter.
+#[derive(Debug)]
+pub struct ShowEffectivePolicyParams {
+    pub user: Option<String>,
+    pub table: String,
+}
+
 /// Classifies a parsed SQL statement into a high-level kind
 /// for routing to the appropriate handler in the coordinator.
 #[derive(Debug)]
@@ -69,6 +82,14 @@ pub enum StatementKind {
     ShowEffectiveGrants(String),
     /// CHECK ACCESS privilege ON resource FOR USER "name"
     CheckAccess(CheckAccessParams),
+    /// SHOW EFFECTIVE POLICY [FOR USER "name"] ON <table> — introspect the
+    /// row filters, column masks, and restrictions that the policy resolver
+    /// would apply for (user, table). Diagnostic read path (issue
+    /// no-show-effective-policy-or-tags).
+    ShowEffectivePolicy(ShowEffectivePolicyParams),
+    /// SHOW TAGS ON <table> — read back the `sqe.column-tags` property as
+    /// (column, tag) rows. Diagnostic round-trip for ALTER TABLE ... SET TAGS.
+    ShowTags(String),
     Utility(Box<Statement>),
     ExplainFull(String), // inner SQL string (EXPLAIN FULL pre-processed)
     // Transaction stubs — no-ops for JDBC tools that use setAutoCommit(false).
@@ -148,6 +169,8 @@ impl StatementKind {
             StatementKind::ShowGrants(_) => "showgrants",
             StatementKind::ShowEffectiveGrants(_) => "showeffectivegrants",
             StatementKind::CheckAccess(_) => "checkaccess",
+            StatementKind::ShowEffectivePolicy(_) => "showeffectivepolicy",
+            StatementKind::ShowTags(_) => "showtags",
             StatementKind::Utility(_) => "utility",
             StatementKind::ExplainFull(_) => "explain_full",
             StatementKind::Begin => "begin",
@@ -309,6 +332,38 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
     if let Some(rest) = strip_prefix_ci(trimmed, "CHECK ACCESS ") {
         let rest = rest.trim().trim_end_matches(';');
         return parse_check_access(rest);
+    }
+
+    // Pre-scan for SHOW EFFECTIVE POLICY [FOR USER "name"] ON <table>.
+    // Check the FOR USER form before the bare form so the longer prefix wins.
+    if let Some(rest) = strip_prefix_ci(trimmed, "SHOW EFFECTIVE POLICY FOR USER ") {
+        let rest = rest.trim().trim_end_matches(';');
+        return parse_show_effective_policy(rest, true);
+    }
+    if let Some(rest) = strip_prefix_ci(trimmed, "SHOW EFFECTIVE POLICY ") {
+        let rest = rest.trim().trim_end_matches(';');
+        return parse_show_effective_policy(rest, false);
+    }
+
+    // Pre-scan for SHOW TAGS ON <table>. sqlparser would mis-classify "SHOW
+    // TAGS" as a generic SHOW variable, so intercept it here. The bare
+    // `SHOW TAGS ON` (no table) is also matched so it yields a precise error
+    // rather than falling through to sqlparser.
+    let show_tags_rest = strip_prefix_ci(trimmed, "SHOW TAGS ON ").or_else(|| {
+        if trimmed.trim_end_matches(';').trim_end().eq_ignore_ascii_case("SHOW TAGS ON") {
+            Some("")
+        } else {
+            None
+        }
+    });
+    if let Some(rest) = show_tags_rest {
+        let table = rest.trim().trim_end_matches(';').trim().to_string();
+        if table.is_empty() {
+            return Err(sqe_core::SqeError::Execution(
+                "SHOW TAGS requires: SHOW TAGS ON <table>".to_string(),
+            ));
+        }
+        return Ok(StatementKind::ShowTags(table));
     }
 
     // Pre-scan for ALTER TABLE ... CREATE/DROP BRANCH|TAG. These are not part of
@@ -652,6 +707,52 @@ fn parse_check_access(rest: &str) -> sqe_core::Result<StatementKind> {
     }))
 }
 
+/// Parse the remainder of a `SHOW EFFECTIVE POLICY ...` statement.
+///
+/// When `has_user` is true the input is `"<name>" ON <table>` (the
+/// `FOR USER ` prefix was already stripped); otherwise it is just `ON <table>`
+/// and the user defaults to the session user (`None`).
+fn parse_show_effective_policy(rest: &str, has_user: bool) -> sqe_core::Result<StatementKind> {
+    let bad_syntax = || {
+        sqe_core::SqeError::Execution(
+            "SHOW EFFECTIVE POLICY requires: SHOW EFFECTIVE POLICY [FOR USER \"<name>\"] ON <table>"
+                .to_string(),
+        )
+    };
+
+    let (user, table) = if has_user {
+        // Input is `<name> ON <table>` (the `FOR USER ` prefix was stripped).
+        let upper = rest.to_uppercase();
+        let on_pos = upper.find(" ON ").ok_or_else(bad_syntax)?;
+        let user = rest[..on_pos]
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
+        if user.is_empty() {
+            return Err(sqe_core::SqeError::Execution(
+                "SHOW EFFECTIVE POLICY FOR USER requires a non-empty user name".to_string(),
+            ));
+        }
+        (Some(user), rest[on_pos + 4..].trim().to_string())
+    } else {
+        // Input is `ON <table>` (the bare-form remainder starts with `ON`).
+        let table = strip_prefix_ci(rest, "ON ").ok_or_else(bad_syntax)?;
+        (None, table.trim().to_string())
+    };
+
+    if table.is_empty() {
+        return Err(sqe_core::SqeError::Execution(
+            "SHOW EFFECTIVE POLICY requires a table after ON".to_string(),
+        ));
+    }
+
+    Ok(StatementKind::ShowEffectivePolicy(ShowEffectivePolicyParams {
+        user,
+        table,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -890,6 +991,112 @@ mod tests {
         } else {
             panic!("Expected CheckAccess");
         }
+    }
+
+    // ── SHOW EFFECTIVE POLICY ───────────────────────────────────────────
+
+    #[test]
+    fn test_show_effective_policy_self_form() {
+        let result = parse_and_classify("SHOW EFFECTIVE POLICY ON cat.ns.orders").unwrap();
+        match result {
+            StatementKind::ShowEffectivePolicy(p) => {
+                assert_eq!(p.user, None, "self form has no explicit user");
+                assert_eq!(p.table, "cat.ns.orders");
+            }
+            other => panic!("Expected ShowEffectivePolicy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_show_effective_policy_for_user_form() {
+        let result =
+            parse_and_classify("SHOW EFFECTIVE POLICY FOR USER \"alice\" ON ns.orders").unwrap();
+        match result {
+            StatementKind::ShowEffectivePolicy(p) => {
+                assert_eq!(p.user.as_deref(), Some("alice"));
+                assert_eq!(p.table, "ns.orders");
+            }
+            other => panic!("Expected ShowEffectivePolicy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_show_effective_policy_case_insensitive_and_bare_table() {
+        let result = parse_and_classify("show effective policy on orders").unwrap();
+        match result {
+            StatementKind::ShowEffectivePolicy(p) => {
+                assert_eq!(p.user, None);
+                assert_eq!(p.table, "orders");
+            }
+            other => panic!("Expected ShowEffectivePolicy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_show_effective_policy_quoted_user() {
+        let result =
+            parse_and_classify("SHOW EFFECTIVE POLICY FOR USER 'bob' ON \"my ns\".\"my tbl\"")
+                .unwrap();
+        match result {
+            StatementKind::ShowEffectivePolicy(p) => {
+                assert_eq!(p.user.as_deref(), Some("bob"));
+                assert_eq!(p.table, "\"my ns\".\"my tbl\"");
+            }
+            other => panic!("Expected ShowEffectivePolicy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_show_effective_policy_missing_on_errors() {
+        let result = parse_and_classify("SHOW EFFECTIVE POLICY orders");
+        assert!(result.is_err(), "missing ON should be rejected");
+    }
+
+    #[test]
+    fn test_show_effective_policy_name() {
+        let kind = StatementKind::ShowEffectivePolicy(ShowEffectivePolicyParams {
+            user: None,
+            table: "t".to_string(),
+        });
+        assert_eq!(kind.name(), "showeffectivepolicy");
+    }
+
+    // ── SHOW TAGS ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_show_tags_dotted_name() {
+        let result = parse_and_classify("SHOW TAGS ON cat.ns.customers").unwrap();
+        match result {
+            StatementKind::ShowTags(table) => assert_eq!(table, "cat.ns.customers"),
+            other => panic!("Expected ShowTags, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_show_tags_case_insensitive() {
+        let result = parse_and_classify("show tags on orders").unwrap();
+        assert!(matches!(result, StatementKind::ShowTags(ref t) if t == "orders"));
+    }
+
+    #[test]
+    fn test_show_tags_quoted_name() {
+        let result = parse_and_classify("SHOW TAGS ON \"my ns\".\"my tbl\"").unwrap();
+        match result {
+            StatementKind::ShowTags(table) => assert_eq!(table, "\"my ns\".\"my tbl\""),
+            other => panic!("Expected ShowTags, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_show_tags_missing_table_errors() {
+        let result = parse_and_classify("SHOW TAGS ON ");
+        assert!(result.is_err(), "missing table should be rejected");
+    }
+
+    #[test]
+    fn test_show_tags_name() {
+        let kind = StatementKind::ShowTags("t".to_string());
+        assert_eq!(kind.name(), "showtags");
     }
 
     #[test]

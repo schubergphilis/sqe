@@ -437,6 +437,61 @@ fn summarise_policies(table_policies: &HashMap<String, ResolvedPolicy>) -> Polic
     }
 }
 
+/// Resolve the effective policy for a single (user, table) pair for the
+/// `SHOW EFFECTIVE POLICY` diagnostic, mirroring the per-table resolution the
+/// `PlanRewriter` performs at query time.
+///
+/// The flow matches the rewriter exactly: `store.resolve()` for the resource
+/// policy, then (when `col_tags` is non-empty) `store.resolve_tags()` followed
+/// by `merge_tag_masks` with the same precedence contract. The caller supplies
+/// `col_tags` (the table's `column -> tags` map, read from the loaded Iceberg
+/// metadata) rather than threading the rewriter's `TagSource` cache. On a
+/// resolve failure this returns the same deny-all sentinel (`lit(false)` row
+/// filter) the rewriter would inject, so the diagnostic never under-reports.
+///
+/// `namespace`/`table` must be the SAME flattened policy key the rewriter uses
+/// (`resolve_policy_key` -> last dotted namespace component), or the diagnostic
+/// would describe a different policy than enforcement applies.
+pub async fn resolve_effective_policy(
+    store: &dyn PolicyStore,
+    user: &sqe_core::session::SessionUser,
+    table: &str,
+    namespace: &str,
+    col_tags: &HashMap<String, Vec<String>>,
+) -> ResolvedPolicy {
+    let mut policy = match store.resolve(user, table, namespace).await {
+        Ok(p) => p,
+        Err(_) => {
+            // Same deny-all sentinel the rewriter injects on resolve failure.
+            let mut deny = ResolvedPolicy::default();
+            deny.row_filters.push(lit(false));
+            return deny;
+        }
+    };
+
+    let all_tags: HashSet<String> = col_tags.values().flatten().cloned().collect();
+    if !all_tags.is_empty() {
+        let (tag_masks_by_tag, tag_filters, unmappable_tags) =
+            store.resolve_tags(user, &all_tags).await;
+        let identity = SessionIdentity {
+            username: user.username.clone(),
+            roles: user.roles.clone(),
+            database: None,
+            schema: None,
+        };
+        merge_tag_masks(
+            &mut policy,
+            col_tags,
+            &tag_masks_by_tag,
+            tag_filters,
+            &unmappable_tags,
+            &identity,
+        );
+    }
+
+    policy
+}
+
 /// Merge tag-derived masks and row filters into an existing `ResolvedPolicy`.
 ///
 /// # Precedence (LOCKED — security contract)
@@ -1217,5 +1272,70 @@ mod tests {
             rendered.contains("department"),
             "rewritten plan must reference the sibling column, got:\n{rendered}"
         );
+    }
+
+    // ── resolve_effective_policy (SHOW EFFECTIVE POLICY diagnostic) ───────
+    // The diagnostic must report the SAME resolution the rewriter applies:
+    // resource policy from store.resolve, plus tag-merged masks/filters.
+
+    fn diag_user(roles: &[&str]) -> sqe_core::session::SessionUser {
+        sqe_core::session::SessionUser {
+            username: "alice".to_string(),
+            roles: roles.iter().map(|r| r.to_string()).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_effective_policy_surfaces_resource_masks_and_filters() {
+        let store = crate::policy_store::InMemoryPolicyStore::new();
+        let mut p = ResolvedPolicy::default();
+        p.column_masks.insert("ssn".to_string(), MaskType::Hash);
+        p.row_filters.push(col("region").eq(lit("EU")));
+        p.restricted_columns.push("notes".to_string());
+        store.add_table_policy("hr", "employees", p).await;
+
+        let got = resolve_effective_policy(
+            &store,
+            &diag_user(&[]),
+            "employees",
+            "hr",
+            &HashMap::new(),
+        )
+        .await;
+
+        assert!(matches!(got.column_masks.get("ssn"), Some(MaskType::Hash)));
+        assert_eq!(got.row_filters.len(), 1);
+        assert_eq!(got.restricted_columns, vec!["notes".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn resolve_effective_policy_no_policy_is_empty_passthrough() {
+        let store = crate::policy_store::InMemoryPolicyStore::new();
+        let got = resolve_effective_policy(
+            &store,
+            &diag_user(&[]),
+            "orders",
+            "sales",
+            &HashMap::new(),
+        )
+        .await;
+        assert!(got.column_masks.is_empty());
+        assert!(got.row_filters.is_empty());
+        assert!(got.restricted_columns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_effective_policy_matches_rewriter_key_via_namespace() {
+        // The store keys on "{namespace}.{table}"; the caller must pass the
+        // last namespace component (as resolve_policy_key derives), so a policy
+        // registered under "ns2" is found when the table is cat.ns1.ns2.t.
+        let store = crate::policy_store::InMemoryPolicyStore::new();
+        let mut p = ResolvedPolicy::default();
+        p.column_masks.insert("email".to_string(), MaskType::Nullify);
+        store.add_table_policy("ns2", "t", p).await;
+
+        let got =
+            resolve_effective_policy(&store, &diag_user(&[]), "t", "ns2", &HashMap::new()).await;
+        assert!(matches!(got.column_masks.get("email"), Some(MaskType::Nullify)));
     }
 }
