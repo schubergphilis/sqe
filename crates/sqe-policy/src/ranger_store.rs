@@ -773,6 +773,35 @@ mod tests {
     }
 
     #[test]
+    fn custom_mask_unparseable_expr_restricts_column_failclosed() {
+        // A resource CUSTOM mask whose valueExpr cannot be parsed (here a
+        // qualified reference, which parse_sql_predicate rejects) must fail
+        // closed: the column is restricted and carries no mask, never returned
+        // raw. This pins the documented behavior of the resource CUSTOM path.
+        let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
+        bundle.policies[0].data_mask_policy_items[0]
+            .data_mask_info
+            .data_mask_type = "CUSTOM".to_string();
+        bundle.policies[0].data_mask_policy_items[0]
+            .data_mask_info
+            .value_expr = Some("t.department".to_string());
+        let policy = resolve_from_bundle(
+            &bundle,
+            &user("alice", &["analyst"]),
+            "orders",
+            "sales",
+        );
+        assert!(
+            policy.restricted_columns.contains(&"amount".to_string()),
+            "unparseable CUSTOM mask must restrict the column (fail-closed)"
+        );
+        assert!(
+            !policy.column_masks.contains_key("amount"),
+            "restricted column must not also carry a mask"
+        );
+    }
+
+    #[test]
     fn mask_none_is_exemption() {
         let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
         bundle.policies[0].data_mask_policy_items[0]

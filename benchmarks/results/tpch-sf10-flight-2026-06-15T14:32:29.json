@@ -1,0 +1,24 @@
+{
+  "benchmark": "tpch",
+  "scale_factor": 10.0,
+  "protocol": "flight",
+  "timestamp": "2026-06-15T14:32:29",
+  "summary": {
+    "total": 1,
+    "pass": 0,
+    "fail": 0,
+    "diff": 0,
+    "skip": 0,
+    "error": 1,
+    "total_duration_ms": 60002
+  },
+  "queries": [
+    {
+      "id": "q17",
+      "status": "error",
+      "duration_ms": 60002,
+      "rows": 0,
+      "message": "Timed out after 60s"
+    }
+  ]
+}

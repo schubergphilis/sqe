@@ -189,4 +189,12 @@ We went from maintaining a Trino fork to shipping a purpose-built engine in Rust
 
 ---
 
+## Update 2026-05-27
+
+The protocol roster grew. The list at the top of this post says "Arrow Flight SQL as the primary protocol, plus a Trino HTTP compatibility layer." Two months later, we added a third: **DuckDB's Quack RPC** (`docs/blog/2026-05-26-speaking-quack.md`). Sqe-server now answers `ATTACH 'quack:host'` from any DuckDB-aware client, and the `quack_query(uri, sql)` table-valued function pulls from remote DuckDB instances. We did not write a wire protocol; we adopted the one DuckDB ships and ported its codec to pure Rust. Every dbt-duckdb model, marimo notebook, and DuckDB SQL client now talks to SQE without configuration changes.
+
+The architecture call still holds. DataFusion-as-library, iceberg-rust-as-native, bearer-token-passthrough-as-architecture: all three made the Quack work cheap. Adding the protocol was about 1600 lines of codec plus a thin server crate, and the auth chain wired straight in.
+
+---
+
 *SQE is open-sourced under Apache 2.0.*

@@ -226,3 +226,9 @@ The result is partly DataFusion's Parquet reader being well-tuned, partly that V
 This is one query against one URL. Real workloads bounce between local Parquet, S3 buckets, hf:// datasets, and Iceberg tables in a Polaris catalog. The 200 ms is not a benchmark claim. It is a smoke test that says "the embedded mode is at least as fast as DuckDB on the basic file-load case." We have not yet built a head-to-head benchmark suite for embedded mode; the existing TPC-H / TPC-DS / SSB / ClickBench results are all in cluster mode against Trino 465.
 
 The dot-command surface is the part the screenshot above probably told you faster. SQE's REPL has the same dot commands DuckDB users type without thinking: `.tables`, `.schema`, `.catalogs`, `.read`, `.timer`, `.format`. Plus `.help`. Plus `.exit` and `.quit`. Each maps to either a built-in REPL action or a standard SQL query that DataFusion already knows how to run. The hardest part of writing the dot-command layer was getting `.timer on` to wrap the `df.collect().await` call cleanly without leaking timing into the test paths.
+
+---
+
+## Update 2026-05-27
+
+The "accidentally a DuckDB" framing turned out to undersell where this was going. Three weeks after this post we shipped the Quack RPC protocol, end-to-end, as both a server and a client. Sqe-server now answers `ATTACH 'quack:host'` from any DuckDB CLI, dbt-duckdb, marimo notebook, or DuckDB-aware tool. The `quack_query(uri, sql)` table-valued function lets sqe-server pull from a remote DuckDB in the same query as an Iceberg table. We did not accidentally create a DuckDB. We accidentally created a protocol-compatible engine. Details in `2026-05-26-speaking-quack.md`.

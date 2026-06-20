@@ -904,4 +904,64 @@ mod tests {
             "Custom mask should return the provided expression unchanged"
         );
     }
+
+    #[tokio::test]
+    async fn custom_mask_referencing_sibling_resolves_end_to_end() {
+        use crate::policy_store::InMemoryPolicyStore;
+        use crate::session_udf::SessionIdentity;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::TableReference;
+        use datafusion::logical_expr::builder::table_scan;
+        use sqe_core::SessionUser;
+
+        let schema = Schema::new(vec![
+            Field::new("salary", DataType::Utf8, true),
+            Field::new("department", DataType::Utf8, true),
+        ]);
+        let scan = table_scan(
+            Some(TableReference::partial("hr", "employees")),
+            &schema,
+            None,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        let identity = SessionIdentity {
+            username: "bob".to_string(),
+            roles: vec![],
+            database: Some("db".to_string()),
+            schema: Some("hr".to_string()),
+        };
+        let mask_expr = parse_sql_predicate(
+            "CASE WHEN department = 'HR' THEN salary ELSE '0' END",
+            &identity,
+        )
+        .unwrap();
+
+        let mut policy = ResolvedPolicy::default();
+        policy
+            .column_masks
+            .insert("salary".to_string(), MaskType::Custom(mask_expr));
+
+        let store = InMemoryPolicyStore::new();
+        store.add_table_policy("hr", "employees", policy).await;
+
+        let rewriter = PolicyPlanRewriter::new(Arc::new(store));
+        let user = SessionUser {
+            username: "bob".to_string(),
+            roles: vec![],
+        };
+
+        let rewritten = rewriter
+            .evaluate(&user, scan)
+            .await
+            .expect("rewrite with sibling-referencing CUSTOM mask must succeed");
+
+        let rendered = format!("{}", rewritten.display_indent());
+        assert!(
+            rendered.contains("department"),
+            "rewritten plan must reference the sibling column, got:\n{rendered}"
+        );
+    }
 }

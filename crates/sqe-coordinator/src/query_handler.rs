@@ -3330,6 +3330,24 @@ impl QueryHandler {
                     _ => (None, Some(name.to_string()), None),
                 }
             }
+            Some(sqlparser::ast::GrantObjects::FutureTablesInSchema { schemas })
+                if !schemas.is_empty() =>
+            {
+                // Ranger has no "future-only" resource; a table wildcard ("*")
+                // covers existing and future tables in the schema. We document
+                // this as the SQE meaning of ON FUTURE TABLES.
+                let name = &schemas[0];
+                let parts: Vec<String> = object_name_parts(name);
+                match parts.len() {
+                    1 => (None, Some(parts[0].clone()), Some("*".to_string())),
+                    2 => (
+                        Some(parts[0].clone()),
+                        Some(parts[1].clone()),
+                        Some("*".to_string()),
+                    ),
+                    _ => (None, Some(name.to_string()), Some("*".to_string())),
+                }
+            }
             _ => (None, None, None),
         };
 
@@ -4982,6 +5000,37 @@ mod tests {
 
         assert_eq!(stmt.privilege, "INSERT");
         assert!(matches!(stmt.grantee, Grantee::Group(ref n) if n == "SG-Risk"));
+    }
+
+    #[test]
+    fn extract_grant_statement_future_tables_in_schema() {
+        use sqe_policy::grants::Grantee;
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let sql = "GRANT SELECT ON FUTURE TABLES IN SCHEMA my_catalog.sales TO ROLE analyst";
+        let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+        let stmt = QueryHandler::extract_grant_statement(&stmts[0]).unwrap();
+
+        assert_eq!(stmt.privilege, "SELECT");
+        assert_eq!(stmt.catalog.as_deref(), Some("my_catalog"));
+        assert_eq!(stmt.namespace.as_deref(), Some("sales"));
+        assert_eq!(stmt.table.as_deref(), Some("*"));
+        assert!(matches!(stmt.grantee, Grantee::Role(ref n) if n == "analyst"));
+    }
+
+    #[test]
+    fn extract_grant_statement_future_tables_single_part_schema() {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let sql = "GRANT SELECT ON FUTURE TABLES IN SCHEMA sales TO alice";
+        let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+        let stmt = QueryHandler::extract_grant_statement(&stmts[0]).unwrap();
+
+        assert_eq!(stmt.catalog, None);
+        assert_eq!(stmt.namespace.as_deref(), Some("sales"));
+        assert_eq!(stmt.table.as_deref(), Some("*"));
     }
 
     #[test]
