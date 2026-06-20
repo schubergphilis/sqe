@@ -31,6 +31,13 @@ impl NativeJsonlSink {
     pub fn from_writer(w: Box<dyn Write + Send>) -> Self {
         Self { w }
     }
+
+    /// Write a pre-formatted line (no serialization). Used by the legacy
+    /// `log()` path so both legacy flat-JSON and canonical events flow through
+    /// the same single writer, preventing torn lines on the native file.
+    pub fn write_raw_line(&mut self, line: &str) -> std::io::Result<()> {
+        writeln!(self.w, "{line}")
+    }
 }
 
 impl AuditSink for NativeJsonlSink {
