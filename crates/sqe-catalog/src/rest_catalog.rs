@@ -276,6 +276,12 @@ impl TableMetadataCache {
     ///
     /// Key suffix format: `"|{namespace_display}.{table_name}"` — identical to
     /// the tail of `table_cache_key` (which prefixes the token fingerprint).
+    ///
+    /// The `ends_with` scan is O(entries), but `entries` is bounded by the
+    /// cache `max_capacity` (1000) and this runs once per table per query, so
+    /// the cost is microseconds -- noise versus the catalog HTTP round-trips it
+    /// replaces. A suffix-to-key index is only worth adding if `max_capacity`
+    /// is ever raised by orders of magnitude.
     pub fn properties_for(
         &self,
         namespace_display: &str,

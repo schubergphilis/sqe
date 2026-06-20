@@ -117,6 +117,19 @@ pub(crate) struct RowFilterInfo {
 
 // --- RangerStore struct, constructor, and download fetch ---
 
+/// PolicyType discriminators in the Ranger bundle JSON (`policyType` field).
+/// 0 = access (not enforced here), 1 = DATAMASK, 2 = ROWFILTER.
+const POLICY_TYPE_DATAMASK: i32 = 1;
+const POLICY_TYPE_ROWFILTER: i32 = 2;
+
+/// Ranger `dataMaskType` discriminator for an operator-authored masking
+/// expression. Shared by `map_mask` and `resolve_tag_policies` so the resource
+/// path and the tag path agree on the CUSTOM special-case.
+const MASK_TYPE_CUSTOM: &str = "CUSTOM";
+
+/// Single, constant key for the user-independent ServicePolicies bundle cache.
+const BUNDLE_KEY: &str = "__bundle__";
+
 /// Fine-grained policy store backed by a `hive`-type Ranger service.
 pub struct RangerStore {
     client: Client,
@@ -125,6 +138,12 @@ pub struct RangerStore {
     admin_user: String,
     admin_password: SecretString,
     cache: Cache<String, ResolvedPolicy>,
+    /// Cache of the raw, user-independent ServicePolicies bundle under a single
+    /// `BUNDLE_KEY`. The bundle is the same for every user, so caching it here
+    /// (with the same TTL as the per-user `cache`) avoids re-downloading and
+    /// re-parsing it on every query and every tagged table. `Arc` keeps the
+    /// moka `get`/`insert` clones cheap.
+    bundle_cache: Cache<&'static str, Arc<ServicePolicies>>,
     breaker: Arc<PolicyCircuitBreaker>,
 }
 
@@ -151,6 +170,10 @@ impl RangerStore {
             cache: Cache::builder()
                 .time_to_live(Duration::from_secs(cfg.cache_ttl_secs))
                 .max_capacity(cfg.cache_max_entries)
+                .build(),
+            bundle_cache: Cache::builder()
+                .time_to_live(Duration::from_secs(cfg.cache_ttl_secs))
+                .max_capacity(1)
                 .build(),
             breaker: Arc::new(PolicyCircuitBreaker::new(
                 "Ranger",
@@ -192,6 +215,22 @@ impl RangerStore {
             sqe_core::error::SqeError::Execution(format!("Failed to parse Ranger bundle: {e}"))
         })?;
         self.breaker.record_success();
+        Ok(bundle)
+    }
+
+    /// Return the ServicePolicies bundle, served from the bundle cache when
+    /// fresh. On a cache miss, downloads + parses via `fetch_bundle` and stores
+    /// the result. The bundle is user-independent, so a single cached copy is
+    /// shared across every `resolve` / `resolve_tags` call within the TTL.
+    ///
+    /// Fail-closed is preserved: a fetch error propagates (`?`) and is NEVER
+    /// cached, so the next caller retries (subject to the circuit breaker).
+    async fn cached_bundle(&self) -> sqe_core::Result<Arc<ServicePolicies>> {
+        if let Some(bundle) = self.bundle_cache.get(BUNDLE_KEY).await {
+            return Ok(bundle);
+        }
+        let bundle = Arc::new(self.fetch_bundle().await?);
+        self.bundle_cache.insert(BUNDLE_KEY, bundle.clone()).await;
         Ok(bundle)
     }
 }
@@ -270,7 +309,7 @@ fn map_mask(info: &DataMaskInfo, column: &str, identity: &SessionIdentity) -> Re
         "MASK_NULL" => Ok(Some(MaskType::Nullify)),
         "MASK_NONE" => Ok(None),
         "MASK_HASH" => Ok(Some(MaskType::Hash)),
-        "CUSTOM" => {
+        MASK_TYPE_CUSTOM => {
             let expr_str = info.value_expr.as_deref().ok_or(())?;
             // Ranger CUSTOM masks use `{col}` as the column placeholder.
             // Substitute with the real column name so the parsed Expr references
@@ -339,7 +378,7 @@ fn resolve_from_bundle(
         // Data-mask policy (policyType 1). A datamask policy's `column`
         // resource can list several columns that all receive the same mask;
         // iterate ALL of them so multi-column policies don't leak.
-        if p.policy_type == 1 {
+        if p.policy_type == POLICY_TYPE_DATAMASK {
             let Some(col_res) = p.resources.get("column") else { continue };
             if col_res.is_excludes {
                 // "mask all columns EXCEPT these" cannot be honored on the
@@ -381,7 +420,7 @@ fn resolve_from_bundle(
         }
 
         // Row-filter policy (policyType 2)
-        if p.policy_type == 2 {
+        if p.policy_type == POLICY_TYPE_ROWFILTER {
             for item in &p.row_filter_policy_items {
                 if !item_matches(&item.users, &item.roles, &item.groups, user) {
                     continue;
@@ -478,7 +517,7 @@ pub(crate) fn resolve_tag_policies(
             }
 
             // policyType 1: datamask
-            if p.policy_type == 1 {
+            if p.policy_type == POLICY_TYPE_DATAMASK {
                 for item in &p.data_mask_policy_items {
                     if !item_matches(&item.users, &item.roles, &item.groups, &user) {
                         continue;
@@ -488,7 +527,7 @@ pub(crate) fn resolve_tag_policies(
                     // Store the raw template as TagMaskSpec::Custom; merge_tag_masks
                     // performs the substitution and parses the expression per column.
                     // On parse failure the rewriter restricts the column (fail-closed).
-                    if item.data_mask_info.data_mask_type == "CUSTOM" {
+                    if item.data_mask_info.data_mask_type == MASK_TYPE_CUSTOM {
                         if let Some(template) = &item.data_mask_info.value_expr {
                             masks.insert(tag_value.clone(), TagMaskSpec::Custom(template.clone()));
                         } else {
@@ -524,7 +563,7 @@ pub(crate) fn resolve_tag_policies(
             }
 
             // policyType 2: rowfilter
-            if p.policy_type == 2 {
+            if p.policy_type == POLICY_TYPE_ROWFILTER {
                 for item in &p.row_filter_policy_items {
                     if !item_matches(&item.users, &item.roles, &item.groups, &user) {
                         continue;
@@ -571,7 +610,7 @@ impl PolicyStore for RangerStore {
         if let Some(cached) = self.cache.get(&key).await {
             return Ok(cached);
         }
-        let bundle = self.fetch_bundle().await?;
+        let bundle = self.cached_bundle().await?;
         let policy = resolve_from_bundle(&bundle, user, table_name, namespace);
         self.cache.insert(key, policy.clone()).await;
         Ok(policy)
@@ -606,7 +645,7 @@ impl PolicyStore for RangerStore {
             );
         }
 
-        let bundle = match self.fetch_bundle().await {
+        let bundle = match self.cached_bundle().await {
             Ok(b) => b,
             Err(e) => {
                 warn!(
@@ -638,6 +677,9 @@ impl PolicyStore for RangerStore {
 
     fn invalidate_all(&self) {
         self.cache.invalidate_all();
+        // Also drop the shared bundle so a manual refresh does not serve a stale
+        // bundle until its TTL elapses.
+        self.bundle_cache.invalidate_all();
     }
 }
 
@@ -707,6 +749,29 @@ mod tests {
         // from_config must succeed even with an empty URL (no network call).
         let store = RangerStore::from_config(&cfg);
         assert!(store.is_ok(), "from_config failed: {:?}", store.err());
+    }
+
+    /// `cached_bundle` serves a warm bundle from the cache without re-fetching.
+    /// We seed the bundle cache directly (no HTTP), then assert the returned Arc
+    /// is pointer-identical to the seeded one -- proving the cache hit path is
+    /// taken and `fetch_bundle` (which would fail on the empty URL) is skipped.
+    #[tokio::test]
+    async fn cached_bundle_serves_warm_copy_without_fetch() {
+        let store = RangerStore::from_config(&RangerPolicyConfig::default()).unwrap();
+        let seeded: Arc<ServicePolicies> = Arc::new(serde_json::from_str(BUNDLE).unwrap());
+        store
+            .bundle_cache
+            .insert(BUNDLE_KEY, seeded.clone())
+            .await;
+
+        let got = store
+            .cached_bundle()
+            .await
+            .expect("warm bundle must be served from cache");
+        assert!(
+            Arc::ptr_eq(&seeded, &got),
+            "cached_bundle must return the cached Arc, not a re-fetched copy"
+        );
     }
 
     fn user(name: &str, roles: &[&str]) -> SessionUser {
