@@ -119,8 +119,8 @@ scripts/integration-test.sh
 If your change affects user-facing behavior, update the relevant docs. Key files:
 
 - `README.md` -- roadmap checklist and feature overview
-- `docs/features.md` -- detailed feature comparison
-- `docs/trino-compatibility.md` -- Trino SQL compatibility matrix
+- `docs/site/compare/features.md` -- detailed feature comparison
+- `docs/site/compare/trino-compatibility.md` -- Trino SQL compatibility matrix
 
 ## License
 
