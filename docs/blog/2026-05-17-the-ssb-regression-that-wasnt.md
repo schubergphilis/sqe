@@ -2,6 +2,12 @@
 title: "The SSB regression that wasn't"
 description: "MR #220 wired runtime filters into iceberg-rust's scan path and dropped TPC-DS 67%. SSB looked like it regressed 6%. Two failed heuristic attempts, one parquet-trace session, and ten warm passes later, the regression turned out to be measurement noise. The fix-the-fix that wasn't, and the data-clustering insight that explains why two suites with the same code path behave nothing alike."
 pubDate: "2026-05-17"
+author: "Jacob Verhoeks"
+tags:
+  - "performance"
+  - "datafusion"
+  - "iceberg"
+  - "benchmarks"
 ---
 
 ## The setup

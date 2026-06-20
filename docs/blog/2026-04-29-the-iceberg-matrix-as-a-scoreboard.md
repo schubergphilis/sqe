@@ -121,3 +121,11 @@ For users, it tells you which engines actually do the thing the spec says they d
 Public scoreboards for open standards are how ecosystems mature. Closed compatibility claims are how lock-in happens. Pick the one that matches your strategy.
 
 We picked the matrix.
+
+---
+
+## Update 2026-05-27
+
+The matrix pattern transferred. When we ported DuckDB's Quack protocol four weeks after this post, the first artefact we wrote was a type matrix at `docs/quack-datatype-matrix.md`: one row per DuckDB type, status column with the same three-level rubric, evidence column pointing to live `duckdb 1.5.3` CLI sessions. Every parameterised type subsequently got its own MR with the matrix row updated in the same diff. The matrix doc was the design doc and the work tracker. The Quack arc finished in two days; the type matrix told us exactly what was left and when to stop.
+
+Same pattern, different protocol. Same lesson: the rubric beats the score, the evidence beats the claim, and the cell-by-cell discipline is what actually moves the work forward.

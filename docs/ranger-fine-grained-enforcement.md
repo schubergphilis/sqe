@@ -159,6 +159,25 @@ type (a `Nullify` on a BIGINT emits a typed Int64 NULL, not a Utf8 NULL), so
 downstream Filter, Join, and GroupBy operators see the shape they expect and a
 predicate cannot coerce both sides to Utf8 and leak masked rows.
 
+### Masking on the value of another column
+
+A CUSTOM mask is an arbitrary SQL expression, and it can reference other columns
+of the same row, not only the column being masked. The Ranger `valueExpr` uses
+`{col}` for the masked column; any other bare column name resolves against the
+table's scan schema.
+
+Example: mask `salary` only for rows outside the HR department.
+
+```sql
+-- Ranger CUSTOM mask valueExpr on column `salary`:
+CASE WHEN department = 'HR' THEN {col} ELSE '0' END
+```
+
+Limitation: only bare column names resolve. A qualified reference such as
+`t.department` fails to parse, and SQE fails closed by restricting the column
+(it is dropped from the result, not returned raw). Reference siblings by their
+bare name.
+
 ## Role-conditional policy (session-context functions)
 
 SQE registers five session-context scalar UDFs, defined in
