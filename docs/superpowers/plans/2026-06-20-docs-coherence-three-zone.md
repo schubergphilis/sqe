@@ -48,7 +48,15 @@ Expected: mdBook builds to `target/book` with no error.
 Run: `make benchmark-charts`
 Expected: charts (re)render under `docs/benchmark/charts/` with no error. (If the Python venv is missing, note it and skip; the path-repoint in Phase 7 is still verifiable by inspecting the script.)
 
-- [ ] **Step 4: Record the loose-file inventory for later diffing**
+- [ ] **Step 4: Confirm the ebook toolchain is present (Phases 7-8 depend on it)**
+
+Run: `make ebook`
+Expected: builds `docs/ebook/build/sovereign-by-design.{pdf,epub}`. If Pandoc/xelatex
+is missing and the build fails, do NOT proceed to Phase 8 ebook re-sanitization blind:
+either install the toolchain, or mark Task 10 Step 4 as "deferred — sanitize ebook
+chapter sources by hand, rebuild on a machine with the toolchain." Record which.
+
+- [ ] **Step 5: Record the loose-file inventory for later diffing**
 
 Run:
 ```bash
@@ -136,6 +144,11 @@ git commit -m "docs(restructure): move comparison sources into docs/site/compare
 ---
 
 ## Phase 3: Merge book-duplicate loose files into the canonical book
+
+> **CONTENT-LOSS HOTSPOT.** Tasks 4-5 are prose merges, the one place this migration
+> can silently drop material. These steps need judgment, not mechanical moves. For
+> every loose file, before `git rm`, confirm that each unique paragraph/section either
+> already exists in the book or has been folded in. Do not delete on faith.
 
 For each file: read the loose file AND its book counterpart, fold any content present in the loose file but missing from the book page into that page under a clearly-titled subsection, then `git rm` the loose file. The book is canonical; nothing reference-y remains loose.
 
@@ -501,29 +514,39 @@ git commit -m "docs(restructure): re-point Makefile, chart script, and CLAUDE.md
 - Create: `scripts/leak-scan-site.sh`
 - Modify: `Makefile` (add a `leak-scan` target)
 
-- [ ] **Step 1: Copy the getsqe leak-scan patterns into a repo-local scanner**
+- [ ] **Step 1: Create a SECURITY-ONLY repo-local scanner**
 
-Create `scripts/leak-scan-site.sh` (mirror the getsqe `website/scripts/leak-scan.sh` patterns: 12-digit account IDs, `eu-central`/`eu-west`, `amazonaws`, internal `crates/sqe-*` except `sqe-cli`/`sqe-coordinator`, `sbp.gitlab.schubergphilis.com`, `vpf-data-ai/chameleon`, `jacobadmin`/`jacobbuilder`, `MR !\d+`, `feat/`/`chore/` branch refs). It scans `docs/site` recursively and exits non-zero on any hit, printing `file:line:content`.
+Per the spec's split invariant, this scanner enforces only secrets/PII at source. It
+must NOT match cosmetic patterns (MR/branch refs, regions, `amazonaws`, crate paths) —
+those stay in source and are rewritten presentation-only by the getsqe sync.
+Create `scripts/leak-scan-site.sh` covering only: 12-digit account IDs, personal IAM
+names (`jacobadmin`/`jacobbuilder`), internal GitLab host, and monorepo path.
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="${1:-docs/site}"
-PATTERN='([0-9]{12})|eu-(central|west)(-[0-9])?|amazonaws|crates/sqe-(auth|core|sql|policy|catalog|planner|coordinator-[a-z]*|worker|bench|trino-compat|metrics)|sbp\.gitlab\.schubergphilis\.com|vpf-data-ai/chameleon|jacobadmin|jacobbuilder|MR ![0-9]+'
+# SECURITY-ONLY. Cosmetic patterns (MR !/feat/chore/region/amazonaws/crate paths) are
+# intentionally NOT here — they are kept in source and rewritten by the getsqe sync.
+PATTERN='([0-9]{12})|sbp\.gitlab\.schubergphilis\.com|vpf-data-ai/chameleon|jacobadmin|jacobbuilder'
 if grep -rnaIE "$PATTERN" "$ROOT" \
      --include='*.md' --include='*.toml' --include='*.json' --include='*.svg' \
-   | grep -vE 'sqe-cli|sqe-coordinator|123456789012|000000000000'; then
-  echo "LEAK-SCAN: docs/site is not publish-clean (hits above)" >&2
+   | grep -vE '123456789012|000000000000'; then
+  echo "LEAK-SCAN: docs/site contains secrets/PII (hits above)" >&2
   exit 1
 fi
 echo "leak-scan: docs/site clean"
 ```
 Then: `chmod +x scripts/leak-scan-site.sh`.
 
-- [ ] **Step 2: Run it and fix every hit at source**
+- [ ] **Step 2: Run it and fix every SECURITY hit at source (leave cosmetics alone)**
 
 Run: `bash scripts/leak-scan-site.sh docs/site`
-For each hit, edit the source file to use the placeholder (`123456789012` for account IDs, `eu-example-1`/`eu-example-2` for regions, public crate names, `github.com/schubergphilis/sqe` for internal URLs, `quickstart-admin`/`quickstart-builder` for IAM). Re-run until it prints `leak-scan: docs/site clean`.
-Note: the ebook `build/` PDF/EPUB are binaries the text scan skips; rebuild them with `make ebook` after sanitizing the chapter sources so the artifacts are clean too.
+For each hit, edit the source file to use the placeholder: `123456789012` for account
+IDs, `quickstart-admin`/`quickstart-builder` for IAM names, `github.com/schubergphilis/sqe`
+for the internal GitLab URL/monorepo path. Do NOT touch `MR !`, `feat/`, region, or
+crate-path text — those are kept. Re-run until it prints `leak-scan: docs/site clean`.
+Note: the ebook `build/` PDF/EPUB are binaries the text scan skips; rebuild them with
+`make ebook` after sanitizing the chapter sources so the artifacts are clean too.
 
 - [ ] **Step 3: Add a Makefile target**
 
@@ -578,9 +601,15 @@ Edit `website/scripts/sync-from-sqe.sh`:
 - line 87: `$SQE_DIR/benchmarks/results` -> unchanged (repo root)
 - line 129 sed: the `.md` -> GitHub-blob rewrite base `docs/\1` -> `docs/site/compare/\1` (compare docs are what carry these links)
 
-- [ ] **Step 2: Retire the secret-redaction sed block, keep leak-scan as a guard**
+- [ ] **Step 2: Retire only the SECURITY redaction rules; keep the cosmetic rewrites**
 
-Since `docs/site` is now publish-clean at source, delete the 12-rule sanitizer `sed` block in `sync-from-sqe.sh` (the section after `# --- 7. Deterministic sanitizer`). Keep the final leak-scan gate so the build still fails if a leak ever reappears.
+`docs/site` is now secret-clean at source, so delete the *security* sed rules from the
+sanitizer block: the 12-digit account-id rule, the 13+-digit snapshot guard, the
+`sbp.gitlab…`/monorepo-path rules, and the `jacobadmin`/`jacobbuilder` rules. KEEP the
+cosmetic rewrites that carry traceability or normalization: `MR !` -> "an earlier
+change", `feat/`/`chore/` -> branch phrasing, `eu-central`/`eu-west` -> `eu-example-*`,
+`amazonaws` -> `aws-endpoint`/`aws`, `crates/sqe-*` -> bare crate name. Keep the final
+leak-scan gate as a guard so the build still fails if a secret ever reappears.
 
 - [ ] **Step 3: Update getsqe/CLAUDE.md source paths**
 
@@ -619,9 +648,15 @@ git commit -m "sync: re-point to docs/site + docs/evidence, retire sanitizer (so
 Edit line 23: `SRC_BOOK="$SQE_DIR/docs/book"` -> `SRC_BOOK="$SQE_DIR/docs/site/book"`.
 Leave the quickstart OVERVIEW overlay (line 42, reads `$SQE_DIR/quickstart/*/OVERVIEW.md`) unchanged.
 
-- [ ] **Step 2: Retire the secret-redaction sed block, keep the book.toml de-brand**
+- [ ] **Step 2: Retire only the SECURITY rules; keep cosmetics and the book.toml de-brand**
 
-Delete the 13-rule sanitizer `sed -E -i ''` block (lines 80-98). KEEP the `book.toml` de-brand `sed` (lines 52-56) — that rewrites repo URL/authors/build-dir, not secrets. Keep the leak-scan gate (lines 101-105) as a guard.
+From the `sed -E -i ''` block (lines 80-98), delete the *security* rules only: the
+12-digit account-id rule (85), the 13+-digit snapshot guard (84), the `sbp.gitlab…`
+host + URL rules (93-94), the monorepo-path rule (95), and `jacobadmin`/`jacobbuilder`
+(96-97). KEEP the cosmetic rules: crate-path strip with the `@@KEEP@@` sentinel (81-83),
+region rewrites (86-87), `amazonaws` (88-89), `MR !` (90), `feat/`/`chore/` (91-92).
+KEEP the `book.toml` de-brand `sed` (lines 52-56) — repo URL/authors/build-dir, not
+secrets. Keep the leak-scan gate (lines 101-105) as a guard.
 
 - [ ] **Step 3: Dry-run the docs-website sync and build**
 
@@ -677,6 +712,15 @@ Then open a PR (the getsqe sub-repo changes go as their own PRs in their respect
 
 ---
 
+## Deferred follow-on (not in this plan's scope)
+
+**Backfill MR/branch references to permalinks.** A later pass converts `MR !358`-style
+references in `docs/site/book/src/design-notes/` to stable links (linked commits or a
+public changelog entry) so they read cleanly in published docs AND stay traceable. Once
+done, the cosmetic `MR !`/`feat/`/`chore/` rewrites can be removed from both getsqe sync
+scripts, moving the sync closer to a pure copy. Tracked here so the decision ("keep MR
+refs in source now, backfill later") is not lost.
+
 ## Self-review notes (coverage check)
 
 - Three zones created + the no-loose-file rule -> Tasks 1-8, verified Task 13 Step 1. ✓
@@ -684,7 +728,7 @@ Then open a PR (the getsqe sub-repo changes go as their own PRs in their respect
 - `features.md`/`trino`/`duckdb` kept as compare sources -> Task 3. ✓
 - Design history published as design-notes -> Task 6. ✓
 - Internal + evidence sweeps -> Tasks 7-8. ✓
-- Publish-clean invariant + retire sanitizers -> Tasks 10-12. ✓
+- Split invariant: security fixed at source (leak-scan-site.sh), cosmetics kept + MR backfill deferred -> Tasks 10-12 + Deferred follow-on. ✓
 - Full migration surface (Makefile, render script, both CLAUDE.md, both sync scripts) -> Tasks 9, 11, 12. ✓
 - Verification + rollback (feature branch) -> Task 13; rollback = revert branch. ✓
 - All four REVIEW items resolved in the header. ✓

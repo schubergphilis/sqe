@@ -100,17 +100,30 @@ Top-level `docs/` holds zero loose files. Every file lands in exactly one zone:
 
 ### Publish-clean-at-source invariant (the key principle)
 
-`docs/site/` must contain no secrets, ever: placeholder account IDs (`123456789012`),
-public crate names (`sqe-cli`, `sqe-coordinator`), generic regions (`eu-example-1`),
-no personal IAM names, no internal GitLab/monorepo paths.
+The current sync sanitizer does two unlike jobs. Split them:
 
-Consequence: the website sync becomes copy + build. The leak-scan *verifies*
-cleanliness (a guard) rather than *creating* it (a transformer). The 12 sed rules in
-`sync-from-sqe.sh` are retired. A leak-scan over `docs/site/` is added to the SQE
-repo's own checks so the source stays clean.
+- **Security redaction (fix at source).** Real account IDs -> `123456789012`, no
+  personal IAM names (`jacobadmin`), no internal hostnames (`sbp.gitlab…`), no
+  monorepo paths (`vpf-data-ai/chameleon`). These are secrets/PII and must be
+  placeholders even internally. `docs/site/` must never contain them. A repo-local
+  leak-scan (`scripts/leak-scan-site.sh`) enforces exactly this set as a guard, and
+  the corresponding rules are retired from both getsqe sync scripts.
+- **Cosmetic normalization (keep in sync for now).** `MR !358` -> "an earlier
+  change", `feat/x` -> "a feature branch", `eu-central-1` -> `eu-example-1`,
+  `amazonaws` -> `aws-endpoint`, `crates/sqe-foo` -> `sqe-foo`. These are not secrets;
+  they carry internal traceability (MR numbers are load-bearing references). They stay
+  in the source and remain presentation-only rewrites in the getsqe sync scripts.
 
-Migration cost: a one-time sanitize-in-place sweep of the site zone (the ebook source
-still carries real account IDs today per `PUBLISH-CHECKLIST.md`).
+Consequence: the website sync drops the fragile security rules (including the
+ordering-sensitive 13-digit-before-12-digit account redaction) and keeps only the thin
+cosmetic rewrites. The leak-scan still gates as a guard.
+
+Deferred backfill: a later pass converts MR/branch references to stable permalinks
+(linked commits) so they read cleanly AND stay traceable; at that point the cosmetic
+rewrites can retire too and the sync becomes a pure copy.
+
+Migration cost: a one-time security sanitize-in-place sweep of the site zone (the ebook
+source still carries real account IDs today per `PUBLISH-CHECKLIST.md`).
 
 ### Design notes (the published engineering story)
 
