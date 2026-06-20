@@ -88,6 +88,24 @@ SELECT * FROM read_csv('s3://bucket/sales/*.csv',
 
 CSV-specific named args: `delimiter`, `has_header`, `quote`, `escape`, `comment`, `null_regex`, `file_extension`. JSON-specific: `newline_delimited`, `file_extension`.
 
+`read_csv` also accepts the DuckDB-style aliases `sep` / `delim` for the delimiter, `header` for `has_header`, `nullstr` for `null_regex`, and `compress` / `compression` for the codec. Delimiter and codec default from the path extension: `.csv` is comma, `.tsv` is tab, `.psv` is pipe, `.ssv` is semicolon, and a `.gz` / `.bz2` / `.xz` / `.zst` suffix is stripped before delimiter detection.
+
+### `read_delta()`
+
+`read_delta()` reads a Delta Lake table directly. It takes the same S3 credential args as the other TVFs plus time-travel args: `version` (a snapshot id) or `timestamp` (RFC3339). The two are mutually exclusive, and reads are read-only.
+
+```sql
+-- Latest snapshot
+SELECT * FROM read_delta('/data/delta/transactions');
+
+-- Time travel to a specific version
+SELECT * FROM read_delta('/data/delta/transactions', version => '12');
+
+-- Land a Delta table into local Iceberg via CTAS
+CREATE TABLE iceberg.warehouse.legacy_sales AS
+    SELECT * FROM read_delta('/legacy/delta/sales');
+```
+
 ### Auto-detect: `SELECT * FROM 'file.ext'`
 
 DuckDB-style sugar for "I just want to query this file." The engine looks at the file extension and picks the right reader:
@@ -141,7 +159,78 @@ SELECT * FROM read_json('hf://models/<owner>/<name>/config.json');
 
 The resolver expands `hf://datasets/<owner>/<name>/<path>` to `https://huggingface.co/datasets/<owner>/<name>/resolve/<rev>/<path>` and routes through the same HTTP object store as raw HTTPS URLs. Default revision is `main`.
 
-Public datasets work without any auth. Private datasets are not yet supported (HF token plumbing is on the roadmap).
+Public datasets work without any auth. Private datasets read `HF_TOKEN` from the environment if it is set.
+
+### Storage backends
+
+The TVFs resolve S3 and S3-compatible stores, Azure, and GCS. Credentials default from the engine's `[storage]` block (or the relevant provider chain) and can be overridden per query with named args.
+
+Cloudflare R2 is S3-compatible. Point the endpoint at the account URL and use `auto` for the region:
+
+```sql
+SELECT * FROM read_parquet(
+    's3://my-r2-bucket/data.parquet',
+    access_key => '<R2_ACCESS_KEY_ID>',
+    secret_key => '<R2_SECRET_ACCESS_KEY>',
+    endpoint   => 'https://<account-id>.r2.cloudflarestorage.com',
+    region     => 'auto'
+);
+```
+
+MinIO, Ceph RGW, SeaweedFS, Garage, and rustfs are also S3-compatible: same args, endpoint pointing at the local server. Set `s3_allow_http = true` in `[storage]` (or pass an `http://` endpoint) to allow plain HTTP for local development.
+
+Azure ADLS Gen2 / Blob accepts three URL forms: `abfss://<container>@<account>.dfs.core.windows.net/<path>`, the plaintext `abfs://...`, or the shorthand `azure://<container>/<path>` with the account from config.
+
+```sql
+-- Shared key
+SELECT * FROM read_parquet(
+    'abfss://my-container@myaccount.dfs.core.windows.net/data.parquet',
+    azure_access_key => '<storage-account-key>'
+);
+
+-- SAS token
+SELECT * FROM read_csv(
+    'abfss://logs@myaccount.dfs.core.windows.net/events.csv',
+    azure_sas_token => 'sv=2024-08-04&ss=b&...'
+);
+```
+
+Google Cloud Storage uses `gs://` or `gcs://`. Auth is a service-account JSON file path, an inline JSON key, or Application Default Credentials.
+
+```sql
+SELECT * FROM read_parquet(
+    'gs://my-bucket/data.parquet',
+    gcs_service_account_path => '/var/secrets/gcs-key.json'
+);
+
+-- ADC (gcloud config, GCE metadata, GKE Workload Identity)
+SELECT * FROM read_parquet('gs://my-bucket/data.parquet');
+```
+
+Permanent credentials for any backend live in the engine's `[storage]` block (`azure_account`, `azure_access_key`, `azure_sas_token`, `gcs_service_account_path`, `gcs_service_account_key`).
+
+### Catalog backends
+
+Startup `--catalog NAME=PATH` flags attach SQLite-backed Iceberg catalogs. To mount any other backend from the REPL, use SQL `ATTACH` / `DETACH` and the secret primitives, which behave the same as on the cluster server. Mounts are process-local: the registry and secret store reset on exit.
+
+```sql
+sqe> CREATE SECRET prod (TYPE bearer, TOKEN 'eyJ...');
+sqe> ATTACH 'http://catalog.example.com/api/catalog' AS prod_cat
+       (TYPE iceberg_rest, WAREHOUSE 'analytics', SECRET prod);
+sqe> SELECT * FROM prod_cat.sales.orders LIMIT 5;
+sqe> DETACH prod_cat;
+```
+
+Supported `TYPE` values are `iceberg_rest`, `glue`, `s3tables`, `hms`, `jdbc`, `sqlite`, and `hadoop`. See [Runtime catalog management](../operations/catalogs.md) for the full reference. The matrix of where each backend can be reached:
+
+| Backend | Cluster (TOML) | Embedded (`--catalog`) | Embedded (`ATTACH`) |
+|---|---|---|---|
+| Iceberg REST (Polaris, Nessie, Unity) | yes | no | yes |
+| AWS Glue | yes | no | yes |
+| AWS S3 Tables | yes | no | yes |
+| Hive Metastore | yes | no | yes |
+| JDBC (Postgres / MySQL / SQLite) | yes | SQLite only | yes |
+| Hadoop (storage-only) | yes | yes (file:// path scan) | yes |
 
 ### `COPY ... TO 'file'`
 
@@ -173,7 +262,14 @@ sqe-cli --embedded -e \
 sqe-cli --embedded -e "SELECT count(*) FROM iceberg.staging.events"
 ```
 
-`CREATE TABLE ... AS SELECT ...` (CTAS) is a known limitation: the embedded mode does not yet have a Parquet writer + iceberg-transaction commit pipeline, so the upstream provider rejects table providers that carry data. Use a separate `CREATE TABLE` (schema only) followed by `INSERT INTO ... SELECT ...` once the embedded INSERT path lands, or load via the cluster path for now.
+The full DML surface works against the embedded catalog: `CREATE TABLE`, `CREATE TABLE AS SELECT` (CTAS), `INSERT INTO`, `UPDATE`, `DELETE`, and `MERGE INTO`. Streaming writes keep CTAS and INSERT constant-memory, so loading a large external file straight into a local Iceberg table does not OOM:
+
+```bash
+sqe-cli --embedded -e "CREATE TABLE iceberg.staging.orders_2026 AS \
+    SELECT id, region, total FROM read_parquet('s3://bucket/2026/*.parquet') WHERE total > 0"
+```
+
+Default DML mode is Copy-on-Write. Set `write.delete.mode`, `write.update.mode`, or `write.merge.mode` to `merge-on-read` on the table to opt into the delete-file writer.
 
 The on-disk layout:
 
