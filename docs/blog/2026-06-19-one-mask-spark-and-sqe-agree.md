@@ -52,12 +52,14 @@ The folded literal is what ships to workers. The function call never crosses the
 
 Tag-based masking, "any column tagged `PII` is masked show-last-4," splits into two halves stored in two places, on purpose.
 
-The mask-per-tag rule lives in Ranger as a `tag`-service policy, shared with Spark like everything else. The tag-to-column association lives in the Iceberg table property `sqe.column-tags`:
+The mask-per-tag rule lives in Ranger as a `tag`-service policy, shared with Spark like everything else. The tag-to-column association lives in the Iceberg table property `sqe.column-tags`, authored with `SET TAGS`:
 
 ```sql
 ALTER TABLE sales_wh.sales.orders
-  SET TBLPROPERTIES ('sqe.column-tags' = '{"ssn":["PII"],"amount":["FINANCIAL"]}');
+  SET TAGS (ssn = ('PII'), amount = ('FINANCIAL'));
 ```
+
+`SET TAGS` writes the `sqe.column-tags` property for you and merges, so it changes only the columns you name. The Snowflake form works too: `MODIFY COLUMN ssn SET TAG PII = 'true'`, where the tag name is the label and the value is ignored.
 
 Storing associations as a table property beats the Ranger or Atlas tag store on four counts. They cover federated catalogs Polaris cannot gate. They need no Atlas or tagsync deployment. They travel with the data through clone, replicate, and rename. And SQE already reads the table metadata on every scan, so the read is free.
 
