@@ -839,6 +839,10 @@ impl QueryHandler {
                 StatementKind::ShowGrants(ref target) => self.handle_show_grants(session, target).await,
                 StatementKind::ShowEffectiveGrants(ref user) => self.handle_show_effective_grants(session, user).await,
                 StatementKind::CheckAccess(ref params) => self.handle_check_access(session, params).await,
+                StatementKind::ShowEffectivePolicy(ref params) => {
+                    self.handle_show_effective_policy(session, params).await
+                }
+                StatementKind::ShowTags(ref table) => self.handle_show_tags(session, table).await,
 
                 // DDL/DML invalidation scope (issue #11): a 50 ms SessionContext
                 // rebuild on cache miss multiplied by every active user's next
@@ -3584,6 +3588,237 @@ impl QueryHandler {
         Ok(vec![batch])
     }
 
+    /// Handle `SHOW EFFECTIVE POLICY [FOR USER "u"] ON <table>`.
+    ///
+    /// Runs the SAME policy resolution the plan rewriter applies for (user,
+    /// table): resolves the resource policy via the wired `PolicyStore`, then
+    /// merges tag-derived masks and filters using the table's own
+    /// `sqe.column-tags`. Returns a redacted, row-per-effect description.
+    ///
+    /// Gating mirrors SHOW EFFECTIVE GRANTS: self-introspection is always
+    /// allowed; `FOR USER other` requires admin (`require_self_or_admin`).
+    ///
+    /// Redaction: only the mask *type* name is surfaced (never `Redact`'s
+    /// replacement, `Custom`'s expression body, or any row-filter body) so the
+    /// diagnostic cannot leak the literals embedded in a policy expression.
+    async fn handle_show_effective_policy(
+        &self,
+        session: &Session,
+        params: &sqe_sql::ShowEffectivePolicyParams,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // Default target is the session user. `FOR USER other` is gated BEFORE
+        // any catalog/policy work so an unauthorised caller cannot probe another
+        // principal's policy (issue #260, same gate as SHOW EFFECTIVE GRANTS).
+        let target_user = params.user.as_deref().unwrap_or(&session.user.username);
+        self.require_self_or_admin(session, target_user, "SHOW EFFECTIVE POLICY")?;
+
+        let store = self.policy_store.as_deref().ok_or_else(|| {
+            SqeError::NotImplemented(
+                "Policy enforcement is not configured. Set [policy] backend in the config."
+                    .to_string(),
+            )
+        })?;
+
+        // Load the table's column tags via the caller's token (catalog gates
+        // read access). The returned TableIdent gives the policy key without a
+        // second parse.
+        let (table_ident, col_tags) =
+            self.catalog_ops.load_column_tags(session, &params.table).await?;
+
+        // Derive the (namespace, table) policy key the SAME way the rewriter
+        // does (`resolve_policy_key`): the last DOT-separated component of the
+        // namespace. `parse_table_ref` collapses a 3-part reference to a single
+        // namespace component, but a quoted multi-level component (e.g.
+        // `cat."ns1.ns2".tbl`) stays as the string "ns1.ns2"; the rewriter and
+        // the write path both key on its last component ("ns2"), so we must too
+        // or the diagnostic would resolve a different policy than enforcement.
+        let namespace_raw = table_ident
+            .namespace()
+            .as_ref()
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "default".to_string());
+        let namespace = namespace_raw
+            .rsplit('.')
+            .next()
+            .unwrap_or(&namespace_raw)
+            .to_string();
+        let table_name = table_ident.name().to_string();
+
+        // The target user's roles are only known for the self case. For
+        // `FOR USER other` we have no role lookup wired (the session holds only
+        // the caller's roles), so role-based policy for another principal is
+        // resolved with an empty role set. See the report's known-gaps note.
+        let target = if params.user.is_none()
+            || params.user.as_deref() == Some(session.user.username.as_str())
+        {
+            session.user.clone()
+        } else {
+            sqe_core::session::SessionUser {
+                username: target_user.to_string(),
+                roles: Vec::new(),
+            }
+        };
+
+        let policy = sqe_policy::plan_rewriter::resolve_effective_policy(
+            store,
+            &target,
+            &table_name,
+            &namespace,
+            &col_tags,
+        )
+        .await;
+
+        Self::effective_policy_to_record_batch(&policy)
+    }
+
+    /// Build the `SHOW EFFECTIVE POLICY` result batch from a `ResolvedPolicy`.
+    ///
+    /// Columns: `kind` (`row_filter` | `column_mask` | `column_restriction` |
+    /// `denied`), `column` (null for row filters / denied), `detail` (redacted),
+    /// `source` (best-effort origin; `policy` for now). Rows are emitted in a
+    /// deterministic order: denied, then row filters, then masks (sorted by
+    /// column), then restrictions (sorted).
+    fn effective_policy_to_record_batch(
+        policy: &sqe_policy::ResolvedPolicy,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("kind", DataType::Utf8, false),
+            Field::new("column", DataType::Utf8, true),
+            Field::new("detail", DataType::Utf8, false),
+            Field::new("source", DataType::Utf8, false),
+        ]));
+
+        let mut kind_b = StringBuilder::new();
+        let mut col_b = StringBuilder::new();
+        let mut detail_b = StringBuilder::new();
+        let mut source_b = StringBuilder::new();
+
+        let mut push = |kind: &str, column: Option<&str>, detail: &str, source: &str| {
+            kind_b.append_value(kind);
+            match column {
+                Some(c) => col_b.append_value(c),
+                None => col_b.append_null(),
+            }
+            detail_b.append_value(detail);
+            source_b.append_value(source);
+        };
+
+        // Deny-all sentinel: the resolver signals a fully-denied table by
+        // pushing `lit(false)` into row_filters. Surface it as a single `denied`
+        // row rather than counting it as a normal filter.
+        let denied = policy
+            .row_filters
+            .iter()
+            .any(|e| matches!(e, datafusion::logical_expr::Expr::Literal(sv, _) if sv == &datafusion::scalar::ScalarValue::Boolean(Some(false))));
+
+        if denied {
+            push("denied", None, "access denied (deny-all policy)", "policy");
+        } else {
+            let n = policy.row_filters.len();
+            if n > 0 {
+                // Never print the filter expression body: it can embed literals.
+                push(
+                    "row_filter",
+                    None,
+                    &format!("{n} row filter(s) applied"),
+                    "policy",
+                );
+            }
+        }
+
+        // Column masks, sorted by column for deterministic output. Only the
+        // mask TYPE name is surfaced (redaction).
+        let mut masks: Vec<(&String, &sqe_policy::MaskType)> = policy.column_masks.iter().collect();
+        masks.sort_by(|a, b| a.0.cmp(b.0));
+        for (col, mask) in masks {
+            push("column_mask", Some(col), Self::mask_type_name(mask), "policy");
+        }
+
+        // Restricted columns, sorted.
+        let mut restricted = policy.restricted_columns.clone();
+        restricted.sort();
+        for col in &restricted {
+            push("column_restriction", Some(col), "restricted", "policy");
+        }
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(kind_b.finish()) as ArrayRef,
+                Arc::new(col_b.finish()) as ArrayRef,
+                Arc::new(detail_b.finish()) as ArrayRef,
+                Arc::new(source_b.finish()) as ArrayRef,
+            ],
+        )
+        .map_err(|e| SqeError::Execution(format!("Failed to build result batch: {e}")))?;
+
+        Ok(vec![batch])
+    }
+
+    /// Redaction-safe label for a `MaskType`: the variant name only, never the
+    /// `Redact` replacement string or the `Custom` expression body.
+    fn mask_type_name(mask: &sqe_policy::MaskType) -> &'static str {
+        match mask {
+            sqe_policy::MaskType::Nullify => "Nullify",
+            sqe_policy::MaskType::Redact(_) => "Redact",
+            sqe_policy::MaskType::Hash => "Hash",
+            sqe_policy::MaskType::Custom(_) => "Custom",
+            sqe_policy::MaskType::PartialMask { .. } => "PartialMask",
+            sqe_policy::MaskType::DateShowYear => "DateShowYear",
+        }
+    }
+
+    /// Handle `SHOW TAGS ON <table>` — read back the `sqe.column-tags` property
+    /// as (column, tag) rows. No extra SQE gate: `load_column_tags` loads the
+    /// table with the caller's token, so the catalog enforces read access.
+    /// Empty result when the table carries no tags.
+    async fn handle_show_tags(
+        &self,
+        session: &Session,
+        table: &str,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let (_table_ident, col_tags) = self.catalog_ops.load_column_tags(session, table).await?;
+        Self::tags_to_record_batch(&col_tags)
+    }
+
+    /// Build the `SHOW TAGS` result batch: one row per (column, tag), sorted by
+    /// (column, tag) for deterministic output.
+    fn tags_to_record_batch(
+        col_tags: &std::collections::HashMap<String, Vec<String>>,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("column", DataType::Utf8, false),
+            Field::new("tag", DataType::Utf8, false),
+        ]));
+
+        let mut rows: Vec<(&str, &str)> = Vec::new();
+        for (col, tags) in col_tags {
+            for tag in tags {
+                rows.push((col.as_str(), tag.as_str()));
+            }
+        }
+        rows.sort_unstable();
+
+        let mut col_b = StringBuilder::new();
+        let mut tag_b = StringBuilder::new();
+        for (col, tag) in rows {
+            col_b.append_value(col);
+            tag_b.append_value(tag);
+        }
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(col_b.finish()) as ArrayRef,
+                Arc::new(tag_b.finish()) as ArrayRef,
+            ],
+        )
+        .map_err(|e| SqeError::Execution(format!("Failed to build result batch: {e}")))?;
+
+        Ok(vec![batch])
+    }
+
     /// Convert a list of `GrantEntry` values into a `RecordBatch` for the client.
     fn grants_to_record_batch(
         entries: &[sqe_policy::grants::GrantEntry],
@@ -4772,6 +5007,148 @@ mod tests {
         config.role_overrides.insert("admin".to_string(), 600);
         let session = test_session(vec![]);
         assert_eq!(timeout_for_session(&config, &session), 300);
+    }
+
+    // ── SHOW EFFECTIVE POLICY / SHOW TAGS result builders ────────
+    // The handlers gate + resolve against a live catalog/store, but the
+    // RecordBatch-building helpers are pure and tested here with synthetic
+    // input. Redaction: only the mask TYPE name appears in `detail`.
+
+    fn string_col(batch: &RecordBatch, idx: usize) -> Vec<Option<String>> {
+        use arrow_array::Array;
+        let arr = batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .expect("string column");
+        (0..arr.len())
+            .map(|i| {
+                if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i).to_string())
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn effective_policy_batch_redacts_and_orders_rows() {
+        let mut p = sqe_policy::ResolvedPolicy::default();
+        p.row_filters.push(datafusion::logical_expr::col("region")
+            .eq(datafusion::logical_expr::lit("EU")));
+        p.column_masks
+            .insert("ssn".to_string(), sqe_policy::MaskType::Hash);
+        // Redact carries a replacement string that MUST NOT appear in output.
+        p.column_masks.insert(
+            "name".to_string(),
+            sqe_policy::MaskType::Redact("SECRET_VALUE".to_string()),
+        );
+        p.restricted_columns.push("notes".to_string());
+
+        let batches = QueryHandler::effective_policy_to_record_batch(&p).unwrap();
+        let b = &batches[0];
+        let kinds = string_col(b, 0);
+        let cols = string_col(b, 1);
+        let details = string_col(b, 2);
+
+        // row_filter (no column), then masks sorted by column (name, ssn), then
+        // restriction.
+        assert_eq!(kinds[0].as_deref(), Some("row_filter"));
+        assert_eq!(cols[0], None, "row filter has no column");
+        assert_eq!(details[0].as_deref(), Some("1 row filter(s) applied"));
+
+        assert_eq!(kinds[1].as_deref(), Some("column_mask"));
+        assert_eq!(cols[1].as_deref(), Some("name"));
+        assert_eq!(details[1].as_deref(), Some("Redact"));
+
+        assert_eq!(kinds[2].as_deref(), Some("column_mask"));
+        assert_eq!(cols[2].as_deref(), Some("ssn"));
+        assert_eq!(details[2].as_deref(), Some("Hash"));
+
+        assert_eq!(kinds[3].as_deref(), Some("column_restriction"));
+        assert_eq!(cols[3].as_deref(), Some("notes"));
+        assert_eq!(details[3].as_deref(), Some("restricted"));
+
+        // No detail field may leak the Redact replacement literal.
+        for d in details.iter().flatten() {
+            assert!(!d.contains("SECRET_VALUE"), "mask body leaked: {d}");
+        }
+    }
+
+    #[test]
+    fn effective_policy_batch_deny_all_emits_single_denied_row() {
+        let mut p = sqe_policy::ResolvedPolicy::default();
+        p.row_filters.push(datafusion::logical_expr::lit(false));
+        let batches = QueryHandler::effective_policy_to_record_batch(&p).unwrap();
+        let b = &batches[0];
+        assert_eq!(b.num_rows(), 1, "deny-all collapses to one row");
+        assert_eq!(string_col(b, 0)[0].as_deref(), Some("denied"));
+    }
+
+    #[test]
+    fn effective_policy_batch_empty_policy_is_empty() {
+        let p = sqe_policy::ResolvedPolicy::default();
+        let batches = QueryHandler::effective_policy_to_record_batch(&p).unwrap();
+        assert_eq!(batches[0].num_rows(), 0);
+    }
+
+    #[test]
+    fn tags_batch_sorted_one_row_per_pair() {
+        let mut map: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        map.insert("email".to_string(), vec!["PII".to_string(), "CONTACT".to_string()]);
+        map.insert("id".to_string(), vec!["PK".to_string()]);
+
+        let batches = QueryHandler::tags_to_record_batch(&map).unwrap();
+        let b = &batches[0];
+        let cols = string_col(b, 0);
+        let tags = string_col(b, 1);
+        assert_eq!(b.num_rows(), 3);
+        // Sorted by (column, tag): (email, CONTACT), (email, PII), (id, PK).
+        assert_eq!(cols[0].as_deref(), Some("email"));
+        assert_eq!(tags[0].as_deref(), Some("CONTACT"));
+        assert_eq!(cols[1].as_deref(), Some("email"));
+        assert_eq!(tags[1].as_deref(), Some("PII"));
+        assert_eq!(cols[2].as_deref(), Some("id"));
+        assert_eq!(tags[2].as_deref(), Some("PK"));
+    }
+
+    #[test]
+    fn tags_batch_empty_when_no_tags() {
+        let map: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        let batches = QueryHandler::tags_to_record_batch(&map).unwrap();
+        assert_eq!(batches[0].num_rows(), 0);
+    }
+
+    #[test]
+    fn mask_type_name_covers_all_variants() {
+        use sqe_policy::MaskType;
+        assert_eq!(QueryHandler::mask_type_name(&MaskType::Nullify), "Nullify");
+        assert_eq!(
+            QueryHandler::mask_type_name(&MaskType::Redact("x".into())),
+            "Redact"
+        );
+        assert_eq!(QueryHandler::mask_type_name(&MaskType::Hash), "Hash");
+        assert_eq!(
+            QueryHandler::mask_type_name(&MaskType::Custom(datafusion::logical_expr::lit("e"))),
+            "Custom"
+        );
+        assert_eq!(
+            QueryHandler::mask_type_name(&MaskType::PartialMask {
+                show_first: 0,
+                show_last: 4,
+                upper: 'x',
+                lower: 'x',
+                digit: 'x'
+            }),
+            "PartialMask"
+        );
+        assert_eq!(
+            QueryHandler::mask_type_name(&MaskType::DateShowYear),
+            "DateShowYear"
+        );
     }
 
     // ── scan_task_projection ─────────────────────────────────────

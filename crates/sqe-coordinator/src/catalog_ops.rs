@@ -998,6 +998,32 @@ impl CatalogOps {
         Ok(())
     }
 
+    /// Read back the `sqe.column-tags` property of a table as a
+    /// `column -> [tags]` map. Powers `SHOW TAGS ON <table>` and the tag-merge
+    /// step of `SHOW EFFECTIVE POLICY`. Loads the table via the caller's token,
+    /// so the catalog's own read-access enforcement gates the call (no extra
+    /// SQE gate needed). Returns an empty map for a table with no tags.
+    ///
+    /// Also returns the resolved `TableIdent` so callers can derive the policy
+    /// key without re-parsing the reference.
+    #[instrument(skip(self, session), fields(username = %session.user.username))]
+    pub async fn load_column_tags(
+        &self,
+        session: &Session,
+        table: &str,
+    ) -> sqe_core::Result<(TableIdent, HashMap<String, Vec<String>>)> {
+        let object_name = parse_object_name(table)?;
+        let table_ident = parse_table_ref(&object_name)?;
+
+        let session_catalog = self
+            .session_catalog_for(session, catalog_qualifier(&object_name).as_deref())
+            .await?;
+
+        let table = session_catalog.load_table(&table_ident).await?;
+        let tags = crate::tag_source_impl::parse_column_tags(table.metadata().properties());
+        Ok((table_ident, tags))
+    }
+
     /// Execute a parsed `PartitionEvolution` (ALTER TABLE ... ADD/DROP/REPLACE
     /// PARTITION FIELD) against the catalog.
     ///
