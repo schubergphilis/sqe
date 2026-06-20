@@ -81,7 +81,7 @@ SQE_BUILD_ARGS := \
         benchmark-charts test clippy fmt fmt-check clean clean-rust clean-rustbook \
         clean-ebook clean-benchmark-charts clean-images check-tools maintain \
         build build-sqe sbom sbom-sqe sqe-config images \
-        login buildx-builder push push-sqe
+        login buildx-builder push push-sqe leak-scan
 
 # ── Default target ────────────────────────────────────────────────────────
 help:
@@ -125,6 +125,7 @@ help:
 	@echo ""
 	@echo "  Diagnostics:"
 	@echo "    make check-tools  Verify cargo / mdbook / pandoc / d2 / mmdc are present"
+	@echo "    make leak-scan    Scan docs/site for secrets/PII before publishing"
 
 all: dev rustbook ebook build sbom
 
@@ -301,3 +302,8 @@ check-tools:
 	@echo "  rustbook needs:  mdbook, mdbook-mermaid"
 	@echo "  ebook needs:     pandoc, pandoc-crossref, d2, mmdc, xelatex (or weasyprint)"
 	@echo "  ebook PDF needs: rsvg-convert (librsvg) or cairosvg for SVG -> PDF"
+
+# ── Publish guard: secrets / PII scan ─────────────────────────────────────
+leak-scan:
+	@echo "==> Scanning docs/site for leaks"
+	@bash scripts/leak-scan-site.sh docs/site

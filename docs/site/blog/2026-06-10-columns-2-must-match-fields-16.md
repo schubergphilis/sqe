@@ -35,7 +35,7 @@ The bug had been on main for almost a month. Nothing in CI caught it because CI 
 
 ## The tourniquet
 
-The first fix ([!327](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/merge_requests/327)) was deliberately boring: stop pushing projection to workers. Workers return full rows, the coordinator narrows them by name, and the reassembly path got extracted into a function with regression tests pinning the contract. Parity went from 0/22 to 22/22 against Trino. Shipped.
+The first fix ([!327](https://github.com/schubergphilis/sqe)) was deliberately boring: stop pushing projection to workers. Workers return full rows, the coordinator narrows them by name, and the reassembly path got extracted into a function with regression tests pinning the contract. Parity went from 0/22 to 22/22 against Trino. Shipped.
 
 Correct, but at a cost we named in the MR. A query that needs two columns of `lineitem` now reads all sixteen from S3 and ships all sixteen over Flight. We then ran the harness at SF1 and saw it: 22/22 matched, but the scan-heavy queries ran around 5x slower than Trino.
 
@@ -57,7 +57,7 @@ let schema = builder.schema().clone();
 
 The old buffering path had read the schema from `batches[0].schema()`, the actual data. That is why April worked. The rewrite swapped the source of truth from the data to the builder, one line, and nothing in the worker's tests compared the advertised schema against the emitted batches.
 
-The fix ([!329](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/merge_requests/329)):
+The fix ([!329](https://github.com/schubergphilis/sqe)):
 
 ```rust
 let schema = stream.schema().clone();
