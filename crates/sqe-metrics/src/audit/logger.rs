@@ -1,11 +1,16 @@
-use std::io::Write;
 use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 
+use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+use super::chain::HashChain;
+use super::event::{
+    Actor, AuditEvent, AuditKind, Integrity, Outcome, PolicyAudit, QueryInfo, QueryStats, Timing,
+};
 use super::redact_pii;
+use super::sink::{AuditFormat, AuditSink, NativeJsonlSink, OcsfJsonlSink};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AuditEntry {
@@ -50,13 +55,125 @@ pub struct AuditEntry {
 /// Compute SHA-256 hash of normalised SQL (whitespace-collapsed, uppercase keywords).
 pub fn query_hash(sql: &str) -> String {
     use sha2::{Digest, Sha256};
-    let normalised: String = sql.split_whitespace().collect::<Vec<_>>().join(" ").to_uppercase();
+    let normalised: String = sql
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_uppercase();
     let hash = Sha256::digest(normalised.as_bytes());
     format!("{hash:x}")
 }
 
+/// Compute a chain hash over raw bytes: `sha256(prev_hash || body_bytes)`.
+///
+/// Used to chain legacy `AuditEntry` records without converting them to `AuditEvent`.
+fn chain_hash_raw(prev_hash: &str, body: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(prev_hash.as_bytes());
+    hasher.update(body);
+    format!("{:x}", hasher.finalize())
+}
+
+/// Inject an `Integrity` block into a serialized JSON object string.
+///
+/// Expects `json` to be a `{...}` object. Strips the closing `}`, appends
+/// `,"integrity":{...}}`. If `json` is empty or malformed, appends the
+/// integrity as a standalone object (best-effort, never panics).
+fn inject_integrity(json: &str, integrity: &Integrity) -> String {
+    let integrity_json = match serde_json::to_string(integrity) {
+        Ok(s) => s,
+        Err(_) => return json.to_string(),
+    };
+    let trimmed = json.trim_end();
+    if let Some(body) = trimmed.strip_suffix('}') {
+        format!("{body},\"integrity\":{integrity_json}}}")
+    } else {
+        // Malformed JSON: append best-effort.
+        format!("{json},\"integrity\":{integrity_json}")
+    }
+}
+
+/// Convert a (pre-redacted) `AuditEntry` to the canonical `AuditEvent` type.
+///
+/// Used by `log_event` paths that need the structured event. The legacy `log()`
+/// path preserves the flat `AuditEntry` JSON format.
+///
+/// Mapping notes:
+/// - `timestamp: String` parsed as RFC-3339; falls back to `Utc::now()` on failure.
+/// - `status: String` "success" -> `Outcome::Success`; anything else -> `Outcome::Failure`.
+/// - `tables_touched: Vec<String>` has no exact target in the structured event model.
+///   The field is noted but currently dropped from the AuditEvent representation.
+///   It will be wired into `resources` in a follow-up task.
+impl From<AuditEntry> for AuditEvent {
+    fn from(e: AuditEntry) -> Self {
+        let time = DateTime::parse_from_rfc3339(&e.timestamp)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| chrono::Utc::now());
+
+        let outcome = if e.status.eq_ignore_ascii_case("success") {
+            Outcome::Success
+        } else {
+            Outcome::Failure {
+                error_type: Some(e.status.clone()),
+                error_code: None,
+                message: None,
+            }
+        };
+
+        let policy = if e.row_filters_applied > 0
+            || !e.columns_masked.is_empty()
+            || !e.columns_restricted.is_empty()
+            || e.policy_denied
+        {
+            Some(PolicyAudit {
+                row_filters_applied: e.row_filters_applied,
+                columns_masked: e.columns_masked,
+                columns_restricted: e.columns_restricted,
+                denied: e.policy_denied,
+            })
+        } else {
+            None
+        };
+
+        AuditEvent {
+            time,
+            kind: AuditKind::Query,
+            actor: Actor {
+                username: e.username,
+                ..Default::default()
+            },
+            outcome,
+            resources: Vec::new(),
+            policy,
+            timing: Some(Timing {
+                duration_ms: e.duration_ms,
+                ..Default::default()
+            }),
+            stats: Some(QueryStats {
+                rows_returned: e.rows_returned,
+                ..Default::default()
+            }),
+            query: Some(QueryInfo {
+                text: e.query_text,
+                query_hash: e.query_hash,
+                statement_type: e.statement_type,
+            }),
+            session_id: e.session_id,
+            client_ip: e.client_ip,
+            integrity: Integrity::default(),
+        }
+    }
+}
+
+/// Message type sent to the audit writer thread.
 enum AuditMsg {
-    Entry(Box<AuditEntry>),
+    /// Legacy `AuditEntry` path from `log()`. Already PII-redacted.
+    /// Written as flat `AuditEntry` JSON + an appended `integrity` block,
+    /// preserving the on-disk format for consumers that parse the flat shape.
+    Legacy(Box<AuditEntry>),
+    /// Canonical event from `log_event()`. Fan-out to all sinks with chain stamp.
+    Event(Box<AuditEvent>),
     Flush(Sender<()>),
 }
 
@@ -65,8 +182,51 @@ pub struct AuditLogger {
     worker: std::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
+/// Derive the OCSF file path from the native path.
+///
+/// Given `audit.jsonl`, produces `audit.ocsf.jsonl`.
+/// Given `audit` (no extension), produces `audit.ocsf.jsonl`.
+/// This keeps both files in the same directory with clear naming.
+fn ocsf_path_from(native_path: &std::path::Path) -> std::path::PathBuf {
+    let stem = native_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let dir = native_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    dir.join(format!("{stem}.ocsf.jsonl"))
+}
+
+fn open_sink_file(path: &std::path::Path) -> Result<std::fs::File, String> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("Failed to open audit log file '{}': {e}", path.display()))
+}
+
 impl AuditLogger {
+    /// Create a logger writing native JSONL to `path`.
+    ///
+    /// An empty path disables logging (no-op logger).
     pub fn new(path: &str) -> Result<Self, String> {
+        Self::with_config(path, AuditFormat::Native)
+    }
+
+    /// Create a logger with a configurable output format.
+    ///
+    /// - `Native`: writes to `path`.
+    /// - `Ocsf`: writes OCSF JSON to `path`.
+    /// - `Both`: writes native JSON to `path` and OCSF JSON to the derived
+    ///   path (see [`ocsf_path_from`]).
+    ///
+    /// The legacy `log(&AuditEntry)` path always writes flat `AuditEntry` JSON
+    /// (with an appended `integrity` block) to the native/ocsf sink's underlying
+    /// file. `log_event` fans out to all sinks via the `AuditSink` trait.
+    ///
+    /// An empty `path` disables logging regardless of format.
+    pub fn with_config(path: &str, format: AuditFormat) -> Result<Self, String> {
         if path.is_empty() {
             return Ok(Self {
                 tx: None,
@@ -74,53 +234,111 @@ impl AuditLogger {
             });
         }
 
-        let file = std::fs::OpenOptions::new()
+        let native_path = std::path::Path::new(path);
+
+        let sinks: Vec<Box<dyn AuditSink>> = match format {
+            AuditFormat::Native => {
+                let file = open_sink_file(native_path)?;
+                vec![Box::new(NativeJsonlSink::from_writer(Box::new(file)))]
+            }
+            AuditFormat::Ocsf => {
+                let file = open_sink_file(native_path)?;
+                vec![Box::new(OcsfJsonlSink::from_writer(Box::new(file)))]
+            }
+            AuditFormat::Both => {
+                let native_file = open_sink_file(native_path)?;
+                let ocsf_p = ocsf_path_from(native_path);
+                let ocsf_file = open_sink_file(&ocsf_p)?;
+                vec![
+                    Box::new(NativeJsonlSink::from_writer(Box::new(native_file))),
+                    Box::new(OcsfJsonlSink::from_writer(Box::new(ocsf_file))),
+                ]
+            }
+        };
+
+        // For the legacy `log()` path we need a direct-write file handle so we
+        // can write the flat AuditEntry + integrity JSON bypassing the sink trait.
+        // We open the same native file path a second time in append mode.
+        let legacy_file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(path)
-            .map_err(|e| format!("Failed to open audit log file '{path}': {e}"))?;
+            .open(native_path)
+            .map_err(|e| format!("Failed to open legacy audit log file '{path}': {e}"))?;
 
         let path_owned = path.to_string();
         let (tx, rx) = mpsc::channel::<AuditMsg>();
         let worker = std::thread::Builder::new()
             .name("sqe-audit-writer".to_string())
             .spawn(move || {
-                let mut writer = std::io::BufWriter::new(file);
+                let mut sinks = sinks;
+                let mut chain = HashChain::new();
+                let mut legacy_writer = std::io::BufWriter::new(legacy_file);
                 while let Ok(msg) = rx.recv() {
                     match msg {
-                        AuditMsg::Entry(entry) => {
-                            // Drain whatever else has piled up so we batch
-                            // multiple entries between flushes.
+                        AuditMsg::Legacy(entry) => {
                             let mut batch = vec![*entry];
                             while let Ok(more) = rx.try_recv() {
                                 match more {
-                                    AuditMsg::Entry(e) => batch.push(*e),
+                                    AuditMsg::Legacy(e) => batch.push(*e),
+                                    AuditMsg::Event(e) => {
+                                        Self::flush_legacy(&mut legacy_writer, &path_owned);
+                                        flush_sinks(&mut sinks, &path_owned);
+                                        // Process this event immediately.
+                                        Self::write_events(&mut sinks, &mut chain, &mut [*e], &path_owned);
+                                        flush_sinks(&mut sinks, &path_owned);
+                                    }
                                     AuditMsg::Flush(ack) => {
-                                        Self::write_batch(&mut writer, &batch, &path_owned);
+                                        Self::write_legacy_batch(&mut legacy_writer, &mut chain, &batch, &path_owned);
                                         batch.clear();
-                                        if let Err(e) = writer.flush() {
-                                            tracing::error!("AUDIT: flush failed for '{path_owned}': {e}");
-                                        }
+                                        Self::flush_legacy(&mut legacy_writer, &path_owned);
+                                        flush_sinks(&mut sinks, &path_owned);
                                         let _ = ack.send(());
                                     }
                                 }
                             }
                             if !batch.is_empty() {
-                                Self::write_batch(&mut writer, &batch, &path_owned);
-                                if let Err(e) = writer.flush() {
-                                    tracing::error!("AUDIT: flush failed for '{path_owned}': {e}");
+                                Self::write_legacy_batch(&mut legacy_writer, &mut chain, &batch, &path_owned);
+                                Self::flush_legacy(&mut legacy_writer, &path_owned);
+                                flush_sinks(&mut sinks, &path_owned);
+                            }
+                        }
+                        AuditMsg::Event(event) => {
+                            let mut batch = vec![*event];
+                            while let Ok(more) = rx.try_recv() {
+                                match more {
+                                    AuditMsg::Event(e) => batch.push(*e),
+                                    AuditMsg::Legacy(e) => {
+                                        Self::write_events(&mut sinks, &mut chain, &mut batch, &path_owned);
+                                        batch.clear();
+                                        flush_sinks(&mut sinks, &path_owned);
+                                        // Process this legacy entry immediately.
+                                        Self::write_legacy_batch(&mut legacy_writer, &mut chain, &[*e], &path_owned);
+                                        Self::flush_legacy(&mut legacy_writer, &path_owned);
+                                    }
+                                    AuditMsg::Flush(ack) => {
+                                        Self::write_events(&mut sinks, &mut chain, &mut batch, &path_owned);
+                                        batch.clear();
+                                        Self::flush_legacy(&mut legacy_writer, &path_owned);
+                                        flush_sinks(&mut sinks, &path_owned);
+                                        let _ = ack.send(());
+                                    }
                                 }
+                            }
+                            if !batch.is_empty() {
+                                Self::write_events(&mut sinks, &mut chain, &mut batch, &path_owned);
+                                Self::flush_legacy(&mut legacy_writer, &path_owned);
+                                flush_sinks(&mut sinks, &path_owned);
                             }
                         }
                         AuditMsg::Flush(ack) => {
-                            if let Err(e) = writer.flush() {
-                                tracing::error!("AUDIT: flush failed for '{path_owned}': {e}");
-                            }
+                            Self::flush_legacy(&mut legacy_writer, &path_owned);
+                            flush_sinks(&mut sinks, &path_owned);
                             let _ = ack.send(());
                         }
                     }
                 }
-                let _ = writer.flush();
+                Self::flush_legacy(&mut legacy_writer, &path_owned);
+                flush_sinks(&mut sinks, &path_owned);
             })
             .map_err(|e| format!("Failed to start audit writer thread: {e}"))?;
 
@@ -131,30 +349,71 @@ impl AuditLogger {
         })
     }
 
-    fn write_batch(
+    /// Write a batch of legacy `AuditEntry` records as flat JSON + integrity block.
+    fn write_legacy_batch(
         writer: &mut std::io::BufWriter<std::fs::File>,
+        chain: &mut HashChain,
         batch: &[AuditEntry],
         path: &str,
     ) {
+        use std::io::Write;
         for entry in batch {
-            let json = match serde_json::to_string(entry) {
+            let body_json = match serde_json::to_string(entry) {
                 Ok(j) => j,
                 Err(e) => {
                     tracing::error!("AUDIT: serialization failed: {e}");
                     continue;
                 }
             };
-            if let Err(e) = writeln!(writer, "{json}") {
+            // Build integrity: seq + prev_hash are set by the chain state;
+            // hash = sha256(prev_hash || body_json).
+            let seq = chain.next_seq();
+            let prev = chain.current_prev_hash().to_string();
+            let hash = chain_hash_raw(&prev, body_json.as_bytes());
+            chain.advance(hash.clone());
+            let integrity = Integrity { seq, prev_hash: prev, hash };
+            let line = inject_integrity(&body_json, &integrity);
+            if let Err(e) = writeln!(writer, "{line}") {
                 tracing::error!("AUDIT: write failed for '{path}': {e}");
             }
         }
     }
 
+    fn flush_legacy(writer: &mut std::io::BufWriter<std::fs::File>, path: &str) {
+        use std::io::Write;
+        if let Err(e) = writer.flush() {
+            tracing::error!("AUDIT: flush failed for '{path}': {e}");
+        }
+    }
+
+    /// Write a batch of canonical `AuditEvent` records to all sinks with chain stamping.
+    fn write_events(
+        sinks: &mut Vec<Box<dyn AuditSink>>,
+        chain: &mut HashChain,
+        batch: &mut [AuditEvent],
+        path: &str,
+    ) {
+        for event in batch.iter_mut() {
+            chain.stamp(event);
+            for sink in sinks.iter_mut() {
+                if let Err(e) = sink.write_line(event) {
+                    tracing::error!("AUDIT: write failed for '{path}': {e}");
+                }
+            }
+        }
+    }
+
+    /// Log an `AuditEntry` (legacy path). Redaction runs here before the entry
+    /// is sent to the worker. The worker writes the flat `AuditEntry` JSON format
+    /// plus an appended `integrity` block, preserving backward compatibility with
+    /// consumers that parse the flat shape.
     pub fn log(&self, entry: &AuditEntry) {
         let Some(ref tx) = self.tx else {
             return;
         };
 
+        // Redaction runs on the caller side, before the entry is queued.
+        // Task 7 will add redaction for the `log_event` path.
         let redacted = if entry.query_text.is_some() {
             AuditEntry {
                 query_text: entry.query_text.as_deref().map(redact_pii),
@@ -193,8 +452,20 @@ impl AuditLogger {
             }
         };
 
-        if let Err(e) = tx.send(AuditMsg::Entry(Box::new(redacted))) {
+        if let Err(e) = tx.send(AuditMsg::Legacy(Box::new(redacted))) {
             tracing::error!("AUDIT: writer dropped, entry not recorded: {e}");
+        }
+    }
+
+    /// Log a canonical `AuditEvent` directly. Redaction (Task 7) is not yet
+    /// applied here; callers are responsible for sanitising PII before calling
+    /// this method.
+    pub fn log_event(&self, event: AuditEvent) {
+        let Some(ref tx) = self.tx else {
+            return;
+        };
+        if let Err(e) = tx.send(AuditMsg::Event(Box::new(event))) {
+            tracing::error!("AUDIT: writer dropped, event not recorded: {e}");
         }
     }
 
@@ -209,6 +480,14 @@ impl AuditLogger {
             return;
         }
         let _ = ack_rx.recv();
+    }
+}
+
+fn flush_sinks(sinks: &mut Vec<Box<dyn AuditSink>>, path: &str) {
+    for sink in sinks.iter_mut() {
+        if let Err(e) = sink.flush() {
+            tracing::error!("AUDIT: flush failed for '{path}': {e}");
+        }
     }
 }
 
@@ -430,5 +709,24 @@ mod tests {
         );
         assert!(!content.contains("carol@example.com"), "PII must not appear in audit log");
         assert!(content.contains("[EMAIL]"));
+    }
+
+    #[test]
+    fn both_format_writes_native_and_ocsf_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let logger = AuditLogger::with_config(
+            path.to_str().unwrap(),
+            crate::audit::AuditFormat::Both,
+        )
+        .unwrap();
+        logger.log_event(crate::audit::sample_query_event());
+        logger.flush();
+        let native = std::fs::read_to_string(&path).unwrap();
+        let ocsf = std::fs::read_to_string(dir.path().join("audit.ocsf.jsonl")).unwrap();
+        assert!(native.contains("\"kind\":\"query\""));
+        assert!(ocsf.contains("\"class_uid\":6005"));
+        // Every native record carries an integrity hash.
+        assert!(native.contains("\"hash\":"));
     }
 }
